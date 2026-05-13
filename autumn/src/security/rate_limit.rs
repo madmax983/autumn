@@ -73,7 +73,6 @@ use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroUsize;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Instant;
@@ -83,7 +82,9 @@ use axum::http::{HeaderValue, Request, Response, StatusCode};
 use http::header::{HeaderName, RETRY_AFTER};
 use tower::{Layer, Service};
 
-use super::config::{RateLimitBackend, RateLimitBackendFailure, RateLimitConfig};
+use super::config::RateLimitConfig;
+#[cfg(feature = "redis")]
+use super::config::{RateLimitBackend, RateLimitBackendFailure};
 
 const X_RATELIMIT_LIMIT: HeaderName = HeaderName::from_static("x-ratelimit-limit");
 const X_RATELIMIT_REMAINING: HeaderName = HeaderName::from_static("x-ratelimit-remaining");
@@ -230,7 +231,7 @@ struct RedisStore {
     key_prefix: String,
     failure_mode: RateLimitBackendFailure,
     /// Set to `true` once on the first Redis error; reset when it recovers.
-    outage_logged: AtomicBool,
+    outage_logged: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(feature = "redis")]
@@ -254,7 +255,7 @@ impl RedisStore {
             connection,
             key_prefix,
             failure_mode,
-            outage_logged: AtomicBool::new(false),
+            outage_logged: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -287,7 +288,7 @@ impl RedisStore {
         match result {
             Ok(values) if values.len() == 3 => {
                 // Redis recovered after an outage — reset the flag so we warn again next time.
-                self.outage_logged.store(false, Ordering::Relaxed);
+                self.outage_logged.store(false, std::sync::atomic::Ordering::Relaxed);
                 let allowed = values[0] == 1;
                 if allowed {
                     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -301,7 +302,7 @@ impl RedisStore {
             }
             Err(err) => {
                 // Emit one warning per outage, not per request.
-                if !self.outage_logged.swap(true, Ordering::Relaxed) {
+                if !self.outage_logged.swap(true, std::sync::atomic::Ordering::Relaxed) {
                     tracing::warn!(
                         error = %err,
                         key_prefix = %self.key_prefix,
@@ -439,10 +440,10 @@ impl Limiter {
         }
     }
 
-    fn build_backend(config: &RateLimitConfig) -> BucketBackend {
+    fn build_backend(_config: &RateLimitConfig) -> BucketBackend {
         #[cfg(feature = "redis")]
-        if config.backend == RateLimitBackend::Redis {
-            if let Some(url) = config.redis.url.as_deref().filter(|u| !u.trim().is_empty()) {
+        if _config.backend == RateLimitBackend::Redis {
+            if let Some(url) = _config.redis.url.as_deref().filter(|u| !u.trim().is_empty()) {
                 match redis::Client::open(url) {
                     Ok(client) => {
                         match redis::aio::ConnectionManager::new_lazy_with_config(
@@ -452,8 +453,8 @@ impl Limiter {
                             Ok(conn) => {
                                 return BucketBackend::Redis(RedisStore::new(
                                     conn,
-                                    config.redis.key_prefix.clone(),
-                                    config.on_backend_failure,
+                                    _config.redis.key_prefix.clone(),
+                                    _config.on_backend_failure,
                                 ));
                             }
                             Err(err) => {

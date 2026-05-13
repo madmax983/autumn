@@ -667,10 +667,16 @@ pub struct RateLimitConfig {
     ///
     /// Set to `"redis"` in multi-replica deployments so the configured
     /// rate cap is enforced globally rather than per pod.
+    ///
+    /// Requires the `redis` cargo feature.
+    #[cfg(feature = "redis")]
     #[serde(default)]
     pub backend: RateLimitBackend,
 
     /// Redis backend options. Used when `backend = "redis"`.
+    ///
+    /// Requires the `redis` cargo feature.
+    #[cfg(feature = "redis")]
     #[serde(default)]
     pub redis: RateLimitRedisConfig,
 
@@ -678,6 +684,9 @@ pub struct RateLimitConfig {
     ///
     /// `"fail_open"` lets requests through (matches single-replica posture).
     /// `"fail_closed"` returns `429` until the backend recovers.
+    ///
+    /// Requires the `redis` cargo feature.
+    #[cfg(feature = "redis")]
     #[serde(default)]
     pub on_backend_failure: RateLimitBackendFailure,
 }
@@ -690,8 +699,11 @@ impl Default for RateLimitConfig {
             burst: default_burst(),
             trust_forwarded_headers: false,
             trusted_proxies: Vec::new(),
+            #[cfg(feature = "redis")]
             backend: RateLimitBackend::default(),
+            #[cfg(feature = "redis")]
             redis: RateLimitRedisConfig::default(),
+            #[cfg(feature = "redis")]
             on_backend_failure: RateLimitBackendFailure::default(),
         }
     }
@@ -703,7 +715,10 @@ impl Default for RateLimitConfig {
 /// (issue #535) and `SchedulerBackend` (issue #531): one `backend = "redis"` flip
 /// per subsystem, identical failure semantics.
 ///
+/// Requires the `redis` cargo feature.
+///
 /// [`CacheBackend`]: crate::config::CacheBackend
+#[cfg(feature = "redis")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RateLimitBackend {
@@ -720,6 +735,9 @@ pub enum RateLimitBackend {
 ///
 /// Configures the limiter's posture when the storage backend (Redis) is
 /// unavailable. Matches the pattern used by the webhook replay store.
+///
+/// Requires the `redis` cargo feature.
+#[cfg(feature = "redis")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RateLimitBackendFailure {
@@ -736,6 +754,9 @@ pub enum RateLimitBackendFailure {
 /// Redis-specific options for the rate-limit backend.
 ///
 /// Used when `security.rate_limit.backend = "redis"`.
+///
+/// Requires the `redis` cargo feature.
+#[cfg(feature = "redis")]
 #[derive(Debug, Clone, Deserialize)]
 pub struct RateLimitRedisConfig {
     /// Redis connection URL (e.g. `redis://127.0.0.1:6379`).
@@ -748,6 +769,7 @@ pub struct RateLimitRedisConfig {
     pub key_prefix: String,
 }
 
+#[cfg(feature = "redis")]
 impl Default for RateLimitRedisConfig {
     fn default() -> Self {
         Self {
@@ -757,6 +779,7 @@ impl Default for RateLimitRedisConfig {
     }
 }
 
+#[cfg(feature = "redis")]
 fn default_rate_limit_redis_key_prefix() -> String {
     "autumn:rate_limit".to_owned()
 }
@@ -1114,26 +1137,29 @@ mod tests {
         assert_eq!(config.burst, 20);
         assert!(!config.trust_forwarded_headers);
         assert!(config.trusted_proxies.is_empty());
-        assert_eq!(config.backend, RateLimitBackend::Memory);
-        assert_eq!(config.on_backend_failure, RateLimitBackendFailure::FailOpen);
-        assert_eq!(
-            config.redis.key_prefix,
-            "autumn:rate_limit"
-        );
+        #[cfg(feature = "redis")]
+        {
+            assert_eq!(config.backend, RateLimitBackend::Memory);
+            assert_eq!(config.on_backend_failure, RateLimitBackendFailure::FailOpen);
+            assert_eq!(config.redis.key_prefix, "autumn:rate_limit");
+        }
     }
 
+    #[cfg(feature = "redis")]
     #[test]
     fn rate_limit_backend_deserializes_memory() {
         let config: RateLimitConfig = toml::from_str("backend = \"memory\"").unwrap();
         assert_eq!(config.backend, RateLimitBackend::Memory);
     }
 
+    #[cfg(feature = "redis")]
     #[test]
     fn rate_limit_backend_deserializes_redis() {
         let config: RateLimitConfig = toml::from_str("backend = \"redis\"").unwrap();
         assert_eq!(config.backend, RateLimitBackend::Redis);
     }
 
+    #[cfg(feature = "redis")]
     #[test]
     fn rate_limit_on_backend_failure_deserializes_fail_open() {
         let config: RateLimitConfig =
@@ -1144,6 +1170,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "redis")]
     #[test]
     fn rate_limit_on_backend_failure_deserializes_fail_closed() {
         let config: RateLimitConfig =
@@ -1154,6 +1181,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "redis")]
     #[test]
     fn rate_limit_redis_config_deserializes() {
         let toml_str = r#"
@@ -1171,6 +1199,7 @@ mod tests {
         assert_eq!(config.redis.key_prefix, "myapp:rl");
     }
 
+    #[cfg(feature = "redis")]
     #[test]
     fn rate_limit_redis_config_defaults_key_prefix() {
         let config: RateLimitConfig = toml::from_str("backend = \"redis\"").unwrap();

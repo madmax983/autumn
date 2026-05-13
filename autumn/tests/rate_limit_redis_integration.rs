@@ -1,3 +1,4 @@
+#![cfg(feature = "redis")]
 //! Integration tests: Redis-backed rate limiter across two "replicas".
 //!
 //! Verifies that with `backend = "redis"`, a single client IP hitting
