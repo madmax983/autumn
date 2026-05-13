@@ -138,6 +138,19 @@ fn classify_statement(normalized: &str) -> Vec<SafetyFinding> {
         return findings;
     }
 
+    // DROP VIEW
+    if normalized.starts_with("drop view") {
+        findings.push(SafetyFinding {
+            operation: "DROP VIEW".to_owned(),
+            risk: RiskLevel::Destructive,
+            why: "Drops the view. Old replicas that query this view will error immediately \
+                  during a rolling deploy.",
+            next_action: "Use expand/contract: first deploy code that no longer references the \
+                          view, then drop it in a subsequent release.",
+        });
+        return findings;
+    }
+
     // DROP COLUMN
     if normalized.contains(" drop column ") {
         findings.push(SafetyFinding {
@@ -261,6 +274,23 @@ fn classify_statement(normalized: &str) -> Vec<SafetyFinding> {
                           one-off task (`autumn task`) after the schema migration has deployed. \
                           Add a NOT VALID constraint first if you need the constraint enforced \
                           before the backfill completes.",
+        });
+    }
+
+    // CTE-prefixed bulk DML — WITH … UPDATE / DELETE / INSERT
+    // A CTE starts with `with` so the plain DML checks above don't fire.
+    if normalized.starts_with("with ")
+        && (normalized.contains(") update ")
+            || normalized.contains(") delete ")
+            || normalized.contains(") insert into "))
+    {
+        findings.push(SafetyFinding {
+            operation: "Bulk DML (data backfill via CTE)".to_owned(),
+            risk: RiskLevel::DataBackfill,
+            why: "A CTE that writes (UPDATE, DELETE, INSERT) locks rows for the duration of the \
+                  transaction. On large tables this can time out or block application traffic.",
+            next_action: "Run the data backfill as a separate idempotent background job or \
+                          one-off task (`autumn task`) after the schema migration has deployed.",
         });
     }
 
@@ -410,6 +440,21 @@ mod tests {
     }
 
     // ── destructive patterns ──────────────────────────────────────────────────
+
+    #[test]
+    fn drop_view_is_destructive() {
+        let findings = classify_sql("DROP VIEW active_posts;");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].risk, RiskLevel::Destructive);
+        assert_eq!(findings[0].operation, "DROP VIEW");
+    }
+
+    #[test]
+    fn drop_view_cascade_is_destructive() {
+        let findings = classify_sql("DROP VIEW active_posts CASCADE;");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].risk, RiskLevel::Destructive);
+    }
 
     #[test]
     fn drop_table_is_destructive() {
@@ -671,6 +716,36 @@ mod tests {
                 || f.next_action.to_lowercase().contains("task"),
             "next_action should recommend a separate job or task: {}",
             f.next_action
+        );
+    }
+
+    #[test]
+    fn cte_update_is_data_backfill() {
+        let sql = "WITH batch AS (SELECT id FROM posts WHERE status IS NULL LIMIT 1000) \
+                   UPDATE posts SET status = 'draft' FROM batch WHERE posts.id = batch.id;";
+        let findings = classify_sql(sql);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].risk, RiskLevel::DataBackfill);
+        assert_eq!(findings[0].operation, "Bulk DML (data backfill via CTE)");
+    }
+
+    #[test]
+    fn cte_delete_is_data_backfill() {
+        let sql = "WITH doomed AS (SELECT id FROM posts WHERE archived = true) DELETE FROM posts USING doomed WHERE posts.id = doomed.id;";
+        let findings = classify_sql(sql);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].risk, RiskLevel::DataBackfill);
+    }
+
+    #[test]
+    fn cte_select_only_is_safe() {
+        // A read-only CTE should not produce a DataBackfill finding.
+        let sql = "WITH recent AS (SELECT id FROM posts ORDER BY created_at DESC LIMIT 10) \
+                   SELECT * FROM recent;";
+        let findings = classify_sql(sql);
+        assert!(
+            findings.iter().all(|f| f.risk != RiskLevel::DataBackfill),
+            "read-only CTE must not produce DataBackfill finding: {findings:?}"
         );
     }
 
