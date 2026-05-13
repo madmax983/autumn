@@ -6,10 +6,12 @@
 //!
 //! # Known limitations
 //!
-//! - Statement splitting uses `;` as the delimiter. Semicolons inside string
-//!   literals or `PostgreSQL` dollar-quoted blocks (`$$…$$`) will produce
-//!   incorrect splits. Real migration files almost never embed semicolons in
-//!   strings, so this is an acceptable approximation.
+//! - Statement splitting uses `;` as the delimiter with awareness of
+//!   `PostgreSQL` dollar-quoted blocks (`$$…$$` and `$tag$…$tag$`).
+//!   Semicolons inside a dollar-quoted function body are kept intact so that
+//!   a `-- autumn-safety: reviewed` marker correctly suppresses the whole
+//!   statement. Semicolons inside single-quoted string literals are not
+//!   handled; that pattern is essentially absent from real migration files.
 //! - Line comment stripping matches `--` by position on each line. A `--`
 //!   sequence inside a string literal would be incorrectly treated as a comment
 //!   start. Again, this pattern is essentially absent from real migration files.
@@ -104,12 +106,60 @@ pub fn has_unsafe_findings(findings: &[SafetyFinding]) -> bool {
 
 // ── internals ────────────────────────────────────────────────────────────────
 
+/// Split `sql` into individual statements, using `;` as the delimiter.
+///
+/// Dollar-quoted blocks (`$$…$$`, `$tag$…$tag$`) are kept intact so that
+/// semicolons inside a function body do not produce spurious fragments.
 fn split_statements(sql: &str) -> Vec<String> {
-    sql.split(';')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned)
-        .collect()
+    let mut statements = Vec::new();
+    let mut current = String::new();
+    let mut i = 0;
+
+    while i < sql.len() {
+        let rest = &sql[i..];
+
+        // Detect a dollar-quote opening: $identifier$ (identifier may be empty → $$).
+        // When found, consume everything up to and including the matching closing tag
+        // so that semicolons inside the body are not treated as statement separators.
+        if let Some(after_dollar) = rest.strip_prefix('$')
+            && let Some(close_in_rest1) = after_dollar.find('$')
+        {
+            let tag_body = &after_dollar[..close_in_rest1];
+            if tag_body.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                let tag_len = 1 + close_in_rest1 + 1; // opening $ + body + closing $
+                let tag = &rest[..tag_len];
+                if let Some(close_pos) = rest[tag_len..].find(tag) {
+                    // Push opening tag + body + closing tag as one chunk.
+                    current.push_str(&rest[..tag_len + close_pos + tag_len]);
+                    i += tag_len + close_pos + tag_len;
+                } else {
+                    // Unclosed dollar-quote: consume to end of input.
+                    current.push_str(rest);
+                    i = sql.len();
+                }
+                continue;
+            }
+        }
+
+        if rest.starts_with(';') {
+            let trimmed = current.trim().to_owned();
+            if !trimmed.is_empty() {
+                statements.push(trimmed);
+            }
+            current.clear();
+            i += 1;
+        } else {
+            let c = rest.chars().next().unwrap();
+            current.push(c);
+            i += c.len_utf8();
+        }
+    }
+
+    let trimmed = current.trim().to_owned();
+    if !trimmed.is_empty() {
+        statements.push(trimmed);
+    }
+    statements
 }
 
 /// Split a normalized `ALTER TABLE` statement into individual subcommand strings.
@@ -1163,6 +1213,48 @@ mod tests {
             "DROP TABLE after a block comment containing ';' must still be classified"
         );
         assert_eq!(findings[0].risk, RiskLevel::Destructive);
+    }
+
+    // ── dollar-quoted function bodies ─────────────────────────────────────────
+
+    #[test]
+    fn dollar_quoted_function_with_semicolons_is_one_statement() {
+        // The semicolons inside $$ ... $$ must not produce extra statement fragments.
+        let sql = "CREATE FUNCTION bump() RETURNS void AS $$ BEGIN \
+                   UPDATE posts SET hits = hits + 1; RETURN; END; $$ LANGUAGE plpgsql;";
+        let findings = classify_sql(sql);
+        assert_eq!(
+            findings.len(),
+            1,
+            "dollar-quoted body with semicolons must produce exactly one finding: {findings:?}"
+        );
+        assert_eq!(findings[0].risk, RiskLevel::ManualReview);
+    }
+
+    #[test]
+    fn autumn_safety_reviewed_suppresses_function_with_dml_in_body() {
+        // Without dollar-quote-aware splitting the DML fragment would escape suppression.
+        let sql = "-- autumn-safety: reviewed\n\
+                   CREATE FUNCTION migrate_posts() RETURNS void AS $$\n\
+                   BEGIN\n  UPDATE posts SET migrated = true;\n  RETURN;\nEND;\n\
+                   $$ LANGUAGE plpgsql;";
+        let findings = classify_sql(sql);
+        assert!(
+            findings.is_empty(),
+            "reviewed marker must suppress a dollar-quoted function containing DML: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn tagged_dollar_quote_with_semicolons_is_one_statement() {
+        let sql = "CREATE FUNCTION foo() RETURNS void AS $func$ \
+                   BEGIN UPDATE posts SET x = 1; END; $func$ LANGUAGE plpgsql;";
+        let findings = classify_sql(sql);
+        assert_eq!(
+            findings.len(),
+            1,
+            "tagged dollar-quote body with semicolons must not split: {findings:?}"
+        );
     }
 
     // ── DROP INDEX ────────────────────────────────────────────────────────────
