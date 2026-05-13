@@ -878,6 +878,15 @@ mod tests {
     }
 
     #[test]
+    fn size_clamping_boundary_check() {
+        let r = PageRequest::new(1, MAX_PAGE_SIZE);
+        assert_eq!(r.size(), MAX_PAGE_SIZE);
+
+        let over = PageRequest::new(1, MAX_PAGE_SIZE + 1);
+        assert_eq!(over.size(), MAX_PAGE_SIZE);
+    }
+
+    #[test]
     fn size_zero_falls_back_to_default() {
         let r = PageRequest::new(3, 0);
         assert_eq!(r.size(), DEFAULT_PAGE_SIZE);
@@ -1185,6 +1194,15 @@ mod tests {
 
         let under = CursorRequest::new(None, MAX_PAGE_SIZE - 1);
         assert_eq!(under.size(), MAX_PAGE_SIZE - 1);
+    }
+
+    #[test]
+    fn cursor_size_clamping_boundary_check() {
+        let r = CursorRequest::new(None, MAX_PAGE_SIZE);
+        assert_eq!(r.size(), MAX_PAGE_SIZE);
+
+        let over = CursorRequest::new(None, MAX_PAGE_SIZE + 1);
+        assert_eq!(over.size(), MAX_PAGE_SIZE);
     }
 
     #[test]
