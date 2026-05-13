@@ -269,7 +269,7 @@ mod tests {
     /// `POST` into `PUT`/`PATCH`/`DELETE` — the inner `MethodRouter`
     /// returns `405` before the layer ever runs. The override convention
     /// requires running before route matching, so wrap the router as a
-    /// tower::Service.
+    /// `tower::Service`.
     fn layered_router() -> MethodOverrideService<Router> {
         let router = Router::new()
             .route("/items", post(|| async { "created" }))
