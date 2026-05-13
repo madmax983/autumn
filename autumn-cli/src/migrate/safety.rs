@@ -106,6 +106,47 @@ fn split_statements(sql: &str) -> Vec<String> {
         .collect()
 }
 
+/// Split a normalized `ALTER TABLE` statement into individual subcommand strings.
+///
+/// Strips the `alter table <name>` prefix and splits the remaining text on
+/// commas that are not enclosed in parentheses, trimming each segment.
+fn alter_table_subcommands(normalized: &str) -> Vec<&str> {
+    let after_prefix = normalized.strip_prefix("alter table ").unwrap_or("");
+    let subcommands_start = after_prefix.find(' ').map_or(after_prefix.len(), |i| i + 1);
+    let subcommands = &after_prefix[subcommands_start..];
+
+    let mut result = Vec::new();
+    let mut depth: i32 = 0;
+    let mut start = 0;
+    for (i, c) in subcommands.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                result.push(subcommands[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    let last = subcommands[start..].trim();
+    if !last.is_empty() {
+        result.push(last);
+    }
+    result
+}
+
+/// True iff `subcommand` is an ALTER TABLE subcommand that Autumn fully classifies.
+///
+/// A subcommand is "known" when a specific safety rule covers all risk scenarios
+/// for it (including the case where it is safe and produces no finding).
+fn is_known_alter_subcommand(subcommand: &str) -> bool {
+    subcommand.starts_with("add column ")
+        || subcommand.starts_with("drop column ")
+        || subcommand.starts_with("rename ") // RENAME COLUMN or RENAME TO
+        || (subcommand.starts_with("alter column ") && subcommand.contains(" type "))
+}
+
 /// Strip line comments, collapse whitespace, and lowercase a single statement.
 fn normalize_statement(stmt: &str) -> String {
     stmt.lines()
@@ -204,31 +245,38 @@ fn classify_statement(normalized: &str) -> Vec<SafetyFinding> {
         });
     }
 
-    // ADD COLUMN NOT NULL without DEFAULT
-    // Use " default " (word-boundary) so column names like `defaulted_at` don't suppress the check.
-    if normalized.contains(" add column ")
-        && normalized.contains("not null")
-        && !normalized.contains(" default ")
-    {
-        findings.push(SafetyFinding {
-            operation: "ADD COLUMN NOT NULL (no default)".to_owned(),
-            risk: RiskLevel::PotentiallyBlocking,
-            why: "Adding a NOT NULL column without a DEFAULT forces Postgres to validate every \
-                  existing row under an exclusive lock. On a large table this may time out.",
-            next_action: "Provide a DEFAULT value, or add the column as nullable first, backfill \
-                          existing rows, then add the NOT NULL constraint in a later migration.",
-        });
+    // ADD COLUMN NOT NULL without DEFAULT — checked per subcommand so that a DEFAULT
+    // on one column in a multi-column ALTER TABLE does not suppress the check for other
+    // columns that lack a DEFAULT.
+    if normalized.starts_with("alter table") {
+        for subcommand in alter_table_subcommands(normalized) {
+            if subcommand.starts_with("add column ")
+                && subcommand.contains("not null")
+                && !subcommand.contains(" default ")
+            {
+                findings.push(SafetyFinding {
+                    operation: "ADD COLUMN NOT NULL (no default)".to_owned(),
+                    risk: RiskLevel::PotentiallyBlocking,
+                    why: "Adding a NOT NULL column without a DEFAULT forces Postgres to validate \
+                          every existing row under an exclusive lock. On a large table this may \
+                          time out.",
+                    next_action: "Provide a DEFAULT value, or add the column as nullable first, \
+                                  backfill existing rows, then add the NOT NULL constraint in a \
+                                  later migration.",
+                });
+                break; // one finding per statement is sufficient
+            }
+        }
     }
 
-    // Unclassified ALTER TABLE subcommand — catch operations like DROP CONSTRAINT,
-    // ADD CONSTRAINT, and ALTER COLUMN SET NOT NULL that aren't covered by the rules
-    // above. Only fires when none of the specific rules produced a finding.
-    if normalized.starts_with("alter table") && findings.is_empty() {
-        let known_subcommand = normalized.contains(" add column ")
-            || normalized.contains(" drop column ")
-            || normalized.contains(" rename ") // RENAME COLUMN or RENAME TO
-            || (normalized.contains(" alter column ") && normalized.contains(" type "));
-        if !known_subcommand {
+    // Unclassified ALTER TABLE subcommand — fires when any subcommand in the statement
+    // is not covered by the specific rules above. Checking all subcommands individually
+    // prevents a known-safe subcommand (e.g. ADD COLUMN) from hiding an unknown one
+    // (e.g. DROP CONSTRAINT) in the same multi-action ALTER TABLE.
+    if normalized.starts_with("alter table") {
+        let subcommands = alter_table_subcommands(normalized);
+        let all_known = subcommands.iter().all(|s| is_known_alter_subcommand(s));
+        if !all_known {
             findings.push(SafetyFinding {
                 operation: "Unclassified ALTER TABLE".to_owned(),
                 risk: RiskLevel::ManualReview,
@@ -506,6 +554,32 @@ mod tests {
     }
 
     // ── potentially blocking patterns ─────────────────────────────────────────
+
+    #[test]
+    fn multi_column_add_only_flags_clause_without_default() {
+        // ADD COLUMN score has DEFAULT — ADD COLUMN slug does NOT. Only slug should be flagged.
+        let sql = "ALTER TABLE posts \
+                   ADD COLUMN score INT NOT NULL DEFAULT 0, \
+                   ADD COLUMN slug TEXT NOT NULL;";
+        let findings = classify_sql(sql);
+        assert_eq!(
+            findings.len(),
+            1,
+            "only the column without a DEFAULT should be flagged"
+        );
+        assert_eq!(findings[0].risk, RiskLevel::PotentiallyBlocking);
+    }
+
+    #[test]
+    fn mixed_known_and_unknown_alter_table_subcommands_flagged() {
+        // ADD COLUMN is safe, but DROP CONSTRAINT is unclassified — should get ManualReview.
+        let sql = "ALTER TABLE posts ADD COLUMN subtitle TEXT, DROP CONSTRAINT posts_title_key;";
+        let findings = classify_sql(sql);
+        assert!(
+            findings.iter().any(|f| f.risk == RiskLevel::ManualReview),
+            "unknown subcommand must produce ManualReview: {findings:?}"
+        );
+    }
 
     #[test]
     fn add_not_null_column_without_default_is_blocking() {
