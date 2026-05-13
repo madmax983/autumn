@@ -185,6 +185,18 @@ fn is_form_urlencoded(headers: &http::HeaderMap) -> bool {
         .is_some_and(|ct| ct.starts_with("application/x-www-form-urlencoded"))
 }
 
+/// Returns `true` only when the request advertises a `Content-Length`
+/// strictly larger than `limit`. A missing or unparseable header returns
+/// `false`, since we can't make a confident determination without
+/// buffering — those cases fall through to the buffered scan.
+fn content_length_exceeds(headers: &http::HeaderMap, limit: usize) -> bool {
+    headers
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .is_some_and(|len| len > limit as u64)
+}
+
 impl<S, ResBody> Service<Request<axum::body::Body>> for MethodOverrideService<S>
 where
     S: Service<Request<axum::body::Body>, Response = Response<ResBody>> + Clone + Send + 'static,
@@ -209,6 +221,17 @@ where
             return Box::pin(async move { inner.call(req).await });
         }
 
+        // If the client advertises a body larger than the scan cap, skip
+        // override processing entirely and forward the original body
+        // untouched. We never buffer it, so handlers downstream still
+        // receive the full submission verbatim — a form that's too large
+        // to scan for `_method` simply doesn't get the override applied.
+        if content_length_exceeds(req.headers(), MAX_BODY_SCAN_BYTES) {
+            let mut inner = self.inner.clone();
+            std::mem::swap(&mut self.inner, &mut inner);
+            return Box::pin(async move { inner.call(req).await });
+        }
+
         let config = Arc::clone(&self.config);
         let mut inner = self.inner.clone();
         std::mem::swap(&mut self.inner, &mut inner);
@@ -217,9 +240,23 @@ where
             // Temporarily take ownership of the body so we can buffer it
             // for parsing without losing the bytes the handler will need.
             let body = std::mem::replace(req.body_mut(), axum::body::Body::empty());
-            let bytes = axum::body::to_bytes(body, MAX_BODY_SCAN_BYTES)
-                .await
-                .unwrap_or_else(|_| axum::body::Bytes::new());
+            let Ok(bytes) = axum::body::to_bytes(body, MAX_BODY_SCAN_BYTES).await else {
+                // Body exceeded the scan cap while buffering (e.g.
+                // chunked transfer with no Content-Length) or read
+                // failed. We've already consumed the body, so we can
+                // no longer forward the request faithfully — return
+                // an explicit 413 instead of silently corrupting it
+                // with an empty body.
+                let mut response = Response::new(ResBody::from(
+                    "Form body too large for method-override scanning.",
+                ));
+                *response.status_mut() = StatusCode::PAYLOAD_TOO_LARGE;
+                response.headers_mut().insert(
+                    http::header::CONTENT_TYPE,
+                    http::HeaderValue::from_static("text/plain; charset=utf-8"),
+                );
+                return Ok(response);
+            };
 
             let outcome = scan_form_for_override(&bytes, &config.field_name);
 
@@ -584,5 +621,108 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(&body[..], b"deleted");
+    }
+
+    /// Regression: a form-urlencoded POST larger than the scan cap must
+    /// still reach its handler with the body intact when it doesn't
+    /// declare an override. Previously the scan failure path emptied
+    /// the body, corrupting any large legitimate POST routed through
+    /// the global override layer.
+    #[tokio::test]
+    async fn large_form_post_without_override_preserves_full_body() {
+        async fn measure(body: bytes::Bytes) -> String {
+            format!("{}", body.len())
+        }
+        // Raise the handler-side body limit so the test exercises the
+        // middleware's pass-through path rather than axum's own default
+        // 2 MiB body cap on extractors.
+        let router = Router::new()
+            .route("/upload", post(measure))
+            .layer(axum::extract::DefaultBodyLimit::max(8 * 1024 * 1024));
+        let app = MethodOverrideLayer::new().layer(router);
+
+        // 3 MiB payload: comfortably over MAX_BODY_SCAN_BYTES (2 MiB).
+        let big = "x".repeat(3 * 1024 * 1024);
+        let payload = format!("title={big}");
+        let payload_len = payload.len();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/upload")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .header("content-length", payload_len.to_string())
+                    .body(Body::from(payload))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 32)
+            .await
+            .unwrap();
+        let observed: usize = std::str::from_utf8(&body).unwrap().parse().unwrap();
+        assert_eq!(
+            observed, payload_len,
+            "handler must see the full original body, not an empty one"
+        );
+    }
+
+    /// A POST whose body actually exceeds the scan cap during buffering
+    /// (e.g. chunked transfer encoding without an accurate Content-Length)
+    /// returns an explicit `413` rather than passing an empty body to
+    /// downstream handlers.
+    #[tokio::test]
+    async fn unbounded_oversized_form_post_returns_413() {
+        async fn handler(body: String) -> String {
+            body
+        }
+        let router = Router::new().route("/x", post(handler));
+        let app = MethodOverrideLayer::new().layer(router);
+
+        // No Content-Length header -> content_length_exceeds returns
+        // false and we attempt to buffer. The body itself is larger
+        // than the scan cap so `to_bytes` will error.
+        let payload = "x".repeat(3 * 1024 * 1024);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/x")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(payload))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[test]
+    fn content_length_exceeds_only_when_strictly_larger() {
+        let mut headers = http::HeaderMap::new();
+        assert!(!content_length_exceeds(&headers, 1024));
+
+        headers.insert(
+            http::header::CONTENT_LENGTH,
+            http::HeaderValue::from_static("1024"),
+        );
+        assert!(!content_length_exceeds(&headers, 1024));
+
+        headers.insert(
+            http::header::CONTENT_LENGTH,
+            http::HeaderValue::from_static("1025"),
+        );
+        assert!(content_length_exceeds(&headers, 1024));
+
+        // Unparseable header values stay conservative: don't short-circuit.
+        headers.insert(
+            http::header::CONTENT_LENGTH,
+            http::HeaderValue::from_static("not-a-number"),
+        );
+        assert!(!content_length_exceeds(&headers, 1024));
     }
 }
