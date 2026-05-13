@@ -666,10 +666,9 @@ pub struct RateLimitConfig {
     /// Bucket store backend. Default: `"memory"` (in-process, single-replica).
     ///
     /// Set to `"redis"` in multi-replica deployments so the configured
-    /// rate cap is enforced globally rather than per pod.
-    ///
-    /// Requires the `redis` cargo feature.
-    #[cfg(feature = "redis")]
+    /// rate cap is enforced globally rather than per pod. Requires the
+    /// `redis` cargo feature to take effect; without it, a startup warning
+    /// is emitted and the memory backend is used.
     #[serde(default)]
     pub backend: RateLimitBackend,
 
@@ -699,7 +698,6 @@ impl Default for RateLimitConfig {
             burst: default_burst(),
             trust_forwarded_headers: false,
             trusted_proxies: Vec::new(),
-            #[cfg(feature = "redis")]
             backend: RateLimitBackend::default(),
             #[cfg(feature = "redis")]
             redis: RateLimitRedisConfig::default(),
@@ -715,10 +713,11 @@ impl Default for RateLimitConfig {
 /// (issue #535) and `SchedulerBackend` (issue #531): one `backend = "redis"` flip
 /// per subsystem, identical failure semantics.
 ///
-/// Requires the `redis` cargo feature.
+/// The enum is always available so misconfiguration is detectable even when the
+/// `redis` cargo feature is disabled. Without the feature, selecting `Redis`
+/// emits a startup warning and falls back to `Memory`.
 ///
 /// [`CacheBackend`]: crate::config::CacheBackend
-#[cfg(feature = "redis")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RateLimitBackend {
@@ -728,10 +727,11 @@ pub enum RateLimitBackend {
     Memory,
     /// Shared Redis store coordinated via an atomic Lua script. The configured
     /// rate is enforced globally across all replicas.
+    ///
+    /// Requires the `redis` cargo feature.
     Redis,
 }
 
-#[cfg(feature = "redis")]
 impl RateLimitBackend {
     pub(crate) fn from_env_value(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
@@ -1222,7 +1222,6 @@ mod tests {
         assert!(config.redis.url.is_none());
     }
 
-    #[cfg(feature = "redis")]
     #[test]
     fn rate_limit_backend_from_env_value() {
         assert_eq!(
@@ -1241,7 +1240,7 @@ mod tests {
         assert_eq!(RateLimitBackend::from_env_value(""), None);
     }
 
-    #[cfg(feature = "redis")]
+    #[cfg(feature = "redis")] // RateLimitBackendFailure is redis-gated
     #[test]
     fn rate_limit_backend_failure_from_env_value() {
         assert_eq!(

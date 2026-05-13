@@ -1766,18 +1766,20 @@ impl AutumnConfig {
             "AUTUMN_SECURITY__RATE_LIMIT__TRUSTED_PROXIES",
             &mut self.security.rate_limit.trusted_proxies,
         );
+        // BACKEND is always parsed so misconfiguration is surfaced even without
+        // the redis feature (build_backend will warn and fall back to memory).
+        if let Ok(val) = env.var("AUTUMN_SECURITY__RATE_LIMIT__BACKEND") {
+            match crate::security::config::RateLimitBackend::from_env_value(&val) {
+                Some(backend) => self.security.rate_limit.backend = backend,
+                None => eprintln!(
+                    "Warning: AUTUMN_SECURITY__RATE_LIMIT__BACKEND={val:?} is not valid \
+                     (expected memory or redis), ignoring"
+                ),
+            }
+        }
         #[cfg(feature = "redis")]
         {
-            use crate::security::config::{RateLimitBackend, RateLimitBackendFailure};
-            if let Ok(val) = env.var("AUTUMN_SECURITY__RATE_LIMIT__BACKEND") {
-                match RateLimitBackend::from_env_value(&val) {
-                    Some(backend) => self.security.rate_limit.backend = backend,
-                    None => eprintln!(
-                        "Warning: AUTUMN_SECURITY__RATE_LIMIT__BACKEND={val:?} is not valid \
-                         (expected memory or redis), ignoring"
-                    ),
-                }
-            }
+            use crate::security::config::RateLimitBackendFailure;
             if let Ok(val) = env.var("AUTUMN_SECURITY__RATE_LIMIT__ON_BACKEND_FAILURE") {
                 match RateLimitBackendFailure::from_env_value(&val) {
                     Some(mode) => self.security.rate_limit.on_backend_failure = mode,
@@ -3528,7 +3530,6 @@ path = "/healthz"
         );
     }
 
-    #[cfg(feature = "redis")]
     #[test]
     fn env_override_rate_limit_backend_redis() {
         use crate::security::config::RateLimitBackend;
@@ -3538,7 +3539,6 @@ path = "/healthz"
         assert_eq!(config.security.rate_limit.backend, RateLimitBackend::Redis);
     }
 
-    #[cfg(feature = "redis")]
     #[test]
     fn env_override_rate_limit_backend_memory() {
         use crate::security::config::RateLimitBackend;
@@ -3548,7 +3548,6 @@ path = "/healthz"
         assert_eq!(config.security.rate_limit.backend, RateLimitBackend::Memory);
     }
 
-    #[cfg(feature = "redis")]
     #[test]
     fn env_override_rate_limit_backend_invalid_ignored() {
         use crate::security::config::RateLimitBackend;

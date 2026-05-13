@@ -82,9 +82,9 @@ use axum::http::{HeaderValue, Request, Response, StatusCode};
 use http::header::{HeaderName, RETRY_AFTER};
 use tower::{Layer, Service};
 
-use super::config::RateLimitConfig;
 #[cfg(feature = "redis")]
-use super::config::{RateLimitBackend, RateLimitBackendFailure};
+use super::config::RateLimitBackendFailure;
+use super::config::{RateLimitBackend, RateLimitConfig};
 
 const X_RATELIMIT_LIMIT: HeaderName = HeaderName::from_static("x-ratelimit-limit");
 const X_RATELIMIT_REMAINING: HeaderName = HeaderName::from_static("x-ratelimit-remaining");
@@ -401,7 +401,17 @@ impl Limiter {
         }
     }
 
-    fn build_backend(#[allow(unused_variables)] config: &RateLimitConfig) -> BucketBackend {
+    fn build_backend(config: &RateLimitConfig) -> BucketBackend {
+        if config.backend == RateLimitBackend::Redis {
+            #[cfg(not(feature = "redis"))]
+            {
+                tracing::warn!(
+                    "rate-limit backend = \"redis\" requires the `redis` cargo feature; \
+                     falling back to memory. Enable the feature or set backend = \"memory\"."
+                );
+                return BucketBackend::Memory(MemoryStore::new());
+            }
+        }
         #[cfg(feature = "redis")]
         if config.backend == RateLimitBackend::Redis {
             if let Some(url) = config.redis.url.as_deref().filter(|u| !u.trim().is_empty()) {
@@ -449,6 +459,7 @@ impl Limiter {
 
     /// Consume one token for `key`. Returns `None` when throttling must be bypassed
     /// (no client, or Redis fail-open).
+    #[allow(clippy::unused_async)] // async is needed for the Redis arm when that feature is active
     async fn decide(&self, key: &str) -> Option<Decision> {
         match &self.backend {
             BucketBackend::Memory(store) => {
