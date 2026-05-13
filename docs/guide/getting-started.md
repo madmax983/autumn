@@ -777,6 +777,80 @@ The htmx attributes you will use most often:
 The pattern: your handler returns an HTML fragment (not a full page), htmx
 swaps it into the DOM. No JavaScript required.
 
+### Plain HTML forms targeting PUT/PATCH/DELETE
+
+When you want the same edit and delete flows to work with JavaScript
+disabled (or before htmx loads), submit a plain `<form>` and include a
+hidden `_method` field. Autumn rewrites the request to the declared
+HTTP method **before route matching**, so your `#[put]`, `#[patch]`, and
+`#[delete]` handlers stay semantically honest:
+
+```rust,no_run
+use autumn_web::form::method_input;
+use autumn_web::prelude::*;
+use autumn_web::security::CsrfToken;
+
+#[get("/todos/{id}/edit")]
+async fn edit_form(id: Path<i32>, csrf: Option<CsrfToken>) -> Markup {
+    html! {
+        form method="post" action=(format!("/todos/{}", *id)) {
+            // Hidden field. Autumn rewrites this POST to DELETE.
+            (method_input("DELETE"))
+            @if let Some(token) = csrf.as_ref() {
+                input type="hidden" name="_csrf" value=(token.token());
+            }
+            button type="submit" { "Delete" }
+        }
+    }
+}
+```
+
+A few notes:
+
+- The override is honoured only for `POST` requests with
+  `Content-Type: application/x-www-form-urlencoded`. Headers like
+  `X-HTTP-Method-Override` are intentionally not enabled by default.
+- It is also enforced as **same-origin**: the request must carry
+  `Sec-Fetch-Site: same-origin` or `none` (sent by every browser
+  since ~2020), or — for `same-site` or when `Sec-Fetch-Site` is
+  absent — its `Origin` header must match the request's scheme,
+  host, and port. This is stricter than `same-site` alone, because
+  `same-site` accepts sibling subdomains under the same registrable
+  domain (e.g. `evil.example.com` -> `app.example.com`). When
+  running behind a TLS-terminating reverse proxy, the scheme is
+  read from `X-Forwarded-Proto` (leftmost client-facing value);
+  the host is read from `X-Forwarded-Host` if surfaced, otherwise
+  from `Host`. Requests that don't meet these conditions are
+  forwarded as the original `POST` so a cross-origin form can
+  never reach a route declared only as `#[delete]`. The
+  `autumn_web::test::TestApp` `form()` helper sets
+  `Sec-Fetch-Site: same-origin` automatically.
+- Unknown override values (anything other than `PUT`, `PATCH`, `DELETE`,
+  case-insensitive) reject with `400 Bad Request` before your handler runs.
+- Form-urlencoded bodies larger than 2 MiB are rejected with
+  `413 Payload Too Large` so an oversized form with `_method=DELETE`
+  isn't silently demoted to a `POST` (body-size-driven semantics).
+  Use `multipart/form-data` for large submissions.
+- CSRF still treats the transport `POST` as unsafe — an overridden
+  `DELETE` without a valid token returns `403 Forbidden` just like any
+  other mutating POST.
+- `autumn routes` and `/actuator/routes` keep reporting the declared
+  method (`DELETE`, `PUT`, `PATCH`) so route listings, OpenAPI docs, and
+  log filters stay accurate.
+
+If you build the form through `ChangesetForm::form_tag`, just pass the
+declared method and the helper handles the override and CSRF inputs
+for you:
+
+```rust,ignore
+form.form_tag("/todos/42", "delete", html! { button { "Delete" } })
+// Renders: <form method="post" action="/todos/42">
+//            <input type="hidden" name="_method" value="DELETE">
+//            <input type="hidden" name="_csrf" value="...">
+//            <button>Delete</button>
+//          </form>
+```
+
 ---
 
 ## Error Handling

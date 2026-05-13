@@ -13,7 +13,7 @@ use std::sync::LazyLock;
 use autumn_web::flash::Flash;
 use autumn_web::job::{JobAdminQuery, JobAdminSnapshot, JobScheduleSummary, job_admin_backend};
 use autumn_web::prelude::HxResponseExt;
-use autumn_web::security::CsrfToken;
+use autumn_web::security::{CsrfFormField, CsrfToken};
 use autumn_web::{AppState, AutumnError, AutumnResult};
 use axum::extract::{FromRequestParts, Path, Query, State};
 use axum::http::request::Parts;
@@ -39,17 +39,30 @@ use crate::traits::{
 /// Autumn enables CSRF only for the `prod` profile by default, so a plain
 /// `CsrfToken` extractor would crash every admin page in dev/test with a
 /// 500. This wrapper reads the same request extension and falls back to an
-/// empty token when the layer isn't installed — the rendered `_csrf`
+/// empty token when the layer isn't installed — the rendered CSRF
 /// hidden input and `<meta>` are then harmless because the middleware
 /// that would validate them isn't running either.
 #[derive(Debug, Clone, Default)]
-pub struct AdminCsrf(String);
+pub struct AdminCsrf {
+    token: String,
+    form_field: String,
+}
 
 impl AdminCsrf {
     /// The CSRF token, or `""` if `CsrfLayer` is not installed.
     #[must_use]
     pub fn token(&self) -> &str {
-        &self.0
+        &self.token
+    }
+
+    /// The configured form field name, or Autumn's default when CSRF is absent.
+    #[must_use]
+    pub fn form_field(&self) -> &str {
+        if self.form_field.is_empty() {
+            "_csrf"
+        } else {
+            &self.form_field
+        }
     }
 }
 
@@ -62,7 +75,11 @@ impl<S: Send + Sync> FromRequestParts<S> for AdminCsrf {
             .get::<CsrfToken>()
             .map(|t| t.token().to_owned())
             .unwrap_or_default();
-        Ok(Self(token))
+        let form_field = parts
+            .extensions
+            .get::<CsrfFormField>()
+            .map_or_else(|| "_csrf".to_owned(), |field| field.0.clone());
+        Ok(Self { token, form_field })
     }
 }
 
@@ -353,6 +370,7 @@ async fn jobs_dashboard(
         &snapshot,
         &messages,
         csrf.token(),
+        csrf.form_field(),
         &prefix,
         &actuator_prefix,
     )))
@@ -496,6 +514,7 @@ async fn model_list(
         &filters,
         &messages,
         csrf.token(),
+        csrf.form_field(),
         &prefix,
         &actuator_prefix,
     )))
@@ -526,6 +545,7 @@ async fn model_new_form(
         None,
         &messages,
         csrf.token(),
+        csrf.form_field(),
         &prefix,
         &actuator_prefix,
     )))
@@ -634,6 +654,7 @@ async fn model_edit_form(
         Some(id),
         &messages,
         csrf.token(),
+        csrf.form_field(),
         &prefix,
         &actuator_prefix,
     )))
@@ -665,7 +686,7 @@ async fn model_update(
 /// `POST /admin/{slug}/actions` — Execute a bulk action.
 ///
 /// Form body carries `action=<name>`, repeated `ids=<id>` for each selected
-/// row, and `_csrf=<token>`. Validates the action name against the model's
+/// row, and the CSRF token field. Validates the action name against the model's
 /// declared `actions()` list, parses every `ids` entry as `i64`, then
 /// dispatches to [`AdminModel::execute_action`].
 async fn model_action(
@@ -690,7 +711,7 @@ async fn model_action(
                 Ok(id) => ids.push(id),
                 Err(_) => malformed_id = true,
             },
-            // ignore _csrf and any unknown keys
+            // ignore the CSRF token field and any unknown keys
             _ => {}
         }
     }
@@ -813,7 +834,13 @@ fn coerce_form_fields(mut data: Value, fields: &[AdminField]) -> Value {
 
 fn coerce_form_value(value: &mut Value, field: &AdminField) {
     if !field.required
-        && matches!(field.kind, AdminFieldKind::Integer | AdminFieldKind::Float)
+        && matches!(
+            field.kind,
+            AdminFieldKind::Integer
+                | AdminFieldKind::Float
+                | AdminFieldKind::Date
+                | AdminFieldKind::DateTime
+        )
         && matches!(value, Value::String(raw) if raw.trim().is_empty())
     {
         *value = Value::Null;
@@ -1023,6 +1050,17 @@ mod tests {
     }
 
     #[test]
+    fn coerce_form_fields_converts_blank_optional_date_strings_to_null() {
+        let fields = vec![
+            AdminField::new("published_on", AdminFieldKind::Date).optional(),
+            AdminField::new("starts_at", AdminFieldKind::DateTime).optional(),
+        ];
+        let out = coerce_form_fields(json!({"published_on": "", "starts_at": "   "}), &fields);
+
+        assert_eq!(out, json!({"published_on": null, "starts_at": null}));
+    }
+
+    #[test]
     fn validate_sort_key_passes_known_sortable_displayed_fields() {
         let fields = fields(&[("name", AdminFieldKind::Text)]);
         assert_eq!(
@@ -1167,6 +1205,7 @@ mod tests {
             .await
             .expect("infallible");
         assert_eq!(extracted.token(), "");
+        assert_eq!(extracted.form_field(), "_csrf");
     }
 
     #[tokio::test]
@@ -1197,6 +1236,22 @@ mod tests {
             .unwrap();
         // No panic, no 500 — just an empty-string body because no CsrfLayer.
         assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn admin_csrf_extractor_reads_configured_form_field_from_extensions() {
+        let req = axum::http::Request::builder().uri("/").body(()).unwrap();
+        let (mut parts, ()) = req.into_parts();
+        parts
+            .extensions
+            .insert(CsrfFormField("authenticity_token".to_owned()));
+
+        let extracted = AdminCsrf::from_request_parts(&mut parts, &())
+            .await
+            .expect("infallible");
+
+        assert_eq!(extracted.token(), "");
+        assert_eq!(extracted.form_field(), "authenticity_token");
     }
 
     #[test]

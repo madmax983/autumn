@@ -605,14 +605,17 @@ pub use auth::RequireApiToken;
 /// Postgres-backed API token store (requires `db` feature).
 ///
 /// Production replacement for [`auth::InMemoryApiTokenStore`]. Hashes tokens
-/// at rest and persists them across restarts. Use with [`API_TOKEN_MIGRATIONS`].
+/// at rest and persists them across restarts. Use with [`API_TOKEN_MIGRATIONS`]
+/// for dev/test startup checks; `autumn migrate` applies the token-table
+/// framework migration in production.
 #[cfg(feature = "db")]
 pub use auth::DbApiTokenStore;
 
 /// Embedded Diesel migrations for the `api_tokens` table (requires `db` feature).
 ///
-/// Pass to `app().migrations()` so that the `api_tokens` table is created
-/// automatically alongside your application migrations.
+/// Pass to `app().migrations()` so that dev/test startup migration checks can
+/// create and validate the `api_tokens` table alongside your application
+/// migrations.
 #[cfg(feature = "db")]
 pub use auth::API_TOKEN_MIGRATIONS;
 

@@ -16,6 +16,7 @@ name = "autumn"
 path = "src/main.rs"
 
 [dependencies]
+autumn-web = { version = "0.4.0", path = "../autumn", default-features = false, features = ["db", "htmx", "maud"] }
 clap = { version = "4", features = ["derive", "env"] }
 crossterm = "0.29"
 ctrlc = "3.5.2"

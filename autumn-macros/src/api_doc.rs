@@ -520,8 +520,9 @@ pub fn infer_query_params(input_fn: &syn::ItemFn) -> Option<TokenStream> {
 ///
 /// Two detection strategies:
 /// 1. `#[secured]` still in attrs (route macro is outermost; secured is below it).
-/// 2. `__autumn_session` param present (secured was above the route macro and
-///    already expanded its body — roles are not recoverable in this case).
+/// 2. Function-local `__AUTUMN_SECURED_ROLES` marker present (secured was
+///    above the route macro and already expanded its body).
+/// 3. Legacy fallback: `__autumn_session` param present.
 pub fn extract_secured_info(input_fn: &syn::ItemFn) -> (bool, TokenStream) {
     // Case 1 — #[secured] or #[autumn_web::secured] visible as a remaining attribute.
     for attr in &input_fn.attrs {
@@ -539,7 +540,14 @@ pub fn extract_secured_info(input_fn: &syn::ItemFn) -> (bool, TokenStream) {
     }
 
     // Case 2 — #[secured] was above the route macro and already expanded;
-    // detect the injected `__autumn_session` parameter.
+    // read the marker emitted into the guarded function body.
+    if let Some(roles) = extract_secured_roles_marker(input_fn) {
+        let roles_tokens = emit_static_str_slice(&roles);
+        return (true, roles_tokens);
+    }
+
+    // Case 3 — compatibility fallback for expansions produced before the
+    // marker existed. This can only recover that the route is secured.
     let has_session = input_fn.sig.inputs.iter().any(|param| {
         if let syn::FnArg::Typed(pt) = param
             && let syn::Pat::Ident(pi) = pt.pat.as_ref()
@@ -553,6 +561,62 @@ pub fn extract_secured_info(input_fn: &syn::ItemFn) -> (bool, TokenStream) {
     }
 
     (false, quote! { &[] })
+}
+
+fn extract_secured_roles_marker(input_fn: &syn::ItemFn) -> Option<Vec<String>> {
+    extract_secured_roles_marker_from_stmts(&input_fn.block.stmts)
+}
+
+fn extract_secured_roles_marker_from_stmts(stmts: &[syn::Stmt]) -> Option<Vec<String>> {
+    stmts
+        .iter()
+        .find_map(extract_secured_roles_marker_from_stmt)
+}
+
+fn extract_secured_roles_marker_from_stmt(stmt: &syn::Stmt) -> Option<Vec<String>> {
+    match stmt {
+        syn::Stmt::Item(syn::Item::Const(item_const))
+            if item_const.ident == "__AUTUMN_SECURED_ROLES" =>
+        {
+            extract_roles_from_marker_expr(&item_const.expr)
+        }
+        syn::Stmt::Expr(expr, _) => extract_secured_roles_marker_from_expr(expr),
+        syn::Stmt::Local(local) => local
+            .init
+            .as_ref()
+            .and_then(|init| extract_secured_roles_marker_from_expr(&init.expr)),
+        _ => None,
+    }
+}
+
+fn extract_secured_roles_marker_from_expr(expr: &syn::Expr) -> Option<Vec<String>> {
+    match expr {
+        syn::Expr::Block(block) => extract_secured_roles_marker_from_stmts(&block.block.stmts),
+        syn::Expr::Async(block) => extract_secured_roles_marker_from_stmts(&block.block.stmts),
+        syn::Expr::Unsafe(block) => extract_secured_roles_marker_from_stmts(&block.block.stmts),
+        _ => None,
+    }
+}
+
+fn extract_roles_from_marker_expr(expr: &syn::Expr) -> Option<Vec<String>> {
+    let syn::Expr::Reference(reference) = expr else {
+        return None;
+    };
+    let syn::Expr::Array(array) = reference.expr.as_ref() else {
+        return None;
+    };
+
+    let mut roles = Vec::with_capacity(array.elems.len());
+    for elem in &array.elems {
+        let syn::Expr::Lit(lit) = elem else {
+            return None;
+        };
+        let syn::Lit::Str(role) = &lit.lit else {
+            return None;
+        };
+        roles.push(role.value());
+    }
+    Some(roles)
 }
 
 fn extract_secured_roles(attr: &syn::Attribute) -> Vec<String> {
@@ -641,5 +705,46 @@ mod tests {
         assert_eq!(primitive_json_type("i64"), Some("integer"));
         assert_eq!(primitive_json_type("bool"), Some("boolean"));
         assert_eq!(primitive_json_type("Foo"), None);
+    }
+
+    #[test]
+    fn secured_roles_marker_extracts_roles() {
+        let input_fn: syn::ItemFn = syn::parse_quote! {
+            async fn handler() {
+                const __AUTUMN_SECURED_ROLES: &[&str] = &["admin", "editor"];
+            }
+        };
+
+        assert_eq!(
+            extract_secured_roles_marker(&input_fn),
+            Some(vec!["admin".to_owned(), "editor".to_owned()])
+        );
+    }
+
+    #[test]
+    fn secured_roles_marker_extracts_empty_roles() {
+        let input_fn: syn::ItemFn = syn::parse_quote! {
+            async fn handler() {
+                const __AUTUMN_SECURED_ROLES: &[&str] = &[];
+            }
+        };
+
+        assert_eq!(extract_secured_roles_marker(&input_fn), Some(Vec::new()));
+    }
+
+    #[test]
+    fn secured_roles_marker_extracts_nested_roles() {
+        let input_fn: syn::ItemFn = syn::parse_quote! {
+            async fn handler() {
+                {
+                    const __AUTUMN_SECURED_ROLES: &[&str] = &["admin"];
+                }
+            }
+        };
+
+        assert_eq!(
+            extract_secured_roles_marker(&input_fn),
+            Some(vec!["admin".to_owned()])
+        );
     }
 }

@@ -33,6 +33,8 @@
 //! (which the `#[cached]` macro generates) to read and write values that are
 //! `serde::Serialize + serde::Deserialize`. The plain [`autumn_web::cache::insert`]
 //! / [`autumn_web::cache::get`] functions work only for in-process backends.
+//! `CacheResponseLayer` uses Autumn's serde-aware cache path internally, so
+//! HTTP response caching is supported with this Redis backend.
 
 use std::any::Any;
 use std::sync::Arc;
@@ -62,7 +64,8 @@ pub enum RedisCacheError {
 /// (or equivalently the `#[cached]` macro) to store and retrieve values — both
 /// functions handle JSON serialization transparently. The plain
 /// `autumn_web::cache::insert` / `get` functions perform only in-memory
-/// downcasts and will miss on cross-replica reads.
+/// downcasts and will miss on cross-replica reads. `CacheResponseLayer` is
+/// safe to use because it stores response entries through the serialized path.
 ///
 /// # Runtime requirement
 ///
@@ -421,5 +424,84 @@ mod tests {
         // Cross-replica
         let from_b: Option<Item> = get_cached(&cache_b, "item:1");
         assert_eq!(from_b, Some(item));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn redis_cache_response_layer_caches_http_gets() {
+        use std::convert::Infallible;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use autumn_web::cache::CacheResponseLayer;
+        use autumn_web::reexports::axum::body::{Body, to_bytes};
+        use autumn_web::reexports::http::{Request, StatusCode};
+        use tower::{Service, ServiceBuilder, ServiceExt};
+
+        let container = RedisImage::default().start().await.unwrap();
+        let port = container.get_host_port_ipv4(6379).await.unwrap();
+        let url = format!("redis://127.0.0.1:{port}");
+
+        let cache: Arc<dyn autumn_web::cache::Cache> =
+            Arc::new(RedisCache::connect(&url, "http-response").await.unwrap());
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        let inner = {
+            let counter = counter.clone();
+            tower::service_fn(move |_req: Request<Body>| {
+                let counter = counter.clone();
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, Infallible>(
+                        autumn_web::reexports::axum::response::Response::builder()
+                            .status(StatusCode::OK)
+                            .header("x-cache-test", "redis")
+                            .body(Body::from("redis-body"))
+                            .expect("infallible response builder"),
+                    )
+                }
+            })
+        };
+
+        let mut svc = ServiceBuilder::new()
+            .layer(CacheResponseLayer::from_shared(cache.clone()))
+            .service(inner);
+
+        let req = Request::get("/redis-backed")
+            .body(Body::empty())
+            .expect("infallible response builder");
+        let resp = svc
+            .ready()
+            .await
+            .expect("service ready")
+            .call(req)
+            .await
+            .expect("infallible service");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let req = Request::get("/redis-backed")
+            .body(Body::empty())
+            .expect("infallible response builder");
+        let resp = svc
+            .ready()
+            .await
+            .expect("service ready")
+            .call(req)
+            .await
+            .expect("infallible service");
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("x-cache-test")
+                .and_then(|v| v.to_str().ok()),
+            Some("redis")
+        );
+        let body = to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body collection");
+        assert_eq!(body.as_ref(), b"redis-body");
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+        cache.invalidate("http:/redis-backed");
     }
 }

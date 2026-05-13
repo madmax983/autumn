@@ -550,6 +550,14 @@ pub fn form_tag(
 }
 
 /// Internal: render a `<form>` element using an explicit CSRF field name.
+///
+/// When `method` is `PUT`, `PATCH`, or `DELETE` (case-insensitive), the
+/// browser-facing form method is rewritten to `POST` and a hidden
+/// `<input name="_method" value="...">` is emitted so the autumn
+/// [`MethodOverrideLayer`](crate::middleware::MethodOverrideLayer) can
+/// rewrite the request back to the declared method before route matching.
+/// This lets server-rendered HTML target `#[put]` / `#[patch]` /
+/// `#[delete]` routes without any client JavaScript.
 #[cfg(feature = "maud")]
 #[allow(clippy::needless_pass_by_value)]
 fn form_tag_inner(
@@ -559,13 +567,81 @@ fn form_tag_inner(
     csrf_token: Option<&str>,
     content: maud::Markup,
 ) -> maud::Markup {
+    let (browser_method, override_value) = browser_method_and_override(method);
     maud::html! {
-        form action=(action) method=(method) {
+        form action=(action) method=(browser_method) {
+            @if let Some(override_method) = override_value {
+                input
+                    type="hidden"
+                    name=(crate::middleware::DEFAULT_METHOD_OVERRIDE_FIELD)
+                    value=(override_method);
+            }
             @if let Some(token) = csrf_token {
                 input type="hidden" name=(csrf_field) value=(token);
             }
             (content)
         }
+    }
+}
+
+/// Translate a declared form method into the browser transport method and
+/// any required `_method` override value.
+///
+/// Returns `(transport, override)` where `override` is `Some(value)` only
+/// when the declared method needs a hidden `_method` field.
+#[cfg(feature = "maud")]
+fn browser_method_and_override(method: &str) -> (&'static str, Option<&'static str>) {
+    let trimmed = method.trim();
+    if trimmed.eq_ignore_ascii_case("PUT") {
+        ("post", Some("PUT"))
+    } else if trimmed.eq_ignore_ascii_case("PATCH") {
+        ("post", Some("PATCH"))
+    } else if trimmed.eq_ignore_ascii_case("DELETE") {
+        ("post", Some("DELETE"))
+    } else if trimmed.eq_ignore_ascii_case("GET") {
+        ("get", None)
+    } else {
+        ("post", None)
+    }
+}
+
+/// Render a hidden `<input name="_method" value="...">` field for the
+/// declared HTTP method.
+///
+/// Use this directly when constructing a form by hand (without
+/// [`ChangesetForm`] or [`form_tag`]) targeting a `#[put]`, `#[patch]`,
+/// or `#[delete]` route from a plain HTML browser submission.
+///
+/// ```rust,ignore
+/// use autumn_web::form::method_input;
+///
+/// maud::html! {
+///     form method="post" action="/posts/42" {
+///         (method_input("DELETE"))
+///         button { "Delete post" }
+///     }
+/// }
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn method_input(method: &str) -> maud::Markup {
+    let normalized = method.trim();
+    let value = if normalized.eq_ignore_ascii_case("PUT") {
+        "PUT"
+    } else if normalized.eq_ignore_ascii_case("PATCH") {
+        "PATCH"
+    } else if normalized.eq_ignore_ascii_case("DELETE") {
+        "DELETE"
+    } else {
+        // `GET`/`POST` (and anything else) don't need an override — emit
+        // nothing rather than producing an invalid override field.
+        return maud::html! {};
+    };
+    maud::html! {
+        input
+            type="hidden"
+            name=(crate::middleware::DEFAULT_METHOD_OVERRIDE_FIELD)
+            value=(value);
     }
 }
 
@@ -1114,6 +1190,57 @@ mod tests {
     fn form_tag_includes_content() {
         let html = form_tag("/x", "post", None, maud::html! { span { "inner" } }).into_string();
         assert!(html.contains("inner"), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn form_tag_emits_method_override_for_delete() {
+        let html = form_tag("/posts/42", "delete", None, maud::html! { "" }).into_string();
+        // Browser-facing method must be POST so native form submission works.
+        assert!(html.contains(r#"method="post""#), "{html}");
+        assert!(!html.contains(r#"method="delete""#), "{html}");
+        // Hidden override field tells the autumn middleware to rewrite to DELETE.
+        assert!(html.contains(r#"name="_method""#), "{html}");
+        assert!(html.contains(r#"value="DELETE""#), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn form_tag_emits_method_override_for_put_and_patch() {
+        let put_html = form_tag("/p/1", "put", None, maud::html! { "" }).into_string();
+        assert!(put_html.contains(r#"method="post""#));
+        assert!(put_html.contains(r#"value="PUT""#));
+
+        let patch_html = form_tag("/p/1", "PATCH", None, maud::html! { "" }).into_string();
+        assert!(patch_html.contains(r#"method="post""#));
+        assert!(patch_html.contains(r#"value="PATCH""#));
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn form_tag_no_override_for_get_or_post() {
+        let get_html = form_tag("/p", "get", None, maud::html! { "" }).into_string();
+        assert!(!get_html.contains("_method"), "{get_html}");
+        let post_html = form_tag("/p", "post", None, maud::html! { "" }).into_string();
+        assert!(!post_html.contains("_method"), "{post_html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn method_input_emits_hidden_field_for_mutating_methods() {
+        for method in ["PUT", "PATCH", "DELETE", "delete"] {
+            let html = method_input(method).into_string();
+            assert!(html.contains(r#"name="_method""#), "{html}");
+            assert!(html.contains(r#"type="hidden""#), "{html}");
+        }
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn method_input_is_empty_for_safe_or_unknown_methods() {
+        assert_eq!(method_input("GET").into_string(), "");
+        assert_eq!(method_input("POST").into_string(), "");
+        assert_eq!(method_input("BREW").into_string(), "");
     }
 
     #[cfg(feature = "maud")]

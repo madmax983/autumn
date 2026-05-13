@@ -1689,15 +1689,26 @@ impl AppBuilder {
         tracing::info!(addr = %addr, "Listening");
 
         let server_shutdown_wait = server_shutdown.clone();
+        // Wrap the built router with the HTML form method-override layer at
+        // the very edge — outside path and method routing — so a plain
+        // browser `<form method="post">` carrying `_method=PUT|PATCH|DELETE`
+        // can reach the declared PUT/PATCH/DELETE handler. `Router::layer`
+        // applies middleware per registered method handler in axum 0.8,
+        // which is too late: the inner `MethodRouter` returns `405` before
+        // a layered service ever runs. Wrapping the whole router as a
+        // tower::Service is the documented way to run middleware before
+        // route matching.
+        let service = tower::Layer::layer(&crate::middleware::MethodOverrideLayer::new(), router);
+        let make_service =
+            axum::ServiceExt::<axum::extract::Request>::into_make_service_with_connect_info::<
+                std::net::SocketAddr,
+            >(service);
         let server_task = tokio::spawn(async move {
-            axum::serve(
-                listener,
-                router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-            )
-            .with_graceful_shutdown(async move {
-                server_shutdown_wait.cancelled().await;
-            })
-            .await
+            axum::serve(listener, make_service)
+                .with_graceful_shutdown(async move {
+                    server_shutdown_wait.cancelled().await;
+                })
+                .await
         });
 
         let shutdown_state = state.clone();

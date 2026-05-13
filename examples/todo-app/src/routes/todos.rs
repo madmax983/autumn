@@ -4,8 +4,9 @@
 //! use htmx attributes for interactive toggle/delete behaviour.
 
 use autumn_web::extract::Path;
-use autumn_web::form::ChangesetForm;
-use autumn_web::prelude::{IntoResponse, StatusCode, Validate};
+use autumn_web::form::{ChangesetForm, method_input};
+use autumn_web::prelude::{HxRequest, IntoResponse, StatusCode, Validate};
+use autumn_web::security::CsrfToken;
 use autumn_web::{AutumnError, AutumnResult, Db, Markup, Redirect, delete, get, html, post};
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
@@ -210,12 +211,14 @@ pub async fn list(db: Db) -> AutumnResult<Markup> {
     list_page(db, &blank).await
 }
 
-/// Show a single todo by ID.
-#[get("/todos/{id}")]
-pub async fn detail(id: Path<i64>, mut db: Db) -> AutumnResult<Markup> {
-    let todo = Todo::find(*id, &mut db).await?;
-
-    Ok(layout(
+/// Render the detail page body for a todo.
+///
+/// Extracted so the rendering — including the no-JavaScript delete form —
+/// can be unit-tested without spinning up a database. The `csrf_token`
+/// parameter mirrors what `#[get("/todos/{id}")]` receives in real
+/// requests: `None` when CSRF protection is disabled (e.g. dev profile).
+fn detail_view(todo: &Todo, csrf_token: Option<&str>) -> Markup {
+    layout(
         &format!("Todo: {}", todo.title),
         html! {
             a href=(paths::list())
@@ -242,9 +245,40 @@ pub async fn detail(id: Path<i64>, mut db: Db) -> AutumnResult<Markup> {
                         "Created " (todo.created_at.format("%b %d, %Y at %H:%M"))
                     }
                 }
+
+                form method="post"
+                     action=(paths::delete_todo(todo.id))
+                     class="mt-6 flex items-center gap-3 border-t border-stone-100 pt-4" {
+                    (method_input("DELETE"))
+                    @if let Some(token) = csrf_token {
+                        input type="hidden" name="_csrf" value=(token);
+                    }
+                    button type="submit"
+                           class="text-sm text-red-600 hover:text-red-700 \
+                                  underline-offset-2 hover:underline cursor-pointer" {
+                        "Delete this todo"
+                    }
+                    span class="text-xs text-stone-400" {
+                        "Works without JavaScript"
+                    }
+                }
             }
         },
-    ))
+    )
+}
+
+/// Show a single todo by ID.
+///
+/// The page renders a plain HTML `<form method="post">` carrying a hidden
+/// `_method=DELETE` field as a no-JavaScript fallback alongside the
+/// htmx-driven delete button on the list view. Both paths hit the same
+/// declared `#[delete("/todos/{id}")]` handler — Autumn's method-override
+/// middleware rewrites the transport `POST` to `DELETE` before route
+/// matching.
+#[get("/todos/{id}")]
+pub async fn detail(id: Path<i64>, mut db: Db, csrf: Option<CsrfToken>) -> AutumnResult<Markup> {
+    let todo = Todo::find(*id, &mut db).await?;
+    Ok(detail_view(&todo, csrf.as_ref().map(CsrfToken::token)))
 }
 
 /// Create a new todo from a form submission.
@@ -287,11 +321,21 @@ pub async fn toggle(id: Path<i64>, mut db: Db) -> AutumnResult<Markup> {
     Ok(todo_item(&updated))
 }
 
-/// Delete a todo by ID (htmx endpoint).
+/// Delete a todo by ID.
 ///
-/// Returns an empty string so htmx removes the element from the DOM.
+/// Serves two callers off the same `#[delete]` route:
+/// - htmx button on the list view: returns an empty body so htmx removes
+///   the element from the DOM.
+/// - Plain HTML form (no JavaScript): a `<form method="post">` carrying
+///   `_method=DELETE` is rewritten to `DELETE` by Autumn's method-override
+///   middleware before route matching. The handler redirects back to the
+///   list, which is the no-JS-friendly response.
 #[delete("/todos/{id}")]
-pub async fn delete_todo(id: Path<i64>, mut db: Db) -> AutumnResult<String> {
+pub async fn delete_todo(
+    id: Path<i64>,
+    mut db: Db,
+    hx: HxRequest,
+) -> AutumnResult<impl IntoResponse> {
     let deleted = diesel::delete(todos::table.find(*id))
         .execute(&mut *db)
         .await?;
@@ -303,7 +347,11 @@ pub async fn delete_todo(id: Path<i64>, mut db: Db) -> AutumnResult<String> {
         )));
     }
 
-    Ok(String::new())
+    if hx.is_htmx {
+        Ok(String::new().into_response())
+    } else {
+        Ok(Redirect::to(&paths::list()).into_response())
+    }
 }
 
 autumn_web::paths![index, list, detail, create, toggle, delete_todo];
@@ -395,6 +443,40 @@ mod tests {
         let html = new_todo_form(&form).into_string();
         assert!(html.contains(r#"aria-invalid="false""#));
         assert!(html.contains(r#"value="Buy milk""#));
+    }
+
+    /// Detail-page renders a plain `<form method="post">` that targets
+    /// the declared `#[delete]` route via the `_method` override field.
+    /// This is the no-JavaScript delete path alongside the htmx-driven
+    /// delete on the list view.
+    #[test]
+    fn detail_view_renders_no_js_delete_form() {
+        let todo = Todo {
+            id: 42,
+            title: "Write docs".into(),
+            completed: false,
+            created_at: chrono::DateTime::from_timestamp(0, 0).unwrap().naive_utc(),
+        };
+        let html = detail_view(&todo, Some("csrf-tok-xyz")).into_string();
+        assert!(html.contains(r#"method="post""#), "{html}");
+        assert!(html.contains(r#"action="/todos/42""#), "{html}");
+        assert!(html.contains(r#"name="_method""#), "{html}");
+        assert!(html.contains(r#"value="DELETE""#), "{html}");
+        assert!(html.contains(r#"value="csrf-tok-xyz""#), "{html}");
+        assert!(html.contains("Delete this todo"), "{html}");
+    }
+
+    #[test]
+    fn detail_view_omits_csrf_input_when_token_absent() {
+        let todo = Todo {
+            id: 7,
+            title: "No csrf".into(),
+            completed: true,
+            created_at: chrono::DateTime::from_timestamp(0, 0).unwrap().naive_utc(),
+        };
+        let html = detail_view(&todo, None).into_string();
+        assert!(html.contains(r#"name="_method""#), "{html}");
+        assert!(!html.contains(r#"name="_csrf""#), "{html}");
     }
 }
 

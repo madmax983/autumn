@@ -144,6 +144,18 @@ async fn admin_handler() -> AutumnResult<&'static str> {
     Ok("admin")
 }
 
+#[secured]
+#[get("/protected-top-first")]
+async fn top_first_protected_handler() -> AutumnResult<&'static str> {
+    Ok("secret")
+}
+
+#[secured("admin", "editor")]
+#[get("/admin-top-first")]
+async fn top_first_admin_handler() -> AutumnResult<&'static str> {
+    Ok("admin")
+}
+
 #[test]
 fn get_macro_populates_api_doc() {
     let route = __autumn_route_info_hello();
@@ -521,6 +533,26 @@ fn secured_route_with_role_has_required_roles() {
         route.api_doc.required_roles,
         &["admin"],
         "#[secured(\"admin\")] must populate required_roles"
+    );
+}
+
+#[test]
+fn secured_route_above_route_attribute_has_secured_flag() {
+    let route = __autumn_route_info_top_first_protected_handler();
+    assert!(
+        route.api_doc.secured,
+        "#[secured] above the route attribute must still set secured = true"
+    );
+}
+
+#[test]
+fn secured_route_above_route_attribute_preserves_required_roles() {
+    let route = __autumn_route_info_top_first_admin_handler();
+    assert!(route.api_doc.secured);
+    assert_eq!(
+        route.api_doc.required_roles,
+        &["admin", "editor"],
+        "#[secured(...)] above the route attribute must preserve required_roles"
     );
 }
 

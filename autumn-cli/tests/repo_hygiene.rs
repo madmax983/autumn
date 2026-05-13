@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -63,6 +64,21 @@ fn git(root: &Path, args: &[&str]) -> Output {
         .current_dir(root)
         .output()
         .expect("failed to run git")
+}
+
+fn bash_command() -> Command {
+    #[cfg(windows)]
+    {
+        for candidate in [
+            r"C:\Program Files\Git\bin\bash.exe",
+            r"C:\Program Files\Git\usr\bin\bash.exe",
+        ] {
+            if Path::new(candidate).is_file() {
+                return Command::new(candidate);
+            }
+        }
+    }
+    Command::new("bash")
 }
 
 fn member_manifest_forbids_unsafe_code(manifest_toml: &toml::Value) -> bool {
@@ -321,6 +337,62 @@ fn publish_dry_run_script_uses_list_not_no_verify() {
         !script.contains(r#"cargo package -p "$crate" --no-verify --allow-dirty"#),
         "{} must not use `--no-verify`; that triggers registry resolution and causes false failures for plugin crates",
         script_path.display(),
+    );
+}
+
+#[test]
+fn release_notes_script_detects_breaking_section_with_long_changelog_entry() {
+    let root = workspace_root();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let scripts_dir = tmp.path().join("scripts");
+    let migrations_dir = tmp.path().join("docs/migrations");
+    std::fs::create_dir_all(&scripts_dir).expect("scripts dir");
+    std::fs::create_dir_all(&migrations_dir).expect("migrations dir");
+    std::fs::copy(
+        root.join("scripts/check-release-notes.sh"),
+        scripts_dir.join("check-release-notes.sh"),
+    )
+    .expect("copy release-notes script");
+
+    std::fs::write(
+        tmp.path().join("Cargo.toml"),
+        "[workspace.package]\nversion = \"0.4.0\"\n",
+    )
+    .expect("workspace manifest");
+    std::fs::write(migrations_dir.join("0.4.0.md"), "# Migrating to 0.4.0\n")
+        .expect("migration guide");
+
+    let mut changelog = String::from(
+        "# Changelog\n\n\
+         ## [0.4.0] - 2026-05-11\n\n\
+         ### Breaking Changes\n\n\
+         - A deliberate break acknowledged by the migration guide.\n\n\
+         ### Added\n",
+    );
+    for i in 0..200_000 {
+        writeln!(changelog, "- filler line {i}").expect("write filler line");
+    }
+    changelog.push_str("\n## [0.3.0] - 2026-04-01\n\n- Previous release.\n");
+    std::fs::write(tmp.path().join("CHANGELOG.md"), changelog).expect("changelog");
+
+    let output = bash_command()
+        .arg("scripts/check-release-notes.sh")
+        .current_dir(tmp.path())
+        .output()
+        .expect("run release-notes check");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "release-notes check failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("migration guide exists: docs/migrations/0.4.0.md"),
+        "breaking release should be acknowledged by the migration guide:\nstdout:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("non-breaking release"),
+        "breaking release was misclassified as non-breaking:\nstdout:\n{stdout}"
     );
 }
 

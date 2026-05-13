@@ -112,10 +112,11 @@ pub struct RawCacheBytes(pub Vec<u8>);
 /// erasure, allowing a single cache instance to store heterogeneous
 /// types from different `#[cached]` functions.
 ///
-/// Use the free functions [`get`] / [`insert`] for non-serde types (e.g.
-/// HTTP responses in [`CacheResponseLayer`]), or [`get_cached`] /
-/// [`insert_cached`] for types that also implement `serde` — which is
-/// required for cross-replica backends like Redis.
+/// Use the free functions [`get`] / [`insert`] for in-process-only values,
+/// or [`get_cached`] / [`insert_cached`] for types that also implement
+/// `serde`, which is required for cross-replica backends like Redis.
+/// [`CacheResponseLayer`] uses the serde-aware path so HTTP response caching
+/// works with both in-process and raw-byte backends.
 pub trait Cache: Send + Sync + 'static {
     /// Retrieve a type-erased value by key. Returns `None` on miss.
     ///

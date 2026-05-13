@@ -476,12 +476,19 @@ pub fn admin_layout(
 
 // ── Jobs dashboard ──────────────────────────────────────────────────
 
+fn csrf_hidden_input(csrf_token: &str, csrf_form_field: &str) -> Markup {
+    html! {
+        input type="hidden" name=(csrf_form_field) value=(csrf_token);
+    }
+}
+
 /// Render the built-in jobs admin dashboard.
 pub fn jobs_page(
     registry: &AdminRegistry,
     snapshot: &JobAdminSnapshot,
     messages: &[FlashMessage],
     csrf_token: &str,
+    csrf_form_field: &str,
     prefix: &str,
     actuator_prefix: &str,
 ) -> Markup {
@@ -504,6 +511,7 @@ pub fn jobs_page(
             &snapshot.enqueued,
             "enqueued_page",
             csrf_token,
+            csrf_form_field,
             prefix,
         ))
         (job_list_card(
@@ -512,6 +520,7 @@ pub fn jobs_page(
             &snapshot.running,
             "running_page",
             csrf_token,
+            csrf_form_field,
             prefix,
         ))
         (job_list_card(
@@ -520,6 +529,7 @@ pub fn jobs_page(
             &snapshot.completed,
             "completed_page",
             csrf_token,
+            csrf_form_field,
             prefix,
         ))
         (job_list_card(
@@ -528,6 +538,7 @@ pub fn jobs_page(
             &snapshot.failed,
             "failed_page",
             csrf_token,
+            csrf_form_field,
             prefix,
         ))
         (job_schedules_card(&snapshot.schedules))
@@ -581,6 +592,7 @@ fn job_list_card(
     page: &JobAdminPage,
     page_param: &str,
     csrf_token: &str,
+    csrf_form_field: &str,
     prefix: &str,
 ) -> Markup {
     html! {
@@ -620,7 +632,7 @@ fn job_list_card(
                             }
                         }
                         @for record in &page.records {
-                            (job_row(record, csrf_token, prefix))
+                            (job_row(record, csrf_token, csrf_form_field, prefix))
                         }
                     }
                 }
@@ -630,7 +642,12 @@ fn job_list_card(
     }
 }
 
-fn job_row(record: &JobAdminRecord, csrf_token: &str, prefix: &str) -> Markup {
+fn job_row(
+    record: &JobAdminRecord,
+    csrf_token: &str,
+    csrf_form_field: &str,
+    prefix: &str,
+) -> Markup {
     html! {
         tr {
             td {
@@ -646,7 +663,7 @@ fn job_row(record: &JobAdminRecord, csrf_token: &str, prefix: &str) -> Markup {
             td { (optional_text(record.principal_id.as_deref())) }
             td { (optional_text(record.correlation_id.as_deref())) }
             td { (job_error(record)) }
-            td { (job_actions(record, csrf_token, prefix)) }
+            td { (job_actions(record, csrf_token, csrf_form_field, prefix)) }
         }
     }
 }
@@ -667,14 +684,19 @@ fn job_error(record: &JobAdminRecord) -> Markup {
     }
 }
 
-fn job_actions(record: &JobAdminRecord, csrf_token: &str, prefix: &str) -> Markup {
+fn job_actions(
+    record: &JobAdminRecord,
+    csrf_token: &str,
+    csrf_form_field: &str,
+    prefix: &str,
+) -> Markup {
     html! {
         div class="job-actions" {
             @if record.status == JobAdminStatus::Failed {
-                (job_action_form(prefix, &record.id, "retry", "Retry", "btn btn-sm btn-primary", csrf_token))
-                (job_action_form(prefix, &record.id, "discard", "Discard", "btn btn-sm btn-danger", csrf_token))
+                (job_action_form(prefix, &record.id, "retry", "Retry", "btn btn-sm btn-primary", csrf_token, csrf_form_field))
+                (job_action_form(prefix, &record.id, "discard", "Discard", "btn btn-sm btn-danger", csrf_token, csrf_form_field))
             } @else if record.status == JobAdminStatus::Enqueued {
-                (job_action_form(prefix, &record.id, "cancel", "Cancel", "btn btn-sm btn-danger", csrf_token))
+                (job_action_form(prefix, &record.id, "cancel", "Cancel", "btn btn-sm btn-danger", csrf_token, csrf_form_field))
             } @else {
                 span style="color: var(--text-muted);" { "—" }
             }
@@ -689,10 +711,11 @@ fn job_action_form(
     label: &str,
     class_name: &str,
     csrf_token: &str,
+    csrf_form_field: &str,
 ) -> Markup {
     html! {
         form method="post" action={ (prefix) "/jobs/" (id) "/" (action) } {
-            input type="hidden" name="_csrf" value=(csrf_token);
+            (csrf_hidden_input(csrf_token, csrf_form_field))
             button type="submit" class=(class_name) {
                 (label)
             }
@@ -839,6 +862,7 @@ pub fn model_list_page(
     filters: &[(String, String)],
     messages: &[FlashMessage],
     csrf_token: &str,
+    csrf_form_field: &str,
     prefix: &str,
     actuator_prefix: &str,
 ) -> Markup {
@@ -900,7 +924,7 @@ pub fn model_list_page(
             // Bulk-action form wraps the table so the row checkboxes
             // submit alongside the action selector.
             form method="post" action={ (prefix) "/" (model_slug) "/actions" } {
-                input type="hidden" name="_csrf" value=(csrf_token);
+                (csrf_hidden_input(csrf_token, csrf_form_field))
 
             // Table
             div class="table-wrap" {
@@ -1104,6 +1128,7 @@ pub fn model_form_page(
     id: Option<i64>,
     messages: &[FlashMessage],
     csrf_token: &str,
+    csrf_form_field: &str,
     prefix: &str,
     actuator_prefix: &str,
 ) -> Markup {
@@ -1138,7 +1163,7 @@ pub fn model_form_page(
                         (prefix) "/" (model_slug)
                     }
                 } {
-                input type="hidden" name="_csrf" value=(csrf_token);
+                (csrf_hidden_input(csrf_token, csrf_form_field))
 
                 @for field in &editable_fields {
                     div class="form-group" {
@@ -1691,6 +1716,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn jobs_page_renders_lists_actions_polling_and_csrf() {
         use autumn_web::job::{
             JobAdminPage, JobAdminRecord, JobAdminSnapshot, JobAdminStatus, JobScheduleSummary,
@@ -1779,7 +1805,16 @@ mod tests {
             bounded_history_limit: 1_000,
         };
 
-        let html = jobs_page(&r, &snapshot, &[], "tok-job", "/admin", "/actuator").into_string();
+        let html = jobs_page(
+            &r,
+            &snapshot,
+            &[],
+            "tok-job",
+            "authenticity_token",
+            "/admin",
+            "/actuator",
+        )
+        .into_string();
         assert!(html.contains("Jobs"));
         assert!(html.contains("Enqueued"));
         assert!(html.contains("Running"));
@@ -1790,7 +1825,8 @@ mod tests {
         assert!(html.contains(r#"action="/admin/jobs/job-failed/retry""#));
         assert!(html.contains(r#"action="/admin/jobs/job-failed/discard""#));
         assert!(html.contains(r#"action="/admin/jobs/job-enqueued/cancel""#));
-        assert!(html.contains(r#"name="_csrf" value="tok-job""#));
+        assert!(html.contains(r#"name="authenticity_token" value="tok-job""#));
+        assert!(!html.contains(r#"name="_csrf" value="tok-job""#));
         assert!(html.contains(r#"hx-get="/admin/jobs/counters""#));
         assert!(html.contains(r#"hx-trigger="load, every 2s""#));
         assert!(html.contains("send-digest"));
@@ -1821,14 +1857,16 @@ mod tests {
             None,
             &[],
             "tok-xyz",
+            "authenticity_token",
             "/admin",
             "/actuator",
         )
         .into_string();
         assert!(
-            html.contains(r#"<input type="hidden" name="_csrf" value="tok-xyz""#),
-            "_csrf hidden field missing: {html}"
+            html.contains(r#"<input type="hidden" name="authenticity_token" value="tok-xyz""#),
+            "custom CSRF hidden field missing: {html}"
         );
+        assert!(!html.contains(r#"name="_csrf" value="tok-xyz""#));
     }
 
     #[test]
@@ -1847,6 +1885,7 @@ mod tests {
             Some(1),
             &[],
             "t",
+            "_csrf",
             "/admin",
             "/actuator",
         )
@@ -1878,6 +1917,7 @@ mod tests {
             Some(42),
             &[],
             "t",
+            "_csrf",
             "/admin",
             "/actuator",
         )
@@ -2024,6 +2064,7 @@ mod tests {
             &[],
             &[],
             "t",
+            "_csrf",
             "/admin",
             "/actuator",
         )
@@ -2071,6 +2112,7 @@ mod tests {
             &[],
             &[],
             "t",
+            "_csrf",
             "/admin",
             "/actuator",
         )
@@ -2115,6 +2157,7 @@ mod tests {
             &[],
             &[],
             "t",
+            "_csrf",
             "/admin",
             "/actuator",
         )
@@ -2171,6 +2214,7 @@ mod tests {
             &active_filters,
             &[],
             "t",
+            "_csrf",
             "/admin",
             "/actuator",
         )
@@ -2222,6 +2266,7 @@ mod tests {
             &active_filters,
             &[],
             "t",
+            "_csrf",
             "/admin",
             "/actuator",
         )
@@ -2274,6 +2319,7 @@ mod tests {
             &active_filters,
             &[],
             "t",
+            "_csrf",
             "/admin",
             "/actuator",
         )
@@ -2322,6 +2368,7 @@ mod tests {
             &[],
             &[],
             "tok",
+            "admin_csrf",
             "/admin",
             "/actuator",
         )
@@ -2332,9 +2379,10 @@ mod tests {
             "list view must wrap table in a form posting to /actions: {html}"
         );
         assert!(
-            html.contains(r#"name="_csrf" value="tok""#),
-            "_csrf token must be in the bulk-action form: {html}"
+            html.contains(r#"name="admin_csrf" value="tok""#),
+            "configured CSRF token field must be in the bulk-action form: {html}"
         );
+        assert!(!html.contains(r#"name="_csrf" value="tok""#));
         // Both action options appear, with the dangerous one tagged for
         // client-side confirm.
         assert!(html.contains(r#"value="delete""#));
@@ -2369,6 +2417,7 @@ mod tests {
             &[],
             &[],
             "t",
+            "_csrf",
             "/admin",
             "/actuator",
         )
@@ -2406,6 +2455,7 @@ mod tests {
             &[],
             &[],
             "tok",
+            "_csrf",
             "/admin",
             "/actuator",
         )

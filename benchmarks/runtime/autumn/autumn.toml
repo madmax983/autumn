@@ -1,0 +1,12 @@
+[server]
+host = "0.0.0.0"
+port = 8080
+
+[database]
+# Overridden at runtime via DATABASE_URL env var.
+url = "postgres://benchmark:benchmark@localhost:5432/benchmark"
+pool_size = 20
+
+[logging]
+level = "warn"
+format = "json"

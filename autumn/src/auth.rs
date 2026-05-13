@@ -1176,7 +1176,7 @@ where
                 .headers()
                 .get(http::header::AUTHORIZATION)
                 .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.strip_prefix("Bearer "))
+                .and_then(parse_bearer_token)
                 .map(str::to_owned);
 
             let Some(raw_token) = raw_token else {
@@ -1200,6 +1200,11 @@ where
             }
         })
     }
+}
+
+fn parse_bearer_token(header: &str) -> Option<&str> {
+    let (scheme, token) = header.split_once(' ')?;
+    scheme.eq_ignore_ascii_case("Bearer").then_some(token)
 }
 
 /// Build a `401 Unauthorized` response using the standard Problem Details body.
@@ -1271,9 +1276,11 @@ fn api_token_problem_context(req: &axum::extract::Request) -> (Option<String>, O
 
 /// Embedded Diesel migrations for the `api_tokens` table.
 ///
-/// Include this in your application's `.migrations()` call so that the
-/// `api_tokens` table is created and kept up-to-date alongside your own
-/// migrations:
+/// Include this in your application's `.migrations()` call so that dev/test
+/// startup migration checks can create and validate the `api_tokens` table
+/// alongside your own migrations. In production, `autumn migrate` applies the
+/// matching framework migration before token commands or `DbApiTokenStore`
+/// need the table:
 ///
 /// ```rust,ignore
 /// use autumn_web::auth::API_TOKEN_MIGRATIONS;
@@ -1329,8 +1336,10 @@ mod db_store {
     ///
     /// # Setup
     ///
-    /// Pass [`super::API_TOKEN_MIGRATIONS`] to your app builder so the
-    /// `api_tokens` table is created automatically:
+    /// Pass [`super::API_TOKEN_MIGRATIONS`] to your app builder so dev/test
+    /// startup migration checks can create and validate the `api_tokens`
+    /// table automatically. In production, run `autumn migrate`; the CLI
+    /// applies the matching framework migration explicitly.
     ///
     /// ```rust,ignore
     /// use autumn_web::auth::{API_TOKEN_MIGRATIONS, DbApiTokenStore};
@@ -2785,6 +2794,34 @@ mod api_token_tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn require_api_token_accepts_case_insensitive_bearer_scheme() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let store = Arc::new(InMemoryApiTokenStore::default());
+        let raw = store.issue("user:1").await.unwrap();
+
+        for scheme in ["bearer", "bEaReR"] {
+            let app = axum::Router::new()
+                .route("/", axum::routing::get(|| async { "ok" }))
+                .layer(RequireApiToken::new(Arc::clone(&store)));
+
+            let response = app
+                .oneshot(
+                    http::Request::builder()
+                        .uri("/")
+                        .header(http::header::AUTHORIZATION, format!("{scheme} {raw}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK, "scheme {scheme}");
+        }
     }
 
     #[tokio::test]

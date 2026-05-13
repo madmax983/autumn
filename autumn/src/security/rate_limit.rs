@@ -243,14 +243,18 @@ impl Limiter {
     /// skipped, but only when the request peer is present and trusted.
     /// Without a trusted proxy list, the last non-empty XFF entry is used
     /// for the existing single-proxy setup where proxies append the peer
-    /// address after any client-supplied header value.
+    /// address after any client-supplied header value. If that entry is
+    /// the immediate socket peer, the peer has appended its own address,
+    /// so the client entry immediately to its left is used instead.
     fn client_ip<B>(&self, req: &Request<B>) -> Option<String> {
+        let peer_ip = Self::peer_ip(req);
+
         if self.trust_forwarded_headers && self.forwarded_headers_allowed(req) {
             let xff_ip = req
                 .headers()
                 .get("x-forwarded-for")
                 .and_then(|v| v.to_str().ok())
-                .and_then(|s| self.client_ip_from_x_forwarded_for(s));
+                .and_then(|s| self.client_ip_from_x_forwarded_for(s, peer_ip));
 
             if xff_ip.is_some() {
                 return xff_ip;
@@ -269,7 +273,7 @@ impl Limiter {
             }
         }
 
-        Self::peer_ip(req).map(|ip| ip.to_string())
+        peer_ip.map(|ip| ip.to_string())
     }
 
     fn peer_ip<B>(req: &Request<B>) -> Option<IpAddr> {
@@ -286,14 +290,22 @@ impl Limiter {
         Self::peer_ip(req).is_some_and(|peer_ip| self.is_trusted_proxy(peer_ip))
     }
 
-    fn client_ip_from_x_forwarded_for(&self, header: &str) -> Option<String> {
+    fn client_ip_from_x_forwarded_for(
+        &self,
+        header: &str,
+        peer_ip: Option<IpAddr>,
+    ) -> Option<String> {
         if !self.trusted_proxies_configured {
-            return header
-                .rsplit(',')
-                .next()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(ToOwned::to_owned);
+            let mut entries = header.rsplit(',').map(str::trim).filter(|s| !s.is_empty());
+            let last = entries.next()?;
+
+            if peer_ip.is_some_and(|peer_ip| last.parse::<IpAddr>().is_ok_and(|ip| ip == peer_ip)) {
+                return entries
+                    .next()
+                    .map_or_else(|| Some(last.to_owned()), |entry| Some(entry.to_owned()));
+            }
+
+            return Some(last.to_owned());
         }
 
         for entry in header.rsplit(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -587,13 +599,10 @@ mod tests {
 
     #[test]
     fn client_ip_uses_proxy_appended_entry_without_proxy_list() {
-        let req: Request<()> = Request::builder()
-            .header("X-Forwarded-For", "attacker_spoofed_ip, real_client_ip")
-            .body(())
-            .expect("infallible response builder");
+        let req = req_with_connect_info("attacker_spoofed_ip, 198.51.100.77", "203.0.113.10:4000");
         assert_eq!(
             limiter(true).client_ip(&req).as_deref(),
-            Some("real_client_ip")
+            Some("198.51.100.77")
         );
     }
 
@@ -616,6 +625,16 @@ mod tests {
         assert_eq!(
             limiter(true).client_ip(&req).as_deref(),
             Some("203.0.113.10")
+        );
+    }
+
+    #[test]
+    fn client_ip_skips_peer_self_append_without_configured_proxy_list() {
+        let req = req_with_connect_info("198.51.100.77, 203.0.113.10", "203.0.113.10:4000");
+
+        assert_eq!(
+            limiter(true).client_ip(&req).as_deref(),
+            Some("198.51.100.77")
         );
     }
 

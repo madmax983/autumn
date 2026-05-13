@@ -1,0 +1,10 @@
+<!DOCTYPE html>
+<html xmlns:th="http://www.thymeleaf.org" lang="en">
+<head><meta charset="utf-8"/><title th:text="${post.title}">Post</title></head>
+<body>
+<h1 th:text="${post.title}"></h1>
+<p>By <span th:text="${post.author}"></span></p>
+<em th:unless="${post.published}">Draft</em>
+<div th:text="${post.body}"></div>
+</body>
+</html>

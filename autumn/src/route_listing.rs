@@ -340,6 +340,32 @@ mod tests {
         assert_eq!(infos.len(), 2);
     }
 
+    /// Acceptance criterion for issue #605: `autumn routes` /
+    /// `/actuator/routes` must keep reporting the declared effective
+    /// method (`PUT`, `PATCH`, `DELETE`) even though HTML browser
+    /// submissions transport those mutations as `POST` with a hidden
+    /// `_method` override.
+    ///
+    /// Route metadata is collected at registration time from
+    /// `Route::method`, never from any per-request rewrite, so the
+    /// listing stays semantically honest regardless of how clients
+    /// reach the route.
+    #[test]
+    fn collect_route_infos_reports_declared_method_for_overridable_routes() {
+        let routes = vec![
+            make_route(Method::PUT, "/posts/{id}", "update_post"),
+            make_route(Method::PATCH, "/posts/{id}", "patch_post"),
+            make_route(Method::DELETE, "/posts/{id}", "delete_post"),
+        ];
+        let sources = vec![RouteSource::User; 3];
+        let infos = collect_route_infos(&routes, &sources, &[]);
+        let methods: Vec<&str> = infos.iter().map(|i| i.method.as_str()).collect();
+        assert_eq!(methods, vec!["PUT", "PATCH", "DELETE"]);
+        // The transport method browsers actually use must never appear in
+        // the listing for these routes.
+        assert!(infos.iter().all(|i| i.method != "POST"), "{infos:?}");
+    }
+
     #[test]
     fn collect_route_infos_scoped_group_prepends_prefix() {
         let group = ScopedGroup {

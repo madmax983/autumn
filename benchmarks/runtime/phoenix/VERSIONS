@@ -1,0 +1,5 @@
+framework: Phoenix 1.7.14
+language:  Elixir 1.17 / OTP 27
+http:      Bandit (HTTP/1.1 + HTTP/2)
+db:        Ecto 3.12 + Postgrex
+postgres:  16 (benchmark container)

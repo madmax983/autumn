@@ -304,6 +304,10 @@ fn generate_scaffold_full_e2e_post() {
             "title:String",
             "body:Text",
             "published:bool",
+            "subtitle:Option<String>",
+            "views:Option<i64>",
+            "published_at:Option<NaiveDateTime>",
+            "token:Option<Uuid>",
         ],
     );
 
@@ -329,8 +333,11 @@ fn generate_scaffold_full_e2e_post() {
         "#[post(\"/posts/{id}/update\")]",
         "pub async fn index",
         "pub async fn show",
-        "pub async fn new_form() -> AutumnResult<Markup>",
+        "pub async fn new_form(",
         "pub async fn update",
+        "use autumn_web::security::{CsrfFormField, CsrfToken};",
+        "input type=\"hidden\" name=(csrf_field_name)",
+        "(csrf_input(csrf.as_ref(), csrf_field.as_ref()))",
     ] {
         assert!(routes.contains(needle), "routes file missing: {needle}");
     }
@@ -673,6 +680,10 @@ fn generated_scaffold_cargo_checks() {
             "title:String",
             "body:Text",
             "published:bool",
+            "subtitle:Option<String>",
+            "views:Option<i64>",
+            "published_at:Option<NaiveDateTime>",
+            "token:Option<Uuid>",
         ],
     );
 
@@ -685,6 +696,8 @@ fn generated_scaffold_cargo_checks() {
         "maud",
         "serde",
         "serde_json",
+        "serde_urlencoded",
+        "url",
     ] {
         assert!(
             cargo_toml_after.contains(&format!("{dep} =")),

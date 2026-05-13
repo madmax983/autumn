@@ -1,0 +1,5 @@
+framework: Rails 7.2.x
+language:  Ruby 3.3.6
+server:    Puma 6.x
+db:        ActiveRecord + pg 1.5.x
+postgres:  16 (benchmark container)

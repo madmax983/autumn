@@ -1,0 +1,5 @@
+framework: Django 5.1.4
+language:  Python 3.12
+server:    Gunicorn 23.x + Uvicorn workers (ASGI)
+db:        Django ORM + psycopg 3.x
+postgres:  16 (benchmark container)
