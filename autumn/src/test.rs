@@ -525,13 +525,19 @@ impl RequestBuilder {
 
     /// Set the request body to URL-encoded form data.
     ///
-    /// Automatically sets `Content-Type: application/x-www-form-urlencoded`.
+    /// Automatically sets `Content-Type: application/x-www-form-urlencoded`
+    /// and `Sec-Fetch-Site: same-origin` to mirror what a real browser
+    /// would send for a same-origin `<form method="post">` — which is
+    /// what the method-override middleware requires to honour
+    /// `_method=PUT|PATCH|DELETE` overrides.
     #[must_use]
     pub fn form(mut self, body: &str) -> Self {
         self.headers.push((
             "content-type".to_owned(),
             "application/x-www-form-urlencoded".to_owned(),
         ));
+        self.headers
+            .push(("sec-fetch-site".to_owned(), "same-origin".to_owned()));
         self.body = Body::from(body.to_owned());
         self
     }

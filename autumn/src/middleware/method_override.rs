@@ -16,6 +16,27 @@
 //! preserved exactly so downstream extractors (including CSRF
 //! validation) read it unchanged.
 //!
+//! # Same-origin requirement
+//!
+//! The override is strictly a convention for browser HTML forms
+//! originating from the same origin. The layer enforces this rather
+//! than relying solely on CSRF, because a route declared as `#[delete]`
+//! would otherwise become reachable from any cross-origin form when
+//! CSRF protection is disabled or the path is CSRF-exempt — a
+//! reachability change browsers' same-origin policy would normally
+//! prevent for direct `DELETE` requests.
+//!
+//! The check uses, in order:
+//!
+//! 1. `Sec-Fetch-Site` (sent by all browsers since ~2020). Allowed
+//!    values: `same-origin`, `same-site`, `none`. `cross-site` is
+//!    rejected.
+//! 2. Fallback when `Sec-Fetch-Site` is absent: `Origin` is compared
+//!    host-for-host with `Host`. A mismatch is rejected.
+//! 3. If both signals are absent, the override is **not** applied —
+//!    the request is forwarded as the original `POST` so route
+//!    matching rejects it on its own (fail closed).
+//!
 //! # Failure modes
 //!
 //! - An unrecognised override value (e.g. `_method=BREW`) is rejected
@@ -144,6 +165,7 @@ pub async fn method_override_rejection_filter(
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
+    use crate::middleware::exception_filter::AutumnErrorInfo;
     use axum::response::IntoResponse;
 
     if let Some(rejection) = request
@@ -151,26 +173,37 @@ pub async fn method_override_rejection_filter(
         .get::<MethodOverrideRejection>()
         .copied()
     {
-        return match rejection {
+        let (status, message) = match rejection {
             MethodOverrideRejection::InvalidValue => (
                 StatusCode::BAD_REQUEST,
-                [(
-                    http::header::CONTENT_TYPE,
-                    http::HeaderValue::from_static("text/plain; charset=utf-8"),
-                )],
                 "Invalid method override value: must be PUT, PATCH, or DELETE.",
-            )
-                .into_response(),
+            ),
             MethodOverrideRejection::BodyTooLarge => (
                 StatusCode::PAYLOAD_TOO_LARGE,
-                [(
-                    http::header::CONTENT_TYPE,
-                    http::HeaderValue::from_static("text/plain; charset=utf-8"),
-                )],
                 "Form body too large for method-override scanning.",
-            )
-                .into_response(),
+            ),
         };
+        let mut response = (
+            status,
+            [(
+                http::header::CONTENT_TYPE,
+                http::HeaderValue::from_static("text/plain; charset=utf-8"),
+            )],
+            message,
+        )
+            .into_response();
+        // Surface this as a framework error so the exception filter
+        // chain (problem-details normalization, custom HTML error-page
+        // rendering) processes it the same as any handler-generated
+        // error response. Without this extension, `ExceptionFilterFuture`
+        // treats the response as pre-formed and skips renegotiation.
+        response.extensions_mut().insert(AutumnErrorInfo {
+            status,
+            message: message.to_owned(),
+            details: None,
+            problem_type: None,
+        });
+        return response;
     }
     next.run(request).await
 }
@@ -276,6 +309,62 @@ fn content_length_exceeds(headers: &http::HeaderMap, limit: usize) -> bool {
         .is_some_and(|len| len > limit as u64)
 }
 
+/// Is the request a same-origin browser form submission?
+///
+/// The override convention is documented for browser HTML forms, so we
+/// only honour it when the request really did originate from the same
+/// origin. Without this check a CSRF-disabled (or CSRF-exempt) route
+/// declared as `#[delete]` could be reached by a cross-origin form
+/// using `_method=DELETE` even though the equivalent direct `DELETE`
+/// request would be blocked by the browser's same-origin policy.
+///
+/// Decision matrix (returns `true` to allow the override):
+///
+/// 1. `Sec-Fetch-Site` is sent by every browser released since ~2020
+///    and is the most reliable signal. We allow `same-origin`,
+///    `same-site`, and `none` (user-initiated, no opener) and reject
+///    `cross-site`.
+/// 2. When `Sec-Fetch-Site` is absent, fall back to comparing the
+///    `Origin` header against `Host`. Modern browsers always send
+///    `Origin` for `POST`, so a mismatch here means the request really
+///    is cross-origin.
+/// 3. When both signals are absent, deny the override (fail closed).
+///    Such requests are either an extremely old browser or a non-
+///    browser client; in either case the documented browser-form
+///    convention does not apply, so the safe thing is to forward the
+///    request as the original `POST` and let route matching reject it.
+fn is_same_origin_form(headers: &http::HeaderMap) -> bool {
+    if let Some(site) = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) {
+        return matches!(site, "same-origin" | "same-site" | "none");
+    }
+
+    let origin = headers
+        .get(http::header::ORIGIN)
+        .and_then(|v| v.to_str().ok());
+    let host = headers
+        .get(http::header::HOST)
+        .and_then(|v| v.to_str().ok());
+
+    match (origin, host) {
+        (Some(origin), Some(host)) => origin_matches_host(origin, host),
+        // No origin and no Sec-Fetch-Site: fail closed.
+        _ => false,
+    }
+}
+
+/// `Origin` is a scheme + host (+ optional port); `Host` is host
+/// (+ optional port). We treat them as same-origin when the
+/// host:port portion matches.
+fn origin_matches_host(origin: &str, host: &str) -> bool {
+    let origin_authority = origin
+        .strip_prefix("https://")
+        .or_else(|| origin.strip_prefix("http://"))
+        .unwrap_or(origin);
+    // Trim any trailing path (defensive — `Origin` should not include one).
+    let origin_authority = origin_authority.split('/').next().unwrap_or("");
+    origin_authority.eq_ignore_ascii_case(host)
+}
+
 impl<S, ResBody> Service<Request<axum::body::Body>> for MethodOverrideService<S>
 where
     S: Service<Request<axum::body::Body>, Response = Response<ResBody>> + Clone + Send + 'static,
@@ -292,9 +381,16 @@ where
     }
 
     fn call(&mut self, mut req: Request<axum::body::Body>) -> Self::Future {
-        // Only POST requests are eligible for override. Same-origin form
-        // semantics: nothing else is allowed to silently morph methods.
-        if req.method() != http::Method::POST || !is_form_urlencoded(req.headers()) {
+        // Only POST form-urlencoded submissions originating from the
+        // same origin are eligible. Same-origin form semantics: nothing
+        // else is allowed to silently morph methods, because a request
+        // that browsers won't make directly (e.g. a cross-origin
+        // `<form>` submitting to a `#[delete]` route) must not gain
+        // reachability via the override convention.
+        if req.method() != http::Method::POST
+            || !is_form_urlencoded(req.headers())
+            || !is_same_origin_form(req.headers())
+        {
             let mut inner = self.inner.clone();
             std::mem::swap(&mut self.inner, &mut inner);
             return Box::pin(async move { inner.call(req).await });
@@ -408,6 +504,7 @@ mod tests {
                     .method("POST")
                     .uri("/items")
                     .header("content-type", "application/x-www-form-urlencoded")
+                    .header("sec-fetch-site", "same-origin")
                     .body(Body::from("title=hello"))
                     .unwrap(),
             )
@@ -430,6 +527,7 @@ mod tests {
                     .method("POST")
                     .uri("/items/1")
                     .header("content-type", "application/x-www-form-urlencoded")
+                    .header("sec-fetch-site", "same-origin")
                     .body(Body::from("_method=PUT&title=hi"))
                     .unwrap(),
             )
@@ -452,6 +550,7 @@ mod tests {
                     .method("POST")
                     .uri("/items/1")
                     .header("content-type", "application/x-www-form-urlencoded")
+                    .header("sec-fetch-site", "same-origin")
                     .body(Body::from("_method=patch"))
                     .unwrap(),
             )
@@ -474,6 +573,7 @@ mod tests {
                     .method("POST")
                     .uri("/items/1")
                     .header("content-type", "application/x-www-form-urlencoded")
+                    .header("sec-fetch-site", "same-origin")
                     .body(Body::from("_method=DELETE"))
                     .unwrap(),
             )
@@ -496,6 +596,7 @@ mod tests {
                     .method("POST")
                     .uri("/items/1")
                     .header("content-type", "application/x-www-form-urlencoded")
+                    .header("sec-fetch-site", "same-origin")
                     .body(Body::from("_method=BREW"))
                     .unwrap(),
             )
@@ -568,6 +669,7 @@ mod tests {
                     .method("POST")
                     .uri("/echo")
                     .header("content-type", "application/x-www-form-urlencoded")
+                    .header("sec-fetch-site", "same-origin")
                     .body(Body::from(payload))
                     .unwrap(),
             )
@@ -595,6 +697,7 @@ mod tests {
                     .method("POST")
                     .uri("/x")
                     .header("content-type", "application/x-www-form-urlencoded")
+                    .header("sec-fetch-site", "same-origin")
                     .body(Body::from("_method=DELETE"))
                     .unwrap(),
             )
@@ -622,6 +725,7 @@ mod tests {
                     .method("POST")
                     .uri("/items/1")
                     .header("content-type", "application/x-www-form-urlencoded")
+                    .header("sec-fetch-site", "same-origin")
                     .body(Body::from("x-method=DELETE"))
                     .unwrap(),
             )
@@ -660,6 +764,7 @@ mod tests {
                     .method("POST")
                     .uri("/items/1")
                     .header("content-type", "application/x-www-form-urlencoded")
+                    .header("sec-fetch-site", "same-origin")
                     .header(http::header::ACCEPT, "text/html")
                     .header("Cookie", "autumn-csrf=valid-cookie-token")
                     .body(Body::from("_method=DELETE"))
@@ -691,6 +796,7 @@ mod tests {
                     .method("POST")
                     .uri("/items/1")
                     .header("content-type", "application/x-www-form-urlencoded")
+                    .header("sec-fetch-site", "same-origin")
                     .header("Cookie", format!("autumn-csrf={token}"))
                     .body(Body::from(format!("_csrf={token}&_method=DELETE")))
                     .unwrap(),
@@ -734,6 +840,7 @@ mod tests {
                     .method("POST")
                     .uri("/upload")
                     .header("content-type", "application/x-www-form-urlencoded")
+                    .header("sec-fetch-site", "same-origin")
                     .header("content-length", payload_len.to_string())
                     .body(Body::from(payload))
                     .unwrap(),
@@ -779,6 +886,7 @@ mod tests {
                     .method("POST")
                     .uri("/x")
                     .header("content-type", "application/x-www-form-urlencoded")
+                    .header("sec-fetch-site", "same-origin")
                     .body(Body::from(payload))
                     .unwrap(),
             )
@@ -833,6 +941,7 @@ mod tests {
                     .method("POST")
                     .uri("/x")
                     .header("content-type", "application/x-www-form-urlencoded")
+                    .header("sec-fetch-site", "same-origin")
                     .body(Body::from("_method=BREW"))
                     .unwrap(),
             )
@@ -844,6 +953,185 @@ mod tests {
             *cell.lock().unwrap(),
             Some(MethodOverrideRejection::InvalidValue)
         );
+    }
+
+    /// A POST carrying `_method=DELETE` from a cross-site context must
+    /// NOT be honoured as a DELETE. Without this check, a route declared
+    /// as `#[delete]` only — which native browser forms can never reach
+    /// directly — would become reachable from any third-party site that
+    /// renders a form pointing at it (when CSRF is disabled or the path
+    /// is CSRF-exempt).
+    #[tokio::test]
+    async fn cross_site_form_is_not_honoured_as_override() {
+        // Inner /items/{id} only has DELETE; no POST handler. If the
+        // override were applied, we'd see 200 "delete-ok". If the
+        // override is correctly skipped, we should see 405 (POST not
+        // allowed for that route).
+        let app = layered_router();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/items/1")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .header("sec-fetch-site", "cross-site")
+                    .body(Body::from("_method=DELETE"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "cross-site override must not be applied; expected the inner \
+             router to reject the underlying POST"
+        );
+    }
+
+    /// When `Sec-Fetch-Site` is absent we fall back to comparing
+    /// `Origin` with `Host`. A mismatch means the request is
+    /// cross-origin and the override must not apply.
+    #[tokio::test]
+    async fn origin_host_mismatch_is_not_honoured_as_override() {
+        let app = layered_router();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/items/1")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .header("origin", "https://evil.example")
+                    .header("host", "app.example")
+                    .body(Body::from("_method=DELETE"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    /// `Origin` and `Host` match (both `app.example`) — same origin via
+    /// the fallback path; the override should apply.
+    #[tokio::test]
+    async fn origin_host_match_is_honoured_as_override() {
+        let app = layered_router();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/items/1")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .header("origin", "https://app.example")
+                    .header("host", "app.example")
+                    .body(Body::from("_method=DELETE"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// Neither `Sec-Fetch-Site` nor `Origin` present: fail closed. The
+    /// override is not applied — the request flows through as POST.
+    #[tokio::test]
+    async fn missing_origin_signals_fail_closed() {
+        let app = layered_router();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/items/1")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("_method=DELETE"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // /items/1 has no POST handler, so a non-overridden POST yields 405.
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    /// Helper-level cases that don't require the full router wiring.
+    #[test]
+    fn is_same_origin_form_decision_matrix() {
+        // Sec-Fetch-Site values
+        for site in ["same-origin", "same-site", "none"] {
+            let mut h = http::HeaderMap::new();
+            h.insert("sec-fetch-site", http::HeaderValue::from_str(site).unwrap());
+            assert!(
+                is_same_origin_form(&h),
+                "sec-fetch-site={site} should be allowed"
+            );
+        }
+        let mut h = http::HeaderMap::new();
+        h.insert(
+            "sec-fetch-site",
+            http::HeaderValue::from_static("cross-site"),
+        );
+        assert!(!is_same_origin_form(&h));
+
+        // Origin matches Host
+        let mut h = http::HeaderMap::new();
+        h.insert(
+            http::header::ORIGIN,
+            http::HeaderValue::from_static("https://app.example"),
+        );
+        h.insert(
+            http::header::HOST,
+            http::HeaderValue::from_static("app.example"),
+        );
+        assert!(is_same_origin_form(&h));
+
+        // Origin does not match Host
+        let mut h = http::HeaderMap::new();
+        h.insert(
+            http::header::ORIGIN,
+            http::HeaderValue::from_static("https://evil.example"),
+        );
+        h.insert(
+            http::header::HOST,
+            http::HeaderValue::from_static("app.example"),
+        );
+        assert!(!is_same_origin_form(&h));
+
+        // Neither signal present: fail closed.
+        let h = http::HeaderMap::new();
+        assert!(!is_same_origin_form(&h));
+    }
+
+    /// Override rejection responses carry an `AutumnErrorInfo` extension
+    /// so the framework exception filter chain — problem-details
+    /// negotiation, custom HTML error-page rendering — processes them
+    /// the same as a handler-generated error response.
+    #[tokio::test]
+    async fn rejection_response_carries_autumn_error_info() {
+        use crate::middleware::exception_filter::AutumnErrorInfo;
+
+        let app = layered_router();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/items/1")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .header("sec-fetch-site", "same-origin")
+                    .body(Body::from("_method=BREW"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let info = response
+            .extensions()
+            .get::<AutumnErrorInfo>()
+            .expect("override rejection must carry AutumnErrorInfo");
+        assert_eq!(info.status, StatusCode::BAD_REQUEST);
+        assert!(info.message.contains("PUT, PATCH, or DELETE"));
     }
 
     #[test]
