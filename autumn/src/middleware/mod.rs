@@ -28,7 +28,8 @@ pub(crate) mod trace_context;
 pub use exception_filter::{AutumnErrorInfo, ExceptionFilter, ExceptionFilterLayer};
 pub use method_override::{
     DEFAULT_METHOD_OVERRIDE_FIELD, MethodOverrideConfig, MethodOverrideLayer,
-    MethodOverrideService, OverriddenMethod,
+    MethodOverrideRejection, MethodOverrideService, OverriddenMethod,
+    method_override_rejection_filter,
 };
 pub use metrics::{MetricsCollector, MetricsLayer};
 pub use request_id::{RequestId, RequestIdLayer};

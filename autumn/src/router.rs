@@ -1082,6 +1082,21 @@ fn apply_middleware(
 
     router = apply_cors_middleware(router, config);
     router = apply_csrf_middleware(router, config, signing_keys_opt.clone());
+    // Method-override rejection filter. The outer `MethodOverrideLayer`
+    // (applied at the `axum::serve` boundary so it can rewrite the
+    // request method before route matching) stamps a
+    // [`MethodOverrideRejection`] extension when the override field
+    // value is invalid or the body was too large to scan; this inner
+    // middleware converts that extension into the corresponding
+    // `400`/`413` response. Running it here means the rejection flows
+    // through the rest of the response stack (security headers,
+    // request IDs, metrics, error-page filter) rather than bypassing
+    // them. Placed outside CSRF so a `BodyTooLarge` (empty body)
+    // doesn't get masked by a `403` from CSRF's missing-token branch,
+    // and a clear `400 invalid _method` outranks "missing CSRF".
+    router = router.layer(axum::middleware::from_fn(
+        crate::middleware::method_override_rejection_filter,
+    ));
     router = apply_rate_limit_middleware(router, config);
     router = apply_upload_middleware(router, config);
 
