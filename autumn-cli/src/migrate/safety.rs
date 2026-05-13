@@ -296,26 +296,51 @@ fn classify_statement(normalized: &str) -> Vec<SafetyFinding> {
         });
     }
 
-    // ADD COLUMN NOT NULL without DEFAULT — checked per subcommand so that a DEFAULT
-    // on one column in a multi-column ALTER TABLE does not suppress the check for other
-    // columns that lack a DEFAULT.
+    // ADD COLUMN NOT NULL — checked per subcommand so that a DEFAULT on one column
+    // in a multi-column ALTER TABLE does not suppress the check for other columns.
+    //
+    // Two unsafe cases:
+    //  1. No DEFAULT at all — Postgres must validate every existing row under lock.
+    //  2. Volatile DEFAULT (contains a function call) — Postgres must evaluate the
+    //     function per-row and cannot use the fast constant-default path (PG 11+),
+    //     so the table is still rewritten under the exclusive lock.
     if normalized.starts_with("alter table") {
         for subcommand in alter_table_subcommands(normalized) {
-            if subcommand.starts_with("add column ")
-                && subcommand.contains("not null")
-                && !subcommand.contains(" default ")
-            {
-                findings.push(SafetyFinding {
-                    operation: "ADD COLUMN NOT NULL (no default)".to_owned(),
-                    risk: RiskLevel::PotentiallyBlocking,
-                    why: "Adding a NOT NULL column without a DEFAULT forces Postgres to validate \
-                          every existing row under an exclusive lock. On a large table this may \
-                          time out.",
-                    next_action: "Provide a DEFAULT value, or add the column as nullable first, \
-                                  backfill existing rows, then add the NOT NULL constraint in a \
-                                  later migration.",
-                });
-                break; // one finding per statement is sufficient
+            if subcommand.starts_with("add column ") && subcommand.contains("not null") {
+                let has_default = subcommand.contains(" default ");
+                // A DEFAULT is "volatile" when it contains a function call (has `(`
+                // anywhere after the `default` keyword).  Constant literals such as
+                // `DEFAULT 0` or `DEFAULT ''` do not contain `(`.
+                let has_volatile_default = has_default
+                    && subcommand
+                        .find(" default ")
+                        .is_some_and(|pos| subcommand[pos..].contains('('));
+
+                if !has_default {
+                    findings.push(SafetyFinding {
+                        operation: "ADD COLUMN NOT NULL (no default)".to_owned(),
+                        risk: RiskLevel::PotentiallyBlocking,
+                        why: "Adding a NOT NULL column without a DEFAULT forces Postgres to \
+                              validate every existing row under an exclusive lock. On a large \
+                              table this may time out.",
+                        next_action: "Provide a constant DEFAULT value, or add the column as \
+                                      nullable first, backfill existing rows, then add the NOT \
+                                      NULL constraint in a later migration.",
+                    });
+                    break; // one finding per statement is sufficient
+                } else if has_volatile_default {
+                    findings.push(SafetyFinding {
+                        operation: "ADD COLUMN NOT NULL (volatile default)".to_owned(),
+                        risk: RiskLevel::PotentiallyBlocking,
+                        why: "A function-call DEFAULT (e.g. random(), now(), gen_random_uuid()) \
+                              is volatile: Postgres must evaluate it for every existing row under \
+                              an exclusive lock, potentially rewriting the entire table.",
+                        next_action: "Use a constant literal DEFAULT instead (e.g. DEFAULT 0, \
+                                      DEFAULT ''), or add the column nullable, backfill, then \
+                                      add the NOT NULL constraint in a later migration.",
+                    });
+                    break; // one finding per statement is sufficient
+                }
             }
         }
     }
@@ -655,6 +680,43 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].risk, RiskLevel::PotentiallyBlocking);
         assert_eq!(findings[0].operation, "ADD COLUMN NOT NULL (no default)");
+    }
+
+    #[test]
+    fn add_not_null_column_with_volatile_default_is_blocking() {
+        let findings = classify_sql(
+            "ALTER TABLE posts ADD COLUMN token UUID NOT NULL DEFAULT gen_random_uuid();",
+        );
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].risk, RiskLevel::PotentiallyBlocking);
+        assert_eq!(
+            findings[0].operation,
+            "ADD COLUMN NOT NULL (volatile default)"
+        );
+    }
+
+    #[test]
+    fn add_not_null_column_with_now_default_is_blocking() {
+        let findings = classify_sql(
+            "ALTER TABLE posts ADD COLUMN created_at TIMESTAMP NOT NULL DEFAULT now();",
+        );
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].risk, RiskLevel::PotentiallyBlocking);
+        assert_eq!(
+            findings[0].operation,
+            "ADD COLUMN NOT NULL (volatile default)"
+        );
+    }
+
+    #[test]
+    fn add_not_null_column_with_constant_default_is_safe() {
+        // Constant literals use the PG11+ fast path — no table rewrite.
+        let findings =
+            classify_sql("ALTER TABLE posts ADD COLUMN active BOOLEAN NOT NULL DEFAULT false;");
+        assert!(
+            findings.is_empty(),
+            "constant DEFAULT false must be safe: {findings:?}"
+        );
     }
 
     #[test]
