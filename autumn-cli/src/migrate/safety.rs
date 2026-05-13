@@ -69,7 +69,11 @@ pub struct SafetyFinding {
 /// allowing operators to acknowledge and suppress findings they have manually
 /// reviewed and accepted.
 pub fn classify_sql(sql: &str) -> Vec<SafetyFinding> {
-    split_statements(sql)
+    // Strip block comments at the whole-SQL level before splitting so that a
+    // semicolon inside a block comment (e.g. `/* note; end */`) does not produce
+    // a spurious empty statement fragment.
+    let without_block_comments = strip_block_comments(sql);
+    split_statements(&without_block_comments)
         .iter()
         .filter(|stmt| !has_review_suppression(stmt))
         .flat_map(|stmt| classify_statement(&normalize_statement(stmt)))
@@ -394,6 +398,18 @@ fn classify_statement(normalized: &str) -> Vec<SafetyFinding> {
         });
     }
 
+    // DROP INDEX (non-concurrent) — holds an exclusive table lock
+    if normalized.starts_with("drop index") && !normalized.contains("concurrently") {
+        findings.push(SafetyFinding {
+            operation: "DROP INDEX (non-concurrent)".to_owned(),
+            risk: RiskLevel::PotentiallyBlocking,
+            why: "Non-concurrent DROP INDEX acquires an AccessExclusiveLock on the table, \
+                  blocking all reads and writes for the duration of the drop.",
+            next_action: "Use DROP INDEX CONCURRENTLY to avoid the exclusive table lock. \
+                          Add `run_in_transaction = false` to the migration's `metadata.toml`.",
+        });
+    }
+
     // Generic catch-all — DDL/DML not matched by any rule above
     let is_known_start = normalized.starts_with("drop table")
         || normalized.starts_with("drop index")
@@ -410,7 +426,7 @@ fn classify_statement(normalized: &str) -> Vec<SafetyFinding> {
         || normalized.starts_with("drop sequence")
         || normalized.starts_with("create type")
         || normalized.starts_with("alter type")
-        || normalized.starts_with("drop type")
+        // `drop type` is intentionally absent — falls through to ManualReview
         || normalized.starts_with("create extension")
         || normalized.starts_with("create view")
         || normalized.starts_with("drop view")
@@ -1035,5 +1051,58 @@ mod tests {
             findings.iter().all(|f| f.risk != RiskLevel::Destructive),
             "Destructive keyword inside block comment must not produce a Destructive finding"
         );
+    }
+
+    #[test]
+    fn block_comment_with_semicolon_does_not_hide_following_statement() {
+        // The semicolon inside the block comment must not split the statement early.
+        let sql = "/* cleanup; safe to drop */ DROP TABLE posts;";
+        let findings = classify_sql(sql);
+        assert_eq!(
+            findings.len(),
+            1,
+            "DROP TABLE after a block comment containing ';' must still be classified"
+        );
+        assert_eq!(findings[0].risk, RiskLevel::Destructive);
+    }
+
+    // ── DROP INDEX ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn drop_index_non_concurrent_is_potentially_blocking() {
+        let findings = classify_sql("DROP INDEX idx_posts_title;");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].risk, RiskLevel::PotentiallyBlocking);
+        assert_eq!(findings[0].operation, "DROP INDEX (non-concurrent)");
+    }
+
+    #[test]
+    fn drop_index_concurrently_is_safe_from_classifier() {
+        // CONCURRENTLY avoids the table lock; the opt-out check in migrate.rs handles
+        // the metadata.toml requirement separately.
+        let findings = classify_sql("DROP INDEX CONCURRENTLY idx_posts_title;");
+        assert!(
+            findings
+                .iter()
+                .all(|f| f.risk != RiskLevel::PotentiallyBlocking
+                    || f.operation.contains("CONCURRENTLY")),
+            "DROP INDEX CONCURRENTLY must not produce a non-concurrent finding"
+        );
+    }
+
+    // ── DROP TYPE ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn drop_type_requires_manual_review() {
+        let findings = classify_sql("DROP TYPE status;");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].risk, RiskLevel::ManualReview);
+    }
+
+    #[test]
+    fn drop_type_cascade_requires_manual_review() {
+        let findings = classify_sql("DROP TYPE status CASCADE;");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].risk, RiskLevel::ManualReview);
     }
 }
