@@ -1,0 +1,14 @@
+<!DOCTYPE html>
+<html xmlns:th="http://www.thymeleaf.org" lang="en">
+<head><meta charset="utf-8"/><title>Posts</title></head>
+<body>
+<h1>Posts</h1>
+<ul>
+  <li th:each="post : ${posts}">
+    <a th:href="@{/posts/{id}(id=${post.id})}" th:text="${post.title}"></a>
+    — <span th:text="${post.author}"></span>
+    <em th:unless="${post.published}"> [draft]</em>
+  </li>
+</ul>
+</body>
+</html>

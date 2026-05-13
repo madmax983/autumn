@@ -46,12 +46,23 @@ jobs:
         run: ./scripts/check-examples.sh
 
   # ---------------------------------------------------------------------------
+  # 0b. Benchmark harness structure gate
+  # ---------------------------------------------------------------------------
+  benchmarks:
+    name: Benchmark harness structure gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check benchmark harness completeness
+        run: ./scripts/check-benchmarks.sh
+
+  # ---------------------------------------------------------------------------
   # 1. Crate metadata
   # ---------------------------------------------------------------------------
   metadata:
     name: Crate metadata
     runs-on: ubuntu-latest
-    needs: examples
+    needs: [examples, benchmarks]
     steps:
       - uses: actions/checkout@v4
       - name: Check required crates.io metadata fields

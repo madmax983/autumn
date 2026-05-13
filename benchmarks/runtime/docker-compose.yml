@@ -1,0 +1,168 @@
+# Comparable-infrastructure benchmark track.
+#
+# Spins up Postgres and all six framework apps behind a single network.
+# Each app exposes a unique host port so the load generator can target
+# any one of them without reconfiguration.
+#
+# Port map:
+#   5432  – Postgres
+#   8001  – Autumn      (Rust / Axum)
+#   8002  – Spring Boot (Java 21 / Tomcat)
+#   8003  – Rails       (Ruby 3.3 / Puma)
+#   8004  – Django      (Python 3.12 / Gunicorn + Uvicorn)
+#   8005  – Phoenix     (Elixir 1.17 / Cowboy)
+#   8006  – Loco        (Rust / Axum)
+#
+# Usage:
+#   docker compose up -d db
+#   docker compose up -d --build autumn spring-boot rails django phoenix loco
+#   # wait for health checks, then run:
+#   # cd load && ./run.sh autumn http://localhost:8001
+
+version: "3.9"
+
+x-db-env: &db-env
+  DATABASE_URL: postgres://benchmark:benchmark@db:5432/benchmark
+
+x-app-defaults: &app-defaults
+  restart: unless-stopped
+  depends_on:
+    db:
+      condition: service_healthy
+  networks:
+    - bench
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: benchmark
+      POSTGRES_USER: benchmark
+      POSTGRES_PASSWORD: benchmark
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./schema/init.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+      - ./seed/seed.sql:/docker-entrypoint-initdb.d/02-seed.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U benchmark -d benchmark"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - bench
+
+  autumn:
+    <<: *app-defaults
+    build:
+      context: autumn
+      dockerfile: Dockerfile
+    environment:
+      <<: *db-env
+      AUTUMN_SERVER__HOST: "0.0.0.0"
+      AUTUMN_SERVER__PORT: "8080"
+      RUST_LOG: "warn"
+    ports:
+      - "8001:8080"
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 512M
+
+  spring-boot:
+    <<: *app-defaults
+    build:
+      context: spring-boot
+      dockerfile: Dockerfile
+    environment:
+      <<: *db-env
+      SERVER_PORT: "8080"
+    ports:
+      - "8002:8080"
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 512M
+
+  rails:
+    <<: *app-defaults
+    build:
+      context: rails
+      dockerfile: Dockerfile
+    environment:
+      DATABASE_URL: postgres://benchmark:benchmark@db:5432/benchmark
+      RAILS_ENV: production
+      SECRET_KEY_BASE: benchmarksecretkeybase0000000000000000000000000000000000000000000
+      RAILS_SERVE_STATIC_FILES: "true"
+      RAILS_LOG_TO_STDOUT: "true"
+      PORT: "8080"
+    ports:
+      - "8003:8080"
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 512M
+
+  django:
+    <<: *app-defaults
+    build:
+      context: django
+      dockerfile: Dockerfile
+    environment:
+      DATABASE_URL: postgres://benchmark:benchmark@db:5432/benchmark
+      DJANGO_ENV: production
+      SECRET_KEY: benchmarksecretkey0000000000000000000000000000000000000000000000
+      PORT: "8080"
+    ports:
+      - "8004:8080"
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 512M
+
+  phoenix:
+    <<: *app-defaults
+    build:
+      context: phoenix
+      dockerfile: Dockerfile
+    environment:
+      DATABASE_URL: ecto://benchmark:benchmark@db/benchmark
+      SECRET_KEY_BASE: benchmarksecretkeybasephoenix0000000000000000000000000000000000
+      PHX_SERVER: "true"
+      PORT: "8080"
+    ports:
+      - "8005:8080"
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 512M
+
+  loco:
+    <<: *app-defaults
+    build:
+      context: loco
+      dockerfile: Dockerfile
+    environment:
+      <<: *db-env
+      LOCO_APP_PORT: "8080"
+      RUST_LOG: "warn"
+    ports:
+      - "8006:8080"
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 512M
+
+volumes:
+  pgdata:
+
+networks:
+  bench:
+    driver: bridge
