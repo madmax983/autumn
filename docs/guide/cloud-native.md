@@ -81,6 +81,24 @@ With the `telemetry-otlp` cargo feature enabled and `telemetry.enabled = true`:
   of the pooled connection — Diesel activity performed through it appears
   as a child of the request span in Jaeger / Tempo / Datadog.
 
+## Harvest Backends
+
+| Backend | When to pick it |
+|---|---|
+| `local` | Local dev and single-process demos; jobs are lost on restart |
+| `postgres` | Production with Postgres already in the stack; no Redis required |
+| `redis` | Very high job throughput, or Redis is already a dependency |
+
+`postgres` reuses the configured `[database]` pool and claims jobs via
+`SELECT … FOR UPDATE SKIP LOCKED`, making it safe across any number of replicas
+without adding Redis. Enable it with `jobs.backend = "postgres"` and run
+`autumn migrate` before the first worker starts.
+
+`redis` offers a higher throughput ceiling and sub-millisecond poll latency but
+adds Redis as an infrastructure dependency. Prefer `postgres` if your ops budget
+does not include Redis, and switch to `redis` if job throughput saturates the
+Postgres connection pool.
+
 ## File Uploads
 
 The `Multipart` extractor's `save_to(path)` primitive writes to the local
@@ -168,30 +186,12 @@ Use `#[scheduled]` when:
 - duplicate execution per replica is acceptable or explicitly coordinated
 - you do not need durable retries or workflow history
 
-Use Harvest (`#[job]`) when:
+Use Harvest when:
 
 - the task must survive restarts
 - retries and visibility matter
 - work should be coordinated across replicas
 - you are really describing a workflow, not a cron callback
-
-### Choosing a Harvest backend
-
-| Backend | When to pick it |
-|---|---|
-| `local` | Local dev and single-process demos; jobs are lost on restart |
-| `postgres` | Production with Postgres already in the stack; no Redis required |
-| `redis` | Very high job throughput, or Redis is already a dependency |
-
-`postgres` reuses the configured `[database]` pool and claims jobs via
-`SELECT … FOR UPDATE SKIP LOCKED`, making it safe across any number of replicas
-without adding Redis. Enable it with `jobs.backend = "postgres"` and run
-`autumn migrate` before the first worker starts.
-
-`redis` offers a higher throughput ceiling and sub-millisecond poll latency but
-adds Redis as an infrastructure dependency. Prefer `postgres` if your ops budget
-does not include Redis, and switch to `redis` if job throughput saturates the
-Postgres connection pool.
 
 ## Migration Jobs
 
@@ -209,6 +209,88 @@ AUTUMN_DATABASE__PRIMARY_URL="postgres://user:pass@primary:5432/app" autumn migr
 `AUTUMN_DATABASE__PRIMARY_URL` keeps the deployment contract explicit. Keep
 `auto_migrate_in_production = false` on web replicas unless you are deliberately
 running a single-process deployment.
+
+## Migration Safety Preflight
+
+Before applying migrations in production, run the safety check in CI or locally:
+
+```bash
+autumn migrate check
+```
+
+`autumn migrate check` reads every `migrations/*/up.sql` file from disk (no
+database connection required) and classifies each SQL statement by its risk for
+a rolling deploy. It exits **0** when all statements are fully safe and **1**
+when any finding is `potentially-blocking`, `destructive`, `irreversible`,
+`data-backfill`, or `manual-review`. Each finding includes a one-line reason and
+a concrete next action.
+
+Example output:
+
+```
+✓ 20240301_create_posts                 safe
+✗ 20240312_add_index_posts_title        potentially-blocking
+  └─ CREATE INDEX (non-concurrent): holds an exclusive table lock for the entire build
+     next: Use CREATE INDEX CONCURRENTLY instead.
+✗ 20240315_rename_body_to_content       irreversible
+  └─ RENAME COLUMN: breaks queries from old replicas still referencing the old name
+     next: Use expand/contract: add the new column, dual-write, backfill, update code, drop old.
+```
+
+### Risk levels
+
+| Level | Meaning |
+|---|---|
+| `safe` | Additive, backward-compatible. Safe for rolling deploys. |
+| `potentially-blocking` | May acquire a table-level lock on large datasets. |
+| `destructive` | Removes data or structure; old replicas may fail until restart. |
+| `irreversible` | Cannot be undone without a multi-step expand/contract cycle. |
+| `data-backfill` | Schema change is safe but requires a separate backfill job. |
+| `manual-review` | Autumn cannot auto-classify this statement; operator review required. |
+
+### Adding `autumn migrate check` to CI
+
+```yaml
+# GitHub Actions example
+- name: Check migration safety
+  run: autumn migrate check
+```
+
+Place this step after building the binary and before any deployment step that
+applies migrations. A non-zero exit code fails the pipeline, preventing unsafe
+migrations from reaching production unreviewed.
+
+### The expand/contract pattern
+
+Most "dangerous" schema changes can be made safe by splitting them into two
+separately deployed changes:
+
+1. **Expand** — add the new column or table alongside the old one; update code
+   to dual-write and read from either. This migration is `safe` and can be
+   applied with a rolling deploy.
+2. **Contract** — once all replicas run the new code, remove the old
+   column/table. This migration may be `destructive` but is now safe because no
+   running code references the old structure.
+
+Common patterns:
+
+| Goal | Naïve (unsafe) | Expand/contract (safe) |
+|---|---|---|
+| Rename a column | `RENAME COLUMN old TO new` | Add `new`, dual-write, backfill, drop `old` |
+| Change a column type | `ALTER COLUMN x TYPE bigint` | Add `x_new bigint`, migrate data, swap code, drop `x` |
+| Drop a column | `DROP COLUMN body` | First deploy: remove all reads/writes; second deploy: `DROP COLUMN` |
+| Add NOT NULL | `ADD COLUMN x INT NOT NULL` | Add nullable, backfill, add constraint `NOT VALID`, validate |
+
+### When a maintenance window is required
+
+Some operations cannot be made zero-downtime regardless of the pattern:
+
+- **Non-concurrent index creation** on very large tables (prefer
+  `CREATE INDEX CONCURRENTLY`).
+- **Adding a primary key** to a table with existing rows without `NOT VALID`.
+- **Enabling row-level security** on a table referenced by live queries.
+
+For these, schedule a maintenance window and communicate the outage to users.
 
 ## Database Topology
 
@@ -424,7 +506,9 @@ Before calling an Autumn app "cloud ready", verify:
 - cache uses the Redis backend if replicas > 1
 - file uploads use the `S3` blob store if replicas > 1
 - mail uses SMTP, not log/file transport
-- migrations run before web rollout
-- background jobs use `postgres` or `redis` backend (not `local`) in multi-replica deployments
+- `autumn migrate check` passes in CI before the deploy job
+- migrations run before web rollout via a dedicated migration job
+- destructive/irreversible migrations follow the expand/contract pattern
+- background jobs use the right runtime model
 - multi-replica write paths use `#[lock_version]` (optimistic) or `with_lock` (pessimistic) to prevent lost updates
 - the generated container image builds without manual template surgery

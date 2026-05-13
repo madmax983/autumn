@@ -2873,6 +2873,145 @@ const PG_STATUS_COMPLETED: &str = "completed";
 const PG_STATUS_FAILED: &str = "failed";
 
 #[cfg(feature = "db")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PgLifecycleRecord<'a> {
+    Success,
+    Retry { error: &'a str, attempt: u32 },
+    Failure { error: &'a str },
+}
+
+#[cfg(feature = "db")]
+const fn pg_claim_transition_applied(rows_affected: usize) -> bool {
+    rows_affected > 0
+}
+
+#[cfg(feature = "db")]
+fn record_pg_lifecycle_after_ack(
+    ack_applied: bool,
+    job_name: &str,
+    job_id: &str,
+    lifecycle: PgLifecycleRecord<'_>,
+    state: &AppState,
+    job_admin: &JobAdminMemoryBackend,
+) -> bool {
+    if !ack_applied {
+        return false;
+    }
+
+    match lifecycle {
+        PgLifecycleRecord::Success => {
+            state.job_registry.record_success(job_name);
+            job_admin.record_success(job_id);
+        }
+        PgLifecycleRecord::Retry { error, attempt } => {
+            state.job_registry.record_retry(job_name, error, attempt);
+            job_admin.record_retrying(job_id, error);
+        }
+        PgLifecycleRecord::Failure { error } => {
+            state
+                .job_registry
+                .record_failure(job_name, error.to_owned(), true);
+            job_admin.record_failure(job_id, error.to_owned());
+        }
+    }
+
+    true
+}
+
+#[cfg(feature = "db")]
+fn record_pg_lifecycle_ack_result(
+    ack_result: AutumnResult<bool>,
+    job_name: &str,
+    job_id: &str,
+    outcome: &str,
+    lifecycle: PgLifecycleRecord<'_>,
+    state: &AppState,
+    job_admin: &JobAdminMemoryBackend,
+) -> bool {
+    match ack_result {
+        Ok(applied) => {
+            let recorded = record_pg_lifecycle_after_ack(
+                applied, job_name, job_id, lifecycle, state, job_admin,
+            );
+            if !recorded {
+                tracing::warn!(
+                    job = %job_name,
+                    job_id = %job_id,
+                    outcome = %outcome,
+                    "postgres job ack skipped because claim changed"
+                );
+            }
+            recorded
+        }
+        Err(error) => {
+            tracing::warn!(
+                job = %job_name,
+                job_id = %job_id,
+                outcome = %outcome,
+                error = %error,
+                "postgres job ack failed"
+            );
+            false
+        }
+    }
+}
+
+#[cfg(feature = "db")]
+fn record_pg_row_lifecycle_ack_result(
+    ack_result: AutumnResult<bool>,
+    row: &PgJobRow,
+    outcome: &str,
+    lifecycle: PgLifecycleRecord<'_>,
+    state: &AppState,
+    job_admin: &JobAdminMemoryBackend,
+) -> bool {
+    record_pg_lifecycle_ack_result(
+        ack_result, &row.name, &row.id, outcome, lifecycle, state, job_admin,
+    )
+}
+
+#[cfg(feature = "db")]
+fn record_pg_cancel_after_ack(
+    ack_result: AutumnResult<bool>,
+    job_name: &str,
+    job_id: &str,
+    state: &AppState,
+) -> bool {
+    match ack_result {
+        Ok(true) => {
+            state.job_registry.record_cancel(job_name);
+            true
+        }
+        Ok(false) => {
+            tracing::warn!(
+                job = %job_name,
+                job_id = %job_id,
+                "postgres job cancel ack skipped because claim changed"
+            );
+            false
+        }
+        Err(error) => {
+            tracing::warn!(
+                job = %job_name,
+                job_id = %job_id,
+                error = %error,
+                "postgres job cancel ack failed"
+            );
+            false
+        }
+    }
+}
+
+#[cfg(feature = "db")]
+fn record_pg_row_cancel_after_ack(
+    ack_result: AutumnResult<bool>,
+    row: &PgJobRow,
+    state: &AppState,
+) -> bool {
+    record_pg_cancel_after_ack(ack_result, &row.name, &row.id, state)
+}
+
+#[cfg(feature = "db")]
 const PG_WORKER_IDLE_SLEEP: std::time::Duration = std::time::Duration::from_millis(200);
 #[cfg(feature = "db")]
 const PG_MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
@@ -3057,7 +3196,7 @@ async fn pg_claim_next_job(pool: &PgPool, worker_id: &str) -> Option<PgJobRow> {
 
 /// Mark a running job as completed.
 #[cfg(feature = "db")]
-async fn pg_ack_success(pool: &PgPool, job_id: &str, worker_id: &str) -> AutumnResult<()> {
+async fn pg_ack_success(pool: &PgPool, job_id: &str, worker_id: &str) -> AutumnResult<bool> {
     use diesel_async::RunQueryDsl as _;
 
     let mut conn = pool
@@ -3074,7 +3213,7 @@ async fn pg_ack_success(pool: &PgPool, job_id: &str, worker_id: &str) -> AutumnR
     .bind::<diesel::sql_types::Text, _>(worker_id)
     .execute(&mut *conn)
     .await
-    .map(|_| ())
+    .map(pg_claim_transition_applied)
     .map_err(|e| AutumnError::internal_server_error_msg(format!("pg job ack failed: {e}")))
 }
 
@@ -3086,7 +3225,7 @@ async fn pg_nack_failure(
     worker_id: &str,
     error: &str,
     row: &PgJobRow,
-) -> AutumnResult<()> {
+) -> AutumnResult<bool> {
     use diesel_async::RunQueryDsl as _;
 
     let mut conn = pool
@@ -3114,7 +3253,7 @@ async fn pg_nack_failure(
         .bind::<diesel::sql_types::Text, _>(worker_id)
         .execute(&mut *conn)
         .await
-        .map(|_| ())
+        .map(pg_claim_transition_applied)
         .map_err(|e| AutumnError::internal_server_error_msg(format!("pg job retry failed: {e}")))
     } else {
         diesel::sql_query(
@@ -3131,7 +3270,7 @@ async fn pg_nack_failure(
         .bind::<diesel::sql_types::Text, _>(worker_id)
         .execute(&mut *conn)
         .await
-        .map(|_| ())
+        .map(pg_claim_transition_applied)
         .map_err(|e| {
             AutumnError::internal_server_error_msg(format!("pg job dead-letter failed: {e}"))
         })
@@ -3147,7 +3286,7 @@ async fn pg_ack_dead_letter(
     job_id: &str,
     worker_id: &str,
     error: &str,
-) -> AutumnResult<()> {
+) -> AutumnResult<bool> {
     use diesel_async::RunQueryDsl as _;
 
     let mut conn = pool
@@ -3168,7 +3307,7 @@ async fn pg_ack_dead_letter(
     .bind::<diesel::sql_types::Text, _>(worker_id)
     .execute(&mut *conn)
     .await
-    .map(|_| ())
+    .map(pg_claim_transition_applied)
     .map_err(|e| AutumnError::internal_server_error_msg(format!("pg job dead-letter failed: {e}")))
 }
 
@@ -3235,10 +3374,8 @@ async fn pg_execute_job(
     let max_attempts = u32::try_from(row.max_attempts).unwrap_or(1);
 
     if job_admin.try_record_start(&row.id, attempt) == JobAdminStartDecision::Canceled {
-        state.job_registry.record_cancel(&row.name);
-        pg_nack_failure(pool, &row.id, worker_id, "canceled by operator", &row)
-            .await
-            .ok();
+        let ack = pg_nack_failure(pool, &row.id, worker_id, "canceled by operator", &row).await;
+        record_pg_row_cancel_after_ack(ack, &row, state);
         return;
     }
     state.job_registry.record_start(&row.name);
@@ -3252,47 +3389,43 @@ async fn pg_execute_job(
 
     let Some(handler) = handler_opt else {
         let error = format!("unknown job '{}'", row.name);
-        state
-            .job_registry
-            .record_failure(&row.name, error.clone(), true);
-        job_admin.record_failure(&row.id, error.clone());
-        pg_nack_failure(pool, &row.id, worker_id, &error, &row)
-            .await
-            .ok();
+        let ack = pg_nack_failure(pool, &row.id, worker_id, &error, &row).await;
+        let lifecycle = PgLifecycleRecord::Failure { error: &error };
+        record_pg_row_lifecycle_ack_result(ack, &row, "unknown-type", lifecycle, state, job_admin);
         return;
     };
 
     match run_job_handler(handler, state.clone(), payload).await {
         JobExecutionOutcome::Succeeded => {
-            state.job_registry.record_success(&row.name);
-            job_admin.record_success(&row.id);
-            pg_ack_success(pool, &row.id, worker_id).await.ok();
+            let ack = pg_ack_success(pool, &row.id, worker_id).await;
+            record_pg_row_lifecycle_ack_result(
+                ack,
+                &row,
+                "success",
+                PgLifecycleRecord::Success,
+                state,
+                job_admin,
+            );
         }
         JobExecutionOutcome::Failed(error) => {
-            if attempt < max_attempts {
-                state.job_registry.record_retry(&row.name, &error, attempt);
-                job_admin.record_retrying(&row.id, &error);
+            let lifecycle = if attempt < max_attempts {
+                PgLifecycleRecord::Retry {
+                    error: &error,
+                    attempt,
+                }
             } else {
-                state
-                    .job_registry
-                    .record_failure(&row.name, error.clone(), true);
-                job_admin.record_failure(&row.id, error.clone());
-            }
-            pg_nack_failure(pool, &row.id, worker_id, &error, &row)
-                .await
-                .ok();
+                PgLifecycleRecord::Failure { error: &error }
+            };
+            let ack = pg_nack_failure(pool, &row.id, worker_id, &error, &row).await;
+            record_pg_row_lifecycle_ack_result(ack, &row, "failure", lifecycle, state, job_admin);
         }
         // Panics dead-letter immediately regardless of remaining attempts,
         // matching the local and redis backend behaviour.
         JobExecutionOutcome::Panicked(error) => {
             tracing::error!(job = %row.name, error = %error, "postgres job handler panicked");
-            state
-                .job_registry
-                .record_failure(&row.name, error.clone(), true);
-            job_admin.record_failure(&row.id, error.clone());
-            pg_ack_dead_letter(pool, &row.id, worker_id, &error)
-                .await
-                .ok();
+            let ack = pg_ack_dead_letter(pool, &row.id, worker_id, &error).await;
+            let lifecycle = PgLifecycleRecord::Failure { error: &error };
+            record_pg_row_lifecycle_ack_result(ack, &row, "panic", lifecycle, state, job_admin);
         }
     }
 }
@@ -5233,6 +5366,293 @@ mod tests {
             assert_eq!(pg_retry_delay_ms(250, 2), 500);
             assert_eq!(pg_retry_delay_ms(250, 3), 1_000);
             assert_eq!(pg_retry_delay_ms(250, 4), 2_000);
+        }
+
+        fn pg_test_row(id: &str, name: &str, attempt: i32, max_attempts: i32) -> PgJobRow {
+            PgJobRow {
+                id: id.to_owned(),
+                name: name.to_owned(),
+                payload: "{}".to_owned(),
+                status: PG_STATUS_RUNNING.to_owned(),
+                attempt,
+                max_attempts,
+                initial_backoff_ms: 1,
+                enqueued_at: None,
+                started_at: None,
+                finished_at: None,
+                claimed_by: Some("worker".to_owned()),
+                claimed_at: None,
+                last_error: None,
+            }
+        }
+
+        #[test]
+        fn pg_claim_transition_requires_affected_row() {
+            assert!(!pg_claim_transition_applied(0));
+            assert!(pg_claim_transition_applied(1));
+        }
+
+        #[test]
+        fn pg_success_lifecycle_is_skipped_when_ack_does_not_apply() {
+            let state = AppState::for_test().with_profile("dev");
+            state.job_registry().register("slow_success");
+            state.job_registry().record_enqueue("slow_success");
+            state.job_registry().record_start("slow_success");
+            let job_admin = JobAdminMemoryBackend::new_for_test(32);
+            let job_id =
+                job_admin.record_enqueue_for_test("slow_success", serde_json::json!({}), 1, 3);
+            job_admin.record_start_for_test(&job_id, 1);
+
+            assert!(!record_pg_lifecycle_ack_result(
+                Ok(false),
+                "slow_success",
+                &job_id,
+                "success",
+                PgLifecycleRecord::Success,
+                &state,
+                &job_admin
+            ));
+
+            let status = state.job_registry().snapshot()["slow_success"].clone();
+            assert_eq!(status.in_flight, 1);
+            assert_eq!(status.total_successes, 0);
+            let snapshot = job_admin.snapshot_sync(&JobAdminQuery::default());
+            assert_eq!(snapshot.completed.total, 0);
+            assert_eq!(snapshot.running.total, 1);
+        }
+
+        #[test]
+        fn pg_success_lifecycle_is_recorded_after_ack_applies() {
+            let state = AppState::for_test().with_profile("dev");
+            state.job_registry().register("slow_success");
+            state.job_registry().record_enqueue("slow_success");
+            state.job_registry().record_start("slow_success");
+            let job_admin = JobAdminMemoryBackend::new_for_test(32);
+            let job_id =
+                job_admin.record_enqueue_for_test("slow_success", serde_json::json!({}), 1, 3);
+            job_admin.record_start_for_test(&job_id, 1);
+
+            assert!(record_pg_lifecycle_ack_result(
+                Ok(true),
+                "slow_success",
+                &job_id,
+                "success",
+                PgLifecycleRecord::Success,
+                &state,
+                &job_admin
+            ));
+
+            let status = state.job_registry().snapshot()["slow_success"].clone();
+            assert_eq!(status.in_flight, 0);
+            assert_eq!(status.total_successes, 1);
+            let snapshot = job_admin.snapshot_sync(&JobAdminQuery::default());
+            assert_eq!(snapshot.completed.total, 1);
+            assert_eq!(snapshot.running.total, 0);
+        }
+
+        #[test]
+        fn pg_failure_lifecycle_is_skipped_when_ack_does_not_apply() {
+            let state = AppState::for_test().with_profile("dev");
+            state.job_registry().register("slow_failure");
+            state.job_registry().record_enqueue("slow_failure");
+            state.job_registry().record_start("slow_failure");
+            let job_admin = JobAdminMemoryBackend::new_for_test(32);
+            let job_id =
+                job_admin.record_enqueue_for_test("slow_failure", serde_json::json!({}), 1, 1);
+            job_admin.record_start_for_test(&job_id, 1);
+
+            assert!(!record_pg_lifecycle_ack_result(
+                Ok(false),
+                "slow_failure",
+                &job_id,
+                "failure",
+                PgLifecycleRecord::Failure {
+                    error: "visibility timeout expired"
+                },
+                &state,
+                &job_admin
+            ));
+
+            let status = state.job_registry().snapshot()["slow_failure"].clone();
+            assert_eq!(status.in_flight, 1);
+            assert_eq!(status.total_failures, 0);
+            assert_eq!(status.dead_letters, 0);
+            let snapshot = job_admin.snapshot_sync(&JobAdminQuery::default());
+            assert_eq!(snapshot.failed.total, 0);
+            assert_eq!(snapshot.running.total, 1);
+        }
+
+        #[test]
+        fn pg_failure_lifecycle_is_recorded_after_ack_applies() {
+            let state = AppState::for_test().with_profile("dev");
+            state.job_registry().register("slow_failure");
+            state.job_registry().record_enqueue("slow_failure");
+            state.job_registry().record_start("slow_failure");
+            let job_admin = JobAdminMemoryBackend::new_for_test(32);
+            let job_id =
+                job_admin.record_enqueue_for_test("slow_failure", serde_json::json!({}), 1, 1);
+            job_admin.record_start_for_test(&job_id, 1);
+
+            assert!(record_pg_lifecycle_ack_result(
+                Ok(true),
+                "slow_failure",
+                &job_id,
+                "failure",
+                PgLifecycleRecord::Failure {
+                    error: "worker failed"
+                },
+                &state,
+                &job_admin
+            ));
+
+            let status = state.job_registry().snapshot()["slow_failure"].clone();
+            assert_eq!(status.in_flight, 0);
+            assert_eq!(status.total_failures, 1);
+            assert_eq!(status.dead_letters, 1);
+            let snapshot = job_admin.snapshot_sync(&JobAdminQuery::default());
+            assert_eq!(snapshot.failed.total, 1);
+            assert_eq!(
+                snapshot.failed.records[0].last_error.as_deref(),
+                Some("worker failed")
+            );
+        }
+
+        #[test]
+        fn pg_retry_lifecycle_is_recorded_after_ack_applies() {
+            let state = AppState::for_test().with_profile("dev");
+            state.job_registry().register("slow_retry");
+            state.job_registry().record_enqueue("slow_retry");
+            state.job_registry().record_start("slow_retry");
+            let job_admin = JobAdminMemoryBackend::new_for_test(32);
+            let job_id =
+                job_admin.record_enqueue_for_test("slow_retry", serde_json::json!({}), 1, 3);
+            job_admin.record_start_for_test(&job_id, 1);
+
+            assert!(record_pg_lifecycle_ack_result(
+                Ok(true),
+                "slow_retry",
+                &job_id,
+                "failure",
+                PgLifecycleRecord::Retry {
+                    error: "try again",
+                    attempt: 1,
+                },
+                &state,
+                &job_admin
+            ));
+
+            let status = state.job_registry().snapshot()["slow_retry"].clone();
+            assert_eq!(status.in_flight, 0);
+            assert_eq!(status.total_failures, 0);
+            assert_eq!(status.last_error.as_deref(), Some("try again"));
+            let admin = job_admin.inner.read().expect("job admin lock");
+            assert_eq!(
+                admin.records.get(&job_id).expect("admin record").status,
+                JobAdminStatus::Retrying
+            );
+        }
+
+        #[test]
+        fn pg_lifecycle_is_skipped_when_ack_errors() {
+            let state = AppState::for_test().with_profile("dev");
+            state.job_registry().register("slow_success");
+            state.job_registry().record_enqueue("slow_success");
+            state.job_registry().record_start("slow_success");
+            let job_admin = JobAdminMemoryBackend::new_for_test(32);
+            let job_id =
+                job_admin.record_enqueue_for_test("slow_success", serde_json::json!({}), 1, 3);
+            job_admin.record_start_for_test(&job_id, 1);
+
+            assert!(!record_pg_lifecycle_ack_result(
+                Err(AutumnError::internal_server_error_msg("ack failed")),
+                "slow_success",
+                &job_id,
+                "success",
+                PgLifecycleRecord::Success,
+                &state,
+                &job_admin
+            ));
+
+            let status = state.job_registry().snapshot()["slow_success"].clone();
+            assert_eq!(status.in_flight, 1);
+            assert_eq!(status.total_successes, 0);
+        }
+
+        #[test]
+        fn pg_cancel_lifecycle_waits_for_ack() {
+            let state = AppState::for_test().with_profile("dev");
+            state.job_registry().register("cancel_me");
+            state.job_registry().record_enqueue("cancel_me");
+
+            assert!(!record_pg_cancel_after_ack(
+                Ok(false),
+                "cancel_me",
+                "job-1",
+                &state
+            ));
+            assert_eq!(state.job_registry().snapshot()["cancel_me"].queued, 1);
+
+            assert!(record_pg_cancel_after_ack(
+                Ok(true),
+                "cancel_me",
+                "job-1",
+                &state
+            ));
+            assert_eq!(state.job_registry().snapshot()["cancel_me"].queued, 0);
+        }
+
+        #[test]
+        fn pg_cancel_lifecycle_is_skipped_when_ack_errors() {
+            let state = AppState::for_test().with_profile("dev");
+            state.job_registry().register("cancel_me");
+            state.job_registry().record_enqueue("cancel_me");
+
+            assert!(!record_pg_cancel_after_ack(
+                Err(AutumnError::internal_server_error_msg("ack failed")),
+                "cancel_me",
+                "job-1",
+                &state
+            ));
+            assert_eq!(state.job_registry().snapshot()["cancel_me"].queued, 1);
+        }
+
+        #[test]
+        fn pg_row_lifecycle_uses_row_identity_after_ack_applies() {
+            let state = AppState::for_test().with_profile("dev");
+            state.job_registry().register("row_success");
+            state.job_registry().record_enqueue("row_success");
+            state.job_registry().record_start("row_success");
+            let job_admin = JobAdminMemoryBackend::new_for_test(32);
+            let job_id =
+                job_admin.record_enqueue_for_test("row_success", serde_json::json!({}), 1, 3);
+            job_admin.record_start_for_test(&job_id, 1);
+            let row = pg_test_row(&job_id, "row_success", 1, 3);
+
+            assert!(record_pg_row_lifecycle_ack_result(
+                Ok(true),
+                &row,
+                "success",
+                PgLifecycleRecord::Success,
+                &state,
+                &job_admin
+            ));
+
+            let status = state.job_registry().snapshot()["row_success"].clone();
+            assert_eq!(status.total_successes, 1);
+            let snapshot = job_admin.snapshot_sync(&JobAdminQuery::default());
+            assert_eq!(snapshot.completed.records[0].id, job_id);
+        }
+
+        #[test]
+        fn pg_row_cancel_uses_row_identity_after_ack_applies() {
+            let state = AppState::for_test().with_profile("dev");
+            state.job_registry().register("row_cancel");
+            state.job_registry().record_enqueue("row_cancel");
+            let row = pg_test_row("row-cancel-1", "row_cancel", 1, 3);
+
+            assert!(record_pg_row_cancel_after_ack(Ok(true), &row, &state));
+
+            assert_eq!(state.job_registry().snapshot()["row_cancel"].queued, 0);
         }
 
         #[tokio::test]
