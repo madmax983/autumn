@@ -204,11 +204,23 @@ fn alter_table_subcommands(normalized: &str) -> Vec<&str> {
 /// A subcommand is "known" when a specific safety rule covers all risk scenarios
 /// for it (including the case where it is safe and produces no finding).
 fn is_known_alter_subcommand(subcommand: &str) -> bool {
-    subcommand.starts_with("add column ")
+    // `add column` is known unless it carries an inline PRIMARY KEY constraint,
+    // which Autumn does not specifically classify.  UNIQUE and REFERENCES are handled
+    // by dedicated rules; NOT NULL is handled by the NOT NULL rule.
+    let add_col_known =
+        subcommand.starts_with("add column ") && !subcommand.contains(" primary key");
+    add_col_known
         || subcommand.starts_with("drop column ")
         || subcommand.starts_with("rename column ") // RENAME COLUMN
         || subcommand.starts_with("rename to ") // RENAME TABLE (ALTER TABLE … RENAME TO …)
         || (subcommand.starts_with("alter column ") && subcommand.contains(" type "))
+}
+
+/// Returns `true` when the normalized `add column` subcommand carries an inline
+/// `UNIQUE` constraint keyword.  Trailing-space / end-of-string anchoring prevents
+/// matching a column or table name that contains `unique` as a substring.
+fn has_inline_unique_constraint(subcommand: &str) -> bool {
+    subcommand.contains(" unique ") || subcommand.ends_with(" unique")
 }
 
 /// Remove `/* ... */` block comments from `sql`.
@@ -431,6 +443,40 @@ fn classify_statement(normalized: &str) -> Vec<SafetyFinding> {
                     });
                     break; // one finding per statement is sufficient
                 }
+            }
+        }
+    }
+
+    // ADD COLUMN with inline UNIQUE — implicitly builds a non-concurrent unique index
+    // ADD COLUMN with inline REFERENCES — scans existing rows to validate the FK
+    if normalized.starts_with("alter table") {
+        for subcommand in alter_table_subcommands(normalized) {
+            if !subcommand.starts_with("add column ") {
+                continue;
+            }
+            if has_inline_unique_constraint(subcommand) {
+                findings.push(SafetyFinding {
+                    operation: "ADD COLUMN UNIQUE (inline constraint)".to_owned(),
+                    risk: RiskLevel::PotentiallyBlocking,
+                    why: "An inline UNIQUE constraint implicitly builds a non-concurrent unique \
+                          index under an exclusive table lock, blocking all reads and writes during \
+                          the build.",
+                    next_action: "Add the column without UNIQUE first, then create the unique \
+                                  index in a separate migration using \
+                                  `CREATE UNIQUE INDEX CONCURRENTLY`.",
+                });
+            }
+            if subcommand.contains(" references ") {
+                findings.push(SafetyFinding {
+                    operation: "ADD COLUMN REFERENCES (inline FK)".to_owned(),
+                    risk: RiskLevel::PotentiallyBlocking,
+                    why: "An inline REFERENCES constraint scans all existing rows to validate the \
+                          foreign key, acquiring locks that can block writes on the referenced \
+                          table.",
+                    next_action: "Add the column without the constraint first, then add the FK \
+                                  using `ADD CONSTRAINT ... FOREIGN KEY ... NOT VALID` and \
+                                  validate separately with `VALIDATE CONSTRAINT`.",
+                });
             }
         }
     }
@@ -840,6 +886,53 @@ mod tests {
         assert!(
             findings.is_empty(),
             "constant DEFAULT false must be safe: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn add_column_with_inline_unique_is_potentially_blocking() {
+        let findings = classify_sql("ALTER TABLE posts ADD COLUMN slug TEXT UNIQUE;");
+        assert_eq!(
+            findings.len(),
+            1,
+            "inline UNIQUE must be flagged: {findings:?}"
+        );
+        assert_eq!(findings[0].risk, RiskLevel::PotentiallyBlocking);
+        assert_eq!(
+            findings[0].operation,
+            "ADD COLUMN UNIQUE (inline constraint)"
+        );
+    }
+
+    #[test]
+    fn add_column_with_inline_references_is_potentially_blocking() {
+        let findings =
+            classify_sql("ALTER TABLE posts ADD COLUMN user_id INT REFERENCES users(id);");
+        assert_eq!(
+            findings.len(),
+            1,
+            "inline REFERENCES must be flagged: {findings:?}"
+        );
+        assert_eq!(findings[0].risk, RiskLevel::PotentiallyBlocking);
+        assert_eq!(findings[0].operation, "ADD COLUMN REFERENCES (inline FK)");
+    }
+
+    #[test]
+    fn add_column_with_primary_key_requires_manual_review() {
+        // PRIMARY KEY inline on ADD COLUMN is not specifically classified.
+        let findings = classify_sql("ALTER TABLE posts ADD COLUMN id BIGSERIAL PRIMARY KEY;");
+        assert!(
+            findings.iter().any(|f| f.risk == RiskLevel::ManualReview),
+            "inline PRIMARY KEY must require manual review: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn add_column_without_constraints_does_not_trigger_manual_review() {
+        let findings = classify_sql("ALTER TABLE posts ADD COLUMN subtitle TEXT;");
+        assert!(
+            findings.iter().all(|f| f.risk != RiskLevel::ManualReview),
+            "simple ADD COLUMN must not trigger ManualReview: {findings:?}"
         );
     }
 
