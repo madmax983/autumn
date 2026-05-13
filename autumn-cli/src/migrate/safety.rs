@@ -62,11 +62,28 @@ pub struct SafetyFinding {
 /// Classify the SQL content of an `up.sql` file and return all safety findings.
 ///
 /// Returns an empty `Vec` when the migration is fully additive and safe.
+///
+/// A statement annotated with `-- autumn-safety: reviewed` is skipped entirely,
+/// allowing operators to acknowledge and suppress findings they have manually
+/// reviewed and accepted.
 pub fn classify_sql(sql: &str) -> Vec<SafetyFinding> {
     split_statements(sql)
         .iter()
+        .filter(|stmt| !has_review_suppression(stmt))
         .flat_map(|stmt| classify_statement(&normalize_statement(stmt)))
         .collect()
+}
+
+/// Returns `true` if the raw (un-normalized) statement carries an operator
+/// acknowledgement marker (`-- autumn-safety: reviewed`).
+///
+/// The check is done on the raw text before comment-stripping so the marker
+/// is not accidentally erased.
+fn has_review_suppression(stmt: &str) -> bool {
+    stmt.lines().any(|line| {
+        let trimmed = line.trim();
+        trimmed.starts_with("--") && trimmed.contains("autumn-safety: reviewed")
+    })
 }
 
 /// True iff all findings are at the `Safe` risk level (or there are none).
@@ -175,9 +192,10 @@ fn classify_statement(normalized: &str) -> Vec<SafetyFinding> {
     }
 
     // ADD COLUMN NOT NULL without DEFAULT
+    // Use " default " (word-boundary) so column names like `defaulted_at` don't suppress the check.
     if normalized.contains(" add column ")
         && normalized.contains("not null")
-        && !normalized.contains("default")
+        && !normalized.contains(" default ")
     {
         findings.push(SafetyFinding {
             operation: "ADD COLUMN NOT NULL (no default)".to_owned(),
@@ -359,6 +377,19 @@ mod tests {
     }
 
     #[test]
+    fn add_not_null_column_name_containing_default_is_blocking() {
+        // Column named `defaulted_at` must not be mistaken for having a DEFAULT clause.
+        let sql = "ALTER TABLE posts ADD COLUMN defaulted_at TIMESTAMP NOT NULL;";
+        let findings = classify_sql(sql);
+        assert_eq!(
+            findings.len(),
+            1,
+            "column name containing 'default' must not suppress finding"
+        );
+        assert_eq!(findings[0].risk, RiskLevel::PotentiallyBlocking);
+    }
+
+    #[test]
     fn create_concurrent_index_is_safe() {
         let sql = "CREATE INDEX CONCURRENTLY idx_posts_title ON posts (title);";
         let findings = classify_sql(sql);
@@ -508,6 +539,39 @@ mod tests {
         let sql = "-- autumn-safety: destructive\nALTER TABLE posts DROP COLUMN body;";
         let findings = classify_sql(sql);
         assert_eq!(findings.len(), 1);
+    }
+
+    #[test]
+    fn autumn_safety_reviewed_suppresses_manual_review_finding() {
+        // Operator acknowledges a CREATE FUNCTION is safe for their deploy.
+        let sql = "-- autumn-safety: reviewed\nCREATE FUNCTION noop() RETURNS void LANGUAGE sql AS $$SELECT 1$$;";
+        let findings = classify_sql(sql);
+        assert!(
+            findings.is_empty(),
+            "reviewed marker must suppress ManualReview finding: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn autumn_safety_reviewed_suppresses_unclassified_alter_table() {
+        let sql = "-- autumn-safety: reviewed\nALTER TABLE users DROP CONSTRAINT users_email_key;";
+        let findings = classify_sql(sql);
+        assert!(
+            findings.is_empty(),
+            "reviewed marker must suppress finding: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn autumn_safety_destructive_does_not_suppress() {
+        // Only the `reviewed` marker suppresses; other autumn-safety values are informational.
+        let sql = "-- autumn-safety: destructive\nALTER TABLE posts DROP COLUMN body;";
+        let findings = classify_sql(sql);
+        assert_eq!(
+            findings.len(),
+            1,
+            "non-reviewed marker must not suppress findings"
+        );
     }
 
     // ── helper predicates ─────────────────────────────────────────────────────
