@@ -327,10 +327,15 @@ fn classify_statement(normalized: &str) -> Vec<SafetyFinding> {
 
     // CTE-prefixed bulk DML — WITH … UPDATE / DELETE / INSERT
     // A CTE starts with `with` so the plain DML checks above don't fire.
+    // Check both the outer statement (`) update/delete/insert`) and CTE bodies
+    // (`(update/delete/insert`) to catch data-modifying CTEs followed by SELECT.
     if normalized.starts_with("with ")
         && (normalized.contains(") update ")
             || normalized.contains(") delete ")
-            || normalized.contains(") insert into "))
+            || normalized.contains(") insert into ")
+            || normalized.contains("(update ")
+            || normalized.contains("(delete ")
+            || normalized.contains("(insert into "))
     {
         findings.push(SafetyFinding {
             operation: "Bulk DML (data backfill via CTE)".to_owned(),
@@ -820,6 +825,19 @@ mod tests {
         assert!(
             findings.iter().all(|f| f.risk != RiskLevel::DataBackfill),
             "read-only CTE must not produce DataBackfill finding: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn cte_body_write_with_outer_select_is_data_backfill() {
+        // data-modifying CTE where the outer statement is SELECT, not UPDATE/DELETE.
+        let sql = "WITH touched AS \
+                   (UPDATE posts SET migrated = true WHERE migrated IS NULL RETURNING id) \
+                   SELECT count(*) FROM touched;";
+        let findings = classify_sql(sql);
+        assert!(
+            findings.iter().any(|f| f.risk == RiskLevel::DataBackfill),
+            "data-modifying CTE with outer SELECT must still be flagged: {findings:?}"
         );
     }
 

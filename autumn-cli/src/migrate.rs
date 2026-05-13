@@ -177,8 +177,14 @@ fn check_concurrent_index_transaction_opt_out(
 
     let metadata_path = migration_dir.join("metadata.toml");
     let opted_out = std::fs::read_to_string(&metadata_path)
-        .map(|content| content.contains("run_in_transaction = false"))
-        .unwrap_or(false);
+        .ok()
+        .and_then(|content| toml::from_str::<toml::Table>(&content).ok())
+        .and_then(|table| {
+            table
+                .get("run_in_transaction")
+                .and_then(toml::Value::as_bool)
+        })
+        .is_some_and(|v| !v);
 
     if !opted_out {
         findings.push(safety::SafetyFinding {
@@ -732,6 +738,50 @@ replica_url = "postgres://replica:5432/app"
             findings.is_empty(),
             "correctly opted-out CONCURRENTLY should produce no additional findings"
         );
+    }
+
+    #[test]
+    fn concurrent_index_with_run_in_transaction_false_no_spaces_is_not_flagged() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let migration_dir = tmp.path().join("20260104000000_add_index");
+        std::fs::create_dir_all(&migration_dir).unwrap();
+        std::fs::write(
+            migration_dir.join("metadata.toml"),
+            "run_in_transaction=false\n",
+        )
+        .unwrap();
+
+        let sql = "CREATE INDEX CONCURRENTLY idx_posts_title ON posts (title);";
+        let mut findings = Vec::new();
+        check_concurrent_index_transaction_opt_out(sql, &migration_dir, &mut findings);
+
+        assert!(
+            findings.is_empty(),
+            "TOML `run_in_transaction=false` (no spaces) should also suppress the finding"
+        );
+    }
+
+    #[test]
+    fn concurrent_index_with_commented_out_flag_is_flagged() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let migration_dir = tmp.path().join("20260104000000_add_index");
+        std::fs::create_dir_all(&migration_dir).unwrap();
+        std::fs::write(
+            migration_dir.join("metadata.toml"),
+            "# run_in_transaction = false\n",
+        )
+        .unwrap();
+
+        let sql = "CREATE INDEX CONCURRENTLY idx_posts_title ON posts (title);";
+        let mut findings = Vec::new();
+        check_concurrent_index_transaction_opt_out(sql, &migration_dir, &mut findings);
+
+        assert_eq!(
+            findings.len(),
+            1,
+            "a commented-out opt-out should NOT suppress the finding"
+        );
+        assert_eq!(findings[0].risk, safety::RiskLevel::PotentiallyBlocking);
     }
 
     #[test]
