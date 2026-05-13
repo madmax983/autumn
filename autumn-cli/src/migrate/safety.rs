@@ -386,6 +386,20 @@ fn classify_statement(normalized: &str) -> Vec<SafetyFinding> {
         return findings;
     }
 
+    // DROP SEQUENCE
+    if normalized.starts_with("drop sequence") {
+        findings.push(SafetyFinding {
+            operation: "DROP SEQUENCE".to_owned(),
+            risk: RiskLevel::Destructive,
+            why: "Dropping a sequence breaks any column that uses it as a default \
+                  (`nextval(seq)`) and any application code that calls `nextval` directly. \
+                  Old replicas will error immediately on INSERT.",
+            next_action: "Use expand/contract: first deploy code that no longer relies on this \
+                          sequence, then drop it in a subsequent release.",
+        });
+        return findings;
+    }
+
     // DROP COLUMN
     if normalized.contains(" drop column ") {
         findings.push(SafetyFinding {
@@ -784,6 +798,21 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].risk, RiskLevel::Destructive);
         assert_eq!(findings[0].operation, "DROP TABLE");
+    }
+
+    #[test]
+    fn drop_sequence_is_destructive() {
+        let findings = classify_sql("DROP SEQUENCE posts_id_seq;");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].risk, RiskLevel::Destructive);
+        assert_eq!(findings[0].operation, "DROP SEQUENCE");
+    }
+
+    #[test]
+    fn drop_sequence_cascade_is_destructive() {
+        let findings = classify_sql("DROP SEQUENCE posts_id_seq CASCADE;");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].risk, RiskLevel::Destructive);
     }
 
     #[test]
