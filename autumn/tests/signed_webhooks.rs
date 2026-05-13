@@ -432,7 +432,10 @@ async fn rejects_missing_malformed_stale_and_bad_signatures_with_problem_details
         .await;
     problem_json(&malformed, 400);
 
-    let stale_timestamp = now - 301;
+    // Use a 600s offset — well beyond the 300s tolerance — so that the few
+    // seconds of test execution time on a slow Windows CI runner never shrinks
+    // the skew below the threshold and causes a spurious 200.
+    let stale_timestamp = now - 600;
     let stale = client
         .post("/webhooks/stripe")
         .header("content-type", "application/json")
@@ -445,7 +448,9 @@ async fn rejects_missing_malformed_stale_and_bad_signatures_with_problem_details
         .await;
     problem_json(&stale, 401);
 
-    let future_timestamp = now + 301;
+    // Capture the future timestamp immediately before sending so that only the
+    // round-trip time (not prior requests) affects the skew.
+    let future_timestamp = unix_now() + 600;
     let future = client
         .post("/webhooks/stripe")
         .header("content-type", "application/json")
