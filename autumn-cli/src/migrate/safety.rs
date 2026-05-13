@@ -202,9 +202,9 @@ fn normalize_statement(stmt: &str) -> String {
 pub fn contains_concurrent_index(sql: &str) -> bool {
     split_statements(sql).iter().any(|stmt| {
         let normalized = normalize_statement(stmt);
-        normalized.contains("create index concurrently")
-            || normalized.contains("create unique index concurrently")
-            || normalized.contains("drop index concurrently")
+        normalized.contains("create index concurrently ")
+            || normalized.contains("create unique index concurrently ")
+            || normalized.starts_with("drop index concurrently ")
     })
 }
 
@@ -424,7 +424,9 @@ fn classify_statement(normalized: &str) -> Vec<SafetyFinding> {
     }
 
     // DROP INDEX (non-concurrent) — holds an exclusive table lock
-    if normalized.starts_with("drop index") && !normalized.contains("concurrently") {
+    // Use token-aware check: `concurrently` must be the SQL option immediately after
+    // `drop index`, not a substring of the index name (e.g. idx_concurrently).
+    if normalized.starts_with("drop index") && !normalized.starts_with("drop index concurrently ") {
         findings.push(SafetyFinding {
             operation: "DROP INDEX (non-concurrent)".to_owned(),
             risk: RiskLevel::PotentiallyBlocking,
@@ -1135,6 +1137,18 @@ mod tests {
         let findings = classify_sql("DROP INDEX idx_posts_title;");
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].risk, RiskLevel::PotentiallyBlocking);
+        assert_eq!(findings[0].operation, "DROP INDEX (non-concurrent)");
+    }
+
+    #[test]
+    fn drop_index_with_concurrently_in_name_is_still_blocking() {
+        // "concurrently" appears in the index name, not as the SQL token.
+        let findings = classify_sql("DROP INDEX idx_concurrently;");
+        assert_eq!(
+            findings.len(),
+            1,
+            "index named idx_concurrently must still be flagged as non-concurrent: {findings:?}"
+        );
         assert_eq!(findings[0].operation, "DROP INDEX (non-concurrent)");
     }
 
