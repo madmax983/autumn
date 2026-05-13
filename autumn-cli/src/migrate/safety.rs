@@ -157,6 +157,20 @@ fn normalize_statement(stmt: &str) -> String {
         .to_lowercase()
 }
 
+/// Returns `true` when `sql` contains an executable `CREATE INDEX CONCURRENTLY`
+/// or `CREATE UNIQUE INDEX CONCURRENTLY` statement.
+///
+/// Uses the same comment-stripping and whitespace-normalization pipeline as
+/// [`classify_sql`] so that a concurrent index mentioned only inside a SQL
+/// comment (e.g. `-- CREATE INDEX CONCURRENTLY ...`) is not counted.
+pub fn contains_concurrent_index(sql: &str) -> bool {
+    split_statements(sql).iter().any(|stmt| {
+        let normalized = normalize_statement(stmt);
+        normalized.contains("create index concurrently")
+            || normalized.contains("create unique index concurrently")
+    })
+}
+
 /// Apply all pattern checks to a single normalized (lowercase, single-spaced) statement.
 #[allow(clippy::too_many_lines)]
 fn classify_statement(normalized: &str) -> Vec<SafetyFinding> {
@@ -892,6 +906,44 @@ mod tests {
         assert!(
             findings.iter().all(|f| f.risk != RiskLevel::ManualReview),
             "safe ADD COLUMN should not produce ManualReview: {findings:?}"
+        );
+    }
+
+    // ── contains_concurrent_index ─────────────────────────────────────────────
+
+    #[test]
+    fn contains_concurrent_index_true_for_executable_statement() {
+        assert!(contains_concurrent_index(
+            "CREATE INDEX CONCURRENTLY idx ON posts (title);"
+        ));
+        assert!(contains_concurrent_index(
+            "CREATE UNIQUE INDEX CONCURRENTLY idx ON posts (slug);"
+        ));
+    }
+
+    #[test]
+    fn contains_concurrent_index_false_for_non_concurrent() {
+        assert!(!contains_concurrent_index(
+            "CREATE INDEX idx ON posts (title);"
+        ));
+    }
+
+    #[test]
+    fn contains_concurrent_index_false_for_comment_only_mention() {
+        let sql = "-- TODO: use CREATE INDEX CONCURRENTLY later\n\
+                   CREATE INDEX idx ON posts (title);";
+        assert!(
+            !contains_concurrent_index(sql),
+            "a CONCURRENTLY reference only in a comment must return false"
+        );
+    }
+
+    #[test]
+    fn contains_concurrent_index_true_for_multiline_statement() {
+        let sql = "CREATE INDEX\n  CONCURRENTLY idx_posts_title ON posts (title);";
+        assert!(
+            contains_concurrent_index(sql),
+            "multi-line CONCURRENTLY statement must be detected"
         );
     }
 }

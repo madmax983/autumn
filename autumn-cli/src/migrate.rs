@@ -166,12 +166,7 @@ fn check_concurrent_index_transaction_opt_out(
     migration_dir: &Path,
     findings: &mut Vec<safety::SafetyFinding>,
 ) {
-    let lower = sql.to_lowercase();
-    // Collapse whitespace so multi-line statements like `CREATE INDEX\n  CONCURRENTLY` match.
-    let normalized = lower.split_whitespace().collect::<Vec<_>>().join(" ");
-    let uses_concurrently = normalized.contains("create index concurrently")
-        || normalized.contains("create unique index concurrently");
-    if !uses_concurrently {
+    if !safety::contains_concurrent_index(sql) {
         return;
     }
 
@@ -816,6 +811,25 @@ replica_url = "postgres://replica:5432/app"
         assert!(
             findings.is_empty(),
             "non-CONCURRENTLY index should not be flagged by opt-out check"
+        );
+    }
+
+    #[test]
+    fn concurrent_index_in_sql_comment_is_not_flagged() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let migration_dir = tmp.path().join("20260104000000_add_index");
+        std::fs::create_dir_all(&migration_dir).unwrap();
+
+        // The concurrent index is only mentioned in a comment; the actual
+        // statement is a plain (non-concurrent) CREATE INDEX.
+        let sql = "-- TODO: switch to CREATE INDEX CONCURRENTLY once traffic drops\n\
+                   CREATE INDEX idx_posts_title ON posts (title);";
+        let mut findings = Vec::new();
+        check_concurrent_index_transaction_opt_out(sql, &migration_dir, &mut findings);
+
+        assert!(
+            findings.is_empty(),
+            "a CONCURRENTLY reference inside a SQL comment must not trigger the opt-out check"
         );
     }
 
