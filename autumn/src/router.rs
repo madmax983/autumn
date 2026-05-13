@@ -1148,9 +1148,19 @@ fn apply_middleware(
     //   Metrics -> ExceptionFilter -> ErrorPageContext -> Session ->
     //   SecurityHeaders -> RequestId -> [user layers] ->
     //   RateLimit -> CSRF -> CORS -> handler
+    let all_filters_arc = std::sync::Arc::new(all_filters.clone());
     let router = router
         .layer(crate::middleware::error_page_filter::ErrorPageContextLayer)
         .layer(ExceptionFilterLayer::new(all_filters))
+        .layer(axum::middleware::from_fn(
+            move |mut req: axum::extract::Request, next: axum::middleware::Next| {
+                let filters = all_filters_arc.clone();
+                async move {
+                    req.extensions_mut().insert(filters);
+                    next.run(req).await
+                }
+            },
+        ))
         .layer(crate::middleware::MetricsLayer::new(state.metrics.clone()));
 
     Ok(router)

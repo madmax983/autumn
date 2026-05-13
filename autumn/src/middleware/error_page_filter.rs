@@ -243,15 +243,40 @@ pub fn accept_prefers_html(headers: &axum::http::HeaderMap) -> bool {
 ///
 /// This is mounted as the router's fallback so unmatched routes get proper
 /// error pages instead of Axum's default plain-text "Not Found".
-pub async fn fallback_404_handler(method: axum::http::Method, uri: axum::http::Uri) -> Response {
+pub async fn fallback_404_handler(
+    method: axum::http::Method,
+    uri: axum::http::Uri,
+    req: axum::extract::Request,
+) -> Response {
     if matches!(method, axum::http::Method::GET | axum::http::Method::HEAD)
         && uri.path() == crate::router::DEFAULT_FAVICON_PATH
     {
         return axum::http::StatusCode::NO_CONTENT.into_response();
     }
 
-    crate::error::AutumnError::not_found_msg(format!("No route matches {}", uri.path()))
-        .into_response()
+    let err = crate::error::AutumnError::not_found_msg(format!("No route matches {}", uri.path()));
+    let response = err.into_response();
+
+    // Axum fallback routes are executed outside the inner layer stack, meaning they
+    // bypass our global ExceptionFilterLayer if registered naively.
+    // We extract the filters from the request extensions, where we will put them
+    // in router.rs.
+    if let (Some(filters), Some(error_info)) = (
+        req.extensions()
+            .get::<std::sync::Arc<Vec<std::sync::Arc<dyn crate::middleware::ExceptionFilter>>>>(),
+        response
+            .extensions()
+            .get::<crate::middleware::AutumnErrorInfo>()
+            .cloned(),
+    ) {
+        let mut response = response;
+        for filter in filters.iter() {
+            response = filter.filter(&error_info, response);
+        }
+        return response;
+    }
+
+    response
 }
 
 impl ErrorPageFilter {
@@ -736,7 +761,12 @@ mod tests {
     #[tokio::test]
     async fn fallback_404_handler_creates_correct_error() {
         let uri = axum::http::Uri::from_static("/some/unknown/path");
-        let response = fallback_404_handler(axum::http::Method::GET, uri).await;
+        let response = fallback_404_handler(
+            axum::http::Method::GET,
+            uri,
+            axum::extract::Request::new(axum::body::Body::empty()),
+        )
+        .await;
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -748,7 +778,12 @@ mod tests {
     #[tokio::test]
     async fn fallback_404_handler_ignores_query_params() {
         let uri = axum::http::Uri::from_static("/search?q=rust&sort=desc");
-        let response = fallback_404_handler(axum::http::Method::GET, uri).await;
+        let response = fallback_404_handler(
+            axum::http::Method::GET,
+            uri,
+            axum::extract::Request::new(axum::body::Body::empty()),
+        )
+        .await;
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -760,7 +795,12 @@ mod tests {
     #[tokio::test]
     async fn fallback_404_handler_with_root_path() {
         let uri = axum::http::Uri::from_static("/");
-        let response = fallback_404_handler(axum::http::Method::GET, uri).await;
+        let response = fallback_404_handler(
+            axum::http::Method::GET,
+            uri,
+            axum::extract::Request::new(axum::body::Body::empty()),
+        )
+        .await;
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -774,6 +814,7 @@ mod tests {
         let response = fallback_404_handler(
             axum::http::Method::GET,
             axum::http::Uri::from_static(crate::router::DEFAULT_FAVICON_PATH),
+            axum::extract::Request::new(axum::body::Body::empty()),
         )
         .await;
 
@@ -789,6 +830,7 @@ mod tests {
         let response = fallback_404_handler(
             axum::http::Method::HEAD,
             axum::http::Uri::from_static(crate::router::DEFAULT_FAVICON_PATH),
+            axum::extract::Request::new(axum::body::Body::empty()),
         )
         .await;
 
@@ -804,6 +846,7 @@ mod tests {
         let response = fallback_404_handler(
             axum::http::Method::POST,
             axum::http::Uri::from_static(crate::router::DEFAULT_FAVICON_PATH),
+            axum::extract::Request::new(axum::body::Body::empty()),
         )
         .await;
 
