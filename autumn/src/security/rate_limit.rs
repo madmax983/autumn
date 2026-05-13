@@ -135,9 +135,7 @@ impl MemoryStore {
             let elapsed = now
                 .saturating_duration_since(bucket.last_refill)
                 .as_secs_f64();
-            bucket.tokens = elapsed
-                .mul_add(refill_per_sec, bucket.tokens)
-                .min(burst);
+            bucket.tokens = elapsed.mul_add(refill_per_sec, bucket.tokens).min(burst);
             bucket.last_refill = now;
 
             let result = if bucket.tokens >= 1.0 {
@@ -259,12 +257,7 @@ impl RedisStore {
         }
     }
 
-    async fn decide(
-        &self,
-        key: &str,
-        burst: f64,
-        refill_per_sec: f64,
-    ) -> Option<Decision> {
+    async fn decide(&self, key: &str, burst: f64, refill_per_sec: f64) -> Option<Decision> {
         use std::time::{SystemTime, UNIX_EPOCH};
 
         let redis_key = format!("{}:{}", self.key_prefix, key);
@@ -288,7 +281,8 @@ impl RedisStore {
         match result {
             Ok(values) if values.len() == 3 => {
                 // Redis recovered after an outage — reset the flag so we warn again next time.
-                self.outage_logged.store(false, std::sync::atomic::Ordering::Relaxed);
+                self.outage_logged
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
                 let allowed = values[0] == 1;
                 if allowed {
                     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -302,7 +296,10 @@ impl RedisStore {
             }
             Err(err) => {
                 // Emit one warning per outage, not per request.
-                if !self.outage_logged.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                if !self
+                    .outage_logged
+                    .swap(true, std::sync::atomic::Ordering::Relaxed)
+                {
                     tracing::warn!(
                         error = %err,
                         key_prefix = %self.key_prefix,
@@ -312,9 +309,9 @@ impl RedisStore {
                 }
                 match self.failure_mode {
                     RateLimitBackendFailure::FailOpen => None,
-                    RateLimitBackendFailure::FailClosed => {
-                        Some(Decision::Denied { retry_after_secs: 1 })
-                    }
+                    RateLimitBackendFailure::FailClosed => Some(Decision::Denied {
+                        retry_after_secs: 1,
+                    }),
                 }
             }
             Ok(_) => {
@@ -443,7 +440,12 @@ impl Limiter {
     fn build_backend(_config: &RateLimitConfig) -> BucketBackend {
         #[cfg(feature = "redis")]
         if _config.backend == RateLimitBackend::Redis {
-            if let Some(url) = _config.redis.url.as_deref().filter(|u| !u.trim().is_empty()) {
+            if let Some(url) = _config
+                .redis
+                .url
+                .as_deref()
+                .filter(|u| !u.trim().is_empty())
+            {
                 match redis::Client::open(url) {
                     Ok(client) => {
                         match redis::aio::ConnectionManager::new_lazy_with_config(
@@ -494,9 +496,7 @@ impl Limiter {
                 Some(store.decide(key, Instant::now(), self.burst, self.refill_per_sec))
             }
             #[cfg(feature = "redis")]
-            BucketBackend::Redis(store) => {
-                store.decide(key, self.burst, self.refill_per_sec).await
-            }
+            BucketBackend::Redis(store) => store.decide(key, self.burst, self.refill_per_sec).await,
         }
     }
 }
