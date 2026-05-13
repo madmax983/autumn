@@ -24,6 +24,25 @@ impl WebhookProvider {
             )),
         }
     }
+
+    const fn as_slug(self) -> &'static str {
+        match self {
+            Self::Stripe => "stripe",
+            Self::Github => "github",
+            Self::Slack => "slack",
+            Self::Generic => "generic",
+        }
+    }
+}
+
+fn fresh_sim_delivery_id(provider: WebhookProvider) -> String {
+    let mut random = [0_u8; 16];
+    if let Err(error) = getrandom::fill(&mut random) {
+        eprintln!("Error: failed to generate webhook delivery ID: {error}");
+        std::process::exit(1);
+    }
+
+    format!("sim-{}-{}", provider.as_slug(), hex::encode(random))
 }
 
 pub fn run_sim(provider_str: &str, url: &str, secret: &str, payload: &str) {
@@ -64,7 +83,7 @@ pub fn run_sim(provider_str: &str, url: &str, secret: &str, payload: &str) {
             let signature_hex = hex::encode(result.into_bytes());
 
             req = req.header("X-Webhook-Signature", format!("sha256={signature_hex}"));
-            req = req.header("X-Webhook-Delivery", "sim-delivery-123");
+            req = req.header("X-Webhook-Delivery", fresh_sim_delivery_id(provider));
             req = req.header("X-Webhook-Event", "sim.event");
         }
         WebhookProvider::Github => {
@@ -75,7 +94,7 @@ pub fn run_sim(provider_str: &str, url: &str, secret: &str, payload: &str) {
             let signature_hex = hex::encode(result.into_bytes());
 
             req = req.header("X-Hub-Signature-256", format!("sha256={signature_hex}"));
-            req = req.header("X-GitHub-Delivery", "sim-delivery-123");
+            req = req.header("X-GitHub-Delivery", fresh_sim_delivery_id(provider));
             req = req.header("X-GitHub-Event", "sim.event");
         }
         WebhookProvider::Stripe => {
@@ -121,6 +140,9 @@ pub fn run_sim(provider_str: &str, url: &str, secret: &str, payload: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
 
     #[test]
     fn test_provider_from_str() {
@@ -145,5 +167,75 @@ mod tests {
             WebhookProvider::Generic
         );
         assert!(WebhookProvider::from_str("unknown").is_err());
+    }
+
+    fn capture_delivery_header(provider: &str, header: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind webhook capture server");
+        let addr = listener.local_addr().expect("capture server local addr");
+
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept simulated webhook");
+            let mut raw_request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+
+            loop {
+                let bytes_read = stream
+                    .read(&mut buffer)
+                    .expect("read simulated webhook request");
+                if bytes_read == 0 {
+                    break;
+                }
+
+                raw_request.extend_from_slice(&buffer[..bytes_read]);
+                if raw_request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK")
+                .expect("write simulated webhook response");
+
+            let request = String::from_utf8_lossy(&raw_request);
+            request
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case(header)
+                        .then(|| value.trim().to_owned())
+                })
+                .unwrap_or_else(|| panic!("missing {header} header in request:\n{request}"))
+        });
+
+        let url = format!("http://{addr}/webhook");
+        run_sim(provider, &url, "secret", r#"{"ok":true}"#);
+
+        handle.join().expect("capture server should finish")
+    }
+
+    #[test]
+    fn generic_sim_uses_fresh_delivery_id_per_invocation() {
+        let first = capture_delivery_header("generic", "X-Webhook-Delivery");
+        let second = capture_delivery_header("generic", "X-Webhook-Delivery");
+
+        assert_ne!(
+            first, second,
+            "generic simulator reused a delivery ID, poisoning replay protection"
+        );
+        assert_ne!(first, "sim-delivery-123");
+        assert_ne!(second, "sim-delivery-123");
+    }
+
+    #[test]
+    fn github_sim_uses_fresh_delivery_id_per_invocation() {
+        let first = capture_delivery_header("github", "X-GitHub-Delivery");
+        let second = capture_delivery_header("github", "X-GitHub-Delivery");
+
+        assert_ne!(
+            first, second,
+            "github simulator reused a delivery ID, poisoning replay protection"
+        );
+        assert_ne!(first, "sim-delivery-123");
+        assert_ne!(second, "sim-delivery-123");
     }
 }
