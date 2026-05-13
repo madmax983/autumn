@@ -45,7 +45,9 @@ else
 end
 
 local expiry_secs = math.ceil(burst / refill_per_sec) + 2
-redis.call('HSET', key, 'tokens', tostring(tokens), 'ts', tostring(now_ms))
+-- Use math.max to keep the stored timestamp monotonic across replicas with clock skew.
+local stored_ts = math.max(now_ms, last_ts)
+redis.call('HSET', key, 'tokens', tostring(tokens), 'ts', tostring(stored_ts))
 redis.call('EXPIRE', key, expiry_secs)
 
 return {allowed, remaining, retry_after_secs}

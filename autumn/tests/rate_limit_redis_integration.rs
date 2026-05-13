@@ -9,7 +9,8 @@
 //! memory backend still leaks ~2× the configured limit across two instances
 //! (the contrast described in the acceptance criteria).
 //!
-//! **Requires Docker** to be running.
+//! The Docker-dependent test (`two_replicas_share_global_budget`) is gated
+//! on the `test-support` feature (which pulls in `testcontainers`).
 
 use autumn_web::security::{
     RateLimitBackend, RateLimitBackendFailure, RateLimitConfig, RateLimitLayer,
@@ -19,25 +20,7 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::routing::get;
-use testcontainers::runners::AsyncRunner;
-use testcontainers_modules::redis::Redis as RedisImage;
 use tower::ServiceExt;
-
-fn redis_config(rps: f64, burst: u32, redis_url: &str) -> RateLimitConfig {
-    RateLimitConfig {
-        enabled: true,
-        requests_per_second: rps,
-        burst,
-        trust_forwarded_headers: true,
-        trusted_proxies: Vec::new(),
-        backend: RateLimitBackend::Redis,
-        redis: RateLimitRedisConfig {
-            url: Some(redis_url.to_owned()),
-            key_prefix: "test:rl".to_owned(),
-        },
-        on_backend_failure: RateLimitBackendFailure::FailOpen,
-    }
-}
 
 fn app_from_config(config: &RateLimitConfig) -> Router {
     Router::new()
@@ -59,9 +42,13 @@ fn req_for_ip(ip: &str) -> Request<Body> {
 /// burst=20, rps=10. We fire 60 requests very quickly (negligible refill)
 /// alternating between two routers. With a *global* budget of burst=20 tokens,
 /// at most ~20 should be allowed regardless of which replica handles them.
+#[cfg(feature = "test-support")]
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn two_replicas_share_global_budget() {
+    use testcontainers::runners::AsyncRunner;
+    use testcontainers_modules::redis::Redis as RedisImage;
+
     let container = RedisImage::default()
         .start()
         .await
@@ -72,7 +59,19 @@ async fn two_replicas_share_global_budget() {
         .expect("redis port");
     let redis_url = format!("redis://127.0.0.1:{port}");
 
-    let config = redis_config(10.0, 20, &redis_url);
+    let config = RateLimitConfig {
+        enabled: true,
+        requests_per_second: 10.0,
+        burst: 20,
+        trust_forwarded_headers: true,
+        trusted_proxies: Vec::new(),
+        backend: RateLimitBackend::Redis,
+        redis: RateLimitRedisConfig {
+            url: Some(redis_url),
+            key_prefix: "test:rl".to_owned(),
+        },
+        on_backend_failure: RateLimitBackendFailure::FailOpen,
+    };
     let app_a = app_from_config(&config);
     let app_b = app_from_config(&config);
 
