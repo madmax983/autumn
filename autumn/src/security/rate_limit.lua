@@ -42,6 +42,10 @@ else
     local deficit = 1.0 - tokens
     retry_after_secs = math.ceil(deficit / refill_per_sec)
     if retry_after_secs < 1 then retry_after_secs = 1 end
+    -- Cap at 7 days, matching the TTL cap below: deficit/refill_per_sec becomes
+    -- infinite when refill_per_sec is near zero (Rust clamps it to f64::MIN_POSITIVE),
+    -- producing an unparseable Redis reply that triggers the backend-error path.
+    if retry_after_secs > 604800 then retry_after_secs = 604800 end
 end
 
 -- Cap at 7 days so math.ceil(burst/refill_per_sec) never produces infinity
