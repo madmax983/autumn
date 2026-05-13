@@ -1162,12 +1162,8 @@ mod tests {
     #[cfg(feature = "redis")]
     #[test]
     fn rate_limit_on_backend_failure_deserializes_fail_open() {
-        let config: RateLimitConfig =
-            toml::from_str("on_backend_failure = \"fail_open\"").unwrap();
-        assert_eq!(
-            config.on_backend_failure,
-            RateLimitBackendFailure::FailOpen
-        );
+        let config: RateLimitConfig = toml::from_str("on_backend_failure = \"fail_open\"").unwrap();
+        assert_eq!(config.on_backend_failure, RateLimitBackendFailure::FailOpen);
     }
 
     #[cfg(feature = "redis")]
@@ -1192,10 +1188,7 @@ mod tests {
         "#;
         let config: RateLimitConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.backend, RateLimitBackend::Redis);
-        assert_eq!(
-            config.redis.url.as_deref(),
-            Some("redis://localhost:6379")
-        );
+        assert_eq!(config.redis.url.as_deref(), Some("redis://localhost:6379"));
         assert_eq!(config.redis.key_prefix, "myapp:rl");
     }
 
