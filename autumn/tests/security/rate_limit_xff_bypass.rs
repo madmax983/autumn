@@ -13,6 +13,7 @@ async fn rate_limit_xff_bypass() {
         burst: 1,                      // only 1 request allowed
         trust_forwarded_headers: true, // typical for setups behind load balancers
         trusted_proxies: vec!["203.0.113.10".to_string()],
+        ..Default::default()
     };
 
     let app = Router::new()
