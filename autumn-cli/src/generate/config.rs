@@ -29,6 +29,7 @@ use serde::Deserialize;
 
 use super::GenerateError;
 use super::model::ModelOptions;
+use super::naming::pascal;
 use super::scaffold::ScaffoldOptions;
 
 /// One resource's scaffold metadata from a TOML config file.
@@ -70,7 +71,10 @@ pub fn read_scaffold_config(
     let mut config: GeneratorConfig = toml::from_str(&content).map_err(|e| {
         GenerateError::Config(format!("invalid TOML in {}: {e}", config_path.display()))
     })?;
-    Ok(config.scaffold.remove(resource_name))
+    // Normalize to PascalCase so `bookmark` and `Bookmark` both match
+    // `[scaffold.Bookmark]`, consistent with how the generator itself handles
+    // resource names passed on the CLI.
+    Ok(config.scaffold.remove(pascal(resource_name).as_str()))
 }
 
 /// Merge a TOML config entry with CLI-supplied values.
@@ -166,6 +170,18 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
         assert!(entry.validations.is_empty());
         assert!(entry.defaults.is_empty());
         assert!(entry.queries.is_empty());
+    }
+
+    #[test]
+    fn snake_case_name_matches_pascal_case_toml_section() {
+        let tmp = TempDir::new().unwrap();
+        let path = write_config(&tmp, "[scaffold.Bookmark]\nfields = [\"url:String\"]\n");
+
+        // CLI input `bookmark` (snake_case) must find `[scaffold.Bookmark]`.
+        let entry = read_scaffold_config(&path, "bookmark")
+            .unwrap()
+            .expect("snake_case name should resolve to PascalCase section");
+        assert_eq!(entry.fields, vec!["url:String"]);
     }
 
     #[test]

@@ -831,7 +831,8 @@ fn run_generate_command(cmd: GenerateCommands) {
                     Ok(Some(e)) => e,
                     Ok(None) => {
                         eprintln!(
-                            "Error: no [scaffold.{name}] section found in {}",
+                            "Error: no [scaffold.{}] section found in {}",
+                            generate::naming::pascal(&name),
                             path.display()
                         );
                         std::process::exit(1);
