@@ -5613,7 +5613,10 @@ mod tests {
             ));
 
             let status = state.job_registry().snapshot()["evicted_job"].clone();
-            assert_eq!(status.in_flight, 0, "in_flight must be balanced after stale eviction");
+            assert_eq!(
+                status.in_flight, 0,
+                "in_flight must be balanced after stale eviction"
+            );
             assert_eq!(status.total_successes, 0);
             assert_eq!(
                 status.last_error.as_deref(),
