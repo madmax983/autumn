@@ -1022,10 +1022,7 @@ pub async fn enqueue_on_conn<A: serde::Serialize>(
 ///
 /// Returns an error if the job runtime is not initialized or if `args`
 /// cannot be serialized to JSON.
-pub async fn enqueue_after_commit<A: serde::Serialize>(
-    name: &str,
-    args: A,
-) -> AutumnResult<()> {
+pub async fn enqueue_after_commit<A: serde::Serialize>(name: &str, args: A) -> AutumnResult<()> {
     let payload = serde_json::to_value(&args).map_err(|e| {
         AutumnError::internal_server_error(std::io::Error::other(format!(
             "job args serialization failed: {e}"
@@ -1162,6 +1159,15 @@ impl JobClient {
         name: &str,
         payload: impl serde::Serialize,
     ) -> AutumnResult<()> {
+        // Validate name eagerly so a typo/unregistered job fails the
+        // transaction (before any DB commit) rather than being silently
+        // dropped later when the deferred callback runs.
+        if !self.per_job_defaults.contains_key(name) {
+            return Err(AutumnError::internal_server_error(std::io::Error::other(
+                format!("job '{name}' is not registered; add it to AppBuilder::jobs()"),
+            )));
+        }
+
         let name = name.to_string();
         let payload = serde_json::to_value(payload).map_err(|e| {
             AutumnError::internal_server_error(std::io::Error::other(format!(
@@ -1179,17 +1185,17 @@ impl JobClient {
             async move { client.enqueue(&name, payload).await }
         });
 
+        #[cfg(feature = "db")]
         crate::db::AFTER_COMMIT_REGISTRY
             .try_with(|registry| {
                 let f = f_opt.take().expect("closure only entered once");
-                let boxed: crate::db::CommitCallback =
-                    Box::new(move || Box::pin(f()));
+                let boxed: crate::db::CommitCallback = Box::new(move || Box::pin(f()));
                 registry.lock().expect("registry lock").push(boxed);
             })
             .ok();
 
         if let Some(f) = f_opt {
-            // Not inside a db.tx — enqueue immediately.
+            // Not inside a db.tx (or db feature is off) — enqueue immediately.
             tracing::debug!(
                 "enqueue_after_commit: no active transaction; enqueueing '{name_for_log}' immediately"
             );
@@ -6759,7 +6765,10 @@ mod tests {
 
         // The job should have been enqueued immediately (not deferred)
         let received = timeout(Duration::from_millis(100), rx.recv()).await;
-        assert!(received.is_ok(), "job should be received immediately outside tx");
+        assert!(
+            received.is_ok(),
+            "job should be received immediately outside tx"
+        );
         let job = received.unwrap().expect("channel should not be closed");
         assert_eq!(job.name, "test_job");
     }
@@ -6784,7 +6793,10 @@ mod tests {
 
         // Job must NOT have been enqueued yet
         let not_received = timeout(Duration::from_millis(50), rx.recv()).await;
-        assert!(not_received.is_err(), "job must not be enqueued before commit");
+        assert!(
+            not_received.is_err(),
+            "job must not be enqueued before commit"
+        );
 
         // Drain callbacks (simulating commit)
         let callbacks: Vec<CommitCallback> = {
@@ -6797,7 +6809,10 @@ mod tests {
 
         // Now the job should appear
         let received = timeout(Duration::from_millis(100), rx.recv()).await;
-        assert!(received.is_ok(), "job should be enqueued after commit callbacks run");
+        assert!(
+            received.is_ok(),
+            "job should be enqueued after commit callbacks run"
+        );
         let job = received.unwrap().expect("channel should not be closed");
         assert_eq!(job.name, "test_job");
     }

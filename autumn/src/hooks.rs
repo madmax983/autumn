@@ -209,7 +209,7 @@ pub trait MutationHooks: Send + Sync + 'static {
 
     /// Called after a new record is inserted **and the transaction commits**.
     ///
-    /// Unlike [`after_create`], this hook fires only when the surrounding
+    /// Unlike `after_create`, this hook fires only when the surrounding
     /// database transaction has been durably committed. Use this variant for
     /// side-effects (job enqueues, emails, cache invalidation) that must not
     /// execute if the transaction rolls back.
@@ -227,7 +227,7 @@ pub trait MutationHooks: Send + Sync + 'static {
 
     /// Called after an existing record is updated **and the transaction commits**.
     ///
-    /// The same transactional guarantee as [`after_create_commit`] applies:
+    /// The same transactional guarantee as `after_create_commit` applies:
     /// this hook is not called when the surrounding transaction rolls back.
     fn after_update_commit(
         &self,
@@ -239,7 +239,7 @@ pub trait MutationHooks: Send + Sync + 'static {
 
     /// Called after a record is deleted **and the transaction commits**.
     ///
-    /// The same transactional guarantee as [`after_create_commit`] applies:
+    /// The same transactional guarantee as `after_create_commit` applies:
     /// this hook is not called when the surrounding transaction rolls back.
     fn after_delete_commit(
         &self,
@@ -817,8 +817,8 @@ mod tests {
 
     #[tokio::test]
     async fn custom_hooks_can_override_commit_variants() {
-        use std::sync::atomic::{AtomicU32, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
 
         static CALLS: AtomicU32 = AtomicU32::new(0);
 
@@ -835,7 +835,10 @@ mod tests {
                 _ctx: &mut MutationContext,
                 _record: &Self::Model,
             ) -> impl Future<Output = AutumnResult<()>> + Send {
-                async { CALLS.fetch_add(1, Ordering::SeqCst); Ok(()) }
+                async {
+                    CALLS.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
             }
 
             fn after_update_commit(
@@ -843,7 +846,10 @@ mod tests {
                 _ctx: &mut MutationContext,
                 _record: &Self::Model,
             ) -> impl Future<Output = AutumnResult<()>> + Send {
-                async { CALLS.fetch_add(1, Ordering::SeqCst); Ok(()) }
+                async {
+                    CALLS.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
             }
 
             fn after_delete_commit(
@@ -851,7 +857,10 @@ mod tests {
                 _ctx: &mut MutationContext,
                 _record: &Self::Model,
             ) -> impl Future<Output = AutumnResult<()>> + Send {
-                async { CALLS.fetch_add(1, Ordering::SeqCst); Ok(()) }
+                async {
+                    CALLS.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
             }
         }
 

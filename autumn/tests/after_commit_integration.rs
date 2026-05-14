@@ -26,8 +26,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use autumn_web::db::{
-        register_after_commit, CommitCallback, AFTER_COMMIT_FAILURES_TOTAL,
-        AFTER_COMMIT_REGISTRY,
+        AFTER_COMMIT_FAILURES_TOTAL, AFTER_COMMIT_REGISTRY, CommitCallback, register_after_commit,
     };
 
     // ── Helpers ─────────────────────────────────────────────────────────────
@@ -180,7 +179,10 @@ mod tests {
             count: i64,
         }
 
-        async fn start_postgres() -> (testcontainers::ContainerAsync<Postgres>, Pool<AsyncPgConnection>) {
+        async fn start_postgres() -> (
+            testcontainers::ContainerAsync<Postgres>,
+            Pool<AsyncPgConnection>,
+        ) {
             let container = Postgres::default()
                 .start()
                 .await
@@ -228,25 +230,26 @@ mod tests {
             let registry: Arc<Mutex<Vec<CommitCallback>>> = Arc::new(Mutex::new(Vec::new()));
 
             let result: Result<(), diesel::result::Error> = AFTER_COMMIT_REGISTRY
-                .scope(registry.clone(), conn.transaction(|c| {
-                    let cc = cc.clone();
-                    Box::pin(async move {
-                        diesel::sql_query(
-                            "INSERT INTO ac_test (name) VALUES ('committed')",
-                        )
-                        .execute(c)
-                        .await?;
+                .scope(
+                    registry.clone(),
+                    conn.transaction(|c| {
+                        let cc = cc.clone();
+                        Box::pin(async move {
+                            diesel::sql_query("INSERT INTO ac_test (name) VALUES ('committed')")
+                                .execute(c)
+                                .await?;
 
-                        // Registers a deferred callback because the scope is active.
-                        register_after_commit(move || async move {
-                            *cc.lock().expect("counter lock") += 1;
-                            Ok(())
+                            // Registers a deferred callback because the scope is active.
+                            register_after_commit(move || async move {
+                                *cc.lock().expect("counter lock") += 1;
+                                Ok(())
+                            })
+                            .await;
+
+                            Ok::<_, diesel::result::Error>(())
                         })
-                        .await;
-
-                        Ok::<_, diesel::result::Error>(())
-                    })
-                }))
+                    }),
+                )
                 .await;
 
             assert!(result.is_ok(), "transaction should commit");
@@ -292,25 +295,28 @@ mod tests {
             let registry: Arc<Mutex<Vec<CommitCallback>>> = Arc::new(Mutex::new(Vec::new()));
 
             let result: Result<(), diesel::result::Error> = AFTER_COMMIT_REGISTRY
-                .scope(registry.clone(), conn.transaction(|c| {
-                    let cc = cc.clone();
-                    Box::pin(async move {
-                        diesel::sql_query(
-                            "INSERT INTO ac_test (name) VALUES ('should-roll-back')",
-                        )
-                        .execute(c)
-                        .await?;
+                .scope(
+                    registry.clone(),
+                    conn.transaction(|c| {
+                        let cc = cc.clone();
+                        Box::pin(async move {
+                            diesel::sql_query(
+                                "INSERT INTO ac_test (name) VALUES ('should-roll-back')",
+                            )
+                            .execute(c)
+                            .await?;
 
-                        register_after_commit(move || async move {
-                            *cc.lock().expect("counter lock") += 1;
-                            Ok(())
+                            register_after_commit(move || async move {
+                                *cc.lock().expect("counter lock") += 1;
+                                Ok(())
+                            })
+                            .await;
+
+                            // Force rollback.
+                            Err::<(), _>(diesel::result::Error::RollbackTransaction)
                         })
-                        .await;
-
-                        // Force rollback.
-                        Err::<(), _>(diesel::result::Error::RollbackTransaction)
-                    })
-                }))
+                    }),
+                )
                 .await;
 
             assert!(result.is_err(), "transaction should have rolled back");
@@ -360,26 +366,29 @@ mod tests {
             let registry: Arc<Mutex<Vec<CommitCallback>>> = Arc::new(Mutex::new(Vec::new()));
 
             let result: Result<(), diesel::result::Error> = AFTER_COMMIT_REGISTRY
-                .scope(registry.clone(), conn.transaction(|c| {
-                    let cbc = cbc.clone();
-                    Box::pin(async move {
-                        diesel::sql_query(
+                .scope(
+                    registry.clone(),
+                    conn.transaction(|c| {
+                        let cbc = cbc.clone();
+                        Box::pin(async move {
+                            diesel::sql_query(
                             "INSERT INTO ac_test (name) VALUES ('committed-despite-bad-callback')",
                         )
                         .execute(c)
                         .await?;
 
-                        register_after_commit(move || async move {
-                            *cbc.lock().expect("flag lock") = true;
-                            Err(autumn_web::AutumnError::internal_server_error_msg(
-                                "intentional callback error for testing",
-                            ))
-                        })
-                        .await;
+                            register_after_commit(move || async move {
+                                *cbc.lock().expect("flag lock") = true;
+                                Err(autumn_web::AutumnError::internal_server_error_msg(
+                                    "intentional callback error for testing",
+                                ))
+                            })
+                            .await;
 
-                        Ok::<_, diesel::result::Error>(())
-                    })
-                }))
+                            Ok::<_, diesel::result::Error>(())
+                        })
+                    }),
+                )
                 .await;
 
             assert!(result.is_ok(), "transaction itself should commit");
@@ -396,7 +405,10 @@ mod tests {
             .await
             .expect("count query")
             .count;
-            assert_eq!(row_count, 1, "committed row must survive a failing callback");
+            assert_eq!(
+                row_count, 1,
+                "committed row must survive a failing callback"
+            );
 
             // The callback was invoked (the failure is not silently swallowed).
             assert!(

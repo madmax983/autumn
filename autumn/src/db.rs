@@ -109,9 +109,7 @@ where
 
     // If still Some, the task-local wasn't set — we're outside a tx; run eagerly.
     if let Some(f) = f_opt {
-        tracing::debug!(
-            "register_after_commit: no active transaction; running callback eagerly"
-        );
+        tracing::debug!("register_after_commit: no active transaction; running callback eagerly");
         if let Err(e) = f().await {
             tracing::error!("register_after_commit eager callback failed: {e}");
         }
@@ -396,8 +394,7 @@ impl Db {
         // that code running inside the closure (jobs, mailer, hooks) can push
         // callbacks without having access to `Db` directly. The `Arc` lets us
         // read the registry after the `scope` future completes.
-        let registry: Arc<Mutex<Vec<CommitCallback>>> =
-            Arc::new(Mutex::new(Vec::new()));
+        let registry: Arc<Mutex<Vec<CommitCallback>>> = Arc::new(Mutex::new(Vec::new()));
 
         let result = AFTER_COMMIT_REGISTRY
             .scope(registry.clone(), self.conn.transaction::<T, E, _>(f))
@@ -406,23 +403,26 @@ impl Db {
 
         guard.disarmed = true;
 
-        // On commit: drain and run every registered callback. An error in a
-        // callback is logged and counted but does NOT roll back the
-        // already-committed tx.
+        // On commit: spawn each callback as an independent task so that
+        // callbacks can acquire DB pool connections without deadlocking
+        // (this Db instance still holds its connection until dropped).
+        // Errors are counted and logged; they do NOT affect the committed tx.
         if result.is_ok() {
             let callbacks: Vec<CommitCallback> = {
                 let mut reg = registry.lock().expect("registry lock");
                 std::mem::take(&mut *reg)
             };
             for cb in callbacks {
-                if let Err(e) = cb().await {
-                    AFTER_COMMIT_FAILURES_TOTAL.fetch_add(1, Ordering::Relaxed);
-                    tracing::error!(
-                        autumn.after_commit.failures_total =
-                            AFTER_COMMIT_FAILURES_TOTAL.load(Ordering::Relaxed),
-                        "after_commit callback failed (tx already committed): {e}"
-                    );
-                }
+                tokio::task::spawn(async move {
+                    if let Err(e) = cb().await {
+                        AFTER_COMMIT_FAILURES_TOTAL.fetch_add(1, Ordering::Relaxed);
+                        tracing::error!(
+                            autumn.after_commit.failures_total =
+                                AFTER_COMMIT_FAILURES_TOTAL.load(Ordering::Relaxed),
+                            "after_commit callback failed (tx already committed): {e}"
+                        );
+                    }
+                });
             }
         }
 
@@ -611,8 +611,8 @@ impl DatabasePoolProvider for DieselDeadpoolPoolProvider {
 mod tests {
     use super::*;
     use crate::config::DatabaseConfig;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     // ── after_commit tests ───────────────────────────────────────
@@ -636,9 +636,7 @@ mod tests {
         let counter = Arc::new(AtomicUsize::new(0));
         let c = counter.clone();
 
-        let registry = Arc::new(std::sync::Mutex::new(
-            Vec::<CommitCallback>::new(),
-        ));
+        let registry = Arc::new(std::sync::Mutex::new(Vec::<CommitCallback>::new()));
 
         // Simulate being inside a db.tx by setting the task-local
         AFTER_COMMIT_REGISTRY
@@ -672,9 +670,7 @@ mod tests {
         let counter = Arc::new(AtomicUsize::new(0));
         let c = counter.clone();
 
-        let registry = Arc::new(std::sync::Mutex::new(
-            Vec::<CommitCallback>::new(),
-        ));
+        let registry = Arc::new(std::sync::Mutex::new(Vec::<CommitCallback>::new()));
 
         AFTER_COMMIT_REGISTRY
             .scope(registry.clone(), async {
@@ -695,9 +691,7 @@ mod tests {
     #[tokio::test]
     async fn register_after_commit_callbacks_run_in_registration_order() {
         let order = Arc::new(std::sync::Mutex::new(Vec::<u32>::new()));
-        let registry = Arc::new(std::sync::Mutex::new(
-            Vec::<CommitCallback>::new(),
-        ));
+        let registry = Arc::new(std::sync::Mutex::new(Vec::<CommitCallback>::new()));
 
         let o1 = order.clone();
         let o2 = order.clone();
@@ -737,14 +731,14 @@ mod tests {
     #[tokio::test]
     async fn register_after_commit_callback_error_is_swallowed() {
         // A failing callback is logged but doesn't panic or propagate.
-        let registry = Arc::new(std::sync::Mutex::new(
-            Vec::<CommitCallback>::new(),
-        ));
+        let registry = Arc::new(std::sync::Mutex::new(Vec::<CommitCallback>::new()));
 
         AFTER_COMMIT_REGISTRY
             .scope(registry.clone(), async {
                 register_after_commit(|| async {
-                    Err(crate::AutumnError::internal_server_error_msg("deliberate error"))
+                    Err(crate::AutumnError::internal_server_error_msg(
+                        "deliberate error",
+                    ))
                 })
                 .await;
             })
