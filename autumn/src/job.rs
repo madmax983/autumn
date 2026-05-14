@@ -2912,6 +2912,10 @@ fn record_pg_lifecycle_after_ack(
         PgLifecycleRecord::Retry { error, attempt } => {
             state.job_registry.record_retry(job_name, error, attempt);
             job_admin.record_retrying(job_id, error);
+            // The row is back in autumn_jobs with status='enqueued'; reflect
+            // that in the process-local counters so /actuator shows it as queued.
+            state.job_registry.record_enqueue(job_name);
+            job_admin.record_requeued(job_id, attempt + 1);
         }
         PgLifecycleRecord::Failure { error } => {
             state
@@ -3395,8 +3399,11 @@ async fn pg_execute_job(
         .map(|info| info.handler);
 
     let Some(handler) = handler_opt else {
+        // Dead-letter immediately: no handler will ever exist on this process,
+        // so requeueing (pg_nack_failure) would cause every worker to
+        // repeatedly claim and discard the job until attempts are exhausted.
         let error = format!("unknown job '{}'", row.name);
-        let ack = pg_nack_failure(pool, &row.id, worker_id, &error, &row).await;
+        let ack = pg_ack_dead_letter(pool, &row.id, worker_id, &error).await;
         let lifecycle = PgLifecycleRecord::Failure { error: &error };
         record_pg_row_lifecycle_ack_result(ack, &row, "unknown-type", lifecycle, state, job_admin);
         return;
