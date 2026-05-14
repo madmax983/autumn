@@ -2895,6 +2895,13 @@ fn record_pg_lifecycle_after_ack(
     job_admin: &JobAdminMemoryBackend,
 ) -> bool {
     if !ack_applied {
+        // The claim was evicted by stale-claim recovery before this ack ran.
+        // Decrement in_flight so /actuator metrics don't leak; the recovery
+        // task already transitioned the row in the database.
+        state
+            .job_registry
+            .record_retry(job_name, "visibility timeout expired", 0);
+        job_admin.record_retrying(job_id, "visibility timeout expired");
         return false;
     }
 
@@ -5545,11 +5552,15 @@ mod tests {
             assert_eq!(status.in_flight, 0);
             assert_eq!(status.total_failures, 0);
             assert_eq!(status.last_error.as_deref(), Some("try again"));
-            let admin = job_admin.inner.read().expect("job admin lock");
-            assert_eq!(
-                admin.records.get(&job_id).expect("admin record").status,
-                JobAdminStatus::Retrying
-            );
+            let admin_status = job_admin
+                .inner
+                .read()
+                .expect("job admin lock")
+                .records
+                .get(&job_id)
+                .expect("admin record")
+                .status;
+            assert_eq!(admin_status, JobAdminStatus::Retrying);
         }
 
         #[test]
@@ -5576,6 +5587,47 @@ mod tests {
             let status = state.job_registry().snapshot()["slow_success"].clone();
             assert_eq!(status.in_flight, 1);
             assert_eq!(status.total_successes, 0);
+        }
+
+        #[test]
+        fn pg_lifecycle_balances_inflight_on_stale_eviction() {
+            // When ack returns Ok(false) the claim was evicted by stale-claim
+            // recovery; in_flight must be decremented so metrics don't leak.
+            let state = AppState::for_test().with_profile("dev");
+            state.job_registry().register("evicted_job");
+            state.job_registry().record_enqueue("evicted_job");
+            state.job_registry().record_start("evicted_job");
+            let job_admin = JobAdminMemoryBackend::new_for_test(32);
+            let job_id =
+                job_admin.record_enqueue_for_test("evicted_job", serde_json::json!({}), 1, 3);
+            job_admin.record_start_for_test(&job_id, 1);
+
+            assert!(!record_pg_lifecycle_ack_result(
+                Ok(false),
+                "evicted_job",
+                &job_id,
+                "success",
+                PgLifecycleRecord::Success,
+                &state,
+                &job_admin
+            ));
+
+            let status = state.job_registry().snapshot()["evicted_job"].clone();
+            assert_eq!(status.in_flight, 0, "in_flight must be balanced after stale eviction");
+            assert_eq!(status.total_successes, 0);
+            assert_eq!(
+                status.last_error.as_deref(),
+                Some("visibility timeout expired")
+            );
+            let admin_status = job_admin
+                .inner
+                .read()
+                .expect("job admin lock")
+                .records
+                .get(&job_id)
+                .expect("admin record")
+                .status;
+            assert_eq!(admin_status, JobAdminStatus::Retrying);
         }
 
         #[test]
