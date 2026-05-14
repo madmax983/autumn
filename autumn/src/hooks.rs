@@ -830,37 +830,31 @@ mod tests {
             type NewModel = ();
             type UpdateModel = ();
 
-            fn after_create_commit(
+            async fn after_create_commit(
                 &self,
                 _ctx: &mut MutationContext,
                 _record: &Self::Model,
-            ) -> impl Future<Output = AutumnResult<()>> + Send {
-                async {
-                    CALLS.fetch_add(1, Ordering::SeqCst);
-                    Ok(())
-                }
+            ) -> AutumnResult<()> {
+                CALLS.fetch_add(1, Ordering::SeqCst);
+                Ok(())
             }
 
-            fn after_update_commit(
+            async fn after_update_commit(
                 &self,
                 _ctx: &mut MutationContext,
                 _record: &Self::Model,
-            ) -> impl Future<Output = AutumnResult<()>> + Send {
-                async {
-                    CALLS.fetch_add(1, Ordering::SeqCst);
-                    Ok(())
-                }
+            ) -> AutumnResult<()> {
+                CALLS.fetch_add(1, Ordering::SeqCst);
+                Ok(())
             }
 
-            fn after_delete_commit(
+            async fn after_delete_commit(
                 &self,
                 _ctx: &mut MutationContext,
                 _record: &Self::Model,
-            ) -> impl Future<Output = AutumnResult<()>> + Send {
-                async {
-                    CALLS.fetch_add(1, Ordering::SeqCst);
-                    Ok(())
-                }
+            ) -> AutumnResult<()> {
+                CALLS.fetch_add(1, Ordering::SeqCst);
+                Ok(())
             }
         }
 

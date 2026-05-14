@@ -156,7 +156,7 @@ mod tests {
 
         let after = AFTER_COMMIT_FAILURES_TOTAL.load(Ordering::Relaxed);
         assert!(
-            after >= before + 1,
+            after > before,
             "AFTER_COMMIT_FAILURES_TOTAL should have incremented: before={before} after={after}"
         );
     }
@@ -206,7 +206,7 @@ mod tests {
             name TEXT      NOT NULL
         )";
 
-        /// Scenario **(b)**: transaction commits → the after_commit callback fires
+        /// Scenario **(b)**: transaction commits → the `after_commit` callback fires
         /// exactly once and the committed row is visible.
         #[tokio::test]
         #[ignore = "requires Docker (testcontainers)"]
@@ -340,7 +340,7 @@ mod tests {
             assert_eq!(row_count, 0, "rolled-back row must not be visible");
         }
 
-        /// Scenario **(c)** — full: transaction commits, but the after_commit
+        /// Scenario **(c)** — full: transaction commits, but the `after_commit`
         /// callback returns an error.  The committed domain row must still be
         /// present (the DB state stands) and the failure counter increments.
         #[tokio::test]
@@ -419,7 +419,7 @@ mod tests {
             // The failure counter was bumped.
             let after = AFTER_COMMIT_FAILURES_TOTAL.fetch_add(0, Ordering::Relaxed);
             assert!(
-                after >= before + 1,
+                after > before,
                 "AFTER_COMMIT_FAILURES_TOTAL should have incremented: before={before} after={after}"
             );
         }
