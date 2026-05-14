@@ -119,6 +119,8 @@ mod tests {
 
     #[test]
     fn reddit_background_jobs_register_request_side_effects() {
+        use crate::jobs::{PostPublicationJob, UserOnboardingJob};
+
         let jobs = crate::jobs::registered_jobs();
         let by_name = jobs
             .iter()
@@ -133,5 +135,20 @@ mod tests {
         assert_eq!(jobs.len(), 2);
         assert!(by_name.contains(&("user_onboarding", (5, 500))));
         assert!(by_name.contains(&("post_publication", (5, 500))));
+
+        // NAME constants must match the registered job names so enqueue_on_conn callers
+        // don't need to duplicate the string.
+        assert_eq!(UserOnboardingJob::NAME, "user_onboarding");
+        assert_eq!(PostPublicationJob::NAME, "post_publication");
+    }
+
+    #[test]
+    fn default_profile_uses_postgres_jobs_backend() {
+        let env = MockEnv::new().with("AUTUMN_MANIFEST_DIR", env!("CARGO_MANIFEST_DIR"));
+        let config = AutumnConfig::load_with_env(&env).expect("default config should load");
+        assert_eq!(
+            config.jobs.backend, "postgres",
+            "autumn.toml must set jobs.backend = \"postgres\" as the default"
+        );
     }
 }

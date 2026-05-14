@@ -81,6 +81,24 @@ With the `telemetry-otlp` cargo feature enabled and `telemetry.enabled = true`:
   of the pooled connection — Diesel activity performed through it appears
   as a child of the request span in Jaeger / Tempo / Datadog.
 
+## Harvest Backends
+
+| Backend | When to pick it |
+|---|---|
+| `local` | Local dev and single-process demos; jobs are lost on restart |
+| `postgres` | Production with Postgres already in the stack; no Redis required |
+| `redis` | Very high job throughput, or Redis is already a dependency |
+
+`postgres` reuses the configured `[database]` pool and claims jobs via
+`SELECT … FOR UPDATE SKIP LOCKED`, making it safe across any number of replicas
+without adding Redis. Enable it with `jobs.backend = "postgres"` and run
+`autumn migrate` before the first worker starts.
+
+`redis` offers a higher throughput ceiling and sub-millisecond poll latency but
+adds Redis as an infrastructure dependency. Prefer `postgres` if your ops budget
+does not include Redis, and switch to `redis` if job throughput saturates the
+Postgres connection pool.
+
 ## File Uploads
 
 The `Multipart` extractor's `save_to(path)` primitive writes to the local

@@ -86,13 +86,14 @@
 //! | `AUTUMN_CHANNELS__CAPACITY` | `channels.capacity` | `usize` |
 //! | `AUTUMN_CHANNELS__REDIS__URL` | `channels.redis.url` | `String` |
 //! | `AUTUMN_CHANNELS__REDIS__KEY_PREFIX` | `channels.redis.key_prefix` | `String` |
-//! | `AUTUMN_JOBS__BACKEND` | `jobs.backend` | `local` / `redis` |
+//! | `AUTUMN_JOBS__BACKEND` | `jobs.backend` | `local` / `postgres` / `redis` |
 //! | `AUTUMN_JOBS__WORKERS` | `jobs.workers` | `usize` |
 //! | `AUTUMN_JOBS__MAX_ATTEMPTS` | `jobs.max_attempts` | `u32` |
 //! | `AUTUMN_JOBS__INITIAL_BACKOFF_MS` | `jobs.initial_backoff_ms` | `u64` |
 //! | `AUTUMN_JOBS__REDIS__URL` | `jobs.redis.url` | `String` |
 //! | `AUTUMN_JOBS__REDIS__KEY_PREFIX` | `jobs.redis.key_prefix` | `String` |
 //! | `AUTUMN_JOBS__REDIS__VISIBILITY_TIMEOUT_MS` | `jobs.redis.visibility_timeout_ms` | `u64` |
+//! | `AUTUMN_JOBS__POSTGRES__VISIBILITY_TIMEOUT_MS` | `jobs.postgres.visibility_timeout_ms` | `u64` |
 //! | `AUTUMN_SCHEDULER__BACKEND` | `scheduler.backend` | `in_process` / `postgres` |
 //! | `AUTUMN_SCHEDULER__LEASE_TTL_SECS` | `scheduler.lease_ttl_secs` | `u64` |
 //! | `AUTUMN_SCHEDULER__REPLICA_ID` | `scheduler.replica_id` | `String` |
@@ -1028,6 +1029,7 @@ pub struct JobConfig {
     /// Runtime backend selection.
     ///
     /// - `local` (default): in-process Tokio queue
+    /// - `postgres`: Postgres-backed durable queue (requires `db` feature)
     /// - `redis`: Redis-backed durable queue (requires `redis` feature)
     #[serde(default = "default_job_backend")]
     pub backend: String,
@@ -1043,6 +1045,9 @@ pub struct JobConfig {
     /// Redis backend options.
     #[serde(default)]
     pub redis: JobRedisConfig,
+    /// Postgres backend options.
+    #[serde(default)]
+    pub postgres: JobPostgresConfig,
 }
 
 impl Default for JobConfig {
@@ -1053,6 +1058,7 @@ impl Default for JobConfig {
             max_attempts: default_job_max_attempts(),
             initial_backoff_ms: default_job_backoff_ms(),
             redis: JobRedisConfig::default(),
+            postgres: JobPostgresConfig::default(),
         }
     }
 }
@@ -1079,6 +1085,29 @@ impl Default for JobRedisConfig {
             visibility_timeout_ms: default_jobs_redis_visibility_timeout_ms(),
         }
     }
+}
+
+/// Postgres backend configuration options for the job runner.
+#[derive(Debug, Clone, Deserialize)]
+pub struct JobPostgresConfig {
+    /// Duration before an in-flight job claim is considered stale and recovered.
+    ///
+    /// Workers that crash mid-job have their claim reclaimed by another worker
+    /// within this bound. Default: 30 seconds.
+    #[serde(default = "default_jobs_pg_visibility_timeout_ms")]
+    pub visibility_timeout_ms: u64,
+}
+
+impl Default for JobPostgresConfig {
+    fn default() -> Self {
+        Self {
+            visibility_timeout_ms: default_jobs_pg_visibility_timeout_ms(),
+        }
+    }
+}
+
+const fn default_jobs_pg_visibility_timeout_ms() -> u64 {
+    30_000
 }
 
 fn default_job_backend() -> String {
@@ -1605,6 +1634,11 @@ impl AutumnConfig {
             env,
             "AUTUMN_JOBS__REDIS__VISIBILITY_TIMEOUT_MS",
             &mut self.jobs.redis.visibility_timeout_ms,
+        );
+        parse_env(
+            env,
+            "AUTUMN_JOBS__POSTGRES__VISIBILITY_TIMEOUT_MS",
+            &mut self.jobs.postgres.visibility_timeout_ms,
         );
     }
 

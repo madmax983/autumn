@@ -31,6 +31,7 @@ db = [
     "dep:pq-sys",
     "dep:scoped-futures",
     "diesel/postgres",
+    "diesel/chrono",
 ]
 test-support = ["dep:testcontainers", "dep:testcontainers-modules"]
 telemetry-otlp = [

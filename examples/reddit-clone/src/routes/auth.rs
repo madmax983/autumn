@@ -176,7 +176,14 @@ pub async fn register(
                     .await
                     .map_err(|_| AutumnError::unprocessable_msg("Username already taken"))?;
 
-                enqueue_user_onboarding(&user).await?;
+                // Enqueue inside the transaction so the job row rolls back
+                // atomically if the user INSERT fails or the tx is cancelled.
+                autumn_web::job::enqueue_on_conn(
+                    UserOnboardingJob::NAME,
+                    UserOnboardingArgs::from_user(&user),
+                    conn,
+                )
+                .await?;
 
                 Ok::<_, AutumnError>(user)
             }
@@ -193,10 +200,6 @@ pub async fn register(
     AccountMailer.deliver_later_welcome(&mailer, email, user.username.clone());
 
     Ok(Redirect::to("/"))
-}
-
-async fn enqueue_user_onboarding(user: &User) -> AutumnResult<()> {
-    UserOnboardingJob::enqueue(UserOnboardingArgs::from_user(user)).await
 }
 
 // ── Login ──────────────────────────────────────────────────────
@@ -251,7 +254,7 @@ mod tests {
             avatar: None,
         };
 
-        let error = enqueue_user_onboarding(&user)
+        let error = UserOnboardingJob::enqueue(UserOnboardingArgs::from_user(&user))
             .await
             .expect_err("missing job runtime should fail registration");
 
