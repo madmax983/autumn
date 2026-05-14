@@ -34,6 +34,7 @@ use super::scaffold::ScaffoldOptions;
 
 /// One resource's scaffold metadata from a TOML config file.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ScaffoldConfigEntry {
     #[serde(default)]
     pub fields: Vec<String>,
@@ -182,6 +183,27 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             .unwrap()
             .expect("snake_case name should resolve to PascalCase section");
         assert_eq!(entry.fields, vec!["url:String"]);
+    }
+
+    #[test]
+    fn unknown_key_returns_config_error() {
+        let tmp = TempDir::new().unwrap();
+        // `index` is the wrong key; the correct key is `indexes`.
+        let path = write_config(
+            &tmp,
+            "[scaffold.Post]\nfields = [\"title:String\"]\nindex = [\"title\"]\n",
+        );
+
+        let err = read_scaffold_config(&path, "Post").unwrap_err();
+        assert!(
+            matches!(err, GenerateError::Config(_)),
+            "misspelled key should return Config error, got: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("index"),
+            "error should mention the unknown key; got: {msg}"
+        );
     }
 
     #[test]
