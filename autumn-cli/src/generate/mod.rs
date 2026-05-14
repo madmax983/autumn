@@ -12,6 +12,7 @@
 
 pub mod admin;
 pub mod auth;
+pub mod config;
 pub mod dsl;
 pub mod emit;
 pub mod migration;
@@ -50,6 +51,10 @@ pub enum GenerateError {
     /// Filesystem error during code emission.
     #[error("{0}")]
     Io(#[from] std::io::Error),
+
+    /// Generator config file is invalid or missing a required section.
+    #[error("{0}")]
+    Config(String),
 }
 
 /// ⚡ Bolt optimization: Formats collision paths directly into a pre-allocated

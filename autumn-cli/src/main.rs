@@ -524,6 +524,10 @@ enum GenerateCommands {
         /// Add a derived repository query, e.g. `find_by_tag:tag`.
         #[arg(long, value_name = "METHOD:FIELD")]
         query: Vec<String>,
+        /// Load scaffold metadata from a TOML config file (e.g. `autumn.generate.toml`).
+        /// CLI flags take precedence over values in the config file.
+        #[arg(long, value_name = "PATH")]
+        config: Option<std::path::PathBuf>,
         /// Print the file plan and exit without writing anything.
         #[arg(long)]
         dry_run: bool,
@@ -817,17 +821,36 @@ fn run_generate_command(cmd: GenerateCommands) {
             validate,
             default,
             query,
+            config,
             dry_run,
             force,
         } => {
-            let options = generate::scaffold::ScaffoldOptions {
-                model: generate::model::ModelOptions {
-                    indexes: index,
-                    validations: validate,
-                    defaults: default,
+            let config_entry = config.as_ref().map_or_else(
+                generate::config::ScaffoldConfigEntry::default,
+                |path| match generate::config::read_scaffold_config(path, &name) {
+                    Ok(Some(e)) => e,
+                    Ok(None) => {
+                        eprintln!(
+                            "Error: no [scaffold.{}] section found in {}",
+                            generate::naming::pascal(&name),
+                            path.display()
+                        );
+                        std::process::exit(1);
+                    }
+                    Err(e) => {
+                        eprintln!("Error: {e}");
+                        std::process::exit(1);
+                    }
                 },
-                queries: query,
-            };
+            );
+            let (fields, options) = generate::config::merge_config_with_cli(
+                config_entry,
+                &fields,
+                &index,
+                &validate,
+                &default,
+                &query,
+            );
             generate::scaffold::run(&name, &fields, generate::Flags { dry_run, force }, &options);
         }
     }
@@ -1231,6 +1254,26 @@ mod tests {
         assert_eq!(validate, vec!["url=url"]);
         assert_eq!(default, vec!["alive=true"]);
         assert_eq!(query, vec!["find_by_alive:alive"]);
+    }
+
+    #[test]
+    fn parse_generate_scaffold_config_flag() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "generate",
+            "scaffold",
+            "Post",
+            "--config",
+            "autumn.generate.toml",
+        ])
+        .unwrap();
+        let Commands::Generate(GenerateCommands::Scaffold { config, .. }) = cli.command else {
+            panic!("expected generate scaffold");
+        };
+        assert_eq!(
+            config,
+            Some(std::path::PathBuf::from("autumn.generate.toml"))
+        );
     }
 
     #[test]
