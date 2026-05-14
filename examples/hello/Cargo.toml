@@ -6,6 +6,7 @@ publish = false
 
 [dependencies]
 autumn-web = { path = "../../autumn" }
+autumn-monitor-plugin = { path = "../../autumn-monitor-plugin" }
 
 [lints.rust]
 unsafe_code = "forbid"

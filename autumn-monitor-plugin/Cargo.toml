@@ -1,0 +1,13 @@
+[package]
+name = "autumn-monitor-plugin"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+autumn-web = { path = "../autumn", default-features = false, features = ["htmx", "maud"] }
+maud = { version = "0.27", features = ["axum"] }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+
+[lints.rust]
+unsafe_code = "forbid"

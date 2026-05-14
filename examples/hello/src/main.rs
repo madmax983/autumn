@@ -18,6 +18,7 @@ async fn hello_name(name: Path<String>) -> String {
 #[autumn_web::main]
 async fn main() {
     autumn_web::app()
+        .plugin(autumn_monitor_plugin::MonitorPlugin::new())
         .routes(routes![index, hello, hello_name])
         .run()
         .await;
