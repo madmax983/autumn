@@ -3359,6 +3359,7 @@ async fn pg_recover_stale_claims(pool: &PgPool, visibility_timeout_ms: u64) {
            WHERE status = 'running' \
              AND claimed_at < NOW() - ($1::BIGINT * INTERVAL '1 millisecond') \
            FOR UPDATE SKIP LOCKED \
+           LIMIT 100 \
          )",
     )
     .bind::<diesel::sql_types::BigInt, _>(i64::try_from(visibility_timeout_ms).unwrap_or(i64::MAX))
@@ -3437,6 +3438,26 @@ async fn pg_execute_job(
     }
 }
 
+/// Dedicated maintenance task: runs stale-claim recovery on a fixed interval.
+///
+/// Spawned once per runtime rather than per-worker so maintenance always runs
+/// even when all workers are occupied with long-running jobs.
+#[cfg(feature = "db")]
+async fn pg_maintenance_loop(
+    pool: PgPool,
+    visibility_timeout_ms: u64,
+    shutdown: tokio_util::sync::CancellationToken,
+) {
+    let mut interval = tokio::time::interval(PG_MAINTENANCE_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = interval.tick() => pg_recover_stale_claims(&pool, visibility_timeout_ms).await,
+            () = shutdown.cancelled() => break,
+        }
+    }
+}
+
 #[cfg(feature = "db")]
 async fn pg_worker_loop(
     pool: PgPool,
@@ -3445,19 +3466,8 @@ async fn pg_worker_loop(
     state: AppState,
     job_admin: JobAdminMemoryBackend,
     shutdown: tokio_util::sync::CancellationToken,
-    visibility_timeout_ms: u64,
 ) {
-    let mut last_maintenance = std::time::Instant::now()
-        .checked_sub(PG_MAINTENANCE_INTERVAL)
-        .unwrap_or_else(std::time::Instant::now);
-
     loop {
-        let now = std::time::Instant::now();
-        if now.duration_since(last_maintenance) >= PG_MAINTENANCE_INTERVAL {
-            last_maintenance = now;
-            pg_recover_stale_claims(&pool, visibility_timeout_ms).await;
-        }
-
         match pg_claim_next_job(&pool, &worker_id).await {
             Some(row) => {
                 pg_execute_job(row, &jobs_by_name, &pool, &worker_id, &state, &job_admin).await;
@@ -3494,6 +3504,7 @@ impl PgJobAdminBackend {
         let enqueued = pg_admin_page(
             &mut conn,
             PG_STATUS_ENQUEUED,
+            "enqueued_at",
             None,
             query.enqueued_page,
             per_page,
@@ -3502,6 +3513,7 @@ impl PgJobAdminBackend {
         let running = pg_admin_page(
             &mut conn,
             PG_STATUS_RUNNING,
+            "started_at",
             None,
             query.running_page,
             per_page,
@@ -3510,6 +3522,7 @@ impl PgJobAdminBackend {
         let completed = pg_admin_page(
             &mut conn,
             PG_STATUS_COMPLETED,
+            "finished_at",
             Some(now - chrono::TimeDelta::hours(24)),
             query.completed_page,
             per_page,
@@ -3518,6 +3531,7 @@ impl PgJobAdminBackend {
         let failed = pg_admin_page(
             &mut conn,
             PG_STATUS_FAILED,
+            "finished_at",
             Some(now - chrono::TimeDelta::days(7)),
             query.failed_page,
             per_page,
@@ -3635,10 +3649,16 @@ impl JobAdminBackend for PgJobAdminBackend {
 }
 
 /// Paginated query for one status group in the admin dashboard.
+///
+/// `sort_col` must be the literal column name that is indexed for this status
+/// (e.g. `"enqueued_at"`, `"started_at"`, `"finished_at"`). It is a `&'static
+/// str` from our own call sites — never user input — so embedding it via
+/// `format!` is safe.
 #[cfg(feature = "db")]
 async fn pg_admin_page(
     conn: &mut diesel_async::pooled_connection::deadpool::Object<diesel_async::AsyncPgConnection>,
     status: &str,
+    sort_col: &'static str,
     since: Option<chrono::DateTime<chrono::Utc>>,
     page: u64,
     per_page: i64,
@@ -3656,10 +3676,10 @@ async fn pg_admin_page(
     };
 
     let (total, rows) = if let Some(since) = since {
-        let total = diesel::sql_query(
+        let total = diesel::sql_query(format!(
             "SELECT COUNT(*) AS count FROM autumn_jobs \
-             WHERE status = $1 AND COALESCE(finished_at, started_at, enqueued_at) >= $2",
-        )
+             WHERE status = $1 AND {sort_col} >= $2"
+        ))
         .bind::<diesel::sql_types::Text, _>(status)
         .bind::<diesel::sql_types::Timestamptz, _>(since)
         .get_result::<PgCount>(&mut **conn)
@@ -3669,8 +3689,8 @@ async fn pg_admin_page(
 
         let rows = diesel::sql_query(format!(
             "SELECT {PG_JOB_SELECT_COLS} FROM autumn_jobs \
-             WHERE status = $1 AND COALESCE(finished_at, started_at, enqueued_at) >= $2 \
-             ORDER BY COALESCE(finished_at, started_at, enqueued_at) DESC \
+             WHERE status = $1 AND {sort_col} >= $2 \
+             ORDER BY {sort_col} DESC \
              LIMIT $3 OFFSET $4"
         ))
         .bind::<diesel::sql_types::Text, _>(status)
@@ -3696,7 +3716,7 @@ async fn pg_admin_page(
         let rows = diesel::sql_query(format!(
             "SELECT {PG_JOB_SELECT_COLS} FROM autumn_jobs \
              WHERE status = $1 \
-             ORDER BY COALESCE(finished_at, started_at, enqueued_at) DESC NULLS LAST \
+             ORDER BY {sort_col} DESC NULLS LAST \
              LIMIT $2 OFFSET $3"
         ))
         .bind::<diesel::sql_types::Text, _>(status)
@@ -3770,6 +3790,15 @@ fn start_postgres_runtime(
     let visibility_timeout_ms = config.postgres.visibility_timeout_ms;
     let worker_count = config.workers.max(1);
 
+    // Single maintenance task shared across all workers.
+    {
+        let pool = pool.clone();
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            pg_maintenance_loop(pool, visibility_timeout_ms, shutdown).await;
+        });
+    }
+
     for _ in 0..worker_count {
         let pool = pool.clone();
         let jobs_by_name = Arc::clone(&jobs_by_name);
@@ -3778,16 +3807,7 @@ fn start_postgres_runtime(
         let shutdown = shutdown.clone();
         tokio::spawn(async move {
             let worker_id = format!("{}:{}", std::process::id(), uuid::Uuid::new_v4());
-            pg_worker_loop(
-                pool,
-                worker_id,
-                jobs_by_name,
-                state,
-                job_admin,
-                shutdown,
-                visibility_timeout_ms,
-            )
-            .await;
+            pg_worker_loop(pool, worker_id, jobs_by_name, state, job_admin, shutdown).await;
         });
     }
 

@@ -28,3 +28,8 @@ CREATE INDEX IF NOT EXISTS idx_autumn_jobs_status_finished
 CREATE INDEX IF NOT EXISTS idx_autumn_jobs_enqueued_dashboard
     ON autumn_jobs (enqueued_at DESC)
     WHERE status = 'enqueued';
+
+-- Stale-claim recovery scans running jobs by claimed_at
+CREATE INDEX IF NOT EXISTS idx_autumn_jobs_stale_recovery
+    ON autumn_jobs (claimed_at)
+    WHERE status = 'running';
