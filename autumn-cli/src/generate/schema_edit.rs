@@ -177,10 +177,21 @@ fn split_on_keyword(s: &str, keyword: &str) -> Option<(String, String)> {
 }
 
 /// SQL for adding columns to a table.
+///
+/// Prepends an `autumn-safety` comment for `NOT NULL` columns that have no
+/// `DEFAULT` — those require a backfill or a default before the constraint can
+/// be added safely on a live table.
 #[must_use]
 pub fn add_columns_up_sql(table: &str, fields: &[Field]) -> String {
     let mut out = String::new();
     for f in fields {
+        if !f.nullable {
+            let _ = writeln!(
+                out,
+                "-- autumn-safety: potentially-blocking \
+                 -- add a DEFAULT or backfill existing rows before enforcing NOT NULL"
+            );
+        }
         let _ = writeln!(
             out,
             "ALTER TABLE {table} ADD COLUMN {} {} {};",
@@ -203,10 +214,20 @@ pub fn add_columns_down_sql(table: &str, fields: &[Field]) -> String {
 }
 
 /// SQL for removing columns from a table.
+///
+/// Prepends an `autumn-safety` comment for each `DROP COLUMN` to make the
+/// rolling-deploy risk visible at a glance and machine-parseable by
+/// `autumn migrate check`.
 #[must_use]
 pub fn remove_columns_up_sql(table: &str, fields: &[Field]) -> String {
     let mut out = String::new();
     for f in fields {
+        let _ = writeln!(
+            out,
+            "-- autumn-safety: destructive \
+             -- old replicas that reference this column will fail until restarted; \
+             use expand/contract"
+        );
         let _ = writeln!(out, "ALTER TABLE {table} DROP COLUMN {};", f.name);
     }
     out
@@ -562,6 +583,37 @@ mod tests {
         let sql = add_columns_up_sql("posts", &f);
         assert!(sql.contains("ALTER TABLE posts ADD COLUMN title TEXT NOT NULL;"));
         assert!(sql.contains("ALTER TABLE posts ADD COLUMN count INTEGER NOT NULL;"));
+    }
+
+    #[test]
+    fn add_columns_up_sql_includes_safety_comment_for_not_null() {
+        let f = fields(&["title:String"]);
+        let sql = add_columns_up_sql("posts", &f);
+        assert!(
+            sql.contains("autumn-safety: potentially-blocking"),
+            "NOT NULL column must carry a safety comment; got:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn add_columns_up_sql_no_safety_comment_for_nullable() {
+        let f = fields(&["subtitle:Option<String>"]);
+        let sql = add_columns_up_sql("posts", &f);
+        assert!(
+            !sql.contains("autumn-safety"),
+            "nullable column must NOT carry a safety comment; got:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn remove_columns_up_sql_includes_safety_comment() {
+        let f = fields(&["body:String"]);
+        let sql = remove_columns_up_sql("posts", &f);
+        assert!(
+            sql.contains("autumn-safety: destructive"),
+            "DROP COLUMN must carry a safety comment; got:\n{sql}"
+        );
+        assert!(sql.contains("ALTER TABLE posts DROP COLUMN body;"));
     }
 
     #[test]

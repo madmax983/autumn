@@ -95,8 +95,12 @@ impl MetricsCollector {
     /// Record a completed request.
     pub fn record(&self, method: &str, route: &str, status: u16, latency_ms: u64) {
         self.inner.requests_total.fetch_add(1, Ordering::Relaxed);
+        self.record_status(status);
+        self.record_global_latency(latency_ms);
+        self.record_route(method, route, latency_ms);
+    }
 
-        // Status bucket
+    fn record_status(&self, status: u16) {
         match status / 100 {
             2 => self
                 .inner
@@ -120,18 +124,18 @@ impl MetricsCollector {
                 .fetch_add(1, Ordering::Relaxed),
             _ => 0,
         };
+    }
 
-        // Global latency
-        {
-            if let Ok(mut latencies) = self.inner.latencies_ms.write() {
-                if latencies.len() >= MAX_LATENCY_SAMPLES {
-                    latencies.pop_front();
-                }
-                latencies.push_back(latency_ms);
+    fn record_global_latency(&self, latency_ms: u64) {
+        if let Ok(mut latencies) = self.inner.latencies_ms.write() {
+            if latencies.len() >= MAX_LATENCY_SAMPLES {
+                latencies.pop_front();
             }
+            latencies.push_back(latency_ms);
         }
+    }
 
-        // Per-route (sharded)
+    fn record_route(&self, method: &str, route: &str, latency_ms: u64) {
         // ⚡ Bolt Optimization:
         // FNV-1a hash is faster than DefaultHasher (SipHash) for short strings like routes.
         // We don't need cryptographic security or HashDoS resistance here since this is internal.

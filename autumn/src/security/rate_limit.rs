@@ -29,6 +29,26 @@
 //! invoke the router via [`tower::ServiceExt::oneshot`] fall into this
 //! bucket and must not be throttled.
 //!
+//! # Backends
+//!
+//! The bucket store is configurable via [`RateLimitConfig::backend`]:
+//!
+//! - `"memory"` (default): in-process LRU of token buckets. Zero-config for
+//!   development. Each replica enforces the limit independently, so a
+//!   3-replica deployment permits up to 3× the configured rate.
+//! - `"redis"`: shared bucket store coordinated across replicas via an atomic
+//!   Lua script. The configured rate is enforced globally regardless of replica
+//!   count. Reuses the same Redis connection as sessions, cache, and the
+//!   scheduler.
+//!
+//! When the Redis backend is unavailable, behavior is controlled by
+//! [`RateLimitConfig::on_backend_failure`]:
+//! - `"fail_open"` (default): allow the request through, matching the
+//!   existing single-replica posture.
+//! - `"fail_closed"`: return `429` until the backend recovers.
+//!
+//! A single `tracing::warn!` is emitted per outage, not per request.
+//!
 //! # Configuration
 //!
 //! See [`RateLimitConfig`] for available settings.
@@ -38,6 +58,14 @@
 //! enabled = true
 //! requests_per_second = 10.0
 //! burst = 20
+//!
+//! # Multi-replica: share the budget across all pods
+//! backend = "redis"
+//! on_backend_failure = "fail_open"
+//!
+//! [security.rate_limit.redis]
+//! url = "redis://redis:6379"
+//! key_prefix = "myapp:rate_limit"
 //! ```
 
 use lru::LruCache;
@@ -45,7 +73,6 @@ use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroUsize;
 use std::pin::Pin;
-
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Instant;
@@ -55,10 +82,220 @@ use axum::http::{HeaderValue, Request, Response, StatusCode};
 use http::header::{HeaderName, RETRY_AFTER};
 use tower::{Layer, Service};
 
-use super::config::RateLimitConfig;
+#[cfg(feature = "redis")]
+use super::config::RateLimitBackendFailure;
+use super::config::{RateLimitBackend, RateLimitConfig};
 
 const X_RATELIMIT_LIMIT: HeaderName = HeaderName::from_static("x-ratelimit-limit");
 const X_RATELIMIT_REMAINING: HeaderName = HeaderName::from_static("x-ratelimit-remaining");
+
+/// Outcome of consuming one token from a bucket.
+#[derive(Debug, Clone, Copy)]
+enum Decision {
+    Allowed { remaining: u32 },
+    Denied { retry_after_secs: u64 },
+}
+
+// ── In-memory bucket store ────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy)]
+struct Bucket {
+    tokens: f64,
+    last_refill: Instant,
+}
+
+/// Per-IP token bucket state stored in-process.
+#[derive(Debug)]
+struct MemoryStore {
+    buckets: Mutex<LruCache<String, Bucket>>,
+}
+
+impl MemoryStore {
+    fn new() -> Self {
+        Self {
+            buckets: Mutex::new(LruCache::new(
+                NonZeroUsize::new(10_000).expect("10_000 is non-zero"),
+            )),
+        }
+    }
+
+    #[allow(clippy::significant_drop_tightening)]
+    fn decide(&self, key: &str, now: Instant, burst: f64, refill_per_sec: f64) -> Decision {
+        let tokens_after = {
+            let mut buckets = match self.buckets.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+
+            let mut bucket = buckets.get(key).copied().unwrap_or(Bucket {
+                tokens: burst,
+                last_refill: now,
+            });
+
+            let elapsed = now
+                .saturating_duration_since(bucket.last_refill)
+                .as_secs_f64();
+            bucket.tokens = elapsed.mul_add(refill_per_sec, bucket.tokens).min(burst);
+            bucket.last_refill = now;
+
+            let result = if bucket.tokens >= 1.0 {
+                bucket.tokens -= 1.0;
+                Ok(bucket.tokens)
+            } else {
+                Err(bucket.tokens)
+            };
+
+            buckets.put(key.to_owned(), bucket);
+            result
+        };
+
+        match tokens_after {
+            Ok(remaining_tokens) => {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let remaining = remaining_tokens.floor() as u32;
+                Decision::Allowed { remaining }
+            }
+            Err(current_tokens) => {
+                let deficit = 1.0 - current_tokens;
+                let secs = (deficit / refill_per_sec).ceil().max(1.0);
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let retry_after_secs = secs as u64;
+                Decision::Denied { retry_after_secs }
+            }
+        }
+    }
+}
+
+// ── Redis bucket store ────────────────────────────────────────────────────────
+
+#[cfg(feature = "redis")]
+const RATE_LIMIT_LUA: &str = include_str!("rate_limit.lua");
+
+#[cfg(feature = "redis")]
+struct RedisStore {
+    connection: redis::aio::ConnectionManager,
+    key_prefix: String,
+    failure_mode: RateLimitBackendFailure,
+    /// Set to `true` once on the first Redis error; reset when it recovers.
+    outage_logged: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(feature = "redis")]
+impl std::fmt::Debug for RedisStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RedisStore")
+            .field("key_prefix", &self.key_prefix)
+            .field("failure_mode", &self.failure_mode)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "redis")]
+impl RedisStore {
+    const fn new(
+        connection: redis::aio::ConnectionManager,
+        key_prefix: String,
+        failure_mode: RateLimitBackendFailure,
+    ) -> Self {
+        Self {
+            connection,
+            key_prefix,
+            failure_mode,
+            outage_logged: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    async fn decide(&self, key: &str, burst: f64, refill_per_sec: f64) -> Option<Decision> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let redis_key = format!("{}:{}", self.key_prefix, key);
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+
+        let script = redis::Script::new(RATE_LIMIT_LUA);
+        let result: redis::RedisResult<Vec<i64>> = {
+            let mut conn = self.connection.clone();
+            script
+                .key(&redis_key)
+                .arg(burst)
+                .arg(refill_per_sec)
+                .arg(i64::try_from(now_ms).unwrap_or(i64::MAX))
+                .invoke_async(&mut conn)
+                .await
+        };
+
+        match result {
+            Ok(values) if values.len() == 3 => {
+                // Redis recovered after an outage — reset the flag so we warn again next time.
+                self.outage_logged
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                let allowed = values[0] == 1;
+                if allowed {
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let remaining = values[1] as u32;
+                    Some(Decision::Allowed { remaining })
+                } else {
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let retry_after_secs = values[2].max(1) as u64;
+                    Some(Decision::Denied { retry_after_secs })
+                }
+            }
+            Err(err) => {
+                // Emit one warning per outage, not per request.
+                if !self
+                    .outage_logged
+                    .swap(true, std::sync::atomic::Ordering::Relaxed)
+                {
+                    tracing::warn!(
+                        error = %err,
+                        key_prefix = %self.key_prefix,
+                        "rate-limit Redis backend unavailable; \
+                         switching to on_backend_failure posture"
+                    );
+                }
+                match self.failure_mode {
+                    RateLimitBackendFailure::FailOpen => None,
+                    RateLimitBackendFailure::FailClosed => Some(Decision::Denied {
+                        retry_after_secs: 1,
+                    }),
+                }
+            }
+            Ok(values) => {
+                // Unexpected script return shape — treat as backend error.
+                if !self
+                    .outage_logged
+                    .swap(true, std::sync::atomic::Ordering::Relaxed)
+                {
+                    tracing::warn!(
+                        ?values,
+                        key_prefix = %self.key_prefix,
+                        "rate-limit Redis backend: unexpected script return value; \
+                         switching to on_backend_failure posture"
+                    );
+                }
+                match self.failure_mode {
+                    RateLimitBackendFailure::FailOpen => None,
+                    RateLimitBackendFailure::FailClosed => Some(Decision::Denied {
+                        retry_after_secs: 1,
+                    }),
+                }
+            }
+        }
+    }
+}
+
+// ── Backend enum ──────────────────────────────────────────────────────────────
+
+#[derive(Debug)]
+enum BucketBackend {
+    Memory(MemoryStore),
+    #[cfg(feature = "redis")]
+    Redis(RedisStore),
+}
+
+// ── Limiter (shared state) ────────────────────────────────────────────────────
 
 /// Shared rate limiter state.
 #[derive(Debug)]
@@ -69,13 +306,7 @@ struct Limiter {
     trust_forwarded_headers: bool,
     trusted_proxies_configured: bool,
     trusted_proxies: Vec<TrustedProxy>,
-    buckets: Mutex<LruCache<String, Bucket>>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct Bucket {
-    tokens: f64,
-    last_refill: Instant,
+    backend: BucketBackend,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -137,13 +368,6 @@ impl TrustedProxy {
     }
 }
 
-/// Outcome of consuming one token from a bucket.
-#[derive(Debug, Clone, Copy)]
-enum Decision {
-    Allowed { remaining: u32 },
-    Denied { retry_after_secs: u64 },
-}
-
 impl Limiter {
     fn from_config(config: &RateLimitConfig) -> Self {
         let burst = f64::from(config.burst.max(1));
@@ -163,6 +387,9 @@ impl Limiter {
                 })
             })
             .collect();
+
+        let backend = Self::build_backend(config);
+
         Self {
             refill_per_sec,
             burst,
@@ -170,59 +397,76 @@ impl Limiter {
             trust_forwarded_headers: config.trust_forwarded_headers,
             trusted_proxies_configured,
             trusted_proxies,
-            buckets: Mutex::new(LruCache::new(
-                NonZeroUsize::new(10_000).expect("10_000 is non-zero"),
-            )),
+            backend,
         }
     }
 
-    #[allow(clippy::significant_drop_tightening)] // lock protects the bucket mutation
-    fn decide(&self, key: &str, now: Instant) -> Decision {
-        // Scope the lock guard so it's released before we produce the final
-        // `Decision`. Keeps the critical section tight.
-        let tokens_after = {
-            let mut buckets = match self.buckets.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-
-            let mut bucket = buckets.get(key).copied().unwrap_or(Bucket {
-                tokens: self.burst,
-                last_refill: now,
-            });
-
-            let elapsed = now
-                .saturating_duration_since(bucket.last_refill)
-                .as_secs_f64();
-            bucket.tokens = elapsed
-                .mul_add(self.refill_per_sec, bucket.tokens)
-                .min(self.burst);
-            bucket.last_refill = now;
-
-            let result = if bucket.tokens >= 1.0 {
-                bucket.tokens -= 1.0;
-                Ok(bucket.tokens)
+    fn build_backend(config: &RateLimitConfig) -> BucketBackend {
+        if config.backend == RateLimitBackend::Redis {
+            #[cfg(not(feature = "redis"))]
+            {
+                tracing::warn!(
+                    "rate-limit backend = \"redis\" requires the `redis` cargo feature; \
+                     falling back to memory. Enable the feature or set backend = \"memory\"."
+                );
+                return BucketBackend::Memory(MemoryStore::new());
+            }
+        }
+        #[cfg(feature = "redis")]
+        if config.backend == RateLimitBackend::Redis {
+            if let Some(url) = config.redis.url.as_deref().filter(|u| !u.trim().is_empty()) {
+                match redis::Client::open(url) {
+                    Ok(client) => {
+                        match redis::aio::ConnectionManager::new_lazy_with_config(
+                            client,
+                            redis::aio::ConnectionManagerConfig::new(),
+                        ) {
+                            Ok(conn) => {
+                                return BucketBackend::Redis(RedisStore::new(
+                                    conn,
+                                    config.redis.key_prefix.clone(),
+                                    config.on_backend_failure,
+                                ));
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                    error = %err,
+                                    url = %url,
+                                    "rate-limit Redis backend: failed to create \
+                                     connection manager; falling back to memory"
+                                );
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            url = %url,
+                            "rate-limit Redis backend: invalid Redis URL; \
+                             falling back to memory"
+                        );
+                    }
+                }
             } else {
-                Err(bucket.tokens)
-            };
-
-            buckets.put(key.to_owned(), bucket);
-            result
-        };
-
-        match tokens_after {
-            Ok(remaining_tokens) => {
-                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                let remaining = remaining_tokens.floor() as u32;
-                Decision::Allowed { remaining }
+                tracing::warn!(
+                    "rate-limit backend = \"redis\" but no redis.url configured; \
+                     falling back to memory"
+                );
             }
-            Err(current_tokens) => {
-                let deficit = 1.0 - current_tokens;
-                let secs = (deficit / self.refill_per_sec).ceil().max(1.0);
-                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                let retry_after_secs = secs as u64;
-                Decision::Denied { retry_after_secs }
+        }
+        BucketBackend::Memory(MemoryStore::new())
+    }
+
+    /// Consume one token for `key`. Returns `None` when throttling must be bypassed
+    /// (no client, or Redis fail-open).
+    #[allow(clippy::unused_async)] // async is needed for the Redis arm when that feature is active
+    async fn decide(&self, key: &str) -> Option<Decision> {
+        match &self.backend {
+            BucketBackend::Memory(store) => {
+                Some(store.decide(key, Instant::now(), self.burst, self.refill_per_sec))
             }
+            #[cfg(feature = "redis")]
+            BucketBackend::Redis(store) => store.decide(key, self.burst, self.refill_per_sec).await,
         }
     }
 }
@@ -250,11 +494,21 @@ impl Limiter {
         let peer_ip = Self::peer_ip(req);
 
         if self.trust_forwarded_headers && self.forwarded_headers_allowed(req) {
-            let xff_ip = req
-                .headers()
-                .get("x-forwarded-for")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| self.client_ip_from_x_forwarded_for(s, peer_ip));
+            let xff_ip = {
+                let all_xff: Vec<&str> = req
+                    .headers()
+                    .get_all("x-forwarded-for")
+                    .iter()
+                    .filter_map(|v| v.to_str().ok())
+                    .collect();
+
+                if all_xff.is_empty() {
+                    None
+                } else {
+                    let joined = all_xff.join(", ");
+                    self.client_ip_from_x_forwarded_for(&joined, peer_ip)
+                }
+            };
 
             if xff_ip.is_some() {
                 return xff_ip;
@@ -328,6 +582,8 @@ impl Limiter {
     }
 }
 
+// ── Tower layer & service ─────────────────────────────────────────────────────
+
 /// Tower [`Layer`] that applies rate limiting.
 ///
 /// Applied automatically when `security.rate_limit.enabled = true`.
@@ -381,15 +637,8 @@ where
     }
 
     fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
-        let now = Instant::now();
-        // When no identifiable client is present (no trusted forwarding
-        // header, no ConnectInfo), bypass rate limiting. This covers
-        // in-process callers like the static site generator and test
-        // harnesses that invoke the router via `oneshot`.
-        let decision = self
-            .limiter
-            .client_ip(&req)
-            .map(|key| self.limiter.decide(&key, now));
+        // Extract the client key synchronously (no I/O required).
+        let client_key = self.limiter.client_ip(&req);
 
         let limiter = Arc::clone(&self.limiter);
         let mut inner = self.inner.clone();
@@ -397,6 +646,12 @@ where
         std::mem::swap(&mut self.inner, &mut inner);
 
         Box::pin(async move {
+            // Resolve the rate-limit decision (may be async for the Redis backend).
+            let decision = match client_key {
+                Some(key) => limiter.decide(&key).await,
+                None => None,
+            };
+
             match decision {
                 Some(Decision::Denied { retry_after_secs }) => {
                     let mut response = Response::new(ResBody::default());
@@ -438,6 +693,7 @@ mod tests {
             // they don't need a real TCP listener.
             trust_forwarded_headers: true,
             trusted_proxies: Vec::new(),
+            ..Default::default()
         }
     }
 
@@ -463,6 +719,7 @@ mod tests {
             burst: 5,
             trust_forwarded_headers: trust,
             trusted_proxies: Vec::new(),
+            ..Default::default()
         })
     }
 
@@ -473,6 +730,7 @@ mod tests {
             burst: 5,
             trust_forwarded_headers: true,
             trusted_proxies: proxies.iter().map(|proxy| (*proxy).to_owned()).collect(),
+            ..Default::default()
         })
     }
 
@@ -794,6 +1052,7 @@ mod tests {
             burst: 1,
             trust_forwarded_headers: false,
             trusted_proxies: Vec::new(),
+            ..Default::default()
         };
         let app = app(&config);
         let peer: SocketAddr = "198.51.100.1:2000"
@@ -834,6 +1093,7 @@ mod tests {
             burst: 1,
             trust_forwarded_headers: true,
             trusted_proxies: vec!["203.0.113.10".to_owned()],
+            ..Default::default()
         };
         let app = app(&config);
 
@@ -884,6 +1144,7 @@ mod tests {
             burst: 1,
             trust_forwarded_headers: false,
             trusted_proxies: Vec::new(),
+            ..Default::default()
         };
         let app = app(&config);
 
@@ -915,6 +1176,7 @@ mod tests {
             burst: 1,
             trust_forwarded_headers: true,
             trusted_proxies: vec!["203.0.113.10".to_owned()],
+            ..Default::default()
         };
         let app = app(&config);
 
@@ -948,6 +1210,7 @@ mod tests {
             burst: 1,
             trust_forwarded_headers: true,
             trusted_proxies: vec!["203.0.113.10:443".to_owned(), "198.51.100.0/999".to_owned()],
+            ..Default::default()
         };
         let app = app(&config);
         let peer: SocketAddr = "192.0.2.44:4000"
@@ -978,5 +1241,55 @@ mod tests {
             .await
             .expect("infallible response builder");
         assert_eq!(blocked.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    // ── Redis backend build_backend fallback tests ────────────────────────────
+
+    #[cfg(feature = "redis")]
+    #[test]
+    fn build_backend_falls_back_to_memory_when_redis_url_missing() {
+        use super::super::config::{
+            RateLimitBackend, RateLimitBackendFailure, RateLimitRedisConfig,
+        };
+        let config = RateLimitConfig {
+            enabled: true,
+            requests_per_second: 10.0,
+            burst: 5,
+            trust_forwarded_headers: false,
+            trusted_proxies: Vec::new(),
+            backend: RateLimitBackend::Redis,
+            redis: RateLimitRedisConfig {
+                url: None,
+                key_prefix: "test:rl".to_owned(),
+            },
+            on_backend_failure: RateLimitBackendFailure::FailOpen,
+        };
+        // When no Redis URL is provided, build_backend must not panic and the
+        // limiter must still enforce in-memory rate limits.
+        let limiter = Limiter::from_config(&config);
+        assert!(matches!(limiter.backend, BucketBackend::Memory(_)));
+    }
+
+    #[cfg(feature = "redis")]
+    #[test]
+    fn build_backend_falls_back_to_memory_for_invalid_redis_url() {
+        use super::super::config::{
+            RateLimitBackend, RateLimitBackendFailure, RateLimitRedisConfig,
+        };
+        let config = RateLimitConfig {
+            enabled: true,
+            requests_per_second: 10.0,
+            burst: 5,
+            trust_forwarded_headers: false,
+            trusted_proxies: Vec::new(),
+            backend: RateLimitBackend::Redis,
+            redis: RateLimitRedisConfig {
+                url: Some("not_a_valid_redis_url://???".to_owned()),
+                key_prefix: "test:rl".to_owned(),
+            },
+            on_backend_failure: RateLimitBackendFailure::FailClosed,
+        };
+        let limiter = Limiter::from_config(&config);
+        assert!(matches!(limiter.backend, BucketBackend::Memory(_)));
     }
 }

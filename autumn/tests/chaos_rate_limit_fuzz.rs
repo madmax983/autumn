@@ -38,6 +38,7 @@ proptest! {
                     burst: 2,
                     trust_forwarded_headers: true,
                     trusted_proxies: Vec::new(),
+                    ..Default::default()
                 };
                 let layer = RateLimitLayer::from_config(&config);
                 let mut svc = layer.layer(MockService);

@@ -16,6 +16,7 @@ mod seed;
 mod setup;
 mod task;
 mod token;
+mod webhook;
 /// The Autumn web framework CLI.
 #[derive(Parser)]
 #[command(name = "autumn", version, about = "The Autumn web framework CLI")]
@@ -168,6 +169,9 @@ enum Commands {
     #[command(subcommand, verbatim_doc_comment)]
     Release(ReleaseCommands),
 
+    /// Simulate a signed webhook request to the local application.
+    #[command(subcommand, verbatim_doc_comment)]
+    Webhook(WebhookCommands),
     /// Issue and revoke API bearer tokens backed by the `api_tokens` table.
     ///
     /// Requires the `api_tokens` table to exist. Run `autumn migrate` first;
@@ -295,6 +299,43 @@ enum Commands {
 enum MigrateCommands {
     /// Show migration status (applied and pending)
     Status,
+    /// Run a production-safety preflight check on all migration SQL files.
+    ///
+    /// Classifies every `up.sql` in the migrations directory into one of:
+    /// safe, potentially-blocking, destructive, irreversible, data-backfill,
+    /// or manual-review-required.
+    ///
+    /// Exits with code 0 when all migrations are safe for a rolling deploy.
+    /// Exits with code 1 and prints a detailed report when any unsafe or
+    /// unclassified operations are detected.
+    ///
+    /// Does not require a database connection — safe to run in CI before deploy.
+    ///
+    /// # Example
+    ///
+    ///   autumn migrate check
+    #[command(verbatim_doc_comment)]
+    Check,
+}
+
+/// Subcommands for `autumn token`.
+
+#[derive(Subcommand)]
+enum WebhookCommands {
+    /// Send a simulated webhook request with a generated HMAC signature.
+    Sim {
+        /// The provider to simulate (stripe, github, slack, generic).
+        provider: String,
+        /// The target URL to send the webhook to.
+        url: String,
+        /// The webhook secret used to sign the request.
+        #[arg(long)]
+        #[arg(long, env = "AUTUMN_WEBHOOK_SECRET")]
+        secret: String,
+        /// The payload to send in the request body.
+        #[arg(long)]
+        payload: String,
+    },
 }
 
 /// Subcommands for `autumn token`.
@@ -483,6 +524,10 @@ enum GenerateCommands {
         /// Add a derived repository query, e.g. `find_by_tag:tag`.
         #[arg(long, value_name = "METHOD:FIELD")]
         query: Vec<String>,
+        /// Load scaffold metadata from a TOML config file (e.g. `autumn.generate.toml`).
+        /// CLI flags take precedence over values in the config file.
+        #[arg(long, value_name = "PATH")]
+        config: Option<std::path::PathBuf>,
         /// Print the file plan and exit without writing anything.
         #[arg(long)]
         dry_run: bool,
@@ -508,6 +553,7 @@ fn run_command(command: Commands) {
         Commands::Migrate { action } => {
             let action = match action {
                 Some(MigrateCommands::Status) => migrate::MigrateAction::Status,
+                Some(MigrateCommands::Check) => migrate::MigrateAction::Check,
                 None => migrate::MigrateAction::Run,
             };
             migrate::run(action);
@@ -525,6 +571,13 @@ fn run_command(command: Commands) {
                 with_seed,
             },
         ),
+
+        Commands::Webhook(WebhookCommands::Sim {
+            provider,
+            url,
+            secret,
+            payload,
+        }) => webhook::run_sim(&provider, &url, &secret, &payload),
         Commands::Seed { profile, package } => seed::run(&profile, package.as_deref()),
         Commands::Task {
             package,
@@ -768,17 +821,36 @@ fn run_generate_command(cmd: GenerateCommands) {
             validate,
             default,
             query,
+            config,
             dry_run,
             force,
         } => {
-            let options = generate::scaffold::ScaffoldOptions {
-                model: generate::model::ModelOptions {
-                    indexes: index,
-                    validations: validate,
-                    defaults: default,
+            let config_entry = config.as_ref().map_or_else(
+                generate::config::ScaffoldConfigEntry::default,
+                |path| match generate::config::read_scaffold_config(path, &name) {
+                    Ok(Some(e)) => e,
+                    Ok(None) => {
+                        eprintln!(
+                            "Error: no [scaffold.{}] section found in {}",
+                            generate::naming::pascal(&name),
+                            path.display()
+                        );
+                        std::process::exit(1);
+                    }
+                    Err(e) => {
+                        eprintln!("Error: {e}");
+                        std::process::exit(1);
+                    }
                 },
-                queries: query,
-            };
+            );
+            let (fields, options) = generate::config::merge_config_with_cli(
+                config_entry,
+                &fields,
+                &index,
+                &validate,
+                &default,
+                &query,
+            );
             generate::scaffold::run(&name, &fields, generate::Flags { dry_run, force }, &options);
         }
     }
@@ -969,6 +1041,23 @@ mod tests {
                 action: Some(MigrateCommands::Status)
             }
         ));
+    }
+
+    #[test]
+    fn parse_migrate_check() {
+        let cli = Cli::try_parse_from(["autumn", "migrate", "check"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Migrate {
+                action: Some(MigrateCommands::Check)
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_migrate_no_subcommand_runs_migrations() {
+        let cli = Cli::try_parse_from(["autumn", "migrate"]).unwrap();
+        assert!(matches!(cli.command, Commands::Migrate { action: None }));
     }
 
     #[test]
@@ -1165,6 +1254,26 @@ mod tests {
         assert_eq!(validate, vec!["url=url"]);
         assert_eq!(default, vec!["alive=true"]);
         assert_eq!(query, vec!["find_by_alive:alive"]);
+    }
+
+    #[test]
+    fn parse_generate_scaffold_config_flag() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "generate",
+            "scaffold",
+            "Post",
+            "--config",
+            "autumn.generate.toml",
+        ])
+        .unwrap();
+        let Commands::Generate(GenerateCommands::Scaffold { config, .. }) = cli.command else {
+            panic!("expected generate scaffold");
+        };
+        assert_eq!(
+            config,
+            Some(std::path::PathBuf::from("autumn.generate.toml"))
+        );
     }
 
     #[test]
