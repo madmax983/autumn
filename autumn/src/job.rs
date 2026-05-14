@@ -2895,12 +2895,28 @@ fn record_pg_lifecycle_after_ack(
 ) -> bool {
     if !ack_applied {
         // The claim was evicted by stale-claim recovery before this ack ran.
-        // Decrement in_flight so /actuator metrics don't leak; the recovery
-        // task already transitioned the row in the database.
-        state
-            .job_registry
-            .record_retry(job_name, "visibility timeout expired", 0);
-        job_admin.record_retrying(job_id, "visibility timeout expired");
+        // The recovery task already transitioned the row in the database:
+        // - non-terminal attempts are requeued (attempt < max_attempts)
+        // - terminal attempts are dead-lettered (attempt >= max_attempts)
+        // Mirror whichever outcome the worker intended so /actuator metrics stay
+        // consistent with the database row.
+        match lifecycle {
+            PgLifecycleRecord::Failure { error } => {
+                // Stale recovery dead-lettered the row (final attempt).
+                state
+                    .job_registry
+                    .record_failure(job_name, error.to_owned(), true);
+                job_admin.record_failure(job_id, error.to_owned());
+            }
+            _ => {
+                // Non-terminal or successful outcome: decrement in_flight and
+                // mark as retrying; the row is already back in the queue.
+                state
+                    .job_registry
+                    .record_retry(job_name, "visibility timeout expired", 0);
+                job_admin.record_retrying(job_id, "visibility timeout expired");
+            }
+        }
         return false;
     }
 
@@ -5830,7 +5846,10 @@ mod tests {
         }
 
         #[test]
-        fn pg_failure_lifecycle_is_skipped_when_ack_does_not_apply() {
+        fn pg_terminal_failure_stale_eviction_records_dead_letter() {
+            // When a final-attempt job's ack returns Ok(false), stale-claim
+            // recovery already dead-lettered the row; total_failures and
+            // dead_letters must be incremented to stay in sync with the DB.
             let state = AppState::for_test().with_profile("dev");
             state.job_registry().register("slow_failure");
             state.job_registry().record_enqueue("slow_failure");
@@ -5854,10 +5873,10 @@ mod tests {
 
             let status = state.job_registry().snapshot()["slow_failure"].clone();
             assert_eq!(status.in_flight, 0);
-            assert_eq!(status.total_failures, 0);
-            assert_eq!(status.dead_letters, 0);
+            assert_eq!(status.total_failures, 1, "terminal stale eviction must increment total_failures");
+            assert_eq!(status.dead_letters, 1, "terminal stale eviction must increment dead_letters");
             let snapshot = job_admin.snapshot_sync(&JobAdminQuery::default());
-            assert_eq!(snapshot.failed.total, 0);
+            assert_eq!(snapshot.failed.total, 1, "failed list must show the dead-lettered job");
             assert_eq!(snapshot.running.total, 0);
         }
 
@@ -6003,6 +6022,57 @@ mod tests {
                 .expect("admin record")
                 .status;
             assert_eq!(admin_status, JobAdminStatus::Retrying);
+        }
+
+        #[test]
+        fn pg_terminal_stale_eviction_records_failure_and_dead_letter() {
+            // When ack returns Ok(false) on a final-attempt job (lifecycle=Failure),
+            // stale recovery already dead-lettered the row in the DB.  The
+            // in-memory metrics must reflect a dead-letter, not a retry.
+            let state = AppState::for_test().with_profile("dev");
+            state.job_registry().register("terminal_job");
+            state.job_registry().record_enqueue("terminal_job");
+            state.job_registry().record_start("terminal_job");
+            let job_admin = JobAdminMemoryBackend::new_for_test(32);
+            let job_id =
+                job_admin.record_enqueue_for_test("terminal_job", serde_json::json!({}), 1, 1);
+            job_admin.record_start_for_test(&job_id, 1);
+
+            assert!(!record_pg_lifecycle_ack_result(
+                Ok(false),
+                "terminal_job",
+                &job_id,
+                "failure",
+                PgLifecycleRecord::Failure {
+                    error: "handler timed out"
+                },
+                &state,
+                &job_admin
+            ));
+
+            let status = state.job_registry().snapshot()["terminal_job"].clone();
+            assert_eq!(status.in_flight, 0, "in_flight must be balanced");
+            assert_eq!(
+                status.total_failures, 1,
+                "terminal stale eviction must increment total_failures"
+            );
+            assert_eq!(
+                status.dead_letters, 1,
+                "terminal stale eviction must increment dead_letters"
+            );
+            let admin_status = job_admin
+                .inner
+                .read()
+                .expect("job admin lock")
+                .records
+                .get(&job_id)
+                .expect("admin record")
+                .status;
+            assert_eq!(
+                admin_status,
+                JobAdminStatus::Failed,
+                "admin must show Failed, not Retrying, after terminal stale eviction"
+            );
         }
 
         #[test]
