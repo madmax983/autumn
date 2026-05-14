@@ -352,17 +352,9 @@ fn is_volatile_function_default(default_expr: &str) -> bool {
 }
 
 /// Apply all pattern checks to a single normalized (lowercase, single-spaced) statement.
-#[allow(clippy::too_many_lines)]
-fn classify_statement(normalized: &str) -> Vec<SafetyFinding> {
-    if normalized.is_empty() {
-        return vec![];
-    }
-
-    let mut findings = Vec::new();
-
-    // DROP TABLE — check first; it subsumes DROP COLUMN detection
+fn check_drop_operations(normalized: &str) -> Option<SafetyFinding> {
     if normalized.starts_with("drop table") {
-        findings.push(SafetyFinding {
+        return Some(SafetyFinding {
             operation: "DROP TABLE".to_owned(),
             risk: RiskLevel::Destructive,
             why: "Drops the entire table and all its data. Old replicas that reference this \
@@ -370,12 +362,10 @@ fn classify_statement(normalized: &str) -> Vec<SafetyFinding> {
             next_action: "Use expand/contract: first deploy code that stops using the table, \
                           then drop it in a subsequent release.",
         });
-        return findings;
     }
 
-    // DROP VIEW
     if normalized.starts_with("drop view") {
-        findings.push(SafetyFinding {
+        return Some(SafetyFinding {
             operation: "DROP VIEW".to_owned(),
             risk: RiskLevel::Destructive,
             why: "Drops the view. Old replicas that query this view will error immediately \
@@ -383,12 +373,10 @@ fn classify_statement(normalized: &str) -> Vec<SafetyFinding> {
             next_action: "Use expand/contract: first deploy code that no longer references the \
                           view, then drop it in a subsequent release.",
         });
-        return findings;
     }
 
-    // DROP SEQUENCE
     if normalized.starts_with("drop sequence") {
-        findings.push(SafetyFinding {
+        return Some(SafetyFinding {
             operation: "DROP SEQUENCE".to_owned(),
             risk: RiskLevel::Destructive,
             why: "Dropping a sequence breaks any column that uses it as a default \
@@ -397,12 +385,10 @@ fn classify_statement(normalized: &str) -> Vec<SafetyFinding> {
             next_action: "Use expand/contract: first deploy code that no longer relies on this \
                           sequence, then drop it in a subsequent release.",
         });
-        return findings;
     }
 
-    // DROP COLUMN
     if normalized.contains(" drop column ") {
-        findings.push(SafetyFinding {
+        return Some(SafetyFinding {
             operation: "DROP COLUMN".to_owned(),
             risk: RiskLevel::Destructive,
             why: "Removes a column and its data. Old replicas that SELECT or INSERT this column \
@@ -412,9 +398,12 @@ fn classify_statement(normalized: &str) -> Vec<SafetyFinding> {
         });
     }
 
-    // RENAME COLUMN
+    None
+}
+
+fn check_rename_operations(normalized: &str) -> Option<SafetyFinding> {
     if normalized.contains(" rename column ") {
-        findings.push(SafetyFinding {
+        return Some(SafetyFinding {
             operation: "RENAME COLUMN".to_owned(),
             risk: RiskLevel::Irreversible,
             why: "Renaming a column breaks queries from old replicas that still reference the \
@@ -424,12 +413,11 @@ fn classify_statement(normalized: &str) -> Vec<SafetyFinding> {
         });
     }
 
-    // RENAME TABLE
     if normalized.contains("alter table")
         && normalized.contains(" rename to ")
         && !normalized.contains(" rename column ")
     {
-        findings.push(SafetyFinding {
+        return Some(SafetyFinding {
             operation: "RENAME TABLE".to_owned(),
             risk: RiskLevel::Irreversible,
             why: "Renaming a table breaks all queries from old replicas that reference the \
@@ -439,11 +427,14 @@ fn classify_statement(normalized: &str) -> Vec<SafetyFinding> {
         });
     }
 
-    // ALTER COLUMN TYPE
+    None
+}
+
+fn check_alter_column_type(normalized: &str) -> Option<SafetyFinding> {
     if let Some(i) = normalized.find("alter column")
         && normalized[i..].contains(" type ")
     {
-        findings.push(SafetyFinding {
+        return Some(SafetyFinding {
             operation: "ALTER COLUMN TYPE".to_owned(),
             risk: RiskLevel::Destructive,
             why: "Changing a column's type rewrites the column data and may be incompatible \
@@ -452,121 +443,109 @@ fn classify_statement(normalized: &str) -> Vec<SafetyFinding> {
                           use the new column, then drop the old one.",
         });
     }
+    None
+}
 
-    // ADD COLUMN NOT NULL — checked per subcommand so that a DEFAULT on one column
-    // in a multi-column ALTER TABLE does not suppress the check for other columns.
-    //
-    // Two unsafe cases:
-    //  1. No DEFAULT at all — Postgres must validate every existing row under lock.
-    //  2. Volatile DEFAULT (contains a function call) — Postgres must evaluate the
-    //     function per-row and cannot use the fast constant-default path (PG 11+),
-    //     so the table is still rewritten under the exclusive lock.
-    if normalized.starts_with("alter table") {
-        for subcommand in alter_table_subcommands(normalized) {
-            if subcommand.starts_with("add column ") && subcommand.contains("not null") {
-                let has_default = subcommand.contains(" default ");
-                // A DEFAULT is "volatile" when it is a VOLATILE function call —
-                // i.e. one that Postgres must evaluate per-row, preventing the PG11+
-                // fast-constant-default path.  STABLE functions (e.g. `now()`) are
-                // evaluated once at statement time and do not require a table rewrite.
-                let has_volatile_default = has_default
-                    && subcommand.find(" default ").is_some_and(|pos| {
-                        let default_expr = subcommand[pos + " default ".len()..].trim();
-                        is_volatile_function_default(default_expr)
-                    });
+fn check_alter_table(normalized: &str) -> Vec<SafetyFinding> {
+    let mut findings = Vec::new();
+    if !normalized.starts_with("alter table") {
+        return findings;
+    }
 
-                if !has_default {
-                    findings.push(SafetyFinding {
-                        operation: "ADD COLUMN NOT NULL (no default)".to_owned(),
-                        risk: RiskLevel::PotentiallyBlocking,
-                        why: "Adding a NOT NULL column without a DEFAULT forces Postgres to \
-                              validate every existing row under an exclusive lock. On a large \
-                              table this may time out.",
-                        next_action: "Provide a constant DEFAULT value, or add the column as \
-                                      nullable first, backfill existing rows, then add the NOT \
-                                      NULL constraint in a later migration.",
-                    });
-                    break; // one finding per statement is sufficient
-                } else if has_volatile_default {
-                    findings.push(SafetyFinding {
-                        operation: "ADD COLUMN NOT NULL (volatile default)".to_owned(),
-                        risk: RiskLevel::PotentiallyBlocking,
-                        why: "A volatile function-call DEFAULT (e.g. random(), gen_random_uuid()) \
-                              is evaluated per-row: Postgres cannot use the PG11+ fast-constant \
-                              path and must rewrite the entire table under an exclusive lock.",
-                        next_action: "Use a constant literal DEFAULT instead (e.g. DEFAULT 0, \
-                                      DEFAULT ''), or add the column nullable, backfill, then \
-                                      add the NOT NULL constraint in a later migration.",
-                    });
-                    break; // one finding per statement is sufficient
-                }
+    let subcommands = alter_table_subcommands(normalized);
+
+    for subcommand in &subcommands {
+        if subcommand.starts_with("add column ") && subcommand.contains("not null") {
+            let has_default = subcommand.contains(" default ");
+            let has_volatile_default = has_default
+                && subcommand.find(" default ").is_some_and(|pos| {
+                    let default_expr = subcommand[pos + " default ".len()..].trim();
+                    is_volatile_function_default(default_expr)
+                });
+
+            if !has_default {
+                findings.push(SafetyFinding {
+                    operation: "ADD COLUMN NOT NULL (no default)".to_owned(),
+                    risk: RiskLevel::PotentiallyBlocking,
+                    why: "Adding a NOT NULL column without a DEFAULT forces Postgres to \
+                          validate every existing row under an exclusive lock. On a large \
+                          table this may time out.",
+                    next_action: "Provide a constant DEFAULT value, or add the column as \
+                                  nullable first, backfill existing rows, then add the NOT \
+                                  NULL constraint in a later migration.",
+                });
+                break;
+            } else if has_volatile_default {
+                findings.push(SafetyFinding {
+                    operation: "ADD COLUMN NOT NULL (volatile default)".to_owned(),
+                    risk: RiskLevel::PotentiallyBlocking,
+                    why: "A volatile function-call DEFAULT (e.g. random(), gen_random_uuid()) \
+                          is evaluated per-row: Postgres cannot use the PG11+ fast-constant \
+                          path and must rewrite the entire table under an exclusive lock.",
+                    next_action: "Use a constant literal DEFAULT instead (e.g. DEFAULT 0, \
+                                  DEFAULT ''), or add the column nullable, backfill, then \
+                                  add the NOT NULL constraint in a later migration.",
+                });
+                break;
             }
         }
     }
 
-    // ADD COLUMN with inline UNIQUE — implicitly builds a non-concurrent unique index
-    // ADD COLUMN with inline REFERENCES — scans existing rows to validate the FK
-    if normalized.starts_with("alter table") {
-        for subcommand in alter_table_subcommands(normalized) {
-            if !subcommand.starts_with("add column ") {
-                continue;
-            }
-            if has_inline_unique_constraint(subcommand) {
-                findings.push(SafetyFinding {
-                    operation: "ADD COLUMN UNIQUE (inline constraint)".to_owned(),
-                    risk: RiskLevel::PotentiallyBlocking,
-                    why: "An inline UNIQUE constraint implicitly builds a non-concurrent unique \
-                          index under an exclusive table lock, blocking all reads and writes during \
-                          the build.",
-                    next_action: "Add the column without UNIQUE first, then create the unique \
-                                  index in a separate migration using \
-                                  `CREATE UNIQUE INDEX CONCURRENTLY`.",
-                });
-            }
-            if subcommand.contains(" references ") {
-                findings.push(SafetyFinding {
-                    operation: "ADD COLUMN REFERENCES (inline FK)".to_owned(),
-                    risk: RiskLevel::PotentiallyBlocking,
-                    why: "An inline REFERENCES constraint scans all existing rows to validate the \
-                          foreign key, acquiring locks that can block writes on the referenced \
-                          table.",
-                    next_action: "Add the column without the constraint first, then add the FK \
-                                  using `ADD CONSTRAINT ... FOREIGN KEY ... NOT VALID` and \
-                                  validate separately with `VALIDATE CONSTRAINT`.",
-                });
-            }
+    for subcommand in &subcommands {
+        if !subcommand.starts_with("add column ") {
+            continue;
         }
-    }
-
-    // Unclassified ALTER TABLE subcommand — fires when any subcommand in the statement
-    // is not covered by the specific rules above. Checking all subcommands individually
-    // prevents a known-safe subcommand (e.g. ADD COLUMN) from hiding an unknown one
-    // (e.g. DROP CONSTRAINT) in the same multi-action ALTER TABLE.
-    if normalized.starts_with("alter table") {
-        let subcommands = alter_table_subcommands(normalized);
-        let all_known = subcommands.iter().all(|s| is_known_alter_subcommand(s));
-        if !all_known {
+        if has_inline_unique_constraint(subcommand) {
             findings.push(SafetyFinding {
-                operation: "Unclassified ALTER TABLE".to_owned(),
-                risk: RiskLevel::ManualReview,
-                why: "Autumn cannot automatically assess the safety of this ALTER TABLE \
-                      subcommand for a rolling deploy. Some operations (e.g. DROP CONSTRAINT, \
-                      ALTER COLUMN SET NOT NULL, ADD CONSTRAINT) acquire table locks or validate \
-                      existing rows.",
-                next_action: "Review the statement manually. If it is safe, you may suppress \
-                              this finding by adding `-- autumn-safety: reviewed` above the \
-                              statement.",
+                operation: "ADD COLUMN UNIQUE (inline constraint)".to_owned(),
+                risk: RiskLevel::PotentiallyBlocking,
+                why: "An inline UNIQUE constraint implicitly builds a non-concurrent unique \
+                      index under an exclusive table lock, blocking all reads and writes during \
+                      the build.",
+                next_action: "Add the column without UNIQUE first, then create the unique \
+                              index in a separate migration using \
+                              `CREATE UNIQUE INDEX CONCURRENTLY`.",
+            });
+        }
+        if subcommand.contains(" references ") {
+            findings.push(SafetyFinding {
+                operation: "ADD COLUMN REFERENCES (inline FK)".to_owned(),
+                risk: RiskLevel::PotentiallyBlocking,
+                why: "An inline REFERENCES constraint scans all existing rows to validate the \
+                      foreign key, acquiring locks that can block writes on the referenced \
+                      table.",
+                next_action: "Add the column without the constraint first, then add the FK \
+                              using `ADD CONSTRAINT ... FOREIGN KEY ... NOT VALID` and \
+                              validate separately with `VALIDATE CONSTRAINT`.",
             });
         }
     }
 
-    // CREATE INDEX / CREATE UNIQUE INDEX without CONCURRENTLY
+    let all_known = subcommands.iter().all(|s| is_known_alter_subcommand(s));
+    if !all_known {
+        findings.push(SafetyFinding {
+            operation: "Unclassified ALTER TABLE".to_owned(),
+            risk: RiskLevel::ManualReview,
+            why: "Autumn cannot automatically assess the safety of this ALTER TABLE \
+                  subcommand for a rolling deploy. Some operations (e.g. DROP CONSTRAINT, \
+                  ALTER COLUMN SET NOT NULL, ADD CONSTRAINT) acquire table locks or validate \
+                  existing rows.",
+            next_action: "Review the statement manually. If it is safe, you may suppress \
+                          this finding by adding `-- autumn-safety: reviewed` above the \
+                          statement.",
+        });
+    }
+
+    findings
+}
+
+fn check_index_operations(normalized: &str) -> Option<SafetyFinding> {
     let is_create_index =
         normalized.starts_with("create index") || normalized.starts_with("create unique index");
     let is_concurrent = normalized.starts_with("create index concurrently")
         || normalized.starts_with("create unique index concurrently");
     if is_create_index && !is_concurrent {
-        findings.push(SafetyFinding {
+        return Some(SafetyFinding {
             operation: "CREATE INDEX (non-concurrent)".to_owned(),
             risk: RiskLevel::PotentiallyBlocking,
             why: "Non-concurrent index creation holds an exclusive table lock for the entire \
@@ -576,13 +555,27 @@ fn classify_statement(normalized: &str) -> Vec<SafetyFinding> {
         });
     }
 
-    // Data backfill — bulk DML inside a migration requires a separate job
+    if normalized.starts_with("drop index") && !normalized.starts_with("drop index concurrently ") {
+        return Some(SafetyFinding {
+            operation: "DROP INDEX (non-concurrent)".to_owned(),
+            risk: RiskLevel::PotentiallyBlocking,
+            why: "Non-concurrent DROP INDEX acquires an AccessExclusiveLock on the table, \
+                  blocking all reads and writes for the duration of the drop.",
+            next_action: "Use DROP INDEX CONCURRENTLY to avoid the exclusive table lock. \
+                          Add `run_in_transaction = false` to the migration's `metadata.toml`.",
+        });
+    }
+
+    None
+}
+
+fn check_data_backfill(normalized: &str) -> Option<SafetyFinding> {
     if normalized.starts_with("update ")
         || normalized.starts_with("insert into ")
         || normalized.starts_with("delete from ")
         || normalized.starts_with("merge into ")
     {
-        findings.push(SafetyFinding {
+        return Some(SafetyFinding {
             operation: "Bulk DML (data backfill)".to_owned(),
             risk: RiskLevel::DataBackfill,
             why: "Running bulk UPDATE or INSERT inside a migration locks rows for the duration \
@@ -595,10 +588,6 @@ fn classify_statement(normalized: &str) -> Vec<SafetyFinding> {
         });
     }
 
-    // CTE-prefixed bulk DML — WITH … UPDATE / DELETE / INSERT
-    // A CTE starts with `with` so the plain DML checks above don't fire.
-    // Check both the outer statement (`) update/delete/insert`) and CTE bodies
-    // (`(update/delete/insert`) to catch data-modifying CTEs followed by SELECT.
     if normalized.starts_with("with ")
         && (normalized.contains(") update ")
             || normalized.contains(") delete ")
@@ -607,7 +596,7 @@ fn classify_statement(normalized: &str) -> Vec<SafetyFinding> {
             || normalized.contains("(delete ")
             || normalized.contains("(insert into "))
     {
-        findings.push(SafetyFinding {
+        return Some(SafetyFinding {
             operation: "Bulk DML (data backfill via CTE)".to_owned(),
             risk: RiskLevel::DataBackfill,
             why: "A CTE that writes (UPDATE, DELETE, INSERT) locks rows for the duration of the \
@@ -617,24 +606,12 @@ fn classify_statement(normalized: &str) -> Vec<SafetyFinding> {
         });
     }
 
-    // DROP INDEX (non-concurrent) — holds an exclusive table lock
-    // Use token-aware check: `concurrently` must be the SQL option immediately after
-    // `drop index`, not a substring of the index name (e.g. idx_concurrently).
-    if normalized.starts_with("drop index") && !normalized.starts_with("drop index concurrently ") {
-        findings.push(SafetyFinding {
-            operation: "DROP INDEX (non-concurrent)".to_owned(),
-            risk: RiskLevel::PotentiallyBlocking,
-            why: "Non-concurrent DROP INDEX acquires an AccessExclusiveLock on the table, \
-                  blocking all reads and writes for the duration of the drop.",
-            next_action: "Use DROP INDEX CONCURRENTLY to avoid the exclusive table lock. \
-                          Add `run_in_transaction = false` to the migration's `metadata.toml`.",
-        });
-    }
+    None
+}
 
-    // ALTER TYPE RENAME VALUE — renaming an enum label breaks old replicas that
-    // still INSERT or compare against the old label during a rolling deploy.
+fn check_type_operations(normalized: &str) -> Option<SafetyFinding> {
     if normalized.starts_with("alter type") && normalized.contains(" rename value ") {
-        findings.push(SafetyFinding {
+        return Some(SafetyFinding {
             operation: "ALTER TYPE RENAME VALUE".to_owned(),
             risk: RiskLevel::Irreversible,
             why: "Renaming an enum label breaks old replicas that still insert, compare, or \
@@ -642,12 +619,10 @@ fn classify_statement(normalized: &str) -> Vec<SafetyFinding> {
             next_action: "Use expand/contract: add a new enum value, migrate all writes to use \
                           it, then remove the old value in a subsequent release.",
         });
-        return findings;
     }
 
-    // ALTER TYPE RENAME TO — renaming the type itself breaks references in old replicas.
     if normalized.starts_with("alter type") && normalized.contains(" rename to ") {
-        findings.push(SafetyFinding {
+        return Some(SafetyFinding {
             operation: "ALTER TYPE RENAME".to_owned(),
             risk: RiskLevel::Irreversible,
             why: "Renaming a type breaks all references to its old name in old replicas, \
@@ -655,13 +630,15 @@ fn classify_statement(normalized: &str) -> Vec<SafetyFinding> {
             next_action: "Coordinate a maintenance window or use expand/contract by creating \
                           the new type, migrating columns/code, then dropping the old one.",
         });
-        return findings;
     }
 
-    // Generic catch-all — DDL/DML not matched by any rule above
+    None
+}
+
+fn check_unclassified(normalized: &str) -> Option<SafetyFinding> {
     let is_known_start = normalized.starts_with("drop table")
         || normalized.starts_with("drop index")
-        || normalized.starts_with("alter table") // unclassified subcommands handled above
+        || normalized.starts_with("alter table")
         || normalized.starts_with("create table")
         || normalized.starts_with("create index")
         || normalized.starts_with("create unique index")
@@ -689,7 +666,7 @@ fn classify_statement(normalized: &str) -> Vec<SafetyFinding> {
         || normalized.starts_with("revoke ");
 
     if starts_with_ddl_keyword && !is_known_start {
-        findings.push(SafetyFinding {
+        return Some(SafetyFinding {
             operation: "Unclassified DDL".to_owned(),
             risk: RiskLevel::ManualReview,
             why: "Autumn cannot automatically assess the safety of this statement for a rolling \
@@ -698,6 +675,50 @@ fn classify_statement(normalized: &str) -> Vec<SafetyFinding> {
             next_action: "Review the statement manually. If it is safe, you may suppress this \
                           finding by adding `-- autumn-safety: reviewed` above the statement.",
         });
+    }
+
+    None
+}
+
+fn classify_statement(normalized: &str) -> Vec<SafetyFinding> {
+    if normalized.is_empty() {
+        return vec![];
+    }
+
+    let mut findings = Vec::new();
+
+    if let Some(finding) = check_drop_operations(normalized) {
+        findings.push(finding);
+        if normalized.starts_with("drop table") || normalized.starts_with("drop view") || normalized.starts_with("drop sequence") {
+            return findings;
+        }
+    }
+
+    if let Some(finding) = check_rename_operations(normalized) {
+        findings.push(finding);
+    }
+
+    if let Some(finding) = check_alter_column_type(normalized) {
+        findings.push(finding);
+    }
+
+    findings.extend(check_alter_table(normalized));
+
+    if let Some(finding) = check_index_operations(normalized) {
+        findings.push(finding);
+    }
+
+    if let Some(finding) = check_data_backfill(normalized) {
+        findings.push(finding);
+    }
+
+    if let Some(finding) = check_type_operations(normalized) {
+        findings.push(finding);
+        return findings;
+    }
+
+    if let Some(finding) = check_unclassified(normalized) {
+        findings.push(finding);
     }
 
     findings
