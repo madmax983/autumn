@@ -660,6 +660,10 @@ pub struct AutumnConfig {
     #[serde(default)]
     pub cache: CacheConfig,
 
+    /// HTTP idempotency-key middleware settings.
+    #[serde(default)]
+    pub idempotency: IdempotencyConfig,
+
     /// Real-time channel backend settings.
     #[serde(default)]
     pub channels: ChannelConfig,
@@ -975,6 +979,56 @@ const fn default_scheduler_lease_ttl_secs() -> u64 {
 
 fn default_scheduler_key_prefix() -> String {
     "autumn:scheduler".to_owned()
+}
+
+/// Storage backend selection for HTTP idempotency keys.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum IdempotencyBackend {
+    #[default]
+    Memory,
+    Redis,
+}
+
+impl IdempotencyBackend {
+    /// Parse an environment variable value for idempotency backend selection.
+    #[must_use]
+    pub fn from_env_value(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "memory" | "mem" => Some(Self::Memory),
+            "redis" => Some(Self::Redis),
+            _ => None,
+        }
+    }
+}
+
+/// HTTP idempotency-key middleware settings.
+#[derive(Debug, Clone, Deserialize)]
+pub struct IdempotencyConfig {
+    /// Storage backend for idempotency records.
+    #[serde(default)]
+    pub backend: IdempotencyBackend,
+    /// Time-to-live in seconds for stored idempotency records.
+    #[serde(default = "default_idempotency_ttl_secs")]
+    pub ttl_secs: u64,
+    /// Allow the in-memory backend in production environments.
+    #[serde(default)]
+    pub allow_memory_in_production: bool,
+}
+
+impl Default for IdempotencyConfig {
+    fn default() -> Self {
+        Self {
+            backend: IdempotencyBackend::default(),
+            ttl_secs: default_idempotency_ttl_secs(),
+            allow_memory_in_production: false,
+        }
+    }
+}
+
+const fn default_idempotency_ttl_secs() -> u64 {
+    86_400
 }
 
 /// `OpenAPI` spec runtime exposure settings.
@@ -1351,10 +1405,33 @@ impl AutumnConfig {
         self.apply_scheduler_env_overrides_with_env(env);
         self.apply_auth_env_overrides_with_env(env);
         self.apply_security_env_overrides_with_env(env);
+        self.apply_idempotency_env_overrides_with_env(env);
         #[cfg(feature = "storage")]
         self.apply_storage_env_overrides_with_env(env);
         #[cfg(feature = "mail")]
         self.apply_mail_env_overrides_with_env(env);
+    }
+
+    fn apply_idempotency_env_overrides_with_env(&mut self, env: &dyn Env) {
+        if let Ok(val) = env.var("AUTUMN_IDEMPOTENCY__BACKEND") {
+            match IdempotencyBackend::from_env_value(&val) {
+                Some(backend) => self.idempotency.backend = backend,
+                None => eprintln!(
+                    "Warning: unrecognised AUTUMN_IDEMPOTENCY__BACKEND value {:?}; ignoring",
+                    val
+                ),
+            }
+        }
+        parse_env(
+            env,
+            "AUTUMN_IDEMPOTENCY__TTL_SECS",
+            &mut self.idempotency.ttl_secs,
+        );
+        parse_env_bool(
+            env,
+            "AUTUMN_IDEMPOTENCY__ALLOW_MEMORY_IN_PRODUCTION",
+            &mut self.idempotency.allow_memory_in_production,
+        );
     }
 
     fn apply_server_env_overrides_with_env(&mut self, env: &dyn Env) {

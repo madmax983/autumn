@@ -83,6 +83,7 @@ pub use channels::{
 pub mod config;
 #[cfg(feature = "db")]
 pub mod db;
+pub mod idempotency;
 pub mod error;
 pub mod error_pages;
 pub mod extract;
