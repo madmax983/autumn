@@ -5870,10 +5870,19 @@ mod tests {
 
             let status = state.job_registry().snapshot()["slow_failure"].clone();
             assert_eq!(status.in_flight, 0);
-            assert_eq!(status.total_failures, 1, "terminal stale eviction must increment total_failures");
-            assert_eq!(status.dead_letters, 1, "terminal stale eviction must increment dead_letters");
+            assert_eq!(
+                status.total_failures, 1,
+                "terminal stale eviction must increment total_failures"
+            );
+            assert_eq!(
+                status.dead_letters, 1,
+                "terminal stale eviction must increment dead_letters"
+            );
             let snapshot = job_admin.snapshot_sync(&JobAdminQuery::default());
-            assert_eq!(snapshot.failed.total, 1, "failed list must show the dead-lettered job");
+            assert_eq!(
+                snapshot.failed.total, 1,
+                "failed list must show the dead-lettered job"
+            );
             assert_eq!(snapshot.running.total, 0);
         }
 
