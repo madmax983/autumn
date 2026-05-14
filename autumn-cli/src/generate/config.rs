@@ -65,14 +65,10 @@ pub fn read_scaffold_config(
     config_path: &Path,
     resource_name: &str,
 ) -> Result<Option<ScaffoldConfigEntry>, GenerateError> {
-    let content = std::fs::read_to_string(config_path).map_err(|e| {
-        std::io::Error::new(e.kind(), format!("{}: {e}", config_path.display()))
-    })?;
+    let content = std::fs::read_to_string(config_path)
+        .map_err(|e| std::io::Error::new(e.kind(), format!("{}: {e}", config_path.display())))?;
     let mut config: GeneratorConfig = toml::from_str(&content).map_err(|e| {
-        GenerateError::Config(format!(
-            "invalid TOML in {}: {e}",
-            config_path.display()
-        ))
+        GenerateError::Config(format!("invalid TOML in {}: {e}", config_path.display()))
     })?;
     Ok(config.scaffold.remove(resource_name))
 }
@@ -100,7 +96,11 @@ pub fn merge_config_with_cli(
     (
         fields,
         ScaffoldOptions {
-            model: ModelOptions { indexes, validations, defaults },
+            model: ModelOptions {
+                indexes,
+                validations,
+                defaults,
+            },
             queries,
         },
     )
@@ -144,9 +144,15 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             vec!["url:String", "title:String", "tag:String", "alive:bool"]
         );
         assert_eq!(entry.indexes, vec!["url", "tag"]);
-        assert_eq!(entry.validations, vec!["url=url", "title=length:min=1,max=200"]);
+        assert_eq!(
+            entry.validations,
+            vec!["url=url", "title=length:min=1,max=200"]
+        );
         assert_eq!(entry.defaults, vec!["alive=true"]);
-        assert_eq!(entry.queries, vec!["find_by_tag:tag", "find_by_alive:alive"]);
+        assert_eq!(
+            entry.queries,
+            vec!["find_by_tag:tag", "find_by_alive:alive"]
+        );
     }
 
     #[test]
@@ -232,27 +238,15 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
 
     #[test]
     fn merge_cli_indexes_override_toml_indexes() {
-        let (_, opts) = merge_config_with_cli(
-            bookmark_entry(),
-            &[],
-            &["tag".into()],
-            &[],
-            &[],
-            &[],
-        );
+        let (_, opts) =
+            merge_config_with_cli(bookmark_entry(), &[], &["tag".into()], &[], &[], &[]);
         assert_eq!(opts.model.indexes, vec!["tag"]);
     }
 
     #[test]
     fn merge_cli_validations_override_toml_validations() {
-        let (_, opts) = merge_config_with_cli(
-            bookmark_entry(),
-            &[],
-            &[],
-            &["url=email".into()],
-            &[],
-            &[],
-        );
+        let (_, opts) =
+            merge_config_with_cli(bookmark_entry(), &[], &[], &["url=email".into()], &[], &[]);
         assert_eq!(opts.model.validations, vec!["url=email"]);
     }
 

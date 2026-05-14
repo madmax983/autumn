@@ -973,7 +973,13 @@ fn generate_scaffold_from_config_file() {
 
     run_autumn(
         &project,
-        &["generate", "scaffold", "Bookmark", "--config", "autumn.generate.toml"],
+        &[
+            "generate",
+            "scaffold",
+            "Bookmark",
+            "--config",
+            "autumn.generate.toml",
+        ],
     );
 
     let model = fs::read_to_string(project.join("src/models/bookmark.rs")).unwrap();
@@ -1014,7 +1020,10 @@ fn generate_scaffold_from_config_file() {
         })
         .expect("create_bookmarks migration must exist");
     let up = fs::read_to_string(migration.path().join("up.sql")).unwrap();
-    assert!(up.contains("alive BOOLEAN NOT NULL DEFAULT TRUE"), "SQL missing default: {up}");
+    assert!(
+        up.contains("alive BOOLEAN NOT NULL DEFAULT TRUE"),
+        "SQL missing default: {up}"
+    );
     assert!(
         up.contains("CREATE INDEX idx_bookmarks_url ON bookmarks (url);"),
         "SQL missing url index: {up}"
@@ -1057,9 +1066,18 @@ fn generate_scaffold_cli_overrides_toml_config() {
     );
 
     let model = fs::read_to_string(project.join("src/models/post.rs")).unwrap();
-    assert!(model.contains("pub content: String"), "model must have CLI field 'content': {model}");
-    assert!(!model.contains("pub title: String"), "model must not have TOML field 'title': {model}");
-    assert!(!model.contains("pub body:"), "model must not have TOML field 'body': {model}");
+    assert!(
+        model.contains("pub content: String"),
+        "model must have CLI field 'content': {model}"
+    );
+    assert!(
+        !model.contains("pub title: String"),
+        "model must not have TOML field 'title': {model}"
+    );
+    assert!(
+        !model.contains("pub body:"),
+        "model must not have TOML field 'body': {model}"
+    );
 
     let migration = fs::read_dir(project.join("migrations"))
         .unwrap()
@@ -1085,7 +1103,14 @@ fn generate_scaffold_rejects_missing_config_file() {
 
     let (_, stderr, code) = run_autumn_failing(
         &project,
-        &["generate", "scaffold", "Post", "title:String", "--config", "nonexistent.toml"],
+        &[
+            "generate",
+            "scaffold",
+            "Post",
+            "title:String",
+            "--config",
+            "nonexistent.toml",
+        ],
     );
 
     assert_eq!(code, Some(1), "expected exit code 1; got {code:?}");
@@ -1109,7 +1134,13 @@ fn generate_scaffold_rejects_config_missing_resource_section() {
 
     let (_, stderr, code) = run_autumn_failing(
         &project,
-        &["generate", "scaffold", "Post", "--config", "autumn.generate.toml"],
+        &[
+            "generate",
+            "scaffold",
+            "Post",
+            "--config",
+            "autumn.generate.toml",
+        ],
     );
 
     assert_eq!(code, Some(1), "expected exit code 1; got {code:?}");
@@ -1152,11 +1183,26 @@ fn generated_scaffold_config_cargo_checks() {
 
     run_autumn(
         &project,
-        &["generate", "scaffold", "Bookmark", "--config", "autumn.generate.toml"],
+        &[
+            "generate",
+            "scaffold",
+            "Bookmark",
+            "--config",
+            "autumn.generate.toml",
+        ],
     );
 
     let cargo_toml = fs::read_to_string(project.join("Cargo.toml")).unwrap();
-    for dep in ["chrono", "diesel", "diesel-async", "maud", "serde", "serde_urlencoded", "url", "validator"] {
+    for dep in [
+        "chrono",
+        "diesel",
+        "diesel-async",
+        "maud",
+        "serde",
+        "serde_urlencoded",
+        "url",
+        "validator",
+    ] {
         assert!(
             cargo_toml.contains(&format!("{dep} =")),
             "Cargo.toml missing '{dep}' after config-driven scaffold"

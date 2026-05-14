@@ -827,25 +827,28 @@ fn run_generate_command(cmd: GenerateCommands) {
         } => {
             let config_entry = match config {
                 None => generate::config::ScaffoldConfigEntry::default(),
-                Some(ref path) => {
-                    match generate::config::read_scaffold_config(path, &name) {
-                        Ok(Some(e)) => e,
-                        Ok(None) => {
-                            eprintln!(
-                                "Error: no [scaffold.{name}] section found in {}",
-                                path.display()
-                            );
-                            std::process::exit(1);
-                        }
-                        Err(e) => {
-                            eprintln!("Error: {e}");
-                            std::process::exit(1);
-                        }
+                Some(ref path) => match generate::config::read_scaffold_config(path, &name) {
+                    Ok(Some(e)) => e,
+                    Ok(None) => {
+                        eprintln!(
+                            "Error: no [scaffold.{name}] section found in {}",
+                            path.display()
+                        );
+                        std::process::exit(1);
                     }
-                }
+                    Err(e) => {
+                        eprintln!("Error: {e}");
+                        std::process::exit(1);
+                    }
+                },
             };
             let (fields, options) = generate::config::merge_config_with_cli(
-                config_entry, &fields, &index, &validate, &default, &query,
+                config_entry,
+                &fields,
+                &index,
+                &validate,
+                &default,
+                &query,
             );
             generate::scaffold::run(&name, &fields, generate::Flags { dry_run, force }, &options);
         }
