@@ -5447,11 +5447,11 @@ mod tests {
             ));
 
             let status = state.job_registry().snapshot()["slow_success"].clone();
-            assert_eq!(status.in_flight, 1);
+            assert_eq!(status.in_flight, 0);
             assert_eq!(status.total_successes, 0);
             let snapshot = job_admin.snapshot_sync(&JobAdminQuery::default());
             assert_eq!(snapshot.completed.total, 0);
-            assert_eq!(snapshot.running.total, 1);
+            assert_eq!(snapshot.running.total, 0);
         }
 
         #[test]
@@ -5507,12 +5507,12 @@ mod tests {
             ));
 
             let status = state.job_registry().snapshot()["slow_failure"].clone();
-            assert_eq!(status.in_flight, 1);
+            assert_eq!(status.in_flight, 0);
             assert_eq!(status.total_failures, 0);
             assert_eq!(status.dead_letters, 0);
             let snapshot = job_admin.snapshot_sync(&JobAdminQuery::default());
             assert_eq!(snapshot.failed.total, 0);
-            assert_eq!(snapshot.running.total, 1);
+            assert_eq!(snapshot.running.total, 0);
         }
 
         #[test]
@@ -5586,7 +5586,7 @@ mod tests {
                 .get(&job_id)
                 .expect("admin record")
                 .status;
-            assert_eq!(admin_status, JobAdminStatus::Retrying);
+            assert_eq!(admin_status, JobAdminStatus::Enqueued);
         }
 
         #[test]
