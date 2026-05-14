@@ -825,9 +825,9 @@ fn run_generate_command(cmd: GenerateCommands) {
             dry_run,
             force,
         } => {
-            let config_entry = match config {
-                None => generate::config::ScaffoldConfigEntry::default(),
-                Some(ref path) => match generate::config::read_scaffold_config(path, &name) {
+            let config_entry = config.as_ref().map_or_else(
+                generate::config::ScaffoldConfigEntry::default,
+                |path| match generate::config::read_scaffold_config(path, &name) {
                     Ok(Some(e)) => e,
                     Ok(None) => {
                         eprintln!(
@@ -842,7 +842,7 @@ fn run_generate_command(cmd: GenerateCommands) {
                         std::process::exit(1);
                     }
                 },
-            };
+            );
             let (fields, options) = generate::config::merge_config_with_cli(
                 config_entry,
                 &fields,
