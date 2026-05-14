@@ -350,17 +350,24 @@ pub fn check_route_prefix(
 /// Both named params (`{id}`) and catch-all params (`{*rest}`) normalize to
 /// `{}`. matchit (Axum's router) treats a named param and a catch-all at the
 /// same path position as a conflict, so they must map to the same key.
+///
+/// ⚡ Bolt: Uses pre-allocation and avoids `.collect::<Vec<_>>()` to prevent
+/// intermediate heap allocations when normalizing paths.
 fn normalize_path_for_collision(path: &str) -> String {
-    path.split('/')
-        .map(|seg| {
-            if seg.starts_with('{') && seg.ends_with('}') {
-                "{}"
-            } else {
-                seg
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("/")
+    let mut result = String::with_capacity(path.len());
+    let mut first = true;
+    for seg in path.split('/') {
+        if !first {
+            result.push('/');
+        }
+        first = false;
+        if seg.starts_with('{') && seg.ends_with('}') {
+            result.push_str("{}");
+        } else {
+            result.push_str(seg);
+        }
+    }
+    result
 }
 
 /// Detect route collisions: any two routes sharing the same (method, path) pair.
@@ -895,6 +902,11 @@ mod tests {
             "/static/app.js"
         );
         assert_eq!(normalize_path_for_collision("/"), "/");
+        assert_eq!(normalize_path_for_collision("no_slash"), "no_slash");
+        assert_eq!(normalize_path_for_collision("{just_id}"), "{}");
+        assert_eq!(normalize_path_for_collision(""), "");
+        assert_eq!(normalize_path_for_collision("//"), "//");
+        assert_eq!(normalize_path_for_collision("/{id}/"), "/{}/");
     }
 
     // ── check_sensitive_surfaces ───────────────────────────────────────────
