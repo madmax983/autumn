@@ -5378,6 +5378,352 @@ mod tests {
         assert!(global_job_client().is_none());
     }
 
+    // ── Pure-logic unit tests (no infrastructure required) ───────────────────
+
+    #[test]
+    fn job_admin_status_label_is_stable() {
+        assert_eq!(JobAdminStatus::Enqueued.label(), "enqueued");
+        assert_eq!(JobAdminStatus::Running.label(), "running");
+        assert_eq!(JobAdminStatus::Retrying.label(), "retrying");
+        assert_eq!(JobAdminStatus::Completed.label(), "completed");
+        assert_eq!(JobAdminStatus::Failed.label(), "failed");
+        assert_eq!(JobAdminStatus::Discarded.label(), "discarded");
+        assert_eq!(JobAdminStatus::Canceled.label(), "canceled");
+        assert_eq!(JobAdminStatus::Retried.label(), "retried");
+    }
+
+    #[test]
+    fn job_admin_page_total_pages_rounds_up() {
+        assert_eq!(JobAdminPage::new(Vec::new(), 11, 1, 5).total_pages(), 3);
+        assert_eq!(JobAdminPage::new(Vec::new(), 10, 1, 5).total_pages(), 2);
+        assert_eq!(JobAdminPage::new(Vec::new(), 0, 1, 5).total_pages(), 0);
+        assert_eq!(JobAdminPage::new(Vec::new(), 1, 1, 5).total_pages(), 1);
+    }
+
+    #[test]
+    fn job_admin_page_total_pages_is_zero_when_per_page_is_zero() {
+        assert_eq!(JobAdminPage::new(Vec::new(), 5, 1, 0).total_pages(), 0);
+    }
+
+    #[test]
+    fn job_admin_snapshot_empty_has_correct_shape() {
+        let snap = JobAdminSnapshot::empty();
+        assert_eq!(snap.enqueued.total, 0);
+        assert_eq!(snap.running.total, 0);
+        assert_eq!(snap.completed.total, 0);
+        assert_eq!(snap.failed.total, 0);
+        assert!(snap.schedules.is_empty());
+        assert_eq!(snap.bounded_history_limit, DEFAULT_JOB_ADMIN_HISTORY_LIMIT);
+        assert_eq!(snap.enqueued.per_page, DEFAULT_JOB_ADMIN_PER_PAGE);
+    }
+
+    #[test]
+    fn job_admin_query_default_starts_at_page_one() {
+        let q = JobAdminQuery::default();
+        assert_eq!(q.enqueued_page, 1);
+        assert_eq!(q.running_page, 1);
+        assert_eq!(q.completed_page, 1);
+        assert_eq!(q.failed_page, 1);
+        assert_eq!(q.per_page, DEFAULT_JOB_ADMIN_PER_PAGE);
+    }
+
+    #[test]
+    fn format_job_panic_extracts_owned_string_message() {
+        let panic: Box<dyn std::any::Any + Send> = Box::new("stripe timed out".to_owned());
+        assert_eq!(
+            format_job_panic(panic.as_ref()),
+            "job handler panicked: stripe timed out"
+        );
+    }
+
+    #[test]
+    fn format_job_panic_extracts_static_str() {
+        let s: &'static str = "static panic message";
+        let panic: Box<dyn std::any::Any + Send> = Box::new(s);
+        assert_eq!(
+            format_job_panic(panic.as_ref()),
+            "job handler panicked: static panic message"
+        );
+    }
+
+    #[test]
+    fn format_job_panic_handles_non_string_payload() {
+        let panic: Box<dyn std::any::Any + Send> = Box::new(42u32);
+        assert_eq!(
+            format_job_panic(panic.as_ref()),
+            "job handler panicked: non-string panic payload"
+        );
+    }
+
+    #[test]
+    fn job_payload_identity_prefers_principal_id_over_principal_and_user_id() {
+        let (principal, _) = job_payload_identity(&serde_json::json!({
+            "principal_id": "pid-1",
+            "principal": "pid-2",
+            "user_id": 3
+        }));
+        assert_eq!(principal.as_deref(), Some("pid-1"));
+    }
+
+    #[test]
+    fn job_payload_identity_falls_back_to_principal_then_user_id() {
+        let (p1, _) = job_payload_identity(&serde_json::json!({"principal": "p-abc"}));
+        assert_eq!(p1.as_deref(), Some("p-abc"));
+
+        let (p2, _) = job_payload_identity(&serde_json::json!({"user_id": 42}));
+        assert_eq!(p2.as_deref(), Some("42"));
+    }
+
+    #[test]
+    fn job_payload_identity_prefers_correlation_id_over_request_id() {
+        let (_, correlation) = job_payload_identity(&serde_json::json!({
+            "correlation_id": "cid-1",
+            "request_id": "cid-2"
+        }));
+        assert_eq!(correlation.as_deref(), Some("cid-1"));
+    }
+
+    #[test]
+    fn job_payload_identity_falls_back_to_request_id() {
+        let (_, correlation) = job_payload_identity(&serde_json::json!({"request_id": "req-abc"}));
+        assert_eq!(correlation.as_deref(), Some("req-abc"));
+    }
+
+    #[test]
+    fn job_payload_identity_ignores_empty_string_values() {
+        let (principal, correlation) = job_payload_identity(&serde_json::json!({
+            "principal_id": "",
+            "user_id": 99,
+            "correlation_id": "",
+            "request_id": "req-fallback"
+        }));
+        assert_eq!(principal.as_deref(), Some("99"));
+        assert_eq!(correlation.as_deref(), Some("req-fallback"));
+    }
+
+    #[test]
+    fn job_payload_identity_stringifies_numeric_values() {
+        let (principal, _) = job_payload_identity(&serde_json::json!({"user_id": 123}));
+        assert_eq!(principal.as_deref(), Some("123"));
+    }
+
+    #[test]
+    fn job_payload_identity_stringifies_boolean_values() {
+        let (principal, _) = job_payload_identity(&serde_json::json!({"user_id": true}));
+        assert_eq!(principal.as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn job_payload_identity_returns_none_for_non_object_payload() {
+        let (principal, correlation) = job_payload_identity(&serde_json::json!("not an object"));
+        assert!(principal.is_none());
+        assert!(correlation.is_none());
+    }
+
+    #[test]
+    fn job_payload_identity_returns_none_when_no_matching_keys() {
+        let (principal, correlation) =
+            job_payload_identity(&serde_json::json!({"unrelated": "value"}));
+        assert!(principal.is_none());
+        assert!(correlation.is_none());
+    }
+
+    #[test]
+    fn job_admin_start_returns_missing_for_unknown_id() {
+        let backend = JobAdminMemoryBackend::new_for_test(32);
+        assert_eq!(
+            backend.try_record_start("nonexistent", 1),
+            JobAdminStartDecision::Missing
+        );
+    }
+
+    #[test]
+    fn job_admin_start_returns_already_transitioned_for_non_enqueued_job() {
+        let backend = JobAdminMemoryBackend::new_for_test(32);
+        let id = backend.record_enqueue_for_test("work", serde_json::json!({}), 1, 3);
+        backend.record_start_for_test(&id, 1);
+        backend.record_success_for_test(&id);
+
+        assert_eq!(
+            backend.try_record_start(&id, 1),
+            JobAdminStartDecision::AlreadyTransitioned
+        );
+    }
+
+    #[tokio::test]
+    async fn job_admin_record_retrying_transitions_to_retrying_status() {
+        let backend = JobAdminMemoryBackend::new_for_test(32);
+        let id = backend.record_enqueue_for_test("work", serde_json::json!({}), 1, 3);
+        backend.record_start_for_test(&id, 1);
+        backend.record_retrying(&id, "temporary glitch");
+
+        let snapshot = backend
+            .snapshot(JobAdminQuery::default())
+            .await
+            .expect("snapshot");
+        assert!(
+            snapshot.running.records.is_empty(),
+            "running should be empty after retrying"
+        );
+        assert!(
+            snapshot.failed.records.is_empty(),
+            "retrying is not terminal-failed"
+        );
+        assert!(
+            snapshot.enqueued.records.is_empty(),
+            "retrying is not enqueued"
+        );
+    }
+
+    #[tokio::test]
+    async fn job_admin_record_requeued_transitions_back_to_enqueued() {
+        let backend = JobAdminMemoryBackend::new_for_test(32);
+        let id = backend.record_enqueue_for_test("work", serde_json::json!({}), 1, 3);
+        backend.record_start_for_test(&id, 1);
+        backend.record_retrying(&id, "glitch");
+        backend.record_requeued(&id, 2);
+
+        let snapshot = backend
+            .snapshot(JobAdminQuery::default())
+            .await
+            .expect("snapshot after requeue");
+        assert_eq!(snapshot.enqueued.total, 1);
+        assert_eq!(snapshot.enqueued.records[0].attempt, 2);
+    }
+
+    #[tokio::test]
+    async fn job_admin_discard_rejects_non_failed_job() {
+        let backend = JobAdminMemoryBackend::new_for_test(32);
+        let id = backend.record_enqueue_for_test("work", serde_json::json!({}), 1, 3);
+
+        let error = backend
+            .discard(&id)
+            .await
+            .expect_err("enqueued job must not be discardable");
+        assert!(
+            error
+                .to_string()
+                .contains("only failed jobs can be discarded"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn job_admin_cancel_rejects_non_enqueued_job() {
+        let backend = JobAdminMemoryBackend::new_for_test(32);
+        let id = backend.record_enqueue_for_test("work", serde_json::json!({}), 1, 3);
+        backend.record_start_for_test(&id, 1);
+
+        let error = backend
+            .cancel(&id)
+            .await
+            .expect_err("running job must not be cancelable");
+        assert!(
+            error
+                .to_string()
+                .contains("only enqueued jobs can be canceled"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn job_admin_history_limit_evicts_finished_jobs_keeping_active() {
+        let backend = JobAdminMemoryBackend::with_history_limit(3);
+        for _ in 0..3 {
+            let id = backend.record_enqueue_for_test("done", serde_json::json!({}), 1, 1);
+            backend.record_start_for_test(&id, 1);
+            backend.record_success_for_test(&id);
+        }
+        let active_id = backend.record_enqueue_for_test("active", serde_json::json!({}), 1, 3);
+        let overflow_id = backend.record_enqueue_for_test("overflow", serde_json::json!({}), 1, 1);
+        backend.record_start_for_test(&overflow_id, 1);
+        backend.record_success_for_test(&overflow_id);
+
+        let snapshot = backend
+            .snapshot(JobAdminQuery::default())
+            .await
+            .expect("snapshot");
+        assert_eq!(
+            snapshot.enqueued.total, 1,
+            "active job must survive eviction"
+        );
+        assert_eq!(snapshot.enqueued.records[0].id, active_id);
+    }
+
+    #[tokio::test]
+    async fn job_admin_snapshot_pagination_second_page() {
+        let backend = JobAdminMemoryBackend::new_for_test(100);
+        for i in 0..5u32 {
+            backend.record_enqueue_for_test("work", serde_json::json!({"n": i}), 1, 3);
+        }
+
+        let snapshot = backend
+            .snapshot(JobAdminQuery {
+                enqueued_page: 2,
+                running_page: 1,
+                completed_page: 1,
+                failed_page: 1,
+                per_page: 3,
+            })
+            .await
+            .expect("snapshot page 2");
+
+        assert_eq!(snapshot.enqueued.total, 5);
+        assert_eq!(snapshot.enqueued.records.len(), 2);
+        assert_eq!(snapshot.enqueued.page, 2);
+        assert_eq!(snapshot.enqueued.total_pages(), 2);
+    }
+
+    #[tokio::test]
+    async fn run_job_handler_reports_async_panics() {
+        let state = AppState::for_test().with_profile("dev");
+        let outcome = run_job_handler(panicking_handler, state, serde_json::json!({})).await;
+        assert_eq!(
+            outcome,
+            JobExecutionOutcome::Panicked("job handler panicked: forced panic".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn local_unknown_job_name_records_failure_and_does_not_requeue() {
+        let state = AppState::for_test().with_profile("dev");
+        let jobs_by_name: Arc<RwLock<HashMap<String, JobInfo>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let (tx, mut rx) = mpsc::channel(1);
+        let job_admin = JobAdminMemoryBackend::new_for_test(32);
+        let job_id = job_admin.record_enqueue_for_test("ghost", serde_json::json!({}), 1, 1);
+
+        execute_local_job(
+            QueuedJob {
+                id: job_id.clone(),
+                name: "ghost".to_string(),
+                payload: serde_json::json!({}),
+                attempt: 1,
+                max_attempts: 1,
+                initial_backoff_ms: 1,
+            },
+            &jobs_by_name,
+            &tx,
+            &state,
+            &job_admin,
+        )
+        .await;
+
+        assert!(timeout(Duration::from_millis(25), rx.recv()).await.is_err());
+        let snapshot = job_admin
+            .snapshot(JobAdminQuery::default())
+            .await
+            .expect("snapshot");
+        assert_eq!(snapshot.failed.total, 1);
+        assert!(
+            snapshot.failed.records[0]
+                .last_error
+                .as_deref()
+                .is_some_and(|e| e.contains("unknown job")),
+            "unknown job error message expected"
+        );
+    }
+
     // ── Postgres backend (RED → GREEN) ────────────────────────────────────────
 
     #[cfg(feature = "db")]
