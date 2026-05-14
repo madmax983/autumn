@@ -679,6 +679,10 @@ impl Mailer {
     ///
     /// Returns an error when no active Tokio runtime is available to host the
     /// background task.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal after-commit registry mutex is poisoned.
     pub fn try_deliver_later(&self, mail: Mail) -> Result<(), MailError> {
         if self.transport.is_disabled() {
             return Ok(());
@@ -691,7 +695,7 @@ impl Mailer {
         {
             let mailer = self.clone();
             let deferred = mail.clone();
-            let mut f_opt: Option<(Mailer, Mail)> = Some((mailer, deferred));
+            let mut f_opt: Option<(Self, Mail)> = Some((mailer, deferred));
 
             crate::db::AFTER_COMMIT_REGISTRY
                 .try_with(|registry| {

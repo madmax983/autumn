@@ -1143,6 +1143,12 @@ impl JobClient {
     /// Returns an error if `payload` cannot be serialized to JSON, or if the
     /// underlying enqueue fails (backend error, unregistered job name, etc.).
     ///
+    /// # Panics
+    ///
+    /// Panics if the internal after-commit registry mutex is poisoned (only
+    /// possible if a previous thread holding the lock panicked, which should
+    /// not occur in normal operation).
+    ///
     /// # Example
     ///
     /// ```rust,ignore

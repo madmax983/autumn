@@ -80,6 +80,12 @@ pub static AFTER_COMMIT_FAILURES_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// If called **outside** any active transaction, the callback runs immediately
 /// (eager execution) with a `debug`-level log note.
 ///
+/// # Panics
+///
+/// Panics if the internal registry mutex is poisoned (only possible if a
+/// previous thread holding the lock panicked, which should not occur in normal
+/// operation).
+///
 /// # Example
 ///
 /// ```rust,ignore
@@ -360,6 +366,11 @@ impl Db {
     /// - this `Db` is already inside a transaction,
     /// - this `Db` has been poisoned by a previously cancelled/dropped
     ///   transaction future.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal after-commit registry mutex is poisoned (only
+    /// possible if a previous thread holding the lock panicked).
     pub async fn tx<'a, T, E, F>(&'a mut self, f: F) -> Result<T, crate::error::AutumnError>
     where
         T: Send + 'a,
