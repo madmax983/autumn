@@ -29,11 +29,82 @@ use axum::extract::FromRequestParts;
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::deadpool::Pool;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::Instrument as _;
 
 use crate::config::DatabaseConfig;
 use crate::error::AutumnError;
+
+// ── After-commit callback infrastructure ─────────────────────────────────────
+
+/// A boxed async callback registered for post-transaction execution.
+///
+/// Stored in [`AFTER_COMMIT_REGISTRY`] during an active [`Db::tx`] block.
+/// The registry is drained and each callback is awaited after the transaction
+/// commits successfully. On rollback or panic the callbacks are dropped
+/// without being called.
+pub type CommitCallback = Box<
+    dyn FnOnce() -> Pin<Box<dyn Future<Output = crate::AutumnResult<()>> + Send + 'static>>
+        + Send
+        + 'static,
+>;
+
+tokio::task_local! {
+    /// Task-local registry used by [`Db::tx`] to accumulate after-commit
+    /// callbacks. Only set while the [`Db::tx`] future is being polled;
+    /// absent outside a transaction block.
+    pub static AFTER_COMMIT_REGISTRY: Arc<Mutex<Vec<CommitCallback>>>;
+}
+
+/// Register a callback to run after the current database transaction commits.
+///
+/// If called inside a [`Db::tx`] block, the callback is deferred until the
+/// transaction commits successfully. On rollback the callback is dropped
+/// without being called.
+///
+/// If called **outside** any active transaction, the callback runs immediately
+/// (eager execution) with a `debug`-level log note.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// db.tx(move |conn| {
+///     scoped_boxed(async move {
+///         diesel::insert_into(users::table).values(&new_user).execute(conn).await?;
+///         autumn_web::db::register_after_commit(|| async {
+///             welcome_email_job.enqueue("user_id", user_id).await
+///         }).await;
+///         Ok(())
+///     })
+/// }).await?;
+/// ```
+pub async fn register_after_commit<F, Fut>(f: F)
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = crate::AutumnResult<()>> + Send + 'static,
+{
+    let mut f_opt = Some(f);
+    AFTER_COMMIT_REGISTRY
+        .try_with(|registry| {
+            let f = f_opt.take().expect("closure only entered once");
+            let boxed: CommitCallback = Box::new(move || Box::pin(f()));
+            registry.lock().expect("registry lock").push(boxed);
+        })
+        .ok();
+
+    // If still Some, the task-local wasn't set — we're outside a tx; run eagerly.
+    if let Some(f) = f_opt {
+        tracing::debug!(
+            "register_after_commit: no active transaction; running callback eagerly"
+        );
+        if let Err(e) = f().await {
+            tracing::error!("register_after_commit eager callback failed: {e}");
+        }
+    }
+}
 
 /// Trait to abstract the state requirement for the `Db` extractor.
 /// This breaks the circular dependency between the database extractor
@@ -309,12 +380,34 @@ impl Db {
             disarmed: false,
         };
 
-        let result = self
-            .conn
-            .transaction::<T, E, _>(f)
+        // Each tx gets its own callback registry shared with the task-local so
+        // that code running inside the closure (jobs, mailer, hooks) can push
+        // callbacks without having access to `Db` directly. The `Arc` lets us
+        // read the registry after the `scope` future completes.
+        let registry: Arc<Mutex<Vec<CommitCallback>>> =
+            Arc::new(Mutex::new(Vec::new()));
+
+        let result = AFTER_COMMIT_REGISTRY
+            .scope(registry.clone(), self.conn.transaction::<T, E, _>(f))
             .await
             .map_err(Into::into);
+
         guard.disarmed = true;
+
+        // On commit: drain and run every registered callback. An error in a
+        // callback is logged but does NOT roll back the already-committed tx.
+        if result.is_ok() {
+            let callbacks: Vec<CommitCallback> = {
+                let mut reg = registry.lock().expect("registry lock");
+                std::mem::take(&mut *reg)
+            };
+            for cb in callbacks {
+                if let Err(e) = cb().await {
+                    tracing::error!("after_commit callback failed (tx already committed): {e}");
+                }
+            }
+        }
+
         result
     }
 }
@@ -500,7 +593,154 @@ impl DatabasePoolProvider for DieselDeadpoolPoolProvider {
 mod tests {
     use super::*;
     use crate::config::DatabaseConfig;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use std::time::Duration;
+
+    // ── after_commit tests ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn register_after_commit_outside_tx_runs_eagerly() {
+        // When called outside a db.tx block, the callback should run immediately.
+        let counter = Arc::new(AtomicUsize::new(0));
+        let c = counter.clone();
+        register_after_commit(move || async move {
+            c.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+        .await;
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn register_after_commit_inside_scope_defers_until_drained() {
+        // Inside a task-local scope (simulating Db::tx), callbacks are deferred.
+        let counter = Arc::new(AtomicUsize::new(0));
+        let c = counter.clone();
+
+        let registry = Arc::new(std::sync::Mutex::new(
+            Vec::<CommitCallback>::new(),
+        ));
+
+        // Simulate being inside a db.tx by setting the task-local
+        AFTER_COMMIT_REGISTRY
+            .scope(registry.clone(), async {
+                register_after_commit(move || async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+                .await;
+            })
+            .await;
+
+        // Callback must NOT have run yet
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+
+        // Drain and run the callbacks (simulating post-commit)
+        let callbacks: Vec<CommitCallback> = {
+            let mut reg = registry.lock().unwrap();
+            std::mem::take(&mut *reg)
+        };
+        for cb in callbacks {
+            cb().await.unwrap();
+        }
+
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn register_after_commit_on_rollback_callbacks_dropped() {
+        // Callbacks registered inside a tx scope that is NOT drained are dropped.
+        let counter = Arc::new(AtomicUsize::new(0));
+        let c = counter.clone();
+
+        let registry = Arc::new(std::sync::Mutex::new(
+            Vec::<CommitCallback>::new(),
+        ));
+
+        AFTER_COMMIT_REGISTRY
+            .scope(registry.clone(), async {
+                register_after_commit(move || async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+                .await;
+            })
+            .await;
+
+        // Simulate rollback: drop the callbacks without running them
+        drop(registry);
+
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn register_after_commit_callbacks_run_in_registration_order() {
+        let order = Arc::new(std::sync::Mutex::new(Vec::<u32>::new()));
+        let registry = Arc::new(std::sync::Mutex::new(
+            Vec::<CommitCallback>::new(),
+        ));
+
+        let o1 = order.clone();
+        let o2 = order.clone();
+        let o3 = order.clone();
+
+        AFTER_COMMIT_REGISTRY
+            .scope(registry.clone(), async {
+                register_after_commit(move || async move {
+                    o1.lock().unwrap().push(1);
+                    Ok(())
+                })
+                .await;
+                register_after_commit(move || async move {
+                    o2.lock().unwrap().push(2);
+                    Ok(())
+                })
+                .await;
+                register_after_commit(move || async move {
+                    o3.lock().unwrap().push(3);
+                    Ok(())
+                })
+                .await;
+            })
+            .await;
+
+        let callbacks: Vec<CommitCallback> = {
+            let mut reg = registry.lock().unwrap();
+            std::mem::take(&mut *reg)
+        };
+        for cb in callbacks {
+            cb().await.unwrap();
+        }
+
+        assert_eq!(*order.lock().unwrap(), vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn register_after_commit_callback_error_is_swallowed() {
+        // A failing callback is logged but doesn't panic or propagate.
+        let registry = Arc::new(std::sync::Mutex::new(
+            Vec::<CommitCallback>::new(),
+        ));
+
+        AFTER_COMMIT_REGISTRY
+            .scope(registry.clone(), async {
+                register_after_commit(|| async {
+                    Err(crate::AutumnError::internal_server_error_msg("deliberate error"))
+                })
+                .await;
+            })
+            .await;
+
+        let callbacks: Vec<CommitCallback> = {
+            let mut reg = registry.lock().unwrap();
+            std::mem::take(&mut *reg)
+        };
+        // Running a failing callback should not panic
+        for cb in callbacks {
+            let _ = cb().await;
+        }
+    }
 
     // ── Pool provider trait tests ────────────────────────────────
 

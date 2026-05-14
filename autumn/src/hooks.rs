@@ -206,6 +206,48 @@ pub trait MutationHooks: Send + Sync + 'static {
     ) -> impl Future<Output = AutumnResult<()>> + Send {
         async { Ok(()) }
     }
+
+    /// Called after a new record is inserted **and the transaction commits**.
+    ///
+    /// Unlike [`after_create`], this hook fires only when the surrounding
+    /// database transaction has been durably committed. Use this variant for
+    /// side-effects (job enqueues, emails, cache invalidation) that must not
+    /// execute if the transaction rolls back.
+    ///
+    /// When using [`Db::tx`](crate::db::Db::tx), the generated repository
+    /// code registers this as an [`after_commit`](crate::db::register_after_commit)
+    /// callback so it inherits the transactional guarantee automatically.
+    fn after_create_commit(
+        &self,
+        _ctx: &mut MutationContext,
+        _record: &Self::Model,
+    ) -> impl Future<Output = AutumnResult<()>> + Send {
+        async { Ok(()) }
+    }
+
+    /// Called after an existing record is updated **and the transaction commits**.
+    ///
+    /// The same transactional guarantee as [`after_create_commit`] applies:
+    /// this hook is not called when the surrounding transaction rolls back.
+    fn after_update_commit(
+        &self,
+        _ctx: &mut MutationContext,
+        _record: &Self::Model,
+    ) -> impl Future<Output = AutumnResult<()>> + Send {
+        async { Ok(()) }
+    }
+
+    /// Called after a record is deleted **and the transaction commits**.
+    ///
+    /// The same transactional guarantee as [`after_create_commit`] applies:
+    /// this hook is not called when the surrounding transaction rolls back.
+    fn after_delete_commit(
+        &self,
+        _ctx: &mut MutationContext,
+        _record: &Self::Model,
+    ) -> impl Future<Output = AutumnResult<()>> + Send {
+        async { Ok(()) }
+    }
 }
 
 /// Stable hook-construction contract used by generated repositories.
@@ -750,6 +792,80 @@ mod tests {
         assert!(hooks.before_delete(&mut ctx, &model).await.is_ok());
         assert!(hooks.after_create(&mut ctx, &model).await.is_ok());
         assert!(hooks.after_update(&mut ctx, &model).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn no_hooks_commit_variants_are_noop() {
+        // after_*_commit variants must also be no-ops on NoHooks
+        let hooks: NoHooks<(), (), ()> = NoHooks::default();
+        let mut ctx = MutationContext::new(MutationOp::Create);
+        let model = ();
+
+        assert!(
+            hooks.after_create_commit(&mut ctx, &model).await.is_ok(),
+            "after_create_commit must default to Ok(())"
+        );
+        assert!(
+            hooks.after_update_commit(&mut ctx, &model).await.is_ok(),
+            "after_update_commit must default to Ok(())"
+        );
+        assert!(
+            hooks.after_delete_commit(&mut ctx, &model).await.is_ok(),
+            "after_delete_commit must default to Ok(())"
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_hooks_can_override_commit_variants() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+
+        static CALLS: AtomicU32 = AtomicU32::new(0);
+
+        #[derive(Clone, Default)]
+        struct CountingHooks;
+
+        impl MutationHooks for CountingHooks {
+            type Model = ();
+            type NewModel = ();
+            type UpdateModel = ();
+
+            fn after_create_commit(
+                &self,
+                _ctx: &mut MutationContext,
+                _record: &Self::Model,
+            ) -> impl Future<Output = AutumnResult<()>> + Send {
+                async { CALLS.fetch_add(1, Ordering::SeqCst); Ok(()) }
+            }
+
+            fn after_update_commit(
+                &self,
+                _ctx: &mut MutationContext,
+                _record: &Self::Model,
+            ) -> impl Future<Output = AutumnResult<()>> + Send {
+                async { CALLS.fetch_add(1, Ordering::SeqCst); Ok(()) }
+            }
+
+            fn after_delete_commit(
+                &self,
+                _ctx: &mut MutationContext,
+                _record: &Self::Model,
+            ) -> impl Future<Output = AutumnResult<()>> + Send {
+                async { CALLS.fetch_add(1, Ordering::SeqCst); Ok(()) }
+            }
+        }
+
+        CALLS.store(0, Ordering::SeqCst);
+        let hooks = CountingHooks;
+        let mut ctx = MutationContext::new(MutationOp::Create);
+        let model = ();
+
+        hooks.after_create_commit(&mut ctx, &model).await.unwrap();
+        hooks.after_update_commit(&mut ctx, &model).await.unwrap();
+        hooks.after_delete_commit(&mut ctx, &model).await.unwrap();
+
+        assert_eq!(CALLS.load(Ordering::SeqCst), 3);
+        let _ = Arc::new(CountingHooks); // ensure Arc usage works (Clone check)
     }
 
     // ── Patch serde tests ──────────────────────────────────────────

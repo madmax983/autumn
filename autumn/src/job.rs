@@ -1059,6 +1059,74 @@ impl JobClient {
         result
     }
 
+    /// Enqueue a job that fires **only after the surrounding transaction commits**.
+    ///
+    /// When called inside a [`Db::tx`](crate::db::Db::tx) block, the enqueue is
+    /// deferred until the transaction commits successfully. If the transaction
+    /// rolls back, the job is never enqueued.
+    ///
+    /// When called **outside** any active transaction, the job is enqueued
+    /// immediately (equivalent to [`enqueue`](Self::enqueue)) and a `debug`-level
+    /// log entry is emitted to make the no-op deferral visible.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `payload` cannot be serialized to JSON, or if the
+    /// underlying enqueue fails (backend error, unregistered job name, etc.).
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// db.tx(move |conn| scoped_boxed(async move {
+    ///     let user = repo.create(new_user, conn).await?;
+    ///     job_client
+    ///         .enqueue_after_commit("welcome_email", WelcomeArgs { user_id: user.id })
+    ///         .await?;
+    ///     Ok(user)
+    /// })).await?;
+    /// ```
+    pub async fn enqueue_after_commit(
+        &self,
+        name: &str,
+        payload: impl serde::Serialize,
+    ) -> AutumnResult<()> {
+        let name = name.to_string();
+        let payload = serde_json::to_value(payload).map_err(|e| {
+            AutumnError::internal_server_error(std::io::Error::other(format!(
+                "enqueue_after_commit: failed to serialize payload for job '{name}': {e}"
+            )))
+        })?;
+        let client = self.clone();
+        // Keep a copy for the debug log in the eager path (name is moved into f_opt).
+        let name_for_log = name.clone();
+
+        let mut f_opt = Some(move || {
+            let client = client.clone();
+            let name = name.clone();
+            let payload = payload.clone();
+            async move { client.enqueue(&name, payload).await }
+        });
+
+        crate::db::AFTER_COMMIT_REGISTRY
+            .try_with(|registry| {
+                let f = f_opt.take().expect("closure only entered once");
+                let boxed: crate::db::CommitCallback =
+                    Box::new(move || Box::pin(f()));
+                registry.lock().expect("registry lock").push(boxed);
+            })
+            .ok();
+
+        if let Some(f) = f_opt {
+            // Not inside a db.tx — enqueue immediately.
+            tracing::debug!(
+                "enqueue_after_commit: no active transaction; enqueueing '{name_for_log}' immediately"
+            );
+            f().await?;
+        }
+
+        Ok(())
+    }
+
     async fn enqueue_durable(
         &self,
         id: String,
@@ -6586,5 +6654,79 @@ mod tests {
             .optional()
             .unwrap_or(None)
         }
+    }
+
+    // ── enqueue_after_commit tests ────────────────────────────────
+
+    fn make_test_client() -> (JobClient, tokio::sync::mpsc::Receiver<QueuedJob>) {
+        let (tx, rx) = mpsc::channel(16);
+        let client = JobClient {
+            local_sender: Some(tx),
+            #[cfg(feature = "redis")]
+            redis: None,
+            #[cfg(feature = "db")]
+            pg_pool: None,
+            registry: crate::actuator::JobRegistry::new(),
+            job_admin: JobAdminMemoryBackend::new_for_test(32),
+            default_max_attempts: 3,
+            default_initial_backoff_ms: 100,
+            per_job_defaults: HashMap::from([("test_job".to_string(), (3_u32, 100_u64))]),
+        };
+        (client, rx)
+    }
+
+    #[tokio::test]
+    async fn enqueue_after_commit_outside_tx_enqueues_immediately() {
+        use std::time::Duration;
+        let (client, mut rx) = make_test_client();
+
+        client
+            .enqueue_after_commit("test_job", serde_json::json!({"x": 1}))
+            .await
+            .expect("enqueue_after_commit should succeed outside tx");
+
+        // The job should have been enqueued immediately (not deferred)
+        let received = timeout(Duration::from_millis(100), rx.recv()).await;
+        assert!(received.is_ok(), "job should be received immediately outside tx");
+        let job = received.unwrap().expect("channel should not be closed");
+        assert_eq!(job.name, "test_job");
+    }
+
+    #[tokio::test]
+    async fn enqueue_after_commit_inside_scope_defers_enqueue() {
+        use crate::db::{AFTER_COMMIT_REGISTRY, CommitCallback};
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        let (client, mut rx) = make_test_client();
+        let registry = Arc::new(Mutex::new(Vec::<CommitCallback>::new()));
+
+        AFTER_COMMIT_REGISTRY
+            .scope(registry.clone(), async {
+                client
+                    .enqueue_after_commit("test_job", serde_json::json!({"x": 2}))
+                    .await
+                    .expect("enqueue_after_commit should succeed inside scope");
+            })
+            .await;
+
+        // Job must NOT have been enqueued yet
+        let not_received = timeout(Duration::from_millis(50), rx.recv()).await;
+        assert!(not_received.is_err(), "job must not be enqueued before commit");
+
+        // Drain callbacks (simulating commit)
+        let callbacks: Vec<CommitCallback> = {
+            let mut reg = registry.lock().unwrap();
+            std::mem::take(&mut *reg)
+        };
+        for cb in callbacks {
+            cb().await.unwrap();
+        }
+
+        // Now the job should appear
+        let received = timeout(Duration::from_millis(100), rx.recv()).await;
+        assert!(received.is_ok(), "job should be enqueued after commit callbacks run");
+        let job = received.unwrap().expect("channel should not be closed");
+        assert_eq!(job.name, "test_job");
     }
 }
