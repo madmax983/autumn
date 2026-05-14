@@ -1635,6 +1635,11 @@ impl AutumnConfig {
             "AUTUMN_JOBS__REDIS__VISIBILITY_TIMEOUT_MS",
             &mut self.jobs.redis.visibility_timeout_ms,
         );
+        parse_env(
+            env,
+            "AUTUMN_JOBS__POSTGRES__VISIBILITY_TIMEOUT_MS",
+            &mut self.jobs.postgres.visibility_timeout_ms,
+        );
     }
 
     fn apply_scheduler_env_overrides_with_env(&mut self, env: &dyn Env) {

@@ -1119,21 +1119,20 @@ impl JobClient {
             self.default_initial_backoff_ms
         };
         let id = uuid::Uuid::new_v4().to_string();
+
+        // Postgres transactional path: the caller controls when the surrounding
+        // transaction commits, so we cannot safely update process-local counters
+        // here — the row may disappear on rollback while the counter persists.
+        if self.pg_pool.is_some() {
+            return pg_enqueue_on_conn(conn, id, name, payload, job_max_attempts, job_backoff_ms)
+                .await;
+        }
+
         self.registry.record_enqueue(name);
         self.job_admin
             .record_enqueue(id.clone(), name, payload.clone(), 1, job_max_attempts);
 
-        let result = if self.pg_pool.is_some() {
-            pg_enqueue_on_conn(
-                conn,
-                id.clone(),
-                name,
-                payload,
-                job_max_attempts,
-                job_backoff_ms,
-            )
-            .await
-        } else if let Some(sender) = &self.local_sender {
+        let result = if let Some(sender) = &self.local_sender {
             sender
                 .send(QueuedJob {
                     id: id.clone(),
