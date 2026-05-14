@@ -1003,6 +1003,78 @@ pub async fn enqueue_on_conn<A: serde::Serialize>(
     client.enqueue_on_conn(name, payload, conn).await
 }
 
+/// Enqueue a job that fires **only after the surrounding transaction commits**.
+///
+/// This is the module-level companion to [`JobClient::enqueue_after_commit`].
+/// It delegates to the globally initialized job client.
+///
+/// When called inside a [`Db::tx`](crate::db::Db::tx) block, the enqueue is
+/// deferred until the transaction commits. On rollback the job is dropped.
+///
+/// When called outside any active transaction, the job is enqueued
+/// immediately with a `debug`-level log noting the eager path.
+///
+/// For the `postgres` backend, prefer [`enqueue_in_tx`] when you have the
+/// connection available: writing the job row inside the same transaction
+/// gives exactly-once enqueue with no after-commit indirection.
+///
+/// # Errors
+///
+/// Returns an error if the job runtime is not initialized or if `args`
+/// cannot be serialized to JSON.
+pub async fn enqueue_after_commit<A: serde::Serialize>(
+    name: &str,
+    args: A,
+) -> AutumnResult<()> {
+    let payload = serde_json::to_value(&args).map_err(|e| {
+        AutumnError::internal_server_error(std::io::Error::other(format!(
+            "job args serialization failed: {e}"
+        )))
+    })?;
+    let Some(client) = global_job_client() else {
+        return Err(AutumnError::internal_server_error(std::io::Error::other(
+            "job runtime is not initialized; register jobs with AppBuilder::jobs()",
+        )));
+    };
+    client.enqueue_after_commit(name, payload).await
+}
+
+/// Enqueue a job inside an **already-open connection**, writing the job row
+/// inside the caller's transaction for exactly-once semantics.
+///
+/// This is the optimal-path API for the `postgres` backend: the job row
+/// is written inside the user's own DB transaction. If the transaction rolls
+/// back, the job row disappears with it — no after-commit indirection needed.
+///
+/// For `redis` and `local` backends `conn` is ignored and the call falls back
+/// to the normal enqueue path (same as [`enqueue_on_conn`]).
+///
+/// # Errors
+///
+/// Returns an error if the job runtime is not initialized, if `args`
+/// cannot be serialized to JSON, or if the database INSERT fails.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// db.tx(move |conn| {
+///     scoped_boxed(async move {
+///         let user = diesel::insert_into(users::table).values(&new_user)
+///             .get_result(conn).await?;
+///         autumn_web::job::enqueue_in_tx("welcome_email", &WelcomeArgs { user_id: user.id }, conn).await?;
+///         Ok(user)
+///     })
+/// }).await?;
+/// ```
+#[cfg(feature = "db")]
+pub async fn enqueue_in_tx<A: serde::Serialize>(
+    name: &str,
+    args: A,
+    conn: &mut diesel_async::AsyncPgConnection,
+) -> AutumnResult<()> {
+    enqueue_on_conn(name, args, conn).await
+}
+
 impl JobClient {
     /// Enqueue a job by name with a JSON payload.
     ///

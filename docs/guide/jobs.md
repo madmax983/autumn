@@ -154,4 +154,61 @@ autumn migrate   # creates autumn_jobs, your domain tables, etc.
 The migration is bundled with the framework and is applied automatically by
 `autumn migrate` as long as the `db` feature is enabled.
 
+---
+
+## Transactional enqueue
+
+When a job must be enqueued **atomically with a database write**, use one of
+the approaches below to avoid the dual-write problem (job enqueued but DB
+rolled back, or DB committed but job lost on crash).
+
+### `enqueue_after_commit` — any backend
+
+`autumn_web::job::enqueue_after_commit` registers the enqueue as an
+after-commit callback inside the surrounding `db.tx` block. The job is only
+dispatched if the transaction commits. Works with every job backend.
+
+```rust,no_run
+use autumn_web::prelude::*;
+use scoped_futures::ScopedFutureExt;
+
+async fn create_order(mut db: Db) -> AutumnResult<()> {
+    db.tx(|conn| async move {
+        // ... INSERT order ...
+
+        // Enqueued only after INSERT commits; dropped if the tx rolls back.
+        autumn_web::job::enqueue_after_commit("ship_order", &args).await?;
+
+        Ok::<_, AutumnError>(())
+    }.scope_boxed())
+    .await
+}
+```
+
+### `enqueue_in_tx` / `enqueue_on_conn` — Postgres backend only
+
+On the Postgres backend the job row can live in the **same transaction** as
+the domain row. Both commit or roll back together — maximum durability at
+the cost of being limited to the `postgres` backend.
+
+```rust,no_run
+use autumn_web::prelude::*;
+use scoped_futures::ScopedFutureExt;
+
+async fn create_order(mut db: Db) -> AutumnResult<()> {
+    db.tx(|conn| async move {
+        // ... INSERT order using conn ...
+
+        // Job row written into the same transaction.
+        autumn_web::job::enqueue_in_tx("ship_order", &args, conn).await?;
+
+        Ok::<_, AutumnError>(())
+    }.scope_boxed())
+    .await
+}
+```
+
+See [Transactions → after_commit](transactions.md#after_commit--deferring-side-effects-until-the-db-write-is-durable)
+for a full comparison of the two strategies and guidance on when to use each.
+
 For cloud-native rollout run the migration job first, then start web and workers.

@@ -644,32 +644,96 @@ impl Mailer {
 
     /// Queue mail for later delivery.
     ///
-    /// This release falls back to an in-process Tokio task. The method shape is
-    /// intentionally stable so Harvest-backed durable dispatch can slot in
-    /// behind the same call once the web crate and Harvest plugin share a
-    /// first-class queue contract.
+    /// When called **inside a [`Db::tx`](autumn_web::db::Db::tx) block**, the
+    /// delivery is automatically deferred until the transaction commits. On
+    /// rollback the mail is silently dropped — no orphaned sends.
+    ///
+    /// When called outside any active transaction the behaviour is unchanged:
+    /// the mail is dispatched in a background Tokio task immediately.
+    ///
+    /// Use [`deliver_later_eager`](Self::deliver_later_eager) when you need the
+    /// mail to fire regardless of whether the surrounding transaction commits
+    /// (e.g. security alerts that must go out on any code path).
     pub fn deliver_later(&self, mail: Mail) {
         if let Err(error) = self.try_deliver_later(mail) {
             tracing::error!(error = %error, "background mail delivery was not scheduled");
         }
     }
 
-    /// Queue mail for later delivery.
+    /// Queue mail for later delivery, **bypassing any active transaction**.
+    ///
+    /// Unlike [`deliver_later`](Self::deliver_later), this method always
+    /// spawns the delivery immediately — it does not check for an active
+    /// `db.tx` block. Use this when the mail must be sent even if the
+    /// surrounding transaction rolls back (e.g. "someone tried to log in"
+    /// security alerts, rate-limit notices).
+    pub fn deliver_later_eager(&self, mail: Mail) {
+        if let Err(error) = self.try_deliver_later_eager(mail) {
+            tracing::error!(error = %error, "background mail delivery was not scheduled");
+        }
+    }
+
+    /// Queue mail for later delivery, deferring when inside a `db.tx`.
     ///
     /// # Errors
     ///
     /// Returns an error when no active Tokio runtime is available to host the
     /// background task.
     pub fn try_deliver_later(&self, mail: Mail) -> Result<(), MailError> {
-        // Honor the disabled-transport contract for deferred mail too: if the
-        // operator turned mail off for this profile, deliver_later must drop
-        // the message just like immediate `send` does — even when a queue is
-        // attached. Otherwise `Mailer::builder().transport(Disabled)
-        // .delivery_queue(...)` would persist mail through the queue branch.
         if self.transport.is_disabled() {
             return Ok(());
         }
         let mail = mail.with_defaults(&self.defaults);
+
+        // When inside a db.tx, push the spawn as an after-commit callback so
+        // the mail only fires if the transaction commits successfully.
+        #[cfg(feature = "db")]
+        {
+            let mailer = self.clone();
+            let deferred = mail.clone();
+            let mut f_opt: Option<(Mailer, Mail)> = Some((mailer, deferred));
+
+            crate::db::AFTER_COMMIT_REGISTRY
+                .try_with(|registry| {
+                    let (m, m_mail) = f_opt.take().expect("once");
+                    let boxed: crate::db::CommitCallback = Box::new(move || {
+                        Box::pin(async move {
+                            m.spawn_mail_delivery(m_mail).map_err(|e| {
+                                crate::AutumnError::internal_server_error_msg(e.to_string())
+                            })
+                        })
+                    });
+                    registry.lock().expect("registry lock").push(boxed);
+                })
+                .ok();
+
+            if f_opt.is_none() {
+                // Successfully registered for after-commit; skip the eager spawn.
+                return Ok(());
+            }
+        }
+
+        // Outside a transaction (or `db` feature not enabled) — spawn immediately.
+        self.spawn_mail_delivery(mail)
+    }
+
+    /// Queue mail for later delivery, always spawning immediately.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no active Tokio runtime is available.
+    pub fn try_deliver_later_eager(&self, mail: Mail) -> Result<(), MailError> {
+        if self.transport.is_disabled() {
+            return Ok(());
+        }
+        let mail = mail.with_defaults(&self.defaults);
+        self.spawn_mail_delivery(mail)
+    }
+
+    fn spawn_mail_delivery(&self, mail: Mail) -> Result<(), MailError> {
+        // Honor the disabled-transport contract: if the operator turned mail off
+        // for this profile, deliver_later must drop the message just like
+        // immediate `send` does — even when a queue is attached.
         let handle = tokio::runtime::Handle::try_current().map_err(|_| {
             MailError::RuntimeUnavailable(
                 "deliver_later requires an active Tokio runtime".to_owned(),

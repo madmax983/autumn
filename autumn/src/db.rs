@@ -31,6 +31,7 @@ use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::deadpool::Pool;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::Instrument as _;
@@ -58,6 +59,17 @@ tokio::task_local! {
     /// absent outside a transaction block.
     pub static AFTER_COMMIT_REGISTRY: Arc<Mutex<Vec<CommitCallback>>>;
 }
+
+/// Total count of after-commit callback errors since process start.
+///
+/// Incremented each time a callback registered via [`register_after_commit`]
+/// or [`Db::tx`] returns an error **after** the transaction has already
+/// committed. The underlying transaction is unaffected; this counter surfaces
+/// failures for alerting and dashboards.
+///
+/// Exposed by the `/actuator/health` endpoint as
+/// `autumn_after_commit_failures_total` in the system-info block.
+pub static AFTER_COMMIT_FAILURES_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 /// Register a callback to run after the current database transaction commits.
 ///
@@ -395,7 +407,8 @@ impl Db {
         guard.disarmed = true;
 
         // On commit: drain and run every registered callback. An error in a
-        // callback is logged but does NOT roll back the already-committed tx.
+        // callback is logged and counted but does NOT roll back the
+        // already-committed tx.
         if result.is_ok() {
             let callbacks: Vec<CommitCallback> = {
                 let mut reg = registry.lock().expect("registry lock");
@@ -403,7 +416,12 @@ impl Db {
             };
             for cb in callbacks {
                 if let Err(e) = cb().await {
-                    tracing::error!("after_commit callback failed (tx already committed): {e}");
+                    AFTER_COMMIT_FAILURES_TOTAL.fetch_add(1, Ordering::Relaxed);
+                    tracing::error!(
+                        autumn.after_commit.failures_total =
+                            AFTER_COMMIT_FAILURES_TOTAL.load(Ordering::Relaxed),
+                        "after_commit callback failed (tx already committed): {e}"
+                    );
                 }
             }
         }

@@ -354,10 +354,10 @@ pub async fn submit(
                 .execute(conn)
                 .await?;
 
-            autumn_web::job::enqueue_on_conn(
+            // Fires only after the transaction commits — no orphaned jobs on rollback.
+            autumn_web::job::enqueue_after_commit(
                 PostPublicationJob::NAME,
                 PostPublicationArgs::new(post_id, &title, &slug, &subreddit_slug, &author_username),
-                conn,
             )
             .await?;
 

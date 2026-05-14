@@ -344,6 +344,19 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                 self.hooks.after_create(&mut ctx, &record).await?;
 
+                // Register after_create_commit to run after the surrounding tx
+                // commits. Falls back to eager execution when called outside a
+                // db.tx block (matching the register_after_commit contract).
+                {
+                    let __hooks = ::autumn_web::hooks::RepositoryHooksClone::autumn_clone(&self.hooks);
+                    let mut __ctx = ctx.clone();
+                    let __record = record.clone();
+                    ::autumn_web::db::register_after_commit(move || async move {
+                        __hooks.after_create_commit(&mut __ctx, &__record).await
+                    })
+                    .await;
+                }
+
                 Ok(record)
             };
 
@@ -435,6 +448,18 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 };
 
                 self.hooks.after_update(&mut ctx, &record).await?;
+
+                // Register after_update_commit to run after the surrounding tx commits.
+                {
+                    let __hooks = ::autumn_web::hooks::RepositoryHooksClone::autumn_clone(&self.hooks);
+                    let mut __ctx = ctx.clone();
+                    let __record = record.clone();
+                    ::autumn_web::db::register_after_commit(move || async move {
+                        __hooks.after_update_commit(&mut __ctx, &__record).await
+                    })
+                    .await;
+                }
+
                 Ok(record)
             };
 
@@ -464,6 +489,17 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     .execute(&mut conn)
                     .await
                     .map_err(::autumn_web::AutumnError::from)?;
+
+                // Register after_delete_commit to run after the surrounding tx commits.
+                {
+                    let __hooks = ::autumn_web::hooks::RepositoryHooksClone::autumn_clone(&self.hooks);
+                    let mut __ctx = ctx.clone();
+                    let __record = record.clone();
+                    ::autumn_web::db::register_after_commit(move || async move {
+                        __hooks.after_delete_commit(&mut __ctx, &__record).await
+                    })
+                    .await;
+                }
 
                 Ok(())
             };
