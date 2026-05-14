@@ -2900,22 +2900,19 @@ fn record_pg_lifecycle_after_ack(
         // - terminal attempts are dead-lettered (attempt >= max_attempts)
         // Mirror whichever outcome the worker intended so /actuator metrics stay
         // consistent with the database row.
-        match lifecycle {
-            PgLifecycleRecord::Failure { error } => {
-                // Stale recovery dead-lettered the row (final attempt).
-                state
-                    .job_registry
-                    .record_failure(job_name, error.to_owned(), true);
-                job_admin.record_failure(job_id, error.to_owned());
-            }
-            _ => {
-                // Non-terminal or successful outcome: decrement in_flight and
-                // mark as retrying; the row is already back in the queue.
-                state
-                    .job_registry
-                    .record_retry(job_name, "visibility timeout expired", 0);
-                job_admin.record_retrying(job_id, "visibility timeout expired");
-            }
+        if let PgLifecycleRecord::Failure { error } = lifecycle {
+            // Stale recovery dead-lettered the row (final attempt).
+            state
+                .job_registry
+                .record_failure(job_name, error.to_owned(), true);
+            job_admin.record_failure(job_id, error.to_owned());
+        } else {
+            // Non-terminal or successful outcome: decrement in_flight and
+            // mark as retrying; the row is already back in the queue.
+            state
+                .job_registry
+                .record_retry(job_name, "visibility timeout expired", 0);
+            job_admin.record_retrying(job_id, "visibility timeout expired");
         }
         return false;
     }
