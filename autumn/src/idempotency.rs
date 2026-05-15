@@ -39,10 +39,32 @@ const fn is_mutating_method(method: &Method) -> bool {
     )
 }
 
-fn compute_body_hash(bytes: &[u8]) -> Vec<u8> {
+fn compute_body_hash(bytes: &[u8], content_type: Option<&[u8]>) -> Vec<u8> {
     let mut hasher = DefaultHasher::new();
+    content_type.unwrap_or(b"").hash(&mut hasher);
     bytes.hash(&mut hasher);
     hasher.finish().to_le_bytes().to_vec()
+}
+
+/// Namespace the cache key by method, path, a hash of the Authorization header,
+/// and the client-supplied idempotency key.
+///
+/// Namespacing by method+path prevents cross-endpoint cache collisions (P2).
+/// Namespacing by Authorization hash prevents cross-principal collisions (P1).
+fn build_storage_key(
+    idempotency_key: &str,
+    method: &Method,
+    uri: &axum::http::Uri,
+    headers: &HeaderMap,
+) -> String {
+    let path = uri.path_and_query().map_or_else(|| uri.path(), |pq| pq.as_str());
+    let auth = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let mut h = DefaultHasher::new();
+    auth.hash(&mut h);
+    format!("{}:{}:{:x}:{}", method, path, h.finish(), idempotency_key)
 }
 
 fn extract_replay_headers(headers: &HeaderMap) -> Vec<(String, Vec<u8>)> {
@@ -493,6 +515,8 @@ where
         return inner.call(req).await;
     }
     let (parts, body) = req.into_parts();
+    let storage_key = build_storage_key(&idempotency_key, &parts.method, &parts.uri, &parts.headers);
+    let content_type = parts.headers.get(axum::http::header::CONTENT_TYPE).map(axum::http::HeaderValue::as_bytes);
 
     let body_limit = parts
         .extensions
@@ -507,10 +531,10 @@ where
             .unwrap());
     };
 
-    let body_hash = compute_body_hash(&body_bytes);
+    let body_hash = compute_body_hash(&body_bytes, content_type);
 
     // ── Cache hit ──────────────────────────────────────────────────────────
-    if let Some(entry) = store.get(&idempotency_key) {
+    if let Some(entry) = store.get(&storage_key) {
         return Ok(handle_cache_hit(
             entry,
             &body_hash,
@@ -520,14 +544,12 @@ where
     }
 
     // ── In-flight check (concurrent duplicate) ─────────────────────────────
-    if !store.try_lock(&idempotency_key) {
+    if !store.try_lock(&storage_key) {
         tracing::debug!(
             idempotency.key = %idempotency_key,
             "Idempotency key already in flight — returning 409"
         );
-        if let Some(m) = &metrics {
-            m.record_idempotency_conflict();
-        }
+        metrics.as_ref().inspect(|m| m.record_idempotency_conflict());
         return Ok(Response::builder()
             .status(StatusCode::CONFLICT)
             .header("retry-after", "1")
@@ -540,8 +562,8 @@ where
 
     // Double-check after acquiring the lock: a concurrent request may have
     // completed between our miss check and lock acquisition.
-    if let Some(entry) = store.get(&idempotency_key) {
-        store.unlock(&idempotency_key);
+    if let Some(entry) = store.get(&storage_key) {
+        store.unlock(&storage_key);
         return Ok(handle_cache_hit(
             entry,
             &body_hash,
@@ -564,7 +586,7 @@ where
     // buffering to avoid materialising large responses in memory.
     let resp_bytes = match collect_response_for_cache(resp_body).await {
         Err(()) => {
-            store.unlock(&idempotency_key);
+            store.unlock(&storage_key);
             tracing::warn!(
                 idempotency.key = %idempotency_key,
                 "I/O error reading response body; not storing idempotency entry"
@@ -573,7 +595,7 @@ where
         }
         Ok(Err(passthrough_body)) => {
             // Body exceeded MAX_CACHEABLE_RESPONSE_BODY — stream through.
-            store.unlock(&idempotency_key);
+            store.unlock(&storage_key);
             tracing::debug!(
                 idempotency.key = %idempotency_key,
                 limit_bytes = MAX_CACHEABLE_RESPONSE_BODY,
@@ -594,9 +616,9 @@ where
             headers: extract_replay_headers(&resp_parts.headers),
             body: resp_bytes.to_vec(),
         };
-        store.set(&idempotency_key, record, body_hash, ttl);
+        store.set(&storage_key, record, body_hash, ttl);
     }
-    store.unlock(&idempotency_key);
+    store.unlock(&storage_key);
 
     metrics.as_ref().inspect(|m| m.record_idempotency_miss());
 

@@ -17,6 +17,15 @@ fn make_store(ttl: Duration) -> Arc<dyn autumn_web::idempotency::IdempotencyStor
     Arc::new(MemoryIdempotencyStore::new(ttl))
 }
 
+/// Replicates the storage-key format used by `IdempotencyLayer` so tests can
+/// pre-lock the exact slot the middleware will look up.
+fn storage_key(method: &str, path: &str, auth: &str, idempotency_key: &str) -> String {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    auth.hash(&mut h);
+    format!("{}:{}:{:x}:{}", method, path, h.finish(), idempotency_key)
+}
+
 /// Axum middleware that injects a 5-byte `UploadConfig` limit into extensions.
 /// Used by `test_request_body_too_large_returns_413` to trigger the 413 path
 /// in the idempotency middleware without needing a 32 MiB request body.
@@ -317,8 +326,10 @@ async fn test_concurrent_duplicate_returns_409() {
         .route("/ping", axum::routing::post(ok_handler))
         .layer(layer);
 
-    // Lock the key manually to simulate an in-flight request.
-    store.try_lock("inflight-key");
+    // Pre-lock the scoped storage key to simulate an in-flight request.
+    // The middleware namespaces by method, path, and auth, so we replicate
+    // the same format here (no Authorization header → auth = "").
+    store.try_lock(&storage_key("POST", "/ping", "", "inflight-key"));
 
     let req = axum::http::Request::builder()
         .method("POST")
@@ -682,6 +693,123 @@ fn test_default_store_ttl_trait_impl() {
         BareStore.default_ttl(),
         Duration::from_secs(86_400),
         "IdempotencyStore::default_ttl() must return 24 hours"
+    );
+}
+
+/// Requests to different paths sharing the same `Idempotency-Key` are stored
+/// independently — no cross-endpoint replay occurs (P2: request-target scope).
+#[tokio::test]
+async fn test_different_paths_same_key_are_independent() {
+    use tower::ServiceExt;
+
+    let store = make_store(Duration::from_secs(3600));
+    let layer = IdempotencyLayer::new(store);
+
+    let app = axum::Router::new()
+        .route("/a", axum::routing::post(|| async { "a" }))
+        .route("/b", axum::routing::post(|| async { "b" }))
+        .layer(layer);
+
+    let req_a = axum::http::Request::builder()
+        .method("POST")
+        .uri("/a")
+        .header("idempotency-key", "shared-path-key")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp_a = app.clone().oneshot(req_a).await.unwrap();
+    assert_eq!(resp_a.status(), StatusCode::OK);
+    assert!(resp_a.headers().get("x-idempotent-replayed").is_none());
+
+    let req_b = axum::http::Request::builder()
+        .method("POST")
+        .uri("/b")
+        .header("idempotency-key", "shared-path-key")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp_b = app.clone().oneshot(req_b).await.unwrap();
+    assert_eq!(resp_b.status(), StatusCode::OK);
+    assert!(
+        resp_b.headers().get("x-idempotent-replayed").is_none(),
+        "different path with same key must not replay another endpoint's response"
+    );
+}
+
+/// Requests with different `Authorization` headers sharing the same
+/// `Idempotency-Key` are stored independently — no cross-principal replay
+/// occurs (P1: authenticated principal scope).
+#[tokio::test]
+async fn test_different_auth_same_key_are_independent() {
+    use tower::ServiceExt;
+
+    let store = make_store(Duration::from_secs(3600));
+    let layer = IdempotencyLayer::new(store);
+
+    let app = axum::Router::new()
+        .route("/action", axum::routing::post(ok_handler))
+        .layer(layer);
+
+    let req_a = axum::http::Request::builder()
+        .method("POST")
+        .uri("/action")
+        .header("idempotency-key", "shared-auth-key")
+        .header("authorization", "Bearer token-user-a")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp_a = app.clone().oneshot(req_a).await.unwrap();
+    assert_eq!(resp_a.status(), StatusCode::OK);
+    assert!(resp_a.headers().get("x-idempotent-replayed").is_none());
+
+    let req_b = axum::http::Request::builder()
+        .method("POST")
+        .uri("/action")
+        .header("idempotency-key", "shared-auth-key")
+        .header("authorization", "Bearer token-user-b")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp_b = app.clone().oneshot(req_b).await.unwrap();
+    assert_eq!(resp_b.status(), StatusCode::OK);
+    assert!(
+        resp_b.headers().get("x-idempotent-replayed").is_none(),
+        "different Authorization with same key must not replay another principal's response"
+    );
+}
+
+/// The same body bytes with a different `Content-Type` are treated as a
+/// distinct payload; the middleware returns 422 to signal the key is being
+/// reused for a representationally different request (P2: representation scope).
+#[tokio::test]
+async fn test_different_content_type_same_body_returns_422() {
+    use tower::ServiceExt;
+
+    let store = make_store(Duration::from_secs(3600));
+    let layer = IdempotencyLayer::new(store);
+
+    let app = axum::Router::new()
+        .route("/items", axum::routing::post(ok_handler))
+        .layer(layer);
+
+    let req1 = axum::http::Request::builder()
+        .method("POST")
+        .uri("/items")
+        .header("idempotency-key", "ct-scope-key")
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(r#"{"x":1}"#))
+        .unwrap();
+    let resp1 = app.clone().oneshot(req1).await.unwrap();
+    assert_eq!(resp1.status(), StatusCode::OK);
+
+    let req2 = axum::http::Request::builder()
+        .method("POST")
+        .uri("/items")
+        .header("idempotency-key", "ct-scope-key")
+        .header("content-type", "application/xml")
+        .body(axum::body::Body::from(r#"{"x":1}"#))
+        .unwrap();
+    let resp2 = app.clone().oneshot(req2).await.unwrap();
+    assert_eq!(
+        resp2.status(),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "same bytes with different Content-Type must return 422 (payload mismatch)"
     );
 }
 
