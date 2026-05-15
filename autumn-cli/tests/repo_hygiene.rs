@@ -97,6 +97,46 @@ fn member_manifest_forbids_unsafe_code(manifest_toml: &toml::Value) -> bool {
 }
 
 #[test]
+fn workspace_test_profile_keeps_ci_artifacts_bounded() {
+    let root = workspace_root();
+    let root_toml = read_workspace_manifest(&root);
+    let test_profile = root_toml
+        .get("profile")
+        .and_then(|profile| profile.get("test"))
+        .unwrap_or_else(|| {
+            panic!(
+                "workspace Cargo.toml must set [profile.test] so `cargo test --workspace` \
+                 does not fill CI disks with full debug artifacts"
+            )
+        });
+
+    assert_eq!(
+        test_profile.get("debug").and_then(toml::Value::as_str),
+        Some("line-tables-only"),
+        "[profile.test] should keep only line-table debug info for useful panic locations \
+         without full debug artifact bloat",
+    );
+    assert_eq!(
+        test_profile
+            .get("incremental")
+            .and_then(toml::Value::as_bool),
+        Some(false),
+        "[profile.test] should disable incremental caches in CI-sized test builds",
+    );
+
+    let build_override = test_profile
+        .get("build-override")
+        .unwrap_or_else(|| panic!("[profile.test.build-override] should be set"));
+    assert_eq!(
+        build_override
+            .get("debug")
+            .and_then(toml::Value::as_integer),
+        Some(0),
+        "[profile.test.build-override] should avoid debug info for build scripts and proc macros",
+    );
+}
+
+#[test]
 fn first_run_docs_match_current_release_line() {
     let root = workspace_root();
     let root_toml = read_workspace_manifest(&root);
