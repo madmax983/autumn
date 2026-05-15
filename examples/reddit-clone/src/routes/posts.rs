@@ -354,10 +354,12 @@ pub async fn submit(
                 .execute(conn)
                 .await?;
 
-            // Fires only after the transaction commits — no orphaned jobs on rollback.
-            autumn_web::job::enqueue_after_commit(
+            // Default jobs.backend is Postgres, so keep the job row in this
+            // transaction: a failed enqueue rolls back the post and vote too.
+            autumn_web::job::enqueue_on_conn(
                 PostPublicationJob::NAME,
                 PostPublicationArgs::new(post_id, &title, &slug, &subreddit_slug, &author_username),
+                conn,
             )
             .await?;
 

@@ -176,11 +176,12 @@ pub async fn register(
                     .await
                     .map_err(|_| AutumnError::unprocessable_msg("Username already taken"))?;
 
-                // Enqueue and mail both register as after_commit callbacks because
-                // we're inside db.tx — they fire only if the INSERT commits.
-                autumn_web::job::enqueue_after_commit(
+                // The default profile uses the Postgres job backend, so the
+                // job row is inserted on this transaction connection.
+                autumn_web::job::enqueue_on_conn(
                     UserOnboardingJob::NAME,
                     UserOnboardingArgs::from_user(&user),
+                    conn,
                 )
                 .await?;
 

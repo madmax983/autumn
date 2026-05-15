@@ -75,6 +75,35 @@ pub(crate) fn record_after_commit_failure() -> u64 {
     AFTER_COMMIT_FAILURES_TOTAL.fetch_add(1, Ordering::Relaxed) + 1
 }
 
+pub(crate) fn reject_ambient_after_commit_registry_for_tx() -> Result<(), AutumnError> {
+    if AFTER_COMMIT_REGISTRY.try_with(|_| ()).is_ok() {
+        return Err(AutumnError::bad_request_msg(
+            "Nested Db::tx calls are not supported",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn spawn_committed_after_commit_callbacks(
+    callbacks: Vec<CommitCallback>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if callbacks.is_empty() {
+        return None;
+    }
+
+    Some(tokio::task::spawn(async move {
+        for cb in callbacks {
+            if let Err(e) = cb().await {
+                let failures_total = record_after_commit_failure();
+                tracing::error!(
+                    autumn.after_commit.failures_total = failures_total,
+                    "after_commit callback failed (tx already committed): {e}"
+                );
+            }
+        }
+    }))
+}
+
 /// Register a callback to run after the current database transaction commits.
 ///
 /// If called inside a [`Db::tx`] block, the callback is deferred until the
@@ -402,6 +431,7 @@ impl Db {
                 "Nested Db::tx calls are not supported",
             ));
         }
+        reject_ambient_after_commit_registry_for_tx()?;
         self.tx_depth += 1;
         let mut guard = TxDepthGuard {
             depth: &mut self.tx_depth,
@@ -422,26 +452,16 @@ impl Db {
 
         guard.disarmed = true;
 
-        // On commit: spawn each callback as an independent task so that
-        // callbacks can acquire DB pool connections without deadlocking
-        // (this Db instance still holds its connection until dropped).
+        // On commit: spawn the registered callbacks outside the transaction
+        // connection, but await them sequentially inside that task so callback
+        // dependencies observe registration order.
         // Errors are counted and logged; they do NOT affect the committed tx.
         if result.is_ok() {
             let callbacks: Vec<CommitCallback> = {
                 let mut reg = registry.lock().expect("registry lock");
                 std::mem::take(&mut *reg)
             };
-            for cb in callbacks {
-                tokio::task::spawn(async move {
-                    if let Err(e) = cb().await {
-                        let failures_total = record_after_commit_failure();
-                        tracing::error!(
-                            autumn.after_commit.failures_total = failures_total,
-                            "after_commit callback failed (tx already committed): {e}"
-                        );
-                    }
-                });
-            }
+            let _ = spawn_committed_after_commit_callbacks(callbacks);
         }
 
         result
@@ -762,6 +782,67 @@ mod tests {
         }
 
         assert_eq!(*order.lock().unwrap(), vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn production_after_commit_drain_preserves_registration_order() {
+        let order = Arc::new(std::sync::Mutex::new(Vec::<u32>::new()));
+        let (release_first, wait_first) = tokio::sync::oneshot::channel::<()>();
+
+        let first_order = order.clone();
+        let second_order = order.clone();
+        let callbacks: Vec<CommitCallback> = vec![
+            Box::new(move || {
+                Box::pin(async move {
+                    wait_first
+                        .await
+                        .expect("test should release first callback");
+                    first_order.lock().unwrap().push(1);
+                    Ok(())
+                })
+            }),
+            Box::new(move || {
+                Box::pin(async move {
+                    second_order.lock().unwrap().push(2);
+                    Ok(())
+                })
+            }),
+        ];
+
+        let drain = spawn_committed_after_commit_callbacks(callbacks)
+            .expect("non-empty callback list should spawn a drain task");
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            *order.lock().unwrap(),
+            Vec::<u32>::new(),
+            "later callbacks must wait for earlier callbacks to finish"
+        );
+
+        release_first
+            .send(())
+            .expect("first callback receiver alive");
+        drain.await.expect("drain task should not panic");
+
+        assert_eq!(*order.lock().unwrap(), vec![1, 2]);
+    }
+
+    #[tokio::test]
+    async fn db_tx_rejects_ambient_after_commit_registry() {
+        let registry = Arc::new(std::sync::Mutex::new(Vec::<CommitCallback>::new()));
+
+        let err = AFTER_COMMIT_REGISTRY
+            .scope(registry, async {
+                reject_ambient_after_commit_registry_for_tx().expect_err(
+                    "starting Db::tx inside an ambient transaction registry should fail",
+                )
+            })
+            .await;
+
+        assert!(
+            err.to_string().contains("Nested Db::tx calls"),
+            "unexpected nested transaction error: {err}"
+        );
     }
 
     #[tokio::test]

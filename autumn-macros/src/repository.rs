@@ -348,7 +348,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 // commits. Falls back to eager execution when called outside a
                 // db.tx block (matching the register_after_commit contract).
                 {
-                    let __hooks = ::autumn_web::hooks::RepositoryHooksClone::autumn_clone(&self.hooks);
+                    let __hooks = <#hooks_ident as ::autumn_web::hooks::RepositoryHooksClone>::autumn_clone(&self.hooks);
                     let mut __ctx = ctx.clone();
                     let __record = record.clone();
                     ::autumn_web::db::register_after_commit(move || async move {
@@ -451,7 +451,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                 // Register after_update_commit to run after the surrounding tx commits.
                 {
-                    let __hooks = ::autumn_web::hooks::RepositoryHooksClone::autumn_clone(&self.hooks);
+                    let __hooks = <#hooks_ident as ::autumn_web::hooks::RepositoryHooksClone>::autumn_clone(&self.hooks);
                     let mut __ctx = ctx.clone();
                     let __record = record.clone();
                     ::autumn_web::db::register_after_commit(move || async move {
@@ -492,7 +492,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                 // Register after_delete_commit to run after the surrounding tx commits.
                 {
-                    let __hooks = ::autumn_web::hooks::RepositoryHooksClone::autumn_clone(&self.hooks);
+                    let __hooks = <#hooks_ident as ::autumn_web::hooks::RepositoryHooksClone>::autumn_clone(&self.hooks);
                     let mut __ctx = ctx.clone();
                     let __record = record.clone();
                     ::autumn_web::db::register_after_commit(move || async move {
@@ -1156,6 +1156,21 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             #struct_fields
         }
 
+        // Extractor: pull pool from AppState (same pattern as Db extractor)
+        impl ::autumn_web::reexports::axum::extract::FromRequestParts<::autumn_web::AppState> for #pg_name {
+            type Rejection = ::autumn_web::AutumnError;
+
+            async fn from_request_parts(
+                _parts: &mut ::autumn_web::reexports::http::request::Parts,
+                state: &::autumn_web::AppState,
+            ) -> Result<Self, Self::Rejection> {
+                let pool = state.pool()
+                    .ok_or_else(|| ::autumn_web::AutumnError::service_unavailable_msg("No database pool configured"))?
+                    .clone();
+                #extractor_init
+            }
+        }
+
         #clone_impl
 
         impl #trait_name for #pg_name {
@@ -1271,21 +1286,6 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     .scope_boxed()
                 })
                 .await
-            }
-        }
-
-        // Extractor: pull pool from AppState (same pattern as Db extractor)
-        impl ::autumn_web::reexports::axum::extract::FromRequestParts<::autumn_web::AppState> for #pg_name {
-            type Rejection = ::autumn_web::AutumnError;
-
-            async fn from_request_parts(
-                _parts: &mut ::autumn_web::reexports::http::request::Parts,
-                state: &::autumn_web::AppState,
-            ) -> Result<Self, Self::Rejection> {
-                let pool = state.pool()
-                    .ok_or_else(|| ::autumn_web::AutumnError::service_unavailable_msg("No database pool configured"))?
-                    .clone();
-                #extractor_init
             }
         }
 
