@@ -108,12 +108,16 @@ impl MetricsCollector {
 
     /// Increment the idempotency cache miss counter.
     pub fn record_idempotency_miss(&self) {
-        self.inner.idempotency_misses.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .idempotency_misses
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Increment the idempotency conflict counter (concurrent duplicate request).
     pub fn record_idempotency_conflict(&self) {
-        self.inner.idempotency_conflicts.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .idempotency_conflicts
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record a completed request.

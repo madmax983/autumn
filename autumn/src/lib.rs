@@ -83,7 +83,6 @@ pub use channels::{
 pub mod config;
 #[cfg(feature = "db")]
 pub mod db;
-pub mod idempotency;
 pub mod error;
 pub mod error_pages;
 pub mod extract;
@@ -92,6 +91,7 @@ pub mod health;
 pub mod hooks;
 #[cfg(feature = "i18n")]
 pub mod i18n;
+pub mod idempotency;
 /// Translation lookup macro with compile-time key validation.
 ///
 /// Re-exported from [`crate::i18n::t`] for ergonomic
