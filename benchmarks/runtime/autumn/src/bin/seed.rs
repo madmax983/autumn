@@ -6,7 +6,7 @@
 //! Requires DATABASE_URL to be set.
 
 use diesel::prelude::*;
-use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 
 diesel::table! {
     posts (id) {
@@ -47,8 +47,7 @@ struct SeedToken {
 
 #[tokio::main]
 async fn main() {
-    let db_url = std::env::var("DATABASE_URL")
-        .expect("DATABASE_URL must be set");
+    let db_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
 
     let mut conn = AsyncPgConnection::establish(&db_url)
         .await

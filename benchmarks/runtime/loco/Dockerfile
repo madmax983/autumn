@@ -3,8 +3,9 @@ WORKDIR /workspace
 
 # Minimal stub workspace to allow -p build without pulling in the whole repo.
 RUN cargo new --bin bench-loco-stub
-COPY Cargo.toml /workspace/bench-loco/Cargo.toml
+COPY Cargo.toml /workspace/bench-loco/
 COPY src /workspace/bench-loco/src
+COPY migrations /workspace/bench-loco/migrations
 WORKDIR /workspace/bench-loco
 RUN cargo build --release
 
@@ -21,6 +22,6 @@ ENV LOCO_APP_PORT=8080
 ENV RUST_LOG=warn
 EXPOSE 8080
 HEALTHCHECK --interval=10s --timeout=5s --start-period=30s \
-  CMD curl -sf http://localhost:${LOCO_APP_PORT}/health || exit 1
+  CMD curl -sf http://localhost:${LOCO_APP_PORT}/_health || exit 1
 
-CMD ["/app/bench-loco", "start"]
+CMD ["/app/bench-loco", "-e", "production", "start"]

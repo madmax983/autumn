@@ -40,17 +40,19 @@ export default function () {
   listTime.add(listRes.timings.duration);
   const listOk = check(listRes, {
     "html list 200":          (r) => r.status === 200,
-    "html list contains h1":  (r) => r.body.includes("<h1>"),
+    "html list contains h1":  (r) => (r.body || "").includes("<h1>"),
   });
   errorRate.add(!listOk);
 
   // --- Detail page (random post from seed range) ---
   const id = Math.floor(Math.random() * POST_COUNT) + 1;
-  const detailRes = http.get(`${BASE_URL}/posts/${id}`);
+  const detailRes = http.get(`${BASE_URL}/posts/${id}`, {
+    tags: { name: "/posts/:id" },
+  });
   detailTime.add(detailRes.timings.duration);
   const detailOk = check(detailRes, {
     "html detail 200":         (r) => r.status === 200,
-    "html detail contains h1": (r) => r.body.includes("<h1>"),
+    "html detail contains h1": (r) => (r.body || "").includes("<h1>"),
   });
   errorRate.add(!detailOk);
 

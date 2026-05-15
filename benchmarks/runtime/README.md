@@ -70,7 +70,8 @@ benchmarks/runtime/
     │   ├── html-page.js      # Server-rendered HTML test
     │   ├── validation-fail.js # Validation error path test
     │   └── auth-protected.js # Authenticated route test
-    └── run.sh                # Orchestration script
+    ├── run.sh                # Local k6 orchestration script
+    └── run-docker.ps1        # Dockerized k6 runner for PowerShell/Windows
 ```
 
 ## Metrics
@@ -96,43 +97,47 @@ Supplementary metrics (collected manually outside k6):
 
 See [Tracks](#tracks) below for the full step-by-step workflow. Quick summary:
 
-```bash
-# Comparable track — all frameworks at once
+```powershell
+# Comparable track - all frameworks at once
 cd benchmarks/runtime
-docker compose up -d db && sleep 5
-docker compose up -d --build autumn spring-boot rails django phoenix loco
-sleep 30
-cd load && ./run.sh all --vus 50 --duration 60s
+docker --context default compose up -d --build autumn spring-boot rails django phoenix loco
+docker --context default compose ps
+.\load\run-docker.ps1 all -Vus 50 -Duration 60s
+
+# Repeat the full matrix 5 times for a more stable sample.
+.\load\run-docker.ps1 all -Vus 50 -Duration 60s -Repeat 5
 ```
 
-Results land in `load/results/<timestamp>/`. Fill in [`RESULTS.md`](RESULTS.md)
-after the run.
+Results land in `results/docker-k6_<timestamp>/`. `aggregate.csv` keeps one row
+per run/framework/scenario, and `aggregate-summary.csv` reports medians across
+the repeated runs. Fill in [`RESULTS.md`](RESULTS.md) after the run.
 
 ## Tracks
 
 ### Running the Comparable Infrastructure Track
 
-```bash
+```powershell
 cd benchmarks/runtime
 
-# 1. Start Postgres (schema + seed loaded via docker-entrypoint-initdb.d).
-docker compose up -d db
-sleep 5
+# 1. Build and start Postgres plus all framework apps.
+docker --context default compose up -d --build autumn spring-boot rails django phoenix loco
 
-# 2. Build and start all framework apps.
-docker compose up -d --build autumn spring-boot rails django phoenix loco
+# 2. Wait for health checks (all apps expose /health).
+docker --context default compose ps
 
-# 3. Wait for health checks (all apps expose /health).
-#    Check with: docker compose ps
-sleep 30
-
-# 4. Run the full suite against every framework.
-#    k6 must be installed: https://k6.io/docs/get-started/installation/
-cd load
-./run.sh all --vus 50 --duration 60s
+# 3. Run the full suite with Dockerized k6.
+.\load\run-docker.ps1 all -Vus 50 -Duration 60s
 ```
 
-Results are written to `load/results/<timestamp>/<framework>/`.
+Results are written to `results/docker-k6_<timestamp>/<framework>/` and summarized
+in `results/docker-k6_<timestamp>/aggregate.csv`. When `-Repeat` is greater than
+1, per-run outputs are written under `run-01`, `run-02`, etc., and
+`aggregate-summary.csv` contains the median throughput, p95, average latency,
+check pass rate, and HTTP failure rate for each framework/scenario.
+
+The Compose Postgres service raises `max_connections` for this all-services
+track. Otherwise idle pools from the six apps can exhaust the default Postgres
+connection budget and poison later runs.
 
 ### Running Against a Single Framework
 
@@ -140,6 +145,12 @@ Results are written to `load/results/<timestamp>/<framework>/`.
 cd benchmarks/runtime/load
 ./run.sh autumn http://localhost:8001 --vus 50 --duration 60s
 ./run.sh rails  http://localhost:8003 --vus 20 --duration 30s
+```
+
+```powershell
+cd benchmarks/runtime
+.\load\run-docker.ps1 autumn -Vus 50 -Duration 60s
+.\load\run-docker.ps1 rails -Vus 20 -Duration 30s
 ```
 
 ### Running the Idiomatic Framework Track
@@ -174,7 +185,7 @@ cd benchmarks/runtime/rails
 # Requires: Ruby 3.3+, Bundler
 bundle install
 DATABASE_URL=postgres://benchmark:benchmark@localhost:5432/benchmark \
-RAILS_ENV=production SECRET_KEY_BASE=changeme \
+RAILS_ENV=production SECRET_KEY_BASE=changeme RAILS_MAX_THREADS=20 \
   bundle exec rails db:migrate && bundle exec puma
 ```
 
@@ -257,17 +268,18 @@ benchmark apps do not silently rot.
 
 ## Results
 
-Benchmark results are stored in `load/results/` (not committed — add to
-`.gitignore`). Each run produces a timestamped directory:
+Benchmark results are stored in `results/` and ignored by Git. Each run
+produces a timestamped directory:
 
 ```
-load/results/20260512_103000/
+results/docker-k6_20260512_103000/
+├── aggregate.csv
+├── aggregate-summary.csv
 ├── autumn/
-│   ├── json-crud.json
-│   ├── html-page.json
-│   ├── validation-fail.json
-│   ├── auth-protected.json
-│   └── summary.json
+│   ├── json-crud-summary.json
+│   ├── html-page-summary.json
+│   ├── validation-fail-summary.json
+│   └── auth-protected-summary.json
 ├── spring-boot/...
 └── ...
 ```
