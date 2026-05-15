@@ -103,6 +103,7 @@ mod factory_tests {
 
     // ── DB tests ───────────────────────────────────────────────
 
+    #[cfg(feature = "test-support")]
     async fn setup_table(pool: &Pool<AsyncPgConnection>) {
         let mut conn = pool.get().await.unwrap();
         diesel::sql_query(
@@ -123,6 +124,7 @@ mod factory_tests {
             .unwrap();
     }
 
+    #[cfg(feature = "test-support")]
     #[tokio::test]
     #[ignore = "requires Docker (testcontainers)"]
     async fn factory_create_persists_and_returns_record() {
@@ -142,6 +144,7 @@ mod factory_tests {
         assert!(item.active);
     }
 
+    #[cfg(feature = "test-support")]
     #[tokio::test]
     #[ignore = "requires Docker (testcontainers)"]
     async fn factory_create_default_then_query() {
@@ -166,6 +169,7 @@ mod factory_tests {
         assert_eq!(fetched.id, created.id);
     }
 
+    #[cfg(feature = "test-support")]
     #[tokio::test]
     #[ignore = "requires Docker (testcontainers)"]
     async fn factory_create_multiple_independent_records() {
@@ -269,6 +273,7 @@ mod composition_tests {
 
     // ── DB tests (Docker required) ───────────────────────────────
 
+    #[cfg(feature = "test-support")]
     async fn setup(
         pool: &diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
     ) {
@@ -298,6 +303,7 @@ mod composition_tests {
             .unwrap();
     }
 
+    #[cfg(feature = "test-support")]
     #[tokio::test]
     #[ignore = "requires Docker (testcontainers)"]
     async fn factory_auto_creates_associated_model() {
@@ -315,6 +321,7 @@ mod composition_tests {
         assert_eq!(post.title, "Auto-composed post");
     }
 
+    #[cfg(feature = "test-support")]
     #[tokio::test]
     #[ignore = "requires Docker (testcontainers)"]
     async fn factory_uses_pre_built_user_when_supplied() {
@@ -334,6 +341,7 @@ mod composition_tests {
         assert_eq!(post.user_id, user.id);
     }
 
+    #[cfg(feature = "test-support")]
     #[tokio::test]
     #[ignore = "requires Docker (testcontainers)"]
     async fn factory_explicit_user_id_skips_auto_create() {
