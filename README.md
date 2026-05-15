@@ -142,8 +142,9 @@ async fn index() -> &'static str {
     "Welcome to Autumn!"
 }
 
+use autumn_web::extract::Path;
 #[get("/hello/{name}")]
-async fn hello_name(name: autumn_web::extract::Path<String>) -> String {
+async fn hello_name(name: Path<String>) -> String {
     format!("Hello, {}!", *name)
 }
 

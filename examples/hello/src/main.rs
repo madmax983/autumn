@@ -10,6 +10,7 @@ async fn hello() -> &'static str {
     "Hello, Autumn!"
 }
 
+use autumn_web::extract::Path;
 #[get("/hello/{name}")]
 async fn hello_name(name: Path<String>) -> String {
     format!("Hello, {}!", *name)

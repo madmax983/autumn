@@ -111,8 +111,9 @@ async fn hello() -> &'static str {
     "Hello, Autumn!"
 }
 
+use autumn_web::extract::Path;
 #[get("/hello/{name}")]
-async fn hello_name(name: autumn_web::extract::Path<String>) -> String {
+async fn hello_name(name: Path<String>) -> String {
     format!("Hello, {}!", *name)
 }
 
@@ -131,7 +132,8 @@ There is a lot happening in a small file. Here is what each piece does:
 - **`#[get("/")]`** — a route macro that registers `index` as a GET handler
   for the root path. Autumn provides `#[get]`, `#[post]`, `#[put]`, and
   `#[delete]` macros.
-- **`#[get("/hello/{name}")]`** — a route with a path parameter. The `{name}`
+- **`use autumn_web::extract::Path;
+#[get("/hello/{name}")]`** — a route with a path parameter. The `{name}`
   segment is extracted into the handler's `Path<String>` argument.
 - **`autumn_web::extract::Path`** — an extractor that pulls typed values from the
   URL path. Autumn re-exports Axum's extractors so you don't need `axum` as a
