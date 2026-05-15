@@ -18,12 +18,10 @@ static X_IDEMPOTENT_REPLAYED: &str = "x-idempotent-replayed";
 /// Guards against crashes that leave the lock permanently held.
 const IN_FLIGHT_TTL: Duration = Duration::from_secs(30);
 
-/// Maximum response body size buffered for caching. Responses larger than this
-/// return 502 rather than exhaust server memory.
-const MAX_RESPONSE_BODY_SIZE: usize = 10 * 1024 * 1024; // 10 MiB
-
-/// Maximum request body size read for hash comparison. Larger bodies get 413.
-const MAX_REQUEST_BODY_SIZE: usize = 10 * 1024 * 1024; // 10 MiB
+/// Maximum response body size stored in the idempotency cache. Responses
+/// larger than this are returned to the client as-is but not cached, so a
+/// subsequent retry with the same key will re-execute the handler.
+const MAX_CACHEABLE_RESPONSE_BODY: usize = 10 * 1024 * 1024; // 10 MiB
 
 const fn is_mutating_method(method: &Method) -> bool {
     matches!(
@@ -100,6 +98,13 @@ pub trait IdempotencyStore: Send + Sync + 'static {
 
     /// Release the in-flight lock for `key`.
     fn unlock(&self, key: &str);
+
+    /// The preferred TTL for this store. Used by [`IdempotencyLayer::new`] as
+    /// the default expiry when no explicit `.with_ttl()` is given. Defaults to
+    /// 24 hours if the store does not override this method.
+    fn default_ttl(&self) -> Duration {
+        Duration::from_secs(86_400)
+    }
 }
 
 // ── Memory store ──────────────────────────────────────────────────────────────
@@ -116,15 +121,17 @@ pub struct MemoryIdempotencyStore {
     in_flight: RwLock<HashMap<String, Instant>>,
     /// Counts `set` calls to trigger periodic expired-entry eviction.
     write_count: AtomicU64,
+    default_ttl: Duration,
 }
 
 impl MemoryIdempotencyStore {
     #[must_use]
-    pub fn new(_default_ttl: Duration) -> Self {
+    pub fn new(default_ttl: Duration) -> Self {
         Self {
             entries: RwLock::new(HashMap::new()),
             in_flight: RwLock::new(HashMap::new()),
             write_count: AtomicU64::new(0),
+            default_ttl,
         }
     }
 }
@@ -171,6 +178,10 @@ impl IdempotencyStore for MemoryIdempotencyStore {
 
     fn unlock(&self, key: &str) {
         self.in_flight.write().unwrap().remove(key);
+    }
+
+    fn default_ttl(&self) -> Duration {
+        self.default_ttl
     }
 }
 
@@ -362,9 +373,10 @@ pub struct IdempotencyLayer {
 impl IdempotencyLayer {
     #[must_use]
     pub fn new(store: Arc<dyn IdempotencyStore>) -> Self {
+        let ttl = store.default_ttl();
         Self {
             store,
-            ttl: Duration::from_secs(86_400),
+            ttl,
             metrics: None,
         }
     }
@@ -423,7 +435,11 @@ where
     }
 
     fn call(&mut self, req: Request<Body>) -> Self::Future {
-        let inner = self.inner.clone();
+        // Clone-and-swap: the instance that was polled ready becomes `inner`
+        // for this call; `self.inner` is replaced with a fresh clone for the
+        // next call. This preserves Tower backpressure semantics.
+        let clone = self.inner.clone();
+        let inner = std::mem::replace(&mut self.inner, clone);
         let store = self.store.clone();
         let ttl = self.ttl;
         let metrics = self.metrics.clone();
@@ -459,8 +475,13 @@ where
 
     let (parts, body) = req.into_parts();
 
-    // Return 413 if the request body exceeds the hash-comparison limit.
-    let Ok(body_bytes) = axum::body::to_bytes(body, MAX_REQUEST_BODY_SIZE).await else {
+    // Buffer the request body for fingerprinting. We do not apply our own
+    // size cap here — the upload middleware (outer layer) wraps the body in
+    // axum's DefaultBodyLimit, so exceeding the configured per-app limit
+    // causes an error here and we return 413. Using usize::MAX ensures that
+    // valid large uploads permitted by the app config are not rejected solely
+    // because an Idempotency-Key header is present.
+    let Ok(body_bytes) = axum::body::to_bytes(body, usize::MAX).await else {
         let response = Response::builder()
             .status(StatusCode::PAYLOAD_TOO_LARGE)
             .body(Body::from(
@@ -514,16 +535,15 @@ where
     let (resp_parts, resp_body) = response.into_parts();
     let status = resp_parts.status.as_u16();
 
-    // Buffer the response body. If it exceeds the size cap the body is consumed
-    // and cannot be reconstituted, so return the response with the correct
-    // status and original headers but an empty body — better than a synthetic
-    // 502 that masks a successful handler operation and triggers a retry.
-    let Ok(resp_bytes) = axum::body::to_bytes(resp_body, MAX_RESPONSE_BODY_SIZE).await else {
+    // Buffer the full response body without a hard read limit. If buffering
+    // fails (I/O error — extremely rare) we return the response with the
+    // correct status but an empty body to avoid masking a successful handler
+    // operation with a synthetic error.
+    let Ok(resp_bytes) = axum::body::to_bytes(resp_body, usize::MAX).await else {
         store.unlock(&idempotency_key);
         tracing::warn!(
             idempotency.key = %idempotency_key,
-            limit_bytes = MAX_RESPONSE_BODY_SIZE,
-            "Response body exceeded cache size limit; not storing idempotency entry"
+            "Failed to buffer response body; not storing idempotency entry"
         );
         return Ok(Response::from_parts(resp_parts, Body::empty()));
     };
@@ -534,14 +554,24 @@ where
     // delivers set-cookie normally.
     let replay_headers = extract_replay_headers(&resp_parts.headers);
 
-    // Only cache successful responses (2xx) so transient errors can be retried.
-    if (200u32..300).contains(&u32::from(status)) {
+    // Cache only successful (2xx) responses that fit within the size cap.
+    // Oversized responses are returned to the client as-is; a subsequent retry
+    // with the same key will re-execute the handler.
+    let cacheable = resp_bytes.len() <= MAX_CACHEABLE_RESPONSE_BODY;
+    if cacheable && (200u32..300).contains(&u32::from(status)) {
         let record = IdempotencyRecord {
             status,
             headers: replay_headers,
             body: resp_bytes.to_vec(),
         };
         store.set(&idempotency_key, record, body_hash, ttl);
+    } else if !cacheable {
+        tracing::debug!(
+            idempotency.key = %idempotency_key,
+            body_bytes = resp_bytes.len(),
+            limit_bytes = MAX_CACHEABLE_RESPONSE_BODY,
+            "Response body too large to cache; idempotency not guaranteed for retries"
+        );
     }
 
     // Unlock only after caching so concurrent duplicates get a 409 rather than
