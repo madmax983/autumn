@@ -1089,7 +1089,7 @@ fn apply_middleware(
     // `.layer()` call wraps all earlier ones, so applying idempotency here
     // makes it the innermost layer — CSRF and CORS sit outside it and therefore
     // validate every request before the idempotency shortcut fires.
-    if config.idempotency.enabled {
+    if config.idempotency.enabled.unwrap_or(false) {
         use crate::idempotency::{IdempotencyLayer, IdempotencyStore, MemoryIdempotencyStore};
         use std::time::Duration;
 

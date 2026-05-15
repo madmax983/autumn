@@ -1033,8 +1033,12 @@ pub struct IdempotencyConfig {
     ///
     /// When `true`, mutating requests that carry an `Idempotency-Key` header
     /// are deduplicated using the configured backend.
+    ///
+    /// `None` means the field was absent from the config file; the
+    /// `AppBuilder::idempotent()` builder flag may still enable it.
+    /// `Some(false)` is an explicit operator opt-out that overrides the builder.
     #[serde(default)]
-    pub enabled: bool,
+    pub enabled: Option<bool>,
     /// Storage backend for idempotency records.
     #[serde(default)]
     pub backend: IdempotencyBackend,
@@ -1052,7 +1056,7 @@ pub struct IdempotencyConfig {
 impl Default for IdempotencyConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: None,
             backend: IdempotencyBackend::default(),
             ttl_secs: default_idempotency_ttl_secs(),
             allow_memory_in_production: false,
@@ -1447,7 +1451,7 @@ impl AutumnConfig {
     }
 
     fn apply_idempotency_env_overrides_with_env(&mut self, env: &dyn Env) {
-        parse_env_bool(
+        parse_env_option_bool(
             env,
             "AUTUMN_IDEMPOTENCY__ENABLED",
             &mut self.idempotency.enabled,
@@ -2676,6 +2680,16 @@ fn parse_env_bool(env: &dyn Env, key: &str, target: &mut bool) {
         match val.as_str() {
             "true" | "1" => *target = true,
             "false" | "0" => *target = false,
+            _ => eprintln!("Warning: {key}={val:?} is not valid (expected true/false), ignoring"),
+        }
+    }
+}
+
+fn parse_env_option_bool(env: &dyn Env, key: &str, target: &mut Option<bool>) {
+    if let Ok(val) = env.var(key) {
+        match val.as_str() {
+            "true" | "1" => *target = Some(true),
+            "false" | "0" => *target = Some(false),
             _ => eprintln!("Warning: {key}={val:?} is not valid (expected true/false), ignoring"),
         }
     }

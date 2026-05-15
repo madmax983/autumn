@@ -265,7 +265,17 @@ mod redis_store {
             let mut conn = self.connection.clone();
             tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(async move {
-                    let data: Option<Vec<u8>> = conn.get(&redis_key).await.ok().flatten();
+                    let data: Option<Vec<u8>> = match conn.get(&redis_key).await {
+                        Ok(v) => v,
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "Redis GET failed for idempotency key; \
+                                 treating as cache miss (idempotency degraded)"
+                            );
+                            None
+                        }
+                    };
                     data.and_then(|bytes| {
                         serde_json::from_slice::<StoredEntry>(&bytes).ok().map(|e| {
                             IdempotencyEntry {
@@ -329,14 +339,16 @@ mod redis_store {
                     match result {
                         Ok(opt) => opt.is_some(), // Some("OK") = acquired, None = already held
                         Err(e) => {
-                            // Redis unavailable: degrade gracefully — allow the request
-                            // through rather than returning 409 for every request.
+                            // Redis unavailable: fail closed so concurrent retries during an
+                            // outage cannot both enter the handler and duplicate side effects.
+                            // Clients receive 409 and should retry; once Redis recovers the
+                            // lock can be acquired normally.
                             tracing::warn!(
                                 error = %e,
                                 "Redis idempotency lock unavailable; \
-                                 allowing request through (degraded mode)"
+                                 failing closed to prevent duplicate processing"
                             );
-                            true
+                            false
                         }
                     }
                 })

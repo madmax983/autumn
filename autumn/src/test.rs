@@ -302,7 +302,7 @@ impl TestApp {
     /// production uses.
     #[must_use]
     pub const fn idempotent(mut self) -> Self {
-        self.config.idempotency.enabled = true;
+        self.config.idempotency.enabled = Some(true);
         self
     }
 

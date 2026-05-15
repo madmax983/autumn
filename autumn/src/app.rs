@@ -1511,8 +1511,10 @@ impl AppBuilder {
         if idempotency_enabled {
             let env_disabled = std::env::var("AUTUMN_IDEMPOTENCY__ENABLED")
                 .is_ok_and(|v| matches!(v.to_lowercase().as_str(), "false" | "0" | "no" | "off"));
-            if !env_disabled {
-                config.idempotency.enabled = true;
+            // Only apply the builder default when neither the env var nor the
+            // loaded config file explicitly sets enabled = false.
+            if !env_disabled && config.idempotency.enabled != Some(false) {
+                config.idempotency.enabled = Some(true);
             }
         }
 
@@ -1884,8 +1886,10 @@ impl AppBuilder {
         if idempotency_enabled {
             let env_disabled = std::env::var("AUTUMN_IDEMPOTENCY__ENABLED")
                 .is_ok_and(|v| matches!(v.to_lowercase().as_str(), "false" | "0" | "no" | "off"));
-            if !env_disabled {
-                config.idempotency.enabled = true;
+            // Only apply the builder default when neither the env var nor the
+            // loaded config file explicitly sets enabled = false.
+            if !env_disabled && config.idempotency.enabled != Some(false) {
+                config.idempotency.enabled = Some(true);
             }
         }
 
@@ -3048,7 +3052,7 @@ fn fail_fast_on_invalid_webhook_config(config: &AutumnConfig) {
 }
 
 fn fail_fast_on_invalid_idempotency_config(config: &AutumnConfig) {
-    if !config.idempotency.enabled {
+    if !config.idempotency.enabled.unwrap_or(false) {
         return;
     }
     let is_production = matches!(config.profile.as_deref(), Some("prod" | "production"));

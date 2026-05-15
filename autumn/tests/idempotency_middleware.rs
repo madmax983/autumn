@@ -406,7 +406,10 @@ async fn test_metrics_recorded() {
 #[test]
 fn test_config_fields() {
     let config = autumn_web::config::IdempotencyConfig::default();
-    assert!(!config.enabled, "middleware is opt-in by default");
+    assert!(
+        config.enabled.is_none(),
+        "middleware must be absent (not enabled) by default"
+    );
     assert_eq!(config.ttl_secs, 86_400, "default TTL is 24 hours");
     assert!(
         !config.allow_memory_in_production,
