@@ -24,6 +24,9 @@ import { Rate, Trend } from "k6/metrics";
 const BASE_URL    = __ENV.BASE_URL    || "http://localhost:8001";
 const BENCH_TOKEN = __ENV.BENCH_TOKEN || "benchmark-token-abc123";
 const PROTECTED   = `${BASE_URL}/api/posts/protected`;
+const AUTH_FAILURE_PARAMS = {
+  responseCallback: http.expectedStatuses(401),
+};
 
 export const options = {
   vus:      parseInt(__ENV.VUS || "20"),
@@ -52,7 +55,7 @@ export default function () {
 
   } else if (scenario < 0.85) {
     // 15 %: no Authorization header
-    const res = http.get(PROTECTED);
+    const res = http.get(PROTECTED, AUTH_FAILURE_PARAMS);
     unauthTime.add(res.timings.duration);
     check(res, { "no token → 401": (r) => r.status === 401 });
     errorRate.add(res.status >= 500);
@@ -61,6 +64,7 @@ export default function () {
     // 15 %: wrong token
     const res = http.get(PROTECTED, {
       headers: { Authorization: "Bearer invalid-token-xyz" },
+      responseCallback: http.expectedStatuses(401),
     });
     unauthTime.add(res.timings.duration);
     check(res, { "bad token → 401": (r) => r.status === 401 });
