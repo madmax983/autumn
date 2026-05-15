@@ -172,7 +172,6 @@ mod redis_store {
     use super::{IdempotencyEntry, IdempotencyRecord, IdempotencyStore};
     use redis::{AsyncCommands, aio::ConnectionManager, aio::ConnectionManagerConfig, Client};
     use serde::{Deserialize, Serialize};
-    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     const LOCK_TTL_SECS: u64 = 30;
@@ -195,6 +194,11 @@ mod redis_store {
     }
 
     impl RedisIdempotencyStore {
+        /// Creates a [`RedisIdempotencyStore`] from the application idempotency config.
+        ///
+        /// # Errors
+        /// Returns an error string if no Redis URL is configured or if the Redis
+        /// client cannot be opened.
         pub fn from_config(
             config: &crate::config::IdempotencyConfig,
         ) -> Result<Self, String> {
@@ -275,7 +279,7 @@ mod redis_store {
                     tokio::runtime::Handle::current().block_on(async move {
                         let _: Result<(), _> =
                             conn.set_ex(&redis_key, bytes, ttl_secs).await;
-                    })
+                    });
                 });
             }
         }
@@ -305,7 +309,7 @@ mod redis_store {
             tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(async move {
                     let _: Result<(), _> = conn.del(&lock_key).await;
-                })
+                });
             });
         }
     }

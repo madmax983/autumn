@@ -3059,7 +3059,7 @@ fn fail_fast_on_invalid_idempotency_config(config: &AutumnConfig) {
             .redis
             .url
             .as_deref()
-            .map_or(true, |u| u.trim().is_empty());
+            .is_none_or(|u| u.trim().is_empty());
         if url_missing {
             eprintln!(
                 "Redis idempotency backend requires a connection URL.\n\
