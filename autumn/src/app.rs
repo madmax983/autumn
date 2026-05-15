@@ -108,6 +108,7 @@ pub fn app() -> AppBuilder {
         #[cfg(feature = "mail")]
         mail_previews: Vec::new(),
         declared_routes: Vec::new(),
+        idempotency_enabled: false,
     }
 }
 
@@ -267,6 +268,10 @@ pub struct AppBuilder {
     /// opaque `nest_routers`. Included in `autumn routes` output even though
     /// the underlying Axum router is not enumerable.
     declared_routes: Vec<crate::route_listing::RouteInfo>,
+    /// Whether `.idempotent()` was called on this builder. Applied to the
+    /// loaded `AutumnConfig` before router assembly so that startup validation
+    /// and `apply_middleware` both see `config.idempotency.enabled = true`.
+    idempotency_enabled: bool,
 }
 
 /// Boxed builder closure that constructs a durable
@@ -718,6 +723,27 @@ impl AppBuilder {
         self.custom_layers
             .iter()
             .any(|registered| registered.type_id == layer_type)
+    }
+
+    /// Enable the HTTP idempotency-key middleware for this application.
+    ///
+    /// Mutating requests (`POST`, `PUT`, `PATCH`, `DELETE`) that carry an
+    /// `Idempotency-Key` header are deduplicated: the first response is cached
+    /// and replayed byte-for-byte on subsequent identical requests.
+    ///
+    /// The storage backend and TTL are taken from the `[idempotency]` block in
+    /// `autumn.toml` (defaulting to in-process memory with a 24 h TTL).
+    /// For multi-replica deployments set `backend = "redis"` and configure
+    /// `[idempotency.redis]`.
+    ///
+    /// # Startup validation
+    ///
+    /// In production (`AUTUMN_PROFILE=production`) the memory backend is
+    /// rejected unless `allow_memory_in_production = true` is set explicitly.
+    #[must_use]
+    pub fn idempotent(mut self) -> Self {
+        self.idempotency_enabled = true;
+        self
     }
 
     /// Returns the registered custom layer types in registration order.
@@ -1468,13 +1494,20 @@ impl AppBuilder {
             #[cfg(feature = "mail")]
             mail_previews,
             declared_routes: _,
+            idempotency_enabled,
         } = self;
 
         let all_routes = routes;
 
         // 1 & 2. Load configuration and initialize logging/telemetry
-        let (config, _telemetry_guard) =
+        let (mut config, _telemetry_guard) =
             load_config_and_telemetry(config_loader_factory, telemetry_provider).await;
+
+        // Apply builder-level flag: `.idempotent()` enables the middleware even
+        // when `autumn.toml` doesn't set `[idempotency] enabled = true`.
+        if idempotency_enabled {
+            config.idempotency.enabled = true;
+        }
 
         #[cfg(feature = "i18n")]
         let i18n_bundle =
@@ -1513,6 +1546,9 @@ impl AppBuilder {
         // before the app binds. Missing secrets should fail before a real
         // provider retry loop starts hammering a broken endpoint.
         fail_fast_on_invalid_webhook_config(&config);
+
+        // 4f. Idempotency backend must be production-ready when enabled.
+        fail_fast_on_invalid_idempotency_config(&config);
 
         // 4f. Provision the configured BlobStore *before* `setup_database`.
         // `LocalBlobStore::new` does real IO (creates + canonicalizes the
@@ -1830,13 +1866,17 @@ impl AppBuilder {
             #[cfg(feature = "mail")]
             mail_previews,
             declared_routes: _,
+            idempotency_enabled,
         } = self;
 
         let all_routes = routes;
 
         // Load config (same as normal startup)
-        let (config, _telemetry_guard) =
+        let (mut config, _telemetry_guard) =
             load_config_and_telemetry(config_loader_factory, telemetry_provider).await;
+        if idempotency_enabled {
+            config.idempotency.enabled = true;
+        }
 
         #[cfg(feature = "i18n")]
         let i18n_bundle =
@@ -2993,6 +3033,40 @@ fn fail_fast_on_invalid_webhook_config(config: &AutumnConfig) {
     if let Err(error) = config.security.webhooks.validate(is_production) {
         eprintln!("Invalid signed webhook configuration: {error}");
         std::process::exit(1);
+    }
+}
+
+fn fail_fast_on_invalid_idempotency_config(config: &AutumnConfig) {
+    if !config.idempotency.enabled {
+        return;
+    }
+    let is_production = matches!(config.profile.as_deref(), Some("prod" | "production"));
+    if is_production
+        && config.idempotency.backend == crate::config::IdempotencyBackend::Memory
+        && !config.idempotency.allow_memory_in_production
+    {
+        eprintln!(
+            "The in-memory idempotency backend is not safe for multi-replica production use.\n\
+             Set `[idempotency] backend = \"redis\"` in autumn.toml, or set \
+             `allow_memory_in_production = true` to suppress this check."
+        );
+        std::process::exit(1);
+    }
+    #[cfg(feature = "redis")]
+    if config.idempotency.backend == crate::config::IdempotencyBackend::Redis {
+        let url_missing = config
+            .idempotency
+            .redis
+            .url
+            .as_deref()
+            .map_or(true, |u| u.trim().is_empty());
+        if url_missing {
+            eprintln!(
+                "Redis idempotency backend requires a connection URL.\n\
+                 Set AUTUMN_IDEMPOTENCY__REDIS__URL or `[idempotency.redis] url` in autumn.toml."
+            );
+            std::process::exit(1);
+        }
     }
 }
 

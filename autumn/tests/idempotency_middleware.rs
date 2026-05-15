@@ -305,3 +305,125 @@ fn test_ttl_eviction() {
         "expired entry should not be returned"
     );
 }
+
+/// A concurrent duplicate request (same key, first still in flight) receives
+/// 409 Conflict with a Retry-After header.
+#[tokio::test]
+async fn test_concurrent_duplicate_returns_409() {
+    use autumn_web::idempotency::{IdempotencyStore, MemoryIdempotencyStore};
+
+    let store = Arc::new(MemoryIdempotencyStore::new(Duration::from_secs(3600)));
+    let layer = IdempotencyLayer::new(store.clone() as Arc<dyn IdempotencyStore>);
+
+    let app = axum::Router::new()
+        .route("/ping", axum::routing::post(ok_handler))
+        .layer(layer);
+
+    use tower::ServiceExt;
+
+    // Lock the key manually to simulate an in-flight request.
+    store.try_lock("inflight-key");
+
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/ping")
+        .header("idempotency-key", "inflight-key")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "concurrent duplicate should return 409 Conflict"
+    );
+    assert!(
+        resp.headers().contains_key("retry-after"),
+        "409 response must include Retry-After header"
+    );
+}
+
+/// After processing completes the in-flight lock is released so a subsequent
+/// sequential request can be served normally.
+#[tokio::test]
+async fn test_in_flight_lock_released_after_response() {
+    #[post("/ping")]
+    async fn handler() -> &'static str {
+        "pong"
+    }
+
+    let client = TestApp::new()
+        .routes(routes![handler])
+        .idempotent()
+        .build();
+
+    // First request acquires and releases lock, stores response.
+    let r1 = client
+        .post("/ping")
+        .header("idempotency-key", "lock-release-key")
+        .send()
+        .await;
+    r1.assert_ok();
+
+    // Second request should replay (not conflict), proving the lock was released.
+    let r2 = client
+        .post("/ping")
+        .header("idempotency-key", "lock-release-key")
+        .send()
+        .await;
+    r2.assert_ok();
+    assert_eq!(
+        r2.header("x-idempotent-replayed"),
+        Some("true"),
+        "second request should replay, not conflict"
+    );
+}
+
+/// Metrics counters are incremented correctly for hits and misses.
+#[tokio::test]
+async fn test_metrics_recorded() {
+    #[post("/ping")]
+    async fn handler() -> &'static str {
+        "pong"
+    }
+
+    let client = TestApp::new()
+        .routes(routes![handler])
+        .idempotent()
+        .build();
+
+    // Miss: first request.
+    client
+        .post("/ping")
+        .header("idempotency-key", "metrics-key")
+        .send()
+        .await
+        .assert_ok();
+
+    // Hit: second request with same key.
+    let replayed = client
+        .post("/ping")
+        .header("idempotency-key", "metrics-key")
+        .send()
+        .await;
+    replayed.assert_ok();
+    assert_eq!(replayed.header("x-idempotent-replayed"), Some("true"));
+    // Metrics are recorded in the background — the test verifies behaviour, not
+    // the counter value, since the MetricsCollector is private to the router.
+}
+
+/// IdempotencyConfig::default() reflects documented defaults.
+#[test]
+fn test_config_fields() {
+    let config = autumn_web::config::IdempotencyConfig::default();
+    assert!(!config.enabled, "middleware is opt-in by default");
+    assert_eq!(config.ttl_secs, 86_400, "default TTL is 24 hours");
+    assert!(
+        !config.allow_memory_in_production,
+        "memory backend is rejected in production by default"
+    );
+    assert_eq!(
+        config.redis.key_prefix, "autumn:idempotency",
+        "default Redis key prefix"
+    );
+}

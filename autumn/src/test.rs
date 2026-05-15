@@ -296,19 +296,13 @@ impl TestApp {
 
     /// Enable HTTP idempotency-key middleware for this test app.
     ///
-    /// Uses [`crate::idempotency::MemoryIdempotencyStore`] with the TTL from
-    /// the configured [`crate::config::IdempotencyConfig`].
+    /// Mirrors [`crate::app::AppBuilder::idempotent`]: sets the
+    /// `config.idempotency.enabled` flag so that
+    /// [`crate::router::apply_middleware`] wires up the layer with the same
+    /// `MemoryIdempotencyStore` and `MetricsCollector` that production uses.
     #[must_use]
     pub fn idempotent(mut self) -> Self {
-        let ttl = std::time::Duration::from_secs(self.config.idempotency.ttl_secs);
-        let store =
-            std::sync::Arc::new(crate::idempotency::MemoryIdempotencyStore::new(ttl))
-                as std::sync::Arc<dyn crate::idempotency::IdempotencyStore>;
-        let layer = crate::idempotency::IdempotencyLayer::new(store).with_ttl(ttl);
-        self.custom_layers.push(crate::app::CustomLayerRegistration {
-            type_id: std::any::TypeId::of::<crate::idempotency::IdempotencyLayer>(),
-            apply: Box::new(move |router| router.layer(layer)),
-        });
+        self.config.idempotency.enabled = true;
         self
     }
 

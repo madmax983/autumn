@@ -1003,9 +1003,38 @@ impl IdempotencyBackend {
     }
 }
 
+/// Redis connection settings for the idempotency backend.
+#[derive(Debug, Clone, Deserialize)]
+pub struct IdempotencyRedisConfig {
+    /// Redis connection URL (e.g. `redis://localhost:6379`).
+    pub url: Option<String>,
+    /// Key prefix for all idempotency entries and locks stored in Redis.
+    #[serde(default = "default_idempotency_redis_key_prefix")]
+    pub key_prefix: String,
+}
+
+impl Default for IdempotencyRedisConfig {
+    fn default() -> Self {
+        Self {
+            url: None,
+            key_prefix: default_idempotency_redis_key_prefix(),
+        }
+    }
+}
+
+fn default_idempotency_redis_key_prefix() -> String {
+    "autumn:idempotency".to_owned()
+}
+
 /// HTTP idempotency-key middleware settings.
 #[derive(Debug, Clone, Deserialize)]
 pub struct IdempotencyConfig {
+    /// Enable the idempotency-key middleware.
+    ///
+    /// When `true`, mutating requests that carry an `Idempotency-Key` header
+    /// are deduplicated using the configured backend.
+    #[serde(default)]
+    pub enabled: bool,
     /// Storage backend for idempotency records.
     #[serde(default)]
     pub backend: IdempotencyBackend,
@@ -1015,14 +1044,19 @@ pub struct IdempotencyConfig {
     /// Allow the in-memory backend in production environments.
     #[serde(default)]
     pub allow_memory_in_production: bool,
+    /// Redis connection settings (used when `backend = "redis"`).
+    #[serde(default)]
+    pub redis: IdempotencyRedisConfig,
 }
 
 impl Default for IdempotencyConfig {
     fn default() -> Self {
         Self {
+            enabled: false,
             backend: IdempotencyBackend::default(),
             ttl_secs: default_idempotency_ttl_secs(),
             allow_memory_in_production: false,
+            redis: IdempotencyRedisConfig::default(),
         }
     }
 }
@@ -1413,6 +1447,7 @@ impl AutumnConfig {
     }
 
     fn apply_idempotency_env_overrides_with_env(&mut self, env: &dyn Env) {
+        parse_env_bool(env, "AUTUMN_IDEMPOTENCY__ENABLED", &mut self.idempotency.enabled);
         if let Ok(val) = env.var("AUTUMN_IDEMPOTENCY__BACKEND") {
             match IdempotencyBackend::from_env_value(&val) {
                 Some(backend) => self.idempotency.backend = backend,
@@ -1431,6 +1466,16 @@ impl AutumnConfig {
             env,
             "AUTUMN_IDEMPOTENCY__ALLOW_MEMORY_IN_PRODUCTION",
             &mut self.idempotency.allow_memory_in_production,
+        );
+        parse_env_string(
+            env,
+            "AUTUMN_IDEMPOTENCY__REDIS__URL",
+            self.idempotency.redis.url.get_or_insert_with(String::new),
+        );
+        parse_env_string(
+            env,
+            "AUTUMN_IDEMPOTENCY__REDIS__KEY_PREFIX",
+            &mut self.idempotency.redis.key_prefix,
         );
     }
 

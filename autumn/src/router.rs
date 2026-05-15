@@ -34,6 +34,9 @@ pub enum RouterBuildError {
     /// The session backend configuration is invalid (e.g. Redis without a URL).
     #[error("invalid session backend configuration: {0}")]
     InvalidSessionBackend(#[from] crate::session::SessionBackendConfigError),
+    /// The idempotency backend configuration is invalid.
+    #[error("invalid idempotency backend configuration: {0}")]
+    InvalidIdempotencyBackend(String),
     /// A user-defined route conflicts with a framework-provided route.
     #[error("framework route overlap at {path}: {existing} conflicts with {incoming}")]
     FrameworkRouteOverlap {
@@ -1116,6 +1119,44 @@ fn apply_middleware(
     }
     if custom_layer_count > 0 {
         tracing::debug!(count = custom_layer_count, "Custom Tower layers applied");
+    }
+
+    // Idempotency-key middleware: inner to user layers so auth/logging still
+    // run on every request, but outer to rate limiting so cached responses
+    // skip the quota. Applied only when explicitly enabled.
+    if config.idempotency.enabled {
+        use std::time::Duration;
+        use crate::idempotency::{IdempotencyLayer, IdempotencyStore, MemoryIdempotencyStore};
+
+        let ttl = Duration::from_secs(config.idempotency.ttl_secs);
+        let store: std::sync::Arc<dyn IdempotencyStore> =
+            match config.idempotency.backend {
+                crate::config::IdempotencyBackend::Memory => {
+                    std::sync::Arc::new(MemoryIdempotencyStore::new(ttl))
+                }
+                #[cfg(feature = "redis")]
+                crate::config::IdempotencyBackend::Redis => {
+                    match crate::idempotency::RedisIdempotencyStore::from_config(
+                        &config.idempotency,
+                    ) {
+                        Ok(s) => std::sync::Arc::new(s),
+                        Err(e) => {
+                            return Err(RouterBuildError::InvalidIdempotencyBackend(e));
+                        }
+                    }
+                }
+                #[allow(unreachable_patterns)]
+                _ => std::sync::Arc::new(MemoryIdempotencyStore::new(ttl)),
+            };
+        let layer = IdempotencyLayer::new(store)
+            .with_ttl(ttl)
+            .with_metrics(state.metrics.clone());
+        router = router.layer(layer);
+        tracing::debug!(
+            backend = ?config.idempotency.backend,
+            ttl_secs = config.idempotency.ttl_secs,
+            "Idempotency-key middleware enabled"
+        );
     }
 
     // Apply framework middleware. Exception filters wrap outermost so they
