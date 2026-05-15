@@ -170,7 +170,7 @@ impl IdempotencyStore for MemoryIdempotencyStore {
 #[cfg(feature = "redis")]
 mod redis_store {
     use super::{IdempotencyEntry, IdempotencyRecord, IdempotencyStore};
-    use redis::{AsyncCommands, aio::ConnectionManager, aio::ConnectionManagerConfig, Client};
+    use redis::{AsyncCommands, Client, aio::ConnectionManager, aio::ConnectionManagerConfig};
     use serde::{Deserialize, Serialize};
     use std::time::{Duration, Instant};
 
@@ -199,9 +199,7 @@ mod redis_store {
         /// # Errors
         /// Returns an error string if no Redis URL is configured or if the Redis
         /// client cannot be opened.
-        pub fn from_config(
-            config: &crate::config::IdempotencyConfig,
-        ) -> Result<Self, String> {
+        pub fn from_config(config: &crate::config::IdempotencyConfig) -> Result<Self, String> {
             let url = config
                 .redis
                 .url
@@ -258,13 +256,7 @@ mod redis_store {
             })
         }
 
-        fn set(
-            &self,
-            key: &str,
-            record: IdempotencyRecord,
-            body_hash: Vec<u8>,
-            ttl: Duration,
-        ) {
+        fn set(&self, key: &str, record: IdempotencyRecord, body_hash: Vec<u8>, ttl: Duration) {
             let redis_key = self.entry_key(key);
             let mut conn = self.connection.clone();
             let entry = StoredEntry {
@@ -277,8 +269,7 @@ mod redis_store {
                 let ttl_secs = ttl.as_secs().max(1);
                 tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(async move {
-                        let _: Result<(), _> =
-                            conn.set_ex(&redis_key, bytes, ttl_secs).await;
+                        let _: Result<(), _> = conn.set_ex(&redis_key, bytes, ttl_secs).await;
                     });
                 });
             }
@@ -454,7 +445,12 @@ where
 
     // ── Cache hit ──────────────────────────────────────────────────────────
     if let Some(entry) = store.get(&idempotency_key) {
-        return Ok(handle_cache_hit(entry, &body_hash, &idempotency_key, metrics.as_ref()));
+        return Ok(handle_cache_hit(
+            entry,
+            &body_hash,
+            &idempotency_key,
+            metrics.as_ref(),
+        ));
     }
 
     // ── In-flight check (concurrent duplicate) ─────────────────────────────
@@ -492,8 +488,7 @@ where
 
     // Buffer the response body. If it exceeds the cap, return 502 — the body
     // was consumed and cannot be reconstituted for streaming.
-    let Ok(resp_bytes) =
-        axum::body::to_bytes(response.into_body(), MAX_RESPONSE_BODY_SIZE).await
+    let Ok(resp_bytes) = axum::body::to_bytes(response.into_body(), MAX_RESPONSE_BODY_SIZE).await
     else {
         store.unlock(&idempotency_key);
         let response = Response::builder()

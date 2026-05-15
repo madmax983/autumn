@@ -1447,7 +1447,11 @@ impl AutumnConfig {
     }
 
     fn apply_idempotency_env_overrides_with_env(&mut self, env: &dyn Env) {
-        parse_env_bool(env, "AUTUMN_IDEMPOTENCY__ENABLED", &mut self.idempotency.enabled);
+        parse_env_bool(
+            env,
+            "AUTUMN_IDEMPOTENCY__ENABLED",
+            &mut self.idempotency.enabled,
+        );
         if let Ok(val) = env.var("AUTUMN_IDEMPOTENCY__BACKEND") {
             match IdempotencyBackend::from_env_value(&val) {
                 Some(backend) => self.idempotency.backend = backend,

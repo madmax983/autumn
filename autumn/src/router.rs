@@ -1126,38 +1126,35 @@ fn apply_middleware(
     // run on every request, but outer to rate limiting so cached responses
     // skip the quota. Applied only when explicitly enabled.
     if config.idempotency.enabled {
-        use std::time::Duration;
         use crate::idempotency::{IdempotencyLayer, IdempotencyStore, MemoryIdempotencyStore};
+        use std::time::Duration;
 
         let ttl = Duration::from_secs(config.idempotency.ttl_secs);
-        let store: std::sync::Arc<dyn IdempotencyStore> =
-            match config.idempotency.backend {
-                crate::config::IdempotencyBackend::Memory => {
-                    std::sync::Arc::new(MemoryIdempotencyStore::new(ttl))
-                }
-                #[cfg(feature = "redis")]
-                crate::config::IdempotencyBackend::Redis => {
-                    match crate::idempotency::RedisIdempotencyStore::from_config(
-                        &config.idempotency,
-                    ) {
-                        Ok(s) => std::sync::Arc::new(s),
-                        Err(e) => {
-                            return Err(RouterBuildError::InvalidIdempotencyBackend(e));
-                        }
+        let store: std::sync::Arc<dyn IdempotencyStore> = match config.idempotency.backend {
+            crate::config::IdempotencyBackend::Memory => {
+                std::sync::Arc::new(MemoryIdempotencyStore::new(ttl))
+            }
+            #[cfg(feature = "redis")]
+            crate::config::IdempotencyBackend::Redis => {
+                match crate::idempotency::RedisIdempotencyStore::from_config(&config.idempotency) {
+                    Ok(s) => std::sync::Arc::new(s),
+                    Err(e) => {
+                        return Err(RouterBuildError::InvalidIdempotencyBackend(e));
                     }
                 }
-                // When the `redis` feature is absent the Redis arm above is compiled
-                // out, so this arm catches it and returns an explicit error rather
-                // than silently downgrading to an in-process memory store.
-                #[cfg(not(feature = "redis"))]
-                crate::config::IdempotencyBackend::Redis => {
-                    return Err(RouterBuildError::InvalidIdempotencyBackend(
-                        "idempotency backend 'redis' requires the autumn-web 'redis' feature \
+            }
+            // When the `redis` feature is absent the Redis arm above is compiled
+            // out, so this arm catches it and returns an explicit error rather
+            // than silently downgrading to an in-process memory store.
+            #[cfg(not(feature = "redis"))]
+            crate::config::IdempotencyBackend::Redis => {
+                return Err(RouterBuildError::InvalidIdempotencyBackend(
+                    "idempotency backend 'redis' requires the autumn-web 'redis' feature \
                          flag; rebuild with --features redis or switch to backend = \"memory\""
-                            .to_owned(),
-                    ));
-                }
-            };
+                        .to_owned(),
+                ));
+            }
+        };
         let layer = IdempotencyLayer::new(store)
             .with_ttl(ttl)
             .with_metrics(state.metrics.clone());

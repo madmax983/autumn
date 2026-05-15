@@ -28,10 +28,7 @@ async fn test_deduplication() {
     }
 
     let store = make_store(Duration::from_secs(3600));
-    let client = TestApp::new()
-        .routes(routes![handler])
-        .idempotent()
-        .build();
+    let client = TestApp::new().routes(routes![handler]).idempotent().build();
 
     let r1 = client
         .post("/ping")
@@ -92,10 +89,7 @@ async fn test_no_key_passthrough() {
         "pong"
     }
 
-    let client = TestApp::new()
-        .routes(routes![handler])
-        .idempotent()
-        .build();
+    let client = TestApp::new().routes(routes![handler]).idempotent().build();
 
     let r1 = client.post("/ping").send().await;
     r1.assert_ok();
@@ -114,10 +108,7 @@ async fn test_get_passthrough() {
         "pong"
     }
 
-    let client = TestApp::new()
-        .routes(routes![handler])
-        .idempotent()
-        .build();
+    let client = TestApp::new().routes(routes![handler]).idempotent().build();
 
     let r1 = client
         .get("/ping")
@@ -144,10 +135,7 @@ async fn test_put_deduplication() {
         "updated"
     }
 
-    let client = TestApp::new()
-        .routes(routes![handler])
-        .idempotent()
-        .build();
+    let client = TestApp::new().routes(routes![handler]).idempotent().build();
 
     let r1 = client
         .put("/item")
@@ -174,10 +162,7 @@ async fn test_distinct_keys_are_independent() {
         "pong"
     }
 
-    let client = TestApp::new()
-        .routes(routes![handler])
-        .idempotent()
-        .build();
+    let client = TestApp::new().routes(routes![handler]).idempotent().build();
 
     // First request with key-a — should be fresh.
     let ra1 = client
@@ -220,10 +205,7 @@ async fn test_x_idempotent_replayed_header_semantics() {
         "pong"
     }
 
-    let client = TestApp::new()
-        .routes(routes![handler])
-        .idempotent()
-        .build();
+    let client = TestApp::new().routes(routes![handler]).idempotent().build();
 
     let fresh = client
         .post("/ping")
@@ -256,10 +238,7 @@ async fn test_idempotent_builder_method() {
         "pong"
     }
 
-    let client = TestApp::new()
-        .routes(routes![handler])
-        .idempotent()
-        .build();
+    let client = TestApp::new().routes(routes![handler]).idempotent().build();
 
     let r1 = client
         .post("/ping")
@@ -281,7 +260,10 @@ async fn test_idempotent_builder_method() {
 #[test]
 fn test_config_default_ttl_is_24h() {
     let config = autumn_web::config::IdempotencyConfig::default();
-    assert_eq!(config.ttl_secs, 86_400, "default TTL should be 86400 seconds");
+    assert_eq!(
+        config.ttl_secs, 86_400,
+        "default TTL should be 86400 seconds"
+    );
 }
 
 /// Entries past their TTL are not replayed.
@@ -351,10 +333,7 @@ async fn test_in_flight_lock_released_after_response() {
         "pong"
     }
 
-    let client = TestApp::new()
-        .routes(routes![handler])
-        .idempotent()
-        .build();
+    let client = TestApp::new().routes(routes![handler]).idempotent().build();
 
     // First request acquires and releases lock, stores response.
     let r1 = client
@@ -386,10 +365,7 @@ async fn test_metrics_recorded() {
         "pong"
     }
 
-    let client = TestApp::new()
-        .routes(routes![handler])
-        .idempotent()
-        .build();
+    let client = TestApp::new().routes(routes![handler]).idempotent().build();
 
     // Miss: first request.
     client
