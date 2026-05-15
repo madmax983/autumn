@@ -1510,8 +1510,7 @@ impl AppBuilder {
         // incident) without code changes, even when `.idempotent()` is called.
         if idempotency_enabled {
             let env_disabled = std::env::var("AUTUMN_IDEMPOTENCY__ENABLED")
-                .map(|v| matches!(v.to_lowercase().as_str(), "false" | "0" | "no" | "off"))
-                .unwrap_or(false);
+                .is_ok_and(|v| matches!(v.to_lowercase().as_str(), "false" | "0" | "no" | "off"));
             if !env_disabled {
                 config.idempotency.enabled = true;
             }
@@ -1884,8 +1883,7 @@ impl AppBuilder {
             load_config_and_telemetry(config_loader_factory, telemetry_provider).await;
         if idempotency_enabled {
             let env_disabled = std::env::var("AUTUMN_IDEMPOTENCY__ENABLED")
-                .map(|v| matches!(v.to_lowercase().as_str(), "false" | "0" | "no" | "off"))
-                .unwrap_or(false);
+                .is_ok_and(|v| matches!(v.to_lowercase().as_str(), "false" | "0" | "no" | "off"));
             if !env_disabled {
                 config.idempotency.enabled = true;
             }
