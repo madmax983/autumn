@@ -702,9 +702,15 @@ impl Mailer {
                     let (m, m_mail) = f_opt.take().expect("once");
                     let boxed: crate::db::CommitCallback = Box::new(move || {
                         Box::pin(async move {
-                            m.spawn_mail_delivery(m_mail).map_err(|e| {
-                                crate::AutumnError::internal_server_error_msg(e.to_string())
-                            })
+                            if let Some(queue) = m.delivery_queue.clone() {
+                                queue.enqueue(m_mail).await.map_err(|e| {
+                                    crate::AutumnError::internal_server_error_msg(e.to_string())
+                                })
+                            } else {
+                                m.spawn_mail_delivery(m_mail).map_err(|e| {
+                                    crate::AutumnError::internal_server_error_msg(e.to_string())
+                                })
+                            }
                         })
                     });
                     registry.lock().expect("registry lock").push(boxed);
@@ -1957,6 +1963,81 @@ mod tests {
                 Ok(())
             })
         }
+    }
+
+    #[cfg(feature = "db")]
+    struct FailingQueue {
+        tx: tokio::sync::mpsc::UnboundedSender<Mail>,
+    }
+
+    #[cfg(feature = "db")]
+    impl MailDeliveryQueue for FailingQueue {
+        fn enqueue<'a>(
+            &'a self,
+            mail: Mail,
+        ) -> Pin<Box<dyn Future<Output = Result<(), MailError>> + Send + 'a>> {
+            let tx = self.tx.clone();
+            Box::pin(async move {
+                tx.send(mail)
+                    .map_err(|err| MailError::RuntimeUnavailable(err.to_string()))?;
+                Err(MailError::RuntimeUnavailable("queue offline".to_owned()))
+            })
+        }
+    }
+
+    #[cfg(feature = "db")]
+    async fn drain_after_commit_callbacks_for_test(
+        registry: &std::sync::Arc<std::sync::Mutex<Vec<crate::db::CommitCallback>>>,
+    ) {
+        let callbacks: Vec<crate::db::CommitCallback> = {
+            let mut reg = registry.lock().expect("registry lock");
+            std::mem::take(&mut *reg)
+        };
+
+        for cb in callbacks {
+            if let Err(error) = cb().await {
+                crate::db::record_after_commit_failure();
+                tracing::error!("test drain: after_commit callback failed: {error}");
+            }
+        }
+    }
+
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn deferred_deliver_later_queue_failure_increments_after_commit_counter() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Mail>();
+        let mailer = Mailer::builder()
+            .delivery_queue(FailingQueue { tx })
+            .build()
+            .expect("mailer should build");
+        let registry = std::sync::Arc::new(std::sync::Mutex::new(
+            Vec::<crate::db::CommitCallback>::new(),
+        ));
+        let before =
+            crate::db::AFTER_COMMIT_FAILURES_TOTAL.load(std::sync::atomic::Ordering::Relaxed);
+
+        crate::db::AFTER_COMMIT_REGISTRY
+            .scope(registry.clone(), async {
+                mailer
+                    .try_deliver_later(sample_mail())
+                    .expect("registering deferred mail should succeed");
+            })
+            .await;
+
+        drain_after_commit_callbacks_for_test(&registry).await;
+
+        let received = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("queue should be called within 1s")
+            .expect("queue should receive the mail");
+        assert_eq!(received.subject, "Hi");
+
+        let after =
+            crate::db::AFTER_COMMIT_FAILURES_TOTAL.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            after > before,
+            "deferred durable mail handoff failures should count as after_commit failures"
+        );
     }
 
     #[tokio::test]

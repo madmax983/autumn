@@ -67,9 +67,13 @@ tokio::task_local! {
 /// committed. The underlying transaction is unaffected; this counter surfaces
 /// failures for alerting and dashboards.
 ///
-/// Exposed by the `/actuator/health` endpoint as
-/// `autumn_after_commit_failures_total` in the system-info block.
+/// Exposed by the `/actuator/health` endpoint as the top-level
+/// `autumn_after_commit_failures_total` field.
 pub static AFTER_COMMIT_FAILURES_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn record_after_commit_failure() -> u64 {
+    AFTER_COMMIT_FAILURES_TOTAL.fetch_add(1, Ordering::Relaxed) + 1
+}
 
 /// Register a callback to run after the current database transaction commits.
 ///
@@ -117,7 +121,11 @@ where
     if let Some(f) = f_opt {
         tracing::debug!("register_after_commit: no active transaction; running callback eagerly");
         if let Err(e) = f().await {
-            tracing::error!("register_after_commit eager callback failed: {e}");
+            let failures_total = record_after_commit_failure();
+            tracing::error!(
+                autumn.after_commit.failures_total = failures_total,
+                "register_after_commit eager callback failed: {e}"
+            );
         }
     }
 }
@@ -426,10 +434,9 @@ impl Db {
             for cb in callbacks {
                 tokio::task::spawn(async move {
                     if let Err(e) = cb().await {
-                        AFTER_COMMIT_FAILURES_TOTAL.fetch_add(1, Ordering::Relaxed);
+                        let failures_total = record_after_commit_failure();
                         tracing::error!(
-                            autumn.after_commit.failures_total =
-                                AFTER_COMMIT_FAILURES_TOTAL.load(Ordering::Relaxed),
+                            autumn.after_commit.failures_total = failures_total,
                             "after_commit callback failed (tx already committed): {e}"
                         );
                     }
@@ -639,6 +646,24 @@ mod tests {
         })
         .await;
         assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn register_after_commit_eager_failure_increments_failure_counter() {
+        let before = AFTER_COMMIT_FAILURES_TOTAL.load(Ordering::Relaxed);
+
+        register_after_commit(|| async {
+            Err(crate::AutumnError::internal_server_error_msg(
+                "deliberate eager after-commit failure",
+            ))
+        })
+        .await;
+
+        let after = AFTER_COMMIT_FAILURES_TOTAL.load(Ordering::Relaxed);
+        assert!(
+            after > before,
+            "eager after_commit failures should be counted for recovery signals"
+        );
     }
 
     #[tokio::test]
