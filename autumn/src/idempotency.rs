@@ -8,7 +8,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
-use axum::http::{Method, Request, Response, StatusCode};
+use axum::http::{HeaderMap, Method, Request, Response, StatusCode};
 use tower::{Layer, Service};
 
 static IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
@@ -38,7 +38,7 @@ fn compute_body_hash(bytes: &[u8]) -> Vec<u8> {
     hasher.finish().to_le_bytes().to_vec()
 }
 
-fn extract_replay_headers(response: &Response<Body>) -> Vec<(String, Vec<u8>)> {
+fn extract_replay_headers(headers: &HeaderMap) -> Vec<(String, Vec<u8>)> {
     // Headers that must not be cached or replayed.
     // `set-cookie` is excluded to prevent session fixation and replay of expired tokens.
     const SKIP: &[&str] = &[
@@ -53,8 +53,7 @@ fn extract_replay_headers(response: &Response<Body>) -> Vec<(String, Vec<u8>)> {
         "set-cookie",
         "x-idempotent-replayed",
     ];
-    response
-        .headers()
+    headers
         .iter()
         .filter(|(name, _)| !SKIP.contains(&name.as_str()))
         .map(|(name, value)| (name.to_string(), value.as_bytes().to_vec()))
@@ -512,29 +511,34 @@ where
 
     let req = Request::from_parts(parts, Body::from(body_bytes));
     let response = inner.call(req).await?;
+    let (resp_parts, resp_body) = response.into_parts();
+    let status = resp_parts.status.as_u16();
 
-    let status = response.status().as_u16();
-    let headers = extract_replay_headers(&response);
-
-    // Buffer the response body. If it exceeds the cap, return 502 — the body
-    // was consumed and cannot be reconstituted for streaming.
-    let Ok(resp_bytes) = axum::body::to_bytes(response.into_body(), MAX_RESPONSE_BODY_SIZE).await
-    else {
+    // Buffer the response body. If it exceeds the size cap the body is consumed
+    // and cannot be reconstituted, so return the response with the correct
+    // status and original headers but an empty body — better than a synthetic
+    // 502 that masks a successful handler operation and triggers a retry.
+    let Ok(resp_bytes) = axum::body::to_bytes(resp_body, MAX_RESPONSE_BODY_SIZE).await else {
         store.unlock(&idempotency_key);
-        let response = Response::builder()
-            .status(StatusCode::BAD_GATEWAY)
-            .body(Body::from(
-                "response body too large to cache for idempotency",
-            ))
-            .unwrap();
-        return Ok(response);
+        tracing::warn!(
+            idempotency.key = %idempotency_key,
+            limit_bytes = MAX_RESPONSE_BODY_SIZE,
+            "Response body exceeded cache size limit; not storing idempotency entry"
+        );
+        return Ok(Response::from_parts(resp_parts, Body::empty()));
     };
+
+    // Filtered headers for the cache entry: set-cookie is excluded to prevent
+    // session fixation when the stored response is replayed to a later caller.
+    // The immediate (first) response uses the original resp_parts and therefore
+    // delivers set-cookie normally.
+    let replay_headers = extract_replay_headers(&resp_parts.headers);
 
     // Only cache successful responses (2xx) so transient errors can be retried.
     if (200u32..300).contains(&u32::from(status)) {
         let record = IdempotencyRecord {
             status,
-            headers: headers.clone(),
+            headers: replay_headers,
             body: resp_bytes.to_vec(),
         };
         store.set(&idempotency_key, record, body_hash, ttl);
@@ -548,11 +552,9 @@ where
         m.record_idempotency_miss();
     }
 
-    let mut builder = Response::builder().status(status);
-    for (name, value) in &headers {
-        builder = builder.header(name.as_str(), value.as_slice());
-    }
-    Ok(builder.body(Body::from(resp_bytes.to_vec())).unwrap())
+    // Reconstruct from original parts so all headers (including set-cookie) and
+    // response extensions are preserved for outer middleware.
+    Ok(Response::from_parts(resp_parts, Body::from(resp_bytes)))
 }
 
 fn handle_cache_hit(

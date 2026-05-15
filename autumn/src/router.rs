@@ -1084,36 +1084,11 @@ fn apply_middleware(
             None
         };
 
-    router = apply_cors_middleware(router, config);
-    router = apply_csrf_middleware(router, config, signing_keys_opt.clone());
-    // Method-override rejection filter. The outer `MethodOverrideLayer`
-    // (applied at the `axum::serve` boundary so it can rewrite the
-    // request method before route matching) stamps a
-    // [`MethodOverrideRejection`] extension when the override field
-    // value is invalid or the body was too large to scan; this inner
-    // middleware converts that extension into the corresponding
-    // `400`/`413` response. Running it here means the rejection flows
-    // through the rest of the response stack (security headers,
-    // request IDs, metrics, error-page filter) rather than bypassing
-    // them. Placed outside CSRF so a `BodyTooLarge` (empty body)
-    // doesn't get masked by a `403` from CSRF's missing-token branch,
-    // and a clear `400 invalid _method` outranks "missing CSRF".
-    router = router.layer(axum::middleware::from_fn(
-        crate::middleware::method_override_rejection_filter,
-    ));
-    router = apply_rate_limit_middleware(router, config);
-    router = apply_upload_middleware(router, config);
-
-    // Security headers layer (always applied)
-    let security_headers =
-        crate::security::SecurityHeadersLayer::from_config(&config.security.headers);
-    tracing::debug!("Security headers enabled");
-
-    // Idempotency-key middleware: applied BEFORE user layers so it ends up
-    // INNER to them. On a cache hit the user layers (including any auth,
-    // logging, or tenant middleware registered via AppBuilder::layer) run
-    // first and the idempotency check only fires after they pass.  The layer
-    // sits outer to rate limiting, so replayed responses skip the quota.
+    // Idempotency-key middleware: applied BEFORE CORS and CSRF so both security
+    // checks run on every request, including cache hits.  In axum the last
+    // `.layer()` call wraps all earlier ones, so applying idempotency here
+    // makes it the innermost layer — CSRF and CORS sit outside it and therefore
+    // validate every request before the idempotency shortcut fires.
     if config.idempotency.enabled {
         use crate::idempotency::{IdempotencyLayer, IdempotencyStore, MemoryIdempotencyStore};
         use std::time::Duration;
@@ -1155,11 +1130,35 @@ fn apply_middleware(
         );
     }
 
-    // User-registered Tower layers (AppBuilder::layer). Applied AFTER
-    // idempotency so they wrap it — user middleware runs OUTER to idempotency
-    // on ingress, ensuring auth/logging fires on every request including
-    // replays.  Iterate in reverse so the first registered layer ends up
-    // outermost among user layers — matching tower::ServiceBuilder ordering.
+    router = apply_cors_middleware(router, config);
+    router = apply_csrf_middleware(router, config, signing_keys_opt.clone());
+    // Method-override rejection filter. The outer `MethodOverrideLayer`
+    // (applied at the `axum::serve` boundary so it can rewrite the
+    // request method before route matching) stamps a
+    // [`MethodOverrideRejection`] extension when the override field
+    // value is invalid or the body was too large to scan; this inner
+    // middleware converts that extension into the corresponding
+    // `400`/`413` response. Running it here means the rejection flows
+    // through the rest of the response stack (security headers,
+    // request IDs, metrics, error-page filter) rather than bypassing
+    // them. Placed outside CSRF so a `BodyTooLarge` (empty body)
+    // doesn't get masked by a `403` from CSRF's missing-token branch,
+    // and a clear `400 invalid _method` outranks "missing CSRF".
+    router = router.layer(axum::middleware::from_fn(
+        crate::middleware::method_override_rejection_filter,
+    ));
+    router = apply_rate_limit_middleware(router, config);
+    router = apply_upload_middleware(router, config);
+
+    // Security headers layer (always applied)
+    let security_headers =
+        crate::security::SecurityHeadersLayer::from_config(&config.security.headers);
+    tracing::debug!("Security headers enabled");
+
+    // User-registered Tower layers (AppBuilder::layer). Outermost — applied
+    // last so they wrap all framework middleware.  Iterate in reverse so the
+    // first registered layer ends up outermost among user layers — matching
+    // tower::ServiceBuilder ordering.
     let custom_layer_count = custom_layers.len();
     for registered in custom_layers.into_iter().rev() {
         router = (registered.apply)(router);
