@@ -25,7 +25,8 @@ use std::task::{Context, Poll};
 
 use axum::body::Body;
 use axum::http::{Method, StatusCode};
-use http::Request;
+use http::header::{AUTHORIZATION, CACHE_CONTROL, COOKIE, PRAGMA, SET_COOKIE, VARY};
+use http::{HeaderMap, Request};
 use http_body_util::BodyExt;
 use tower::{Layer, Service};
 
@@ -65,6 +66,32 @@ fn cached_response_from_parts(
     }
 }
 
+fn header_value_contains_token(headers: &HeaderMap, name: http::HeaderName, token: &str) -> bool {
+    headers.get_all(name).iter().any(|value| {
+        value.to_str().is_ok_and(|value| {
+            value
+                .split(',')
+                .any(|part| part.trim().eq_ignore_ascii_case(token))
+        })
+    })
+}
+
+fn request_allows_response_cache(headers: &HeaderMap) -> bool {
+    !headers.contains_key(AUTHORIZATION)
+        && !headers.contains_key(COOKIE)
+        && !header_value_contains_token(headers, CACHE_CONTROL, "no-cache")
+        && !header_value_contains_token(headers, CACHE_CONTROL, "no-store")
+        && !header_value_contains_token(headers, PRAGMA, "no-cache")
+}
+
+fn response_allows_response_cache(headers: &HeaderMap) -> bool {
+    !headers.contains_key(SET_COOKIE)
+        && !header_value_contains_token(headers, CACHE_CONTROL, "private")
+        && !header_value_contains_token(headers, CACHE_CONTROL, "no-cache")
+        && !header_value_contains_token(headers, CACHE_CONTROL, "no-store")
+        && !headers.contains_key(VARY)
+}
+
 fn cached_response_into_response(cached: CachedResponse) -> Option<axum::response::Response> {
     let status = StatusCode::from_u16(cached.status).ok()?;
     let mut builder = axum::response::Response::builder().status(status);
@@ -87,6 +114,11 @@ fn cached_response_into_response(cached: CachedResponse) -> Option<axum::respons
 /// Caching rules:
 /// - Only `GET` requests are cached.
 /// - Only `200 OK` responses are cached.
+/// - Requests with `Authorization`, `Cookie`, `Cache-Control: no-cache`,
+///   `Cache-Control: no-store`, or `Pragma: no-cache` bypass the cache.
+/// - Responses with `Set-Cookie`, `Cache-Control: private`,
+///   `Cache-Control: no-cache`, `Cache-Control: no-store`, or any `Vary`
+///   header are not cached.
 /// - The cache key is the request URI path + query string.
 #[derive(Clone)]
 pub struct CacheResponseLayer {
@@ -153,8 +185,11 @@ where
     }
 
     fn call(&mut self, req: Request<Body>) -> Self::Future {
-        // Only cache GET requests
-        if req.method() != Method::GET {
+        // Only cache GET requests whose headers are safe for a shared
+        // URI-keyed response cache. Authenticated/session-bound requests must
+        // reach the inner service so auth checks and personalization cannot be
+        // bypassed by a response cached for the same URI.
+        if req.method() != Method::GET || !request_allows_response_cache(req.headers()) {
             return Box::pin(self.inner.call(req));
         }
 
@@ -200,8 +235,12 @@ where
         Box::pin(async move {
             let response = inner.call(req).await?;
 
-            // Only cache 200 OK responses
-            if response.status() != StatusCode::OK {
+            // Only cache public 200 OK responses. Private, explicitly
+            // non-cacheable, cookie-setting, or varying responses are unsafe
+            // for a shared URI-keyed cache.
+            if response.status() != StatusCode::OK
+                || !response_allows_response_cache(response.headers())
+            {
                 return Ok(response);
             }
 
@@ -419,6 +458,194 @@ mod tests {
             counter.load(Ordering::SeqCst),
             1,
             "raw-byte backends should cache HTTP responses"
+        );
+    }
+
+    #[tokio::test]
+    async fn authorization_requests_bypass_raw_byte_response_cache() {
+        let store = Arc::new(RawOnlyCache::default());
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        let inner = {
+            let counter = counter.clone();
+            tower::service_fn(move |req: Request<Body>| {
+                let counter = counter.clone();
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    if req.headers().contains_key(AUTHORIZATION) {
+                        Ok::<_, Infallible>(
+                            axum::response::Response::builder()
+                                .status(StatusCode::OK)
+                                .header("x-sensitive-token", "alice-secret-header")
+                                .body(Body::from("private profile for alice"))
+                                .expect("infallible response builder"),
+                        )
+                    } else {
+                        Ok::<_, Infallible>(
+                            axum::response::Response::builder()
+                                .status(StatusCode::UNAUTHORIZED)
+                                .body(Body::from("missing auth"))
+                                .expect("infallible response builder"),
+                        )
+                    }
+                }
+            })
+        };
+
+        let mut svc = ServiceBuilder::new()
+            .layer(CacheResponseLayer::from_shared(store))
+            .service(inner);
+
+        let req = Request::get("/profile?view=full")
+            .header(AUTHORIZATION, "Bearer alice")
+            .body(Body::empty())
+            .expect("infallible response builder");
+        let resp = svc
+            .ready()
+            .await
+            .expect("infallible response builder")
+            .call(req)
+            .await
+            .expect("infallible response builder");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("x-sensitive-token")
+                .and_then(|v| v.to_str().ok()),
+            Some("alice-secret-header")
+        );
+
+        let req = Request::get("/profile?view=full")
+            .body(Body::empty())
+            .expect("infallible response builder");
+        let resp = svc
+            .ready()
+            .await
+            .expect("infallible response builder")
+            .call(req)
+            .await
+            .expect("infallible response builder");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .expect("infallible response builder")
+            .to_bytes();
+        assert_eq!(body.as_ref(), b"missing auth");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            2,
+            "unauthenticated requests must reach the inner auth service"
+        );
+    }
+
+    #[tokio::test]
+    async fn private_and_cookie_responses_are_not_cached() {
+        let store = Arc::new(RawOnlyCache::default());
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        let inner = {
+            let counter = counter.clone();
+            tower::service_fn(move |_req: Request<Body>| {
+                let counter = counter.clone();
+                async move {
+                    let call = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                    Ok::<_, Infallible>(
+                        axum::response::Response::builder()
+                            .status(StatusCode::OK)
+                            .header(CACHE_CONTROL, "private, no-store")
+                            .header(SET_COOKIE, "sid=secret; HttpOnly")
+                            .body(Body::from(format!("private response {call}")))
+                            .expect("infallible response builder"),
+                    )
+                }
+            })
+        };
+
+        let mut svc = ServiceBuilder::new()
+            .layer(CacheResponseLayer::from_shared(store))
+            .service(inner);
+
+        for expected_call in 1..=2 {
+            let req = Request::get("/private")
+                .body(Body::empty())
+                .expect("infallible response builder");
+            let resp = svc
+                .ready()
+                .await
+                .expect("infallible response builder")
+                .call(req)
+                .await
+                .expect("infallible response builder");
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = http_body_util::BodyExt::collect(resp.into_body())
+                .await
+                .expect("infallible response builder")
+                .to_bytes();
+            assert_eq!(
+                body.as_ref(),
+                format!("private response {expected_call}").as_bytes()
+            );
+        }
+
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            2,
+            "private or cookie-setting responses must not be reused from cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn vary_responses_are_not_cached() {
+        let store = Arc::new(RawOnlyCache::default());
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        let inner = {
+            let counter = counter.clone();
+            tower::service_fn(move |_req: Request<Body>| {
+                let counter = counter.clone();
+                async move {
+                    let call = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                    Ok::<_, Infallible>(
+                        axum::response::Response::builder()
+                            .status(StatusCode::OK)
+                            .header(VARY, "Authorization")
+                            .body(Body::from(format!("vary response {call}")))
+                            .expect("infallible response builder"),
+                    )
+                }
+            })
+        };
+
+        let mut svc = ServiceBuilder::new()
+            .layer(CacheResponseLayer::from_shared(store))
+            .service(inner);
+
+        for expected_call in 1..=2 {
+            let req = Request::get("/varies")
+                .body(Body::empty())
+                .expect("infallible response builder");
+            let resp = svc
+                .ready()
+                .await
+                .expect("infallible response builder")
+                .call(req)
+                .await
+                .expect("infallible response builder");
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = http_body_util::BodyExt::collect(resp.into_body())
+                .await
+                .expect("infallible response builder")
+                .to_bytes();
+            assert_eq!(
+                body.as_ref(),
+                format!("vary response {expected_call}").as_bytes()
+            );
+        }
+
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            2,
+            "responses with Vary headers cannot use a URI-only cache key"
         );
     }
 
