@@ -23,6 +23,12 @@ const IN_FLIGHT_TTL: Duration = Duration::from_secs(30);
 /// subsequent retry with the same key will re-execute the handler.
 const MAX_CACHEABLE_RESPONSE_BODY: usize = 10 * 1024 * 1024; // 10 MiB
 
+/// Fallback request body read limit used when the upload middleware extension
+/// is absent (e.g. when `IdempotencyLayer` is used directly without the full
+/// framework stack). Matches the framework default for
+/// `security.upload.max_request_size_bytes`.
+const DEFAULT_REQUEST_BODY_LIMIT: usize = 32 * 1024 * 1024; // 32 MiB
+
 const fn is_mutating_method(method: &Method) -> bool {
     matches!(
         *method,
@@ -475,13 +481,15 @@ where
 
     let (parts, body) = req.into_parts();
 
-    // Buffer the request body for fingerprinting. We do not apply our own
-    // size cap here — the upload middleware (outer layer) wraps the body in
-    // axum's DefaultBodyLimit, so exceeding the configured per-app limit
-    // causes an error here and we return 413. Using usize::MAX ensures that
-    // valid large uploads permitted by the app config are not rejected solely
-    // because an Idempotency-Key header is present.
-    let Ok(body_bytes) = axum::body::to_bytes(body, usize::MAX).await else {
+    // Buffer the request body for fingerprinting. Use the per-app upload limit
+    // injected by the upload middleware (outer layer) so the idempotency cap
+    // always matches the configured maximum request size. Fall back to the
+    // framework default when the extension is absent (low-level API usage).
+    let body_limit = parts
+        .extensions
+        .get::<crate::security::config::UploadConfig>()
+        .map_or(DEFAULT_REQUEST_BODY_LIMIT, |c| c.max_request_size_bytes);
+    let Ok(body_bytes) = axum::body::to_bytes(body, body_limit).await else {
         let response = Response::builder()
             .status(StatusCode::PAYLOAD_TOO_LARGE)
             .body(Body::from(
