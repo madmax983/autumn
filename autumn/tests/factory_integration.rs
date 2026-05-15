@@ -7,9 +7,13 @@
 
 #[cfg(feature = "db")]
 mod factory_tests {
+    #[cfg(feature = "test-support")]
     use diesel::prelude::*;
+    #[cfg(feature = "test-support")]
     use diesel_async::AsyncPgConnection;
+    #[cfg(feature = "test-support")]
     use diesel_async::RunQueryDsl;
+    #[cfg(feature = "test-support")]
     use diesel_async::pooled_connection::deadpool::Pool;
 
     // ── Schema ─────────────────────────────────────────────────
@@ -209,6 +213,7 @@ mod factory_tests {
 
 #[cfg(feature = "db")]
 mod composition_tests {
+    #[cfg(feature = "test-support")]
     use diesel_async::RunQueryDsl;
 
     // ── Schema ──────────────────────────────────────────────────
