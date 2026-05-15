@@ -19,8 +19,6 @@
 #   # wait for health checks, then run:
 #   # cd load && ./run.sh autumn http://localhost:8001
 
-version: "3.9"
-
 x-db-env: &db-env
   DATABASE_URL: postgres://benchmark:benchmark@db:5432/benchmark
 
@@ -56,12 +54,15 @@ services:
   autumn:
     <<: *app-defaults
     build:
-      context: autumn
-      dockerfile: Dockerfile
+      context: ../..
+      dockerfile: benchmarks/runtime/autumn/Dockerfile
     environment:
       <<: *db-env
+      AUTUMN_DATABASE__URL: postgres://benchmark:benchmark@db:5432/benchmark
       AUTUMN_SERVER__HOST: "0.0.0.0"
       AUTUMN_SERVER__PORT: "8080"
+      AUTUMN_SECURITY__CSRF__ENABLED: "false"
+      AUTUMN_SECURITY__SIGNING_SECRET: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
       RUST_LOG: "warn"
     ports:
       - "8001:8080"
@@ -77,7 +78,9 @@ services:
       context: spring-boot
       dockerfile: Dockerfile
     environment:
-      <<: *db-env
+      SPRING_DATASOURCE_URL: jdbc:postgresql://db:5432/benchmark
+      SPRING_DATASOURCE_USERNAME: benchmark
+      SPRING_DATASOURCE_PASSWORD: benchmark
       SERVER_PORT: "8080"
     ports:
       - "8002:8080"

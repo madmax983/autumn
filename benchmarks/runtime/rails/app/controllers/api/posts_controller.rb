@@ -54,7 +54,8 @@ module Api
     end
 
     def post_params
-      params.require(:post).permit(:title, :body, :published, :author)
+      source = params[:post].present? ? params.require(:post) : params
+      source.permit(:title, :body, :published, :author)
     end
   end
 end
