@@ -741,7 +741,7 @@ impl AppBuilder {
     /// In production (`AUTUMN_PROFILE=production`) the memory backend is
     /// rejected unless `allow_memory_in_production = true` is set explicitly.
     #[must_use]
-    pub fn idempotent(mut self) -> Self {
+    pub const fn idempotent(mut self) -> Self {
         self.idempotency_enabled = true;
         self
     }

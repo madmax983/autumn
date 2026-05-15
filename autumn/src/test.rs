@@ -297,11 +297,11 @@ impl TestApp {
     /// Enable HTTP idempotency-key middleware for this test app.
     ///
     /// Mirrors [`crate::app::AppBuilder::idempotent`]: sets the
-    /// `config.idempotency.enabled` flag so that
-    /// [`crate::router::apply_middleware`] wires up the layer with the same
-    /// `MemoryIdempotencyStore` and `MetricsCollector` that production uses.
+    /// `config.idempotency.enabled` flag so that the router wires up the layer
+    /// with the same `MemoryIdempotencyStore` and `MetricsCollector` that
+    /// production uses.
     #[must_use]
-    pub fn idempotent(mut self) -> Self {
+    pub const fn idempotent(mut self) -> Self {
         self.config.idempotency.enabled = true;
         self
     }

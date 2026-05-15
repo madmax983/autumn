@@ -1452,8 +1452,7 @@ impl AutumnConfig {
             match IdempotencyBackend::from_env_value(&val) {
                 Some(backend) => self.idempotency.backend = backend,
                 None => eprintln!(
-                    "Warning: unrecognised AUTUMN_IDEMPOTENCY__BACKEND value {:?}; ignoring",
-                    val
+                    "Warning: unrecognised AUTUMN_IDEMPOTENCY__BACKEND value {val:?}; ignoring"
                 ),
             }
         }

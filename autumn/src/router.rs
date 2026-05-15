@@ -36,6 +36,7 @@ pub enum RouterBuildError {
     InvalidSessionBackend(#[from] crate::session::SessionBackendConfigError),
     /// The idempotency backend configuration is invalid.
     #[error("invalid idempotency backend configuration: {0}")]
+    #[allow(dead_code)] // constructed only in the `redis` feature path
     InvalidIdempotencyBackend(String),
     /// A user-defined route conflicts with a framework-provided route.
     #[error("framework route overlap at {path}: {existing} conflicts with {incoming}")]
@@ -1145,8 +1146,17 @@ fn apply_middleware(
                         }
                     }
                 }
-                #[allow(unreachable_patterns)]
-                _ => std::sync::Arc::new(MemoryIdempotencyStore::new(ttl)),
+                // When the `redis` feature is absent the Redis arm above is compiled
+                // out, so this arm catches it and returns an explicit error rather
+                // than silently downgrading to an in-process memory store.
+                #[cfg(not(feature = "redis"))]
+                crate::config::IdempotencyBackend::Redis => {
+                    return Err(RouterBuildError::InvalidIdempotencyBackend(
+                        "idempotency backend 'redis' requires the autumn-web 'redis' feature \
+                         flag; rebuild with --features redis or switch to backend = \"memory\""
+                            .to_owned(),
+                    ));
+                }
             };
         let layer = IdempotencyLayer::new(store)
             .with_ttl(ttl)

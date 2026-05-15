@@ -56,14 +56,14 @@ async fn test_deduplication() {
 /// A different payload with the same key returns 422.
 #[tokio::test]
 async fn test_payload_mismatch_returns_422() {
+    use tower::ServiceExt;
+
     let store = make_store(Duration::from_secs(3600));
     let layer = IdempotencyLayer::new(store);
 
     let app = axum::Router::new()
         .route("/echo", axum::routing::post(ok_handler))
         .layer(layer);
-
-    use tower::ServiceExt;
 
     let req1 = axum::http::Request::builder()
         .method("POST")
@@ -311,6 +311,7 @@ fn test_ttl_eviction() {
 #[tokio::test]
 async fn test_concurrent_duplicate_returns_409() {
     use autumn_web::idempotency::{IdempotencyStore, MemoryIdempotencyStore};
+    use tower::ServiceExt;
 
     let store = Arc::new(MemoryIdempotencyStore::new(Duration::from_secs(3600)));
     let layer = IdempotencyLayer::new(store.clone() as Arc<dyn IdempotencyStore>);
@@ -318,8 +319,6 @@ async fn test_concurrent_duplicate_returns_409() {
     let app = axum::Router::new()
         .route("/ping", axum::routing::post(ok_handler))
         .layer(layer);
-
-    use tower::ServiceExt;
 
     // Lock the key manually to simulate an in-flight request.
     store.try_lock("inflight-key");
@@ -412,7 +411,7 @@ async fn test_metrics_recorded() {
     // the counter value, since the MetricsCollector is private to the router.
 }
 
-/// IdempotencyConfig::default() reflects documented defaults.
+/// `IdempotencyConfig::default()` reflects documented defaults.
 #[test]
 fn test_config_fields() {
     let config = autumn_web::config::IdempotencyConfig::default();
