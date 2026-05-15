@@ -402,3 +402,150 @@ fn test_config_fields() {
         "default Redis key prefix"
     );
 }
+
+/// `MemoryIdempotencyStore::new(ttl)` stores the TTL and exposes it via
+/// `default_ttl()`, and `IdempotencyLayer::new(store)` picks it up.
+#[test]
+fn test_store_ttl_propagates_to_layer() {
+    use autumn_web::idempotency::IdempotencyStore;
+
+    let ttl = Duration::from_secs(300);
+    let store = MemoryIdempotencyStore::new(ttl);
+    assert_eq!(
+        store.default_ttl(),
+        ttl,
+        "store must return the TTL passed to new()"
+    );
+}
+
+/// Non-2xx responses are not cached; a second request with the same key
+/// re-executes the handler rather than replaying the error.
+#[tokio::test]
+async fn test_error_response_not_cached() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static CALL_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    #[post("/fail")]
+    async fn handler() -> (StatusCode, &'static str) {
+        CALL_COUNT.fetch_add(1, Ordering::SeqCst);
+        (StatusCode::INTERNAL_SERVER_ERROR, "boom")
+    }
+
+    let client = TestApp::new().routes(routes![handler]).idempotent().build();
+
+    let r1 = client
+        .post("/fail")
+        .header("idempotency-key", "error-key")
+        .send()
+        .await;
+    r1.assert_status(500);
+    assert_eq!(r1.header("x-idempotent-replayed"), None);
+
+    let r2 = client
+        .post("/fail")
+        .header("idempotency-key", "error-key")
+        .send()
+        .await;
+    r2.assert_status(500);
+    assert_eq!(
+        r2.header("x-idempotent-replayed"),
+        None,
+        "error responses must not be replayed"
+    );
+    assert_eq!(
+        CALL_COUNT.load(Ordering::SeqCst),
+        2,
+        "handler should execute twice since error was not cached"
+    );
+}
+
+/// `set-cookie` headers are delivered on the first (non-replayed) response but
+/// excluded from the cached replay to prevent session fixation.
+#[tokio::test]
+async fn test_set_cookie_on_first_response_absent_on_replay() {
+    use tower::ServiceExt;
+
+    let store = make_store(Duration::from_secs(3600));
+    let layer = IdempotencyLayer::new(store);
+
+    let app = axum::Router::new()
+        .route(
+            "/login",
+            axum::routing::post(|| async {
+                axum::response::Response::builder()
+                    .status(200)
+                    .header("set-cookie", "session=abc; HttpOnly; SameSite=Strict")
+                    .body(axum::body::Body::from("ok"))
+                    .unwrap()
+            }),
+        )
+        .layer(layer);
+
+    let req1 = axum::http::Request::builder()
+        .method("POST")
+        .uri("/login")
+        .header("idempotency-key", "login-key")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp1 = app.clone().oneshot(req1).await.unwrap();
+    assert_eq!(resp1.status(), StatusCode::OK);
+    assert!(
+        resp1.headers().contains_key("set-cookie"),
+        "first response must include set-cookie"
+    );
+    assert!(
+        !resp1.headers().contains_key("x-idempotent-replayed"),
+        "first response must not have x-idempotent-replayed"
+    );
+
+    let req2 = axum::http::Request::builder()
+        .method("POST")
+        .uri("/login")
+        .header("idempotency-key", "login-key")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp2 = app.clone().oneshot(req2).await.unwrap();
+    assert_eq!(resp2.status(), StatusCode::OK);
+    assert!(
+        !resp2.headers().contains_key("set-cookie"),
+        "replayed response must NOT include set-cookie"
+    );
+    assert_eq!(
+        resp2
+            .headers()
+            .get("x-idempotent-replayed")
+            .map(|v| v.to_str().unwrap()),
+        Some("true"),
+        "replayed response must have x-idempotent-replayed: true"
+    );
+}
+
+/// DELETE requests with an idempotency key are deduplicated (DELETE is mutating).
+#[tokio::test]
+async fn test_delete_deduplication() {
+    use autumn_web::delete;
+
+    #[delete("/item")]
+    async fn handler() -> &'static str {
+        "deleted"
+    }
+
+    let client = TestApp::new().routes(routes![handler]).idempotent().build();
+
+    let r1 = client
+        .delete("/item")
+        .header("idempotency-key", "delete-key-1")
+        .send()
+        .await;
+    r1.assert_ok();
+    assert_eq!(r1.header("x-idempotent-replayed"), None);
+
+    let r2 = client
+        .delete("/item")
+        .header("idempotency-key", "delete-key-1")
+        .send()
+        .await;
+    r2.assert_ok();
+    assert_eq!(r2.header("x-idempotent-replayed"), Some("true"));
+}
