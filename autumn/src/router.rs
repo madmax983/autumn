@@ -1109,22 +1109,11 @@ fn apply_middleware(
         crate::security::SecurityHeadersLayer::from_config(&config.security.headers);
     tracing::debug!("Security headers enabled");
 
-    // User-registered Tower layers (AppBuilder::layer). Applied BEFORE
-    // RequestIdLayer wraps the router, so user middleware sits INNER to
-    // RequestId on ingress and can read the generated request ID from the
-    // request extensions. Iterate in reverse so the first registered layer
-    // ends up outermost among user layers — matching tower::ServiceBuilder.
-    let custom_layer_count = custom_layers.len();
-    for registered in custom_layers.into_iter().rev() {
-        router = (registered.apply)(router);
-    }
-    if custom_layer_count > 0 {
-        tracing::debug!(count = custom_layer_count, "Custom Tower layers applied");
-    }
-
-    // Idempotency-key middleware: inner to user layers so auth/logging still
-    // run on every request, but outer to rate limiting so cached responses
-    // skip the quota. Applied only when explicitly enabled.
+    // Idempotency-key middleware: applied BEFORE user layers so it ends up
+    // INNER to them. On a cache hit the user layers (including any auth,
+    // logging, or tenant middleware registered via AppBuilder::layer) run
+    // first and the idempotency check only fires after they pass.  The layer
+    // sits outer to rate limiting, so replayed responses skip the quota.
     if config.idempotency.enabled {
         use crate::idempotency::{IdempotencyLayer, IdempotencyStore, MemoryIdempotencyStore};
         use std::time::Duration;
@@ -1164,6 +1153,19 @@ fn apply_middleware(
             ttl_secs = config.idempotency.ttl_secs,
             "Idempotency-key middleware enabled"
         );
+    }
+
+    // User-registered Tower layers (AppBuilder::layer). Applied AFTER
+    // idempotency so they wrap it — user middleware runs OUTER to idempotency
+    // on ingress, ensuring auth/logging fires on every request including
+    // replays.  Iterate in reverse so the first registered layer ends up
+    // outermost among user layers — matching tower::ServiceBuilder ordering.
+    let custom_layer_count = custom_layers.len();
+    for registered in custom_layers.into_iter().rev() {
+        router = (registered.apply)(router);
+    }
+    if custom_layer_count > 0 {
+        tracing::debug!(count = custom_layer_count, "Custom Tower layers applied");
     }
 
     // Apply framework middleware. Exception filters wrap outermost so they

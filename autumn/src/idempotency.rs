@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -114,6 +115,8 @@ pub trait IdempotencyStore: Send + Sync + 'static {
 pub struct MemoryIdempotencyStore {
     entries: RwLock<HashMap<String, IdempotencyEntry>>,
     in_flight: RwLock<HashMap<String, Instant>>,
+    /// Counts `set` calls to trigger periodic expired-entry eviction.
+    write_count: AtomicU64,
 }
 
 impl MemoryIdempotencyStore {
@@ -122,6 +125,7 @@ impl MemoryIdempotencyStore {
         Self {
             entries: RwLock::new(HashMap::new()),
             in_flight: RwLock::new(HashMap::new()),
+            write_count: AtomicU64::new(0),
         }
     }
 }
@@ -139,9 +143,15 @@ impl IdempotencyStore for MemoryIdempotencyStore {
             body_hash,
             expires_at: Instant::now() + ttl,
         };
-        // Lazy expiry: `get` already filters stale entries. We don't scan the
-        // entire map here to keep writes O(1).
-        self.entries.write().unwrap().insert(key.to_owned(), entry);
+        let mut entries = self.entries.write().unwrap();
+        entries.insert(key.to_owned(), entry);
+        // Periodically evict expired entries to bound memory growth for
+        // long-running processes. O(N) scan is amortised over every 128 writes.
+        let n = self.write_count.fetch_add(1, Ordering::Relaxed);
+        if n.is_multiple_of(128) {
+            let now = Instant::now();
+            entries.retain(|_, v| v.expires_at > now);
+        }
     }
 
     fn try_lock(&self, key: &str) -> bool {
@@ -269,7 +279,16 @@ mod redis_store {
                 let ttl_secs = ttl.as_secs().max(1);
                 tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(async move {
-                        let _: Result<(), _> = conn.set_ex(&redis_key, bytes, ttl_secs).await;
+                        if let Err(e) = conn.set_ex::<_, _, ()>(&redis_key, bytes, ttl_secs).await {
+                            // The handler already succeeded. Log and continue so
+                            // the response is returned; a retry will re-execute
+                            // the handler (idempotency guarantee is degraded).
+                            tracing::warn!(
+                                error = %e,
+                                "Failed to persist idempotency entry to Redis; \
+                                 a retry may re-execute the handler"
+                            );
+                        }
                     });
                 });
             }
@@ -280,16 +299,27 @@ mod redis_store {
             let mut conn = self.connection.clone();
             tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(async move {
-                    let result: Option<String> = redis::cmd("SET")
+                    let result: Result<Option<String>, _> = redis::cmd("SET")
                         .arg(&lock_key)
                         .arg("1")
                         .arg("NX")
                         .arg("EX")
                         .arg(LOCK_TTL_SECS)
                         .query_async(&mut conn)
-                        .await
-                        .unwrap_or(None);
-                    result.is_some()
+                        .await;
+                    match result {
+                        Ok(opt) => opt.is_some(), // Some("OK") = acquired, None = already held
+                        Err(e) => {
+                            // Redis unavailable: degrade gracefully — allow the request
+                            // through rather than returning 409 for every request.
+                            tracing::warn!(
+                                error = %e,
+                                "Redis idempotency lock unavailable; \
+                                 allowing request through (degraded mode)"
+                            );
+                            true
+                        }
+                    }
                 })
             })
         }
