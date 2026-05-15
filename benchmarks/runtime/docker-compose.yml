@@ -79,6 +79,7 @@ services:
       context: spring-boot
       dockerfile: Dockerfile
     environment:
+      <<: *db-env
       SPRING_DATASOURCE_URL: jdbc:postgresql://db:5432/benchmark
       SPRING_DATASOURCE_USERNAME: benchmark
       SPRING_DATASOURCE_PASSWORD: benchmark

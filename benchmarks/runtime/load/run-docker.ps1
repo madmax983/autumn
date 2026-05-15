@@ -19,8 +19,8 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $ScriptDir = $PSScriptRoot
-$RuntimeDir = Resolve-Path (Join-Path $ScriptDir "..")
-$K6Dir = Resolve-Path (Join-Path $ScriptDir "k6")
+$RuntimeDir = (Resolve-Path (Join-Path $ScriptDir "..")).Path
+$K6Dir = (Resolve-Path (Join-Path $ScriptDir "k6")).Path
 
 function Get-Median {
     param([double[]]$Values)
@@ -118,7 +118,7 @@ for ($run = 1; $run -le $Repeat; $run++) {
 $summaryFiles = @(Get-ChildItem -Path $OutDir -Recurse -Filter "*-summary.json" -ErrorAction SilentlyContinue)
 if ($summaryFiles.Count -gt 0) {
     $rows = foreach ($file in $summaryFiles) {
-        $json = Get-Content $file.FullName -Raw | ConvertFrom-Json
+        $json = Get-Content $file.FullName -Raw -Encoding UTF8 | ConvertFrom-Json
         $metrics = $json.metrics
         $relativeDir = $file.Directory.FullName.Substring($OutDir.Length).TrimStart("\", "/")
         $parts = $relativeDir -split "[\\/]"
@@ -138,7 +138,7 @@ if ($summaryFiles.Count -gt 0) {
     }
 
     $aggregatePath = Join-Path $OutDir "aggregate.csv"
-    $rows | Sort-Object run, framework, scenario | Export-Csv -NoTypeInformation -Path $aggregatePath
+    $rows | Sort-Object run, framework, scenario | Export-Csv -NoTypeInformation -Path $aggregatePath -Encoding UTF8
 
     $summaryRows = foreach ($group in ($rows | Group-Object framework, scenario)) {
         $items = @($group.Group)
@@ -164,7 +164,7 @@ if ($summaryFiles.Count -gt 0) {
     }
 
     $summaryPath = Join-Path $OutDir "aggregate-summary.csv"
-    $summaryRows | Sort-Object framework, scenario | Export-Csv -NoTypeInformation -Path $summaryPath
+    $summaryRows | Sort-Object framework, scenario | Export-Csv -NoTypeInformation -Path $summaryPath -Encoding UTF8
 
     Write-Host ""
     Write-Host "Aggregate:"

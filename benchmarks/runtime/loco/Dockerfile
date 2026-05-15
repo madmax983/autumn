@@ -3,7 +3,7 @@ WORKDIR /workspace
 
 # Minimal stub workspace to allow -p build without pulling in the whole repo.
 RUN cargo new --bin bench-loco-stub
-COPY Cargo.toml Cargo.lock /workspace/bench-loco/
+COPY Cargo.toml /workspace/bench-loco/
 COPY src /workspace/bench-loco/src
 COPY migrations /workspace/bench-loco/migrations
 WORKDIR /workspace/bench-loco
