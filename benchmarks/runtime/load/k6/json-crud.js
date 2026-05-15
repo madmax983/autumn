@@ -21,6 +21,8 @@ import { check, sleep } from "k6";
 import { Rate, Trend } from "k6/metrics";
 
 const BASE_URL = __ENV.BASE_URL || "http://localhost:8001";
+const HEADERS = { "Content-Type": "application/json" };
+const DETAIL_TAG = { name: "/api/posts/:id" };
 
 export const options = {
   vus:      parseInt(__ENV.VUS || "20"),
@@ -37,10 +39,8 @@ const listTime   = new Trend("list_duration",   true);
 const showTime   = new Trend("show_duration",   true);
 
 export default function () {
-  const headers = { "Content-Type": "application/json" };
-
   // --- List ---
-  const listRes = http.get(`${BASE_URL}/api/posts`, { headers });
+  const listRes = http.get(`${BASE_URL}/api/posts`, { headers: HEADERS });
   listTime.add(listRes.timings.duration);
   check(listRes, { "list 200": (r) => r.status === 200 });
   errorRate.add(listRes.status !== 200);
@@ -52,7 +52,7 @@ export default function () {
     published: true,
     author:    "k6-runner",
   });
-  const createRes = http.post(`${BASE_URL}/api/posts`, payload, { headers });
+  const createRes = http.post(`${BASE_URL}/api/posts`, payload, { headers: HEADERS });
   createTime.add(createRes.timings.duration);
   const created = check(createRes, { "create 201": (r) => r.status === 201 });
   errorRate.add(!created);
@@ -63,7 +63,10 @@ export default function () {
 
     if (newId) {
       // --- Show ---
-      const showRes = http.get(`${BASE_URL}/api/posts/${newId}`, { headers });
+      const showRes = http.get(`${BASE_URL}/api/posts/${newId}`, {
+        headers: HEADERS,
+        tags: DETAIL_TAG,
+      });
       showTime.add(showRes.timings.duration);
       check(showRes, { "show 200": (r) => r.status === 200 });
       errorRate.add(showRes.status !== 200);
@@ -72,13 +75,16 @@ export default function () {
       const updateRes = http.patch(
         `${BASE_URL}/api/posts/${newId}`,
         JSON.stringify({ title: "Updated by k6" }),
-        { headers }
+        { headers: HEADERS, tags: DETAIL_TAG }
       );
       check(updateRes, { "update 200": (r) => r.status === 200 });
       errorRate.add(updateRes.status !== 200);
 
       // --- Delete ---
-      const delRes = http.del(`${BASE_URL}/api/posts/${newId}`, null, { headers });
+      const delRes = http.del(`${BASE_URL}/api/posts/${newId}`, null, {
+        headers: HEADERS,
+        tags: DETAIL_TAG,
+      });
       check(delRes, { "delete 204": (r) => r.status === 204 });
       errorRate.add(delRes.status !== 204);
     }

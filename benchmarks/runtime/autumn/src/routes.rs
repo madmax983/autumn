@@ -9,10 +9,11 @@
 
 use autumn_web::extract::Path;
 use autumn_web::prelude::{IntoResponse, Json, StatusCode};
+use autumn_web::reexports::http::HeaderMap;
 use autumn_web::{AutumnError, AutumnResult, Db, Markup, delete, get, html, patch, post};
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::models::{ApiToken, NewPost, Post, PostUpdate};
 use crate::schema::posts;
@@ -20,7 +21,7 @@ use crate::schema::posts;
 // ── Shared error response shape ───────────────────────────────────────────────
 
 #[derive(Serialize)]
-struct ErrBody {
+pub(crate) struct ErrBody {
     error: String,
 }
 
@@ -33,6 +34,7 @@ fn err_json(msg: impl Into<String>) -> (StatusCode, Json<ErrBody>) {
 
 // ── Validation helpers ────────────────────────────────────────────────────────
 
+#[cfg(test)]
 pub fn validate_new_post_pub(p: &NewPost) -> Result<(), String> {
     validate_new_post(p)
 }
@@ -108,7 +110,10 @@ pub async fn api_delete(id: Path<i64>, mut db: Db) -> AutumnResult<StatusCode> {
         .execute(&mut *db)
         .await?;
     if n == 0 {
-        return Err(AutumnError::not_found_msg(format!("post {} not found", *id)));
+        return Err(AutumnError::not_found_msg(format!(
+            "post {} not found",
+            *id
+        )));
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -122,18 +127,39 @@ pub async fn api_delete(id: Path<i64>, mut db: Db) -> AutumnResult<StatusCode> {
 #[get("/api/posts/protected")]
 pub async fn api_protected(
     mut db: Db,
-    headers: autumn_web::prelude::HeaderMap,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrBody>)> {
     let token = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "))
-        .ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(ErrBody { error: "missing or invalid Authorization header".into() })))?;
+        .ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(ErrBody {
+                    error: "missing or invalid Authorization header".into(),
+                }),
+            )
+        })?;
 
     let principal = ApiToken::verify(token, &mut db)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrBody { error: e.to_string() })))?
-        .ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(ErrBody { error: "invalid token".into() })))?;
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrBody {
+                    error: e.to_string(),
+                }),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(ErrBody {
+                    error: "invalid token".into(),
+                }),
+            )
+        })?;
 
     #[derive(Serialize)]
     struct Stats {
@@ -147,7 +173,10 @@ pub async fn api_protected(
         .await
         .map_err(|e| err_json(e.to_string()))?;
 
-    Ok(Json(Stats { principal, total_posts: total }))
+    Ok(Json(Stats {
+        principal,
+        total_posts: total,
+    }))
 }
 
 // ── Server-rendered HTML ──────────────────────────────────────────────────────

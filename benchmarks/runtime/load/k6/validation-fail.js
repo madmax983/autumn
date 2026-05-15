@@ -24,7 +24,10 @@ import { check, sleep } from "k6";
 import { Rate, Trend } from "k6/metrics";
 
 const BASE_URL = __ENV.BASE_URL || "http://localhost:8001";
-const HEADERS  = { "Content-Type": "application/json" };
+const PARAMS = {
+  headers: { "Content-Type": "application/json" },
+  responseCallback: http.expectedStatuses(422),
+};
 
 export const options = {
   vus:      parseInt(__ENV.VUS || "20"),
@@ -55,7 +58,7 @@ export default function () {
   const res = http.post(
     `${BASE_URL}/api/posts`,
     JSON.stringify(payload),
-    { headers: HEADERS }
+    PARAMS
   );
   validLatency.add(res.timings.duration);
 

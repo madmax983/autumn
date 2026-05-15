@@ -66,26 +66,16 @@ pub struct PostUpdate {
 
 // ── ApiToken ──────────────────────────────────────────────────────────────────
 
-#[derive(Queryable, Selectable)]
-#[diesel(table_name = api_tokens)]
-pub struct ApiToken {
-    pub id: i64,
-    pub token: String,
-    pub principal: String,
-    pub created_at: DateTime<Utc>,
-}
+pub struct ApiToken;
 
 impl ApiToken {
-    pub async fn verify(
-        raw: &str,
-        db: &mut AsyncPgConnection,
-    ) -> AutumnResult<Option<String>> {
-        let row = api_tokens::table
+    pub async fn verify(raw: &str, db: &mut AsyncPgConnection) -> AutumnResult<Option<String>> {
+        let principal = api_tokens::table
             .filter(api_tokens::token.eq(raw))
-            .select(Self::as_select())
+            .select(api_tokens::principal)
             .first(db)
             .await
             .optional()?;
-        Ok(row.map(|t| t.principal))
+        Ok(principal)
     }
 }

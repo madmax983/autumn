@@ -1,6 +1,7 @@
 server:
   port: {{get_env(name="LOCO_APP_PORT", default="8080")}}
-  host: 0.0.0.0
+  binding: 0.0.0.0
+  host: http://localhost
   middlewares:
     limit_payload:
       enable: true
@@ -15,7 +16,7 @@ database:
   idle_timeout: 500
   min_connections: 1
   max_connections: 20
-  auto_migrate: true
+  auto_migrate: false
 
 logger:
   enable: true
