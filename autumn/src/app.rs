@@ -1503,10 +1503,18 @@ impl AppBuilder {
         let (mut config, _telemetry_guard) =
             load_config_and_telemetry(config_loader_factory, telemetry_provider).await;
 
-        // Apply builder-level flag: `.idempotent()` enables the middleware even
-        // when `autumn.toml` doesn't set `[idempotency] enabled = true`.
+        // Apply builder-level flag: `.idempotent()` enables the middleware when
+        // neither `autumn.toml` nor the environment explicitly disable it.
+        // The env var `AUTUMN_IDEMPOTENCY__ENABLED` is re-checked here so
+        // operators can disable idempotency at runtime (e.g. during a Redis
+        // incident) without code changes, even when `.idempotent()` is called.
         if idempotency_enabled {
-            config.idempotency.enabled = true;
+            let env_disabled = std::env::var("AUTUMN_IDEMPOTENCY__ENABLED")
+                .map(|v| matches!(v.to_lowercase().as_str(), "false" | "0" | "no" | "off"))
+                .unwrap_or(false);
+            if !env_disabled {
+                config.idempotency.enabled = true;
+            }
         }
 
         #[cfg(feature = "i18n")]
@@ -1875,7 +1883,12 @@ impl AppBuilder {
         let (mut config, _telemetry_guard) =
             load_config_and_telemetry(config_loader_factory, telemetry_provider).await;
         if idempotency_enabled {
-            config.idempotency.enabled = true;
+            let env_disabled = std::env::var("AUTUMN_IDEMPOTENCY__ENABLED")
+                .map(|v| matches!(v.to_lowercase().as_str(), "false" | "0" | "no" | "off"))
+                .unwrap_or(false);
+            if !env_disabled {
+                config.idempotency.enabled = true;
+            }
         }
 
         #[cfg(feature = "i18n")]

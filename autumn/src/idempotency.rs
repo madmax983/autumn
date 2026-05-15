@@ -1,3 +1,6 @@
+use bytes::Bytes;
+use futures::StreamExt as FuturesStreamExt;
+
 use std::collections::HashMap;
 use std::future::Future;
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -470,33 +473,26 @@ where
         return inner.call(req).await;
     }
 
-    let idempotency_key = match req.headers().get(IDEMPOTENCY_KEY_HEADER) {
-        Some(v) => v.to_str().unwrap_or("").to_owned(),
-        None => return inner.call(req).await,
+    let Some(key_hdr) = req.headers().get(IDEMPOTENCY_KEY_HEADER) else {
+        return inner.call(req).await;
     };
-
+    let idempotency_key = key_hdr.to_str().unwrap_or("").to_owned();
     if idempotency_key.is_empty() {
         return inner.call(req).await;
     }
-
     let (parts, body) = req.into_parts();
 
-    // Buffer the request body for fingerprinting. Use the per-app upload limit
-    // injected by the upload middleware (outer layer) so the idempotency cap
-    // always matches the configured maximum request size. Fall back to the
-    // framework default when the extension is absent (low-level API usage).
     let body_limit = parts
         .extensions
         .get::<crate::security::config::UploadConfig>()
         .map_or(DEFAULT_REQUEST_BODY_LIMIT, |c| c.max_request_size_bytes);
     let Ok(body_bytes) = axum::body::to_bytes(body, body_limit).await else {
-        let response = Response::builder()
+        return Ok(Response::builder()
             .status(StatusCode::PAYLOAD_TOO_LARGE)
             .body(Body::from(
                 "request body too large for idempotency middleware",
             ))
-            .unwrap();
-        return Ok(response);
+            .unwrap());
     };
 
     let body_hash = compute_body_hash(&body_bytes);
@@ -520,79 +516,112 @@ where
         if let Some(m) = &metrics {
             m.record_idempotency_conflict();
         }
-        let response = Response::builder()
+        return Ok(Response::builder()
             .status(StatusCode::CONFLICT)
             .header("retry-after", "1")
             .body(Body::from(
                 "a request with this idempotency key is already being processed; \
                  retry after 1 second",
             ))
-            .unwrap();
-        return Ok(response);
+            .unwrap());
     }
 
-    // ── Cache miss: forward to handler, then cache the result ──────────────
+    // Double-check after acquiring the lock: a concurrent request may have
+    // completed between our miss check and lock acquisition.
+    if let Some(entry) = store.get(&idempotency_key) {
+        store.unlock(&idempotency_key);
+        return Ok(handle_cache_hit(
+            entry,
+            &body_hash,
+            &idempotency_key,
+            metrics.as_ref(),
+        ));
+    }
+
     tracing::debug!(
         idempotency.key = %idempotency_key,
-        idempotency.replayed = false,
         "Idempotency cache miss — forwarding to handler"
     );
 
-    let req = Request::from_parts(parts, Body::from(body_bytes));
-    let response = inner.call(req).await?;
+    let response = inner
+        .call(Request::from_parts(parts, Body::from(body_bytes)))
+        .await?;
     let (resp_parts, resp_body) = response.into_parts();
-    let status = resp_parts.status.as_u16();
 
-    // Buffer the full response body without a hard read limit. If buffering
-    // fails (I/O error — extremely rare) we return the response with the
-    // correct status but an empty body to avoid masking a successful handler
-    // operation with a synthetic error.
-    let Ok(resp_bytes) = axum::body::to_bytes(resp_body, usize::MAX).await else {
-        store.unlock(&idempotency_key);
-        tracing::warn!(
-            idempotency.key = %idempotency_key,
-            "Failed to buffer response body; not storing idempotency entry"
-        );
-        return Ok(Response::from_parts(resp_parts, Body::empty()));
+    // Collect up to the cache cap; stream oversized bodies through without
+    // buffering to avoid materialising large responses in memory.
+    let resp_bytes = match collect_response_for_cache(resp_body).await {
+        Err(()) => {
+            store.unlock(&idempotency_key);
+            tracing::warn!(
+                idempotency.key = %idempotency_key,
+                "I/O error reading response body; not storing idempotency entry"
+            );
+            return Ok(Response::from_parts(resp_parts, Body::empty()));
+        }
+        Ok(Err(passthrough_body)) => {
+            // Body exceeded MAX_CACHEABLE_RESPONSE_BODY — stream through.
+            store.unlock(&idempotency_key);
+            tracing::debug!(
+                idempotency.key = %idempotency_key,
+                limit_bytes = MAX_CACHEABLE_RESPONSE_BODY,
+                "Response body exceeded cache limit; streaming through without caching"
+            );
+            return Ok(Response::from_parts(resp_parts, passthrough_body));
+        }
+        Ok(Ok(bytes)) => bytes,
     };
 
-    // Filtered headers for the cache entry: set-cookie is excluded to prevent
-    // session fixation when the stored response is replayed to a later caller.
-    // The immediate (first) response uses the original resp_parts and therefore
-    // delivers set-cookie normally.
-    let replay_headers = extract_replay_headers(&resp_parts.headers);
-
-    // Cache only successful (2xx) responses that fit within the size cap.
-    // Oversized responses are returned to the client as-is; a subsequent retry
-    // with the same key will re-execute the handler.
-    let cacheable = resp_bytes.len() <= MAX_CACHEABLE_RESPONSE_BODY;
-    if cacheable && (200u32..300).contains(&u32::from(status)) {
+    // Cache only 2xx responses; store before unlocking so concurrent duplicates
+    // still see a locked key rather than racing to re-execute the handler.
+    let status = resp_parts.status.as_u16();
+    if (200u32..300).contains(&u32::from(status)) {
         let record = IdempotencyRecord {
             status,
-            headers: replay_headers,
+            // set-cookie excluded: prevents session fixation on replay.
+            headers: extract_replay_headers(&resp_parts.headers),
             body: resp_bytes.to_vec(),
         };
         store.set(&idempotency_key, record, body_hash, ttl);
-    } else if !cacheable {
-        tracing::debug!(
-            idempotency.key = %idempotency_key,
-            body_bytes = resp_bytes.len(),
-            limit_bytes = MAX_CACHEABLE_RESPONSE_BODY,
-            "Response body too large to cache; idempotency not guaranteed for retries"
-        );
     }
-
-    // Unlock only after caching so concurrent duplicates get a 409 rather than
-    // racing to acquire the lock before the entry is stored.
     store.unlock(&idempotency_key);
 
-    if let Some(m) = &metrics {
-        m.record_idempotency_miss();
-    }
+    metrics.as_ref().inspect(|m| m.record_idempotency_miss());
 
-    // Reconstruct from original parts so all headers (including set-cookie) and
-    // response extensions are preserved for outer middleware.
+    // Reconstruct from original parts — preserves set-cookie and extensions.
     Ok(Response::from_parts(resp_parts, Body::from(resp_bytes)))
+}
+
+/// Collect response body bytes up to `MAX_CACHEABLE_RESPONSE_BODY`.
+///
+/// Returns:
+/// - `Ok(Ok(bytes))` — body is within the limit and fully collected
+/// - `Ok(Err(body))` — body exceeded the limit; the returned `Body` chains the
+///   already-read bytes with the remaining stream for pass-through delivery
+/// - `Err(())` — I/O error while reading the body stream
+async fn collect_response_for_cache(body: Body) -> Result<Result<Bytes, Body>, ()> {
+    let mut buf = Vec::<u8>::new();
+    let mut data_stream = body.into_data_stream();
+    loop {
+        match data_stream.next().await {
+            None => break,
+            Some(Err(_)) => return Err(()),
+            Some(Ok(chunk)) => {
+                buf.extend_from_slice(&chunk);
+                if buf.len() > MAX_CACHEABLE_RESPONSE_BODY {
+                    let leading = Bytes::from(buf);
+                    let passthrough = Body::from_stream(
+                        futures::stream::once(futures::future::ready(Ok::<Bytes, axum::Error>(
+                            leading,
+                        )))
+                        .chain(data_stream),
+                    );
+                    return Ok(Err(passthrough));
+                }
+            }
+        }
+    }
+    Ok(Ok(Bytes::from(buf)))
 }
 
 fn handle_cache_hit(
