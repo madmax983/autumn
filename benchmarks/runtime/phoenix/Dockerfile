@@ -1,4 +1,4 @@
-FROM hexpm/elixir:1.17.3-erlang-27.1-debian-bookworm-20241016 AS builder
+FROM hexpm/elixir:1.17.3-erlang-27.1.1-debian-bookworm-20240926-slim AS builder
 ENV MIX_ENV=prod
 WORKDIR /app
 

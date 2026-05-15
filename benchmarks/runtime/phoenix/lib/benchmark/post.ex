@@ -10,7 +10,7 @@ defmodule Benchmark.Post do
     field :body,      :string
     field :published, :boolean, default: false
     field :author,    :string
-    timestamps(type: :utc_datetime)
+    timestamps(inserted_at: :created_at, type: :utc_datetime)
   end
 
   def changeset(post, attrs) do
@@ -22,6 +22,6 @@ defmodule Benchmark.Post do
   end
 
   def recent(repo) do
-    repo.all(from p in __MODULE__, order_by: [desc: p.inserted_at], limit: 50)
+    repo.all(from p in __MODULE__, order_by: [desc: p.created_at], limit: 50)
   end
 end

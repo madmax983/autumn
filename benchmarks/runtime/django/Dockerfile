@@ -22,8 +22,7 @@ HEALTHCHECK --interval=10s --timeout=5s --start-period=30s \
   CMD curl -sf http://localhost:${PORT}/health || exit 1
 
 CMD ["sh", "-c", \
-  "python manage.py migrate --noinput && \
-   gunicorn benchapp.wsgi:application \
+  "gunicorn benchapp.asgi:application \
      --worker-class uvicorn.workers.UvicornWorker \
      --workers 4 \
      --bind 0.0.0.0:${PORT} \

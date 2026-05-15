@@ -7,13 +7,13 @@ defmodule Benchmark.Repo.Migrations.CreatePosts do
       add :body,      :text,    null: false
       add :published, :boolean, null: false, default: false
       add :author,    :text,    null: false
-      timestamps(type: :utc_datetime)
+      timestamps(inserted_at: :created_at, type: :utc_datetime)
     end
 
     create table(:api_tokens) do
       add :token,     :text, null: false
       add :principal, :text, null: false
-      timestamps(updated_at: false, type: :utc_datetime)
+      timestamps(inserted_at: :created_at, updated_at: false, type: :utc_datetime)
     end
 
     create unique_index(:api_tokens, [:token])
