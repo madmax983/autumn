@@ -17,6 +17,21 @@ fn make_store(ttl: Duration) -> Arc<dyn autumn_web::idempotency::IdempotencyStor
     Arc::new(MemoryIdempotencyStore::new(ttl))
 }
 
+/// Axum middleware that injects a 5-byte `UploadConfig` limit into extensions.
+/// Used by `test_request_body_too_large_returns_413` to trigger the 413 path
+/// in the idempotency middleware without needing a 32 MiB request body.
+async fn inject_tiny_upload_limit(
+    mut req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use autumn_web::security::UploadConfig;
+    req.extensions_mut().insert(UploadConfig {
+        max_request_size_bytes: 5,
+        ..Default::default()
+    });
+    next.run(req).await
+}
+
 // ── tests ─────────────────────────────────────────────────────────────────────
 
 /// Identical POST with the same idempotency key replays the first response.
@@ -518,6 +533,152 @@ async fn test_set_cookie_on_first_response_absent_on_replay() {
             .map(|v| v.to_str().unwrap()),
         Some("true"),
         "replayed response must have x-idempotent-replayed: true"
+    );
+}
+
+/// An empty `Idempotency-Key` header value is treated as absent — the request
+/// is passed through without caching.
+#[tokio::test]
+async fn test_empty_idempotency_key_is_passthrough() {
+    use tower::ServiceExt;
+
+    let store = make_store(Duration::from_secs(3600));
+    let layer = IdempotencyLayer::new(store);
+
+    let app = axum::Router::new()
+        .route("/ping", axum::routing::post(ok_handler))
+        .layer(layer);
+
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/ping")
+        .header("idempotency-key", "")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        resp.headers().get("x-idempotent-replayed").is_none(),
+        "empty key should not be cached or replayed"
+    );
+}
+
+/// When the request body exceeds the `UploadConfig` size limit the idempotency
+/// middleware returns 413 Payload Too Large before forwarding to the handler.
+#[tokio::test]
+async fn test_request_body_too_large_returns_413() {
+    use tower::ServiceExt;
+
+    let store = make_store(Duration::from_secs(3600));
+    let layer = IdempotencyLayer::new(store);
+
+    // inject_tiny_upload_limit must be OUTER (applied last) so it runs before
+    // idempotency reads the UploadConfig extension.
+    let app = axum::Router::new()
+        .route("/upload", axum::routing::post(ok_handler))
+        .layer(layer)
+        .layer(axum::middleware::from_fn(inject_tiny_upload_limit));
+
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/upload")
+        .header("idempotency-key", "big-body-key")
+        .body(axum::body::Body::from("more than five bytes"))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "body larger than UploadConfig limit must return 413"
+    );
+}
+
+/// A response body larger than the 10 MiB cache cap is streamed through to the
+/// client without being stored. A second request with the same key re-runs the
+/// handler rather than replaying a cached response.
+#[tokio::test]
+async fn test_large_response_not_cached_and_streamed_through() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tower::ServiceExt;
+
+    static CALL_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    // One byte over the 10 MiB cache cap.
+    const OVER_CAP: usize = 10 * 1024 * 1024 + 1;
+
+    let store = make_store(Duration::from_secs(3600));
+    let layer = IdempotencyLayer::new(store);
+
+    let app = axum::Router::new()
+        .route(
+            "/big",
+            axum::routing::post(|| async {
+                CALL_COUNT.fetch_add(1, Ordering::SeqCst);
+                axum::response::Response::builder()
+                    .status(200)
+                    .body(axum::body::Body::from(vec![b'x'; OVER_CAP]))
+                    .unwrap()
+            }),
+        )
+        .layer(layer);
+
+    // First request — handler runs; response is streamed through uncached.
+    let req1 = axum::http::Request::builder()
+        .method("POST")
+        .uri("/big")
+        .header("idempotency-key", "large-resp-key")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp1 = app.clone().oneshot(req1).await.unwrap();
+    assert_eq!(resp1.status(), StatusCode::OK);
+    let bytes1 = axum::body::to_bytes(resp1.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(bytes1.len(), OVER_CAP, "full body must be delivered");
+
+    // Second request — not cached; handler runs again.
+    let req2 = axum::http::Request::builder()
+        .method("POST")
+        .uri("/big")
+        .header("idempotency-key", "large-resp-key")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp2 = app.clone().oneshot(req2).await.unwrap();
+    assert_eq!(resp2.status(), StatusCode::OK);
+    assert!(
+        resp2.headers().get("x-idempotent-replayed").is_none(),
+        "oversized response must not be replayed from cache"
+    );
+    assert_eq!(
+        CALL_COUNT.load(Ordering::SeqCst),
+        2,
+        "handler must execute twice when response body exceeds cache cap"
+    );
+}
+
+/// The default `IdempotencyStore::default_ttl()` implementation returns 24 h.
+/// Custom stores that do not override the method get this default.
+#[test]
+fn test_default_store_ttl_trait_impl() {
+    use autumn_web::idempotency::{IdempotencyEntry, IdempotencyRecord, IdempotencyStore};
+
+    struct BareStore;
+    impl IdempotencyStore for BareStore {
+        fn get(&self, _: &str) -> Option<IdempotencyEntry> {
+            None
+        }
+        fn set(&self, _: &str, _: IdempotencyRecord, _: Vec<u8>, _: Duration) {}
+        fn try_lock(&self, _: &str) -> bool {
+            true
+        }
+        fn unlock(&self, _: &str) {}
+        // default_ttl() deliberately not overridden — tests the trait default.
+    }
+
+    assert_eq!(
+        BareStore.default_ttl(),
+        Duration::from_secs(86_400),
+        "IdempotencyStore::default_ttl() must return 24 hours"
     );
 }
 
