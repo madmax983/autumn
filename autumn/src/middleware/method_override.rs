@@ -396,29 +396,35 @@ fn origin_matches_request(origin: &str, headers: &http::HeaderMap) -> bool {
         return false;
     };
 
-    let expected_host = headers
-        .get("x-forwarded-host")
-        .and_then(|v| v.to_str().ok())
-        .or_else(|| {
+    let expected_host = {
+        let mut forwarded_hosts = Vec::new();
+        for value in headers.get_all("x-forwarded-host") {
+            if let Ok(s) = value.to_str() {
+                forwarded_hosts.extend(s.split(',').map(str::trim).filter(|s| !s.is_empty()));
+            }
+        }
+        forwarded_hosts.last().map(ToString::to_string).or_else(|| {
             headers
                 .get(http::header::HOST)
                 .and_then(|v| v.to_str().ok())
-        });
+                .map(ToString::to_string)
+        })
+    };
     let Some(expected_host) = expected_host else {
         return false;
     };
-    if !origin_authority.eq_ignore_ascii_case(expected_host) {
+    if !origin_authority.eq_ignore_ascii_case(&expected_host) {
         return false;
     }
 
-    if let Some(scheme) = headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-    {
-        // Multiple `X-Forwarded-Proto` values can be chained by
-        // intermediaries; the leftmost (client-facing) is the one
-        // that matters here.
-        let outermost = scheme.split(',').next().unwrap_or(scheme).trim();
+    let mut forwarded_protos = Vec::new();
+    for value in headers.get_all("x-forwarded-proto") {
+        if let Ok(s) = value.to_str() {
+            forwarded_protos.extend(s.split(',').map(str::trim).filter(|s| !s.is_empty()));
+        }
+    }
+
+    if let Some(outermost) = forwarded_protos.first() {
         return outermost.eq_ignore_ascii_case(origin_scheme);
     }
 
