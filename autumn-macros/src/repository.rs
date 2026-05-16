@@ -34,6 +34,7 @@ struct RepoConfig {
     model_name: Ident,
     table_name: String,
     hooks_type: Option<Ident>,
+    commit_hooks: bool,
     api_path: Option<String>,
     policy_type: Option<Ident>,
     scope_type: Option<Ident>,
@@ -43,6 +44,7 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
     let mut model_name: Option<Ident> = None;
     let mut table_name: Option<String> = None;
     let mut hooks_type: Option<Ident> = None;
+    let mut commit_hooks = false;
     let mut api_path: Option<String> = None;
     let mut policy_type: Option<Ident> = None;
     let mut scope_type: Option<Ident> = None;
@@ -53,6 +55,10 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
         if meta.path.is_ident("hooks") {
             let value: Ident = meta.value()?.parse()?;
             hooks_type = Some(value);
+            Ok(())
+        } else if meta.path.is_ident("commit_hooks") {
+            let value: syn::LitBool = meta.value()?.parse()?;
+            commit_hooks = value.value;
             Ok(())
         } else if meta.path.is_ident("table") {
             let value: LitStr = meta.value()?.parse()?;
@@ -75,7 +81,7 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
             Ok(())
         } else {
             Err(meta.error(
-                "expected model name, table = \"...\", hooks = Type, api = \"/path\", policy = Type, or scope = Type",
+                "expected model name, table = \"...\", hooks = Type, commit_hooks = true, api = \"/path\", policy = Type, or scope = Type",
             ))
         }
     })
@@ -87,12 +93,19 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
             "expected model name: #[repository(ModelName)]",
         )
     })?;
+    if commit_hooks && hooks_type.is_none() {
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "commit_hooks = true requires hooks = Type",
+        ));
+    }
     let table = table_name.unwrap_or_else(|| infer_table_name(&model));
 
     Ok(RepoConfig {
         model_name: model,
         table_name: table,
         hooks_type,
+        commit_hooks,
         api_path,
         policy_type,
         scope_type,
@@ -229,6 +242,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let new_name = format_ident!("New{model_name}");
     let update_name = format_ident!("Update{model_name}");
     let vis = &trait_def.vis;
+    let commit_hooks_enabled = config.hooks_type.is_some() && config.commit_hooks;
 
     // Parse derived query methods from trait body
     let mut derived_trait_methods = Vec::new();
@@ -324,15 +338,25 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         };
 
-        let extractor_init = quote! {
-            #pg_name::__autumn_register_repository_commit_hooks();
-            Ok(#pg_name {
-                pool,
-                hooks: <#hooks_ident as ::autumn_web::hooks::RepositoryHooksDefault>::autumn_default(),
-            })
+        let extractor_init = if commit_hooks_enabled {
+            quote! {
+                #pg_name::__autumn_register_repository_commit_hooks();
+                Ok(#pg_name {
+                    pool,
+                    hooks: <#hooks_ident as ::autumn_web::hooks::RepositoryHooksDefault>::autumn_default(),
+                })
+            }
+        } else {
+            quote! {
+                Ok(#pg_name {
+                    pool,
+                    hooks: <#hooks_ident as ::autumn_web::hooks::RepositoryHooksDefault>::autumn_default(),
+                })
+            }
         };
 
-        let hook_support_methods = quote! {
+        let hook_support_methods = if commit_hooks_enabled {
+            quote! {
             #[doc(hidden)]
             fn __autumn_repository_commit_hook_key() -> &'static str {
                 ::core::concat!(
@@ -412,23 +436,31 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     );
                 });
             }
+            }
+        } else {
+            quote! {}
         };
 
-        let hook_inventory_registration = quote! {
-            ::autumn_web::reexports::inventory::submit! {
-                ::autumn_web::__private::RepositoryCommitHookDescriptor {
-                    register: #pg_name::__autumn_register_repository_commit_hooks,
+        let hook_inventory_registration = if commit_hooks_enabled {
+            quote! {
+                ::autumn_web::reexports::inventory::submit! {
+                    ::autumn_web::__private::RepositoryCommitHookDescriptor {
+                        register: #pg_name::__autumn_register_repository_commit_hooks,
+                    }
                 }
             }
+        } else {
+            quote! {}
         };
 
         // ── save (hooked) ─────────────────────────────────
-        let save_body = quote! {
-            use ::autumn_web::reexports::diesel::prelude::*;
-            use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-            use ::autumn_web::reexports::diesel_async::AsyncConnection;
-            use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
-            use ::autumn_web::hooks::{MutationContext, MutationOp, MutationHooks};
+        let save_body = if commit_hooks_enabled {
+            quote! {
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                use ::autumn_web::reexports::diesel_async::AsyncConnection;
+                use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
+                use ::autumn_web::hooks::{MutationContext, MutationOp, MutationHooks};
 
             Self::__autumn_register_repository_commit_hooks();
             let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
@@ -500,12 +532,47 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             __autumn_finalize_result?;
             ::autumn_web::__private::kick_repository_commit_hook_dispatcher(&self.pool);
 
-            Ok(record)
+                Ok(record)
+            }
+        } else {
+            quote! {
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                use ::autumn_web::reexports::diesel_async::AsyncConnection;
+                use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
+                use ::autumn_web::hooks::{MutationContext, MutationOp, MutationHooks};
+
+                let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                let (record, mut ctx) = conn
+                    .transaction::<(#model_name, MutationContext), ::autumn_web::AutumnError, _>(|conn| {
+                        async move {
+                            let mut input = new.clone();
+                            let mut ctx = MutationContext::new(MutationOp::Create);
+
+                            self.hooks.before_create(&mut ctx, &mut input).await?;
+
+                            let record = ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                                .values(&input)
+                                .get_result::<#model_name>(conn)
+                                .await
+                                .map_err(::autumn_web::AutumnError::from)?;
+
+                            Ok((record, ctx))
+                        }
+                        .scope_boxed()
+                    })
+                    .await?;
+                ::core::mem::drop(conn);
+                self.hooks.after_create(&mut ctx, &record).await?;
+
+                Ok(record)
+            }
         };
 
         // ── update (hooked) ───────────────────────────────
         let draft_ext_trait = format_ident!("{}DraftExt", model_name);
-        let update_body = quote! {
+        let update_body = if commit_hooks_enabled {
+            quote! {
             use ::autumn_web::reexports::diesel::prelude::*;
             use ::autumn_web::reexports::diesel_async::RunQueryDsl;
             use ::autumn_web::reexports::diesel_async::AsyncConnection;
@@ -635,16 +702,101 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             __autumn_finalize_result?;
             ::autumn_web::__private::kick_repository_commit_hook_dispatcher(&self.pool);
 
-            Ok(record)
+                Ok(record)
+            }
+        } else {
+            quote! {
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                use ::autumn_web::reexports::diesel_async::AsyncConnection;
+                use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
+                use ::autumn_web::hooks::{MutationContext, MutationOp, MutationHooks, UpdateDraft};
+                use ::autumn_web::repository::{AutumnLockVersionModelExt as _, AutumnLockVersionUpdateExt as _};
+
+                let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                let (record, mut ctx) = conn
+                    .transaction::<(#model_name, MutationContext), ::autumn_web::AutumnError, _>(|conn| {
+                        async move {
+                            let mut ctx = MutationContext::new(MutationOp::Update);
+                            let record: #model_name = if let ::core::option::Option::Some(expected_version) =
+                                changes.__autumn_lock_version_expected()
+                            {
+                                let current = #table_ident::table
+                                    .find(id)
+                                    .for_update()
+                                    .first::<#model_name>(conn)
+                                    .await
+                                    .optional()
+                                    .map_err(::autumn_web::AutumnError::from)?
+                                    .ok_or_else(|| ::autumn_web::AutumnError::not_found_msg(
+                                        format!("{} with id {} not found", stringify!(#model_name), id)
+                                    ))?;
+
+                                if let ::core::option::Option::Some(actual_version) =
+                                    current.__autumn_lock_version_actual()
+                                {
+                                    if actual_version != expected_version {
+                                        return Err(::autumn_web::AutumnError::conflict(
+                                            ::autumn_web::RepositoryError::Conflict {
+                                                id,
+                                                expected_version,
+                                                actual_version: ::core::option::Option::Some(actual_version),
+                                            },
+                                        ));
+                                    }
+                                }
+
+                                let mut draft = <UpdateDraft<#model_name> as #draft_ext_trait>::from_patch(&current, changes)?;
+                                self.hooks.before_update(&mut ctx, &mut draft).await?;
+
+                                let proposed = draft.into_after();
+                                ::autumn_web::reexports::diesel::update(#table_ident::table.find(id))
+                                    .set(&proposed)
+                                    .get_result::<#model_name>(conn)
+                                    .await
+                                    .map_err(::autumn_web::AutumnError::from)?
+                            } else {
+                                let current = #table_ident::table
+                                    .find(id)
+                                    .first::<#model_name>(conn)
+                                    .await
+                                    .optional()
+                                    .map_err(::autumn_web::AutumnError::from)?
+                                    .ok_or_else(|| ::autumn_web::AutumnError::not_found_msg(
+                                        format!("{} with id {} not found", stringify!(#model_name), id)
+                                    ))?;
+
+                                let mut draft = <UpdateDraft<#model_name> as #draft_ext_trait>::from_patch(&current, changes)?;
+                                self.hooks.before_update(&mut ctx, &mut draft).await?;
+
+                                let proposed = draft.into_after();
+                                ::autumn_web::reexports::diesel::update(#table_ident::table.find(id))
+                                    .set(&proposed)
+                                    .get_result::<#model_name>(conn)
+                                    .await
+                                    .map_err(::autumn_web::AutumnError::from)?
+                            };
+
+                            Ok((record, ctx))
+                        }
+                        .scope_boxed()
+                    })
+                    .await?;
+                ::core::mem::drop(conn);
+                self.hooks.after_update(&mut ctx, &record).await?;
+
+                Ok(record)
+            }
         };
 
         // ── delete (hooked) ───────────────────────────────
-        let delete_body = quote! {
-            use ::autumn_web::reexports::diesel::prelude::*;
-            use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-            use ::autumn_web::reexports::diesel_async::AsyncConnection;
-            use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
-            use ::autumn_web::hooks::{MutationContext, MutationOp, MutationHooks};
+        let delete_body = if commit_hooks_enabled {
+            quote! {
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                use ::autumn_web::reexports::diesel_async::AsyncConnection;
+                use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
+                use ::autumn_web::hooks::{MutationContext, MutationOp, MutationHooks};
 
             Self::__autumn_register_repository_commit_hooks();
             let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
@@ -695,7 +847,54 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             ::core::mem::drop(conn);
             ::autumn_web::__private::kick_repository_commit_hook_dispatcher(&self.pool);
 
-            Ok(())
+                Ok(())
+            }
+        } else {
+            quote! {
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                use ::autumn_web::reexports::diesel_async::AsyncConnection;
+                use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
+                use ::autumn_web::hooks::{MutationContext, MutationOp, MutationHooks};
+
+                let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                conn
+                    .transaction::<(), ::autumn_web::AutumnError, _>(|conn| {
+                        async move {
+                            let mut ctx = MutationContext::new(MutationOp::Delete);
+
+                            let record = #table_ident::table
+                                .find(id)
+                                .for_update()
+                                .first::<#model_name>(conn)
+                                .await
+                                .optional()
+                                .map_err(::autumn_web::AutumnError::from)?
+                                .ok_or_else(|| ::autumn_web::AutumnError::not_found_msg(
+                                    format!("{} with id {} not found", stringify!(#model_name), id)
+                                ))?;
+
+                            self.hooks.before_delete(&mut ctx, &record).await?;
+
+                            let __autumn_deleted = ::autumn_web::reexports::diesel::delete(#table_ident::table.find(id))
+                                .execute(conn)
+                                .await
+                                .map_err(::autumn_web::AutumnError::from)?;
+                            if __autumn_deleted == 0 {
+                                return Err(::autumn_web::AutumnError::not_found_msg(
+                                    format!("{} with id {} not found", stringify!(#model_name), id)
+                                ));
+                            }
+
+                            Ok(())
+                        }
+                        .scope_boxed()
+                    })
+                    .await?;
+                ::core::mem::drop(conn);
+
+                Ok(())
+            }
         };
 
         (
@@ -827,7 +1026,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         )
     };
 
-    let route_hook_registration = if config.hooks_type.is_some() {
+    let route_hook_registration = if commit_hooks_enabled {
         quote! { #pg_name::__autumn_register_repository_commit_hooks(); }
     } else {
         quote! {}
@@ -1567,6 +1766,34 @@ mod tests {
                 .map(std::string::ToString::to_string),
             Some("PostHooks".to_string())
         );
+        assert!(
+            !config.commit_hooks,
+            "ordinary hooks must not opt into the durable commit-hook queue"
+        );
+    }
+
+    #[test]
+    fn parse_repo_args_with_commit_hooks() {
+        let tokens: proc_macro2::TokenStream = "Post, hooks = PostHooks, commit_hooks = true"
+            .parse()
+            .unwrap();
+        let config = parse_repo_args(tokens).unwrap();
+        assert_eq!(config.model_name.to_string(), "Post");
+        assert!(config.hooks_type.is_some());
+        assert!(config.commit_hooks);
+    }
+
+    #[test]
+    fn parse_repo_args_rejects_commit_hooks_without_hooks() {
+        let tokens: proc_macro2::TokenStream = "Post, commit_hooks = true".parse().unwrap();
+        let err = match parse_repo_args(tokens) {
+            Ok(_) => panic!("commit hooks require a hook type"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("requires hooks"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -1619,9 +1846,32 @@ mod tests {
     }
 
     #[test]
-    fn hooked_repository_commit_hooks_enqueue_durable_rows() {
+    fn hooked_repository_without_commit_hooks_uses_ordinary_hooks_only() {
         let output = repository_macro(
             quote! { Post, hooks = PostHooks },
+            quote! { pub trait PostRepository {} },
+        );
+        let generated = output.to_string();
+
+        assert!(
+            generated.contains("self . hooks . before_create")
+                && generated.contains("self . hooks . after_create")
+                && generated.contains("self . hooks . before_update")
+                && generated.contains("self . hooks . after_update"),
+            "ordinary hooks should still be generated: {generated}"
+        );
+        assert!(
+            !generated.contains("enqueue_repository_commit_hook")
+                && !generated.contains("RepositoryCommitHookDescriptor")
+                && !generated.contains("__autumn_register_repository_commit_hooks"),
+            "ordinary hooks must not require or dispatch through the durable commit-hook queue: {generated}"
+        );
+    }
+
+    #[test]
+    fn hooked_repository_commit_hooks_enqueue_durable_rows_when_opted_in() {
+        let output = repository_macro(
+            quote! { Post, hooks = PostHooks, commit_hooks = true },
             quote! { pub trait PostRepository {} },
         );
         let generated = output.to_string();

@@ -24,6 +24,10 @@
 //! pub trait ArticleRepository {}
 //! ```
 //!
+//! The durable `after_*_commit` hooks are opt-in because they require Autumn's
+//! framework-owned commit-hook queue table. Enable them explicitly with
+//! `#[repository(Article, hooks = ArticleHooks, commit_hooks = true)]`.
+//!
 //! The hooks type **must** implement [`Default`] and [`Clone`] (the
 //! generated extractor constructs it via `Default::default()` and the
 //! repository struct derives `Clone`).
@@ -214,10 +218,11 @@ pub trait MutationHooks: Send + Sync + 'static {
     /// side-effects (job enqueues, emails, cache invalidation) that must not
     /// execute if the transaction rolls back.
     ///
-    /// Generated repository code writes this hook's intent to Autumn's
-    /// framework-owned durable commit-hook queue in the same transaction as the
-    /// mutation. Replicas claim queued hooks with Postgres row locks, so a
-    /// process-local task disappearing does not lose the side effect.
+    /// When the repository is declared with `commit_hooks = true`, generated
+    /// repository code writes this hook's intent to Autumn's framework-owned
+    /// durable commit-hook queue in the same transaction as the mutation.
+    /// Replicas claim queued hooks with Postgres row locks, so a process-local
+    /// task disappearing does not lose the side effect.
     fn after_create_commit(
         &self,
         _ctx: &mut MutationContext,

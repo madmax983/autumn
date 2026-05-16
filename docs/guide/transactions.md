@@ -166,8 +166,16 @@ transaction state, call `deliver_later_eager` instead.
 ### Repository hooks
 
 The repository macro wires the `after_create_commit`, `after_update_commit`,
-and `after_delete_commit` hooks from `MutationHooks` automatically. Override
-them to run post-commit side effects without touching the generated CRUD code:
+and `after_delete_commit` hooks from `MutationHooks` when durable commit hooks
+are explicitly enabled on the repository:
+
+```rust,ignore
+#[repository(Post, hooks = PostHooks, commit_hooks = true)]
+pub trait PostRepository {}
+```
+
+Override them to run post-commit side effects without touching the generated
+CRUD code:
 
 ```rust,no_run
 impl MutationHooks for PostHooks {
@@ -203,5 +211,5 @@ may need manual recovery.
 | Job + DB write on any backend | `enqueue_after_commit` inside `db.tx` |
 | Job + DB write on Postgres backend (highest durability) | `enqueue_in_tx` / `enqueue_on_conn` inside `db.tx` |
 | Email triggered by a DB write | `deliver_later` inside `db.tx` (auto-deferred) |
-| Repository create/update/delete side effect | `after_create_commit` / `after_update_commit` / `after_delete_commit` hook |
+| Repository create/update/delete side effect | `after_create_commit` / `after_update_commit` / `after_delete_commit` hook with `commit_hooks = true` |
 | Custom side effect on commit | `register_after_commit` inside `db.tx` |

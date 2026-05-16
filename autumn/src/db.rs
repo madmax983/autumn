@@ -29,7 +29,10 @@ use axum::extract::FromRequestParts;
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::deadpool::Pool;
+use futures::FutureExt as _;
+use std::any::Any;
 use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -93,15 +96,42 @@ pub(crate) fn spawn_committed_after_commit_callbacks(
 
     Some(tokio::task::spawn(async move {
         for cb in callbacks {
-            if let Err(e) = cb().await {
-                let failures_total = record_after_commit_failure();
-                tracing::error!(
-                    autumn.after_commit.failures_total = failures_total,
-                    "after_commit callback failed (tx already committed): {e}"
-                );
+            let result = match std::panic::catch_unwind(AssertUnwindSafe(cb)) {
+                Ok(callback) => AssertUnwindSafe(callback).catch_unwind().await,
+                Err(panic) => Err(panic),
+            };
+
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    let failures_total = record_after_commit_failure();
+                    tracing::error!(
+                        autumn.after_commit.failures_total = failures_total,
+                        "after_commit callback failed (tx already committed): {e}"
+                    );
+                }
+                Err(panic) => {
+                    let failures_total = record_after_commit_failure();
+                    let panic = after_commit_panic_message(&*panic);
+                    tracing::error!(
+                        autumn.after_commit.failures_total = failures_total,
+                        "after_commit callback panicked (tx already committed): {panic}"
+                    );
+                }
             }
         }
     }))
+}
+
+fn after_commit_panic_message(payload: &(dyn Any + Send)) -> String {
+    match (
+        payload.downcast_ref::<&'static str>(),
+        payload.downcast_ref::<String>(),
+    ) {
+        (Some(message), _) => (*message).to_owned(),
+        (_, Some(message)) => message.clone(),
+        (None, None) => "non-string panic payload".to_owned(),
+    }
 }
 
 /// Register a callback to run after the current database transaction commits.
@@ -650,7 +680,7 @@ mod tests {
     use super::*;
     use crate::config::DatabaseConfig;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::time::Duration;
 
     // ── after_commit tests ───────────────────────────────────────
@@ -825,6 +855,38 @@ mod tests {
         drain.await.expect("drain task should not panic");
 
         assert_eq!(*order.lock().unwrap(), vec![1, 2]);
+    }
+
+    #[tokio::test]
+    async fn production_after_commit_drain_isolates_panicking_callbacks() {
+        let before = AFTER_COMMIT_FAILURES_TOTAL.load(Ordering::Relaxed);
+        let ran_later = Arc::new(AtomicU64::new(0));
+        let later = ran_later.clone();
+
+        let callbacks: Vec<CommitCallback> = vec![
+            Box::new(|| Box::pin(async { panic!("deliberate after_commit panic") })),
+            Box::new(move || {
+                Box::pin(async move {
+                    later.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+            }),
+        ];
+
+        let drain = spawn_committed_after_commit_callbacks(callbacks)
+            .expect("non-empty callback list should spawn a drain task");
+        drain.await.expect("panicking callback should be isolated");
+
+        assert_eq!(
+            ran_later.load(Ordering::SeqCst),
+            1,
+            "later callbacks must still run after an earlier callback panics"
+        );
+        let after = AFTER_COMMIT_FAILURES_TOTAL.load(Ordering::Relaxed);
+        assert!(
+            after > before,
+            "panicking after_commit callbacks must increment the failure counter"
+        );
     }
 
     #[tokio::test]

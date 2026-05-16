@@ -139,6 +139,44 @@ fn has_hook_serde_adapter(field: &Field, mode: SerdeAdapterMode) -> bool {
         }
 }
 
+enum SerdeDefaultKind {
+    Default,
+    Path(syn::Path),
+}
+
+fn serde_default_kind(field: &Field) -> Option<SerdeDefaultKind> {
+    let mut default = None;
+    for attr in field
+        .attrs
+        .iter()
+        .filter(|attr| attr.path().is_ident("serde"))
+    {
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("default") {
+                if meta.input.peek(syn::Token![=]) {
+                    let value: LitStr = meta.value()?.parse()?;
+                    if let Ok(path) = value.parse::<syn::Path>() {
+                        default = Some(SerdeDefaultKind::Path(path));
+                    }
+                } else {
+                    default = Some(SerdeDefaultKind::Default);
+                }
+            }
+            Ok(())
+        });
+    }
+    default
+}
+
+fn commit_hook_missing_field_default_expr(field: &Field) -> Option<TokenStream> {
+    match serde_default_kind(field) {
+        Some(SerdeDefaultKind::Default) => Some(quote! { ::core::default::Default::default() }),
+        Some(SerdeDefaultKind::Path(path)) => Some(quote! { #path() }),
+        None if is_option_type(&field.ty) => Some(quote! { ::core::option::Option::None }),
+        None => None,
+    }
+}
+
 /// Extract the associated model type from `#[factory_assoc(TypeName)]` if present.
 ///
 /// Returns `Some(Ident)` for the associated type, or `None` if the attribute is absent.
@@ -968,6 +1006,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             let ident = f.ident.as_ref().expect("named field");
             let ty = &f.ty;
             let field_name = LitStr::new(&ident.to_string(), ident.span());
+            let missing_default = commit_hook_missing_field_default_expr(f);
             let field_value = if has_hook_serde_adapter(f, SerdeAdapterMode::Deserialize) {
                 let serde_attrs = hook_serde_adapter_attrs(f, SerdeAdapterMode::Deserialize);
                 quote! {
@@ -1013,19 +1052,35 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         })?
                 }
             };
-            quote! {
-                let #ident: #ty = {
-                    let __autumn_field = __autumn_object.remove(#field_name)
-                        .ok_or_else(|| {
-                            ::autumn_web::AutumnError::internal_server_error_msg(format!(
-                                "deserialize repository commit hook record field {}.{}: missing field",
-                                stringify!(#name),
-                                #field_name
-                            ))
-                        })?;
-                    #field_value
-                };
-            }
+            missing_default.map_or_else(
+                || {
+                    quote! {
+                    let #ident: #ty = {
+                        let __autumn_field = __autumn_object.remove(#field_name)
+                            .ok_or_else(|| {
+                                ::autumn_web::AutumnError::internal_server_error_msg(format!(
+                                    "deserialize repository commit hook record field {}.{}: missing field",
+                                    stringify!(#name),
+                                    #field_name
+                                ))
+                            })?;
+                        #field_value
+                    };
+                }
+                },
+                |missing_default| {
+                    quote! {
+                    let #ident: #ty = match __autumn_object.remove(#field_name) {
+                        ::core::option::Option::Some(__autumn_field) => {
+                            #field_value
+                        }
+                        ::core::option::Option::None => {
+                            #missing_default
+                        }
+                    };
+                }
+                },
+            )
         })
         .collect();
     let commit_hook_construct_fields: Vec<TokenStream> = all_fields
@@ -1043,7 +1098,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             quote! { #ty: ::serde::Serialize }
         })
         .collect();
-    let commit_hook_deserialize_bounds: Vec<TokenStream> = all_fields
+    let mut commit_hook_deserialize_bounds: Vec<TokenStream> = all_fields
         .iter()
         .filter(|f| !has_hook_serde_adapter(f, SerdeAdapterMode::Deserialize))
         .map(|f| {
@@ -1051,6 +1106,16 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             quote! { #ty: ::serde::de::DeserializeOwned }
         })
         .collect();
+    commit_hook_deserialize_bounds.extend(
+        all_fields
+            .iter()
+            .filter(|f| !is_option_type(&f.ty))
+            .filter(|f| matches!(serde_default_kind(f), Some(SerdeDefaultKind::Default)))
+            .map(|f| {
+                let ty = &f.ty;
+                quote! { #ty: ::core::default::Default }
+            }),
+    );
     let commit_hook_serialize_where = if commit_hook_serialize_bounds.is_empty() {
         quote! {}
     } else {
@@ -1437,6 +1502,44 @@ mod tests {
     }
 
     // ── Existing tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn model_commit_hook_codec_defaults_missing_compatible_fields() {
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Account {
+                    #[id]
+                    pub id: i64,
+                    pub reset_token: Option<String>,
+                    #[serde(default = "default_reset_token")]
+                    pub special_token: Option<String>,
+                    #[serde(default)]
+                    pub display_name: String,
+                    #[serde(default = "default_status")]
+                    pub status: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+
+        assert!(
+            generated.contains(":: core :: option :: Option :: None"),
+            "missing Option fields in old durable payloads should default to None: {generated}"
+        );
+        assert!(
+            generated.contains(":: core :: default :: Default :: default ()"),
+            "missing #[serde(default)] fields in old durable payloads should use Default::default(): {generated}"
+        );
+        assert!(
+            generated.contains("default_status ()"),
+            "missing #[serde(default = \"...\")] fields in old durable payloads should call the configured default function: {generated}"
+        );
+        assert!(
+            generated.contains("default_reset_token ()"),
+            "explicit serde defaults should beat the generic Option::None fallback: {generated}"
+        );
+    }
 
     #[test]
     fn pascal_to_snake_simple() {

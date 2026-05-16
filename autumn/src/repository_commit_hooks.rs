@@ -114,6 +114,28 @@ impl RepositoryCommitHookKickState {
     }
 }
 
+#[doc(hidden)]
+#[must_use]
+pub struct RepositoryCommitHookPendingHeartbeat {
+    shutdown: CancellationToken,
+}
+
+impl RepositoryCommitHookPendingHeartbeat {
+    const fn new(shutdown: CancellationToken) -> Self {
+        Self { shutdown }
+    }
+
+    pub fn cancel(&self) {
+        self.shutdown.cancel();
+    }
+}
+
+impl Drop for RepositoryCommitHookPendingHeartbeat {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+    }
+}
+
 /// Link-time descriptor emitted by generated repositories with commit hooks.
 ///
 /// The worker replays these descriptors at startup so queued hook rows can be
@@ -372,12 +394,11 @@ pub async fn discard_repository_commit_hook_pending(
 }
 
 #[doc(hidden)]
-#[must_use]
 pub fn start_repository_commit_hook_pending_finalizer_heartbeat(
     pool: PgPool,
     hook_id: String,
     owner: String,
-) -> CancellationToken {
+) -> RepositoryCommitHookPendingHeartbeat {
     let shutdown = CancellationToken::new();
     let heartbeat_shutdown = shutdown.child_token();
     tokio::spawn(async move {
@@ -400,7 +421,7 @@ pub fn start_repository_commit_hook_pending_finalizer_heartbeat(
             }
         }
     });
-    shutdown
+    RepositoryCommitHookPendingHeartbeat::new(shutdown)
 }
 
 fn serialize_repository_commit_hook_payloads<C, R>(
@@ -1055,6 +1076,19 @@ mod tests {
             HOOK_RECOVER_STALE_PENDING_SQL.contains("status = 'pending_after_hook'")
                 && HOOK_RECOVER_STALE_PENDING_SQL.contains("status = 'enqueued'"),
             "abandoned staged rows must eventually become claimable by the durable worker"
+        );
+    }
+
+    #[test]
+    fn pending_heartbeat_guard_cancels_on_drop() {
+        let guard = RepositoryCommitHookPendingHeartbeat::new(CancellationToken::new());
+        let child = guard.shutdown.child_token();
+
+        drop(guard);
+
+        assert!(
+            child.is_cancelled(),
+            "dropping the pending heartbeat guard must cancel recovery-blocking heartbeats"
         );
     }
 

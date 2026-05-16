@@ -33,4 +33,7 @@ pub trait ArticleRepository {
     fn find_by_title(title: String) -> Vec<Article>;
 }
 
+#[autumn_web::repository(Article, hooks = ArticleHooks, commit_hooks = true)]
+pub trait ArticleCommitRepository {}
+
 fn main() {}
