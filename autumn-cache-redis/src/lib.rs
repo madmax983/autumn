@@ -281,7 +281,7 @@ impl Default for RedisCachePlugin {
     }
 }
 
-impl autumn_web::plugin::Plugin for RedisCachePlugin {
+impl autumn_web::app::Plugin for RedisCachePlugin {
     fn build(self, app: autumn_web::app::AppBuilder) -> autumn_web::app::AppBuilder {
         app.on_startup(|state| async move {
             // Read the config the framework already stored as an extension.

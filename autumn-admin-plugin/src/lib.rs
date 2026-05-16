@@ -56,7 +56,7 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use autumn_web::app::AppBuilder;
-use autumn_web::plugin::Plugin;
+use autumn_web::app::Plugin;
 use autumn_web::route_listing::RouteInfo;
 
 /// The admin panel plugin.

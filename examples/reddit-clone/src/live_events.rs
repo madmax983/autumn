@@ -15,9 +15,9 @@ use std::time::Duration;
 
 use autumn_web::AppState;
 use autumn_web::app::AppBuilder;
+use autumn_web::app::Plugin;
 use autumn_web::config::AutumnConfig;
 use autumn_web::error::AutumnError;
-use autumn_web::plugin::Plugin;
 use chrono::{NaiveDateTime, Utc};
 use diesel::ExpressionMethods;
 use diesel::QueryDsl;

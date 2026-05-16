@@ -25,6 +25,7 @@
 //! ```
 
 use std::any::{Any, TypeId};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
@@ -59,6 +60,78 @@ use crate::state::AppState;
 /// async fn main() {
 ///     autumn_web::app()
 ///         .routes(routes![index])
+/// A reusable Autumn integration that wires itself into an [`AppBuilder`].
+pub trait Plugin: Sized + Send + 'static {
+    /// Stable identifier used for duplicate-registration detection.
+    ///
+    /// Defaults to [`std::any::type_name`] of the concrete plugin struct, so
+    /// two instances of the same type collide by default. Override to allow
+    /// multiple instances of the same type to coexist; the return type is
+    /// [`Cow<'static, str>`](std::borrow::Cow) so plugins can compute a
+    /// unique label from runtime configuration without leaking memory.
+    fn name(&self) -> Cow<'static, str> {
+        Cow::Borrowed(std::any::type_name::<Self>())
+    }
+
+    /// Apply this plugin's configuration to the builder.
+    ///
+    /// Called exactly once per `AppBuilder`. Implementations typically chain
+    /// [`AppBuilder::on_startup`], [`AppBuilder::on_shutdown`],
+    /// [`AppBuilder::nest`], [`AppBuilder::with_extension`] and (with the
+    /// `db` feature) [`AppBuilder::migrations`].
+    ///
+    /// Plugins can also install **tier-1 subsystem replacements** here —
+    /// [`AppBuilder::with_config_loader`], [`AppBuilder::with_pool_provider`]
+    /// (with the `db` feature), [`AppBuilder::with_telemetry_provider`], and
+    /// [`AppBuilder::with_session_store`] — which is the canonical way to
+    /// distribute a custom subsystem (e.g. `AwsSecretsConfigPlugin`) for
+    /// downstream consumers as a one-line install. See
+    /// `docs/guide/extensibility.md` for the full extensibility model.
+    #[must_use]
+    fn build(self, app: AppBuilder) -> AppBuilder;
+}
+
+/// A bundle of plugins that can be applied to an [`AppBuilder`] in one call.
+///
+/// Implemented for every [`Plugin`] and for tuples of up to eight plugins.
+/// Used by [`AppBuilder::plugins`](AppBuilder::plugins).
+pub trait Plugins: Sized {
+    /// Apply every plugin in this bundle to the builder, in declaration order.
+    #[must_use]
+    fn apply(self, app: AppBuilder) -> AppBuilder;
+}
+
+impl<P: Plugin> Plugins for P {
+    fn apply(self, app: AppBuilder) -> AppBuilder {
+        app.plugin(self)
+    }
+}
+
+macro_rules! impl_plugins_tuple {
+    ($($idx:tt => $ty:ident),+ $(,)?) => {
+        impl<$($ty: Plugin),+> Plugins for ($($ty,)+) {
+            #[allow(non_snake_case)]
+            fn apply(self, app: AppBuilder) -> AppBuilder {
+                let ($($ty,)+) = self;
+                let app = app;
+                $(let app = app.plugin($ty);)+
+                app
+            }
+        }
+    };
+}
+
+impl_plugins_tuple!(0 => P0);
+impl_plugins_tuple!(0 => P0, 1 => P1);
+impl_plugins_tuple!(0 => P0, 1 => P1, 2 => P2);
+impl_plugins_tuple!(0 => P0, 1 => P1, 2 => P2, 3 => P3);
+impl_plugins_tuple!(0 => P0, 1 => P1, 2 => P2, 3 => P3, 4 => P4);
+impl_plugins_tuple!(0 => P0, 1 => P1, 2 => P2, 3 => P3, 4 => P4, 5 => P5);
+impl_plugins_tuple!(0 => P0, 1 => P1, 2 => P2, 3 => P3, 4 => P4, 5 => P5, 6 => P6);
+impl_plugins_tuple!(
+    0 => P0, 1 => P1, 2 => P2, 3 => P3, 4 => P4, 5 => P5, 6 => P6, 7 => P7
+);
+
 ///         .run()
 ///         .await;
 /// }
@@ -1295,18 +1368,18 @@ impl AppBuilder {
         self
     }
 
-    /// Apply a [`Plugin`](crate::plugin::Plugin) to the builder.
+    /// Apply a [`Plugin`](crate::app::Plugin) to the builder.
     ///
-    /// The plugin's [`build`](crate::plugin::Plugin::build) runs exactly once
+    /// The plugin's [`build`](crate::app::Plugin::build) runs exactly once
     /// per [`AppBuilder`]. Registering two plugins that share a
-    /// [`name`](crate::plugin::Plugin::name) is a no-op after the first: the
+    /// [`name`](crate::app::Plugin::name) is a no-op after the first: the
     /// duplicate emits a `tracing::warn!` and the builder is returned
     /// unchanged.
     #[must_use]
     #[track_caller]
     pub fn plugin<P>(mut self, plugin: P) -> Self
     where
-        P: crate::plugin::Plugin,
+        P: crate::app::Plugin,
     {
         let name = plugin.name();
         if self.registered_plugins.contains(name.as_ref()) {
@@ -1326,17 +1399,17 @@ impl AppBuilder {
         result
     }
 
-    /// Apply a [`Plugins`](crate::plugin::Plugins) bundle (a plugin or tuple
+    /// Apply a [`Plugins`](crate::app::Plugins) bundle (a plugin or tuple
     /// of plugins) to the builder, in declaration order.
     #[must_use]
     pub fn plugins<P>(self, plugins: P) -> Self
     where
-        P: crate::plugin::Plugins,
+        P: crate::app::Plugins,
     {
         plugins.apply(self)
     }
 
-    /// Return `true` if a plugin with the given [`Plugin::name`](crate::plugin::Plugin::name)
+    /// Return `true` if a plugin with the given [`Plugin::name`](crate::app::Plugin::name)
     /// has already been applied to this builder.
     #[must_use]
     pub fn has_plugin(&self, name: &str) -> bool {
@@ -6867,7 +6940,7 @@ mod tests {
         route: Route,
     }
 
-    impl crate::plugin::Plugin for TestPlugin {
+    impl crate::app::Plugin for TestPlugin {
         fn name(&self) -> std::borrow::Cow<'static, str> {
             std::borrow::Cow::Borrowed(self.name)
         }
@@ -6926,7 +6999,7 @@ mod tests {
     /// A plugin that registers a route and then registers a nested plugin.
     struct OuterPlugin;
 
-    impl crate::plugin::Plugin for OuterPlugin {
+    impl crate::app::Plugin for OuterPlugin {
         fn name(&self) -> std::borrow::Cow<'static, str> {
             "outer".into()
         }
@@ -6956,5 +7029,133 @@ mod tests {
             crate::route_listing::RouteSource::Plugin("outer".to_owned()),
             "second route should be re-attributed to outer plugin after nested build"
         );
+    }
+}
+
+#[cfg(test)]
+mod plugin_tests {
+    use std::borrow::Cow;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
+    use super::*;
+
+    #[derive(Default)]
+    struct Recorder {
+        events: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl Recorder {
+        fn new() -> Self {
+            Self::default()
+        }
+
+        fn events(&self) -> Vec<&'static str> {
+            self.events
+                .lock()
+                .expect("lock shouldn't be poisoned")
+                .clone()
+        }
+
+        fn push(&self, label: &'static str) {
+            self.events
+                .lock()
+                .expect("lock shouldn't be poisoned")
+                .push(label);
+        }
+    }
+
+    struct RecordingPlugin {
+        label: &'static str,
+        recorder: Arc<Recorder>,
+    }
+
+    impl Plugin for RecordingPlugin {
+        fn name(&self) -> Cow<'static, str> {
+            Cow::Borrowed(self.label)
+        }
+
+        fn build(self, app: AppBuilder) -> AppBuilder {
+            self.recorder.push(self.label);
+            app
+        }
+    }
+
+    struct ColaPlugin {
+        recorder: Arc<Recorder>,
+    }
+
+    impl Plugin for ColaPlugin {
+        fn build(self, app: AppBuilder) -> AppBuilder {
+            self.recorder.push("cola");
+            app
+        }
+    }
+
+    struct PepsiPlugin {
+        recorder: Arc<Recorder>,
+    }
+
+    impl Plugin for PepsiPlugin {
+        fn build(self, app: AppBuilder) -> AppBuilder {
+            self.recorder.push("pepsi");
+            app
+        }
+    }
+
+    #[test]
+    fn single_plugin_builds_once() {
+        let recorder = Arc::new(Recorder::new());
+        let builder = crate::app::app().plugin(RecordingPlugin {
+            label: "only",
+            recorder: recorder.clone(),
+        });
+
+        assert_eq!(recorder.events(), vec!["only"]);
+        assert!(builder.has_plugin("only"));
+    }
+
+    #[test]
+    fn duplicate_named_plugin_is_skipped_with_warning() {
+        let recorder = Arc::new(Recorder::new());
+        let builder = crate::app::app()
+            .plugin(RecordingPlugin {
+                label: "dup",
+                recorder: recorder.clone(),
+            })
+            .plugin(RecordingPlugin {
+                label: "dup",
+                recorder: recorder.clone(),
+            });
+
+        assert_eq!(recorder.events(), vec!["dup"]);
+        assert!(builder.has_plugin("dup"));
+    }
+
+    #[test]
+    fn single_plugin_applied_via_plugins_trait() {
+        let recorder = Arc::new(Recorder::new());
+        let builder = crate::app::app().plugins(RecordingPlugin {
+            label: "single_via_trait",
+            recorder: recorder.clone(),
+        });
+
+        assert_eq!(recorder.events(), vec!["single_via_trait"]);
+        assert!(builder.has_plugin("single_via_trait"));
+    }
+
+    #[test]
+    fn tuple_of_plugins_applies_in_declaration_order() {
+        let recorder = Arc::new(Recorder::new());
+        let _builder = crate::app::app().plugins((
+            ColaPlugin {
+                recorder: recorder.clone(),
+            },
+            PepsiPlugin {
+                recorder: recorder.clone(),
+            },
+        ));
+
+        assert_eq!(recorder.events(), vec!["cola", "pepsi"]);
     }
 }

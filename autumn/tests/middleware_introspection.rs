@@ -3,7 +3,7 @@ use std::borrow::Cow;
 
 use autumn_web::app;
 use autumn_web::app::AppBuilder;
-use autumn_web::plugin::Plugin;
+use autumn_web::app::Plugin;
 
 #[derive(Clone)]
 struct AuthLayer;
