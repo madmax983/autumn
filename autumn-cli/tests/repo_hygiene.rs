@@ -484,3 +484,66 @@ fn bookmarks_example_tracks_regenerated_scaffold_layout() {
         );
     }
 }
+
+#[test]
+fn benchmark_runtime_startup_applies_packaged_migrations() {
+    let root = workspace_root();
+
+    let spring_properties_path =
+        root.join("benchmarks/runtime/spring-boot/src/main/resources/application.properties");
+    let spring_properties = std::fs::read_to_string(&spring_properties_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", spring_properties_path.display()));
+    assert!(
+        spring_properties.contains("spring.flyway.enabled=true"),
+        "{} must keep Flyway enabled so standalone fresh benchmark databases get the packaged schema",
+        spring_properties_path.display(),
+    );
+    assert!(
+        !spring_properties.contains("spring.flyway.enabled=false"),
+        "{} must not disable Flyway for standalone benchmark runs",
+        spring_properties_path.display(),
+    );
+
+    let django_dockerfile_path = root.join("benchmarks/runtime/django/Dockerfile");
+    let django_dockerfile = std::fs::read_to_string(&django_dockerfile_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", django_dockerfile_path.display()));
+    assert!(
+        django_dockerfile.contains("python manage.py migrate --noinput &&")
+            && django_dockerfile.contains("gunicorn benchapp.asgi:application"),
+        "{} must run Django migrations before serving the benchmark",
+        django_dockerfile_path.display(),
+    );
+
+    let autumn_main_path = root.join("benchmarks/runtime/autumn/src/main.rs");
+    let autumn_main = std::fs::read_to_string(&autumn_main_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", autumn_main_path.display()));
+    assert!(
+        autumn_main.contains("embed_migrations!()")
+            && autumn_main.contains(".migrations(MIGRATIONS)"),
+        "{} must register benchmark migrations before running Autumn",
+        autumn_main_path.display(),
+    );
+
+    let rails_dockerfile_path = root.join("benchmarks/runtime/rails/Dockerfile");
+    let rails_dockerfile = std::fs::read_to_string(&rails_dockerfile_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", rails_dockerfile_path.display()));
+    assert!(
+        rails_dockerfile.contains("bundle exec rails db:migrate && bundle exec puma"),
+        "{} must run Rails migrations before starting Puma",
+        rails_dockerfile_path.display(),
+    );
+
+    let loco_production_path = root.join("benchmarks/runtime/loco/config/production.yaml");
+    let loco_production = std::fs::read_to_string(&loco_production_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", loco_production_path.display()));
+    assert!(
+        loco_production.contains("auto_migrate: true"),
+        "{} must keep Loco auto-migration enabled for fresh benchmark databases",
+        loco_production_path.display(),
+    );
+    assert!(
+        !loco_production.contains("auto_migrate: false"),
+        "{} must not disable Loco auto-migration for standalone benchmark runs",
+        loco_production_path.display(),
+    );
+}
