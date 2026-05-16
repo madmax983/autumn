@@ -501,24 +501,35 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     __autumn_commit_hook_id.clone(),
                     __autumn_commit_hook_owner.clone(),
                 );
-            let __autumn_after_create = self.hooks.after_create(&mut ctx, &record).await;
-            if let ::core::result::Result::Err(__autumn_error) = __autumn_after_create {
-                if let ::core::result::Result::Err(__autumn_discard_error) =
-                    ::autumn_web::__private::discard_repository_commit_hook_pending(
+            let __autumn_after_create = ::autumn_web::__private::catch_repository_after_hook_unwind(
+                self.hooks.after_create(&mut ctx, &record)
+            )
+            .await;
+            match __autumn_after_create {
+                ::core::result::Result::Ok(::core::result::Result::Ok(())) => {}
+                ::core::result::Result::Ok(::core::result::Result::Err(__autumn_error)) => {
+                    let __autumn_error_message = ::std::format!("{__autumn_error}");
+                    ::autumn_web::__private::mark_repository_commit_hook_after_hook_failed(
                         &self.pool,
                         &__autumn_commit_hook_id,
                         &__autumn_commit_hook_owner,
+                        __autumn_error_message,
                     )
-                    .await
-                {
-                    ::autumn_web::reexports::tracing::warn!(
-                        hook_id = %__autumn_commit_hook_id,
-                        error = %__autumn_discard_error,
-                        "failed to discard staged repository commit hook after after_create failed"
-                    );
+                    .await;
+                    __autumn_pending_heartbeat.cancel();
+                    return ::core::result::Result::Err(__autumn_error);
                 }
-                __autumn_pending_heartbeat.cancel();
-                return ::core::result::Result::Err(__autumn_error);
+                ::core::result::Result::Err(__autumn_panic) => {
+                    ::autumn_web::__private::mark_repository_commit_hook_after_hook_failed(
+                        &self.pool,
+                        &__autumn_commit_hook_id,
+                        &__autumn_commit_hook_owner,
+                        "after_create panicked",
+                    )
+                    .await;
+                    __autumn_pending_heartbeat.cancel();
+                    ::std::panic::resume_unwind(__autumn_panic);
+                }
             }
             let __autumn_finalize_result = ::autumn_web::__private::finalize_repository_commit_hook_after_hook(
                 &self.pool,
@@ -671,24 +682,35 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     __autumn_commit_hook_id.clone(),
                     __autumn_commit_hook_owner.clone(),
                 );
-            let __autumn_after_update = self.hooks.after_update(&mut ctx, &record).await;
-            if let ::core::result::Result::Err(__autumn_error) = __autumn_after_update {
-                if let ::core::result::Result::Err(__autumn_discard_error) =
-                    ::autumn_web::__private::discard_repository_commit_hook_pending(
+            let __autumn_after_update = ::autumn_web::__private::catch_repository_after_hook_unwind(
+                self.hooks.after_update(&mut ctx, &record)
+            )
+            .await;
+            match __autumn_after_update {
+                ::core::result::Result::Ok(::core::result::Result::Ok(())) => {}
+                ::core::result::Result::Ok(::core::result::Result::Err(__autumn_error)) => {
+                    let __autumn_error_message = ::std::format!("{__autumn_error}");
+                    ::autumn_web::__private::mark_repository_commit_hook_after_hook_failed(
                         &self.pool,
                         &__autumn_commit_hook_id,
                         &__autumn_commit_hook_owner,
+                        __autumn_error_message,
                     )
-                    .await
-                {
-                    ::autumn_web::reexports::tracing::warn!(
-                        hook_id = %__autumn_commit_hook_id,
-                        error = %__autumn_discard_error,
-                        "failed to discard staged repository commit hook after after_update failed"
-                    );
+                    .await;
+                    __autumn_pending_heartbeat.cancel();
+                    return ::core::result::Result::Err(__autumn_error);
                 }
-                __autumn_pending_heartbeat.cancel();
-                return ::core::result::Result::Err(__autumn_error);
+                ::core::result::Result::Err(__autumn_panic) => {
+                    ::autumn_web::__private::mark_repository_commit_hook_after_hook_failed(
+                        &self.pool,
+                        &__autumn_commit_hook_id,
+                        &__autumn_commit_hook_owner,
+                        "after_update panicked",
+                    )
+                    .await;
+                    __autumn_pending_heartbeat.cancel();
+                    ::std::panic::resume_unwind(__autumn_panic);
+                }
             }
             let __autumn_finalize_result = ::autumn_web::__private::finalize_repository_commit_hook_after_hook(
                 &self.pool,
@@ -1888,8 +1910,8 @@ mod tests {
             "generated repositories must only make staged after_*_commit hooks dispatchable after regular after hooks succeed: {generated}"
         );
         assert!(
-            generated.contains("discard_repository_commit_hook_pending"),
-            "generated repositories must discard staged after_*_commit hooks when regular after hooks fail: {generated}"
+            generated.contains("mark_repository_commit_hook_after_hook_failed"),
+            "generated repositories must mark staged after_*_commit hooks non-dispatchable when regular after hooks fail: {generated}"
         );
         assert!(
             generated.contains("RepositoryCommitHookDescriptor"),
@@ -1954,6 +1976,21 @@ mod tests {
             create_after < create_finalize,
             "after_create_commit dispatch must see the finalized MutationContext from after_create: {generated}"
         );
+        let create_failure_mark = generated
+            .find("mark_repository_commit_hook_after_hook_failed")
+            .expect("after_create failure path should mark the staged row as non-dispatchable");
+        let create_cancel = generated
+            .find("__autumn_pending_heartbeat . cancel ()")
+            .expect("after_create path should cancel the pending heartbeat");
+        assert!(
+            generated.contains("catch_repository_after_hook_unwind")
+                && generated.contains(":: std :: panic :: resume_unwind"),
+            "after_create panics must be caught long enough to discard staged commit hooks before unwinding: {generated}"
+        );
+        assert!(
+            create_failure_mark < create_cancel,
+            "after_create failure must mark the staged row before canceling its heartbeat: {generated}"
+        );
     }
 
     #[test]
@@ -1984,6 +2021,18 @@ mod tests {
         assert!(
             update_after < update_finalize,
             "after_update_commit dispatch must see the finalized MutationContext from after_update: {generated}"
+        );
+        let update_failure_mark = generated[update_after..]
+            .find("mark_repository_commit_hook_after_hook_failed")
+            .map(|idx| update_after + idx)
+            .expect("after_update failure path should mark the staged row as non-dispatchable");
+        let update_cancel = generated[update_after..]
+            .find("__autumn_pending_heartbeat . cancel ()")
+            .map(|idx| update_after + idx)
+            .expect("after_update path should cancel the pending heartbeat");
+        assert!(
+            update_failure_mark < update_cancel,
+            "after_update failure must mark the staged row before canceling its heartbeat: {generated}"
         );
     }
 

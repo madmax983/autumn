@@ -38,6 +38,7 @@ const HOOK_WORKER_IDLE_SLEEP: Duration = Duration::from_millis(250);
 const HOOK_STALE_CLAIM_AFTER: Duration = Duration::from_secs(60);
 const HOOK_CLAIM_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const HOOK_PENDING_FINALIZER_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+const HOOK_AFTER_HOOK_FAILURE_MARK_RETRY_SLEEP: Duration = Duration::from_millis(100);
 const HOOK_ACK_SUCCESS_SQL: &str = "UPDATE autumn_repository_commit_hooks \
      SET status = 'completed', finished_at = NOW(), \
          context = '{}'::JSONB, record = '{}'::JSONB, \
@@ -61,6 +62,14 @@ const HOOK_FINALIZE_AFTER_HOOK_SQL: &str = "UPDATE autumn_repository_commit_hook
      WHERE id = $3 AND claimed_by = $4 AND status = 'pending_after_hook'";
 const HOOK_DISCARD_PENDING_SQL: &str = "DELETE FROM autumn_repository_commit_hooks \
      WHERE id = $1 AND claimed_by = $2 AND status = 'pending_after_hook'";
+const HOOK_AFTER_HOOK_FAILED_SQL: &str = "UPDATE autumn_repository_commit_hooks \
+     SET status = 'after_hook_failed', \
+         finished_at = NOW(), \
+         context = '{}'::JSONB, record = '{}'::JSONB, \
+         claimed_by = NULL, claimed_at = NULL, last_error = $1 \
+     WHERE id = $2 \
+       AND (claimed_by = $3 OR claimed_by IS NULL) \
+       AND status IN ('pending_after_hook', 'enqueued')";
 const HOOK_EXTEND_PENDING_FINALIZER_SQL: &str = "UPDATE autumn_repository_commit_hooks \
      SET claimed_at = NOW() \
      WHERE id = $1 AND claimed_by = $2 AND status = 'pending_after_hook'";
@@ -391,6 +400,81 @@ pub async fn discard_repository_commit_hook_pending(
                 "repository commit hook pending discard failed: {error}"
             ))
         })
+}
+
+/// Mark a staged create/update commit hook as permanently non-dispatchable
+/// after the regular `after_*` hook failed or panicked.
+///
+/// This retries transient pool or database failures before returning so stale
+/// pending recovery cannot later promote a known failed regular after hook.
+pub async fn mark_repository_commit_hook_after_hook_failed(
+    pool: &PgPool,
+    hook_id: &str,
+    owner: &str,
+    failure: impl Into<String>,
+) {
+    let failure = failure.into();
+    loop {
+        match pg_mark_repository_commit_hook_after_hook_failed(pool, hook_id, owner, &failure).await
+        {
+            Ok(true) => return,
+            Ok(false) => {
+                tracing::warn!(
+                    hook_id = %hook_id,
+                    "repository commit hook staged row was already unavailable while marking after-hook failure"
+                );
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    hook_id = %hook_id,
+                    error = %error,
+                    "failed to mark repository commit hook after-hook failure; retrying"
+                );
+                tokio::time::sleep(HOOK_AFTER_HOOK_FAILURE_MARK_RETRY_SLEEP).await;
+            }
+        }
+    }
+}
+
+async fn pg_mark_repository_commit_hook_after_hook_failed(
+    pool: &PgPool,
+    hook_id: &str,
+    owner: &str,
+    failure: &str,
+) -> AutumnResult<bool> {
+    let mut conn = pool.get().await.map_err(|error| {
+        AutumnError::internal_server_error_msg(format!("pg pool error: {error}"))
+    })?;
+
+    diesel::sql_query(HOOK_AFTER_HOOK_FAILED_SQL)
+        .bind::<diesel::sql_types::Text, _>(failure)
+        .bind::<diesel::sql_types::Text, _>(hook_id)
+        .bind::<diesel::sql_types::Text, _>(owner)
+        .execute(&mut *conn)
+        .await
+        .map(|rows| rows > 0)
+        .map_err(|error| {
+            AutumnError::internal_server_error_msg(format!(
+                "repository commit hook after-hook failure mark failed: {error}"
+            ))
+        })
+}
+
+/// Catch panics from a regular repository `after_*` hook while preserving its
+/// `AutumnResult`.
+///
+/// # Errors
+///
+/// Returns `Err` when the hook future panics. A hook that completes normally
+/// still returns its own `AutumnResult` inside `Ok`.
+pub async fn catch_repository_after_hook_unwind<Fut>(
+    future: Fut,
+) -> Result<AutumnResult<()>, Box<dyn Any + Send>>
+where
+    Fut: Future<Output = AutumnResult<()>> + Send,
+{
+    std::panic::AssertUnwindSafe(future).catch_unwind().await
 }
 
 #[doc(hidden)]
@@ -1062,10 +1146,12 @@ mod tests {
             "finalization must only promote the staged row it owns"
         );
         assert!(
-            HOOK_DISCARD_PENDING_SQL.contains("DELETE FROM autumn_repository_commit_hooks")
-                && HOOK_DISCARD_PENDING_SQL.contains("claimed_by = $2")
-                && HOOK_DISCARD_PENDING_SQL.contains("status = 'pending_after_hook'"),
-            "failed regular after hooks must discard the staged commit-hook row"
+            HOOK_AFTER_HOOK_FAILED_SQL.contains("status = 'after_hook_failed'")
+                && HOOK_AFTER_HOOK_FAILED_SQL.contains("context = '{}'::JSONB")
+                && HOOK_AFTER_HOOK_FAILED_SQL.contains("record = '{}'::JSONB")
+                && HOOK_AFTER_HOOK_FAILED_SQL
+                    .contains("status IN ('pending_after_hook', 'enqueued')"),
+            "failed regular after hooks must mark staged rows terminal and non-dispatchable"
         );
         assert!(
             HOOK_EXTEND_PENDING_FINALIZER_SQL.contains("claimed_at = NOW()")
