@@ -427,17 +427,23 @@ fn check_duplicate_registration(plugin_name: &str, routes: &[RouteInfo]) -> Chec
     }
 }
 
+/// ⚡ Bolt: Iterates and pushes directly to a pre-allocated `String` instead of
+/// chaining `.collect::<Vec<_>>().join("/")` to avoid intermediate heap allocations.
 fn normalize_path_for_collision(path: &str) -> String {
-    path.split('/')
-        .map(|seg| {
-            if seg.starts_with('{') && seg.ends_with('}') {
-                "{}"
-            } else {
-                seg
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("/")
+    let mut out = String::with_capacity(path.len());
+    let mut first = true;
+    for seg in path.split('/') {
+        if !first {
+            out.push('/');
+        }
+        first = false;
+        if seg.starts_with('{') && seg.ends_with('}') {
+            out.push_str("{}");
+        } else {
+            out.push_str(seg);
+        }
+    }
+    out
 }
 
 fn check_collisions(routes: &[RouteInfo]) -> CheckResult {
