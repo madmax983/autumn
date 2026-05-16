@@ -856,6 +856,87 @@ mod tests {
     }
 
     #[test]
+    fn trusted_proxy_contains_ipv6() {
+        let proxy = TrustedProxy::parse("2001:db8::/32").unwrap();
+        assert!(proxy.contains("2001:db8:1234::1".parse().unwrap()));
+        assert!(!proxy.contains("2001:db9::1".parse().unwrap()));
+
+        let proxy_exact = TrustedProxy::parse("2001:db8::1").unwrap();
+        assert!(proxy_exact.contains("2001:db8::1".parse().unwrap()));
+        assert!(!proxy_exact.contains("2001:db8::2".parse().unwrap()));
+    }
+
+    #[test]
+    fn build_backend_memory_config_returns_memory() {
+        let config = RateLimitConfig {
+            backend: RateLimitBackend::Memory,
+            ..Default::default()
+        };
+        let backend = Limiter::build_backend(&config);
+        assert!(matches!(backend, BucketBackend::Memory(_)));
+    }
+
+    #[cfg(feature = "redis")]
+    #[test]
+    fn build_backend_redis_with_empty_url_falls_back_to_memory() {
+        let config = RateLimitConfig {
+            backend: RateLimitBackend::Redis,
+            redis: super::super::config::RateLimitRedisConfig {
+                url: Some("   ".to_string()),
+                key_prefix: "test".to_string(),
+            },
+            ..Default::default()
+        };
+        let backend = Limiter::build_backend(&config);
+        assert!(matches!(backend, BucketBackend::Memory(_)));
+    }
+
+    #[test]
+    fn memory_store_retry_after_calculation() {
+        let store = MemoryStore::new();
+        let now = Instant::now();
+        // Burst 1.0, Refill 0.1 tokens/sec (10 sec per token)
+        let _ = store.decide("ip1", now, 1.0, 0.1); // Consumes 1.0, bucket.tokens = 0.0
+
+        // Immediately after, bucket.tokens = 0.0. Deficit = 1.0. Secs = 1.0 / 0.1 = 10.0
+        match store.decide("ip1", now, 1.0, 0.1) {
+            Decision::Denied { retry_after_secs } => assert_eq!(retry_after_secs, 10),
+            Decision::Allowed { .. } => panic!("Expected Denied"),
+        }
+
+        // 5 seconds later, bucket.tokens = 0.5. Deficit = 0.5. Secs = 0.5 / 0.1 = 5.0
+        let later = now + Duration::from_secs(5);
+        match store.decide("ip1", later, 1.0, 0.1) {
+            Decision::Denied { retry_after_secs } => assert_eq!(retry_after_secs, 5),
+            Decision::Allowed { .. } => panic!("Expected Denied"),
+        }
+
+        // 9.5 seconds later, bucket.tokens = 0.95. Deficit = 0.05. Secs = 0.05 / 0.1 = 0.5 -> ceil -> 1.0
+        let even_later = now + Duration::from_millis(9500);
+        match store.decide("ip1", even_later, 1.0, 0.1) {
+            Decision::Denied { retry_after_secs } => assert_eq!(retry_after_secs, 1),
+            Decision::Allowed { .. } => panic!("Expected Denied"),
+        }
+    }
+
+    #[test]
+    fn rate_limit_service_poll_ready() {
+        use std::convert::Infallible;
+        use tower::Service;
+        let config = RateLimitConfig::default();
+        let mut service = RateLimitLayer::from_config(&config).layer(tower::service_fn(
+            |_req: Request<Body>| async { Ok::<_, Infallible>(Response::new(Body::empty())) },
+        ));
+
+        // Use a dummy context
+        let waker = futures::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+
+        let poll = service.poll_ready(&mut cx);
+        assert!(poll.is_ready());
+    }
+
+    #[test]
     fn client_ip_uses_proxy_appended_entry_without_proxy_list() {
         let req = req_with_connect_info("attacker_spoofed_ip, 198.51.100.77", "203.0.113.10:4000");
         assert_eq!(
@@ -1244,6 +1325,30 @@ mod tests {
     }
 
     // ── Redis backend build_backend fallback tests ────────────────────────────
+
+    #[cfg(feature = "redis")]
+    #[tokio::test]
+    async fn redis_store_debug_format() {
+        use super::super::config::RateLimitBackendFailure;
+        // Check that RedisStore implements Debug correctly, logging key_prefix and failure_mode
+        let client = redis::Client::open("redis://127.0.0.1/").unwrap();
+        let connection = redis::aio::ConnectionManager::new_lazy_with_config(
+            client,
+            redis::aio::ConnectionManagerConfig::new(),
+        )
+        .unwrap();
+        let store = RedisStore::new(
+            connection,
+            "test_prefix".to_string(),
+            RateLimitBackendFailure::FailOpen,
+        );
+        let dbg = format!("{store:?}");
+        assert!(dbg.contains("RedisStore"));
+        assert!(dbg.contains("key_prefix"));
+        assert!(dbg.contains("test_prefix"));
+        assert!(dbg.contains("failure_mode"));
+        assert!(dbg.contains("FailOpen"));
+    }
 
     #[cfg(feature = "redis")]
     #[test]
