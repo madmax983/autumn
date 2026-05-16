@@ -37,6 +37,7 @@ const HOOK_SELECT_COLS: &str = "id, handler_key, hook_name, context::TEXT AS con
 const HOOK_WORKER_IDLE_SLEEP: Duration = Duration::from_millis(250);
 const HOOK_STALE_CLAIM_AFTER: Duration = Duration::from_secs(60);
 const HOOK_CLAIM_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+const HOOK_PENDING_FINALIZER_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const HOOK_ACK_SUCCESS_SQL: &str = "UPDATE autumn_repository_commit_hooks \
      SET status = 'completed', finished_at = NOW(), \
          context = '{}'::JSONB, record = '{}'::JSONB, \
@@ -51,14 +52,36 @@ const HOOK_ENQUEUE_INSERT_SQL: &str = "INSERT INTO autumn_repository_commit_hook
      VALUES ($1, $2, $3, $4::JSONB, $5::JSONB, 'enqueued', 1, 5, 1000, NOW(), NOW())";
 const HOOK_PENDING_INSERT_SQL: &str = "INSERT INTO autumn_repository_commit_hooks \
      (id, handler_key, hook_name, context, record, status, attempt, \
-      max_attempts, initial_backoff_ms, enqueued_at, run_at) \
-     VALUES ($1, $2, $3, $4::JSONB, $5::JSONB, 'pending_after_hook', 1, 5, 1000, NOW(), NOW())";
+      max_attempts, initial_backoff_ms, enqueued_at, run_at, claimed_by, claimed_at) \
+     VALUES ($1, $2, $3, $4::JSONB, $5::JSONB, 'pending_after_hook', 1, 5, 1000, NOW(), NOW(), $6, NOW())";
 const HOOK_FINALIZE_AFTER_HOOK_SQL: &str = "UPDATE autumn_repository_commit_hooks \
      SET context = $1::JSONB, record = $2::JSONB, status = 'enqueued', \
-         run_at = NOW(), enqueued_at = COALESCE(enqueued_at, NOW()), last_error = NULL \
-     WHERE id = $3 AND status = 'pending_after_hook'";
+         run_at = NOW(), enqueued_at = COALESCE(enqueued_at, NOW()), \
+         claimed_by = NULL, claimed_at = NULL, last_error = NULL \
+     WHERE id = $3 AND claimed_by = $4 AND status = 'pending_after_hook'";
 const HOOK_DISCARD_PENDING_SQL: &str = "DELETE FROM autumn_repository_commit_hooks \
-     WHERE id = $1 AND status = 'pending_after_hook'";
+     WHERE id = $1 AND claimed_by = $2 AND status = 'pending_after_hook'";
+const HOOK_EXTEND_PENDING_FINALIZER_SQL: &str = "UPDATE autumn_repository_commit_hooks \
+     SET claimed_at = NOW() \
+     WHERE id = $1 AND claimed_by = $2 AND status = 'pending_after_hook'";
+const HOOK_RECOVER_STALE_RUNNING_SQL: &str = "UPDATE autumn_repository_commit_hooks \
+     SET status = 'enqueued', \
+         run_at = NOW(), \
+         started_at = NULL, \
+         claimed_by = NULL, \
+         claimed_at = NULL, \
+         last_error = COALESCE(last_error, $1) \
+     WHERE status = 'running' \
+       AND claimed_at < NOW() - ($2::BIGINT * INTERVAL '1 millisecond')";
+const HOOK_RECOVER_STALE_PENDING_SQL: &str = "UPDATE autumn_repository_commit_hooks \
+     SET status = 'enqueued', \
+         run_at = NOW(), \
+         started_at = NULL, \
+         claimed_by = NULL, \
+         claimed_at = NULL, \
+         last_error = COALESCE(last_error, $1) \
+     WHERE status = 'pending_after_hook' \
+       AND claimed_at < NOW() - ($2::BIGINT * INTERVAL '1 millisecond')";
 
 static REPOSITORY_COMMIT_HOOK_RUNNERS: OnceLock<
     RwLock<HashMap<String, RepositoryCommitHookRegistration>>,
@@ -248,13 +271,14 @@ pub async fn enqueue_repository_commit_hook_pending_on_conn<C, R>(
     hook_name: &str,
     context: &C,
     record: &R,
-) -> AutumnResult<String>
+) -> AutumnResult<(String, String)>
 where
     C: Serialize + Sync + ?Sized,
     R: Serialize + Sync + ?Sized,
 {
     let (context, record) = serialize_repository_commit_hook_payloads(context, record)?;
     let id = uuid::Uuid::new_v4().to_string();
+    let owner = repository_commit_hook_pending_owner_id();
 
     diesel::sql_query(HOOK_PENDING_INSERT_SQL)
         .bind::<diesel::sql_types::Text, _>(id.clone())
@@ -262,9 +286,10 @@ where
         .bind::<diesel::sql_types::Text, _>(hook_name)
         .bind::<diesel::sql_types::Text, _>(context)
         .bind::<diesel::sql_types::Text, _>(record)
+        .bind::<diesel::sql_types::Text, _>(owner.clone())
         .execute(conn)
         .await
-        .map(|_| id)
+        .map(|_| (id, owner))
         .map_err(|error| {
             AutumnError::internal_server_error_msg(format!(
                 "repository commit hook staging failed: {error}"
@@ -282,6 +307,7 @@ where
 pub async fn finalize_repository_commit_hook_after_hook<C, R>(
     pool: &PgPool,
     hook_id: &str,
+    owner: &str,
     context: &C,
     record: &R,
 ) -> AutumnResult<()>
@@ -298,6 +324,7 @@ where
         .bind::<diesel::sql_types::Text, _>(context)
         .bind::<diesel::sql_types::Text, _>(record)
         .bind::<diesel::sql_types::Text, _>(hook_id)
+        .bind::<diesel::sql_types::Text, _>(owner)
         .execute(&mut *conn)
         .await
         .map_err(|error| {
@@ -325,6 +352,7 @@ where
 pub async fn discard_repository_commit_hook_pending(
     pool: &PgPool,
     hook_id: &str,
+    owner: &str,
 ) -> AutumnResult<()> {
     let mut conn = pool.get().await.map_err(|error| {
         AutumnError::internal_server_error_msg(format!("pg pool error: {error}"))
@@ -332,6 +360,7 @@ pub async fn discard_repository_commit_hook_pending(
 
     diesel::sql_query(HOOK_DISCARD_PENDING_SQL)
         .bind::<diesel::sql_types::Text, _>(hook_id)
+        .bind::<diesel::sql_types::Text, _>(owner)
         .execute(&mut *conn)
         .await
         .map(|_| ())
@@ -340,6 +369,38 @@ pub async fn discard_repository_commit_hook_pending(
                 "repository commit hook pending discard failed: {error}"
             ))
         })
+}
+
+#[doc(hidden)]
+#[must_use]
+pub fn start_repository_commit_hook_pending_finalizer_heartbeat(
+    pool: PgPool,
+    hook_id: String,
+    owner: String,
+) -> CancellationToken {
+    let shutdown = CancellationToken::new();
+    let heartbeat_shutdown = shutdown.child_token();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                () = heartbeat_shutdown.cancelled() => break,
+                () = tokio::time::sleep(HOOK_PENDING_FINALIZER_HEARTBEAT_INTERVAL) => {
+                    match pg_extend_repository_commit_hook_pending_finalizer(&pool, &hook_id, &owner).await {
+                        Ok(true) => {}
+                        Ok(false) => break,
+                        Err(error) => {
+                            tracing::warn!(
+                                hook_id = %hook_id,
+                                error = %error,
+                                "failed to extend repository commit hook pending finalizer lease"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    });
+    shutdown
 }
 
 fn serialize_repository_commit_hook_payloads<C, R>(
@@ -677,6 +738,28 @@ async fn pg_extend_repository_commit_hook_claim(
         })
 }
 
+async fn pg_extend_repository_commit_hook_pending_finalizer(
+    pool: &PgPool,
+    hook_id: &str,
+    owner: &str,
+) -> AutumnResult<bool> {
+    let mut conn = pool.get().await.map_err(|error| {
+        AutumnError::internal_server_error_msg(format!("pg pool error: {error}"))
+    })?;
+
+    diesel::sql_query(HOOK_EXTEND_PENDING_FINALIZER_SQL)
+        .bind::<diesel::sql_types::Text, _>(hook_id)
+        .bind::<diesel::sql_types::Text, _>(owner)
+        .execute(&mut *conn)
+        .await
+        .map(|rows| rows > 0)
+        .map_err(|error| {
+            AutumnError::internal_server_error_msg(format!(
+                "repository commit hook pending finalizer heartbeat failed: {error}"
+            ))
+        })
+}
+
 async fn pg_nack_repository_commit_hook_failure(
     pool: &PgPool,
     hook_id: &str,
@@ -744,21 +827,11 @@ async fn recover_stale_repository_commit_hooks(pool: &PgPool, worker_id: &str) {
         return;
     };
 
-    if let Err(error) = diesel::sql_query(
-        "UPDATE autumn_repository_commit_hooks \
-         SET status = 'enqueued', \
-             run_at = NOW(), \
-             started_at = NULL, \
-             claimed_by = NULL, \
-             claimed_at = NULL, \
-             last_error = COALESCE(last_error, $1) \
-         WHERE status = 'running' \
-           AND claimed_at < NOW() - ($2::BIGINT * INTERVAL '1 millisecond')",
-    )
-    .bind::<diesel::sql_types::Text, _>(format!("stale claim recovered by {worker_id}"))
-    .bind::<diesel::sql_types::BigInt, _>(stale_after_ms)
-    .execute(&mut *conn)
-    .await
+    if let Err(error) = diesel::sql_query(HOOK_RECOVER_STALE_RUNNING_SQL)
+        .bind::<diesel::sql_types::Text, _>(format!("stale claim recovered by {worker_id}"))
+        .bind::<diesel::sql_types::BigInt, _>(stale_after_ms)
+        .execute(&mut *conn)
+        .await
     {
         if is_missing_hook_table_error(&error) {
             tracing::debug!(
@@ -767,6 +840,27 @@ async fn recover_stale_repository_commit_hooks(pool: &PgPool, worker_id: &str) {
             );
         } else {
             tracing::warn!(error = %error, "repository commit hook stale recovery failed");
+        }
+    }
+
+    if let Err(error) = diesel::sql_query(HOOK_RECOVER_STALE_PENDING_SQL)
+        .bind::<diesel::sql_types::Text, _>(format!(
+            "stale pending after hook recovered by {worker_id}"
+        ))
+        .bind::<diesel::sql_types::BigInt, _>(stale_after_ms)
+        .execute(&mut *conn)
+        .await
+    {
+        if is_missing_hook_table_error(&error) {
+            tracing::debug!(
+                error = %error,
+                "repository commit hook queue table is not available yet"
+            );
+        } else {
+            tracing::warn!(
+                error = %error,
+                "repository commit hook stale pending recovery failed"
+            );
         }
     }
 }
@@ -796,6 +890,10 @@ fn format_repository_commit_hook_panic(payload: &(dyn Any + Send)) -> String {
 
 fn repository_commit_hook_worker_id() -> String {
     format!("repository-hook-{}", uuid::Uuid::new_v4())
+}
+
+fn repository_commit_hook_pending_owner_id() -> String {
+    format!("repository-hook-pending-{}", uuid::Uuid::new_v4())
 }
 
 #[cfg(test)]
@@ -904,6 +1002,10 @@ mod tests {
             HOOK_CLAIM_HEARTBEAT_INTERVAL < HOOK_STALE_CLAIM_AFTER,
             "heartbeat interval must be shorter than stale recovery threshold"
         );
+        assert!(
+            HOOK_PENDING_FINALIZER_HEARTBEAT_INTERVAL < HOOK_STALE_CLAIM_AFTER,
+            "pending finalizer heartbeat interval must be shorter than stale recovery threshold"
+        );
     }
 
     #[test]
@@ -926,18 +1028,33 @@ mod tests {
             "create/update hooks must first be staged in a non-dispatchable lifecycle state"
         );
         assert!(
+            HOOK_PENDING_INSERT_SQL.contains("claimed_by, claimed_at"),
+            "staged rows must carry a finalizer lease so recovery can distinguish live after hooks from abandoned rows"
+        );
+        assert!(
             HOOK_FINALIZE_AFTER_HOOK_SQL.contains("status = 'enqueued'"),
             "after-hook finalization must make the row dispatchable only after regular hooks succeed"
         );
         assert!(
             HOOK_FINALIZE_AFTER_HOOK_SQL
-                .contains("WHERE id = $3 AND status = 'pending_after_hook'"),
+                .contains("WHERE id = $3 AND claimed_by = $4 AND status = 'pending_after_hook'"),
             "finalization must only promote the staged row it owns"
         );
         assert!(
             HOOK_DISCARD_PENDING_SQL.contains("DELETE FROM autumn_repository_commit_hooks")
+                && HOOK_DISCARD_PENDING_SQL.contains("claimed_by = $2")
                 && HOOK_DISCARD_PENDING_SQL.contains("status = 'pending_after_hook'"),
             "failed regular after hooks must discard the staged commit-hook row"
+        );
+        assert!(
+            HOOK_EXTEND_PENDING_FINALIZER_SQL.contains("claimed_at = NOW()")
+                && HOOK_EXTEND_PENDING_FINALIZER_SQL.contains("status = 'pending_after_hook'"),
+            "long-running regular after hooks must heartbeat their staged-row finalizer lease"
+        );
+        assert!(
+            HOOK_RECOVER_STALE_PENDING_SQL.contains("status = 'pending_after_hook'")
+                && HOOK_RECOVER_STALE_PENDING_SQL.contains("status = 'enqueued'"),
+            "abandoned staged rows must eventually become claimable by the durable worker"
         );
     }
 

@@ -181,6 +181,7 @@ pub mod __private {
         enqueue_repository_commit_hook_on_conn, enqueue_repository_commit_hook_pending_on_conn,
         finalize_repository_commit_hook_after_hook, kick_repository_commit_hook_dispatcher,
         register_repository_commit_hook_runner,
+        start_repository_commit_hook_pending_finalizer_heartbeat,
     };
 
     // Shared factory creation depth — bounds cyclic `#[factory_assoc]` chains

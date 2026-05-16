@@ -336,9 +336,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             #[doc(hidden)]
             fn __autumn_repository_commit_hook_key() -> &'static str {
                 ::core::concat!(
-                    ::core::module_path!(),
+                    ::core::env!("CARGO_PKG_NAME"),
                     "::",
-                    ::core::stringify!(#pg_name),
+                    ::core::stringify!(#table_ident),
                     "::",
                     ::core::stringify!(#model_name),
                     "::",
@@ -432,8 +432,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
             Self::__autumn_register_repository_commit_hooks();
             let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
-            let (record, mut ctx, __autumn_commit_hook_id, __autumn_commit_hook_record) = conn
-                .transaction::<(#model_name, MutationContext, ::std::string::String, ::autumn_web::reexports::serde_json::Value), ::autumn_web::AutumnError, _>(|conn| {
+            let (record, mut ctx, __autumn_commit_hook_id, __autumn_commit_hook_owner, __autumn_commit_hook_record) = conn
+                .transaction::<(#model_name, MutationContext, ::std::string::String, ::std::string::String, ::autumn_web::reexports::serde_json::Value), ::autumn_web::AutumnError, _>(|conn| {
                     async move {
                         let mut input = new.clone();
                         let mut ctx = MutationContext::new(MutationOp::Create);
@@ -448,7 +448,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             .map_err(::autumn_web::AutumnError::from)?;
 
                         let __autumn_commit_hook_record = record.__autumn_commit_hook_to_value()?;
-                        let __autumn_commit_hook_id = ::autumn_web::__private::enqueue_repository_commit_hook_pending_on_conn(
+                        let (__autumn_commit_hook_id, __autumn_commit_hook_owner) = ::autumn_web::__private::enqueue_repository_commit_hook_pending_on_conn(
                             conn,
                             Self::__autumn_repository_commit_hook_key(),
                             "create",
@@ -457,17 +457,25 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         )
                         .await?;
 
-                        Ok((record, ctx, __autumn_commit_hook_id, __autumn_commit_hook_record))
+                        Ok((record, ctx, __autumn_commit_hook_id, __autumn_commit_hook_owner, __autumn_commit_hook_record))
                     }
                     .scope_boxed()
                 })
                 .await?;
+            ::core::mem::drop(conn);
+            let __autumn_pending_heartbeat =
+                ::autumn_web::__private::start_repository_commit_hook_pending_finalizer_heartbeat(
+                    self.pool.clone(),
+                    __autumn_commit_hook_id.clone(),
+                    __autumn_commit_hook_owner.clone(),
+                );
             let __autumn_after_create = self.hooks.after_create(&mut ctx, &record).await;
             if let ::core::result::Result::Err(__autumn_error) = __autumn_after_create {
                 if let ::core::result::Result::Err(__autumn_discard_error) =
                     ::autumn_web::__private::discard_repository_commit_hook_pending(
                         &self.pool,
                         &__autumn_commit_hook_id,
+                        &__autumn_commit_hook_owner,
                     )
                     .await
                 {
@@ -477,15 +485,19 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         "failed to discard staged repository commit hook after after_create failed"
                     );
                 }
+                __autumn_pending_heartbeat.cancel();
                 return ::core::result::Result::Err(__autumn_error);
             }
-            ::autumn_web::__private::finalize_repository_commit_hook_after_hook(
+            let __autumn_finalize_result = ::autumn_web::__private::finalize_repository_commit_hook_after_hook(
                 &self.pool,
                 &__autumn_commit_hook_id,
+                &__autumn_commit_hook_owner,
                 &ctx,
                 &__autumn_commit_hook_record,
             )
-            .await?;
+            .await;
+            __autumn_pending_heartbeat.cancel();
+            __autumn_finalize_result?;
             ::autumn_web::__private::kick_repository_commit_hook_dispatcher(&self.pool);
 
             Ok(record)
@@ -503,8 +515,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
             Self::__autumn_register_repository_commit_hooks();
             let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
-            let (record, mut ctx, __autumn_commit_hook_id, __autumn_commit_hook_record) = conn
-                .transaction::<(#model_name, MutationContext, ::std::string::String, ::autumn_web::reexports::serde_json::Value), ::autumn_web::AutumnError, _>(|conn| {
+            let (record, mut ctx, __autumn_commit_hook_id, __autumn_commit_hook_owner, __autumn_commit_hook_record) = conn
+                .transaction::<(#model_name, MutationContext, ::std::string::String, ::std::string::String, ::autumn_web::reexports::serde_json::Value), ::autumn_web::AutumnError, _>(|conn| {
                     async move {
                         let mut ctx = MutationContext::new(MutationOp::Update);
                         let record: #model_name = if let ::core::option::Option::Some(expected_version) =
@@ -571,7 +583,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         };
 
                         let __autumn_commit_hook_record = record.__autumn_commit_hook_to_value()?;
-                        let __autumn_commit_hook_id = ::autumn_web::__private::enqueue_repository_commit_hook_pending_on_conn(
+                        let (__autumn_commit_hook_id, __autumn_commit_hook_owner) = ::autumn_web::__private::enqueue_repository_commit_hook_pending_on_conn(
                             conn,
                             Self::__autumn_repository_commit_hook_key(),
                             "update",
@@ -580,17 +592,25 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         )
                         .await?;
 
-                        Ok((record, ctx, __autumn_commit_hook_id, __autumn_commit_hook_record))
+                        Ok((record, ctx, __autumn_commit_hook_id, __autumn_commit_hook_owner, __autumn_commit_hook_record))
                     }
                     .scope_boxed()
                 })
                 .await?;
+            ::core::mem::drop(conn);
+            let __autumn_pending_heartbeat =
+                ::autumn_web::__private::start_repository_commit_hook_pending_finalizer_heartbeat(
+                    self.pool.clone(),
+                    __autumn_commit_hook_id.clone(),
+                    __autumn_commit_hook_owner.clone(),
+                );
             let __autumn_after_update = self.hooks.after_update(&mut ctx, &record).await;
             if let ::core::result::Result::Err(__autumn_error) = __autumn_after_update {
                 if let ::core::result::Result::Err(__autumn_discard_error) =
                     ::autumn_web::__private::discard_repository_commit_hook_pending(
                         &self.pool,
                         &__autumn_commit_hook_id,
+                        &__autumn_commit_hook_owner,
                     )
                     .await
                 {
@@ -600,15 +620,19 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         "failed to discard staged repository commit hook after after_update failed"
                     );
                 }
+                __autumn_pending_heartbeat.cancel();
                 return ::core::result::Result::Err(__autumn_error);
             }
-            ::autumn_web::__private::finalize_repository_commit_hook_after_hook(
+            let __autumn_finalize_result = ::autumn_web::__private::finalize_repository_commit_hook_after_hook(
                 &self.pool,
                 &__autumn_commit_hook_id,
+                &__autumn_commit_hook_owner,
                 &ctx,
                 &__autumn_commit_hook_record,
             )
-            .await?;
+            .await;
+            __autumn_pending_heartbeat.cancel();
+            __autumn_finalize_result?;
             ::autumn_web::__private::kick_repository_commit_hook_dispatcher(&self.pool);
 
             Ok(record)
@@ -632,6 +656,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         // Load current record for before_delete context
                         let record = #table_ident::table
                             .find(id)
+                            .for_update()
                             .first::<#model_name>(conn)
                             .await
                             .optional()
@@ -642,10 +667,15 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                         self.hooks.before_delete(&mut ctx, &record).await?;
 
-                        ::autumn_web::reexports::diesel::delete(#table_ident::table.find(id))
+                        let __autumn_deleted = ::autumn_web::reexports::diesel::delete(#table_ident::table.find(id))
                             .execute(conn)
                             .await
                             .map_err(::autumn_web::AutumnError::from)?;
+                        if __autumn_deleted == 0 {
+                            return Err(::autumn_web::AutumnError::not_found_msg(
+                                format!("{} with id {} not found", stringify!(#model_name), id)
+                            ));
+                        }
 
                         let __autumn_commit_hook_record = record.__autumn_commit_hook_to_value()?;
                         ::autumn_web::__private::enqueue_repository_commit_hook_on_conn(
@@ -662,6 +692,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     .scope_boxed()
                 })
                 .await?;
+            ::core::mem::drop(conn);
             ::autumn_web::__private::kick_repository_commit_hook_dispatcher(&self.pool);
 
             Ok(())
@@ -1616,6 +1647,14 @@ mod tests {
             "generated after_*_commit hooks must not use the process-local callback registry"
         );
         assert!(
+            !generated.contains("module_path"),
+            "durable hook handler keys must not depend on Rust module paths: {generated}"
+        );
+        assert!(
+            generated.contains("env ! (\"CARGO_PKG_NAME\")"),
+            "durable hook handler keys should include a stable package/table/model identity: {generated}"
+        );
+        assert!(
             generated.contains("__autumn_commit_hook_to_value")
                 && generated.contains("__autumn_commit_hook_from_value"),
             "generated repository hook runners must use the framework's full-fidelity record codec: {generated}"
@@ -1638,12 +1677,19 @@ mod tests {
         let create_after = generated
             .find("self . hooks . after_create (& mut ctx , & record)")
             .expect("after_create hook should still be generated");
+        let create_drop_conn = generated
+            .find(":: core :: mem :: drop (conn)")
+            .expect("create path should release the repository connection before after/finalize");
         let create_finalize = generated
             .find("finalize_repository_commit_hook_after_hook (& self . pool , & __autumn_commit_hook_id")
             .expect("create commit hook should be finalized after after_create succeeds");
         assert!(
             create_stage < create_after,
             "create commit hook rows must be staged inside the mutation transaction: {generated}"
+        );
+        assert!(
+            create_stage < create_drop_conn && create_drop_conn < create_after,
+            "create path must release its checked-out connection before after_create/finalize checks out from the pool: {generated}"
         );
         assert!(
             create_after < create_finalize,
@@ -1655,6 +1701,10 @@ mod tests {
         let update_after = generated
             .find("self . hooks . after_update (& mut ctx , & record)")
             .expect("after_update hook should still be generated");
+        let update_drop_conn = generated[update_stage..update_after]
+            .find(":: core :: mem :: drop (conn)")
+            .map(|idx| update_stage + idx)
+            .expect("update path should release the repository connection before after/finalize");
         let update_finalize = generated
             .rfind("finalize_repository_commit_hook_after_hook (& self . pool , & __autumn_commit_hook_id")
             .expect("update commit hook should be finalized after after_update succeeds");
@@ -1663,8 +1713,31 @@ mod tests {
             "update commit hook rows must be staged inside the mutation transaction: {generated}"
         );
         assert!(
+            update_stage < update_drop_conn && update_drop_conn < update_after,
+            "update path must release its checked-out connection before after_update/finalize checks out from the pool: {generated}"
+        );
+        assert!(
             update_after < update_finalize,
             "after_update_commit dispatch must see the finalized MutationContext from after_update: {generated}"
+        );
+        let delete_start = generated
+            .find("MutationOp :: Delete")
+            .expect("delete path should still be generated");
+        let delete_generated = &generated[delete_start..];
+        let delete_lock = delete_generated
+            .find(". for_update ()")
+            .expect("delete path should lock the row before before_delete");
+        let before_delete = delete_generated
+            .find("before_delete")
+            .expect("before_delete hook should still be generated");
+        assert!(
+            delete_lock < before_delete,
+            "delete path must lock the row before invoking before_delete: {generated}"
+        );
+        assert!(
+            generated.contains("let __autumn_deleted =")
+                && generated.contains("if __autumn_deleted == 0"),
+            "delete path must not enqueue after_delete_commit when no row was deleted: {generated}"
         );
     }
 

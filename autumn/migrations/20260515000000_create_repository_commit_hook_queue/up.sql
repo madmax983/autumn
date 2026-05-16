@@ -31,3 +31,8 @@ CREATE INDEX IF NOT EXISTS idx_autumn_repository_commit_hooks_handler_ready
 CREATE INDEX IF NOT EXISTS idx_autumn_repository_commit_hooks_stale_recovery
     ON autumn_repository_commit_hooks (claimed_at)
     WHERE status = 'running';
+
+-- Staged create/update hooks are leased by the request until regular after hooks finish.
+CREATE INDEX IF NOT EXISTS idx_autumn_repository_commit_hooks_pending_recovery
+    ON autumn_repository_commit_hooks (claimed_at)
+    WHERE status = 'pending_after_hook';
