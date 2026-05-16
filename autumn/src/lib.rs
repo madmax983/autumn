@@ -113,6 +113,8 @@ pub mod route_listing;
 #[cfg(feature = "db")]
 pub mod repository;
 #[cfg(feature = "db")]
+pub(crate) mod repository_commit_hooks;
+#[cfg(feature = "db")]
 pub use repository::RepositoryError;
 
 /// Router construction and integration with Axum.
@@ -173,6 +175,14 @@ pub mod ws;
 /// This module is semver-exempt. Do not use it directly.
 #[doc(hidden)]
 pub mod __private {
+    #[cfg(feature = "db")]
+    pub use crate::repository_commit_hooks::{
+        RepositoryCommitHookDescriptor, discard_repository_commit_hook_pending,
+        enqueue_repository_commit_hook_on_conn, enqueue_repository_commit_hook_pending_on_conn,
+        finalize_repository_commit_hook_after_hook, kick_repository_commit_hook_dispatcher,
+        register_repository_commit_hook_runner,
+    };
+
     // Shared factory creation depth — bounds cyclic `#[factory_assoc]` chains
     // across all models in a single create() chain.
     //
@@ -856,6 +866,7 @@ pub mod reexports {
     #[cfg(feature = "db")]
     pub use diesel_async;
     pub use http;
+    pub use inventory;
     #[cfg(feature = "mail")]
     pub use lettre;
     #[cfg(feature = "db")]

@@ -56,7 +56,7 @@ use serde::{Deserialize, Serialize};
 // ── Mutation operation & context ─────────────────────────────────────
 
 /// The kind of mutation being performed on a repository record.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum MutationOp {
     /// A new record is being created.
@@ -89,7 +89,7 @@ impl std::fmt::Display for MutationOp {
 ///
 /// Carries actor identity, request metadata, and timestamps so that
 /// hook implementations can perform auditing, validation, or enrichment.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MutationContext {
     /// The mutation operation type.
     pub op: MutationOp,
@@ -214,9 +214,10 @@ pub trait MutationHooks: Send + Sync + 'static {
     /// side-effects (job enqueues, emails, cache invalidation) that must not
     /// execute if the transaction rolls back.
     ///
-    /// When using [`Db::tx`](crate::db::Db::tx), the generated repository
-    /// code registers this as an [`after_commit`](crate::db::register_after_commit)
-    /// callback so it inherits the transactional guarantee automatically.
+    /// Generated repository code writes this hook's intent to Autumn's
+    /// framework-owned durable commit-hook queue in the same transaction as the
+    /// mutation. Replicas claim queued hooks with Postgres row locks, so a
+    /// process-local task disappearing does not lose the side effect.
     fn after_create_commit(
         &self,
         _ctx: &mut MutationContext,

@@ -1535,12 +1535,17 @@ impl AppBuilder {
 
         // 5. Create database pool and run migrations (if configured)
         #[cfg(feature = "db")]
-        let database = setup_database(&config, migrations, pool_provider_factory)
-            .await
-            .unwrap_or_else(|e| {
-                tracing::error!("{e}");
-                std::process::exit(1);
-            });
+        let database = setup_database(
+            &config,
+            migrations,
+            pool_provider_factory,
+            RepositoryCommitHookQueueMigrationMode::Runtime,
+        )
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!("{e}");
+            std::process::exit(1);
+        });
         #[cfg(feature = "db")]
         let pool = database.topology;
         #[cfg(feature = "db")]
@@ -1680,6 +1685,14 @@ impl AppBuilder {
 
         let shutdown_timeout = config.server.shutdown_timeout_secs;
         let server_shutdown = tokio_util::sync::CancellationToken::new();
+
+        #[cfg(feature = "db")]
+        if let Some(pool) = state.pool().cloned() {
+            crate::repository_commit_hooks::start_repository_commit_hook_worker(
+                pool,
+                server_shutdown.child_token(),
+            );
+        }
 
         if let Err(error) = initialize_job_runtime(jobs, &state, &server_shutdown, &config.jobs) {
             tracing::error!(error = %error, "job runtime initialization failed");
@@ -1903,12 +1916,17 @@ impl AppBuilder {
 
         // Build state (with DB if configured)
         #[cfg(feature = "db")]
-        let database = setup_database(&config, vec![], pool_provider_factory)
-            .await
-            .unwrap_or_else(|e| {
-                eprintln!("{e}");
-                std::process::exit(1);
-            });
+        let database = setup_database(
+            &config,
+            vec![],
+            pool_provider_factory,
+            RepositoryCommitHookQueueMigrationMode::StaticBuild,
+        )
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(1);
+        });
         #[cfg(feature = "db")]
         let pool = database.topology;
         #[cfg(feature = "db")]
@@ -2204,12 +2222,17 @@ impl AppBuilder {
         );
 
         #[cfg(feature = "db")]
-        let database = setup_database(&config, migrations, pool_provider_factory)
-            .await
-            .unwrap_or_else(|error| {
-                eprintln!("{error}");
-                std::process::exit(1);
-            });
+        let database = setup_database(
+            &config,
+            migrations,
+            pool_provider_factory,
+            RepositoryCommitHookQueueMigrationMode::Runtime,
+        )
+        .await
+        .unwrap_or_else(|error| {
+            eprintln!("{error}");
+            std::process::exit(1);
+        });
         #[cfg(feature = "db")]
         let pool = database.topology;
         #[cfg(feature = "db")]
@@ -2262,6 +2285,14 @@ impl AppBuilder {
         let _storage_router = storage_bootstrap.and_then(|bootstrap| bootstrap.install(&state));
 
         let task_shutdown = tokio_util::sync::CancellationToken::new();
+        #[cfg(feature = "db")]
+        if let Some(pool) = state.pool().cloned() {
+            crate::repository_commit_hooks::start_repository_commit_hook_worker(
+                pool,
+                task_shutdown.child_token(),
+            );
+        }
+
         if let Err(error) = initialize_job_runtime(jobs, &state, &task_shutdown, &config.jobs) {
             eprintln!("job runtime initialization failed: {error}");
             std::process::exit(1);
@@ -3278,7 +3309,13 @@ async fn setup_database(
     config: &AutumnConfig,
     migrations: Vec<crate::migrate::EmbeddedMigrations>,
     pool_provider: Option<PoolProviderFactory>,
+    hook_queue_migration_mode: RepositoryCommitHookQueueMigrationMode,
 ) -> Result<DatabaseBootstrap, String> {
+    let migrations = migrations_with_repository_commit_hook_queue(
+        migrations,
+        crate::repository_commit_hooks::has_repository_commit_hook_descriptors(),
+        hook_queue_migration_mode,
+    );
     let check_replica_migrations = !migrations.is_empty();
     let topology = match pool_provider {
         Some(factory) => factory(config.database.clone()).await,
@@ -3331,6 +3368,51 @@ async fn setup_database(
         topology,
         replica_readiness,
         replica_migration_check,
+    })
+}
+
+#[cfg(feature = "db")]
+const REPOSITORY_COMMIT_HOOK_QUEUE_MIGRATION: &str =
+    "20260515000000_create_repository_commit_hook_queue";
+
+#[cfg(feature = "db")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RepositoryCommitHookQueueMigrationMode {
+    Runtime,
+    StaticBuild,
+}
+
+#[cfg(feature = "db")]
+fn migrations_with_repository_commit_hook_queue(
+    mut migrations: Vec<crate::migrate::EmbeddedMigrations>,
+    hook_queue_required: bool,
+    mode: RepositoryCommitHookQueueMigrationMode,
+) -> Vec<crate::migrate::EmbeddedMigrations> {
+    if hook_queue_required
+        && mode == RepositoryCommitHookQueueMigrationMode::Runtime
+        && !migration_sets_include_repository_commit_hook_queue(&migrations)
+    {
+        migrations.push(crate::repository_commit_hooks::REPOSITORY_COMMIT_HOOK_MIGRATIONS);
+    }
+    migrations
+}
+
+#[cfg(feature = "db")]
+fn migration_sets_include_repository_commit_hook_queue(
+    migrations: &[crate::migrate::EmbeddedMigrations],
+) -> bool {
+    use diesel::migration::{Migration, MigrationSource as _};
+    use diesel::pg::Pg;
+
+    migrations.iter().any(|source| {
+        let Ok(source_migrations): Result<Vec<Box<dyn Migration<Pg>>>, _> = source.migrations()
+        else {
+            return false;
+        };
+
+        source_migrations
+            .iter()
+            .any(|migration| migration.name().to_string() == REPOSITORY_COMMIT_HOOK_QUEUE_MIGRATION)
     })
 }
 
@@ -4254,6 +4336,10 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tower::ServiceExt;
 
+    #[cfg(feature = "db")]
+    const APP_TEST_MIGRATIONS: crate::migrate::EmbeddedMigrations =
+        diesel_migrations::embed_migrations!("test_migrations");
+
     /// Shared no-op `MailDeliveryQueue` used by builder tests so the trait
     /// impl body is defined once and exercised by at least one test.
     #[cfg(feature = "mail")]
@@ -4371,9 +4457,14 @@ mod tests {
             ..
         } = app().with_pool_provider(PassthroughPoolProvider);
 
-        let database = setup_database(&config, Vec::new(), pool_provider_factory)
-            .await
-            .expect("custom provider should build database topology");
+        let database = setup_database(
+            &config,
+            Vec::new(),
+            pool_provider_factory,
+            RepositoryCommitHookQueueMigrationMode::Runtime,
+        )
+        .await
+        .expect("custom provider should build database topology");
         let topology = database.topology.expect("database should be configured");
 
         assert_eq!(topology.primary().status().max_size, 5);
@@ -4399,6 +4490,91 @@ mod tests {
         assert!(state.read_pool().is_none());
         let (status, _) = crate::probe::readiness_response(&state).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn hooked_repository_apps_include_hook_queue_framework_migration() {
+        let migrations = migrations_with_repository_commit_hook_queue(
+            vec![APP_TEST_MIGRATIONS],
+            true,
+            RepositoryCommitHookQueueMigrationMode::Runtime,
+        );
+        let names = migration_names(&migrations);
+
+        assert!(
+            names
+                .iter()
+                .any(|name| name == REPOSITORY_COMMIT_HOOK_QUEUE_MIGRATION),
+            "hooked repository apps must auto-register the durable hook queue migration"
+        );
+        assert!(
+            names.iter().all(|name| !name.contains("api_tokens")),
+            "hooked repository apps must not auto-register unrelated framework migrations: {names:?}"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn runtime_hooked_apps_include_hook_queue_framework_migration_without_app_migrations() {
+        let migrations = migrations_with_repository_commit_hook_queue(
+            Vec::new(),
+            true,
+            RepositoryCommitHookQueueMigrationMode::Runtime,
+        );
+        let names = migration_names(&migrations);
+
+        assert!(
+            names
+                .iter()
+                .any(|name| name == REPOSITORY_COMMIT_HOOK_QUEUE_MIGRATION),
+            "runtime hooked repository apps must install the durable hook queue even when app migrations are managed elsewhere"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn static_builds_do_not_auto_add_hook_queue_when_no_migrations_registered() {
+        let migrations = migrations_with_repository_commit_hook_queue(
+            Vec::new(),
+            true,
+            RepositoryCommitHookQueueMigrationMode::StaticBuild,
+        );
+
+        assert!(
+            migrations.is_empty(),
+            "static/export builds that pass no migrations must not mutate the database"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn unhooked_apps_do_not_auto_add_hook_queue_framework_migration() {
+        let migrations = migrations_with_repository_commit_hook_queue(
+            Vec::new(),
+            false,
+            RepositoryCommitHookQueueMigrationMode::Runtime,
+        );
+
+        assert!(
+            migrations.is_empty(),
+            "unhooked apps should not get durable hook queue migrations for free"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    fn migration_names(migrations: &[crate::migrate::EmbeddedMigrations]) -> Vec<String> {
+        use diesel::migration::{Migration, MigrationSource as _};
+        use diesel::pg::Pg;
+
+        migrations
+            .iter()
+            .flat_map(|source| {
+                let migrations: Vec<Box<dyn Migration<Pg>>> = source.migrations().unwrap();
+                migrations
+            })
+            .map(|migration| migration.name().to_string())
+            .collect()
     }
 
     #[cfg(feature = "db")]

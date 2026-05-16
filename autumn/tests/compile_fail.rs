@@ -80,6 +80,8 @@ fn compile_pass_tests() {
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/repository_with_hooks.rs");
     #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/repository_hooks_serde_skipped_model.rs");
+    #[cfg(feature = "db")]
     t.pass("tests/compile-pass/repository_with_api.rs");
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/repository_with_hooks_and_api.rs");

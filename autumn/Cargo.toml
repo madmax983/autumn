@@ -70,6 +70,7 @@ scoped-futures = { version = "0.1.4", optional = true }
 futures.workspace = true
 http.workspace = true
 indexmap.workspace = true
+inventory.workspace = true
 libsqlite3-sys = { workspace = true, optional = true }
 maud = { workspace = true, optional = true }
 moka = { workspace = true, optional = true }

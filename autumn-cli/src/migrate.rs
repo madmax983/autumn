@@ -18,8 +18,9 @@ pub mod safety;
 use std::path::Path;
 use std::process::Command;
 
-use autumn_web::auth::API_TOKEN_MIGRATIONS;
-use autumn_web::migrate::{EmbeddedMigrations, MigrationError, MigrationResult};
+use autumn_web::migrate::{
+    EmbeddedMigrations, FRAMEWORK_MIGRATIONS, MigrationError, MigrationResult,
+};
 
 /// Default directory containing Diesel migration files.
 const DEFAULT_MIGRATIONS_DIR: &str = "migrations";
@@ -326,7 +327,7 @@ fn run_framework_migrations_inner<F>(
 where
     F: FnOnce(&str, EmbeddedMigrations) -> Result<MigrationResult, MigrationError>,
 {
-    run_pending(database_url, API_TOKEN_MIGRATIONS)
+    run_pending(database_url, FRAMEWORK_MIGRATIONS)
 }
 
 fn run_diesel_migration_run(database_url: &str, migrations_dir: &Path, label: &str) {
@@ -391,7 +392,7 @@ fn pending_framework_migrations_inner<F>(
 where
     F: FnOnce(&str, EmbeddedMigrations) -> Result<Vec<String>, MigrationError>,
 {
-    pending_migrations(database_url, API_TOKEN_MIGRATIONS)
+    pending_migrations(database_url, FRAMEWORK_MIGRATIONS)
 }
 
 fn show_diesel_migration_status(database_url: &str, migrations_dir: &Path) {
@@ -605,12 +606,13 @@ mod tests {
     }
 
     #[test]
-    fn embedded_api_token_migrations_include_real_schema_migration() {
+    fn embedded_framework_migrations_include_durable_hook_queue() {
         use autumn_web::reexports::diesel::migration::{Migration, MigrationSource};
         use autumn_web::reexports::diesel::pg::Pg;
 
-        let migrations: Vec<Box<dyn Migration<Pg>>> =
-            autumn_web::auth::API_TOKEN_MIGRATIONS.migrations().unwrap();
+        let migrations: Vec<Box<dyn Migration<Pg>>> = autumn_web::migrate::FRAMEWORK_MIGRATIONS
+            .migrations()
+            .unwrap();
         let names: Vec<_> = migrations
             .iter()
             .map(|migration| migration.name().to_string())
@@ -620,7 +622,13 @@ mod tests {
             names
                 .iter()
                 .any(|name| name == "20260512000000_create_api_tokens"),
-            "API token embedded migrations must include the timestamped schema migration: {names:?}"
+            "framework migrations must include the timestamped API token schema migration: {names:?}"
+        );
+        assert!(
+            names
+                .iter()
+                .any(|name| name == "20260515000000_create_repository_commit_hook_queue"),
+            "framework migrations must include the durable repository commit hook queue: {names:?}"
         );
     }
 
