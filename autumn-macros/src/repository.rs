@@ -1786,9 +1786,8 @@ mod tests {
     #[test]
     fn parse_repo_args_rejects_commit_hooks_without_hooks() {
         let tokens: proc_macro2::TokenStream = "Post, commit_hooks = true".parse().unwrap();
-        let err = match parse_repo_args(tokens) {
-            Ok(_) => panic!("commit hooks require a hook type"),
-            Err(err) => err,
+        let Err(err) = parse_repo_args(tokens) else {
+            panic!("commit hooks require a hook type");
         };
         assert!(
             err.to_string().contains("requires hooks"),
@@ -1868,13 +1867,17 @@ mod tests {
         );
     }
 
-    #[test]
-    fn hooked_repository_commit_hooks_enqueue_durable_rows_when_opted_in() {
-        let output = repository_macro(
+    fn durable_hook_repository_tokens() -> String {
+        repository_macro(
             quote! { Post, hooks = PostHooks, commit_hooks = true },
             quote! { pub trait PostRepository {} },
-        );
-        let generated = output.to_string();
+        )
+        .to_string()
+    }
+
+    #[test]
+    fn hooked_repository_commit_hooks_register_durable_runner_when_opted_in() {
+        let generated = durable_hook_repository_tokens();
 
         assert!(
             generated.contains("enqueue_repository_commit_hook_pending_on_conn"),
@@ -1921,6 +1924,12 @@ mod tests {
             !generated.contains("self . hooks . after_update (& mut ctx , & record) . await ?"),
             "after_update errors must be reported without rolling back the updated record: {generated}"
         );
+    }
+
+    #[test]
+    fn hooked_repository_create_commit_hooks_finalize_after_regular_after_hook() {
+        let generated = durable_hook_repository_tokens();
+
         let create_stage = generated
             .find("\"create\" , & ctx , & __autumn_commit_hook_record")
             .expect("create commit hook staging should use the encoded record");
@@ -1945,6 +1954,12 @@ mod tests {
             create_after < create_finalize,
             "after_create_commit dispatch must see the finalized MutationContext from after_create: {generated}"
         );
+    }
+
+    #[test]
+    fn hooked_repository_update_commit_hooks_finalize_after_regular_after_hook() {
+        let generated = durable_hook_repository_tokens();
+
         let update_stage = generated
             .find("\"update\" , & ctx , & __autumn_commit_hook_record")
             .expect("update commit hook staging should use the encoded record");
@@ -1970,6 +1985,12 @@ mod tests {
             update_after < update_finalize,
             "after_update_commit dispatch must see the finalized MutationContext from after_update: {generated}"
         );
+    }
+
+    #[test]
+    fn hooked_repository_delete_commit_hooks_lock_and_check_deleted_count() {
+        let generated = durable_hook_repository_tokens();
+
         let delete_start = generated
             .find("MutationOp :: Delete")
             .expect("delete path should still be generated");
