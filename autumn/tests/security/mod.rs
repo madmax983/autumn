@@ -13,3 +13,4 @@ pub mod fallback_middleware_bypass;
 pub mod rate_limit_xff_bypass;
 pub mod session_exhaustion;
 pub mod session_fixation;
+pub mod method_override_xfh_spoofing;

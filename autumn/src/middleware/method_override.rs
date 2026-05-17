@@ -396,18 +396,31 @@ fn origin_matches_request(origin: &str, headers: &http::HeaderMap) -> bool {
         return false;
     };
 
-    let expected_host = headers
-        .get("x-forwarded-host")
-        .and_then(|v| v.to_str().ok())
-        .or_else(|| {
+    let expected_host = {
+        let xfh: Vec<&str> = headers
+            .get_all("x-forwarded-host")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect();
+
+        if xfh.is_empty() {
             headers
                 .get(http::header::HOST)
                 .and_then(|v| v.to_str().ok())
-        });
+                .map(ToOwned::to_owned)
+        } else {
+            let joined = xfh.join(",");
+            joined
+                .rsplit(',')
+                .next()
+                .map(str::trim)
+                .map(ToOwned::to_owned)
+        }
+    };
     let Some(expected_host) = expected_host else {
         return false;
     };
-    if !origin_authority.eq_ignore_ascii_case(expected_host) {
+    if !origin_authority.eq_ignore_ascii_case(&expected_host) {
         return false;
     }
 
