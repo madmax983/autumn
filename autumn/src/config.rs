@@ -1045,6 +1045,13 @@ pub struct IdempotencyConfig {
     /// Time-to-live in seconds for stored idempotency records.
     #[serde(default = "default_idempotency_ttl_secs")]
     pub ttl_secs: u64,
+    /// Maximum stale lifetime for distributed in-flight locks.
+    ///
+    /// The lock is released as soon as the handler finishes. This value is only
+    /// the backend safety expiry for crashes or lost unlocks, so it should be
+    /// comfortably longer than any supported mutating request duration.
+    #[serde(default = "default_idempotency_in_flight_ttl_secs")]
+    pub in_flight_ttl_secs: u64,
     /// Allow the in-memory backend in production environments.
     #[serde(default)]
     pub allow_memory_in_production: bool,
@@ -1059,6 +1066,7 @@ impl Default for IdempotencyConfig {
             enabled: None,
             backend: IdempotencyBackend::default(),
             ttl_secs: default_idempotency_ttl_secs(),
+            in_flight_ttl_secs: default_idempotency_in_flight_ttl_secs(),
             allow_memory_in_production: false,
             redis: IdempotencyRedisConfig::default(),
         }
@@ -1066,6 +1074,10 @@ impl Default for IdempotencyConfig {
 }
 
 const fn default_idempotency_ttl_secs() -> u64 {
+    86_400
+}
+
+const fn default_idempotency_in_flight_ttl_secs() -> u64 {
     86_400
 }
 
@@ -1468,6 +1480,11 @@ impl AutumnConfig {
             env,
             "AUTUMN_IDEMPOTENCY__TTL_SECS",
             &mut self.idempotency.ttl_secs,
+        );
+        parse_env(
+            env,
+            "AUTUMN_IDEMPOTENCY__IN_FLIGHT_TTL_SECS",
+            &mut self.idempotency.in_flight_ttl_secs,
         );
         parse_env_bool(
             env,

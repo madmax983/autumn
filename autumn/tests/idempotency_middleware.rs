@@ -1,11 +1,16 @@
 //! Integration tests for HTTP idempotency-key middleware (issue #677).
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use autumn_web::idempotency::{IdempotencyLayer, MemoryIdempotencyStore};
 use autumn_web::test::TestApp;
 use autumn_web::{get, post, put, routes};
 use axum::http::StatusCode;
+use tower::{Layer, Service};
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -20,10 +25,23 @@ fn make_store(ttl: Duration) -> Arc<dyn autumn_web::idempotency::IdempotencyStor
 /// Replicates the storage-key format used by `IdempotencyLayer` so tests can
 /// pre-lock the exact slot the middleware will look up.
 fn storage_key(method: &str, path: &str, auth: &str, idempotency_key: &str) -> String {
-    use std::hash::{DefaultHasher, Hash, Hasher};
-    let mut h = DefaultHasher::new();
-    auth.hash(&mut h);
-    format!("{}:{}:{:x}:{}", method, path, h.finish(), idempotency_key)
+    use sha2::Digest as _;
+
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"authorization:");
+    if !auth.is_empty() {
+        hasher.update(auth.as_bytes());
+    }
+    hasher.update(b"\nsession:");
+    let principal = hasher
+        .finalize()
+        .iter()
+        .fold(String::with_capacity(64), |mut out, byte| {
+            use std::fmt::Write as _;
+            let _ = write!(out, "{byte:02x}");
+            out
+        });
+    format!("{method}:{path}:{principal}:{idempotency_key}")
 }
 
 /// Axum middleware that injects a 5-byte `UploadConfig` limit into extensions.
@@ -72,6 +90,142 @@ async fn test_deduplication() {
     assert_eq!(r1.text(), r2.text());
 
     let _ = store; // keep store alive
+}
+
+static INTERCEPT_CALLS: AtomicUsize = AtomicUsize::new(0);
+static INTERCEPTED_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
+static ANONYMOUS_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+/// Route-local interceptor used to prove idempotency replays still traverse
+/// `#[intercept(...)]` layers before the cached response is returned.
+#[derive(Clone)]
+struct CountInterceptLayer;
+
+#[derive(Clone)]
+struct CountInterceptService<S> {
+    inner: S,
+}
+
+impl<S> Layer<S> for CountInterceptLayer {
+    type Service = CountInterceptService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        CountInterceptService { inner }
+    }
+}
+
+impl<S> Service<axum::extract::Request> for CountInterceptService<S>
+where
+    S: Service<
+            axum::extract::Request,
+            Response = axum::response::Response,
+            Error = std::convert::Infallible,
+        > + Clone
+        + Send
+        + 'static,
+    S::Future: Send + 'static,
+{
+    type Response = axum::response::Response;
+    type Error = std::convert::Infallible;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: axum::extract::Request) -> Self::Future {
+        INTERCEPT_CALLS.fetch_add(1, Ordering::SeqCst);
+        let clone = self.inner.clone();
+        let mut inner = std::mem::replace(&mut self.inner, clone);
+        Box::pin(async move { inner.call(req).await })
+    }
+}
+
+#[post("/public-create")]
+async fn anonymous_create_handler() -> &'static str {
+    ANONYMOUS_HANDLER_CALLS.fetch_add(1, Ordering::SeqCst);
+    "created"
+}
+
+#[post("/intercepted")]
+#[intercept(CountInterceptLayer)]
+async fn intercepted_create_handler() -> &'static str {
+    INTERCEPTED_HANDLER_CALLS.fetch_add(1, Ordering::SeqCst);
+    "created"
+}
+
+/// Anonymous requests without an existing session cookie still share a stable
+/// anonymous idempotency scope. The global `SessionLayer` creates a fresh
+/// request-local `Session` for each request, but that generated ID must not split
+/// the idempotency cache when no cookie was persisted by the client.
+#[tokio::test]
+async fn test_anonymous_requests_without_cookie_replay() {
+    ANONYMOUS_HANDLER_CALLS.store(0, Ordering::SeqCst);
+
+    let client = TestApp::new()
+        .routes(routes![anonymous_create_handler])
+        .idempotent()
+        .build();
+
+    let r1 = client
+        .post("/public-create")
+        .header("idempotency-key", "anonymous-create")
+        .send()
+        .await;
+    r1.assert_ok();
+    assert_eq!(r1.header("set-cookie"), None);
+
+    let r2 = client
+        .post("/public-create")
+        .header("idempotency-key", "anonymous-create")
+        .send()
+        .await;
+    r2.assert_ok();
+    assert_eq!(r2.header("x-idempotent-replayed"), Some("true"));
+    assert_eq!(
+        ANONYMOUS_HANDLER_CALLS.load(Ordering::SeqCst),
+        1,
+        "anonymous retry without a session cookie must not re-enter the handler"
+    );
+}
+
+/// Cached idempotency replays must still pass through route-local interceptors
+/// such as auth, tenant, and audit layers.
+#[tokio::test]
+async fn test_replay_traverses_route_interceptor_without_reentering_handler() {
+    INTERCEPT_CALLS.store(0, Ordering::SeqCst);
+    INTERCEPTED_HANDLER_CALLS.store(0, Ordering::SeqCst);
+
+    let client = TestApp::new()
+        .routes(routes![intercepted_create_handler])
+        .idempotent()
+        .build();
+
+    let r1 = client
+        .post("/intercepted")
+        .header("idempotency-key", "intercepted-key")
+        .send()
+        .await;
+    r1.assert_ok();
+    assert_eq!(r1.header("x-idempotent-replayed"), None);
+
+    let r2 = client
+        .post("/intercepted")
+        .header("idempotency-key", "intercepted-key")
+        .send()
+        .await;
+    r2.assert_ok();
+    assert_eq!(r2.header("x-idempotent-replayed"), Some("true"));
+    assert_eq!(
+        INTERCEPT_CALLS.load(Ordering::SeqCst),
+        2,
+        "route interceptor must run for the fresh request and replay"
+    );
+    assert_eq!(
+        INTERCEPTED_HANDLER_CALLS.load(Ordering::SeqCst),
+        1,
+        "cached replay must not re-enter the mutating handler"
+    );
 }
 
 /// A different payload with the same key returns 422.
@@ -329,7 +483,10 @@ async fn test_concurrent_duplicate_returns_409() {
     // Pre-lock the scoped storage key to simulate an in-flight request.
     // The middleware namespaces by method, path, and auth, so we replicate
     // the same format here (no Authorization header → auth = "").
-    store.try_lock(&storage_key("POST", "/ping", "", "inflight-key"));
+    store.try_lock(
+        &storage_key("POST", "/ping", "", "inflight-key"),
+        Duration::from_secs(3600),
+    );
 
     let req = axum::http::Request::builder()
         .method("POST")
@@ -422,6 +579,10 @@ fn test_config_fields() {
         "middleware must be absent (not enabled) by default"
     );
     assert_eq!(config.ttl_secs, 86_400, "default TTL is 24 hours");
+    assert_eq!(
+        config.in_flight_ttl_secs, 86_400,
+        "default in-flight lock TTL is long enough for supported request durations"
+    );
     assert!(
         !config.allow_memory_in_production,
         "memory backend is rejected in production by default"
@@ -486,6 +647,64 @@ async fn test_error_response_not_cached() {
         CALL_COUNT.load(Ordering::SeqCst),
         2,
         "handler should execute twice since error was not cached"
+    );
+}
+
+/// Redirect-after-post is a successful mutation outcome and must be cached,
+/// otherwise a client retry can duplicate the side effect before following the
+/// redirect.
+#[tokio::test]
+async fn test_successful_redirect_response_is_cached() {
+    use tower::ServiceExt;
+
+    static CALL_COUNT: AtomicUsize = AtomicUsize::new(0);
+    CALL_COUNT.store(0, Ordering::SeqCst);
+
+    let store = make_store(Duration::from_secs(3600));
+    let layer = IdempotencyLayer::new(store);
+
+    let app = axum::Router::new()
+        .route(
+            "/create-then-redirect",
+            axum::routing::post(|| async {
+                CALL_COUNT.fetch_add(1, Ordering::SeqCst);
+                axum::response::Response::builder()
+                    .status(StatusCode::SEE_OTHER)
+                    .header("location", "/created")
+                    .body(axum::body::Body::empty())
+                    .unwrap()
+            }),
+        )
+        .layer(layer);
+
+    let req1 = axum::http::Request::builder()
+        .method("POST")
+        .uri("/create-then-redirect")
+        .header("idempotency-key", "redirect-key")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp1 = app.clone().oneshot(req1).await.unwrap();
+    assert_eq!(resp1.status(), StatusCode::SEE_OTHER);
+
+    let req2 = axum::http::Request::builder()
+        .method("POST")
+        .uri("/create-then-redirect")
+        .header("idempotency-key", "redirect-key")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp2 = app.clone().oneshot(req2).await.unwrap();
+    assert_eq!(resp2.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        resp2
+            .headers()
+            .get("x-idempotent-replayed")
+            .map(|v| v.to_str().unwrap()),
+        Some("true")
+    );
+    assert_eq!(
+        CALL_COUNT.load(Ordering::SeqCst),
+        1,
+        "successful redirect retry must replay instead of re-entering the handler"
     );
 }
 
@@ -682,7 +901,7 @@ fn test_default_store_ttl_trait_impl() {
             None
         }
         fn set(&self, _: &str, _: IdempotencyRecord, _: Vec<u8>, _: Duration) {}
-        fn try_lock(&self, _: &str) -> bool {
+        fn try_lock(&self, _: &str, _: Duration) -> bool {
             true
         }
         fn unlock(&self, _: &str) {}

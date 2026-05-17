@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use futures::StreamExt as FuturesStreamExt;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -10,16 +10,12 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
-use axum::http::{HeaderMap, Method, Request, Response, StatusCode};
+use axum::http::{HeaderMap, Method, Request, Response, StatusCode, request::Parts};
 use sha2::Digest as _;
 use tower::{Layer, Service};
 
 static IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
 static X_IDEMPOTENT_REPLAYED: &str = "x-idempotent-replayed";
-
-/// How long an in-flight marker survives before being treated as stale.
-/// Guards against crashes that leave the lock permanently held.
-const IN_FLIGHT_TTL: Duration = Duration::from_secs(30);
 
 /// Maximum response body size stored in the idempotency cache. Responses
 /// larger than this are returned to the client as-is but not cached, so a
@@ -106,7 +102,9 @@ async fn build_storage_key_for_parts(
     let uri = parts.uri.clone();
     let headers = parts.headers.clone();
     let session = parts.extensions.get::<crate::session::Session>().cloned();
-    let session_id = if let Some(session) = session {
+    let session_id = if let Some(session) = session
+        && session.is_cookie_backed().await
+    {
         Some(session.id().await)
     } else {
         None
@@ -178,7 +176,7 @@ pub trait IdempotencyStore: Send + Sync + 'static {
     ///
     /// Returns `true` if the lock was acquired (no concurrent request in flight)
     /// or `false` if another request is already processing this key.
-    fn try_lock(&self, key: &str) -> bool;
+    fn try_lock(&self, key: &str, lock_ttl: Duration) -> bool;
 
     /// Release the in-flight lock for `key`.
     fn unlock(&self, key: &str);
@@ -195,14 +193,14 @@ pub trait IdempotencyStore: Send + Sync + 'static {
 
 /// In-memory idempotency store backed by a `RwLock<HashMap>`.
 ///
-/// Evicts expired entries lazily on `get`. In-flight markers are evicted
-/// lazily per-key on `try_lock` using a 30-second stale threshold.
+/// Evicts expired entries lazily on `get`. In-flight markers remain held until
+/// `unlock` because this process owns both the handler and the in-memory lock.
 ///
 /// Suitable for single-process deployments and integration tests. For
 /// multi-replica deployments configure `backend = "redis"` in `autumn.toml`.
 pub struct MemoryIdempotencyStore {
     entries: RwLock<HashMap<String, IdempotencyEntry>>,
-    in_flight: RwLock<HashMap<String, Instant>>,
+    in_flight: RwLock<HashSet<String>>,
     /// Counts `set` calls to trigger periodic expired-entry eviction.
     write_count: AtomicU64,
     default_ttl: Duration,
@@ -213,7 +211,7 @@ impl MemoryIdempotencyStore {
     pub fn new(default_ttl: Duration) -> Self {
         Self {
             entries: RwLock::new(HashMap::new()),
-            in_flight: RwLock::new(HashMap::new()),
+            in_flight: RwLock::new(HashSet::new()),
             write_count: AtomicU64::new(0),
             default_ttl,
         }
@@ -244,19 +242,14 @@ impl IdempotencyStore for MemoryIdempotencyStore {
         }
     }
 
-    fn try_lock(&self, key: &str) -> bool {
+    fn try_lock(&self, key: &str, _lock_ttl: Duration) -> bool {
         let mut in_flight = self.in_flight.write().unwrap();
-        let now = Instant::now();
-        // Check only the requested key's lock for staleness — avoids O(N) retain
-        // on every lock acquisition under high concurrency.
-        if in_flight
-            .get(key)
-            .is_some_and(|&started_at| now.duration_since(started_at) < IN_FLIGHT_TTL)
-        {
+        // Check only the requested key's active in-flight marker.
+        if in_flight.contains(key) {
             return false; // still in flight
         }
-        // Not locked, or lock is stale (handler crashed) — acquire.
-        in_flight.insert(key.to_owned(), now);
+        // Not locked: acquire until the handler finishes and unlocks.
+        in_flight.insert(key.to_owned());
         true
     }
 
@@ -277,8 +270,6 @@ mod redis_store {
     use redis::{AsyncCommands, Client, aio::ConnectionManager, aio::ConnectionManagerConfig};
     use serde::{Deserialize, Serialize};
     use std::time::{Duration, Instant};
-
-    const LOCK_TTL_SECS: u64 = 30;
 
     #[derive(Serialize, Deserialize)]
     struct StoredEntry {
@@ -398,8 +389,9 @@ mod redis_store {
             }
         }
 
-        fn try_lock(&self, key: &str) -> bool {
+        fn try_lock(&self, key: &str, lock_ttl: Duration) -> bool {
             let lock_key = self.lock_key(key);
+            let lock_ttl_secs = lock_ttl.as_secs().max(1);
             let mut conn = self.connection.clone();
             tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(async move {
@@ -408,7 +400,7 @@ mod redis_store {
                         .arg("1")
                         .arg("NX")
                         .arg("EX")
-                        .arg(LOCK_TTL_SECS)
+                        .arg(lock_ttl_secs)
                         .query_async(&mut conn)
                         .await;
                     match result {
@@ -445,6 +437,62 @@ mod redis_store {
 #[cfg(feature = "redis")]
 pub use redis_store::RedisIdempotencyStore;
 
+#[derive(Clone)]
+struct IdempotencyReplayResponse {
+    record: IdempotencyRecord,
+}
+
+impl IdempotencyReplayResponse {
+    fn into_response(self) -> Response<Body> {
+        response_from_record(self.record)
+    }
+}
+
+/// Inner route layer used by Autumn-generated handlers to stop before the
+/// mutating handler when an outer idempotency layer has already found a replay.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct IdempotencyReplayLayer;
+
+#[derive(Clone)]
+pub struct IdempotencyReplayService<S> {
+    inner: S,
+}
+
+impl<S> Layer<S> for IdempotencyReplayLayer {
+    type Service = IdempotencyReplayService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        IdempotencyReplayService { inner }
+    }
+}
+
+impl<S> Service<Request<Body>> for IdempotencyReplayService<S>
+where
+    S: Service<Request<Body>, Response = Response<Body>, Error = std::convert::Infallible>
+        + Clone
+        + Send
+        + 'static,
+    S::Future: Send + 'static,
+{
+    type Response = Response<Body>;
+    type Error = std::convert::Infallible;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, mut req: Request<Body>) -> Self::Future {
+        if let Some(replay) = req.extensions_mut().remove::<IdempotencyReplayResponse>() {
+            return Box::pin(async move { Ok(replay.into_response()) });
+        }
+
+        let clone = self.inner.clone();
+        let mut inner = std::mem::replace(&mut self.inner, clone);
+        Box::pin(async move { inner.call(req).await })
+    }
+}
+
 // ── Layer ─────────────────────────────────────────────────────────────────────
 
 /// Tower [`Layer`] that enforces HTTP idempotency semantics per IETF
@@ -463,6 +511,8 @@ pub use redis_store::RedisIdempotencyStore;
 pub struct IdempotencyLayer {
     store: Arc<dyn IdempotencyStore>,
     ttl: Duration,
+    in_flight_ttl: Duration,
+    replay_through_inner: bool,
     metrics: Option<crate::middleware::MetricsCollector>,
 }
 
@@ -473,6 +523,8 @@ impl IdempotencyLayer {
         Self {
             store,
             ttl,
+            in_flight_ttl: ttl,
+            replay_through_inner: false,
             metrics: None,
         }
     }
@@ -480,6 +532,18 @@ impl IdempotencyLayer {
     #[must_use]
     pub const fn with_ttl(mut self, ttl: Duration) -> Self {
         self.ttl = ttl;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_in_flight_ttl(mut self, ttl: Duration) -> Self {
+        self.in_flight_ttl = ttl;
+        self
+    }
+
+    #[must_use]
+    pub const fn replay_through_inner(mut self) -> Self {
+        self.replay_through_inner = true;
         self
     }
 
@@ -498,6 +562,8 @@ impl<S> Layer<S> for IdempotencyLayer {
             inner,
             store: self.store.clone(),
             ttl: self.ttl,
+            in_flight_ttl: self.in_flight_ttl,
+            replay_through_inner: self.replay_through_inner,
             metrics: self.metrics.clone(),
         }
     }
@@ -511,6 +577,8 @@ pub struct IdempotencyService<S> {
     inner: S,
     store: Arc<dyn IdempotencyStore>,
     ttl: Duration,
+    in_flight_ttl: Duration,
+    replay_through_inner: bool,
     metrics: Option<crate::middleware::MetricsCollector>,
 }
 
@@ -538,8 +606,18 @@ where
         let inner = std::mem::replace(&mut self.inner, clone);
         let store = self.store.clone();
         let ttl = self.ttl;
+        let in_flight_ttl = self.in_flight_ttl;
+        let replay_through_inner = self.replay_through_inner;
         let metrics = self.metrics.clone();
-        Box::pin(handle_idempotent_request(inner, store, ttl, metrics, req))
+        Box::pin(handle_idempotent_request(
+            inner,
+            store,
+            ttl,
+            in_flight_ttl,
+            replay_through_inner,
+            metrics,
+            req,
+        ))
     }
 }
 
@@ -563,10 +641,57 @@ fn in_flight_conflict_response() -> Response<Body> {
         .unwrap()
 }
 
+struct PreparedIdempotencyRequest {
+    idempotency_key: String,
+    storage_key: String,
+    body_hash: Vec<u8>,
+    parts: Parts,
+    body_bytes: Bytes,
+}
+
+fn request_idempotency_key(req: &Request<Body>) -> Option<String> {
+    let key = req
+        .headers()
+        .get(IDEMPOTENCY_KEY_HEADER)?
+        .to_str()
+        .unwrap_or("");
+    (!key.is_empty()).then(|| key.to_owned())
+}
+
+async fn prepare_idempotency_request(
+    idempotency_key: String,
+    req: Request<Body>,
+) -> Result<PreparedIdempotencyRequest, Response<Body>> {
+    let (parts, body) = req.into_parts();
+    let storage_key = build_storage_key_for_parts(&idempotency_key, &parts).await;
+    let content_type = parts
+        .headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .map(axum::http::HeaderValue::as_bytes);
+    let body_limit = parts
+        .extensions
+        .get::<crate::security::config::UploadConfig>()
+        .map_or(DEFAULT_REQUEST_BODY_LIMIT, |c| c.max_request_size_bytes);
+    let body_bytes = axum::body::to_bytes(body, body_limit)
+        .await
+        .map_err(|_| request_body_too_large_response())?;
+    let body_hash = compute_body_hash(&body_bytes, content_type);
+
+    Ok(PreparedIdempotencyRequest {
+        idempotency_key,
+        storage_key,
+        body_hash,
+        parts,
+        body_bytes,
+    })
+}
+
 async fn handle_idempotent_request<S>(
     mut inner: S,
     store: Arc<dyn IdempotencyStore>,
     ttl: Duration,
+    in_flight_ttl: Duration,
+    replay_through_inner: bool,
     metrics: Option<crate::middleware::MetricsCollector>,
     req: Request<Body>,
 ) -> Result<Response<Body>, std::convert::Infallible>
@@ -580,44 +705,31 @@ where
         return inner.call(req).await;
     }
 
-    let Some(key_hdr) = req.headers().get(IDEMPOTENCY_KEY_HEADER) else {
+    let Some(idempotency_key) = request_idempotency_key(&req) else {
         return inner.call(req).await;
     };
-    let idempotency_key = key_hdr.to_str().unwrap_or("").to_owned();
-    if idempotency_key.is_empty() {
-        return inner.call(req).await;
-    }
-    let (parts, body) = req.into_parts();
-    let storage_key = build_storage_key_for_parts(&idempotency_key, &parts).await;
-    let content_type = parts
-        .headers
-        .get(axum::http::header::CONTENT_TYPE)
-        .map(axum::http::HeaderValue::as_bytes);
 
-    let body_limit = parts
-        .extensions
-        .get::<crate::security::config::UploadConfig>()
-        .map_or(DEFAULT_REQUEST_BODY_LIMIT, |c| c.max_request_size_bytes);
-    let Ok(body_bytes) = axum::body::to_bytes(body, body_limit).await else {
-        return Ok(request_body_too_large_response());
+    let prepared = match prepare_idempotency_request(idempotency_key, req).await {
+        Ok(prepared) => prepared,
+        Err(response) => return Ok(response),
     };
-
-    let body_hash = compute_body_hash(&body_bytes, content_type);
 
     // ── Cache hit ──────────────────────────────────────────────────────────
-    if let Some(entry) = store.get(&storage_key) {
-        return Ok(handle_cache_hit(
+    if let Some(entry) = store.get(&prepared.storage_key) {
+        return replay_cache_hit(
+            &mut inner,
             entry,
-            &body_hash,
-            &idempotency_key,
+            prepared,
             metrics.as_ref(),
-        ));
+            replay_through_inner,
+        )
+        .await;
     }
 
     // ── In-flight check (concurrent duplicate) ─────────────────────────────
-    if !store.try_lock(&storage_key) {
+    if !store.try_lock(&prepared.storage_key, in_flight_ttl) {
         tracing::debug!(
-            idempotency.key = %idempotency_key,
+            idempotency.key = %prepared.idempotency_key,
             "Idempotency key already in flight — returning 409"
         );
         metrics
@@ -628,15 +740,41 @@ where
 
     // Double-check after acquiring the lock: a concurrent request may have
     // completed between our miss check and lock acquisition.
-    if let Some(entry) = store.get(&storage_key) {
-        store.unlock(&storage_key);
-        return Ok(handle_cache_hit(
+    if let Some(entry) = store.get(&prepared.storage_key) {
+        store.unlock(&prepared.storage_key);
+        return replay_cache_hit(
+            &mut inner,
             entry,
-            &body_hash,
-            &idempotency_key,
+            prepared,
             metrics.as_ref(),
-        ));
+            replay_through_inner,
+        )
+        .await;
     }
+
+    handle_cache_miss(inner, store.as_ref(), ttl, prepared, metrics.as_ref()).await
+}
+
+async fn handle_cache_miss<S>(
+    mut inner: S,
+    store: &dyn IdempotencyStore,
+    ttl: Duration,
+    prepared: PreparedIdempotencyRequest,
+    metrics: Option<&crate::middleware::MetricsCollector>,
+) -> Result<Response<Body>, std::convert::Infallible>
+where
+    S: Service<Request<Body>, Response = Response<Body>, Error = std::convert::Infallible>
+        + Send
+        + 'static,
+    S::Future: Send + 'static,
+{
+    let PreparedIdempotencyRequest {
+        idempotency_key,
+        storage_key,
+        body_hash,
+        parts,
+        body_bytes,
+    } = prepared;
 
     tracing::debug!(
         idempotency.key = %idempotency_key,
@@ -659,7 +797,9 @@ where
             );
             return Ok(Response::from_parts(resp_parts, passthrough_body));
         }
-        CollectedResponseBody::TooLarge(passthrough_body) => {
+        CollectedResponseBody::TooLarge {
+            passthrough_body, ..
+        } => {
             // Body exceeded MAX_CACHEABLE_RESPONSE_BODY — stream through.
             store.unlock(&storage_key);
             tracing::debug!(
@@ -672,10 +812,10 @@ where
         CollectedResponseBody::Cacheable(bytes) => bytes,
     };
 
-    // Cache only 2xx responses; store before unlocking so concurrent duplicates
+    // Cache successful 2xx/3xx responses; store before unlocking so concurrent duplicates
     // still see a locked key rather than racing to re-execute the handler.
     let status = resp_parts.status.as_u16();
-    if (200u32..300).contains(&u32::from(status)) {
+    if (200u32..400).contains(&u32::from(status)) {
         let record = IdempotencyRecord {
             status,
             // set-cookie excluded: prevents session fixation on replay.
@@ -686,7 +826,9 @@ where
     }
     store.unlock(&storage_key);
 
-    metrics.as_ref().inspect(|m| m.record_idempotency_miss());
+    if let Some(m) = metrics {
+        m.record_idempotency_miss();
+    }
 
     // Reconstruct from original parts — preserves set-cookie and extensions.
     Ok(Response::from_parts(resp_parts, Body::from(resp_bytes)))
@@ -702,11 +844,19 @@ where
 ///   preserves the already-read bytes and then yields the original stream error
 enum CollectedResponseBody {
     Cacheable(Bytes),
-    TooLarge(Body),
+    TooLarge {
+        passthrough_body: Body,
+        #[cfg_attr(not(test), allow(dead_code))]
+        buffered_len: usize,
+    },
     StreamError(Body),
 }
 
 async fn collect_response_for_cache(body: Body) -> CollectedResponseBody {
+    collect_response_for_cache_with_limit(body, MAX_CACHEABLE_RESPONSE_BODY).await
+}
+
+async fn collect_response_for_cache_with_limit(body: Body, limit: usize) -> CollectedResponseBody {
     let mut buf = Vec::<u8>::new();
     let mut data_stream = body.into_data_stream();
     loop {
@@ -719,38 +869,57 @@ async fn collect_response_for_cache(body: Body) -> CollectedResponseBody {
                 return CollectedResponseBody::StreamError(passthrough);
             }
             Some(Ok(chunk)) => {
-                buf.extend_from_slice(&chunk);
-                if buf.len() > MAX_CACHEABLE_RESPONSE_BODY {
-                    let leading = Bytes::from(buf);
-                    let passthrough = Body::from_stream(
-                        futures::stream::once(futures::future::ready(Ok::<Bytes, axum::Error>(
-                            leading,
-                        )))
-                        .chain(data_stream),
-                    );
-                    return CollectedResponseBody::TooLarge(passthrough);
+                if chunk.len() > limit.saturating_sub(buf.len()) {
+                    let buffered_len = buf.len();
+                    let mut leading_chunks = Vec::with_capacity(2);
+                    if !buf.is_empty() {
+                        leading_chunks.push(Ok::<Bytes, axum::Error>(Bytes::from(buf)));
+                    }
+                    leading_chunks.push(Ok::<Bytes, axum::Error>(chunk));
+                    let passthrough =
+                        Body::from_stream(futures::stream::iter(leading_chunks).chain(data_stream));
+                    return CollectedResponseBody::TooLarge {
+                        passthrough_body: passthrough,
+                        buffered_len,
+                    };
                 }
+                buf.extend_from_slice(&chunk);
             }
         }
     }
     CollectedResponseBody::Cacheable(Bytes::from(buf))
 }
 
-fn handle_cache_hit(
+async fn replay_cache_hit<S>(
+    inner: &mut S,
     entry: IdempotencyEntry,
-    body_hash: &[u8],
-    idempotency_key: &str,
+    prepared: PreparedIdempotencyRequest,
     metrics: Option<&crate::middleware::MetricsCollector>,
-) -> Response<Body> {
+    replay_through_inner: bool,
+) -> Result<Response<Body>, std::convert::Infallible>
+where
+    S: Service<Request<Body>, Response = Response<Body>, Error = std::convert::Infallible>
+        + Send
+        + 'static,
+    S::Future: Send + 'static,
+{
+    let PreparedIdempotencyRequest {
+        idempotency_key,
+        body_hash,
+        mut parts,
+        body_bytes,
+        ..
+    } = prepared;
+
     if entry.body_hash != body_hash {
         tracing::debug!(
             idempotency.key = %idempotency_key,
             "Idempotency payload mismatch — returning 422"
         );
-        return Response::builder()
+        return Ok(Response::builder()
             .status(StatusCode::UNPROCESSABLE_ENTITY)
             .body(Body::from("idempotency key reused with different payload"))
-            .unwrap();
+            .unwrap());
     }
 
     tracing::debug!(
@@ -762,13 +931,27 @@ fn handle_cache_hit(
         m.record_idempotency_hit();
     }
 
-    let mut builder = Response::builder().status(entry.record.status);
-    for (name, value) in &entry.record.headers {
+    let replay = IdempotencyReplayResponse {
+        record: entry.record,
+    };
+    if replay_through_inner {
+        parts.extensions.insert(replay);
+        return inner
+            .call(Request::from_parts(parts, Body::from(body_bytes)))
+            .await;
+    }
+
+    Ok(replay.into_response())
+}
+
+fn response_from_record(record: IdempotencyRecord) -> Response<Body> {
+    let mut builder = Response::builder().status(record.status);
+    for (name, value) in &record.headers {
         builder = builder.header(name.as_str(), value.as_slice());
     }
     builder
         .header(X_IDEMPOTENT_REPLAYED, "true")
-        .body(Body::from(entry.record.body))
+        .body(Body::from(record.body))
         .unwrap()
 }
 
@@ -812,7 +995,7 @@ mod tests {
             self.record_key(key);
         }
 
-        fn try_lock(&self, key: &str) -> bool {
+        fn try_lock(&self, key: &str, _lock_ttl: Duration) -> bool {
             self.record_key(key);
             true
         }
@@ -891,6 +1074,30 @@ mod tests {
             body.is_err(),
             "idempotency middleware must preserve response body stream errors"
         );
+    }
+
+    #[tokio::test]
+    async fn collect_response_checks_chunk_size_before_buffering_past_cap() {
+        let chunk = Bytes::from(vec![b'x'; 64]);
+        match collect_response_for_cache_with_limit(Body::from(chunk), 10).await {
+            CollectedResponseBody::TooLarge {
+                passthrough_body,
+                buffered_len,
+            } => {
+                assert_eq!(
+                    buffered_len, 0,
+                    "single over-cap chunk must not be copied into the cache buffer first"
+                );
+                let delivered = axum::body::to_bytes(passthrough_body, usize::MAX)
+                    .await
+                    .expect("passthrough body should collect");
+                assert_eq!(delivered.len(), 64);
+            }
+            CollectedResponseBody::Cacheable(_) => {
+                panic!("over-cap chunk must not be considered cacheable")
+            }
+            CollectedResponseBody::StreamError(_) => panic!("body should not stream-error"),
+        }
     }
 
     #[tokio::test]

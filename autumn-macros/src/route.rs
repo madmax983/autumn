@@ -163,6 +163,11 @@ fn build_handler_expr(
     interceptors: &[syn::Path],
 ) -> TokenStream {
     let mut expr = quote! { ::autumn_web::reexports::axum::routing::#routing_fn(#handler_name) };
+    expr = quote! {
+        ::autumn_web::reexports::axum::routing::MethodRouter::<
+            ::autumn_web::AppState, ::core::convert::Infallible
+        >::layer(#expr, ::autumn_web::idempotency::IdempotencyReplayLayer)
+    };
     for interceptor in interceptors.iter().rev() {
         // Explicit type annotation avoids inference ambiguity with chained .layer() calls.
         expr = quote! {

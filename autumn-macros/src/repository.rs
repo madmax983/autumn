@@ -861,7 +861,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 ::autumn_web::Route {
                     method: ::autumn_web::reexports::http::Method::GET,
                     path: #api_path,
-                    handler: ::autumn_web::reexports::axum::routing::get(#list_fn),
+                    handler: ::autumn_web::reexports::axum::routing::MethodRouter::<
+                        ::autumn_web::AppState, ::core::convert::Infallible
+                    >::layer(
+                        ::autumn_web::reexports::axum::routing::get(#list_fn),
+                        ::autumn_web::idempotency::IdempotencyReplayLayer,
+                    ),
                     name: ::core::stringify!(#list_fn),
                     api_doc: ::autumn_web::openapi::ApiDoc {
                         method: "GET",
@@ -907,7 +912,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 ::autumn_web::Route {
                     method: ::autumn_web::reexports::http::Method::GET,
                     path: #id_path,
-                    handler: ::autumn_web::reexports::axum::routing::get(#get_fn),
+                    handler: ::autumn_web::reexports::axum::routing::MethodRouter::<
+                        ::autumn_web::AppState, ::core::convert::Infallible
+                    >::layer(
+                        ::autumn_web::reexports::axum::routing::get(#get_fn),
+                        ::autumn_web::idempotency::IdempotencyReplayLayer,
+                    ),
                     name: ::core::stringify!(#get_fn),
                     api_doc: ::autumn_web::openapi::ApiDoc {
                         method: "GET",
@@ -949,7 +959,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 ::autumn_web::Route {
                     method: ::autumn_web::reexports::http::Method::POST,
                     path: #api_path,
-                    handler: ::autumn_web::reexports::axum::routing::post(#create_fn),
+                    handler: ::autumn_web::reexports::axum::routing::MethodRouter::<
+                        ::autumn_web::AppState, ::core::convert::Infallible
+                    >::layer(
+                        ::autumn_web::reexports::axum::routing::post(#create_fn),
+                        ::autumn_web::idempotency::IdempotencyReplayLayer,
+                    ),
                     name: ::core::stringify!(#create_fn),
                     api_doc: ::autumn_web::openapi::ApiDoc {
                         method: "POST",
@@ -996,7 +1011,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 ::autumn_web::Route {
                     method: ::autumn_web::reexports::http::Method::PUT,
                     path: #id_path,
-                    handler: ::autumn_web::reexports::axum::routing::put(#update_fn),
+                    handler: ::autumn_web::reexports::axum::routing::MethodRouter::<
+                        ::autumn_web::AppState, ::core::convert::Infallible
+                    >::layer(
+                        ::autumn_web::reexports::axum::routing::put(#update_fn),
+                        ::autumn_web::idempotency::IdempotencyReplayLayer,
+                    ),
                     name: ::core::stringify!(#update_fn),
                     api_doc: ::autumn_web::openapi::ApiDoc {
                         method: "PUT",
@@ -1043,7 +1063,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 ::autumn_web::Route {
                     method: ::autumn_web::reexports::http::Method::DELETE,
                     path: #id_path,
-                    handler: ::autumn_web::reexports::axum::routing::delete(#delete_fn),
+                    handler: ::autumn_web::reexports::axum::routing::MethodRouter::<
+                        ::autumn_web::AppState, ::core::convert::Infallible
+                    >::layer(
+                        ::autumn_web::reexports::axum::routing::delete(#delete_fn),
+                        ::autumn_web::idempotency::IdempotencyReplayLayer,
+                    ),
                     name: ::core::stringify!(#delete_fn),
                     api_doc: ::autumn_web::openapi::ApiDoc {
                         method: "DELETE",

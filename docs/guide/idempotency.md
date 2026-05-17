@@ -57,6 +57,7 @@ X-Idempotent-Replayed: true
 enabled   = true
 backend   = "memory"   # "memory" | "redis"
 ttl_secs  = 86400      # how long to cache responses (default: 24 h)
+in_flight_ttl_secs = 86400 # Redis safety expiry for active in-flight locks
 
 # Memory backend: allow in production (off by default, see below)
 allow_memory_in_production = false
@@ -72,6 +73,9 @@ Environment overrides:
 | Variable | Overrides |
 |---|---|
 | `AUTUMN_IDEMPOTENCY__ENABLED` | `idempotency.enabled` |
+| `AUTUMN_IDEMPOTENCY__BACKEND` | `idempotency.backend` |
+| `AUTUMN_IDEMPOTENCY__TTL_SECS` | `idempotency.ttl_secs` |
+| `AUTUMN_IDEMPOTENCY__IN_FLIGHT_TTL_SECS` | `idempotency.in_flight_ttl_secs` |
 | `AUTUMN_IDEMPOTENCY__REDIS__URL` | `idempotency.redis.url` |
 | `AUTUMN_IDEMPOTENCY__REDIS__KEY_PREFIX` | `idempotency.redis.key_prefix` |
 
@@ -82,6 +86,7 @@ Environment overrides:
 | `enabled` | `false` (opt-in) |
 | `backend` | `"memory"` |
 | `ttl_secs` | `86400` (24 hours) |
+| `in_flight_ttl_secs` | `86400` (24 hours) |
 | `allow_memory_in_production` | `false` |
 | `redis.key_prefix` | `"autumn:idempotency"` |
 
@@ -124,15 +129,17 @@ Requires the `redis` Cargo feature on `autumn-web`.
 | Condition | Status | Extra header |
 |---|---|---|
 | First request for a key | handler's status | — |
-| Repeat with same body | `200` (cached) | `X-Idempotent-Replayed: true` |
+| Repeat with same body | cached status | `X-Idempotent-Replayed: true` |
 | Repeat with different body | `422 Unprocessable Entity` | — |
 | Concurrent duplicate (first still in-flight) | `409 Conflict` | `Retry-After: 1` |
 | No `Idempotency-Key` header | handler's status | — |
 | Non-mutating method (GET, HEAD) | handler's status | — |
 
-**Only 2xx responses are cached.** If a handler returns an error (5xx, 4xx),
-the entry is not stored and the next attempt re-executes the handler — allowing
-transient failures to be retried freely.
+**Only successful 2xx and 3xx responses are cached.** Redirect-after-post
+responses such as `303 See Other` are treated as successful mutation outcomes.
+If a handler returns an error (5xx, 4xx), the entry is not stored and the next
+attempt re-executes the handler — allowing transient failures to be retried
+freely.
 
 ### Payload mismatch (422)
 
@@ -267,7 +274,7 @@ impl IdempotencyStore for MyStore {
         /* ... */
     }
 
-    fn try_lock(&self, key: &str) -> bool { /* true = lock acquired */ }
+    fn try_lock(&self, key: &str, lock_ttl: Duration) -> bool { /* true = lock acquired */ }
 
     fn unlock(&self, key: &str) { /* ... */ }
 }

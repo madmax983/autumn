@@ -6,11 +6,13 @@
 //! like actuators and probes.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::app::ScopedGroup;
 use crate::config::AutumnConfig;
 use crate::error_pages::{self, SharedRenderer};
 use crate::extract::State;
+use crate::idempotency::{IdempotencyLayer, IdempotencyStore, MemoryIdempotencyStore};
 use crate::middleware::RequestIdLayer;
 use crate::middleware::dev;
 use crate::middleware::exception_filter::{
@@ -261,7 +263,8 @@ pub fn try_build_router_inner(
         &config.session.cookie_name,
     )?;
 
-    let mut router = group_and_mount_routes(route_list);
+    let idempotency_layer = build_idempotency_layer(config, &state)?;
+    let mut router = group_and_mount_routes(route_list, idempotency_layer.as_ref());
 
     let dev_reload_enabled = dev::is_enabled_with_env(&crate::config::OsEnv);
 
@@ -286,7 +289,7 @@ pub fn try_build_router_inner(
     router = router.nest_service("/static", tower_http::services::ServeDir::new(&static_dir));
     router = router.layer(axum::middleware::from_fn(asset_cache_control));
 
-    router = mount_scoped_groups(router, ctx.scoped_groups);
+    router = mount_scoped_groups(router, ctx.scoped_groups, idempotency_layer.as_ref());
 
     router = mount_raw_routers(router, ctx.merge_routers, ctx.nest_routers);
 
@@ -755,7 +758,10 @@ fn check_openapi_path_against(
     Ok(())
 }
 
-fn group_and_mount_routes(route_list: Vec<Route>) -> axum::Router<AppState> {
+fn group_and_mount_routes(
+    route_list: Vec<Route>,
+    idempotency_layer: Option<&IdempotencyLayer>,
+) -> axum::Router<AppState> {
     // Group routes by path so multiple methods on the same path
     // (e.g. GET /admin + POST /admin) are merged into a single
     // MethodRouter. Axum 0.7+ panics if .route() is called twice
@@ -780,7 +786,10 @@ fn group_and_mount_routes(route_list: Vec<Route>) -> axum::Router<AppState> {
     }
 
     let mut router = axum::Router::new();
-    for (path, method_router) in grouped {
+    for (path, mut method_router) in grouped {
+        if let Some(layer) = idempotency_layer {
+            method_router = method_router.layer(layer.clone());
+        }
         router = router.route(path, method_router);
     }
     router
@@ -931,6 +940,7 @@ fn mount_actuator_endpoints(
 fn mount_scoped_groups(
     mut router: axum::Router<AppState>,
     scoped_groups: Vec<ScopedGroup>,
+    idempotency_layer: Option<&IdempotencyLayer>,
 ) -> axum::Router<AppState> {
     // Mount scoped route groups (each with its own middleware layer).
     for group in scoped_groups {
@@ -944,6 +954,9 @@ fn mount_scoped_groups(
                 "Mounted scoped route"
             );
             sub_router = sub_router.route(route.path, route.handler);
+        }
+        if let Some(layer) = idempotency_layer {
+            sub_router = sub_router.layer(layer.clone());
         }
         sub_router = (group.apply_layer)(sub_router);
         router = router.nest(&group.prefix, sub_router);
@@ -1055,6 +1068,53 @@ where
     ))
 }
 
+fn build_idempotency_layer(
+    config: &AutumnConfig,
+    state: &AppState,
+) -> Result<Option<crate::idempotency::IdempotencyLayer>, RouterBuildError> {
+    if !config.idempotency.enabled.unwrap_or(false) {
+        return Ok(None);
+    }
+
+    let ttl = Duration::from_secs(config.idempotency.ttl_secs);
+    let in_flight_ttl = Duration::from_secs(config.idempotency.in_flight_ttl_secs);
+    let store: std::sync::Arc<dyn IdempotencyStore> = match config.idempotency.backend {
+        crate::config::IdempotencyBackend::Memory => {
+            std::sync::Arc::new(MemoryIdempotencyStore::new(ttl))
+        }
+        #[cfg(feature = "redis")]
+        crate::config::IdempotencyBackend::Redis => {
+            match crate::idempotency::RedisIdempotencyStore::from_config(&config.idempotency) {
+                Ok(s) => std::sync::Arc::new(s),
+                Err(e) => return Err(RouterBuildError::InvalidIdempotencyBackend(e)),
+            }
+        }
+        #[cfg(not(feature = "redis"))]
+        crate::config::IdempotencyBackend::Redis => {
+            return Err(RouterBuildError::InvalidIdempotencyBackend(
+                "idempotency backend 'redis' requires the autumn-web 'redis' feature \
+                 flag; rebuild with --features redis or switch to backend = \"memory\""
+                    .to_owned(),
+            ));
+        }
+    };
+
+    tracing::debug!(
+        backend = ?config.idempotency.backend,
+        ttl_secs = config.idempotency.ttl_secs,
+        in_flight_ttl_secs = config.idempotency.in_flight_ttl_secs,
+        "Idempotency-key middleware enabled"
+    );
+
+    Ok(Some(
+        IdempotencyLayer::new(store)
+            .with_ttl(ttl)
+            .with_in_flight_ttl(in_flight_ttl)
+            .with_metrics(state.metrics.clone())
+            .replay_through_inner(),
+    ))
+}
+
 #[allow(clippy::cognitive_complexity)]
 fn apply_middleware(
     mut router: axum::Router<AppState>,
@@ -1083,52 +1143,6 @@ fn apply_middleware(
         } else {
             None
         };
-
-    // Idempotency-key middleware: applied BEFORE CORS and CSRF so both security
-    // checks run on every request, including cache hits.  In axum the last
-    // `.layer()` call wraps all earlier ones, so applying idempotency here
-    // makes it the innermost layer — CSRF and CORS sit outside it and therefore
-    // validate every request before the idempotency shortcut fires.
-    if config.idempotency.enabled.unwrap_or(false) {
-        use crate::idempotency::{IdempotencyLayer, IdempotencyStore, MemoryIdempotencyStore};
-        use std::time::Duration;
-
-        let ttl = Duration::from_secs(config.idempotency.ttl_secs);
-        let store: std::sync::Arc<dyn IdempotencyStore> = match config.idempotency.backend {
-            crate::config::IdempotencyBackend::Memory => {
-                std::sync::Arc::new(MemoryIdempotencyStore::new(ttl))
-            }
-            #[cfg(feature = "redis")]
-            crate::config::IdempotencyBackend::Redis => {
-                match crate::idempotency::RedisIdempotencyStore::from_config(&config.idempotency) {
-                    Ok(s) => std::sync::Arc::new(s),
-                    Err(e) => {
-                        return Err(RouterBuildError::InvalidIdempotencyBackend(e));
-                    }
-                }
-            }
-            // When the `redis` feature is absent the Redis arm above is compiled
-            // out, so this arm catches it and returns an explicit error rather
-            // than silently downgrading to an in-process memory store.
-            #[cfg(not(feature = "redis"))]
-            crate::config::IdempotencyBackend::Redis => {
-                return Err(RouterBuildError::InvalidIdempotencyBackend(
-                    "idempotency backend 'redis' requires the autumn-web 'redis' feature \
-                         flag; rebuild with --features redis or switch to backend = \"memory\""
-                        .to_owned(),
-                ));
-            }
-        };
-        let layer = IdempotencyLayer::new(store)
-            .with_ttl(ttl)
-            .with_metrics(state.metrics.clone());
-        router = router.layer(layer);
-        tracing::debug!(
-            backend = ?config.idempotency.backend,
-            ttl_secs = config.idempotency.ttl_secs,
-            "Idempotency-key middleware enabled"
-        );
-    }
 
     router = apply_cors_middleware(router, config);
     router = apply_csrf_middleware(router, config, signing_keys_opt.clone());

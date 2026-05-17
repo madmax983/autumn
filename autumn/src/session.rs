@@ -97,6 +97,7 @@ struct SessionInner {
     id: String,
     old_id: Option<String>,
     data: HashMap<String, String>,
+    cookie_backed: bool,
     dirty: bool,
     destroyed: bool,
 }
@@ -106,15 +107,24 @@ impl Session {
     #[doc(hidden)]
     #[must_use]
     pub fn new_for_test(id: String, data: HashMap<String, String>) -> Self {
-        Self::new(id, data)
+        Self::new_cookie_backed(id, data)
     }
 
     fn new(id: String, data: HashMap<String, String>) -> Self {
+        Self::with_cookie_state(id, data, false)
+    }
+
+    fn new_cookie_backed(id: String, data: HashMap<String, String>) -> Self {
+        Self::with_cookie_state(id, data, true)
+    }
+
+    fn with_cookie_state(id: String, data: HashMap<String, String>, cookie_backed: bool) -> Self {
         Self {
             inner: Arc::new(RwLock::new(SessionInner {
                 id,
                 old_id: None,
                 data,
+                cookie_backed,
                 dirty: false,
                 destroyed: false,
             })),
@@ -124,6 +134,12 @@ impl Session {
     /// Returns the session ID.
     pub async fn id(&self) -> String {
         self.inner.read().await.id.clone()
+    }
+
+    /// Returns whether this session ID came from a valid request cookie rather
+    /// than being generated for the current request.
+    pub async fn is_cookie_backed(&self) -> bool {
+        self.inner.read().await.cookie_backed
     }
 
     /// Get a value from the session.
@@ -735,7 +751,12 @@ where
             };
 
             // 2. Create session handle and insert into extensions
-            let session = Session::new(session_id.clone(), data);
+            let cookie_backed = existing_id.as_ref().is_some_and(|id| id == &session_id);
+            let session = if cookie_backed {
+                Session::new_cookie_backed(session_id.clone(), data)
+            } else {
+                Session::new(session_id.clone(), data)
+            };
             req.extensions_mut().insert(session.clone());
 
             // 3. Call inner service
