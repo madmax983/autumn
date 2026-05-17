@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use futures::StreamExt as FuturesStreamExt;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -70,12 +70,23 @@ fn principal_scope_digest(auth: Option<&str>, session_id: Option<&str>) -> Strin
     hex_lower(hasher.finalize())
 }
 
+fn push_storage_key_component(hasher: &mut sha2::Sha256, label: &str, value: &[u8]) {
+    hasher.update(label.as_bytes());
+    hasher.update(b":");
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(b":");
+    hasher.update(value);
+    hasher.update(b";");
+}
+
 /// Namespace the cache key by method, path, a stable principal digest, and the
 /// client-supplied idempotency key.
 ///
 /// Namespacing by method+path prevents cross-endpoint cache collisions (P2).
 /// Namespacing by Authorization and session scope prevents cross-principal
-/// collisions (P1), including cookie-backed authenticated sessions.
+/// collisions (P1), including cookie-backed authenticated sessions. Each
+/// component is length-delimited inside a SHA-256 digest so raw `:` bytes in
+/// paths or client-controlled keys cannot synthesize another storage key.
 fn build_storage_key(
     idempotency_key: &str,
     method: &Method,
@@ -91,7 +102,12 @@ fn build_storage_key(
         .and_then(|v| v.to_str().ok())
         .filter(|auth| !auth.is_empty());
     let principal = principal_scope_digest(auth, session_id);
-    format!("{method}:{path}:{principal}:{idempotency_key}")
+    let mut hasher = sha2::Sha256::new();
+    push_storage_key_component(&mut hasher, "method", method.as_str().as_bytes());
+    push_storage_key_component(&mut hasher, "target", path.as_bytes());
+    push_storage_key_component(&mut hasher, "principal", principal.as_bytes());
+    push_storage_key_component(&mut hasher, "idempotency-key", idempotency_key.as_bytes());
+    format!("v2:{}", hex_lower(hasher.finalize()))
 }
 
 async fn build_storage_key_for_parts(
@@ -160,6 +176,23 @@ pub struct IdempotencyEntry {
 
 // ── Store trait ───────────────────────────────────────────────────────────────
 
+/// Error returned when an idempotency backend fails to persist a successful
+/// mutation response.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("{message}")]
+pub struct IdempotencyStoreError {
+    message: String,
+}
+
+impl IdempotencyStoreError {
+    #[must_use]
+    pub fn backend(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
 /// Pluggable storage backend for idempotency entries.
 ///
 /// Implementors must be `Send + Sync + 'static` to be used across async tasks.
@@ -171,6 +204,27 @@ pub trait IdempotencyStore: Send + Sync + 'static {
 
     /// Persist a response with the given TTL.
     fn set(&self, key: &str, record: IdempotencyRecord, body_hash: Vec<u8>, ttl: Duration);
+
+    /// Persist a response with the given TTL, surfacing backend failures.
+    ///
+    /// Existing infallible stores can implement only [`Self::set`]. Fallible
+    /// backends should override this method so the middleware can fail closed
+    /// rather than reporting a cacheable success that was not stored.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdempotencyStoreError`] when the backend cannot persist the
+    /// response record.
+    fn try_set(
+        &self,
+        key: &str,
+        record: IdempotencyRecord,
+        body_hash: Vec<u8>,
+        ttl: Duration,
+    ) -> Result<(), IdempotencyStoreError> {
+        self.set(key, record, body_hash, ttl);
+        Ok(())
+    }
 
     /// Acquire an in-flight lock for `key`.
     ///
@@ -194,13 +248,13 @@ pub trait IdempotencyStore: Send + Sync + 'static {
 /// In-memory idempotency store backed by a `RwLock<HashMap>`.
 ///
 /// Evicts expired entries lazily on `get`. In-flight markers remain held until
-/// `unlock` because this process owns both the handler and the in-memory lock.
+/// `unlock` or until their configured in-flight lock TTL expires.
 ///
 /// Suitable for single-process deployments and integration tests. For
 /// multi-replica deployments configure `backend = "redis"` in `autumn.toml`.
 pub struct MemoryIdempotencyStore {
     entries: RwLock<HashMap<String, IdempotencyEntry>>,
-    in_flight: RwLock<HashSet<String>>,
+    in_flight: RwLock<HashMap<String, Instant>>,
     /// Counts `set` calls to trigger periodic expired-entry eviction.
     write_count: AtomicU64,
     default_ttl: Duration,
@@ -211,7 +265,7 @@ impl MemoryIdempotencyStore {
     pub fn new(default_ttl: Duration) -> Self {
         Self {
             entries: RwLock::new(HashMap::new()),
-            in_flight: RwLock::new(HashSet::new()),
+            in_flight: RwLock::new(HashMap::new()),
             write_count: AtomicU64::new(0),
             default_ttl,
         }
@@ -242,14 +296,23 @@ impl IdempotencyStore for MemoryIdempotencyStore {
         }
     }
 
-    fn try_lock(&self, key: &str, _lock_ttl: Duration) -> bool {
+    fn try_lock(&self, key: &str, lock_ttl: Duration) -> bool {
+        let now = Instant::now();
         let mut in_flight = self.in_flight.write().unwrap();
         // Check only the requested key's active in-flight marker.
-        if in_flight.contains(key) {
+        if let Some(expires_at) = in_flight.get(key)
+            && *expires_at > now
+        {
             return false; // still in flight
         }
-        // Not locked: acquire until the handler finishes and unlocks.
-        in_flight.insert(key.to_owned());
+        // Not locked: acquire until the handler finishes, unlocks, or the
+        // safety TTL expires after cancellation.
+        let ttl = if lock_ttl.is_zero() {
+            Duration::from_secs(1)
+        } else {
+            lock_ttl
+        };
+        in_flight.insert(key.to_owned(), now + ttl);
         true
     }
 
@@ -266,7 +329,7 @@ impl IdempotencyStore for MemoryIdempotencyStore {
 
 #[cfg(feature = "redis")]
 mod redis_store {
-    use super::{IdempotencyEntry, IdempotencyRecord, IdempotencyStore};
+    use super::{IdempotencyEntry, IdempotencyRecord, IdempotencyStore, IdempotencyStoreError};
     use redis::{AsyncCommands, Client, aio::ConnectionManager, aio::ConnectionManagerConfig};
     use serde::{Deserialize, Serialize};
     use std::time::{Duration, Instant};
@@ -362,6 +425,21 @@ mod redis_store {
         }
 
         fn set(&self, key: &str, record: IdempotencyRecord, body_hash: Vec<u8>, ttl: Duration) {
+            if let Err(error) = self.try_set(key, record, body_hash, ttl) {
+                tracing::warn!(
+                    error = %error,
+                    "Failed to persist idempotency entry to Redis"
+                );
+            }
+        }
+
+        fn try_set(
+            &self,
+            key: &str,
+            record: IdempotencyRecord,
+            body_hash: Vec<u8>,
+            ttl: Duration,
+        ) -> Result<(), IdempotencyStoreError> {
             let redis_key = self.entry_key(key);
             let mut conn = self.connection.clone();
             let entry = StoredEntry {
@@ -370,23 +448,23 @@ mod redis_store {
                 body: record.body,
                 body_hash,
             };
-            if let Ok(bytes) = serde_json::to_vec(&entry) {
-                let ttl_secs = ttl.as_secs().max(1);
-                tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current().block_on(async move {
-                        if let Err(e) = conn.set_ex::<_, _, ()>(&redis_key, bytes, ttl_secs).await {
-                            // The handler already succeeded. Log and continue so
-                            // the response is returned; a retry will re-execute
-                            // the handler (idempotency guarantee is degraded).
-                            tracing::warn!(
-                                error = %e,
-                                "Failed to persist idempotency entry to Redis; \
-                                 a retry may re-execute the handler"
-                            );
-                        }
-                    });
-                });
-            }
+            let bytes = serde_json::to_vec(&entry).map_err(|e| {
+                IdempotencyStoreError::backend(format!(
+                    "failed to serialize idempotency entry: {e}"
+                ))
+            })?;
+            let ttl_secs = ttl.as_secs().max(1);
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async move {
+                    conn.set_ex::<_, _, ()>(&redis_key, bytes, ttl_secs)
+                        .await
+                        .map_err(|e| {
+                            IdempotencyStoreError::backend(format!(
+                                "failed to persist idempotency entry to Redis: {e}"
+                            ))
+                        })
+                })
+            })
         }
 
         fn try_lock(&self, key: &str, lock_ttl: Duration) -> bool {
@@ -641,12 +719,55 @@ fn in_flight_conflict_response() -> Response<Body> {
         .unwrap()
 }
 
+fn persistence_failed_response() -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::SERVICE_UNAVAILABLE)
+        .body(Body::from("idempotency persistence unavailable"))
+        .unwrap()
+}
+
 struct PreparedIdempotencyRequest {
     idempotency_key: String,
     storage_key: String,
     body_hash: Vec<u8>,
+    session: Option<crate::session::Session>,
     parts: Parts,
     body_bytes: Bytes,
+}
+
+struct InFlightLockGuard {
+    store: Arc<dyn IdempotencyStore>,
+    key: String,
+    unlock_on_drop: bool,
+}
+
+impl InFlightLockGuard {
+    fn new(store: Arc<dyn IdempotencyStore>, key: String) -> Self {
+        Self {
+            store,
+            key,
+            unlock_on_drop: true,
+        }
+    }
+
+    fn unlock_now(&mut self) {
+        if self.unlock_on_drop {
+            self.store.unlock(&self.key);
+            self.unlock_on_drop = false;
+        }
+    }
+
+    const fn keep_locked_until_ttl(&mut self) {
+        self.unlock_on_drop = false;
+    }
+}
+
+impl Drop for InFlightLockGuard {
+    fn drop(&mut self) {
+        if self.unlock_on_drop {
+            self.store.unlock(&self.key);
+        }
+    }
 }
 
 fn request_idempotency_key(req: &Request<Body>) -> Option<String> {
@@ -664,6 +785,7 @@ async fn prepare_idempotency_request(
 ) -> Result<PreparedIdempotencyRequest, Response<Body>> {
     let (parts, body) = req.into_parts();
     let storage_key = build_storage_key_for_parts(&idempotency_key, &parts).await;
+    let session = parts.extensions.get::<crate::session::Session>().cloned();
     let content_type = parts
         .headers
         .get(axum::http::header::CONTENT_TYPE)
@@ -681,6 +803,7 @@ async fn prepare_idempotency_request(
         idempotency_key,
         storage_key,
         body_hash,
+        session,
         parts,
         body_bytes,
     })
@@ -737,11 +860,12 @@ where
             .inspect(|m| m.record_idempotency_conflict());
         return Ok(in_flight_conflict_response());
     }
+    let mut lock_guard = InFlightLockGuard::new(store.clone(), prepared.storage_key.clone());
 
     // Double-check after acquiring the lock: a concurrent request may have
     // completed between our miss check and lock acquisition.
     if let Some(entry) = store.get(&prepared.storage_key) {
-        store.unlock(&prepared.storage_key);
+        lock_guard.unlock_now();
         return replay_cache_hit(
             &mut inner,
             entry,
@@ -752,15 +876,16 @@ where
         .await;
     }
 
-    handle_cache_miss(inner, store.as_ref(), ttl, prepared, metrics.as_ref()).await
+    handle_cache_miss(inner, store, ttl, prepared, metrics.as_ref(), lock_guard).await
 }
 
 async fn handle_cache_miss<S>(
     mut inner: S,
-    store: &dyn IdempotencyStore,
+    store: Arc<dyn IdempotencyStore>,
     ttl: Duration,
     prepared: PreparedIdempotencyRequest,
     metrics: Option<&crate::middleware::MetricsCollector>,
+    mut lock_guard: InFlightLockGuard,
 ) -> Result<Response<Body>, std::convert::Infallible>
 where
     S: Service<Request<Body>, Response = Response<Body>, Error = std::convert::Infallible>
@@ -772,6 +897,7 @@ where
         idempotency_key,
         storage_key,
         body_hash,
+        session,
         parts,
         body_bytes,
     } = prepared;
@@ -790,7 +916,7 @@ where
     // buffering to avoid materialising large responses in memory.
     let resp_bytes = match collect_response_for_cache(resp_body).await {
         CollectedResponseBody::StreamError(passthrough_body) => {
-            store.unlock(&storage_key);
+            lock_guard.unlock_now();
             tracing::warn!(
                 idempotency.key = %idempotency_key,
                 "I/O error reading response body; passing the body error through without storing idempotency entry"
@@ -801,7 +927,7 @@ where
             passthrough_body, ..
         } => {
             // Body exceeded MAX_CACHEABLE_RESPONSE_BODY — stream through.
-            store.unlock(&storage_key);
+            lock_guard.unlock_now();
             tracing::debug!(
                 idempotency.key = %idempotency_key,
                 limit_bytes = MAX_CACHEABLE_RESPONSE_BODY,
@@ -816,15 +942,35 @@ where
     // still see a locked key rather than racing to re-execute the handler.
     let status = resp_parts.status.as_u16();
     if (200u32..400).contains(&u32::from(status)) {
-        let record = IdempotencyRecord {
-            status,
-            // set-cookie excluded: prevents session fixation on replay.
-            headers: extract_replay_headers(&resp_parts.headers),
-            body: resp_bytes.to_vec(),
+        let session_mutated = if let Some(session) = &session {
+            session.has_pending_changes().await
+        } else {
+            false
         };
-        store.set(&storage_key, record, body_hash, ttl);
+        if session_mutated {
+            tracing::debug!(
+                idempotency.key = %idempotency_key,
+                "Session changed during idempotent request; skipping cache so retry can receive Set-Cookie"
+            );
+        } else {
+            let record = IdempotencyRecord {
+                status,
+                // set-cookie excluded: prevents session fixation on replay.
+                headers: extract_replay_headers(&resp_parts.headers),
+                body: resp_bytes.to_vec(),
+            };
+            if let Err(error) = store.try_set(&storage_key, record, body_hash, ttl) {
+                tracing::error!(
+                    idempotency.key = %idempotency_key,
+                    error = %error,
+                    "Idempotency persistence failed after handler success; failing closed"
+                );
+                lock_guard.keep_locked_until_ttl();
+                return Ok(persistence_failed_response());
+            }
+        }
     }
-    store.unlock(&storage_key);
+    lock_guard.unlock_now();
 
     if let Some(m) = metrics {
         m.record_idempotency_miss();
@@ -1045,6 +1191,23 @@ mod tests {
         hex_lower(hasher.finalize())
     }
 
+    fn expected_storage_key(
+        method: &str,
+        path: &str,
+        auth: Option<&str>,
+        session_id: Option<&str>,
+        idempotency_key: &str,
+    ) -> String {
+        use sha2::Digest as _;
+        let principal = expected_principal_digest(auth, session_id);
+        let mut hasher = sha2::Sha256::new();
+        push_storage_key_component(&mut hasher, "method", method.as_bytes());
+        push_storage_key_component(&mut hasher, "target", path.as_bytes());
+        push_storage_key_component(&mut hasher, "principal", principal.as_bytes());
+        push_storage_key_component(&mut hasher, "idempotency-key", idempotency_key.as_bytes());
+        format!("v2:{}", hex_lower(hasher.finalize()))
+    }
+
     #[tokio::test]
     async fn response_body_stream_errors_are_not_replaced_with_empty_success() {
         let store = Arc::new(MemoryIdempotencyStore::new(Duration::from_secs(60)));
@@ -1156,7 +1319,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn storage_key_hashes_authorization_with_stable_sha256_digest() {
+    async fn storage_key_hashes_length_delimited_components() {
         let observed_store = RecordingStore::default();
         let service = IdempotencyLayer::new(Arc::new(observed_store.clone())).layer(
             tower::service_fn(|_req: Request<Body>| async {
@@ -1182,14 +1345,17 @@ mod tests {
 
         let keys = observed_store.keys();
         let storage_key = keys.first().expect("storage key should be recorded");
-        let segments = storage_key.splitn(4, ':').collect::<Vec<_>>();
-        assert_eq!(segments.len(), 4);
-        assert_eq!(segments[0], "POST");
-        assert_eq!(segments[1], "/payments");
         assert_eq!(
-            segments[2],
-            expected_principal_digest(Some("Bearer stable-token"), None)
+            storage_key,
+            &expected_storage_key(
+                "POST",
+                "/payments",
+                Some("Bearer stable-token"),
+                None,
+                "pay-once"
+            )
         );
-        assert_eq!(segments[3], "pay-once");
+        assert!(!storage_key.contains("/payments"));
+        assert!(!storage_key.contains("pay-once"));
     }
 }

@@ -141,6 +141,16 @@ If a handler returns an error (5xx, 4xx), the entry is not stored and the next
 attempt re-executes the handler — allowing transient failures to be retried
 freely.
 
+Responses that modify the Autumn `Session` are not cached. Session cookies are
+finalized by the outer `SessionLayer` after route-level idempotency has run, so
+retries for session-mutating routes re-execute the handler instead of replaying
+a cached success without the required `Set-Cookie` header.
+
+Routes mounted through `AppBuilder::merge()` or `AppBuilder::nest()` are covered
+by `.idempotent()` as part of the application middleware stack. If you apply
+`IdempotencyLayer` manually to a raw Axum router, use the layer directly as shown
+below.
+
 ### Payload mismatch (422)
 
 If a client sends the same key with a different request body, it almost
@@ -262,7 +272,9 @@ let app = axum::Router::new()
 When you need a custom backend (e.g. DynamoDB, Postgres advisory locks), implement the `IdempotencyStore` trait:
 
 ```rust,ignore
-use autumn_web::idempotency::{IdempotencyEntry, IdempotencyRecord, IdempotencyStore};
+use autumn_web::idempotency::{
+    IdempotencyEntry, IdempotencyRecord, IdempotencyStore, IdempotencyStoreError,
+};
 use std::time::Duration;
 
 struct MyStore { /* ... */ }
@@ -272,6 +284,17 @@ impl IdempotencyStore for MyStore {
 
     fn set(&self, key: &str, record: IdempotencyRecord, body_hash: Vec<u8>, ttl: Duration) {
         /* ... */
+    }
+
+    fn try_set(
+        &self,
+        key: &str,
+        record: IdempotencyRecord,
+        body_hash: Vec<u8>,
+        ttl: Duration,
+    ) -> Result<(), IdempotencyStoreError> {
+        self.set(key, record, body_hash, ttl);
+        Ok(())
     }
 
     fn try_lock(&self, key: &str, lock_ttl: Duration) -> bool { /* true = lock acquired */ }

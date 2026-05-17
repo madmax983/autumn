@@ -1,4 +1,5 @@
 //! Integration tests for HTTP idempotency-key middleware (issue #677).
+use std::convert::Infallible;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -6,10 +7,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use autumn_web::idempotency::{IdempotencyLayer, MemoryIdempotencyStore};
+use autumn_web::idempotency::{IdempotencyLayer, IdempotencyStoreError, MemoryIdempotencyStore};
+use autumn_web::session::Session;
 use autumn_web::test::TestApp;
-use autumn_web::{get, post, put, routes};
+use autumn_web::{AppState, get, post, put, routes};
+use axum::body::Body;
 use axum::http::StatusCode;
+use axum::response::Response;
 use tower::{Layer, Service};
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -24,7 +28,7 @@ fn make_store(ttl: Duration) -> Arc<dyn autumn_web::idempotency::IdempotencyStor
 
 /// Replicates the storage-key format used by `IdempotencyLayer` so tests can
 /// pre-lock the exact slot the middleware will look up.
-fn storage_key(method: &str, path: &str, auth: &str, idempotency_key: &str) -> String {
+fn principal_digest(auth: &str) -> String {
     use sha2::Digest as _;
 
     let mut hasher = sha2::Sha256::new();
@@ -33,15 +37,46 @@ fn storage_key(method: &str, path: &str, auth: &str, idempotency_key: &str) -> S
         hasher.update(auth.as_bytes());
     }
     hasher.update(b"\nsession:");
-    let principal = hasher
+    hasher
         .finalize()
         .iter()
         .fold(String::with_capacity(64), |mut out, byte| {
             use std::fmt::Write as _;
             let _ = write!(out, "{byte:02x}");
             out
-        });
-    format!("{method}:{path}:{principal}:{idempotency_key}")
+        })
+}
+
+fn storage_key(method: &str, path: &str, auth: &str, idempotency_key: &str) -> String {
+    use sha2::Digest as _;
+
+    fn push_component(hasher: &mut sha2::Sha256, label: &str, value: &[u8]) {
+        hasher.update(label.as_bytes());
+        hasher.update(b":");
+        hasher.update((value.len() as u64).to_be_bytes());
+        hasher.update(b":");
+        hasher.update(value);
+        hasher.update(b";");
+    }
+
+    let principal = principal_digest(auth);
+
+    let mut storage = sha2::Sha256::new();
+    push_component(&mut storage, "method", method.as_bytes());
+    push_component(&mut storage, "target", path.as_bytes());
+    push_component(&mut storage, "principal", principal.as_bytes());
+    push_component(&mut storage, "idempotency-key", idempotency_key.as_bytes());
+    format!(
+        "v2:{}",
+        storage
+            .finalize()
+            .iter()
+            .fold(String::with_capacity(64), |mut out, byte| {
+                use std::fmt::Write as _;
+                let _ = write!(out, "{byte:02x}");
+                out
+            })
+    )
 }
 
 /// Axum middleware that injects a 5-byte `UploadConfig` limit into extensions.
@@ -95,6 +130,9 @@ async fn test_deduplication() {
 static INTERCEPT_CALLS: AtomicUsize = AtomicUsize::new(0);
 static INTERCEPTED_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static ANONYMOUS_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
+static RAW_MERGE_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
+static RAW_NEST_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
+static SESSION_LOGIN_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 /// Route-local interceptor used to prove idempotency replays still traverse
 /// `#[intercept(...)]` layers before the cached response is returned.
@@ -147,11 +185,133 @@ async fn anonymous_create_handler() -> &'static str {
     "created"
 }
 
+async fn raw_merge_create_handler() -> &'static str {
+    RAW_MERGE_HANDLER_CALLS.fetch_add(1, Ordering::SeqCst);
+    "raw-merged"
+}
+
+async fn raw_nest_create_handler() -> &'static str {
+    RAW_NEST_HANDLER_CALLS.fetch_add(1, Ordering::SeqCst);
+    "raw-nested"
+}
+
+#[post("/session-login")]
+async fn session_login_handler(session: Session) -> &'static str {
+    SESSION_LOGIN_HANDLER_CALLS.fetch_add(1, Ordering::SeqCst);
+    session.insert("user_id", "42").await;
+    session.rotate_id().await;
+    "logged-in"
+}
+
 #[post("/intercepted")]
 #[intercept(CountInterceptLayer)]
 async fn intercepted_create_handler() -> &'static str {
     INTERCEPTED_HANDLER_CALLS.fetch_add(1, Ordering::SeqCst);
     "created"
+}
+
+#[tokio::test]
+async fn test_merged_raw_router_is_idempotent() {
+    RAW_MERGE_HANDLER_CALLS.store(0, Ordering::SeqCst);
+    let raw = axum::Router::<AppState>::new()
+        .route("/raw-create", axum::routing::post(raw_merge_create_handler));
+
+    let client = TestApp::new().merge(raw).idempotent().build();
+
+    let r1 = client
+        .post("/raw-create")
+        .header("idempotency-key", "raw-merge-key")
+        .send()
+        .await;
+    r1.assert_ok();
+    assert_eq!(r1.header("x-idempotent-replayed"), None);
+
+    let r2 = client
+        .post("/raw-create")
+        .header("idempotency-key", "raw-merge-key")
+        .send()
+        .await;
+    r2.assert_ok();
+    assert_eq!(r2.header("x-idempotent-replayed"), Some("true"));
+    assert_eq!(r2.text(), "raw-merged");
+    assert_eq!(
+        RAW_MERGE_HANDLER_CALLS.load(Ordering::SeqCst),
+        1,
+        "raw routers mounted with AppBuilder::merge must not re-run on replay"
+    );
+}
+
+#[tokio::test]
+async fn test_nested_raw_router_is_idempotent() {
+    RAW_NEST_HANDLER_CALLS.store(0, Ordering::SeqCst);
+    let raw = axum::Router::<AppState>::new()
+        .route("/raw-create", axum::routing::post(raw_nest_create_handler));
+
+    let client = TestApp::new().nest("/api", raw).idempotent().build();
+
+    let r1 = client
+        .post("/api/raw-create")
+        .header("idempotency-key", "raw-nest-key")
+        .send()
+        .await;
+    r1.assert_ok();
+    assert_eq!(r1.header("x-idempotent-replayed"), None);
+
+    let r2 = client
+        .post("/api/raw-create")
+        .header("idempotency-key", "raw-nest-key")
+        .send()
+        .await;
+    r2.assert_ok();
+    assert_eq!(r2.header("x-idempotent-replayed"), Some("true"));
+    assert_eq!(r2.text(), "raw-nested");
+    assert_eq!(
+        RAW_NEST_HANDLER_CALLS.load(Ordering::SeqCst),
+        1,
+        "raw routers mounted with AppBuilder::nest must not re-run on replay"
+    );
+}
+
+#[tokio::test]
+async fn test_session_mutating_response_is_not_cached_without_final_cookie() {
+    SESSION_LOGIN_HANDLER_CALLS.store(0, Ordering::SeqCst);
+    let client = TestApp::new()
+        .routes(routes![session_login_handler])
+        .idempotent()
+        .build();
+
+    let r1 = client
+        .post("/session-login")
+        .header("idempotency-key", "session-login-key")
+        .send()
+        .await;
+    r1.assert_ok();
+    assert_eq!(r1.header("x-idempotent-replayed"), None);
+    assert!(
+        r1.header("set-cookie").is_some(),
+        "fresh session mutation must append the session cookie"
+    );
+
+    let r2 = client
+        .post("/session-login")
+        .header("idempotency-key", "session-login-key")
+        .send()
+        .await;
+    r2.assert_ok();
+    assert_eq!(
+        r2.header("x-idempotent-replayed"),
+        None,
+        "session-mutating responses must not replay a cached pre-SessionLayer response"
+    );
+    assert!(
+        r2.header("set-cookie").is_some(),
+        "retry after a lost login response must still receive the session cookie"
+    );
+    assert_eq!(
+        SESSION_LOGIN_HANDLER_CALLS.load(Ordering::SeqCst),
+        2,
+        "session-mutating retries should re-enter rather than replay without Set-Cookie"
+    );
 }
 
 /// Anonymous requests without an existing session cookie still share a stable
@@ -540,6 +700,68 @@ async fn test_in_flight_lock_released_after_response() {
     );
 }
 
+#[tokio::test]
+async fn test_in_flight_lock_released_when_request_future_is_cancelled() {
+    use tokio::sync::Notify;
+    use tower::ServiceExt;
+
+    static CALL_COUNT: AtomicUsize = AtomicUsize::new(0);
+    CALL_COUNT.store(0, Ordering::SeqCst);
+
+    let started = Arc::new(Notify::new());
+    let never_finish = Arc::new(Notify::new());
+    let store = make_store(Duration::from_secs(3600));
+    let layer = IdempotencyLayer::new(store).with_in_flight_ttl(Duration::from_secs(60));
+    let app = axum::Router::new()
+        .route(
+            "/slow",
+            axum::routing::post({
+                let started = Arc::clone(&started);
+                let never_finish = Arc::clone(&never_finish);
+                move || {
+                    let started = Arc::clone(&started);
+                    let never_finish = Arc::clone(&never_finish);
+                    async move {
+                        CALL_COUNT.fetch_add(1, Ordering::SeqCst);
+                        started.notify_one();
+                        never_finish.notified().await;
+                        "finished"
+                    }
+                }
+            }),
+        )
+        .layer(layer);
+
+    let req1 = axum::http::Request::builder()
+        .method("POST")
+        .uri("/slow")
+        .header("idempotency-key", "cancelled-key")
+        .body(Body::empty())
+        .unwrap();
+    let pending = tokio::spawn(app.clone().oneshot(req1));
+    started.notified().await;
+    pending.abort();
+    let _ = pending.await;
+    never_finish.notify_one();
+
+    let req2 = axum::http::Request::builder()
+        .method("POST")
+        .uri("/slow")
+        .header("idempotency-key", "cancelled-key")
+        .body(Body::empty())
+        .unwrap();
+    let resp2 = tokio::time::timeout(Duration::from_millis(200), app.clone().oneshot(req2))
+        .await
+        .expect("retry should not hang behind a leaked in-flight lock")
+        .expect("retry request should complete");
+
+    assert_ne!(
+        resp2.status(),
+        StatusCode::CONFLICT,
+        "cancelling the first request must drop the in-flight lock"
+    );
+}
+
 /// Metrics counters are incremented correctly for hits and misses.
 #[tokio::test]
 async fn test_metrics_recorded() {
@@ -605,6 +827,24 @@ fn test_store_ttl_propagates_to_layer() {
         store.default_ttl(),
         ttl,
         "store must return the TTL passed to new()"
+    );
+}
+
+#[test]
+fn test_memory_in_flight_lock_expires_after_lock_ttl() {
+    use autumn_web::idempotency::IdempotencyStore;
+
+    let store = MemoryIdempotencyStore::new(Duration::from_secs(3600));
+    assert!(
+        store.try_lock("stale-lock", Duration::from_millis(10)),
+        "first acquisition should succeed"
+    );
+
+    std::thread::sleep(Duration::from_millis(30));
+
+    assert!(
+        store.try_lock("stale-lock", Duration::from_millis(10)),
+        "memory in-flight locks must honor lock_ttl instead of leaking forever"
     );
 }
 
@@ -889,6 +1129,84 @@ async fn test_large_response_not_cached_and_streamed_through() {
     );
 }
 
+#[derive(Default)]
+struct FailingPersistenceStore {
+    unlocks: AtomicUsize,
+}
+
+impl autumn_web::idempotency::IdempotencyStore for FailingPersistenceStore {
+    fn get(&self, _key: &str) -> Option<autumn_web::idempotency::IdempotencyEntry> {
+        None
+    }
+
+    fn set(
+        &self,
+        _key: &str,
+        _record: autumn_web::idempotency::IdempotencyRecord,
+        _body_hash: Vec<u8>,
+        _ttl: Duration,
+    ) {
+    }
+
+    fn try_set(
+        &self,
+        _key: &str,
+        _record: autumn_web::idempotency::IdempotencyRecord,
+        _body_hash: Vec<u8>,
+        _ttl: Duration,
+    ) -> Result<(), IdempotencyStoreError> {
+        Err(IdempotencyStoreError::backend("forced persistence failure"))
+    }
+
+    fn try_lock(&self, _key: &str, _lock_ttl: Duration) -> bool {
+        true
+    }
+
+    fn unlock(&self, _key: &str) {
+        self.unlocks.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[tokio::test]
+async fn test_persistence_failure_surfaces_and_keeps_lock_closed() {
+    use tower::ServiceExt;
+
+    static CALL_COUNT: AtomicUsize = AtomicUsize::new(0);
+    CALL_COUNT.store(0, Ordering::SeqCst);
+
+    let store = Arc::new(FailingPersistenceStore::default());
+    let layer = IdempotencyLayer::new(store.clone());
+    let app = axum::Router::new()
+        .route(
+            "/charge",
+            axum::routing::post(|| async {
+                CALL_COUNT.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, Infallible>(Response::new(Body::from("charged")))
+            }),
+        )
+        .layer(layer);
+
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/charge")
+        .header("idempotency-key", "redis-write-failed")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a successful mutation must not be reported as cacheable success when persistence fails"
+    );
+    assert_eq!(CALL_COUNT.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        store.unlocks.load(Ordering::SeqCst),
+        0,
+        "persistence failure should fail closed by leaving the in-flight lock to expire"
+    );
+}
+
 /// The default `IdempotencyStore::default_ttl()` implementation returns 24 h.
 /// Custom stores that do not override the method get this default.
 #[test]
@@ -951,6 +1269,57 @@ async fn test_different_paths_same_key_are_independent() {
         resp_b.headers().get("x-idempotent-replayed").is_none(),
         "different path with same key must not replay another endpoint's response"
     );
+}
+
+/// Raw delimiters in request paths and idempotency keys must not let one
+/// endpoint synthesize another endpoint's storage key.
+#[tokio::test]
+async fn test_storage_key_delimits_path_principal_and_client_key() {
+    use tower::ServiceExt;
+
+    let principal = principal_digest("");
+    let colliding_path = format!("/a:{principal}:b");
+    let colliding_key = format!("b:{principal}:k");
+    let store = make_store(Duration::from_secs(3600));
+    let layer = IdempotencyLayer::new(store);
+
+    let app = axum::Router::new()
+        .route(
+            &colliding_path,
+            axum::routing::post(|| async { "path-with-delimiters" }),
+        )
+        .route("/a", axum::routing::post(|| async { "plain-path" }))
+        .layer(layer);
+
+    let req1 = axum::http::Request::builder()
+        .method("POST")
+        .uri(&colliding_path)
+        .header("idempotency-key", "k")
+        .body(Body::from("same"))
+        .unwrap();
+    let resp1 = app.clone().oneshot(req1).await.unwrap();
+    assert_eq!(resp1.status(), StatusCode::OK);
+    let body1 = axum::body::to_bytes(resp1.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(body1, "path-with-delimiters");
+
+    let req2 = axum::http::Request::builder()
+        .method("POST")
+        .uri("/a")
+        .header("idempotency-key", colliding_key)
+        .body(Body::from("same"))
+        .unwrap();
+    let resp2 = app.clone().oneshot(req2).await.unwrap();
+    assert_eq!(resp2.status(), StatusCode::OK);
+    assert!(
+        resp2.headers().get("x-idempotent-replayed").is_none(),
+        "delimiter-bearing path/key components must not collide"
+    );
+    let body2 = axum::body::to_bytes(resp2.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(body2, "plain-path");
 }
 
 /// Requests with different `Authorization` headers sharing the same

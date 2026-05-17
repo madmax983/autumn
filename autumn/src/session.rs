@@ -142,6 +142,11 @@ impl Session {
         self.inner.read().await.cookie_backed
     }
 
+    pub(crate) async fn has_pending_changes(&self) -> bool {
+        let inner = self.inner.read().await;
+        inner.dirty || inner.destroyed
+    }
+
     /// Get a value from the session.
     pub async fn get(&self, key: &str) -> Option<String> {
         self.inner.read().await.data.get(key).cloned()

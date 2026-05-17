@@ -730,6 +730,12 @@ impl AppBuilder {
     /// Mutating requests (`POST`, `PUT`, `PATCH`, `DELETE`) that carry an
     /// `Idempotency-Key` header are deduplicated: the first response is cached
     /// and replayed byte-for-byte on subsequent identical requests.
+    /// Session-mutating responses are not cached because their `Set-Cookie`
+    /// headers are finalized by the outer session middleware after route-level
+    /// idempotency runs.
+    ///
+    /// The middleware also covers raw Axum routers registered with
+    /// [`merge`](Self::merge) or [`nest`](Self::nest).
     ///
     /// The storage backend and TTL are taken from the `[idempotency]` block in
     /// `autumn.toml` (defaulting to in-process memory with a 24 h TTL).
