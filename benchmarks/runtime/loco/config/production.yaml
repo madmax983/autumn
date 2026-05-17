@@ -16,7 +16,7 @@ database:
   idle_timeout: 500
   min_connections: 1
   max_connections: 20
-  auto_migrate: true
+  auto_migrate: false
 
 logger:
   enable: true

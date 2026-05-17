@@ -27,4 +27,4 @@ EXPOSE 8080
 HEALTHCHECK --interval=10s --timeout=5s --start-period=30s \
   CMD curl -sf http://localhost:${PORT}/health || exit 1
 
-CMD ["sh", "-c", "bundle exec rails db:migrate && bundle exec puma -C config/puma.rb"]
+CMD ["bundle", "exec", "puma", "-C", "config/puma.rb"]
