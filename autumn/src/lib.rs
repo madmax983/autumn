@@ -120,6 +120,7 @@ pub use repository::RepositoryError;
 /// This module is responsible for taking the application's configuration,
 /// defined routes, middleware, and state, and building the final `axum::Router`
 /// that will handle incoming HTTP requests.
+pub(crate) mod layer_registration;
 pub(crate) mod router;
 
 #[cfg(feature = "db")]

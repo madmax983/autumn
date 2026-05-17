@@ -173,6 +173,8 @@ type PolicyRegistration = Box<dyn FnOnce(&crate::authorization::PolicyRegistry) 
 ///         .await;
 /// }
 /// ```
+use crate::layer_registration::{CustomLayerRegistration, ScopedGroup};
+
 pub struct AppBuilder {
     routes: Vec<Route>,
     /// Parallel to `routes`: registration origin for each route.
@@ -277,40 +279,6 @@ pub(crate) type MailDeliveryQueueFactory = Box<
     dyn FnOnce(&AppState) -> crate::AutumnResult<Arc<dyn crate::mail::MailDeliveryQueue>> + Send,
 >;
 
-/// A group of routes sharing a common path prefix and middleware layer.
-///
-/// Created by [`AppBuilder::scoped`]. The routes are mounted under the
-/// prefix with the middleware applied only to this group.
-pub(crate) struct ScopedGroup {
-    pub(crate) prefix: String,
-    pub(crate) routes: Vec<Route>,
-    /// Registration origin: user application or a named plugin.
-    pub(crate) source: crate::route_listing::RouteSource,
-    /// Closure that applies the layer to a sub-router.
-    pub(crate) apply_layer:
-        Box<dyn FnOnce(axum::Router<AppState>) -> axum::Router<AppState> + Send>,
-}
-
-/// A deferred router mutator that applies a user-registered
-/// [`tower::Layer`] to the app-wide router.
-///
-/// Stored on [`AppBuilder`] by [`AppBuilder::layer`] and drained inside
-/// `apply_middleware` where the final layer stack is assembled.
-pub(crate) type CustomLayerApplier =
-    Box<dyn FnOnce(axum::Router<AppState>) -> axum::Router<AppState> + Send>;
-
-/// Metadata and deferred application closure for a user-registered layer.
-pub(crate) struct CustomLayerRegistration {
-    /// Concrete type for the registered layer.
-    pub(crate) type_id: TypeId,
-    /// Deferred router mutation that applies the layer.
-    pub(crate) apply: CustomLayerApplier,
-}
-
-mod sealed {
-    pub trait Sealed {}
-}
-
 /// Marker trait for types that can be registered with
 /// [`AppBuilder::layer`] as an app-wide Tower middleware.
 ///
@@ -329,13 +297,13 @@ mod sealed {
     label = "this type does not implement `tower::Layer<axum::routing::Route>` with the required service bounds",
     note = "`AppBuilder::layer(..)` requires:\n    L: tower::Layer<axum::routing::Route> + Clone + Send + Sync + 'static,\n    L::Service: Service<axum::extract::Request, Response = axum::response::Response, Error = Infallible> + Clone + Send + Sync + 'static,\n    <L::Service as Service<axum::extract::Request>>::Future: Send + 'static\nSee docs/guide/middleware.md for common patterns and how to wrap raw-error layers (e.g. TimeoutLayer) with HandleErrorLayer."
 )]
-pub trait IntoAppLayer: sealed::Sealed + Send + Sync + 'static {
+pub trait IntoAppLayer: crate::layer_registration::sealed::Sealed + Send + Sync + 'static {
     /// Apply this layer to the given router. Not intended for direct use.
     #[doc(hidden)]
     fn apply_to(self, router: axum::Router<AppState>) -> axum::Router<AppState>;
 }
 
-impl<L> sealed::Sealed for L
+impl<L> crate::layer_registration::sealed::Sealed for L
 where
     L: tower::Layer<axum::routing::Route> + Clone + Send + Sync + 'static,
     L::Service: tower::Service<

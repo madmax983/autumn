@@ -7,10 +7,10 @@
 
 use std::sync::Arc;
 
-use crate::app::ScopedGroup;
 use crate::config::AutumnConfig;
 use crate::error_pages::{self, SharedRenderer};
 use crate::extract::State;
+use crate::layer_registration::ScopedGroup;
 use crate::middleware::RequestIdLayer;
 use crate::middleware::dev;
 use crate::middleware::exception_filter::{
@@ -115,7 +115,7 @@ pub struct RouterContext {
     /// [`AppBuilder::layer`](crate::app::AppBuilder::layer). Applied inside
     /// [`RequestIdLayer`] on the ingress
     /// path so user middleware observes the generated request ID.
-    pub custom_layers: Vec<crate::app::CustomLayerRegistration>,
+    pub custom_layers: Vec<crate::layer_registration::CustomLayerRegistration>,
     pub error_page_renderer: Option<SharedRenderer>,
     /// Custom session store installed via
     /// [`AppBuilder::with_session_store`](crate::app::AppBuilder::with_session_store).
@@ -1057,7 +1057,7 @@ fn apply_middleware(
     config: &AutumnConfig,
     state: &AppState,
     exception_filters: Vec<Arc<dyn ExceptionFilter>>,
-    custom_layers: Vec<crate::app::CustomLayerRegistration>,
+    custom_layers: Vec<crate::layer_registration::CustomLayerRegistration>,
     error_page_renderer: Option<SharedRenderer>,
     session_store: Option<Arc<dyn crate::session::BoxedSessionStore>>,
 ) -> Result<axum::Router<AppState>, RouterBuildError> {
@@ -2091,7 +2091,7 @@ mod tests {
         async fn child() -> &'static str {
             "inner"
         }
-        let group = crate::app::ScopedGroup {
+        let group = crate::layer_registration::ScopedGroup {
             prefix: "/api".to_owned(),
             routes: vec![Route {
                 method: http::Method::GET,
@@ -2175,7 +2175,7 @@ mod tests {
             },
             repository: None,
         };
-        let group = crate::app::ScopedGroup {
+        let group = crate::layer_registration::ScopedGroup {
             prefix: "/orgs/{org_id}".to_owned(),
             routes: vec![child],
             source: crate::route_listing::RouteSource::User,

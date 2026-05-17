@@ -161,7 +161,7 @@ pub struct TestApp {
     routes: Vec<Route>,
     merge_routers: Vec<axum::Router<crate::state::AppState>>,
     nest_routers: Vec<(String, axum::Router<crate::state::AppState>)>,
-    custom_layers: Vec<crate::app::CustomLayerRegistration>,
+    custom_layers: Vec<crate::layer_registration::CustomLayerRegistration>,
     config: AutumnConfig,
     #[cfg(feature = "openapi")]
     openapi: Option<crate::openapi::OpenApiConfig>,
@@ -287,7 +287,7 @@ impl TestApp {
     #[must_use]
     pub fn layer<L: crate::app::IntoAppLayer>(mut self, layer: L) -> Self {
         self.custom_layers
-            .push(crate::app::CustomLayerRegistration {
+            .push(crate::layer_registration::CustomLayerRegistration {
                 type_id: std::any::TypeId::of::<L>(),
                 apply: Box::new(move |router| layer.apply_to(router)),
             });
