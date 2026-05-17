@@ -362,6 +362,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 ::core::concat!(
                     ::core::env!("CARGO_PKG_NAME"),
                     "::",
+                    ::core::module_path!(),
+                    "::",
                     ::core::stringify!(#table_ident),
                     "::",
                     ::core::stringify!(#model_name),
@@ -540,8 +542,18 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             )
             .await;
             __autumn_pending_heartbeat.cancel();
-            __autumn_finalize_result?;
-            ::autumn_web::__private::kick_repository_commit_hook_dispatcher(&self.pool);
+            match __autumn_finalize_result {
+                ::core::result::Result::Ok(()) => {
+                    ::autumn_web::__private::kick_repository_commit_hook_dispatcher(&self.pool);
+                }
+                ::core::result::Result::Err(__autumn_error) => {
+                    ::autumn_web::reexports::tracing::warn!(
+                        hook_id = %__autumn_commit_hook_id,
+                        error = %__autumn_error,
+                        "failed to finalize repository create commit hook after mutation commit; leaving staged row for recovery"
+                    );
+                }
+            }
 
                 Ok(record)
             }
@@ -721,8 +733,18 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             )
             .await;
             __autumn_pending_heartbeat.cancel();
-            __autumn_finalize_result?;
-            ::autumn_web::__private::kick_repository_commit_hook_dispatcher(&self.pool);
+            match __autumn_finalize_result {
+                ::core::result::Result::Ok(()) => {
+                    ::autumn_web::__private::kick_repository_commit_hook_dispatcher(&self.pool);
+                }
+                ::core::result::Result::Err(__autumn_error) => {
+                    ::autumn_web::reexports::tracing::warn!(
+                        hook_id = %__autumn_commit_hook_id,
+                        error = %__autumn_error,
+                        "failed to finalize repository update commit hook after mutation commit; leaving staged row for recovery"
+                    );
+                }
+            }
 
                 Ok(record)
             }
@@ -1922,8 +1944,8 @@ mod tests {
             "generated after_*_commit hooks must not use the process-local callback registry"
         );
         assert!(
-            !generated.contains("module_path"),
-            "durable hook handler keys must not depend on Rust module paths: {generated}"
+            generated.contains("module_path ! ()"),
+            "durable hook handler keys must include the repository module path to avoid cross-module runner collisions: {generated}"
         );
         assert!(
             generated.contains("env ! (\"CARGO_PKG_NAME\")"),
@@ -1945,6 +1967,24 @@ mod tests {
         assert!(
             !generated.contains("self . hooks . after_update (& mut ctx , & record) . await ?"),
             "after_update errors must be reported without rolling back the updated record: {generated}"
+        );
+    }
+
+    #[test]
+    fn hooked_repository_commit_hook_finalization_failures_are_non_fatal() {
+        let generated = durable_hook_repository_tokens();
+
+        assert!(
+            !generated.contains("__autumn_finalize_result ?"),
+            "post-commit finalization failures must not make save/update report the committed mutation as failed: {generated}"
+        );
+        assert!(
+            generated
+                .contains("failed to finalize repository create commit hook after mutation commit")
+                && generated.contains(
+                    "failed to finalize repository update commit hook after mutation commit"
+                ),
+            "post-commit finalization failures should be logged and left for stale-pending recovery: {generated}"
         );
     }
 

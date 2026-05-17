@@ -39,6 +39,7 @@ const HOOK_STALE_CLAIM_AFTER: Duration = Duration::from_secs(60);
 const HOOK_CLAIM_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const HOOK_PENDING_FINALIZER_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const HOOK_AFTER_HOOK_FAILURE_MARK_RETRY_SLEEP: Duration = Duration::from_millis(100);
+const HOOK_AFTER_HOOK_FAILURE_MARK_MAX_ATTEMPTS: usize = 3;
 const HOOK_ACK_SUCCESS_SQL: &str = "UPDATE autumn_repository_commit_hooks \
      SET status = 'completed', finished_at = NOW(), \
          context = '{}'::JSONB, record = '{}'::JSONB, \
@@ -419,8 +420,8 @@ pub async fn discard_repository_commit_hook_pending(
 /// Mark a staged create/update commit hook as permanently non-dispatchable
 /// after the regular `after_*` hook failed or panicked.
 ///
-/// This retries transient pool or database failures before returning so stale
-/// pending recovery cannot later promote a known failed regular after hook.
+/// This retries transient pool or database failures a bounded number of times
+/// so callers can return the original hook error without hanging forever.
 pub async fn mark_repository_commit_hook_after_hook_failed(
     pool: &PgPool,
     hook_id: &str,
@@ -428,7 +429,7 @@ pub async fn mark_repository_commit_hook_after_hook_failed(
     failure: impl Into<String>,
 ) {
     let failure = failure.into();
-    loop {
+    for attempt in 1..=HOOK_AFTER_HOOK_FAILURE_MARK_MAX_ATTEMPTS {
         match pg_mark_repository_commit_hook_after_hook_failed(pool, hook_id, owner, &failure).await
         {
             Ok(true) => return,
@@ -440,9 +441,20 @@ pub async fn mark_repository_commit_hook_after_hook_failed(
                 return;
             }
             Err(error) => {
+                if attempt == HOOK_AFTER_HOOK_FAILURE_MARK_MAX_ATTEMPTS {
+                    tracing::warn!(
+                        hook_id = %hook_id,
+                        error = %error,
+                        attempts = HOOK_AFTER_HOOK_FAILURE_MARK_MAX_ATTEMPTS,
+                        "failed to mark repository commit hook after-hook failure; giving up so the committed mutation can return"
+                    );
+                    return;
+                }
                 tracing::warn!(
                     hook_id = %hook_id,
                     error = %error,
+                    attempt,
+                    max_attempts = HOOK_AFTER_HOOK_FAILURE_MARK_MAX_ATTEMPTS,
                     "failed to mark repository commit hook after-hook failure; retrying"
                 );
                 tokio::time::sleep(HOOK_AFTER_HOOK_FAILURE_MARK_RETRY_SLEEP).await;
@@ -1066,6 +1078,30 @@ mod tests {
         assert!(
             err.to_string().contains("runner not registered"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn after_hook_failure_marking_returns_when_pool_is_unavailable() {
+        use diesel_async::AsyncPgConnection;
+        use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+
+        let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new("not-a-postgres-url");
+        let pool = Pool::builder(manager)
+            .max_size(1)
+            .runtime(deadpool::Runtime::Tokio1)
+            .build()
+            .expect("pool");
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(750),
+            mark_repository_commit_hook_after_hook_failed(&pool, "hook-id", "owner", "boom"),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "after-hook failure marking must not block a committed mutation forever when the pool/database is down"
         );
     }
 
