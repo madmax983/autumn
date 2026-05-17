@@ -1143,6 +1143,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     &record,
                 )
                 .await?;
+                ::autumn_web::idempotency::__disallow_replay_cache(&__autumn_idempotency_state);
             }
         } else {
             quote! {}
@@ -1159,6 +1160,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     &__autumn_new_payload,
                 )
                 .await?;
+                ::autumn_web::idempotency::__disallow_replay_cache(&__autumn_idempotency_state);
             }
         } else {
             quote! {}
@@ -1199,6 +1201,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     &__existing,
                 )
                 .await?;
+                ::autumn_web::idempotency::__disallow_replay_cache(&__autumn_idempotency_state);
             }
         } else {
             quote! {}
@@ -1214,6 +1217,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     &__existing,
                 )
                 .await?;
+                ::autumn_web::idempotency::__disallow_replay_cache(&__autumn_idempotency_state);
             }
         } else {
             quote! {}
@@ -1223,6 +1227,11 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 ::autumn_web::reexports::axum::extract::State(__autumn_state):
                     ::autumn_web::reexports::axum::extract::State<::autumn_web::AppState>,
                 __autumn_session: ::autumn_web::session::Session,
+                __autumn_idempotency_state: ::core::option::Option<
+                    ::autumn_web::reexports::axum::extract::Extension<
+                        ::autumn_web::idempotency::IdempotencyRequestState
+                    >
+                >,
             }
         } else {
             quote! {}

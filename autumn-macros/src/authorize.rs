@@ -205,6 +205,16 @@ pub fn authorize_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         };
         input_fn.sig.inputs.insert(0, session_param);
     }
+    if !has_input_named(&input_fn, "__autumn_idempotency_state") {
+        let idempotency_param: syn::FnArg = parse_quote! {
+            __autumn_idempotency_state: ::core::option::Option<
+                ::autumn_web::reexports::axum::extract::Extension<
+                    ::autumn_web::idempotency::IdempotencyRequestState
+                >
+            >
+        };
+        input_fn.sig.inputs.insert(0, idempotency_param);
+    }
 
     let action_lit = syn::LitStr::new(&action_str, proc_macro2::Span::call_site());
     let original_body = &input_fn.block;
@@ -216,6 +226,7 @@ pub fn authorize_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 #action_lit,
                 &#from_ident,
             ).await?;
+            ::autumn_web::idempotency::__disallow_replay_cache(&__autumn_idempotency_state);
             #original_body
         }
     };

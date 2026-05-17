@@ -58,6 +58,7 @@ pub fn secured_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             __autumn_state.auth_session_key(),
             __AUTUMN_SECURED_ROLES,
         ).await?;
+        ::autumn_web::idempotency::__disallow_replay_cache(&__autumn_idempotency_state);
     };
 
     // Inject hidden State<AppState> and Session parameters at the start of
@@ -78,6 +79,16 @@ pub fn secured_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             __autumn_session: ::autumn_web::session::Session
         };
         input_fn.sig.inputs.insert(0, session_param);
+    }
+    if !has_input_named(&input_fn, "__autumn_idempotency_state") {
+        let idempotency_param: syn::FnArg = syn::parse_quote! {
+            __autumn_idempotency_state: ::core::option::Option<
+                ::autumn_web::reexports::axum::extract::Extension<
+                    ::autumn_web::idempotency::IdempotencyRequestState
+                >
+            >
+        };
+        input_fn.sig.inputs.insert(0, idempotency_param);
     }
 
     // Prepend the check call to the function body

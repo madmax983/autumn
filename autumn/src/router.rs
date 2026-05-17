@@ -266,7 +266,7 @@ pub fn try_build_router_inner(
     let idempotency_layers = build_idempotency_layers(config, &state)?;
     let route_idempotency_layer = idempotency_layers.as_ref().map(|layers| &layers.route);
     let raw_idempotency_layer = idempotency_layers.as_ref().map(|layers| &layers.raw);
-    let mut router = group_and_mount_routes(route_list, route_idempotency_layer);
+    let mut router = group_and_mount_routes(route_list, idempotency_layers.as_ref());
 
     let dev_reload_enabled = dev::is_enabled_with_env(&crate::config::OsEnv);
 
@@ -767,7 +767,7 @@ fn check_openapi_path_against(
 
 fn group_and_mount_routes(
     route_list: Vec<Route>,
-    idempotency_layer: Option<&IdempotencyLayer>,
+    idempotency_layers: Option<&BuiltIdempotencyLayers>,
 ) -> axum::Router<AppState> {
     // Group routes by path so multiple methods on the same path
     // (e.g. GET /admin + POST /admin) are merged into a single
@@ -784,22 +784,40 @@ fn group_and_mount_routes(
         );
     }
     for route in route_list {
+        let selected_layer =
+            idempotency_layers.map(|layers| idempotency_layer_for_route(&route, layers));
+        let mut handler = route.handler;
+        if let Some(layer) = selected_layer {
+            handler = handler.layer(layer.clone());
+        }
         grouped
             .entry(route.path)
             .and_modify(|existing| {
-                *existing = std::mem::take(existing).merge(route.handler.clone());
+                *existing = std::mem::take(existing).merge(handler.clone());
             })
-            .or_insert(route.handler);
+            .or_insert(handler);
     }
 
     let mut router = axum::Router::new();
-    for (path, mut method_router) in grouped {
-        if let Some(layer) = idempotency_layer {
-            method_router = method_router.layer(layer.clone());
-        }
+    for (path, method_router) in grouped {
         router = router.route(path, method_router);
     }
     router
+}
+
+fn idempotency_layer_for_route<'a>(
+    route: &Route,
+    layers: &'a BuiltIdempotencyLayers,
+) -> &'a IdempotencyLayer {
+    if route_uses_generated_replay_stop(route) {
+        &layers.route
+    } else {
+        &layers.raw
+    }
+}
+
+fn route_uses_generated_replay_stop(route: &Route) -> bool {
+    route.repository.is_some() || route.api_doc.method == route.method.as_str()
 }
 
 #[cfg_attr(not(feature = "mail"), allow(unused_variables))]

@@ -10,7 +10,7 @@ use std::time::Duration;
 use autumn_web::idempotency::{IdempotencyLayer, IdempotencyStoreError, MemoryIdempotencyStore};
 use autumn_web::session::Session;
 use autumn_web::test::TestApp;
-use autumn_web::{AppState, get, post, put, routes};
+use autumn_web::{AppState, Route, get, post, put, routes};
 use axum::body::Body;
 use axum::http::StatusCode;
 use axum::response::Response;
@@ -133,6 +133,7 @@ static ANONYMOUS_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static RAW_MERGE_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static RAW_NEST_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static SESSION_LOGIN_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
+static MANUAL_ROUTE_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 /// Route-local interceptor used to prove idempotency replays still traverse
 /// `#[intercept(...)]` layers before the cached response is returned.
@@ -193,6 +194,11 @@ async fn raw_merge_create_handler() -> &'static str {
 async fn raw_nest_create_handler() -> &'static str {
     RAW_NEST_HANDLER_CALLS.fetch_add(1, Ordering::SeqCst);
     "raw-nested"
+}
+
+async fn manual_route_create_handler() -> &'static str {
+    MANUAL_ROUTE_HANDLER_CALLS.fetch_add(1, Ordering::SeqCst);
+    "manual-route"
 }
 
 #[post("/session-login")]
@@ -269,6 +275,43 @@ async fn test_nested_raw_router_is_idempotent() {
         RAW_NEST_HANDLER_CALLS.load(Ordering::SeqCst),
         1,
         "raw routers mounted with AppBuilder::nest must not re-run on replay"
+    );
+}
+
+#[tokio::test]
+async fn test_manual_route_registered_through_routes_is_idempotent() {
+    MANUAL_ROUTE_HANDLER_CALLS.store(0, Ordering::SeqCst);
+    let route = Route {
+        method: axum::http::Method::POST,
+        path: "/manual-create",
+        handler: axum::routing::post(manual_route_create_handler),
+        name: "manual_route_create_handler",
+        api_doc: autumn_web::openapi::ApiDoc::default(),
+        repository: None,
+    };
+
+    let client = TestApp::new().routes(vec![route]).idempotent().build();
+
+    let r1 = client
+        .post("/manual-create")
+        .header("idempotency-key", "manual-route-key")
+        .send()
+        .await;
+    r1.assert_ok();
+    assert_eq!(r1.header("x-idempotent-replayed"), None);
+
+    let r2 = client
+        .post("/manual-create")
+        .header("idempotency-key", "manual-route-key")
+        .send()
+        .await;
+    r2.assert_ok();
+    assert_eq!(r2.header("x-idempotent-replayed"), Some("true"));
+    assert_eq!(r2.text(), "manual-route");
+    assert_eq!(
+        MANUAL_ROUTE_HANDLER_CALLS.load(Ordering::SeqCst),
+        1,
+        "manual Route values accepted by AppBuilder::routes must not re-run on replay"
     );
 }
 

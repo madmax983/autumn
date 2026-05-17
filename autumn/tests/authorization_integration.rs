@@ -55,6 +55,12 @@ async fn update_note_inline(
     Ok("ok")
 }
 
+#[autumn_web::post("/secured-admin")]
+#[autumn_web::secured("admin")]
+async fn secured_admin_mutation() -> AutumnResult<&'static str> {
+    Ok("ok")
+}
+
 // ── Helpers ───────────────────────────────────────────────────
 
 fn build_app(
@@ -194,6 +200,27 @@ fn build_attr_app(
         .build()
 }
 
+fn build_idempotent_attr_app(
+    store: MemoryStore,
+    forbidden_response: ForbiddenResponse,
+) -> autumn_web::test::TestClient {
+    TestApp::new()
+        .routes(routes![update_note_attr])
+        .policy::<Note, _>(AdminOrOwnerPolicy)
+        .forbidden_response(forbidden_response)
+        .layer(SessionLayer::new(store, SessionConfig::default()))
+        .idempotent()
+        .build()
+}
+
+fn build_idempotent_secured_app(store: MemoryStore) -> autumn_web::test::TestClient {
+    TestApp::new()
+        .routes(routes![secured_admin_mutation])
+        .layer(SessionLayer::new(store, SessionConfig::default()))
+        .idempotent()
+        .build()
+}
+
 async fn post_with_session(
     client: &autumn_web::test::TestClient,
     path: &str,
@@ -240,6 +267,66 @@ async fn attribute_macro_honors_forbidden_response_override() {
     let client = build_attr_app(store, ForbiddenResponse::Forbidden403);
     let response = post_with_session(&client, "/notes-attr/1", "sess-stranger").await;
     assert_eq!(response.status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn idempotent_replay_does_not_bypass_authorize_policy_changes() {
+    let store = MemoryStore::new();
+    seed_session(&store, "sess-policy", "999", Some("admin")).await;
+    let client = build_idempotent_attr_app(store.clone(), ForbiddenResponse::Forbidden403);
+
+    let first = client
+        .post("/notes-attr/1")
+        .header("Cookie", "autumn.sid=sess-policy")
+        .header("idempotency-key", "policy-recheck-key")
+        .send()
+        .await;
+    assert_eq!(first.status, StatusCode::OK);
+
+    seed_session(&store, "sess-policy", "999", None).await;
+
+    let retry = client
+        .post("/notes-attr/1")
+        .header("Cookie", "autumn.sid=sess-policy")
+        .header("idempotency-key", "policy-recheck-key")
+        .send()
+        .await;
+    assert_eq!(
+        retry.status,
+        StatusCode::FORBIDDEN,
+        "cached idempotency replay must not skip the current #[authorize] policy check"
+    );
+    assert_eq!(retry.header("x-idempotent-replayed"), None);
+}
+
+#[tokio::test]
+async fn idempotent_replay_does_not_bypass_secured_role_changes() {
+    let store = MemoryStore::new();
+    seed_session(&store, "sess-secured", "999", Some("admin")).await;
+    let client = build_idempotent_secured_app(store.clone());
+
+    let first = client
+        .post("/secured-admin")
+        .header("Cookie", "autumn.sid=sess-secured")
+        .header("idempotency-key", "secured-recheck-key")
+        .send()
+        .await;
+    assert_eq!(first.status, StatusCode::OK);
+
+    seed_session(&store, "sess-secured", "999", Some("viewer")).await;
+
+    let retry = client
+        .post("/secured-admin")
+        .header("Cookie", "autumn.sid=sess-secured")
+        .header("idempotency-key", "secured-recheck-key")
+        .send()
+        .await;
+    assert_eq!(
+        retry.status,
+        StatusCode::FORBIDDEN,
+        "cached idempotency replay must not skip the current #[secured] role check"
+    );
+    assert_eq!(retry.header("x-idempotent-replayed"), None);
 }
 
 // ── #[authorize] stacked with #[secured] ──────────────────────
