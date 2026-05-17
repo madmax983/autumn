@@ -70,6 +70,113 @@ fn user_attrs(field: &Field) -> Vec<&syn::Attribute> {
         .collect()
 }
 
+#[derive(Clone, Copy)]
+enum SerdeAdapterMode {
+    Serialize,
+    Deserialize,
+}
+
+#[derive(Default)]
+struct SerdeAdapterAttrs {
+    with: Option<LitStr>,
+    serialize_with: Option<LitStr>,
+    deserialize_with: Option<LitStr>,
+}
+
+fn serde_adapter_attrs(field: &Field) -> SerdeAdapterAttrs {
+    let mut adapters = SerdeAdapterAttrs::default();
+    for attr in field
+        .attrs
+        .iter()
+        .filter(|attr| attr.path().is_ident("serde"))
+    {
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("with") {
+                adapters.with = Some(meta.value()?.parse()?);
+            } else if meta.path.is_ident("serialize_with") {
+                adapters.serialize_with = Some(meta.value()?.parse()?);
+            } else if meta.path.is_ident("deserialize_with") {
+                adapters.deserialize_with = Some(meta.value()?.parse()?);
+            }
+            Ok(())
+        });
+    }
+    adapters
+}
+
+fn hook_serde_adapter_attrs(field: &Field, mode: SerdeAdapterMode) -> Vec<TokenStream> {
+    let adapters = serde_adapter_attrs(field);
+    let mut entries = Vec::new();
+    if let Some(with) = adapters.with {
+        entries.push(quote! { with = #with });
+    }
+    match mode {
+        SerdeAdapterMode::Serialize => {
+            if let Some(serialize_with) = adapters.serialize_with {
+                entries.push(quote! { serialize_with = #serialize_with });
+            }
+        }
+        SerdeAdapterMode::Deserialize => {
+            if let Some(deserialize_with) = adapters.deserialize_with {
+                entries.push(quote! { deserialize_with = #deserialize_with });
+            }
+        }
+    }
+
+    if entries.is_empty() {
+        Vec::new()
+    } else {
+        vec![quote! { #[serde(#(#entries),*)] }]
+    }
+}
+
+fn has_hook_serde_adapter(field: &Field, mode: SerdeAdapterMode) -> bool {
+    let adapters = serde_adapter_attrs(field);
+    adapters.with.is_some()
+        || match mode {
+            SerdeAdapterMode::Serialize => adapters.serialize_with.is_some(),
+            SerdeAdapterMode::Deserialize => adapters.deserialize_with.is_some(),
+        }
+}
+
+enum SerdeDefaultKind {
+    Default,
+    Path(syn::Path),
+}
+
+fn serde_default_kind(field: &Field) -> Option<SerdeDefaultKind> {
+    let mut default = None;
+    for attr in field
+        .attrs
+        .iter()
+        .filter(|attr| attr.path().is_ident("serde"))
+    {
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("default") {
+                if meta.input.peek(syn::Token![=]) {
+                    let value: LitStr = meta.value()?.parse()?;
+                    if let Ok(path) = value.parse::<syn::Path>() {
+                        default = Some(SerdeDefaultKind::Path(path));
+                    }
+                } else {
+                    default = Some(SerdeDefaultKind::Default);
+                }
+            }
+            Ok(())
+        });
+    }
+    default
+}
+
+fn commit_hook_missing_field_default_expr(field: &Field) -> Option<TokenStream> {
+    match serde_default_kind(field) {
+        Some(SerdeDefaultKind::Default) => Some(quote! { ::core::default::Default::default() }),
+        Some(SerdeDefaultKind::Path(path)) => Some(quote! { #path() }),
+        None if is_option_type(&field.ty) => Some(quote! { ::core::option::Option::None }),
+        None => None,
+    }
+}
+
 /// Extract the associated model type from `#[factory_assoc(TypeName)]` if present.
 ///
 /// Returns `Some(Ident)` for the associated type, or `None` if the attribute is absent.
@@ -823,6 +930,202 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         let extra: &[&&Field] = lock_version_field.as_slice();
         emit_schema_fn_body_ext(&fields_for_new, true, extra)
     };
+    let commit_hook_serialize_fields: Vec<TokenStream> = all_fields
+        .iter()
+        .map(|f| {
+            let ident = f.ident.as_ref().expect("named field");
+            let ty = &f.ty;
+            let field_name = LitStr::new(&ident.to_string(), ident.span());
+            let field_value = if has_hook_serde_adapter(f, SerdeAdapterMode::Serialize) {
+                let serde_attrs = hook_serde_adapter_attrs(f, SerdeAdapterMode::Serialize);
+                quote! {
+                    {
+                        #[derive(::serde::Serialize)]
+                        struct __AutumnCommitHookSerializeField {
+                            #(#serde_attrs)*
+                            value: #ty,
+                        }
+                        let __autumn_field = __AutumnCommitHookSerializeField {
+                            value: self.#ident.clone(),
+                        };
+                        let __autumn_field_value =
+                            ::autumn_web::reexports::serde_json::to_value(&__autumn_field)
+                                .map_err(|__error| {
+                                    ::autumn_web::AutumnError::internal_server_error_msg(format!(
+                                        "serialize repository commit hook record field {}.{}: {}",
+                                        stringify!(#name),
+                                        #field_name,
+                                        __error
+                                    ))
+                                })?;
+                        match __autumn_field_value {
+                            ::autumn_web::reexports::serde_json::Value::Object(mut __autumn_field_object) => {
+                                __autumn_field_object.remove("value").ok_or_else(|| {
+                                    ::autumn_web::AutumnError::internal_server_error_msg(format!(
+                                        "serialize repository commit hook record field {}.{}: missing adapter output",
+                                        stringify!(#name),
+                                        #field_name
+                                    ))
+                                })?
+                            }
+                            __autumn_other => {
+                                return Err(::autumn_web::AutumnError::internal_server_error_msg(format!(
+                                    "serialize repository commit hook record field {}.{}: expected adapter object, got {}",
+                                    stringify!(#name),
+                                    #field_name,
+                                    __autumn_other
+                                )));
+                            }
+                        }
+                    }
+                }
+            } else {
+                quote! {
+                    ::autumn_web::reexports::serde_json::to_value(&self.#ident)
+                        .map_err(|__error| {
+                            ::autumn_web::AutumnError::internal_server_error_msg(format!(
+                                "serialize repository commit hook record field {}.{}: {}",
+                                stringify!(#name),
+                                #field_name,
+                                __error
+                            ))
+                        })?
+                }
+            };
+            quote! {
+                __autumn_object.insert(
+                    ::std::string::String::from(#field_name),
+                    #field_value
+                );
+            }
+        })
+        .collect();
+    let commit_hook_deserialize_fields: Vec<TokenStream> = all_fields
+        .iter()
+        .map(|f| {
+            let ident = f.ident.as_ref().expect("named field");
+            let ty = &f.ty;
+            let field_name = LitStr::new(&ident.to_string(), ident.span());
+            let missing_default = commit_hook_missing_field_default_expr(f);
+            let field_value = if has_hook_serde_adapter(f, SerdeAdapterMode::Deserialize) {
+                let serde_attrs = hook_serde_adapter_attrs(f, SerdeAdapterMode::Deserialize);
+                quote! {
+                    {
+                        #[derive(::serde::Deserialize)]
+                        struct __AutumnCommitHookDeserializeField {
+                            #(#serde_attrs)*
+                            value: #ty,
+                        }
+                        let mut __autumn_wrapper_object =
+                            ::autumn_web::reexports::serde_json::Map::new();
+                        __autumn_wrapper_object.insert(
+                            ::std::string::String::from("value"),
+                            __autumn_field,
+                        );
+                        let __autumn_wrapper: __AutumnCommitHookDeserializeField =
+                            ::autumn_web::reexports::serde_json::from_value(
+                                ::autumn_web::reexports::serde_json::Value::Object(
+                                    __autumn_wrapper_object,
+                                ),
+                            )
+                            .map_err(|__error| {
+                                ::autumn_web::AutumnError::internal_server_error_msg(format!(
+                                    "deserialize repository commit hook record field {}.{}: {}",
+                                    stringify!(#name),
+                                    #field_name,
+                                    __error
+                                ))
+                            })?;
+                        __autumn_wrapper.value
+                    }
+                }
+            } else {
+                quote! {
+                    ::autumn_web::reexports::serde_json::from_value(__autumn_field)
+                        .map_err(|__error| {
+                            ::autumn_web::AutumnError::internal_server_error_msg(format!(
+                                "deserialize repository commit hook record field {}.{}: {}",
+                                stringify!(#name),
+                                #field_name,
+                                __error
+                            ))
+                        })?
+                }
+            };
+            missing_default.map_or_else(
+                || {
+                    quote! {
+                    let #ident: #ty = {
+                        let __autumn_field = __autumn_object.remove(#field_name)
+                            .ok_or_else(|| {
+                                ::autumn_web::AutumnError::internal_server_error_msg(format!(
+                                    "deserialize repository commit hook record field {}.{}: missing field",
+                                    stringify!(#name),
+                                    #field_name
+                                ))
+                            })?;
+                        #field_value
+                    };
+                }
+                },
+                |missing_default| {
+                    quote! {
+                    let #ident: #ty = match __autumn_object.remove(#field_name) {
+                        ::core::option::Option::Some(__autumn_field) => {
+                            #field_value
+                        }
+                        ::core::option::Option::None => {
+                            #missing_default
+                        }
+                    };
+                }
+                },
+            )
+        })
+        .collect();
+    let commit_hook_construct_fields: Vec<TokenStream> = all_fields
+        .iter()
+        .map(|f| {
+            let ident = f.ident.as_ref().expect("named field");
+            quote! { #ident: #ident }
+        })
+        .collect();
+    let commit_hook_serialize_bounds: Vec<TokenStream> = all_fields
+        .iter()
+        .filter(|f| !has_hook_serde_adapter(f, SerdeAdapterMode::Serialize))
+        .map(|f| {
+            let ty = &f.ty;
+            quote! { #ty: ::serde::Serialize }
+        })
+        .collect();
+    let mut commit_hook_deserialize_bounds: Vec<TokenStream> = all_fields
+        .iter()
+        .filter(|f| !has_hook_serde_adapter(f, SerdeAdapterMode::Deserialize))
+        .map(|f| {
+            let ty = &f.ty;
+            quote! { #ty: ::serde::de::DeserializeOwned }
+        })
+        .collect();
+    commit_hook_deserialize_bounds.extend(
+        all_fields
+            .iter()
+            .filter(|f| !is_option_type(&f.ty))
+            .filter(|f| matches!(serde_default_kind(f), Some(SerdeDefaultKind::Default)))
+            .map(|f| {
+                let ty = &f.ty;
+                quote! { #ty: ::core::default::Default }
+            }),
+    );
+    let commit_hook_serialize_where = if commit_hook_serialize_bounds.is_empty() {
+        quote! {}
+    } else {
+        quote! { where #(#commit_hook_serialize_bounds,)* }
+    };
+    let commit_hook_deserialize_where = if commit_hook_deserialize_bounds.is_empty() {
+        quote! {}
+    } else {
+        quote! { where #(#commit_hook_deserialize_bounds,)* }
+    };
 
     quote! {
         #[derive(Debug, Clone, ::diesel::Queryable, ::diesel::Selectable, ::diesel::AsChangeset)]
@@ -954,12 +1257,50 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         }
 
+        // ── Durable commit-hook codec ───────────────────────────────────
+        // Hidden durable commit-hook codec. These methods serialize fields
+        // individually so public serde visibility attributes do not drop
+        // payload data needed by after_*_commit runners.
+        impl #name {
+            #[doc(hidden)]
+            pub fn __autumn_commit_hook_to_value(
+                &self,
+            ) -> ::autumn_web::AutumnResult<::autumn_web::reexports::serde_json::Value>
+            #commit_hook_serialize_where
+            {
+                let mut __autumn_object = ::autumn_web::reexports::serde_json::Map::new();
+                #(#commit_hook_serialize_fields)*
+                Ok(::autumn_web::reexports::serde_json::Value::Object(__autumn_object))
+            }
+
+            #[doc(hidden)]
+            pub fn __autumn_commit_hook_from_value(
+                __autumn_value: ::autumn_web::reexports::serde_json::Value,
+            ) -> ::autumn_web::AutumnResult<Self>
+            #commit_hook_deserialize_where
+            {
+                let mut __autumn_object = match __autumn_value {
+                    ::autumn_web::reexports::serde_json::Value::Object(__autumn_object) => __autumn_object,
+                    __autumn_other => {
+                        return Err(::autumn_web::AutumnError::internal_server_error_msg(format!(
+                            "deserialize repository commit hook record for {}: expected object, got {}",
+                            stringify!(#name),
+                            __autumn_other
+                        )));
+                    }
+                };
+                #(#commit_hook_deserialize_fields)*
+                Ok(Self {
+                    #(#commit_hook_construct_fields,)*
+                })
+            }
+        }
+
         // ── Optimistic-lock helpers ─────────────────────────────────────
         // Always emitted so the generated repository code can call them
         // unconditionally regardless of whether the model has a
-        // `#[lock_version]` field.  The `None` paths compile away with zero
+        // `#[lock_version]` field. The `None` paths compile away with zero
         // overhead for models that don't use optimistic locking.
-
         impl #name {
             /// Returns the current stored lock version, or `None` if this model
             /// does not have a `#[lock_version]` field.
@@ -1085,7 +1426,120 @@ mod tests {
         assert!(attrs.is_empty());
     }
 
+    #[test]
+    fn model_commit_hook_codec_includes_serde_skipped_fields() {
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Account {
+                    #[id]
+                    pub id: i64,
+                    pub email: String,
+                    #[serde(skip_serializing)]
+                    pub password_hash: String,
+                    #[serde(skip)]
+                    pub reset_token: Option<String>,
+                }
+            },
+        );
+        let generated = output.to_string();
+
+        assert!(
+            generated.contains("__autumn_commit_hook_to_value")
+                && generated.contains("__autumn_commit_hook_from_value"),
+            "models must implement the full-fidelity commit hook codec: {generated}"
+        );
+        assert!(
+            generated.contains("\"password_hash\""),
+            "commit hook codec must serialize skip_serializing fields: {generated}"
+        );
+        assert!(
+            generated.contains("\"reset_token\""),
+            "commit hook codec must serialize skip fields instead of defaulting them: {generated}"
+        );
+    }
+
+    #[test]
+    fn model_commit_hook_codec_preserves_serde_adapters() {
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct LedgerEntry {
+                    #[id]
+                    pub id: i64,
+                    #[serde(with = "cents_adapter")]
+                    pub amount_cents: i64,
+                    #[serde(
+                        serialize_with = "token_adapter::serialize",
+                        deserialize_with = "token_adapter::deserialize"
+                    )]
+                    pub external_token: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+
+        assert!(
+            generated.contains("__AutumnCommitHookSerializeField"),
+            "commit hook codec must serialize adapted fields through serde field helpers: {generated}"
+        );
+        assert!(
+            generated.contains("__AutumnCommitHookDeserializeField"),
+            "commit hook codec must deserialize adapted fields through serde field helpers: {generated}"
+        );
+        assert!(
+            generated.contains("with = \"cents_adapter\""),
+            "commit hook codec must preserve serde with adapters: {generated}"
+        );
+        assert!(
+            generated.contains("serialize_with = \"token_adapter::serialize\""),
+            "commit hook codec must preserve serialize_with adapters: {generated}"
+        );
+        assert!(
+            generated.contains("deserialize_with = \"token_adapter::deserialize\""),
+            "commit hook codec must preserve deserialize_with adapters: {generated}"
+        );
+    }
+
     // ── Existing tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn model_commit_hook_codec_defaults_missing_compatible_fields() {
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Account {
+                    #[id]
+                    pub id: i64,
+                    pub reset_token: Option<String>,
+                    #[serde(default = "default_reset_token")]
+                    pub special_token: Option<String>,
+                    #[serde(default)]
+                    pub display_name: String,
+                    #[serde(default = "default_status")]
+                    pub status: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+
+        assert!(
+            generated.contains(":: core :: option :: Option :: None"),
+            "missing Option fields in old durable payloads should default to None: {generated}"
+        );
+        assert!(
+            generated.contains(":: core :: default :: Default :: default ()"),
+            "missing #[serde(default)] fields in old durable payloads should use Default::default(): {generated}"
+        );
+        assert!(
+            generated.contains("default_status ()"),
+            "missing #[serde(default = \"...\")] fields in old durable payloads should call the configured default function: {generated}"
+        );
+        assert!(
+            generated.contains("default_reset_token ()"),
+            "explicit serde defaults should beat the generic Option::None fallback: {generated}"
+        );
+    }
 
     #[test]
     fn pascal_to_snake_simple() {

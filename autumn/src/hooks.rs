@@ -24,6 +24,10 @@
 //! pub trait ArticleRepository {}
 //! ```
 //!
+//! The durable `after_*_commit` hooks are opt-in because they require Autumn's
+//! framework-owned commit-hook queue table. Enable them explicitly with
+//! `#[repository(Article, hooks = ArticleHooks, commit_hooks = true)]`.
+//!
 //! The hooks type **must** implement [`Default`] and [`Clone`] (the
 //! generated extractor constructs it via `Default::default()` and the
 //! repository struct derives `Clone`).
@@ -56,7 +60,7 @@ use serde::{Deserialize, Serialize};
 // ── Mutation operation & context ─────────────────────────────────────
 
 /// The kind of mutation being performed on a repository record.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum MutationOp {
     /// A new record is being created.
@@ -89,7 +93,7 @@ impl std::fmt::Display for MutationOp {
 ///
 /// Carries actor identity, request metadata, and timestamps so that
 /// hook implementations can perform auditing, validation, or enrichment.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MutationContext {
     /// The mutation operation type.
     pub op: MutationOp,
@@ -200,6 +204,51 @@ pub trait MutationHooks: Send + Sync + 'static {
 
     /// Called after an existing record is updated.
     fn after_update(
+        &self,
+        _ctx: &mut MutationContext,
+        _record: &Self::Model,
+    ) -> impl Future<Output = AutumnResult<()>> + Send {
+        async { Ok(()) }
+    }
+
+    /// Called after a new record is inserted **and the transaction commits**.
+    ///
+    /// Unlike `after_create`, this hook fires only when the surrounding
+    /// database transaction has been durably committed. Use this variant for
+    /// side-effects (job enqueues, emails, cache invalidation) that must not
+    /// execute if the transaction rolls back.
+    ///
+    /// When the repository is declared with `commit_hooks = true`, generated
+    /// repository code writes this hook's intent to Autumn's framework-owned
+    /// durable commit-hook queue in the same transaction as the mutation.
+    /// Replicas claim queued hooks with Postgres row locks, so a process-local
+    /// task disappearing is recovered by retrying or dead-lettering the row
+    /// instead of silently losing the side effect.
+    fn after_create_commit(
+        &self,
+        _ctx: &mut MutationContext,
+        _record: &Self::Model,
+    ) -> impl Future<Output = AutumnResult<()>> + Send {
+        async { Ok(()) }
+    }
+
+    /// Called after an existing record is updated **and the transaction commits**.
+    ///
+    /// The same transactional guarantee as `after_create_commit` applies:
+    /// this hook is not called when the surrounding transaction rolls back.
+    fn after_update_commit(
+        &self,
+        _ctx: &mut MutationContext,
+        _record: &Self::Model,
+    ) -> impl Future<Output = AutumnResult<()>> + Send {
+        async { Ok(()) }
+    }
+
+    /// Called after a record is deleted **and the transaction commits**.
+    ///
+    /// The same transactional guarantee as `after_create_commit` applies:
+    /// this hook is not called when the surrounding transaction rolls back.
+    fn after_delete_commit(
         &self,
         _ctx: &mut MutationContext,
         _record: &Self::Model,
@@ -750,6 +799,83 @@ mod tests {
         assert!(hooks.before_delete(&mut ctx, &model).await.is_ok());
         assert!(hooks.after_create(&mut ctx, &model).await.is_ok());
         assert!(hooks.after_update(&mut ctx, &model).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn no_hooks_commit_variants_are_noop() {
+        // after_*_commit variants must also be no-ops on NoHooks
+        let hooks: NoHooks<(), (), ()> = NoHooks::default();
+        let mut ctx = MutationContext::new(MutationOp::Create);
+        let model = ();
+
+        assert!(
+            hooks.after_create_commit(&mut ctx, &model).await.is_ok(),
+            "after_create_commit must default to Ok(())"
+        );
+        assert!(
+            hooks.after_update_commit(&mut ctx, &model).await.is_ok(),
+            "after_update_commit must default to Ok(())"
+        );
+        assert!(
+            hooks.after_delete_commit(&mut ctx, &model).await.is_ok(),
+            "after_delete_commit must default to Ok(())"
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_hooks_can_override_commit_variants() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        static CALLS: AtomicU32 = AtomicU32::new(0);
+
+        #[derive(Clone, Default)]
+        struct CountingHooks;
+
+        impl MutationHooks for CountingHooks {
+            type Model = ();
+            type NewModel = ();
+            type UpdateModel = ();
+
+            async fn after_create_commit(
+                &self,
+                _ctx: &mut MutationContext,
+                _record: &Self::Model,
+            ) -> AutumnResult<()> {
+                CALLS.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+
+            async fn after_update_commit(
+                &self,
+                _ctx: &mut MutationContext,
+                _record: &Self::Model,
+            ) -> AutumnResult<()> {
+                CALLS.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+
+            async fn after_delete_commit(
+                &self,
+                _ctx: &mut MutationContext,
+                _record: &Self::Model,
+            ) -> AutumnResult<()> {
+                CALLS.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        CALLS.store(0, Ordering::SeqCst);
+        let hooks = CountingHooks;
+        let mut ctx = MutationContext::new(MutationOp::Create);
+        let model = ();
+
+        hooks.after_create_commit(&mut ctx, &model).await.unwrap();
+        hooks.after_update_commit(&mut ctx, &model).await.unwrap();
+        hooks.after_delete_commit(&mut ctx, &model).await.unwrap();
+
+        assert_eq!(CALLS.load(Ordering::SeqCst), 3);
+        let _ = Arc::new(CountingHooks); // ensure Arc usage works (Clone check)
     }
 
     // ── Patch serde tests ──────────────────────────────────────────

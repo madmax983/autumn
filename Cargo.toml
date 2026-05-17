@@ -2,6 +2,16 @@
 members = ["autumn", "autumn-macros", "autumn-cli", "autumn-admin-plugin", "autumn-storage-s3", "autumn-cache-redis", "examples/hello", "examples/todo-app", "examples/blog", "examples/bookmarks", "examples/bookmarks-distributed", "examples/wiki", "examples/reddit-clone", "examples/custom_config_loader", "examples/ws-echo", "examples/signed-webhooks"]
 resolver = "3"
 
+# `cargo test --workspace` builds every example, plugin, integration test, and
+# proc macro in one target tree. Keep CI artifacts bounded on ubuntu-latest while
+# preserving line numbers in panic backtraces.
+[profile.test]
+debug = "line-tables-only"
+incremental = false
+
+[profile.test.build-override]
+debug = 0
+
 [patch.crates-io]
 autumn-web = { path = "autumn" }
 
@@ -44,6 +54,7 @@ validator = { version = "0.20", features = ["derive"] }
 bcrypt = "0.19"
 futures = "0.3"
 indexmap = "2"
+inventory = "0.3"
 moka = { version = "0.12", features = ["sync"] }
 chrono = { version = "0.4", features = ["serde"] }
 testcontainers = "0.27"

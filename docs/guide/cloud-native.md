@@ -176,7 +176,13 @@ restarts or replicas.
 
 When email dispatch is coordinated with DB writes, use
 [`Db::tx`](transactions.md) for the database side so the write set commits or
-rolls back atomically.
+rolls back atomically. Call `deliver_later` inside the transaction closure and
+Autumn will automatically defer the mail spawn until after commit, so no emails
+will be sent for rolled-back writes. That deferral is still process-local; use a
+durable outbox or queue row written inside the transaction when the handoff must
+survive restarts. See
+[Transactions -> after_commit](transactions.md#after_commit--post-commit-process-local-callbacks)
+for the complete pattern including jobs.
 
 ## Background Work
 

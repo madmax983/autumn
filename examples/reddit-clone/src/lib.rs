@@ -151,4 +151,21 @@ mod tests {
             "autumn.toml must set jobs.backend = \"postgres\" as the default"
         );
     }
+
+    #[test]
+    fn default_postgres_job_routes_enqueue_inside_user_transaction() {
+        let auth_routes = include_str!("routes/auth.rs");
+        let post_routes = include_str!("routes/posts.rs");
+
+        for (name, source) in [("auth", auth_routes), ("posts", post_routes)] {
+            assert!(
+                source.contains("autumn_web::job::enqueue_on_conn"),
+                "{name} routes must enqueue Postgres-backed jobs on the transaction connection"
+            );
+            assert!(
+                !source.contains("autumn_web::job::enqueue_after_commit"),
+                "{name} routes must not use post-commit job enqueue for the default Postgres backend"
+            );
+        }
+    }
 }

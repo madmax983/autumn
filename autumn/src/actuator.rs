@@ -952,6 +952,8 @@ struct ActuatorHealth {
     version: &'static str,
     profile: String,
     uptime: String,
+    #[cfg(feature = "db")]
+    autumn_after_commit_failures_total: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     checks: Option<HealthChecks>,
 }
@@ -1012,6 +1014,9 @@ pub async fn health<S: ProvideActuatorState + Send + Sync + 'static>(
         version: env!("CARGO_PKG_VERSION"),
         profile: state.profile().to_owned(),
         uptime: state.uptime_display(),
+        #[cfg(feature = "db")]
+        autumn_after_commit_failures_total: crate::db::AFTER_COMMIT_FAILURES_TOTAL
+            .load(std::sync::atomic::Ordering::Relaxed),
         checks,
     };
 
@@ -1760,6 +1765,32 @@ mod tests {
         assert_eq!(json["status"], "ok");
         assert_eq!(json["profile"], "dev");
         assert!(json["uptime"].is_string());
+    }
+
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn actuator_health_exposes_after_commit_failure_counter() {
+        let app = actuator_router(true).with_state(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["autumn_after_commit_failures_total"],
+            crate::db::AFTER_COMMIT_FAILURES_TOTAL.load(std::sync::atomic::Ordering::Relaxed),
+            "/actuator/health should expose the documented after_commit counter"
+        );
     }
 
     #[tokio::test]
