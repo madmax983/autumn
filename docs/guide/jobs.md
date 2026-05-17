@@ -158,15 +158,24 @@ The migration is bundled with the framework and is applied automatically by
 
 ## Transactional enqueue
 
-When a job must be enqueued **atomically with a database write**, use one of
-the approaches below to avoid the dual-write problem (job enqueued but DB
-rolled back, or DB committed but job lost on crash).
+When a job must be coordinated with a database write, choose the API based on
+which guarantee you need:
+
+- `enqueue_after_commit` prevents jobs for rolled-back data on any backend, but
+  the post-commit callback is process-local and can be lost if the process exits
+  after commit.
+- `enqueue_in_tx` / `enqueue_on_conn` on the Postgres backend write the job row
+  in the same transaction as the domain row, which is the crash-safe handoff.
 
 ### `enqueue_after_commit` — any backend
 
 `autumn_web::job::enqueue_after_commit` registers the enqueue as an
 after-commit callback inside the surrounding `db.tx` block. The job is only
 dispatched if the transaction commits. Works with every job backend.
+
+This is not crash-safe delivery. If the process exits after the transaction
+commits but before the callback runs, no job may be recorded. Use this for
+rollback coordination across backends, not as a durable outbox substitute.
 
 ```rust,no_run
 use autumn_web::prelude::*;
@@ -177,6 +186,7 @@ async fn create_order(mut db: Db) -> AutumnResult<()> {
         // ... INSERT order ...
 
         // Enqueued only after INSERT commits; dropped if the tx rolls back.
+        // For crash-safe Postgres handoff, use enqueue_in_tx instead.
         autumn_web::job::enqueue_after_commit("ship_order", &args).await?;
 
         Ok::<_, AutumnError>(())
@@ -188,8 +198,8 @@ async fn create_order(mut db: Db) -> AutumnResult<()> {
 ### `enqueue_in_tx` / `enqueue_on_conn` — Postgres backend only
 
 On the Postgres backend the job row can live in the **same transaction** as
-the domain row. Both commit or roll back together — maximum durability at
-the cost of being limited to the `postgres` backend.
+the domain row. Both commit or roll back together, avoiding the post-commit
+process crash window at the cost of being limited to the `postgres` backend.
 
 ```rust,no_run
 use autumn_web::prelude::*;
@@ -208,7 +218,7 @@ async fn create_order(mut db: Db) -> AutumnResult<()> {
 }
 ```
 
-See [Transactions → after_commit](transactions.md#after_commit--deferring-side-effects-until-the-db-write-is-durable)
+See [Transactions -> after_commit](transactions.md#after_commit--post-commit-process-local-callbacks)
 for a full comparison of the two strategies and guidance on when to use each.
 
 For cloud-native rollout run the migration job first, then start web and workers.

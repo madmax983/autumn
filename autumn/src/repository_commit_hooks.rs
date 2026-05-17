@@ -74,12 +74,26 @@ const HOOK_EXTEND_PENDING_FINALIZER_SQL: &str = "UPDATE autumn_repository_commit
      SET claimed_at = NOW() \
      WHERE id = $1 AND claimed_by = $2 AND status = 'pending_after_hook'";
 const HOOK_RECOVER_STALE_RUNNING_SQL: &str = "UPDATE autumn_repository_commit_hooks \
-     SET status = 'enqueued', \
-         run_at = NOW(), \
+     SET status = CASE \
+           WHEN attempt < max_attempts THEN 'enqueued' \
+           ELSE 'failed' \
+         END, \
+         attempt = CASE \
+           WHEN attempt < max_attempts THEN attempt + 1 \
+           ELSE attempt \
+         END, \
+         run_at = CASE \
+           WHEN attempt < max_attempts THEN NOW() \
+           ELSE run_at \
+         END, \
          started_at = NULL, \
+         finished_at = CASE \
+           WHEN attempt >= max_attempts THEN NOW() \
+           ELSE NULL \
+         END, \
          claimed_by = NULL, \
          claimed_at = NULL, \
-         last_error = COALESCE(last_error, $1) \
+         last_error = $1 \
      WHERE status = 'running' \
        AND claimed_at < NOW() - ($2::BIGINT * INTERVAL '1 millisecond')";
 const HOOK_RECOVER_STALE_PENDING_SQL: &str = "UPDATE autumn_repository_commit_hooks \
@@ -1122,6 +1136,30 @@ mod tests {
         assert!(
             HOOK_ACK_SUCCESS_SQL.contains("record = '{}'::JSONB"),
             "success ack must clear serialized record payload"
+        );
+    }
+
+    #[test]
+    fn stale_running_recovery_counts_against_max_attempts() {
+        assert!(
+            HOOK_RECOVER_STALE_RUNNING_SQL.contains("attempt < max_attempts"),
+            "stale running recovery must branch on retry exhaustion"
+        );
+        assert!(
+            HOOK_RECOVER_STALE_RUNNING_SQL.contains("attempt = CASE"),
+            "stale running recovery must not requeue without updating attempt accounting"
+        );
+        assert!(
+            HOOK_RECOVER_STALE_RUNNING_SQL.contains("attempt + 1"),
+            "stale running recovery must consume the abandoned attempt"
+        );
+        assert!(
+            HOOK_RECOVER_STALE_RUNNING_SQL.contains("ELSE 'failed'"),
+            "stale running recovery must dead-letter rows already at max_attempts"
+        );
+        assert!(
+            !HOOK_RECOVER_STALE_RUNNING_SQL.contains("SET status = 'enqueued'"),
+            "stale running recovery must not unconditionally requeue exhausted rows"
         );
     }
 

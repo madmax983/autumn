@@ -67,19 +67,31 @@ This avoids ambiguity and keeps transaction boundaries explicit.
 
 ---
 
-## `after_commit` — deferring side effects until the DB write is durable
+## `after_commit` — post-commit process-local callbacks
 
 ### The dual-write problem
 
 When a handler writes to the database **and** enqueues a job or sends an email,
-there are two discrete operations. If the DB commits but the job-enqueue fails
-(or the process crashes between the two), the job is lost. If the job is
-enqueued but the DB rolls back, the job fires against non-existent data.
+there are two discrete operations:
 
-Autumn eliminates this race with `after_commit` callbacks — closures that are
-registered inside a `db.tx` block and only executed **after the transaction
-commits successfully**. If the transaction rolls back, the callbacks are
-discarded.
+- If the side effect runs before the DB commit and the transaction rolls back,
+  the side effect fires against data that never existed.
+- If the DB commits and the process exits before post-commit work runs, the
+  side effect can still be lost.
+
+`after_commit` callbacks solve the first problem only. They are closures
+registered inside a `db.tx` block and spawned after the transaction commits
+successfully. If the transaction rolls back, the callbacks are discarded.
+
+They are **not a crash-safe delivery mechanism**. The callbacks are
+process-local work handed to Tokio after the database commit has already
+returned, so a process exit in that window can still lose a Redis enqueue,
+external queue publish, email, or other side effect.
+
+For crash-safe delivery, write a durable outbox, Postgres job row, or queue row
+inside the same transaction as the domain write, then have a worker drain that
+durable record. An `after_commit` callback may still be useful as a wake-up
+hint, but the durable row must be the source of truth.
 
 ### `register_after_commit`
 
@@ -92,8 +104,8 @@ async fn create_user(mut db: Db) -> AutumnResult<()> {
     db.tx(|conn| async move {
         // ... INSERT user ...
 
-        // Registers a closure to run AFTER the transaction commits.
-        // If the transaction rolls back this closure is silently dropped.
+        // Registers a process-local closure to run AFTER the transaction
+        // commits. If the transaction rolls back this closure is dropped.
         register_after_commit(|| async move {
             // Enqueue a job, call an external API, publish an event, etc.
             Ok(())
@@ -108,11 +120,16 @@ async fn create_user(mut db: Db) -> AutumnResult<()> {
 
 ### Jobs — `enqueue_after_commit`
 
-For the common case of enqueueing a background job, use the free function
-`autumn_web::job::enqueue_after_commit`. It behaves like
-`JobClient::enqueue` but defers the enqueue until after the surrounding
-`db.tx` commits. Outside a transaction it enqueues immediately so it is safe
-to call unconditionally.
+For the common cross-backend case of enqueueing a background job after a
+successful write, use the free function `autumn_web::job::enqueue_after_commit`.
+It behaves like `JobClient::enqueue` but defers the enqueue until after the
+surrounding `db.tx` commits. Outside a transaction it enqueues immediately so it
+is safe to call unconditionally.
+
+This is still process-local deferral. If the process exits after commit but
+before the callback runs, no job may be recorded. Use it when you need "no job
+for rolled-back data"; use a transactional enqueue or durable outbox when the
+job handoff itself must survive process loss.
 
 ```rust,no_run
 use autumn_web::prelude::*;
@@ -122,7 +139,8 @@ async fn publish_post(mut db: Db) -> AutumnResult<()> {
     db.tx(|conn| async move {
         // ... INSERT post ...
 
-        // Enqueued only if the INSERT commits — no orphaned jobs.
+        // Enqueued only if the INSERT commits -- no orphaned jobs.
+        // Not crash-safe; use enqueue_in_tx for that on Postgres.
         autumn_web::job::enqueue_after_commit("post_publication", &args).await?;
 
         Ok::<_, AutumnError>(())
@@ -131,10 +149,10 @@ async fn publish_post(mut db: Db) -> AutumnResult<()> {
 }
 ```
 
-When using the Postgres job backend you can alternatively use
-`enqueue_in_tx` / `enqueue_on_conn` to write the job row inside the same
-database transaction — the job row and domain row commit or roll back
-together atomically. See [Jobs → Transactional enqueue](jobs.md#transactional-enqueue).
+When using the Postgres job backend, prefer `enqueue_in_tx` / `enqueue_on_conn`
+for crash-safe job handoff. These APIs write the job row inside the same
+database transaction, so the job row and domain row commit or roll back together
+atomically. See [Jobs -> Transactional enqueue](jobs.md#transactional-enqueue).
 
 ### Mail — auto-deferred `deliver_later`
 
@@ -142,6 +160,11 @@ together atomically. See [Jobs → Transactional enqueue](jobs.md#transactional-
 `#[mailer]`) automatically detect when they are called inside a `db.tx`
 block and defer mail dispatch until the transaction commits. No code change
 is required — simply call `deliver_later` inside the closure.
+
+Like any `after_commit` callback, this only prevents mail for rolled-back
+writes. It does not make an in-process mail spawn, SMTP send, or external queue
+handoff crash-safe unless the configured mail queue records a durable outbox row
+or equivalent durable intent.
 
 ```rust,no_run
 use autumn_web::prelude::*;
@@ -151,7 +174,8 @@ async fn register_user(mut db: Db, mailer: Mailer) -> AutumnResult<()> {
     db.tx(|conn| async move {
         // ... INSERT user ...
 
-        // Automatically deferred until after commit.
+        // Automatically deferred until after commit, but not crash-safe by
+        // itself.
         AccountMailer.deliver_later_welcome(&mailer, email, username);
 
         Ok::<_, AutumnError>(())
@@ -184,7 +208,8 @@ impl MutationHooks for PostHooks {
         ctx: &mut RequestContext,
         record: &Post,
     ) -> AutumnResult<()> {
-        // Runs after the INSERT commits; safe to send a notification.
+        // Runs after the INSERT commits. Use a durable mail queue/outbox if the
+        // notification itself must survive process exit.
         NotificationMailer.deliver_later_new_post(ctx.mailer(), record);
         Ok(())
     }
@@ -208,8 +233,9 @@ may need manual recovery.
 
 | Scenario | Recommended API |
 |---|---|
-| Job + DB write on any backend | `enqueue_after_commit` inside `db.tx` |
-| Job + DB write on Postgres backend (highest durability) | `enqueue_in_tx` / `enqueue_on_conn` inside `db.tx` |
-| Email triggered by a DB write | `deliver_later` inside `db.tx` (auto-deferred) |
+| Job + DB write on any backend, avoiding rolled-back data | `enqueue_after_commit` inside `db.tx` |
+| Crash-safe job + DB write on Postgres | `enqueue_in_tx` / `enqueue_on_conn` inside `db.tx` |
+| Email triggered by a DB write, avoiding rolled-back data | `deliver_later` inside `db.tx` (auto-deferred) |
+| Crash-safe email triggered by a DB write | Insert a durable outbox row in the transaction; use a mail queue/worker to drain it |
 | Repository create/update/delete side effect | `after_create_commit` / `after_update_commit` / `after_delete_commit` hook with `commit_hooks = true` |
 | Custom side effect on commit | `register_after_commit` inside `db.tx` |

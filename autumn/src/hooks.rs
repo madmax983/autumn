@@ -222,7 +222,8 @@ pub trait MutationHooks: Send + Sync + 'static {
     /// repository code writes this hook's intent to Autumn's framework-owned
     /// durable commit-hook queue in the same transaction as the mutation.
     /// Replicas claim queued hooks with Postgres row locks, so a process-local
-    /// task disappearing does not lose the side effect.
+    /// task disappearing is recovered by retrying or dead-lettering the row
+    /// instead of silently losing the side effect.
     fn after_create_commit(
         &self,
         _ctx: &mut MutationContext,

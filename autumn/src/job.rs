@@ -1010,6 +1010,8 @@ pub async fn enqueue_on_conn<A: serde::Serialize>(
 ///
 /// When called inside a [`Db::tx`](crate::db::Db::tx) block, the enqueue is
 /// deferred until the transaction commits. On rollback the job is dropped.
+/// This process-local deferral is not crash-safe: if the process exits after
+/// the commit but before the callback runs, no job may be recorded.
 ///
 /// When called outside any active transaction, the job is enqueued
 /// immediately with a `debug`-level log noting the eager path.
@@ -1133,6 +1135,11 @@ impl JobClient {
     /// When called inside a [`Db::tx`](crate::db::Db::tx) block, the enqueue is
     /// deferred until the transaction commits successfully. If the transaction
     /// rolls back, the job is never enqueued.
+    ///
+    /// The deferred enqueue callback runs in-process after commit. Use
+    /// [`enqueue_in_tx`](crate::job::enqueue_in_tx) / `enqueue_on_conn` with the
+    /// Postgres backend when the job row itself must be committed atomically
+    /// with the domain write.
     ///
     /// When called **outside** any active transaction, the job is enqueued
     /// immediately (equivalent to [`enqueue`](Self::enqueue)) and a `debug`-level

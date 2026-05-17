@@ -486,6 +486,30 @@ fn bookmarks_example_tracks_regenerated_scaffold_layout() {
 }
 
 #[test]
+fn after_commit_docs_do_not_promise_crash_safe_delivery() {
+    let root = workspace_root();
+    let transactions_path = root.join("docs/guide/transactions.md");
+    let transactions = std::fs::read_to_string(&transactions_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", transactions_path.display()));
+
+    assert!(
+        transactions.contains("not a crash-safe delivery mechanism"),
+        "{} must explicitly warn that process-local after_commit callbacks can be lost after commit",
+        transactions_path.display(),
+    );
+    assert!(
+        transactions.contains("durable outbox"),
+        "{} must point crash-safe side effects at an in-transaction outbox or queue",
+        transactions_path.display(),
+    );
+    assert!(
+        !transactions.contains("Autumn eliminates this race with `after_commit` callbacks"),
+        "{} must not claim after_commit eliminates the DB-commit/process-crash race",
+        transactions_path.display(),
+    );
+}
+
+#[test]
 fn benchmark_runtime_startup_applies_packaged_migrations() {
     let root = workspace_root();
 

@@ -648,6 +648,10 @@ impl Mailer {
     /// delivery is automatically deferred until the transaction commits. On
     /// rollback the mail is silently dropped — no orphaned sends.
     ///
+    /// This deferral is process-local. It prevents mail for rolled-back writes,
+    /// but it does not make the post-commit mail handoff crash-safe unless the
+    /// configured [`MailDeliveryQueue`] records a durable outbox/queue entry.
+    ///
     /// When called outside any active transaction the behaviour is unchanged:
     /// the mail is dispatched in a background Tokio task immediately.
     ///

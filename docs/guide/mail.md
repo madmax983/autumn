@@ -93,6 +93,11 @@ the mail task is spawned only after the transaction commits. If the transaction
 rolls back, the mail is silently discarded — no ghost emails for data that was
 never saved.
 
+This deferral is not crash-safe delivery by itself. If the process exits after
+commit but before the callback runs, no mail handoff may happen. Use it to avoid
+mail for rolled-back writes; use an in-transaction outbox row plus a durable
+queue/worker when the mail itself must survive restarts.
+
 ```rust,no_run
 use autumn_web::prelude::*;
 use scoped_futures::ScopedFutureExt;
@@ -102,7 +107,8 @@ async fn register(mut db: Db, mailer: Mailer) -> AutumnResult<()> {
     db.tx(|conn| async move {
         // ... INSERT user ...
 
-        // Mail is only sent if the INSERT commits.
+        // Mail is only sent if the INSERT commits. Persist an outbox row too
+        // if the mail must survive process exit.
         AccountMailer.deliver_later_welcome(&mailer, email, username);
 
         Ok::<_, AutumnError>(())
@@ -115,7 +121,7 @@ To bypass deferral and always spawn immediately — for example when outside a
 transaction or when you deliberately want fire-and-forget semantics — use
 `deliver_later_eager` / `try_deliver_later_eager`.
 
-See [Transactions → after_commit](transactions.md#after_commit--deferring-side-effects-until-the-db-write-is-durable)
+See [Transactions -> after_commit](transactions.md#after_commit--post-commit-process-local-callbacks)
 for the full story on atomic DB + mail patterns.
 
 ## Previewing Emails In Dev
@@ -242,13 +248,14 @@ acknowledged single-replica escape hatch, not a recommended production setup.
 
 ### DB-Write + Mail Patterns (Outbox)
 
-When a request both writes to the DB and dispatches mail, send mail **after**
-the DB transaction commits, but make the dispatch idempotent so retries
-recover:
+When a request both writes to the DB and dispatches mail, persist the mail
+intent in the same transaction as the domain write, then make the dispatch
+idempotent so retries recover:
 
 1. Inside `Db::tx`, insert the user row **and** an `email_outbox` row
    (`(id, kind, payload, status='pending')`) atomically.
-2. After commit, call `mailer.deliver_later(...)`.
+2. After commit, call `mailer.deliver_later(...)` as an optional wake-up hint,
+   or let a worker poll pending outbox rows.
 3. A `MailDeliveryQueue` implementation reads the outbox row, sends the email,
    and marks the row `sent`. On retry, it skips already-`sent` rows. This is
    the canonical outbox pattern: the DB transaction is the source of truth for

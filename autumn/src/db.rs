@@ -140,6 +140,12 @@ fn after_commit_panic_message(payload: &(dyn Any + Send)) -> String {
 /// transaction commits successfully. On rollback the callback is dropped
 /// without being called.
 ///
+/// The deferred callback is process-local work spawned after commit. It avoids
+/// side effects for rolled-back transactions, but it is not a crash-safe
+/// delivery mechanism. For side effects that must survive process exit, write a
+/// durable outbox or queue row inside the same database transaction and use
+/// this callback only as an optional wake-up hint.
+///
 /// If called **outside** any active transaction, the callback runs immediately
 /// (eager execution) with a `debug`-level log note.
 ///

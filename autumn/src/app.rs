@@ -1686,17 +1686,17 @@ impl AppBuilder {
         let shutdown_timeout = config.server.shutdown_timeout_secs;
         let server_shutdown = tokio_util::sync::CancellationToken::new();
 
+        if let Err(error) = initialize_job_runtime(jobs, &state, &server_shutdown, &config.jobs) {
+            tracing::error!(error = %error, "job runtime initialization failed");
+            std::process::exit(1);
+        }
+
         #[cfg(feature = "db")]
         if let Some(pool) = state.pool().cloned() {
             crate::repository_commit_hooks::start_repository_commit_hook_worker(
                 pool,
                 server_shutdown.child_token(),
             );
-        }
-
-        if let Err(error) = initialize_job_runtime(jobs, &state, &server_shutdown, &config.jobs) {
-            tracing::error!(error = %error, "job runtime initialization failed");
-            std::process::exit(1);
         }
 
         tracing::info!(addr = %addr, "Listening");
@@ -2285,17 +2285,17 @@ impl AppBuilder {
         let _storage_router = storage_bootstrap.and_then(|bootstrap| bootstrap.install(&state));
 
         let task_shutdown = tokio_util::sync::CancellationToken::new();
+        if let Err(error) = initialize_job_runtime(jobs, &state, &task_shutdown, &config.jobs) {
+            eprintln!("job runtime initialization failed: {error}");
+            std::process::exit(1);
+        }
+
         #[cfg(feature = "db")]
         if let Some(pool) = state.pool().cloned() {
             crate::repository_commit_hooks::start_repository_commit_hook_worker(
                 pool,
                 task_shutdown.child_token(),
             );
-        }
-
-        if let Err(error) = initialize_job_runtime(jobs, &state, &task_shutdown, &config.jobs) {
-            eprintln!("job runtime initialization failed: {error}");
-            std::process::exit(1);
         }
 
         if let Err(error) = run_startup_hooks(&startup_hooks, state.clone()).await {
@@ -4490,6 +4490,35 @@ mod tests {
         assert!(state.read_pool().is_none());
         let (status, _) = crate::probe::readiness_response(&state).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn repository_commit_hook_worker_starts_after_job_runtime_initialization() {
+        let source = include_str!("app.rs").replace("\r\n", "\n");
+        let server_init = "initialize_job_runtime(jobs, &state, &server_shutdown, &config.jobs)";
+        let server_worker = "start_repository_commit_hook_worker(\n                pool,\n                server_shutdown.child_token(),\n            );";
+        let task_init = "initialize_job_runtime(jobs, &state, &task_shutdown, &config.jobs)";
+        let task_worker = "start_repository_commit_hook_worker(\n                pool,\n                task_shutdown.child_token(),\n            );";
+
+        assert!(
+            source
+                .find(server_init)
+                .expect("normal server path should initialize jobs")
+                < source
+                    .find(server_worker)
+                    .expect("normal server path should start repository hook worker"),
+            "normal server startup must initialize jobs before repository commit hooks can enqueue them"
+        );
+        assert!(
+            source
+                .find(task_init)
+                .expect("task runner path should initialize jobs")
+                < source
+                    .find(task_worker)
+                    .expect("task runner path should start repository hook worker"),
+            "task runner startup must initialize jobs before repository commit hooks can enqueue them"
+        );
     }
 
     #[cfg(feature = "db")]
