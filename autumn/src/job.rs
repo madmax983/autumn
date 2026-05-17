@@ -1350,7 +1350,8 @@ async fn execute_local_job(
                 let id = job.id.clone();
                 let name = job.name.clone();
                 let payload = job.payload;
-                let delay = backoff_ms.saturating_mul(2_u64.saturating_pow(job.attempt - 1));
+                let delay =
+                    backoff_ms.saturating_mul(2_u64.saturating_pow(job.attempt.saturating_sub(1)));
                 tokio::spawn(async move {
                     tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                     registry.record_enqueue(&name);
@@ -6586,5 +6587,53 @@ mod tests {
             .optional()
             .unwrap_or(None)
         }
+    }
+}
+
+#[cfg(test)]
+mod havoc_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn execute_local_job_does_not_panic_on_zero_attempt() {
+        let state = AppState::for_test().with_profile("dev");
+        state.job_registry().register("flaky");
+        state.job_registry().record_enqueue("flaky");
+
+        let mut jobs = HashMap::new();
+        jobs.insert(
+            "flaky".to_string(),
+            JobInfo {
+                name: "flaky".to_string(),
+                max_attempts: 2,
+                initial_backoff_ms: 1,
+                handler: |_, _| {
+                    Box::pin(
+                        async move { Err(crate::AutumnError::internal_server_error_msg("fail")) },
+                    )
+                },
+            },
+        );
+        let jobs_by_name = Arc::new(RwLock::new(jobs));
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let job_admin = JobAdminMemoryBackend::new_for_test(32);
+        let job_id = job_admin.record_enqueue_for_test("flaky", serde_json::json!({}), 1, 2);
+
+        execute_local_job(
+            QueuedJob {
+                id: job_id.clone(),
+                name: "flaky".to_string(),
+                payload: serde_json::json!({}),
+                attempt: 0, // This should trigger the panic
+                max_attempts: 2,
+                initial_backoff_ms: 1,
+            },
+            &jobs_by_name,
+            &tx,
+            &state,
+            &job_admin,
+        )
+        .await;
     }
 }
