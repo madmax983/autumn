@@ -369,10 +369,26 @@ fn build_openapi_router(
         }
     }
 
-    // Walk both top-level routes and scoped groups. For scoped groups the
-    // effective path is `prefix + route.path`; we materialize these into
-    // fresh `ApiDoc`s so the rendered spec reflects the actual URL the
-    // user will call.
+    let docs = prepare_api_docs(route_list, scoped_groups);
+    let refs: Vec<&crate::openapi::ApiDoc> = docs.iter().collect();
+    let spec = crate::openapi::generate_spec(&config, &refs);
+    let spec_json = serde_json::to_string_pretty(&spec)
+        .unwrap_or_else(|e| format!("{{\"error\": \"failed to serialize spec: {e}\"}}"));
+
+    let router = mount_openapi_endpoints(&config, spec_json);
+
+    Ok(Some(router))
+}
+
+/// Walk both top-level routes and scoped groups. For scoped groups the
+/// effective path is `prefix + route.path`; we materialize these into
+/// fresh `ApiDoc`s so the rendered spec reflects the actual URL the
+/// user will call.
+#[cfg(feature = "openapi")]
+fn prepare_api_docs(
+    route_list: &[Route],
+    scoped_groups: &[ScopedGroup],
+) -> Vec<crate::openapi::ApiDoc> {
     let mut docs: Vec<crate::openapi::ApiDoc> = Vec::new();
     for route in route_list {
         docs.push(route.api_doc.clone());
@@ -408,12 +424,14 @@ fn build_openapi_router(
             docs.push(doc);
         }
     }
+    docs
+}
 
-    let refs: Vec<&crate::openapi::ApiDoc> = docs.iter().collect();
-    let spec = crate::openapi::generate_spec(&config, &refs);
-    let spec_json = serde_json::to_string_pretty(&spec)
-        .unwrap_or_else(|e| format!("{{\"error\": \"failed to serialize spec: {e}\"}}"));
-
+#[cfg(feature = "openapi")]
+fn mount_openapi_endpoints(
+    config: &crate::openapi::OpenApiConfig,
+    spec_json: String,
+) -> axum::Router<AppState> {
     let spec_body = Arc::new(spec_json);
     let json_path = config.openapi_json_path.clone();
     let swagger_path = config.swagger_ui_path.clone();
@@ -510,7 +528,7 @@ fn build_openapi_router(
         "Mounted OpenAPI endpoints"
     );
 
-    Ok(Some(router))
+    router
 }
 
 /// Join a nest/scope prefix with a child route path, matching
