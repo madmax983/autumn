@@ -942,6 +942,8 @@ fn mount_scoped_groups(
             sub_router = sub_router.route(route.path, route.handler);
         }
         sub_router = (group.apply_layer)(sub_router);
+        sub_router =
+            sub_router.fallback(crate::middleware::error_page_filter::fallback_404_handler);
         router = router.nest(&group.prefix, sub_router);
     }
     router
