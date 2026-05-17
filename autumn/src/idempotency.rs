@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -136,8 +136,20 @@ async fn build_storage_key_for_parts(
 }
 
 fn extract_replay_headers(headers: &HeaderMap) -> Vec<(String, Vec<u8>)> {
+    extract_replay_headers_with_policy(headers, false)
+}
+
+fn extract_finalized_session_replay_headers(headers: &HeaderMap) -> Vec<(String, Vec<u8>)> {
+    extract_replay_headers_with_policy(headers, true)
+}
+
+fn extract_replay_headers_with_policy(
+    headers: &HeaderMap,
+    include_set_cookie: bool,
+) -> Vec<(String, Vec<u8>)> {
     // Headers that must not be cached or replayed.
-    // `set-cookie` is excluded to prevent session fixation and replay of expired tokens.
+    // `set-cookie` is replayed only for finalized session-mutating responses
+    // so lost successful mutations can deliver the session state they created.
     const SKIP: &[&str] = &[
         "connection",
         "transfer-encoding",
@@ -147,12 +159,13 @@ fn extract_replay_headers(headers: &HeaderMap) -> Vec<(String, Vec<u8>)> {
         "proxy-authorization",
         "te",
         "trailer",
-        "set-cookie",
         "x-idempotent-replayed",
     ];
     headers
         .iter()
-        .filter(|(name, _)| !SKIP.contains(&name.as_str()))
+        .filter(|(name, _)| {
+            !SKIP.contains(&name.as_str()) && (include_set_cookie || name.as_str() != "set-cookie")
+        })
         .map(|(name, value)| (name.to_string(), value.as_bytes().to_vec()))
         .collect()
 }
@@ -777,7 +790,7 @@ fn in_flight_conflict_response() -> Response<Body> {
         .unwrap()
 }
 
-fn persistence_failed_response() -> Response<Body> {
+pub(crate) fn persistence_failed_response() -> Response<Body> {
     Response::builder()
         .status(StatusCode::SERVICE_UNAVAILABLE)
         .body(Body::from("idempotency persistence unavailable"))
@@ -825,6 +838,106 @@ impl Drop for InFlightLockGuard {
         if self.unlock_on_drop {
             self.store.unlock(&self.key);
         }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct DeferredIdempotencyCommit {
+    inner: Arc<Mutex<Option<DeferredIdempotencyState>>>,
+}
+
+struct DeferredIdempotencyState {
+    store: Arc<dyn IdempotencyStore>,
+    storage_key: String,
+    idempotency_key: String,
+    record: IdempotencyRecord,
+    body_hash: Vec<u8>,
+    ttl: Duration,
+    lock_guard: InFlightLockGuard,
+}
+
+impl DeferredIdempotencyCommit {
+    fn new(
+        store: Arc<dyn IdempotencyStore>,
+        storage_key: String,
+        idempotency_key: String,
+        record: IdempotencyRecord,
+        body_hash: Vec<u8>,
+        ttl: Duration,
+        lock_guard: InFlightLockGuard,
+    ) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(Some(DeferredIdempotencyState {
+                store,
+                storage_key,
+                idempotency_key,
+                record,
+                body_hash,
+                ttl,
+                lock_guard,
+            }))),
+        }
+    }
+
+    fn commit_with_final_headers(&self, headers: &HeaderMap) -> Result<(), IdempotencyStoreError> {
+        let Some(mut state) = self
+            .inner
+            .lock()
+            .expect("deferred idempotency commit lock poisoned")
+            .take()
+        else {
+            return Ok(());
+        };
+
+        state.record.headers = extract_finalized_session_replay_headers(headers);
+        if let Err(error) =
+            state
+                .store
+                .try_set(&state.storage_key, state.record, state.body_hash, state.ttl)
+        {
+            tracing::error!(
+                idempotency.key = %state.idempotency_key,
+                error = %error,
+                "Deferred idempotency persistence failed after finalized session response; failing closed"
+            );
+            state.lock_guard.keep_locked_until_ttl();
+            return Err(error);
+        }
+        state.lock_guard.unlock_now();
+        Ok(())
+    }
+
+    fn keep_locked_until_ttl(&self) {
+        let Some(mut state) = self
+            .inner
+            .lock()
+            .expect("deferred idempotency commit lock poisoned")
+            .take()
+        else {
+            return;
+        };
+        state.lock_guard.keep_locked_until_ttl();
+    }
+}
+
+pub(crate) fn finalize_deferred_session_commit(
+    response: &mut Response<Body>,
+) -> Result<(), IdempotencyStoreError> {
+    let Some(commit) = response
+        .extensions_mut()
+        .remove::<DeferredIdempotencyCommit>()
+    else {
+        return Ok(());
+    };
+    commit.commit_with_final_headers(response.headers())
+}
+
+pub(crate) fn keep_deferred_session_commit_locked(response: &mut Response<Body>) {
+    if let Some(commit) = response
+        .extensions_mut()
+        .remove::<DeferredIdempotencyCommit>()
+    {
+        commit.keep_locked_until_ttl();
     }
 }
 
@@ -972,7 +1085,7 @@ where
     let response = inner
         .call(Request::from_parts(parts, Body::from(body_bytes)))
         .await?;
-    let (resp_parts, resp_body) = response.into_parts();
+    let (mut resp_parts, resp_body) = response.into_parts();
 
     // Collect up to the cache cap; stream oversized bodies through without
     // buffering to avoid materialising large responses in memory.
@@ -1009,27 +1122,38 @@ where
         } else {
             false
         };
+        let record = IdempotencyRecord {
+            status,
+            headers: extract_replay_headers(&resp_parts.headers),
+            body: resp_bytes.to_vec(),
+        };
         if session_mutated {
             tracing::debug!(
                 idempotency.key = %idempotency_key,
-                "Session changed during idempotent request; skipping cache so retry can receive Set-Cookie"
+                "Session changed during idempotent request; deferring cache write until SessionLayer finalizes Set-Cookie"
             );
-        } else {
-            let record = IdempotencyRecord {
-                status,
-                // set-cookie excluded: prevents session fixation on replay.
-                headers: extract_replay_headers(&resp_parts.headers),
-                body: resp_bytes.to_vec(),
-            };
-            if let Err(error) = store.try_set(&storage_key, record, body_hash, ttl) {
-                tracing::error!(
-                    idempotency.key = %idempotency_key,
-                    error = %error,
-                    "Idempotency persistence failed after handler success; failing closed"
-                );
-                lock_guard.keep_locked_until_ttl();
-                return Ok(persistence_failed_response());
+            resp_parts.extensions.insert(DeferredIdempotencyCommit::new(
+                store,
+                storage_key,
+                idempotency_key,
+                record,
+                body_hash,
+                ttl,
+                lock_guard,
+            ));
+            if let Some(m) = metrics {
+                m.record_idempotency_miss();
             }
+            return Ok(Response::from_parts(resp_parts, Body::from(resp_bytes)));
+        }
+        if let Err(error) = store.try_set(&storage_key, record, body_hash, ttl) {
+            tracing::error!(
+                idempotency.key = %idempotency_key,
+                error = %error,
+                "Idempotency persistence failed after handler success; failing closed"
+            );
+            lock_guard.keep_locked_until_ttl();
+            return Ok(persistence_failed_response());
         }
     }
     lock_guard.unlock_now();

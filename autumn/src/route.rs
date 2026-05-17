@@ -69,11 +69,19 @@ pub struct RepositoryApiMeta {
 pub enum RouteIdempotency {
     /// Unknown/manual routes have no generated replay consumer, so cache hits
     /// must be replayed directly before the handler is called.
+    ///
+    /// Use this only when the supplied `MethodRouter` does not
+    /// contain route-local authorization, tenant, audit, or similar layers that
+    /// must run again before a cached success can be returned.
     #[default]
     Direct,
     /// Autumn-generated routes install a replay consumer inside the route
     /// stack or generated guard body, allowing route-local middleware and
     /// guards to run before the cached response is returned.
+    ///
+    /// Manual layered routes can use this too, but they must place
+    /// [`crate::idempotency::IdempotencyReplayLayer`] after those checks and
+    /// before the mutating handler.
     ReplayThroughInner,
 }
 

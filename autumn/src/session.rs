@@ -771,6 +771,7 @@ where
             let inner_guard = session.inner.read().await;
             if inner_guard.destroyed {
                 if let Err(error) = store.destroy(&session_id).await {
+                    crate::idempotency::keep_deferred_session_commit_locked(&mut response);
                     return Ok(session_store_unavailable_response(&error));
                 }
                 if let Ok(val) = HeaderValue::from_str(&build_expire_cookie(&config)) {
@@ -782,10 +783,13 @@ where
                 if let Some(ref old_id) = inner_guard.old_id
                     && let Err(error) = store.destroy(old_id).await
                 {
+                    drop(inner_guard);
+                    crate::idempotency::keep_deferred_session_commit_locked(&mut response);
                     return Ok(session_store_unavailable_response(&error));
                 }
                 drop(inner_guard);
                 if let Err(error) = store.save(&sid, data).await {
+                    crate::idempotency::keep_deferred_session_commit_locked(&mut response);
                     return Ok(session_store_unavailable_response(&error));
                 }
                 // Sign the session ID when signing keys are active
@@ -796,6 +800,10 @@ where
                 if let Ok(val) = HeaderValue::from_str(&build_set_cookie(&config, &cookie_value)) {
                     response.headers_mut().append(SET_COOKIE, val);
                 }
+            }
+
+            if crate::idempotency::finalize_deferred_session_commit(&mut response).is_err() {
+                return Ok(crate::idempotency::persistence_failed_response());
             }
 
             Ok(response)
