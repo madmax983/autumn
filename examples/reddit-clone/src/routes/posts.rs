@@ -354,6 +354,8 @@ pub async fn submit(
                 .execute(conn)
                 .await?;
 
+            // Default jobs.backend is Postgres, so keep the job row in this
+            // transaction: a failed enqueue rolls back the post and vote too.
             autumn_web::job::enqueue_on_conn(
                 PostPublicationJob::NAME,
                 PostPublicationArgs::new(post_id, &title, &slug, &subreddit_slug, &author_username),

@@ -154,4 +154,71 @@ autumn migrate   # creates autumn_jobs, your domain tables, etc.
 The migration is bundled with the framework and is applied automatically by
 `autumn migrate` as long as the `db` feature is enabled.
 
+---
+
+## Transactional enqueue
+
+When a job must be coordinated with a database write, choose the API based on
+which guarantee you need:
+
+- `enqueue_after_commit` prevents jobs for rolled-back data on any backend, but
+  the post-commit callback is process-local and can be lost if the process exits
+  after commit.
+- `enqueue_in_tx` / `enqueue_on_conn` on the Postgres backend write the job row
+  in the same transaction as the domain row, which is the crash-safe handoff.
+
+### `enqueue_after_commit` — any backend
+
+`autumn_web::job::enqueue_after_commit` registers the enqueue as an
+after-commit callback inside the surrounding `db.tx` block. The job is only
+dispatched if the transaction commits. Works with every job backend.
+
+This is not crash-safe delivery. If the process exits after the transaction
+commits but before the callback runs, no job may be recorded. Use this for
+rollback coordination across backends, not as a durable outbox substitute.
+
+```rust,no_run
+use autumn_web::prelude::*;
+use scoped_futures::ScopedFutureExt;
+
+async fn create_order(mut db: Db) -> AutumnResult<()> {
+    db.tx(|conn| async move {
+        // ... INSERT order ...
+
+        // Enqueued only after INSERT commits; dropped if the tx rolls back.
+        // For crash-safe Postgres handoff, use enqueue_in_tx instead.
+        autumn_web::job::enqueue_after_commit("ship_order", &args).await?;
+
+        Ok::<_, AutumnError>(())
+    }.scope_boxed())
+    .await
+}
+```
+
+### `enqueue_in_tx` / `enqueue_on_conn` — Postgres backend only
+
+On the Postgres backend the job row can live in the **same transaction** as
+the domain row. Both commit or roll back together, avoiding the post-commit
+process crash window at the cost of being limited to the `postgres` backend.
+
+```rust,no_run
+use autumn_web::prelude::*;
+use scoped_futures::ScopedFutureExt;
+
+async fn create_order(mut db: Db) -> AutumnResult<()> {
+    db.tx(|conn| async move {
+        // ... INSERT order using conn ...
+
+        // Job row written into the same transaction.
+        autumn_web::job::enqueue_in_tx("ship_order", &args, conn).await?;
+
+        Ok::<_, AutumnError>(())
+    }.scope_boxed())
+    .await
+}
+```
+
+See [Transactions -> after_commit](transactions.md#after_commit--post-commit-process-local-callbacks)
+for a full comparison of the two strategies and guidance on when to use each.
+
 For cloud-native rollout run the migration job first, then start web and workers.

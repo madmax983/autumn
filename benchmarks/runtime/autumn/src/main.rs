@@ -2,11 +2,15 @@ mod models;
 mod routes;
 mod schema;
 
+use autumn_web::migrate::{EmbeddedMigrations, embed_migrations};
 use autumn_web::routes;
+
+const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
 
 #[autumn_web::main]
 async fn main() {
     autumn_web::app()
+        .migrations(MIGRATIONS)
         .routes(routes![
             routes::api_list,
             routes::api_show,

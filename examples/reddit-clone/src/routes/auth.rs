@@ -176,14 +176,16 @@ pub async fn register(
                     .await
                     .map_err(|_| AutumnError::unprocessable_msg("Username already taken"))?;
 
-                // Enqueue inside the transaction so the job row rolls back
-                // atomically if the user INSERT fails or the tx is cancelled.
+                // The default profile uses the Postgres job backend, so the
+                // job row is inserted on this transaction connection.
                 autumn_web::job::enqueue_on_conn(
                     UserOnboardingJob::NAME,
                     UserOnboardingArgs::from_user(&user),
                     conn,
                 )
                 .await?;
+
+                AccountMailer.deliver_later_welcome(&mailer, email, user.username.clone());
 
                 Ok::<_, AutumnError>(user)
             }
@@ -196,8 +198,6 @@ pub async fn register(
     session.insert("user_id", user.id.to_string()).await;
     session.insert("username", &user.username).await;
     session.insert("role", &user.role).await;
-
-    AccountMailer.deliver_later_welcome(&mailer, email, user.username.clone());
 
     Ok(Redirect::to("/"))
 }

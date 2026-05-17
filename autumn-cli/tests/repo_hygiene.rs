@@ -97,6 +97,46 @@ fn member_manifest_forbids_unsafe_code(manifest_toml: &toml::Value) -> bool {
 }
 
 #[test]
+fn workspace_test_profile_keeps_ci_artifacts_bounded() {
+    let root = workspace_root();
+    let root_toml = read_workspace_manifest(&root);
+    let test_profile = root_toml
+        .get("profile")
+        .and_then(|profile| profile.get("test"))
+        .unwrap_or_else(|| {
+            panic!(
+                "workspace Cargo.toml must set [profile.test] so `cargo test --workspace` \
+                 does not fill CI disks with full debug artifacts"
+            )
+        });
+
+    assert_eq!(
+        test_profile.get("debug").and_then(toml::Value::as_str),
+        Some("line-tables-only"),
+        "[profile.test] should keep only line-table debug info for useful panic locations \
+         without full debug artifact bloat",
+    );
+    assert_eq!(
+        test_profile
+            .get("incremental")
+            .and_then(toml::Value::as_bool),
+        Some(false),
+        "[profile.test] should disable incremental caches in CI-sized test builds",
+    );
+
+    let build_override = test_profile
+        .get("build-override")
+        .unwrap_or_else(|| panic!("[profile.test.build-override] should be set"));
+    assert_eq!(
+        build_override
+            .get("debug")
+            .and_then(toml::Value::as_integer),
+        Some(0),
+        "[profile.test.build-override] should avoid debug info for build scripts and proc macros",
+    );
+}
+
+#[test]
 fn first_run_docs_match_current_release_line() {
     let root = workspace_root();
     let root_toml = read_workspace_manifest(&root);
@@ -443,4 +483,91 @@ fn bookmarks_example_tracks_regenerated_scaffold_layout() {
             "issue #534 expects the old flat bookmarks source file to be replaced: {replaced_path}",
         );
     }
+}
+
+#[test]
+fn after_commit_docs_do_not_promise_crash_safe_delivery() {
+    let root = workspace_root();
+    let transactions_path = root.join("docs/guide/transactions.md");
+    let transactions = std::fs::read_to_string(&transactions_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", transactions_path.display()));
+
+    assert!(
+        transactions.contains("not a crash-safe delivery mechanism"),
+        "{} must explicitly warn that process-local after_commit callbacks can be lost after commit",
+        transactions_path.display(),
+    );
+    assert!(
+        transactions.contains("durable outbox"),
+        "{} must point crash-safe side effects at an in-transaction outbox or queue",
+        transactions_path.display(),
+    );
+    assert!(
+        !transactions.contains("Autumn eliminates this race with `after_commit` callbacks"),
+        "{} must not claim after_commit eliminates the DB-commit/process-crash race",
+        transactions_path.display(),
+    );
+}
+
+#[test]
+fn benchmark_runtime_startup_applies_packaged_migrations() {
+    let root = workspace_root();
+
+    let spring_properties_path =
+        root.join("benchmarks/runtime/spring-boot/src/main/resources/application.properties");
+    let spring_properties = std::fs::read_to_string(&spring_properties_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", spring_properties_path.display()));
+    assert!(
+        spring_properties.contains("spring.flyway.enabled=true"),
+        "{} must keep Flyway enabled so standalone fresh benchmark databases get the packaged schema",
+        spring_properties_path.display(),
+    );
+    assert!(
+        !spring_properties.contains("spring.flyway.enabled=false"),
+        "{} must not disable Flyway for standalone benchmark runs",
+        spring_properties_path.display(),
+    );
+
+    let django_dockerfile_path = root.join("benchmarks/runtime/django/Dockerfile");
+    let django_dockerfile = std::fs::read_to_string(&django_dockerfile_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", django_dockerfile_path.display()));
+    assert!(
+        django_dockerfile.contains("python manage.py migrate --noinput &&")
+            && django_dockerfile.contains("gunicorn benchapp.asgi:application"),
+        "{} must run Django migrations before serving the benchmark",
+        django_dockerfile_path.display(),
+    );
+
+    let autumn_main_path = root.join("benchmarks/runtime/autumn/src/main.rs");
+    let autumn_main = std::fs::read_to_string(&autumn_main_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", autumn_main_path.display()));
+    assert!(
+        autumn_main.contains("embed_migrations!()")
+            && autumn_main.contains(".migrations(MIGRATIONS)"),
+        "{} must register benchmark migrations before running Autumn",
+        autumn_main_path.display(),
+    );
+
+    let rails_dockerfile_path = root.join("benchmarks/runtime/rails/Dockerfile");
+    let rails_dockerfile = std::fs::read_to_string(&rails_dockerfile_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", rails_dockerfile_path.display()));
+    assert!(
+        rails_dockerfile.contains("bundle exec rails db:migrate && bundle exec puma"),
+        "{} must run Rails migrations before starting Puma",
+        rails_dockerfile_path.display(),
+    );
+
+    let loco_production_path = root.join("benchmarks/runtime/loco/config/production.yaml");
+    let loco_production = std::fs::read_to_string(&loco_production_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", loco_production_path.display()));
+    assert!(
+        loco_production.contains("auto_migrate: true"),
+        "{} must keep Loco auto-migration enabled for fresh benchmark databases",
+        loco_production_path.display(),
+    );
+    assert!(
+        !loco_production.contains("auto_migrate: false"),
+        "{} must not disable Loco auto-migration for standalone benchmark runs",
+        loco_production_path.display(),
+    );
 }
