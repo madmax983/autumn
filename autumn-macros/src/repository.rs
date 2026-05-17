@@ -1509,9 +1509,14 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         };
         let delete_body = if has_policy {
             quote! {
+                let __autumn_replay_response =
+                    ::autumn_web::idempotency::__replay_response(&__autumn_idempotency_replay);
                 let __existing = match repo.find_by_id(id).await {
                     ::core::result::Result::Ok(::core::option::Option::Some(existing)) => existing,
                     ::core::result::Result::Ok(::core::option::Option::None) => {
+                        if let ::core::option::Option::Some(response) = __autumn_replay_response {
+                            return ::autumn_web::idempotency::IdempotencyReplayOr::Replay(response);
+                        }
                         return ::autumn_web::idempotency::IdempotencyReplayOr::Inner(
                             ::core::result::Result::Err(::autumn_web::AutumnError::not_found_msg("not found"))
                         );
@@ -1535,9 +1540,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         ::core::result::Result::Err(err)
                     );
                 }
-                if let ::core::option::Option::Some(response) =
-                    ::autumn_web::idempotency::__replay_response(&__autumn_idempotency_replay)
-                {
+                if let ::core::option::Option::Some(response) = __autumn_replay_response {
                     return ::autumn_web::idempotency::IdempotencyReplayOr::Replay(response);
                 }
                 if let ::core::result::Result::Err(err) = repo.delete_by_id(id).await {
@@ -2161,6 +2164,12 @@ mod tests {
         assert!(
             generated.contains("IdempotencyReplayOr"),
             "policy-backed repository mutations need a response wrapper for post-policy replay: {generated}"
+        );
+        assert!(
+            generated.contains(
+                "Option :: None) => { if let :: core :: option :: Option :: Some (response) = __autumn_replay_response"
+            ),
+            "policy-backed delete retries must replay a cached 204 when the deleted row is already gone: {generated}"
         );
     }
 

@@ -730,12 +730,14 @@ impl AppBuilder {
     /// Mutating requests (`POST`, `PUT`, `PATCH`, `DELETE`) that carry an
     /// `Idempotency-Key` header are deduplicated: the first response is cached
     /// and replayed byte-for-byte on subsequent identical requests.
-    /// Session-mutating responses are not cached because their `Set-Cookie`
-    /// headers are finalized by the outer session middleware after route-level
-    /// idempotency runs.
+    /// Session-mutating responses are cached after the outer session middleware
+    /// has finalized `Set-Cookie`, so retries can observe the successful
+    /// mutation without re-entering the handler.
     ///
-    /// The middleware also covers raw Axum routers registered with
-    /// [`merge`](Self::merge) or [`nest`](Self::nest).
+    /// Raw Axum routers registered with [`merge`](Self::merge) or
+    /// [`nest`](Self::nest) are opaque to Autumn. They are not automatically
+    /// deduplicated by this flag; install idempotency and replay-stop layers
+    /// inside those routers when raw routes need the same semantics.
     ///
     /// The storage backend and TTL are taken from the `[idempotency]` block in
     /// `autumn.toml` (defaulting to in-process memory with a 24 h TTL).
@@ -773,6 +775,8 @@ impl AppBuilder {
     /// The merged router shares the same [`AppState`] (database pool,
     /// config, etc.) and Autumn's global middleware (request IDs,
     /// security headers, session management) applies to its routes.
+    /// `.idempotent()` does not automatically deduplicate this opaque router;
+    /// install idempotency layers inside the raw router when needed.
     ///
     /// Merged routes are added **after** Autumn's annotated routes.
     /// If both define the same method+path pair, Axum treats that as an
@@ -814,7 +818,9 @@ impl AppBuilder {
     /// for mounting a self-contained API version or third-party router.
     ///
     /// The nested router shares the same [`AppState`] and Autumn's global
-    /// middleware applies to its routes.
+    /// middleware applies to its routes. `.idempotent()` does not automatically
+    /// deduplicate this opaque router; install idempotency layers inside the
+    /// raw router when needed.
     ///
     /// Can be called multiple times with different prefixes.
     ///

@@ -141,15 +141,18 @@ If a handler returns an error (5xx, 4xx), the entry is not stored and the next
 attempt re-executes the handler — allowing transient failures to be retried
 freely.
 
-Responses that modify the Autumn `Session` are not cached. Session cookies are
-finalized by the outer `SessionLayer` after route-level idempotency has run, so
-retries for session-mutating routes re-execute the handler instead of replaying
-a cached success without the required `Set-Cookie` header.
+Responses that modify the Autumn `Session` are cached after the outer
+`SessionLayer` saves the session and appends `Set-Cookie`. A retry after a lost
+login, checkout flash, or session rotation receives the finalized cached
+response instead of re-entering the mutating handler.
 
-Routes mounted through `AppBuilder::merge()` or `AppBuilder::nest()` are covered
-by `.idempotent()` as part of the application middleware stack. If you apply
-`IdempotencyLayer` manually to a raw Axum router, use the layer directly as shown
-below.
+Routes mounted through `AppBuilder::merge()` or `AppBuilder::nest()` are raw
+Axum escape hatches and are opaque to Autumn. `.idempotent()` does not
+automatically deduplicate those raw routers, because doing so outside the raw
+router would skip route-local auth, tenant, or audit layers on cache hits. If a
+raw router needs idempotency, apply `IdempotencyLayer::replay_through_inner()`
+and place `IdempotencyReplayLayer` inside the route stack after the checks that
+must still run on replay.
 
 Generated repositories with durable `after_*_commit` hooks also receive the
 framework-scoped idempotency key in `MutationContext::idempotency_key` when the
@@ -256,7 +259,9 @@ async fn duplicate_post_replays() {
 ```
 
 You can also instantiate the layer directly against a raw axum `Router` for
-lower-level tests that need finer-grained control over the store:
+lower-level tests that need finer-grained control over the store. The direct
+form below should only wrap simple routes where no route-local middleware must
+run again before replay:
 
 ```rust,no_run
 use std::{sync::Arc, time::Duration};

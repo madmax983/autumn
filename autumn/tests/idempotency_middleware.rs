@@ -136,6 +136,7 @@ static INTERCEPTED_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static ANONYMOUS_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static RAW_MERGE_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static RAW_NEST_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
+static RAW_LAYERED_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static SESSION_LOGIN_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static MANUAL_ROUTE_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static MANUAL_OPENAPI_ROUTE_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -143,6 +144,8 @@ static MANUAL_SCOPED_ROUTE_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static MANUAL_LAYERED_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static MANUAL_LAYERED_AUTH_CALLS: AtomicUsize = AtomicUsize::new(0);
 static MANUAL_LAYERED_ALLOWED: AtomicBool = AtomicBool::new(true);
+static RAW_LAYERED_AUTH_CALLS: AtomicUsize = AtomicUsize::new(0);
+static RAW_LAYERED_ALLOWED: AtomicBool = AtomicBool::new(true);
 static SESSION_SAVE_FAILURE_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 /// Route-local interceptor used to prove idempotency replays still traverse
@@ -238,6 +241,54 @@ where
     }
 }
 
+#[derive(Clone)]
+struct RawLayeredAuthLayer;
+
+#[derive(Clone)]
+struct RawLayeredAuthService<S> {
+    inner: S,
+}
+
+impl<S> Layer<S> for RawLayeredAuthLayer {
+    type Service = RawLayeredAuthService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        RawLayeredAuthService { inner }
+    }
+}
+
+impl<S> Service<axum::extract::Request> for RawLayeredAuthService<S>
+where
+    S: Service<
+            axum::extract::Request,
+            Response = axum::response::Response,
+            Error = std::convert::Infallible,
+        > + Clone
+        + Send
+        + 'static,
+    S::Future: Send + 'static,
+{
+    type Response = axum::response::Response;
+    type Error = std::convert::Infallible;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: axum::extract::Request) -> Self::Future {
+        RAW_LAYERED_AUTH_CALLS.fetch_add(1, Ordering::SeqCst);
+        if !RAW_LAYERED_ALLOWED.load(Ordering::SeqCst) {
+            return Box::pin(async move {
+                Ok((StatusCode::FORBIDDEN, "raw route layer denied").into_response())
+            });
+        }
+        let clone = self.inner.clone();
+        let mut inner = std::mem::replace(&mut self.inner, clone);
+        Box::pin(async move { inner.call(req).await })
+    }
+}
+
 #[post("/public-create")]
 async fn anonymous_create_handler() -> &'static str {
     ANONYMOUS_HANDLER_CALLS.fetch_add(1, Ordering::SeqCst);
@@ -252,6 +303,11 @@ async fn raw_merge_create_handler() -> &'static str {
 async fn raw_nest_create_handler() -> &'static str {
     RAW_NEST_HANDLER_CALLS.fetch_add(1, Ordering::SeqCst);
     "raw-nested"
+}
+
+async fn raw_layered_create_handler() -> &'static str {
+    RAW_LAYERED_HANDLER_CALLS.fetch_add(1, Ordering::SeqCst);
+    "raw-layered"
 }
 
 async fn manual_route_create_handler() -> &'static str {
@@ -317,7 +373,7 @@ async fn intercepted_create_handler() -> &'static str {
 }
 
 #[tokio::test]
-async fn test_merged_raw_router_is_idempotent() {
+async fn test_merged_raw_router_requires_explicit_idempotency_layer() {
     RAW_MERGE_HANDLER_CALLS.store(0, Ordering::SeqCst);
     let raw = axum::Router::<AppState>::new()
         .route("/raw-create", axum::routing::post(raw_merge_create_handler));
@@ -338,17 +394,17 @@ async fn test_merged_raw_router_is_idempotent() {
         .send()
         .await;
     r2.assert_ok();
-    assert_eq!(r2.header("x-idempotent-replayed"), Some("true"));
+    assert_eq!(r2.header("x-idempotent-replayed"), None);
     assert_eq!(r2.text(), "raw-merged");
     assert_eq!(
         RAW_MERGE_HANDLER_CALLS.load(Ordering::SeqCst),
-        1,
-        "raw routers mounted with AppBuilder::merge must not re-run on replay"
+        2,
+        "raw routers are opaque; callers must install their own replay stop before expecting dedupe"
     );
 }
 
 #[tokio::test]
-async fn test_nested_raw_router_is_idempotent() {
+async fn test_nested_raw_router_requires_explicit_idempotency_layer() {
     RAW_NEST_HANDLER_CALLS.store(0, Ordering::SeqCst);
     let raw = axum::Router::<AppState>::new()
         .route("/raw-create", axum::routing::post(raw_nest_create_handler));
@@ -369,12 +425,51 @@ async fn test_nested_raw_router_is_idempotent() {
         .send()
         .await;
     r2.assert_ok();
-    assert_eq!(r2.header("x-idempotent-replayed"), Some("true"));
+    assert_eq!(r2.header("x-idempotent-replayed"), None);
     assert_eq!(r2.text(), "raw-nested");
     assert_eq!(
         RAW_NEST_HANDLER_CALLS.load(Ordering::SeqCst),
+        2,
+        "raw nested routers are opaque; callers must install their own replay stop before expecting dedupe"
+    );
+}
+
+#[tokio::test]
+async fn test_merged_raw_router_layers_run_on_retry() {
+    RAW_LAYERED_HANDLER_CALLS.store(0, Ordering::SeqCst);
+    RAW_LAYERED_AUTH_CALLS.store(0, Ordering::SeqCst);
+    RAW_LAYERED_ALLOWED.store(true, Ordering::SeqCst);
+    let raw = axum::Router::<AppState>::new().route(
+        "/raw-layered-create",
+        axum::routing::post(raw_layered_create_handler).route_layer(RawLayeredAuthLayer),
+    );
+
+    let client = TestApp::new().merge(raw).idempotent().build();
+
+    client
+        .post("/raw-layered-create")
+        .header("idempotency-key", "raw-layered-key")
+        .send()
+        .await
+        .assert_ok();
+
+    RAW_LAYERED_ALLOWED.store(false, Ordering::SeqCst);
+    let retry = client
+        .post("/raw-layered-create")
+        .header("idempotency-key", "raw-layered-key")
+        .send()
+        .await;
+    retry.assert_status(StatusCode::FORBIDDEN.as_u16());
+    assert_eq!(retry.header("x-idempotent-replayed"), None);
+    assert_eq!(
+        RAW_LAYERED_AUTH_CALLS.load(Ordering::SeqCst),
+        2,
+        "raw router-local layers must not be skipped by app-level direct replay"
+    );
+    assert_eq!(
+        RAW_LAYERED_HANDLER_CALLS.load(Ordering::SeqCst),
         1,
-        "raw routers mounted with AppBuilder::nest must not re-run on replay"
+        "the retry should be stopped by the raw router layer before the handler"
     );
 }
 
