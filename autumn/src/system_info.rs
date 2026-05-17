@@ -21,8 +21,7 @@ pub(crate) async fn system_info_handler() -> Json<SystemInfo> {
             os: env::consts::OS.to_owned(),
             arch: env::consts::ARCH.to_owned(),
             available_parallelism: thread::available_parallelism()
-                .map(std::num::NonZero::get)
-                .unwrap_or(1),
+                .map_or(1, std::num::NonZero::get),
         })
         .clone(),
     )

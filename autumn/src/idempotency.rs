@@ -3,7 +3,6 @@ use futures::StreamExt as FuturesStreamExt;
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::hash::{DefaultHasher, Hash, Hasher};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -12,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::http::{HeaderMap, Method, Request, Response, StatusCode};
+use sha2::Digest as _;
 use tower::{Layer, Service};
 
 static IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
@@ -40,31 +40,84 @@ const fn is_mutating_method(method: &Method) -> bool {
 }
 
 fn compute_body_hash(bytes: &[u8], content_type: Option<&[u8]>) -> Vec<u8> {
-    let mut hasher = DefaultHasher::new();
-    content_type.unwrap_or(b"").hash(&mut hasher);
-    bytes.hash(&mut hasher);
-    hasher.finish().to_le_bytes().to_vec()
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"content-type:");
+    if let Some(content_type) = content_type {
+        hasher.update(content_type);
+    }
+    hasher.update(b"\nbody:");
+    hasher.update(bytes);
+    hasher.finalize().to_vec()
 }
 
-/// Namespace the cache key by method, path, a hash of the Authorization header,
-/// and the client-supplied idempotency key.
+fn hex_lower(bytes: impl AsRef<[u8]>) -> String {
+    bytes.as_ref().iter().fold(
+        String::with_capacity(bytes.as_ref().len() * 2),
+        |mut out, byte| {
+            use std::fmt::Write as _;
+            let _ = write!(out, "{byte:02x}");
+            out
+        },
+    )
+}
+
+fn principal_scope_digest(auth: Option<&str>, session_id: Option<&str>) -> String {
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"authorization:");
+    if let Some(auth) = auth {
+        hasher.update(auth.as_bytes());
+    }
+    hasher.update(b"\nsession:");
+    if let Some(session_id) = session_id {
+        hasher.update(session_id.as_bytes());
+    }
+    hex_lower(hasher.finalize())
+}
+
+/// Namespace the cache key by method, path, a stable principal digest, and the
+/// client-supplied idempotency key.
 ///
 /// Namespacing by method+path prevents cross-endpoint cache collisions (P2).
-/// Namespacing by Authorization hash prevents cross-principal collisions (P1).
+/// Namespacing by Authorization and session scope prevents cross-principal
+/// collisions (P1), including cookie-backed authenticated sessions.
 fn build_storage_key(
     idempotency_key: &str,
     method: &Method,
     uri: &axum::http::Uri,
     headers: &HeaderMap,
+    session_id: Option<&str>,
 ) -> String {
-    let path = uri.path_and_query().map_or_else(|| uri.path(), |pq| pq.as_str());
+    let path = uri
+        .path_and_query()
+        .map_or_else(|| uri.path(), |pq| pq.as_str());
     let auth = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    let mut h = DefaultHasher::new();
-    auth.hash(&mut h);
-    format!("{}:{}:{:x}:{}", method, path, h.finish(), idempotency_key)
+        .filter(|auth| !auth.is_empty());
+    let principal = principal_scope_digest(auth, session_id);
+    format!("{method}:{path}:{principal}:{idempotency_key}")
+}
+
+async fn build_storage_key_for_parts(
+    idempotency_key: &str,
+    parts: &axum::http::request::Parts,
+) -> String {
+    let method = parts.method.clone();
+    let uri = parts.uri.clone();
+    let headers = parts.headers.clone();
+    let session = parts.extensions.get::<crate::session::Session>().cloned();
+    let session_id = if let Some(session) = session {
+        Some(session.id().await)
+    } else {
+        None
+    };
+    build_storage_key(
+        idempotency_key,
+        &method,
+        &uri,
+        &headers,
+        session_id.as_deref(),
+    )
 }
 
 fn extract_replay_headers(headers: &HeaderMap) -> Vec<(String, Vec<u8>)> {
@@ -490,6 +543,26 @@ where
     }
 }
 
+fn request_body_too_large_response() -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::PAYLOAD_TOO_LARGE)
+        .body(Body::from(
+            "request body too large for idempotency middleware",
+        ))
+        .unwrap()
+}
+
+fn in_flight_conflict_response() -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::CONFLICT)
+        .header("retry-after", "1")
+        .body(Body::from(
+            "a request with this idempotency key is already being processed; \
+             retry after 1 second",
+        ))
+        .unwrap()
+}
+
 async fn handle_idempotent_request<S>(
     mut inner: S,
     store: Arc<dyn IdempotencyStore>,
@@ -515,20 +588,18 @@ where
         return inner.call(req).await;
     }
     let (parts, body) = req.into_parts();
-    let storage_key = build_storage_key(&idempotency_key, &parts.method, &parts.uri, &parts.headers);
-    let content_type = parts.headers.get(axum::http::header::CONTENT_TYPE).map(axum::http::HeaderValue::as_bytes);
+    let storage_key = build_storage_key_for_parts(&idempotency_key, &parts).await;
+    let content_type = parts
+        .headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .map(axum::http::HeaderValue::as_bytes);
 
     let body_limit = parts
         .extensions
         .get::<crate::security::config::UploadConfig>()
         .map_or(DEFAULT_REQUEST_BODY_LIMIT, |c| c.max_request_size_bytes);
     let Ok(body_bytes) = axum::body::to_bytes(body, body_limit).await else {
-        return Ok(Response::builder()
-            .status(StatusCode::PAYLOAD_TOO_LARGE)
-            .body(Body::from(
-                "request body too large for idempotency middleware",
-            ))
-            .unwrap());
+        return Ok(request_body_too_large_response());
     };
 
     let body_hash = compute_body_hash(&body_bytes, content_type);
@@ -549,15 +620,10 @@ where
             idempotency.key = %idempotency_key,
             "Idempotency key already in flight — returning 409"
         );
-        metrics.as_ref().inspect(|m| m.record_idempotency_conflict());
-        return Ok(Response::builder()
-            .status(StatusCode::CONFLICT)
-            .header("retry-after", "1")
-            .body(Body::from(
-                "a request with this idempotency key is already being processed; \
-                 retry after 1 second",
-            ))
-            .unwrap());
+        metrics
+            .as_ref()
+            .inspect(|m| m.record_idempotency_conflict());
+        return Ok(in_flight_conflict_response());
     }
 
     // Double-check after acquiring the lock: a concurrent request may have
@@ -585,15 +651,15 @@ where
     // Collect up to the cache cap; stream oversized bodies through without
     // buffering to avoid materialising large responses in memory.
     let resp_bytes = match collect_response_for_cache(resp_body).await {
-        Err(()) => {
+        CollectedResponseBody::StreamError(passthrough_body) => {
             store.unlock(&storage_key);
             tracing::warn!(
                 idempotency.key = %idempotency_key,
-                "I/O error reading response body; not storing idempotency entry"
+                "I/O error reading response body; passing the body error through without storing idempotency entry"
             );
-            return Ok(Response::from_parts(resp_parts, Body::empty()));
+            return Ok(Response::from_parts(resp_parts, passthrough_body));
         }
-        Ok(Err(passthrough_body)) => {
+        CollectedResponseBody::TooLarge(passthrough_body) => {
             // Body exceeded MAX_CACHEABLE_RESPONSE_BODY — stream through.
             store.unlock(&storage_key);
             tracing::debug!(
@@ -603,7 +669,7 @@ where
             );
             return Ok(Response::from_parts(resp_parts, passthrough_body));
         }
-        Ok(Ok(bytes)) => bytes,
+        CollectedResponseBody::Cacheable(bytes) => bytes,
     };
 
     // Cache only 2xx responses; store before unlocking so concurrent duplicates
@@ -629,17 +695,29 @@ where
 /// Collect response body bytes up to `MAX_CACHEABLE_RESPONSE_BODY`.
 ///
 /// Returns:
-/// - `Ok(Ok(bytes))` — body is within the limit and fully collected
-/// - `Ok(Err(body))` — body exceeded the limit; the returned `Body` chains the
+/// - `Cacheable(bytes)` — body is within the limit and fully collected
+/// - `TooLarge(body)` — body exceeded the limit; the returned `Body` chains the
 ///   already-read bytes with the remaining stream for pass-through delivery
-/// - `Err(())` — I/O error while reading the body stream
-async fn collect_response_for_cache(body: Body) -> Result<Result<Bytes, Body>, ()> {
+/// - `StreamError(body)` — reading the body stream failed; the returned `Body`
+///   preserves the already-read bytes and then yields the original stream error
+enum CollectedResponseBody {
+    Cacheable(Bytes),
+    TooLarge(Body),
+    StreamError(Body),
+}
+
+async fn collect_response_for_cache(body: Body) -> CollectedResponseBody {
     let mut buf = Vec::<u8>::new();
     let mut data_stream = body.into_data_stream();
     loop {
         match data_stream.next().await {
             None => break,
-            Some(Err(_)) => return Err(()),
+            Some(Err(err)) => {
+                let leading = Bytes::from(buf);
+                let passthrough =
+                    Body::from_stream(futures::stream::iter(vec![Ok(leading), Err(err)]));
+                return CollectedResponseBody::StreamError(passthrough);
+            }
             Some(Ok(chunk)) => {
                 buf.extend_from_slice(&chunk);
                 if buf.len() > MAX_CACHEABLE_RESPONSE_BODY {
@@ -650,12 +728,12 @@ async fn collect_response_for_cache(body: Body) -> Result<Result<Bytes, Body>, (
                         )))
                         .chain(data_stream),
                     );
-                    return Ok(Err(passthrough));
+                    return CollectedResponseBody::TooLarge(passthrough);
                 }
             }
         }
     }
-    Ok(Ok(Bytes::from(buf)))
+    CollectedResponseBody::Cacheable(Bytes::from(buf))
 }
 
 fn handle_cache_hit(
@@ -692,4 +770,219 @@ fn handle_cache_hit(
         .header(X_IDEMPOTENT_REPLAYED, "true")
         .body(Body::from(entry.record.body))
         .unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::header::AUTHORIZATION;
+    use std::collections::HashMap;
+    use std::convert::Infallible;
+    use std::sync::Mutex;
+    use tower::ServiceExt;
+
+    #[derive(Clone, Default)]
+    struct RecordingStore {
+        keys: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl RecordingStore {
+        fn keys(&self) -> Vec<String> {
+            self.keys
+                .lock()
+                .expect("recording store lock poisoned")
+                .clone()
+        }
+
+        fn record_key(&self, key: &str) {
+            self.keys
+                .lock()
+                .expect("recording store lock poisoned")
+                .push(key.to_owned());
+        }
+    }
+
+    impl IdempotencyStore for RecordingStore {
+        fn get(&self, key: &str) -> Option<IdempotencyEntry> {
+            self.record_key(key);
+            None
+        }
+
+        fn set(&self, key: &str, _record: IdempotencyRecord, _body_hash: Vec<u8>, _ttl: Duration) {
+            self.record_key(key);
+        }
+
+        fn try_lock(&self, key: &str) -> bool {
+            self.record_key(key);
+            true
+        }
+
+        fn unlock(&self, key: &str) {
+            self.record_key(key);
+        }
+    }
+
+    fn idempotent_post(path: &str, key: &str, body: &'static str) -> Request<Body> {
+        Request::builder()
+            .method(Method::POST)
+            .uri(path)
+            .header(IDEMPOTENCY_KEY_HEADER, key)
+            .body(Body::from(body))
+            .expect("request builder should be valid")
+    }
+
+    fn session_with_user(session_id: &str, user_id: &str) -> crate::session::Session {
+        let mut data = HashMap::new();
+        data.insert("user_id".to_owned(), user_id.to_owned());
+        crate::session::Session::new_for_test(session_id.to_owned(), data)
+    }
+
+    fn hex_lower(bytes: impl AsRef<[u8]>) -> String {
+        bytes.as_ref().iter().fold(
+            String::with_capacity(bytes.as_ref().len() * 2),
+            |mut out, byte| {
+                use std::fmt::Write as _;
+                let _ = write!(out, "{byte:02x}");
+                out
+            },
+        )
+    }
+
+    fn expected_principal_digest(auth: Option<&str>, session_id: Option<&str>) -> String {
+        use sha2::Digest as _;
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(b"authorization:");
+        if let Some(auth) = auth {
+            hasher.update(auth.as_bytes());
+        }
+        hasher.update(b"\nsession:");
+        if let Some(session_id) = session_id {
+            hasher.update(session_id.as_bytes());
+        }
+        hex_lower(hasher.finalize())
+    }
+
+    #[tokio::test]
+    async fn response_body_stream_errors_are_not_replaced_with_empty_success() {
+        let store = Arc::new(MemoryIdempotencyStore::new(Duration::from_secs(60)));
+        let service = IdempotencyLayer::new(store).layer(tower::service_fn(
+            |_req: Request<Body>| async move {
+                let stream = futures::stream::iter(vec![
+                    Ok::<Bytes, std::io::Error>(Bytes::from_static(b"partial")),
+                    Err(std::io::Error::other("stream failed")),
+                ]);
+                Ok::<_, Infallible>(
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .body(Body::from_stream(stream))
+                        .expect("response builder should be valid"),
+                )
+            },
+        ));
+
+        let response = service
+            .oneshot(idempotent_post("/stream", "stream-key", "same"))
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await;
+        assert!(
+            body.is_err(),
+            "idempotency middleware must preserve response body stream errors"
+        );
+    }
+
+    #[tokio::test]
+    async fn cookie_session_extension_scopes_idempotency_storage_key() {
+        let store = Arc::new(MemoryIdempotencyStore::new(Duration::from_secs(60)));
+        let mut service = IdempotencyLayer::new(store).layer(tower::service_fn(
+            |req: Request<Body>| async move {
+                let session = req
+                    .extensions()
+                    .get::<crate::session::Session>()
+                    .cloned()
+                    .expect("session extension should be present");
+                let user_id = session
+                    .get("user_id")
+                    .await
+                    .expect("session should contain user_id");
+                Ok::<_, Infallible>(Response::new(Body::from(user_id)))
+            },
+        ));
+
+        let mut alice_req = idempotent_post("/orders", "shared-key", "same");
+        alice_req
+            .extensions_mut()
+            .insert(session_with_user("session-alice", "alice"));
+        let alice_response = service
+            .ready()
+            .await
+            .expect("service should be ready")
+            .call(alice_req)
+            .await
+            .expect("alice request should complete");
+        let alice_body = axum::body::to_bytes(alice_response.into_body(), usize::MAX)
+            .await
+            .expect("alice body should collect");
+        assert_eq!(alice_body, Bytes::from_static(b"alice"));
+
+        let mut bob_req = idempotent_post("/orders", "shared-key", "same");
+        bob_req
+            .extensions_mut()
+            .insert(session_with_user("session-bob", "bob"));
+        let bob_response = service
+            .ready()
+            .await
+            .expect("service should be ready")
+            .call(bob_req)
+            .await
+            .expect("bob request should complete");
+        assert!(
+            bob_response.headers().get(X_IDEMPOTENT_REPLAYED).is_none(),
+            "a different cookie-backed session must not replay another user's response"
+        );
+        let bob_body = axum::body::to_bytes(bob_response.into_body(), usize::MAX)
+            .await
+            .expect("bob body should collect");
+        assert_eq!(bob_body, Bytes::from_static(b"bob"));
+    }
+
+    #[tokio::test]
+    async fn storage_key_hashes_authorization_with_stable_sha256_digest() {
+        let observed_store = RecordingStore::default();
+        let service = IdempotencyLayer::new(Arc::new(observed_store.clone())).layer(
+            tower::service_fn(|_req: Request<Body>| async {
+                Ok::<_, Infallible>(Response::new(Body::from("ok")))
+            }),
+        );
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/payments")
+            .header(IDEMPOTENCY_KEY_HEADER, "pay-once")
+            .header(AUTHORIZATION, "Bearer stable-token")
+            .body(Body::from("same"))
+            .expect("request builder should be valid");
+
+        let response = service
+            .oneshot(request)
+            .await
+            .expect("request should complete");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body should collect");
+        assert_eq!(body, Bytes::from_static(b"ok"));
+
+        let keys = observed_store.keys();
+        let storage_key = keys.first().expect("storage key should be recorded");
+        let segments = storage_key.splitn(4, ':').collect::<Vec<_>>();
+        assert_eq!(segments.len(), 4);
+        assert_eq!(segments[0], "POST");
+        assert_eq!(segments[1], "/payments");
+        assert_eq!(
+            segments[2],
+            expected_principal_digest(Some("Bearer stable-token"), None)
+        );
+        assert_eq!(segments[3], "pay-once");
+    }
 }
