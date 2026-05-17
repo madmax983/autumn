@@ -320,11 +320,27 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         hook_inventory_registration,
     ) = if let Some(ref hooks_ident) = config.hooks_type {
         // ── Struct fields with hooks ───────────────────────
+        let idempotency_struct_field = if commit_hooks_enabled {
+            quote! {
+                idempotency: ::core::option::Option<::autumn_web::idempotency::IdempotencyContext>,
+            }
+        } else {
+            quote! {}
+        };
+        let idempotency_clone_field = if commit_hooks_enabled {
+            quote! {
+                idempotency: self.idempotency.clone(),
+            }
+        } else {
+            quote! {}
+        };
+
         let struct_fields = quote! {
             pool: ::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Pool<
                 ::autumn_web::reexports::diesel_async::AsyncPgConnection,
             >,
             hooks: #hooks_ident,
+            #idempotency_struct_field
         };
 
         let clone_impl = quote! {
@@ -333,6 +349,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     Self {
                         pool: self.pool.clone(),
                         hooks: <#hooks_ident as ::autumn_web::hooks::RepositoryHooksClone>::autumn_clone(&self.hooks),
+                        #idempotency_clone_field
                     }
                 }
             }
@@ -344,6 +361,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 Ok(#pg_name {
                     pool,
                     hooks: <#hooks_ident as ::autumn_web::hooks::RepositoryHooksDefault>::autumn_default(),
+                    idempotency: _parts
+                        .extensions
+                        .get::<::autumn_web::idempotency::IdempotencyContext>()
+                        .cloned(),
                 })
             }
         } else {
@@ -471,6 +492,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     async move {
                         let mut input = new.clone();
                         let mut ctx = MutationContext::new(MutationOp::Create);
+                        if let ::core::option::Option::Some(__autumn_idempotency) = &self.idempotency {
+                            ctx.set_idempotency_key(__autumn_idempotency.scoped_key());
+                        }
 
                         // before_create can validate/reject/rewrite
                         self.hooks.before_create(&mut ctx, &mut input).await?;
@@ -486,6 +510,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             conn,
                             Self::__autumn_repository_commit_hook_key(),
                             "create",
+                            ctx.idempotency_key.as_deref(),
                             &ctx,
                             &__autumn_commit_hook_record,
                         )
@@ -609,6 +634,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 .transaction::<(#model_name, MutationContext, ::std::string::String, ::std::string::String, ::autumn_web::reexports::serde_json::Value), ::autumn_web::AutumnError, _>(|conn| {
                     async move {
                         let mut ctx = MutationContext::new(MutationOp::Update);
+                        if let ::core::option::Option::Some(__autumn_idempotency) = &self.idempotency {
+                            ctx.set_idempotency_key(__autumn_idempotency.scoped_key());
+                        }
                         let record: #model_name = if let ::core::option::Option::Some(expected_version) =
                             changes.__autumn_lock_version_expected()
                         {
@@ -677,6 +705,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             conn,
                             Self::__autumn_repository_commit_hook_key(),
                             "update",
+                            ctx.idempotency_key.as_deref(),
                             &ctx,
                             &__autumn_commit_hook_record,
                         )
@@ -848,6 +877,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 .transaction::<(), ::autumn_web::AutumnError, _>(|conn| {
                     async move {
                         let mut ctx = MutationContext::new(MutationOp::Delete);
+                        if let ::core::option::Option::Some(__autumn_idempotency) = &self.idempotency {
+                            ctx.set_idempotency_key(__autumn_idempotency.scoped_key());
+                        }
 
                         // Load current record for before_delete context
                         let record = #table_ident::table
@@ -878,6 +910,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             conn,
                             Self::__autumn_repository_commit_hook_key(),
                             "delete",
+                            ctx.idempotency_key.as_deref(),
                             &ctx,
                             &__autumn_commit_hook_record,
                         )
@@ -1949,6 +1982,18 @@ mod tests {
         let generated = durable_hook_repository_tokens();
 
         assert!(
+            generated.contains("IdempotencyContext"),
+            "generated commit-hook repositories must extract the request idempotency context: {generated}"
+        );
+        assert!(
+            generated.contains("ctx . set_idempotency_key"),
+            "generated commit-hook repositories must seed MutationContext with the scoped idempotency key: {generated}"
+        );
+        assert!(
+            generated.contains("ctx . idempotency_key . as_deref ()"),
+            "generated commit-hook rows must use the scoped idempotency key for durable dedupe: {generated}"
+        );
+        assert!(
             generated.contains("enqueue_repository_commit_hook_pending_on_conn"),
             "generated repositories must durably stage after_*_commit hooks before the mutation commits: {generated}"
         );
@@ -2018,7 +2063,9 @@ mod tests {
         let generated = durable_hook_repository_tokens();
 
         let create_stage = generated
-            .find("\"create\" , & ctx , & __autumn_commit_hook_record")
+            .find(
+                "\"create\" , ctx . idempotency_key . as_deref () , & ctx , & __autumn_commit_hook_record",
+            )
             .expect("create commit hook staging should use the encoded record");
         let create_after = generated
             .find("self . hooks . after_create (& mut ctx , & record)")
@@ -2063,7 +2110,9 @@ mod tests {
         let generated = durable_hook_repository_tokens();
 
         let update_stage = generated
-            .find("\"update\" , & ctx , & __autumn_commit_hook_record")
+            .find(
+                "\"update\" , ctx . idempotency_key . as_deref () , & ctx , & __autumn_commit_hook_record",
+            )
             .expect("update commit hook staging should use the encoded record");
         let update_after = generated
             .find("self . hooks . after_update (& mut ctx , & record)")

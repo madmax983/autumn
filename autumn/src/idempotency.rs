@@ -166,6 +166,34 @@ pub struct IdempotencyRecord {
     pub body: Vec<u8>,
 }
 
+/// Request-scoped idempotency metadata made available to inner handlers.
+///
+/// The raw `Idempotency-Key` header is available via [`Self::key`]. The
+/// scoped key is the framework's collision-safe, principal-scoped storage key
+/// and is the safer value to reuse for durable side-effect deduplication.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IdempotencyContext {
+    key: String,
+    scoped_key: String,
+}
+
+impl IdempotencyContext {
+    #[must_use]
+    pub(crate) const fn new(key: String, scoped_key: String) -> Self {
+        Self { key, scoped_key }
+    }
+
+    #[must_use]
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    #[must_use]
+    pub fn scoped_key(&self) -> &str {
+        &self.scoped_key
+    }
+}
+
 /// Cache entry wrapping a record with expiry and request body fingerprint.
 #[derive(Clone)]
 pub struct IdempotencyEntry {
@@ -783,8 +811,12 @@ async fn prepare_idempotency_request(
     idempotency_key: String,
     req: Request<Body>,
 ) -> Result<PreparedIdempotencyRequest, Response<Body>> {
-    let (parts, body) = req.into_parts();
+    let (mut parts, body) = req.into_parts();
     let storage_key = build_storage_key_for_parts(&idempotency_key, &parts).await;
+    parts.extensions.insert(IdempotencyContext::new(
+        idempotency_key.clone(),
+        storage_key.clone(),
+    ));
     let session = parts.extensions.get::<crate::session::Session>().cloned();
     let content_type = parts
         .headers
@@ -1357,5 +1389,59 @@ mod tests {
         );
         assert!(!storage_key.contains("/payments"));
         assert!(!storage_key.contains("pay-once"));
+    }
+
+    #[tokio::test]
+    async fn forwarded_request_carries_scoped_idempotency_context() {
+        let observed = Arc::new(Mutex::new(None::<(String, String)>));
+        let observed_context = observed.clone();
+        let service = IdempotencyLayer::new(Arc::new(MemoryIdempotencyStore::new(
+            Duration::from_secs(60),
+        )))
+        .layer(tower::service_fn(move |req: Request<Body>| {
+            let observed_context = observed_context.clone();
+            async move {
+                let context = req
+                    .extensions()
+                    .get::<IdempotencyContext>()
+                    .cloned()
+                    .expect("idempotency context should be available to inner handlers");
+                *observed_context
+                    .lock()
+                    .expect("observed context lock poisoned") =
+                    Some((context.key().to_owned(), context.scoped_key().to_owned()));
+                Ok::<_, Infallible>(Response::new(Body::from("ok")))
+            }
+        }));
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/payments")
+            .header(IDEMPOTENCY_KEY_HEADER, "pay-once")
+            .header(AUTHORIZATION, "Bearer stable-token")
+            .body(Body::from("same"))
+            .expect("request builder should be valid");
+
+        let response = service
+            .oneshot(request)
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let observed = observed
+            .lock()
+            .expect("observed context lock poisoned")
+            .clone()
+            .expect("inner handler should record idempotency context");
+        assert_eq!(observed.0, "pay-once");
+        assert_eq!(
+            observed.1,
+            expected_storage_key(
+                "POST",
+                "/payments",
+                Some("Bearer stable-token"),
+                None,
+                "pay-once"
+            )
+        );
     }
 }

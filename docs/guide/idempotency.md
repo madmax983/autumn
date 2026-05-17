@@ -151,6 +151,11 @@ by `.idempotent()` as part of the application middleware stack. If you apply
 `IdempotencyLayer` manually to a raw Axum router, use the layer directly as shown
 below.
 
+Generated repositories with durable `after_*_commit` hooks also receive the
+framework-scoped idempotency key in `MutationContext::idempotency_key` when the
+repository is extracted from an idempotent HTTP request. Autumn uses that key to
+de-duplicate durable commit-hook queue rows for duplicate request attempts.
+
 ### Payload mismatch (422)
 
 If a client sends the same key with a different request body, it almost

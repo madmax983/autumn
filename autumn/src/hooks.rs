@@ -105,6 +105,10 @@ pub struct MutationContext {
     pub now: chrono::DateTime<chrono::Utc>,
     /// Cache keys to invalidate after the mutation.
     pub invalidate_keys: Vec<String>,
+    /// Framework-scoped idempotency key for this mutation, when the mutation
+    /// came from an idempotent HTTP request or a hook set one explicitly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
 }
 
 impl MutationContext {
@@ -120,12 +124,18 @@ impl MutationContext {
             request_id: Some(uuid::Uuid::new_v4().to_string()),
             now: chrono::Utc::now(),
             invalidate_keys: Vec::new(),
+            idempotency_key: None,
         }
     }
 
     /// Add a cache key to the invalidation list.
     pub fn invalidate(&mut self, key: impl Into<String>) {
         self.invalidate_keys.push(key.into());
+    }
+
+    /// Set a scoped idempotency key for durable side-effect deduplication.
+    pub fn set_idempotency_key(&mut self, key: impl Into<String>) {
+        self.idempotency_key = Some(key.into());
     }
 }
 
@@ -782,6 +792,30 @@ mod tests {
         let mut ctx = MutationContext::new(MutationOp::Update);
         ctx.actor = Some("user-123".into());
         assert_eq!(ctx.actor.as_deref(), Some("user-123"));
+    }
+
+    #[test]
+    fn mutation_context_carries_scoped_idempotency_key() {
+        let mut ctx = MutationContext::new(MutationOp::Create);
+        assert!(ctx.idempotency_key.is_none());
+
+        ctx.set_idempotency_key("v2:scoped-http-key");
+
+        assert_eq!(ctx.idempotency_key.as_deref(), Some("v2:scoped-http-key"));
+    }
+
+    #[test]
+    fn mutation_context_deserializes_without_idempotency_key() {
+        let ctx: MutationContext = serde_json::from_value(serde_json::json!({
+            "op": "Create",
+            "actor": null,
+            "request_id": "request-1",
+            "now": "2026-05-17T00:00:00Z",
+            "invalidate_keys": []
+        }))
+        .expect("old durable hook payloads should deserialize");
+
+        assert!(ctx.idempotency_key.is_none());
     }
 
     // ── MutationHooks / NoHooks tests ───────────────────────────────

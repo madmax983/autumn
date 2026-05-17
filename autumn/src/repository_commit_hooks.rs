@@ -20,6 +20,7 @@ use diesel_async::pooled_connection::deadpool::Pool;
 use futures::FutureExt as _;
 use serde::Serialize;
 use serde_json::Value;
+use sha2::Digest as _;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
@@ -51,11 +52,13 @@ const HOOK_EXTEND_CLAIM_SQL: &str = "UPDATE autumn_repository_commit_hooks \
 const HOOK_ENQUEUE_INSERT_SQL: &str = "INSERT INTO autumn_repository_commit_hooks \
      (id, handler_key, hook_name, context, record, status, attempt, \
       max_attempts, initial_backoff_ms, enqueued_at, run_at) \
-     VALUES ($1, $2, $3, $4::JSONB, $5::JSONB, 'enqueued', 1, 5, 1000, NOW(), NOW())";
+     VALUES ($1, $2, $3, $4::JSONB, $5::JSONB, 'enqueued', 1, 5, 1000, NOW(), NOW()) \
+     ON CONFLICT (id) DO NOTHING";
 const HOOK_PENDING_INSERT_SQL: &str = "INSERT INTO autumn_repository_commit_hooks \
      (id, handler_key, hook_name, context, record, status, attempt, \
       max_attempts, initial_backoff_ms, enqueued_at, run_at, claimed_by, claimed_at) \
-     VALUES ($1, $2, $3, $4::JSONB, $5::JSONB, 'pending_after_hook', 1, 5, 1000, NOW(), NOW(), $6, NOW())";
+     VALUES ($1, $2, $3, $4::JSONB, $5::JSONB, 'pending_after_hook', 1, 5, 1000, NOW(), NOW(), $6, NOW()) \
+     ON CONFLICT (id) DO NOTHING";
 const HOOK_FINALIZE_AFTER_HOOK_SQL: &str = "UPDATE autumn_repository_commit_hooks \
      SET context = $1::JSONB, record = $2::JSONB, status = 'enqueued', \
          run_at = NOW(), enqueued_at = COALESCE(enqueued_at, NOW()), \
@@ -275,6 +278,7 @@ pub async fn enqueue_repository_commit_hook_on_conn<C, R>(
     conn: &mut diesel_async::AsyncPgConnection,
     handler_key: &str,
     hook_name: &str,
+    idempotency_key: Option<&str>,
     context: &C,
     record: &R,
 ) -> AutumnResult<()>
@@ -283,7 +287,7 @@ where
     R: Serialize + Sync + ?Sized,
 {
     let (context, record) = serialize_repository_commit_hook_payloads(context, record)?;
-    let id = uuid::Uuid::new_v4().to_string();
+    let id = repository_commit_hook_id(idempotency_key, handler_key, hook_name);
 
     diesel::sql_query(HOOK_ENQUEUE_INSERT_SQL)
         .bind::<diesel::sql_types::Text, _>(id)
@@ -315,6 +319,7 @@ pub async fn enqueue_repository_commit_hook_pending_on_conn<C, R>(
     conn: &mut diesel_async::AsyncPgConnection,
     handler_key: &str,
     hook_name: &str,
+    idempotency_key: Option<&str>,
     context: &C,
     record: &R,
 ) -> AutumnResult<(String, String)>
@@ -323,7 +328,7 @@ where
     R: Serialize + Sync + ?Sized,
 {
     let (context, record) = serialize_repository_commit_hook_payloads(context, record)?;
-    let id = uuid::Uuid::new_v4().to_string();
+    let id = repository_commit_hook_id(idempotency_key, handler_key, hook_name);
     let owner = repository_commit_hook_pending_owner_id();
 
     diesel::sql_query(HOOK_PENDING_INSERT_SQL)
@@ -380,6 +385,18 @@ where
         })?;
 
     if rows > 0 {
+        Ok(())
+    } else {
+        missing_repository_commit_hook_finalization_result(hook_id)
+    }
+}
+
+fn missing_repository_commit_hook_finalization_result(hook_id: &str) -> AutumnResult<()> {
+    if hook_id.starts_with("idempotent:") {
+        tracing::debug!(
+            hook_id = %hook_id,
+            "repository commit hook finalization skipped duplicate idempotent staged row"
+        );
         Ok(())
     } else {
         Err(AutumnError::internal_server_error_msg(format!(
@@ -1019,6 +1036,42 @@ fn format_repository_commit_hook_panic(payload: &(dyn Any + Send)) -> String {
     )
 }
 
+fn repository_commit_hook_id(
+    idempotency_key: Option<&str>,
+    handler_key: &str,
+    hook_name: &str,
+) -> String {
+    let Some(idempotency_key) = idempotency_key.filter(|key| !key.is_empty()) else {
+        return uuid::Uuid::new_v4().to_string();
+    };
+
+    let mut hasher = sha2::Sha256::new();
+    push_hook_id_component(&mut hasher, "handler", handler_key.as_bytes());
+    push_hook_id_component(&mut hasher, "hook", hook_name.as_bytes());
+    push_hook_id_component(&mut hasher, "idempotency", idempotency_key.as_bytes());
+    format!("idempotent:{}", hex_lower(hasher.finalize()))
+}
+
+fn push_hook_id_component(hasher: &mut sha2::Sha256, label: &str, value: &[u8]) {
+    hasher.update(label.as_bytes());
+    hasher.update(b":");
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(b":");
+    hasher.update(value);
+    hasher.update(b";");
+}
+
+fn hex_lower(bytes: impl AsRef<[u8]>) -> String {
+    bytes.as_ref().iter().fold(
+        String::with_capacity(bytes.as_ref().len() * 2),
+        |mut out, byte| {
+            use std::fmt::Write as _;
+            let _ = write!(out, "{byte:02x}");
+            out
+        },
+    )
+}
+
 fn repository_commit_hook_worker_id() -> String {
     format!("repository-hook-{}", uuid::Uuid::new_v4())
 }
@@ -1149,6 +1202,61 @@ mod tests {
         assert_eq!(retry_delay_ms(100, 1), 100);
         assert_eq!(retry_delay_ms(100, 2), 200);
         assert_eq!(retry_delay_ms(100, 3), 400);
+    }
+
+    #[test]
+    fn idempotent_hook_ids_are_deterministic_and_safely_delimited() {
+        let first =
+            repository_commit_hook_id(Some("v2:request"), "pkg::module::posts::Post", "create");
+        let second =
+            repository_commit_hook_id(Some("v2:request"), "pkg::module::posts::Post", "create");
+        let other_hook =
+            repository_commit_hook_id(Some("v2:request"), "pkg::module::posts::Post", "update");
+
+        assert_eq!(first, second);
+        assert_ne!(first, other_hook);
+        assert!(first.starts_with("idempotent:"));
+        assert!(!first.contains("v2:request"));
+        assert!(!first.contains("pkg::module::posts::Post"));
+    }
+
+    #[test]
+    fn non_idempotent_hook_ids_remain_fresh() {
+        let first = repository_commit_hook_id(None, "handler", "create");
+        let second = repository_commit_hook_id(None, "handler", "create");
+
+        assert_ne!(first, second);
+        assert!(uuid::Uuid::parse_str(&first).is_ok());
+        assert!(uuid::Uuid::parse_str(&second).is_ok());
+    }
+
+    #[test]
+    fn hook_insert_sql_ignores_duplicate_idempotent_rows() {
+        assert!(
+            HOOK_ENQUEUE_INSERT_SQL.contains("ON CONFLICT (id) DO NOTHING"),
+            "direct delete commit hooks must dedupe duplicate idempotency rows"
+        );
+        assert!(
+            HOOK_PENDING_INSERT_SQL.contains("ON CONFLICT (id) DO NOTHING"),
+            "staged create/update commit hooks must dedupe duplicate idempotency rows"
+        );
+    }
+
+    #[test]
+    fn missing_idempotent_finalization_is_successful_duplicate() {
+        assert!(missing_repository_commit_hook_finalization_result("idempotent:abc").is_ok());
+    }
+
+    #[test]
+    fn missing_non_idempotent_finalization_remains_an_error() {
+        let err = missing_repository_commit_hook_finalization_result("random-id")
+            .expect_err("missing non-idempotent staged rows should still be reported");
+
+        assert!(
+            err.to_string()
+                .contains("finalization skipped missing staged row"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
