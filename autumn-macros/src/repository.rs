@@ -1143,7 +1143,6 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     &record,
                 )
                 .await?;
-                ::autumn_web::idempotency::__disallow_replay_cache(&__autumn_idempotency_state);
             }
         } else {
             quote! {}
@@ -1160,7 +1159,6 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     &__autumn_new_payload,
                 )
                 .await?;
-                ::autumn_web::idempotency::__disallow_replay_cache(&__autumn_idempotency_state);
             }
         } else {
             quote! {}
@@ -1201,7 +1199,6 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     &__existing,
                 )
                 .await?;
-                ::autumn_web::idempotency::__disallow_replay_cache(&__autumn_idempotency_state);
             }
         } else {
             quote! {}
@@ -1217,7 +1214,6 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     &__existing,
                 )
                 .await?;
-                ::autumn_web::idempotency::__disallow_replay_cache(&__autumn_idempotency_state);
             }
         } else {
             quote! {}
@@ -1227,9 +1223,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 ::autumn_web::reexports::axum::extract::State(__autumn_state):
                     ::autumn_web::reexports::axum::extract::State<::autumn_web::AppState>,
                 __autumn_session: ::autumn_web::session::Session,
-                __autumn_idempotency_state: ::core::option::Option<
+                __autumn_idempotency_replay: ::core::option::Option<
                     ::autumn_web::reexports::axum::extract::Extension<
-                        ::autumn_web::idempotency::IdempotencyRequestState
+                        ::autumn_web::idempotency::IdempotencyReplayResponse
                     >
                 >,
             }
@@ -1368,6 +1364,235 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             quote! {}
         };
 
+        let create_return_type = if has_policy {
+            quote! {
+                ::autumn_web::idempotency::IdempotencyReplayOr<
+                    ::autumn_web::AutumnResult<(
+                        ::autumn_web::reexports::http::StatusCode,
+                        ::autumn_web::prelude::Json<#model_name>
+                    )>
+                >
+            }
+        } else {
+            quote! {
+                ::autumn_web::AutumnResult<(
+                    ::autumn_web::reexports::http::StatusCode,
+                    ::autumn_web::prelude::Json<#model_name>
+                )>
+            }
+        };
+        let create_body = if has_policy {
+            quote! {
+                let new: #new_name = match ::autumn_web::reexports::serde_json::from_value(
+                    __autumn_new_payload.clone(),
+                ) {
+                    ::core::result::Result::Ok(new) => new,
+                    ::core::result::Result::Err(err) => {
+                        return ::autumn_web::idempotency::IdempotencyReplayOr::Inner(
+                            ::core::result::Result::Err(
+                                ::autumn_web::AutumnError::unprocessable_msg(err.to_string())
+                            )
+                        );
+                    }
+                };
+                if let ::core::result::Result::Err(err) =
+                    ::autumn_web::authorization::__check_policy_create_payload::<#model_name>(
+                        &__autumn_state,
+                        &__autumn_session,
+                        &__autumn_new_payload,
+                    )
+                    .await
+                {
+                    return ::autumn_web::idempotency::IdempotencyReplayOr::Inner(
+                        ::core::result::Result::Err(err)
+                    );
+                }
+                if let ::core::option::Option::Some(response) =
+                    ::autumn_web::idempotency::__replay_response(&__autumn_idempotency_replay)
+                {
+                    return ::autumn_web::idempotency::IdempotencyReplayOr::Replay(response);
+                }
+                let record = match repo.save(&new).await {
+                    ::core::result::Result::Ok(record) => record,
+                    ::core::result::Result::Err(err) => {
+                        return ::autumn_web::idempotency::IdempotencyReplayOr::Inner(
+                            ::core::result::Result::Err(err)
+                        );
+                    }
+                };
+                ::autumn_web::idempotency::IdempotencyReplayOr::Inner(::core::result::Result::Ok((
+                    ::autumn_web::reexports::http::StatusCode::CREATED,
+                    ::autumn_web::prelude::Json(record)
+                )))
+            }
+        } else {
+            quote! {
+                #decode_create_payload
+                #policy_check_create_pre
+                let record = repo.save(&new).await?;
+                Ok((::autumn_web::reexports::http::StatusCode::CREATED, ::autumn_web::prelude::Json(record)))
+            }
+        };
+        let update_return_type = if has_policy {
+            quote! {
+                ::autumn_web::idempotency::IdempotencyReplayOr<
+                    ::autumn_web::AutumnResult<::autumn_web::prelude::Json<#model_name>>
+                >
+            }
+        } else {
+            quote! {
+                ::autumn_web::AutumnResult<::autumn_web::prelude::Json<#model_name>>
+            }
+        };
+        let update_body = if has_policy {
+            quote! {
+                let __existing = match repo.find_by_id(id).await {
+                    ::core::result::Result::Ok(::core::option::Option::Some(existing)) => existing,
+                    ::core::result::Result::Ok(::core::option::Option::None) => {
+                        return ::autumn_web::idempotency::IdempotencyReplayOr::Inner(
+                            ::core::result::Result::Err(::autumn_web::AutumnError::not_found_msg("not found"))
+                        );
+                    }
+                    ::core::result::Result::Err(err) => {
+                        return ::autumn_web::idempotency::IdempotencyReplayOr::Inner(
+                            ::core::result::Result::Err(err)
+                        );
+                    }
+                };
+                if let ::core::result::Result::Err(err) =
+                    ::autumn_web::authorization::__check_policy::<#model_name>(
+                        &__autumn_state,
+                        &__autumn_session,
+                        "update",
+                        &__existing,
+                    )
+                    .await
+                {
+                    return ::autumn_web::idempotency::IdempotencyReplayOr::Inner(
+                        ::core::result::Result::Err(err)
+                    );
+                }
+                if let ::core::option::Option::Some(response) =
+                    ::autumn_web::idempotency::__replay_response(&__autumn_idempotency_replay)
+                {
+                    return ::autumn_web::idempotency::IdempotencyReplayOr::Replay(response);
+                }
+                let record = match repo.update(id, &patch).await {
+                    ::core::result::Result::Ok(record) => record,
+                    ::core::result::Result::Err(err) => {
+                        return ::autumn_web::idempotency::IdempotencyReplayOr::Inner(
+                            ::core::result::Result::Err(err)
+                        );
+                    }
+                };
+                ::autumn_web::idempotency::IdempotencyReplayOr::Inner(
+                    ::core::result::Result::Ok(::autumn_web::prelude::Json(record))
+                )
+            }
+        } else {
+            quote! {
+                #policy_check_update_pre
+                let record = repo.update(id, &patch).await?;
+                Ok(::autumn_web::prelude::Json(record))
+            }
+        };
+        let delete_return_type = if has_policy {
+            quote! {
+                ::autumn_web::idempotency::IdempotencyReplayOr<
+                    ::autumn_web::AutumnResult<::autumn_web::reexports::http::StatusCode>
+                >
+            }
+        } else {
+            quote! {
+                ::autumn_web::AutumnResult<::autumn_web::reexports::http::StatusCode>
+            }
+        };
+        let delete_body = if has_policy {
+            quote! {
+                let __existing = match repo.find_by_id(id).await {
+                    ::core::result::Result::Ok(::core::option::Option::Some(existing)) => existing,
+                    ::core::result::Result::Ok(::core::option::Option::None) => {
+                        return ::autumn_web::idempotency::IdempotencyReplayOr::Inner(
+                            ::core::result::Result::Err(::autumn_web::AutumnError::not_found_msg("not found"))
+                        );
+                    }
+                    ::core::result::Result::Err(err) => {
+                        return ::autumn_web::idempotency::IdempotencyReplayOr::Inner(
+                            ::core::result::Result::Err(err)
+                        );
+                    }
+                };
+                if let ::core::result::Result::Err(err) =
+                    ::autumn_web::authorization::__check_policy::<#model_name>(
+                        &__autumn_state,
+                        &__autumn_session,
+                        "delete",
+                        &__existing,
+                    )
+                    .await
+                {
+                    return ::autumn_web::idempotency::IdempotencyReplayOr::Inner(
+                        ::core::result::Result::Err(err)
+                    );
+                }
+                if let ::core::option::Option::Some(response) =
+                    ::autumn_web::idempotency::__replay_response(&__autumn_idempotency_replay)
+                {
+                    return ::autumn_web::idempotency::IdempotencyReplayOr::Replay(response);
+                }
+                if let ::core::result::Result::Err(err) = repo.delete_by_id(id).await {
+                    return ::autumn_web::idempotency::IdempotencyReplayOr::Inner(
+                        ::core::result::Result::Err(err)
+                    );
+                }
+                ::autumn_web::idempotency::IdempotencyReplayOr::Inner(::core::result::Result::Ok(
+                    ::autumn_web::reexports::http::StatusCode::NO_CONTENT
+                ))
+            }
+        } else {
+            quote! {
+                #policy_check_delete_pre
+                repo.delete_by_id(id).await?;
+                Ok(::autumn_web::reexports::http::StatusCode::NO_CONTENT)
+            }
+        };
+        let create_handler_expr = if has_policy {
+            quote! { ::autumn_web::reexports::axum::routing::post(#create_fn) }
+        } else {
+            quote! {
+                ::autumn_web::reexports::axum::routing::MethodRouter::<
+                    ::autumn_web::AppState, ::core::convert::Infallible
+                >::layer(
+                    ::autumn_web::reexports::axum::routing::post(#create_fn),
+                    ::autumn_web::idempotency::IdempotencyReplayLayer,
+                )
+            }
+        };
+        let update_handler_expr = if has_policy {
+            quote! { ::autumn_web::reexports::axum::routing::put(#update_fn) }
+        } else {
+            quote! {
+                ::autumn_web::reexports::axum::routing::MethodRouter::<
+                    ::autumn_web::AppState, ::core::convert::Infallible
+                >::layer(
+                    ::autumn_web::reexports::axum::routing::put(#update_fn),
+                    ::autumn_web::idempotency::IdempotencyReplayLayer,
+                )
+            }
+        };
+        let delete_handler_expr = if has_policy {
+            quote! { ::autumn_web::reexports::axum::routing::delete(#delete_fn) }
+        } else {
+            quote! {
+                ::autumn_web::reexports::axum::routing::MethodRouter::<
+                    ::autumn_web::AppState, ::core::convert::Infallible
+                >::layer(
+                    ::autumn_web::reexports::axum::routing::delete(#delete_fn),
+                    ::autumn_web::idempotency::IdempotencyReplayLayer,
+                )
+            }
+        };
+
         quote! {
             // ── Auto-generated REST API handlers ─────────────────
 
@@ -1419,6 +1644,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         policy_check: #policy_check_fn,
                         scope_check: #list_scope_check_fn,
                     }),
+                    idempotency: ::autumn_web::RouteIdempotency::ReplayThroughInner,
                 }
             }
 
@@ -1467,6 +1693,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         policy_check: #policy_check_fn,
                         scope_check: #non_list_scope_check_fn,
                     }),
+                    idempotency: ::autumn_web::RouteIdempotency::ReplayThroughInner,
                 }
             }
 
@@ -1474,11 +1701,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 #session_state_args
                 repo: #pg_name,
                 #create_payload_arg,
-            ) -> ::autumn_web::AutumnResult<(::autumn_web::reexports::http::StatusCode, ::autumn_web::prelude::Json<#model_name>)> {
-                #decode_create_payload
-                #policy_check_create_pre
-                let record = repo.save(&new).await?;
-                Ok((::autumn_web::reexports::http::StatusCode::CREATED, ::autumn_web::prelude::Json(record)))
+            ) -> #create_return_type {
+                #create_body
             }
 
             #[doc(hidden)]
@@ -1487,12 +1711,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 ::autumn_web::Route {
                     method: ::autumn_web::reexports::http::Method::POST,
                     path: #api_path,
-                    handler: ::autumn_web::reexports::axum::routing::MethodRouter::<
-                        ::autumn_web::AppState, ::core::convert::Infallible
-                    >::layer(
-                        ::autumn_web::reexports::axum::routing::post(#create_fn),
-                        ::autumn_web::idempotency::IdempotencyReplayLayer,
-                    ),
+                    handler: #create_handler_expr,
                     name: ::core::stringify!(#create_fn),
                     api_doc: ::autumn_web::openapi::ApiDoc {
                         method: "POST",
@@ -1520,6 +1739,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         policy_check: #policy_check_fn,
                         scope_check: #non_list_scope_check_fn,
                     }),
+                    idempotency: ::autumn_web::RouteIdempotency::ReplayThroughInner,
                 }
             }
 
@@ -1528,10 +1748,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 ::autumn_web::extract::Path(id): ::autumn_web::extract::Path<i64>,
                 repo: #pg_name,
                 ::autumn_web::prelude::Json(patch): ::autumn_web::prelude::Json<#update_name>,
-            ) -> ::autumn_web::AutumnResult<::autumn_web::prelude::Json<#model_name>> {
-                #policy_check_update_pre
-                let record = repo.update(id, &patch).await?;
-                Ok(::autumn_web::prelude::Json(record))
+            ) -> #update_return_type {
+                #update_body
             }
 
             #[doc(hidden)]
@@ -1540,12 +1758,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 ::autumn_web::Route {
                     method: ::autumn_web::reexports::http::Method::PUT,
                     path: #id_path,
-                    handler: ::autumn_web::reexports::axum::routing::MethodRouter::<
-                        ::autumn_web::AppState, ::core::convert::Infallible
-                    >::layer(
-                        ::autumn_web::reexports::axum::routing::put(#update_fn),
-                        ::autumn_web::idempotency::IdempotencyReplayLayer,
-                    ),
+                    handler: #update_handler_expr,
                     name: ::core::stringify!(#update_fn),
                     api_doc: ::autumn_web::openapi::ApiDoc {
                         method: "PUT",
@@ -1574,6 +1787,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         policy_check: #policy_check_fn,
                         scope_check: #non_list_scope_check_fn,
                     }),
+                    idempotency: ::autumn_web::RouteIdempotency::ReplayThroughInner,
                 }
             }
 
@@ -1581,10 +1795,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 #session_state_args
                 ::autumn_web::extract::Path(id): ::autumn_web::extract::Path<i64>,
                 repo: #pg_name,
-            ) -> ::autumn_web::AutumnResult<::autumn_web::reexports::http::StatusCode> {
-                #policy_check_delete_pre
-                repo.delete_by_id(id).await?;
-                Ok(::autumn_web::reexports::http::StatusCode::NO_CONTENT)
+            ) -> #delete_return_type {
+                #delete_body
             }
 
             #[doc(hidden)]
@@ -1593,12 +1805,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 ::autumn_web::Route {
                     method: ::autumn_web::reexports::http::Method::DELETE,
                     path: #id_path,
-                    handler: ::autumn_web::reexports::axum::routing::MethodRouter::<
-                        ::autumn_web::AppState, ::core::convert::Infallible
-                    >::layer(
-                        ::autumn_web::reexports::axum::routing::delete(#delete_fn),
-                        ::autumn_web::idempotency::IdempotencyReplayLayer,
-                    ),
+                    handler: #delete_handler_expr,
                     name: ::core::stringify!(#delete_fn),
                     api_doc: ::autumn_web::openapi::ApiDoc {
                         method: "DELETE",
@@ -1615,6 +1822,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         policy_check: #policy_check_fn,
                         scope_check: #non_list_scope_check_fn,
                     }),
+                    idempotency: ::autumn_web::RouteIdempotency::ReplayThroughInner,
                 }
             }
 
@@ -1936,6 +2144,24 @@ mod tests {
         let config = parse_repo_args(tokens).unwrap();
         assert_eq!(config.model_name.to_string(), "Post");
         assert_eq!(config.api_path.as_deref(), Some("/api/posts"));
+    }
+
+    #[test]
+    fn policy_repository_api_replays_after_generated_policy_checks() {
+        let generated = repository_macro(
+            quote! { Post, api = "/api/posts", policy = PostPolicy },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("__replay_response"),
+            "policy-backed repository routes must consume cached replays after policy checks: {generated}"
+        );
+        assert!(
+            generated.contains("IdempotencyReplayOr"),
+            "policy-backed repository mutations need a response wrapper for post-policy replay: {generated}"
+        );
     }
 
     #[test]

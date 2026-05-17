@@ -3819,6 +3819,7 @@ mod validate_repository_api_policies_tests {
             name: "test_route",
             api_doc: crate::openapi::ApiDoc::default(),
             repository: meta,
+            idempotency: crate::route::RouteIdempotency::Direct,
         }
     }
 
@@ -4832,6 +4833,7 @@ mod tests {
                 ..Default::default()
             },
             repository: None,
+            idempotency: crate::route::RouteIdempotency::Direct,
         }
     }
 
@@ -4947,6 +4949,7 @@ mod tests {
                     ..Default::default()
                 },
                 repository: None,
+                idempotency: crate::route::RouteIdempotency::Direct,
             }],
             &config,
             state,
@@ -5374,6 +5377,7 @@ mod tests {
                 ..Default::default()
             },
             repository: None,
+            idempotency: crate::route::RouteIdempotency::Direct,
         }];
         let config = AutumnConfig::default();
         let state = AppState {
@@ -5434,6 +5438,7 @@ mod tests {
                     ..Default::default()
                 },
                 repository: None,
+                idempotency: crate::route::RouteIdempotency::Direct,
             },
             Route {
                 method: http::Method::POST,
@@ -5448,6 +5453,7 @@ mod tests {
                     ..Default::default()
                 },
                 repository: None,
+                idempotency: crate::route::RouteIdempotency::Direct,
             },
         ];
         let config = AutumnConfig::default();
@@ -5817,6 +5823,7 @@ mod tests {
                         ..Default::default()
                     },
                     repository: None,
+                    idempotency: crate::route::RouteIdempotency::Direct,
                 }],
                 &config,
                 state,
@@ -5871,6 +5878,7 @@ mod tests {
                         ..Default::default()
                     },
                     repository: None,
+                    idempotency: crate::route::RouteIdempotency::Direct,
                 }]);
 
                 let response = router

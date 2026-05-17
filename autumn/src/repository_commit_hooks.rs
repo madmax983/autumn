@@ -287,7 +287,7 @@ where
     R: Serialize + Sync + ?Sized,
 {
     let (context, record) = serialize_repository_commit_hook_payloads(context, record)?;
-    let id = repository_commit_hook_id(idempotency_key, handler_key, hook_name);
+    let id = repository_commit_hook_id(idempotency_key, handler_key, hook_name, &record);
 
     diesel::sql_query(HOOK_ENQUEUE_INSERT_SQL)
         .bind::<diesel::sql_types::Text, _>(id)
@@ -328,7 +328,7 @@ where
     R: Serialize + Sync + ?Sized,
 {
     let (context, record) = serialize_repository_commit_hook_payloads(context, record)?;
-    let id = repository_commit_hook_id(idempotency_key, handler_key, hook_name);
+    let id = repository_commit_hook_id(idempotency_key, handler_key, hook_name, &record);
     let owner = repository_commit_hook_pending_owner_id();
 
     diesel::sql_query(HOOK_PENDING_INSERT_SQL)
@@ -1040,6 +1040,7 @@ fn repository_commit_hook_id(
     idempotency_key: Option<&str>,
     handler_key: &str,
     hook_name: &str,
+    record: &str,
 ) -> String {
     let Some(idempotency_key) = idempotency_key.filter(|key| !key.is_empty()) else {
         return uuid::Uuid::new_v4().to_string();
@@ -1049,6 +1050,7 @@ fn repository_commit_hook_id(
     push_hook_id_component(&mut hasher, "handler", handler_key.as_bytes());
     push_hook_id_component(&mut hasher, "hook", hook_name.as_bytes());
     push_hook_id_component(&mut hasher, "idempotency", idempotency_key.as_bytes());
+    push_hook_id_component(&mut hasher, "record", record.as_bytes());
     format!("idempotent:{}", hex_lower(hasher.finalize()))
 }
 
@@ -1206,12 +1208,25 @@ mod tests {
 
     #[test]
     fn idempotent_hook_ids_are_deterministic_and_safely_delimited() {
-        let first =
-            repository_commit_hook_id(Some("v2:request"), "pkg::module::posts::Post", "create");
-        let second =
-            repository_commit_hook_id(Some("v2:request"), "pkg::module::posts::Post", "create");
-        let other_hook =
-            repository_commit_hook_id(Some("v2:request"), "pkg::module::posts::Post", "update");
+        let record = serde_json::json!({ "id": 1, "title": "first" }).to_string();
+        let first = repository_commit_hook_id(
+            Some("v2:request"),
+            "pkg::module::posts::Post",
+            "create",
+            &record,
+        );
+        let second = repository_commit_hook_id(
+            Some("v2:request"),
+            "pkg::module::posts::Post",
+            "create",
+            &record,
+        );
+        let other_hook = repository_commit_hook_id(
+            Some("v2:request"),
+            "pkg::module::posts::Post",
+            "update",
+            &record,
+        );
 
         assert_eq!(first, second);
         assert_ne!(first, other_hook);
@@ -1222,8 +1237,9 @@ mod tests {
 
     #[test]
     fn non_idempotent_hook_ids_remain_fresh() {
-        let first = repository_commit_hook_id(None, "handler", "create");
-        let second = repository_commit_hook_id(None, "handler", "create");
+        let record = serde_json::json!({ "id": 1 }).to_string();
+        let first = repository_commit_hook_id(None, "handler", "create", &record);
+        let second = repository_commit_hook_id(None, "handler", "create", &record);
 
         assert_ne!(first, second);
         assert!(uuid::Uuid::parse_str(&first).is_ok());
@@ -1239,6 +1255,30 @@ mod tests {
         assert!(
             HOOK_PENDING_INSERT_SQL.contains("ON CONFLICT (id) DO NOTHING"),
             "staged create/update commit hooks must dedupe duplicate idempotency rows"
+        );
+    }
+
+    #[test]
+    fn idempotent_hook_ids_distinguish_records_in_same_request() {
+        let first_record = serde_json::json!({ "id": 1, "title": "first" }).to_string();
+        let second_record = serde_json::json!({ "id": 2, "title": "second" }).to_string();
+
+        let first = repository_commit_hook_id(
+            Some("v2:request"),
+            "pkg::module::posts::Post",
+            "create",
+            &first_record,
+        );
+        let second = repository_commit_hook_id(
+            Some("v2:request"),
+            "pkg::module::posts::Post",
+            "create",
+            &second_record,
+        );
+
+        assert_ne!(
+            first, second,
+            "one idempotent request can stage multiple committed records for the same hook"
         );
     }
 

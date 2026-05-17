@@ -13,6 +13,7 @@ use autumn_web::prelude::*;
 use autumn_web::session::{MemoryStore, SessionConfig, SessionLayer, SessionStore};
 use autumn_web::test::TestApp;
 use http::StatusCode;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 // ── Test resource and policy ──────────────────────────────────
 
@@ -41,6 +42,8 @@ const FIXED_NOTE: Note = Note {
     id: 1,
     author_id: 42,
 };
+static SECURED_ADMIN_MUTATION_CALLS: AtomicUsize = AtomicUsize::new(0);
+static SECURED_ADMIN_REPLAY_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 // ── Hand-written handler exercising the inline `authorize` helper ──
 
@@ -58,6 +61,14 @@ async fn update_note_inline(
 #[autumn_web::post("/secured-admin")]
 #[autumn_web::secured("admin")]
 async fn secured_admin_mutation() -> AutumnResult<&'static str> {
+    SECURED_ADMIN_MUTATION_CALLS.fetch_add(1, Ordering::SeqCst);
+    Ok("ok")
+}
+
+#[autumn_web::post("/secured-admin-replay")]
+#[autumn_web::secured("admin")]
+async fn secured_admin_replay_mutation() -> AutumnResult<&'static str> {
+    SECURED_ADMIN_REPLAY_CALLS.fetch_add(1, Ordering::SeqCst);
     Ok("ok")
 }
 
@@ -221,6 +232,14 @@ fn build_idempotent_secured_app(store: MemoryStore) -> autumn_web::test::TestCli
         .build()
 }
 
+fn build_idempotent_secured_replay_app(store: MemoryStore) -> autumn_web::test::TestClient {
+    TestApp::new()
+        .routes(routes![secured_admin_replay_mutation])
+        .layer(SessionLayer::new(store, SessionConfig::default()))
+        .idempotent()
+        .build()
+}
+
 async fn post_with_session(
     client: &autumn_web::test::TestClient,
     path: &str,
@@ -327,6 +346,36 @@ async fn idempotent_replay_does_not_bypass_secured_role_changes() {
         "cached idempotency replay must not skip the current #[secured] role check"
     );
     assert_eq!(retry.header("x-idempotent-replayed"), None);
+}
+
+#[tokio::test]
+async fn idempotent_authorized_secured_mutation_replays_without_rerunning_handler() {
+    SECURED_ADMIN_REPLAY_CALLS.store(0, Ordering::SeqCst);
+    let store = MemoryStore::new();
+    seed_session(&store, "sess-secured-replay", "999", Some("admin")).await;
+    let client = build_idempotent_secured_replay_app(store);
+
+    client
+        .post("/secured-admin-replay")
+        .header("Cookie", "autumn.sid=sess-secured-replay")
+        .header("idempotency-key", "secured-replay-key")
+        .send()
+        .await
+        .assert_ok();
+
+    let replay = client
+        .post("/secured-admin-replay")
+        .header("Cookie", "autumn.sid=sess-secured-replay")
+        .header("idempotency-key", "secured-replay-key")
+        .send()
+        .await;
+    replay.assert_ok();
+    assert_eq!(replay.header("x-idempotent-replayed"), Some("true"));
+    assert_eq!(
+        SECURED_ADMIN_REPLAY_CALLS.load(Ordering::SeqCst),
+        1,
+        "authorized idempotent retries must replay instead of re-entering the mutating handler"
+    );
 }
 
 // ── #[authorize] stacked with #[secured] ──────────────────────

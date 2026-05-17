@@ -264,7 +264,6 @@ pub fn try_build_router_inner(
     )?;
 
     let idempotency_layers = build_idempotency_layers(config, &state)?;
-    let route_idempotency_layer = idempotency_layers.as_ref().map(|layers| &layers.route);
     let raw_idempotency_layer = idempotency_layers.as_ref().map(|layers| &layers.raw);
     let mut router = group_and_mount_routes(route_list, idempotency_layers.as_ref());
 
@@ -291,7 +290,7 @@ pub fn try_build_router_inner(
     router = router.nest_service("/static", tower_http::services::ServeDir::new(&static_dir));
     router = router.layer(axum::middleware::from_fn(asset_cache_control));
 
-    router = mount_scoped_groups(router, ctx.scoped_groups, route_idempotency_layer);
+    router = mount_scoped_groups(router, ctx.scoped_groups, idempotency_layers.as_ref());
 
     router = mount_raw_routers(
         router,
@@ -805,7 +804,7 @@ fn group_and_mount_routes(
     router
 }
 
-fn idempotency_layer_for_route<'a>(
+const fn idempotency_layer_for_route<'a>(
     route: &Route,
     layers: &'a BuiltIdempotencyLayers,
 ) -> &'a IdempotencyLayer {
@@ -816,8 +815,11 @@ fn idempotency_layer_for_route<'a>(
     }
 }
 
-fn route_uses_generated_replay_stop(route: &Route) -> bool {
-    route.repository.is_some() || route.api_doc.method == route.method.as_str()
+const fn route_uses_generated_replay_stop(route: &Route) -> bool {
+    matches!(
+        route.idempotency,
+        crate::route::RouteIdempotency::ReplayThroughInner
+    )
 }
 
 #[cfg_attr(not(feature = "mail"), allow(unused_variables))]
@@ -965,7 +967,7 @@ fn mount_actuator_endpoints(
 fn mount_scoped_groups(
     mut router: axum::Router<AppState>,
     scoped_groups: Vec<ScopedGroup>,
-    idempotency_layer: Option<&IdempotencyLayer>,
+    idempotency_layers: Option<&BuiltIdempotencyLayers>,
 ) -> axum::Router<AppState> {
     // Mount scoped route groups (each with its own middleware layer).
     for group in scoped_groups {
@@ -978,10 +980,13 @@ fn mount_scoped_groups(
                 scope = %group.prefix,
                 "Mounted scoped route"
             );
-            sub_router = sub_router.route(route.path, route.handler);
-        }
-        if let Some(layer) = idempotency_layer {
-            sub_router = sub_router.layer(layer.clone());
+            let selected_layer =
+                idempotency_layers.map(|layers| idempotency_layer_for_route(&route, layers));
+            let mut handler = route.handler;
+            if let Some(layer) = selected_layer {
+                handler = handler.layer(layer.clone());
+            }
+            sub_router = sub_router.route(route.path, handler);
         }
         sub_router = (group.apply_layer)(sub_router);
         router = router.nest(&group.prefix, sub_router);
@@ -2212,6 +2217,7 @@ mod tests {
                     ..Default::default()
                 },
                 repository: None,
+                idempotency: crate::route::RouteIdempotency::Direct,
             }],
             source: crate::route_listing::RouteSource::User,
             apply_layer: Box::new(|r| r),
@@ -2280,6 +2286,7 @@ mod tests {
                 ..Default::default()
             },
             repository: None,
+            idempotency: crate::route::RouteIdempotency::Direct,
         };
         let group = crate::app::ScopedGroup {
             prefix: "/orgs/{org_id}".to_owned(),
@@ -2343,6 +2350,7 @@ mod tests {
                 ..Default::default()
             },
             repository: None,
+            idempotency: crate::route::RouteIdempotency::Direct,
         };
 
         let protected_routes = vec![route];
@@ -2512,6 +2520,7 @@ mod tests {
                 ..Default::default()
             },
             repository: None,
+            idempotency: crate::route::RouteIdempotency::Direct,
         };
 
         let ctx = RouterContext {
@@ -2578,6 +2587,7 @@ mod tests {
                 ..Default::default()
             },
             repository: None,
+            idempotency: crate::route::RouteIdempotency::Direct,
         };
 
         let ctx = RouterContext {

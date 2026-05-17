@@ -138,6 +138,7 @@ fn snake_case(name: &str) -> String {
     out
 }
 
+#[allow(clippy::too_many_lines)]
 pub fn authorize_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // Parse the args first; the parser may surface a leading `"action"`
     // string literal as the bare-Path action via the `Meta::Path` branch
@@ -205,11 +206,11 @@ pub fn authorize_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         };
         input_fn.sig.inputs.insert(0, session_param);
     }
-    if !has_input_named(&input_fn, "__autumn_idempotency_state") {
+    if !has_input_named(&input_fn, "__autumn_idempotency_replay") {
         let idempotency_param: syn::FnArg = parse_quote! {
-            __autumn_idempotency_state: ::core::option::Option<
+            __autumn_idempotency_replay: ::core::option::Option<
                 ::autumn_web::reexports::axum::extract::Extension<
-                    ::autumn_web::idempotency::IdempotencyRequestState
+                    ::autumn_web::idempotency::IdempotencyReplayResponse
                 >
             >
         };
@@ -218,16 +219,54 @@ pub fn authorize_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let action_lit = syn::LitStr::new(&action_str, proc_macro2::Span::call_site());
     let original_body = &input_fn.block;
+    let original_response = match &input_fn.sig.output {
+        syn::ReturnType::Default => quote! {
+            let __autumn_inner: () = (async move #original_body).await;
+            ::autumn_web::reexports::axum::response::IntoResponse::into_response(__autumn_inner)
+        },
+        syn::ReturnType::Type(_, ty) if matches!(ty.as_ref(), syn::Type::ImplTrait(_)) => quote! {
+            ::autumn_web::reexports::axum::response::IntoResponse::into_response(
+                (async move #original_body).await
+            )
+        },
+        syn::ReturnType::Type(_, ty) => quote! {
+            let __autumn_inner: #ty = (async move #original_body).await;
+            ::autumn_web::reexports::axum::response::IntoResponse::into_response(__autumn_inner)
+        },
+    };
+    let body_already_has_replay_guard = quote!(#original_body)
+        .to_string()
+        .contains("__AUTUMN_IDEMPOTENCY_REPLAY_GUARD");
+    let replay_stop = if body_already_has_replay_guard {
+        quote! {}
+    } else {
+        quote! {
+            const __AUTUMN_IDEMPOTENCY_REPLAY_GUARD: () = ();
+            if let ::core::option::Option::Some(__autumn_response) =
+                ::autumn_web::idempotency::__replay_response(&__autumn_idempotency_replay)
+            {
+                return __autumn_response;
+            }
+        }
+    };
+    input_fn
+        .attrs
+        .push(parse_quote!(#[allow(clippy::too_many_arguments)]));
+    input_fn.sig.output = parse_quote! {
+        -> ::autumn_web::reexports::axum::response::Response
+    };
     input_fn.block = parse_quote! {
         {
-            ::autumn_web::authorization::__check_policy::<#resource_ident>(
+            if let ::core::result::Result::Err(__autumn_error) = ::autumn_web::authorization::__check_policy::<#resource_ident>(
                 &__autumn_state,
                 &__autumn_session,
                 #action_lit,
                 &#from_ident,
-            ).await?;
-            ::autumn_web::idempotency::__disallow_replay_cache(&__autumn_idempotency_state);
-            #original_body
+            ).await {
+                return ::autumn_web::reexports::axum::response::IntoResponse::into_response(__autumn_error);
+            }
+            #replay_stop
+            #original_response
         }
     };
 

@@ -4,13 +4,14 @@ use futures::StreamExt as FuturesStreamExt;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::http::{HeaderMap, Method, Request, Response, StatusCode, request::Parts};
+use axum::response::IntoResponse;
 use sha2::Digest as _;
 use tower::{Layer, Service};
 
@@ -191,48 +192,6 @@ impl IdempotencyContext {
     #[must_use]
     pub fn scoped_key(&self) -> &str {
         &self.scoped_key
-    }
-}
-
-/// Request-scoped cache policy used by generated authorization guards.
-///
-/// Handler-body authorization checks cannot run before a route-level replay
-/// layer. When a generated guard marks this request as authorization-checked,
-/// the idempotency middleware fails closed by skipping response caching so a
-/// future retry must execute the current guard again.
-#[derive(Clone, Debug)]
-pub struct IdempotencyRequestState {
-    replay_cache_allowed: Arc<AtomicBool>,
-}
-
-impl IdempotencyRequestState {
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            replay_cache_allowed: Arc::new(AtomicBool::new(true)),
-        }
-    }
-
-    /// Prevent this response from being persisted for future replay.
-    pub fn disallow_replay_cache(&self) {
-        self.replay_cache_allowed.store(false, Ordering::Release);
-    }
-
-    fn replay_cache_allowed(&self) -> bool {
-        self.replay_cache_allowed.load(Ordering::Acquire)
-    }
-}
-
-impl Default for IdempotencyRequestState {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[doc(hidden)]
-pub fn __disallow_replay_cache(state: &Option<axum::extract::Extension<IdempotencyRequestState>>) {
-    if let Some(axum::extract::Extension(state)) = state {
-        state.disallow_replay_cache();
     }
 }
 
@@ -585,14 +544,43 @@ mod redis_store {
 #[cfg(feature = "redis")]
 pub use redis_store::RedisIdempotencyStore;
 
+#[doc(hidden)]
 #[derive(Clone)]
-struct IdempotencyReplayResponse {
+pub struct IdempotencyReplayResponse {
     record: IdempotencyRecord,
 }
 
 impl IdempotencyReplayResponse {
     fn into_response(self) -> Response<Body> {
         response_from_record(self.record)
+    }
+}
+
+#[doc(hidden)]
+#[must_use]
+pub fn __replay_response(
+    replay: &Option<axum::extract::Extension<IdempotencyReplayResponse>>,
+) -> Option<Response<Body>> {
+    replay
+        .as_ref()
+        .map(|axum::extract::Extension(replay)| replay.clone().into_response())
+}
+
+#[doc(hidden)]
+pub enum IdempotencyReplayOr<T> {
+    Replay(Response<Body>),
+    Inner(T),
+}
+
+impl<T> IntoResponse for IdempotencyReplayOr<T>
+where
+    T: IntoResponse,
+{
+    fn into_response(self) -> Response<Body> {
+        match self {
+            Self::Replay(response) => response,
+            Self::Inner(inner) => inner.into_response(),
+        }
     }
 }
 
@@ -801,7 +789,6 @@ struct PreparedIdempotencyRequest {
     storage_key: String,
     body_hash: Vec<u8>,
     session: Option<crate::session::Session>,
-    request_state: IdempotencyRequestState,
     parts: Parts,
     body_bytes: Bytes,
 }
@@ -856,12 +843,10 @@ async fn prepare_idempotency_request(
 ) -> Result<PreparedIdempotencyRequest, Response<Body>> {
     let (mut parts, body) = req.into_parts();
     let storage_key = build_storage_key_for_parts(&idempotency_key, &parts).await;
-    let request_state = IdempotencyRequestState::new();
     parts.extensions.insert(IdempotencyContext::new(
         idempotency_key.clone(),
         storage_key.clone(),
     ));
-    parts.extensions.insert(request_state.clone());
     let session = parts.extensions.get::<crate::session::Session>().cloned();
     let content_type = parts
         .headers
@@ -881,7 +866,6 @@ async fn prepare_idempotency_request(
         storage_key,
         body_hash,
         session,
-        request_state,
         parts,
         body_bytes,
     })
@@ -976,7 +960,6 @@ where
         storage_key,
         body_hash,
         session,
-        request_state,
         parts,
         body_bytes,
     } = prepared;
@@ -1030,11 +1013,6 @@ where
             tracing::debug!(
                 idempotency.key = %idempotency_key,
                 "Session changed during idempotent request; skipping cache so retry can receive Set-Cookie"
-            );
-        } else if !request_state.replay_cache_allowed() {
-            tracing::debug!(
-                idempotency.key = %idempotency_key,
-                "Authorization or policy guard ran during idempotent request; skipping cache so retry rechecks access"
             );
         } else {
             let record = IdempotencyRecord {

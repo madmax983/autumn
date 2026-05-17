@@ -13,7 +13,7 @@
 use proc_macro2::TokenStream;
 use quote::quote;
 use syn::parse::Parser as _;
-use syn::{ItemFn, LitStr};
+use syn::{ItemFn, LitStr, parse_quote};
 
 use crate::param_helpers::has_input_named;
 
@@ -53,12 +53,44 @@ pub fn secured_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let check_call = quote! {
         // Route macros read this marker when #[secured] expands before #[get]/#[post]/etc.
         const __AUTUMN_SECURED_ROLES: &[&str] = &[#(#role_literals),*];
-        ::autumn_web::auth::__check_secured_with_key(
+        if let ::core::result::Result::Err(__autumn_error) = ::autumn_web::auth::__check_secured_with_key(
             &__autumn_session,
             __autumn_state.auth_session_key(),
             __AUTUMN_SECURED_ROLES,
-        ).await?;
-        ::autumn_web::idempotency::__disallow_replay_cache(&__autumn_idempotency_state);
+        ).await {
+            return ::autumn_web::reexports::axum::response::IntoResponse::into_response(__autumn_error);
+        }
+    };
+    let original_body = &input_fn.block;
+    let original_response = match &input_fn.sig.output {
+        syn::ReturnType::Default => quote! {
+            let __autumn_inner: () = (async move #original_body).await;
+            ::autumn_web::reexports::axum::response::IntoResponse::into_response(__autumn_inner)
+        },
+        syn::ReturnType::Type(_, ty) if matches!(ty.as_ref(), syn::Type::ImplTrait(_)) => quote! {
+            ::autumn_web::reexports::axum::response::IntoResponse::into_response(
+                (async move #original_body).await
+            )
+        },
+        syn::ReturnType::Type(_, ty) => quote! {
+            let __autumn_inner: #ty = (async move #original_body).await;
+            ::autumn_web::reexports::axum::response::IntoResponse::into_response(__autumn_inner)
+        },
+    };
+    let body_already_has_replay_guard = quote!(#original_body)
+        .to_string()
+        .contains("__AUTUMN_IDEMPOTENCY_REPLAY_GUARD");
+    let replay_stop = if body_already_has_replay_guard {
+        quote! {}
+    } else {
+        quote! {
+            const __AUTUMN_IDEMPOTENCY_REPLAY_GUARD: () = ();
+            if let ::core::option::Option::Some(__autumn_response) =
+                ::autumn_web::idempotency::__replay_response(&__autumn_idempotency_replay)
+            {
+                return __autumn_response;
+            }
+        }
     };
 
     // Inject hidden State<AppState> and Session parameters at the start of
@@ -80,23 +112,29 @@ pub fn secured_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         };
         input_fn.sig.inputs.insert(0, session_param);
     }
-    if !has_input_named(&input_fn, "__autumn_idempotency_state") {
+    if !has_input_named(&input_fn, "__autumn_idempotency_replay") {
         let idempotency_param: syn::FnArg = syn::parse_quote! {
-            __autumn_idempotency_state: ::core::option::Option<
+            __autumn_idempotency_replay: ::core::option::Option<
                 ::autumn_web::reexports::axum::extract::Extension<
-                    ::autumn_web::idempotency::IdempotencyRequestState
+                    ::autumn_web::idempotency::IdempotencyReplayResponse
                 >
             >
         };
         input_fn.sig.inputs.insert(0, idempotency_param);
     }
 
-    // Prepend the check call to the function body
-    let original_body = &input_fn.block;
+    input_fn
+        .attrs
+        .push(parse_quote!(#[allow(clippy::too_many_arguments)]));
+    input_fn.sig.output = parse_quote! {
+        -> ::autumn_web::reexports::axum::response::Response
+    };
+
     input_fn.block = syn::parse_quote! {
         {
             #check_call
-            #original_body
+            #replay_stop
+            #original_response
         }
     };
 

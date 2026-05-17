@@ -10,7 +10,7 @@ use std::time::Duration;
 use autumn_web::idempotency::{IdempotencyLayer, IdempotencyStoreError, MemoryIdempotencyStore};
 use autumn_web::session::Session;
 use autumn_web::test::TestApp;
-use autumn_web::{AppState, Route, get, post, put, routes};
+use autumn_web::{AppState, Route, RouteIdempotency, get, post, put, routes};
 use axum::body::Body;
 use axum::http::StatusCode;
 use axum::response::Response;
@@ -134,6 +134,8 @@ static RAW_MERGE_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static RAW_NEST_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static SESSION_LOGIN_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static MANUAL_ROUTE_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
+static MANUAL_OPENAPI_ROUTE_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
+static MANUAL_SCOPED_ROUTE_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 /// Route-local interceptor used to prove idempotency replays still traverse
 /// `#[intercept(...)]` layers before the cached response is returned.
@@ -199,6 +201,16 @@ async fn raw_nest_create_handler() -> &'static str {
 async fn manual_route_create_handler() -> &'static str {
     MANUAL_ROUTE_HANDLER_CALLS.fetch_add(1, Ordering::SeqCst);
     "manual-route"
+}
+
+async fn manual_openapi_route_create_handler() -> &'static str {
+    MANUAL_OPENAPI_ROUTE_HANDLER_CALLS.fetch_add(1, Ordering::SeqCst);
+    "manual-openapi-route"
+}
+
+async fn manual_scoped_route_create_handler() -> &'static str {
+    MANUAL_SCOPED_ROUTE_HANDLER_CALLS.fetch_add(1, Ordering::SeqCst);
+    "manual-scoped-route"
 }
 
 #[post("/session-login")]
@@ -288,6 +300,7 @@ async fn test_manual_route_registered_through_routes_is_idempotent() {
         name: "manual_route_create_handler",
         api_doc: autumn_web::openapi::ApiDoc::default(),
         repository: None,
+        idempotency: RouteIdempotency::Direct,
     };
 
     let client = TestApp::new().routes(vec![route]).idempotent().build();
@@ -312,6 +325,87 @@ async fn test_manual_route_registered_through_routes_is_idempotent() {
         MANUAL_ROUTE_HANDLER_CALLS.load(Ordering::SeqCst),
         1,
         "manual Route values accepted by AppBuilder::routes must not re-run on replay"
+    );
+}
+
+#[tokio::test]
+async fn test_manual_route_with_openapi_method_is_idempotent() {
+    MANUAL_OPENAPI_ROUTE_HANDLER_CALLS.store(0, Ordering::SeqCst);
+    let route = Route {
+        method: axum::http::Method::POST,
+        path: "/manual-openapi-create",
+        handler: axum::routing::post(manual_openapi_route_create_handler),
+        name: "manual_openapi_route_create_handler",
+        api_doc: autumn_web::openapi::ApiDoc {
+            method: "POST",
+            path: "/manual-openapi-create",
+            operation_id: "manual_openapi_route_create_handler",
+            success_status: 200,
+            ..Default::default()
+        },
+        repository: None,
+        idempotency: RouteIdempotency::Direct,
+    };
+
+    let client = TestApp::new().routes(vec![route]).idempotent().build();
+
+    client
+        .post("/manual-openapi-create")
+        .header("idempotency-key", "manual-openapi-route-key")
+        .send()
+        .await
+        .assert_ok();
+
+    let replay = client
+        .post("/manual-openapi-create")
+        .header("idempotency-key", "manual-openapi-route-key")
+        .send()
+        .await;
+    replay.assert_ok();
+    assert_eq!(replay.header("x-idempotent-replayed"), Some("true"));
+    assert_eq!(
+        MANUAL_OPENAPI_ROUTE_HANDLER_CALLS.load(Ordering::SeqCst),
+        1,
+        "OpenAPI metadata must not imply a manual Route has a generated replay stop"
+    );
+}
+
+#[tokio::test]
+async fn test_manual_scoped_route_registered_through_routes_is_idempotent() {
+    MANUAL_SCOPED_ROUTE_HANDLER_CALLS.store(0, Ordering::SeqCst);
+    let route = Route {
+        method: axum::http::Method::POST,
+        path: "/manual-scoped-create",
+        handler: axum::routing::post(manual_scoped_route_create_handler),
+        name: "manual_scoped_route_create_handler",
+        api_doc: autumn_web::openapi::ApiDoc::default(),
+        repository: None,
+        idempotency: RouteIdempotency::Direct,
+    };
+
+    let client = TestApp::new()
+        .scoped("/api", tower::layer::util::Identity::new(), vec![route])
+        .idempotent()
+        .build();
+
+    client
+        .post("/api/manual-scoped-create")
+        .header("idempotency-key", "manual-scoped-route-key")
+        .send()
+        .await
+        .assert_ok();
+
+    let replay = client
+        .post("/api/manual-scoped-create")
+        .header("idempotency-key", "manual-scoped-route-key")
+        .send()
+        .await;
+    replay.assert_ok();
+    assert_eq!(replay.header("x-idempotent-replayed"), Some("true"));
+    assert_eq!(
+        MANUAL_SCOPED_ROUTE_HANDLER_CALLS.load(Ordering::SeqCst),
+        1,
+        "manual Route values inside AppBuilder::scoped must not re-run on replay"
     );
 }
 

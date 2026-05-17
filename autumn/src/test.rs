@@ -159,6 +159,7 @@ use diesel_async::pooled_connection::deadpool::Pool;
 /// ```
 pub struct TestApp {
     routes: Vec<Route>,
+    scoped_groups: Vec<crate::app::ScopedGroup>,
     merge_routers: Vec<axum::Router<crate::state::AppState>>,
     nest_routers: Vec<(String, axum::Router<crate::state::AppState>)>,
     custom_layers: Vec<crate::app::CustomLayerRegistration>,
@@ -191,6 +192,7 @@ impl TestApp {
 
         Self {
             routes: Vec::new(),
+            scoped_groups: Vec::new(),
             merge_routers: Vec::new(),
             nest_routers: Vec::new(),
             custom_layers: Vec::new(),
@@ -268,6 +270,31 @@ impl TestApp {
     #[must_use]
     pub fn merge(mut self, router: axum::Router<crate::state::AppState>) -> Self {
         self.merge_routers.push(router);
+        self
+    }
+
+    /// Mount routes under a scoped prefix with a route-local layer.
+    #[must_use]
+    pub fn scoped<L>(mut self, prefix: &str, layer: L, routes: Vec<Route>) -> Self
+    where
+        L: tower::Layer<axum::routing::Route> + Clone + Send + Sync + 'static,
+        L::Service: tower::Service<
+                axum::http::Request<axum::body::Body>,
+                Response = axum::http::Response<axum::body::Body>,
+                Error = std::convert::Infallible,
+            > + Clone
+            + Send
+            + Sync
+            + 'static,
+        <L::Service as tower::Service<axum::http::Request<axum::body::Body>>>::Future:
+            Send + 'static,
+    {
+        self.scoped_groups.push(crate::app::ScopedGroup {
+            prefix: prefix.to_owned(),
+            routes,
+            source: crate::route_listing::RouteSource::User,
+            apply_layer: Box::new(move |router| router.layer(layer)),
+        });
         self
     }
 
@@ -398,7 +425,7 @@ impl TestApp {
             state,
             crate::router::RouterContext {
                 exception_filters: Vec::new(),
-                scoped_groups: Vec::new(),
+                scoped_groups: self.scoped_groups,
                 merge_routers: self.merge_routers,
                 nest_routers: self.nest_routers,
                 custom_layers: self.custom_layers,
@@ -967,6 +994,7 @@ mod tests {
                     ..Default::default()
                 },
                 repository: None,
+                idempotency: crate::route::RouteIdempotency::Direct,
             },
             Route {
                 method: Method::POST,
@@ -981,6 +1009,7 @@ mod tests {
                     ..Default::default()
                 },
                 repository: None,
+                idempotency: crate::route::RouteIdempotency::Direct,
             },
             Route {
                 method: Method::POST,
@@ -995,6 +1024,7 @@ mod tests {
                     ..Default::default()
                 },
                 repository: None,
+                idempotency: crate::route::RouteIdempotency::Direct,
             },
         ]
     }
@@ -1097,6 +1127,7 @@ mod tests {
                 ..Default::default()
             },
             repository: None,
+            idempotency: crate::route::RouteIdempotency::Direct,
         }];
         let client = TestApp::new().routes(routes).build();
 
