@@ -67,12 +67,10 @@ pub struct RepositoryApiMeta {
 /// for this route.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RouteIdempotency {
-    /// Unknown/manual routes have no generated replay consumer, so cache hits
-    /// must be replayed directly before the handler is called.
-    ///
-    /// Use this only when the supplied `MethodRouter` does not
-    /// contain route-local authorization, tenant, audit, or similar layers that
-    /// must run again before a cached success can be returned.
+    /// Unknown/manual routes have no guaranteed generated replay consumer.
+    /// Autumn stores the first successful mutation but fails closed on cache
+    /// hits instead of directly replaying a stale success around any
+    /// route-local authorization, tenant, audit, or similar layers.
     #[default]
     Direct,
     /// Autumn-generated routes install a replay consumer inside the route

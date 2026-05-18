@@ -805,7 +805,7 @@ const fn idempotency_layer_for_route<'a>(
     if route_uses_generated_replay_stop(route) {
         &layers.route
     } else {
-        &layers.raw
+        &layers.manual
     }
 }
 
@@ -1094,7 +1094,7 @@ where
 
 struct BuiltIdempotencyLayers {
     route: crate::idempotency::IdempotencyLayer,
-    raw: crate::idempotency::IdempotencyLayer,
+    manual: crate::idempotency::IdempotencyLayer,
 }
 
 fn build_idempotency_layers(
@@ -1142,7 +1142,7 @@ fn build_idempotency_layers(
 
     Ok(Some(BuiltIdempotencyLayers {
         route: base.clone().replay_through_inner(),
-        raw: base,
+        manual: base.fail_closed_on_replay(),
     }))
 }
 

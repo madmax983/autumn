@@ -141,6 +141,7 @@ static RAW_NEST_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static RAW_LAYERED_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static SESSION_LOGIN_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static SESSION_ROTATION_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
+static SESSION_ALIAS_FAILURE_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static LOOKUP_FAILURE_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static REPLAY_METADATA_POLICY_CALLS: AtomicUsize = AtomicUsize::new(0);
 static REPLAY_METADATA_MUTATION_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -150,6 +151,9 @@ static MANUAL_SCOPED_ROUTE_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static MANUAL_LAYERED_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static MANUAL_LAYERED_AUTH_CALLS: AtomicUsize = AtomicUsize::new(0);
 static MANUAL_LAYERED_ALLOWED: AtomicBool = AtomicBool::new(true);
+static MANUAL_DIRECT_LAYERED_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
+static MANUAL_DIRECT_LAYERED_AUTH_CALLS: AtomicUsize = AtomicUsize::new(0);
+static MANUAL_DIRECT_LAYERED_ALLOWED: AtomicBool = AtomicBool::new(true);
 static RAW_LAYERED_AUTH_CALLS: AtomicUsize = AtomicUsize::new(0);
 static RAW_LAYERED_ALLOWED: AtomicBool = AtomicBool::new(true);
 static SESSION_SAVE_FAILURE_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -248,6 +252,54 @@ where
 }
 
 #[derive(Clone)]
+struct ManualDirectLayeredAuthLayer;
+
+#[derive(Clone)]
+struct ManualDirectLayeredAuthService<S> {
+    inner: S,
+}
+
+impl<S> Layer<S> for ManualDirectLayeredAuthLayer {
+    type Service = ManualDirectLayeredAuthService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        ManualDirectLayeredAuthService { inner }
+    }
+}
+
+impl<S> Service<axum::extract::Request> for ManualDirectLayeredAuthService<S>
+where
+    S: Service<
+            axum::extract::Request,
+            Response = axum::response::Response,
+            Error = std::convert::Infallible,
+        > + Clone
+        + Send
+        + 'static,
+    S::Future: Send + 'static,
+{
+    type Response = axum::response::Response;
+    type Error = std::convert::Infallible;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: axum::extract::Request) -> Self::Future {
+        MANUAL_DIRECT_LAYERED_AUTH_CALLS.fetch_add(1, Ordering::SeqCst);
+        if !MANUAL_DIRECT_LAYERED_ALLOWED.load(Ordering::SeqCst) {
+            return Box::pin(async move {
+                Ok((StatusCode::FORBIDDEN, "manual direct route layer denied").into_response())
+            });
+        }
+        let clone = self.inner.clone();
+        let mut inner = std::mem::replace(&mut self.inner, clone);
+        Box::pin(async move { inner.call(req).await })
+    }
+}
+
+#[derive(Clone)]
 struct RawLayeredAuthLayer;
 
 #[derive(Clone)]
@@ -336,6 +388,11 @@ async fn manual_layered_route_create_handler() -> &'static str {
     "manual-layered-route"
 }
 
+async fn manual_direct_layered_route_create_handler() -> &'static str {
+    MANUAL_DIRECT_LAYERED_HANDLER_CALLS.fetch_add(1, Ordering::SeqCst);
+    "manual-direct-layered-route"
+}
+
 async fn session_save_failure_handler(session: Session) -> &'static str {
     SESSION_SAVE_FAILURE_HANDLER_CALLS.fetch_add(1, Ordering::SeqCst);
     session.insert("user_id", "42").await;
@@ -373,6 +430,13 @@ async fn session_login_handler(session: Session) -> &'static str {
 
 async fn session_rotation_handler(session: Session) -> &'static str {
     SESSION_ROTATION_HANDLER_CALLS.fetch_add(1, Ordering::SeqCst);
+    session.insert("user_id", "42").await;
+    session.rotate_id().await;
+    "logged-in"
+}
+
+async fn session_alias_failure_handler(session: Session) -> &'static str {
+    SESSION_ALIAS_FAILURE_HANDLER_CALLS.fetch_add(1, Ordering::SeqCst);
     session.insert("user_id", "42").await;
     session.rotate_id().await;
     "logged-in"
@@ -510,7 +574,7 @@ async fn test_merged_raw_router_layers_run_on_retry() {
 }
 
 #[tokio::test]
-async fn test_manual_route_registered_through_routes_is_idempotent() {
+async fn test_manual_route_registered_through_routes_fails_closed_without_replay_stop() {
     MANUAL_ROUTE_HANDLER_CALLS.store(0, Ordering::SeqCst);
     let route = Route {
         method: axum::http::Method::POST,
@@ -537,18 +601,17 @@ async fn test_manual_route_registered_through_routes_is_idempotent() {
         .header("idempotency-key", "manual-route-key")
         .send()
         .await;
-    r2.assert_ok();
-    assert_eq!(r2.header("x-idempotent-replayed"), Some("true"));
-    assert_eq!(r2.text(), "manual-route");
+    r2.assert_status(StatusCode::CONFLICT.as_u16());
+    assert_eq!(r2.header("x-idempotent-replayed"), None);
     assert_eq!(
         MANUAL_ROUTE_HANDLER_CALLS.load(Ordering::SeqCst),
         1,
-        "manual Route values accepted by AppBuilder::routes must not re-run on replay"
+        "manual Route values without an inner replay stop must fail closed instead of re-running"
     );
 }
 
 #[tokio::test]
-async fn test_manual_route_with_openapi_method_is_idempotent() {
+async fn test_manual_route_with_openapi_method_fails_closed_without_replay_stop() {
     MANUAL_OPENAPI_ROUTE_HANDLER_CALLS.store(0, Ordering::SeqCst);
     let route = Route {
         method: axum::http::Method::POST,
@@ -580,17 +643,17 @@ async fn test_manual_route_with_openapi_method_is_idempotent() {
         .header("idempotency-key", "manual-openapi-route-key")
         .send()
         .await;
-    replay.assert_ok();
-    assert_eq!(replay.header("x-idempotent-replayed"), Some("true"));
+    replay.assert_status(StatusCode::CONFLICT.as_u16());
+    assert_eq!(replay.header("x-idempotent-replayed"), None);
     assert_eq!(
         MANUAL_OPENAPI_ROUTE_HANDLER_CALLS.load(Ordering::SeqCst),
         1,
-        "OpenAPI metadata must not imply a manual Route has a generated replay stop"
+        "OpenAPI metadata must not imply a manual Route can safely replay directly"
     );
 }
 
 #[tokio::test]
-async fn test_manual_scoped_route_registered_through_routes_is_idempotent() {
+async fn test_manual_scoped_route_registered_through_routes_fails_closed_without_replay_stop() {
     MANUAL_SCOPED_ROUTE_HANDLER_CALLS.store(0, Ordering::SeqCst);
     let route = Route {
         method: axum::http::Method::POST,
@@ -619,12 +682,12 @@ async fn test_manual_scoped_route_registered_through_routes_is_idempotent() {
         .header("idempotency-key", "manual-scoped-route-key")
         .send()
         .await;
-    replay.assert_ok();
-    assert_eq!(replay.header("x-idempotent-replayed"), Some("true"));
+    replay.assert_status(StatusCode::CONFLICT.as_u16());
+    assert_eq!(replay.header("x-idempotent-replayed"), None);
     assert_eq!(
         MANUAL_SCOPED_ROUTE_HANDLER_CALLS.load(Ordering::SeqCst),
         1,
-        "manual Route values inside AppBuilder::scoped must not re-run on replay"
+        "manual scoped Route values without an inner replay stop must fail closed instead of re-running"
     );
 }
 
@@ -766,6 +829,134 @@ async fn test_session_rotation_replays_for_old_and_new_cookie_scopes() {
     );
 }
 
+struct SecondSetFailsStore {
+    inner: MemoryIdempotencyStore,
+    sets: AtomicUsize,
+}
+
+impl SecondSetFailsStore {
+    fn new(ttl: Duration) -> Self {
+        Self {
+            inner: MemoryIdempotencyStore::new(ttl),
+            sets: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl IdempotencyStore for SecondSetFailsStore {
+    fn get(&self, key: &str) -> Option<autumn_web::idempotency::IdempotencyEntry> {
+        self.inner.get(key)
+    }
+
+    fn set(
+        &self,
+        key: &str,
+        record: autumn_web::idempotency::IdempotencyRecord,
+        body_hash: Vec<u8>,
+        ttl: Duration,
+    ) {
+        self.inner.set(key, record, body_hash, ttl);
+    }
+
+    fn try_set(
+        &self,
+        key: &str,
+        record: autumn_web::idempotency::IdempotencyRecord,
+        body_hash: Vec<u8>,
+        ttl: Duration,
+    ) -> Result<(), IdempotencyStoreError> {
+        if self.sets.fetch_add(1, Ordering::SeqCst) == 1 {
+            return Err(IdempotencyStoreError::backend("forced alias write failure"));
+        }
+        self.inner.try_set(key, record, body_hash, ttl)
+    }
+
+    fn try_lock(&self, key: &str, lock_ttl: Duration) -> bool {
+        self.inner.try_lock(key, lock_ttl)
+    }
+
+    fn unlock(&self, key: &str) {
+        self.inner.unlock(key);
+    }
+
+    fn default_ttl(&self) -> Duration {
+        self.inner.default_ttl()
+    }
+}
+
+#[tokio::test]
+async fn test_session_rotation_alias_write_failure_leaves_old_cookie_replay_cached() {
+    SESSION_ALIAS_FAILURE_HANDLER_CALLS.store(0, Ordering::SeqCst);
+
+    let session_store = MemoryStore::new();
+    let mut existing = HashMap::new();
+    existing.insert("guest".to_owned(), "1".to_owned());
+    session_store
+        .save("guest-session-alias-fail", existing)
+        .await
+        .unwrap();
+
+    let idempotency_store: Arc<dyn IdempotencyStore> =
+        Arc::new(SecondSetFailsStore::new(Duration::from_secs(60)));
+    let app = axum::Router::new()
+        .route(
+            "/session-login",
+            axum::routing::post(session_alias_failure_handler),
+        )
+        .layer(IdempotencyLayer::new(idempotency_store))
+        .layer(SessionLayer::new(session_store, SessionConfig::default()));
+
+    let first = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method(axum::http::Method::POST)
+                .uri("/session-login")
+                .header("idempotency-key", "rotating-session-alias-fails")
+                .header("cookie", "autumn.sid=guest-session-alias-fail")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        first.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "alias persistence failure should replace the successful mutation response"
+    );
+    assert!(
+        first.headers().get("set-cookie").is_none(),
+        "failed finalized idempotency persistence must not hand out a new session cookie"
+    );
+
+    let retry = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method(axum::http::Method::POST)
+                .uri("/session-login")
+                .header("idempotency-key", "rotating-session-alias-fails")
+                .header("cookie", "autumn.sid=guest-session-alias-fail")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(retry.status(), StatusCode::OK);
+    assert_eq!(
+        retry
+            .headers()
+            .get("x-idempotent-replayed")
+            .and_then(|value| value.to_str().ok()),
+        Some("true"),
+        "old-cookie retries must still hit the original cached record after alias persistence fails"
+    );
+    assert_eq!(
+        SESSION_ALIAS_FAILURE_HANDLER_CALLS.load(Ordering::SeqCst),
+        1,
+        "partial alias persistence failure must not allow the old-cookie retry to rerun"
+    );
+}
+
 #[tokio::test]
 async fn test_session_save_failure_keeps_idempotency_key_closed() {
     SESSION_SAVE_FAILURE_HANDLER_CALLS.store(0, Ordering::SeqCst);
@@ -860,6 +1051,53 @@ async fn test_manual_layered_route_can_check_access_before_replay_stop() {
         MANUAL_LAYERED_HANDLER_CALLS.load(Ordering::SeqCst),
         1,
         "the explicit replay stop must prevent the mutating handler from rerunning"
+    );
+}
+
+#[tokio::test]
+async fn test_manual_layered_direct_route_fails_closed_instead_of_stale_replay() {
+    MANUAL_DIRECT_LAYERED_HANDLER_CALLS.store(0, Ordering::SeqCst);
+    MANUAL_DIRECT_LAYERED_AUTH_CALLS.store(0, Ordering::SeqCst);
+    MANUAL_DIRECT_LAYERED_ALLOWED.store(true, Ordering::SeqCst);
+
+    let route = Route {
+        method: axum::http::Method::POST,
+        path: "/manual-layered-direct-create",
+        handler: axum::routing::post(manual_direct_layered_route_create_handler)
+            .layer(ManualDirectLayeredAuthLayer),
+        name: "manual_direct_layered_route_create_handler",
+        api_doc: autumn_web::openapi::ApiDoc::default(),
+        repository: None,
+        idempotency: RouteIdempotency::Direct,
+    };
+
+    let client = TestApp::new().routes(vec![route]).idempotent().build();
+
+    client
+        .post("/manual-layered-direct-create")
+        .header("idempotency-key", "manual-layered-direct-route-key")
+        .send()
+        .await
+        .assert_ok();
+
+    MANUAL_DIRECT_LAYERED_ALLOWED.store(false, Ordering::SeqCst);
+    let replay = client
+        .post("/manual-layered-direct-create")
+        .header("idempotency-key", "manual-layered-direct-route-key")
+        .send()
+        .await;
+
+    replay.assert_status(StatusCode::CONFLICT.as_u16());
+    assert_eq!(replay.header("x-idempotent-replayed"), None);
+    assert_eq!(
+        MANUAL_DIRECT_LAYERED_AUTH_CALLS.load(Ordering::SeqCst),
+        1,
+        "direct manual replay must not release a cached success around route-local layers"
+    );
+    assert_eq!(
+        MANUAL_DIRECT_LAYERED_HANDLER_CALLS.load(Ordering::SeqCst),
+        1,
+        "direct manual replay must not re-enter the mutating handler"
     );
 }
 

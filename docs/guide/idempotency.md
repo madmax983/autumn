@@ -154,6 +154,13 @@ raw router needs idempotency, apply `IdempotencyLayer::replay_through_inner()`
 and place `IdempotencyReplayLayer` inside the route stack after the checks that
 must still run on replay.
 
+Manually constructed `Route` values passed to `AppBuilder::routes()` or
+`AppBuilder::scoped()` are also treated as unknown by default. Autumn records
+the first successful mutation, but cache hits fail closed with `409 Conflict`
+unless the route explicitly opts into `RouteIdempotency::ReplayThroughInner`
+and installs `IdempotencyReplayLayer` after any route-local checks that must run
+again before replay.
+
 Generated repositories with durable `after_*_commit` hooks also receive the
 framework-scoped idempotency key in `MutationContext::idempotency_key` when the
 repository is extracted from an idempotent HTTP request. Autumn uses that key to

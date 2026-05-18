@@ -778,6 +778,7 @@ pub struct IdempotencyLayer {
     ttl: Duration,
     in_flight_ttl: Duration,
     replay_through_inner: bool,
+    fail_closed_on_replay: bool,
     metrics: Option<crate::middleware::MetricsCollector>,
 }
 
@@ -790,6 +791,7 @@ impl IdempotencyLayer {
             ttl,
             in_flight_ttl: ttl,
             replay_through_inner: false,
+            fail_closed_on_replay: false,
             metrics: None,
         }
     }
@@ -809,6 +811,14 @@ impl IdempotencyLayer {
     #[must_use]
     pub const fn replay_through_inner(mut self) -> Self {
         self.replay_through_inner = true;
+        self.fail_closed_on_replay = false;
+        self
+    }
+
+    #[must_use]
+    pub const fn fail_closed_on_replay(mut self) -> Self {
+        self.replay_through_inner = false;
+        self.fail_closed_on_replay = true;
         self
     }
 
@@ -829,6 +839,7 @@ impl<S> Layer<S> for IdempotencyLayer {
             ttl: self.ttl,
             in_flight_ttl: self.in_flight_ttl,
             replay_through_inner: self.replay_through_inner,
+            fail_closed_on_replay: self.fail_closed_on_replay,
             metrics: self.metrics.clone(),
         }
     }
@@ -844,6 +855,16 @@ pub struct IdempotencyService<S> {
     ttl: Duration,
     in_flight_ttl: Duration,
     replay_through_inner: bool,
+    fail_closed_on_replay: bool,
+    metrics: Option<crate::middleware::MetricsCollector>,
+}
+
+struct IdempotencyRequestConfig {
+    store: Arc<dyn IdempotencyStore>,
+    ttl: Duration,
+    in_flight_ttl: Duration,
+    replay_through_inner: bool,
+    fail_closed_on_replay: bool,
     metrics: Option<crate::middleware::MetricsCollector>,
 }
 
@@ -869,20 +890,15 @@ where
         // next call. This preserves Tower backpressure semantics.
         let clone = self.inner.clone();
         let inner = std::mem::replace(&mut self.inner, clone);
-        let store = self.store.clone();
-        let ttl = self.ttl;
-        let in_flight_ttl = self.in_flight_ttl;
-        let replay_through_inner = self.replay_through_inner;
-        let metrics = self.metrics.clone();
-        Box::pin(handle_idempotent_request(
-            inner,
-            store,
-            ttl,
-            in_flight_ttl,
-            replay_through_inner,
-            metrics,
-            req,
-        ))
+        let config = IdempotencyRequestConfig {
+            store: self.store.clone(),
+            ttl: self.ttl,
+            in_flight_ttl: self.in_flight_ttl,
+            replay_through_inner: self.replay_through_inner,
+            fail_closed_on_replay: self.fail_closed_on_replay,
+            metrics: self.metrics.clone(),
+        };
+        Box::pin(handle_idempotent_request(inner, config, req))
     }
 }
 
@@ -902,6 +918,15 @@ fn in_flight_conflict_response() -> Response<Body> {
         .body(Body::from(
             "a request with this idempotency key is already being processed; \
              retry after 1 second",
+        ))
+        .unwrap()
+}
+
+fn replay_requires_inner_stop_response() -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::CONFLICT)
+        .body(Body::from(
+            "idempotency replay requires an inner replay stop for this route",
         ))
         .unwrap()
 }
@@ -993,8 +1018,9 @@ impl DeferredIdempotencyCommit {
         };
 
         state.record.headers = extract_finalized_session_replay_headers(headers);
-        let mut storage_keys = state.alias_storage_keys;
+        let mut storage_keys = Vec::with_capacity(state.alias_storage_keys.len() + 1);
         storage_keys.push(state.storage_key);
+        storage_keys.extend(state.alias_storage_keys);
         for storage_key in storage_keys {
             if let Err(error) = state.store.try_set(
                 &storage_key,
@@ -1124,11 +1150,7 @@ async fn prepare_idempotency_request(
 
 async fn handle_idempotent_request<S>(
     mut inner: S,
-    store: Arc<dyn IdempotencyStore>,
-    ttl: Duration,
-    in_flight_ttl: Duration,
-    replay_through_inner: bool,
-    metrics: Option<crate::middleware::MetricsCollector>,
+    config: IdempotencyRequestConfig,
     req: Request<Body>,
 ) -> Result<Response<Body>, std::convert::Infallible>
 where
@@ -1137,6 +1159,15 @@ where
         + 'static,
     S::Future: Send + 'static,
 {
+    let IdempotencyRequestConfig {
+        store,
+        ttl,
+        in_flight_ttl,
+        replay_through_inner,
+        fail_closed_on_replay,
+        metrics,
+    } = config;
+
     if !is_mutating_method(req.method()) {
         return inner.call(req).await;
     }
@@ -1159,6 +1190,7 @@ where
                 prepared,
                 metrics.as_ref(),
                 replay_through_inner,
+                fail_closed_on_replay,
             )
             .await;
         }
@@ -1197,6 +1229,7 @@ where
                 prepared,
                 metrics.as_ref(),
                 replay_through_inner,
+                fail_closed_on_replay,
             )
             .await;
         }
@@ -1400,6 +1433,7 @@ async fn replay_cache_hit<S>(
     prepared: PreparedIdempotencyRequest,
     metrics: Option<&crate::middleware::MetricsCollector>,
     replay_through_inner: bool,
+    fail_closed_on_replay: bool,
 ) -> Result<Response<Body>, std::convert::Infallible>
 where
     S: Service<Request<Body>, Response = Response<Body>, Error = std::convert::Infallible>
@@ -1426,11 +1460,20 @@ where
             .unwrap());
     }
 
+    if fail_closed_on_replay {
+        tracing::warn!(
+            idempotency.key = %idempotency_key,
+            "Idempotency cache hit reached a route without an inner replay stop; failing closed"
+        );
+        return Ok(replay_requires_inner_stop_response());
+    }
+
     tracing::debug!(
         idempotency.key = %idempotency_key,
         idempotency.replayed = true,
         "Idempotency cache hit — replaying stored response"
     );
+
     if let Some(m) = metrics {
         m.record_idempotency_hit();
     }
