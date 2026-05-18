@@ -173,6 +173,8 @@ static RAW_NEST_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static RAW_LAYERED_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static SESSION_LOGIN_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static SESSION_ROTATION_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
+static SESSION_MARKER_ROTATION_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
+static BLOCKING_SESSION_ROTATION_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static SESSION_ALIAS_FAILURE_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static LOOKUP_FAILURE_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static REPLAY_METADATA_POLICY_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -464,6 +466,53 @@ impl SessionStore for FailingSaveSessionStore {
     }
 }
 
+#[derive(Clone)]
+struct BlockingSaveSessionStore {
+    sessions: Arc<tokio::sync::RwLock<HashMap<String, HashMap<String, String>>>>,
+    old_session_id: String,
+    old_destroyed: Arc<tokio::sync::Notify>,
+    release_save: Arc<tokio::sync::Notify>,
+    block_next_save: Arc<AtomicBool>,
+}
+
+impl BlockingSaveSessionStore {
+    fn new(old_session_id: &str) -> Self {
+        Self {
+            sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            old_session_id: old_session_id.to_owned(),
+            old_destroyed: Arc::new(tokio::sync::Notify::new()),
+            release_save: Arc::new(tokio::sync::Notify::new()),
+            block_next_save: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    async fn seed(&self, id: &str, data: HashMap<String, String>) {
+        self.sessions.write().await.insert(id.to_owned(), data);
+    }
+}
+
+impl SessionStore for BlockingSaveSessionStore {
+    async fn load(&self, id: &str) -> Result<Option<HashMap<String, String>>, SessionStoreError> {
+        Ok(self.sessions.read().await.get(id).cloned())
+    }
+
+    async fn save(&self, id: &str, data: HashMap<String, String>) -> Result<(), SessionStoreError> {
+        if self.block_next_save.swap(false, Ordering::SeqCst) {
+            self.release_save.notified().await;
+        }
+        self.sessions.write().await.insert(id.to_owned(), data);
+        Ok(())
+    }
+
+    async fn destroy(&self, id: &str) -> Result<(), SessionStoreError> {
+        self.sessions.write().await.remove(id);
+        if id == self.old_session_id {
+            self.old_destroyed.notify_waiters();
+        }
+        Ok(())
+    }
+}
+
 #[post("/session-login")]
 async fn session_login_handler(session: Session) -> &'static str {
     SESSION_LOGIN_HANDLER_CALLS.fetch_add(1, Ordering::SeqCst);
@@ -477,6 +526,24 @@ async fn session_rotation_handler(session: Session) -> &'static str {
     session.insert("user_id", "42").await;
     session.rotate_id().await;
     "logged-in"
+}
+
+async fn session_marker_rotation_handler(session: Session) -> String {
+    SESSION_MARKER_ROTATION_HANDLER_CALLS.fetch_add(1, Ordering::SeqCst);
+    let marker = session
+        .get("marker")
+        .await
+        .unwrap_or_else(|| "anonymous".to_owned());
+    session.insert("user_id", "42").await;
+    session.rotate_id().await;
+    marker
+}
+
+async fn blocking_session_rotation_handler(session: Session) -> &'static str {
+    BLOCKING_SESSION_ROTATION_HANDLER_CALLS.fetch_add(1, Ordering::SeqCst);
+    session.insert("user_id", "42").await;
+    session.rotate_id().await;
+    "rotated"
 }
 
 #[post("/secured-session-rotation")]
@@ -886,6 +953,165 @@ async fn test_session_rotation_replays_for_old_and_new_cookie_scopes() {
         1,
         "session rotation must not move retries into a fresh idempotency scope"
     );
+}
+
+#[tokio::test]
+async fn test_stale_cookie_replay_prefers_old_session_record_over_anonymous_primary() {
+    SESSION_MARKER_ROTATION_HANDLER_CALLS.store(0, Ordering::SeqCst);
+
+    let session_store = MemoryStore::new();
+    let mut existing = HashMap::new();
+    existing.insert("marker".to_owned(), "old-session".to_owned());
+    session_store
+        .save("preferred-old-session", existing)
+        .await
+        .unwrap();
+
+    let idempotency_store: Arc<dyn IdempotencyStore> =
+        Arc::new(MemoryIdempotencyStore::new(Duration::from_secs(60)));
+    let app = axum::Router::new()
+        .route(
+            "/session-marker-login",
+            axum::routing::post(session_marker_rotation_handler),
+        )
+        .layer(IdempotencyLayer::new(idempotency_store))
+        .layer(SessionLayer::new(session_store, SessionConfig::default()));
+
+    let anonymous = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method(axum::http::Method::POST)
+                .uri("/session-marker-login")
+                .header("idempotency-key", "stale-cookie-precedence-key")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let anonymous_body = axum::body::to_bytes(anonymous.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(&anonymous_body[..], b"anonymous");
+
+    let old_session = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method(axum::http::Method::POST)
+                .uri("/session-marker-login")
+                .header("idempotency-key", "stale-cookie-precedence-key")
+                .header("cookie", "autumn.sid=preferred-old-session")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let old_session_body = axum::body::to_bytes(old_session.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(&old_session_body[..], b"old-session");
+
+    let retry = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method(axum::http::Method::POST)
+                .uri("/session-marker-login")
+                .header("idempotency-key", "stale-cookie-precedence-key")
+                .header("cookie", "autumn.sid=preferred-old-session")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(retry.status(), StatusCode::OK);
+    assert_eq!(
+        retry
+            .headers()
+            .get("x-idempotent-replayed")
+            .and_then(|value| value.to_str().ok()),
+        Some("true")
+    );
+    let retry_body = axum::body::to_bytes(retry.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        &retry_body[..],
+        b"old-session",
+        "stale-cookie retries must prefer the old-session fallback record over an anonymous primary record"
+    );
+    assert_eq!(
+        SESSION_MARKER_ROTATION_HANDLER_CALLS.load(Ordering::SeqCst),
+        2,
+        "stale-cookie replay must not re-enter the mutating handler"
+    );
+}
+
+#[tokio::test]
+async fn test_stale_cookie_retry_conflicts_with_old_session_in_flight_lock() {
+    BLOCKING_SESSION_ROTATION_HANDLER_CALLS.store(0, Ordering::SeqCst);
+
+    let session_store = BlockingSaveSessionStore::new("in-flight-old-session");
+    let mut existing = HashMap::new();
+    existing.insert("guest".to_owned(), "1".to_owned());
+    session_store.seed("in-flight-old-session", existing).await;
+
+    let old_destroyed = session_store.old_destroyed.clone();
+    let old_destroyed_wait = old_destroyed.notified();
+    let release_save = session_store.release_save.clone();
+    let idempotency_store: Arc<dyn IdempotencyStore> =
+        Arc::new(MemoryIdempotencyStore::new(Duration::from_secs(60)));
+    let app = axum::Router::new()
+        .route(
+            "/blocking-session-login",
+            axum::routing::post(blocking_session_rotation_handler),
+        )
+        .layer(IdempotencyLayer::new(idempotency_store))
+        .layer(SessionLayer::new(session_store, SessionConfig::default()));
+
+    let first_app = app.clone();
+    let first = tokio::spawn(async move {
+        first_app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/blocking-session-login")
+                    .header("idempotency-key", "stale-cookie-in-flight-key")
+                    .header("cookie", "autumn.sid=in-flight-old-session")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    });
+    old_destroyed_wait.await;
+
+    let retry = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method(axum::http::Method::POST)
+                .uri("/blocking-session-login")
+                .header("idempotency-key", "stale-cookie-in-flight-key")
+                .header("cookie", "autumn.sid=in-flight-old-session")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        retry.status(),
+        StatusCode::CONFLICT,
+        "old-cookie retries must observe the old-session in-flight lock"
+    );
+    assert_eq!(
+        BLOCKING_SESSION_ROTATION_HANDLER_CALLS.load(Ordering::SeqCst),
+        1,
+        "old-cookie retry must not re-enter while the first mutation is finalizing"
+    );
+
+    release_save.notify_waiters();
+    let first = first.await.unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
 }
 
 #[tokio::test]

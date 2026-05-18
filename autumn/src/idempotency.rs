@@ -1406,14 +1406,31 @@ fn lookup_prepared_entry(
     store: &dyn IdempotencyStore,
     prepared: &PreparedIdempotencyRequest,
 ) -> Result<Option<IdempotencyEntry>, IdempotencyStoreError> {
-    if let Some(entry) = store.try_get(&prepared.storage_key)? {
+    if let Some(key) = prepared.stale_cookie_storage_key.as_deref()
+        && let Some(entry) = store.try_get(key)?
+    {
         return Ok(Some(entry));
     }
 
-    prepared
-        .stale_cookie_storage_key
-        .as_deref()
-        .map_or(Ok(None), |key| store.try_get(key))
+    store.try_get(&prepared.storage_key)
+}
+
+fn stale_cookie_fallback_in_flight(
+    store: &dyn IdempotencyStore,
+    prepared: &PreparedIdempotencyRequest,
+    in_flight_ttl: Duration,
+) -> bool {
+    let Some(key) = prepared.stale_cookie_storage_key.as_deref() else {
+        return false;
+    };
+
+    let owner = in_flight_lock_owner();
+    if store.try_lock_owned(key, &owner, in_flight_ttl) {
+        store.unlock_owned(key, &owner);
+        false
+    } else {
+        true
+    }
 }
 
 fn cacheable_response_record(
@@ -1485,6 +1502,17 @@ where
             );
             return Ok(persistence_failed_response());
         }
+    }
+
+    if stale_cookie_fallback_in_flight(store.as_ref(), &prepared, in_flight_ttl) {
+        tracing::debug!(
+            idempotency.key = %prepared.idempotency_key,
+            "Stale session cookie idempotency key already in flight — returning 409"
+        );
+        metrics
+            .as_ref()
+            .inspect(|m| m.record_idempotency_conflict());
+        return Ok(in_flight_conflict_response());
     }
 
     // ── In-flight check (concurrent duplicate) ─────────────────────────────
