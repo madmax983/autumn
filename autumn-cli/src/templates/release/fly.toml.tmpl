@@ -51,7 +51,7 @@ kill_timeout = 45
   cpus     = 1
 
 # Fly scrapes this Prometheus text endpoint and surfaces it in the dashboard.
-# /actuator/prometheus emits the Prometheus text format; /actuator/metrics is JSON.
+# /actuator/prometheus is always available (not gated by actuator.sensitive).
 [metrics]
   port = 3000
   path = "/actuator/prometheus"

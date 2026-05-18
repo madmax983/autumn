@@ -629,9 +629,11 @@ Hooks run in **LIFO** (last-in, first-out) order — the last hook registered
 runs first. This means infrastructure registered early in `main()` shuts down
 last, after the code that depends on it.
 
-Plugin ordering rule: plugins call their hooks during `build()`, which is
-called before any app `.on_shutdown()` calls in `main()`. LIFO therefore
-means **app hooks run before plugin hooks** during shutdown.
+Plugin ordering rule: hooks run in registration order, LIFO. Plugins call
+their hooks during `build()`, which runs before app `.on_shutdown()` calls
+in `main()` — so app hooks typically run before plugin hooks. However, any
+`.on_shutdown()` call after a `.plugin()` call will run before that plugin's
+hook.
 
 ```rust
 autumn_web::app()
@@ -660,5 +662,5 @@ Before calling an Autumn app "cloud ready", verify:
 - multi-replica write paths use `#[lock_version]` (optimistic) or `with_lock` (pessimistic) to prevent lost updates
 - the generated container image builds without manual template surgery
 - `server.prestop_grace_secs` is tuned to match your load balancer's deregistration propagation time
-- `terminationGracePeriodSeconds` (Kubernetes) or equivalent is set to `prestop_grace_secs + shutdown_timeout_secs + buffer` (`shutdown_timeout_secs` covers drain **and** hooks combined)
+- `terminationGracePeriodSeconds` (Kubernetes) or equivalent is set to `preStop_hook_secs + prestop_grace_secs + shutdown_timeout_secs + buffer` (`shutdown_timeout_secs` covers drain **and** hooks combined)
 - `autumn_shutdown_aborted_requests_total` is monitored and alerts on any non-zero value after a rolling deploy
