@@ -1164,4 +1164,40 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
+
+    #[tokio::test]
+    async fn database_topology_primary_only_has_no_replica() {
+        let config = DatabaseConfig {
+            primary_url: Some("postgres://user:pass@localhost/db".to_string()),
+            ..DatabaseConfig::default()
+        };
+        let topology = create_topology(&config).unwrap().unwrap();
+
+        let primary = topology.primary().clone();
+
+        let new_topology = DatabaseTopology::primary_only(primary);
+        assert!(
+            new_topology.replica().is_none(),
+            "primary_only must set replica to None"
+        );
+    }
+
+    #[tokio::test]
+    async fn database_topology_from_pools_retains_replica() {
+        let config = DatabaseConfig {
+            primary_url: Some("postgres://user:pass@localhost/db".to_string()),
+            replica_url: Some("postgres://user:pass@localhost/db_replica".to_string()),
+            ..DatabaseConfig::default()
+        };
+        let topology = create_topology(&config).unwrap().unwrap();
+
+        let primary = topology.primary().clone();
+        let replica = topology.replica().cloned();
+
+        let new_topology = DatabaseTopology::from_pools(primary, replica);
+        assert!(
+            new_topology.replica().is_some(),
+            "from_pools must preserve the replica pool"
+        );
+    }
 }

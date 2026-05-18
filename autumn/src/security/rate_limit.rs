@@ -1292,4 +1292,17 @@ mod tests {
         let limiter = Limiter::from_config(&config);
         assert!(matches!(limiter.backend, BucketBackend::Memory(_)));
     }
+
+    #[tokio::test]
+    async fn is_trusted_proxy_returns_false_for_untrusted_ip() {
+        let config = RateLimitConfig {
+            enabled: true,
+            trusted_proxies: vec!["10.0.0.0/8".to_string()],
+            ..RateLimitConfig::default()
+        };
+        let limiter = Limiter::from_config(&config);
+
+        let untrusted_ip: IpAddr = "192.168.1.1".parse().unwrap();
+        assert!(!limiter.is_trusted_proxy(untrusted_ip));
+    }
 }
