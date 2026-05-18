@@ -58,7 +58,16 @@ const HOOK_PENDING_INSERT_SQL: &str = "INSERT INTO autumn_repository_commit_hook
      (id, handler_key, hook_name, context, record, status, attempt, \
        max_attempts, initial_backoff_ms, enqueued_at, run_at, claimed_by, claimed_at) \
      VALUES ($1, $2, $3, $4::JSONB, $5::JSONB, 'pending_after_hook', 1, 5, 1000, NOW(), NOW(), $6, NOW()) \
-     ON CONFLICT (id) DO NOTHING";
+     ON CONFLICT (id) DO UPDATE \
+      SET handler_key = EXCLUDED.handler_key, hook_name = EXCLUDED.hook_name, \
+          context = EXCLUDED.context, record = EXCLUDED.record, \
+          status = 'pending_after_hook', attempt = 1, \
+          max_attempts = EXCLUDED.max_attempts, \
+          initial_backoff_ms = EXCLUDED.initial_backoff_ms, \
+          enqueued_at = EXCLUDED.enqueued_at, run_at = EXCLUDED.run_at, \
+          claimed_by = EXCLUDED.claimed_by, claimed_at = EXCLUDED.claimed_at, \
+          started_at = NULL, finished_at = NULL, last_error = NULL \
+      WHERE autumn_repository_commit_hooks.status = 'after_hook_failed'";
 const HOOK_MARK_AFTER_HOOK_SUCCEEDED_SQL: &str = "UPDATE autumn_repository_commit_hooks \
      SET context = $1::JSONB, record = $2::JSONB, status = 'after_hook_succeeded', \
           claimed_at = NOW(), last_error = NULL \
@@ -1316,8 +1325,10 @@ mod tests {
             "direct delete commit hooks must dedupe duplicate idempotency rows"
         );
         assert!(
-            HOOK_PENDING_INSERT_SQL.contains("ON CONFLICT (id) DO NOTHING"),
-            "staged create/update commit hooks must dedupe duplicate idempotency rows"
+            HOOK_PENDING_INSERT_SQL.contains("ON CONFLICT (id) DO UPDATE")
+                && HOOK_PENDING_INSERT_SQL
+                    .contains("WHERE autumn_repository_commit_hooks.status = 'after_hook_failed'"),
+            "staged create/update commit hooks must dedupe successful duplicate rows while allowing a retry after regular after-hook failure to restage"
         );
     }
 
@@ -1386,6 +1397,24 @@ mod tests {
     #[test]
     fn missing_idempotent_finalization_is_successful_duplicate() {
         assert!(missing_repository_commit_hook_finalization_result("idempotent:abc").is_ok());
+    }
+
+    #[test]
+    fn pending_insert_reopens_only_prior_after_hook_failures() {
+        assert!(
+            HOOK_PENDING_INSERT_SQL.contains("ON CONFLICT (id) DO UPDATE")
+                && HOOK_PENDING_INSERT_SQL.contains("status = 'pending_after_hook'")
+                && HOOK_PENDING_INSERT_SQL.contains("context = EXCLUDED.context")
+                && HOOK_PENDING_INSERT_SQL.contains("record = EXCLUDED.record")
+                && HOOK_PENDING_INSERT_SQL.contains("claimed_by = EXCLUDED.claimed_by")
+                && HOOK_PENDING_INSERT_SQL.contains("last_error = NULL"),
+            "a retried idempotent mutation must be able to restage durable hooks after an earlier regular after-hook failure"
+        );
+        assert!(
+            HOOK_PENDING_INSERT_SQL
+                .contains("WHERE autumn_repository_commit_hooks.status = 'after_hook_failed'"),
+            "restaging must not replace already finalized, enqueued, running, completed, or worker-failed rows"
+        );
     }
 
     #[test]

@@ -86,7 +86,7 @@ fn if_let_generated_check_returns_error(expr_if: &ExprIf) -> bool {
 fn pat_is_some_replay_response(pat: &Pat) -> bool {
     match pat {
         Pat::TupleStruct(tuple) => {
-            path_ends_with(&tuple.path, "Some")
+            path_matches(&tuple.path, &["core", "option", "Option", "Some"])
                 && tuple.elems.len() == 1
                 && pat_binds_ident(&tuple.elems[0], "__autumn_response")
         }
@@ -97,7 +97,7 @@ fn pat_is_some_replay_response(pat: &Pat) -> bool {
 fn pat_is_err_autumn_error(pat: &Pat) -> bool {
     match pat {
         Pat::TupleStruct(tuple) => {
-            path_ends_with(&tuple.path, "Err")
+            path_matches(&tuple.path, &["core", "result", "Result", "Err"])
                 && tuple.elems.len() == 1
                 && pat_binds_ident(&tuple.elems[0], "__autumn_error")
         }
@@ -111,7 +111,10 @@ fn pat_binds_ident(pat: &Pat, expected: &str) -> bool {
 
 fn expr_is_replay_response_call(expr: &Expr) -> bool {
     match expr {
-        Expr::Call(call) => path_expr_ends_with(&call.func, "__replay_response"),
+        Expr::Call(call) => path_expr_matches(
+            &call.func,
+            &["autumn_web", "idempotency", "__replay_response"],
+        ),
         Expr::Group(group) => expr_is_replay_response_call(&group.expr),
         Expr::Paren(paren) => expr_is_replay_response_call(&paren.expr),
         _ => false,
@@ -122,8 +125,13 @@ fn expr_is_generated_auth_check_call(expr: &Expr) -> bool {
     match expr {
         Expr::Await(await_expr) => expr_is_generated_auth_check_call(&await_expr.base),
         Expr::Call(call) => {
-            path_expr_ends_with(&call.func, "__check_secured_with_key")
-                || path_expr_ends_with(&call.func, "__check_policy")
+            path_expr_matches(
+                &call.func,
+                &["autumn_web", "auth", "__check_secured_with_key"],
+            ) || path_expr_matches(
+                &call.func,
+                &["autumn_web", "authorization", "__check_policy"],
+            )
         }
         Expr::Group(group) => expr_is_generated_auth_check_call(&group.expr),
         Expr::Paren(paren) => expr_is_generated_auth_check_call(&paren.expr),
@@ -198,8 +206,20 @@ fn expr_nested_async_body(expr: &Expr) -> Option<&Block> {
     match expr {
         Expr::Async(expr_async) => Some(&expr_async.block),
         Expr::Await(await_expr) => expr_nested_async_body(&await_expr.base),
-        Expr::Call(call) if path_expr_ends_with(&call.func, "into_response") => {
-            call.args.iter().find_map(expr_nested_async_body)
+        Expr::Call(call)
+            if path_expr_matches(
+                &call.func,
+                &[
+                    "autumn_web",
+                    "reexports",
+                    "axum",
+                    "response",
+                    "IntoResponse",
+                    "into_response",
+                ],
+            ) && call.args.len() == 1 =>
+        {
+            call.args.first().and_then(expr_nested_async_body)
         }
         Expr::Group(group) => expr_nested_async_body(&group.expr),
         Expr::Paren(paren) => expr_nested_async_body(&paren.expr),
@@ -212,8 +232,17 @@ fn stmt_is_inner_response_tail(stmt: &Stmt) -> bool {
         return false;
     };
 
-    path_expr_ends_with(&call.func, "into_response")
-        && call.args.len() == 1
+    path_expr_matches(
+        &call.func,
+        &[
+            "autumn_web",
+            "reexports",
+            "axum",
+            "response",
+            "IntoResponse",
+            "into_response",
+        ],
+    ) && call.args.len() == 1
         && call
             .args
             .first()
@@ -226,6 +255,23 @@ fn path_expr_ends_with(expr: &Expr, expected: &str) -> bool {
     };
 
     path_ends_with(&path.path, expected)
+}
+
+fn path_expr_matches(expr: &Expr, expected: &[&str]) -> bool {
+    let Expr::Path(path) = expr else {
+        return false;
+    };
+
+    path_matches(&path.path, expected)
+}
+
+fn path_matches(path: &syn::Path, expected: &[&str]) -> bool {
+    path.segments.len() == expected.len()
+        && path
+            .segments
+            .iter()
+            .zip(expected)
+            .all(|(segment, expected)| segment.ident == expected)
 }
 
 fn path_ends_with(path: &syn::Path, expected: &str) -> bool {
@@ -316,6 +362,45 @@ mod tests {
             })
             .await;
             mutate_after_nested_replay_response();
+        });
+
+        assert!(!block_has_replay_guard(&block));
+    }
+
+    #[test]
+    fn nested_guard_in_non_autumn_into_response_does_not_count() {
+        let block: syn::Block = syn::parse_quote!({
+            evil::IntoResponse::into_response(
+                (async move {
+                    const __AUTUMN_IDEMPOTENCY_REPLAY_GUARD: () = ();
+                    if let ::core::option::Option::Some(__autumn_response) =
+                        ::autumn_web::idempotency::__replay_response(&__autumn_idempotency_replay)
+                    {
+                        return __autumn_response;
+                    }
+                })
+                .await,
+            )
+        });
+
+        assert!(!block_has_replay_guard(&block));
+    }
+
+    #[test]
+    fn nested_guard_in_extra_into_response_argument_does_not_count() {
+        let block: syn::Block = syn::parse_quote!({
+            ::autumn_web::reexports::axum::response::IntoResponse::into_response(
+                side_effect_before_replay_stop(),
+                (async move {
+                    const __AUTUMN_IDEMPOTENCY_REPLAY_GUARD: () = ();
+                    if let ::core::option::Option::Some(__autumn_response) =
+                        ::autumn_web::idempotency::__replay_response(&__autumn_idempotency_replay)
+                    {
+                        return __autumn_response;
+                    }
+                })
+                .await,
+            )
         });
 
         assert!(!block_has_replay_guard(&block));
