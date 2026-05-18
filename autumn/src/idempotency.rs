@@ -58,12 +58,9 @@ fn hex_lower(bytes: impl AsRef<[u8]>) -> String {
     )
 }
 
-fn principal_scope_digest(auth: Option<&str>, session_id: Option<&str>) -> String {
+fn principal_scope_digest(session_id: Option<&str>) -> String {
     let mut hasher = sha2::Sha256::new();
     hasher.update(b"authorization:");
-    if let Some(auth) = auth {
-        hasher.update(auth.as_bytes());
-    }
     hasher.update(b"\nsession:");
     if let Some(session_id) = session_id {
         hasher.update(session_id.as_bytes());
@@ -84,20 +81,19 @@ fn push_storage_key_component(hasher: &mut sha2::Sha256, label: &str, value: &[u
 /// client-supplied idempotency key.
 ///
 /// Namespacing by method+path prevents cross-endpoint cache collisions (P2).
-/// Namespacing by Authorization and session scope prevents cross-principal
-/// collisions (P1), including cookie-backed authenticated sessions. Request
-/// headers are intentionally excluded: client-controlled headers must not let a
-/// retry force a fresh miss after a successful mutation. Opaque route layers
-/// that resolve tenants or policy state must use the fail-closed replay path
-/// instead of storage-key partitioning. Each component is length-delimited
-/// inside a SHA-256 digest so raw `:` bytes in paths or client-controlled keys
-/// cannot synthesize another storage key.
+/// Namespacing by session scope prevents cross-principal collisions (P1) for
+/// cookie-backed authenticated sessions. Request headers, including
+/// `Authorization`, are intentionally excluded: client-controlled headers must
+/// not let a retry force a fresh miss after a successful mutation. Opaque route
+/// layers that resolve tenants, bearer principals, or policy state must use the
+/// fail-closed replay path instead of storage-key partitioning. Each component
+/// is length-delimited inside a SHA-256 digest so raw `:` bytes in paths or
+/// client-controlled keys cannot synthesize another storage key.
 #[derive(Clone)]
 struct StorageKeyContext {
     idempotency_key: String,
     method: Method,
     target: String,
-    authorization: Option<String>,
 }
 
 impl StorageKeyContext {
@@ -106,18 +102,10 @@ impl StorageKeyContext {
             .uri
             .path_and_query()
             .map_or_else(|| parts.uri.path().to_owned(), |pq| pq.as_str().to_owned());
-        let authorization = parts
-            .headers
-            .get(axum::http::header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .filter(|auth| !auth.is_empty())
-            .map(str::to_owned);
-
         Self {
             idempotency_key,
             method: parts.method.clone(),
             target,
-            authorization,
         }
     }
 
@@ -126,7 +114,6 @@ impl StorageKeyContext {
             &self.idempotency_key,
             self.method.as_str(),
             &self.target,
-            self.authorization.as_deref(),
             session_id,
         )
     }
@@ -136,10 +123,9 @@ fn build_storage_key(
     idempotency_key: &str,
     method: &str,
     target: &str,
-    auth: Option<&str>,
     session_id: Option<&str>,
 ) -> String {
-    let principal = principal_scope_digest(auth, session_id);
+    let principal = principal_scope_digest(session_id);
     let mut hasher = sha2::Sha256::new();
     push_storage_key_component(&mut hasher, "method", method.as_bytes());
     push_storage_key_component(&mut hasher, "target", target.as_bytes());
@@ -1842,13 +1828,10 @@ mod tests {
         )
     }
 
-    fn expected_principal_digest(auth: Option<&str>, session_id: Option<&str>) -> String {
+    fn expected_principal_digest(session_id: Option<&str>) -> String {
         use sha2::Digest as _;
         let mut hasher = sha2::Sha256::new();
         hasher.update(b"authorization:");
-        if let Some(auth) = auth {
-            hasher.update(auth.as_bytes());
-        }
         hasher.update(b"\nsession:");
         if let Some(session_id) = session_id {
             hasher.update(session_id.as_bytes());
@@ -1859,12 +1842,11 @@ mod tests {
     fn expected_storage_key(
         method: &str,
         path: &str,
-        auth: Option<&str>,
         session_id: Option<&str>,
         idempotency_key: &str,
     ) -> String {
         use sha2::Digest as _;
-        let principal = expected_principal_digest(auth, session_id);
+        let principal = expected_principal_digest(session_id);
         let mut hasher = sha2::Sha256::new();
         push_storage_key_component(&mut hasher, "method", method.as_bytes());
         push_storage_key_component(&mut hasher, "target", path.as_bytes());
@@ -2041,13 +2023,7 @@ mod tests {
         let storage_key = keys.first().expect("storage key should be recorded");
         assert_eq!(
             storage_key,
-            &expected_storage_key(
-                "POST",
-                "/payments",
-                Some("Bearer stable-token"),
-                None,
-                "pay-once"
-            )
+            &expected_storage_key("POST", "/payments", None, "pay-once")
         );
         assert!(!storage_key.contains("/payments"));
         assert!(!storage_key.contains("pay-once"));
@@ -2097,13 +2073,7 @@ mod tests {
         assert_eq!(observed.0, "pay-once");
         assert_eq!(
             observed.1,
-            expected_storage_key(
-                "POST",
-                "/payments",
-                Some("Bearer stable-token"),
-                None,
-                "pay-once"
-            )
+            expected_storage_key("POST", "/payments", None, "pay-once")
         );
     }
 }

@@ -72,14 +72,11 @@ fn make_store(ttl: Duration) -> Arc<dyn autumn_web::idempotency::IdempotencyStor
 
 /// Replicates the storage-key format used by `IdempotencyLayer` so tests can
 /// pre-lock the exact slot the middleware will look up.
-fn principal_digest(auth: &str) -> String {
+fn principal_digest() -> String {
     use sha2::Digest as _;
 
     let mut hasher = sha2::Sha256::new();
     hasher.update(b"authorization:");
-    if !auth.is_empty() {
-        hasher.update(auth.as_bytes());
-    }
     hasher.update(b"\nsession:");
     hasher
         .finalize()
@@ -91,7 +88,7 @@ fn principal_digest(auth: &str) -> String {
         })
 }
 
-fn storage_key(method: &str, path: &str, auth: &str, idempotency_key: &str) -> String {
+fn storage_key(method: &str, path: &str, idempotency_key: &str) -> String {
     use sha2::Digest as _;
 
     fn push_component(hasher: &mut sha2::Sha256, label: &str, value: &[u8]) {
@@ -103,7 +100,7 @@ fn storage_key(method: &str, path: &str, auth: &str, idempotency_key: &str) -> S
         hasher.update(b";");
     }
 
-    let principal = principal_digest(auth);
+    let principal = principal_digest();
 
     let mut storage = sha2::Sha256::new();
     push_component(&mut storage, "method", method.as_bytes());
@@ -1960,10 +1957,10 @@ async fn test_concurrent_duplicate_returns_409() {
         .layer(layer);
 
     // Pre-lock the scoped storage key to simulate an in-flight request.
-    // The middleware namespaces by method, path, and auth, so we replicate
-    // the same format here (no Authorization header → auth = "").
+    // The middleware namespaces by method and path, so we replicate the same
+    // format here.
     store.try_lock(
-        &storage_key("POST", "/ping", "", "inflight-key"),
+        &storage_key("POST", "/ping", "inflight-key"),
         Duration::from_secs(3600),
     );
 
@@ -2655,7 +2652,7 @@ async fn test_different_paths_same_key_are_independent() {
 async fn test_storage_key_delimits_path_principal_and_client_key() {
     use tower::ServiceExt;
 
-    let principal = principal_digest("");
+    let principal = principal_digest();
     let colliding_path = format!("/a:{principal}:b");
     let colliding_key = format!("b:{principal}:k");
     let store = make_store(Duration::from_secs(3600));
@@ -2700,26 +2697,30 @@ async fn test_storage_key_delimits_path_principal_and_client_key() {
     assert_eq!(body2, "plain-path");
 }
 
-/// Requests with different `Authorization` headers sharing the same
-/// `Idempotency-Key` are stored independently — no cross-principal replay
-/// occurs (P1: authenticated principal scope).
+/// Raw `Authorization` is a request header, not a trusted principal scope.
+/// Changing or removing it on retry must not turn a completed mutation into a
+/// fresh miss.
 #[tokio::test]
-async fn test_different_auth_same_key_are_independent() {
+async fn test_authorization_header_does_not_split_idempotency_scope() {
     use tower::ServiceExt;
 
+    VOLATILE_HEADER_HANDLER_CALLS.store(0, Ordering::SeqCst);
     let store = make_store(Duration::from_secs(3600));
     let layer = IdempotencyLayer::new(store);
 
     let app = axum::Router::new()
-        .route("/action", axum::routing::post(ok_handler))
+        .route(
+            "/auth-header-action",
+            axum::routing::post(volatile_header_create_handler),
+        )
         .layer(layer);
 
     let req_a = axum::http::Request::builder()
         .method("POST")
-        .uri("/action")
+        .uri("/auth-header-action")
         .header("idempotency-key", "shared-auth-key")
         .header("authorization", "Bearer token-user-a")
-        .body(axum::body::Body::empty())
+        .body(axum::body::Body::from("same"))
         .unwrap();
     let resp_a = app.clone().oneshot(req_a).await.unwrap();
     assert_eq!(resp_a.status(), StatusCode::OK);
@@ -2727,16 +2728,24 @@ async fn test_different_auth_same_key_are_independent() {
 
     let req_b = axum::http::Request::builder()
         .method("POST")
-        .uri("/action")
+        .uri("/auth-header-action")
         .header("idempotency-key", "shared-auth-key")
-        .header("authorization", "Bearer token-user-b")
-        .body(axum::body::Body::empty())
+        .body(axum::body::Body::from("same"))
         .unwrap();
     let resp_b = app.clone().oneshot(req_b).await.unwrap();
     assert_eq!(resp_b.status(), StatusCode::OK);
-    assert!(
-        resp_b.headers().get("x-idempotent-replayed").is_none(),
-        "different Authorization with same key must not replay another principal's response"
+    assert_eq!(
+        resp_b
+            .headers()
+            .get("x-idempotent-replayed")
+            .and_then(|value| value.to_str().ok()),
+        Some("true"),
+        "raw Authorization must not be able to force a fresh miss for the same completed mutation"
+    );
+    assert_eq!(
+        VOLATILE_HEADER_HANDLER_CALLS.load(Ordering::SeqCst),
+        1,
+        "changing raw Authorization must not rerun the mutating handler"
     );
 }
 
