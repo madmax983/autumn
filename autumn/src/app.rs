@@ -1752,6 +1752,7 @@ impl AppBuilder {
             });
 
         let shutdown_timeout = config.server.shutdown_timeout_secs;
+        let prestop_grace = config.server.prestop_grace_secs;
         let server_shutdown = tokio_util::sync::CancellationToken::new();
 
         if let Err(error) = initialize_job_runtime(jobs, &state, &server_shutdown, &config.jobs) {
@@ -1796,29 +1797,114 @@ impl AppBuilder {
         let shutdown_signal_token = server_shutdown.clone();
         #[cfg(feature = "ws")]
         let websocket_shutdown = state.shutdown.clone();
+        // Clone metrics so the drain-watchdog can record aborted requests.
+        let shutdown_metrics = state.metrics.clone();
 
+        // Shared timestamp: set by shutdown_task when the listener is cancelled
+        // (phase 5). Main reads it after server_task completes to measure only
+        // actual drain time for hook budget — not the app's full uptime.
+        let drain_started_at: std::sync::Arc<std::sync::OnceLock<std::time::Instant>> =
+            std::sync::Arc::new(std::sync::OnceLock::new());
+        let drain_started_clone = std::sync::Arc::clone(&drain_started_at);
+
+        // Notified by main just before server_task.await (after startup hooks
+        // complete). If SIGTERM arrives during startup hooks the watchdog waits
+        // here so the drain deadline is always measured from when drain starts.
+        let drain_phase_notify = std::sync::Arc::new(tokio::sync::Notify::new());
+        let drain_phase_notify_for_watchdog = std::sync::Arc::clone(&drain_phase_notify);
+        // Boolean companion so the watchdog can skip the wait when SIGTERM arrives
+        // after startup has already finished (the common case).
+        let server_entered_drain = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server_entered_drain_for_watchdog = std::sync::Arc::clone(&server_entered_drain);
+
+        // Shutdown task: handles the rolling-deploy lifecycle phases.
+        //
+        // Phases:
+        //   1. SIGTERM / Ctrl-C received
+        //   2. /ready → 503  (probe flips before listener closes)
+        //   3. prestop_grace elapses  (load-balancer deregistration window)
+        //   4. WebSocket sessions receive close frame
+        //   5. TCP listener stops accepting new connections; jobs/scheduler
+        //      stop dequeuing (they share server_shutdown CancellationToken)
+        //   6. In-flight requests drain within shutdown_timeout_secs; if the
+        //      deadline is exceeded the watchdog exits with code 1 and
+        //      records autumn_shutdown_aborted_requests_total.
+        //
+        // Phases 7-9 (on_shutdown hooks, telemetry flush, DB pool close) run
+        // in main after server_task completes — within the remaining portion
+        // of the same shutdown_timeout_secs budget, not an additional window.
         let shutdown_task = tokio::spawn(async move {
+            // Phase 1: Wait for OS signal.
             shutdown_signal().await;
-            shutdown_state.begin_shutdown();
+            tracing::info!(
+                phase = "signal_received",
+                prestop_grace_secs = prestop_grace,
+                shutdown_timeout_secs = shutdown_timeout,
+                "shutdown: graceful shutdown initiated"
+            );
 
+            // Phase 2: flip /ready → 503 strictly before the listener closes.
+            shutdown_state.begin_shutdown();
+            tracing::info!(phase = "ready_draining", "shutdown: /ready now 503");
+
+            // Phase 3: prestop grace — wait for load balancers to deregister.
+            if prestop_grace > 0 {
+                tokio::time::sleep(std::time::Duration::from_secs(prestop_grace)).await;
+            }
+            tracing::info!(phase = "listener_stopping", "shutdown: stopping listener");
+
+            // Phase 4: send WebSocket close frames.
             #[cfg(feature = "ws")]
             websocket_shutdown.cancel();
 
-            if shutdown_timeout > 5 {
-                tokio::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_secs(
-                        shutdown_timeout.saturating_sub(5),
-                    ))
-                    .await;
-                    tracing::warn!(
-                        timeout_secs = shutdown_timeout,
-                        "Shutdown draining near timeout, force-kill may be imminent"
-                    );
-                });
-            }
-
-            run_shutdown_hooks(&shutdown_hooks).await;
+            // Phase 5: stop listener and signal jobs/scheduler to stop dequeuing.
+            // Record drain-start before cancelling so main gets the right hook
+            // budget even in the startup-overlap case.
+            let _ = drain_started_clone.set(std::time::Instant::now());
             shutdown_signal_token.cancel();
+
+            // Phase 6: drain watchdog — if in-flight drain exceeds the budget,
+            // record aborted count and force non-zero exit before hooks run.
+            //
+            // Always measure the deadline from when drain actually starts so that
+            // in-flight requests always get the full shutdown_timeout_secs window:
+            //
+            //   Normal (SIGTERM after startup): server_entered_drain is already
+            //   true, skip the wait, sleep the full budget.
+            //
+            //   Startup-overlap (SIGTERM during hooks): wait for notify, then
+            //   sleep the full budget. Without this, hooks completing just before
+            //   the watchdog fires would let it exit(1) immediately with no fresh
+            //   drain window for requests that arrived after hooks completed.
+            if !server_entered_drain_for_watchdog.load(std::sync::atomic::Ordering::Acquire) {
+                tracing::warn!(
+                    phase = "signal_during_startup",
+                    "shutdown: SIGTERM during startup hooks; waiting for drain phase \
+                     to begin before enforcing the drain deadline"
+                );
+                // Suspend until main fires notify_one() at drain start.
+                // Orchestrator hard-kill backstop: if hooks never complete, the
+                // orchestrator's kill_timeout / terminationGracePeriodSeconds kills us.
+                drain_phase_notify_for_watchdog.notified().await;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(shutdown_timeout)).await;
+            // Guard against the boundary race where server_task completes at
+            // exactly the deadline before main has called shutdown_task.abort().
+            // Zero active requests means drain completed cleanly; return and let
+            // main complete the cleanup path.
+            if shutdown_metrics.snapshot().http.requests_active == 0 {
+                return;
+            }
+            let aborted = shutdown_metrics.snapshot().http.requests_active;
+            shutdown_metrics.record_shutdown_aborted(aborted);
+            tracing::error!(
+                phase = "in_flight_drain",
+                timeout_secs = shutdown_timeout,
+                autumn_shutdown_aborted_requests_total = aborted,
+                exit_code = 1,
+                "shutdown: in_flight_drain phase exceeded deadline; terminating"
+            );
+            std::process::exit(1);
         });
 
         if let Err(error) = run_startup_hooks(&startup_hooks, state.clone()).await {
@@ -1845,17 +1931,38 @@ impl AppBuilder {
             state.probes().mark_startup_complete();
         }
 
+        // Signal the drain phase. The watchdog checks the flag for the common
+        // case (SIGTERM arrives after startup) and waits on the notify for the
+        // rare case (SIGTERM arrived during startup hooks). Both must be set so
+        // the watchdog never re-enforces the deadline before drain actually starts.
+        server_entered_drain.store(true, std::sync::atomic::Ordering::Release);
+        drain_phase_notify.notify_one();
+
+        // Wait for the server to drain all in-flight requests.  The drain
+        // watchdog in shutdown_task will force-exit if drain takes too long.
         let server_result = server_task.await.unwrap_or_else(|e| {
             tracing::error!("Server task join error: {e}");
             std::process::exit(1);
         });
+        // Drain completed within the deadline; abort the watchdog.
         shutdown_task.abort();
         server_result.unwrap_or_else(|e| {
             tracing::error!("Server error: {e}");
             std::process::exit(1);
         });
 
-        tracing::info!("Server shut down cleanly");
+        // Phase 7: run on_shutdown hooks within the *remaining* portion of
+        // shutdown_timeout_secs (drain + hooks share one budget, not two).
+        // Plugin ordering: plugins register during build() before app hooks,
+        // so app hooks run before plugin hooks (LIFO = last-registered first).
+        let drain_elapsed = drain_started_at
+            .get()
+            .map_or(std::time::Duration::ZERO, std::time::Instant::elapsed);
+        let hook_budget =
+            std::time::Duration::from_secs(shutdown_timeout).saturating_sub(drain_elapsed);
+        run_shutdown_hooks_with_timeout(&shutdown_hooks, hook_budget, hook_budget).await;
+
+        tracing::info!(exit_code = 0, "shutdown: all phases completed cleanly");
     }
 
     /// Render all registered static routes to `dist/` and exit.
@@ -3003,6 +3110,38 @@ fn initialize_job_runtime(
 async fn run_shutdown_hooks(hooks: &[ShutdownHook]) {
     for hook in hooks.iter().rev() {
         hook().await;
+    }
+}
+
+/// Run shutdown hooks in reverse-registration order (LIFO), enforcing a
+/// per-hook timeout and a hard total-budget ceiling.
+///
+/// Plugin ordering rule: plugins register hooks during `build()`, which is
+/// called before any app `on_shutdown` calls, so app hooks run **before**
+/// plugin hooks (LIFO means last-registered runs first).
+///
+/// Overruns are logged at WARN but do not block the remaining budget.
+async fn run_shutdown_hooks_with_timeout(
+    hooks: &[ShutdownHook],
+    per_hook_budget: std::time::Duration,
+    total_budget: std::time::Duration,
+) {
+    let deadline = tokio::time::Instant::now() + total_budget;
+    for hook in hooks.iter().rev() {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            tracing::warn!("shutdown: total hook budget exhausted; skipping remaining hooks");
+            break;
+        }
+        let timeout = remaining.min(per_hook_budget);
+        // Hook overruns are intentionally non-fatal (exit 0 per ADR addendum).
+        // Only drain deadline exhaustion (phase 6) triggers exit(1).
+        if tokio::time::timeout(timeout, hook()).await.is_err() {
+            tracing::warn!(
+                per_hook_budget_ms = timeout.as_millis(),
+                "shutdown: hook overran per-hook timeout; continuing with remaining budget"
+            );
+        }
     }
 }
 
@@ -4391,7 +4530,7 @@ fn format_config_summary(config: &AutumnConfig) -> String {
         \n    telemetry:  {telemetry_status}\
         \n    health:     {} (detailed={})\
         \n    actuator:   sensitive={}\
-        \n    shutdown:   {}s",
+        \n    shutdown:   prestop={}s drain={}s",
         config.server.host,
         config.server.port,
         config.log.level,
@@ -4399,6 +4538,7 @@ fn format_config_summary(config: &AutumnConfig) -> String {
         config.health.path,
         config.health.detailed,
         config.actuator.sensitive,
+        config.server.prestop_grace_secs,
         config.server.shutdown_timeout_secs,
     )
 }
@@ -7281,6 +7421,77 @@ mod tests {
             builder.route_sources[1],
             crate::route_listing::RouteSource::Plugin("outer".to_owned()),
             "second route should be re-attributed to outer plugin after nested build"
+        );
+    }
+
+    // ── shutdown hook timeout tests ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn shutdown_hooks_with_timeout_runs_all_fast_hooks() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let counter = Arc::new(AtomicUsize::new(0));
+        let c1 = Arc::clone(&counter);
+        let c2 = Arc::clone(&counter);
+
+        let hooks: Vec<ShutdownHook> = vec![
+            Box::new(move || {
+                let c = Arc::clone(&c1);
+                Box::pin(async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                })
+            }),
+            Box::new(move || {
+                let c = Arc::clone(&c2);
+                Box::pin(async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                })
+            }),
+        ];
+
+        run_shutdown_hooks_with_timeout(
+            &hooks,
+            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(10),
+        )
+        .await;
+
+        assert_eq!(counter.load(Ordering::SeqCst), 2, "both hooks must run");
+    }
+
+    #[tokio::test]
+    async fn shutdown_hooks_with_timeout_tolerates_slow_hook_overrun() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let fast_ran = Arc::new(AtomicBool::new(false));
+        let fr = Arc::clone(&fast_ran);
+
+        let hooks: Vec<ShutdownHook> = vec![
+            // hook 0 (first registered → runs LAST in LIFO): fast
+            Box::new(move || {
+                let fr = Arc::clone(&fr);
+                Box::pin(async move {
+                    fr.store(true, Ordering::SeqCst);
+                })
+            }),
+            // hook 1 (last registered → runs FIRST in LIFO): slow, exceeds per-hook budget
+            Box::new(|| {
+                Box::pin(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                })
+            }),
+        ];
+
+        // Per-hook budget = 50 ms (hook 0 will overrun).
+        // Total budget = 1 s (ample for hook 1 after the overrun is cut short).
+        run_shutdown_hooks_with_timeout(
+            &hooks,
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_secs(1),
+        )
+        .await;
+
+        assert!(
+            fast_ran.load(Ordering::SeqCst),
+            "fast hook must still run even after slow hook overruns its per-hook budget"
         );
     }
 }

@@ -502,6 +502,149 @@ async fn after_update(&self, ctx: &mut MutationContext, page: &Page) -> AutumnRe
 }
 ```
 
+## Rolling Deploy Lifecycle
+
+Autumn implements a documented, tested shutdown sequence that gives
+load balancers and orchestrators time to drain traffic before the replica
+exits. Every phase has a defined ordering guarantee and a configurable
+timeout.
+
+### Shutdown phases
+
+| # | Phase | Description |
+|---|-------|-------------|
+| 1 | **signal_received** | SIGTERM or Ctrl-C arrives; Autumn begins the shutdown sequence and logs a structured `phase=signal_received` event with configured timeouts. |
+| 2 | **ready_draining** | `/ready` flips to `503 Service Unavailable` **strictly before** the TCP listener closes. Upstream load balancers can now deregister the replica. |
+| 3 | **prestop_grace** | Autumn sleeps `server.prestop_grace_secs` (default `5`). Set this to at least your LB's health-check interval plus deregistration propagation time. |
+| 4 | **ws_closing** | The WebSocket shutdown token fires. Handlers that opt into `WithShutdown` should send a `1001 Going Away` close frame so clients can reconnect to another replica. Handlers that do not use `WithShutdown` will have their connections closed without a close frame. |
+| 5 | **listener_stopping** | The TCP listener stops accepting new connections. `#[job]` workers and `#[scheduled]` tasks stop dequeuing/launching new work — they share the same cancellation token as the listener. |
+| 6 | **in_flight_drain** | In-flight HTTP requests complete for up to `server.shutdown_timeout_secs` (default `30`). Requests still running at the deadline are aborted and counted in `autumn_shutdown_aborted_requests_total`. The process exits with code `1` and a structured log line naming the exceeded phase. |
+| 7 | **app_hooks** | `on_shutdown` hooks run in **LIFO registration order** with a per-hook and total budget equal to `shutdown_timeout_secs`. Plugin hooks registered during `build()` run after app hooks (LIFO means last-registered runs first). Overruns are logged at WARN but do not block the remaining budget. |
+| 8 | **telemetry_flush** | OpenTelemetry span exporter flushes buffered spans (handled by the `_telemetry_guard` drop). |
+| 9 | **db_pool_close** | The Diesel connection pool is dropped with the process. |
+| 10 | **exit 0** | Process exits with code `0` when all phases complete inside their deadlines. |
+
+### Configuration
+
+```toml
+[server]
+# Seconds /ready returns 503 before the listener closes (default: 5).
+# Tune to: LB health-check interval + deregistration propagation time.
+prestop_grace_secs = 5
+
+# Maximum seconds for in-flight requests to drain (default: 30).
+shutdown_timeout_secs = 30
+```
+
+Environment variable overrides:
+
+```
+AUTUMN_SERVER__PRESTOP_GRACE_SECS=10
+AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS=60
+```
+
+### Kubernetes / ECS configuration
+
+Wire `prestop_grace_secs` to your `preStop` hook and termination grace period:
+
+```yaml
+# Kubernetes Deployment example
+spec:
+  template:
+    spec:
+      # Formula: preStop_hook_secs + prestop_grace_secs + shutdown_timeout_secs + buffer
+      # shutdown_timeout_secs covers drain AND on_shutdown hooks combined
+      # (they share one budget, not two separate windows).
+      # If you use a Kubernetes preStop hook, include its duration in the total.
+      # Example: 5 (preStop sleep) + 5 (prestop_grace) + 30 (drain+hooks) + 10 (buffer) = 50 s.
+      terminationGracePeriodSeconds: 50
+      containers:
+        - name: app
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 3000
+            failureThreshold: 1          # deregister immediately on first 503
+          lifecycle:
+            preStop:
+              exec:
+                # Optional: give the LB extra time before SIGTERM arrives.
+                command: ["sleep", "5"]
+```
+
+> The `autumn_shutdown_aborted_requests_total` metric is available at
+> `/actuator/metrics` under `http.shutdown_aborted_requests_total`. Alert
+> when this counter is non-zero across rolling deploys — it indicates that
+> `shutdown_timeout_secs` is too short for your workload.
+>
+> **Note:** when drain times out the process exits with code `1` immediately
+> after recording the count. The in-memory counter is lost at that point.
+> The structured log line (`phase=in_flight_drain autumn_shutdown_aborted_requests_total=N`)
+> emitted just before `exit(1)` is the durable signal — ship those logs to
+> your log aggregator and alert on `exit_code=1` log events as a backup SLI.
+
+### Job and scheduler drain contract
+
+`#[job]` workers stop dequeuing new jobs when the listener closes (phase 5).
+Running job handlers continue concurrently during HTTP drain and are given a
+best-effort opportunity to finish — but because their `tokio::spawn` handles
+are not retained, the process does not wait for them after HTTP drain
+completes. Handlers that cannot finish quickly should use the crash-safe
+checkpoint path (see [Jobs guide](jobs.md)) so work can be resumed on the
+next replica. The same applies to `#[scheduled]` tasks: the scheduler stops
+launching new runs at phase 5, and any in-progress run proceeds
+concurrently during drain but is not awaited at shutdown.
+
+### WebSocket drain contract
+
+Every `#[ws]` handler that uses `WithShutdown` receives a `CancellationToken`
+that is cancelled at phase 4. Handlers should send a close frame on
+cancellation:
+
+```rust
+#[ws("/chat")]
+async fn chat() -> impl WsHandler {
+    WithShutdown(
+        |mut socket: WebSocket, shutdown: CancellationToken| async move {
+            loop {
+                tokio::select! {
+                    msg = socket.recv() => { /* handle */ }
+                    () = shutdown.cancelled() => {
+                        socket.send(Message::Close(Some(CloseFrame {
+                            code: CloseCode::Away,
+                            reason: "server restarting".into(),
+                        }))).await.ok();
+                        break;
+                    }
+                }
+            }
+        },
+    )
+}
+```
+
+### on_shutdown hook ordering
+
+Hooks run in **LIFO** (last-in, first-out) order — the last hook registered
+runs first. This means infrastructure registered early in `main()` shuts down
+last, after the code that depends on it.
+
+Plugin ordering rule: hooks run in registration order, LIFO. Plugins call
+their hooks during `build()`, which runs before app `.on_shutdown()` calls
+in `main()` — so app hooks typically run before plugin hooks. However, any
+`.on_shutdown()` call after a `.plugin()` call will run before that plugin's
+hook.
+
+```rust
+autumn_web::app()
+    .plugin(MyPlugin)          // plugin hook registered first → runs last
+    .on_shutdown(|| async {    // app hook registered second → runs first
+        tracing::info!("app cleanup");
+    })
+    .run()
+    .await;
+```
+
 ## Minimal Deployment Checklist
 
 Before calling an Autumn app "cloud ready", verify:
@@ -518,3 +661,6 @@ Before calling an Autumn app "cloud ready", verify:
 - background jobs use the right runtime model
 - multi-replica write paths use `#[lock_version]` (optimistic) or `with_lock` (pessimistic) to prevent lost updates
 - the generated container image builds without manual template surgery
+- `server.prestop_grace_secs` is tuned to match your load balancer's deregistration propagation time
+- `terminationGracePeriodSeconds` (Kubernetes) or equivalent is set to `preStop_hook_secs + prestop_grace_secs + shutdown_timeout_secs + buffer` (`shutdown_timeout_secs` covers drain **and** hooks combined)
+- `autumn_shutdown_aborted_requests_total` is monitored and alerts on any non-zero value after a rolling deploy

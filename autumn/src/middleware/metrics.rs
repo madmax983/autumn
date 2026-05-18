@@ -49,6 +49,9 @@ struct MetricsInner {
     idempotency_misses: AtomicU64,
     /// Idempotency-key conflicts (concurrent duplicate requests returned 409).
     idempotency_conflicts: AtomicU64,
+    /// Requests still in-flight when the drain deadline expired and were
+    /// forcibly dropped. Exposed as `autumn_shutdown_aborted_requests_total`.
+    shutdown_aborted_requests: AtomicU64,
 }
 
 #[derive(Debug, Default)]
@@ -97,7 +100,18 @@ impl MetricsCollector {
                 idempotency_hits: AtomicU64::new(0),
                 idempotency_misses: AtomicU64::new(0),
                 idempotency_conflicts: AtomicU64::new(0),
+                shutdown_aborted_requests: AtomicU64::new(0),
             }),
+        }
+    }
+
+    /// Record `count` requests that were forcibly aborted because the drain
+    /// deadline expired. Increments `autumn_shutdown_aborted_requests_total`.
+    pub fn record_shutdown_aborted(&self, count: u64) {
+        if count > 0 {
+            self.inner
+                .shutdown_aborted_requests
+                .fetch_add(count, Ordering::Relaxed);
         }
     }
 
@@ -273,6 +287,10 @@ impl MetricsCollector {
                     s4xx: self.inner.by_status.status_4xx.load(Ordering::Relaxed),
                     s5xx: self.inner.by_status.status_5xx.load(Ordering::Relaxed),
                 },
+                shutdown_aborted_requests_total: self
+                    .inner
+                    .shutdown_aborted_requests
+                    .load(Ordering::Relaxed),
             },
             idempotency: IdempotencyMetricsSnapshot {
                 hits: self.inner.idempotency_hits.load(Ordering::Relaxed),
@@ -322,6 +340,9 @@ pub struct HttpMetrics {
     pub by_route: HashMap<String, RouteSnapshot>,
     /// Global distribution of HTTP status codes.
     pub by_status: StatusSnapshot,
+    /// Requests forcibly dropped when the graceful-shutdown drain deadline
+    /// expired (`autumn_shutdown_aborted_requests_total`).
+    pub shutdown_aborted_requests_total: u64,
 }
 
 /// Percentiles for latency measurements.
@@ -478,6 +499,15 @@ where
 pin_project! {
     #[project = MetricsFutureProj]
     /// Future that records metrics after the inner service completes.
+    ///
+    /// **Known limitation:** `requests_active` tracks the tower service future
+    /// lifecycle, not the response-body lifecycle. For SSE / streaming handlers
+    /// the service future completes when the handler returns the `Response`
+    /// (with a streaming body), so `requests_active` is decremented before the
+    /// body is fully sent to the client. This means the
+    /// `autumn_shutdown_aborted_requests_total` watchdog counter may read `0`
+    /// even when streaming connections are still open during graceful shutdown.
+    /// Fixing this requires connection-level tracking at the Hyper layer.
     pub struct MetricsFuture<F> {
         #[pin]
         inner: F,

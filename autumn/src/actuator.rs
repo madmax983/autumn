@@ -1199,6 +1199,18 @@ pub(crate) async fn prometheus_endpoint<S: ProvideActuatorState + Send + Sync + 
         snapshot.http.by_status.s5xx
     );
 
+    // autumn_shutdown_aborted_requests_total
+    out.push_str(
+        "# HELP autumn_shutdown_aborted_requests_total \
+         HTTP requests forcibly dropped when the graceful-shutdown drain deadline expired\n",
+    );
+    out.push_str("# TYPE autumn_shutdown_aborted_requests_total counter\n");
+    let _ = writeln!(
+        out,
+        "autumn_shutdown_aborted_requests_total {}",
+        snapshot.http.shutdown_aborted_requests_total
+    );
+
     // by_route
     if !snapshot.http.by_route.is_empty() {
         out.push_str("# HELP autumn_http_route_requests_total HTTP requests by route and method\n");
@@ -1429,6 +1441,8 @@ pub(crate) fn actuator_endpoint_paths(prefix: &str, sensitive: bool) -> Vec<Stri
         actuator_route_path(prefix, "/ui/metrics"),
     ];
 
+    paths.push(actuator_route_path(prefix, "/prometheus"));
+
     if sensitive {
         paths.push(actuator_route_path(prefix, "/env"));
         paths.push(actuator_route_path(prefix, "/configprops"));
@@ -1436,7 +1450,6 @@ pub(crate) fn actuator_endpoint_paths(prefix: &str, sensitive: bool) -> Vec<Stri
         paths.push(actuator_route_path(prefix, "/tasks"));
         paths.push(actuator_route_path(prefix, "/jobs"));
         paths.push(actuator_route_path(prefix, "/ui/tasks"));
-        paths.push(actuator_route_path(prefix, "/prometheus"));
         #[cfg(feature = "ws")]
         {
             paths.push(actuator_route_path(prefix, "/channels"));
@@ -1482,6 +1495,10 @@ pub(crate) fn actuator_router_with_prefix<
         .route(
             &actuator_route_path(prefix, "/a11y"),
             axum::routing::get(a11y_endpoint::<S>),
+        )
+        .route(
+            &actuator_route_path(prefix, "/prometheus"),
+            axum::routing::get(prometheus_endpoint::<S>),
         );
 
     if sensitive {
@@ -1489,10 +1506,6 @@ pub(crate) fn actuator_router_with_prefix<
             .route(
                 &actuator_route_path(prefix, "/env"),
                 axum::routing::get(env_endpoint::<S>),
-            )
-            .route(
-                &actuator_route_path(prefix, "/prometheus"),
-                axum::routing::get(prometheus_endpoint::<S>),
             )
             .route(
                 &actuator_route_path(prefix, "/configprops"),
@@ -2221,7 +2234,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn actuator_prometheus_hidden_in_nonsensitive_mode() {
+    async fn actuator_prometheus_available_in_nonsensitive_mode() {
         let app = actuator_router(false).with_state(test_state());
         let resp = app
             .oneshot(
@@ -2232,7 +2245,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     // ── Tasks endpoint tests ───────────────────────────────────

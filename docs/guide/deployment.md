@@ -199,20 +199,40 @@ Scaffold a `fly.toml` alongside the production Dockerfile:
 autumn release init --force --target fly
 ```
 
-This creates `fly.toml` wired to the same `Dockerfile` and `/health` check.
+The generated `fly.toml` includes four first-class integrations:
+
+| Feature | What it does |
+|---|---|
+| `/live` + `/ready` checks | Fly uses `/live` to decide machine restarts; `/ready` to gate traffic routing. Autumn flips `/ready` to 503 at drain start so Fly deregisters before the listener closes. |
+| `kill_timeout = 45` | Fly waits 45 s after SIGTERM before SIGKILL — `prestop_grace_secs (5) + shutdown_timeout_secs (30) + 10 s buffer` for the process to log and exit cleanly. Value is an integer (seconds); Fly does not accept a string like `"45s"`. |
+| `[metrics]` → `/actuator/prometheus` | Fly scrapes Autumn's Prometheus text endpoint and surfaces it in the dashboard. No extra agent needed. |
+| `[deploy]` `release_command` (opt-in) | When uncommented, migrations run in a one-shot machine before new app machines start; a failed migration aborts the deploy before any traffic-serving machine is replaced. |
 
 Deploy:
 
 ```bash
 fly launch --no-deploy          # creates the app on fly.io
 fly secrets set AUTUMN_DATABASE__PRIMARY_URL="postgres://user:pass@host:5432/myapp_prod"
-AUTUMN_DATABASE__PRIMARY_URL="postgres://user:pass@host:5432/myapp_prod" autumn migrate
+fly secrets set AUTUMN_SECURITY__SIGNING_SECRET="$(openssl rand -hex 32)"
 fly deploy
 ```
 
-Run the migration step once before `fly deploy`. If you add a read replica,
-configure `AUTUMN_DATABASE__REPLICA_URL` separately and gate readiness until the
-replica has replayed the latest Diesel migration.
+**Using a database?** Uncomment the `release_command` line in `fly.toml` before
+the first `fly deploy`:
+
+```toml
+[deploy]
+  release_command = "autumn migrate"
+```
+
+With it enabled, Fly runs `autumn migrate` in a temporary machine before new app
+machines start. A failed migration aborts the deploy before any traffic-serving
+machine is replaced — keeping the old version live. The line is commented out by
+default because `autumn migrate` exits non-zero when no database URL is set,
+which would fail the first deploy of a database-free app.
+
+If you add a read replica, set `AUTUMN_DATABASE__REPLICA_URL` as a secret and
+Autumn gates `/ready` until the replica has replayed the latest migration.
 
 ---
 

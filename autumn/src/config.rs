@@ -40,6 +40,7 @@
 //! | `AUTUMN_SERVER__PORT` | `server.port` | `u16` |
 //! | `AUTUMN_SERVER__HOST` | `server.host` | `String` |
 //! | `AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS` | `server.shutdown_timeout_secs` | `u64` |
+//! | `AUTUMN_SERVER__PRESTOP_GRACE_SECS` | `server.prestop_grace_secs` | `u64` |
 //! | `AUTUMN_DATABASE__URL` | `database.url` | `String` |
 //! | `AUTUMN_DATABASE__PRIMARY_URL` | `database.primary_url` | `String` |
 //! | `AUTUMN_DATABASE__REPLICA_URL` | `database.replica_url` | `String` |
@@ -389,6 +390,10 @@ fn profile_defaults_as_toml(profile: &str) -> toml::Value {
             let mut server = toml::map::Map::new();
             server.insert("host".into(), "127.0.0.1".into());
             server.insert("shutdown_timeout_secs".into(), toml::Value::Integer(1));
+            // Zero-out the prestop grace in dev: there is no load balancer to
+            // deregister, so the 5-second default would add unnecessary latency
+            // on every Ctrl-C.
+            server.insert("prestop_grace_secs".into(), toml::Value::Integer(0));
             table.insert("server".into(), toml::Value::Table(server));
 
             let mut health = toml::map::Map::new();
@@ -1389,6 +1394,7 @@ impl AutumnConfig {
     /// - `AUTUMN_SERVER__PORT` → `server.port` (u16)
     /// - `AUTUMN_SERVER__HOST` → `server.host` (String)
     /// - `AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS` → `server.shutdown_timeout_secs` (u64)
+    /// - `AUTUMN_SERVER__PRESTOP_GRACE_SECS` → `server.prestop_grace_secs` (u64)
     ///
     /// # Database
     /// - `AUTUMN_DATABASE__PRIMARY_URL` -> `database.primary_url` (String)
@@ -1510,6 +1516,11 @@ impl AutumnConfig {
             env,
             "AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS",
             &mut self.server.shutdown_timeout_secs,
+        );
+        parse_env(
+            env,
+            "AUTUMN_SERVER__PRESTOP_GRACE_SECS",
+            &mut self.server.prestop_grace_secs,
         );
     }
 
@@ -2170,6 +2181,17 @@ pub struct ServerConfig {
     /// requests to complete before forcibly terminating.
     #[serde(default = "default_shutdown_timeout")]
     pub shutdown_timeout_secs: u64,
+
+    /// Seconds between `/ready` returning 503 and the TCP listener
+    /// closing to new connections. Default: `5`.
+    ///
+    /// This gap gives upstream load balancers time to deregister the
+    /// replica before it stops accepting new connections, preventing
+    /// connection resets on in-flight requests from the LB tier.
+    /// Must be tuned to match the LB's health-check interval + deregistration
+    /// propagation time. Set to `0` to disable the grace period.
+    #[serde(default = "default_prestop_grace")]
+    pub prestop_grace_secs: u64,
 }
 
 /// Behavior when a configured read replica is unavailable or stale.
@@ -2732,6 +2754,10 @@ const fn default_shutdown_timeout() -> u64 {
     30
 }
 
+const fn default_prestop_grace() -> u64 {
+    5
+}
+
 const fn default_pool_size() -> usize {
     10
 }
@@ -2780,6 +2806,7 @@ impl Default for ServerConfig {
             port: default_port(),
             host: default_host(),
             shutdown_timeout_secs: default_shutdown_timeout(),
+            prestop_grace_secs: default_prestop_grace(),
         }
     }
 }
@@ -4069,6 +4096,10 @@ path = "/healthz"
         assert_eq!(config.log.format, LogFormat::Pretty);
         assert_eq!(config.server.host, "127.0.0.1");
         assert_eq!(config.server.shutdown_timeout_secs, 1);
+        assert_eq!(
+            config.server.prestop_grace_secs, 0,
+            "dev profile must set prestop_grace_secs = 0 so Ctrl-C is instant"
+        );
         assert_eq!(config.telemetry.environment, "development");
         assert!(config.health.detailed);
         assert_eq!(config.cors.allowed_origins, vec!["*"]);

@@ -779,14 +779,81 @@ previous_secrets = []
     }
 
     #[test]
-    fn fly_toml_has_healthcheck() {
+    fn fly_toml_has_liveness_probe() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::Fly).unwrap();
         let content = fs::read_to_string(dir.join("fly.toml")).unwrap();
         assert!(
-            content.contains("/health"),
-            "fly.toml must wire the /health endpoint as the healthcheck"
+            content.contains("path") && content.contains("/live"),
+            "fly.toml must wire /live as the liveness health check"
+        );
+    }
+
+    #[test]
+    fn fly_toml_has_readiness_probe() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::Fly).unwrap();
+        let content = fs::read_to_string(dir.join("fly.toml")).unwrap();
+        assert!(
+            content.contains("path") && content.contains("/ready"),
+            "fly.toml must wire /ready as the readiness check so Fly stops routing \
+             traffic before the listener closes during graceful shutdown"
+        );
+    }
+
+    #[test]
+    fn fly_toml_has_kill_timeout() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::Fly).unwrap();
+        let content = fs::read_to_string(dir.join("fly.toml")).unwrap();
+        assert!(
+            content.contains("kill_timeout"),
+            "fly.toml must set kill_timeout so Fly waits at least \
+             prestop_grace_secs + shutdown_timeout_secs before sending SIGKILL"
+        );
+        assert!(
+            content.contains("kill_signal"),
+            "fly.toml must set kill_signal = \"SIGTERM\" so Autumn receives the expected signal"
+        );
+    }
+
+    #[test]
+    fn fly_toml_has_metrics_endpoint() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::Fly).unwrap();
+        let content = fs::read_to_string(dir.join("fly.toml")).unwrap();
+        assert!(
+            content.contains("[metrics]"),
+            "fly.toml must include a [metrics] section for Fly's Prometheus scraper"
+        );
+        assert!(
+            content.contains("/actuator/prometheus"),
+            "fly.toml [metrics] must point to /actuator/prometheus (Prometheus text format), \
+             not /actuator/metrics (JSON)"
+        );
+    }
+
+    #[test]
+    fn fly_toml_documents_deploy_release_command() {
+        // release_command is commented out by default: autumn migrate exits non-zero
+        // when no database URL is configured, which would break non-DB app deploys.
+        // The template documents the opt-in pattern so DB users can uncomment it.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::Fly).unwrap();
+        let content = fs::read_to_string(dir.join("fly.toml")).unwrap();
+        assert!(
+            content.contains("autumn migrate"),
+            "fly.toml must document the autumn migrate release command so DB users \
+             can uncomment it"
+        );
+        assert!(
+            content.contains("release_command"),
+            "fly.toml must document release_command so DB users know where to uncomment"
         );
     }
 

@@ -1,9 +1,10 @@
 # ADR 0002: Adopt Explicit Probe Lifecycle Contracts
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-04-09
+- Accepted: 2026-05-18
 - Deciders: Autumn maintainers
-- Tags: health, probes, operations, cloud-native
+- Tags: health, probes, operations, cloud-native, rolling-deploy, shutdown
 
 ## Context
 
@@ -140,6 +141,73 @@ If every app reinvents probe meaning, the framework contributes nothing.
 
 ## Follow-On Work
 
-- Implement probe lifecycle state in the runtime
-- Add readiness check registration to `AppBuilder`
-- Update CLI templates and docs to show probe usage
+- Implement probe lifecycle state in the runtime ✓ (done)
+- Add readiness check registration to `AppBuilder` ✓ (done)
+- Update CLI templates and docs to show probe usage ✓ (done)
+
+---
+
+## Addendum: Rolling Deploy Shutdown Contract (2026-05-18)
+
+This addendum records the full rolling-deploy lifecycle decision that was
+deferred at ADR acceptance time.
+
+### Problem
+
+The original ADR established probe semantics but did not define the complete
+shutdown sequence or the ordering guarantees between phases. Downstream apps
+had no falsifiable contract that SIGTERM → exit did not drop in-flight
+requests, double-run jobs, or kill WebSocket sessions without a close frame.
+
+### Decision
+
+Autumn adopts the following ten-phase shutdown contract:
+
+1. **signal_received** — SIGTERM or Ctrl-C arrives.
+2. **ready_draining** — `/ready` returns `503` strictly before the listener
+   closes.
+3. **prestop_grace** — `server.prestop_grace_secs` (default `5`) elapses;
+   configurable via `AUTUMN_SERVER__PRESTOP_GRACE_SECS`.
+4. **ws_closing** — Open WebSocket sessions receive a `1001 Going Away` close
+   frame.
+5. **listener_stopping** — The TCP listener stops accepting new connections.
+   `#[job]` workers and `#[scheduled]` tasks stop dequeuing; they share the
+   same `CancellationToken` as the listener.
+6. **in_flight_drain** — In-flight HTTP requests drain for up to
+   `server.shutdown_timeout_secs`. Requests exceeding the deadline are aborted
+   and counted in `autumn_shutdown_aborted_requests_total`; the process exits
+   with code `1` and a structured log line naming the exceeded phase.
+7. **app_hooks** — `on_shutdown` hooks run in LIFO registration order within
+   the **remaining** portion of `shutdown_timeout_secs` after drain completes
+   (drain and hooks share one budget, not two separate windows). Plugin hooks
+   (registered during `build()`) run after app hooks (LIFO = last-registered
+   first). Overruns are logged at WARN but do not block the remaining budget.
+8. **telemetry_flush** — OTLP span exporter flushes (handled via guard drop).
+9. **db_pool_close** — Connection pool drops with the process.
+10. **exit 0** — Code `0` when all phases complete within deadlines;
+    code `1` otherwise with a structured `phase=<name>` log event.
+
+### Implementation
+
+- `ServerConfig::prestop_grace_secs` (default `5`)
+- `MetricsCollector::record_shutdown_aborted` populates
+  `autumn_shutdown_aborted_requests_total`
+- `run_shutdown_hooks_with_timeout` enforces per-hook and total budgets
+- Integration tests in `autumn/tests/graceful_shutdown_contract.rs` assert
+  the contract (AC 9: SIGTERM during long HTTP request; probe state during
+  drain)
+
+### Ordering rule (plugin vs app hooks)
+
+**App hooks run before plugin hooks** during shutdown. Plugins register
+during `build()` (before any `.on_shutdown()` in `main()`), so LIFO means
+plugin hooks are earlier in the list and run last.
+
+### Consequences
+
+- No breaking changes to `on_shutdown` for existing users; `run()` calls the
+  same hooks in the same order, now with per-hook timeouts.
+- `prestop_grace_secs` adds a minimum `5`-second shutdown delay. Operators
+  can set it to `0` to disable the delay (not recommended in production).
+- `autumn_shutdown_aborted_requests_total` is now an observable SLI for
+  deploy quality.
