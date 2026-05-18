@@ -39,10 +39,10 @@ struct RepoConfig {
     policy_type: Option<Ident>,
     scope_type: Option<Ident>,
     cursor_key: Option<String>,
-    /// Rust type of the cursor_key field (e.g. `chrono::NaiveDateTime`).
+    /// Rust type of the `cursor_key` field (e.g. `chrono::NaiveDateTime`).
     /// When provided the generated `cursor_page` emits a fully-typed two-part
     /// keyset filter.  When absent it falls back to an id-only cursor which is
-    /// correct whenever cursor_key values are monotonically correlated with id.
+    /// correct whenever `cursor_key` values are monotonically correlated with `id`.
     cursor_key_type: Option<syn::Path>,
 }
 
