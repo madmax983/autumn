@@ -360,7 +360,6 @@ pub fn extract_path_params(path: &str) -> Vec<String> {
 /// The spec is rendered once at build time and stored in an `Arc<String>`
 /// so the `/v3/api-docs` handler performs no serialization per request.
 #[cfg(feature = "openapi")]
-#[allow(clippy::too_many_lines)]
 fn build_openapi_router(
     route_list: &[Route],
     scoped_groups: &[ScopedGroup],
@@ -387,45 +386,7 @@ fn build_openapi_router(
         }
     }
 
-    // Walk both top-level routes and scoped groups. For scoped groups the
-    // effective path is `prefix + route.path`; we materialize these into
-    // fresh `ApiDoc`s so the rendered spec reflects the actual URL the
-    // user will call.
-    let mut docs: Vec<crate::openapi::ApiDoc> = Vec::new();
-    for route in route_list {
-        docs.push(route.api_doc.clone());
-    }
-    for group in scoped_groups {
-        // Extract `{name}` captures from the scope prefix so parameters
-        // declared in the prefix (e.g. `/orgs/{org_id}`) show up on the
-        // generated operation alongside the child route's own params.
-        let prefix_params = extract_path_params(&group.prefix);
-        for route in &group.routes {
-            let mut doc = route.api_doc.clone();
-            // Leak the combined path so it fits the `&'static str` shape of
-            // ApiDoc. The spec is built once per process; the leak is
-            // bounded by the route table size. Using the same
-            // normalization as `join_nested_path` keeps the spec's
-            // paths aligned with the URLs axum actually routes.
-            let full = join_nested_path(&group.prefix, route.api_doc.path);
-            doc.path = Box::leak(full.into_boxed_str());
-
-            if !prefix_params.is_empty() {
-                let mut merged: Vec<&'static str> = prefix_params
-                    .iter()
-                    .map(|p| &*Box::leak(p.clone().into_boxed_str()))
-                    .collect();
-                for existing in route.api_doc.path_params {
-                    if !merged.iter().any(|n| n == existing) {
-                        merged.push(existing);
-                    }
-                }
-                doc.path_params = Box::leak(merged.into_boxed_slice());
-            }
-
-            docs.push(doc);
-        }
-    }
+    let docs = collect_openapi_docs(route_list, scoped_groups);
 
     let refs: Vec<&crate::openapi::ApiDoc> = docs.iter().collect();
     let spec = crate::openapi::generate_spec(&config, &refs);
@@ -453,72 +414,7 @@ fn build_openapi_router(
     );
 
     if let Some(path) = swagger_path {
-        let [css_path, bundle_path, initializer_path] =
-            crate::openapi::swagger_ui_asset_paths(&path);
-        let html_body = Arc::new(crate::openapi::swagger_ui_html(
-            &title,
-            &css_path,
-            &bundle_path,
-            &initializer_path,
-        ));
-        let initializer_body = Arc::new(crate::openapi::swagger_ui_initializer_js(&json_path));
-        router = router.route(
-            &path,
-            axum::routing::get(move || {
-                let html = html_body.clone();
-                async move {
-                    use axum::response::IntoResponse;
-                    (
-                        [(http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
-                        (*html).clone(),
-                    )
-                        .into_response()
-                }
-            }),
-        );
-        router = router.route(
-            &css_path,
-            axum::routing::get(|| async move {
-                use axum::response::IntoResponse;
-                (
-                    [(http::header::CONTENT_TYPE, "text/css; charset=utf-8")],
-                    crate::openapi::SWAGGER_UI_CSS,
-                )
-                    .into_response()
-            }),
-        );
-        router = router.route(
-            &bundle_path,
-            axum::routing::get(|| async move {
-                use axum::body::Bytes;
-                use axum::response::IntoResponse;
-                (
-                    [(
-                        http::header::CONTENT_TYPE,
-                        "application/javascript; charset=utf-8",
-                    )],
-                    Bytes::from_static(crate::openapi::SWAGGER_UI_BUNDLE),
-                )
-                    .into_response()
-            }),
-        );
-        router = router.route(
-            &initializer_path,
-            axum::routing::get(move || {
-                let js = initializer_body.clone();
-                async move {
-                    use axum::response::IntoResponse;
-                    (
-                        [(
-                            http::header::CONTENT_TYPE,
-                            "application/javascript; charset=utf-8",
-                        )],
-                        (*js).clone(),
-                    )
-                        .into_response()
-                }
-            }),
-        );
+        router = mount_swagger_ui_routes(router, &path, &title, &json_path);
     }
 
     tracing::debug!(
@@ -1724,6 +1620,128 @@ pub async fn htmx_csrf_handler() -> axum::response::Response {
         crate::htmx::HTMX_CSRF_JS,
     )
         .into_response()
+}
+
+#[cfg(feature = "openapi")]
+fn collect_openapi_docs(
+    route_list: &[Route],
+    scoped_groups: &[ScopedGroup],
+) -> Vec<crate::openapi::ApiDoc> {
+    // Walk both top-level routes and scoped groups. For scoped groups the
+    // effective path is `prefix + route.path`; we materialize these into
+    // fresh `ApiDoc`s so the rendered spec reflects the actual URL the
+    // user will call.
+    let mut docs: Vec<crate::openapi::ApiDoc> = Vec::new();
+    for route in route_list {
+        docs.push(route.api_doc.clone());
+    }
+    for group in scoped_groups {
+        // Extract `{name}` captures from the scope prefix so parameters
+        // declared in the prefix (e.g. `/orgs/{org_id}`) show up on the
+        // generated operation alongside the child route's own params.
+        let prefix_params = extract_path_params(&group.prefix);
+        for route in &group.routes {
+            let mut doc = route.api_doc.clone();
+            // Leak the combined path so it fits the `&'static str` shape of
+            // ApiDoc. The spec is built once per process; the leak is
+            // bounded by the route table size. Using the same
+            // normalization as `join_nested_path` keeps the spec's
+            // paths aligned with the URLs axum actually routes.
+            let full = join_nested_path(&group.prefix, route.api_doc.path);
+            doc.path = Box::leak(full.into_boxed_str());
+
+            if !prefix_params.is_empty() {
+                let mut merged: Vec<&'static str> = prefix_params
+                    .iter()
+                    .map(|p| &*Box::leak(p.clone().into_boxed_str()))
+                    .collect();
+                for existing in route.api_doc.path_params {
+                    if !merged.iter().any(|n| n == existing) {
+                        merged.push(existing);
+                    }
+                }
+                doc.path_params = Box::leak(merged.into_boxed_slice());
+            }
+
+            docs.push(doc);
+        }
+    }
+    docs
+}
+
+#[cfg(feature = "openapi")]
+fn mount_swagger_ui_routes(
+    mut router: axum::Router<AppState>,
+    path: &str,
+    title: &str,
+    json_path: &str,
+) -> axum::Router<AppState> {
+    let [css_path, bundle_path, initializer_path] = crate::openapi::swagger_ui_asset_paths(path);
+    let html_body = Arc::new(crate::openapi::swagger_ui_html(
+        title,
+        &css_path,
+        &bundle_path,
+        &initializer_path,
+    ));
+    let initializer_body = Arc::new(crate::openapi::swagger_ui_initializer_js(json_path));
+    router = router.route(
+        path,
+        axum::routing::get(move || {
+            let html = html_body.clone();
+            async move {
+                use axum::response::IntoResponse;
+                (
+                    [(http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                    (*html).clone(),
+                )
+                    .into_response()
+            }
+        }),
+    );
+    router = router.route(
+        &css_path,
+        axum::routing::get(|| async move {
+            use axum::response::IntoResponse;
+            (
+                [(http::header::CONTENT_TYPE, "text/css; charset=utf-8")],
+                crate::openapi::SWAGGER_UI_CSS,
+            )
+                .into_response()
+        }),
+    );
+    router = router.route(
+        &bundle_path,
+        axum::routing::get(|| async move {
+            use axum::body::Bytes;
+            use axum::response::IntoResponse;
+            (
+                [(
+                    http::header::CONTENT_TYPE,
+                    "application/javascript; charset=utf-8",
+                )],
+                Bytes::from_static(crate::openapi::SWAGGER_UI_BUNDLE),
+            )
+                .into_response()
+        }),
+    );
+    router = router.route(
+        &initializer_path,
+        axum::routing::get(move || {
+            let js = initializer_body.clone();
+            async move {
+                use axum::response::IntoResponse;
+                (
+                    [(
+                        http::header::CONTENT_TYPE,
+                        "application/javascript; charset=utf-8",
+                    )],
+                    (*js).clone(),
+                )
+                    .into_response()
+            }
+        }),
+    );
+    router
 }
 
 #[cfg(test)]
