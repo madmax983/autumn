@@ -3087,6 +3087,8 @@ async fn run_shutdown_hooks_with_timeout(
             break;
         }
         let timeout = remaining.min(per_hook_budget);
+        // Hook overruns are intentionally non-fatal (exit 0 per ADR addendum).
+        // Only drain deadline exhaustion (phase 6) triggers exit(1).
         if tokio::time::timeout(timeout, hook()).await.is_err() {
             tracing::warn!(
                 per_hook_budget_ms = timeout.as_millis(),
