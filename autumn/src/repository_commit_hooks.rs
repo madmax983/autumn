@@ -56,14 +56,18 @@ const HOOK_ENQUEUE_INSERT_SQL: &str = "INSERT INTO autumn_repository_commit_hook
      ON CONFLICT (id) DO NOTHING";
 const HOOK_PENDING_INSERT_SQL: &str = "INSERT INTO autumn_repository_commit_hooks \
      (id, handler_key, hook_name, context, record, status, attempt, \
-      max_attempts, initial_backoff_ms, enqueued_at, run_at, claimed_by, claimed_at) \
+       max_attempts, initial_backoff_ms, enqueued_at, run_at, claimed_by, claimed_at) \
      VALUES ($1, $2, $3, $4::JSONB, $5::JSONB, 'pending_after_hook', 1, 5, 1000, NOW(), NOW(), $6, NOW()) \
      ON CONFLICT (id) DO NOTHING";
-const HOOK_FINALIZE_AFTER_HOOK_SQL: &str = "UPDATE autumn_repository_commit_hooks \
-     SET context = $1::JSONB, record = $2::JSONB, status = 'enqueued', \
-         run_at = NOW(), enqueued_at = COALESCE(enqueued_at, NOW()), \
-         claimed_by = NULL, claimed_at = NULL, last_error = NULL \
+const HOOK_MARK_AFTER_HOOK_SUCCEEDED_SQL: &str = "UPDATE autumn_repository_commit_hooks \
+     SET context = $1::JSONB, record = $2::JSONB, status = 'after_hook_succeeded', \
+          claimed_at = NOW(), last_error = NULL \
      WHERE id = $3 AND claimed_by = $4 AND status = 'pending_after_hook'";
+const HOOK_FINALIZE_AFTER_HOOK_SQL: &str = "UPDATE autumn_repository_commit_hooks \
+     SET status = 'enqueued', run_at = NOW(), \
+          enqueued_at = COALESCE(enqueued_at, NOW()), \
+          claimed_by = NULL, claimed_at = NULL, last_error = NULL \
+      WHERE id = $1 AND claimed_by = $2 AND status = 'after_hook_succeeded'";
 const HOOK_DISCARD_PENDING_SQL: &str = "DELETE FROM autumn_repository_commit_hooks \
      WHERE id = $1 AND claimed_by = $2 AND status = 'pending_after_hook'";
 const HOOK_AFTER_HOOK_FAILED_SQL: &str = "UPDATE autumn_repository_commit_hooks \
@@ -101,14 +105,36 @@ const HOOK_RECOVER_STALE_RUNNING_SQL: &str = "UPDATE autumn_repository_commit_ho
      WHERE status = 'running' \
        AND claimed_at < NOW() - ($2::BIGINT * INTERVAL '1 millisecond')";
 const HOOK_RECOVER_STALE_PENDING_SQL: &str = "UPDATE autumn_repository_commit_hooks \
-     SET status = 'enqueued', \
-         run_at = NOW(), \
-         started_at = NULL, \
-         claimed_by = NULL, \
-         claimed_at = NULL, \
-         last_error = COALESCE(last_error, $1) \
-     WHERE status = 'pending_after_hook' \
-       AND claimed_at < NOW() - ($2::BIGINT * INTERVAL '1 millisecond')";
+     SET status = CASE \
+            WHEN status = 'after_hook_succeeded' THEN 'enqueued' \
+            ELSE 'after_hook_failed' \
+          END, \
+          run_at = CASE \
+            WHEN status = 'after_hook_succeeded' THEN NOW() \
+            ELSE run_at \
+          END, \
+          enqueued_at = CASE \
+            WHEN status = 'after_hook_succeeded' THEN COALESCE(enqueued_at, NOW()) \
+            ELSE enqueued_at \
+          END, \
+          context = CASE \
+            WHEN status = 'pending_after_hook' THEN '{}'::JSONB \
+            ELSE context \
+          END, \
+          record = CASE \
+            WHEN status = 'pending_after_hook' THEN '{}'::JSONB \
+            ELSE record \
+          END, \
+          finished_at = CASE \
+            WHEN status = 'pending_after_hook' THEN NOW() \
+            ELSE finished_at \
+          END, \
+          started_at = NULL, \
+          claimed_by = NULL, \
+          claimed_at = NULL, \
+          last_error = COALESCE(last_error, $1) \
+      WHERE status IN ('pending_after_hook', 'after_hook_succeeded') \
+        AND claimed_at < NOW() - ($2::BIGINT * INTERVAL '1 millisecond')";
 
 static REPOSITORY_COMMIT_HOOK_RUNNERS: OnceLock<
     RwLock<HashMap<String, RepositoryCommitHookRegistration>>,
@@ -385,9 +411,24 @@ where
         AutumnError::internal_server_error_msg(format!("pg pool error: {error}"))
     })?;
 
-    let rows = diesel::sql_query(HOOK_FINALIZE_AFTER_HOOK_SQL)
+    let rows = diesel::sql_query(HOOK_MARK_AFTER_HOOK_SUCCEEDED_SQL)
         .bind::<diesel::sql_types::Text, _>(context)
         .bind::<diesel::sql_types::Text, _>(record)
+        .bind::<diesel::sql_types::Text, _>(hook_id)
+        .bind::<diesel::sql_types::Text, _>(owner)
+        .execute(&mut *conn)
+        .await
+        .map_err(|error| {
+            AutumnError::internal_server_error_msg(format!(
+                "repository commit hook after-hook success mark failed: {error}"
+            ))
+        })?;
+
+    if rows == 0 {
+        return missing_repository_commit_hook_finalization_result(hook_id);
+    }
+
+    let rows = diesel::sql_query(HOOK_FINALIZE_AFTER_HOOK_SQL)
         .bind::<diesel::sql_types::Text, _>(hook_id)
         .bind::<diesel::sql_types::Text, _>(owner)
         .execute(&mut *conn)
@@ -398,11 +439,13 @@ where
             ))
         })?;
 
-    if rows > 0 {
-        Ok(())
-    } else {
-        missing_repository_commit_hook_finalization_result(hook_id)
+    if rows == 0 {
+        return Err(AutumnError::internal_server_error_msg(format!(
+            "repository commit hook finalization skipped marked row: {hook_id}"
+        )));
     }
+
+    Ok(())
 }
 
 fn missing_repository_commit_hook_finalization_result(hook_id: &str) -> AutumnResult<()> {
@@ -1419,13 +1462,22 @@ mod tests {
             "staged rows must carry a finalizer lease so recovery can distinguish live after hooks from abandoned rows"
         );
         assert!(
-            HOOK_FINALIZE_AFTER_HOOK_SQL.contains("status = 'enqueued'"),
-            "after-hook finalization must make the row dispatchable only after regular hooks succeed"
+            HOOK_MARK_AFTER_HOOK_SUCCEEDED_SQL.contains("status = 'after_hook_succeeded'")
+                && HOOK_MARK_AFTER_HOOK_SUCCEEDED_SQL.contains("context = $1::JSONB")
+                && HOOK_MARK_AFTER_HOOK_SUCCEEDED_SQL.contains("record = $2::JSONB"),
+            "regular after-hook success must durably persist finalized hook payload before enqueue"
         );
         assert!(
-            HOOK_FINALIZE_AFTER_HOOK_SQL
+            HOOK_MARK_AFTER_HOOK_SUCCEEDED_SQL
                 .contains("WHERE id = $3 AND claimed_by = $4 AND status = 'pending_after_hook'"),
-            "finalization must only promote the staged row it owns"
+            "success marking must only advance the staged row it owns"
+        );
+        assert!(
+            HOOK_FINALIZE_AFTER_HOOK_SQL.contains("status = 'enqueued'")
+                && HOOK_FINALIZE_AFTER_HOOK_SQL.contains(
+                    "WHERE id = $1 AND claimed_by = $2 AND status = 'after_hook_succeeded'"
+                ),
+            "after-hook finalization must only enqueue rows with a durable regular-hook success marker"
         );
         assert!(
             HOOK_AFTER_HOOK_FAILED_SQL.contains("status = 'after_hook_failed'")
@@ -1441,9 +1493,22 @@ mod tests {
             "long-running regular after hooks must heartbeat their staged-row finalizer lease"
         );
         assert!(
-            HOOK_RECOVER_STALE_PENDING_SQL.contains("status = 'pending_after_hook'")
-                && HOOK_RECOVER_STALE_PENDING_SQL.contains("status = 'enqueued'"),
-            "abandoned staged rows must eventually become claimable by the durable worker"
+            HOOK_RECOVER_STALE_PENDING_SQL
+                .contains("status IN ('pending_after_hook', 'after_hook_succeeded')")
+                && HOOK_RECOVER_STALE_PENDING_SQL
+                    .contains("WHEN status = 'after_hook_succeeded' THEN 'enqueued'")
+                && HOOK_RECOVER_STALE_PENDING_SQL.contains("ELSE 'after_hook_failed'"),
+            "stale recovery must enqueue only rows with a durable regular-hook success marker"
+        );
+        assert!(
+            HOOK_RECOVER_STALE_PENDING_SQL
+                .contains("WHEN status = 'pending_after_hook' THEN '{}'::JSONB"),
+            "ambiguous stale pending rows must be failed closed without retaining payloads"
+        );
+        assert!(
+            HOOK_RECOVER_STALE_PENDING_SQL
+                .contains("WHEN status = 'pending_after_hook' THEN NOW()"),
+            "ambiguous stale pending rows must be marked terminal when failed closed"
         );
     }
 
