@@ -1371,7 +1371,9 @@ pub fn try_build_router_with_static_inner(
     // then drain it. build_router_pre_state would otherwise see an empty list
     // and incorrectly treat opaque layers as absent when selecting idempotency
     // behaviour for each route.
-    let opaque_present = Some(custom_layers_require_fail_closed_idempotency(&ctx.custom_layers));
+    let opaque_present = Some(custom_layers_require_fail_closed_idempotency(
+        &ctx.custom_layers,
+    ));
     let custom_layers = std::mem::take(&mut ctx.custom_layers);
 
     let inner_router = build_router_pre_state(route_list, config, &state, ctx, opaque_present)?;
