@@ -86,11 +86,11 @@ fn push_storage_key_component(hasher: &mut sha2::Sha256, label: &str, value: &[u
 /// Namespacing by method+path prevents cross-endpoint cache collisions (P2).
 /// Namespacing by Authorization and session scope prevents cross-principal
 /// collisions (P1), including cookie-backed authenticated sessions. Selected
-/// headers such as Host and tenant/workspace/account `X-*` headers prevent
-/// route-local tenant middleware from receiving another tenant's cached
-/// response. Each component is length-delimited inside a SHA-256 digest so raw
-/// `:` bytes in paths or client-controlled keys cannot synthesize another
-/// storage key.
+/// headers such as Host and explicit tenant/workspace/account scope headers
+/// prevent route-local tenant middleware from receiving another tenant's
+/// cached response. Each component is length-delimited inside a SHA-256 digest
+/// so raw `:` bytes in paths or client-controlled keys cannot synthesize
+/// another storage key.
 #[derive(Clone)]
 struct StorageKeyContext {
     idempotency_key: String,
@@ -181,23 +181,19 @@ fn is_storage_scope_header(name: &str) -> bool {
         name.as_str(),
         "host"
             | "x-forwarded-host"
+            | "x-tenant-id"
             | "tenant"
             | "customer-scope"
+            | "x-customer-scope"
             | "workspace"
+            | "x-workspace-id"
             | "account"
+            | "x-account-id"
             | "organization"
+            | "x-organization-id"
             | "org"
-    ) || (name.starts_with("x-")
-        && !matches!(
-            name.as_str(),
-            "x-request-id"
-                | "x-correlation-id"
-                | "x-trace-id"
-                | "x-amzn-trace-id"
-                | "x-forwarded-for"
-                | "x-real-ip"
-        )
-        && !name.starts_with("x-b3-"))
+            | "x-org-id"
+    )
 }
 
 async fn storage_session_id_for_parts(parts: &axum::http::request::Parts) -> Option<String> {

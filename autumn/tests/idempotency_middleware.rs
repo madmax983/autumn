@@ -202,6 +202,9 @@ static SESSION_SAVE_FAILURE_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static TENANT_HEADER_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static TENANT_EXTENSION_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static SCOPED_GENERATED_TENANT_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
+static APP_WIDE_GENERATED_TENANT_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
+static APP_WIDE_TENANT_LAYER_CALLS: AtomicUsize = AtomicUsize::new(0);
+static VOLATILE_HEADER_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static COMMITTED_ERROR_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static SECURED_SESSION_ROTATION_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static SECURED_SESSION_TOUCH_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -446,6 +449,19 @@ async fn manual_layered_route_create_handler() -> &'static str {
 async fn manual_direct_layered_route_create_handler() -> &'static str {
     MANUAL_DIRECT_LAYERED_HANDLER_CALLS.fetch_add(1, Ordering::SeqCst);
     "manual-direct-layered-route"
+}
+
+async fn volatile_header_create_handler() -> &'static str {
+    VOLATILE_HEADER_HANDLER_CALLS.fetch_add(1, Ordering::SeqCst);
+    "volatile-created"
+}
+
+#[post("/app-wide-generated-tenant")]
+async fn app_wide_generated_tenant_handler(
+    axum::extract::Extension(tenant): axum::extract::Extension<String>,
+) -> String {
+    APP_WIDE_GENERATED_TENANT_HANDLER_CALLS.fetch_add(1, Ordering::SeqCst);
+    tenant
 }
 
 async fn session_save_failure_handler(session: Session) -> &'static str {
@@ -2775,6 +2791,56 @@ async fn test_tenant_scope_headers_same_key_are_independent() {
 }
 
 #[tokio::test]
+async fn test_volatile_x_headers_do_not_split_idempotency_scope() {
+    use tower::ServiceExt;
+
+    VOLATILE_HEADER_HANDLER_CALLS.store(0, Ordering::SeqCst);
+    let store = make_store(Duration::from_secs(3600));
+    let layer = IdempotencyLayer::new(store);
+
+    let app = axum::Router::new()
+        .route(
+            "/volatile-action",
+            axum::routing::post(volatile_header_create_handler),
+        )
+        .layer(layer);
+
+    let req_a = axum::http::Request::builder()
+        .method("POST")
+        .uri("/volatile-action")
+        .header("idempotency-key", "volatile-header-key")
+        .header("x-client-window-id", "window-a")
+        .body(axum::body::Body::from("same"))
+        .unwrap();
+    let resp_a = app.clone().oneshot(req_a).await.unwrap();
+    assert_eq!(resp_a.status(), StatusCode::OK);
+    assert!(resp_a.headers().get("x-idempotent-replayed").is_none());
+
+    let req_b = axum::http::Request::builder()
+        .method("POST")
+        .uri("/volatile-action")
+        .header("idempotency-key", "volatile-header-key")
+        .header("x-client-window-id", "window-b")
+        .body(axum::body::Body::from("same"))
+        .unwrap();
+    let resp_b = app.clone().oneshot(req_b).await.unwrap();
+    assert_eq!(resp_b.status(), StatusCode::OK);
+    assert_eq!(
+        resp_b
+            .headers()
+            .get("x-idempotent-replayed")
+            .and_then(|value| value.to_str().ok()),
+        Some("true"),
+        "client-controlled volatile x-* headers must not turn a retry into a fresh miss"
+    );
+    assert_eq!(
+        VOLATILE_HEADER_HANDLER_CALLS.load(Ordering::SeqCst),
+        1,
+        "a changed volatile x-* header must not rerun a cached mutation"
+    );
+}
+
+#[tokio::test]
 async fn test_scoped_generated_route_fails_closed_for_opaque_tenant_scope() {
     async fn scoped_customer_scope(
         mut req: axum::http::Request<Body>,
@@ -2823,6 +2889,62 @@ async fn test_scoped_generated_route_fails_closed_for_opaque_tenant_scope() {
         SCOPED_GENERATED_TENANT_HANDLER_CALLS.load(Ordering::SeqCst),
         1,
         "scoped generated routes must not replay cached mutations across opaque tenant layers"
+    );
+}
+
+#[tokio::test]
+async fn test_app_wide_generated_route_fails_closed_for_opaque_tenant_scope() {
+    async fn app_wide_customer_scope(
+        mut req: axum::http::Request<Body>,
+        next: axum::middleware::Next,
+    ) -> Response {
+        APP_WIDE_TENANT_LAYER_CALLS.fetch_add(1, Ordering::SeqCst);
+        let tenant = req
+            .headers()
+            .get("customer")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("missing")
+            .to_owned();
+        req.extensions_mut().insert(tenant);
+        next.run(req).await
+    }
+
+    APP_WIDE_GENERATED_TENANT_HANDLER_CALLS.store(0, Ordering::SeqCst);
+    APP_WIDE_TENANT_LAYER_CALLS.store(0, Ordering::SeqCst);
+    let client = TestApp::new()
+        .routes(routes![app_wide_generated_tenant_handler])
+        .layer(axum::middleware::from_fn(app_wide_customer_scope))
+        .idempotent()
+        .build();
+
+    let first = client
+        .post("/app-wide-generated-tenant")
+        .header("idempotency-key", "app-wide-generated-tenant-key")
+        .header("customer", "tenant-a")
+        .body("same")
+        .send()
+        .await;
+    first.assert_ok();
+    assert_eq!(first.text(), "tenant-a");
+
+    let retry = client
+        .post("/app-wide-generated-tenant")
+        .header("idempotency-key", "app-wide-generated-tenant-key")
+        .header("customer", "tenant-b")
+        .body("same")
+        .send()
+        .await;
+    retry.assert_status(StatusCode::CONFLICT.as_u16());
+    assert_eq!(retry.header("x-idempotent-replayed"), None);
+    assert_eq!(
+        APP_WIDE_TENANT_LAYER_CALLS.load(Ordering::SeqCst),
+        2,
+        "app-wide tenant middleware must still run before an opaque cached mutation is denied"
+    );
+    assert_eq!(
+        APP_WIDE_GENERATED_TENANT_HANDLER_CALLS.load(Ordering::SeqCst),
+        1,
+        "app-wide generated routes must not replay cached mutations across opaque tenant layers"
     );
 }
 

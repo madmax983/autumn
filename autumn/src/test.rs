@@ -316,6 +316,7 @@ impl TestApp {
         self.custom_layers
             .push(crate::app::CustomLayerRegistration {
                 type_id: std::any::TypeId::of::<L>(),
+                type_name: std::any::type_name::<L>(),
                 apply: Box::new(move |router| layer.apply_to(router)),
             });
         self

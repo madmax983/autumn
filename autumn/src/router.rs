@@ -264,7 +264,13 @@ pub fn try_build_router_inner(
     )?;
 
     let idempotency_layers = build_idempotency_layers(config, &state)?;
-    let mut router = group_and_mount_routes(route_list, idempotency_layers.as_ref());
+    let opaque_app_layers_present =
+        custom_layers_require_fail_closed_idempotency(&ctx.custom_layers);
+    let mut router = group_and_mount_routes(
+        route_list,
+        idempotency_layers.as_ref(),
+        opaque_app_layers_present,
+    );
 
     let dev_reload_enabled = dev::is_enabled_with_env(&crate::config::OsEnv);
 
@@ -766,6 +772,7 @@ fn check_openapi_path_against(
 fn group_and_mount_routes(
     route_list: Vec<Route>,
     idempotency_layers: Option<&BuiltIdempotencyLayers>,
+    opaque_app_layers_present: bool,
 ) -> axum::Router<AppState> {
     // Group routes by path so multiple methods on the same path
     // (e.g. GET /admin + POST /admin) are merged into a single
@@ -782,8 +789,8 @@ fn group_and_mount_routes(
         );
     }
     for route in route_list {
-        let selected_layer =
-            idempotency_layers.map(|layers| idempotency_layer_for_route(&route, layers));
+        let selected_layer = idempotency_layers
+            .map(|layers| idempotency_layer_for_route(&route, layers, opaque_app_layers_present));
         let mut handler = route.handler;
         if let Some(layer) = selected_layer {
             handler = handler.layer(layer.clone());
@@ -806,8 +813,11 @@ fn group_and_mount_routes(
 const fn idempotency_layer_for_route<'a>(
     route: &Route,
     layers: &'a BuiltIdempotencyLayers,
+    opaque_app_layers_present: bool,
 ) -> &'a IdempotencyLayer {
-    if route_uses_generated_replay_stop(route) {
+    if opaque_app_layers_present {
+        &layers.manual
+    } else if route_uses_generated_replay_stop(route) {
         &layers.route
     } else {
         &layers.manual
@@ -819,6 +829,36 @@ const fn route_uses_generated_replay_stop(route: &Route) -> bool {
         route.idempotency,
         crate::route::RouteIdempotency::ReplayThroughInner
     )
+}
+
+fn custom_layers_require_fail_closed_idempotency(
+    custom_layers: &[crate::app::CustomLayerRegistration],
+) -> bool {
+    custom_layers
+        .iter()
+        .any(|registered| !is_idempotency_transparent_app_layer(registered))
+}
+
+fn is_idempotency_transparent_app_layer(registered: &crate::app::CustomLayerRegistration) -> bool {
+    registered
+        .type_name
+        .starts_with("autumn_web::session::SessionLayer<")
+        || registered
+            .type_name
+            .starts_with("autumn::session::SessionLayer<")
+        || registered.type_id
+            == std::any::TypeId::of::<crate::session::SessionLayer<crate::session::MemoryStore>>()
+        || is_i18n_bundle_extension_layer(registered.type_id)
+}
+
+#[cfg(feature = "i18n")]
+fn is_i18n_bundle_extension_layer(type_id: std::any::TypeId) -> bool {
+    type_id == std::any::TypeId::of::<axum::Extension<Arc<crate::i18n::Bundle>>>()
+}
+
+#[cfg(not(feature = "i18n"))]
+const fn is_i18n_bundle_extension_layer(_type_id: std::any::TypeId) -> bool {
+    false
 }
 
 #[cfg_attr(not(feature = "mail"), allow(unused_variables))]

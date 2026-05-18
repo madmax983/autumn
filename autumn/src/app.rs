@@ -308,6 +308,9 @@ pub(crate) type CustomLayerApplier =
 pub(crate) struct CustomLayerRegistration {
     /// Concrete type for the registered layer.
     pub(crate) type_id: TypeId,
+    /// Concrete type name for generic layer families that need router-time
+    /// classification without unstable specialization.
+    pub(crate) type_name: &'static str,
     /// Deferred router mutation that applies the layer.
     pub(crate) apply: CustomLayerApplier,
 }
@@ -708,6 +711,7 @@ impl AppBuilder {
     pub fn layer<L: IntoAppLayer>(mut self, layer: L) -> Self {
         self.custom_layers.push(CustomLayerRegistration {
             type_id: TypeId::of::<L>(),
+            type_name: std::any::type_name::<L>(),
             apply: Box::new(move |router| layer.apply_to(router)),
         });
         self
@@ -3400,6 +3404,7 @@ fn install_i18n_bundle_layer(
     let ext_layer = axum::Extension(bundle);
     custom_layers.push(CustomLayerRegistration {
         type_id: TypeId::of::<axum::Extension<Arc<crate::i18n::Bundle>>>(),
+        type_name: std::any::type_name::<axum::Extension<Arc<crate::i18n::Bundle>>>(),
         apply: Box::new(move |router| router.layer(ext_layer)),
     });
     custom_layers

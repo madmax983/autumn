@@ -456,17 +456,9 @@ where
 }
 
 fn missing_repository_commit_hook_finalization_result(hook_id: &str) -> AutumnResult<()> {
-    if hook_id.starts_with("idempotent:") {
-        tracing::debug!(
-            hook_id = %hook_id,
-            "repository commit hook finalization skipped duplicate idempotent staged row"
-        );
-        Ok(())
-    } else {
-        Err(AutumnError::internal_server_error_msg(format!(
-            "repository commit hook finalization skipped missing staged row: {hook_id}"
-        )))
-    }
+    Err(AutumnError::internal_server_error_msg(format!(
+        "repository commit hook finalization skipped missing staged row: {hook_id}"
+    )))
 }
 
 /// Discard a staged create/update commit hook after the regular after hook
@@ -1396,8 +1388,15 @@ mod tests {
     }
 
     #[test]
-    fn missing_idempotent_finalization_is_successful_duplicate() {
-        assert!(missing_repository_commit_hook_finalization_result("idempotent:abc").is_ok());
+    fn missing_idempotent_finalization_fails_closed() {
+        let err = missing_repository_commit_hook_finalization_result("idempotent:abc")
+            .expect_err("missing idempotent staged rows should fail closed");
+
+        assert!(
+            err.to_string()
+                .contains("finalization skipped missing staged row"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
