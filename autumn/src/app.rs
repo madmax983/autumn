@@ -735,9 +735,11 @@ impl AppBuilder {
     /// mutation without re-entering the handler.
     ///
     /// Raw Axum routers registered with [`merge`](Self::merge) or
-    /// [`nest`](Self::nest) are opaque to Autumn. They are not automatically
-    /// deduplicated by this flag; install idempotency and replay-stop layers
-    /// inside those routers when raw routes need the same semantics.
+    /// [`nest`](Self::nest) are opaque to Autumn. They are protected from
+    /// duplicate mutating retries by failing closed on cache hits; install
+    /// idempotency and replay-stop layers inside those routers when raw routes
+    /// need successful cached-response replay after their own route-local
+    /// checks.
     ///
     /// The storage backend and TTL are taken from the `[idempotency]` block in
     /// `autumn.toml` (defaulting to in-process memory with a 24 h TTL).
@@ -775,8 +777,11 @@ impl AppBuilder {
     /// The merged router shares the same [`AppState`] (database pool,
     /// config, etc.) and Autumn's global middleware (request IDs,
     /// security headers, session management) applies to its routes.
-    /// `.idempotent()` does not automatically deduplicate this opaque router;
-    /// install idempotency layers inside the raw router when needed.
+    /// When `.idempotent()` is enabled, retries that hit an existing raw-route
+    /// idempotency record fail closed instead of rerunning the raw handler or
+    /// replaying around opaque route-local checks. Install idempotency and
+    /// replay-stop layers inside the raw router when successful replay is
+    /// required.
     ///
     /// Merged routes are added **after** Autumn's annotated routes.
     /// If both define the same method+path pair, Axum treats that as an
@@ -818,9 +823,11 @@ impl AppBuilder {
     /// for mounting a self-contained API version or third-party router.
     ///
     /// The nested router shares the same [`AppState`] and Autumn's global
-    /// middleware applies to its routes. `.idempotent()` does not automatically
-    /// deduplicate this opaque router; install idempotency layers inside the
-    /// raw router when needed.
+    /// middleware applies to its routes. When `.idempotent()` is enabled,
+    /// retries that hit an existing raw-route idempotency record fail closed
+    /// instead of rerunning the raw handler or replaying around opaque
+    /// route-local checks. Install idempotency and replay-stop layers inside
+    /// the raw router when successful replay is required.
     ///
     /// Can be called multiple times with different prefixes.
     ///

@@ -352,7 +352,7 @@ async fn idempotent_authorize_session_rotation_replays_final_cookie_for_old_cook
     AUTHORIZE_SESSION_ROTATION_CALLS.store(0, Ordering::SeqCst);
     let store = MemoryStore::new();
     seed_session(&store, "sess-authorize-rotate", "999", Some("admin")).await;
-    let client = build_idempotent_attr_rotation_app(store, ForbiddenResponse::Forbidden403);
+    let client = build_idempotent_attr_rotation_app(store.clone(), ForbiddenResponse::Forbidden403);
 
     let first = client
         .post("/notes-attr-rotate/1")
@@ -361,7 +361,19 @@ async fn idempotent_authorize_session_rotation_replays_final_cookie_for_old_cook
         .send()
         .await;
     first.assert_ok();
-    assert!(first.header("set-cookie").is_some());
+    let set_cookie = first
+        .header("set-cookie")
+        .expect("authorized rotating session response should set a new cookie")
+        .to_owned();
+    let new_cookie = set_cookie
+        .split(';')
+        .next()
+        .expect("set-cookie should start with a cookie pair")
+        .to_owned();
+    let new_session_id = new_cookie
+        .strip_prefix("autumn.sid=")
+        .expect("set-cookie should use the default Autumn session cookie")
+        .to_owned();
 
     let retry = client
         .post("/notes-attr-rotate/1")
@@ -379,6 +391,25 @@ async fn idempotent_authorize_session_rotation_replays_final_cookie_for_old_cook
         AUTHORIZE_SESSION_ROTATION_CALLS.load(Ordering::SeqCst),
         1,
         "authorized session-rotating retries must not re-enter the handler"
+    );
+
+    store.destroy(&new_session_id).await.unwrap();
+    let accepted_cookie_retry = client
+        .post("/notes-attr-rotate/1")
+        .header("Cookie", &new_cookie)
+        .header("idempotency-key", "authorize-rotation-key")
+        .send()
+        .await;
+    assert_eq!(
+        accepted_cookie_retry.status,
+        StatusCode::FORBIDDEN,
+        "a retry after accepting a now-revoked rotated cookie must run current policy checks"
+    );
+    assert_eq!(accepted_cookie_retry.header("x-idempotent-replayed"), None);
+    assert_eq!(
+        AUTHORIZE_SESSION_ROTATION_CALLS.load(Ordering::SeqCst),
+        1,
+        "accepted-cookie policy denials must not re-enter the mutating handler"
     );
 }
 

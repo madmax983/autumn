@@ -291,7 +291,12 @@ pub fn try_build_router_inner(
 
     router = mount_scoped_groups(router, ctx.scoped_groups, idempotency_layers.as_ref());
 
-    router = mount_raw_routers(router, ctx.merge_routers, ctx.nest_routers);
+    router = mount_raw_routers(
+        router,
+        ctx.merge_routers,
+        ctx.nest_routers,
+        idempotency_layers.as_ref(),
+    );
 
     router = apply_middleware(
         router,
@@ -992,11 +997,17 @@ fn mount_raw_routers(
     mut router: axum::Router<AppState>,
     merge_routers: Vec<axum::Router<AppState>>,
     nest_routers: Vec<(String, axum::Router<AppState>)>,
+    idempotency_layers: Option<&BuiltIdempotencyLayers>,
 ) -> axum::Router<AppState> {
     // Merge user-supplied raw Axum routers (escape hatch).
     // Merged after annotated routes so annotated routes take precedence.
     for raw_router in merge_routers {
         tracing::debug!("Merged raw Axum router");
+        let raw_router = if let Some(layers) = idempotency_layers {
+            raw_router.layer(layers.manual.clone())
+        } else {
+            raw_router
+        };
         router = router.merge(raw_router);
     }
 
@@ -1007,6 +1018,11 @@ fn mount_raw_routers(
         // so that unmatched routes within this prefix are protected by global middleware.
         let nested_router =
             raw_router.fallback(crate::middleware::error_page_filter::fallback_404_handler);
+        let nested_router = if let Some(layers) = idempotency_layers {
+            nested_router.layer(layers.manual.clone())
+        } else {
+            nested_router
+        };
         router = router.nest(&prefix, nested_router);
     }
     router

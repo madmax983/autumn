@@ -147,12 +147,13 @@ login, checkout flash, or session rotation receives the finalized cached
 response instead of re-entering the mutating handler.
 
 Routes mounted through `AppBuilder::merge()` or `AppBuilder::nest()` are raw
-Axum escape hatches and are opaque to Autumn. `.idempotent()` does not
-automatically deduplicate those raw routers, because doing so outside the raw
-router would skip route-local auth, tenant, or audit layers on cache hits. If a
-raw router needs idempotency, apply `IdempotencyLayer::replay_through_inner()`
-and place `IdempotencyReplayLayer` inside the route stack after the checks that
-must still run on replay.
+Axum escape hatches and are opaque to Autumn. `.idempotent()` records the first
+successful raw-router mutation, but cache hits fail closed with `409 Conflict`
+instead of rerunning the raw handler or replaying a stale success around
+route-local auth, tenant, or audit layers. If a raw router needs successful
+replay, apply `IdempotencyLayer::replay_through_inner()` inside the raw router
+and place `IdempotencyReplayLayer` in the route stack after the checks that must
+still run on replay.
 
 Manually constructed `Route` values passed to `AppBuilder::routes()` or
 `AppBuilder::scoped()` are also treated as unknown by default. Autumn records

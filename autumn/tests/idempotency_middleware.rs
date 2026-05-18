@@ -517,7 +517,7 @@ async fn intercepted_create_handler() -> &'static str {
 }
 
 #[tokio::test]
-async fn test_merged_raw_router_requires_explicit_idempotency_layer() {
+async fn test_merged_raw_router_fails_closed_on_replay_without_replay_stop() {
     RAW_MERGE_HANDLER_CALLS.store(0, Ordering::SeqCst);
     let raw = axum::Router::<AppState>::new()
         .route("/raw-create", axum::routing::post(raw_merge_create_handler));
@@ -537,18 +537,17 @@ async fn test_merged_raw_router_requires_explicit_idempotency_layer() {
         .header("idempotency-key", "raw-merge-key")
         .send()
         .await;
-    r2.assert_ok();
+    r2.assert_status(StatusCode::CONFLICT.as_u16());
     assert_eq!(r2.header("x-idempotent-replayed"), None);
-    assert_eq!(r2.text(), "raw-merged");
     assert_eq!(
         RAW_MERGE_HANDLER_CALLS.load(Ordering::SeqCst),
-        2,
-        "raw routers are opaque; callers must install their own replay stop before expecting dedupe"
+        1,
+        "raw merged routers must not rerun mutating handlers for a cached idempotency key"
     );
 }
 
 #[tokio::test]
-async fn test_nested_raw_router_requires_explicit_idempotency_layer() {
+async fn test_nested_raw_router_fails_closed_on_replay_without_replay_stop() {
     RAW_NEST_HANDLER_CALLS.store(0, Ordering::SeqCst);
     let raw = axum::Router::<AppState>::new()
         .route("/raw-create", axum::routing::post(raw_nest_create_handler));
@@ -568,18 +567,17 @@ async fn test_nested_raw_router_requires_explicit_idempotency_layer() {
         .header("idempotency-key", "raw-nest-key")
         .send()
         .await;
-    r2.assert_ok();
+    r2.assert_status(StatusCode::CONFLICT.as_u16());
     assert_eq!(r2.header("x-idempotent-replayed"), None);
-    assert_eq!(r2.text(), "raw-nested");
     assert_eq!(
         RAW_NEST_HANDLER_CALLS.load(Ordering::SeqCst),
-        2,
-        "raw nested routers are opaque; callers must install their own replay stop before expecting dedupe"
+        1,
+        "raw nested routers must not rerun mutating handlers for a cached idempotency key"
     );
 }
 
 #[tokio::test]
-async fn test_merged_raw_router_layers_run_on_retry() {
+async fn test_merged_raw_router_layers_do_not_receive_stale_success_on_retry() {
     RAW_LAYERED_HANDLER_CALLS.store(0, Ordering::SeqCst);
     RAW_LAYERED_AUTH_CALLS.store(0, Ordering::SeqCst);
     RAW_LAYERED_ALLOWED.store(true, Ordering::SeqCst);
@@ -603,17 +601,17 @@ async fn test_merged_raw_router_layers_run_on_retry() {
         .header("idempotency-key", "raw-layered-key")
         .send()
         .await;
-    retry.assert_status(StatusCode::FORBIDDEN.as_u16());
+    retry.assert_status(StatusCode::CONFLICT.as_u16());
     assert_eq!(retry.header("x-idempotent-replayed"), None);
     assert_eq!(
         RAW_LAYERED_AUTH_CALLS.load(Ordering::SeqCst),
-        2,
-        "raw router-local layers must not be skipped by app-level direct replay"
+        1,
+        "opaque raw router-local layers cannot safely run before app-level fail-closed replay"
     );
     assert_eq!(
         RAW_LAYERED_HANDLER_CALLS.load(Ordering::SeqCst),
         1,
-        "the retry should be stopped by the raw router layer before the handler"
+        "the retry must not replay stale success or re-enter the mutating raw handler"
     );
 }
 
@@ -888,7 +886,10 @@ async fn test_secured_session_rotation_replays_final_cookie_for_old_cookie_scope
     let client = TestApp::new()
         .routes(routes![secured_session_rotation_handler])
         .idempotent()
-        .layer(SessionLayer::new(session_store, SessionConfig::default()))
+        .layer(SessionLayer::new(
+            session_store.clone(),
+            SessionConfig::default(),
+        ))
         .build();
 
     let first = client
@@ -898,7 +899,19 @@ async fn test_secured_session_rotation_replays_final_cookie_for_old_cookie_scope
         .send()
         .await;
     first.assert_ok();
-    assert!(first.header("set-cookie").is_some());
+    let set_cookie = first
+        .header("set-cookie")
+        .expect("rotating secured session response should set a new cookie")
+        .to_owned();
+    let new_cookie = set_cookie
+        .split(';')
+        .next()
+        .expect("set-cookie should start with a cookie pair")
+        .to_owned();
+    let new_session_id = new_cookie
+        .strip_prefix("autumn.sid=")
+        .expect("set-cookie should use the default Autumn session cookie")
+        .to_owned();
 
     let retry = client
         .post("/secured-session-rotation")
@@ -920,6 +933,21 @@ async fn test_secured_session_rotation_replays_final_cookie_for_old_cookie_scope
         SECURED_SESSION_ROTATION_HANDLER_CALLS.load(Ordering::SeqCst),
         1,
         "secured session-rotating retries must not re-enter the handler"
+    );
+
+    session_store.destroy(&new_session_id).await.unwrap();
+    let accepted_cookie_retry = client
+        .post("/secured-session-rotation")
+        .header("cookie", &new_cookie)
+        .header("idempotency-key", "secured-rotation-key")
+        .send()
+        .await;
+    accepted_cookie_retry.assert_status(StatusCode::UNAUTHORIZED.as_u16());
+    assert_eq!(accepted_cookie_retry.header("x-idempotent-replayed"), None);
+    assert_eq!(
+        SECURED_SESSION_ROTATION_HANDLER_CALLS.load(Ordering::SeqCst),
+        1,
+        "a retry after accepting a now-revoked rotated cookie must not replay the prior success"
     );
 }
 

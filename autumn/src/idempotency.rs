@@ -263,6 +263,23 @@ pub struct IdempotencyRecord {
     pub metadata: Vec<(String, Vec<u8>)>,
 }
 
+const FINALIZED_SESSION_SCOPE_METADATA: &str = "__autumn.idempotency.finalized-session-scope";
+const FINALIZED_SESSION_PRIMARY_SCOPE: &[u8] = b"primary";
+const FINALIZED_SESSION_ALIAS_SCOPE: &[u8] = b"alias";
+
+fn finalized_session_record(
+    mut record: IdempotencyRecord,
+    scope: &'static [u8],
+) -> IdempotencyRecord {
+    record
+        .metadata
+        .retain(|(name, _)| name != FINALIZED_SESSION_SCOPE_METADATA);
+    record
+        .metadata
+        .push((FINALIZED_SESSION_SCOPE_METADATA.to_owned(), scope.to_vec()));
+    record
+}
+
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug)]
 pub struct IdempotencyCacheCommittedErrorResponse;
@@ -831,11 +848,14 @@ pub fn __replay_finalized_session_response(
     replay
         .as_ref()
         .and_then(|axum::extract::Extension(replay)| {
-            replay
+            let has_finalized_session_cookie = replay
                 .record
                 .headers
                 .iter()
-                .any(|(name, _)| name.eq_ignore_ascii_case("set-cookie"))
+                .any(|(name, _)| name.eq_ignore_ascii_case("set-cookie"));
+            let is_primary_session_scope = replay.metadata(FINALIZED_SESSION_SCOPE_METADATA)
+                == Some(FINALIZED_SESSION_PRIMARY_SCOPE);
+            (has_finalized_session_cookie && is_primary_session_scope)
                 .then(|| replay.clone().into_response())
         })
 }
@@ -1202,13 +1222,27 @@ impl DeferredIdempotencyCommit {
         };
 
         state.record.headers = extract_finalized_session_replay_headers(headers);
-        let mut storage_keys = Vec::with_capacity(state.alias_storage_keys.len() + 1);
-        storage_keys.push(state.storage_key);
-        storage_keys.extend(state.alias_storage_keys);
-        for storage_key in storage_keys {
+        let primary_record =
+            finalized_session_record(state.record.clone(), FINALIZED_SESSION_PRIMARY_SCOPE);
+        if let Err(error) = state.store.try_set(
+            &state.storage_key,
+            primary_record,
+            state.body_hash.clone(),
+            state.ttl,
+        ) {
+            tracing::error!(
+                idempotency.key = %state.idempotency_key,
+                error = %error,
+                "Deferred idempotency persistence failed after finalized session response; failing closed"
+            );
+            state.lock_guard.keep_locked_until_ttl();
+            return Err(error);
+        }
+        let alias_record = finalized_session_record(state.record, FINALIZED_SESSION_ALIAS_SCOPE);
+        for storage_key in state.alias_storage_keys {
             if let Err(error) = state.store.try_set(
                 &storage_key,
-                state.record.clone(),
+                alias_record.clone(),
                 state.body_hash.clone(),
                 state.ttl,
             ) {
