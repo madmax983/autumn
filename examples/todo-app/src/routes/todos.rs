@@ -210,7 +210,7 @@ async fn list_page(
 
             (new_todo_form(pending))
 
-            @if page_data.content.is_empty() {
+            @if page_data.total_elements == 0 {
                 div class="text-center py-16" {
                     p class="text-stone-400 text-sm" {
                         "No todos yet. Add one above!"

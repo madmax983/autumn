@@ -112,18 +112,28 @@ with `id` as the tie-breaker:
 pub trait PostRepository {}
 ```
 
-This generates:
+This generates a `cursor_page` method that orders by `(created_at DESC, id DESC)`
+and uses `id` as the sole cursor payload — correct whenever `created_at` values
+are monotonically correlated with `id` (the typical case for auto-increment PKs).
+
+For **universally correct** keyset pagination (e.g. backfilled or imported rows
+where timestamps and ids may diverge), also supply `cursor_key_type`:
 
 ```rust
-async fn cursor_page(&self, req: &CursorRequest) -> AutumnResult<CursorPage<Post>>;
+#[autumn_web::repository(Post, cursor_key = created_at, cursor_key_type = chrono::NaiveDateTime)]
+pub trait PostRepository {}
+```
+
+With `cursor_key_type` the cursor encodes both `(NaiveDateTime, i64)` and the
+WHERE clause becomes the full two-part predicate:
+```sql
+WHERE (created_at < $after_k) OR (created_at = $after_k AND id < $after_id)
 ```
 
 > **Constraint:** `cursor_key` must be declared on a **non-nullable** column.
 > In SQL, comparisons involving `NULL` (`<`, `=`) evaluate to `UNKNOWN`, so
-> a nullable sort key breaks the keyset predicate and silently drops rows.
-> This is true of all keyset pagination, not just Autumn's generated code.
-> If your column is nullable, make it `NOT NULL` or use a custom `cursor_page`
-> implementation that handles `NULL` ordering explicitly.
+> a nullable sort key silently drops rows from all keyset pagination queries.
+> Make the column `NOT NULL` or implement `cursor_page` manually.
 
 ### Calling `cursor_page`
 

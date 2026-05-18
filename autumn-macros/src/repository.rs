@@ -39,6 +39,11 @@ struct RepoConfig {
     policy_type: Option<Ident>,
     scope_type: Option<Ident>,
     cursor_key: Option<String>,
+    /// Rust type of the cursor_key field (e.g. `chrono::NaiveDateTime`).
+    /// When provided the generated `cursor_page` emits a fully-typed two-part
+    /// keyset filter.  When absent it falls back to an id-only cursor which is
+    /// correct whenever cursor_key values are monotonically correlated with id.
+    cursor_key_type: Option<syn::Path>,
 }
 
 fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
@@ -50,6 +55,7 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
     let mut policy_type: Option<Ident> = None;
     let mut scope_type: Option<Ident> = None;
     let mut cursor_key: Option<String> = None;
+    let mut cursor_key_type: Option<syn::Path> = None;
 
     syn::meta::parser(|meta| {
         // `hooks = Ident` must be checked before the catch-all model_name case,
@@ -82,12 +88,16 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
             let value: Ident = meta.value()?.parse()?;
             cursor_key = Some(value.to_string());
             Ok(())
+        } else if meta.path.is_ident("cursor_key_type") {
+            let value: syn::Path = meta.value()?.parse()?;
+            cursor_key_type = Some(value);
+            Ok(())
         } else if meta.path.get_ident().is_some() && model_name.is_none() {
             model_name = Some(meta.path.get_ident().unwrap().clone());
             Ok(())
         } else {
             Err(meta.error(
-                "expected model name, table = \"...\", hooks = Type, commit_hooks = true, api = \"/path\", policy = Type, scope = Type, or cursor_key = field",
+                "expected model name, table = \"...\", hooks = Type, commit_hooks = true, api = \"/path\", policy = Type, scope = Type, cursor_key = field, or cursor_key_type = Type",
             ))
         }
     })
@@ -116,6 +126,7 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
         policy_type,
         scope_type,
         cursor_key,
+        cursor_key_type,
     })
 }
 
@@ -1201,15 +1212,18 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     // `cursor_page` is only generated when the user declares `cursor_key = field`.
     //
-    // Correct keyset pagination requires the cursor to encode ALL sort columns so
-    // the WHERE clause can advance the sort order exactly.  For ORDER BY
-    // (cursor_key DESC, id DESC) the correct predicate is:
+    // Two modes depending on whether `cursor_key_type` is also declared:
     //
-    //   WHERE (cursor_key < after_k) OR (cursor_key = after_k AND id < after_id)
+    // **With `cursor_key_type = Type`** (always correct):
+    //   Cursor payload is `(Type, i64)`.  The WHERE clause advances the
+    //   `(cursor_key DESC, id DESC)` sort order exactly:
+    //     WHERE (cursor_key < after_k) OR (cursor_key = after_k AND id < after_id)
     //
-    // The cursor payload is therefore `(cursor_key_value, id)` — a tuple whose
-    // first element's Rust type is inferred by the compiler from the Diesel
-    // column expression used in the filter below.
+    // **Without `cursor_key_type`** (correct for correlated cursor_key / id):
+    //   Cursor payload is `id` (i64) only.  The filter is `id < after_id`.
+    //   This is correct when cursor_key values are monotonically correlated
+    //   with id (e.g. `created_at` on an auto-increment table).  For
+    //   non-monotonic data (backfills, imports) implement cursor_page manually.
     let (cursor_page_trait_method, cursor_page_impl_method) = if let Some(ref ck) =
         config.cursor_key
     {
@@ -1224,43 +1238,75 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             fn cursor_page(&self, req: &::autumn_web::pagination::CursorRequest)
                 -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<::autumn_web::pagination::CursorPage<#model_name>>> + Send;
         };
-        let impl_method = quote! {
-            async fn cursor_page(
-                &self,
-                req: &::autumn_web::pagination::CursorRequest,
-            ) -> ::autumn_web::AutumnResult<::autumn_web::pagination::CursorPage<#model_name>> {
-                use ::autumn_web::reexports::diesel::prelude::*;
-                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
-                let mut query = #table_ident::table.into_boxed();
-                // Cursor payload is (cursor_key_value, id).  The type of the first
-                // element is inferred by the compiler from its use in the Diesel
-                // filter expressions below.
-                if let ::core::option::Option::Some((after_k, after_id)) =
-                    req.decode::<(_, i64)>()
-                {
-                    query = query.filter(
-                        #table_ident::#cursor_key_ident.lt(after_k.clone()).or(
-                            #table_ident::#cursor_key_ident
-                                .eq(after_k)
-                                .and(#table_ident::id.lt(after_id)),
-                        ),
-                    );
-                }
-                let items: ::std::vec::Vec<#model_name> = query
-                    .order((#table_ident::#cursor_key_ident.desc(), #table_ident::id.desc()))
-                    .limit(req.fetch_limit())
-                    .select(#model_name::as_select())
-                    .load::<#model_name>(&mut conn)
-                    .await
-                    .map_err(::autumn_web::AutumnError::from)?;
-                ::core::result::Result::Ok(
-                    ::autumn_web::pagination::CursorPage::from_overfetched(
-                        items,
-                        req,
-                        |row| (row.#cursor_key_ident.clone(), row.id),
+        let impl_method = if let Some(ref key_type) = config.cursor_key_type {
+            // Full two-part keyset filter — always correct regardless of whether
+            // cursor_key and id are monotonically correlated.
+            quote! {
+                async fn cursor_page(
+                    &self,
+                    req: &::autumn_web::pagination::CursorRequest,
+                ) -> ::autumn_web::AutumnResult<::autumn_web::pagination::CursorPage<#model_name>> {
+                    use ::autumn_web::reexports::diesel::prelude::*;
+                    use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                    let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                    let mut query = #table_ident::table.into_boxed();
+                    if let ::core::option::Option::Some((after_k, after_id)) =
+                        req.decode::<(#key_type, i64)>()
+                    {
+                        query = query.filter(
+                            #table_ident::#cursor_key_ident.lt(after_k.clone()).or(
+                                #table_ident::#cursor_key_ident
+                                    .eq(after_k)
+                                    .and(#table_ident::id.lt(after_id)),
+                            ),
+                        );
+                    }
+                    let items: ::std::vec::Vec<#model_name> = query
+                        .order((#table_ident::#cursor_key_ident.desc(), #table_ident::id.desc()))
+                        .limit(req.fetch_limit())
+                        .select(#model_name::as_select())
+                        .load::<#model_name>(&mut conn)
+                        .await
+                        .map_err(::autumn_web::AutumnError::from)?;
+                    ::core::result::Result::Ok(
+                        ::autumn_web::pagination::CursorPage::from_overfetched(
+                            items,
+                            req,
+                            |row| (row.#cursor_key_ident.clone(), row.id),
+                        )
                     )
-                )
+                }
+            }
+        } else {
+            // id-only cursor — correct when cursor_key and id are monotonically
+            // correlated (the common case for created_at + auto-increment id).
+            quote! {
+                async fn cursor_page(
+                    &self,
+                    req: &::autumn_web::pagination::CursorRequest,
+                ) -> ::autumn_web::AutumnResult<::autumn_web::pagination::CursorPage<#model_name>> {
+                    use ::autumn_web::reexports::diesel::prelude::*;
+                    use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                    let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                    let mut query = #table_ident::table.into_boxed();
+                    if let ::core::option::Option::Some(after_id) = req.decode::<i64>() {
+                        query = query.filter(#table_ident::id.lt(after_id));
+                    }
+                    let items: ::std::vec::Vec<#model_name> = query
+                        .order((#table_ident::#cursor_key_ident.desc(), #table_ident::id.desc()))
+                        .limit(req.fetch_limit())
+                        .select(#model_name::as_select())
+                        .load::<#model_name>(&mut conn)
+                        .await
+                        .map_err(::autumn_web::AutumnError::from)?;
+                    ::core::result::Result::Ok(
+                        ::autumn_web::pagination::CursorPage::from_overfetched(
+                            items,
+                            req,
+                            |row| row.id,
+                        )
+                    )
+                }
             }
         };
         (trait_method, impl_method)
@@ -2651,6 +2697,33 @@ mod tests {
             Some("created_at"),
             "cursor_key attribute must be stored on RepoConfig"
         );
+        assert!(
+            config.cursor_key_type.is_none(),
+            "cursor_key_type must be None when not specified"
+        );
+    }
+
+    #[test]
+    fn parse_repo_args_with_cursor_key_and_type() {
+        let tokens: proc_macro2::TokenStream =
+            "Post, cursor_key = created_at, cursor_key_type = chrono::NaiveDateTime"
+                .parse()
+                .unwrap();
+        let config = parse_repo_args(tokens).unwrap();
+        assert_eq!(config.cursor_key.as_deref(), Some("created_at"));
+        assert!(
+            config.cursor_key_type.is_some(),
+            "cursor_key_type must be parsed when specified"
+        );
+        assert_eq!(
+            config.cursor_key_type.as_ref().map(|p| p
+                .segments
+                .iter()
+                .map(|s| s.ident.to_string())
+                .collect::<Vec<_>>()
+                .join("::")),
+            Some("chrono::NaiveDateTime".to_string()),
+        );
     }
 
     #[test]
@@ -2707,11 +2780,34 @@ mod tests {
             generated.contains("CursorPage <"),
             "cursor_page() must return CursorPage<Model>: {generated}"
         );
-        // The keyset filter must include both sort columns (cursor_key + id),
-        // not just `id < after_id` which is incorrect when cursor_key != id.
+        // Without cursor_key_type the id-only cursor is used (always compiles).
+        assert!(
+            generated.contains("decode :: < i64 >") || generated.contains("decode::<i64>"),
+            "cursor_page() without cursor_key_type must use id-only cursor: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_generates_two_part_filter_when_cursor_key_type_set() {
+        let generated = repository_macro(
+            quote! { Post, cursor_key = created_at, cursor_key_type = chrono::NaiveDateTime },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("fn cursor_page"),
+            "cursor_key + cursor_key_type must generate cursor_page(): {generated}"
+        );
+        // The two-part keyset filter (lt + or + eq + and) must be emitted.
         assert!(
             generated.contains("lt") && generated.contains("eq") && generated.contains("and"),
-            "cursor_page() must use a two-part keyset filter (lt + eq/and): {generated}"
+            "cursor_key_type must cause a two-part keyset filter: {generated}"
+        );
+        // Concrete type — no inference placeholder.
+        assert!(
+            generated.contains("NaiveDateTime"),
+            "cursor_key_type must appear in the decode call: {generated}"
         );
     }
 
