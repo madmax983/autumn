@@ -199,20 +199,30 @@ Scaffold a `fly.toml` alongside the production Dockerfile:
 autumn release init --force --target fly
 ```
 
-This creates `fly.toml` wired to the same `Dockerfile` and `/health` check.
+The generated `fly.toml` includes four first-class integrations:
+
+| Feature | What it does |
+|---|---|
+| `/live` + `/ready` checks | Fly uses `/live` to decide machine restarts; `/ready` to gate traffic routing. Autumn flips `/ready` to 503 at drain start so Fly deregisters before the listener closes. |
+| `kill_timeout = "35s"` | Fly waits 35 s after SIGTERM before SIGKILL — matching `prestop_grace_secs (5) + shutdown_timeout_secs (30)`. |
+| `[metrics]` → `/actuator/metrics` | Fly scrapes Autumn's Prometheus endpoint and surfaces it in the dashboard. No extra agent needed. |
+| `release_command = "autumn migrate"` | Migrations run automatically in a one-shot machine before new app machines start. No manual migrate step required. |
 
 Deploy:
 
 ```bash
 fly launch --no-deploy          # creates the app on fly.io
 fly secrets set AUTUMN_DATABASE__PRIMARY_URL="postgres://user:pass@host:5432/myapp_prod"
-AUTUMN_DATABASE__PRIMARY_URL="postgres://user:pass@host:5432/myapp_prod" autumn migrate
-fly deploy
+fly secrets set AUTUMN_SECURITY__SIGNING_SECRET="$(openssl rand -hex 32)"
+fly deploy                      # runs `autumn migrate` then rolls new machines
 ```
 
-Run the migration step once before `fly deploy`. If you add a read replica,
-configure `AUTUMN_DATABASE__REPLICA_URL` separately and gate readiness until the
-replica has replayed the latest Diesel migration.
+On `fly deploy`, Fly runs `autumn migrate` in a temporary machine first. If the
+migration fails, the deploy stops before any traffic-serving machines are
+replaced — keeping the old version live.
+
+If you add a read replica, set `AUTUMN_DATABASE__REPLICA_URL` as a secret and
+Autumn gates `/ready` until the replica has replayed the latest migration.
 
 ---
 

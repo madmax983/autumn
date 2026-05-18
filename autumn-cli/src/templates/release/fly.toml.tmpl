@@ -4,32 +4,62 @@
 app = "{{project_name}}"
 primary_region = "iad"
 
+# Fly sends SIGKILL when kill_timeout expires.  Set this to at least
+# server.prestop_grace_secs (5) + server.shutdown_timeout_secs (30)
+# so the process has time to drain in-flight requests before SIGKILL arrives.
+kill_signal  = "SIGTERM"
+kill_timeout = "35s"
+
 [build]
   dockerfile = "Dockerfile"
 
+[deploy]
+  # Runs `autumn migrate` in a one-shot machine before new app machines start.
+  # Remove this line if your app does not use a database.
+  release_command = "autumn migrate"
+
 [http_service]
-  internal_port = 3000
-  force_https = true
-  auto_stop_machines = true
-  auto_start_machines = true
+  internal_port        = 3000
+  force_https          = true
+  auto_stop_machines   = true
+  auto_start_machines  = true
   min_machines_running = 0
 
   [http_service.concurrency]
-    type = "connections"
+    type       = "connections"
     hard_limit = 25
     soft_limit = 20
 
 [[vm]]
-  memory = "1gb"
+  memory   = "1gb"
   cpu_kind = "shared"
-  cpus = 1
+  cpus     = 1
+
+# Fly scrapes this Prometheus endpoint and surfaces it in the dashboard.
+[metrics]
+  port = 3000
+  path = "/actuator/metrics"
 
 [checks]
-  [checks.health]
-    port = 3000
-    type = "http"
-    interval = "15s"
-    timeout = "2s"
+  # Liveness: restart the machine if the process is deadlocked or broken.
+  # /live never fails due to a missing dependency (use /ready for that).
+  [checks.live]
+    port         = 3000
+    type         = "http"
+    interval     = "15s"
+    timeout      = "2s"
     grace_period = "5s"
-    method = "get"
-    path = "/health"
+    method       = "get"
+    path         = "/live"
+
+  # Readiness: Fly stops routing traffic to this machine when /ready returns
+  # non-200.  Autumn flips /ready to 503 at the start of graceful shutdown
+  # so the load balancer deregisters before the TCP listener closes.
+  [checks.ready]
+    port         = 3000
+    type         = "http"
+    interval     = "5s"
+    timeout      = "2s"
+    grace_period = "5s"
+    method       = "get"
+    path         = "/ready"
