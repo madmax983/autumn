@@ -2775,4 +2775,176 @@ mod tests {
             },
         );
     }
+
+    // --- Static file serving (SSG/ISG) tests ---
+
+    fn create_static_dist(revalidate: Option<u64>) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dist = dir.path().join("dist");
+        std::fs::create_dir_all(dist.join("about")).expect("mkdir about");
+        std::fs::write(dist.join("index.html"), b"<h1>Home</h1>").expect("write index");
+        std::fs::write(dist.join("about/index.html"), b"<h1>About</h1>").expect("write about");
+
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            "/".to_owned(),
+            crate::static_gen::ManifestEntry {
+                file: "index.html".to_owned(),
+                revalidate: None,
+            },
+        );
+        routes.insert(
+            "/about".to_owned(),
+            crate::static_gen::ManifestEntry {
+                file: "about/index.html".to_owned(),
+                revalidate,
+            },
+        );
+
+        let manifest = crate::static_gen::StaticManifest {
+            generated_at: "2026-05-18T00:00:00Z".to_owned(),
+            autumn_version: "0.4.0".to_owned(),
+            routes,
+        };
+        let json = serde_json::to_string(&manifest).expect("serialize manifest");
+        std::fs::write(dist.join("manifest.json"), json).expect("write manifest");
+        dir
+    }
+
+    #[tokio::test]
+    async fn static_serving_serves_get_request_inside_user_layers() {
+        let tmp = create_static_dist(None);
+        let dist = tmp.path().join("dist");
+        let config = AutumnConfig::default();
+
+        let router = try_build_router_with_static(Vec::new(), &config, test_state(), Some(&dist))
+            .expect("router builds");
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/about")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), b"<h1>About</h1>");
+    }
+
+    #[tokio::test]
+    async fn static_serving_serves_head_request() {
+        let tmp = create_static_dist(None);
+        let dist = tmp.path().join("dist");
+        let config = AutumnConfig::default();
+
+        let router = try_build_router_with_static(Vec::new(), &config, test_state(), Some(&dist))
+            .expect("router builds");
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("HEAD")
+                    .uri("/about")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(body.is_empty(), "HEAD response body should be empty");
+    }
+
+    #[tokio::test]
+    async fn static_serving_normalizes_trailing_slash() {
+        let tmp = create_static_dist(None);
+        let dist = tmp.path().join("dist");
+        let config = AutumnConfig::default();
+
+        let router = try_build_router_with_static(Vec::new(), &config, test_state(), Some(&dist))
+            .expect("router builds");
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/about/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn static_serving_falls_through_for_unknown_route() {
+        let tmp = create_static_dist(None);
+        let dist = tmp.path().join("dist");
+        let config = AutumnConfig::default();
+
+        let router = try_build_router_with_static(Vec::new(), &config, test_state(), Some(&dist))
+            .expect("router builds");
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/not-in-manifest")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn static_serving_skipped_when_no_manifest() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dist = tmp.path().join("dist");
+        std::fs::create_dir_all(&dist).expect("mkdir dist");
+        let config = AutumnConfig::default();
+
+        let router = try_build_router_with_static(Vec::new(), &config, test_state(), Some(&dist))
+            .expect("router builds even without manifest");
+
+        let response = router
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn static_serving_with_isr_manifest_builds_successfully() {
+        let tmp = create_static_dist(Some(3600));
+        let dist = tmp.path().join("dist");
+        let config = AutumnConfig::default();
+
+        let router = try_build_router_with_static(Vec::new(), &config, test_state(), Some(&dist))
+            .expect("router with ISR manifest should build");
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/about")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
 }
