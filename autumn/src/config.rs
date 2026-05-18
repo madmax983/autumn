@@ -40,6 +40,7 @@
 //! | `AUTUMN_SERVER__PORT` | `server.port` | `u16` |
 //! | `AUTUMN_SERVER__HOST` | `server.host` | `String` |
 //! | `AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS` | `server.shutdown_timeout_secs` | `u64` |
+//! | `AUTUMN_SERVER__PRESTOP_GRACE_SECS` | `server.prestop_grace_secs` | `u64` |
 //! | `AUTUMN_DATABASE__URL` | `database.url` | `String` |
 //! | `AUTUMN_DATABASE__PRIMARY_URL` | `database.primary_url` | `String` |
 //! | `AUTUMN_DATABASE__REPLICA_URL` | `database.replica_url` | `String` |
@@ -1389,6 +1390,7 @@ impl AutumnConfig {
     /// - `AUTUMN_SERVER__PORT` → `server.port` (u16)
     /// - `AUTUMN_SERVER__HOST` → `server.host` (String)
     /// - `AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS` → `server.shutdown_timeout_secs` (u64)
+    /// - `AUTUMN_SERVER__PRESTOP_GRACE_SECS` → `server.prestop_grace_secs` (u64)
     ///
     /// # Database
     /// - `AUTUMN_DATABASE__PRIMARY_URL` -> `database.primary_url` (String)
@@ -1510,6 +1512,11 @@ impl AutumnConfig {
             env,
             "AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS",
             &mut self.server.shutdown_timeout_secs,
+        );
+        parse_env(
+            env,
+            "AUTUMN_SERVER__PRESTOP_GRACE_SECS",
+            &mut self.server.prestop_grace_secs,
         );
     }
 
@@ -2170,6 +2177,17 @@ pub struct ServerConfig {
     /// requests to complete before forcibly terminating.
     #[serde(default = "default_shutdown_timeout")]
     pub shutdown_timeout_secs: u64,
+
+    /// Seconds between `/ready` returning 503 and the TCP listener
+    /// closing to new connections. Default: `5`.
+    ///
+    /// This gap gives upstream load balancers time to deregister the
+    /// replica before it stops accepting new connections, preventing
+    /// connection resets on in-flight requests from the LB tier.
+    /// Must be tuned to match the LB's health-check interval + deregistration
+    /// propagation time. Set to `0` to disable the grace period.
+    #[serde(default = "default_prestop_grace")]
+    pub prestop_grace_secs: u64,
 }
 
 /// Behavior when a configured read replica is unavailable or stale.
@@ -2732,6 +2750,10 @@ const fn default_shutdown_timeout() -> u64 {
     30
 }
 
+const fn default_prestop_grace() -> u64 {
+    5
+}
+
 const fn default_pool_size() -> usize {
     10
 }
@@ -2780,6 +2802,7 @@ impl Default for ServerConfig {
             port: default_port(),
             host: default_host(),
             shutdown_timeout_secs: default_shutdown_timeout(),
+            prestop_grace_secs: default_prestop_grace(),
         }
     }
 }
