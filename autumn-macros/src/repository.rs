@@ -562,6 +562,13 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     )
                     .await;
                     __autumn_pending_heartbeat.cancel();
+                    if self.idempotency.is_some() {
+                        return ::core::result::Result::Err(
+                            ::autumn_web::idempotency::__cache_committed_error_response(
+                                ::autumn_web::AutumnError::internal_server_error_msg("after_create panicked")
+                            )
+                        );
+                    }
                     ::std::panic::resume_unwind(__autumn_panic);
                 }
             }
@@ -767,6 +774,13 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     )
                     .await;
                     __autumn_pending_heartbeat.cancel();
+                    if self.idempotency.is_some() {
+                        return ::core::result::Result::Err(
+                            ::autumn_web::idempotency::__cache_committed_error_response(
+                                ::autumn_web::AutumnError::internal_server_error_msg("after_update panicked")
+                            )
+                        );
+                    }
                     ::std::panic::resume_unwind(__autumn_panic);
                 }
             }
@@ -2399,8 +2413,10 @@ mod tests {
             .expect("after_create path should cancel the pending heartbeat");
         assert!(
             generated.contains("catch_repository_after_hook_unwind")
-                && generated.contains(":: std :: panic :: resume_unwind"),
-            "after_create panics must be caught long enough to discard staged commit hooks before unwinding: {generated}"
+                && generated.contains(":: std :: panic :: resume_unwind")
+                && generated.contains("after_create panicked")
+                && generated.contains("__cache_committed_error_response"),
+            "idempotent after_create panics must cache a committed error while non-idempotent calls still unwind: {generated}"
         );
         assert!(
             create_failure_mark < create_cancel,
@@ -2450,6 +2466,12 @@ mod tests {
         assert!(
             update_failure_mark < update_cancel,
             "after_update failure must mark the staged row before canceling its heartbeat: {generated}"
+        );
+        assert!(
+            generated.contains("after_update panicked")
+                && generated.contains("__cache_committed_error_response")
+                && generated.contains(":: std :: panic :: resume_unwind"),
+            "idempotent after_update panics must cache a committed error while non-idempotent calls still unwind: {generated}"
         );
     }
 

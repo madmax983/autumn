@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use autumn_web::idempotency::{
     IdempotencyCacheCommittedErrorResponse, IdempotencyLayer, IdempotencyReplayLayer,
-    IdempotencyScope, IdempotencyStore, IdempotencyStoreError, MemoryIdempotencyStore,
+    IdempotencyStore, IdempotencyStoreError, MemoryIdempotencyStore,
 };
 use autumn_web::session::{
     MemoryStore, Session, SessionConfig, SessionLayer, SessionStore, SessionStoreError,
@@ -101,7 +101,6 @@ fn storage_key(method: &str, path: &str, auth: &str, idempotency_key: &str) -> S
     push_component(&mut storage, "method", method.as_bytes());
     push_component(&mut storage, "target", path.as_bytes());
     push_component(&mut storage, "scope-header-count", b"0");
-    push_component(&mut storage, "scope-extension-count", b"0");
     push_component(&mut storage, "principal", principal.as_bytes());
     push_component(&mut storage, "idempotency-key", idempotency_key.as_bytes());
     format!(
@@ -2414,7 +2413,7 @@ async fn test_tenant_scope_headers_same_key_are_independent() {
 }
 
 #[tokio::test]
-async fn test_tenant_scope_extension_same_key_is_independent() {
+async fn test_route_local_tenant_header_scope_same_key_is_independent() {
     use tower::ServiceExt;
 
     async fn tenant_scope(
@@ -2427,8 +2426,6 @@ async fn test_tenant_scope_extension_same_key_is_independent() {
             .and_then(|value| value.to_str().ok())
             .unwrap_or("missing")
             .to_owned();
-        req.extensions_mut()
-            .insert(IdempotencyScope::new().with("tenant", tenant.as_bytes()));
         req.extensions_mut().insert(tenant);
         next.run(req).await
     }
@@ -2448,7 +2445,7 @@ async fn test_tenant_scope_extension_same_key_is_independent() {
     let req_a = axum::http::Request::builder()
         .method("POST")
         .uri("/tenant-extension-action")
-        .header("idempotency-key", "shared-tenant-extension-key")
+        .header("idempotency-key", "shared-tenant-header-key")
         .header("customer-scope", "tenant-a")
         .body(axum::body::Body::from("same"))
         .unwrap();
@@ -2462,7 +2459,7 @@ async fn test_tenant_scope_extension_same_key_is_independent() {
     let req_b = axum::http::Request::builder()
         .method("POST")
         .uri("/tenant-extension-action")
-        .header("idempotency-key", "shared-tenant-extension-key")
+        .header("idempotency-key", "shared-tenant-header-key")
         .header("customer-scope", "tenant-b")
         .body(axum::body::Body::from("same"))
         .unwrap();
@@ -2470,7 +2467,7 @@ async fn test_tenant_scope_extension_same_key_is_independent() {
     assert_eq!(resp_b.status(), StatusCode::OK);
     assert!(
         resp_b.headers().get("x-idempotent-replayed").is_none(),
-        "idempotency scope extensions must partition cache entries"
+        "route-local tenant headers must partition cache entries before tenant middleware returns replay"
     );
     let body_b = axum::body::to_bytes(resp_b.into_body(), usize::MAX)
         .await

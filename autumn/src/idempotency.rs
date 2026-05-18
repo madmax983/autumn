@@ -98,7 +98,6 @@ struct StorageKeyContext {
     target: String,
     authorization: Option<String>,
     scope_headers: Vec<(String, Vec<u8>)>,
-    scope_extensions: Vec<(String, Vec<u8>)>,
 }
 
 impl StorageKeyContext {
@@ -120,7 +119,6 @@ impl StorageKeyContext {
             target,
             authorization,
             scope_headers: storage_scope_headers(&parts.headers),
-            scope_extensions: storage_scope_extensions(&parts.extensions),
         }
     }
 
@@ -132,7 +130,6 @@ impl StorageKeyContext {
             self.authorization.as_deref(),
             session_id,
             &self.scope_headers,
-            &self.scope_extensions,
         )
     }
 }
@@ -144,7 +141,6 @@ fn build_storage_key(
     auth: Option<&str>,
     session_id: Option<&str>,
     scope_headers: &[(String, Vec<u8>)],
-    scope_extensions: &[(String, Vec<u8>)],
 ) -> String {
     let principal = principal_scope_digest(auth, session_id);
     let mut hasher = sha2::Sha256::new();
@@ -158,15 +154,6 @@ fn build_storage_key(
     for (name, value) in scope_headers {
         push_storage_key_component(&mut hasher, "scope-header-name", name.as_bytes());
         push_storage_key_component(&mut hasher, "scope-header-value", value);
-    }
-    push_storage_key_component(
-        &mut hasher,
-        "scope-extension-count",
-        scope_extensions.len().to_string().as_bytes(),
-    );
-    for (name, value) in scope_extensions {
-        push_storage_key_component(&mut hasher, "scope-extension-name", name.as_bytes());
-        push_storage_key_component(&mut hasher, "scope-extension-value", value);
     }
     push_storage_key_component(&mut hasher, "principal", principal.as_bytes());
     push_storage_key_component(&mut hasher, "idempotency-key", idempotency_key.as_bytes());
@@ -192,7 +179,14 @@ fn is_storage_scope_header(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
     matches!(
         name.as_str(),
-        "host" | "x-forwarded-host" | "tenant" | "workspace" | "account" | "organization" | "org"
+        "host"
+            | "x-forwarded-host"
+            | "tenant"
+            | "customer-scope"
+            | "workspace"
+            | "account"
+            | "organization"
+            | "org"
     ) || (name.starts_with("x-")
         && !matches!(
             name.as_str(),
@@ -204,12 +198,6 @@ fn is_storage_scope_header(name: &str) -> bool {
                 | "x-real-ip"
         )
         && !name.starts_with("x-b3-"))
-}
-
-fn storage_scope_extensions(extensions: &axum::http::Extensions) -> Vec<(String, Vec<u8>)> {
-    extensions
-        .get::<IdempotencyScope>()
-        .map_or_else(Vec::new, IdempotencyScope::sorted_components)
 }
 
 async fn storage_session_id_for_parts(parts: &axum::http::request::Parts) -> Option<String> {
@@ -273,45 +261,6 @@ pub struct IdempotencyRecord {
     pub headers: Vec<(String, Vec<u8>)>,
     pub body: Vec<u8>,
     pub metadata: Vec<(String, Vec<u8>)>,
-}
-
-/// Additional request scope that should partition idempotency storage.
-///
-/// Middleware that resolves tenant/workspace/account identity before the
-/// idempotency layer runs can insert this extension so two logical scopes do
-/// not share the same `Idempotency-Key` cache entry.
-#[derive(Clone, Debug, Default)]
-pub struct IdempotencyScope {
-    components: Vec<(String, Vec<u8>)>,
-}
-
-impl IdempotencyScope {
-    #[must_use]
-    pub const fn new() -> Self {
-        Self {
-            components: Vec::new(),
-        }
-    }
-
-    pub fn push(&mut self, name: impl Into<String>, value: impl AsRef<[u8]>) {
-        self.components.push((name.into(), value.as_ref().to_vec()));
-    }
-
-    #[must_use]
-    pub fn with(mut self, name: impl Into<String>, value: impl AsRef<[u8]>) -> Self {
-        self.push(name, value);
-        self
-    }
-
-    fn sorted_components(&self) -> Vec<(String, Vec<u8>)> {
-        let mut components = self
-            .components
-            .iter()
-            .map(|(name, value)| (name.to_ascii_lowercase(), value.clone()))
-            .collect::<Vec<_>>();
-        components.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
-        components
-    }
 }
 
 #[doc(hidden)]
@@ -1851,7 +1800,6 @@ mod tests {
         push_storage_key_component(&mut hasher, "method", method.as_bytes());
         push_storage_key_component(&mut hasher, "target", path.as_bytes());
         push_storage_key_component(&mut hasher, "scope-header-count", b"0");
-        push_storage_key_component(&mut hasher, "scope-extension-count", b"0");
         push_storage_key_component(&mut hasher, "principal", principal.as_bytes());
         push_storage_key_component(&mut hasher, "idempotency-key", idempotency_key.as_bytes());
         format!("v2:{}", hex_lower(hasher.finalize()))
