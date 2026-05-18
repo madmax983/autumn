@@ -33,6 +33,18 @@ kill_timeout = 45
     hard_limit = 25
     soft_limit = 20
 
+  # Readiness: the Fly proxy uses service-level checks to gate traffic routing.
+  # Top-level [checks] affect machine lifecycle (restarts) but NOT proxy routing.
+  # /ready must be here so the proxy stops sending traffic when Autumn flips
+  # /ready to 503 during the prestop grace window.
+  [[http_service.checks]]
+    grace_period = "5s"
+    interval     = "5s"
+    method       = "GET"
+    path         = "/ready"
+    timeout      = "2s"
+    type         = "http"
+
 [[vm]]
   memory   = "1gb"
   cpu_kind = "shared"
@@ -46,7 +58,8 @@ kill_timeout = 45
 
 [checks]
   # Liveness: restart the machine if the process is deadlocked or broken.
-  # /live never fails due to a missing dependency (use /ready for that).
+  # /live never fails due to a missing dependency.  Use [[http_service.checks]]
+  # above (not this section) to control proxy traffic routing via /ready.
   [checks.live]
     port         = 3000
     type         = "http"
@@ -55,15 +68,3 @@ kill_timeout = 45
     grace_period = "5s"
     method       = "get"
     path         = "/live"
-
-  # Readiness: Fly stops routing traffic to this machine when /ready returns
-  # non-200.  Autumn flips /ready to 503 at the start of graceful shutdown
-  # so the load balancer deregisters before the TCP listener closes.
-  [checks.ready]
-    port         = 3000
-    type         = "http"
-    interval     = "5s"
-    timeout      = "2s"
-    grace_period = "5s"
-    method       = "get"
-    path         = "/ready"

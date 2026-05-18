@@ -1808,11 +1808,16 @@ impl AppBuilder {
         let drain_started_clone = std::sync::Arc::clone(&drain_started_at);
 
         // Notified by main just before server_task.await (after startup hooks
-        // complete). If SIGTERM arrives during startup hooks the watchdog suspends
-        // here rather than returning — it re-enforces the full drain deadline once
-        // startup completes, so the drain deadline is never permanently lost.
+        // complete). If SIGTERM arrives during startup hooks the watchdog waits
+        // here so the drain deadline is always measured from when drain starts.
         let drain_phase_notify = std::sync::Arc::new(tokio::sync::Notify::new());
         let drain_phase_notify_for_watchdog = std::sync::Arc::clone(&drain_phase_notify);
+
+        // Set by main after server_task.await returns (drain complete). Guards
+        // against the boundary race where server_task finishes at exactly the
+        // watchdog deadline before main has called shutdown_task.abort().
+        let server_drained = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server_drained_for_watchdog = std::sync::Arc::clone(&server_drained);
         // Boolean companion so the watchdog can skip the wait when SIGTERM arrives
         // after startup has already finished (the common case).
         let server_entered_drain = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1865,28 +1870,35 @@ impl AppBuilder {
 
             // Phase 6: drain watchdog — if in-flight drain exceeds the budget,
             // record aborted count and force non-zero exit before hooks run.
-            tokio::time::sleep(std::time::Duration::from_secs(shutdown_timeout)).await;
+            //
+            // Always measure the deadline from when drain actually starts so that
+            // in-flight requests always get the full shutdown_timeout_secs window:
+            //
+            //   Normal (SIGTERM after startup): server_entered_drain is already
+            //   true, skip the wait, sleep the full budget.
+            //
+            //   Startup-overlap (SIGTERM during hooks): wait for notify, then
+            //   sleep the full budget. Without this, hooks completing just before
+            //   the watchdog fires would let it exit(1) immediately with no fresh
+            //   drain window for requests that arrived after hooks completed.
             if !server_entered_drain_for_watchdog.load(std::sync::atomic::Ordering::Acquire) {
-                // SIGTERM arrived before startup hooks finished. The server was
-                // not yet in the drain phase, so we must not exit(1) now — that
-                // would be a false positive with 0 aborted requests.
-                //
-                // Instead, wait until main signals that drain has started (i.e.
-                // startup hooks completed), then re-enforce the full drain
-                // deadline from that point. This ensures the drain timeout is
-                // never permanently lost even when shutdown overlaps startup.
-                //
-                // If startup hooks are stuck indefinitely the orchestrator's
-                // hard kill (Fly kill_timeout / K8s terminationGracePeriodSeconds)
-                // provides the final backstop.
                 tracing::warn!(
                     phase = "signal_during_startup",
-                    "shutdown: graceful-shutdown deadline reached before drain phase; \
-                     waiting for startup to complete before re-enforcing drain deadline"
+                    "shutdown: SIGTERM during startup hooks; waiting for drain phase \
+                     to begin before enforcing the drain deadline"
                 );
+                // Suspend until main fires notify_one() at drain start.
+                // Orchestrator hard-kill backstop: if hooks never complete, the
+                // orchestrator's kill_timeout / terminationGracePeriodSeconds kills us.
                 drain_phase_notify_for_watchdog.notified().await;
-                // Startup completed; re-apply the full drain deadline.
-                tokio::time::sleep(std::time::Duration::from_secs(shutdown_timeout)).await;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(shutdown_timeout)).await;
+            // Guard against the boundary race where server_task completes at
+            // exactly the deadline before main has called shutdown_task.abort().
+            // If server_drained is set the drain finished cleanly; return and let
+            // main complete the cleanup path.
+            if server_drained_for_watchdog.load(std::sync::atomic::Ordering::Acquire) {
+                return;
             }
             let aborted = shutdown_metrics.snapshot().http.requests_active;
             shutdown_metrics.record_shutdown_aborted(aborted);
@@ -1937,7 +1949,11 @@ impl AppBuilder {
             tracing::error!("Server task join error: {e}");
             std::process::exit(1);
         });
-        // Drain completed within the deadline — cancel the watchdog.
+        // Drain completed within the deadline. Signal the watchdog before
+        // aborting it so the boundary race (server_task and watchdog both
+        // become runnable at the deadline) resolves cleanly without a spurious
+        // exit(1).
+        server_drained.store(true, std::sync::atomic::Ordering::Release);
         shutdown_task.abort();
         server_result.unwrap_or_else(|e| {
             tracing::error!("Server error: {e}");
