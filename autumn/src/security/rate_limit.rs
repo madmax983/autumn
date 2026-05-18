@@ -1293,3 +1293,65 @@ mod tests {
         assert!(matches!(limiter.backend, BucketBackend::Memory(_)));
     }
 }
+
+#[cfg(test)]
+mod sentinel_tests_more {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn memory_store_retry_after_calculation() {
+        let store = MemoryStore::new();
+        let now = Instant::now();
+
+        assert!(matches!(
+            store.decide("test", now, 1.0, 0.1),
+            Decision::Allowed { .. }
+        ));
+
+        let decision = store.decide("test", now, 1.0, 0.1);
+        match decision {
+            Decision::Denied { retry_after_secs } => {
+                assert_eq!(retry_after_secs, 10);
+            }
+            Decision::Allowed { .. } => panic!("Expected Denied"),
+        }
+
+        let now5 = now + Duration::from_secs(5);
+        let decision5 = store.decide("test", now5, 1.0, 0.1);
+        match decision5 {
+            Decision::Denied { retry_after_secs } => {
+                assert_eq!(retry_after_secs, 5);
+            }
+            Decision::Allowed { .. } => panic!("Expected Denied, got {decision5:?}"),
+        }
+    }
+
+    #[test]
+    fn memory_store_retry_after_calculation_with_partial_tokens() {
+        let store = MemoryStore::new();
+        let now = Instant::now();
+
+        assert!(matches!(
+            store.decide("test_partial", now, 1.0, 0.1),
+            Decision::Allowed { .. }
+        ));
+
+        let decision = store.decide("test_partial", now, 1.0, 0.1);
+        match decision {
+            Decision::Denied { retry_after_secs } => {
+                assert_eq!(retry_after_secs, 10);
+            }
+            Decision::Allowed { .. } => panic!("Expected Denied"),
+        }
+
+        let now3 = now + Duration::from_secs(3);
+        let decision3 = store.decide("test_partial", now3, 1.0, 0.1);
+        match decision3 {
+            Decision::Denied { retry_after_secs } => {
+                assert_eq!(retry_after_secs, 7);
+            }
+            Decision::Allowed { .. } => panic!("Expected Denied"),
+        }
+    }
+}
