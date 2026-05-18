@@ -38,6 +38,7 @@ struct RepoConfig {
     api_path: Option<String>,
     policy_type: Option<Ident>,
     scope_type: Option<Ident>,
+    cursor_key: Option<String>,
 }
 
 fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
@@ -48,6 +49,7 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
     let mut api_path: Option<String> = None;
     let mut policy_type: Option<Ident> = None;
     let mut scope_type: Option<Ident> = None;
+    let mut cursor_key: Option<String> = None;
 
     syn::meta::parser(|meta| {
         // `hooks = Ident` must be checked before the catch-all model_name case,
@@ -76,12 +78,16 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
             let value: Ident = meta.value()?.parse()?;
             scope_type = Some(value);
             Ok(())
+        } else if meta.path.is_ident("cursor_key") {
+            let value: Ident = meta.value()?.parse()?;
+            cursor_key = Some(value.to_string());
+            Ok(())
         } else if meta.path.get_ident().is_some() && model_name.is_none() {
             model_name = Some(meta.path.get_ident().unwrap().clone());
             Ok(())
         } else {
             Err(meta.error(
-                "expected model name, table = \"...\", hooks = Type, commit_hooks = true, api = \"/path\", policy = Type, or scope = Type",
+                "expected model name, table = \"...\", hooks = Type, commit_hooks = true, api = \"/path\", policy = Type, scope = Type, or cursor_key = field",
             ))
         }
     })
@@ -109,6 +115,7 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
         api_path,
         policy_type,
         scope_type,
+        cursor_key,
     })
 }
 
@@ -1148,6 +1155,100 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {}
     };
 
+    // ── Pagination methods (`page` always; `cursor_page` when cursor_key is declared) ──
+    //
+    // `page` executes a COUNT(*) + a LIMIT/OFFSET query and wraps the result in
+    // `Page<Model>`. `cursor_page` uses keyset pagination on the primary key `id`
+    // (always i64 per the Autumn PK convention) so the cursor is stable and
+    // requires no knowledge of the model's field types.  When `cursor_key = field`
+    // is declared, the query also orders by that field (descending) as a secondary
+    // sort key; the cursor payload remains the last-seen `id` so that filtering
+    // is always correct.
+    let pagination_trait_method = quote! {
+        /// Fetch one page of records using offset pagination.
+        ///
+        /// Accepts a [`::autumn_web::pagination::PageRequest`] extractor value
+        /// and returns a [`::autumn_web::pagination::Page`] containing the items
+        /// together with total-elements / total-pages metadata.
+        fn page(&self, req: &::autumn_web::pagination::PageRequest)
+            -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<::autumn_web::pagination::Page<#model_name>>> + Send;
+    };
+
+    let pagination_impl_method = quote! {
+        async fn page(
+            &self,
+            req: &::autumn_web::pagination::PageRequest,
+        ) -> ::autumn_web::AutumnResult<::autumn_web::pagination::Page<#model_name>> {
+            use ::autumn_web::reexports::diesel::prelude::*;
+            use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+            let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+            let total: i64 = #table_ident::table
+                .count()
+                .get_result::<i64>(&mut conn)
+                .await
+                .map_err(::autumn_web::AutumnError::from)?;
+            let items: ::std::vec::Vec<#model_name> = #table_ident::table
+                .limit(req.limit())
+                .offset(req.offset())
+                .select(#model_name::as_select())
+                .load::<#model_name>(&mut conn)
+                .await
+                .map_err(::autumn_web::AutumnError::from)?;
+            ::core::result::Result::Ok(::autumn_web::pagination::Page::new(items, total, req))
+        }
+    };
+
+    // `cursor_page` is only generated when the user declares `cursor_key = field`.
+    // The cursor payload is the last-seen `id` (i64), making the filter always
+    // type-correct.  The `cursor_key` field is used as the primary sort column
+    // (DESC) with `id` as the tie-breaker.
+    let (cursor_page_trait_method, cursor_page_impl_method) =
+        if let Some(ref ck) = config.cursor_key {
+            let cursor_key_ident = format_ident!("{ck}");
+            let trait_method = quote! {
+                /// Fetch one page of records using keyset (cursor) pagination.
+                ///
+                /// The cursor token is opaque — encode / decode it via
+                /// [`::autumn_web::pagination::CursorRequest`].  The result is a
+                /// [`::autumn_web::pagination::CursorPage`] containing a
+                /// `next_cursor` token for the following page.
+                fn cursor_page(&self, req: &::autumn_web::pagination::CursorRequest)
+                    -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<::autumn_web::pagination::CursorPage<#model_name>>> + Send;
+            };
+            let impl_method = quote! {
+                async fn cursor_page(
+                    &self,
+                    req: &::autumn_web::pagination::CursorRequest,
+                ) -> ::autumn_web::AutumnResult<::autumn_web::pagination::CursorPage<#model_name>> {
+                    use ::autumn_web::reexports::diesel::prelude::*;
+                    use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                    let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                    let mut query = #table_ident::table.into_boxed();
+                    // The cursor payload is the last-seen row `id` (i64).
+                    if let ::core::option::Option::Some(after_id) = req.decode::<i64>() {
+                        query = query.filter(#table_ident::id.lt(after_id));
+                    }
+                    let items: ::std::vec::Vec<#model_name> = query
+                        .order((#table_ident::#cursor_key_ident.desc(), #table_ident::id.desc()))
+                        .limit(req.fetch_limit())
+                        .select(#model_name::as_select())
+                        .load::<#model_name>(&mut conn)
+                        .await
+                        .map_err(::autumn_web::AutumnError::from)?;
+                    ::core::result::Result::Ok(
+                        ::autumn_web::pagination::CursorPage::from_overfetched(
+                            items,
+                            req,
+                            |row| row.id,
+                        )
+                    )
+                }
+            };
+            (trait_method, impl_method)
+        } else {
+            (quote! {}, quote! {})
+        };
+
     // ── Build API handlers (when `api = "/path"` is present) ────────────
     let api_handlers = if let Some(ref api_path) = config.api_path {
         let prefix = to_snake_case(&model_name.to_string());
@@ -1947,6 +2048,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             fn delete_by_id(&self, id: i64) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<()>> + Send;
             fn count(&self) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<i64>> + Send;
             fn exists_by_id(&self, id: i64) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<bool>> + Send;
+            #pagination_trait_method
+            #cursor_page_trait_method
             #(#derived_trait_methods)*
         }
 
@@ -2030,6 +2133,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 .map_err(::autumn_web::AutumnError::from)
             }
 
+            #pagination_impl_method
+            #cursor_page_impl_method
             #(#derived_impl_methods)*
         }
 
@@ -2513,5 +2618,89 @@ mod tests {
     #[test]
     fn snake_case_already_lower() {
         assert_eq!(to_snake_case("widget"), "widget");
+    }
+
+    // ── Pagination method generation (issue #681) ──────────────────
+
+    #[test]
+    fn parse_repo_args_with_cursor_key() {
+        let tokens: proc_macro2::TokenStream =
+            "Post, cursor_key = created_at".parse().unwrap();
+        let config = parse_repo_args(tokens).unwrap();
+        assert_eq!(config.model_name.to_string(), "Post");
+        assert_eq!(
+            config.cursor_key.as_deref(),
+            Some("created_at"),
+            "cursor_key attribute must be stored on RepoConfig"
+        );
+    }
+
+    #[test]
+    fn parse_repo_args_cursor_key_combined_with_api() {
+        let tokens: proc_macro2::TokenStream =
+            r#"Post, api = "/api/posts", cursor_key = created_at"#
+                .parse()
+                .unwrap();
+        let config = parse_repo_args(tokens).unwrap();
+        assert_eq!(config.api_path.as_deref(), Some("/api/posts"));
+        assert_eq!(config.cursor_key.as_deref(), Some("created_at"));
+    }
+
+    #[test]
+    fn repository_macro_generates_page_method_in_trait_and_impl() {
+        let generated = repository_macro(
+            quote! { Post },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("fn page"),
+            "repository macro must generate a page() method in the trait: {generated}"
+        );
+        assert!(
+            generated.contains("PageRequest"),
+            "page() method must accept a PageRequest parameter: {generated}"
+        );
+        assert!(
+            generated.contains("Page <"),
+            "page() method must return Page<Model> in the trait: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_generates_cursor_page_when_cursor_key_set() {
+        let generated = repository_macro(
+            quote! { Post, cursor_key = created_at },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("fn cursor_page"),
+            "cursor_key attribute must cause cursor_page() to be generated: {generated}"
+        );
+        assert!(
+            generated.contains("CursorRequest"),
+            "cursor_page() must accept a CursorRequest parameter: {generated}"
+        );
+        assert!(
+            generated.contains("CursorPage <"),
+            "cursor_page() must return CursorPage<Model>: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_does_not_generate_cursor_page_without_cursor_key() {
+        let generated = repository_macro(
+            quote! { Post },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        assert!(
+            !generated.contains("cursor_page"),
+            "cursor_page() must only be generated when cursor_key is declared: {generated}"
+        );
     }
 }
