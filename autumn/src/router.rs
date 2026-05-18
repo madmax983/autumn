@@ -1389,7 +1389,11 @@ pub fn try_build_router_with_static_inner(
     }
 
     let app_router = try_build_router_inner(route_list, config, state, ctx)?;
-    Ok(apply_startup_barrier(app_router, config, &startup_barrier_state))
+    Ok(apply_startup_barrier(
+        app_router,
+        config,
+        &startup_barrier_state,
+    ))
 }
 
 #[derive(Clone)]
