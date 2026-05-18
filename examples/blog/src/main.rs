@@ -41,6 +41,7 @@ async fn main() {
             routes::api::list_json,
             routes::api::create_json,
             routes::api::enqueue_publish_webhook,
+            routes::api::credentials_status,
         ])
         .jobs(jobs![routes::api::publish_webhook])
         .one_off_tasks(one_off_tasks![tasks::cleanup_posts])

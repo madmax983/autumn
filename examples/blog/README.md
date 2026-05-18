@@ -5,6 +5,9 @@ htmx, embedded migrations, and the new hybrid-rendering pipeline.
 
 ## What it demonstrates
 
+- **Encrypted credentials** — `config/credentials/development.toml.enc` is
+  committed to the repo; the master key (`config/master.key`) is excluded by
+  `.gitignore`. Visit `/api/credentials-status` after setting the key.
 - Public blog listing and slug-based post pages
 - Admin UI for create, edit, publish, and delete
 - First-party `autumn-admin-plugin` mounted at `/backoffice`
@@ -41,6 +44,42 @@ cargo run -p blog
 ```
 
 Open <http://localhost:3000>.
+
+## Encrypted credentials
+
+The blog example ships a pre-encrypted `config/credentials/development.toml.enc`
+with placeholder API keys.  To see the credentials workflow end-to-end:
+
+```bash
+# The example master key (never use this in production):
+export AUTUMN_MASTER_KEY=a0b1c2d3e4f5061728394a5b6c7d8e9f0a1b2c3d4e5f6071829304a5b6c7d8ef
+
+# Or load from the file Autumn generated during `autumn new`:
+# export AUTUMN_MASTER_KEY=$(cat config/master.key)
+
+# Run the app — credentials are decrypted at boot from config/credentials/development.toml.enc
+cargo run -p blog
+
+# Verify credentials are loaded
+curl http://localhost:3000/api/credentials-status
+# → {"credentials_loaded":true,"sendgrid_configured":false,"stripe_configured":false}
+
+# Edit credentials (opens $EDITOR):
+autumn credentials edit
+
+# Show redacted summary:
+autumn credentials show
+
+# Show full decrypted content:
+autumn credentials show --reveal
+```
+
+The master key file (`config/master.key`) is in `.gitignore` — it is never
+committed.  The encrypted file (`config/credentials/development.toml.enc`) is
+safe to commit; without the master key it is indistinguishable from random bytes.
+
+See [`docs/guide/credentials.md`](../../docs/guide/credentials.md) for the full
+reference, file format, and production deployment guidance.
 
 ## Generated admin adapter
 

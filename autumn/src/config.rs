@@ -593,6 +593,10 @@ pub enum ConfigError {
     /// database URL scheme).
     #[error("configuration error: {0}")]
     Validation(String),
+
+    /// The credentials file exists but could not be decrypted.
+    #[error("credentials error: {0}")]
+    Credentials(String),
 }
 
 /// Top-level framework configuration.
@@ -711,6 +715,13 @@ pub struct AutumnConfig {
     /// to suppress the spec endpoint in production.
     #[serde(default, rename = "openapi")]
     pub openapi_runtime: OpenApiRuntimeConfig,
+
+    /// Encrypted credentials store loaded from `config/credentials/<env>.toml.enc`.
+    ///
+    /// Empty when no credentials file exists (existing apps continue to boot unchanged).
+    /// Prefer using `config.credentials().get::<String>("stripe_key")` for type-safe access.
+    #[serde(skip)]
+    pub credentials: crate::credentials::CredentialsStore,
 }
 
 impl axum::extract::FromRequestParts<crate::AppState> for AutumnConfig {
@@ -1244,6 +1255,15 @@ const fn default_jobs_redis_visibility_timeout_ms() -> u64 {
 }
 
 impl AutumnConfig {
+    /// Access the decrypted credentials store.
+    ///
+    /// Returns an empty store when no credentials file was found (the feature is opt-in).
+    /// Use `config.credentials().get::<String>("stripe_key")` to access values.
+    #[must_use]
+    pub const fn credentials(&self) -> &crate::credentials::CredentialsStore {
+        &self.credentials
+    }
+
     /// Load configuration with profile-aware layering.
     ///
     /// Applies the six-layer configuration system:
@@ -1332,6 +1352,19 @@ impl AutumnConfig {
         }
 
         config.validate()?;
+
+        let base_dir: PathBuf = env
+            .var("AUTUMN_MANIFEST_DIR")
+            .map_or_else(|_| PathBuf::from("."), PathBuf::from);
+        let cred_profile = config.profile.as_deref().unwrap_or("dev");
+        let master_key_override = env.var("AUTUMN_MASTER_KEY").ok();
+        config.credentials = crate::credentials::load_credentials_with_key_override(
+            cred_profile,
+            &base_dir,
+            master_key_override.as_deref(),
+        )
+        .map_err(|e| ConfigError::Credentials(e.to_string()))?;
+
         Ok(config)
     }
 
@@ -5014,5 +5047,49 @@ path = "/api-spec.json"
             !config.mail.allow_in_process_deliver_later_in_production,
             "flag should default to false when env var is not set"
         );
+    }
+
+    // ── credentials integration ───────────────────────────────────────────
+
+    #[test]
+    fn config_credentials_empty_when_no_directory() {
+        let env = MockEnv::new();
+        let config = AutumnConfig::load_with_env(&env).unwrap();
+        assert!(
+            config.credentials().is_empty(),
+            "existing apps without config/credentials/ must boot with an empty credentials store"
+        );
+    }
+
+    #[test]
+    fn config_has_credentials_accessor() {
+        let config = AutumnConfig::default();
+        let _store = config.credentials();
+    }
+
+    #[test]
+    fn config_credentials_loaded_when_file_present() {
+        use crate::credentials::{MasterKey, encrypt};
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let key = MasterKey::generate();
+        let ct = encrypt(&key, b"stripe_key = \"sk_test_xyz\"\n");
+        std::fs::create_dir_all(tmp.path().join("config/credentials")).unwrap();
+        std::fs::write(
+            tmp.path().join("config/credentials/dev.toml.enc"),
+            &ct,
+        )
+        .unwrap();
+
+        let env = MockEnv::new()
+            .with("AUTUMN_MASTER_KEY", &key.to_hex())
+            .with(
+                "AUTUMN_MANIFEST_DIR",
+                tmp.path().to_str().unwrap(),
+            );
+        let config = AutumnConfig::load_with_env(&env).unwrap();
+        let val: Option<String> = config.credentials().get("stripe_key");
+        assert_eq!(val.as_deref(), Some("sk_test_xyz"));
     }
 }
