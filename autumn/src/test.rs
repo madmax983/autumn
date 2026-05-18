@@ -495,7 +495,7 @@ impl TestClient {
         self.router
     }
 
-    /// Return the [`ProbeState`] wired into this test app's router.
+    /// Return the [`crate::probe::ProbeState`] wired into this test app's router.
     ///
     /// Use this to drive readiness/liveness transitions in integration tests
     /// and verify the HTTP probe endpoints reflect state changes.
