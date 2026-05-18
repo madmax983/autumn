@@ -1199,6 +1199,18 @@ pub(crate) async fn prometheus_endpoint<S: ProvideActuatorState + Send + Sync + 
         snapshot.http.by_status.s5xx
     );
 
+    // autumn_shutdown_aborted_requests_total
+    out.push_str(
+        "# HELP autumn_shutdown_aborted_requests_total \
+         HTTP requests forcibly dropped when the graceful-shutdown drain deadline expired\n",
+    );
+    out.push_str("# TYPE autumn_shutdown_aborted_requests_total counter\n");
+    let _ = writeln!(
+        out,
+        "autumn_shutdown_aborted_requests_total {}",
+        snapshot.http.shutdown_aborted_requests_total
+    );
+
     // by_route
     if !snapshot.http.by_route.is_empty() {
         out.push_str("# HELP autumn_http_route_requests_total HTTP requests by route and method\n");

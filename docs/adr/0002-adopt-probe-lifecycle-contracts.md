@@ -177,8 +177,9 @@ Autumn adopts the following ten-phase shutdown contract:
    `server.shutdown_timeout_secs`. Requests exceeding the deadline are aborted
    and counted in `autumn_shutdown_aborted_requests_total`; the process exits
    with code `1` and a structured log line naming the exceeded phase.
-7. **app_hooks** — `on_shutdown` hooks run in LIFO registration order with
-   per-hook and total budgets equal to `shutdown_timeout_secs`. Plugin hooks
+7. **app_hooks** — `on_shutdown` hooks run in LIFO registration order within
+   the **remaining** portion of `shutdown_timeout_secs` after drain completes
+   (drain and hooks share one budget, not two separate windows). Plugin hooks
    (registered during `build()`) run after app hooks (LIFO = last-registered
    first). Overruns are logged at WARN but do not block the remaining budget.
 8. **telemetry_flush** — OTLP span exporter flushes (handled via guard drop).

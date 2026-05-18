@@ -552,7 +552,11 @@ Wire `prestop_grace_secs` to your `preStop` hook and termination grace period:
 spec:
   template:
     spec:
-      terminationGracePeriodSeconds: 40  # prestop_grace_secs + shutdown_timeout_secs + buffer
+      # Formula: prestop_grace_secs + shutdown_timeout_secs + buffer
+      # shutdown_timeout_secs covers drain AND on_shutdown hooks combined
+      # (they share one budget, not two separate windows).
+      # Default values → 5 + 30 + 10 = 45 s.
+      terminationGracePeriodSeconds: 45
       containers:
         - name: app
           readinessProbe:
@@ -571,14 +575,24 @@ spec:
 > `/actuator/metrics` under `http.shutdown_aborted_requests_total`. Alert
 > when this counter is non-zero across rolling deploys — it indicates that
 > `shutdown_timeout_secs` is too short for your workload.
+>
+> **Note:** when drain times out the process exits with code `1` immediately
+> after recording the count. The in-memory counter is lost at that point.
+> The structured log line (`phase=in_flight_drain autumn_shutdown_aborted_requests_total=N`)
+> emitted just before `exit(1)` is the durable signal — ship those logs to
+> your log aggregator and alert on `exit_code=1` log events as a backup SLI.
 
 ### Job and scheduler drain contract
 
 `#[job]` workers stop dequeuing new jobs when the listener closes (phase 5).
-Running job handlers finish within the same `shutdown_timeout_secs` window or
-checkpoint via the crash-safe path (see [Jobs guide](jobs.md)). The same
-applies to `#[scheduled]` tasks: the scheduler stops launching new runs at
-phase 5 and running tasks honor the drain deadline.
+Running job handlers continue concurrently during HTTP drain and are given a
+best-effort opportunity to finish — but because their `tokio::spawn` handles
+are not retained, the process does not wait for them after HTTP drain
+completes. Handlers that cannot finish quickly should use the crash-safe
+checkpoint path (see [Jobs guide](jobs.md)) so work can be resumed on the
+next replica. The same applies to `#[scheduled]` tasks: the scheduler stops
+launching new runs at phase 5, and any in-progress run proceeds
+concurrently during drain but is not awaited at shutdown.
 
 ### WebSocket drain contract
 
@@ -645,5 +659,5 @@ Before calling an Autumn app "cloud ready", verify:
 - multi-replica write paths use `#[lock_version]` (optimistic) or `with_lock` (pessimistic) to prevent lost updates
 - the generated container image builds without manual template surgery
 - `server.prestop_grace_secs` is tuned to match your load balancer's deregistration propagation time
-- `terminationGracePeriodSeconds` (Kubernetes) or equivalent is set to `prestop_grace_secs + shutdown_timeout_secs + buffer`
+- `terminationGracePeriodSeconds` (Kubernetes) or equivalent is set to `prestop_grace_secs + shutdown_timeout_secs + buffer` (`shutdown_timeout_secs` covers drain **and** hooks combined)
 - `autumn_shutdown_aborted_requests_total` is monitored and alerts on any non-zero value after a rolling deploy

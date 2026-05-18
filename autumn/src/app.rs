@@ -1800,6 +1800,13 @@ impl AppBuilder {
         // Clone metrics so the drain-watchdog can record aborted requests.
         let shutdown_metrics = state.metrics.clone();
 
+        // Shared timestamp: set by shutdown_task when the drain window opens
+        // (phase 5). Main reads it after server_task completes to compute how
+        // much of the shutdown_timeout_secs budget remains for hooks.
+        let drain_started_at: std::sync::Arc<std::sync::OnceLock<std::time::Instant>> =
+            std::sync::Arc::new(std::sync::OnceLock::new());
+        let drain_started_clone = std::sync::Arc::clone(&drain_started_at);
+
         // Shutdown task: handles the rolling-deploy lifecycle phases.
         //
         // Phases:
@@ -1809,13 +1816,13 @@ impl AppBuilder {
         //   4. WebSocket sessions receive close frame
         //   5. TCP listener stops accepting new connections; jobs/scheduler
         //      stop dequeuing (they share server_shutdown CancellationToken)
-        //   6. In-flight requests drain for up to shutdown_timeout_secs; if
-        //      the deadline is exceeded the watchdog exits the process with
-        //      code 1 and records autumn_shutdown_aborted_requests_total.
+        //   6. In-flight requests drain within shutdown_timeout_secs; if the
+        //      deadline is exceeded the watchdog exits with code 1 and
+        //      records autumn_shutdown_aborted_requests_total.
         //
-        // Phases 7-9 (on_shutdown hooks, telemetry flush, DB pool close) are
-        // run in the main task after server_task completes, so they execute
-        // only when the drain succeeds inside the deadline.
+        // Phases 7-9 (on_shutdown hooks, telemetry flush, DB pool close) run
+        // in main after server_task completes — within the remaining portion
+        // of the same shutdown_timeout_secs budget, not an additional window.
         let shutdown_task = tokio::spawn(async move {
             // Phase 1: Wait for OS signal.
             shutdown_signal().await;
@@ -1841,10 +1848,12 @@ impl AppBuilder {
             websocket_shutdown.cancel();
 
             // Phase 5: stop listener and signal jobs/scheduler to stop dequeuing.
+            // Record the drain-start time so main can compute remaining hook budget.
+            let _ = drain_started_clone.set(std::time::Instant::now());
             shutdown_signal_token.cancel();
 
-            // Phase 6: drain watchdog — if in-flight requests exceed the
-            // deadline, record aborted count and force non-zero exit.
+            // Phase 6: drain watchdog — if in-flight drain exceeds the budget,
+            // record aborted count and force non-zero exit before hooks run.
             tokio::time::sleep(std::time::Duration::from_secs(shutdown_timeout)).await;
             let aborted = shutdown_metrics.snapshot().http.requests_active;
             shutdown_metrics.record_shutdown_aborted(aborted);
@@ -1895,15 +1904,16 @@ impl AppBuilder {
             std::process::exit(1);
         });
 
-        // Phase 7: run on_shutdown hooks in LIFO order with per-hook timeout.
+        // Phase 7: run on_shutdown hooks within the *remaining* portion of
+        // shutdown_timeout_secs (drain + hooks share one budget, not two).
         // Plugin ordering: plugins register during build() before app hooks,
-        // so app hooks run before plugin hooks (last-registered runs first).
-        run_shutdown_hooks_with_timeout(
-            &shutdown_hooks,
-            std::time::Duration::from_secs(shutdown_timeout),
-            std::time::Duration::from_secs(shutdown_timeout),
-        )
-        .await;
+        // so app hooks run before plugin hooks (LIFO = last-registered first).
+        let drain_elapsed = drain_started_at
+            .get()
+            .map_or(std::time::Duration::ZERO, std::time::Instant::elapsed);
+        let hook_budget = std::time::Duration::from_secs(shutdown_timeout)
+            .saturating_sub(drain_elapsed);
+        run_shutdown_hooks_with_timeout(&shutdown_hooks, hook_budget, hook_budget).await;
 
         tracing::info!(exit_code = 0, "shutdown: all phases completed cleanly");
     }
@@ -3066,34 +3076,6 @@ async fn run_shutdown_hooks(hooks: &[ShutdownHook]) {
 /// Overruns are logged at WARN but do not block the remaining budget.
 async fn run_shutdown_hooks_with_timeout(
     hooks: &[ShutdownHook],
-    per_hook_budget: std::time::Duration,
-    total_budget: std::time::Duration,
-) {
-    let deadline = tokio::time::Instant::now() + total_budget;
-    for hook in hooks.iter().rev() {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            tracing::warn!("shutdown: total hook budget exhausted; skipping remaining hooks");
-            break;
-        }
-        let timeout = remaining.min(per_hook_budget);
-        if tokio::time::timeout(timeout, hook()).await.is_err() {
-            tracing::warn!(
-                per_hook_budget_ms = timeout.as_millis(),
-                "shutdown: hook overran per-hook timeout; continuing with remaining budget"
-            );
-        }
-    }
-}
-
-/// Public alias used by integration tests.
-///
-/// Exposes `run_shutdown_hooks_with_timeout` so test crates can verify
-/// per-hook timeout and overrun-logging behaviour without going through
-/// the full server lifecycle.
-#[doc(hidden)]
-pub async fn run_shutdown_hooks_with_timeout_for_test(
-    hooks: &[Box<dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync>],
     per_hook_budget: std::time::Duration,
     total_budget: std::time::Duration,
 ) {
@@ -7390,6 +7372,77 @@ mod tests {
             builder.route_sources[1],
             crate::route_listing::RouteSource::Plugin("outer".to_owned()),
             "second route should be re-attributed to outer plugin after nested build"
+        );
+    }
+
+    // ── shutdown hook timeout tests ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn shutdown_hooks_with_timeout_runs_all_fast_hooks() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let counter = Arc::new(AtomicUsize::new(0));
+        let c1 = Arc::clone(&counter);
+        let c2 = Arc::clone(&counter);
+
+        let hooks: Vec<ShutdownHook> = vec![
+            Box::new(move || {
+                let c = Arc::clone(&c1);
+                Box::pin(async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                })
+            }),
+            Box::new(move || {
+                let c = Arc::clone(&c2);
+                Box::pin(async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                })
+            }),
+        ];
+
+        run_shutdown_hooks_with_timeout(
+            &hooks,
+            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(10),
+        )
+        .await;
+
+        assert_eq!(counter.load(Ordering::SeqCst), 2, "both hooks must run");
+    }
+
+    #[tokio::test]
+    async fn shutdown_hooks_with_timeout_tolerates_slow_hook_overrun() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let fast_ran = Arc::new(AtomicBool::new(false));
+        let fr = Arc::clone(&fast_ran);
+
+        let hooks: Vec<ShutdownHook> = vec![
+            // hook 0 (last registered → runs first in LIFO): slow, exceeds per-hook budget
+            Box::new(|| {
+                Box::pin(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                })
+            }),
+            // hook 1: fast — must still run within total budget
+            Box::new(move || {
+                let fr = Arc::clone(&fr);
+                Box::pin(async move {
+                    fr.store(true, Ordering::SeqCst);
+                })
+            }),
+        ];
+
+        // Per-hook budget = 50 ms (hook 0 will overrun).
+        // Total budget = 1 s (ample for hook 1 after the overrun is cut short).
+        run_shutdown_hooks_with_timeout(
+            &hooks,
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_secs(1),
+        )
+        .await;
+
+        assert!(
+            fast_ran.load(Ordering::SeqCst),
+            "fast hook must still run even after slow hook overruns its per-hook budget"
         );
     }
 }
