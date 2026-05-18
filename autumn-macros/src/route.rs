@@ -326,11 +326,15 @@ fn should_stringify_primitive_output(output: &ReturnType) -> bool {
         return false;
     };
 
-    if path.qself.is_some() || path.path.segments.is_empty() {
+    let Some(last_segment) = path.path.segments.last() else {
+        return false;
+    };
+
+    if path.qself.is_some() || !last_segment.arguments.is_empty() {
         return false;
     }
 
-    let ident = path.path.segments.last().unwrap().ident.to_string();
+    let ident = last_segment.ident.to_string();
     matches!(
         ident.as_str(),
         "bool"
