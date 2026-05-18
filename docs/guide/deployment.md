@@ -204,9 +204,9 @@ The generated `fly.toml` includes four first-class integrations:
 | Feature | What it does |
 |---|---|
 | `/live` + `/ready` checks | Fly uses `/live` to decide machine restarts; `/ready` to gate traffic routing. Autumn flips `/ready` to 503 at drain start so Fly deregisters before the listener closes. |
-| `kill_timeout = "35s"` | Fly waits 35 s after SIGTERM before SIGKILL — matching `prestop_grace_secs (5) + shutdown_timeout_secs (30)`. |
-| `[metrics]` → `/actuator/metrics` | Fly scrapes Autumn's Prometheus endpoint and surfaces it in the dashboard. No extra agent needed. |
-| `release_command = "autumn migrate"` | Migrations run automatically in a one-shot machine before new app machines start. No manual migrate step required. |
+| `kill_timeout = "45s"` | Fly waits 45 s after SIGTERM before SIGKILL — `prestop_grace_secs (5) + shutdown_timeout_secs (30) + 10 s buffer` for the process to log and exit cleanly. |
+| `[metrics]` → `/actuator/prometheus` | Fly scrapes Autumn's Prometheus text endpoint and surfaces it in the dashboard. No extra agent needed. |
+| `[deploy]` `release_command` (opt-in) | When uncommented, migrations run in a one-shot machine before new app machines start; a failed migration aborts the deploy before any traffic-serving machine is replaced. |
 
 Deploy:
 
@@ -214,12 +214,22 @@ Deploy:
 fly launch --no-deploy          # creates the app on fly.io
 fly secrets set AUTUMN_DATABASE__PRIMARY_URL="postgres://user:pass@host:5432/myapp_prod"
 fly secrets set AUTUMN_SECURITY__SIGNING_SECRET="$(openssl rand -hex 32)"
-fly deploy                      # runs `autumn migrate` then rolls new machines
+fly deploy
 ```
 
-On `fly deploy`, Fly runs `autumn migrate` in a temporary machine first. If the
-migration fails, the deploy stops before any traffic-serving machines are
-replaced — keeping the old version live.
+**Using a database?** Uncomment the `release_command` line in `fly.toml` before
+the first `fly deploy`:
+
+```toml
+[deploy]
+  release_command = "autumn migrate"
+```
+
+With it enabled, Fly runs `autumn migrate` in a temporary machine before new app
+machines start. A failed migration aborts the deploy before any traffic-serving
+machine is replaced — keeping the old version live. The line is commented out by
+default because `autumn migrate` exits non-zero when no database URL is set,
+which would fail the first deploy of a database-free app.
 
 If you add a read replica, set `AUTUMN_DATABASE__REPLICA_URL` as a secret and
 Autumn gates `/ready` until the replica has replayed the latest migration.

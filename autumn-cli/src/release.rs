@@ -831,25 +831,29 @@ previous_secrets = []
             "fly.toml must include a [metrics] section for Fly's Prometheus scraper"
         );
         assert!(
-            content.contains("/actuator/metrics"),
-            "fly.toml [metrics] must point to /actuator/metrics"
+            content.contains("/actuator/prometheus"),
+            "fly.toml [metrics] must point to /actuator/prometheus (Prometheus text format), \
+             not /actuator/metrics (JSON)"
         );
     }
 
     #[test]
-    fn fly_toml_has_deploy_release_command() {
+    fn fly_toml_documents_deploy_release_command() {
+        // release_command is commented out by default: autumn migrate exits non-zero
+        // when no database URL is configured, which would break non-DB app deploys.
+        // The template documents the opt-in pattern so DB users can uncomment it.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::Fly).unwrap();
         let content = fs::read_to_string(dir.join("fly.toml")).unwrap();
         assert!(
-            content.contains("release_command"),
-            "fly.toml must include a [deploy] release_command so migrations run \
-             automatically in a one-shot machine before new app machines start"
+            content.contains("autumn migrate"),
+            "fly.toml must document the autumn migrate release command so DB users \
+             can uncomment it"
         );
         assert!(
-            content.contains("autumn migrate"),
-            "fly.toml release_command must invoke autumn migrate"
+            content.contains("release_command"),
+            "fly.toml must document release_command so DB users know where to uncomment"
         );
     }
 

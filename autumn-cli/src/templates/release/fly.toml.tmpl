@@ -4,19 +4,21 @@
 app = "{{project_name}}"
 primary_region = "iad"
 
-# Fly sends SIGKILL when kill_timeout expires.  Set this to at least
-# server.prestop_grace_secs (5) + server.shutdown_timeout_secs (30)
-# so the process has time to drain in-flight requests before SIGKILL arrives.
+# Fly sends SIGKILL when kill_timeout expires.  Set this above Autumn's total
+# graceful-shutdown budget: prestop_grace_secs (5) + shutdown_timeout_secs (30)
+# = 35 s, plus 10 s buffer for the process to log and exit cleanly.
 kill_signal  = "SIGTERM"
-kill_timeout = "35s"
+kill_timeout = "45s"
 
 [build]
   dockerfile = "Dockerfile"
 
 [deploy]
-  # Runs `autumn migrate` in a one-shot machine before new app machines start.
-  # Remove this line if your app does not use a database.
-  release_command = "autumn migrate"
+  # Uncomment to run `autumn migrate` in a one-shot machine before new app
+  # machines start.  If the migration fails the deploy stops before any
+  # traffic-serving machine is replaced.  Leave commented for apps without
+  # a database — autumn migrate exits non-zero when no DB URL is configured.
+  # release_command = "autumn migrate"
 
 [http_service]
   internal_port        = 3000
@@ -35,10 +37,11 @@ kill_timeout = "35s"
   cpu_kind = "shared"
   cpus     = 1
 
-# Fly scrapes this Prometheus endpoint and surfaces it in the dashboard.
+# Fly scrapes this Prometheus text endpoint and surfaces it in the dashboard.
+# /actuator/prometheus emits the Prometheus text format; /actuator/metrics is JSON.
 [metrics]
   port = 3000
-  path = "/actuator/metrics"
+  path = "/actuator/prometheus"
 
 [checks]
   # Liveness: restart the machine if the process is deadlocked or broken.
