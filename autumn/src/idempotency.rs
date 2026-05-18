@@ -98,6 +98,7 @@ struct StorageKeyContext {
     target: String,
     authorization: Option<String>,
     scope_headers: Vec<(String, Vec<u8>)>,
+    scope_extensions: Vec<(String, Vec<u8>)>,
 }
 
 impl StorageKeyContext {
@@ -119,6 +120,7 @@ impl StorageKeyContext {
             target,
             authorization,
             scope_headers: storage_scope_headers(&parts.headers),
+            scope_extensions: storage_scope_extensions(&parts.extensions),
         }
     }
 
@@ -130,6 +132,7 @@ impl StorageKeyContext {
             self.authorization.as_deref(),
             session_id,
             &self.scope_headers,
+            &self.scope_extensions,
         )
     }
 }
@@ -141,6 +144,7 @@ fn build_storage_key(
     auth: Option<&str>,
     session_id: Option<&str>,
     scope_headers: &[(String, Vec<u8>)],
+    scope_extensions: &[(String, Vec<u8>)],
 ) -> String {
     let principal = principal_scope_digest(auth, session_id);
     let mut hasher = sha2::Sha256::new();
@@ -154,6 +158,15 @@ fn build_storage_key(
     for (name, value) in scope_headers {
         push_storage_key_component(&mut hasher, "scope-header-name", name.as_bytes());
         push_storage_key_component(&mut hasher, "scope-header-value", value);
+    }
+    push_storage_key_component(
+        &mut hasher,
+        "scope-extension-count",
+        scope_extensions.len().to_string().as_bytes(),
+    );
+    for (name, value) in scope_extensions {
+        push_storage_key_component(&mut hasher, "scope-extension-name", name.as_bytes());
+        push_storage_key_component(&mut hasher, "scope-extension-value", value);
     }
     push_storage_key_component(&mut hasher, "principal", principal.as_bytes());
     push_storage_key_component(&mut hasher, "idempotency-key", idempotency_key.as_bytes());
@@ -177,18 +190,26 @@ fn storage_scope_headers(headers: &HeaderMap) -> Vec<(String, Vec<u8>)> {
 
 fn is_storage_scope_header(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
-    matches!(name.as_str(), "host" | "x-forwarded-host")
-        || (name.starts_with("x-")
-            && !matches!(
-                name.as_str(),
-                "x-request-id"
-                    | "x-correlation-id"
-                    | "x-trace-id"
-                    | "x-amzn-trace-id"
-                    | "x-forwarded-for"
-                    | "x-real-ip"
-            )
-            && !name.starts_with("x-b3-"))
+    matches!(
+        name.as_str(),
+        "host" | "x-forwarded-host" | "tenant" | "workspace" | "account" | "organization" | "org"
+    ) || (name.starts_with("x-")
+        && !matches!(
+            name.as_str(),
+            "x-request-id"
+                | "x-correlation-id"
+                | "x-trace-id"
+                | "x-amzn-trace-id"
+                | "x-forwarded-for"
+                | "x-real-ip"
+        )
+        && !name.starts_with("x-b3-"))
+}
+
+fn storage_scope_extensions(extensions: &axum::http::Extensions) -> Vec<(String, Vec<u8>)> {
+    extensions
+        .get::<IdempotencyScope>()
+        .map_or_else(Vec::new, IdempotencyScope::sorted_components)
 }
 
 async fn storage_session_id_for_parts(parts: &axum::http::request::Parts) -> Option<String> {
@@ -253,6 +274,49 @@ pub struct IdempotencyRecord {
     pub body: Vec<u8>,
     pub metadata: Vec<(String, Vec<u8>)>,
 }
+
+/// Additional request scope that should partition idempotency storage.
+///
+/// Middleware that resolves tenant/workspace/account identity before the
+/// idempotency layer runs can insert this extension so two logical scopes do
+/// not share the same `Idempotency-Key` cache entry.
+#[derive(Clone, Debug, Default)]
+pub struct IdempotencyScope {
+    components: Vec<(String, Vec<u8>)>,
+}
+
+impl IdempotencyScope {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            components: Vec::new(),
+        }
+    }
+
+    pub fn push(&mut self, name: impl Into<String>, value: impl AsRef<[u8]>) {
+        self.components.push((name.into(), value.as_ref().to_vec()));
+    }
+
+    #[must_use]
+    pub fn with(mut self, name: impl Into<String>, value: impl AsRef<[u8]>) -> Self {
+        self.push(name, value);
+        self
+    }
+
+    fn sorted_components(&self) -> Vec<(String, Vec<u8>)> {
+        let mut components = self
+            .components
+            .iter()
+            .map(|(name, value)| (name.to_ascii_lowercase(), value.clone()))
+            .collect::<Vec<_>>();
+        components.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+        components
+    }
+}
+
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub struct IdempotencyCacheCommittedErrorResponse;
 
 #[derive(Clone, Debug)]
 pub(crate) struct IdempotencySessionScope {
@@ -416,8 +480,24 @@ pub trait IdempotencyStore: Send + Sync + 'static {
     /// or `false` if another request is already processing this key.
     fn try_lock(&self, key: &str, lock_ttl: Duration) -> bool;
 
+    /// Acquire an in-flight lock owned by a unique request token.
+    ///
+    /// Stores that support expiring locks should override this together with
+    /// [`Self::unlock_owned`] so a stale request cannot release a newer lock
+    /// acquired after the first lock expired.
+    fn try_lock_owned(&self, key: &str, owner: &str, lock_ttl: Duration) -> bool {
+        let _ = owner;
+        self.try_lock(key, lock_ttl)
+    }
+
     /// Release the in-flight lock for `key`.
     fn unlock(&self, key: &str);
+
+    /// Release the in-flight lock only if it is still owned by `owner`.
+    fn unlock_owned(&self, key: &str, owner: &str) {
+        let _ = owner;
+        self.unlock(key);
+    }
 
     /// The preferred TTL for this store. Used by [`IdempotencyLayer::new`] as
     /// the default expiry when no explicit `.with_ttl()` is given. Defaults to
@@ -438,10 +518,15 @@ pub trait IdempotencyStore: Send + Sync + 'static {
 /// multi-replica deployments configure `backend = "redis"` in `autumn.toml`.
 pub struct MemoryIdempotencyStore {
     entries: RwLock<HashMap<String, IdempotencyEntry>>,
-    in_flight: RwLock<HashMap<String, Instant>>,
+    in_flight: RwLock<HashMap<String, MemoryInFlightLock>>,
     /// Counts `set` calls to trigger periodic expired-entry eviction.
     write_count: AtomicU64,
     default_ttl: Duration,
+}
+
+struct MemoryInFlightLock {
+    owner: String,
+    expires_at: Instant,
 }
 
 impl MemoryIdempotencyStore {
@@ -481,11 +566,15 @@ impl IdempotencyStore for MemoryIdempotencyStore {
     }
 
     fn try_lock(&self, key: &str, lock_ttl: Duration) -> bool {
+        self.try_lock_owned(key, "", lock_ttl)
+    }
+
+    fn try_lock_owned(&self, key: &str, owner: &str, lock_ttl: Duration) -> bool {
         let now = Instant::now();
         let mut in_flight = self.in_flight.write().unwrap();
         // Check only the requested key's active in-flight marker.
-        if let Some(expires_at) = in_flight.get(key)
-            && *expires_at > now
+        if let Some(lock) = in_flight.get(key)
+            && lock.expires_at > now
         {
             return false; // still in flight
         }
@@ -496,12 +585,28 @@ impl IdempotencyStore for MemoryIdempotencyStore {
         } else {
             lock_ttl
         };
-        in_flight.insert(key.to_owned(), now + ttl);
+        in_flight.insert(
+            key.to_owned(),
+            MemoryInFlightLock {
+                owner: owner.to_owned(),
+                expires_at: now + ttl,
+            },
+        );
         true
     }
 
     fn unlock(&self, key: &str) {
         self.in_flight.write().unwrap().remove(key);
+    }
+
+    fn unlock_owned(&self, key: &str, owner: &str) {
+        let mut in_flight = self.in_flight.write().unwrap();
+        if in_flight
+            .get(key)
+            .is_some_and(|lock| lock.owner.as_str() == owner)
+        {
+            in_flight.remove(key);
+        }
     }
 
     fn default_ttl(&self) -> Duration {
@@ -670,6 +775,10 @@ mod redis_store {
         }
 
         fn try_lock(&self, key: &str, lock_ttl: Duration) -> bool {
+            self.try_lock_owned(key, "", lock_ttl)
+        }
+
+        fn try_lock_owned(&self, key: &str, owner: &str, lock_ttl: Duration) -> bool {
             let lock_key = self.lock_key(key);
             let lock_ttl_secs = lock_ttl.as_secs().max(1);
             let mut conn = self.connection.clone();
@@ -677,7 +786,7 @@ mod redis_store {
                 tokio::runtime::Handle::current().block_on(async move {
                     let result: Result<Option<String>, _> = redis::cmd("SET")
                         .arg(&lock_key)
-                        .arg("1")
+                        .arg(owner)
                         .arg("NX")
                         .arg("EX")
                         .arg(lock_ttl_secs)
@@ -708,6 +817,23 @@ mod redis_store {
             tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(async move {
                     let _: Result<(), _> = conn.del(&lock_key).await;
+                });
+            });
+        }
+
+        fn unlock_owned(&self, key: &str, owner: &str) {
+            let lock_key = self.lock_key(key);
+            let mut conn = self.connection.clone();
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async move {
+                    let _: Result<i32, _> = redis::Script::new(
+                        "if redis.call('GET', KEYS[1]) == ARGV[1] then \
+                         return redis.call('DEL', KEYS[1]) else return 0 end",
+                    )
+                    .key(&lock_key)
+                    .arg(owner)
+                    .invoke_async(&mut conn)
+                    .await;
                 });
             });
         }
@@ -763,6 +889,24 @@ pub fn __replay_finalized_session_response(
                 .any(|(name, _)| name.eq_ignore_ascii_case("set-cookie"))
                 .then(|| replay.clone().into_response())
         })
+}
+
+#[doc(hidden)]
+pub async fn __replay_finalized_session_response_for_anonymous(
+    session: &crate::session::Session,
+    auth_session_key: &str,
+    replay: &Option<axum::extract::Extension<IdempotencyReplayResponse>>,
+) -> Option<Response<Body>> {
+    if session.get(auth_session_key).await.is_some() {
+        return None;
+    }
+    __replay_finalized_session_response(replay)
+}
+
+#[doc(hidden)]
+#[must_use]
+pub const fn __cache_committed_error_response(error: crate::AutumnError) -> crate::AutumnError {
+    error.cache_idempotency_response()
 }
 
 #[doc(hidden)]
@@ -1040,21 +1184,23 @@ struct PreparedIdempotencyRequest {
 struct InFlightLockGuard {
     store: Arc<dyn IdempotencyStore>,
     key: String,
+    owner: String,
     unlock_on_drop: bool,
 }
 
 impl InFlightLockGuard {
-    fn new(store: Arc<dyn IdempotencyStore>, key: String) -> Self {
+    fn new(store: Arc<dyn IdempotencyStore>, key: String, owner: String) -> Self {
         Self {
             store,
             key,
+            owner,
             unlock_on_drop: true,
         }
     }
 
     fn unlock_now(&mut self) {
         if self.unlock_on_drop {
-            self.store.unlock(&self.key);
+            self.store.unlock_owned(&self.key, &self.owner);
             self.unlock_on_drop = false;
         }
     }
@@ -1067,7 +1213,7 @@ impl InFlightLockGuard {
 impl Drop for InFlightLockGuard {
     fn drop(&mut self) {
         if self.unlock_on_drop {
-            self.store.unlock(&self.key);
+            self.store.unlock_owned(&self.key, &self.owner);
         }
     }
 }
@@ -1200,6 +1346,10 @@ fn request_idempotency_key(req: &Request<Body>) -> Option<String> {
     (!key.is_empty()).then(|| key.to_owned())
 }
 
+fn in_flight_lock_owner() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
 async fn prepare_idempotency_request(
     idempotency_key: String,
     req: Request<Body>,
@@ -1295,7 +1445,8 @@ where
     }
 
     // ── In-flight check (concurrent duplicate) ─────────────────────────────
-    if !store.try_lock(&prepared.storage_key, in_flight_ttl) {
+    let lock_owner = in_flight_lock_owner();
+    if !store.try_lock_owned(&prepared.storage_key, &lock_owner, in_flight_ttl) {
         tracing::debug!(
             idempotency.key = %prepared.idempotency_key,
             "Idempotency key already in flight — returning 409"
@@ -1305,7 +1456,8 @@ where
             .inspect(|m| m.record_idempotency_conflict());
         return Ok(in_flight_conflict_response());
     }
-    let mut lock_guard = InFlightLockGuard::new(store.clone(), prepared.storage_key.clone());
+    let mut lock_guard =
+        InFlightLockGuard::new(store.clone(), prepared.storage_key.clone(), lock_owner);
 
     // Double-check after acquiring the lock: a concurrent request may have
     // completed between our miss check and lock acquisition.
@@ -1401,11 +1553,16 @@ where
         .extensions
         .remove::<IdempotencyReplayMetadata>()
         .map_or_else(Vec::new, IdempotencyReplayMetadata::into_entries);
+    let cache_committed_error = resp_parts
+        .extensions
+        .remove::<IdempotencyCacheCommittedErrorResponse>()
+        .is_some();
 
-    // Cache successful 2xx/3xx responses; store before unlocking so concurrent duplicates
-    // still see a locked key rather than racing to re-execute the handler.
+    // Cache successful 2xx/3xx responses and explicit "mutation committed"
+    // errors; store before unlocking so concurrent duplicates still see a
+    // locked key rather than racing to re-execute the handler.
     let status = resp_parts.status.as_u16();
-    if (200u32..400).contains(&u32::from(status)) {
+    if (200u32..400).contains(&u32::from(status)) || cache_committed_error {
         let session_mutated = if let Some(session) = &session {
             session.has_pending_changes().await
         } else {
@@ -1694,6 +1851,7 @@ mod tests {
         push_storage_key_component(&mut hasher, "method", method.as_bytes());
         push_storage_key_component(&mut hasher, "target", path.as_bytes());
         push_storage_key_component(&mut hasher, "scope-header-count", b"0");
+        push_storage_key_component(&mut hasher, "scope-extension-count", b"0");
         push_storage_key_component(&mut hasher, "principal", principal.as_bytes());
         push_storage_key_component(&mut hasher, "idempotency-key", idempotency_key.as_bytes());
         format!("v2:{}", hex_lower(hasher.finalize()))
@@ -1707,6 +1865,24 @@ mod tests {
         assert_eq!(context.next_mutation_discriminator(), "0");
         assert_eq!(cloned.next_mutation_discriminator(), "1");
         assert_eq!(context.next_mutation_discriminator(), "2");
+    }
+
+    #[test]
+    fn memory_lock_unlock_owned_does_not_release_newer_owner() {
+        let store = MemoryIdempotencyStore::new(Duration::from_secs(60));
+
+        assert!(store.try_lock_owned("key", "owner-a", Duration::from_millis(5)));
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(store.try_lock_owned("key", "owner-b", Duration::from_secs(60)));
+
+        store.unlock_owned("key", "owner-a");
+        assert!(
+            !store.try_lock_owned("key", "owner-c", Duration::from_secs(60)),
+            "stale owners must not release a newer in-flight lock"
+        );
+
+        store.unlock_owned("key", "owner-b");
+        assert!(store.try_lock_owned("key", "owner-c", Duration::from_secs(60)));
     }
 
     #[tokio::test]

@@ -44,6 +44,7 @@ const FIXED_NOTE: Note = Note {
 };
 static SECURED_ADMIN_MUTATION_CALLS: AtomicUsize = AtomicUsize::new(0);
 static SECURED_ADMIN_REPLAY_CALLS: AtomicUsize = AtomicUsize::new(0);
+static AUTHORIZE_SESSION_ROTATION_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 // ── Hand-written handler exercising the inline `authorize` helper ──
 
@@ -199,6 +200,21 @@ async fn update_note_attr(
     Ok("ok")
 }
 
+#[autumn_web::post("/notes-attr-rotate/{id}")]
+#[autumn_web::authorize("update", resource = Note)]
+async fn update_note_attr_rotate(
+    autumn_web::extract::Path(id): autumn_web::extract::Path<i64>,
+    LoadedNote(note): LoadedNote,
+    session: Session,
+) -> AutumnResult<&'static str> {
+    let _ = id;
+    let _ = note;
+    AUTHORIZE_SESSION_ROTATION_CALLS.fetch_add(1, Ordering::SeqCst);
+    session.insert("user_id", "999").await;
+    session.rotate_id().await;
+    Ok("authorized-rotated")
+}
+
 fn build_attr_app(
     store: MemoryStore,
     forbidden_response: ForbiddenResponse,
@@ -217,6 +233,19 @@ fn build_idempotent_attr_app(
 ) -> autumn_web::test::TestClient {
     TestApp::new()
         .routes(routes![update_note_attr])
+        .policy::<Note, _>(AdminOrOwnerPolicy)
+        .forbidden_response(forbidden_response)
+        .layer(SessionLayer::new(store, SessionConfig::default()))
+        .idempotent()
+        .build()
+}
+
+fn build_idempotent_attr_rotation_app(
+    store: MemoryStore,
+    forbidden_response: ForbiddenResponse,
+) -> autumn_web::test::TestClient {
+    TestApp::new()
+        .routes(routes![update_note_attr_rotate])
         .policy::<Note, _>(AdminOrOwnerPolicy)
         .forbidden_response(forbidden_response)
         .layer(SessionLayer::new(store, SessionConfig::default()))
@@ -316,6 +345,41 @@ async fn idempotent_replay_does_not_bypass_authorize_policy_changes() {
         "cached idempotency replay must not skip the current #[authorize] policy check"
     );
     assert_eq!(retry.header("x-idempotent-replayed"), None);
+}
+
+#[tokio::test]
+async fn idempotent_authorize_session_rotation_replays_final_cookie_for_old_cookie() {
+    AUTHORIZE_SESSION_ROTATION_CALLS.store(0, Ordering::SeqCst);
+    let store = MemoryStore::new();
+    seed_session(&store, "sess-authorize-rotate", "999", Some("admin")).await;
+    let client = build_idempotent_attr_rotation_app(store, ForbiddenResponse::Forbidden403);
+
+    let first = client
+        .post("/notes-attr-rotate/1")
+        .header("Cookie", "autumn.sid=sess-authorize-rotate")
+        .header("idempotency-key", "authorize-rotation-key")
+        .send()
+        .await;
+    first.assert_ok();
+    assert!(first.header("set-cookie").is_some());
+
+    let retry = client
+        .post("/notes-attr-rotate/1")
+        .header("Cookie", "autumn.sid=sess-authorize-rotate")
+        .header("idempotency-key", "authorize-rotation-key")
+        .send()
+        .await;
+    retry.assert_ok();
+    assert_eq!(retry.header("x-idempotent-replayed"), Some("true"));
+    assert!(
+        retry.header("set-cookie").is_some(),
+        "old-cookie retries must receive the finalized rotated session cookie"
+    );
+    assert_eq!(
+        AUTHORIZE_SESSION_ROTATION_CALLS.load(Ordering::SeqCst),
+        1,
+        "authorized session-rotating retries must not re-enter the handler"
+    );
 }
 
 #[tokio::test]

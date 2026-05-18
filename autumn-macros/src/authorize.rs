@@ -262,6 +262,16 @@ pub fn authorize_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 #action_lit,
                 &#from_ident,
             ).await {
+                if let ::core::option::Option::Some(__autumn_response) =
+                    ::autumn_web::idempotency::__replay_finalized_session_response_for_anonymous(
+                        &__autumn_session,
+                        __autumn_state.auth_session_key(),
+                        &__autumn_idempotency_replay,
+                    )
+                    .await
+                {
+                    return __autumn_response;
+                }
                 return ::autumn_web::reexports::axum::response::IntoResponse::into_response(__autumn_error);
             }
             #replay_stop
@@ -359,6 +369,24 @@ mod tests {
         assert!(
             generated.contains("__replay_response"),
             "plain handler text must not suppress the generated replay stop: {generated}"
+        );
+    }
+
+    #[test]
+    fn authorize_denial_can_replay_finalized_session_response_for_old_cookie() {
+        let generated = authorize_macro(
+            quote::quote! { "update", resource = Post },
+            quote::quote! {
+                async fn update_post(post: Post) -> &'static str {
+                    "ok"
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("__replay_finalized_session_response_for_anonymous"),
+            "authorized handlers must let old destroyed-session retries receive cached finalized Set-Cookie responses: {generated}"
         );
     }
 }

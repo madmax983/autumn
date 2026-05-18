@@ -137,6 +137,7 @@ pub struct AutumnError {
     status: StatusCode,
     details: Option<std::collections::HashMap<String, Vec<String>>>,
     problem_type: Option<&'static str>,
+    cache_idempotency_response: bool,
 }
 
 /// Convenience alias -- the standard return type for Autumn handlers.
@@ -166,6 +167,7 @@ where
             status: StatusCode::INTERNAL_SERVER_ERROR,
             details: None,
             problem_type: None,
+            cache_idempotency_response: false,
         }
     }
 }
@@ -206,6 +208,7 @@ impl AutumnError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             details: None,
             problem_type: None,
+            cache_idempotency_response: false,
         }
     }
 
@@ -226,6 +229,7 @@ impl AutumnError {
             status: StatusCode::NOT_FOUND,
             details: None,
             problem_type: None,
+            cache_idempotency_response: false,
         }
     }
 
@@ -246,6 +250,7 @@ impl AutumnError {
             status: StatusCode::BAD_REQUEST,
             details: None,
             problem_type: None,
+            cache_idempotency_response: false,
         }
     }
 
@@ -269,6 +274,7 @@ impl AutumnError {
             status: StatusCode::UNPROCESSABLE_ENTITY,
             details: None,
             problem_type: None,
+            cache_idempotency_response: false,
         }
     }
 
@@ -289,6 +295,7 @@ impl AutumnError {
             status: StatusCode::SERVICE_UNAVAILABLE,
             details: None,
             problem_type: None,
+            cache_idempotency_response: false,
         }
     }
 
@@ -309,6 +316,7 @@ impl AutumnError {
             status: StatusCode::UNAUTHORIZED,
             details: None,
             problem_type: None,
+            cache_idempotency_response: false,
         }
     }
 
@@ -329,6 +337,7 @@ impl AutumnError {
             status: StatusCode::FORBIDDEN,
             details: None,
             problem_type: None,
+            cache_idempotency_response: false,
         }
     }
 
@@ -360,6 +369,7 @@ impl AutumnError {
             status: StatusCode::UNPROCESSABLE_ENTITY,
             details: Some(details),
             problem_type: None,
+            cache_idempotency_response: false,
         }
     }
 
@@ -491,6 +501,7 @@ impl AutumnError {
             status: StatusCode::CONFLICT,
             details: None,
             problem_type: Some("https://autumn.dev/problems/conflict"),
+            cache_idempotency_response: false,
         }
     }
 
@@ -525,6 +536,13 @@ impl AutumnError {
         self.status
     }
 
+    #[doc(hidden)]
+    #[must_use]
+    pub(crate) const fn cache_idempotency_response(mut self) -> Self {
+        self.cache_idempotency_response = true;
+        self
+    }
+
     /// Return the wrapped error's source chain as displayable messages.
     ///
     /// The top-level [`AutumnError`] display already prints the wrapped error
@@ -554,6 +572,10 @@ impl std::fmt::Debug for AutumnError {
             .field("inner", &self.inner)
             .field("details", &self.details)
             .field("problem_type", &self.problem_type)
+            .field(
+                "cache_idempotency_response",
+                &self.cache_idempotency_response,
+            )
             .finish()
     }
 }
@@ -725,6 +747,7 @@ impl IntoResponse for AutumnError {
         let message = self.inner.to_string();
         let details = self.details.clone();
         let problem_type = self.problem_type;
+        let cache_idempotency_response = self.cache_idempotency_response;
 
         // Stash error metadata for exception filters to inspect without
         // parsing the response body.
@@ -754,6 +777,11 @@ impl IntoResponse for AutumnError {
                 "HX-Trigger",
                 HeaderValue::from_static(r#"{"autumn:conflict":true}"#),
             );
+        }
+        if cache_idempotency_response {
+            response
+                .extensions_mut()
+                .insert(crate::idempotency::IdempotencyCacheCommittedErrorResponse);
         }
         response.extensions_mut().insert(error_info);
         response

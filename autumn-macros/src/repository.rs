@@ -549,7 +549,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     )
                     .await;
                     __autumn_pending_heartbeat.cancel();
-                    return ::core::result::Result::Err(__autumn_error);
+                    return ::core::result::Result::Err(
+                        ::autumn_web::idempotency::__cache_committed_error_response(__autumn_error)
+                    );
                 }
                 ::core::result::Result::Err(__autumn_panic) => {
                     ::autumn_web::__private::mark_repository_commit_hook_after_hook_failed(
@@ -582,7 +584,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         error = %__autumn_error,
                         "failed to finalize repository create commit hook after mutation commit; failing request closed"
                     );
-                    return ::core::result::Result::Err(__autumn_error);
+                    return ::core::result::Result::Err(
+                        ::autumn_web::idempotency::__cache_committed_error_response(__autumn_error)
+                    );
                 }
             }
 
@@ -750,7 +754,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     )
                     .await;
                     __autumn_pending_heartbeat.cancel();
-                    return ::core::result::Result::Err(__autumn_error);
+                    return ::core::result::Result::Err(
+                        ::autumn_web::idempotency::__cache_committed_error_response(__autumn_error)
+                    );
                 }
                 ::core::result::Result::Err(__autumn_panic) => {
                     ::autumn_web::__private::mark_repository_commit_hook_after_hook_failed(
@@ -783,7 +789,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         error = %__autumn_error,
                         "failed to finalize repository update commit hook after mutation commit; failing request closed"
                     );
-                    return ::core::result::Result::Err(__autumn_error);
+                    return ::core::result::Result::Err(
+                        ::autumn_web::idempotency::__cache_committed_error_response(__autumn_error)
+                    );
                 }
             }
 
@@ -2336,12 +2344,12 @@ mod tests {
     }
 
     #[test]
-    fn hooked_repository_commit_hook_finalization_failures_fail_closed() {
+    fn hooked_repository_commit_hook_post_commit_failures_are_idempotency_cacheable() {
         let generated = durable_hook_repository_tokens();
 
         assert!(
-            generated.contains("return :: core :: result :: Result :: Err (__autumn_error)"),
-            "post-commit finalization failures must fail closed instead of reporting a cacheable success: {generated}"
+            generated.contains("__cache_committed_error_response (__autumn_error)"),
+            "post-commit hook failures must be marked cacheable so idempotent retries do not duplicate the committed mutation: {generated}"
         );
         assert!(
             generated

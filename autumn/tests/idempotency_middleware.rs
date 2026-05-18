@@ -9,8 +9,8 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use autumn_web::idempotency::{
-    IdempotencyLayer, IdempotencyReplayLayer, IdempotencyStore, IdempotencyStoreError,
-    MemoryIdempotencyStore,
+    IdempotencyCacheCommittedErrorResponse, IdempotencyLayer, IdempotencyReplayLayer,
+    IdempotencyScope, IdempotencyStore, IdempotencyStoreError, MemoryIdempotencyStore,
 };
 use autumn_web::session::{
     MemoryStore, Session, SessionConfig, SessionLayer, SessionStore, SessionStoreError,
@@ -32,9 +32,30 @@ async fn tenant_echo_handler(headers: axum::http::HeaderMap) -> String {
     TENANT_HEADER_HANDLER_CALLS.fetch_add(1, Ordering::SeqCst);
     headers
         .get("x-tenant-id")
+        .or_else(|| headers.get("tenant"))
         .and_then(|value| value.to_str().ok())
         .unwrap_or("missing")
         .to_owned()
+}
+
+async fn tenant_scope_extension_handler(
+    axum::extract::Extension(tenant): axum::extract::Extension<String>,
+) -> String {
+    TENANT_EXTENSION_HANDLER_CALLS.fetch_add(1, Ordering::SeqCst);
+    tenant
+}
+
+async fn committed_error_handler() -> Response {
+    COMMITTED_ERROR_HANDLER_CALLS.fetch_add(1, Ordering::SeqCst);
+    let mut response = (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "repository commit hook finalization failed",
+    )
+        .into_response();
+    response
+        .extensions_mut()
+        .insert(IdempotencyCacheCommittedErrorResponse);
+    response
 }
 
 fn make_store(ttl: Duration) -> Arc<dyn autumn_web::idempotency::IdempotencyStore> {
@@ -80,6 +101,7 @@ fn storage_key(method: &str, path: &str, auth: &str, idempotency_key: &str) -> S
     push_component(&mut storage, "method", method.as_bytes());
     push_component(&mut storage, "target", path.as_bytes());
     push_component(&mut storage, "scope-header-count", b"0");
+    push_component(&mut storage, "scope-extension-count", b"0");
     push_component(&mut storage, "principal", principal.as_bytes());
     push_component(&mut storage, "idempotency-key", idempotency_key.as_bytes());
     format!(
@@ -168,6 +190,8 @@ static RAW_LAYERED_AUTH_CALLS: AtomicUsize = AtomicUsize::new(0);
 static RAW_LAYERED_ALLOWED: AtomicBool = AtomicBool::new(true);
 static SESSION_SAVE_FAILURE_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static TENANT_HEADER_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
+static TENANT_EXTENSION_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
+static COMMITTED_ERROR_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static SECURED_SESSION_ROTATION_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 /// Route-local interceptor used to prove idempotency replays still traverse
@@ -2355,7 +2379,7 @@ async fn test_tenant_scope_headers_same_key_are_independent() {
         .method("POST")
         .uri("/tenant-action")
         .header("idempotency-key", "shared-tenant-key")
-        .header("x-tenant-id", "tenant-a")
+        .header("tenant", "tenant-a")
         .body(axum::body::Body::from("same"))
         .unwrap();
     let resp_a = app.clone().oneshot(req_a).await.unwrap();
@@ -2369,7 +2393,7 @@ async fn test_tenant_scope_headers_same_key_are_independent() {
         .method("POST")
         .uri("/tenant-action")
         .header("idempotency-key", "shared-tenant-key")
-        .header("x-tenant-id", "tenant-b")
+        .header("tenant", "tenant-b")
         .body(axum::body::Body::from("same"))
         .unwrap();
     let resp_b = app.clone().oneshot(req_b).await.unwrap();
@@ -2386,6 +2410,121 @@ async fn test_tenant_scope_headers_same_key_are_independent() {
         TENANT_HEADER_HANDLER_CALLS.load(Ordering::SeqCst),
         2,
         "same principal/path/body/key in different tenants must not replay another tenant's mutation response"
+    );
+}
+
+#[tokio::test]
+async fn test_tenant_scope_extension_same_key_is_independent() {
+    use tower::ServiceExt;
+
+    async fn tenant_scope(
+        mut req: axum::http::Request<Body>,
+        next: axum::middleware::Next,
+    ) -> Response {
+        let tenant = req
+            .headers()
+            .get("customer-scope")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("missing")
+            .to_owned();
+        req.extensions_mut()
+            .insert(IdempotencyScope::new().with("tenant", tenant.as_bytes()));
+        req.extensions_mut().insert(tenant);
+        next.run(req).await
+    }
+
+    TENANT_EXTENSION_HANDLER_CALLS.store(0, Ordering::SeqCst);
+    let store = make_store(Duration::from_secs(3600));
+    let layer = IdempotencyLayer::new(store);
+
+    let app = axum::Router::new()
+        .route(
+            "/tenant-extension-action",
+            axum::routing::post(tenant_scope_extension_handler),
+        )
+        .layer(layer)
+        .layer(axum::middleware::from_fn(tenant_scope));
+
+    let req_a = axum::http::Request::builder()
+        .method("POST")
+        .uri("/tenant-extension-action")
+        .header("idempotency-key", "shared-tenant-extension-key")
+        .header("customer-scope", "tenant-a")
+        .body(axum::body::Body::from("same"))
+        .unwrap();
+    let resp_a = app.clone().oneshot(req_a).await.unwrap();
+    assert_eq!(resp_a.status(), StatusCode::OK);
+    let body_a = axum::body::to_bytes(resp_a.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(body_a, "tenant-a");
+
+    let req_b = axum::http::Request::builder()
+        .method("POST")
+        .uri("/tenant-extension-action")
+        .header("idempotency-key", "shared-tenant-extension-key")
+        .header("customer-scope", "tenant-b")
+        .body(axum::body::Body::from("same"))
+        .unwrap();
+    let resp_b = app.clone().oneshot(req_b).await.unwrap();
+    assert_eq!(resp_b.status(), StatusCode::OK);
+    assert!(
+        resp_b.headers().get("x-idempotent-replayed").is_none(),
+        "idempotency scope extensions must partition cache entries"
+    );
+    let body_b = axum::body::to_bytes(resp_b.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(body_b, "tenant-b");
+    assert_eq!(
+        TENANT_EXTENSION_HANDLER_CALLS.load(Ordering::SeqCst),
+        2,
+        "middleware-resolved tenants must not replay another tenant's mutation response"
+    );
+}
+
+#[tokio::test]
+async fn test_committed_error_response_is_cached() {
+    use tower::ServiceExt;
+
+    COMMITTED_ERROR_HANDLER_CALLS.store(0, Ordering::SeqCst);
+    let store = make_store(Duration::from_secs(3600));
+    let layer = IdempotencyLayer::new(store);
+
+    let app = axum::Router::new()
+        .route(
+            "/committed-error",
+            axum::routing::post(committed_error_handler),
+        )
+        .layer(layer);
+
+    let req1 = axum::http::Request::builder()
+        .method("POST")
+        .uri("/committed-error")
+        .header("idempotency-key", "committed-error-key")
+        .body(axum::body::Body::from("same"))
+        .unwrap();
+    let resp1 = app.clone().oneshot(req1).await.unwrap();
+    assert_eq!(resp1.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(resp1.headers().get("x-idempotent-replayed").is_none());
+
+    let req2 = axum::http::Request::builder()
+        .method("POST")
+        .uri("/committed-error")
+        .header("idempotency-key", "committed-error-key")
+        .body(axum::body::Body::from("same"))
+        .unwrap();
+    let resp2 = app.clone().oneshot(req2).await.unwrap();
+    assert_eq!(resp2.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        resp2.headers().get("x-idempotent-replayed"),
+        Some(&axum::http::HeaderValue::from_static("true")),
+        "committed mutation errors must replay instead of reopening the key"
+    );
+    assert_eq!(
+        COMMITTED_ERROR_HANDLER_CALLS.load(Ordering::SeqCst),
+        1,
+        "cached committed errors must not re-enter the mutating handler"
     );
 }
 

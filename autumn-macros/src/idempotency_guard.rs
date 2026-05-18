@@ -238,18 +238,47 @@ fn if_let_replays_finalized_session_response(expr_if: &ExprIf) -> bool {
 
 fn expr_is_finalized_session_replay_call(expr: &Expr) -> bool {
     match expr {
-        Expr::Call(call) => {
-            path_expr_matches(
+        Expr::Await(await_expr) => expr_is_finalized_session_replay_call(&await_expr.base),
+        Expr::Call(call)
+            if path_expr_matches(
                 &call.func,
                 &[
                     "autumn_web",
                     "idempotency",
                     "__replay_finalized_session_response",
                 ],
-            ) && call.args.len() == 1
+            ) =>
+        {
+            call.args.len() == 1
                 && call
                     .args
                     .first()
+                    .is_some_and(|arg| expr_is_ref_to_ident(arg, "__autumn_idempotency_replay"))
+        }
+        Expr::Call(call)
+            if path_expr_matches(
+                &call.func,
+                &[
+                    "autumn_web",
+                    "idempotency",
+                    "__replay_finalized_session_response_for_anonymous",
+                ],
+            ) =>
+        {
+            call.args.len() == 3
+                && call
+                    .args
+                    .first()
+                    .is_some_and(|arg| expr_is_ref_to_ident(arg, "__autumn_session"))
+                && call
+                    .args
+                    .iter()
+                    .nth(1)
+                    .is_some_and(expr_is_auth_session_key_call)
+                && call
+                    .args
+                    .iter()
+                    .nth(2)
                     .is_some_and(|arg| expr_is_ref_to_ident(arg, "__autumn_idempotency_replay"))
         }
         Expr::Group(group) => expr_is_finalized_session_replay_call(&group.expr),
@@ -601,6 +630,43 @@ mod tests {
                 )
                 .await
             {
+                return ::autumn_web::reexports::axum::response::IntoResponse::into_response(
+                    __autumn_error,
+                );
+            }
+            const __AUTUMN_IDEMPOTENCY_REPLAY_GUARD: () = ();
+            if let ::core::option::Option::Some(__autumn_response) =
+                ::autumn_web::idempotency::__replay_response(&__autumn_idempotency_replay)
+            {
+                return __autumn_response;
+            }
+        });
+
+        assert!(block_has_replay_guard(&block));
+    }
+
+    #[test]
+    fn generated_authorize_prologue_with_anonymous_session_replay_counts() {
+        let block: syn::Block = syn::parse_quote!({
+            if let ::core::result::Result::Err(__autumn_error) =
+                ::autumn_web::authorization::__check_policy::<Post>(
+                    &__autumn_state,
+                    &__autumn_session,
+                    "update",
+                    &post,
+                )
+                .await
+            {
+                if let ::core::option::Option::Some(__autumn_response) =
+                    ::autumn_web::idempotency::__replay_finalized_session_response_for_anonymous(
+                        &__autumn_session,
+                        __autumn_state.auth_session_key(),
+                        &__autumn_idempotency_replay,
+                    )
+                    .await
+                {
+                    return __autumn_response;
+                }
                 return ::autumn_web::reexports::axum::response::IntoResponse::into_response(
                     __autumn_error,
                 );
