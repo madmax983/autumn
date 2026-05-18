@@ -80,24 +80,24 @@ fn push_storage_key_component(hasher: &mut sha2::Sha256, label: &str, value: &[u
     hasher.update(b";");
 }
 
-/// Namespace the cache key by method, path, selected request scope headers, a
-/// stable principal digest, and the client-supplied idempotency key.
+/// Namespace the cache key by method, path, a stable principal digest, and the
+/// client-supplied idempotency key.
 ///
 /// Namespacing by method+path prevents cross-endpoint cache collisions (P2).
 /// Namespacing by Authorization and session scope prevents cross-principal
-/// collisions (P1), including cookie-backed authenticated sessions. Selected
-/// headers such as Host and explicit tenant/workspace/account scope headers
-/// prevent route-local tenant middleware from receiving another tenant's
-/// cached response. Each component is length-delimited inside a SHA-256 digest
-/// so raw `:` bytes in paths or client-controlled keys cannot synthesize
-/// another storage key.
+/// collisions (P1), including cookie-backed authenticated sessions. Request
+/// headers are intentionally excluded: client-controlled headers must not let a
+/// retry force a fresh miss after a successful mutation. Opaque route layers
+/// that resolve tenants or policy state must use the fail-closed replay path
+/// instead of storage-key partitioning. Each component is length-delimited
+/// inside a SHA-256 digest so raw `:` bytes in paths or client-controlled keys
+/// cannot synthesize another storage key.
 #[derive(Clone)]
 struct StorageKeyContext {
     idempotency_key: String,
     method: Method,
     target: String,
     authorization: Option<String>,
-    scope_headers: Vec<(String, Vec<u8>)>,
 }
 
 impl StorageKeyContext {
@@ -118,7 +118,6 @@ impl StorageKeyContext {
             method: parts.method.clone(),
             target,
             authorization,
-            scope_headers: storage_scope_headers(&parts.headers),
         }
     }
 
@@ -129,7 +128,6 @@ impl StorageKeyContext {
             &self.target,
             self.authorization.as_deref(),
             session_id,
-            &self.scope_headers,
         )
     }
 }
@@ -140,60 +138,15 @@ fn build_storage_key(
     target: &str,
     auth: Option<&str>,
     session_id: Option<&str>,
-    scope_headers: &[(String, Vec<u8>)],
 ) -> String {
     let principal = principal_scope_digest(auth, session_id);
     let mut hasher = sha2::Sha256::new();
     push_storage_key_component(&mut hasher, "method", method.as_bytes());
     push_storage_key_component(&mut hasher, "target", target.as_bytes());
-    push_storage_key_component(
-        &mut hasher,
-        "scope-header-count",
-        scope_headers.len().to_string().as_bytes(),
-    );
-    for (name, value) in scope_headers {
-        push_storage_key_component(&mut hasher, "scope-header-name", name.as_bytes());
-        push_storage_key_component(&mut hasher, "scope-header-value", value);
-    }
+    push_storage_key_component(&mut hasher, "scope-header-count", b"0");
     push_storage_key_component(&mut hasher, "principal", principal.as_bytes());
     push_storage_key_component(&mut hasher, "idempotency-key", idempotency_key.as_bytes());
     format!("v2:{}", hex_lower(hasher.finalize()))
-}
-
-fn storage_scope_headers(headers: &HeaderMap) -> Vec<(String, Vec<u8>)> {
-    let mut scope_headers = headers
-        .iter()
-        .filter(|(name, _)| is_storage_scope_header(name.as_str()))
-        .map(|(name, value)| {
-            (
-                name.as_str().to_ascii_lowercase(),
-                value.as_bytes().to_vec(),
-            )
-        })
-        .collect::<Vec<_>>();
-    scope_headers.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
-    scope_headers
-}
-
-fn is_storage_scope_header(name: &str) -> bool {
-    let name = name.to_ascii_lowercase();
-    matches!(
-        name.as_str(),
-        "host"
-            | "x-forwarded-host"
-            | "x-tenant-id"
-            | "tenant"
-            | "customer-scope"
-            | "x-customer-scope"
-            | "workspace"
-            | "x-workspace-id"
-            | "account"
-            | "x-account-id"
-            | "organization"
-            | "x-organization-id"
-            | "org"
-            | "x-org-id"
-    )
 }
 
 async fn storage_session_id_for_parts(parts: &axum::http::request::Parts) -> Option<String> {

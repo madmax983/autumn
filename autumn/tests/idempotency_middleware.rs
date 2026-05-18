@@ -2741,12 +2741,12 @@ async fn test_different_auth_same_key_are_independent() {
 }
 
 #[tokio::test]
-async fn test_tenant_scope_headers_same_key_are_independent() {
+async fn test_client_tenant_headers_do_not_split_fail_closed_idempotency_scope() {
     use tower::ServiceExt;
 
     TENANT_HEADER_HANDLER_CALLS.store(0, Ordering::SeqCst);
     let store = make_store(Duration::from_secs(3600));
-    let layer = IdempotencyLayer::new(store);
+    let layer = IdempotencyLayer::new(store).fail_closed_on_replay();
 
     let app = axum::Router::new()
         .route("/tenant-action", axum::routing::post(tenant_echo_handler))
@@ -2774,19 +2774,12 @@ async fn test_tenant_scope_headers_same_key_are_independent() {
         .body(axum::body::Body::from("same"))
         .unwrap();
     let resp_b = app.clone().oneshot(req_b).await.unwrap();
-    assert_eq!(resp_b.status(), StatusCode::OK);
-    assert!(
-        resp_b.headers().get("x-idempotent-replayed").is_none(),
-        "tenant scope headers must partition idempotency cache entries"
-    );
-    let body_b = axum::body::to_bytes(resp_b.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    assert_eq!(body_b, "tenant-b");
+    assert_eq!(resp_b.status(), StatusCode::CONFLICT);
+    assert!(resp_b.headers().get("x-idempotent-replayed").is_none());
     assert_eq!(
         TENANT_HEADER_HANDLER_CALLS.load(Ordering::SeqCst),
-        2,
-        "same principal/path/body/key in different tenants must not replay another tenant's mutation response"
+        1,
+        "client-controlled tenant headers must not split the storage key or rerun the mutation"
     );
 }
 
@@ -2809,7 +2802,7 @@ async fn test_volatile_x_headers_do_not_split_idempotency_scope() {
         .method("POST")
         .uri("/volatile-action")
         .header("idempotency-key", "volatile-header-key")
-        .header("x-client-window-id", "window-a")
+        .header("x-workspace-id", "workspace-a")
         .body(axum::body::Body::from("same"))
         .unwrap();
     let resp_a = app.clone().oneshot(req_a).await.unwrap();
@@ -2820,7 +2813,7 @@ async fn test_volatile_x_headers_do_not_split_idempotency_scope() {
         .method("POST")
         .uri("/volatile-action")
         .header("idempotency-key", "volatile-header-key")
-        .header("x-client-window-id", "window-b")
+        .header("x-workspace-id", "workspace-b")
         .body(axum::body::Body::from("same"))
         .unwrap();
     let resp_b = app.clone().oneshot(req_b).await.unwrap();
@@ -2949,7 +2942,7 @@ async fn test_app_wide_generated_route_fails_closed_for_opaque_tenant_scope() {
 }
 
 #[tokio::test]
-async fn test_route_local_tenant_header_scope_same_key_is_independent() {
+async fn test_route_local_tenant_header_scope_uses_fail_closed_replay() {
     use tower::ServiceExt;
 
     async fn tenant_scope(
@@ -2968,7 +2961,7 @@ async fn test_route_local_tenant_header_scope_same_key_is_independent() {
 
     TENANT_EXTENSION_HANDLER_CALLS.store(0, Ordering::SeqCst);
     let store = make_store(Duration::from_secs(3600));
-    let layer = IdempotencyLayer::new(store);
+    let layer = IdempotencyLayer::new(store).fail_closed_on_replay();
 
     let app = axum::Router::new()
         .route(
@@ -3000,19 +2993,12 @@ async fn test_route_local_tenant_header_scope_same_key_is_independent() {
         .body(axum::body::Body::from("same"))
         .unwrap();
     let resp_b = app.clone().oneshot(req_b).await.unwrap();
-    assert_eq!(resp_b.status(), StatusCode::OK);
-    assert!(
-        resp_b.headers().get("x-idempotent-replayed").is_none(),
-        "route-local tenant headers must partition cache entries before tenant middleware returns replay"
-    );
-    let body_b = axum::body::to_bytes(resp_b.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    assert_eq!(body_b, "tenant-b");
+    assert_eq!(resp_b.status(), StatusCode::CONFLICT);
+    assert!(resp_b.headers().get("x-idempotent-replayed").is_none());
     assert_eq!(
         TENANT_EXTENSION_HANDLER_CALLS.load(Ordering::SeqCst),
-        2,
-        "middleware-resolved tenants must not replay another tenant's mutation response"
+        1,
+        "middleware-resolved tenant headers must fail closed instead of splitting the storage key or rerunning the mutation"
     );
 }
 
