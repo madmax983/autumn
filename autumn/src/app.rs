@@ -1800,6 +1800,13 @@ impl AppBuilder {
         // Clone metrics so the drain-watchdog can record aborted requests.
         let shutdown_metrics = state.metrics.clone();
 
+        // Shared timestamp: set by shutdown_task when the listener is cancelled
+        // (phase 5). Main reads it after server_task completes to measure only
+        // actual drain time for hook budget — not the app's full uptime.
+        let drain_started_at: std::sync::Arc<std::sync::OnceLock<std::time::Instant>> =
+            std::sync::Arc::new(std::sync::OnceLock::new());
+        let drain_started_clone = std::sync::Arc::clone(&drain_started_at);
+
         // Notified by main just before server_task.await (after startup hooks
         // complete). If SIGTERM arrives during startup hooks the watchdog waits
         // here so the drain deadline is always measured from when drain starts.
@@ -1851,6 +1858,9 @@ impl AppBuilder {
             websocket_shutdown.cancel();
 
             // Phase 5: stop listener and signal jobs/scheduler to stop dequeuing.
+            // Record drain-start before cancelling so main gets the right hook
+            // budget even in the startup-overlap case.
+            let _ = drain_started_clone.set(std::time::Instant::now());
             shutdown_signal_token.cancel();
 
             // Phase 6: drain watchdog — if in-flight drain exceeds the budget,
@@ -1928,9 +1938,6 @@ impl AppBuilder {
         server_entered_drain.store(true, std::sync::atomic::Ordering::Release);
         drain_phase_notify.notify_one();
 
-        // Record the moment drain begins (after startup hooks complete) so the
-        // hook budget below reflects only in-flight drain time, not hook time.
-        let drain_window_start = std::time::Instant::now();
         // Wait for the server to drain all in-flight requests.  The drain
         // watchdog in shutdown_task will force-exit if drain takes too long.
         let server_result = server_task.await.unwrap_or_else(|e| {
@@ -1948,7 +1955,9 @@ impl AppBuilder {
         // shutdown_timeout_secs (drain + hooks share one budget, not two).
         // Plugin ordering: plugins register during build() before app hooks,
         // so app hooks run before plugin hooks (LIFO = last-registered first).
-        let drain_elapsed = drain_window_start.elapsed();
+        let drain_elapsed = drain_started_at
+            .get()
+            .map_or(std::time::Duration::ZERO, std::time::Instant::elapsed);
         let hook_budget =
             std::time::Duration::from_secs(shutdown_timeout).saturating_sub(drain_elapsed);
         run_shutdown_hooks_with_timeout(&shutdown_hooks, hook_budget, hook_budget).await;
@@ -7456,17 +7465,17 @@ mod tests {
         let fr = Arc::clone(&fast_ran);
 
         let hooks: Vec<ShutdownHook> = vec![
-            // hook 0 (last registered → runs first in LIFO): slow, exceeds per-hook budget
-            Box::new(|| {
-                Box::pin(async move {
-                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                })
-            }),
-            // hook 1: fast — must still run within total budget
+            // hook 0 (first registered → runs LAST in LIFO): fast
             Box::new(move || {
                 let fr = Arc::clone(&fr);
                 Box::pin(async move {
                     fr.store(true, Ordering::SeqCst);
+                })
+            }),
+            // hook 1 (last registered → runs FIRST in LIFO): slow, exceeds per-hook budget
+            Box::new(|| {
+                Box::pin(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 })
             }),
         ];

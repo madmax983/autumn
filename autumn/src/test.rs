@@ -337,10 +337,15 @@ impl TestApp {
     /// Construct a [`TestClient`] directly from an `axum::Router`.
     ///
     /// Useful for bypassing `TestApp` builder if you just want to write requests
-    /// against a standard axum Router.
+    /// against a standard axum Router.  The probe state returned by
+    /// [`TestClient::probes`] will be in the default ready state; it is not
+    /// connected to any handler in the supplied router.
     #[must_use]
-    pub const fn from_router(router: axum::Router) -> TestClient {
-        TestClient { router }
+    pub fn from_router(router: axum::Router) -> TestClient {
+        TestClient {
+            router,
+            probes: crate::probe::ProbeState::ready_for_test(),
+        }
     }
 
     /// Register a collection of routes to be built into the `TestApp`.
@@ -386,6 +391,7 @@ impl TestApp {
     pub fn build(self) -> TestClient {
         // Reset the global cache to prevent cross-test contamination.
         crate::cache::clear_global_cache();
+        let probes = crate::probe::ProbeState::ready_for_test();
         let state = AppState {
             extensions: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
@@ -397,7 +403,7 @@ impl TestApp {
             profile: self.config.profile.clone(),
             started_at: std::time::Instant::now(),
             health_detailed: self.config.health.detailed,
-            probes: crate::probe::ProbeState::ready_for_test(),
+            probes: probes.clone(),
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new(&self.config.log.level),
             task_registry: crate::actuator::TaskRegistry::new(),
@@ -437,7 +443,7 @@ impl TestApp {
             },
         )
         .expect("failed to build test router");
-        TestClient { router }
+        TestClient { router, probes }
     }
 }
 
@@ -480,12 +486,21 @@ impl Default for TestApp {
 /// ```
 pub struct TestClient {
     router: axum::Router,
+    probes: crate::probe::ProbeState,
 }
 
 impl TestClient {
     /// Unwrap the underlying [`axum::Router`] out of the [`TestClient`].
     pub fn into_router(self) -> axum::Router {
         self.router
+    }
+
+    /// Return the [`ProbeState`] wired into this test app's router.
+    ///
+    /// Use this to drive readiness/liveness transitions in integration tests
+    /// and verify the HTTP probe endpoints reflect state changes.
+    pub const fn probes(&self) -> &crate::probe::ProbeState {
+        &self.probes
     }
 
     /// Start building a GET request.

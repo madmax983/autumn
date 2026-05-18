@@ -82,7 +82,6 @@ async fn slow_handler() -> &'static str {
 #[tokio::test(flavor = "multi_thread")]
 async fn sigterm_during_long_http_request_drains_cleanly() {
     use autumn_web::prelude::*;
-    use autumn_web::probe::ProbeState;
     use autumn_web::test::TestApp;
     use std::net::SocketAddr;
     use std::sync::Arc;
@@ -93,21 +92,19 @@ async fn sigterm_during_long_http_request_drains_cleanly() {
     use tokio_util::sync::CancellationToken;
 
     let request_completed = Arc::new(AtomicBool::new(false));
-    let ready_was_draining = Arc::new(AtomicBool::new(false));
+    let ready_was_503 = Arc::new(AtomicBool::new(false));
 
     let rc = Arc::clone(&request_completed);
-    let rwd = Arc::clone(&ready_was_draining);
-
-    let probe = ProbeState::ready_for_test();
-    let probe_clone = probe.clone();
+    let r503 = Arc::clone(&ready_was_503);
 
     let shutdown = CancellationToken::new();
     let shutdown_clone = shutdown.clone();
 
-    let router = TestApp::new()
-        .routes(routes![slow_handler])
-        .build()
-        .into_router();
+    // Build via TestApp so probe_state is wired to the same AppState the
+    // router uses — this connects begin_draining() to the /ready handler.
+    let tc = TestApp::new().routes(routes![slow_handler]).build();
+    let probe_clone = tc.probes().clone();
+    let router = tc.into_router();
 
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -141,12 +138,25 @@ async fn sigterm_during_long_http_request_drains_cleanly() {
     });
 
     // After 50 ms the slow request is in-flight (handler sleeps 200 ms).
-    // Flip /ready → 503 before cancelling the listener.
+    // Flip /ready → 503 before cancelling the listener; verify via HTTP.
     tokio::time::sleep(Duration::from_millis(50)).await;
     probe_clone.begin_draining();
-    if probe_clone.draining() {
-        rwd.store(true, Ordering::SeqCst);
-    }
+
+    // Query /ready on the live server — the handler reads the same ProbeState
+    // we just flipped, so the HTTP response must be 503.
+    let mut ready_stream = TcpStream::connect(addr).await.expect("connect /ready");
+    ready_stream
+        .write_all(b"GET /ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .expect("send /ready");
+    let mut ready_buf = Vec::new();
+    ready_stream
+        .read_to_end(&mut ready_buf)
+        .await
+        .expect("read /ready");
+    let ready_resp = String::from_utf8_lossy(&ready_buf);
+    r503.store(ready_resp.starts_with("HTTP/1.1 503"), Ordering::SeqCst);
+
     shutdown_clone.cancel();
 
     tokio::time::timeout(Duration::from_secs(3), client_task)
@@ -159,8 +169,9 @@ async fn sigterm_during_long_http_request_drains_cleanly() {
         "in-flight HTTP request must complete before server exits"
     );
     assert!(
-        ready_was_draining.load(Ordering::SeqCst),
-        "/ready must have been draining (503) before the listener closed"
+        ready_was_503.load(Ordering::SeqCst),
+        "/ready must return 503 after begin_draining(), before the listener closed; \
+         got: {ready_resp}"
     );
 }
 
