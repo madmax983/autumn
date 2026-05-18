@@ -1807,6 +1807,14 @@ impl AppBuilder {
             std::sync::Arc::new(std::sync::OnceLock::new());
         let drain_started_clone = std::sync::Arc::clone(&drain_started_at);
 
+        // Flag set by main just before awaiting server_task (i.e. after startup
+        // hooks complete). The watchdog uses this to distinguish a drain timeout
+        // (server was serving traffic → force exit(1)) from a shutdown that
+        // arrived during startup hooks (server never entered drain → let main
+        // proceed to normal cleanup rather than false-positive exit(1)).
+        let server_entered_drain = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server_entered_drain_for_watchdog = std::sync::Arc::clone(&server_entered_drain);
+
         // Shutdown task: handles the rolling-deploy lifecycle phases.
         //
         // Phases:
@@ -1855,6 +1863,17 @@ impl AppBuilder {
             // Phase 6: drain watchdog — if in-flight drain exceeds the budget,
             // record aborted count and force non-zero exit before hooks run.
             tokio::time::sleep(std::time::Duration::from_secs(shutdown_timeout)).await;
+            if !server_entered_drain_for_watchdog.load(std::sync::atomic::Ordering::Acquire) {
+                // SIGTERM arrived before startup hooks finished; the server never
+                // entered the drain phase, so there are no in-flight requests to
+                // abort. Let the main task complete startup and run normal cleanup.
+                tracing::warn!(
+                    phase = "signal_during_startup",
+                    "shutdown: graceful-shutdown deadline reached before server entered \
+                     drain phase; skipping force-exit to allow startup to complete"
+                );
+                return;
+            }
             let aborted = shutdown_metrics.snapshot().http.requests_active;
             shutdown_metrics.record_shutdown_aborted(aborted);
             tracing::error!(
@@ -1890,6 +1909,11 @@ impl AppBuilder {
             }
             state.probes().mark_startup_complete();
         }
+
+        // Mark that the server has entered the drain phase. The watchdog reads
+        // this to distinguish a real drain timeout from a SIGTERM-during-startup
+        // scenario (where force-exit(1) would be a false positive).
+        server_entered_drain.store(true, std::sync::atomic::Ordering::Release);
 
         // Wait for the server to drain all in-flight requests.  The drain
         // watchdog in shutdown_task will force-exit if drain takes too long.

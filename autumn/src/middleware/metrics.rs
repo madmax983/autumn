@@ -499,6 +499,15 @@ where
 pin_project! {
     #[project = MetricsFutureProj]
     /// Future that records metrics after the inner service completes.
+    ///
+    /// **Known limitation:** `requests_active` tracks the tower service future
+    /// lifecycle, not the response-body lifecycle. For SSE / streaming handlers
+    /// the service future completes when the handler returns the `Response`
+    /// (with a streaming body), so `requests_active` is decremented before the
+    /// body is fully sent to the client. This means the
+    /// `autumn_shutdown_aborted_requests_total` watchdog counter may read `0`
+    /// even when streaming connections are still open during graceful shutdown.
+    /// Fixing this requires connection-level tracking at the Hyper layer.
     pub struct MetricsFuture<F> {
         #[pin]
         inner: F,
