@@ -28,6 +28,15 @@ async fn ok_handler() -> &'static str {
     "pong"
 }
 
+async fn tenant_echo_handler(headers: axum::http::HeaderMap) -> String {
+    TENANT_HEADER_HANDLER_CALLS.fetch_add(1, Ordering::SeqCst);
+    headers
+        .get("x-tenant-id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("missing")
+        .to_owned()
+}
+
 fn make_store(ttl: Duration) -> Arc<dyn autumn_web::idempotency::IdempotencyStore> {
     Arc::new(MemoryIdempotencyStore::new(ttl))
 }
@@ -70,6 +79,7 @@ fn storage_key(method: &str, path: &str, auth: &str, idempotency_key: &str) -> S
     let mut storage = sha2::Sha256::new();
     push_component(&mut storage, "method", method.as_bytes());
     push_component(&mut storage, "target", path.as_bytes());
+    push_component(&mut storage, "scope-header-count", b"0");
     push_component(&mut storage, "principal", principal.as_bytes());
     push_component(&mut storage, "idempotency-key", idempotency_key.as_bytes());
     format!(
@@ -157,6 +167,8 @@ static MANUAL_DIRECT_LAYERED_ALLOWED: AtomicBool = AtomicBool::new(true);
 static RAW_LAYERED_AUTH_CALLS: AtomicUsize = AtomicUsize::new(0);
 static RAW_LAYERED_ALLOWED: AtomicBool = AtomicBool::new(true);
 static SESSION_SAVE_FAILURE_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
+static TENANT_HEADER_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
+static SECURED_SESSION_ROTATION_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 /// Route-local interceptor used to prove idempotency replays still traverse
 /// `#[intercept(...)]` layers before the cached response is returned.
@@ -433,6 +445,15 @@ async fn session_rotation_handler(session: Session) -> &'static str {
     session.insert("user_id", "42").await;
     session.rotate_id().await;
     "logged-in"
+}
+
+#[post("/secured-session-rotation")]
+#[autumn_web::secured]
+async fn secured_session_rotation_handler(session: Session) -> &'static str {
+    SECURED_SESSION_ROTATION_HANDLER_CALLS.fetch_add(1, Ordering::SeqCst);
+    session.insert("user_id", "42").await;
+    session.rotate_id().await;
+    "secured-rotated"
 }
 
 async fn session_alias_failure_handler(session: Session) -> &'static str {
@@ -826,6 +847,56 @@ async fn test_session_rotation_replays_for_old_and_new_cookie_scopes() {
         SESSION_ROTATION_HANDLER_CALLS.load(Ordering::SeqCst),
         1,
         "session rotation must not move retries into a fresh idempotency scope"
+    );
+}
+
+#[tokio::test]
+async fn test_secured_session_rotation_replays_final_cookie_for_old_cookie_scope() {
+    SECURED_SESSION_ROTATION_HANDLER_CALLS.store(0, Ordering::SeqCst);
+
+    let session_store = MemoryStore::new();
+    let mut existing = HashMap::new();
+    existing.insert("user_id".to_owned(), "42".to_owned());
+    session_store
+        .save("secured-guest-session", existing)
+        .await
+        .unwrap();
+
+    let client = TestApp::new()
+        .routes(routes![secured_session_rotation_handler])
+        .idempotent()
+        .layer(SessionLayer::new(session_store, SessionConfig::default()))
+        .build();
+
+    let first = client
+        .post("/secured-session-rotation")
+        .header("cookie", "autumn.sid=secured-guest-session")
+        .header("idempotency-key", "secured-rotation-key")
+        .send()
+        .await;
+    first.assert_ok();
+    assert!(first.header("set-cookie").is_some());
+
+    let retry = client
+        .post("/secured-session-rotation")
+        .header("cookie", "autumn.sid=secured-guest-session")
+        .header("idempotency-key", "secured-rotation-key")
+        .send()
+        .await;
+    retry.assert_ok();
+    assert_eq!(
+        retry.header("x-idempotent-replayed"),
+        Some("true"),
+        "a retry with the destroyed pre-rotation session must replay the finalized session response"
+    );
+    assert!(
+        retry.header("set-cookie").is_some(),
+        "the replay must deliver the rotated session cookie"
+    );
+    assert_eq!(
+        SECURED_SESSION_ROTATION_HANDLER_CALLS.load(Ordering::SeqCst),
+        1,
+        "secured session-rotating retries must not re-enter the handler"
     );
 }
 
@@ -2265,6 +2336,56 @@ async fn test_different_auth_same_key_are_independent() {
     assert!(
         resp_b.headers().get("x-idempotent-replayed").is_none(),
         "different Authorization with same key must not replay another principal's response"
+    );
+}
+
+#[tokio::test]
+async fn test_tenant_scope_headers_same_key_are_independent() {
+    use tower::ServiceExt;
+
+    TENANT_HEADER_HANDLER_CALLS.store(0, Ordering::SeqCst);
+    let store = make_store(Duration::from_secs(3600));
+    let layer = IdempotencyLayer::new(store);
+
+    let app = axum::Router::new()
+        .route("/tenant-action", axum::routing::post(tenant_echo_handler))
+        .layer(layer);
+
+    let req_a = axum::http::Request::builder()
+        .method("POST")
+        .uri("/tenant-action")
+        .header("idempotency-key", "shared-tenant-key")
+        .header("x-tenant-id", "tenant-a")
+        .body(axum::body::Body::from("same"))
+        .unwrap();
+    let resp_a = app.clone().oneshot(req_a).await.unwrap();
+    assert_eq!(resp_a.status(), StatusCode::OK);
+    let body_a = axum::body::to_bytes(resp_a.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(body_a, "tenant-a");
+
+    let req_b = axum::http::Request::builder()
+        .method("POST")
+        .uri("/tenant-action")
+        .header("idempotency-key", "shared-tenant-key")
+        .header("x-tenant-id", "tenant-b")
+        .body(axum::body::Body::from("same"))
+        .unwrap();
+    let resp_b = app.clone().oneshot(req_b).await.unwrap();
+    assert_eq!(resp_b.status(), StatusCode::OK);
+    assert!(
+        resp_b.headers().get("x-idempotent-replayed").is_none(),
+        "tenant scope headers must partition idempotency cache entries"
+    );
+    let body_b = axum::body::to_bytes(resp_b.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(body_b, "tenant-b");
+    assert_eq!(
+        TENANT_HEADER_HANDLER_CALLS.load(Ordering::SeqCst),
+        2,
+        "same principal/path/body/key in different tenants must not replay another tenant's mutation response"
     );
 }
 

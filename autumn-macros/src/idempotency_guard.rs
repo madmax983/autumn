@@ -80,7 +80,7 @@ fn if_let_generated_check_returns_error(expr_if: &ExprIf) -> bool {
 
     pat_is_err_autumn_error(&expr_let.pat)
         && expr_is_generated_auth_check_call(&expr_let.expr)
-        && block_return_mentions_ident(&expr_if.then_branch, "__autumn_error")
+        && block_is_generated_auth_failure_response(&expr_if.then_branch)
 }
 
 fn pat_is_some_replay_response(pat: &Pat) -> bool {
@@ -124,14 +124,46 @@ fn expr_is_replay_response_call(expr: &Expr) -> bool {
 fn expr_is_generated_auth_check_call(expr: &Expr) -> bool {
     match expr {
         Expr::Await(await_expr) => expr_is_generated_auth_check_call(&await_expr.base),
-        Expr::Call(call) => {
-            path_expr_matches(
+        Expr::Call(call)
+            if path_expr_matches(
                 &call.func,
                 &["autumn_web", "auth", "__check_secured_with_key"],
-            ) || path_expr_matches(
+            ) =>
+        {
+            call.args.len() == 3
+                && call
+                    .args
+                    .first()
+                    .is_some_and(|arg| expr_is_ref_to_ident(arg, "__autumn_session"))
+                && call
+                    .args
+                    .iter()
+                    .nth(1)
+                    .is_some_and(expr_is_auth_session_key_call)
+                && call
+                    .args
+                    .iter()
+                    .nth(2)
+                    .is_some_and(|arg| path_expr_ends_with(arg, "__AUTUMN_SECURED_ROLES"))
+        }
+        Expr::Call(call)
+            if path_expr_matches(
                 &call.func,
                 &["autumn_web", "authorization", "__check_policy"],
-            )
+            ) =>
+        {
+            call.args.len() == 4
+                && call
+                    .args
+                    .first()
+                    .is_some_and(|arg| expr_is_ref_to_ident(arg, "__autumn_state"))
+                && call
+                    .args
+                    .iter()
+                    .nth(1)
+                    .is_some_and(|arg| expr_is_ref_to_ident(arg, "__autumn_session"))
+                && call.args.iter().nth(2).is_some_and(expr_is_string_literal)
+                && call.args.iter().nth(3).is_some_and(expr_is_ref_to_path)
         }
         Expr::Group(group) => expr_is_generated_auth_check_call(&group.expr),
         Expr::Paren(paren) => expr_is_generated_auth_check_call(&paren.expr),
@@ -149,30 +181,113 @@ fn block_returns_ident(block: &Block, expected: &str) -> bool {
     })
 }
 
-fn block_return_mentions_ident(block: &Block, expected: &str) -> bool {
-    block.stmts.iter().any(|stmt| match stmt {
-        Stmt::Expr(Expr::Return(ret), _) => ret
+fn block_is_generated_auth_failure_response(block: &Block) -> bool {
+    match block.stmts.as_slice() {
+        [Stmt::Expr(Expr::Return(ret), _)] => ret
             .expr
             .as_ref()
-            .is_some_and(|expr| expr_mentions_ident(expr, expected)),
-        _ => false,
-    })
-}
-
-fn expr_mentions_ident(expr: &Expr, expected: &str) -> bool {
-    match expr {
-        Expr::Path(_) => path_expr_ends_with(expr, expected),
-        Expr::Call(call) => {
-            path_expr_ends_with(&call.func, expected)
-                || call
-                    .args
-                    .iter()
-                    .any(|arg| expr_mentions_ident(arg, expected))
+            .is_some_and(|expr| expr_is_autumn_error_response(expr)),
+        [
+            Stmt::Expr(Expr::If(replay_if), _),
+            Stmt::Expr(Expr::Return(ret), _),
+        ] => {
+            if_let_replays_finalized_session_response(replay_if)
+                && ret
+                    .expr
+                    .as_ref()
+                    .is_some_and(|expr| expr_is_autumn_error_response(expr))
         }
-        Expr::Group(group) => expr_mentions_ident(&group.expr, expected),
-        Expr::Paren(paren) => expr_mentions_ident(&paren.expr, expected),
         _ => false,
     }
+}
+
+fn expr_is_autumn_error_response(expr: &Expr) -> bool {
+    match expr {
+        Expr::Call(call) => {
+            path_expr_matches(
+                &call.func,
+                &[
+                    "autumn_web",
+                    "reexports",
+                    "axum",
+                    "response",
+                    "IntoResponse",
+                    "into_response",
+                ],
+            ) && call.args.len() == 1
+                && call
+                    .args
+                    .first()
+                    .is_some_and(|arg| path_expr_ends_with(arg, "__autumn_error"))
+        }
+        Expr::Group(group) => expr_is_autumn_error_response(&group.expr),
+        Expr::Paren(paren) => expr_is_autumn_error_response(&paren.expr),
+        _ => false,
+    }
+}
+
+fn if_let_replays_finalized_session_response(expr_if: &ExprIf) -> bool {
+    let Expr::Let(expr_let) = expr_if.cond.as_ref() else {
+        return false;
+    };
+
+    pat_is_some_replay_response(&expr_let.pat)
+        && expr_is_finalized_session_replay_call(&expr_let.expr)
+        && block_returns_ident(&expr_if.then_branch, "__autumn_response")
+}
+
+fn expr_is_finalized_session_replay_call(expr: &Expr) -> bool {
+    match expr {
+        Expr::Call(call) => {
+            path_expr_matches(
+                &call.func,
+                &[
+                    "autumn_web",
+                    "idempotency",
+                    "__replay_finalized_session_response",
+                ],
+            ) && call.args.len() == 1
+                && call
+                    .args
+                    .first()
+                    .is_some_and(|arg| expr_is_ref_to_ident(arg, "__autumn_idempotency_replay"))
+        }
+        Expr::Group(group) => expr_is_finalized_session_replay_call(&group.expr),
+        Expr::Paren(paren) => expr_is_finalized_session_replay_call(&paren.expr),
+        _ => false,
+    }
+}
+
+fn expr_is_ref_to_ident(expr: &Expr, expected: &str) -> bool {
+    let Expr::Reference(reference) = expr else {
+        return false;
+    };
+
+    path_expr_ends_with(&reference.expr, expected)
+}
+
+fn expr_is_ref_to_path(expr: &Expr) -> bool {
+    matches!(expr, Expr::Reference(reference) if matches!(reference.expr.as_ref(), Expr::Path(_)))
+}
+
+fn expr_is_auth_session_key_call(expr: &Expr) -> bool {
+    let Expr::MethodCall(call) = expr else {
+        return false;
+    };
+
+    call.method == "auth_session_key"
+        && call.args.is_empty()
+        && path_expr_ends_with(&call.receiver, "__autumn_state")
+}
+
+const fn expr_is_string_literal(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Lit(syn::ExprLit {
+            lit: syn::Lit::Str(_),
+            ..
+        })
+    )
 }
 
 fn generated_nested_response_body(block: &Block, index: usize) -> Option<&Block> {
@@ -401,6 +516,60 @@ mod tests {
                 })
                 .await,
             )
+        });
+
+        assert!(!block_has_replay_guard(&block));
+    }
+
+    #[test]
+    fn secured_prologue_with_side_effect_argument_does_not_count() {
+        let block: syn::Block = syn::parse_quote!({
+            const __AUTUMN_SECURED_ROLES: &[&str] = &["admin"];
+            if let ::core::result::Result::Err(__autumn_error) =
+                ::autumn_web::auth::__check_secured_with_key(
+                    side_effect_before_replay_stop(),
+                    __autumn_state.auth_session_key(),
+                    __AUTUMN_SECURED_ROLES,
+                )
+                .await
+            {
+                return ::autumn_web::reexports::axum::response::IntoResponse::into_response(
+                    __autumn_error,
+                );
+            }
+            const __AUTUMN_IDEMPOTENCY_REPLAY_GUARD: () = ();
+            if let ::core::option::Option::Some(__autumn_response) =
+                ::autumn_web::idempotency::__replay_response(&__autumn_idempotency_replay)
+            {
+                return __autumn_response;
+            }
+        });
+
+        assert!(!block_has_replay_guard(&block));
+    }
+
+    #[test]
+    fn authorize_prologue_with_side_effect_argument_does_not_count() {
+        let block: syn::Block = syn::parse_quote!({
+            if let ::core::result::Result::Err(__autumn_error) =
+                ::autumn_web::authorization::__check_policy::<Post>(
+                    &__autumn_state,
+                    &__autumn_session,
+                    side_effect_before_replay_stop(),
+                    &post,
+                )
+                .await
+            {
+                return ::autumn_web::reexports::axum::response::IntoResponse::into_response(
+                    __autumn_error,
+                );
+            }
+            const __AUTUMN_IDEMPOTENCY_REPLAY_GUARD: () = ();
+            if let ::core::option::Option::Some(__autumn_response) =
+                ::autumn_web::idempotency::__replay_response(&__autumn_idempotency_replay)
+            {
+                return __autumn_response;
+            }
         });
 
         assert!(!block_has_replay_guard(&block));

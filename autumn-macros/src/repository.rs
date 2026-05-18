@@ -580,8 +580,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     ::autumn_web::reexports::tracing::warn!(
                         hook_id = %__autumn_commit_hook_id,
                         error = %__autumn_error,
-                        "failed to finalize repository create commit hook after mutation commit; leaving staged row for recovery"
+                        "failed to finalize repository create commit hook after mutation commit; failing request closed"
                     );
+                    return ::core::result::Result::Err(__autumn_error);
                 }
             }
 
@@ -780,8 +781,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     ::autumn_web::reexports::tracing::warn!(
                         hook_id = %__autumn_commit_hook_id,
                         error = %__autumn_error,
-                        "failed to finalize repository update commit hook after mutation commit; leaving staged row for recovery"
+                        "failed to finalize repository update commit hook after mutation commit; failing request closed"
                     );
+                    return ::core::result::Result::Err(__autumn_error);
                 }
             }
 
@@ -2334,20 +2336,20 @@ mod tests {
     }
 
     #[test]
-    fn hooked_repository_commit_hook_finalization_failures_are_non_fatal() {
+    fn hooked_repository_commit_hook_finalization_failures_fail_closed() {
         let generated = durable_hook_repository_tokens();
 
         assert!(
-            !generated.contains("__autumn_finalize_result ?"),
-            "post-commit finalization failures must not make save/update report the committed mutation as failed: {generated}"
+            generated.contains("return :: core :: result :: Result :: Err (__autumn_error)"),
+            "post-commit finalization failures must fail closed instead of reporting a cacheable success: {generated}"
         );
         assert!(
             generated
-                .contains("failed to finalize repository create commit hook after mutation commit")
+                .contains("failed to finalize repository create commit hook after mutation commit; failing request closed")
                 && generated.contains(
-                    "failed to finalize repository update commit hook after mutation commit"
+                    "failed to finalize repository update commit hook after mutation commit; failing request closed"
                 ),
-            "post-commit finalization failures should be logged and left for stale-pending recovery: {generated}"
+            "post-commit finalization failures should be logged as fail-closed outcomes: {generated}"
         );
     }
 

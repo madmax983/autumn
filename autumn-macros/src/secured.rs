@@ -59,6 +59,13 @@ pub fn secured_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             __autumn_state.auth_session_key(),
             __AUTUMN_SECURED_ROLES,
         ).await {
+            if __autumn_error.status() == ::autumn_web::reexports::http::StatusCode::UNAUTHORIZED {
+                if let ::core::option::Option::Some(__autumn_response) =
+                    ::autumn_web::idempotency::__replay_finalized_session_response(&__autumn_idempotency_replay)
+                {
+                    return __autumn_response;
+                }
+            }
             return ::autumn_web::reexports::axum::response::IntoResponse::into_response(__autumn_error);
         }
     };

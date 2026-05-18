@@ -67,7 +67,7 @@ const HOOK_PENDING_INSERT_SQL: &str = "INSERT INTO autumn_repository_commit_hook
           enqueued_at = EXCLUDED.enqueued_at, run_at = EXCLUDED.run_at, \
           claimed_by = EXCLUDED.claimed_by, claimed_at = EXCLUDED.claimed_at, \
           started_at = NULL, finished_at = NULL, last_error = NULL \
-      WHERE autumn_repository_commit_hooks.status = 'after_hook_failed'";
+      WHERE autumn_repository_commit_hooks.status IN ('pending_after_hook', 'after_hook_failed')";
 const HOOK_MARK_AFTER_HOOK_SUCCEEDED_SQL: &str = "UPDATE autumn_repository_commit_hooks \
      SET context = $1::JSONB, record = $2::JSONB, status = 'after_hook_succeeded', \
           claimed_at = NOW(), last_error = NULL \
@@ -1326,9 +1326,10 @@ mod tests {
         );
         assert!(
             HOOK_PENDING_INSERT_SQL.contains("ON CONFLICT (id) DO UPDATE")
-                && HOOK_PENDING_INSERT_SQL
-                    .contains("WHERE autumn_repository_commit_hooks.status = 'after_hook_failed'"),
-            "staged create/update commit hooks must dedupe successful duplicate rows while allowing a retry after regular after-hook failure to restage"
+                && HOOK_PENDING_INSERT_SQL.contains(
+                    "WHERE autumn_repository_commit_hooks.status IN ('pending_after_hook', 'after_hook_failed')"
+                ),
+            "staged create/update commit hooks must dedupe successful duplicate rows while allowing a retry to reclaim unfinalized or failed staged rows"
         );
     }
 
@@ -1400,7 +1401,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_insert_reopens_only_prior_after_hook_failures() {
+    fn pending_insert_reclaims_only_unfinalized_or_failed_rows() {
         assert!(
             HOOK_PENDING_INSERT_SQL.contains("ON CONFLICT (id) DO UPDATE")
                 && HOOK_PENDING_INSERT_SQL.contains("status = 'pending_after_hook'")
@@ -1408,12 +1409,13 @@ mod tests {
                 && HOOK_PENDING_INSERT_SQL.contains("record = EXCLUDED.record")
                 && HOOK_PENDING_INSERT_SQL.contains("claimed_by = EXCLUDED.claimed_by")
                 && HOOK_PENDING_INSERT_SQL.contains("last_error = NULL"),
-            "a retried idempotent mutation must be able to restage durable hooks after an earlier regular after-hook failure"
+            "a retried idempotent mutation must be able to restage durable hooks after an earlier unfinalized or failed regular after-hook"
         );
         assert!(
-            HOOK_PENDING_INSERT_SQL
-                .contains("WHERE autumn_repository_commit_hooks.status = 'after_hook_failed'"),
-            "restaging must not replace already finalized, enqueued, running, completed, or worker-failed rows"
+            HOOK_PENDING_INSERT_SQL.contains(
+                "WHERE autumn_repository_commit_hooks.status IN ('pending_after_hook', 'after_hook_failed')"
+            ),
+            "restaging must reclaim unfinalized pending rows but not replace already finalized, enqueued, running, completed, or worker-failed rows"
         );
     }
 
