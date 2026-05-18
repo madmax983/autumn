@@ -432,6 +432,7 @@ impl TestApp {
                 custom_layers: self.custom_layers,
                 error_page_renderer: None,
                 session_store: None,
+                static_layer: None,
                 #[cfg(feature = "openapi")]
                 openapi: self.openapi,
             },

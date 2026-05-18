@@ -128,6 +128,11 @@ pub struct RouterContext {
     /// When `Some`, [`apply_session_layer`](crate::session::apply_session_layer)
     /// uses it directly and skips the config-driven backend selection.
     pub session_store: Option<Arc<dyn crate::session::BoxedSessionStore>>,
+    /// Pre-built static file layer for SSG/ISG serving. When `Some`,
+    /// the static-first middleware is inserted INSIDE user layers so that
+    /// user-registered Tower layers (e.g. compression) can process static
+    /// responses.
+    pub static_layer: Option<crate::static_gen::StaticFileLayer>,
     /// `OpenAPI` generation configuration. When `Some`, the router mounts
     /// an `openapi.json` endpoint and (optionally) a Swagger UI page
     /// describing the application's routes.
@@ -162,6 +167,7 @@ pub fn try_build_router(
             custom_layers: Vec::new(),
             error_page_renderer: None,
             session_store: None,
+            static_layer: None,
             #[cfg(feature = "openapi")]
             openapi: None,
         },
@@ -223,6 +229,7 @@ pub fn try_build_router_merged(
             custom_layers: Vec::new(),
             error_page_renderer: None,
             session_store: None,
+            static_layer: None,
             #[cfg(feature = "openapi")]
             openapi: None,
         },
@@ -312,6 +319,7 @@ pub fn try_build_router_inner(
         ctx.custom_layers,
         ctx.error_page_renderer,
         ctx.session_store,
+        ctx.static_layer,
     )?;
 
     if dev_reload_enabled {
@@ -1112,6 +1120,7 @@ fn apply_middleware(
     custom_layers: Vec<crate::app::CustomLayerRegistration>,
     error_page_renderer: Option<SharedRenderer>,
     session_store: Option<Arc<dyn crate::session::BoxedSessionStore>>,
+    static_layer: Option<crate::static_gen::StaticFileLayer>,
 ) -> Result<axum::Router<AppState>, RouterBuildError> {
     // 404 fallback handler for unmatched routes must be registered BEFORE global middleware
     // so that unmatched routes are still protected by rate limiting, CSRF, CORS, etc.
@@ -1157,9 +1166,64 @@ fn apply_middleware(
         crate::security::SecurityHeadersLayer::from_config(&config.security.headers);
     tracing::debug!("Security headers enabled");
 
-    // User-registered Tower layers (AppBuilder::layer). Outermost — applied
-    // last so they wrap all framework middleware.  Iterate in reverse so the
-    // first registered layer ends up outermost among user layers — matching
+    // Static-first serving for SSG/ISG routes. Inserted HERE — after the
+    // inner framework middleware (CORS, CSRF, rate-limit) but BEFORE user
+    // layers — so that user-registered Tower layers (e.g. compression) can
+    // process static responses on the way out. The ISR regeneration router
+    // is snapshotted at this point (before user layers), so re-rendered
+    // pages are saved as raw HTML rather than already-transformed bytes.
+    if let Some(layer) = static_layer {
+        let has_isr = layer
+            .manifest()
+            .routes
+            .values()
+            .any(|e| e.revalidate.is_some());
+        let layer = if has_isr {
+            layer.with_router(router.clone().with_state(state.clone()))
+        } else {
+            layer
+        };
+        let layer = Arc::new(layer);
+        router = router.layer(axum::middleware::from_fn(
+            move |req: axum::extract::Request, next: axum::middleware::Next| {
+                let layer = layer.clone();
+                async move {
+                    let is_get = req.method() == http::Method::GET;
+                    let is_head = req.method() == http::Method::HEAD;
+                    if is_get || is_head {
+                        let path = req.uri().path();
+                        // Normalize trailing slash: /about/ → /about (but keep / as /)
+                        let normalized = if path.len() > 1 && path.ends_with('/') {
+                            &path[..path.len() - 1]
+                        } else {
+                            path
+                        };
+                        if let Some(file_path) = layer.resolve(normalized)
+                            && let Ok(contents) = tokio::fs::read(&file_path).await
+                        {
+                            let body = if is_head {
+                                axum::body::Body::empty()
+                            } else {
+                                axum::body::Body::from(contents)
+                            };
+                            return http::Response::builder()
+                                .status(http::StatusCode::OK)
+                                .header(http::header::CONTENT_TYPE, "text/html; charset=utf-8")
+                                .body(body)
+                                .expect("infallible response builder");
+                        }
+                    }
+                    next.run(req).await
+                }
+            },
+        ));
+        tracing::debug!("Static-first middleware applied (inside user layers)");
+    }
+
+    // User-registered Tower layers (AppBuilder::layer). Applied after the
+    // static-first middleware so they wrap it and can process static
+    // responses (e.g. compression).  Iterate in reverse so the first
+    // registered layer ends up outermost among user layers — matching
     // tower::ServiceBuilder ordering.
     let custom_layer_count = custom_layers.len();
     for registered in custom_layers.into_iter().rev() {
@@ -1209,10 +1273,11 @@ fn apply_middleware(
     // Error page context layer must be inner to the exception filter so
     // WantsHtml is set on the response before the filter inspects it.
     // Full ingress layer order (outermost -> innermost):
-    //   TraceContext (applied outside the startup barrier / static-first
-    //   middleware so short-circuit responses still carry traceparent) ->
+    //   TraceContext (applied outside the startup barrier so short-circuit
+    //   responses still carry traceparent) ->
     //   Metrics -> ExceptionFilter -> ErrorPageContext -> Session ->
     //   SecurityHeaders -> RequestId -> [user layers] ->
+    //   StaticFileMiddleware (when SSG/ISG enabled) ->
     //   RateLimit -> CSRF -> CORS -> handler
     let router = router
         .layer(crate::middleware::error_page_filter::ErrorPageContextLayer)
@@ -1281,6 +1346,7 @@ pub fn try_build_router_with_static(
             custom_layers: Vec::new(),
             error_page_renderer: None,
             session_store: None,
+            static_layer: None,
             #[cfg(feature = "openapi")]
             openapi: None,
         },
@@ -1292,111 +1358,38 @@ pub fn try_build_router_with_static_inner(
     config: &AutumnConfig,
     state: AppState,
     dist_dir: Option<&std::path::Path>,
-    ctx: RouterContext,
+    mut ctx: RouterContext,
 ) -> Result<axum::Router, RouterBuildError> {
     let startup_barrier_state = state.clone();
-    let app_router = try_build_router_inner(route_list, config, state, ctx)?;
 
-    let Some(dist) = dist_dir else {
-        return Ok(apply_startup_barrier(
-            app_router,
-            config,
-            &startup_barrier_state,
-        ));
-    };
-
-    let Some(layer) = crate::static_gen::StaticFileLayer::new(dist) else {
-        tracing::debug!(
-            dist = %dist.display(),
-            "No valid manifest.json in dist dir; skipping static file layer"
-        );
-        return Ok(apply_startup_barrier(
-            app_router,
-            config,
-            &startup_barrier_state,
-        ));
-    };
-
-    // Enable ISR regeneration by attaching the app router to the static layer.
-    // Routes with `revalidate` set will spawn background re-render tasks
-    // when their files become stale.
-    let has_isr = layer
-        .manifest()
-        .routes
-        .values()
-        .any(|e| e.revalidate.is_some());
-    let layer = if has_isr {
-        layer.with_router(app_router.clone())
-    } else {
-        layer
-    };
-
-    for (route, entry) in &layer.manifest().routes {
-        tracing::debug!(
-            route = %route,
-            file = %entry.file,
-            revalidate = ?entry.revalidate,
-            "Static route"
-        );
+    // Build the static file layer before router assembly so it can be
+    // threaded into apply_middleware and inserted INSIDE user layers.
+    // This ensures user-registered layers (e.g. compression) can process
+    // static responses on the way out.
+    if let Some(dist) = dist_dir {
+        match crate::static_gen::StaticFileLayer::new(dist) {
+            Some(layer) => {
+                for (route, entry) in &layer.manifest().routes {
+                    tracing::debug!(
+                        route = %route,
+                        file = %entry.file,
+                        revalidate = ?entry.revalidate,
+                        "Static route"
+                    );
+                }
+                ctx.static_layer = Some(layer);
+            }
+            None => {
+                tracing::debug!(
+                    dist = %dist.display(),
+                    "No valid manifest.json in dist dir; skipping static file layer"
+                );
+            }
+        }
     }
 
-    // Store the layer in an Arc so the static-first middleware can use it.
-    let layer = Arc::new(layer);
-
-    // Static-first serving: intercept GET/HEAD requests whose path appears
-    // in the manifest and serve pre-built HTML directly, BEFORE the dynamic
-    // router runs.  This matches Next.js SSG/ISR semantics where static
-    // pages always win over dynamic handlers.
-    //
-    // Requests not in the manifest (including non-GET/HEAD methods) fall
-    // through to the dynamic router unchanged.
-    //
-    // ISR staleness checking happens inside `resolve()`: stale pages are
-    // still served immediately while background regeneration runs
-    // (stale-while-revalidate).
-    let static_layer = layer;
-    let router = app_router.layer(axum::middleware::from_fn(
-        move |req: axum::extract::Request, next: axum::middleware::Next| {
-            let static_layer = static_layer.clone();
-            async move {
-                let is_get = req.method() == http::Method::GET;
-                let is_head = req.method() == http::Method::HEAD;
-                if is_get || is_head {
-                    let path = req.uri().path();
-                    // Normalize trailing slash: /about/ → /about (but keep / as /)
-                    let normalized = if path.len() > 1 && path.ends_with('/') {
-                        &path[..path.len() - 1]
-                    } else {
-                        path
-                    };
-                    if let Some(file_path) = static_layer.resolve(normalized)
-                        && let Ok(contents) = tokio::fs::read(&file_path).await
-                    {
-                        let body = if is_head {
-                            axum::body::Body::empty()
-                        } else {
-                            axum::body::Body::from(contents)
-                        };
-                        return http::Response::builder()
-                            .status(http::StatusCode::OK)
-                            .header(http::header::CONTENT_TYPE, "text/html; charset=utf-8")
-                            .body(body)
-                            .expect("infallible response builder");
-                    }
-                }
-                next.run(req).await
-            }
-        },
-    ));
-    let router = router.layer(crate::security::SecurityHeadersLayer::from_config(
-        &config.security.headers,
-    ));
-
-    Ok(apply_startup_barrier(
-        router,
-        config,
-        &startup_barrier_state,
-    ))
+    let app_router = try_build_router_inner(route_list, config, state, ctx)?;
+    Ok(apply_startup_barrier(app_router, config, &startup_barrier_state))
 }
 
 #[derive(Clone)]
@@ -2295,6 +2288,7 @@ mod tests {
             custom_layers: Vec::new(),
             error_page_renderer: None,
             session_store: None,
+            static_layer: None,
             openapi: Some(openapi),
         };
         let err = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx)
@@ -2593,6 +2587,7 @@ mod tests {
             custom_layers: Vec::new(),
             error_page_renderer: None,
             session_store: None,
+            static_layer: None,
             openapi: Some(openapi),
         };
         let err = super::try_build_router_inner(vec![user_route], &config, test_state(), ctx)
@@ -2617,6 +2612,7 @@ mod tests {
             custom_layers: Vec::new(),
             error_page_renderer: None,
             session_store: None,
+            static_layer: None,
             openapi: Some(openapi),
         };
         let err = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx)
@@ -2660,6 +2656,7 @@ mod tests {
             custom_layers: Vec::new(),
             error_page_renderer: None,
             session_store: None,
+            static_layer: None,
             openapi: Some(openapi),
         };
         let err = super::try_build_router_inner(vec![user_route], &config, test_state(), ctx)
@@ -2687,6 +2684,7 @@ mod tests {
             custom_layers: Vec::new(),
             error_page_renderer: None,
             session_store: None,
+            static_layer: None,
             openapi: Some(openapi),
         };
         let err = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx)
@@ -2720,6 +2718,7 @@ mod tests {
             custom_layers: Vec::new(),
             error_page_renderer: None,
             session_store: None,
+            static_layer: None,
             openapi: Some(openapi),
         };
         let err = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx)
@@ -2753,6 +2752,7 @@ mod tests {
                     custom_layers: Vec::new(),
                     error_page_renderer: None,
                     session_store: None,
+                    static_layer: None,
                     openapi: Some(openapi),
                 };
                 let err = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx)
