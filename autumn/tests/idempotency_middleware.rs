@@ -192,6 +192,7 @@ static TENANT_HEADER_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static TENANT_EXTENSION_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static COMMITTED_ERROR_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static SECURED_SESSION_ROTATION_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
+static SECURED_SESSION_TOUCH_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 /// Route-local interceptor used to prove idempotency replays still traverse
 /// `#[intercept(...)]` layers before the cached response is returned.
@@ -477,6 +478,14 @@ async fn secured_session_rotation_handler(session: Session) -> &'static str {
     session.insert("user_id", "42").await;
     session.rotate_id().await;
     "secured-rotated"
+}
+
+#[post("/secured-session-touch")]
+#[autumn_web::secured]
+async fn secured_session_touch_handler(session: Session) -> &'static str {
+    SECURED_SESSION_TOUCH_HANDLER_CALLS.fetch_add(1, Ordering::SeqCst);
+    session.insert("flash", "saved").await;
+    "secured-touched"
 }
 
 async fn session_alias_failure_handler(session: Session) -> &'static str {
@@ -948,6 +957,55 @@ async fn test_secured_session_rotation_replays_final_cookie_for_old_cookie_scope
         SECURED_SESSION_ROTATION_HANDLER_CALLS.load(Ordering::SeqCst),
         1,
         "a retry after accepting a now-revoked rotated cookie must not replay the prior success"
+    );
+}
+
+#[tokio::test]
+async fn test_secured_same_session_mutation_denial_does_not_replay_cached_success() {
+    SECURED_SESSION_TOUCH_HANDLER_CALLS.store(0, Ordering::SeqCst);
+
+    let session_store = MemoryStore::new();
+    let mut existing = HashMap::new();
+    existing.insert("user_id".to_owned(), "42".to_owned());
+    session_store
+        .save("secured-touch-session", existing)
+        .await
+        .unwrap();
+
+    let client = TestApp::new()
+        .routes(routes![secured_session_touch_handler])
+        .idempotent()
+        .layer(SessionLayer::new(
+            session_store.clone(),
+            SessionConfig::default(),
+        ))
+        .build();
+
+    let first = client
+        .post("/secured-session-touch")
+        .header("cookie", "autumn.sid=secured-touch-session")
+        .header("idempotency-key", "secured-touch-key")
+        .send()
+        .await;
+    first.assert_ok();
+    assert!(first.header("set-cookie").is_some());
+
+    session_store
+        .save("secured-touch-session", HashMap::new())
+        .await
+        .unwrap();
+    let retry = client
+        .post("/secured-session-touch")
+        .header("cookie", "autumn.sid=secured-touch-session")
+        .header("idempotency-key", "secured-touch-key")
+        .send()
+        .await;
+    retry.assert_status(StatusCode::UNAUTHORIZED.as_u16());
+    assert_eq!(retry.header("x-idempotent-replayed"), None);
+    assert_eq!(
+        SECURED_SESSION_TOUCH_HANDLER_CALLS.load(Ordering::SeqCst),
+        1,
+        "dirty same-session retries must run current secured checks instead of replaying cached success"
     );
 }
 

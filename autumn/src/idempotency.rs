@@ -264,8 +264,8 @@ pub struct IdempotencyRecord {
 }
 
 const FINALIZED_SESSION_SCOPE_METADATA: &str = "__autumn.idempotency.finalized-session-scope";
-const FINALIZED_SESSION_PRIMARY_SCOPE: &[u8] = b"primary";
-const FINALIZED_SESSION_ALIAS_SCOPE: &[u8] = b"alias";
+const FINALIZED_SESSION_OLD_SCOPE: &[u8] = b"old-session-scope";
+const FINALIZED_SESSION_CURRENT_SCOPE: &[u8] = b"current-session-scope";
 
 fn finalized_session_record(
     mut record: IdempotencyRecord,
@@ -853,9 +853,9 @@ pub fn __replay_finalized_session_response(
                 .headers
                 .iter()
                 .any(|(name, _)| name.eq_ignore_ascii_case("set-cookie"));
-            let is_primary_session_scope = replay.metadata(FINALIZED_SESSION_SCOPE_METADATA)
-                == Some(FINALIZED_SESSION_PRIMARY_SCOPE);
-            (has_finalized_session_cookie && is_primary_session_scope)
+            let is_old_session_scope = replay.metadata(FINALIZED_SESSION_SCOPE_METADATA)
+                == Some(FINALIZED_SESSION_OLD_SCOPE);
+            (has_finalized_session_cookie && is_old_session_scope)
                 .then(|| replay.clone().into_response())
         })
 }
@@ -1222,8 +1222,12 @@ impl DeferredIdempotencyCommit {
         };
 
         state.record.headers = extract_finalized_session_replay_headers(headers);
-        let primary_record =
-            finalized_session_record(state.record.clone(), FINALIZED_SESSION_PRIMARY_SCOPE);
+        let primary_scope = if state.alias_storage_keys.is_empty() {
+            FINALIZED_SESSION_CURRENT_SCOPE
+        } else {
+            FINALIZED_SESSION_OLD_SCOPE
+        };
+        let primary_record = finalized_session_record(state.record.clone(), primary_scope);
         if let Err(error) = state.store.try_set(
             &state.storage_key,
             primary_record,
@@ -1238,7 +1242,7 @@ impl DeferredIdempotencyCommit {
             state.lock_guard.keep_locked_until_ttl();
             return Err(error);
         }
-        let alias_record = finalized_session_record(state.record, FINALIZED_SESSION_ALIAS_SCOPE);
+        let alias_record = finalized_session_record(state.record, FINALIZED_SESSION_CURRENT_SCOPE);
         for storage_key in state.alias_storage_keys {
             if let Err(error) = state.store.try_set(
                 &storage_key,
