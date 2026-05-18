@@ -167,6 +167,7 @@ async fn test_deduplication() {
 static INTERCEPT_CALLS: AtomicUsize = AtomicUsize::new(0);
 static INTERCEPTED_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static ANONYMOUS_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
+static STALE_COOKIE_ANONYMOUS_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static RAW_MERGE_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static RAW_NEST_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static RAW_LAYERED_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -194,8 +195,9 @@ static COMMITTED_ERROR_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static SECURED_SESSION_ROTATION_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static SECURED_SESSION_TOUCH_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 
-/// Route-local interceptor used to prove idempotency replays still traverse
-/// `#[intercept(...)]` layers before the cached response is returned.
+/// Route-local interceptor used to prove generated routes with opaque
+/// `#[intercept(...)]` layers do not replay cached responses across scopes
+/// the idempotency storage key cannot see.
 #[derive(Clone)]
 struct CountInterceptLayer;
 
@@ -386,6 +388,12 @@ where
 #[post("/public-create")]
 async fn anonymous_create_handler() -> &'static str {
     ANONYMOUS_HANDLER_CALLS.fetch_add(1, Ordering::SeqCst);
+    "created"
+}
+
+#[post("/stale-cookie-public-create")]
+async fn stale_cookie_anonymous_create_handler() -> &'static str {
+    STALE_COOKIE_ANONYMOUS_HANDLER_CALLS.fetch_add(1, Ordering::SeqCst);
     "created"
 }
 
@@ -1375,10 +1383,43 @@ async fn test_anonymous_requests_without_cookie_replay() {
     );
 }
 
-/// Cached idempotency replays must still pass through route-local interceptors
-/// such as auth, tenant, and audit layers.
 #[tokio::test]
-async fn test_replay_traverses_route_interceptor_without_reentering_handler() {
+async fn test_stale_session_cookies_do_not_split_anonymous_idempotency_scope() {
+    STALE_COOKIE_ANONYMOUS_HANDLER_CALLS.store(0, Ordering::SeqCst);
+
+    let client = TestApp::new()
+        .routes(routes![stale_cookie_anonymous_create_handler])
+        .idempotent()
+        .build();
+
+    let first = client
+        .post("/stale-cookie-public-create")
+        .header("cookie", "autumn.sid=stale-a")
+        .header("idempotency-key", "stale-cookie-anonymous-key")
+        .send()
+        .await;
+    first.assert_ok();
+    assert_eq!(first.header("x-idempotent-replayed"), None);
+
+    let retry = client
+        .post("/stale-cookie-public-create")
+        .header("cookie", "autumn.sid=stale-b")
+        .header("idempotency-key", "stale-cookie-anonymous-key")
+        .send()
+        .await;
+    retry.assert_ok();
+    assert_eq!(retry.header("x-idempotent-replayed"), Some("true"));
+    assert_eq!(
+        STALE_COOKIE_ANONYMOUS_HANDLER_CALLS.load(Ordering::SeqCst),
+        1,
+        "unloaded session cookies must not create attacker-controlled anonymous idempotency scopes"
+    );
+}
+
+/// Generated routes with opaque route-local interceptors fail closed on replay
+/// unless their scopes are explicit in the idempotency key.
+#[tokio::test]
+async fn test_intercepted_route_fails_closed_on_replay_without_visible_scope() {
     INTERCEPT_CALLS.store(0, Ordering::SeqCst);
     INTERCEPTED_HANDLER_CALLS.store(0, Ordering::SeqCst);
 
@@ -1400,12 +1441,12 @@ async fn test_replay_traverses_route_interceptor_without_reentering_handler() {
         .header("idempotency-key", "intercepted-key")
         .send()
         .await;
-    r2.assert_ok();
-    assert_eq!(r2.header("x-idempotent-replayed"), Some("true"));
+    r2.assert_status(StatusCode::CONFLICT.as_u16());
+    assert_eq!(r2.header("x-idempotent-replayed"), None);
     assert_eq!(
         INTERCEPT_CALLS.load(Ordering::SeqCst),
-        2,
-        "route interceptor must run for the fresh request and replay"
+        1,
+        "opaque route interceptors must not release cached successes across unkeyed scopes"
     );
     assert_eq!(
         INTERCEPTED_HANDLER_CALLS.load(Ordering::SeqCst),

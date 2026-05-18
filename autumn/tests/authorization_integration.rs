@@ -13,7 +13,7 @@ use autumn_web::prelude::*;
 use autumn_web::session::{MemoryStore, SessionConfig, SessionLayer, SessionStore};
 use autumn_web::test::TestApp;
 use http::StatusCode;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 // ── Test resource and policy ──────────────────────────────────
 
@@ -38,6 +38,15 @@ impl Policy<Note> for AdminOrOwnerPolicy {
     }
 }
 
+#[derive(Default, Clone)]
+struct AnonymousTogglePolicy;
+
+impl Policy<Note> for AnonymousTogglePolicy {
+    fn can_update<'a>(&'a self, _ctx: &'a PolicyContext, _note: &'a Note) -> BoxFuture<'a, bool> {
+        Box::pin(async move { ANONYMOUS_POLICY_ALLOWED.load(Ordering::SeqCst) })
+    }
+}
+
 const FIXED_NOTE: Note = Note {
     id: 1,
     author_id: 42,
@@ -46,6 +55,8 @@ static SECURED_ADMIN_MUTATION_CALLS: AtomicUsize = AtomicUsize::new(0);
 static SECURED_ADMIN_REPLAY_CALLS: AtomicUsize = AtomicUsize::new(0);
 static AUTHORIZE_SESSION_ROTATION_CALLS: AtomicUsize = AtomicUsize::new(0);
 static AUTHORIZE_SESSION_TOUCH_CALLS: AtomicUsize = AtomicUsize::new(0);
+static AUTHORIZE_ANONYMOUS_SESSION_TOUCH_CALLS: AtomicUsize = AtomicUsize::new(0);
+static ANONYMOUS_POLICY_ALLOWED: AtomicBool = AtomicBool::new(true);
 
 // ── Hand-written handler exercising the inline `authorize` helper ──
 
@@ -230,6 +241,20 @@ async fn update_note_attr_touch(
     Ok("authorized-touched")
 }
 
+#[autumn_web::post("/notes-anon-touch/{id}")]
+#[autumn_web::authorize("update", resource = Note)]
+async fn update_note_anonymous_touch(
+    autumn_web::extract::Path(id): autumn_web::extract::Path<i64>,
+    LoadedNote(note): LoadedNote,
+    session: Session,
+) -> AutumnResult<&'static str> {
+    let _ = id;
+    let _ = note;
+    AUTHORIZE_ANONYMOUS_SESSION_TOUCH_CALLS.fetch_add(1, Ordering::SeqCst);
+    session.insert("flash", "saved").await;
+    Ok("anonymous-touched")
+}
+
 fn build_attr_app(
     store: MemoryStore,
     forbidden_response: ForbiddenResponse,
@@ -275,6 +300,19 @@ fn build_idempotent_attr_touch_app(
     TestApp::new()
         .routes(routes![update_note_attr_touch])
         .policy::<Note, _>(AdminOrOwnerPolicy)
+        .forbidden_response(forbidden_response)
+        .layer(SessionLayer::new(store, SessionConfig::default()))
+        .idempotent()
+        .build()
+}
+
+fn build_idempotent_anonymous_touch_app(
+    store: MemoryStore,
+    forbidden_response: ForbiddenResponse,
+) -> autumn_web::test::TestClient {
+    TestApp::new()
+        .routes(routes![update_note_anonymous_touch])
+        .policy::<Note, _>(AnonymousTogglePolicy)
         .forbidden_response(forbidden_response)
         .layer(SessionLayer::new(store, SessionConfig::default()))
         .idempotent()
@@ -477,6 +515,43 @@ async fn idempotent_authorize_same_session_mutation_denial_does_not_replay_cache
         AUTHORIZE_SESSION_TOUCH_CALLS.load(Ordering::SeqCst),
         1,
         "same-session policy denials must not re-enter the mutating handler"
+    );
+}
+
+#[tokio::test]
+async fn idempotent_anonymous_session_mutation_denial_does_not_replay_cached_success() {
+    AUTHORIZE_ANONYMOUS_SESSION_TOUCH_CALLS.store(0, Ordering::SeqCst);
+    ANONYMOUS_POLICY_ALLOWED.store(true, Ordering::SeqCst);
+    let store = MemoryStore::new();
+    let client = build_idempotent_anonymous_touch_app(store, ForbiddenResponse::Forbidden403);
+
+    let first = client
+        .post("/notes-anon-touch/1")
+        .header("idempotency-key", "authorize-anonymous-touch-key")
+        .send()
+        .await;
+    first.assert_ok();
+    assert!(
+        first.header("set-cookie").is_some(),
+        "anonymous session mutation should persist the new session cookie"
+    );
+
+    ANONYMOUS_POLICY_ALLOWED.store(false, Ordering::SeqCst);
+    let retry = client
+        .post("/notes-anon-touch/1")
+        .header("idempotency-key", "authorize-anonymous-touch-key")
+        .send()
+        .await;
+    assert_eq!(
+        retry.status,
+        StatusCode::FORBIDDEN,
+        "anonymous retries must run current policy checks instead of replaying cached success"
+    );
+    assert_eq!(retry.header("x-idempotent-replayed"), None);
+    assert_eq!(
+        AUTHORIZE_ANONYMOUS_SESSION_TOUCH_CALLS.load(Ordering::SeqCst),
+        1,
+        "anonymous policy denials must not re-enter the mutating handler"
     );
 }
 

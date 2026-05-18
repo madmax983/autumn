@@ -115,12 +115,18 @@ pub fn route_macro(
     let query_schema = api_doc::schema_option(api_doc::infer_query_params(&input_fn));
     let (secured, required_roles) = api_doc::extract_secured_info(&input_fn);
     let body_guarded_replay = secured || has_authorize_guard(&input_fn);
+    let intercepted_route = !interceptors.is_empty();
     let handler_expr = build_handler_expr(
         &routing_fn,
         &handler_name,
         &interceptors,
-        !body_guarded_replay,
+        !body_guarded_replay && !intercepted_route,
     );
+    let route_idempotency = if intercepted_route {
+        quote! { ::autumn_web::RouteIdempotency::Direct }
+    } else {
+        quote! { ::autumn_web::RouteIdempotency::ReplayThroughInner }
+    };
     let api_doc_fields = api_doc_attr.emit_ident_fields(fn_name);
     let http_method_lit = LitStr::new(http_method, Span::call_site());
 
@@ -154,7 +160,7 @@ pub fn route_macro(
                     #api_doc_fields
                 },
                 repository: ::core::option::Option::None,
-                idempotency: ::autumn_web::RouteIdempotency::ReplayThroughInner,
+                idempotency: #route_idempotency,
             }
         }
 
@@ -428,6 +434,31 @@ mod tests {
         assert!(
             generated.contains("IdempotencyReplayLayer"),
             "plain handler text must not be mistaken for a generated replay stop: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_interceptor_uses_direct_idempotency() {
+        let generated = route_macro(
+            "POST",
+            "post",
+            quote! { "/items" },
+            quote! {
+                #[intercept(TenantLayer)]
+                async fn create_item() -> &'static str {
+                    "created"
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("RouteIdempotency :: Direct"),
+            "intercepted routes must fail closed when replay scope is not explicit: {generated}"
+        );
+        assert!(
+            !generated.contains("IdempotencyReplayLayer"),
+            "intercepted routes must not advertise an implicit replay stop: {generated}"
         );
     }
 }
