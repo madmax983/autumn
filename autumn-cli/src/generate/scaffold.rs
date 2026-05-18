@@ -311,7 +311,7 @@ use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 
 use crate::models::{snake_name}::{{{pascal_name}, New{pascal_name}}};
-use crate::repositories::{snake_name}::Pg{pascal_name}Repository;
+use crate::repositories::{snake_name}::{{{pascal_name}Repository, Pg{pascal_name}Repository}};
 use crate::schema::{plural};
 
 fn csrf_input(csrf: Option<&CsrfToken>, field: Option<&CsrfFormField>) -> Markup {{

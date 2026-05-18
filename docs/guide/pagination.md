@@ -118,6 +118,13 @@ This generates:
 async fn cursor_page(&self, req: &CursorRequest) -> AutumnResult<CursorPage<Post>>;
 ```
 
+> **Constraint:** `cursor_key` must be declared on a **non-nullable** column.
+> In SQL, comparisons involving `NULL` (`<`, `=`) evaluate to `UNKNOWN`, so
+> a nullable sort key breaks the keyset predicate and silently drops rows.
+> This is true of all keyset pagination, not just Autumn's generated code.
+> If your column is nullable, make it `NOT NULL` or use a custom `cursor_page`
+> implementation that handles `NULL` ordering explicitly.
+
 ### Calling `cursor_page`
 
 ```rust

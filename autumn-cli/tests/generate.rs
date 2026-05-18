@@ -1250,6 +1250,12 @@ fn generate_scaffold_index_uses_paginated_repo_method() {
         !routes.contains(".load(&mut *db)"),
         "scaffold index must not load every row without pagination: {routes}"
     );
+    // The repository trait must be imported so `repo.page()` (a trait method)
+    // resolves at compile time — without it the generated code fails with E0599.
+    assert!(
+        routes.contains("PostRepository"),
+        "scaffold routes must import the PostRepository trait (needed to call repo.page()): {routes}"
+    );
 }
 
 #[test]

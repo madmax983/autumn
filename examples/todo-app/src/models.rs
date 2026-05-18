@@ -34,7 +34,7 @@ impl Todo {
     pub async fn page(req: &PageRequest, db: &mut AsyncPgConnection) -> AutumnResult<Page<Self>> {
         let total: i64 = todos::table.count().get_result(db).await?;
         let items = todos::table
-            .order(todos::created_at.desc())
+            .order((todos::created_at.desc(), todos::id.desc()))
             .limit(req.limit())
             .offset(req.offset())
             .select(Self::as_select())
