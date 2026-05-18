@@ -551,7 +551,10 @@ mod tests {
             !html.contains("href=\"/todos?page=0"),
             "first page must not link to page 0: {html}"
         );
-        assert!(html.contains("Page 1 of 3"), "must show current page of total: {html}");
+        assert!(
+            html.contains("Page 1 of 3"),
+            "must show current page of total: {html}"
+        );
     }
 
     #[test]
@@ -568,7 +571,10 @@ mod tests {
             .collect();
         let page: Page<Todo> = Page::new(items, 5, &req);
         let html = pagination_controls(&page, "/todos").into_string();
-        assert!(html.is_empty(), "single page must render no pagination controls: {html}");
+        assert!(
+            html.is_empty(),
+            "single page must render no pagination controls: {html}"
+        );
     }
 }
 
