@@ -119,10 +119,16 @@ pub struct RouterContext {
     pub nest_routers: Vec<(String, axum::Router<AppState>)>,
     /// Custom Tower layers registered via
     /// [`AppBuilder::layer`](crate::app::AppBuilder::layer). Applied inside
-    /// [`RequestIdLayer`] on the ingress
-    /// path so user middleware observes the generated request ID.  When
-    /// `dist_dir` is active (SSG/ISG build), they are applied outside the
-    /// static-first middleware instead so they can process static responses.
+    /// [`RequestIdLayer`] and the session layer on the ingress path so user
+    /// middleware observes the generated request ID and session context.
+    ///
+    /// **SSG/ISG mode trade-off**: when `dist_dir` is active, layers are
+    /// moved outside the static-first middleware so they can process
+    /// pre-rendered responses (e.g. compression).  As a side effect they also
+    /// run *before* `RequestIdLayer`, session, `MetricsLayer`, and
+    /// `ExceptionFilterLayer` for all requests (static and dynamic).  Layers
+    /// that depend on extensions set by those framework layers — such as the
+    /// request ID or session data — will not find them in SSG mode.
     pub custom_layers: Vec<crate::app::CustomLayerRegistration>,
     pub error_page_renderer: Option<SharedRenderer>,
     /// Custom session store installed via
@@ -242,7 +248,7 @@ pub fn try_build_router_inner(
     state: AppState,
     ctx: RouterContext,
 ) -> Result<axum::Router, RouterBuildError> {
-    let router = build_router_pre_state(route_list, config, &state, ctx)?;
+    let router = build_router_pre_state(route_list, config, &state, ctx, None)?;
     Ok(router.with_state(state))
 }
 
@@ -255,6 +261,10 @@ fn build_router_pre_state(
     config: &AutumnConfig,
     state: &AppState,
     ctx: RouterContext,
+    // When custom_layers are extracted from ctx before this call (SSG path),
+    // the caller pre-computes the flag so the idempotency selector still sees
+    // the real layer list even though ctx.custom_layers is empty.
+    opaque_app_layers_override: Option<bool>,
 ) -> Result<axum::Router<AppState>, RouterBuildError> {
     // Fail-fast if an OpenAPI mount path collides with a user or
     // framework GET route — axum panics on overlapping method routes,
@@ -280,8 +290,8 @@ fn build_router_pre_state(
     )?;
 
     let idempotency_layers = build_idempotency_layers(config, state)?;
-    let opaque_app_layers_present =
-        custom_layers_require_fail_closed_idempotency(&ctx.custom_layers);
+    let opaque_app_layers_present = opaque_app_layers_override
+        .unwrap_or_else(|| custom_layers_require_fail_closed_idempotency(&ctx.custom_layers));
     let mut router = group_and_mount_routes(
         route_list,
         idempotency_layers.as_ref(),
@@ -1356,9 +1366,15 @@ pub fn try_build_router_with_static_inner(
     //   • Static serving remains available even if the session backend is down.
     //   • ISR regeneration uses the inner router (no user layers), ensuring
     //     re-rendered pages are saved as raw HTML rather than pre-transformed.
+    //
+    // Compute the idempotency flag NOW while custom_layers is still populated,
+    // then drain it. build_router_pre_state would otherwise see an empty list
+    // and incorrectly treat opaque layers as absent when selecting idempotency
+    // behaviour for each route.
+    let opaque_present = Some(custom_layers_require_fail_closed_idempotency(&ctx.custom_layers));
     let custom_layers = std::mem::take(&mut ctx.custom_layers);
 
-    let inner_router = build_router_pre_state(route_list, config, &state, ctx)?;
+    let inner_router = build_router_pre_state(route_list, config, &state, ctx, opaque_present)?;
 
     // Attach the inner router for ISR background regeneration. Because user
     // layers are excluded, re-renders produce raw HTML (no compression, etc.)
