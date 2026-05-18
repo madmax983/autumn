@@ -75,9 +75,7 @@ const HOOK_AFTER_HOOK_FAILED_SQL: &str = "UPDATE autumn_repository_commit_hooks 
          finished_at = NOW(), \
          context = '{}'::JSONB, record = '{}'::JSONB, \
          claimed_by = NULL, claimed_at = NULL, last_error = $1 \
-     WHERE id = $2 \
-       AND (claimed_by = $3 OR claimed_by IS NULL) \
-       AND status IN ('pending_after_hook', 'enqueued')";
+      WHERE id = $2 AND claimed_by = $3 AND status = 'pending_after_hook'";
 const HOOK_EXTEND_PENDING_FINALIZER_SQL: &str = "UPDATE autumn_repository_commit_hooks \
      SET claimed_at = NOW() \
      WHERE id = $1 AND claimed_by = $2 AND status = 'pending_after_hook'";
@@ -1483,9 +1481,15 @@ mod tests {
             HOOK_AFTER_HOOK_FAILED_SQL.contains("status = 'after_hook_failed'")
                 && HOOK_AFTER_HOOK_FAILED_SQL.contains("context = '{}'::JSONB")
                 && HOOK_AFTER_HOOK_FAILED_SQL.contains("record = '{}'::JSONB")
-                && HOOK_AFTER_HOOK_FAILED_SQL
-                    .contains("status IN ('pending_after_hook', 'enqueued')"),
-            "failed regular after hooks must mark staged rows terminal and non-dispatchable"
+                && HOOK_AFTER_HOOK_FAILED_SQL.contains(
+                    "WHERE id = $2 AND claimed_by = $3 AND status = 'pending_after_hook'"
+                ),
+            "failed regular after hooks must mark only the owner-scoped staged row terminal and non-dispatchable"
+        );
+        assert!(
+            !HOOK_AFTER_HOOK_FAILED_SQL.contains("claimed_by IS NULL")
+                && !HOOK_AFTER_HOOK_FAILED_SQL.contains("'enqueued'"),
+            "duplicate idempotent retries must not dead-letter already finalized hook rows"
         );
         assert!(
             HOOK_EXTEND_PENDING_FINALIZER_SQL.contains("claimed_at = NOW()")

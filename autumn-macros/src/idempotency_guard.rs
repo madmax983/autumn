@@ -1,4 +1,4 @@
-use syn::{Block, Expr, Item, Stmt};
+use syn::{Block, Expr, ExprIf, Item, Pat, Stmt};
 
 const REPLAY_GUARD_IDENT: &str = "__AUTUMN_IDEMPOTENCY_REPLAY_GUARD";
 
@@ -10,50 +10,59 @@ pub fn block_has_replay_guard(block: &Block) -> bool {
         )
     });
 
-    has_marker && block_calls_replay_response(block)
+    has_marker && block.stmts.iter().any(stmt_is_generated_replay_guard)
 }
 
-fn block_calls_replay_response(block: &Block) -> bool {
-    block.stmts.iter().any(stmt_calls_replay_response)
+fn stmt_is_generated_replay_guard(stmt: &Stmt) -> bool {
+    let Stmt::Expr(Expr::If(expr_if), _) = stmt else {
+        return false;
+    };
+
+    if_let_replays_and_returns(expr_if)
 }
 
-fn stmt_calls_replay_response(stmt: &Stmt) -> bool {
-    match stmt {
-        Stmt::Expr(expr, _) => expr_calls_replay_response(expr),
-        Stmt::Local(syn::Local {
-            init: Some(init), ..
-        }) => expr_calls_replay_response(&init.expr),
-        Stmt::Item(_) | Stmt::Macro(_) | Stmt::Local(_) => false,
-    }
+fn if_let_replays_and_returns(expr_if: &ExprIf) -> bool {
+    let Expr::Let(expr_let) = expr_if.cond.as_ref() else {
+        return false;
+    };
+
+    pat_is_some_replay_response(&expr_let.pat)
+        && expr_is_replay_response_call(&expr_let.expr)
+        && block_returns_ident(&expr_if.then_branch, "__autumn_response")
 }
 
-fn expr_calls_replay_response(expr: &Expr) -> bool {
-    match expr {
-        Expr::Call(call) => {
-            path_expr_ends_with(&call.func, "__replay_response")
-                || call.args.iter().any(expr_calls_replay_response)
-        }
-        Expr::If(expr_if) => {
-            expr_calls_replay_response(&expr_if.cond)
-                || block_calls_replay_response(&expr_if.then_branch)
-                || expr_if
-                    .else_branch
-                    .as_ref()
-                    .is_some_and(|(_, else_expr)| expr_calls_replay_response(else_expr))
-        }
-        Expr::Let(expr_let) => expr_calls_replay_response(&expr_let.expr),
-        Expr::Block(expr_block) => block_calls_replay_response(&expr_block.block),
-        Expr::Async(expr_async) => block_calls_replay_response(&expr_async.block),
-        Expr::Await(expr_await) => expr_calls_replay_response(&expr_await.base),
-        Expr::Match(expr_match) => {
-            expr_calls_replay_response(&expr_match.expr)
-                || expr_match
-                    .arms
-                    .iter()
-                    .any(|arm| expr_calls_replay_response(&arm.body))
+fn pat_is_some_replay_response(pat: &Pat) -> bool {
+    match pat {
+        Pat::TupleStruct(tuple) => {
+            path_ends_with(&tuple.path, "Some")
+                && tuple.elems.len() == 1
+                && pat_binds_ident(&tuple.elems[0], "__autumn_response")
         }
         _ => false,
     }
+}
+
+fn pat_binds_ident(pat: &Pat, expected: &str) -> bool {
+    matches!(pat, Pat::Ident(ident) if ident.ident == expected)
+}
+
+fn expr_is_replay_response_call(expr: &Expr) -> bool {
+    match expr {
+        Expr::Call(call) => path_expr_ends_with(&call.func, "__replay_response"),
+        Expr::Group(group) => expr_is_replay_response_call(&group.expr),
+        Expr::Paren(paren) => expr_is_replay_response_call(&paren.expr),
+        _ => false,
+    }
+}
+
+fn block_returns_ident(block: &Block, expected: &str) -> bool {
+    block.stmts.iter().any(|stmt| match stmt {
+        Stmt::Expr(Expr::Return(ret), _) => ret
+            .expr
+            .as_ref()
+            .is_some_and(|expr| path_expr_ends_with(expr, expected)),
+        _ => false,
+    })
 }
 
 fn path_expr_ends_with(expr: &Expr, expected: &str) -> bool {
@@ -61,8 +70,11 @@ fn path_expr_ends_with(expr: &Expr, expected: &str) -> bool {
         return false;
     };
 
-    path.path
-        .segments
+    path_ends_with(&path.path, expected)
+}
+
+fn path_ends_with(path: &syn::Path, expected: &str) -> bool {
+    path.segments
         .last()
         .is_some_and(|segment| segment.ident == expected)
 }
@@ -85,6 +97,17 @@ mod tests {
         let block: syn::Block = syn::parse_quote!({
             const __AUTUMN_IDEMPOTENCY_REPLAY_GUARD: () = ();
             let _ = "plain user const";
+        });
+
+        assert!(!block_has_replay_guard(&block));
+    }
+
+    #[test]
+    fn marker_const_and_non_returned_replay_call_do_not_count_as_replay_guard() {
+        let block: syn::Block = syn::parse_quote!({
+            const __AUTUMN_IDEMPOTENCY_REPLAY_GUARD: () = ();
+            let _ignored =
+                ::autumn_web::idempotency::__replay_response(&__autumn_idempotency_replay);
         });
 
         assert!(!block_has_replay_guard(&block));
