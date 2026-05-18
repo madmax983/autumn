@@ -16,6 +16,7 @@ mod authorize;
 mod cached;
 mod collect;
 mod i18n;
+mod idempotency_guard;
 mod job;
 mod jobs_macro;
 mod mail_previews_macro;

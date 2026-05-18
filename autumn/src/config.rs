@@ -660,6 +660,10 @@ pub struct AutumnConfig {
     #[serde(default)]
     pub cache: CacheConfig,
 
+    /// HTTP idempotency-key middleware settings.
+    #[serde(default)]
+    pub idempotency: IdempotencyConfig,
+
     /// Real-time channel backend settings.
     #[serde(default)]
     pub channels: ChannelConfig,
@@ -975,6 +979,106 @@ const fn default_scheduler_lease_ttl_secs() -> u64 {
 
 fn default_scheduler_key_prefix() -> String {
     "autumn:scheduler".to_owned()
+}
+
+/// Storage backend selection for HTTP idempotency keys.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum IdempotencyBackend {
+    #[default]
+    Memory,
+    Redis,
+}
+
+impl IdempotencyBackend {
+    /// Parse an environment variable value for idempotency backend selection.
+    #[must_use]
+    pub fn from_env_value(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "memory" | "mem" => Some(Self::Memory),
+            "redis" => Some(Self::Redis),
+            _ => None,
+        }
+    }
+}
+
+/// Redis connection settings for the idempotency backend.
+#[derive(Debug, Clone, Deserialize)]
+pub struct IdempotencyRedisConfig {
+    /// Redis connection URL (e.g. `redis://localhost:6379`).
+    pub url: Option<String>,
+    /// Key prefix for all idempotency entries and locks stored in Redis.
+    #[serde(default = "default_idempotency_redis_key_prefix")]
+    pub key_prefix: String,
+}
+
+impl Default for IdempotencyRedisConfig {
+    fn default() -> Self {
+        Self {
+            url: None,
+            key_prefix: default_idempotency_redis_key_prefix(),
+        }
+    }
+}
+
+fn default_idempotency_redis_key_prefix() -> String {
+    "autumn:idempotency".to_owned()
+}
+
+/// HTTP idempotency-key middleware settings.
+#[derive(Debug, Clone, Deserialize)]
+pub struct IdempotencyConfig {
+    /// Enable the idempotency-key middleware.
+    ///
+    /// When `true`, mutating requests that carry an `Idempotency-Key` header
+    /// are deduplicated using the configured backend.
+    ///
+    /// `None` means the field was absent from the config file; the
+    /// `AppBuilder::idempotent()` builder flag may still enable it.
+    /// `Some(false)` is an explicit operator opt-out that overrides the builder.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// Storage backend for idempotency records.
+    #[serde(default)]
+    pub backend: IdempotencyBackend,
+    /// Time-to-live in seconds for stored idempotency records.
+    #[serde(default = "default_idempotency_ttl_secs")]
+    pub ttl_secs: u64,
+    /// Maximum stale lifetime for distributed in-flight locks.
+    ///
+    /// The lock is released as soon as the handler finishes. This value is only
+    /// the backend safety expiry for crashes or lost unlocks, so it should be
+    /// comfortably longer than any supported mutating request duration.
+    #[serde(default = "default_idempotency_in_flight_ttl_secs")]
+    pub in_flight_ttl_secs: u64,
+    /// Allow the in-memory backend in production environments.
+    #[serde(default)]
+    pub allow_memory_in_production: bool,
+    /// Redis connection settings (used when `backend = "redis"`).
+    #[serde(default)]
+    pub redis: IdempotencyRedisConfig,
+}
+
+impl Default for IdempotencyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: None,
+            backend: IdempotencyBackend::default(),
+            ttl_secs: default_idempotency_ttl_secs(),
+            in_flight_ttl_secs: default_idempotency_in_flight_ttl_secs(),
+            allow_memory_in_production: false,
+            redis: IdempotencyRedisConfig::default(),
+        }
+    }
+}
+
+const fn default_idempotency_ttl_secs() -> u64 {
+    86_400
+}
+
+const fn default_idempotency_in_flight_ttl_secs() -> u64 {
+    86_400
 }
 
 /// `OpenAPI` spec runtime exposure settings.
@@ -1351,10 +1455,52 @@ impl AutumnConfig {
         self.apply_scheduler_env_overrides_with_env(env);
         self.apply_auth_env_overrides_with_env(env);
         self.apply_security_env_overrides_with_env(env);
+        self.apply_idempotency_env_overrides_with_env(env);
         #[cfg(feature = "storage")]
         self.apply_storage_env_overrides_with_env(env);
         #[cfg(feature = "mail")]
         self.apply_mail_env_overrides_with_env(env);
+    }
+
+    fn apply_idempotency_env_overrides_with_env(&mut self, env: &dyn Env) {
+        parse_env_option_bool(
+            env,
+            "AUTUMN_IDEMPOTENCY__ENABLED",
+            &mut self.idempotency.enabled,
+        );
+        if let Ok(val) = env.var("AUTUMN_IDEMPOTENCY__BACKEND") {
+            match IdempotencyBackend::from_env_value(&val) {
+                Some(backend) => self.idempotency.backend = backend,
+                None => eprintln!(
+                    "Warning: unrecognised AUTUMN_IDEMPOTENCY__BACKEND value {val:?}; ignoring"
+                ),
+            }
+        }
+        parse_env(
+            env,
+            "AUTUMN_IDEMPOTENCY__TTL_SECS",
+            &mut self.idempotency.ttl_secs,
+        );
+        parse_env(
+            env,
+            "AUTUMN_IDEMPOTENCY__IN_FLIGHT_TTL_SECS",
+            &mut self.idempotency.in_flight_ttl_secs,
+        );
+        parse_env_bool(
+            env,
+            "AUTUMN_IDEMPOTENCY__ALLOW_MEMORY_IN_PRODUCTION",
+            &mut self.idempotency.allow_memory_in_production,
+        );
+        parse_env_string(
+            env,
+            "AUTUMN_IDEMPOTENCY__REDIS__URL",
+            self.idempotency.redis.url.get_or_insert_with(String::new),
+        );
+        parse_env_string(
+            env,
+            "AUTUMN_IDEMPOTENCY__REDIS__KEY_PREFIX",
+            &mut self.idempotency.redis.key_prefix,
+        );
     }
 
     fn apply_server_env_overrides_with_env(&mut self, env: &dyn Env) {
@@ -2551,6 +2697,16 @@ fn parse_env_bool(env: &dyn Env, key: &str, target: &mut bool) {
         match val.as_str() {
             "true" | "1" => *target = true,
             "false" | "0" => *target = false,
+            _ => eprintln!("Warning: {key}={val:?} is not valid (expected true/false), ignoring"),
+        }
+    }
+}
+
+fn parse_env_option_bool(env: &dyn Env, key: &str, target: &mut Option<bool>) {
+    if let Ok(val) = env.var(key) {
+        match val.as_str() {
+            "true" | "1" => *target = Some(true),
+            "false" | "0" => *target = Some(false),
             _ => eprintln!("Warning: {key}={val:?} is not valid (expected true/false), ignoring"),
         }
     }

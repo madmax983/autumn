@@ -43,6 +43,12 @@ struct MetricsInner {
     by_status: StatusBuckets,
     /// Global latency samples (bounded ring buffer).
     latencies_ms: RwLock<VecDeque<u64>>,
+    /// Idempotency-key cache hits (replayed responses).
+    idempotency_hits: AtomicU64,
+    /// Idempotency-key cache misses (new requests).
+    idempotency_misses: AtomicU64,
+    /// Idempotency-key conflicts (concurrent duplicate requests returned 409).
+    idempotency_conflicts: AtomicU64,
 }
 
 #[derive(Debug, Default)]
@@ -88,8 +94,30 @@ impl MetricsCollector {
                 shards,
                 by_status: StatusBuckets::default(),
                 latencies_ms: RwLock::new(VecDeque::with_capacity(MAX_LATENCY_SAMPLES)),
+                idempotency_hits: AtomicU64::new(0),
+                idempotency_misses: AtomicU64::new(0),
+                idempotency_conflicts: AtomicU64::new(0),
             }),
         }
+    }
+
+    /// Increment the idempotency cache hit counter.
+    pub fn record_idempotency_hit(&self) {
+        self.inner.idempotency_hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment the idempotency cache miss counter.
+    pub fn record_idempotency_miss(&self) {
+        self.inner
+            .idempotency_misses
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment the idempotency conflict counter (concurrent duplicate request).
+    pub fn record_idempotency_conflict(&self) {
+        self.inner
+            .idempotency_conflicts
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record a completed request.
@@ -246,6 +274,11 @@ impl MetricsCollector {
                     s5xx: self.inner.by_status.status_5xx.load(Ordering::Relaxed),
                 },
             },
+            idempotency: IdempotencyMetricsSnapshot {
+                hits: self.inner.idempotency_hits.load(Ordering::Relaxed),
+                misses: self.inner.idempotency_misses.load(Ordering::Relaxed),
+                conflicts: self.inner.idempotency_conflicts.load(Ordering::Relaxed),
+            },
         }
     }
 }
@@ -261,6 +294,19 @@ impl Default for MetricsCollector {
 pub struct MetricsSnapshot {
     /// HTTP-specific metrics including latency and status codes.
     pub http: HttpMetrics,
+    /// Idempotency-key middleware counters (zero when middleware is not enabled).
+    pub idempotency: IdempotencyMetricsSnapshot,
+}
+
+/// Idempotency-key middleware counters.
+#[derive(Serialize, Default)]
+pub struct IdempotencyMetricsSnapshot {
+    /// Number of requests served from the idempotency cache (replayed responses).
+    pub hits: u64,
+    /// Number of new requests processed through to the handler.
+    pub misses: u64,
+    /// Number of 409 Conflict responses issued for concurrent duplicate keys.
+    pub conflicts: u64,
 }
 
 /// A snapshot of HTTP metrics across the entire application.

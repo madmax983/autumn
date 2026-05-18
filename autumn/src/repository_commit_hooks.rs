@@ -20,6 +20,7 @@ use diesel_async::pooled_connection::deadpool::Pool;
 use futures::FutureExt as _;
 use serde::Serialize;
 use serde_json::Value;
+use sha2::Digest as _;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
@@ -51,16 +52,31 @@ const HOOK_EXTEND_CLAIM_SQL: &str = "UPDATE autumn_repository_commit_hooks \
 const HOOK_ENQUEUE_INSERT_SQL: &str = "INSERT INTO autumn_repository_commit_hooks \
      (id, handler_key, hook_name, context, record, status, attempt, \
       max_attempts, initial_backoff_ms, enqueued_at, run_at) \
-     VALUES ($1, $2, $3, $4::JSONB, $5::JSONB, 'enqueued', 1, 5, 1000, NOW(), NOW())";
+     VALUES ($1, $2, $3, $4::JSONB, $5::JSONB, 'enqueued', 1, 5, 1000, NOW(), NOW()) \
+     ON CONFLICT (id) DO NOTHING";
 const HOOK_PENDING_INSERT_SQL: &str = "INSERT INTO autumn_repository_commit_hooks \
      (id, handler_key, hook_name, context, record, status, attempt, \
-      max_attempts, initial_backoff_ms, enqueued_at, run_at, claimed_by, claimed_at) \
-     VALUES ($1, $2, $3, $4::JSONB, $5::JSONB, 'pending_after_hook', 1, 5, 1000, NOW(), NOW(), $6, NOW())";
-const HOOK_FINALIZE_AFTER_HOOK_SQL: &str = "UPDATE autumn_repository_commit_hooks \
-     SET context = $1::JSONB, record = $2::JSONB, status = 'enqueued', \
-         run_at = NOW(), enqueued_at = COALESCE(enqueued_at, NOW()), \
-         claimed_by = NULL, claimed_at = NULL, last_error = NULL \
+       max_attempts, initial_backoff_ms, enqueued_at, run_at, claimed_by, claimed_at) \
+     VALUES ($1, $2, $3, $4::JSONB, $5::JSONB, 'pending_after_hook', 1, 5, 1000, NOW(), NOW(), $6, NOW()) \
+     ON CONFLICT (id) DO UPDATE \
+      SET handler_key = EXCLUDED.handler_key, hook_name = EXCLUDED.hook_name, \
+          context = EXCLUDED.context, record = EXCLUDED.record, \
+          status = 'pending_after_hook', attempt = 1, \
+          max_attempts = EXCLUDED.max_attempts, \
+          initial_backoff_ms = EXCLUDED.initial_backoff_ms, \
+          enqueued_at = EXCLUDED.enqueued_at, run_at = EXCLUDED.run_at, \
+          claimed_by = EXCLUDED.claimed_by, claimed_at = EXCLUDED.claimed_at, \
+          started_at = NULL, finished_at = NULL, last_error = NULL \
+      WHERE autumn_repository_commit_hooks.status IN ('pending_after_hook', 'after_hook_failed')";
+const HOOK_MARK_AFTER_HOOK_SUCCEEDED_SQL: &str = "UPDATE autumn_repository_commit_hooks \
+     SET context = $1::JSONB, record = $2::JSONB, status = 'after_hook_succeeded', \
+          claimed_at = NOW(), last_error = NULL \
      WHERE id = $3 AND claimed_by = $4 AND status = 'pending_after_hook'";
+const HOOK_FINALIZE_AFTER_HOOK_SQL: &str = "UPDATE autumn_repository_commit_hooks \
+     SET status = 'enqueued', run_at = NOW(), \
+          enqueued_at = COALESCE(enqueued_at, NOW()), \
+          claimed_by = NULL, claimed_at = NULL, last_error = NULL \
+      WHERE id = $1 AND claimed_by = $2 AND status = 'after_hook_succeeded'";
 const HOOK_DISCARD_PENDING_SQL: &str = "DELETE FROM autumn_repository_commit_hooks \
      WHERE id = $1 AND claimed_by = $2 AND status = 'pending_after_hook'";
 const HOOK_AFTER_HOOK_FAILED_SQL: &str = "UPDATE autumn_repository_commit_hooks \
@@ -68,9 +84,7 @@ const HOOK_AFTER_HOOK_FAILED_SQL: &str = "UPDATE autumn_repository_commit_hooks 
          finished_at = NOW(), \
          context = '{}'::JSONB, record = '{}'::JSONB, \
          claimed_by = NULL, claimed_at = NULL, last_error = $1 \
-     WHERE id = $2 \
-       AND (claimed_by = $3 OR claimed_by IS NULL) \
-       AND status IN ('pending_after_hook', 'enqueued')";
+      WHERE id = $2 AND claimed_by = $3 AND status = 'pending_after_hook'";
 const HOOK_EXTEND_PENDING_FINALIZER_SQL: &str = "UPDATE autumn_repository_commit_hooks \
      SET claimed_at = NOW() \
      WHERE id = $1 AND claimed_by = $2 AND status = 'pending_after_hook'";
@@ -98,14 +112,36 @@ const HOOK_RECOVER_STALE_RUNNING_SQL: &str = "UPDATE autumn_repository_commit_ho
      WHERE status = 'running' \
        AND claimed_at < NOW() - ($2::BIGINT * INTERVAL '1 millisecond')";
 const HOOK_RECOVER_STALE_PENDING_SQL: &str = "UPDATE autumn_repository_commit_hooks \
-     SET status = 'enqueued', \
-         run_at = NOW(), \
-         started_at = NULL, \
-         claimed_by = NULL, \
-         claimed_at = NULL, \
-         last_error = COALESCE(last_error, $1) \
-     WHERE status = 'pending_after_hook' \
-       AND claimed_at < NOW() - ($2::BIGINT * INTERVAL '1 millisecond')";
+     SET status = CASE \
+            WHEN status = 'after_hook_succeeded' THEN 'enqueued' \
+            ELSE 'after_hook_failed' \
+          END, \
+          run_at = CASE \
+            WHEN status = 'after_hook_succeeded' THEN NOW() \
+            ELSE run_at \
+          END, \
+          enqueued_at = CASE \
+            WHEN status = 'after_hook_succeeded' THEN COALESCE(enqueued_at, NOW()) \
+            ELSE enqueued_at \
+          END, \
+          context = CASE \
+            WHEN status = 'pending_after_hook' THEN '{}'::JSONB \
+            ELSE context \
+          END, \
+          record = CASE \
+            WHEN status = 'pending_after_hook' THEN '{}'::JSONB \
+            ELSE record \
+          END, \
+          finished_at = CASE \
+            WHEN status = 'pending_after_hook' THEN NOW() \
+            ELSE finished_at \
+          END, \
+          started_at = NULL, \
+          claimed_by = NULL, \
+          claimed_at = NULL, \
+          last_error = COALESCE(last_error, $1) \
+      WHERE status IN ('pending_after_hook', 'after_hook_succeeded') \
+        AND claimed_at < NOW() - ($2::BIGINT * INTERVAL '1 millisecond')";
 
 static REPOSITORY_COMMIT_HOOK_RUNNERS: OnceLock<
     RwLock<HashMap<String, RepositoryCommitHookRegistration>>,
@@ -275,6 +311,8 @@ pub async fn enqueue_repository_commit_hook_on_conn<C, R>(
     conn: &mut diesel_async::AsyncPgConnection,
     handler_key: &str,
     hook_name: &str,
+    idempotency_key: Option<&str>,
+    idempotency_discriminator: Option<&str>,
     context: &C,
     record: &R,
 ) -> AutumnResult<()>
@@ -283,7 +321,13 @@ where
     R: Serialize + Sync + ?Sized,
 {
     let (context, record) = serialize_repository_commit_hook_payloads(context, record)?;
-    let id = uuid::Uuid::new_v4().to_string();
+    let id = repository_commit_hook_id(
+        idempotency_key,
+        idempotency_discriminator,
+        handler_key,
+        hook_name,
+        &record,
+    );
 
     diesel::sql_query(HOOK_ENQUEUE_INSERT_SQL)
         .bind::<diesel::sql_types::Text, _>(id)
@@ -315,6 +359,8 @@ pub async fn enqueue_repository_commit_hook_pending_on_conn<C, R>(
     conn: &mut diesel_async::AsyncPgConnection,
     handler_key: &str,
     hook_name: &str,
+    idempotency_key: Option<&str>,
+    idempotency_discriminator: Option<&str>,
     context: &C,
     record: &R,
 ) -> AutumnResult<(String, String)>
@@ -323,7 +369,13 @@ where
     R: Serialize + Sync + ?Sized,
 {
     let (context, record) = serialize_repository_commit_hook_payloads(context, record)?;
-    let id = uuid::Uuid::new_v4().to_string();
+    let id = repository_commit_hook_id(
+        idempotency_key,
+        idempotency_discriminator,
+        handler_key,
+        hook_name,
+        &record,
+    );
     let owner = repository_commit_hook_pending_owner_id();
 
     diesel::sql_query(HOOK_PENDING_INSERT_SQL)
@@ -366,9 +418,24 @@ where
         AutumnError::internal_server_error_msg(format!("pg pool error: {error}"))
     })?;
 
-    let rows = diesel::sql_query(HOOK_FINALIZE_AFTER_HOOK_SQL)
+    let rows = diesel::sql_query(HOOK_MARK_AFTER_HOOK_SUCCEEDED_SQL)
         .bind::<diesel::sql_types::Text, _>(context)
         .bind::<diesel::sql_types::Text, _>(record)
+        .bind::<diesel::sql_types::Text, _>(hook_id)
+        .bind::<diesel::sql_types::Text, _>(owner)
+        .execute(&mut *conn)
+        .await
+        .map_err(|error| {
+            AutumnError::internal_server_error_msg(format!(
+                "repository commit hook after-hook success mark failed: {error}"
+            ))
+        })?;
+
+    if rows == 0 {
+        return missing_repository_commit_hook_finalization_result(hook_id);
+    }
+
+    let rows = diesel::sql_query(HOOK_FINALIZE_AFTER_HOOK_SQL)
         .bind::<diesel::sql_types::Text, _>(hook_id)
         .bind::<diesel::sql_types::Text, _>(owner)
         .execute(&mut *conn)
@@ -379,13 +446,19 @@ where
             ))
         })?;
 
-    if rows > 0 {
-        Ok(())
-    } else {
-        Err(AutumnError::internal_server_error_msg(format!(
-            "repository commit hook finalization skipped missing staged row: {hook_id}"
-        )))
+    if rows == 0 {
+        return Err(AutumnError::internal_server_error_msg(format!(
+            "repository commit hook finalization skipped marked row: {hook_id}"
+        )));
     }
+
+    Ok(())
+}
+
+fn missing_repository_commit_hook_finalization_result(hook_id: &str) -> AutumnResult<()> {
+    Err(AutumnError::internal_server_error_msg(format!(
+        "repository commit hook finalization skipped missing staged row: {hook_id}"
+    )))
 }
 
 /// Discard a staged create/update commit hook after the regular after hook
@@ -1019,6 +1092,49 @@ fn format_repository_commit_hook_panic(payload: &(dyn Any + Send)) -> String {
     )
 }
 
+fn repository_commit_hook_id(
+    idempotency_key: Option<&str>,
+    idempotency_discriminator: Option<&str>,
+    handler_key: &str,
+    hook_name: &str,
+    record: &str,
+) -> String {
+    let Some(idempotency_key) = idempotency_key.filter(|key| !key.is_empty()) else {
+        return uuid::Uuid::new_v4().to_string();
+    };
+
+    let mut hasher = sha2::Sha256::new();
+    push_hook_id_component(&mut hasher, "handler", handler_key.as_bytes());
+    push_hook_id_component(&mut hasher, "hook", hook_name.as_bytes());
+    push_hook_id_component(&mut hasher, "idempotency", idempotency_key.as_bytes());
+    if let Some(discriminator) = idempotency_discriminator {
+        push_hook_id_component(&mut hasher, "mutation", discriminator.as_bytes());
+    } else {
+        push_hook_id_component(&mut hasher, "record", record.as_bytes());
+    }
+    format!("idempotent:{}", hex_lower(hasher.finalize()))
+}
+
+fn push_hook_id_component(hasher: &mut sha2::Sha256, label: &str, value: &[u8]) {
+    hasher.update(label.as_bytes());
+    hasher.update(b":");
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(b":");
+    hasher.update(value);
+    hasher.update(b";");
+}
+
+fn hex_lower(bytes: impl AsRef<[u8]>) -> String {
+    bytes.as_ref().iter().fold(
+        String::with_capacity(bytes.as_ref().len() * 2),
+        |mut out, byte| {
+            use std::fmt::Write as _;
+            let _ = write!(out, "{byte:02x}");
+            out
+        },
+    )
+}
+
 fn repository_commit_hook_worker_id() -> String {
     format!("repository-hook-{}", uuid::Uuid::new_v4())
 }
@@ -1152,6 +1268,169 @@ mod tests {
     }
 
     #[test]
+    fn idempotent_hook_ids_are_deterministic_and_safely_delimited() {
+        let record = serde_json::json!({ "id": 1, "title": "first" }).to_string();
+        let first = repository_commit_hook_id(
+            Some("v2:request"),
+            Some("0"),
+            "pkg::module::posts::Post",
+            "create",
+            &record,
+        );
+        let second = repository_commit_hook_id(
+            Some("v2:request"),
+            Some("0"),
+            "pkg::module::posts::Post",
+            "create",
+            &record,
+        );
+        let other_hook = repository_commit_hook_id(
+            Some("v2:request"),
+            Some("0"),
+            "pkg::module::posts::Post",
+            "update",
+            &record,
+        );
+
+        assert_eq!(first, second);
+        assert_ne!(first, other_hook);
+        assert!(first.starts_with("idempotent:"));
+        assert!(!first.contains("v2:request"));
+        assert!(!first.contains("pkg::module::posts::Post"));
+    }
+
+    #[test]
+    fn non_idempotent_hook_ids_remain_fresh() {
+        let record = serde_json::json!({ "id": 1 }).to_string();
+        let first = repository_commit_hook_id(None, None, "handler", "create", &record);
+        let second = repository_commit_hook_id(None, None, "handler", "create", &record);
+
+        assert_ne!(first, second);
+        assert!(uuid::Uuid::parse_str(&first).is_ok());
+        assert!(uuid::Uuid::parse_str(&second).is_ok());
+    }
+
+    #[test]
+    fn hook_insert_sql_ignores_duplicate_idempotent_rows() {
+        assert!(
+            HOOK_ENQUEUE_INSERT_SQL.contains("ON CONFLICT (id) DO NOTHING"),
+            "direct delete commit hooks must dedupe duplicate idempotency rows"
+        );
+        assert!(
+            HOOK_PENDING_INSERT_SQL.contains("ON CONFLICT (id) DO UPDATE")
+                && HOOK_PENDING_INSERT_SQL.contains(
+                    "WHERE autumn_repository_commit_hooks.status IN ('pending_after_hook', 'after_hook_failed')"
+                ),
+            "staged create/update commit hooks must dedupe successful duplicate rows while allowing a retry to reclaim unfinalized or failed staged rows"
+        );
+    }
+
+    #[test]
+    fn idempotent_hook_ids_distinguish_records_in_same_request() {
+        let first_record = serde_json::json!({ "id": 1, "title": "first" }).to_string();
+        let second_record = serde_json::json!({ "id": 2, "title": "second" }).to_string();
+
+        let first = repository_commit_hook_id(
+            Some("v2:request"),
+            Some("0"),
+            "pkg::module::posts::Post",
+            "create",
+            &first_record,
+        );
+        let second = repository_commit_hook_id(
+            Some("v2:request"),
+            Some("1"),
+            "pkg::module::posts::Post",
+            "create",
+            &second_record,
+        );
+
+        assert_ne!(
+            first, second,
+            "one idempotent request can stage multiple committed records for the same hook"
+        );
+    }
+
+    #[test]
+    fn idempotent_hook_ids_distinguish_same_record_sequences_in_same_request() {
+        let record = serde_json::json!({ "id": 1, "title": "same" }).to_string();
+
+        let first = repository_commit_hook_id(
+            Some("v2:request"),
+            Some("0"),
+            "pkg::module::posts::Post",
+            "update",
+            &record,
+        );
+        let second = repository_commit_hook_id(
+            Some("v2:request"),
+            Some("1"),
+            "pkg::module::posts::Post",
+            "update",
+            &record,
+        );
+        let first_again = repository_commit_hook_id(
+            Some("v2:request"),
+            Some("0"),
+            "pkg::module::posts::Post",
+            "update",
+            &record,
+        );
+
+        assert_eq!(
+            first, first_again,
+            "the same mutation sequence must dedupe across duplicate request attempts"
+        );
+        assert_ne!(
+            first, second,
+            "distinct mutations in one request must not collapse just because their final record serializes identically"
+        );
+    }
+
+    #[test]
+    fn missing_idempotent_finalization_fails_closed() {
+        let err = missing_repository_commit_hook_finalization_result("idempotent:abc")
+            .expect_err("missing idempotent staged rows should fail closed");
+
+        assert!(
+            err.to_string()
+                .contains("finalization skipped missing staged row"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn pending_insert_reclaims_only_unfinalized_or_failed_rows() {
+        assert!(
+            HOOK_PENDING_INSERT_SQL.contains("ON CONFLICT (id) DO UPDATE")
+                && HOOK_PENDING_INSERT_SQL.contains("status = 'pending_after_hook'")
+                && HOOK_PENDING_INSERT_SQL.contains("context = EXCLUDED.context")
+                && HOOK_PENDING_INSERT_SQL.contains("record = EXCLUDED.record")
+                && HOOK_PENDING_INSERT_SQL.contains("claimed_by = EXCLUDED.claimed_by")
+                && HOOK_PENDING_INSERT_SQL.contains("last_error = NULL"),
+            "a retried idempotent mutation must be able to restage durable hooks after an earlier unfinalized or failed regular after-hook"
+        );
+        assert!(
+            HOOK_PENDING_INSERT_SQL.contains(
+                "WHERE autumn_repository_commit_hooks.status IN ('pending_after_hook', 'after_hook_failed')"
+            ),
+            "restaging must reclaim unfinalized pending rows but not replace already finalized, enqueued, running, completed, or worker-failed rows"
+        );
+    }
+
+    #[test]
+    fn missing_non_idempotent_finalization_remains_an_error() {
+        let err = missing_repository_commit_hook_finalization_result("random-id")
+            .expect_err("missing non-idempotent staged rows should still be reported");
+
+        assert!(
+            err.to_string()
+                .contains("finalization skipped missing staged row"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn claim_heartbeat_runs_before_stale_recovery() {
         assert!(
             HOOK_CLAIM_HEARTBEAT_INTERVAL < HOOK_STALE_CLAIM_AFTER,
@@ -1211,21 +1490,36 @@ mod tests {
             "staged rows must carry a finalizer lease so recovery can distinguish live after hooks from abandoned rows"
         );
         assert!(
-            HOOK_FINALIZE_AFTER_HOOK_SQL.contains("status = 'enqueued'"),
-            "after-hook finalization must make the row dispatchable only after regular hooks succeed"
+            HOOK_MARK_AFTER_HOOK_SUCCEEDED_SQL.contains("status = 'after_hook_succeeded'")
+                && HOOK_MARK_AFTER_HOOK_SUCCEEDED_SQL.contains("context = $1::JSONB")
+                && HOOK_MARK_AFTER_HOOK_SUCCEEDED_SQL.contains("record = $2::JSONB"),
+            "regular after-hook success must durably persist finalized hook payload before enqueue"
         );
         assert!(
-            HOOK_FINALIZE_AFTER_HOOK_SQL
+            HOOK_MARK_AFTER_HOOK_SUCCEEDED_SQL
                 .contains("WHERE id = $3 AND claimed_by = $4 AND status = 'pending_after_hook'"),
-            "finalization must only promote the staged row it owns"
+            "success marking must only advance the staged row it owns"
+        );
+        assert!(
+            HOOK_FINALIZE_AFTER_HOOK_SQL.contains("status = 'enqueued'")
+                && HOOK_FINALIZE_AFTER_HOOK_SQL.contains(
+                    "WHERE id = $1 AND claimed_by = $2 AND status = 'after_hook_succeeded'"
+                ),
+            "after-hook finalization must only enqueue rows with a durable regular-hook success marker"
         );
         assert!(
             HOOK_AFTER_HOOK_FAILED_SQL.contains("status = 'after_hook_failed'")
                 && HOOK_AFTER_HOOK_FAILED_SQL.contains("context = '{}'::JSONB")
                 && HOOK_AFTER_HOOK_FAILED_SQL.contains("record = '{}'::JSONB")
-                && HOOK_AFTER_HOOK_FAILED_SQL
-                    .contains("status IN ('pending_after_hook', 'enqueued')"),
-            "failed regular after hooks must mark staged rows terminal and non-dispatchable"
+                && HOOK_AFTER_HOOK_FAILED_SQL.contains(
+                    "WHERE id = $2 AND claimed_by = $3 AND status = 'pending_after_hook'"
+                ),
+            "failed regular after hooks must mark only the owner-scoped staged row terminal and non-dispatchable"
+        );
+        assert!(
+            !HOOK_AFTER_HOOK_FAILED_SQL.contains("claimed_by IS NULL")
+                && !HOOK_AFTER_HOOK_FAILED_SQL.contains("'enqueued'"),
+            "duplicate idempotent retries must not dead-letter already finalized hook rows"
         );
         assert!(
             HOOK_EXTEND_PENDING_FINALIZER_SQL.contains("claimed_at = NOW()")
@@ -1233,9 +1527,22 @@ mod tests {
             "long-running regular after hooks must heartbeat their staged-row finalizer lease"
         );
         assert!(
-            HOOK_RECOVER_STALE_PENDING_SQL.contains("status = 'pending_after_hook'")
-                && HOOK_RECOVER_STALE_PENDING_SQL.contains("status = 'enqueued'"),
-            "abandoned staged rows must eventually become claimable by the durable worker"
+            HOOK_RECOVER_STALE_PENDING_SQL
+                .contains("status IN ('pending_after_hook', 'after_hook_succeeded')")
+                && HOOK_RECOVER_STALE_PENDING_SQL
+                    .contains("WHEN status = 'after_hook_succeeded' THEN 'enqueued'")
+                && HOOK_RECOVER_STALE_PENDING_SQL.contains("ELSE 'after_hook_failed'"),
+            "stale recovery must enqueue only rows with a durable regular-hook success marker"
+        );
+        assert!(
+            HOOK_RECOVER_STALE_PENDING_SQL
+                .contains("WHEN status = 'pending_after_hook' THEN '{}'::JSONB"),
+            "ambiguous stale pending rows must be failed closed without retaining payloads"
+        );
+        assert!(
+            HOOK_RECOVER_STALE_PENDING_SQL
+                .contains("WHEN status = 'pending_after_hook' THEN NOW()"),
+            "ambiguous stale pending rows must be marked terminal when failed closed"
         );
     }
 

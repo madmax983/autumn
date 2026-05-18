@@ -216,6 +216,13 @@ impl MutationHooks for PostHooks {
 }
 ```
 
+When a generated repository mutation runs inside an HTTP request covered by
+Autumn idempotency, `MutationContext::idempotency_key` is populated with the
+framework-scoped idempotency key. Durable `after_*_commit` queue rows use that
+same scoped key to de-duplicate duplicate dispatch rows for a retried request,
+and hook implementations can reuse it as a provider idempotency token for
+external side effects.
+
 ### Observability
 
 A process-level counter tracks failures in after-commit callbacks (for

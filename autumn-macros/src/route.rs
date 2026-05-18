@@ -17,12 +17,14 @@ use quote::{format_ident, quote};
 use syn::{FnArg, LitStr, ReturnType, Type};
 
 use crate::api_doc;
+use crate::idempotency_guard::block_has_replay_guard;
 use crate::parse;
 
 /// Core implementation shared by all route macros (`#[get]`, `#[post]`, etc.).
 ///
 /// `http_method` is the uppercase method name (e.g., `"GET"`).
 /// `axum_fn` is the lowercase axum routing function name (e.g., `"get"`).
+#[allow(clippy::too_many_lines)]
 pub fn route_macro(
     http_method: &str,
     axum_fn: &str,
@@ -105,8 +107,6 @@ pub fn route_macro(
         || fn_name.clone(),
         |_| format_ident!("__autumn_primitive_handler_{}", fn_name),
     );
-    let handler_expr = build_handler_expr(&routing_fn, &handler_name, &interceptors);
-
     // ── OpenAPI metadata ────────────────────────────────────────
     let path_params = api_doc::extract_path_params(&path.value());
     let path_params_tokens = api_doc::emit_path_param_slice(&path_params);
@@ -114,6 +114,19 @@ pub fn route_macro(
     let response_body = api_doc::schema_option(api_doc::infer_response_body(&input_fn));
     let query_schema = api_doc::schema_option(api_doc::infer_query_params(&input_fn));
     let (secured, required_roles) = api_doc::extract_secured_info(&input_fn);
+    let body_guarded_replay = secured || has_authorize_guard(&input_fn);
+    let intercepted_route = !interceptors.is_empty();
+    let handler_expr = build_handler_expr(
+        &routing_fn,
+        &handler_name,
+        &interceptors,
+        !body_guarded_replay && !intercepted_route,
+    );
+    let route_idempotency = if intercepted_route {
+        quote! { ::autumn_web::RouteIdempotency::Direct }
+    } else {
+        quote! { ::autumn_web::RouteIdempotency::ReplayThroughInner }
+    };
     let api_doc_fields = api_doc_attr.emit_ident_fields(fn_name);
     let http_method_lit = LitStr::new(http_method, Span::call_site());
 
@@ -147,6 +160,7 @@ pub fn route_macro(
                     #api_doc_fields
                 },
                 repository: ::core::option::Option::None,
+                idempotency: #route_idempotency,
             }
         }
 
@@ -161,8 +175,16 @@ fn build_handler_expr(
     routing_fn: &proc_macro2::Ident,
     handler_name: &proc_macro2::Ident,
     interceptors: &[syn::Path],
+    include_replay_layer: bool,
 ) -> TokenStream {
     let mut expr = quote! { ::autumn_web::reexports::axum::routing::#routing_fn(#handler_name) };
+    if include_replay_layer {
+        expr = quote! {
+            ::autumn_web::reexports::axum::routing::MethodRouter::<
+                ::autumn_web::AppState, ::core::convert::Infallible
+            >::layer(#expr, ::autumn_web::idempotency::IdempotencyReplayLayer)
+        };
+    }
     for interceptor in interceptors.iter().rev() {
         // Explicit type annotation avoids inference ambiguity with chained .layer() calls.
         expr = quote! {
@@ -172,6 +194,15 @@ fn build_handler_expr(
         };
     }
     expr
+}
+
+fn has_authorize_guard(input_fn: &syn::ItemFn) -> bool {
+    input_fn.attrs.iter().any(|attr| {
+        attr.path()
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == "authorize")
+    }) || block_has_replay_guard(&input_fn.block)
 }
 
 /// When a `name = "..."` override is active, emit a `pub use` alias for the
@@ -322,7 +353,9 @@ fn should_stringify_primitive_output(output: &ReturnType) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::positional_format_string;
+    use quote::quote;
+
+    use super::{positional_format_string, route_macro};
 
     #[test]
     fn positional_plain_params() {
@@ -380,6 +413,52 @@ mod tests {
         assert_eq!(
             positional_format_string("/{{literal}}/{id}"),
             "/{{literal}}/{}"
+        );
+    }
+
+    #[test]
+    fn route_macro_string_literal_replay_guard_still_injects_layer() {
+        let generated = route_macro(
+            "POST",
+            "post",
+            quote! { "/items" },
+            quote! {
+                async fn create_item() -> &'static str {
+                    let _ = "__AUTUMN_IDEMPOTENCY_REPLAY_GUARD";
+                    "created"
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("IdempotencyReplayLayer"),
+            "plain handler text must not be mistaken for a generated replay stop: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_interceptor_uses_direct_idempotency() {
+        let generated = route_macro(
+            "POST",
+            "post",
+            quote! { "/items" },
+            quote! {
+                #[intercept(TenantLayer)]
+                async fn create_item() -> &'static str {
+                    "created"
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("RouteIdempotency :: Direct"),
+            "intercepted routes must fail closed when replay scope is not explicit: {generated}"
+        );
+        assert!(
+            !generated.contains("IdempotencyReplayLayer"),
+            "intercepted routes must not advertise an implicit replay stop: {generated}"
         );
     }
 }

@@ -33,6 +33,8 @@ CREATE INDEX IF NOT EXISTS idx_autumn_repository_commit_hooks_stale_recovery
     WHERE status = 'running';
 
 -- Staged create/update hooks are leased by the request until regular after hooks finish.
+-- `after_hook_succeeded` rows have durably persisted finalized after-hook payloads and may be
+-- recovered to `enqueued`; ambiguous `pending_after_hook` rows must fail closed instead.
 CREATE INDEX IF NOT EXISTS idx_autumn_repository_commit_hooks_pending_recovery
     ON autumn_repository_commit_hooks (claimed_at)
-    WHERE status = 'pending_after_hook';
+    WHERE status IN ('pending_after_hook', 'after_hook_succeeded');

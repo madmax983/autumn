@@ -6,11 +6,13 @@
 //! like actuators and probes.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::app::ScopedGroup;
 use crate::config::AutumnConfig;
 use crate::error_pages::{self, SharedRenderer};
 use crate::extract::State;
+use crate::idempotency::{IdempotencyLayer, IdempotencyStore, MemoryIdempotencyStore};
 use crate::middleware::RequestIdLayer;
 use crate::middleware::dev;
 use crate::middleware::exception_filter::{
@@ -34,6 +36,10 @@ pub enum RouterBuildError {
     /// The session backend configuration is invalid (e.g. Redis without a URL).
     #[error("invalid session backend configuration: {0}")]
     InvalidSessionBackend(#[from] crate::session::SessionBackendConfigError),
+    /// The idempotency backend configuration is invalid.
+    #[error("invalid idempotency backend configuration: {0}")]
+    #[allow(dead_code)] // constructed only in the `redis` feature path
+    InvalidIdempotencyBackend(String),
     /// A user-defined route conflicts with a framework-provided route.
     #[error("framework route overlap at {path}: {existing} conflicts with {incoming}")]
     FrameworkRouteOverlap {
@@ -257,7 +263,14 @@ pub fn try_build_router_inner(
         &config.session.cookie_name,
     )?;
 
-    let mut router = group_and_mount_routes(route_list);
+    let idempotency_layers = build_idempotency_layers(config, &state)?;
+    let opaque_app_layers_present =
+        custom_layers_require_fail_closed_idempotency(&ctx.custom_layers);
+    let mut router = group_and_mount_routes(
+        route_list,
+        idempotency_layers.as_ref(),
+        opaque_app_layers_present,
+    );
 
     let dev_reload_enabled = dev::is_enabled_with_env(&crate::config::OsEnv);
 
@@ -282,9 +295,14 @@ pub fn try_build_router_inner(
     router = router.nest_service("/static", tower_http::services::ServeDir::new(&static_dir));
     router = router.layer(axum::middleware::from_fn(asset_cache_control));
 
-    router = mount_scoped_groups(router, ctx.scoped_groups);
+    router = mount_scoped_groups(router, ctx.scoped_groups, idempotency_layers.as_ref());
 
-    router = mount_raw_routers(router, ctx.merge_routers, ctx.nest_routers);
+    router = mount_raw_routers(
+        router,
+        ctx.merge_routers,
+        ctx.nest_routers,
+        idempotency_layers.as_ref(),
+    );
 
     router = apply_middleware(
         router,
@@ -751,7 +769,11 @@ fn check_openapi_path_against(
     Ok(())
 }
 
-fn group_and_mount_routes(route_list: Vec<Route>) -> axum::Router<AppState> {
+fn group_and_mount_routes(
+    route_list: Vec<Route>,
+    idempotency_layers: Option<&BuiltIdempotencyLayers>,
+    opaque_app_layers_present: bool,
+) -> axum::Router<AppState> {
     // Group routes by path so multiple methods on the same path
     // (e.g. GET /admin + POST /admin) are merged into a single
     // MethodRouter. Axum 0.7+ panics if .route() is called twice
@@ -767,12 +789,18 @@ fn group_and_mount_routes(route_list: Vec<Route>) -> axum::Router<AppState> {
         );
     }
     for route in route_list {
+        let selected_layer = idempotency_layers
+            .map(|layers| idempotency_layer_for_route(&route, layers, opaque_app_layers_present));
+        let mut handler = route.handler;
+        if let Some(layer) = selected_layer {
+            handler = handler.layer(layer.clone());
+        }
         grouped
             .entry(route.path)
             .and_modify(|existing| {
-                *existing = std::mem::take(existing).merge(route.handler.clone());
+                *existing = std::mem::take(existing).merge(handler.clone());
             })
-            .or_insert(route.handler);
+            .or_insert(handler);
     }
 
     let mut router = axum::Router::new();
@@ -780,6 +808,57 @@ fn group_and_mount_routes(route_list: Vec<Route>) -> axum::Router<AppState> {
         router = router.route(path, method_router);
     }
     router
+}
+
+const fn idempotency_layer_for_route<'a>(
+    route: &Route,
+    layers: &'a BuiltIdempotencyLayers,
+    opaque_app_layers_present: bool,
+) -> &'a IdempotencyLayer {
+    if opaque_app_layers_present {
+        &layers.manual
+    } else if route_uses_generated_replay_stop(route) {
+        &layers.route
+    } else {
+        &layers.manual
+    }
+}
+
+const fn route_uses_generated_replay_stop(route: &Route) -> bool {
+    matches!(
+        route.idempotency,
+        crate::route::RouteIdempotency::ReplayThroughInner
+    )
+}
+
+fn custom_layers_require_fail_closed_idempotency(
+    custom_layers: &[crate::app::CustomLayerRegistration],
+) -> bool {
+    custom_layers
+        .iter()
+        .any(|registered| !is_idempotency_transparent_app_layer(registered))
+}
+
+fn is_idempotency_transparent_app_layer(registered: &crate::app::CustomLayerRegistration) -> bool {
+    registered
+        .type_name
+        .starts_with("autumn_web::session::SessionLayer<")
+        || registered
+            .type_name
+            .starts_with("autumn::session::SessionLayer<")
+        || registered.type_id
+            == std::any::TypeId::of::<crate::session::SessionLayer<crate::session::MemoryStore>>()
+        || is_i18n_bundle_extension_layer(registered.type_id)
+}
+
+#[cfg(feature = "i18n")]
+fn is_i18n_bundle_extension_layer(type_id: std::any::TypeId) -> bool {
+    type_id == std::any::TypeId::of::<axum::Extension<Arc<crate::i18n::Bundle>>>()
+}
+
+#[cfg(not(feature = "i18n"))]
+const fn is_i18n_bundle_extension_layer(_type_id: std::any::TypeId) -> bool {
+    false
 }
 
 #[cfg_attr(not(feature = "mail"), allow(unused_variables))]
@@ -927,6 +1006,7 @@ fn mount_actuator_endpoints(
 fn mount_scoped_groups(
     mut router: axum::Router<AppState>,
     scoped_groups: Vec<ScopedGroup>,
+    idempotency_layers: Option<&BuiltIdempotencyLayers>,
 ) -> axum::Router<AppState> {
     // Mount scoped route groups (each with its own middleware layer).
     for group in scoped_groups {
@@ -939,7 +1019,18 @@ fn mount_scoped_groups(
                 scope = %group.prefix,
                 "Mounted scoped route"
             );
-            sub_router = sub_router.route(route.path, route.handler);
+            // Scoped groups are wrapped by an opaque user-provided layer after
+            // the route handlers are built. The idempotency storage key cannot
+            // know whether that layer authorizes, audits, or resolves tenant
+            // state from non-whitelisted headers/extensions, so cached hits
+            // fail closed instead of replaying through a generated stop inside
+            // the scoped route.
+            let selected_layer = idempotency_layers.map(|layers| &layers.manual);
+            let mut handler = route.handler;
+            if let Some(layer) = selected_layer {
+                handler = handler.layer(layer.clone());
+            }
+            sub_router = sub_router.route(route.path, handler);
         }
         sub_router = (group.apply_layer)(sub_router);
         router = router.nest(&group.prefix, sub_router);
@@ -951,11 +1042,17 @@ fn mount_raw_routers(
     mut router: axum::Router<AppState>,
     merge_routers: Vec<axum::Router<AppState>>,
     nest_routers: Vec<(String, axum::Router<AppState>)>,
+    idempotency_layers: Option<&BuiltIdempotencyLayers>,
 ) -> axum::Router<AppState> {
     // Merge user-supplied raw Axum routers (escape hatch).
     // Merged after annotated routes so annotated routes take precedence.
     for raw_router in merge_routers {
         tracing::debug!("Merged raw Axum router");
+        let raw_router = if let Some(layers) = idempotency_layers {
+            raw_router.layer(layers.manual.clone())
+        } else {
+            raw_router
+        };
         router = router.merge(raw_router);
     }
 
@@ -966,6 +1063,11 @@ fn mount_raw_routers(
         // so that unmatched routes within this prefix are protected by global middleware.
         let nested_router =
             raw_router.fallback(crate::middleware::error_page_filter::fallback_404_handler);
+        let nested_router = if let Some(layers) = idempotency_layers {
+            nested_router.layer(layers.manual.clone())
+        } else {
+            nested_router
+        };
         router = router.nest(&prefix, nested_router);
     }
     router
@@ -1051,6 +1153,60 @@ where
     ))
 }
 
+struct BuiltIdempotencyLayers {
+    route: crate::idempotency::IdempotencyLayer,
+    manual: crate::idempotency::IdempotencyLayer,
+}
+
+fn build_idempotency_layers(
+    config: &AutumnConfig,
+    state: &AppState,
+) -> Result<Option<BuiltIdempotencyLayers>, RouterBuildError> {
+    if !config.idempotency.enabled.unwrap_or(false) {
+        return Ok(None);
+    }
+
+    let ttl = Duration::from_secs(config.idempotency.ttl_secs);
+    let in_flight_ttl = Duration::from_secs(config.idempotency.in_flight_ttl_secs);
+    let store: std::sync::Arc<dyn IdempotencyStore> = match config.idempotency.backend {
+        crate::config::IdempotencyBackend::Memory => {
+            std::sync::Arc::new(MemoryIdempotencyStore::new(ttl))
+        }
+        #[cfg(feature = "redis")]
+        crate::config::IdempotencyBackend::Redis => {
+            match crate::idempotency::RedisIdempotencyStore::from_config(&config.idempotency) {
+                Ok(s) => std::sync::Arc::new(s),
+                Err(e) => return Err(RouterBuildError::InvalidIdempotencyBackend(e)),
+            }
+        }
+        #[cfg(not(feature = "redis"))]
+        crate::config::IdempotencyBackend::Redis => {
+            return Err(RouterBuildError::InvalidIdempotencyBackend(
+                "idempotency backend 'redis' requires the autumn-web 'redis' feature \
+                 flag; rebuild with --features redis or switch to backend = \"memory\""
+                    .to_owned(),
+            ));
+        }
+    };
+
+    tracing::debug!(
+        backend = ?config.idempotency.backend,
+        ttl_secs = config.idempotency.ttl_secs,
+        in_flight_ttl_secs = config.idempotency.in_flight_ttl_secs,
+        "Idempotency-key middleware enabled"
+    );
+
+    let base = IdempotencyLayer::new(store)
+        .with_ttl(ttl)
+        .with_in_flight_ttl(in_flight_ttl)
+        .with_metrics(state.metrics.clone());
+
+    Ok(Some(BuiltIdempotencyLayers {
+        route: base.clone().replay_through_inner(),
+        manual: base.fail_closed_on_replay(),
+    }))
+}
+
 #[allow(clippy::cognitive_complexity)]
 fn apply_middleware(
     mut router: axum::Router<AppState>,
@@ -1105,11 +1261,10 @@ fn apply_middleware(
         crate::security::SecurityHeadersLayer::from_config(&config.security.headers);
     tracing::debug!("Security headers enabled");
 
-    // User-registered Tower layers (AppBuilder::layer). Applied BEFORE
-    // RequestIdLayer wraps the router, so user middleware sits INNER to
-    // RequestId on ingress and can read the generated request ID from the
-    // request extensions. Iterate in reverse so the first registered layer
-    // ends up outermost among user layers — matching tower::ServiceBuilder.
+    // User-registered Tower layers (AppBuilder::layer). Outermost — applied
+    // last so they wrap all framework middleware.  Iterate in reverse so the
+    // first registered layer ends up outermost among user layers — matching
+    // tower::ServiceBuilder ordering.
     let custom_layer_count = custom_layers.len();
     for registered in custom_layers.into_iter().rev() {
         router = (registered.apply)(router);
@@ -2106,6 +2261,7 @@ mod tests {
                     ..Default::default()
                 },
                 repository: None,
+                idempotency: crate::route::RouteIdempotency::Direct,
             }],
             source: crate::route_listing::RouteSource::User,
             apply_layer: Box::new(|r| r),
@@ -2174,6 +2330,7 @@ mod tests {
                 ..Default::default()
             },
             repository: None,
+            idempotency: crate::route::RouteIdempotency::Direct,
         };
         let group = crate::app::ScopedGroup {
             prefix: "/orgs/{org_id}".to_owned(),
@@ -2237,6 +2394,7 @@ mod tests {
                 ..Default::default()
             },
             repository: None,
+            idempotency: crate::route::RouteIdempotency::Direct,
         };
 
         let protected_routes = vec![route];
@@ -2406,6 +2564,7 @@ mod tests {
                 ..Default::default()
             },
             repository: None,
+            idempotency: crate::route::RouteIdempotency::Direct,
         };
 
         let ctx = RouterContext {
@@ -2472,6 +2631,7 @@ mod tests {
                 ..Default::default()
             },
             repository: None,
+            idempotency: crate::route::RouteIdempotency::Direct,
         };
 
         let ctx = RouterContext {

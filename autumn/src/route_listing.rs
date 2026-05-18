@@ -305,6 +305,7 @@ mod tests {
             name,
             api_doc: dummy_api_doc(),
             repository: None,
+            idempotency: crate::route::RouteIdempotency::Direct,
         }
     }
 

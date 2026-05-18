@@ -15,6 +15,7 @@
 //   Scheduled tasks     -> #[scheduled(every = "15m")] hot-rank recalculator
 //   WebSockets          -> #[ws] live feed with Channels + durable app-db relay + pluggable bus
 //   Background Jobs     -> #[job] onboarding + post-publication side effects
+//   Idempotency keys    -> POST/PUT/DELETE deduplication via Idempotency-Key header
 //   Profiles            -> autumn.toml + autumn-dev.toml dev overrides
 //   Actuator            -> /health, /actuator/health, /actuator/info, /actuator/tasks
 //   HTML stack          -> Maud templates, htmx interactivity, Tailwind CSS
@@ -81,6 +82,7 @@ async fn main() {
         ])
         .jobs(reddit_clone::jobs::registered_jobs())
         .plugin(live_events::LiveFeedPlugin::new())
+        .idempotent()
         .run()
         .await;
 }

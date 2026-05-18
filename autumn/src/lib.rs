@@ -91,6 +91,7 @@ pub mod health;
 pub mod hooks;
 #[cfg(feature = "i18n")]
 pub mod i18n;
+pub mod idempotency;
 /// Translation lookup macro with compile-time key validation.
 ///
 /// Re-exported from [`crate::i18n::t`] for ergonomic
@@ -140,7 +141,7 @@ pub mod paths;
 pub mod prelude;
 pub use paths::PathExt;
 pub(crate) mod route;
-pub use route::{RepositoryApiMeta, Route};
+pub use route::{RepositoryApiMeta, Route, RouteIdempotency};
 pub mod scheduler;
 pub mod security;
 pub mod session;
