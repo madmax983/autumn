@@ -119,8 +119,16 @@ pub struct RouterContext {
     pub nest_routers: Vec<(String, axum::Router<AppState>)>,
     /// Custom Tower layers registered via
     /// [`AppBuilder::layer`](crate::app::AppBuilder::layer). Applied inside
-    /// [`RequestIdLayer`] on the ingress
-    /// path so user middleware observes the generated request ID.
+    /// [`RequestIdLayer`] and the session layer on the ingress path so user
+    /// middleware observes the generated request ID and session context.
+    ///
+    /// **SSG/ISG mode trade-off**: when `dist_dir` is active, layers are
+    /// moved outside the static-first middleware so they can process
+    /// pre-rendered responses (e.g. compression).  As a side effect they also
+    /// run *before* `RequestIdLayer`, session, `MetricsLayer`, and
+    /// `ExceptionFilterLayer` for all requests (static and dynamic).  Layers
+    /// that depend on extensions set by those framework layers — such as the
+    /// request ID or session data — will not find them in SSG mode.
     pub custom_layers: Vec<crate::app::CustomLayerRegistration>,
     pub error_page_renderer: Option<SharedRenderer>,
     /// Custom session store installed via
@@ -240,6 +248,24 @@ pub fn try_build_router_inner(
     state: AppState,
     ctx: RouterContext,
 ) -> Result<axum::Router, RouterBuildError> {
+    let router = build_router_pre_state(route_list, config, &state, ctx, None)?;
+    Ok(router.with_state(state))
+}
+
+/// Like [`try_build_router_inner`] but returns `Router<AppState>` before
+/// [`with_state`](axum::Router::with_state) is called.  Used by
+/// [`try_build_router_with_static_inner`] so that user layers and the static
+/// file middleware can be applied to the typed router before state is baked in.
+fn build_router_pre_state(
+    route_list: Vec<Route>,
+    config: &AutumnConfig,
+    state: &AppState,
+    ctx: RouterContext,
+    // When custom_layers are extracted from ctx before this call (SSG path),
+    // the caller pre-computes the flag so the idempotency selector still sees
+    // the real layer list even though ctx.custom_layers is empty.
+    opaque_app_layers_override: Option<bool>,
+) -> Result<axum::Router<AppState>, RouterBuildError> {
     // Fail-fast if an OpenAPI mount path collides with a user or
     // framework GET route — axum panics on overlapping method routes,
     // so surface this as a recoverable error before we start merging.
@@ -263,9 +289,9 @@ pub fn try_build_router_inner(
         &config.session.cookie_name,
     )?;
 
-    let idempotency_layers = build_idempotency_layers(config, &state)?;
-    let opaque_app_layers_present =
-        custom_layers_require_fail_closed_idempotency(&ctx.custom_layers);
+    let idempotency_layers = build_idempotency_layers(config, state)?;
+    let opaque_app_layers_present = opaque_app_layers_override
+        .unwrap_or_else(|| custom_layers_require_fail_closed_idempotency(&ctx.custom_layers));
     let mut router = group_and_mount_routes(
         route_list,
         idempotency_layers.as_ref(),
@@ -307,7 +333,7 @@ pub fn try_build_router_inner(
     router = apply_middleware(
         router,
         config,
-        &state,
+        state,
         ctx.exception_filters,
         ctx.custom_layers,
         ctx.error_page_renderer,
@@ -320,7 +346,7 @@ pub fn try_build_router_inner(
             .layer(axum::middleware::from_fn(dev::inject_live_reload));
     }
 
-    Ok(router.with_state(state))
+    Ok(router)
 }
 
 /// Parse `{name}` captures from a route path.
@@ -1161,6 +1187,11 @@ fn apply_middleware(
     // last so they wrap all framework middleware.  Iterate in reverse so the
     // first registered layer ends up outermost among user layers — matching
     // tower::ServiceBuilder ordering.
+    //
+    // When a static dist dir is active (SSG/ISG build), these layers are
+    // NOT passed here — they are extracted by try_build_router_with_static_inner
+    // and applied outside the static-first middleware instead, so they can
+    // process pre-rendered responses without creating a session dependency.
     let custom_layer_count = custom_layers.len();
     for registered in custom_layers.into_iter().rev() {
         router = (registered.apply)(router);
@@ -1209,10 +1240,12 @@ fn apply_middleware(
     // Error page context layer must be inner to the exception filter so
     // WantsHtml is set on the response before the filter inspects it.
     // Full ingress layer order (outermost -> innermost):
-    //   TraceContext (applied outside the startup barrier / static-first
-    //   middleware so short-circuit responses still carry traceparent) ->
+    //   TraceContext (applied outside the startup barrier so short-circuit
+    //   responses still carry traceparent) ->
+    //   [user layers, when SSG/ISG dist dir active] ->
+    //   StaticFileMiddleware (when SSG/ISG enabled) ->
     //   Metrics -> ExceptionFilter -> ErrorPageContext -> Session ->
-    //   SecurityHeaders -> RequestId -> [user layers] ->
+    //   SecurityHeaders -> RequestId -> [user layers, non-static build] ->
     //   RateLimit -> CSRF -> CORS -> handler
     let router = router
         .layer(crate::middleware::error_page_filter::ErrorPageContextLayer)
@@ -1292,12 +1325,12 @@ pub fn try_build_router_with_static_inner(
     config: &AutumnConfig,
     state: AppState,
     dist_dir: Option<&std::path::Path>,
-    ctx: RouterContext,
+    mut ctx: RouterContext,
 ) -> Result<axum::Router, RouterBuildError> {
     let startup_barrier_state = state.clone();
-    let app_router = try_build_router_inner(route_list, config, state, ctx)?;
 
     let Some(dist) = dist_dir else {
+        let app_router = try_build_router_inner(route_list, config, state, ctx)?;
         return Ok(apply_startup_barrier(
             app_router,
             config,
@@ -1310,25 +1343,12 @@ pub fn try_build_router_with_static_inner(
             dist = %dist.display(),
             "No valid manifest.json in dist dir; skipping static file layer"
         );
+        let app_router = try_build_router_inner(route_list, config, state, ctx)?;
         return Ok(apply_startup_barrier(
             app_router,
             config,
             &startup_barrier_state,
         ));
-    };
-
-    // Enable ISR regeneration by attaching the app router to the static layer.
-    // Routes with `revalidate` set will spawn background re-render tasks
-    // when their files become stale.
-    let has_isr = layer
-        .manifest()
-        .routes
-        .values()
-        .any(|e| e.revalidate.is_some());
-    let layer = if has_isr {
-        layer.with_router(app_router.clone())
-    } else {
-        layer
     };
 
     for (route, entry) in &layer.manifest().routes {
@@ -1340,13 +1360,44 @@ pub fn try_build_router_with_static_inner(
         );
     }
 
-    // Store the layer in an Arc so the static-first middleware can use it.
+    // Extract user layers before building the inner router. They are applied
+    // OUTSIDE the static-first middleware (and outside session) so that:
+    //   • User layers (e.g. compression) can process pre-rendered responses.
+    //   • Static serving remains available even if the session backend is down.
+    //   • ISR regeneration uses the inner router (no user layers), ensuring
+    //     re-rendered pages are saved as raw HTML rather than pre-transformed.
+    //
+    // Compute the idempotency flag NOW while custom_layers is still populated,
+    // then drain it. build_router_pre_state would otherwise see an empty list
+    // and incorrectly treat opaque layers as absent when selecting idempotency
+    // behaviour for each route.
+    let opaque_present = Some(custom_layers_require_fail_closed_idempotency(
+        &ctx.custom_layers,
+    ));
+    let custom_layers = std::mem::take(&mut ctx.custom_layers);
+
+    let inner_router = build_router_pre_state(route_list, config, &state, ctx, opaque_present)?;
+
+    // Attach the inner router for ISR background regeneration. Because user
+    // layers are excluded, re-renders produce raw HTML (no compression, etc.)
+    // that is then saved to disk and served with user-layer processing applied
+    // at request time.
+    let has_isr = layer
+        .manifest()
+        .routes
+        .values()
+        .any(|e| e.revalidate.is_some());
+    let layer = if has_isr {
+        layer.with_router(inner_router.clone().with_state(state.clone()))
+    } else {
+        layer
+    };
     let layer = Arc::new(layer);
 
     // Static-first serving: intercept GET/HEAD requests whose path appears
-    // in the manifest and serve pre-built HTML directly, BEFORE the dynamic
-    // router runs.  This matches Next.js SSG/ISR semantics where static
-    // pages always win over dynamic handlers.
+    // in the manifest and serve pre-built HTML directly — BEFORE the dynamic
+    // router (and session layer) runs. This preserves availability of static
+    // pages even when the session backend is unavailable.
     //
     // Requests not in the manifest (including non-GET/HEAD methods) fall
     // through to the dynamic router unchanged.
@@ -1355,7 +1406,7 @@ pub fn try_build_router_with_static_inner(
     // still served immediately while background regeneration runs
     // (stale-while-revalidate).
     let static_layer = layer;
-    let router = app_router.layer(axum::middleware::from_fn(
+    let mut router: axum::Router<AppState> = inner_router.layer(axum::middleware::from_fn(
         move |req: axum::extract::Request, next: axum::middleware::Next| {
             let static_layer = static_layer.clone();
             async move {
@@ -1388,12 +1439,28 @@ pub fn try_build_router_with_static_inner(
             }
         },
     ));
+
+    // Apply user layers OUTSIDE the static middleware so they wrap it and can
+    // process both static and dynamic responses (e.g. compress the HTML on
+    // the way out). Iterate in reverse so the first registered layer ends up
+    // outermost — matching tower::ServiceBuilder ordering.
+    let custom_layer_count = custom_layers.len();
+    for registered in custom_layers.into_iter().rev() {
+        router = (registered.apply)(router);
+    }
+    if custom_layer_count > 0 {
+        tracing::debug!(
+            count = custom_layer_count,
+            "Custom Tower layers applied outside static middleware"
+        );
+    }
+
     let router = router.layer(crate::security::SecurityHeadersLayer::from_config(
         &config.security.headers,
     ));
 
     Ok(apply_startup_barrier(
-        router,
+        router.with_state(state),
         config,
         &startup_barrier_state,
     ))
@@ -2766,5 +2833,177 @@ mod tests {
                 ));
             },
         );
+    }
+
+    // --- Static file serving (SSG/ISG) tests ---
+
+    fn create_static_dist(revalidate: Option<u64>) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dist = dir.path().join("dist");
+        std::fs::create_dir_all(dist.join("about")).expect("mkdir about");
+        std::fs::write(dist.join("index.html"), b"<h1>Home</h1>").expect("write index");
+        std::fs::write(dist.join("about/index.html"), b"<h1>About</h1>").expect("write about");
+
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            "/".to_owned(),
+            crate::static_gen::ManifestEntry {
+                file: "index.html".to_owned(),
+                revalidate: None,
+            },
+        );
+        routes.insert(
+            "/about".to_owned(),
+            crate::static_gen::ManifestEntry {
+                file: "about/index.html".to_owned(),
+                revalidate,
+            },
+        );
+
+        let manifest = crate::static_gen::StaticManifest {
+            generated_at: "2026-05-18T00:00:00Z".to_owned(),
+            autumn_version: "0.4.0".to_owned(),
+            routes,
+        };
+        let json = serde_json::to_string(&manifest).expect("serialize manifest");
+        std::fs::write(dist.join("manifest.json"), json).expect("write manifest");
+        dir
+    }
+
+    #[tokio::test]
+    async fn static_serving_serves_get_request_inside_user_layers() {
+        let tmp = create_static_dist(None);
+        let dist = tmp.path().join("dist");
+        let config = AutumnConfig::default();
+
+        let router = try_build_router_with_static(Vec::new(), &config, test_state(), Some(&dist))
+            .expect("router builds");
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/about")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), b"<h1>About</h1>");
+    }
+
+    #[tokio::test]
+    async fn static_serving_serves_head_request() {
+        let tmp = create_static_dist(None);
+        let dist = tmp.path().join("dist");
+        let config = AutumnConfig::default();
+
+        let router = try_build_router_with_static(Vec::new(), &config, test_state(), Some(&dist))
+            .expect("router builds");
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("HEAD")
+                    .uri("/about")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(body.is_empty(), "HEAD response body should be empty");
+    }
+
+    #[tokio::test]
+    async fn static_serving_normalizes_trailing_slash() {
+        let tmp = create_static_dist(None);
+        let dist = tmp.path().join("dist");
+        let config = AutumnConfig::default();
+
+        let router = try_build_router_with_static(Vec::new(), &config, test_state(), Some(&dist))
+            .expect("router builds");
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/about/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn static_serving_falls_through_for_unknown_route() {
+        let tmp = create_static_dist(None);
+        let dist = tmp.path().join("dist");
+        let config = AutumnConfig::default();
+
+        let router = try_build_router_with_static(Vec::new(), &config, test_state(), Some(&dist))
+            .expect("router builds");
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/not-in-manifest")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn static_serving_skipped_when_no_manifest() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dist = tmp.path().join("dist");
+        std::fs::create_dir_all(&dist).expect("mkdir dist");
+        let config = AutumnConfig::default();
+
+        let router = try_build_router_with_static(Vec::new(), &config, test_state(), Some(&dist))
+            .expect("router builds even without manifest");
+
+        let response = router
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn static_serving_with_isr_manifest_builds_successfully() {
+        let tmp = create_static_dist(Some(3600));
+        let dist = tmp.path().join("dist");
+        let config = AutumnConfig::default();
+
+        let router = try_build_router_with_static(Vec::new(), &config, test_state(), Some(&dist))
+            .expect("router with ISR manifest should build");
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/about")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }
