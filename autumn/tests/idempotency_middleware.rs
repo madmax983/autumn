@@ -45,6 +45,14 @@ async fn tenant_scope_extension_handler(
     tenant
 }
 
+#[post("/scoped-generated-tenant")]
+async fn scoped_generated_tenant_handler(
+    axum::extract::Extension(tenant): axum::extract::Extension<String>,
+) -> String {
+    SCOPED_GENERATED_TENANT_HANDLER_CALLS.fetch_add(1, Ordering::SeqCst);
+    tenant
+}
+
 async fn committed_error_handler() -> Response {
     COMMITTED_ERROR_HANDLER_CALLS.fetch_add(1, Ordering::SeqCst);
     let mut response = (
@@ -193,6 +201,7 @@ static RAW_LAYERED_ALLOWED: AtomicBool = AtomicBool::new(true);
 static SESSION_SAVE_FAILURE_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static TENANT_HEADER_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static TENANT_EXTENSION_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
+static SCOPED_GENERATED_TENANT_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static COMMITTED_ERROR_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static SECURED_SESSION_ROTATION_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static SECURED_SESSION_TOUCH_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -2762,6 +2771,58 @@ async fn test_tenant_scope_headers_same_key_are_independent() {
         TENANT_HEADER_HANDLER_CALLS.load(Ordering::SeqCst),
         2,
         "same principal/path/body/key in different tenants must not replay another tenant's mutation response"
+    );
+}
+
+#[tokio::test]
+async fn test_scoped_generated_route_fails_closed_for_opaque_tenant_scope() {
+    async fn scoped_customer_scope(
+        mut req: axum::http::Request<Body>,
+        next: axum::middleware::Next,
+    ) -> Response {
+        let tenant = req
+            .headers()
+            .get("customer")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("missing")
+            .to_owned();
+        req.extensions_mut().insert(tenant);
+        next.run(req).await
+    }
+
+    SCOPED_GENERATED_TENANT_HANDLER_CALLS.store(0, Ordering::SeqCst);
+    let client = TestApp::new()
+        .scoped(
+            "/api",
+            axum::middleware::from_fn(scoped_customer_scope),
+            routes![scoped_generated_tenant_handler],
+        )
+        .idempotent()
+        .build();
+
+    let first = client
+        .post("/api/scoped-generated-tenant")
+        .header("idempotency-key", "scoped-generated-tenant-key")
+        .header("customer", "tenant-a")
+        .body("same")
+        .send()
+        .await;
+    first.assert_ok();
+    assert_eq!(first.text(), "tenant-a");
+
+    let retry = client
+        .post("/api/scoped-generated-tenant")
+        .header("idempotency-key", "scoped-generated-tenant-key")
+        .header("customer", "tenant-b")
+        .body("same")
+        .send()
+        .await;
+    retry.assert_status(StatusCode::CONFLICT.as_u16());
+    assert_eq!(retry.header("x-idempotent-replayed"), None);
+    assert_eq!(
+        SCOPED_GENERATED_TENANT_HANDLER_CALLS.load(Ordering::SeqCst),
+        1,
+        "scoped generated routes must not replay cached mutations across opaque tenant layers"
     );
 }
 

@@ -979,8 +979,13 @@ fn mount_scoped_groups(
                 scope = %group.prefix,
                 "Mounted scoped route"
             );
-            let selected_layer =
-                idempotency_layers.map(|layers| idempotency_layer_for_route(&route, layers));
+            // Scoped groups are wrapped by an opaque user-provided layer after
+            // the route handlers are built. The idempotency storage key cannot
+            // know whether that layer authorizes, audits, or resolves tenant
+            // state from non-whitelisted headers/extensions, so cached hits
+            // fail closed instead of replaying through a generated stop inside
+            // the scoped route.
+            let selected_layer = idempotency_layers.map(|layers| &layers.manual);
             let mut handler = route.handler;
             if let Some(layer) = selected_layer {
                 handler = handler.layer(layer.clone());
