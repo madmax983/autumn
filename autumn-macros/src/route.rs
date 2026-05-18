@@ -17,6 +17,7 @@ use quote::{format_ident, quote};
 use syn::{FnArg, LitStr, ReturnType, Type};
 
 use crate::api_doc;
+use crate::idempotency_guard::block_has_replay_guard;
 use crate::parse;
 
 /// Core implementation shared by all route macros (`#[get]`, `#[post]`, etc.).
@@ -195,9 +196,7 @@ fn has_authorize_guard(input_fn: &syn::ItemFn) -> bool {
             .segments
             .last()
             .is_some_and(|segment| segment.ident == "authorize")
-    }) || quote!(#input_fn)
-        .to_string()
-        .contains("__AUTUMN_IDEMPOTENCY_REPLAY_GUARD")
+    }) || block_has_replay_guard(&input_fn.block)
 }
 
 /// When a `name = "..."` override is active, emit a `pub use` alias for the
@@ -348,7 +347,9 @@ fn should_stringify_primitive_output(output: &ReturnType) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::positional_format_string;
+    use quote::quote;
+
+    use super::{positional_format_string, route_macro};
 
     #[test]
     fn positional_plain_params() {
@@ -406,6 +407,27 @@ mod tests {
         assert_eq!(
             positional_format_string("/{{literal}}/{id}"),
             "/{{literal}}/{}"
+        );
+    }
+
+    #[test]
+    fn route_macro_string_literal_replay_guard_still_injects_layer() {
+        let generated = route_macro(
+            "POST",
+            "post",
+            quote! { "/items" },
+            quote! {
+                async fn create_item() -> &'static str {
+                    let _ = "__AUTUMN_IDEMPOTENCY_REPLAY_GUARD";
+                    "created"
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("IdempotencyReplayLayer"),
+            "plain handler text must not be mistaken for a generated replay stop: {generated}"
         );
     }
 }

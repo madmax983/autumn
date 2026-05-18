@@ -121,6 +121,7 @@ fn expect_ident(expr: &Expr, hint: &str) -> syn::Result<Ident> {
     }
 }
 
+use crate::idempotency_guard::block_has_replay_guard;
 use crate::param_helpers::has_input_named;
 
 fn snake_case(name: &str) -> String {
@@ -234,9 +235,7 @@ pub fn authorize_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             ::autumn_web::reexports::axum::response::IntoResponse::into_response(__autumn_inner)
         },
     };
-    let body_already_has_replay_guard = quote!(#original_body)
-        .to_string()
-        .contains("__AUTUMN_IDEMPOTENCY_REPLAY_GUARD");
+    let body_already_has_replay_guard = block_has_replay_guard(original_body);
     let replay_stop = if body_already_has_replay_guard {
         quote! {}
     } else {
@@ -342,5 +341,24 @@ mod tests {
         assert_eq!(snake_case("Post"), "post");
         assert_eq!(snake_case("BlogPost"), "blog_post");
         assert_eq!(snake_case("HTTPRequest"), "h_t_t_p_request");
+    }
+
+    #[test]
+    fn authorize_string_literal_replay_guard_still_injects_replay_stop() {
+        let generated = authorize_macro(
+            quote::quote! { "update", resource = Post },
+            quote::quote! {
+                async fn update_post(post: Post) -> &'static str {
+                    let _ = "__AUTUMN_IDEMPOTENCY_REPLAY_GUARD";
+                    "ok"
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("__replay_response"),
+            "plain handler text must not suppress the generated replay stop: {generated}"
+        );
     }
 }

@@ -279,6 +279,7 @@ pub async fn enqueue_repository_commit_hook_on_conn<C, R>(
     handler_key: &str,
     hook_name: &str,
     idempotency_key: Option<&str>,
+    idempotency_discriminator: Option<&str>,
     context: &C,
     record: &R,
 ) -> AutumnResult<()>
@@ -287,7 +288,13 @@ where
     R: Serialize + Sync + ?Sized,
 {
     let (context, record) = serialize_repository_commit_hook_payloads(context, record)?;
-    let id = repository_commit_hook_id(idempotency_key, handler_key, hook_name, &record);
+    let id = repository_commit_hook_id(
+        idempotency_key,
+        idempotency_discriminator,
+        handler_key,
+        hook_name,
+        &record,
+    );
 
     diesel::sql_query(HOOK_ENQUEUE_INSERT_SQL)
         .bind::<diesel::sql_types::Text, _>(id)
@@ -320,6 +327,7 @@ pub async fn enqueue_repository_commit_hook_pending_on_conn<C, R>(
     handler_key: &str,
     hook_name: &str,
     idempotency_key: Option<&str>,
+    idempotency_discriminator: Option<&str>,
     context: &C,
     record: &R,
 ) -> AutumnResult<(String, String)>
@@ -328,7 +336,13 @@ where
     R: Serialize + Sync + ?Sized,
 {
     let (context, record) = serialize_repository_commit_hook_payloads(context, record)?;
-    let id = repository_commit_hook_id(idempotency_key, handler_key, hook_name, &record);
+    let id = repository_commit_hook_id(
+        idempotency_key,
+        idempotency_discriminator,
+        handler_key,
+        hook_name,
+        &record,
+    );
     let owner = repository_commit_hook_pending_owner_id();
 
     diesel::sql_query(HOOK_PENDING_INSERT_SQL)
@@ -1038,6 +1052,7 @@ fn format_repository_commit_hook_panic(payload: &(dyn Any + Send)) -> String {
 
 fn repository_commit_hook_id(
     idempotency_key: Option<&str>,
+    idempotency_discriminator: Option<&str>,
     handler_key: &str,
     hook_name: &str,
     record: &str,
@@ -1050,7 +1065,11 @@ fn repository_commit_hook_id(
     push_hook_id_component(&mut hasher, "handler", handler_key.as_bytes());
     push_hook_id_component(&mut hasher, "hook", hook_name.as_bytes());
     push_hook_id_component(&mut hasher, "idempotency", idempotency_key.as_bytes());
-    push_hook_id_component(&mut hasher, "record", record.as_bytes());
+    if let Some(discriminator) = idempotency_discriminator {
+        push_hook_id_component(&mut hasher, "mutation", discriminator.as_bytes());
+    } else {
+        push_hook_id_component(&mut hasher, "record", record.as_bytes());
+    }
     format!("idempotent:{}", hex_lower(hasher.finalize()))
 }
 
@@ -1211,18 +1230,21 @@ mod tests {
         let record = serde_json::json!({ "id": 1, "title": "first" }).to_string();
         let first = repository_commit_hook_id(
             Some("v2:request"),
+            Some("0"),
             "pkg::module::posts::Post",
             "create",
             &record,
         );
         let second = repository_commit_hook_id(
             Some("v2:request"),
+            Some("0"),
             "pkg::module::posts::Post",
             "create",
             &record,
         );
         let other_hook = repository_commit_hook_id(
             Some("v2:request"),
+            Some("0"),
             "pkg::module::posts::Post",
             "update",
             &record,
@@ -1238,8 +1260,8 @@ mod tests {
     #[test]
     fn non_idempotent_hook_ids_remain_fresh() {
         let record = serde_json::json!({ "id": 1 }).to_string();
-        let first = repository_commit_hook_id(None, "handler", "create", &record);
-        let second = repository_commit_hook_id(None, "handler", "create", &record);
+        let first = repository_commit_hook_id(None, None, "handler", "create", &record);
+        let second = repository_commit_hook_id(None, None, "handler", "create", &record);
 
         assert_ne!(first, second);
         assert!(uuid::Uuid::parse_str(&first).is_ok());
@@ -1265,12 +1287,14 @@ mod tests {
 
         let first = repository_commit_hook_id(
             Some("v2:request"),
+            Some("0"),
             "pkg::module::posts::Post",
             "create",
             &first_record,
         );
         let second = repository_commit_hook_id(
             Some("v2:request"),
+            Some("1"),
             "pkg::module::posts::Post",
             "create",
             &second_record,
@@ -1279,6 +1303,42 @@ mod tests {
         assert_ne!(
             first, second,
             "one idempotent request can stage multiple committed records for the same hook"
+        );
+    }
+
+    #[test]
+    fn idempotent_hook_ids_distinguish_same_record_sequences_in_same_request() {
+        let record = serde_json::json!({ "id": 1, "title": "same" }).to_string();
+
+        let first = repository_commit_hook_id(
+            Some("v2:request"),
+            Some("0"),
+            "pkg::module::posts::Post",
+            "update",
+            &record,
+        );
+        let second = repository_commit_hook_id(
+            Some("v2:request"),
+            Some("1"),
+            "pkg::module::posts::Post",
+            "update",
+            &record,
+        );
+        let first_again = repository_commit_hook_id(
+            Some("v2:request"),
+            Some("0"),
+            "pkg::module::posts::Post",
+            "update",
+            &record,
+        );
+
+        assert_eq!(
+            first, first_again,
+            "the same mutation sequence must dedupe across duplicate request attempts"
+        );
+        assert_ne!(
+            first, second,
+            "distinct mutations in one request must not collapse just because their final record serializes identically"
         );
     }
 

@@ -241,16 +241,21 @@ impl IdempotencyReplayMetadata {
 /// The raw `Idempotency-Key` header is available via [`Self::key`]. The
 /// scoped key is the framework's collision-safe, principal-scoped storage key
 /// and is the safer value to reuse for durable side-effect deduplication.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct IdempotencyContext {
     key: String,
     scoped_key: String,
+    mutation_sequence: Arc<AtomicU64>,
 }
 
 impl IdempotencyContext {
     #[must_use]
-    pub(crate) const fn new(key: String, scoped_key: String) -> Self {
-        Self { key, scoped_key }
+    pub(crate) fn new(key: String, scoped_key: String) -> Self {
+        Self {
+            key,
+            scoped_key,
+            mutation_sequence: Arc::new(AtomicU64::new(0)),
+        }
     }
 
     #[must_use]
@@ -262,7 +267,27 @@ impl IdempotencyContext {
     pub fn scoped_key(&self) -> &str {
         &self.scoped_key
     }
+
+    /// Return the next request-local mutation discriminator.
+    ///
+    /// Generated repository code uses this to distinguish multiple durable
+    /// side effects produced by one idempotent request while keeping the same
+    /// mutation slot stable across duplicate request attempts.
+    #[must_use]
+    pub fn next_mutation_discriminator(&self) -> String {
+        self.mutation_sequence
+            .fetch_add(1, Ordering::Relaxed)
+            .to_string()
+    }
 }
+
+impl PartialEq for IdempotencyContext {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key && self.scoped_key == other.scoped_key
+    }
+}
+
+impl Eq for IdempotencyContext {}
 
 /// Cache entry wrapping a record with expiry and request body fingerprint.
 #[derive(Clone)]
@@ -1607,6 +1632,16 @@ mod tests {
         push_storage_key_component(&mut hasher, "principal", principal.as_bytes());
         push_storage_key_component(&mut hasher, "idempotency-key", idempotency_key.as_bytes());
         format!("v2:{}", hex_lower(hasher.finalize()))
+    }
+
+    #[test]
+    fn idempotency_context_clones_share_mutation_discriminator_sequence() {
+        let context = IdempotencyContext::new("client-key".to_owned(), "scoped-key".to_owned());
+        let cloned = context.clone();
+
+        assert_eq!(context.next_mutation_discriminator(), "0");
+        assert_eq!(cloned.next_mutation_discriminator(), "1");
+        assert_eq!(context.next_mutation_discriminator(), "2");
     }
 
     #[tokio::test]

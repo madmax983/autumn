@@ -15,6 +15,7 @@ use quote::quote;
 use syn::parse::Parser as _;
 use syn::{ItemFn, LitStr, parse_quote};
 
+use crate::idempotency_guard::block_has_replay_guard;
 use crate::param_helpers::has_input_named;
 
 /// Parse the `#[secured(...)]` attribute arguments.
@@ -77,9 +78,7 @@ pub fn secured_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             ::autumn_web::reexports::axum::response::IntoResponse::into_response(__autumn_inner)
         },
     };
-    let body_already_has_replay_guard = quote!(#original_body)
-        .to_string()
-        .contains("__AUTUMN_IDEMPOTENCY_REPLAY_GUARD");
+    let body_already_has_replay_guard = block_has_replay_guard(original_body);
     let replay_stop = if body_already_has_replay_guard {
         quote! {}
     } else {
@@ -139,4 +138,30 @@ pub fn secured_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     quote! { #input_fn }
+}
+
+#[cfg(test)]
+mod tests {
+    use quote::quote;
+
+    use super::secured_macro;
+
+    #[test]
+    fn secured_string_literal_replay_guard_still_injects_replay_stop() {
+        let generated = secured_macro(
+            quote! {},
+            quote! {
+                async fn guarded() -> &'static str {
+                    let _ = "__AUTUMN_IDEMPOTENCY_REPLAY_GUARD";
+                    "ok"
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("__replay_response"),
+            "plain handler text must not suppress the generated replay stop: {generated}"
+        );
+    }
 }
