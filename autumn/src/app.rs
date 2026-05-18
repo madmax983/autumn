@@ -1725,7 +1725,6 @@ impl AppBuilder {
                 custom_layers,
                 error_page_renderer,
                 session_store,
-                static_layer: None,
                 // Respect the [openapi] profile gate: if disabled in config,
                 // suppress the endpoint even when .openapi(...) was called.
                 #[cfg(feature = "openapi")]
@@ -2099,7 +2098,6 @@ impl AppBuilder {
                 custom_layers,
                 error_page_renderer: None,
                 session_store,
-                static_layer: None,
                 #[cfg(feature = "openapi")]
                 openapi: None,
             },
@@ -4981,7 +4979,6 @@ mod tests {
                 custom_layers,
                 error_page_renderer: None,
                 session_store: None,
-                static_layer: None,
                 #[cfg(feature = "openapi")]
                 openapi: None,
             },
