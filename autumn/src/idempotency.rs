@@ -88,51 +88,77 @@ fn push_storage_key_component(hasher: &mut sha2::Sha256, label: &str, value: &[u
 /// collisions (P1), including cookie-backed authenticated sessions. Each
 /// component is length-delimited inside a SHA-256 digest so raw `:` bytes in
 /// paths or client-controlled keys cannot synthesize another storage key.
+#[derive(Clone)]
+struct StorageKeyContext {
+    idempotency_key: String,
+    method: Method,
+    target: String,
+    authorization: Option<String>,
+}
+
+impl StorageKeyContext {
+    fn from_parts(idempotency_key: String, parts: &axum::http::request::Parts) -> Self {
+        let target = parts
+            .uri
+            .path_and_query()
+            .map_or_else(|| parts.uri.path().to_owned(), |pq| pq.as_str().to_owned());
+        let authorization = parts
+            .headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .filter(|auth| !auth.is_empty())
+            .map(str::to_owned);
+
+        Self {
+            idempotency_key,
+            method: parts.method.clone(),
+            target,
+            authorization,
+        }
+    }
+
+    fn storage_key(&self, session_id: Option<&str>) -> String {
+        build_storage_key(
+            &self.idempotency_key,
+            self.method.as_str(),
+            &self.target,
+            self.authorization.as_deref(),
+            session_id,
+        )
+    }
+}
+
 fn build_storage_key(
     idempotency_key: &str,
-    method: &Method,
-    uri: &axum::http::Uri,
-    headers: &HeaderMap,
+    method: &str,
+    target: &str,
+    auth: Option<&str>,
     session_id: Option<&str>,
 ) -> String {
-    let path = uri
-        .path_and_query()
-        .map_or_else(|| uri.path(), |pq| pq.as_str());
-    let auth = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .filter(|auth| !auth.is_empty());
     let principal = principal_scope_digest(auth, session_id);
     let mut hasher = sha2::Sha256::new();
-    push_storage_key_component(&mut hasher, "method", method.as_str().as_bytes());
-    push_storage_key_component(&mut hasher, "target", path.as_bytes());
+    push_storage_key_component(&mut hasher, "method", method.as_bytes());
+    push_storage_key_component(&mut hasher, "target", target.as_bytes());
     push_storage_key_component(&mut hasher, "principal", principal.as_bytes());
     push_storage_key_component(&mut hasher, "idempotency-key", idempotency_key.as_bytes());
     format!("v2:{}", hex_lower(hasher.finalize()))
 }
 
-async fn build_storage_key_for_parts(
-    idempotency_key: &str,
-    parts: &axum::http::request::Parts,
-) -> String {
-    let method = parts.method.clone();
-    let uri = parts.uri.clone();
-    let headers = parts.headers.clone();
+async fn storage_session_id_for_parts(parts: &axum::http::request::Parts) -> Option<String> {
+    let session_scope = parts
+        .extensions
+        .get::<IdempotencySessionScope>()
+        .and_then(|scope| scope.session_id.as_deref().map(str::to_owned));
     let session = parts.extensions.get::<crate::session::Session>().cloned();
-    let session_id = if let Some(session) = session
+    if session_scope.is_some() {
+        session_scope
+    } else if let Some(session) = session
         && session.is_cookie_backed().await
     {
         Some(session.id().await)
     } else {
         None
-    };
-    build_storage_key(
-        idempotency_key,
-        &method,
-        &uri,
-        &headers,
-        session_id.as_deref(),
-    )
+    }
 }
 
 fn extract_replay_headers(headers: &HeaderMap) -> Vec<(String, Vec<u8>)> {
@@ -178,6 +204,36 @@ pub struct IdempotencyRecord {
     pub status: u16,
     pub headers: Vec<(String, Vec<u8>)>,
     pub body: Vec<u8>,
+    pub metadata: Vec<(String, Vec<u8>)>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct IdempotencySessionScope {
+    session_id: Option<String>,
+}
+
+impl IdempotencySessionScope {
+    #[must_use]
+    pub(crate) const fn new(session_id: Option<String>) -> Self {
+        Self { session_id }
+    }
+}
+
+#[doc(hidden)]
+#[derive(Clone, Debug, Default)]
+pub struct IdempotencyReplayMetadata {
+    entries: Vec<(String, Vec<u8>)>,
+}
+
+impl IdempotencyReplayMetadata {
+    #[must_use]
+    pub const fn new(entries: Vec<(String, Vec<u8>)>) -> Self {
+        Self { entries }
+    }
+
+    fn into_entries(self) -> Vec<(String, Vec<u8>)> {
+        self.entries
+    }
 }
 
 /// Request-scoped idempotency metadata made available to inner handlers.
@@ -243,6 +299,20 @@ impl IdempotencyStoreError {
 pub trait IdempotencyStore: Send + Sync + 'static {
     /// Return the cached entry if it exists and has not expired.
     fn get(&self, key: &str) -> Option<IdempotencyEntry>;
+
+    /// Return the cached entry if it exists, surfacing backend read failures.
+    ///
+    /// Infallible stores can implement only [`Self::get`]. Fallible shared
+    /// backends should override this method so lookup failures fail closed
+    /// instead of being treated as cache misses that can duplicate mutations.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdempotencyStoreError`] when the backend cannot determine
+    /// whether a record exists for this key.
+    fn try_get(&self, key: &str) -> Result<Option<IdempotencyEntry>, IdempotencyStoreError> {
+        Ok(self.get(key))
+    }
 
     /// Persist a response with the given TTL.
     fn set(&self, key: &str, record: IdempotencyRecord, body_hash: Vec<u8>, ttl: Duration);
@@ -381,6 +451,8 @@ mod redis_store {
         status: u16,
         headers: Vec<(String, Vec<u8>)>,
         body: Vec<u8>,
+        #[serde(default)]
+        metadata: Vec<(String, Vec<u8>)>,
         body_hash: Vec<u8>,
     }
 
@@ -432,36 +504,51 @@ mod redis_store {
 
     impl IdempotencyStore for RedisIdempotencyStore {
         fn get(&self, key: &str) -> Option<IdempotencyEntry> {
+            match self.try_get(key) {
+                Ok(entry) => entry,
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "Redis GET failed for idempotency key"
+                    );
+                    None
+                }
+            }
+        }
+
+        fn try_get(&self, key: &str) -> Result<Option<IdempotencyEntry>, IdempotencyStoreError> {
             let redis_key = self.entry_key(key);
             let mut conn = self.connection.clone();
             tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(async move {
-                    let data: Option<Vec<u8>> = match conn.get(&redis_key).await {
-                        Ok(v) => v,
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %e,
-                                "Redis GET failed for idempotency key; \
-                                 treating as cache miss (idempotency degraded)"
-                            );
-                            None
-                        }
-                    };
-                    data.and_then(|bytes| {
-                        serde_json::from_slice::<StoredEntry>(&bytes).ok().map(|e| {
-                            IdempotencyEntry {
-                                record: IdempotencyRecord {
-                                    status: e.status,
-                                    headers: e.headers,
-                                    body: e.body,
-                                },
-                                body_hash: e.body_hash,
-                                // Redis manages TTL natively. Use a fixed 24 h offset
-                                // so the in-process expiry check never fires early.
-                                expires_at: Instant::now() + Duration::from_secs(86_400),
-                            }
-                        })
+                    let data: Option<Vec<u8>> = conn.get(&redis_key).await.map_err(|e| {
+                        IdempotencyStoreError::backend(format!(
+                            "failed to read idempotency entry from Redis: {e}"
+                        ))
+                    })?;
+                    data.map(|bytes| {
+                        serde_json::from_slice::<StoredEntry>(&bytes)
+                            .map(|e| {
+                                IdempotencyEntry {
+                                    record: IdempotencyRecord {
+                                        status: e.status,
+                                        headers: e.headers,
+                                        body: e.body,
+                                        metadata: e.metadata,
+                                    },
+                                    body_hash: e.body_hash,
+                                    // Redis manages TTL natively. Use a fixed 24 h offset
+                                    // so the in-process expiry check never fires early.
+                                    expires_at: Instant::now() + Duration::from_secs(86_400),
+                                }
+                            })
+                            .map_err(|e| {
+                                IdempotencyStoreError::backend(format!(
+                                    "failed to deserialize idempotency entry from Redis: {e}"
+                                ))
+                            })
                     })
+                    .transpose()
                 })
             })
         }
@@ -488,6 +575,7 @@ mod redis_store {
                 status: record.status,
                 headers: record.headers,
                 body: record.body,
+                metadata: record.metadata,
                 body_hash,
             };
             let bytes = serde_json::to_vec(&entry).map_err(|e| {
@@ -567,6 +655,15 @@ impl IdempotencyReplayResponse {
     fn into_response(self) -> Response<Body> {
         response_from_record(self.record)
     }
+
+    #[must_use]
+    pub fn metadata(&self, key: &str) -> Option<&[u8]> {
+        self.record
+            .metadata
+            .iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value.as_slice())
+    }
 }
 
 #[doc(hidden)]
@@ -580,9 +677,21 @@ pub fn __replay_response(
 }
 
 #[doc(hidden)]
+#[must_use]
+pub fn __replay_metadata(
+    replay: &Option<axum::extract::Extension<IdempotencyReplayResponse>>,
+    key: &str,
+) -> Option<Vec<u8>> {
+    replay
+        .as_ref()
+        .and_then(|axum::extract::Extension(replay)| replay.metadata(key).map(<[u8]>::to_vec))
+}
+
+#[doc(hidden)]
 pub enum IdempotencyReplayOr<T> {
     Replay(Response<Body>),
     Inner(T),
+    InnerWithReplayMetadata(T, Vec<(String, Vec<u8>)>),
 }
 
 impl<T> IntoResponse for IdempotencyReplayOr<T>
@@ -593,6 +702,13 @@ where
         match self {
             Self::Replay(response) => response,
             Self::Inner(inner) => inner.into_response(),
+            Self::InnerWithReplayMetadata(inner, metadata) => {
+                let mut response = inner.into_response();
+                response
+                    .extensions_mut()
+                    .insert(IdempotencyReplayMetadata::new(metadata));
+                response
+            }
         }
     }
 }
@@ -800,6 +916,7 @@ pub(crate) fn persistence_failed_response() -> Response<Body> {
 struct PreparedIdempotencyRequest {
     idempotency_key: String,
     storage_key: String,
+    key_context: StorageKeyContext,
     body_hash: Vec<u8>,
     session: Option<crate::session::Session>,
     parts: Parts,
@@ -849,6 +966,8 @@ pub(crate) struct DeferredIdempotencyCommit {
 struct DeferredIdempotencyState {
     store: Arc<dyn IdempotencyStore>,
     storage_key: String,
+    key_context: StorageKeyContext,
+    alias_storage_keys: Vec<String>,
     idempotency_key: String,
     record: IdempotencyRecord,
     body_hash: Vec<u8>,
@@ -857,25 +976,9 @@ struct DeferredIdempotencyState {
 }
 
 impl DeferredIdempotencyCommit {
-    fn new(
-        store: Arc<dyn IdempotencyStore>,
-        storage_key: String,
-        idempotency_key: String,
-        record: IdempotencyRecord,
-        body_hash: Vec<u8>,
-        ttl: Duration,
-        lock_guard: InFlightLockGuard,
-    ) -> Self {
+    fn new(state: DeferredIdempotencyState) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(Some(DeferredIdempotencyState {
-                store,
-                storage_key,
-                idempotency_key,
-                record,
-                body_hash,
-                ttl,
-                lock_guard,
-            }))),
+            inner: Arc::new(Mutex::new(Some(state))),
         }
     }
 
@@ -890,21 +993,47 @@ impl DeferredIdempotencyCommit {
         };
 
         state.record.headers = extract_finalized_session_replay_headers(headers);
-        if let Err(error) =
-            state
-                .store
-                .try_set(&state.storage_key, state.record, state.body_hash, state.ttl)
-        {
-            tracing::error!(
-                idempotency.key = %state.idempotency_key,
-                error = %error,
-                "Deferred idempotency persistence failed after finalized session response; failing closed"
-            );
-            state.lock_guard.keep_locked_until_ttl();
-            return Err(error);
+        let mut storage_keys = state.alias_storage_keys;
+        storage_keys.push(state.storage_key);
+        for storage_key in storage_keys {
+            if let Err(error) = state.store.try_set(
+                &storage_key,
+                state.record.clone(),
+                state.body_hash.clone(),
+                state.ttl,
+            ) {
+                tracing::error!(
+                    idempotency.key = %state.idempotency_key,
+                    error = %error,
+                    "Deferred idempotency persistence failed after finalized session response; failing closed"
+                );
+                state.lock_guard.keep_locked_until_ttl();
+                return Err(error);
+            }
         }
         state.lock_guard.unlock_now();
         Ok(())
+    }
+
+    fn add_session_alias(&self, session_id: Option<&str>) {
+        let mut guard = self
+            .inner
+            .lock()
+            .expect("deferred idempotency commit lock poisoned");
+        let Some(state) = guard.as_mut() else {
+            return;
+        };
+
+        let storage_key = state.key_context.storage_key(session_id);
+        if storage_key != state.storage_key
+            && !state
+                .alias_storage_keys
+                .iter()
+                .any(|existing| existing == &storage_key)
+        {
+            state.alias_storage_keys.push(storage_key);
+        }
+        drop(guard);
     }
 
     fn keep_locked_until_ttl(&self) {
@@ -932,6 +1061,12 @@ pub(crate) fn finalize_deferred_session_commit(
     commit.commit_with_final_headers(response.headers())
 }
 
+pub(crate) fn add_deferred_session_replay_key(response: &Response<Body>, session_id: Option<&str>) {
+    if let Some(commit) = response.extensions().get::<DeferredIdempotencyCommit>() {
+        commit.add_session_alias(session_id);
+    }
+}
+
 pub(crate) fn keep_deferred_session_commit_locked(response: &mut Response<Body>) {
     if let Some(commit) = response
         .extensions_mut()
@@ -955,7 +1090,9 @@ async fn prepare_idempotency_request(
     req: Request<Body>,
 ) -> Result<PreparedIdempotencyRequest, Response<Body>> {
     let (mut parts, body) = req.into_parts();
-    let storage_key = build_storage_key_for_parts(&idempotency_key, &parts).await;
+    let key_context = StorageKeyContext::from_parts(idempotency_key.clone(), &parts);
+    let session_id = storage_session_id_for_parts(&parts).await;
+    let storage_key = key_context.storage_key(session_id.as_deref());
     parts.extensions.insert(IdempotencyContext::new(
         idempotency_key.clone(),
         storage_key.clone(),
@@ -977,6 +1114,7 @@ async fn prepare_idempotency_request(
     Ok(PreparedIdempotencyRequest {
         idempotency_key,
         storage_key,
+        key_context,
         body_hash,
         session,
         parts,
@@ -1013,15 +1151,26 @@ where
     };
 
     // ── Cache hit ──────────────────────────────────────────────────────────
-    if let Some(entry) = store.get(&prepared.storage_key) {
-        return replay_cache_hit(
-            &mut inner,
-            entry,
-            prepared,
-            metrics.as_ref(),
-            replay_through_inner,
-        )
-        .await;
+    match store.try_get(&prepared.storage_key) {
+        Ok(Some(entry)) => {
+            return replay_cache_hit(
+                &mut inner,
+                entry,
+                prepared,
+                metrics.as_ref(),
+                replay_through_inner,
+            )
+            .await;
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::error!(
+                idempotency.key = %prepared.idempotency_key,
+                error = %error,
+                "Idempotency lookup failed; failing closed"
+            );
+            return Ok(persistence_failed_response());
+        }
     }
 
     // ── In-flight check (concurrent duplicate) ─────────────────────────────
@@ -1039,16 +1188,28 @@ where
 
     // Double-check after acquiring the lock: a concurrent request may have
     // completed between our miss check and lock acquisition.
-    if let Some(entry) = store.get(&prepared.storage_key) {
-        lock_guard.unlock_now();
-        return replay_cache_hit(
-            &mut inner,
-            entry,
-            prepared,
-            metrics.as_ref(),
-            replay_through_inner,
-        )
-        .await;
+    match store.try_get(&prepared.storage_key) {
+        Ok(Some(entry)) => {
+            lock_guard.unlock_now();
+            return replay_cache_hit(
+                &mut inner,
+                entry,
+                prepared,
+                metrics.as_ref(),
+                replay_through_inner,
+            )
+            .await;
+        }
+        Ok(None) => {}
+        Err(error) => {
+            lock_guard.keep_locked_until_ttl();
+            tracing::error!(
+                idempotency.key = %prepared.idempotency_key,
+                error = %error,
+                "Idempotency lookup failed after lock acquisition; failing closed"
+            );
+            return Ok(persistence_failed_response());
+        }
     }
 
     handle_cache_miss(inner, store, ttl, prepared, metrics.as_ref(), lock_guard).await
@@ -1071,6 +1232,7 @@ where
     let PreparedIdempotencyRequest {
         idempotency_key,
         storage_key,
+        key_context,
         body_hash,
         session,
         parts,
@@ -1113,6 +1275,11 @@ where
         CollectedResponseBody::Cacheable(bytes) => bytes,
     };
 
+    let replay_metadata = resp_parts
+        .extensions
+        .remove::<IdempotencyReplayMetadata>()
+        .map_or_else(Vec::new, IdempotencyReplayMetadata::into_entries);
+
     // Cache successful 2xx/3xx responses; store before unlocking so concurrent duplicates
     // still see a locked key rather than racing to re-execute the handler.
     let status = resp_parts.status.as_u16();
@@ -1126,6 +1293,7 @@ where
             status,
             headers: extract_replay_headers(&resp_parts.headers),
             body: resp_bytes.to_vec(),
+            metadata: replay_metadata,
         };
         if session_mutated {
             tracing::debug!(
@@ -1133,13 +1301,17 @@ where
                 "Session changed during idempotent request; deferring cache write until SessionLayer finalizes Set-Cookie"
             );
             resp_parts.extensions.insert(DeferredIdempotencyCommit::new(
-                store,
-                storage_key,
-                idempotency_key,
-                record,
-                body_hash,
-                ttl,
-                lock_guard,
+                DeferredIdempotencyState {
+                    store,
+                    storage_key,
+                    key_context,
+                    alias_storage_keys: Vec::new(),
+                    idempotency_key,
+                    record,
+                    body_hash,
+                    ttl,
+                    lock_guard,
+                },
             ));
             if let Some(m) = metrics {
                 m.record_idempotency_miss();

@@ -745,6 +745,11 @@ where
                 }
             };
 
+            req.extensions_mut()
+                .insert(crate::idempotency::IdempotencySessionScope::new(
+                    existing_id.clone(),
+                ));
+
             let (session_id, data) = if let Some(ref id) = existing_id {
                 match store.load(id).await {
                     Ok(Some(data)) => (id.clone(), data),
@@ -777,6 +782,7 @@ where
                 if let Ok(val) = HeaderValue::from_str(&build_expire_cookie(&config)) {
                     response.headers_mut().append(SET_COOKIE, val);
                 }
+                crate::idempotency::add_deferred_session_replay_key(&response, None);
             } else if inner_guard.dirty {
                 let data = inner_guard.data.clone();
                 let sid = inner_guard.id.clone();
@@ -800,6 +806,7 @@ where
                 if let Ok(val) = HeaderValue::from_str(&build_set_cookie(&config, &cookie_value)) {
                     response.headers_mut().append(SET_COOKIE, val);
                 }
+                crate::idempotency::add_deferred_session_replay_key(&response, Some(&sid));
             }
 
             if crate::idempotency::finalize_deferred_session_commit(&mut response).is_err() {

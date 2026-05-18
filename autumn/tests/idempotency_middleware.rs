@@ -12,7 +12,9 @@ use autumn_web::idempotency::{
     IdempotencyLayer, IdempotencyReplayLayer, IdempotencyStore, IdempotencyStoreError,
     MemoryIdempotencyStore,
 };
-use autumn_web::session::{Session, SessionConfig, SessionLayer, SessionStore, SessionStoreError};
+use autumn_web::session::{
+    MemoryStore, Session, SessionConfig, SessionLayer, SessionStore, SessionStoreError,
+};
 use autumn_web::test::TestApp;
 use autumn_web::{AppState, Route, RouteIdempotency, get, post, put, routes};
 use axum::body::Body;
@@ -138,6 +140,10 @@ static RAW_MERGE_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static RAW_NEST_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static RAW_LAYERED_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static SESSION_LOGIN_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
+static SESSION_ROTATION_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
+static LOOKUP_FAILURE_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
+static REPLAY_METADATA_POLICY_CALLS: AtomicUsize = AtomicUsize::new(0);
+static REPLAY_METADATA_MUTATION_CALLS: AtomicUsize = AtomicUsize::new(0);
 static MANUAL_ROUTE_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static MANUAL_OPENAPI_ROUTE_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static MANUAL_SCOPED_ROUTE_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -363,6 +369,36 @@ async fn session_login_handler(session: Session) -> &'static str {
     session.insert("user_id", "42").await;
     session.rotate_id().await;
     "logged-in"
+}
+
+async fn session_rotation_handler(session: Session) -> &'static str {
+    SESSION_ROTATION_HANDLER_CALLS.fetch_add(1, Ordering::SeqCst);
+    session.insert("user_id", "42").await;
+    session.rotate_id().await;
+    "logged-in"
+}
+
+async fn lookup_failure_handler() -> &'static str {
+    LOOKUP_FAILURE_HANDLER_CALLS.fetch_add(1, Ordering::SeqCst);
+    "should-not-run"
+}
+
+async fn replay_metadata_handler(
+    replay: Option<axum::extract::Extension<autumn_web::idempotency::IdempotencyReplayResponse>>,
+) -> autumn_web::idempotency::IdempotencyReplayOr<&'static str> {
+    if let Some(bytes) = autumn_web::idempotency::__replay_metadata(&replay, "policy.record") {
+        REPLAY_METADATA_POLICY_CALLS.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(bytes, b"deleted-record");
+        let response = autumn_web::idempotency::__replay_response(&replay)
+            .expect("cached replay response should accompany replay metadata");
+        return autumn_web::idempotency::IdempotencyReplayOr::Replay(response);
+    }
+
+    REPLAY_METADATA_MUTATION_CALLS.fetch_add(1, Ordering::SeqCst);
+    autumn_web::idempotency::IdempotencyReplayOr::InnerWithReplayMetadata(
+        "deleted",
+        vec![("policy.record".to_owned(), b"deleted-record".to_vec())],
+    )
 }
 
 #[post("/intercepted")]
@@ -635,6 +671,102 @@ async fn test_session_mutating_response_replays_final_cookie_without_rerunning_h
 }
 
 #[tokio::test]
+async fn test_session_rotation_replays_for_old_and_new_cookie_scopes() {
+    SESSION_ROTATION_HANDLER_CALLS.store(0, Ordering::SeqCst);
+
+    let session_store = MemoryStore::new();
+    let mut existing = HashMap::new();
+    existing.insert("guest".to_owned(), "1".to_owned());
+    session_store.save("guest-session", existing).await.unwrap();
+
+    let idempotency_store: Arc<dyn IdempotencyStore> =
+        Arc::new(MemoryIdempotencyStore::new(Duration::from_secs(60)));
+    let app = axum::Router::new()
+        .route(
+            "/session-login",
+            axum::routing::post(session_rotation_handler),
+        )
+        .layer(IdempotencyLayer::new(idempotency_store))
+        .layer(SessionLayer::new(session_store, SessionConfig::default()));
+
+    let first = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method(axum::http::Method::POST)
+                .uri("/session-login")
+                .header("idempotency-key", "rotating-session-key")
+                .header("cookie", "autumn.sid=guest-session")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let set_cookie = first
+        .headers()
+        .get("set-cookie")
+        .and_then(|value| value.to_str().ok())
+        .expect("rotating session response should set a new cookie")
+        .to_owned();
+    let new_cookie = set_cookie
+        .split(';')
+        .next()
+        .expect("set-cookie should start with a cookie pair")
+        .to_owned();
+
+    let old_cookie_retry = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method(axum::http::Method::POST)
+                .uri("/session-login")
+                .header("idempotency-key", "rotating-session-key")
+                .header("cookie", "autumn.sid=guest-session")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(old_cookie_retry.status(), StatusCode::OK);
+    assert_eq!(
+        old_cookie_retry
+            .headers()
+            .get("x-idempotent-replayed")
+            .and_then(|value| value.to_str().ok()),
+        Some("true"),
+        "retry with the pre-rotation cookie must hit the original idempotency record"
+    );
+
+    let new_cookie_retry = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method(axum::http::Method::POST)
+                .uri("/session-login")
+                .header("idempotency-key", "rotating-session-key")
+                .header("cookie", new_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(new_cookie_retry.status(), StatusCode::OK);
+    assert_eq!(
+        new_cookie_retry
+            .headers()
+            .get("x-idempotent-replayed")
+            .and_then(|value| value.to_str().ok()),
+        Some("true"),
+        "retry after accepting the rotated cookie must hit the alias idempotency record"
+    );
+    assert_eq!(
+        SESSION_ROTATION_HANDLER_CALLS.load(Ordering::SeqCst),
+        1,
+        "session rotation must not move retries into a fresh idempotency scope"
+    );
+}
+
+#[tokio::test]
 async fn test_session_save_failure_keeps_idempotency_key_closed() {
     SESSION_SAVE_FAILURE_HANDLER_CALLS.store(0, Ordering::SeqCst);
     let idempotency_store: Arc<dyn IdempotencyStore> =
@@ -728,6 +860,65 @@ async fn test_manual_layered_route_can_check_access_before_replay_stop() {
         MANUAL_LAYERED_HANDLER_CALLS.load(Ordering::SeqCst),
         1,
         "the explicit replay stop must prevent the mutating handler from rerunning"
+    );
+}
+
+#[tokio::test]
+async fn test_replay_metadata_is_available_before_cached_response_is_released() {
+    REPLAY_METADATA_POLICY_CALLS.store(0, Ordering::SeqCst);
+    REPLAY_METADATA_MUTATION_CALLS.store(0, Ordering::SeqCst);
+
+    let store: Arc<dyn IdempotencyStore> =
+        Arc::new(MemoryIdempotencyStore::new(Duration::from_secs(60)));
+    let app = axum::Router::new()
+        .route(
+            "/metadata-delete",
+            axum::routing::delete(replay_metadata_handler),
+        )
+        .layer(IdempotencyLayer::new(store).replay_through_inner());
+
+    let first = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method(axum::http::Method::DELETE)
+                .uri("/metadata-delete")
+                .header("idempotency-key", "metadata-delete-key")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+
+    let replay = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method(axum::http::Method::DELETE)
+                .uri("/metadata-delete")
+                .header("idempotency-key", "metadata-delete-key")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), StatusCode::OK);
+    assert_eq!(
+        replay
+            .headers()
+            .get("x-idempotent-replayed")
+            .and_then(|value| value.to_str().ok()),
+        Some("true")
+    );
+    assert_eq!(
+        REPLAY_METADATA_POLICY_CALLS.load(Ordering::SeqCst),
+        1,
+        "replay-through-inner handlers must be able to inspect cached metadata before replaying"
+    );
+    assert_eq!(
+        REPLAY_METADATA_MUTATION_CALLS.load(Ordering::SeqCst),
+        1,
+        "metadata-backed replay must not re-enter the mutating branch"
     );
 }
 
@@ -1031,6 +1222,7 @@ fn test_ttl_eviction() {
         status: 200,
         headers: vec![],
         body: b"ok".to_vec(),
+        metadata: vec![],
     };
     store.set("evict-key", record, vec![0u8; 8], Duration::from_millis(1));
 
@@ -1543,6 +1735,65 @@ async fn test_large_response_not_cached_and_streamed_through() {
         CALL_COUNT.load(Ordering::SeqCst),
         2,
         "handler must execute twice when response body exceeds cache cap"
+    );
+}
+
+#[derive(Default)]
+struct FailingLookupStore;
+
+impl autumn_web::idempotency::IdempotencyStore for FailingLookupStore {
+    fn get(&self, _key: &str) -> Option<autumn_web::idempotency::IdempotencyEntry> {
+        None
+    }
+
+    fn try_get(
+        &self,
+        _key: &str,
+    ) -> Result<Option<autumn_web::idempotency::IdempotencyEntry>, IdempotencyStoreError> {
+        Err(IdempotencyStoreError::backend("forced lookup failure"))
+    }
+
+    fn set(
+        &self,
+        _key: &str,
+        _record: autumn_web::idempotency::IdempotencyRecord,
+        _body_hash: Vec<u8>,
+        _ttl: Duration,
+    ) {
+    }
+
+    fn try_lock(&self, _key: &str, _lock_ttl: Duration) -> bool {
+        true
+    }
+
+    fn unlock(&self, _key: &str) {}
+}
+
+#[tokio::test]
+async fn test_lookup_failure_fails_closed_before_handler_runs() {
+    LOOKUP_FAILURE_HANDLER_CALLS.store(0, Ordering::SeqCst);
+
+    let app = axum::Router::new()
+        .route("/lookup-fails", axum::routing::post(lookup_failure_handler))
+        .layer(IdempotencyLayer::new(Arc::new(FailingLookupStore)));
+
+    let response = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/lookup-fails")
+                .header("idempotency-key", "redis-read-failed")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        LOOKUP_FAILURE_HANDLER_CALLS.load(Ordering::SeqCst),
+        0,
+        "idempotency lookup failures must not be treated as cache misses"
     );
 }
 

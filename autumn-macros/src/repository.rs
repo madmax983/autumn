@@ -1511,15 +1511,30 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             quote! {
                 let __autumn_replay_response =
                     ::autumn_web::idempotency::__replay_response(&__autumn_idempotency_replay);
+                let __autumn_replay_deleted_record =
+                    ::autumn_web::idempotency::__replay_metadata(
+                        &__autumn_idempotency_replay,
+                        "repository.delete.record",
+                    );
                 let __existing = match repo.find_by_id(id).await {
                     ::core::result::Result::Ok(::core::option::Option::Some(existing)) => existing,
                     ::core::result::Result::Ok(::core::option::Option::None) => {
-                        if let ::core::option::Option::Some(response) = __autumn_replay_response {
-                            return ::autumn_web::idempotency::IdempotencyReplayOr::Replay(response);
+                        if let ::core::option::Option::Some(bytes) = __autumn_replay_deleted_record {
+                            match ::autumn_web::reexports::serde_json::from_slice::<#model_name>(&bytes) {
+                                ::core::result::Result::Ok(existing) => existing,
+                                ::core::result::Result::Err(err) => {
+                                    return ::autumn_web::idempotency::IdempotencyReplayOr::Inner(
+                                        ::core::result::Result::Err(
+                                            ::autumn_web::AutumnError::internal_server_error_msg(err.to_string())
+                                        )
+                                    );
+                                }
+                            }
+                        } else {
+                            return ::autumn_web::idempotency::IdempotencyReplayOr::Inner(
+                                ::core::result::Result::Err(::autumn_web::AutumnError::not_found_msg("not found"))
+                            );
                         }
-                        return ::autumn_web::idempotency::IdempotencyReplayOr::Inner(
-                            ::core::result::Result::Err(::autumn_web::AutumnError::not_found_msg("not found"))
-                        );
                     }
                     ::core::result::Result::Err(err) => {
                         return ::autumn_web::idempotency::IdempotencyReplayOr::Inner(
@@ -1543,14 +1558,29 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 if let ::core::option::Option::Some(response) = __autumn_replay_response {
                     return ::autumn_web::idempotency::IdempotencyReplayOr::Replay(response);
                 }
+                let __autumn_deleted_record_metadata =
+                    match ::autumn_web::reexports::serde_json::to_vec(&__existing) {
+                        ::core::result::Result::Ok(bytes) => bytes,
+                        ::core::result::Result::Err(err) => {
+                            return ::autumn_web::idempotency::IdempotencyReplayOr::Inner(
+                                ::core::result::Result::Err(
+                                    ::autumn_web::AutumnError::internal_server_error_msg(err.to_string())
+                                )
+                            );
+                        }
+                    };
                 if let ::core::result::Result::Err(err) = repo.delete_by_id(id).await {
                     return ::autumn_web::idempotency::IdempotencyReplayOr::Inner(
                         ::core::result::Result::Err(err)
                     );
                 }
-                ::autumn_web::idempotency::IdempotencyReplayOr::Inner(::core::result::Result::Ok(
-                    ::autumn_web::reexports::http::StatusCode::NO_CONTENT
-                ))
+                ::autumn_web::idempotency::IdempotencyReplayOr::InnerWithReplayMetadata(
+                    ::core::result::Result::Ok(::autumn_web::reexports::http::StatusCode::NO_CONTENT),
+                    ::std::vec![(
+                        "repository.delete.record".to_owned(),
+                        __autumn_deleted_record_metadata,
+                    )],
+                )
             }
         } else {
             quote! {
@@ -2166,10 +2196,10 @@ mod tests {
             "policy-backed repository mutations need a response wrapper for post-policy replay: {generated}"
         );
         assert!(
-            generated.contains(
-                "Option :: None) => { if let :: core :: option :: Option :: Some (response) = __autumn_replay_response"
-            ),
-            "policy-backed delete retries must replay a cached 204 when the deleted row is already gone: {generated}"
+            generated.contains("__replay_metadata")
+                && generated.contains("repository.delete.record")
+                && generated.contains("InnerWithReplayMetadata"),
+            "policy-backed delete retries must carry the deleted record so policy checks can run before replay: {generated}"
         );
     }
 
