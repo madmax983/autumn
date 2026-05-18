@@ -1111,7 +1111,11 @@ fn build_idempotency_layers(
     }))
 }
 
-#[allow(clippy::cognitive_complexity)]
+#[allow(
+    clippy::cognitive_complexity,
+    clippy::too_many_arguments,
+    clippy::too_many_lines
+)]
 fn apply_middleware(
     mut router: axum::Router<AppState>,
     config: &AutumnConfig,
