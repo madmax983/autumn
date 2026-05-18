@@ -1911,8 +1911,8 @@ impl AppBuilder {
         let drain_elapsed = drain_started_at
             .get()
             .map_or(std::time::Duration::ZERO, std::time::Instant::elapsed);
-        let hook_budget = std::time::Duration::from_secs(shutdown_timeout)
-            .saturating_sub(drain_elapsed);
+        let hook_budget =
+            std::time::Duration::from_secs(shutdown_timeout).saturating_sub(drain_elapsed);
         run_shutdown_hooks_with_timeout(&shutdown_hooks, hook_budget, hook_budget).await;
 
         tracing::info!(exit_code = 0, "shutdown: all phases completed cleanly");

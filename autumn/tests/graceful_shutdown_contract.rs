@@ -27,10 +27,8 @@ fn server_config_prestop_grace_secs_defaults_to_five() {
 
 #[test]
 fn server_config_prestop_grace_secs_is_configurable_via_toml() {
-    let config: AutumnConfig = toml::from_str(
-        "[server]\nprestop_grace_secs = 12\n",
-    )
-    .expect("config should deserialize");
+    let config: AutumnConfig =
+        toml::from_str("[server]\nprestop_grace_secs = 12\n").expect("config should deserialize");
     assert_eq!(config.server.prestop_grace_secs, 12);
 }
 
@@ -51,8 +49,7 @@ fn metrics_snapshot_includes_shutdown_aborted_requests() {
     let collector = MetricsCollector::new();
     let snap = collector.snapshot();
     assert_eq!(
-        snap.http.shutdown_aborted_requests_total,
-        0,
+        snap.http.shutdown_aborted_requests_total, 0,
         "aborted-requests counter must start at zero"
     );
 }
@@ -84,8 +81,8 @@ async fn slow_handler() -> &'static str {
 /// to dev-deps.
 #[tokio::test(flavor = "multi_thread")]
 async fn sigterm_during_long_http_request_drains_cleanly() {
-    use autumn_web::probe::ProbeState;
     use autumn_web::prelude::*;
+    use autumn_web::probe::ProbeState;
     use autumn_web::test::TestApp;
     use std::net::SocketAddr;
     use std::sync::Arc;
