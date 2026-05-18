@@ -305,7 +305,6 @@ fn render_routes_file(
 use autumn_web::extract::Path;
 use autumn_web::pagination::{{Page, PageRequest}};
 use autumn_web::reexports::axum::body::Bytes;
-use autumn_web::reexports::axum::extract::Query as AxumQuery;
 use autumn_web::security::{{CsrfFormField, CsrfToken}};
 use autumn_web::{{AutumnError, AutumnResult, Db, Markup, get, html, post, secured}};
 use diesel::prelude::*;
@@ -314,9 +313,6 @@ use diesel_async::RunQueryDsl;
 use crate::models::{snake_name}::{{{pascal_name}, New{pascal_name}}};
 use crate::repositories::{snake_name}::Pg{pascal_name}Repository;
 use crate::schema::{plural};
-
-const SCAFFOLD_DEFAULT_PAGE_SIZE: u32 = 25;
-const SCAFFOLD_MAX_PAGE_SIZE: u32 = 100;
 
 fn csrf_input(csrf: Option<&CsrfToken>, field: Option<&CsrfFormField>) -> Markup {{
     let csrf_field_name = field.map(|field| field.0.as_str()).unwrap_or("_csrf");
@@ -375,29 +371,14 @@ fn pagination_nav<T>(page: &Page<T>, base_url: &str) -> Markup {{
 
 /// `GET /{plural}` — paginated list of {snake_name}s.
 ///
-/// Accepts `?page=N&size=M` query parameters. Defaults to page 1 with
-/// `SCAFFOLD_DEFAULT_PAGE_SIZE` items per page. Requests with `size` above
-/// `SCAFFOLD_MAX_PAGE_SIZE` are rejected with HTTP 400.
+/// Accepts `?page=N&size=M` query parameters via the [`PageRequest`] extractor.
+/// Out-of-range or missing values are clamped silently — list endpoints never
+/// return HTTP 400 for bad paging parameters.
 #[get("/{plural}")]
 pub async fn index(
-    AxumQuery(qp): AxumQuery<std::collections::HashMap<String, String>>,
+    page_req: PageRequest,
     repo: Pg{pascal_name}Repository,
 ) -> AutumnResult<Markup> {{
-    let page_num: u32 = qp
-        .get("page")
-        .and_then(|v| v.parse::<u32>().ok())
-        .unwrap_or(1)
-        .max(1);
-    let size: u32 = match qp.get("size").and_then(|v| v.parse::<u32>().ok()) {{
-        Some(0) | None => SCAFFOLD_DEFAULT_PAGE_SIZE,
-        Some(s) if s > SCAFFOLD_MAX_PAGE_SIZE => {{
-            return Err(AutumnError::bad_request_msg(format!(
-                "size cannot exceed {{SCAFFOLD_MAX_PAGE_SIZE}}"
-            )));
-        }}
-        Some(s) => s,
-    }};
-    let page_req = PageRequest::new(page_num, size);
     let page_data: Page<{pascal_name}> = repo.page(&page_req).await?;
     Ok(layout("{pascal_name} index", html! {{
         h1 {{ "{pascal_name}s" }}

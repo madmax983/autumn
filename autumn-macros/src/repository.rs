@@ -1188,6 +1188,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 .await
                 .map_err(::autumn_web::AutumnError::from)?;
             let items: ::std::vec::Vec<#model_name> = #table_ident::table
+                .order(#table_ident::id.desc())
                 .limit(req.limit())
                 .offset(req.offset())
                 .select(#model_name::as_select())
@@ -1199,9 +1200,16 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     // `cursor_page` is only generated when the user declares `cursor_key = field`.
-    // The cursor payload is the last-seen `id` (i64), making the filter always
-    // type-correct.  The `cursor_key` field is used as the primary sort column
-    // (DESC) with `id` as the tie-breaker.
+    //
+    // Correct keyset pagination requires the cursor to encode ALL sort columns so
+    // the WHERE clause can advance the sort order exactly.  For ORDER BY
+    // (cursor_key DESC, id DESC) the correct predicate is:
+    //
+    //   WHERE (cursor_key < after_k) OR (cursor_key = after_k AND id < after_id)
+    //
+    // The cursor payload is therefore `(cursor_key_value, id)` — a tuple whose
+    // first element's Rust type is inferred by the compiler from the Diesel
+    // column expression used in the filter below.
     let (cursor_page_trait_method, cursor_page_impl_method) = if let Some(ref ck) =
         config.cursor_key
     {
@@ -1225,9 +1233,19 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
                 let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
                 let mut query = #table_ident::table.into_boxed();
-                // The cursor payload is the last-seen row `id` (i64).
-                if let ::core::option::Option::Some(after_id) = req.decode::<i64>() {
-                    query = query.filter(#table_ident::id.lt(after_id));
+                // Cursor payload is (cursor_key_value, id).  The type of the first
+                // element is inferred by the compiler from its use in the Diesel
+                // filter expressions below.
+                if let ::core::option::Option::Some((after_k, after_id)) =
+                    req.decode::<(_, i64)>()
+                {
+                    query = query.filter(
+                        #table_ident::#cursor_key_ident.lt(after_k.clone()).or(
+                            #table_ident::#cursor_key_ident
+                                .eq(after_k)
+                                .and(#table_ident::id.lt(after_id)),
+                        ),
+                    );
                 }
                 let items: ::std::vec::Vec<#model_name> = query
                     .order((#table_ident::#cursor_key_ident.desc(), #table_ident::id.desc()))
@@ -1240,7 +1258,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     ::autumn_web::pagination::CursorPage::from_overfetched(
                         items,
                         req,
-                        |row| row.id,
+                        |row| (row.#cursor_key_ident.clone(), row.id),
                     )
                 )
             }
@@ -2663,6 +2681,10 @@ mod tests {
             generated.contains("Page <"),
             "page() method must return Page<Model> in the trait: {generated}"
         );
+        assert!(
+            generated.contains("order"),
+            "page() method must include ORDER BY for deterministic results: {generated}"
+        );
     }
 
     #[test]
@@ -2684,6 +2706,12 @@ mod tests {
         assert!(
             generated.contains("CursorPage <"),
             "cursor_page() must return CursorPage<Model>: {generated}"
+        );
+        // The keyset filter must include both sort columns (cursor_key + id),
+        // not just `id < after_id` which is incorrect when cursor_key != id.
+        assert!(
+            generated.contains("lt") && generated.contains("eq") && generated.contains("and"),
+            "cursor_page() must use a two-part keyset filter (lt + eq/and): {generated}"
         );
     }
 

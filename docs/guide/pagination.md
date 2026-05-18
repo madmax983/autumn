@@ -44,14 +44,16 @@ async fn index(page: PageRequest, repo: PgPostRepository) -> AutumnResult<Json<P
 ### In a scaffold-generated index view
 
 `autumn generate scaffold Post title:String body:Text` emits an `index` action
-that already calls `repo.page()`.  The handler defaults to **25 items per page**
-and rejects `?size` values over **100** with HTTP 400:
+that uses the `PageRequest` extractor to call `repo.page()`.  Out-of-range or
+missing values are clamped silently — consistent with the framework rule that
+list endpoints never return HTTP 400 for pagination parameters:
 
 ```
-GET /posts          → page 1, 25 items
-GET /posts?page=3   → page 3, 25 items
+GET /posts          → page 1, 20 items  (DEFAULT_PAGE_SIZE)
+GET /posts?page=3   → page 3, 20 items
 GET /posts?size=10  → page 1, 10 items
-GET /posts?size=200 → 400 Bad Request
+GET /posts?size=200 → page 1, 100 items (clamped to MAX_PAGE_SIZE)
+GET /posts?size=abc → page 1, 20 items  (unparseable → default)
 ```
 
 A Maud `pagination_nav` helper renders Previous / Next links with `hx-get`
@@ -69,14 +71,7 @@ let req = PageRequest::new(1, 50); // page 1, 50 items
 ```
 
 Values outside the valid range are clamped silently — `PageRequest` never
-returns HTTP 400 on its own.  If you want strict rejection (as the scaffold
-template does), add an explicit guard:
-
-```rust
-if req.size() > 100 {
-    return Err(AutumnError::bad_request_msg("size cannot exceed 100"));
-}
-```
+returns HTTP 400 on its own.
 
 ### Response shape
 

@@ -1253,15 +1253,19 @@ fn generate_scaffold_index_uses_paginated_repo_method() {
 }
 
 #[test]
-fn generate_scaffold_index_rejects_oversized_page() {
-    let (_tmp, project) = fresh_project("scaffold-paginated-oversize-app");
+fn generate_scaffold_index_uses_page_request_extractor() {
+    let (_tmp, project) = fresh_project("scaffold-paginated-extractor-app");
     run_autumn(&project, &["generate", "scaffold", "Post", "title:String"]);
 
     let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
+    // PageRequest extractor handles all clamping — no manual HashMap parsing.
     assert!(
-        routes.contains("100")
-            && (routes.contains("bad_request") || routes.contains("cannot exceed")),
-        "scaffold index must reject page size > 100 with 400 Bad Request: {routes}"
+        routes.contains("page_req: PageRequest") || routes.contains("PageRequest,"),
+        "scaffold index must use the PageRequest extractor: {routes}"
+    );
+    assert!(
+        !routes.contains("HashMap"),
+        "scaffold index must not manually parse query params via HashMap: {routes}"
     );
 }
 
