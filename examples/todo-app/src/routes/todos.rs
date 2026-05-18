@@ -5,6 +5,7 @@
 
 use autumn_web::extract::Path;
 use autumn_web::form::{ChangesetForm, method_input};
+use autumn_web::pagination::{Page, PageRequest};
 use autumn_web::prelude::{HxRequest, IntoResponse, StatusCode, Validate};
 use autumn_web::security::CsrfToken;
 use autumn_web::{AutumnError, AutumnResult, Db, Markup, Redirect, delete, get, html, post};
@@ -149,11 +150,51 @@ fn new_todo_form(pending: &ChangesetForm<TodoForm>) -> Markup {
     html! { div class="flex flex-col gap-2 mb-8" { (form) } }
 }
 
-/// Render the full list page given a todo list and an optional pending form.
-async fn list_page(mut db: Db, pending: &ChangesetForm<TodoForm>) -> AutumnResult<Markup> {
-    let all_todos = Todo::all(&mut db).await?;
-    let done_count = all_todos.iter().filter(|t| t.completed).count();
-    let total = all_todos.len();
+/// Render Previous / page-indicator / Next pagination controls.
+fn pagination_controls(page: &Page<Todo>, base_url: &str) -> Markup {
+    if page.total_pages <= 1 {
+        return html! {};
+    }
+    html! {
+        nav class="flex items-center justify-between mt-6 text-sm" aria-label="Pagination" {
+            @if page.has_previous {
+                a href=(format!("{}?page={}&size={}", base_url, page.page - 1, page.size))
+                   hx-get=(format!("{}?page={}&size={}", base_url, page.page - 1, page.size))
+                   hx-target="body"
+                   class="px-3 py-1.5 bg-white border border-stone-300 rounded-lg \
+                          text-stone-600 hover:border-amber-400 hover:text-amber-700 transition-colors" {
+                    "← Previous"
+                }
+            } @else {
+                span class="px-3 py-1.5 text-stone-300 select-none" { "← Previous" }
+            }
+            span class="text-xs text-stone-400" {
+                "Page " (page.page) " of " (page.total_pages)
+                " \u{2022} " (page.total_elements) " total"
+            }
+            @if page.has_next {
+                a href=(format!("{}?page={}&size={}", base_url, page.page + 1, page.size))
+                   hx-get=(format!("{}?page={}&size={}", base_url, page.page + 1, page.size))
+                   hx-target="body"
+                   class="px-3 py-1.5 bg-white border border-stone-300 rounded-lg \
+                          text-stone-600 hover:border-amber-400 hover:text-amber-700 transition-colors" {
+                    "Next →"
+                }
+            } @else {
+                span class="px-3 py-1.5 text-stone-300 select-none" { "Next →" }
+            }
+        }
+    }
+}
+
+/// Render the full list page given a paginated todo result and an optional pending form.
+async fn list_page(
+    mut db: Db,
+    page_req: &PageRequest,
+    pending: &ChangesetForm<TodoForm>,
+) -> AutumnResult<Markup> {
+    let page_data = Todo::page(page_req, &mut db).await?;
+    let done_count = page_data.content.iter().filter(|t| t.completed).count();
 
     Ok(layout(
         "Autumn Todo App",
@@ -169,7 +210,7 @@ async fn list_page(mut db: Db, pending: &ChangesetForm<TodoForm>) -> AutumnResul
 
             (new_todo_form(pending))
 
-            @if all_todos.is_empty() {
+            @if page_data.total_elements == 0 {
                 div class="text-center py-16" {
                     p class="text-stone-400 text-sm" {
                         "No todos yet. Add one above!"
@@ -178,17 +219,19 @@ async fn list_page(mut db: Db, pending: &ChangesetForm<TodoForm>) -> AutumnResul
             } @else {
                 div class="flex items-center justify-between mb-3 px-1" {
                     p class="text-xs text-stone-400" {
-                        (total) " item" @if total != 1 { "s" }
+                        (page_data.total_elements) " item"
+                        @if page_data.total_elements != 1 { "s" }
                         @if done_count > 0 {
-                            " \u{2022} " (done_count) " done"
+                            " \u{2022} " (done_count) " done this page"
                         }
                     }
                 }
                 ul id="todo-list" class="space-y-2" {
-                    @for todo in &all_todos {
+                    @for todo in &page_data.content {
                         (todo_item(todo))
                     }
                 }
+                (pagination_controls(&page_data, &paths::list()))
             }
         },
     ))
@@ -202,13 +245,16 @@ pub async fn index() -> Redirect {
     Redirect::to(&paths::list())
 }
 
-/// List all todos.
+/// List todos (paginated).
+///
+/// Accepts `?page=N&size=M` query parameters via the [`PageRequest`] extractor.
+/// Defaults to 20 items per page ordered newest-first.
 #[get("/todos")]
-pub async fn list(db: Db) -> AutumnResult<Markup> {
+pub async fn list(page: PageRequest, db: Db) -> AutumnResult<Markup> {
     let blank = ChangesetForm::without_csrf(TodoForm {
         title: String::new(),
     });
-    list_page(db, &blank).await
+    list_page(db, &page, &blank).await
 }
 
 /// Render the detail page body for a todo.
@@ -299,7 +345,8 @@ pub async fn create(db: Db, form: ChangesetForm<TodoForm>) -> AutumnResult<impl 
             Ok(Redirect::to(&paths::list()).into_response())
         }
         Err(form) => {
-            let markup = list_page(db, &form).await?;
+            let page_req = PageRequest::default();
+            let markup = list_page(db, &page_req, &form).await?;
             Ok((StatusCode::UNPROCESSABLE_ENTITY, markup).into_response())
         }
     }
@@ -477,6 +524,57 @@ mod tests {
         let html = detail_view(&todo, None).into_string();
         assert!(html.contains(r#"name="_method""#), "{html}");
         assert!(!html.contains(r#"name="_csrf""#), "{html}");
+    }
+
+    #[test]
+    fn pagination_controls_shows_next_on_first_page() {
+        use autumn_web::pagination::Page;
+        let req = PageRequest::new(1, 5);
+        let items: Vec<Todo> = (1..=5)
+            .map(|i| Todo {
+                id: i,
+                title: format!("Todo {i}"),
+                completed: false,
+                created_at: chrono::DateTime::from_timestamp(0, 0).unwrap().naive_utc(),
+            })
+            .collect();
+        let page: Page<Todo> = Page::new(items, 12, &req);
+        let html = pagination_controls(&page, "/todos").into_string();
+        // Next must be a link on the first page
+        assert!(html.contains("Next"), "first page must show Next: {html}");
+        assert!(
+            html.contains("href=\"/todos?page=2"),
+            "first page must link to page 2: {html}"
+        );
+        // Previous must NOT be a link on the first page (rendered as a disabled span)
+        assert!(
+            !html.contains("href=\"/todos?page=0"),
+            "first page must not link to page 0: {html}"
+        );
+        assert!(
+            html.contains("Page 1 of 3"),
+            "must show current page of total: {html}"
+        );
+    }
+
+    #[test]
+    fn pagination_controls_hidden_for_single_page() {
+        use autumn_web::pagination::Page;
+        let req = PageRequest::new(1, 20);
+        let items: Vec<Todo> = (1..=5)
+            .map(|i| Todo {
+                id: i,
+                title: format!("Todo {i}"),
+                completed: false,
+                created_at: chrono::DateTime::from_timestamp(0, 0).unwrap().naive_utc(),
+            })
+            .collect();
+        let page: Page<Todo> = Page::new(items, 5, &req);
+        let html = pagination_controls(&page, "/todos").into_string();
+        assert!(
+            html.is_empty(),
+            "single page must render no pagination controls: {html}"
+        );
     }
 }
 

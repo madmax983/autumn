@@ -303,6 +303,7 @@ fn render_routes_file(
 //! these are ordinary user code.
 
 use autumn_web::extract::Path;
+use autumn_web::pagination::{{Page, PageRequest}};
 use autumn_web::reexports::axum::body::Bytes;
 use autumn_web::security::{{CsrfFormField, CsrfToken}};
 use autumn_web::{{AutumnError, AutumnResult, Db, Markup, get, html, post, secured}};
@@ -310,6 +311,7 @@ use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 
 use crate::models::{snake_name}::{{{pascal_name}, New{pascal_name}}};
+use crate::repositories::{snake_name}::{{{pascal_name}Repository, Pg{pascal_name}Repository}};
 use crate::schema::{plural};
 
 fn csrf_input(csrf: Option<&CsrfToken>, field: Option<&CsrfFormField>) -> Markup {{
@@ -336,21 +338,57 @@ fn layout(title: &str, content: Markup) -> Markup {{
     }}
 }}
 
-/// `GET /{plural}` — list every {snake_name}.
+/// Render Previous / page-indicator / Next navigation for a paginated list.
+///
+/// Links are htmx-friendly: the `hx-get` attribute targets the whole page body
+/// so progressive-enhancement apps get smooth partial updates without extra JS.
+fn pagination_nav<T>(page: &Page<T>, base_url: &str) -> Markup {{
+    html! {{
+        nav aria-label="Pagination" {{
+            @if page.has_previous {{
+                a href=(format!("{{}}?page={{}}&size={{}}", base_url, page.page - 1, page.size))
+                   hx-get=(format!("{{}}?page={{}}&size={{}}", base_url, page.page - 1, page.size))
+                   hx-target="body" {{
+                    "← Previous"
+                }}
+                " "
+            }}
+            span {{
+                "Page " (page.page) " of " (page.total_pages)
+                " (" (page.total_elements) " total)"
+            }}
+            @if page.has_next {{
+                " "
+                a href=(format!("{{}}?page={{}}&size={{}}", base_url, page.page + 1, page.size))
+                   hx-get=(format!("{{}}?page={{}}&size={{}}", base_url, page.page + 1, page.size))
+                   hx-target="body" {{
+                    "Next →"
+                }}
+            }}
+        }}
+    }}
+}}
+
+/// `GET /{plural}` — paginated list of {snake_name}s.
+///
+/// Accepts `?page=N&size=M` query parameters via the [`PageRequest`] extractor.
+/// Out-of-range or missing values are clamped silently — list endpoints never
+/// return HTTP 400 for bad paging parameters.
 #[get("/{plural}")]
-pub async fn index(mut db: Db) -> AutumnResult<Markup> {{
-    let rows: Vec<{pascal_name}> = {plural}::table
-        .select({pascal_name}::as_select())
-        .load(&mut *db)
-        .await?;
+pub async fn index(
+    page_req: PageRequest,
+    repo: Pg{pascal_name}Repository,
+) -> AutumnResult<Markup> {{
+    let page_data: Page<{pascal_name}> = repo.page(&page_req).await?;
     Ok(layout("{pascal_name} index", html! {{
         h1 {{ "{pascal_name}s" }}
         a href="/{plural}/new" {{ "New {pascal_name}" }}
         ul {{
-            @for row in &rows {{
+            @for row in &page_data.content {{
                 li {{ a href=(format!("/{plural}/{{}}", row.id)) {{ (row.id) }} }}
             }}
         }}
+        (pagination_nav(&page_data, "/{plural}"))
     }}))
 }}
 

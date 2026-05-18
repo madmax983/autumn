@@ -5,6 +5,20 @@ All notable changes to the Autumn framework will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] - 0.5.0
+
+### Added
+
+- **pagination:** Wire first-class pagination into `#[repository]` and scaffold (#681)
+  - `#[repository]` now generates a `page(req: &PageRequest) -> AutumnResult<Page<Model>>` method on every repository struct, enabling offset pagination without hand-written SQL.  Results are ordered by `id DESC` for deterministic page boundaries.
+  - `#[repository(Model, cursor_key = field)]` additionally generates `cursor_page(req: &CursorRequest) -> AutumnResult<CursorPage<Model>>` — keyset pagination sorted by `(field DESC, id DESC)`.  The cursor payload encodes both the sort-key value and `id` so the keyset filter is always correct: `WHERE (field < after_k) OR (field = after_k AND id < after_id)`.
+  - `autumn generate scaffold` index actions use the `PageRequest` extractor directly.  Out-of-range values are clamped silently (consistent with the framework rule that list endpoints never 400 for bad paging params).
+  - Scaffold-generated routes include a `pagination_nav` Maud helper with htmx-friendly Previous / Next links.
+  - `examples/todo-app` updated: `Todo::page` added; HTML list view uses `PageRequest` and renders pagination controls.
+  - `docs/guide/pagination.md` added, covering: offset vs cursor decision guide, macro entry points, overriding page size, declaring a cursor key, htmx wiring.
+
+To opt out of the generated `page` method: implement your own list handler using `repo.find_all()` or a custom Diesel query.  The `find_all` method is unchanged.
+
 ## [0.4.0] - 2026-05-12
 
 ### Added

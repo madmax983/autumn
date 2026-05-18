@@ -1,4 +1,5 @@
 use autumn_web::error::{AutumnError, AutumnResult};
+use autumn_web::pagination::{Page, PageRequest};
 use diesel::prelude::*;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use serde::{Deserialize, Serialize};
@@ -24,6 +25,22 @@ impl Todo {
             .select(Self::as_select())
             .load(db)
             .await?)
+    }
+
+    /// Load a page of todos ordered by creation date (newest first).
+    ///
+    /// Accepts a [`PageRequest`] and returns a [`Page`] containing the items
+    /// together with total-elements / total-pages metadata.
+    pub async fn page(req: &PageRequest, db: &mut AsyncPgConnection) -> AutumnResult<Page<Self>> {
+        let total: i64 = todos::table.count().get_result(db).await?;
+        let items = todos::table
+            .order((todos::created_at.desc(), todos::id.desc()))
+            .limit(req.limit())
+            .offset(req.offset())
+            .select(Self::as_select())
+            .load(db)
+            .await?;
+        Ok(Page::new(items, total, req))
     }
 
     /// Find a single todo by ID, returning 404 if not found.
