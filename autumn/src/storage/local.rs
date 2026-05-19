@@ -545,17 +545,17 @@ pub fn verify_upload(
     expires_at: u64,
     signature: &str,
 ) -> Result<(), BlobStoreError> {
-    let expected = sign_upload(signing_key, blob_key, content_type, expires_at);
-    if !constant_time_eq(expected.as_bytes(), signature.as_bytes()) {
-        return Err(BlobStoreError::Signature(
-            "upload token signature mismatch".into(),
-        ));
-    }
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
     if expires_at < now {
         return Err(BlobStoreError::Signature("upload token expired".into()));
+    }
+    let expected = sign_upload(signing_key, blob_key, content_type, expires_at);
+    if !constant_time_eq(expected.as_bytes(), signature.as_bytes()) {
+        return Err(BlobStoreError::Signature(
+            "upload token signature mismatch".into(),
+        ));
     }
     Ok(())
 }

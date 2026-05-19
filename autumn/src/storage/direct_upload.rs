@@ -10,7 +10,7 @@
 //!    route on the Autumn app itself (`/_blobs/<key>?...`). For S3 backends
 //!    it is a real AWS `SigV4` presigned URL.
 //! 3. App route (CSRF-protected) calls [`complete_direct_upload`] to confirm
-//!    the upload landed and receive a [`Blob`](super::Blob) handle to store in
+//!    the upload landed and receive a [`Blob`] handle to store in
 //!    the database.
 //!
 //! ## Orphan handling
