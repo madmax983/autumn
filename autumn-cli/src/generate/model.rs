@@ -624,12 +624,14 @@ fn sql_default_literal(field: &Field, value: &str) -> Result<String, String> {
             .parse::<f64>()
             .map(|_| value.to_owned())
             .map_err(|_| "float defaults must be valid numbers".to_owned()),
-        FieldKind::Uuid | FieldKind::NaiveDateTime | FieldKind::DateTime | FieldKind::Bytea => {
-            Err(format!(
-                "defaults for {} fields are not supported by `autumn generate` yet",
-                field.rust_type()
-            ))
-        }
+        FieldKind::Uuid
+        | FieldKind::NaiveDateTime
+        | FieldKind::DateTime
+        | FieldKind::Bytea
+        | FieldKind::Attachment => Err(format!(
+            "defaults for {} fields are not supported by `autumn generate` yet",
+            field.rust_type()
+        )),
     }
 }
 
