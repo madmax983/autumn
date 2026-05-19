@@ -61,11 +61,11 @@ use std::task::{Context, Poll};
 use axum::body::Body;
 use axum::response::IntoResponse;
 use http::header::{
-    CACHE_CONTROL, CONTENT_LOCATION, ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED,
-    SET_COOKIE, VARY,
+    CACHE_CONTROL, CONTENT_LOCATION, DATE, ETAG, EXPIRES, IF_MODIFIED_SINCE, IF_NONE_MATCH,
+    LAST_MODIFIED, SET_COOKIE, VARY,
 };
 use http::{HeaderMap, HeaderValue, Response, StatusCode};
-use http_body_util::BodyExt;
+use http_body_util::{BodyExt, Limited};
 use sha2::Digest as _;
 use tower::{Layer, Service};
 
@@ -264,14 +264,16 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 fn hex_lower(bytes: impl AsRef<[u8]>) -> String {
-    bytes.as_ref().iter().fold(
-        String::with_capacity(bytes.as_ref().len() * 2),
-        |mut out, byte| {
-            use std::fmt::Write as _;
-            let _ = write!(out, "{byte:02x}");
-            out
-        },
-    )
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let bytes = bytes.as_ref();
+    let mut out = String::with_capacity(bytes.len() * 2);
+    out.extend(bytes.iter().flat_map(|b| {
+        [
+            HEX[(b >> 4) as usize] as char,
+            HEX[(b & 0xf) as usize] as char,
+        ]
+    }));
+    out
 }
 
 // ── FreshWhen result ──────────────────────────────────────────────────────────
@@ -294,6 +296,12 @@ pub struct FreshWhen {
     etag: ETag,
     last_modified: Option<chrono::DateTime<chrono::Utc>>,
     is_fresh: bool,
+    /// Whether the request carried an `If-None-Match` header.
+    /// Per RFC 7232 §3.3, `If-Modified-Since` MUST be ignored when this is true.
+    if_none_match_present: bool,
+    /// Raw `If-Modified-Since` header value from the request, stored for
+    /// deferred evaluation in [`FreshWhen::last_modified`].
+    raw_if_modified_since: Option<String>,
 }
 
 impl FreshWhen {
@@ -308,23 +316,42 @@ impl FreshWhen {
     ///
     /// When `is_fresh`, the timestamp is included in the `304` response
     /// headers. When stale, it is included in the `200` response headers.
+    ///
+    /// If the request contained an `If-Modified-Since` header but **no**
+    /// `If-None-Match` header (RFC 7232 §3.3), this method re-evaluates
+    /// freshness: the resource is considered fresh when `dt ≤ If-Modified-Since`.
     pub fn last_modified(mut self, dt: impl Into<Option<chrono::DateTime<chrono::Utc>>>) -> Self {
         self.last_modified = dt.into();
+        // RFC 7232 §3.3: evaluate IMS only when INM is absent.
+        if !self.if_none_match_present
+            && let Some(ref ims_str) = self.raw_if_modified_since
+            && let Some(lm) = self.last_modified
+        {
+            self.is_fresh = parse_http_date(ims_str)
+                .is_some_and(|parsed| std::time::SystemTime::from(lm) <= parsed);
+        }
         self
     }
 
     /// Resolve to an HTTP response.
     ///
     /// - **Fresh**: returns `304 Not Modified` with `ETag` / `Last-Modified`
-    ///   preserved, `Set-Cookie` stripped, `Cache-Control` / `Vary` /
-    ///   `Content-Location` preserved.
-    /// - **Stale**: returns the `response` produced by `f` with `ETag` and
-    ///   `Last-Modified` headers injected.
+    ///   preserved, `Set-Cookie` stripped, and `Cache-Control` / `Vary` /
+    ///   `Content-Location` / `Date` / `Expires` copied from `response`.
+    /// - **Stale**: returns `response` with `ETag` and `Last-Modified` injected.
     pub fn or(self, response: impl IntoResponse) -> impl IntoResponse {
+        let r = response.into_response();
         if self.is_fresh {
-            not_modified_response(&self.etag, self.last_modified)
+            let mut not_modified = not_modified_response(&self.etag, self.last_modified);
+            // Copy RFC 7232 §4.1 preservation headers from the built response.
+            for name in [CACHE_CONTROL, VARY, CONTENT_LOCATION, DATE, EXPIRES] {
+                for v in r.headers().get_all(&name) {
+                    not_modified.headers_mut().append(name.clone(), v.clone());
+                }
+            }
+            not_modified
         } else {
-            let mut r = response.into_response();
+            let mut r = r;
             r.headers_mut().insert(ETAG, self.etag.header_value());
             if let Some(lm) = self.last_modified
                 && let Ok(v) = HeaderValue::from_str(&http_date(lm))
@@ -377,14 +404,25 @@ impl FreshWhen {
 /// ```
 pub fn fresh_when<E: IntoETag>(request_headers: &HeaderMap, etag: E) -> FreshWhen {
     let etag = etag.into_etag();
-
-    let is_fresh = check_if_none_match(request_headers, &etag)
-        || check_if_modified_since(request_headers, None);
-
+    let if_none_match_present = request_headers.contains_key(IF_NONE_MATCH);
+    // RFC 7232 §3.3: evaluate INM first; IMS is deferred to last_modified().
+    let is_fresh = if_none_match_present && check_if_none_match(request_headers, &etag);
+    // Store the raw IMS header only when INM is absent; per RFC 7232 §3.3
+    // IMS MUST be ignored when INM is present.
+    let raw_if_modified_since = if if_none_match_present {
+        None
+    } else {
+        request_headers
+            .get(IF_MODIFIED_SINCE)
+            .and_then(|v| v.to_str().ok())
+            .map(ToOwned::to_owned)
+    };
     FreshWhen {
         etag,
         last_modified: None,
         is_fresh,
+        if_none_match_present,
+        raw_if_modified_since,
     }
 }
 
@@ -393,23 +431,6 @@ fn check_if_none_match(headers: &HeaderMap, etag: &ETag) -> bool {
         .get(IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|s| etag.matches_if_none_match(s))
-}
-
-fn check_if_modified_since(
-    headers: &HeaderMap,
-    last_modified: Option<chrono::DateTime<chrono::Utc>>,
-) -> bool {
-    let Some(lm) = last_modified else {
-        return false;
-    };
-    let Some(ims) = headers.get(IF_MODIFIED_SINCE).and_then(|v| v.to_str().ok()) else {
-        return false;
-    };
-    parse_http_date(ims).is_some_and(|parsed| {
-        // Fresh if lm <= ims (client has the latest or newer)
-        let lm_sys: std::time::SystemTime = lm.into();
-        lm_sys <= parsed
-    })
 }
 
 fn not_modified_response(
@@ -556,9 +577,9 @@ where
                     if candidate_etag.matches_if_none_match(inm) {
                         let (parts, _body) = response.into_parts();
                         let mut not_modified = not_modified_response(&candidate_etag, None);
-                        for name in [CACHE_CONTROL, VARY, CONTENT_LOCATION] {
-                            if let Some(v) = parts.headers.get(&name) {
-                                not_modified.headers_mut().insert(name, v.clone());
+                        for name in [CACHE_CONTROL, VARY, CONTENT_LOCATION, DATE, EXPIRES] {
+                            for v in parts.headers.get_all(&name) {
+                                not_modified.headers_mut().append(name.clone(), v.clone());
                             }
                         }
                         not_modified.headers_mut().remove(SET_COOKIE);
@@ -572,16 +593,33 @@ where
 
             let (mut parts, body) = response.into_parts();
 
-            // Buffer the body for ETag computation.
-            let Ok(collected) = body.collect().await else {
-                return Ok(Response::from_parts(parts, Body::empty()));
-            };
-            let bytes = collected.to_bytes();
-
-            if bytes.len() > EtagLayer::MAX_BODY_BYTES {
-                let rebuilt = Response::from_parts(parts, Body::from(bytes));
-                return Ok(rebuilt);
+            // Content-Length upfront guard: skip ETag on known-large bodies
+            // without consuming any bytes (fast path, avoids all buffering).
+            if parts
+                .headers
+                .get(http::header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<usize>().ok())
+                .is_some_and(|len| len > EtagLayer::MAX_BODY_BYTES)
+            {
+                return Ok(Response::from_parts(parts, body));
             }
+
+            // Use Limited to enforce the cap during collection — prevents OOM on
+            // streaming bodies that don't advertise Content-Length.
+            let bytes = match Limited::new(body, EtagLayer::MAX_BODY_BYTES + 1)
+                .collect()
+                .await
+            {
+                Ok(c) => c.to_bytes(),
+                Err(_) => {
+                    // Body exceeded the limit or errored mid-stream. Pass through
+                    // the response without an ETag rather than risking OOM or masking
+                    // the original failure. The Content-Length guard covers the common
+                    // case; this path only triggers for streaming bodies without CL.
+                    return Ok(Response::from_parts(parts, Body::empty()));
+                }
+            };
 
             // Derive a weak ETag from body bytes.
             let etag = {
@@ -595,15 +633,14 @@ where
                 .as_deref()
                 .is_some_and(|inm| etag.matches_if_none_match(inm))
             {
-                // Preserve allowed headers in the 304.
+                // Preserve RFC 7232 §4.1 headers in the 304, including all repeated values.
                 let mut not_modified = not_modified_response(&etag, None);
-                for name in [CACHE_CONTROL, VARY, CONTENT_LOCATION] {
-                    if let Some(v) = parts.headers.get(&name) {
-                        not_modified.headers_mut().insert(name, v.clone());
+                for name in [CACHE_CONTROL, VARY, CONTENT_LOCATION, DATE, EXPIRES] {
+                    for v in parts.headers.get_all(&name) {
+                        not_modified.headers_mut().append(name.clone(), v.clone());
                     }
                 }
-                // Strip Set-Cookie from 304 (default: strip to avoid stale auth
-                // state on intermediaries).
+                // Strip Set-Cookie from 304 to avoid stale auth state on intermediaries.
                 not_modified.headers_mut().remove(SET_COOKIE);
                 return Ok(not_modified);
             }
@@ -616,9 +653,11 @@ where
 
 // ── not_modified helpers ───────────────────────────────────────────────────────
 
-/// Build a minimal `304 Not Modified` response, preserving the headers that
-/// RFC 7232 §4.1 requires intermediaries to pass through:
-/// `Cache-Control`, `Vary`, `Content-Location`, `ETag`, `Last-Modified`.
+/// Build a minimal `304 Not Modified` response.
+///
+/// Preserves the headers RFC 7232 §4.1 requires intermediaries to pass through:
+/// `Cache-Control`, `Content-Location`, `Date`, `ETag`, `Expires`,
+/// `Last-Modified`, `Vary`.
 ///
 /// `Set-Cookie` is **stripped by default** to prevent stale auth tokens from
 /// being replayed by shared caches.
@@ -629,9 +668,9 @@ pub fn build_not_modified(
     last_modified: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Response<Body> {
     let mut response = not_modified_response(etag, last_modified);
-    for name in [CACHE_CONTROL, VARY, CONTENT_LOCATION] {
-        if let Some(v) = original_headers.get(&name) {
-            response.headers_mut().insert(name, v.clone());
+    for name in [CACHE_CONTROL, VARY, CONTENT_LOCATION, DATE, EXPIRES] {
+        for v in original_headers.get_all(&name) {
+            response.headers_mut().append(name.clone(), v.clone());
         }
     }
     response
@@ -932,21 +971,58 @@ mod tests {
     // ── RED: If-Modified-Since fallback ───────────────────────────────────────
 
     #[test]
-    fn fresh_when_if_modified_since_returns_stale_without_if_none_match() {
+    fn fresh_when_if_modified_since_fresh_when_last_modified_not_newer() {
         use chrono::TimeZone;
 
         let last_modified = chrono::Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        // IMS is one second after last_modified → resource not modified since → fresh.
         let ims_time = chrono::Utc.timestamp_opt(1_700_000_001, 0).unwrap();
         let ims_str = http_date(ims_time);
 
         let mut headers = HeaderMap::new();
         headers.insert(IF_MODIFIED_SINCE, HeaderValue::from_str(&ims_str).unwrap());
 
-        // fresh_when only checks If-None-Match. If-Modified-Since fallback
-        // is a separate concern handled by check_if_modified_since with last_modified.
-        // Without an If-None-Match header, fresh_when always returns stale.
+        // No INM → freshness is re-evaluated in last_modified() per RFC 7232 §3.3.
         let result = fresh_when(&headers, 1_i64).last_modified(last_modified);
-        assert!(!result.is_fresh());
+        assert!(result.is_fresh(), "IMS >= last_modified → fresh (304)");
+    }
+
+    #[test]
+    fn fresh_when_if_modified_since_stale_when_resource_newer_than_ims() {
+        use chrono::TimeZone;
+
+        let last_modified = chrono::Utc.timestamp_opt(1_700_000_002, 0).unwrap();
+        // IMS is before last_modified → resource was modified after IMS → stale.
+        let ims_time = chrono::Utc.timestamp_opt(1_700_000_001, 0).unwrap();
+        let ims_str = http_date(ims_time);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(IF_MODIFIED_SINCE, HeaderValue::from_str(&ims_str).unwrap());
+
+        let result = fresh_when(&headers, 1_i64).last_modified(last_modified);
+        assert!(!result.is_fresh(), "last_modified > IMS → stale (200)");
+    }
+
+    #[test]
+    fn fresh_when_ignores_ims_when_inm_present_rfc7232_s3_3() {
+        use chrono::TimeZone;
+
+        let last_modified = chrono::Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        let ims_time = chrono::Utc.timestamp_opt(1_700_000_001, 0).unwrap();
+        let ims_str = http_date(ims_time);
+
+        // INM is present but does NOT match (different etag).
+        let wrong_etag: ETag = 99_i64.into_etag();
+        let mut headers = HeaderMap::new();
+        headers.insert(IF_NONE_MATCH, wrong_etag.header_value());
+        headers.insert(IF_MODIFIED_SINCE, HeaderValue::from_str(&ims_str).unwrap());
+
+        // INM present → IMS MUST be ignored (RFC 7232 §3.3). INM doesn't match → stale.
+        let result = fresh_when(&headers, 1_i64).last_modified(last_modified);
+        assert!(
+            !result.is_fresh(),
+            "IMS must be ignored when INM is present per RFC 7232 §3.3"
+        );
     }
 
     // ── RED: EtagLayer ────────────────────────────────────────────────────────
