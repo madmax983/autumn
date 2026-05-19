@@ -159,7 +159,7 @@ use diesel_async::pooled_connection::deadpool::Pool;
 /// ```
 pub struct TestApp {
     routes: Vec<Route>,
-    scoped_groups: Vec<crate::app::ScopedGroup>,
+    scoped_groups: Vec<crate::route::ScopedGroup>,
     merge_routers: Vec<axum::Router<crate::state::AppState>>,
     nest_routers: Vec<(String, axum::Router<crate::state::AppState>)>,
     custom_layers: Vec<crate::app::CustomLayerRegistration>,
@@ -289,10 +289,10 @@ impl TestApp {
         <L::Service as tower::Service<axum::http::Request<axum::body::Body>>>::Future:
             Send + 'static,
     {
-        self.scoped_groups.push(crate::app::ScopedGroup {
+        self.scoped_groups.push(crate::route::ScopedGroup {
             prefix: prefix.to_owned(),
             routes,
-            source: crate::route_listing::RouteSource::User,
+            source: crate::route::RouteSource::User,
             apply_layer: Box::new(move |router| router.layer(layer)),
         });
         self

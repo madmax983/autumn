@@ -6,49 +6,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::app::ScopedGroup;
 use crate::route::Route;
-
-/// Where a route was registered: by the user application, by a named plugin,
-/// or by the framework itself (probes, actuator, htmx assets, dev reload).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RouteSource {
-    /// Registered directly by the user application.
-    User,
-    /// Registered by a named autumn plugin (e.g. `"admin"` for autumn-admin-plugin).
-    Plugin(String),
-    /// Registered by the framework (probes, actuator, htmx assets, dev reload).
-    Framework,
-}
-
-impl std::fmt::Display for RouteSource {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::User => write!(f, "user"),
-            Self::Plugin(name) => write!(f, "plugin:{name}"),
-            Self::Framework => write!(f, "framework"),
-        }
-    }
-}
-
-impl Serialize for RouteSource {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&self.to_string())
-    }
-}
-
-impl<'de> Deserialize<'de> for RouteSource {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let s = String::deserialize(deserializer)?;
-        Ok(if s == "framework" {
-            Self::Framework
-        } else if let Some(name) = s.strip_prefix("plugin:") {
-            Self::Plugin(name.to_owned())
-        } else {
-            Self::User
-        })
-    }
-}
+pub use crate::route::RouteSource;
+use crate::route::ScopedGroup;
 
 /// Metadata for a single mounted route, suitable for display and JSON export.
 #[derive(Debug, Clone, Serialize, Deserialize)]

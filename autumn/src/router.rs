@@ -8,7 +8,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::app::ScopedGroup;
 use crate::config::AutumnConfig;
 use crate::error_pages::{self, SharedRenderer};
 use crate::extract::State;
@@ -19,6 +18,7 @@ use crate::middleware::exception_filter::{
     ExceptionFilter, ExceptionFilterLayer, ProblemDetailsFilter,
 };
 use crate::route::Route;
+use crate::route::ScopedGroup;
 use crate::state::AppState;
 use axum::middleware::Next;
 use axum::response::IntoResponse;
@@ -2331,7 +2331,7 @@ mod tests {
         async fn child() -> &'static str {
             "inner"
         }
-        let group = crate::app::ScopedGroup {
+        let group = crate::route::ScopedGroup {
             prefix: "/api".to_owned(),
             routes: vec![Route {
                 method: http::Method::GET,
@@ -2348,7 +2348,7 @@ mod tests {
                 repository: None,
                 idempotency: crate::route::RouteIdempotency::Direct,
             }],
-            source: crate::route_listing::RouteSource::User,
+            source: crate::route::RouteSource::User,
             apply_layer: Box::new(|r| r),
         };
 
@@ -2417,10 +2417,10 @@ mod tests {
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
         };
-        let group = crate::app::ScopedGroup {
+        let group = crate::route::ScopedGroup {
             prefix: "/orgs/{org_id}".to_owned(),
             routes: vec![child],
-            source: crate::route_listing::RouteSource::User,
+            source: crate::route::RouteSource::User,
             apply_layer: Box::new(|r| r),
         };
 

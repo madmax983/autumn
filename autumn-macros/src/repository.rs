@@ -1341,8 +1341,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         let has_policy = config.policy_type.is_some();
         let policy_check_show = if has_policy {
             quote! {
-                ::autumn_web::authorization::__check_policy::<#model_name>(
-                    &__autumn_state,
+                __autumn_state.__check_policy::<#model_name>(
                     &__autumn_session,
                     "show",
                     &record,
@@ -1358,8 +1357,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         // leaving the data behind.
         let policy_check_create_pre = if has_policy {
             quote! {
-                ::autumn_web::authorization::__check_policy_create_payload::<#model_name>(
-                    &__autumn_state,
+                __autumn_state.__check_policy_create_payload::<#model_name>(
                     &__autumn_session,
                     &__autumn_new_payload,
                 )
@@ -1397,8 +1395,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             quote! {
                 let __existing = repo.find_by_id(id).await?
                     .ok_or_else(|| ::autumn_web::AutumnError::not_found_msg("not found"))?;
-                ::autumn_web::authorization::__check_policy::<#model_name>(
-                    &__autumn_state,
+                __autumn_state.__check_policy::<#model_name>(
                     &__autumn_session,
                     "update",
                     &__existing,
@@ -1412,8 +1409,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             quote! {
                 let __existing = repo.find_by_id(id).await?
                     .ok_or_else(|| ::autumn_web::AutumnError::not_found_msg("not found"))?;
-                ::autumn_web::authorization::__check_policy::<#model_name>(
-                    &__autumn_state,
+                __autumn_state.__check_policy::<#model_name>(
                     &__autumn_session,
                     "delete",
                     &__existing,
@@ -1456,10 +1452,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     .ok_or_else(|| ::autumn_web::AutumnError::internal_server_error_msg(
                         "missing scope registration"
                     ))?;
-                let __ctx = ::autumn_web::authorization::PolicyContext::from_request(
-                    &__autumn_state,
-                    &__autumn_session,
-                ).await;
+                let __ctx = __autumn_state.policy_context(&__autumn_session).await;
                 let mut __conn = repo.__autumn_acquire_conn().await?;
                 let records = __scope.list(&__ctx, &mut __conn).await?;
                 Ok(::autumn_web::prelude::Json(records))
@@ -1471,10 +1464,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     .ok_or_else(|| ::autumn_web::AutumnError::internal_server_error_msg(
                         "missing policy registration"
                     ))?;
-                let __ctx = ::autumn_web::authorization::PolicyContext::from_request(
-                    &__autumn_state,
-                    &__autumn_session,
-                ).await;
+                let __ctx = __autumn_state.policy_context(&__autumn_session).await;
                 let __all = repo.find_all().await?;
                 let mut __filtered = ::std::vec::Vec::with_capacity(__all.len());
                 for __record in __all {
@@ -1601,9 +1591,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     }
                 };
                 if let ::core::result::Result::Err(err) =
-                    ::autumn_web::authorization::__check_policy_create_payload::<#model_name>(
-                        &__autumn_state,
-                        &__autumn_session,
+                    __autumn_state.__check_policy_create_payload::<#model_name>(&__autumn_session,
                         &__autumn_new_payload,
                     )
                     .await
@@ -1665,9 +1653,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     }
                 };
                 if let ::core::result::Result::Err(err) =
-                    ::autumn_web::authorization::__check_policy::<#model_name>(
-                        &__autumn_state,
-                        &__autumn_session,
+                    __autumn_state.__check_policy::<#model_name>(&__autumn_session,
                         "update",
                         &__existing,
                     )
@@ -1748,9 +1734,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     }
                 };
                 if let ::core::result::Result::Err(err) =
-                    ::autumn_web::authorization::__check_policy::<#model_name>(
-                        &__autumn_state,
-                        &__autumn_session,
+                    __autumn_state.__check_policy::<#model_name>(&__autumn_session,
                         "delete",
                         &__existing,
                     )
