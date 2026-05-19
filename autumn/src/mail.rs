@@ -2362,17 +2362,11 @@ mod tests {
             .expect("static-build mode should not enforce the deliver_later guard");
     }
 
-    /// When `deliver_later` is called inside an active tracing span the
-    /// spawned delivery task must run within that same span so log records
-    /// and OTel child spans created inside the task share the same trace.
     #[tokio::test]
     async fn spawn_mail_delivery_inherits_parent_span() {
         use std::future::Future;
         use std::pin::Pin;
         use std::sync::{Arc, Mutex};
-
-        let captured_span_id: Arc<Mutex<Option<tracing::span::Id>>> = Arc::new(Mutex::new(None));
-        let cap = captured_span_id.clone();
 
         struct CapturingQueue(Arc<Mutex<Option<tracing::span::Id>>>);
         impl MailDeliveryQueue for CapturingQueue {
@@ -2382,25 +2376,25 @@ mod tests {
             ) -> Pin<Box<dyn Future<Output = Result<(), MailError>> + Send + 'a>> {
                 let captured = self.0.clone();
                 Box::pin(async move {
-                    *captured.lock().unwrap() = tracing::Span::current().id().clone();
+                    *captured.lock().unwrap() = tracing::Span::current().id();
                     Ok(())
                 })
             }
         }
 
+        let captured_span_id: Arc<Mutex<Option<tracing::span::Id>>> = Arc::new(Mutex::new(None));
+        let cap = captured_span_id.clone();
+
         let mailer = Mailer::builder()
-            .with_delivery_queue(CapturingQueue(cap.clone()))
+            .delivery_queue(CapturingQueue(cap.clone()))
             .build()
             .expect("mailer with queue should build");
         let mail = sample_mail();
 
-        let subscriber = tracing_subscriber::registry()
-            .with(tracing_subscriber::fmt::layer().with_writer(std::io::sink));
-
         let parent_span_id: Option<tracing::span::Id> =
-            tracing::subscriber::with_default(subscriber, || {
+            tracing::subscriber::with_default(tracing_subscriber::registry(), || {
                 let outer = tracing::info_span!("deliver_later_outer");
-                let id = outer.id().clone();
+                let id = outer.id();
                 let _guard = outer.enter();
                 mailer
                     .try_deliver_later(mail)
