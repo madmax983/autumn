@@ -7334,5 +7334,54 @@ mod tests {
             .expect("valid traceparent with tracestate should parse");
             assert!(cx.span().span_context().is_valid());
         }
+
+        #[test]
+        fn capture_job_trace_context_returns_some_when_active_otel_span() {
+            use opentelemetry::trace::TracerProvider as _;
+            use opentelemetry_sdk::propagation::TraceContextPropagator;
+            use opentelemetry_sdk::trace::SdkTracerProvider;
+            use tracing_opentelemetry::OpenTelemetryLayer;
+            use tracing_subscriber::prelude::*;
+
+            opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
+            let provider = SdkTracerProvider::builder().build();
+            let tracer = provider.tracer("test");
+            let sub = tracing_subscriber::registry().with(OpenTelemetryLayer::new(tracer));
+
+            tracing::subscriber::with_default(sub, || {
+                let span = tracing::info_span!("capture_test");
+                let _guard = span.enter();
+                let (tp, _ts) = capture_job_trace_context();
+                assert!(
+                    tp.is_some(),
+                    "traceparent must be Some when an OTel-linked span is active"
+                );
+            });
+        }
+
+        #[test]
+        fn enqueue_after_commit_span_is_included_in_queued_job() {
+            use opentelemetry_sdk::propagation::TraceContextPropagator;
+            opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            let (client, mut rx) = make_test_client();
+            rt.block_on(async {
+                client
+                    .enqueue_after_commit("test_job", serde_json::json!({}))
+                    .await
+                    .expect("outside tx enqueues immediately");
+                let job = tokio::time::timeout(
+                    std::time::Duration::from_millis(100),
+                    rx.recv(),
+                )
+                .await
+                .expect("job should arrive")
+                .expect("channel open");
+                assert_eq!(job.name, "test_job");
+            });
+        }
     }
 }
