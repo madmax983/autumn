@@ -678,8 +678,8 @@ fn render_model_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::generate::Flags;
     use crate::generate::emit::Action;
-    use crate::generate::{Flags, timestamp_now};
     use std::fs;
     use tempfile::TempDir;
 
