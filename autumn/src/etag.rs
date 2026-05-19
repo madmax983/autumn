@@ -337,7 +337,11 @@ impl FreshWhen {
         self
     }
 
-    /// Resolve to an HTTP response.
+    /// Resolve to an HTTP response (eager).
+    ///
+    /// `response` is **always evaluated** before this method is called — Rust
+    /// evaluates arguments eagerly. Use [`FreshWhen::or_else`] with a closure
+    /// when building the response is expensive and should be skipped on fresh hits.
     ///
     /// - **Fresh**: returns `304 Not Modified` with `ETag` / `Last-Modified`
     ///   preserved, `Set-Cookie` stripped, and `Cache-Control` / `Vary` /
@@ -363,6 +367,31 @@ impl FreshWhen {
             not_modified
         } else {
             let mut r = r;
+            r.headers_mut().insert(ETAG, self.etag.header_value());
+            if let Some(lm) = self.last_modified
+                && let Ok(v) = HeaderValue::from_str(&http_date(lm))
+            {
+                r.headers_mut().insert(LAST_MODIFIED, v);
+            }
+            r
+        }
+    }
+
+    /// Resolve to an HTTP response (lazy).
+    ///
+    /// `f` is called **only when the resource is stale**, so expensive rendering
+    /// or serialization is skipped entirely on fresh hits. The `304` response
+    /// is returned directly without evaluating the closure.
+    ///
+    /// Cache headers (`Cache-Control`, `Vary`, etc.) are **not** copied to the
+    /// `304` because the response is never built for fresh hits. If you need
+    /// those headers preserved on revalidations, either use [`FreshWhen::or`]
+    /// or set them via a middleware layer.
+    pub fn or_else<R: IntoResponse, F: FnOnce() -> R>(self, f: F) -> impl IntoResponse {
+        if self.is_fresh {
+            not_modified_response(&self.etag, self.last_modified)
+        } else {
+            let mut r = f().into_response();
             r.headers_mut().insert(ETAG, self.etag.header_value());
             if let Some(lm) = self.last_modified
                 && let Ok(v) = HeaderValue::from_str(&http_date(lm))
@@ -438,10 +467,11 @@ pub fn fresh_when<E: IntoETag>(request_headers: &HeaderMap, etag: E) -> FreshWhe
 }
 
 fn check_if_none_match(headers: &HeaderMap, etag: &ETag) -> bool {
+    // Iterate all If-None-Match header fields (there may be more than one).
     headers
-        .get(IF_NONE_MATCH)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|s| etag.matches_if_none_match(s))
+        .get_all(IF_NONE_MATCH)
+        .iter()
+        .any(|v| v.to_str().is_ok_and(|s| etag.matches_if_none_match(s)))
 }
 
 fn not_modified_response(
@@ -557,11 +587,22 @@ where
     }
 
     fn call(&mut self, req: http::Request<ReqBody>) -> Self::Future {
-        let if_none_match = req
-            .headers()
-            .get(IF_NONE_MATCH)
-            .and_then(|v| v.to_str().ok())
-            .map(ToOwned::to_owned);
+        // Collect all If-None-Match header fields and join them so that a match
+        // in any field is honoured (multiple fields are equivalent to one
+        // comma-separated list per RFC 7230 §3.2.2).
+        let if_none_match: Option<String> = {
+            let vals: Vec<&str> = req
+                .headers()
+                .get_all(IF_NONE_MATCH)
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+                .collect();
+            if vals.is_empty() {
+                None
+            } else {
+                Some(vals.join(", "))
+            }
+        };
 
         let is_get = req.method() == http::Method::GET;
         let fut = self.inner.call(req);
@@ -693,16 +734,16 @@ pub fn build_not_modified(
     last_modified: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Response<Body> {
     let mut response = not_modified_response(etag, last_modified);
-    for name in [
-        CACHE_CONTROL,
-        VARY,
-        CONTENT_LOCATION,
-        DATE,
-        EXPIRES,
-        LAST_MODIFIED,
-    ] {
+    for name in [CACHE_CONTROL, VARY, CONTENT_LOCATION, DATE, EXPIRES] {
         for v in original_headers.get_all(&name) {
             response.headers_mut().append(name.clone(), v.clone());
+        }
+    }
+    // Copy Last-Modified from original_headers only when not already set
+    // by the explicit `last_modified` argument (avoids conflicting duplicates).
+    if last_modified.is_none() {
+        for v in original_headers.get_all(LAST_MODIFIED) {
+            response.headers_mut().append(LAST_MODIFIED, v.clone());
         }
     }
     response
