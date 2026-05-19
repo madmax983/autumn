@@ -2,6 +2,7 @@ use clap::{Parser, Subcommand};
 
 mod build;
 mod check;
+mod credentials;
 mod dev;
 mod doctor;
 mod export;
@@ -261,6 +262,21 @@ enum Commands {
         format: String,
     },
 
+    /// Manage encrypted credentials for the current Autumn project.
+    ///
+    /// Secrets are stored in `config/credentials/<env>.toml.enc` encrypted with
+    /// AES-256-GCM.  The master key is read from the `AUTUMN_MASTER_KEY`
+    /// environment variable or `config/master.key` (first found wins).
+    ///
+    /// # Examples
+    ///
+    ///   autumn credentials edit
+    ///   autumn credentials edit --env production
+    ///   autumn credentials show
+    ///   autumn credentials show --reveal
+    #[command(subcommand, verbatim_doc_comment)]
+    Credentials(CredentialsCommands),
+
     /// Print every mounted route — method, path, handler, source, middleware.
     ///
     /// Compiles the application (debug profile) and introspects its route
@@ -291,6 +307,29 @@ enum Commands {
         /// Hide framework-internal routes (`/actuator/*`, probes, htmx assets).
         #[arg(long)]
         user_only: bool,
+    },
+}
+
+/// Subcommands for `autumn credentials`.
+#[derive(Subcommand)]
+enum CredentialsCommands {
+    /// Decrypt the credentials file, open it in $VISUAL/$EDITOR, and re-encrypt on save.
+    ///
+    /// Falls back to `vi` on Unix or `notepad` on Windows when neither editor env var is set.
+    /// The plaintext temp file is zeroed before removal.
+    Edit {
+        /// Environment name (controls which `config/credentials/<env>.toml.enc` is used).
+        #[arg(long, default_value = "development")]
+        env: String,
+    },
+    /// Print a summary of the decrypted credentials (keys only, values redacted by default).
+    Show {
+        /// Environment name.
+        #[arg(long, default_value = "development")]
+        env: String,
+        /// Print the decrypted values instead of redacting them.
+        #[arg(long)]
+        reveal: bool,
     },
 }
 
@@ -666,6 +705,14 @@ fn run_command(command: Commands) {
             );
         }
         Commands::Generate(cmd) => run_generate_command(cmd),
+        Commands::Credentials(cmd) => match cmd {
+            CredentialsCommands::Edit { env } => {
+                credentials::run_edit(&credentials::EditOptions { env });
+            }
+            CredentialsCommands::Show { env, reveal } => {
+                credentials::run_show(&credentials::ShowOptions { env, reveal });
+            }
+        },
     }
 }
 
@@ -2143,5 +2190,68 @@ mod tests {
     #[test]
     fn parse_generate_admin_without_name_is_error() {
         assert!(Cli::try_parse_from(["autumn", "generate", "admin"]).is_err());
+    }
+
+    // ── autumn credentials tests ───────────────────────────────────────────
+
+    #[test]
+    fn parse_credentials_edit_defaults() {
+        let cli = Cli::try_parse_from(["autumn", "credentials", "edit"]).unwrap();
+        let Commands::Credentials(CredentialsCommands::Edit { env }) = cli.command else {
+            panic!("expected credentials edit");
+        };
+        assert_eq!(env, "development", "default env should be 'development'");
+    }
+
+    #[test]
+    fn parse_credentials_edit_with_env_flag() {
+        let cli =
+            Cli::try_parse_from(["autumn", "credentials", "edit", "--env", "production"]).unwrap();
+        let Commands::Credentials(CredentialsCommands::Edit { env }) = cli.command else {
+            panic!("expected credentials edit");
+        };
+        assert_eq!(env, "production");
+    }
+
+    #[test]
+    fn parse_credentials_show_defaults() {
+        let cli = Cli::try_parse_from(["autumn", "credentials", "show"]).unwrap();
+        let Commands::Credentials(CredentialsCommands::Show { env, reveal }) = cli.command else {
+            panic!("expected credentials show");
+        };
+        assert_eq!(env, "development");
+        assert!(!reveal, "reveal should default to false");
+    }
+
+    #[test]
+    fn parse_credentials_show_with_reveal() {
+        let cli = Cli::try_parse_from(["autumn", "credentials", "show", "--reveal"]).unwrap();
+        let Commands::Credentials(CredentialsCommands::Show { reveal, .. }) = cli.command else {
+            panic!("expected credentials show");
+        };
+        assert!(reveal);
+    }
+
+    #[test]
+    fn parse_credentials_show_with_env_and_reveal() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "credentials",
+            "show",
+            "--env",
+            "staging",
+            "--reveal",
+        ])
+        .unwrap();
+        let Commands::Credentials(CredentialsCommands::Show { env, reveal }) = cli.command else {
+            panic!("expected credentials show");
+        };
+        assert_eq!(env, "staging");
+        assert!(reveal);
+    }
+
+    #[test]
+    fn parse_credentials_without_subcommand_is_error() {
+        assert!(Cli::try_parse_from(["autumn", "credentials"]).is_err());
     }
 }
