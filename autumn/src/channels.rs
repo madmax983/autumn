@@ -833,8 +833,7 @@ fn run_chain(
 ) -> Result<usize, ChannelPublishError> {
     if idx < interceptors.len() {
         let interceptor = &interceptors[idx];
-        let next =
-            |t: &str, m: &ChannelMessage| run_chain(t, m, interceptors, inner, idx + 1);
+        let next = |t: &str, m: &ChannelMessage| run_chain(t, m, interceptors, inner, idx + 1);
         interceptor.intercept_publish(topic, msg, &next)
     } else {
         inner.publish(topic, msg.clone())
