@@ -304,4 +304,63 @@ mod tests {
         let after = std::fs::read(&path).unwrap();
         assert!(after.iter().all(|&b| b == 0), "file should be zeroed");
     }
+
+    #[test]
+    fn zero_file_nonexistent_path_does_not_panic() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("does-not-exist.txt");
+        zero_file(&path); // must not panic
+    }
+
+    #[test]
+    fn show_credentials_with_reveal_prints_plaintext() {
+        let tmp = TempDir::new().unwrap();
+        setup_credentials(&tmp, "development", "stripe_key = \"sk_live_test\"\n");
+        show_credentials("development", true, tmp.path()).unwrap();
+    }
+
+    #[test]
+    fn show_credentials_reveal_no_key_returns_error() {
+        use autumn_web::credentials::{MasterKey, encrypt};
+        let tmp = TempDir::new().unwrap();
+        // Write encrypted file but no master.key file
+        let key = MasterKey::generate();
+        let ct = encrypt(&key, b"x = \"y\"\n");
+        std::fs::create_dir_all(tmp.path().join("config/credentials")).unwrap();
+        std::fs::write(
+            tmp.path().join("config/credentials/development.toml.enc"),
+            &ct,
+        )
+        .unwrap();
+        // No master.key, no AUTUMN_MASTER_KEY env var → error
+        temp_env::with_var("AUTUMN_MASTER_KEY", None::<&str>, || {
+            let err = show_credentials("development", true, tmp.path()).unwrap_err();
+            assert!(
+                matches!(err, autumn_web::credentials::CredentialsError::NoKeyFound),
+                "expected NoKeyFound, got {err}"
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launch_editor_with_true_succeeds() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("test.toml");
+        std::fs::write(&path, b"").unwrap();
+        let status = launch_editor("true", &path).unwrap();
+        assert!(status.success(), "true should exit 0");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launch_editor_splits_arguments() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("test.toml");
+        std::fs::write(&path, b"").unwrap();
+        // "sh -c true" splits into program="sh", extra_args=["-c", "true"],
+        // then appends file as $0 → runs `true` and exits 0.
+        let status = launch_editor("sh -c true", &path).unwrap();
+        assert!(status.success());
+    }
 }

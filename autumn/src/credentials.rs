@@ -675,4 +675,108 @@ mod tests {
         assert!(dbg.contains("REDACTED"), "Debug impl must redact key bytes");
         assert!(!dbg.contains(&key.to_hex()));
     }
+
+    #[test]
+    fn credentials_path_returns_expected_path() {
+        let tmp = TempDir::new().unwrap();
+        let p = credentials_path("production", tmp.path());
+        assert_eq!(p, tmp.path().join("config/credentials/production.toml.enc"));
+    }
+
+    #[test]
+    fn credentials_store_len_returns_count() {
+        let table: toml::Table = toml::from_str("a = \"x\"\nb = \"y\"\n").unwrap();
+        let store = CredentialsStore { table };
+        assert_eq!(store.len(), 2);
+    }
+
+    #[test]
+    fn credentials_store_is_not_empty_when_populated() {
+        let table: toml::Table = toml::from_str("x = \"v\"\n").unwrap();
+        let store = CredentialsStore { table };
+        assert!(!store.is_empty());
+        assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn load_credentials_returns_toml_error_for_invalid_toml() {
+        let tmp = TempDir::new().unwrap();
+        let key = MasterKey::generate();
+        let ct = encrypt(&key, b"this is not valid toml @@@\x00");
+        std::fs::create_dir_all(tmp.path().join("config/credentials")).unwrap();
+        std::fs::write(
+            tmp.path().join("config/credentials/development.toml.enc"),
+            &ct,
+        )
+        .unwrap();
+        let env = mock_env("AUTUMN_MASTER_KEY", &key.to_hex());
+        let err = load_credentials_with_env("development", tmp.path(), &env).unwrap_err();
+        assert!(
+            matches!(err, CredentialsError::Toml(_)),
+            "invalid TOML should return Toml error, got {err}"
+        );
+    }
+
+    #[test]
+    fn load_credentials_returns_file_truncated_for_non_utf8_plaintext() {
+        let tmp = TempDir::new().unwrap();
+        let key = MasterKey::generate();
+        // Encrypt bytes that are valid AES-GCM output but not valid UTF-8 TOML
+        let non_utf8 = vec![0xC0u8, 0x80u8, 0xFF, 0xFE]; // invalid UTF-8 sequence
+        let ct = encrypt(&key, &non_utf8);
+        std::fs::create_dir_all(tmp.path().join("config/credentials")).unwrap();
+        std::fs::write(
+            tmp.path().join("config/credentials/development.toml.enc"),
+            &ct,
+        )
+        .unwrap();
+        let env = mock_env("AUTUMN_MASTER_KEY", &key.to_hex());
+        let err = load_credentials_with_env("development", tmp.path(), &env).unwrap_err();
+        assert!(
+            matches!(err, CredentialsError::FileTruncated),
+            "non-UTF-8 plaintext should return FileTruncated, got {err}"
+        );
+    }
+
+    #[test]
+    fn invalid_hex_in_key_file_returns_error() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("config")).unwrap();
+        std::fs::write(tmp.path().join("config/master.key"), "not-valid-hex-at-all").unwrap();
+        let err = resolve_master_key_with_env(tmp.path(), &empty_env()).unwrap_err();
+        assert!(
+            matches!(err, CredentialsError::InvalidKeyFormat { .. }),
+            "bad hex in key file should return InvalidKeyFormat, got {err}"
+        );
+    }
+
+    #[test]
+    fn load_credentials_with_key_override_some_uses_override() {
+        let tmp = TempDir::new().unwrap();
+        let key = MasterKey::generate();
+        let ct = encrypt(&key, b"api_key = \"secret\"\n");
+        std::fs::create_dir_all(tmp.path().join("config/credentials")).unwrap();
+        std::fs::write(
+            tmp.path().join("config/credentials/production.toml.enc"),
+            &ct,
+        )
+        .unwrap();
+        let store =
+            load_credentials_with_key_override("production", tmp.path(), Some(&key.to_hex()))
+                .unwrap();
+        let val: Option<String> = store.get("api_key");
+        assert_eq!(val.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn load_credentials_with_key_override_none_falls_back_to_env() {
+        let tmp = TempDir::new().unwrap();
+        let key = MasterKey::generate();
+        let ct = encrypt(&key, b"x = \"y\"\n");
+        std::fs::create_dir_all(tmp.path().join("config/credentials")).unwrap();
+        std::fs::write(tmp.path().join("config/credentials/dev.toml.enc"), &ct).unwrap();
+        // No override and no env var → NoKeyFound
+        let err = load_credentials_with_key_override("dev", tmp.path(), None).unwrap_err();
+        assert!(matches!(err, CredentialsError::NoKeyFound));
+    }
 }

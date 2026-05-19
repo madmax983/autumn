@@ -5085,4 +5085,26 @@ path = "/api-spec.json"
         let val: Option<String> = config.credentials().get("stripe_key");
         assert_eq!(val.as_deref(), Some("sk_test_xyz"));
     }
+
+    #[test]
+    fn config_fails_with_credentials_error_when_key_is_invalid() {
+        use crate::credentials::encrypt;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        // Write an encrypted file but supply a wrong-length key so validation fails
+        let bogus_key = "zz".repeat(32); // 64 chars but not valid hex
+        let ct = encrypt(&crate::credentials::MasterKey::generate(), b"x = \"y\"\n");
+        std::fs::create_dir_all(tmp.path().join("config/credentials")).unwrap();
+        std::fs::write(tmp.path().join("config/credentials/dev.toml.enc"), &ct).unwrap();
+
+        let env = MockEnv::new()
+            .with("AUTUMN_MASTER_KEY", &bogus_key)
+            .with("AUTUMN_MANIFEST_DIR", tmp.path().to_str().unwrap());
+        let err = AutumnConfig::load_with_env(&env).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Credentials(_)),
+            "bad master key should produce ConfigError::Credentials, got {err:?}"
+        );
+    }
 }
