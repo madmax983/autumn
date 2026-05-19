@@ -10,7 +10,7 @@ use super::naming::{pascal, pluralize, snake};
 use super::schema_edit::{
     add_mod_declaration, append_schema_table, create_table_sql_with_metadata, drop_table_sql,
 };
-use super::{Flags, GenerateError, ensure_project_root, timestamp_now};
+use super::{GenerateError, ensure_project_root};
 
 /// Optional metadata applied to generated model fields.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -57,6 +57,7 @@ impl ModelMetadata {
 ///
 /// # Errors
 /// Surfaces project-layout, DSL, and naming errors before any file is written.
+#[allow(dead_code)]
 pub fn plan_model(
     project_root: &Path,
     name: &str,
@@ -97,6 +98,13 @@ pub fn plan_model_with_options(
     // When soft_delete is enabled, append a virtual `deleted_at` field so
     // the SQL migration and schema.rs block include the nullable column.
     let schema_fields: std::borrow::Cow<[Field]> = if options.soft_delete {
+        if fields.iter().any(|f| f.name == "deleted_at") {
+            return Err(GenerateError::InvalidField {
+                token: "deleted_at".to_owned(),
+                reason: "'deleted_at' is managed by --soft-delete; remove it from the field list"
+                    .to_owned(),
+            });
+        }
         let mut augmented = fields.clone();
         augmented.push(Field {
             name: "deleted_at".to_owned(),
@@ -667,29 +675,11 @@ fn render_model_file(
     out
 }
 
-/// CLI entry point — plan and execute, exiting nonzero on any error.
-pub fn run(name: &str, field_tokens: &[String], flags: Flags) {
-    let cwd = match std::env::current_dir() {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("Error: cannot determine current directory: {e}");
-            std::process::exit(1);
-        }
-    };
-    let timestamp = timestamp_now();
-    match plan_model(&cwd, name, field_tokens, &timestamp).and_then(|p| p.execute(flags)) {
-        Ok(()) => {}
-        Err(e) => {
-            eprintln!("Error: {e}");
-            std::process::exit(1);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::generate::emit::Action;
+    use crate::generate::{Flags, timestamp_now};
     use std::fs;
     use tempfile::TempDir;
 
@@ -1225,6 +1215,27 @@ autumn-web = \"0.3\"\n";
         assert!(
             !up.contains("deleted_at"),
             "migration without soft_delete must not contain deleted_at: {up}"
+        );
+    }
+
+    #[test]
+    fn plan_model_soft_delete_rejects_explicit_deleted_at_field() {
+        let tmp = project();
+        let err = plan_model_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "deleted_at:NaiveDateTime".into()],
+            "20260427000000",
+            &ModelOptions {
+                soft_delete: true,
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("deleted_at"),
+            "providing deleted_at with soft_delete must error; got: {msg}"
         );
     }
 

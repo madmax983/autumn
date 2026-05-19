@@ -817,6 +817,7 @@ fn run_release_command(cmd: ReleaseCommands) {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn run_generate_command(cmd: GenerateCommands) {
     match cmd {
         GenerateCommands::Model {

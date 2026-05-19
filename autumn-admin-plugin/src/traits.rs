@@ -204,14 +204,33 @@ pub trait AdminModel: Send + Sync + 'static {
     /// Field metadata for this model.
     fn fields(&self) -> Vec<AdminField>;
 
-    /// Available bulk actions (default: just "Delete selected").
+    /// Available bulk actions.
+    ///
+    /// Defaults to "Delete selected". When `supports_soft_delete()` returns
+    /// `true`, also includes "Restore selected" and "Purge selected" so that
+    /// the admin route validator can dispatch those action names.
     fn actions(&self) -> Vec<AdminAction> {
-        vec![AdminAction {
+        let mut acts = vec![AdminAction {
             name: "delete",
             label: "Delete selected".to_owned(),
             style: ActionStyle::Danger,
             confirm: true,
-        }]
+        }];
+        if self.supports_soft_delete() {
+            acts.push(AdminAction {
+                name: "restore",
+                label: "Restore selected".to_owned(),
+                style: ActionStyle::Default,
+                confirm: false,
+            });
+            acts.push(AdminAction {
+                name: "purge",
+                label: "Purge selected".to_owned(),
+                style: ActionStyle::Danger,
+                confirm: true,
+            });
+        }
+        acts
     }
 
     // ── CRUD operations ─────────────────────────────────────────
@@ -925,6 +944,36 @@ mod tests {
         assert!(
             matches!(err, AdminError::Other(_)),
             "list_deleted on non-soft-delete model must return AdminError::Other: {err:?}"
+        );
+    }
+
+    #[test]
+    fn default_actions_returns_only_delete_when_soft_delete_not_supported() {
+        let model = DeletingModel {
+            deleted: Mutex::new(vec![]),
+            fail_on: None,
+        };
+        let acts = model.actions();
+        assert_eq!(
+            acts.len(),
+            1,
+            "default model must advertise exactly one action"
+        );
+        assert_eq!(acts[0].name, "delete");
+    }
+
+    #[test]
+    fn actions_includes_restore_and_purge_when_soft_delete_supported() {
+        let model = SoftDeleteModel::default();
+        let acts = model.actions();
+        let names: Vec<&str> = acts.iter().map(|a| a.name).collect();
+        assert!(
+            names.contains(&"restore"),
+            "soft-delete model must advertise restore action; got: {names:?}"
+        );
+        assert!(
+            names.contains(&"purge"),
+            "soft-delete model must advertise purge action; got: {names:?}"
         );
     }
 

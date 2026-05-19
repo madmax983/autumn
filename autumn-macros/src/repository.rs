@@ -1346,6 +1346,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             ),
                         );
                     }
+                    // Apply soft-delete filter when enabled.
+                    #[allow(unused_mut)]
+                    let mut query = query #sd_filter;
                     let items: ::std::vec::Vec<#model_name> = query
                         .order((#table_ident::#cursor_key_ident.desc(), #table_ident::id.desc()))
                         .limit(req.fetch_limit())
@@ -1377,6 +1380,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     if let ::core::option::Option::Some(after_id) = req.decode::<i64>() {
                         query = query.filter(#table_ident::id.lt(after_id));
                     }
+                    // Apply soft-delete filter when enabled.
+                    #[allow(unused_mut)]
+                    let mut query = query #sd_filter;
                     let items: ::std::vec::Vec<#model_name> = query
                         .order((#table_ident::#cursor_key_ident.desc(), #table_ident::id.desc()))
                         .limit(req.fetch_limit())
@@ -3279,6 +3285,24 @@ mod tests {
         assert!(
             section.contains("deleted_at"),
             "derived delete_by_title must reference deleted_at in soft-delete mode: {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_soft_delete_cursor_page_applies_sd_filter() {
+        let generated = repository_macro(
+            quote! { Post, soft_delete, cursor_key = created_at },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        let cursor_pos = generated
+            .find("async fn cursor_page")
+            .expect("cursor_page impl must be generated");
+        let section = &generated[cursor_pos..cursor_pos + 800];
+        assert!(
+            section.contains("is_null"),
+            "cursor_page impl must apply deleted_at IS NULL filter in soft-delete mode: {section}"
         );
     }
 
