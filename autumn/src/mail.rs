@@ -2496,6 +2496,61 @@ mod tests {
         });
     }
 
+    #[tokio::test]
+    async fn spawn_mail_delivery_logs_error_when_queue_fails() {
+        use std::future::Future;
+        use std::pin::Pin;
+
+        struct AlwaysFailQueue;
+        impl MailDeliveryQueue for AlwaysFailQueue {
+            fn enqueue<'a>(
+                &'a self,
+                _mail: Mail,
+            ) -> Pin<Box<dyn Future<Output = Result<(), MailError>> + Send + 'a>> {
+                Box::pin(async { Err(MailError::RuntimeUnavailable("always fails".to_owned())) })
+            }
+        }
+
+        let mailer = Mailer::builder()
+            .delivery_queue(AlwaysFailQueue)
+            .build()
+            .expect("build");
+
+        mailer
+            .try_deliver_later(sample_mail())
+            .expect("should schedule");
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    #[tokio::test]
+    async fn spawn_mail_delivery_logs_error_when_transport_fails() {
+        use std::future::Future;
+        use std::pin::Pin;
+
+        struct AlwaysFailTransport;
+        impl MailTransport for AlwaysFailTransport {
+            fn send<'a>(
+                &'a self,
+                _mail: Mail,
+            ) -> Pin<Box<dyn Future<Output = Result<(), MailError>> + Send + 'a>> {
+                Box::pin(async {
+                    Err(MailError::RuntimeUnavailable(
+                        "transport offline".to_owned(),
+                    ))
+                })
+            }
+        }
+
+        let mailer = Mailer::with_transport(AlwaysFailTransport);
+
+        mailer
+            .try_deliver_later(sample_mail())
+            .expect("should schedule");
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
     #[test]
     fn install_mailer_does_not_attach_queue_when_transport_disabled() {
         // When mail.transport = "disabled" the operator has explicitly turned

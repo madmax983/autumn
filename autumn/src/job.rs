@@ -7309,5 +7309,30 @@ mod tests {
                 "0af7651916cd43dd8448eb211c80319c",
             );
         }
+
+        #[test]
+        fn job_map_extractor_keys_returns_all_keys() {
+            use opentelemetry::propagation::Extractor as _;
+            let mut map = std::collections::HashMap::new();
+            map.insert("traceparent".to_owned(), "00-abc-def-01".to_owned());
+            map.insert("tracestate".to_owned(), "vendor=val".to_owned());
+            let extractor = JobMapExtractor(&map);
+            let mut keys = extractor.keys();
+            keys.sort();
+            assert_eq!(keys, vec!["traceparent", "tracestate"]);
+        }
+
+        #[test]
+        fn restore_job_trace_context_with_tracestate_parses_correctly() {
+            use opentelemetry::trace::TraceContextExt as _;
+            use opentelemetry_sdk::propagation::TraceContextPropagator;
+            opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
+            let cx = restore_job_trace_context(
+                Some("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"),
+                Some("vendor=value"),
+            )
+            .expect("valid traceparent with tracestate should parse");
+            assert!(cx.span().span_context().is_valid());
+        }
     }
 }
