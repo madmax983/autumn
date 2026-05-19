@@ -673,7 +673,7 @@ async fn apply_etag(response: Response<Body>, if_none_match: Option<&str>) -> Re
 
     // Manual bounded collection with overflow-safe reconstruction.
     let mut buf = bytes::BytesMut::new();
-    let mut overflow_chunk: Option<bytes::Bytes> = None;
+    let mut overflow_frame: Option<http_body::Frame<bytes::Bytes>> = None;
     let mut stream_errored = false;
 
     loop {
@@ -683,22 +683,28 @@ async fn apply_etag(response: Response<Body>, if_none_match: Option<&str>) -> Re
                 stream_errored = true;
                 break;
             }
-            Some(Ok(frame)) => {
-                if let Ok(data) = frame.into_data() {
+            Some(Ok(frame)) => match frame.into_data() {
+                Ok(data) => {
                     if buf.len() + data.len() > EtagLayer::MAX_BODY_BYTES {
-                        overflow_chunk = Some(data);
+                        overflow_frame = Some(http_body::Frame::data(data));
                         break;
                     }
                     buf.extend_from_slice(&data);
                 }
-            }
+                Err(non_data) => {
+                    // Trailer or unknown frame — stop buffering and reconstruct
+                    // so the non-data frame is forwarded rather than dropped.
+                    overflow_frame = Some(non_data);
+                    break;
+                }
+            },
         }
     }
 
     if stream_errored {
         return Response::from_parts(parts, Body::from(buf.freeze()));
     }
-    if let Some(overflow) = overflow_chunk {
+    if let Some(overflow) = overflow_frame {
         return Response::from_parts(parts, rebuild_oversized_body(buf.freeze(), overflow, body));
     }
 
@@ -729,24 +735,25 @@ async fn apply_etag(response: Response<Body>, if_none_match: Option<&str>) -> Re
 /// chaining: `prefix` (frames collected before the limit was hit) +
 /// `overflow` (the frame that tripped the limit) + `remaining` (the rest of
 /// the original stream).
-fn rebuild_oversized_body(prefix: bytes::Bytes, overflow: bytes::Bytes, remaining: Body) -> Body {
-    let preamble = futures::stream::iter(vec![
-        Ok::<bytes::Bytes, axum::Error>(prefix),
-        Ok::<bytes::Bytes, axum::Error>(overflow),
+///
+/// Uses [`http_body_util::StreamBody`] so that trailer frames are forwarded
+/// rather than discarded (unlike [`Body::from_stream`]), and stream errors are
+/// propagated rather than silently terminating the stream.
+fn rebuild_oversized_body(
+    prefix: bytes::Bytes,
+    overflow: http_body::Frame<bytes::Bytes>,
+    remaining: Body,
+) -> Body {
+    use http_body_util::StreamBody;
+
+    let preamble = futures::stream::iter([
+        Ok::<http_body::Frame<bytes::Bytes>, axum::Error>(http_body::Frame::data(prefix)),
+        Ok(overflow),
     ]);
     let tail = futures::stream::unfold(remaining, |mut b| async move {
-        loop {
-            match BodyExt::frame(&mut b).await {
-                None | Some(Err(_)) => return None,
-                Some(Ok(frame)) => {
-                    if let Ok(data) = frame.into_data() {
-                        return Some((Ok::<bytes::Bytes, axum::Error>(data), b));
-                    }
-                }
-            }
-        }
+        BodyExt::frame(&mut b).await.map(|result| (result, b))
     });
-    Body::from_stream(preamble.chain(tail))
+    Body::new(StreamBody::new(preamble.chain(tail)))
 }
 
 // ── not_modified helpers ───────────────────────────────────────────────────────
