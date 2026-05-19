@@ -162,6 +162,14 @@ pub use crate::webhook::{
     WebhookReplayConfig,
 };
 
+// ── Outbound HTTP client ─────────────────────────────────────────
+/// Traced outbound HTTP client with automatic retries and test-mock support.
+///
+/// Declare it as a handler parameter to get a client pre-configured from
+/// `[http.client]` config and wired into the test mock harness.
+#[cfg(feature = "http-client")]
+pub use crate::http_client::Client;
+
 // ── Application state ────────────────────────────────────────────
 /// Shared application state (for custom extractors).
 pub use crate::state::AppState;

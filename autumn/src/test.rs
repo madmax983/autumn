@@ -177,6 +177,11 @@ pub struct TestApp {
     /// the value derived from
     /// [`SecurityConfig::forbidden_response`](crate::security::SecurityConfig::forbidden_response).
     forbidden_response_override: Option<crate::authorization::ForbiddenResponse>,
+    /// Shared mock registry installed into `AppState` during [`build`](Self::build)
+    /// so that any [`Client`](crate::http_client::Client) extracted inside a
+    /// handler intercepts matching requests.
+    #[cfg(feature = "http-client")]
+    http_mock_registry: Option<std::sync::Arc<crate::http_client::MockRegistry>>,
 }
 
 type TestPolicyRegistration = Box<dyn FnOnce(&crate::authorization::PolicyRegistry) + Send>;
@@ -205,6 +210,8 @@ impl TestApp {
             replica_pool: None,
             policy_registrations: Vec::new(),
             forbidden_response_override: None,
+            #[cfg(feature = "http-client")]
+            http_mock_registry: None,
         }
     }
 
@@ -377,6 +384,63 @@ impl TestApp {
         self
     }
 
+    /// Register a canned HTTP response for outbound requests made via the
+    /// [`Client`](crate::http_client::Client) extractor during this test.
+    ///
+    /// `alias` identifies the named service (must match the alias passed to
+    /// [`Client::named`](crate::http_client::Client::named) in the handler, or
+    /// the key used in `[http.client.base_urls]`).
+    ///
+    /// Returns a [`MockSetupBuilder`](crate::http_client::MockSetupBuilder) on
+    /// which you chain the HTTP method and path before calling
+    /// [`respond_with`](crate::http_client::MockSetupBuilder::respond_with) to
+    /// register the entry and get a
+    /// [`MockHandle`](crate::http_client::MockHandle) for later assertions.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use autumn_web::test::TestApp;
+    /// use serde_json::json;
+    ///
+    /// # async fn example() {
+    /// let mut app = TestApp::new();
+    /// let mock = app
+    ///     .http_mock("stripe")
+    ///     .post("/v1/charges")
+    ///     .respond_with(200, json!({"id": "ch_123", "amount": 1000}));
+    ///
+    /// let client = app.build();
+    /// // … fire requests …
+    /// mock.expect_called(1);
+    /// # }
+    /// ```
+    #[cfg(feature = "http-client")]
+    pub fn http_mock(&mut self, alias: &str) -> crate::http_client::MockSetupBuilder {
+        let registry = self
+            .http_mock_registry
+            .get_or_insert_with(|| std::sync::Arc::new(crate::http_client::MockRegistry::new()))
+            .clone();
+
+        // Resolve base URL from config (if any) so the mock builder can log it.
+        let base_url = self
+            .config
+            .http
+            .client
+            .base_urls
+            .get(alias)
+            .cloned()
+            .unwrap_or_default();
+        let _ = base_url; // stored for future use (URL-based matching)
+
+        crate::http_client::MockSetupBuilder {
+            registry,
+            alias: alias.to_owned(),
+            method: None,
+            path: None,
+        }
+    }
+
     /// Build the application and return a [`TestClient`] ready for requests.
     ///
     /// This constructs the full Axum router with all middleware applied,
@@ -425,6 +489,16 @@ impl TestApp {
             register(state.policy_registry());
         }
         crate::app::install_webhook_registry(&state, &self.config);
+
+        // Install HTTP client config so the Client extractor can read it.
+        #[cfg(feature = "http-client")]
+        state.insert_extension(self.config.http.clone());
+
+        // Install mock registry when http_mock() was called.
+        #[cfg(feature = "http-client")]
+        if let Some(registry) = self.http_mock_registry {
+            state.insert_extension(crate::http_client::HttpMockRegistryExt(registry));
+        }
 
         let router = crate::router::try_build_router_inner(
             self.routes,

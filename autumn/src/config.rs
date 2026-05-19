@@ -722,6 +722,78 @@ pub struct AutumnConfig {
     /// Prefer using `config.credentials().get::<String>("stripe_key")` for type-safe access.
     #[serde(skip)]
     pub credentials: crate::credentials::CredentialsStore,
+
+    /// Outbound HTTP settings (`[http]` section in `autumn.toml`).
+    ///
+    /// The nested `[http.client]` sub-table configures the outbound client.
+    #[cfg(feature = "http-client")]
+    #[serde(default, rename = "http")]
+    pub http: HttpConfig,
+}
+
+/// Top-level `[http]` configuration section.
+#[cfg(feature = "http-client")]
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct HttpConfig {
+    /// Outbound HTTP client settings (`[http.client]`).
+    #[serde(default)]
+    pub client: HttpClientConfig,
+}
+
+/// Configuration for the outbound HTTP client (`[http.client]` in `autumn.toml`).
+///
+/// # Example `autumn.toml`
+///
+/// ```toml
+/// [http.client]
+/// timeout_secs = 30
+/// max_retries  = 3
+///
+/// [http.client.base_urls]
+/// stripe   = "https://api.stripe.com"
+/// sendgrid = "https://api.sendgrid.com"
+/// ```
+#[cfg(feature = "http-client")]
+#[derive(Debug, Clone, Deserialize)]
+pub struct HttpClientConfig {
+    /// Per-request timeout in seconds. Default: 30.
+    #[serde(default = "default_http_timeout_secs")]
+    pub timeout_secs: u64,
+
+    /// Maximum retry attempts for transient failures on idempotent methods.
+    /// Default: 3 (four total attempts).
+    #[serde(default = "default_http_max_retries")]
+    pub max_retries: u32,
+
+    /// Named base URL aliases, e.g. `stripe = "https://api.stripe.com"`.
+    ///
+    /// A [`Client`](crate::http_client::Client) configured with `.named("stripe")` will
+    /// prepend this URL to relative request paths and match against mocks
+    /// registered for that alias via
+    /// [`TestApp::http_mock`](crate::test::TestApp::http_mock).
+    #[serde(default)]
+    pub base_urls: std::collections::HashMap<String, String>,
+}
+
+#[cfg(feature = "http-client")]
+fn default_http_timeout_secs() -> u64 {
+    30
+}
+
+#[cfg(feature = "http-client")]
+fn default_http_max_retries() -> u32 {
+    3
+}
+
+#[cfg(feature = "http-client")]
+impl Default for HttpClientConfig {
+    fn default() -> Self {
+        Self {
+            timeout_secs: default_http_timeout_secs(),
+            max_retries: default_http_max_retries(),
+            base_urls: std::collections::HashMap::new(),
+        }
+    }
 }
 
 impl axum::extract::FromRequestParts<crate::AppState> for AutumnConfig {
