@@ -2362,8 +2362,8 @@ mod tests {
             .expect("static-build mode should not enforce the deliver_later guard");
     }
 
-    #[tokio::test]
-    async fn spawn_mail_delivery_inherits_parent_span() {
+    #[test]
+    fn spawn_mail_delivery_inherits_parent_span() {
         use std::future::Future;
         use std::pin::Pin;
         use std::sync::{Arc, Mutex};
@@ -2383,32 +2383,43 @@ mod tests {
         }
 
         let captured_span_id: Arc<Mutex<Option<tracing::span::Id>>> = Arc::new(Mutex::new(None));
-        let cap = captured_span_id.clone();
 
         let mailer = Mailer::builder()
-            .delivery_queue(CapturingQueue(cap.clone()))
+            .delivery_queue(CapturingQueue(captured_span_id.clone()))
             .build()
             .expect("mailer with queue should build");
         let mail = sample_mail();
 
-        let parent_span_id: Option<tracing::span::Id> =
-            tracing::subscriber::with_default(tracing_subscriber::registry(), || {
-                let outer = tracing::info_span!("deliver_later_outer");
-                let id = outer.id();
-                let _guard = outer.enter();
-                mailer
-                    .try_deliver_later(mail)
-                    .expect("deliver_later must not fail");
-                id
+        // The subscriber must remain active for the entire duration — spanning
+        // both the enqueue call and the spawned task's execution — so that
+        // `tracing::Span::current()` inside the task sees the same span tree
+        // that was active when `try_deliver_later` was called.
+        tracing::subscriber::with_default(tracing_subscriber::registry(), || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build runtime");
+
+            let outer = tracing::info_span!("deliver_later_outer");
+            let outer_id = outer.id();
+
+            rt.block_on(async {
+                {
+                    let _guard = outer.enter();
+                    mailer
+                        .try_deliver_later(mail)
+                        .expect("deliver_later must not fail");
+                }
+
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             });
 
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        let in_task = captured_span_id.lock().unwrap().clone();
-        assert_eq!(
-            in_task, parent_span_id,
-            "delivery task must run inside the span that called deliver_later"
-        );
+            let in_task = captured_span_id.lock().unwrap().clone();
+            assert_eq!(
+                in_task, outer_id,
+                "delivery task must run inside the span that called deliver_later"
+            );
+        });
     }
 
     #[test]
