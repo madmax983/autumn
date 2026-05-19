@@ -326,6 +326,7 @@ struct PresignRequest {
 struct PresignResponse {
     url: String,
     method: String,
+    headers: std::collections::HashMap<String, String>,
     expires_in_secs: u64,
 }
 
@@ -344,6 +345,7 @@ async fn presign(
     Ok(Json(PresignResponse {
         url: result.url,
         method: result.method,
+        headers: result.headers,
         expires_in_secs: result.expires_in.as_secs(),
     }))
 }
@@ -390,8 +392,10 @@ html! {
 ```
 
 Renders a file input with `data-controller="direct-upload"` for Stimulus-style JS
-enhancement, an accessible progress bar placeholder, and a `<noscript>` fallback
-that submits to a through-app upload route for users without JS.
+enhancement and an accessible progress bar placeholder. When JavaScript is unavailable,
+users see a notice explaining the dependency. To provide a fallback upload path for
+no-JS users, wrap the component in a `<noscript>` block with an alternative
+`enctype="multipart/form-data"` form and handler.
 
 ### Orphan handling
 
