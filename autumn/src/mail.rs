@@ -700,22 +700,30 @@ impl Mailer {
             let mailer = self.clone();
             let deferred = mail.clone();
             let mut f_opt: Option<(Self, Mail)> = Some((mailer, deferred));
+            // Capture the caller's span now; the after-commit callback runs in a
+            // fresh task with no request span, so spawn_mail_delivery would see an
+            // empty span and lose trace correlation without this.
+            let deliver_span = tracing::Span::current();
 
             crate::db::AFTER_COMMIT_REGISTRY
                 .try_with(|registry| {
                     let (m, m_mail) = f_opt.take().expect("once");
+                    let span = deliver_span.clone();
                     let boxed: crate::db::CommitCallback = Box::new(move || {
-                        Box::pin(async move {
-                            if let Some(queue) = m.delivery_queue.clone() {
-                                queue.enqueue(m_mail).await.map_err(|e| {
-                                    crate::AutumnError::internal_server_error_msg(e.to_string())
-                                })
-                            } else {
-                                m.spawn_mail_delivery(m_mail).map_err(|e| {
-                                    crate::AutumnError::internal_server_error_msg(e.to_string())
-                                })
-                            }
-                        })
+                        Box::pin(tracing::Instrument::instrument(
+                            async move {
+                                if let Some(queue) = m.delivery_queue.clone() {
+                                    queue.enqueue(m_mail).await.map_err(|e| {
+                                        crate::AutumnError::internal_server_error_msg(e.to_string())
+                                    })
+                                } else {
+                                    m.spawn_mail_delivery(m_mail).map_err(|e| {
+                                        crate::AutumnError::internal_server_error_msg(e.to_string())
+                                    })
+                                }
+                            },
+                            span,
+                        ))
                     });
                     registry.lock().expect("registry lock").push(boxed);
                 })
@@ -755,26 +763,24 @@ impl Mailer {
         })?;
         let parent_span = tracing::Span::current();
         if let Some(queue) = self.delivery_queue.clone() {
-            use tracing::Instrument as _;
-            handle.spawn(
+            handle.spawn(tracing::Instrument::instrument(
                 async move {
                     if let Err(error) = queue.enqueue(mail).await {
                         tracing::error!(error = %error, "durable mail enqueue failed");
                     }
-                }
-                .instrument(parent_span),
-            );
+                },
+                parent_span,
+            ));
         } else {
             let mailer = self.clone();
-            use tracing::Instrument as _;
-            handle.spawn(
+            handle.spawn(tracing::Instrument::instrument(
                 async move {
                     if let Err(error) = mailer.send(mail).await {
                         tracing::error!(error = %error, "background mail delivery failed");
                     }
-                }
-                .instrument(parent_span),
-            );
+                },
+                parent_span,
+            ));
         }
         Ok(())
     }
@@ -2361,12 +2367,11 @@ mod tests {
     /// and OTel child spans created inside the task share the same trace.
     #[tokio::test]
     async fn spawn_mail_delivery_inherits_parent_span() {
-        use std::sync::{Arc, Mutex};
         use std::future::Future;
         use std::pin::Pin;
+        use std::sync::{Arc, Mutex};
 
-        let captured_span_id: Arc<Mutex<Option<tracing::span::Id>>> =
-            Arc::new(Mutex::new(None));
+        let captured_span_id: Arc<Mutex<Option<tracing::span::Id>>> = Arc::new(Mutex::new(None));
         let cap = captured_span_id.clone();
 
         struct CapturingQueue(Arc<Mutex<Option<tracing::span::Id>>>);
@@ -2392,16 +2397,16 @@ mod tests {
         let subscriber = tracing_subscriber::registry()
             .with(tracing_subscriber::fmt::layer().with_writer(std::io::sink));
 
-        let parent_span_id: Option<tracing::span::Id> = tracing::subscriber::with_default(
-            subscriber,
-            || {
+        let parent_span_id: Option<tracing::span::Id> =
+            tracing::subscriber::with_default(subscriber, || {
                 let outer = tracing::info_span!("deliver_later_outer");
                 let id = outer.id().clone();
                 let _guard = outer.enter();
-                mailer.try_deliver_later(mail).expect("deliver_later must not fail");
+                mailer
+                    .try_deliver_later(mail)
+                    .expect("deliver_later must not fail");
                 id
-            },
-        );
+            });
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 

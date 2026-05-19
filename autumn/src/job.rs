@@ -975,6 +975,10 @@ impl opentelemetry::propagation::Injector for JobMapInjector<'_> {
     }
 }
 
+fn build_job_consumer_span(name: &str, attempt: u32) -> tracing::Span {
+    tracing::info_span!("job.execute", "otel.kind" = "consumer", job.name = %name, job.attempt = attempt)
+}
+
 async fn run_job_handler(
     handler: JobHandler,
     state: AppState,
@@ -1284,6 +1288,11 @@ impl JobClient {
         // Keep a copy for the debug log in the eager path (name is moved into f_opt).
         let name_for_log = name.clone();
 
+        // Capture the caller's span now so that capture_job_trace_context() inside
+        // client.enqueue() sees the originating request span even when the callback
+        // runs in the after-commit task, which has no request span of its own.
+        let enqueue_span = tracing::Span::current();
+
         let mut f_opt = Some(move || {
             let client = client.clone();
             let name = name.clone();
@@ -1295,7 +1304,9 @@ impl JobClient {
         crate::db::AFTER_COMMIT_REGISTRY
             .try_with(|registry| {
                 let f = f_opt.take().expect("closure only entered once");
-                let boxed: crate::db::CommitCallback = Box::new(move || Box::pin(f()));
+                let span = enqueue_span.clone();
+                let boxed: crate::db::CommitCallback =
+                    Box::new(move || Box::pin(tracing::Instrument::instrument(f(), span)));
                 registry.lock().expect("registry lock").push(boxed);
             })
             .ok();
@@ -1591,30 +1602,16 @@ async fn execute_local_job(
         250
     };
 
-    // Create a job-execution span.  When `telemetry-otlp` is enabled and the
-    // enqueuing code serialized a W3C `traceparent`, make that span the parent
-    // so the job execution appears as a child of the originating HTTP span in
-    // Jaeger / Tempo / Honeycomb.
-    let job_span = tracing::info_span!(
-        "job.execute",
-        "otel.kind" = "consumer",
-        job.name = %job.name,
-        job.attempt = job.attempt,
-    );
+    let job_span = build_job_consumer_span(&job.name, job.attempt);
     #[cfg(feature = "telemetry-otlp")]
+    if let Some(cx) =
+        restore_job_trace_context(job.traceparent.as_deref(), job.tracestate.as_deref())
     {
         use tracing_opentelemetry::OpenTelemetrySpanExt as _;
-        if let Some(parent_cx) =
-            restore_job_trace_context(job.traceparent.as_deref(), job.tracestate.as_deref())
-        {
-            let _ = job_span.set_parent(parent_cx);
-        }
+        let _ = job_span.set_parent(cx);
     }
-
-    use tracing::Instrument as _;
-    let outcome = run_job_handler(handler, state.clone(), job.payload.clone())
-        .instrument(job_span)
-        .await;
+    let f = run_job_handler(handler, state.clone(), job.payload.clone());
+    let outcome = tracing::Instrument::instrument(f, job_span).await;
     match outcome {
         JobExecutionOutcome::Succeeded => {
             state.job_registry.record_success(&job.name);
@@ -2929,7 +2926,7 @@ async fn dead_letter_invalid_redis_job(
 }
 
 #[cfg(feature = "redis")]
-#[allow(clippy::cognitive_complexity)]
+#[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
 async fn process_redis_job_record(
     connection: &mut redis::aio::ConnectionManager,
     mut record: RedisJobRecord,
@@ -2995,26 +2992,16 @@ async fn process_redis_job_record(
         return;
     }
 
-    let job_span = tracing::info_span!(
-        "job.execute",
-        "otel.kind" = "consumer",
-        job.name = %record.name,
-        job.attempt = record.attempt,
-    );
+    let job_span = build_job_consumer_span(&record.name, record.attempt);
     #[cfg(feature = "telemetry-otlp")]
+    if let Some(cx) =
+        restore_job_trace_context(record.traceparent.as_deref(), record.tracestate.as_deref())
     {
         use tracing_opentelemetry::OpenTelemetrySpanExt as _;
-        if let Some(parent_cx) =
-            restore_job_trace_context(record.traceparent.as_deref(), record.tracestate.as_deref())
-        {
-            let _ = job_span.set_parent(parent_cx);
-        }
+        let _ = job_span.set_parent(cx);
     }
-    use tracing::Instrument as _;
-    match run_job_handler(handler, state.clone(), record.payload.clone())
-        .instrument(job_span)
-        .await
-    {
+    let f = run_job_handler(handler, state.clone(), record.payload.clone());
+    match tracing::Instrument::instrument(f, job_span).await {
         JobExecutionOutcome::Succeeded => {
             match ack_redis_success(connection, worker_config, &record).await {
                 Ok(true) => {
@@ -3789,26 +3776,16 @@ async fn pg_execute_job(
         return;
     };
 
-    let job_span = tracing::info_span!(
-        "job.execute",
-        "otel.kind" = "consumer",
-        job.name = %row.name,
-        job.attempt = row.attempt,
-    );
+    let job_span = build_job_consumer_span(&row.name, attempt);
     #[cfg(feature = "telemetry-otlp")]
+    if let Some(cx) =
+        restore_job_trace_context(row.traceparent.as_deref(), row.tracestate.as_deref())
     {
         use tracing_opentelemetry::OpenTelemetrySpanExt as _;
-        if let Some(parent_cx) =
-            restore_job_trace_context(row.traceparent.as_deref(), row.tracestate.as_deref())
-        {
-            let _ = job_span.set_parent(parent_cx);
-        }
+        let _ = job_span.set_parent(cx);
     }
-    use tracing::Instrument as _;
-    match run_job_handler(handler, state.clone(), payload)
-        .instrument(job_span)
-        .await
-    {
+    let f = run_job_handler(handler, state.clone(), payload);
+    match tracing::Instrument::instrument(f, job_span).await {
         JobExecutionOutcome::Succeeded => {
             let ack = pg_ack_success(pool, &row.id, worker_id).await;
             record_pg_row_lifecycle_ack_result(
@@ -7206,8 +7183,14 @@ mod tests {
             let old_json = r#"{"id":"x","name":"y","payload":{},"attempt":1,"max_attempts":3,"initial_backoff_ms":250}"#;
             let record: RedisJobRecord = serde_json::from_str(old_json)
                 .expect("old-format record without traceparent must deserialize");
-            assert!(record.traceparent.is_none(), "missing field must default to None");
-            assert!(record.tracestate.is_none(), "missing field must default to None");
+            assert!(
+                record.traceparent.is_none(),
+                "missing field must default to None"
+            );
+            assert!(
+                record.tracestate.is_none(),
+                "missing field must default to None"
+            );
         }
 
         #[cfg(feature = "redis")]
