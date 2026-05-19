@@ -226,13 +226,28 @@ fn generate_derived_query(
             }
         }
         "delete" => {
-            quote! {
-                let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
-                ::autumn_web::reexports::diesel::delete(#table_ident::table #(#filters)*)
+            if soft_delete {
+                quote! {
+                    let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
+                    let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                    ::autumn_web::reexports::diesel::update(
+                        #table_ident::table #(#filters)* .filter(#table_ident::deleted_at.is_null())
+                    )
+                    .set(#table_ident::deleted_at.eq(::core::option::Option::Some(__now)))
                     .execute(&mut conn)
                     .await
                     .map_err(::autumn_web::AutumnError::from)?;
-                Ok(())
+                    Ok(())
+                }
+            } else {
+                quote! {
+                    let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                    ::autumn_web::reexports::diesel::delete(#table_ident::table #(#filters)*)
+                        .execute(&mut conn)
+                        .await
+                        .map_err(::autumn_web::AutumnError::from)?;
+                    Ok(())
+                }
             }
         }
         "exists" => {
@@ -950,7 +965,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         let hooked_delete_mutation_stmt = if config.soft_delete {
             quote! {
                 let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
-                let __autumn_deleted = ::autumn_web::reexports::diesel::update(#table_ident::table.find(id))
+                let __autumn_deleted = ::autumn_web::reexports::diesel::update(
+                    #table_ident::table.find(id).filter(#table_ident::deleted_at.is_null())
+                )
                     .set(#table_ident::deleted_at.eq(::core::option::Option::Some(__now)))
                     .execute(conn)
                     .await
@@ -1187,7 +1204,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
                 let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
                 let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
-                let __count = ::autumn_web::reexports::diesel::update(#table_ident::table.find(id))
+                let __count = ::autumn_web::reexports::diesel::update(
+                    #table_ident::table.find(id).filter(#table_ident::deleted_at.is_null())
+                )
                     .set(#table_ident::deleted_at.eq(::core::option::Option::Some(__now)))
                     .execute(&mut conn)
                     .await
@@ -2168,6 +2187,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             fn purge(&self, id: i64) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<()>> + Send;
             fn with_deleted(&self) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<Vec<#model_name>>> + Send;
             fn only_deleted(&self) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<Vec<#model_name>>> + Send;
+            fn page_only_deleted(&self, req: &::autumn_web::pagination::PageRequest) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<::autumn_web::pagination::Page<#model_name>>> + Send;
         }
     } else {
         quote! {}
@@ -2228,6 +2248,31 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     .await
                     .map_err(::autumn_web::AutumnError::from)
             }
+
+            async fn page_only_deleted(
+                &self,
+                req: &::autumn_web::pagination::PageRequest,
+            ) -> ::autumn_web::AutumnResult<::autumn_web::pagination::Page<#model_name>> {
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                let total: i64 = #table_ident::table
+                    .filter(#table_ident::deleted_at.is_not_null())
+                    .count()
+                    .get_result::<i64>(&mut conn)
+                    .await
+                    .map_err(::autumn_web::AutumnError::from)?;
+                let items: ::std::vec::Vec<#model_name> = #table_ident::table
+                    .filter(#table_ident::deleted_at.is_not_null())
+                    .order(#table_ident::id.desc())
+                    .limit(req.limit())
+                    .offset(req.offset())
+                    .select(#model_name::as_select())
+                    .load::<#model_name>(&mut conn)
+                    .await
+                    .map_err(::autumn_web::AutumnError::from)?;
+                ::core::result::Result::Ok(::autumn_web::pagination::Page::new(items, total, req))
+            }
         }
     } else {
         quote! {}
@@ -2286,6 +2331,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
                 #table_ident::table
                     .find(id)
+                    #sd_filter
                     .first::<#model_name>(&mut conn)
                     .await
                     .optional()
@@ -2297,6 +2343,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
                 let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
                 #table_ident::table
+                    #sd_filter
                     .load::<#model_name>(&mut conn)
                     .await
                     .map_err(::autumn_web::AutumnError::from)
@@ -2319,6 +2366,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
                 let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
                 #table_ident::table
+                    #sd_filter
                     .count()
                     .get_result::<i64>(&mut conn)
                     .await
@@ -2330,7 +2378,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
                 let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
                 ::autumn_web::reexports::diesel::select(
-                    ::autumn_web::reexports::diesel::dsl::exists(#table_ident::table.find(id))
+                    ::autumn_web::reexports::diesel::dsl::exists(
+                        #table_ident::table.find(id) #sd_filter
+                    )
                 )
                 .get_result::<bool>(&mut conn)
                 .await
@@ -3116,6 +3166,133 @@ mod tests {
         assert!(
             generated.contains("is_not_null"),
             "only_deleted() must filter rows where deleted_at IS NOT NULL: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_soft_delete_find_by_id_excludes_deleted_rows() {
+        let generated = repository_macro(
+            quote! { Post, soft_delete },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        // Locate find_by_id impl and check it has the is_null filter.
+        let find_by_id = generated
+            .find("async fn find_by_id")
+            .expect("find_by_id must be generated");
+        let section = &generated[find_by_id..find_by_id + 400];
+        assert!(
+            section.contains("is_null"),
+            "find_by_id must filter deleted_at IS NULL: {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_soft_delete_find_all_impl_filters_deleted_rows() {
+        let generated = repository_macro(
+            quote! { Post, soft_delete },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        let find_all = generated
+            .find("async fn find_all")
+            .expect("find_all must be generated");
+        let section = &generated[find_all..find_all + 400];
+        assert!(
+            section.contains("is_null"),
+            "find_all impl must filter deleted_at IS NULL: {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_soft_delete_count_filters_deleted_rows() {
+        let generated = repository_macro(
+            quote! { Post, soft_delete },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        let count_pos = generated
+            .find("async fn count")
+            .expect("count must be generated");
+        let section = &generated[count_pos..count_pos + 400];
+        assert!(
+            section.contains("is_null"),
+            "count impl must filter deleted_at IS NULL: {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_soft_delete_exists_by_id_filters_deleted_rows() {
+        let generated = repository_macro(
+            quote! { Post, soft_delete },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        let exists_pos = generated
+            .find("async fn exists_by_id")
+            .expect("exists_by_id must be generated");
+        let section = &generated[exists_pos..exists_pos + 800];
+        assert!(
+            section.contains("is_null"),
+            "exists_by_id impl must filter deleted_at IS NULL: {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_soft_delete_delete_by_id_targets_only_non_deleted() {
+        let generated = repository_macro(
+            quote! { Post, soft_delete },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        let delete_pos = generated
+            .find("async fn delete_by_id")
+            .expect("delete_by_id must be generated");
+        let section = &generated[delete_pos..delete_pos + 600];
+        assert!(
+            section.contains("is_null"),
+            "delete_by_id soft-delete UPDATE must add deleted_at IS NULL guard: {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_soft_delete_derived_delete_uses_update_not_hard_delete() {
+        let generated = repository_macro(
+            quote! { Post, soft_delete },
+            quote! { pub trait PostRepository {
+                fn delete_by_title(title: String);
+            } },
+        )
+        .to_string();
+
+        // The derived delete_by_title impl (not the trait signature) must be
+        // an UPDATE that sets deleted_at, not a hard DELETE FROM.
+        let impl_delete = generated
+            .find("async fn delete_by_title")
+            .expect("delete_by_title impl must be generated");
+        let section = &generated[impl_delete..impl_delete + 800];
+        assert!(
+            section.contains("deleted_at"),
+            "derived delete_by_title must reference deleted_at in soft-delete mode: {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_soft_delete_generates_page_only_deleted_method() {
+        let generated = repository_macro(
+            quote! { Post, soft_delete },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("page_only_deleted"),
+            "soft_delete must generate a page_only_deleted() method: {generated}"
         );
     }
 }

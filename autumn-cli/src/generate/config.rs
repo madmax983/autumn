@@ -46,6 +46,8 @@ pub struct ScaffoldConfigEntry {
     pub defaults: Vec<String>,
     #[serde(default)]
     pub queries: Vec<String>,
+    #[serde(default)]
+    pub soft_delete: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -89,6 +91,7 @@ pub fn merge_config_with_cli(
     cli_validations: &[String],
     cli_defaults: &[String],
     cli_queries: &[String],
+    cli_soft_delete: bool,
 ) -> (Vec<String>, ScaffoldOptions) {
     let pick = |cli: &[String], toml: Vec<String>| -> Vec<String> {
         if cli.is_empty() { toml } else { cli.to_vec() }
@@ -98,6 +101,8 @@ pub fn merge_config_with_cli(
     let validations = pick(cli_validations, config.validations);
     let defaults = pick(cli_defaults, config.defaults);
     let queries = pick(cli_queries, config.queries);
+    // CLI flag wins; TOML config enables it when present.
+    let soft_delete = cli_soft_delete || config.soft_delete;
     (
         fields,
         ScaffoldOptions {
@@ -105,7 +110,7 @@ pub fn merge_config_with_cli(
                 indexes,
                 validations,
                 defaults,
-                soft_delete: false,
+                soft_delete,
             },
             queries,
         },
@@ -249,12 +254,14 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             validations: vec!["url=url".into()],
             defaults: vec![],
             queries: vec!["find_by_url:url".into()],
+            soft_delete: false,
         }
     }
 
     #[test]
     fn merge_uses_toml_when_all_cli_empty() {
-        let (fields, opts) = merge_config_with_cli(bookmark_entry(), &[], &[], &[], &[], &[]);
+        let (fields, opts) =
+            merge_config_with_cli(bookmark_entry(), &[], &[], &[], &[], &[], false);
         assert_eq!(fields, vec!["url:String", "tag:String"]);
         assert_eq!(opts.model.indexes, vec!["url"]);
         assert_eq!(opts.model.validations, vec!["url=url"]);
@@ -271,6 +278,7 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             &[],
             &[],
             &[],
+            false,
         );
         assert_eq!(fields, vec!["title:String", "body:Text"]);
     }
@@ -278,14 +286,21 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
     #[test]
     fn merge_cli_indexes_override_toml_indexes() {
         let (_, opts) =
-            merge_config_with_cli(bookmark_entry(), &[], &["tag".into()], &[], &[], &[]);
+            merge_config_with_cli(bookmark_entry(), &[], &["tag".into()], &[], &[], &[], false);
         assert_eq!(opts.model.indexes, vec!["tag"]);
     }
 
     #[test]
     fn merge_cli_validations_override_toml_validations() {
-        let (_, opts) =
-            merge_config_with_cli(bookmark_entry(), &[], &[], &["url=email".into()], &[], &[]);
+        let (_, opts) = merge_config_with_cli(
+            bookmark_entry(),
+            &[],
+            &[],
+            &["url=email".into()],
+            &[],
+            &[],
+            false,
+        );
         assert_eq!(opts.model.validations, vec!["url=email"]);
     }
 
@@ -293,7 +308,8 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
     fn merge_cli_defaults_override_toml_defaults() {
         let mut entry = bookmark_entry();
         entry.defaults = vec!["url=example.com".into()];
-        let (_, opts) = merge_config_with_cli(entry, &[], &[], &[], &["tag=general".into()], &[]);
+        let (_, opts) =
+            merge_config_with_cli(entry, &[], &[], &[], &["tag=general".into()], &[], false);
         assert_eq!(opts.model.defaults, vec!["tag=general"]);
     }
 
@@ -306,6 +322,7 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             &[],
             &[],
             &["find_by_tag:tag".into()],
+            false,
         );
         assert_eq!(opts.queries, vec!["find_by_tag:tag"]);
     }
@@ -313,11 +330,56 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
     #[test]
     fn merge_empty_cli_keeps_empty_toml() {
         let entry = ScaffoldConfigEntry::default();
-        let (fields, opts) = merge_config_with_cli(entry, &[], &[], &[], &[], &[]);
+        let (fields, opts) = merge_config_with_cli(entry, &[], &[], &[], &[], &[], false);
         assert!(fields.is_empty());
         assert!(opts.model.indexes.is_empty());
         assert!(opts.model.validations.is_empty());
         assert!(opts.model.defaults.is_empty());
         assert!(opts.queries.is_empty());
+    }
+
+    #[test]
+    fn merge_cli_soft_delete_flag_wins() {
+        let (_, opts) = merge_config_with_cli(bookmark_entry(), &[], &[], &[], &[], &[], true);
+        assert!(
+            opts.model.soft_delete,
+            "cli_soft_delete=true must set soft_delete on the merged options"
+        );
+    }
+
+    #[test]
+    fn merge_toml_soft_delete_propagates() {
+        let mut entry = bookmark_entry();
+        entry.soft_delete = true;
+        let (_, opts) = merge_config_with_cli(entry, &[], &[], &[], &[], &[], false);
+        assert!(
+            opts.model.soft_delete,
+            "soft_delete=true in TOML config must propagate when CLI flag is false"
+        );
+    }
+
+    #[test]
+    fn merge_soft_delete_false_when_both_unset() {
+        let (_, opts) = merge_config_with_cli(bookmark_entry(), &[], &[], &[], &[], &[], false);
+        assert!(
+            !opts.model.soft_delete,
+            "soft_delete must be false when neither CLI nor TOML sets it"
+        );
+    }
+
+    #[test]
+    fn parse_scaffold_config_with_soft_delete() {
+        let tmp = TempDir::new().unwrap();
+        let path = write_config(
+            &tmp,
+            "[scaffold.Article]\nfields = [\"title:String\"]\nsoft_delete = true\n",
+        );
+        let entry = read_scaffold_config(&path, "Article")
+            .unwrap()
+            .expect("Article section must be present");
+        assert!(
+            entry.soft_delete,
+            "soft_delete = true in TOML must be parsed into ScaffoldConfigEntry"
+        );
     }
 }
