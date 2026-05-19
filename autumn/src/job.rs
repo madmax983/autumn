@@ -7340,13 +7340,13 @@ mod tests {
             use opentelemetry::trace::TracerProvider as _;
             use opentelemetry_sdk::propagation::TraceContextPropagator;
             use opentelemetry_sdk::trace::SdkTracerProvider;
-            use tracing_opentelemetry::OpenTelemetryLayer;
             use tracing_subscriber::prelude::*;
 
             opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
             let provider = SdkTracerProvider::builder().build();
             let tracer = provider.tracer("test");
-            let sub = tracing_subscriber::registry().with(OpenTelemetryLayer::new(tracer));
+            let sub = tracing_subscriber::registry()
+                .with(tracing_opentelemetry::layer().with_tracer(tracer));
 
             tracing::subscriber::with_default(sub, || {
                 let span = tracing::info_span!("capture_test");
@@ -7367,7 +7367,19 @@ mod tests {
                 .enable_all()
                 .build()
                 .expect("runtime");
-            let (client, mut rx) = make_test_client();
+            let (tx, mut rx) = mpsc::channel(16);
+            let client = JobClient {
+                local_sender: Some(tx),
+                #[cfg(feature = "redis")]
+                redis: None,
+                #[cfg(feature = "db")]
+                pg_pool: None,
+                registry: crate::actuator::JobRegistry::new(),
+                job_admin: JobAdminMemoryBackend::new_for_test(32),
+                default_max_attempts: 3,
+                default_initial_backoff_ms: 100,
+                per_job_defaults: HashMap::from([("test_job".to_string(), (3_u32, 100_u64))]),
+            };
             rt.block_on(async {
                 client
                     .enqueue_after_commit("test_job", serde_json::json!({}))
