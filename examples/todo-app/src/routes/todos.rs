@@ -340,7 +340,11 @@ pub async fn detail(
 
     // ETag: hash of (created_at_unix, completed flag).
     // Deterministic: same state ⇒ same ETag on every replica.
-    let etag_input = format!("{}-{}", todo.created_at.and_utc().timestamp(), todo.completed);
+    let etag_input = format!(
+        "{}-{}",
+        todo.created_at.and_utc().timestamp(),
+        todo.completed
+    );
     let fw = fresh_when(&headers, etag_input.as_str());
 
     Ok(fw.or(detail_view(&todo, csrf.as_ref().map(CsrfToken::token))))

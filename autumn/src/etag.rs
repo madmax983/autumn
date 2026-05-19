@@ -424,7 +424,9 @@ fn not_modified_response(
     {
         headers.insert(LAST_MODIFIED, v);
     }
-    builder.body(Body::empty()).expect("304 body is always valid")
+    builder
+        .body(Body::empty())
+        .expect("304 body is always valid")
 }
 
 fn http_date(dt: chrono::DateTime<chrono::Utc>) -> String {
@@ -436,12 +438,15 @@ fn parse_http_date(s: &str) -> Option<std::time::SystemTime> {
     chrono::DateTime::parse_from_rfc2822(s)
         .map(|dt| std::time::SystemTime::from(dt.with_timezone(&chrono::Utc)))
         .or_else(|_| {
-            chrono::NaiveDateTime::parse_from_str(s.trim_end_matches(" GMT"), "%a, %d %b %Y %H:%M:%S")
-                .map(|ndt| {
-                    std::time::SystemTime::from(
-                        chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(ndt, chrono::Utc),
-                    )
-                })
+            chrono::NaiveDateTime::parse_from_str(
+                s.trim_end_matches(" GMT"),
+                "%a, %d %b %Y %H:%M:%S",
+            )
+            .map(|ndt| {
+                std::time::SystemTime::from(
+                    chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(ndt, chrono::Utc),
+                )
+            })
         })
         .ok()
 }
@@ -837,7 +842,10 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         let etag_header = response.headers().get(ETAG);
-        assert!(etag_header.is_some(), "ETag header must be set on stale response");
+        assert!(
+            etag_header.is_some(),
+            "ETag header must be set on stale response"
+        );
     }
 
     #[test]
@@ -848,15 +856,15 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(IF_NONE_MATCH, etag.header_value());
 
-        let response = fresh_when(&headers, 5_i64).or(StatusCode::OK).into_response();
+        let response = fresh_when(&headers, 5_i64)
+            .or(StatusCode::OK)
+            .into_response();
 
         assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
 
         // Body must be empty.
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let bytes = rt.block_on(async {
-            response.into_body().collect().await.unwrap().to_bytes()
-        });
+        let bytes = rt.block_on(async { response.into_body().collect().await.unwrap().to_bytes() });
         assert!(bytes.is_empty(), "304 body must be empty, got {bytes:?}");
     }
 
@@ -867,7 +875,9 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(IF_NONE_MATCH, etag_val.clone());
 
-        let response = fresh_when(&headers, 3_i64).or(StatusCode::OK).into_response();
+        let response = fresh_when(&headers, 3_i64)
+            .or(StatusCode::OK)
+            .into_response();
 
         assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
         assert_eq!(response.headers().get(ETAG), Some(&etag_val));
@@ -930,10 +940,7 @@ mod tests {
         let ims_str = http_date(ims_time);
 
         let mut headers = HeaderMap::new();
-        headers.insert(
-            IF_MODIFIED_SINCE,
-            HeaderValue::from_str(&ims_str).unwrap(),
-        );
+        headers.insert(IF_MODIFIED_SINCE, HeaderValue::from_str(&ims_str).unwrap());
 
         // fresh_when only checks If-None-Match. If-Modified-Since fallback
         // is a separate concern handled by check_if_modified_since with last_modified.
@@ -1154,7 +1161,12 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
         assert_eq!(
-            response.headers().get(CACHE_CONTROL).unwrap().to_str().unwrap(),
+            response
+                .headers()
+                .get(CACHE_CONTROL)
+                .unwrap()
+                .to_str()
+                .unwrap(),
             "no-cache"
         );
         assert_eq!(
@@ -1169,8 +1181,8 @@ mod tests {
 
     #[tokio::test]
     async fn integration_first_get_200_second_get_304() {
-        use std::sync::atomic::{AtomicI64, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicI64, Ordering};
 
         let lock_version = Arc::new(AtomicI64::new(1));
         let lv = Arc::clone(&lock_version);

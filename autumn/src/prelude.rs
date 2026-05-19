@@ -97,14 +97,14 @@ pub use http::StatusCode;
 pub use crate::etag::ETag;
 /// Tower middleware that auto-derives weak `ETag`s from response bodies.
 pub use crate::etag::EtagLayer;
-/// Derive a weak `ETag` from any [`Hash`] value.
-pub use crate::etag::hash_etag;
+/// The outcome of a `fresh_when` call — call `.or(response)` to resolve.
+pub use crate::etag::FreshWhen;
 /// Conversion trait — implemented for `String`, `&str`, `i64`, `(NaiveDateTime, i64)`, `ETag`.
 pub use crate::etag::IntoETag;
 /// One-liner conditional-GET helper; returns a [`FreshWhen`] resolved with `.or(response)`.
 pub use crate::etag::fresh_when;
-/// The outcome of a `fresh_when` call — call `.or(response)` to resolve.
-pub use crate::etag::FreshWhen;
+/// Derive a weak `ETag` from any [`Hash`] value.
+pub use crate::etag::hash_etag;
 
 // ── Error handling ───────────────────────────────────────────────
 /// Structured audit event types.
