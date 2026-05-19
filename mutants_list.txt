@@ -1,0 +1,205 @@
+autumn/src/pagination.rs:223:9: replace PageRequest::page -> u32 with 0
+autumn/src/pagination.rs:223:9: replace PageRequest::page -> u32 with 1
+autumn/src/pagination.rs:224:24: replace match guard p >= 1 with true in PageRequest::page
+autumn/src/pagination.rs:224:24: replace match guard p >= 1 with false in PageRequest::page
+autumn/src/pagination.rs:224:26: replace >= with < in PageRequest::page
+autumn/src/pagination.rs:232:9: replace PageRequest::size -> u32 with 0
+autumn/src/pagination.rs:232:9: replace PageRequest::size -> u32 with 1
+autumn/src/pagination.rs:234:24: replace match guard s > MAX_PAGE_SIZE with true in PageRequest::size
+autumn/src/pagination.rs:234:24: replace match guard s > MAX_PAGE_SIZE with false in PageRequest::size
+autumn/src/pagination.rs:234:26: replace > with == in PageRequest::size
+autumn/src/pagination.rs:234:26: replace > with < in PageRequest::size
+autumn/src/pagination.rs:234:26: replace > with >= in PageRequest::size
+autumn/src/pagination.rs:242:9: replace PageRequest::limit -> i64 with 0
+autumn/src/pagination.rs:242:9: replace PageRequest::limit -> i64 with 1
+autumn/src/pagination.rs:242:9: replace PageRequest::limit -> i64 with -1
+autumn/src/pagination.rs:248:9: replace PageRequest::offset -> i64 with 0
+autumn/src/pagination.rs:248:9: replace PageRequest::offset -> i64 with 1
+autumn/src/pagination.rs:248:9: replace PageRequest::offset -> i64 with -1
+autumn/src/pagination.rs:248:36: replace * with + in PageRequest::offset
+autumn/src/pagination.rs:248:36: replace * with / in PageRequest::offset
+autumn/src/pagination.rs:248:23: replace - with + in PageRequest::offset
+autumn/src/pagination.rs:248:23: replace - with / in PageRequest::offset
+autumn/src/pagination.rs:263:9: replace <impl FromRequestParts<S> for PageRequest>::from_request_parts -> Result<Self, Self::Rejection> with Ok(Default::default())
+autumn/src/pagination.rs:272:5: replace parse_query -> PageRequest with Default::default()
+autumn/src/pagination.rs:275:13: delete match arm "page" in parse_query
+autumn/src/pagination.rs:280:13: delete match arm "size" in parse_query
+autumn/src/pagination.rs:371:9: replace Page<T>::empty -> Self with Default::default()
+autumn/src/pagination.rs:379:9: replace Page<T>::map -> Page<U> with Page::new()
+autumn/src/pagination.rs:379:9: replace Page<T>::map -> Page<U> with Page::from_iter([Default::default()])
+autumn/src/pagination.rs:379:9: replace Page<T>::map -> Page<U> with Page::new(Default::default())
+autumn/src/pagination.rs:379:9: replace Page<T>::map -> Page<U> with Page::from(Default::default())
+autumn/src/pagination.rs:404:5: replace base64url_encode -> String with String::new()
+autumn/src/pagination.rs:404:5: replace base64url_encode -> String with "xyzzy".into()
+autumn/src/pagination.rs:407:74: replace | with & in base64url_encode
+autumn/src/pagination.rs:407:74: replace | with ^ in base64url_encode
+autumn/src/pagination.rs:407:45: replace | with & in base64url_encode
+autumn/src/pagination.rs:407:45: replace | with ^ in base64url_encode
+autumn/src/pagination.rs:407:38: replace << with >> in base64url_encode
+autumn/src/pagination.rs:407:68: replace << with >> in base64url_encode
+autumn/src/pagination.rs:408:48: replace & with | in base64url_encode
+autumn/src/pagination.rs:408:48: replace & with ^ in base64url_encode
+autumn/src/pagination.rs:408:41: replace >> with << in base64url_encode
+autumn/src/pagination.rs:409:48: replace & with | in base64url_encode
+autumn/src/pagination.rs:409:48: replace & with ^ in base64url_encode
+autumn/src/pagination.rs:409:41: replace >> with << in base64url_encode
+autumn/src/pagination.rs:410:47: replace & with | in base64url_encode
+autumn/src/pagination.rs:410:47: replace & with ^ in base64url_encode
+autumn/src/pagination.rs:410:41: replace >> with << in base64url_encode
+autumn/src/pagination.rs:411:40: replace & with | in base64url_encode
+autumn/src/pagination.rs:411:40: replace & with ^ in base64url_encode
+autumn/src/pagination.rs:415:9: delete match arm 0 in base64url_encode
+autumn/src/pagination.rs:416:9: delete match arm 1 in base64url_encode
+autumn/src/pagination.rs:421:9: delete match arm 2 in base64url_encode
+autumn/src/pagination.rs:417:39: replace << with >> in base64url_encode
+autumn/src/pagination.rs:418:52: replace & with | in base64url_encode
+autumn/src/pagination.rs:418:52: replace & with ^ in base64url_encode
+autumn/src/pagination.rs:418:45: replace >> with << in base64url_encode
+autumn/src/pagination.rs:419:52: replace & with | in base64url_encode
+autumn/src/pagination.rs:419:52: replace & with ^ in base64url_encode
+autumn/src/pagination.rs:419:45: replace >> with << in base64url_encode
+autumn/src/pagination.rs:422:47: replace | with & in base64url_encode
+autumn/src/pagination.rs:422:47: replace | with ^ in base64url_encode
+autumn/src/pagination.rs:422:40: replace << with >> in base64url_encode
+autumn/src/pagination.rs:422:68: replace << with >> in base64url_encode
+autumn/src/pagination.rs:423:52: replace & with | in base64url_encode
+autumn/src/pagination.rs:423:52: replace & with ^ in base64url_encode
+autumn/src/pagination.rs:423:45: replace >> with << in base64url_encode
+autumn/src/pagination.rs:424:52: replace & with | in base64url_encode
+autumn/src/pagination.rs:424:52: replace & with ^ in base64url_encode
+autumn/src/pagination.rs:424:45: replace >> with << in base64url_encode
+autumn/src/pagination.rs:425:51: replace & with | in base64url_encode
+autumn/src/pagination.rs:425:51: replace & with ^ in base64url_encode
+autumn/src/pagination.rs:425:45: replace >> with << in base64url_encode
+autumn/src/pagination.rs:433:5: replace base64url_decode -> Option<Vec<u8>> with None
+autumn/src/pagination.rs:433:5: replace base64url_decode -> Option<Vec<u8>> with Some(vec![])
+autumn/src/pagination.rs:433:5: replace base64url_decode -> Option<Vec<u8>> with Some(vec![0])
+autumn/src/pagination.rs:433:5: replace base64url_decode -> Option<Vec<u8>> with Some(vec![1])
+autumn/src/pagination.rs:436:13: delete match arm b'A'..= b'Z' in base64url_decode
+autumn/src/pagination.rs:437:13: delete match arm b'a'..= b'z' in base64url_decode
+autumn/src/pagination.rs:438:13: delete match arm b'0'..= b'9' in base64url_decode
+autumn/src/pagination.rs:439:13: delete match arm b'-' in base64url_decode
+autumn/src/pagination.rs:440:13: delete match arm b'_' in base64url_decode
+autumn/src/pagination.rs:436:45: replace - with + in base64url_decode
+autumn/src/pagination.rs:436:45: replace - with / in base64url_decode
+autumn/src/pagination.rs:437:53: replace + with - in base64url_decode
+autumn/src/pagination.rs:437:53: replace + with * in base64url_decode
+autumn/src/pagination.rs:437:45: replace - with + in base64url_decode
+autumn/src/pagination.rs:437:45: replace - with / in base64url_decode
+autumn/src/pagination.rs:438:53: replace + with - in base64url_decode
+autumn/src/pagination.rs:438:53: replace + with * in base64url_decode
+autumn/src/pagination.rs:438:45: replace - with + in base64url_decode
+autumn/src/pagination.rs:438:45: replace - with / in base64url_decode
+autumn/src/pagination.rs:446:17: replace <= with > in base64url_decode
+autumn/src/pagination.rs:446:13: replace + with - in base64url_decode
+autumn/src/pagination.rs:446:13: replace + with * in base64url_decode
+autumn/src/pagination.rs:450:13: replace | with & in base64url_decode
+autumn/src/pagination.rs:450:13: replace | with ^ in base64url_decode
+autumn/src/pagination.rs:449:13: replace | with & in base64url_decode
+autumn/src/pagination.rs:449:13: replace | with ^ in base64url_decode
+autumn/src/pagination.rs:448:13: replace | with & in base64url_decode
+autumn/src/pagination.rs:448:13: replace | with ^ in base64url_decode
+autumn/src/pagination.rs:447:35: replace << with >> in base64url_decode
+autumn/src/pagination.rs:448:37: replace << with >> in base64url_decode
+autumn/src/pagination.rs:448:30: replace + with - in base64url_decode
+autumn/src/pagination.rs:448:30: replace + with * in base64url_decode
+autumn/src/pagination.rs:449:37: replace << with >> in base64url_decode
+autumn/src/pagination.rs:449:30: replace + with - in base64url_decode
+autumn/src/pagination.rs:449:30: replace + with * in base64url_decode
+autumn/src/pagination.rs:450:29: replace + with - in base64url_decode
+autumn/src/pagination.rs:450:29: replace + with * in base64url_decode
+autumn/src/pagination.rs:451:41: replace & with | in base64url_decode
+autumn/src/pagination.rs:451:41: replace & with ^ in base64url_decode
+autumn/src/pagination.rs:451:34: replace >> with << in base64url_decode
+autumn/src/pagination.rs:452:40: replace & with | in base64url_decode
+autumn/src/pagination.rs:452:40: replace & with ^ in base64url_decode
+autumn/src/pagination.rs:452:34: replace >> with << in base64url_decode
+autumn/src/pagination.rs:453:33: replace & with | in base64url_decode
+autumn/src/pagination.rs:453:33: replace & with ^ in base64url_decode
+autumn/src/pagination.rs:454:11: replace += with -= in base64url_decode
+autumn/src/pagination.rs:454:11: replace += with *= in base64url_decode
+autumn/src/pagination.rs:457:9: delete match arm 0 in base64url_decode
+autumn/src/pagination.rs:458:9: delete match arm 1 in base64url_decode
+autumn/src/pagination.rs:459:9: delete match arm 2 in base64url_decode
+autumn/src/pagination.rs:463:9: delete match arm 3 in base64url_decode
+autumn/src/pagination.rs:456:23: replace - with + in base64url_decode
+autumn/src/pagination.rs:456:23: replace - with / in base64url_decode
+autumn/src/pagination.rs:460:46: replace | with & in base64url_decode
+autumn/src/pagination.rs:460:46: replace | with ^ in base64url_decode
+autumn/src/pagination.rs:460:39: replace << with >> in base64url_decode
+autumn/src/pagination.rs:460:70: replace << with >> in base64url_decode
+autumn/src/pagination.rs:460:63: replace + with - in base64url_decode
+autumn/src/pagination.rs:460:63: replace + with * in base64url_decode
+autumn/src/pagination.rs:461:45: replace & with | in base64url_decode
+autumn/src/pagination.rs:461:45: replace & with ^ in base64url_decode
+autumn/src/pagination.rs:461:38: replace >> with << in base64url_decode
+autumn/src/pagination.rs:466:17: replace | with & in base64url_decode
+autumn/src/pagination.rs:466:17: replace | with ^ in base64url_decode
+autumn/src/pagination.rs:465:17: replace | with & in base64url_decode
+autumn/src/pagination.rs:465:17: replace | with ^ in base64url_decode
+autumn/src/pagination.rs:464:39: replace << with >> in base64url_decode
+autumn/src/pagination.rs:465:41: replace << with >> in base64url_decode
+autumn/src/pagination.rs:465:34: replace + with - in base64url_decode
+autumn/src/pagination.rs:465:34: replace + with * in base64url_decode
+autumn/src/pagination.rs:466:41: replace << with >> in base64url_decode
+autumn/src/pagination.rs:466:34: replace + with - in base64url_decode
+autumn/src/pagination.rs:466:34: replace + with * in base64url_decode
+autumn/src/pagination.rs:467:45: replace & with | in base64url_decode
+autumn/src/pagination.rs:467:45: replace & with ^ in base64url_decode
+autumn/src/pagination.rs:467:38: replace >> with << in base64url_decode
+autumn/src/pagination.rs:468:44: replace & with | in base64url_decode
+autumn/src/pagination.rs:468:44: replace & with ^ in base64url_decode
+autumn/src/pagination.rs:468:38: replace >> with << in base64url_decode
+autumn/src/pagination.rs:504:9: replace Cursor::encode -> Result<String, serde_json::Error> with Ok(String::new())
+autumn/src/pagination.rs:504:9: replace Cursor::encode -> Result<String, serde_json::Error> with Ok("xyzzy".into())
+autumn/src/pagination.rs:516:9: replace Cursor::decode -> Option<T> with None
+autumn/src/pagination.rs:516:9: replace Cursor::decode -> Option<T> with Some(Default::default())
+autumn/src/pagination.rs:538:9: replace Cursor::encode_signed -> Result<String, serde_json::Error> with Ok(String::new())
+autumn/src/pagination.rs:538:9: replace Cursor::encode_signed -> Result<String, serde_json::Error> with Ok("xyzzy".into())
+autumn/src/pagination.rs:556:9: replace Cursor::decode_signed -> Option<T> with None
+autumn/src/pagination.rs:556:9: replace Cursor::decode_signed -> Option<T> with Some(Default::default())
+autumn/src/pagination.rs:559:12: delete ! in Cursor::decode_signed
+autumn/src/pagination.rs:568:5: replace hmac_sha256 -> [u8; 32] with [0; 32]
+autumn/src/pagination.rs:568:5: replace hmac_sha256 -> [u8; 32] with [1; 32]
+autumn/src/pagination.rs:577:5: replace constant_time_eq -> bool with true
+autumn/src/pagination.rs:577:5: replace constant_time_eq -> bool with false
+autumn/src/pagination.rs:625:9: replace CursorRequest::cursor -> Option<&str> with None
+autumn/src/pagination.rs:625:9: replace CursorRequest::cursor -> Option<&str> with Some("")
+autumn/src/pagination.rs:625:9: replace CursorRequest::cursor -> Option<&str> with Some("xyzzy")
+autumn/src/pagination.rs:634:9: replace CursorRequest::decode -> Option<T> with None
+autumn/src/pagination.rs:634:9: replace CursorRequest::decode -> Option<T> with Some(Default::default())
+autumn/src/pagination.rs:645:9: replace CursorRequest::decode_signed -> Option<T> with None
+autumn/src/pagination.rs:645:9: replace CursorRequest::decode_signed -> Option<T> with Some(Default::default())
+autumn/src/pagination.rs:651:9: replace CursorRequest::size -> u32 with 0
+autumn/src/pagination.rs:651:9: replace CursorRequest::size -> u32 with 1
+autumn/src/pagination.rs:653:24: replace match guard s > MAX_PAGE_SIZE with true in CursorRequest::size
+autumn/src/pagination.rs:653:24: replace match guard s > MAX_PAGE_SIZE with false in CursorRequest::size
+autumn/src/pagination.rs:653:26: replace > with == in CursorRequest::size
+autumn/src/pagination.rs:653:26: replace > with < in CursorRequest::size
+autumn/src/pagination.rs:653:26: replace > with >= in CursorRequest::size
+autumn/src/pagination.rs:661:9: replace CursorRequest::limit -> i64 with 0
+autumn/src/pagination.rs:661:9: replace CursorRequest::limit -> i64 with 1
+autumn/src/pagination.rs:661:9: replace CursorRequest::limit -> i64 with -1
+autumn/src/pagination.rs:671:9: replace CursorRequest::fetch_limit -> i64 with 0
+autumn/src/pagination.rs:671:9: replace CursorRequest::fetch_limit -> i64 with 1
+autumn/src/pagination.rs:671:9: replace CursorRequest::fetch_limit -> i64 with -1
+autumn/src/pagination.rs:671:28: replace + with - in CursorRequest::fetch_limit
+autumn/src/pagination.rs:671:28: replace + with * in CursorRequest::fetch_limit
+autumn/src/pagination.rs:682:9: replace <impl FromRequestParts<S> for CursorRequest>::from_request_parts -> Result<Self, Self::Rejection> with Ok(Default::default())
+autumn/src/pagination.rs:694:5: replace parse_cursor_query -> CursorRequest with Default::default()
+autumn/src/pagination.rs:700:13: delete match arm "size" in parse_cursor_query
+autumn/src/pagination.rs:697:25: replace match guard !value.is_empty() with true in parse_cursor_query
+autumn/src/pagination.rs:697:25: replace match guard !value.is_empty() with false in parse_cursor_query
+autumn/src/pagination.rs:697:25: delete ! in parse_cursor_query
+autumn/src/pagination.rs:770:9: replace CursorPage<T>::from_overfetched -> Self with Default::default()
+autumn/src/pagination.rs:795:9: replace CursorPage<T>::from_overfetched_signed -> Self with Default::default()
+autumn/src/pagination.rs:811:9: replace CursorPage<T>::from_overfetched_inner -> Self with Default::default()
+autumn/src/pagination.rs:813:36: replace > with == in CursorPage<T>::from_overfetched_inner
+autumn/src/pagination.rs:813:36: replace > with < in CursorPage<T>::from_overfetched_inner
+autumn/src/pagination.rs:813:36: replace > with >= in CursorPage<T>::from_overfetched_inner
+autumn/src/pagination.rs:828:33: replace && with || in CursorPage<T>::from_overfetched_inner
+autumn/src/pagination.rs:842:9: replace CursorPage<T>::empty -> Self with Default::default()
+autumn/src/pagination.rs:852:9: replace CursorPage<T>::map -> CursorPage<U> with CursorPage::new()
+autumn/src/pagination.rs:852:9: replace CursorPage<T>::map -> CursorPage<U> with CursorPage::from_iter([Default::default()])
+autumn/src/pagination.rs:852:9: replace CursorPage<T>::map -> CursorPage<U> with CursorPage::new(Default::default())
+autumn/src/pagination.rs:852:9: replace CursorPage<T>::map -> CursorPage<U> with CursorPage::from(Default::default())

@@ -1728,3 +1728,71 @@ mod tests {
         assert!(res_signed.is_err());
     }
 }
+
+#[cfg(test)]
+mod tests_from_overfetched_inner {
+    use super::*;
+
+    #[test]
+    fn test_from_overfetched_inner_empty() {
+        let req = CursorRequest::new(None, 2);
+        let items: Vec<i32> = vec![];
+        let page = CursorPage::from_overfetched_inner(items, &req, |&n| n, |_| None::<String>);
+        assert_eq!(page.content, Vec::<i32>::new());
+        assert_eq!(page.size, 2);
+        assert!(!page.has_next);
+        assert!(page.next_cursor.is_none());
+    }
+
+    #[test]
+    fn test_from_overfetched_inner_under_limit() {
+        let req = CursorRequest::new(None, 2);
+        let items = vec![1];
+        let page = CursorPage::from_overfetched_inner(items, &req, |&n| n, |_| None::<String>);
+        assert_eq!(page.content, vec![1]);
+        assert_eq!(page.size, 2);
+        assert!(!page.has_next);
+        assert!(page.next_cursor.is_none());
+    }
+}
+
+#[cfg(test)]
+mod tests_additional {
+    use super::*;
+
+    #[test]
+    fn cursor_page_from_overfetched_handles_encoding_failure_sets_has_next_false() {
+        let req = CursorRequest::new(None, 2);
+        let items = vec![1, 2, 3]; // overfetched
+
+        let page = CursorPage::from_overfetched_inner(
+            items,
+            &req,
+            |&n| n,
+            |_| None::<String>, // force encoding failure
+        );
+
+        // This fails if && was replaced with ||, because has_next (true) || false -> true
+        // But we want it to be false.
+        assert!(
+            !page.has_next,
+            "has_next should be false when encoding fails"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests_from_overfetched_inner_bounds {
+    use super::*;
+
+    #[test]
+    fn test_from_overfetched_inner_exact_limit() {
+        let req = CursorRequest::new(None, 2);
+        let items = vec![1, 2];
+        let page = CursorPage::from_overfetched_inner(items, &req, |&n| n, |n| Some(n.to_string()));
+        assert_eq!(page.content, vec![1, 2]);
+        assert_eq!(page.size, 2);
+        assert!(!page.has_next);
+        assert!(page.next_cursor.is_none());
+    }
+}
