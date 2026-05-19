@@ -967,6 +967,7 @@ pub fn serve_router(store: &LocalBlobStore) -> axum::Router<crate::AppState> {
 
     #[derive(Debug, serde::Deserialize)]
     struct UploadQuery {
+        upload: i32,
         ct: String,
         exp: u64,
         sig: String,
@@ -1004,7 +1005,7 @@ pub fn serve_router(store: &LocalBlobStore) -> axum::Router<crate::AppState> {
     let store_for_upload = store.clone();
     let upload_handler = move |Path(blob_key): Path<String>,
                                Query(q): Query<UploadQuery>,
-                               body: bytes::Bytes| {
+                               body: axum::body::Body| {
         let store = store_for_upload.clone();
         async move {
             if let Err(err) = verify_upload_with_rotation(
@@ -1017,7 +1018,17 @@ pub fn serve_router(store: &LocalBlobStore) -> axum::Router<crate::AppState> {
             ) {
                 return (StatusCode::FORBIDDEN, err.to_string()).into_response();
             }
-            match store.put(&blob_key, &q.ct, body).await {
+
+            use futures::StreamExt;
+            let stream = body.into_data_stream();
+            let byte_stream = Box::pin(
+                stream.map(|item| match item {
+                    Ok(bytes) => Ok(bytes),
+                    Err(e) => Err(crate::storage::BlobStoreError::Io(e.to_string())),
+                })
+            );
+
+            match store.put_stream(&blob_key, &q.ct, byte_stream).await {
                 Ok(_blob) => StatusCode::OK.into_response(),
                 Err(err) => err.into_autumn_error().into_response(),
             }

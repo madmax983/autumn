@@ -47,7 +47,7 @@ use super::{Blob, BlobMeta, BlobStore, BlobStoreError};
 /// Returned by [`BlobStore::presign_put`]. Hand the whole struct to your
 /// frontend (e.g., via a JSON endpoint) so it can start the upload without
 /// routing bytes through your Autumn process.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct PresignPutResult {
     /// URL the browser should send the PUT request to.
     pub url: String,
