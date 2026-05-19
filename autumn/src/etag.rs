@@ -702,7 +702,20 @@ async fn apply_etag(response: Response<Body>, if_none_match: Option<&str>) -> Re
     }
 
     if stream_errored {
-        return Response::from_parts(parts, Body::from(buf.freeze()));
+        // Surface the error so clients/caches see a truncated response rather
+        // than silently-complete partial data.  Deliver any bytes already
+        // buffered, then inject an error frame to close the body abnormally.
+        let frozen = buf.freeze();
+        let err = axum::Error::new(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "upstream body error during ETag buffering",
+        ));
+        let frames: Vec<Result<bytes::Bytes, axum::Error>> = if frozen.is_empty() {
+            vec![Err(err)]
+        } else {
+            vec![Ok(frozen), Err(err)]
+        };
+        return Response::from_parts(parts, Body::from_stream(futures::stream::iter(frames)));
     }
     if let Some(overflow) = overflow_frame {
         return Response::from_parts(parts, rebuild_oversized_body(buf.freeze(), overflow, body));
