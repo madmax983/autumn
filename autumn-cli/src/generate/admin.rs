@@ -228,7 +228,9 @@ const fn admin_field_kind(field: &Field) -> &'static str {
         FieldKind::Bool => "AdminFieldKind::Boolean",
         FieldKind::F32 | FieldKind::F64 => "AdminFieldKind::Float",
         FieldKind::NaiveDateTime | FieldKind::DateTime => "AdminFieldKind::DateTime",
-        FieldKind::Bytea => "AdminFieldKind::Hidden",
+        // Bytea and Attachment both render as hidden in the admin panel —
+        // binary blobs and file metadata aren't suitable for direct inline editing.
+        FieldKind::Bytea | FieldKind::Attachment => "AdminFieldKind::Hidden",
     }
 }
 

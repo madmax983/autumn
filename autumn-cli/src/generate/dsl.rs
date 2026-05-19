@@ -79,10 +79,24 @@ pub enum FieldKind {
     DateTime,
     /// `Vec<u8>` / `Bytea` — `BYTEA`.
     Bytea,
+    /// `Blob` stored as `JSONB` — a file attachment with direct-upload support.
+    ///
+    /// Maps to a Postgres `JSONB` column that stores the [`autumn_web::storage::Blob`]
+    /// metadata (key, content-type, byte-size, etag). The bytes themselves live
+    /// in the configured storage backend (local disk or S3-compatible).
+    ///
+    /// Always emitted as `Option<autumn_web::storage::Blob>` in the model struct
+    /// so the attachment is optional by default. Wrap in `Option<Attachment>` to
+    /// be explicit, or leave as `Attachment` (equivalent: nullable is the default
+    /// and safe choice for file fields).
+    Attachment,
 }
 
 impl FieldKind {
     /// Rust type token used inside `#[model]` structs.
+    ///
+    /// For [`Attachment`](Self::Attachment), always returns the inner `Blob`
+    /// type. Nullability wrapping (`Option<…>`) is applied by [`Field::rust_type`].
     #[must_use]
     pub const fn rust_type(self) -> &'static str {
         match self {
@@ -96,6 +110,7 @@ impl FieldKind {
             Self::NaiveDateTime => "chrono::NaiveDateTime",
             Self::DateTime => "chrono::DateTime<chrono::Utc>",
             Self::Bytea => "Vec<u8>",
+            Self::Attachment => "autumn_web::storage::Blob",
         }
     }
 
@@ -113,6 +128,7 @@ impl FieldKind {
             Self::NaiveDateTime => "Timestamp",
             Self::DateTime => "Timestamptz",
             Self::Bytea => "Bytea",
+            Self::Attachment => "Jsonb",
         }
     }
 
@@ -130,13 +146,23 @@ impl FieldKind {
             Self::NaiveDateTime => "TIMESTAMP",
             Self::DateTime => "TIMESTAMPTZ",
             Self::Bytea => "BYTEA",
+            Self::Attachment => "JSONB",
         }
+    }
+
+    /// Returns `true` for field kinds that represent file attachments (blobs).
+    ///
+    /// Used by the scaffold generator to detect fields that need multipart
+    /// upload handling instead of the standard form-encoded path.
+    #[must_use]
+    pub const fn is_attachment(self) -> bool {
+        matches!(self, Self::Attachment)
     }
 }
 
 /// Comma-separated list of supported types, for error messages and `--help`.
 pub const SUPPORTED_TYPES: &str = "String, Text, i32, i64, bool, f32, f64, \
-    Uuid, NaiveDateTime, DateTime, Vec<u8>, Bytea, Option<…>";
+    Uuid, NaiveDateTime, DateTime, Vec<u8>, Bytea, Attachment, Option<…>";
 
 /// Parse a single CLI token of the form `name:Type`.
 ///
@@ -215,7 +241,13 @@ fn parse_type(ty: &str) -> Option<(FieldKind, bool)> {
         let kind = atomic_type(inner.trim())?;
         Some((kind, true))
     } else {
-        atomic_type(ty).map(|k| (k, false))
+        atomic_type(ty).map(|k| {
+            // Attachment fields are always nullable: a file attachment is
+            // almost universally optional (a post might not have a cover image),
+            // and `Option<Blob>` is the idiomatic Rust representation.
+            let nullable = matches!(k, FieldKind::Attachment);
+            (k, nullable)
+        })
     }
 }
 
@@ -232,6 +264,10 @@ fn atomic_type(ty: &str) -> Option<FieldKind> {
         "NaiveDateTime" => Some(FieldKind::NaiveDateTime),
         "DateTime" => Some(FieldKind::DateTime),
         "Bytea" => Some(FieldKind::Bytea),
+        // Attachment / attachment: file-attachment blob stored as JSONB.
+        // Accept both casing variants so `cover_image:Attachment` and
+        // `cover_image:attachment` both work.
+        "Attachment" | "attachment" => Some(FieldKind::Attachment),
         _ => {
             // Allow `Vec<u8>` as a synonym for `Bytea`.
             strip_wrapper(ty, "Vec").and_then(|inner| {
@@ -441,5 +477,73 @@ mod tests {
         let f = parse_field(" name : String ").unwrap();
         assert_eq!(f.name, "name");
         assert_eq!(f.kind, FieldKind::String);
+    }
+
+    // ── RED: Attachment field kind ──────────────────────────────────────────
+
+    #[test]
+    fn parse_attachment_pascal() {
+        let f = parse_field("cover_image:Attachment").unwrap();
+        assert_eq!(f.kind, FieldKind::Attachment);
+        assert!(f.nullable, "attachment fields must default to nullable");
+    }
+
+    #[test]
+    fn parse_attachment_lowercase() {
+        let f = parse_field("cover_image:attachment").unwrap();
+        assert_eq!(f.kind, FieldKind::Attachment);
+    }
+
+    #[test]
+    fn attachment_rust_type_is_blob() {
+        let f = parse_field("cover_image:Attachment").unwrap();
+        assert_eq!(f.rust_type(), "Option<autumn_web::storage::Blob>");
+    }
+
+    #[test]
+    fn attachment_sql_type_is_jsonb() {
+        let f = parse_field("cover_image:Attachment").unwrap();
+        assert_eq!(f.sql_type(), "JSONB");
+    }
+
+    #[test]
+    fn attachment_schema_type_is_jsonb() {
+        let f = parse_field("cover_image:Attachment").unwrap();
+        assert_eq!(f.schema_type(), "Nullable<Jsonb>");
+    }
+
+    #[test]
+    fn attachment_is_attachment_returns_true() {
+        assert!(FieldKind::Attachment.is_attachment());
+        assert!(!FieldKind::String.is_attachment());
+        assert!(!FieldKind::Uuid.is_attachment());
+    }
+
+    #[test]
+    fn optional_attachment_parses() {
+        let f = parse_field("avatar:Option<Attachment>").unwrap();
+        assert_eq!(f.kind, FieldKind::Attachment);
+        assert!(f.nullable);
+        assert_eq!(f.rust_type(), "Option<autumn_web::storage::Blob>");
+    }
+
+    #[test]
+    fn attachment_in_list_of_fields() {
+        let tokens = vec![
+            "title:String".into(),
+            "cover_image:Attachment".into(),
+            "count:i64".into(),
+        ];
+        let fields = parse_fields(&tokens).unwrap();
+        assert_eq!(fields.len(), 3);
+        assert_eq!(fields[1].kind, FieldKind::Attachment);
+    }
+
+    #[test]
+    fn attachment_appears_in_supported_types_constant() {
+        assert!(
+            SUPPORTED_TYPES.contains("Attachment"),
+            "SUPPORTED_TYPES must list Attachment"
+        );
     }
 }

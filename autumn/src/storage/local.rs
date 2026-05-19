@@ -17,7 +17,7 @@ use http::StatusCode;
 use sha2::{Digest, Sha256};
 
 use super::blob::{Blob, BlobMeta};
-use super::{BlobFuture, BlobStore, BlobStoreError, ByteStream, validate_key};
+use super::{BlobFuture, BlobStore, BlobStoreError, ByteStream, direct_upload::PresignPutResult, validate_key};
 
 /// HMAC signing key used by the local backend.
 ///
@@ -458,6 +458,162 @@ impl BlobStore for LocalBlobStore {
             Ok(url)
         })
     }
+
+    fn presign_put<'a>(
+        &'a self,
+        key: &'a str,
+        content_type: &'a str,
+        expires_in: Duration,
+    ) -> BlobFuture<'a, PresignPutResult> {
+        Box::pin(async move {
+            validate_key(key)?;
+            let expires_in = if expires_in.is_zero() {
+                self.inner.default_expiry
+            } else {
+                expires_in
+            };
+            let exp_at = SystemTime::now()
+                .checked_add(expires_in)
+                .unwrap_or(UNIX_EPOCH)
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+
+            // Sign over "upload:{key}:{content_type}:{exp}" — the "upload:" prefix
+            // ensures upload tokens cannot be confused with download tokens which sign
+            // over "{key}:{exp}" only.
+            let signature =
+                sign_upload(self.inner.signing_key.as_bytes(), key, content_type, exp_at);
+            let encoded_key = encode_key_path(key);
+            let encoded_ct = encode_query_value(content_type);
+            let url = format!(
+                "{base}/{encoded_key}?upload=1&ct={encoded_ct}&exp={exp_at}&sig={signature}",
+                base = self.inner.mount_path.trim_end_matches('/'),
+            );
+            Ok(PresignPutResult {
+                url,
+                method: "PUT".to_owned(),
+                headers: std::collections::HashMap::new(),
+                expires_in,
+            })
+        })
+    }
+}
+
+/// Compute the upload signature for `(key, content_type, expiry)`.
+///
+/// Distinct from the download [`sign`] by the `"upload:"` prefix — ensures a
+/// presigned download URL cannot be replayed as an upload token.
+///
+/// # Panics
+///
+/// Never; `Hmac::new_from_slice` accepts any key length.
+#[must_use]
+pub fn sign_upload(
+    key_bytes: &[u8],
+    blob_key: &str,
+    content_type: &str,
+    expires_at: u64,
+) -> String {
+    use hmac::{Hmac, Mac};
+    let mut mac =
+        <Hmac<Sha256> as Mac>::new_from_slice(key_bytes).expect("HMAC accepts any key length");
+    mac.update(b"upload:");
+    mac.update(blob_key.as_bytes());
+    mac.update(b":");
+    mac.update(content_type.as_bytes());
+    mac.update(b":");
+    mac.update(expires_at.to_string().as_bytes());
+    hex(mac.finalize().into_bytes())
+}
+
+/// Verify an upload token `(key, content_type, expiry, signature)`.
+///
+/// Returns `Ok(())` when the signature matches and `expires_at` is still in
+/// the future.
+///
+/// # Errors
+///
+/// Returns [`BlobStoreError::Signature`] for malformed, expired, or mismatched
+/// tokens.
+pub fn verify_upload(
+    signing_key: &[u8],
+    blob_key: &str,
+    content_type: &str,
+    expires_at: u64,
+    signature: &str,
+) -> Result<(), BlobStoreError> {
+    let expected = sign_upload(signing_key, blob_key, content_type, expires_at);
+    if !constant_time_eq(expected.as_bytes(), signature.as_bytes()) {
+        return Err(BlobStoreError::Signature("upload token signature mismatch".into()));
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    if expires_at < now {
+        return Err(BlobStoreError::Signature("upload token expired".into()));
+    }
+    Ok(())
+}
+
+/// Verify an upload token against the current key and each previous key in a
+/// rotation grace window.
+pub(crate) fn verify_upload_with_rotation(
+    current: &SigningKey,
+    previous: &[SigningKey],
+    blob_key: &str,
+    content_type: &str,
+    expires_at: u64,
+    signature: &str,
+) -> Result<(), BlobStoreError> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    if expires_at < now {
+        return Err(BlobStoreError::Signature("upload token expired".into()));
+    }
+    let expected_current = sign_upload(current.as_bytes(), blob_key, content_type, expires_at);
+    if constant_time_eq(expected_current.as_bytes(), signature.as_bytes()) {
+        return Ok(());
+    }
+    for prev in previous {
+        let expected = sign_upload(prev.as_bytes(), blob_key, content_type, expires_at);
+        if constant_time_eq(expected.as_bytes(), signature.as_bytes()) {
+            return Ok(());
+        }
+    }
+    Err(BlobStoreError::Signature("upload token signature mismatch".into()))
+}
+
+/// Percent-encode a value for use in a URL query parameter.
+///
+/// Encodes characters that would otherwise be interpreted as query
+/// delimiters (`&`, `=`, `?`, `+`) or that break URL parsing (space,
+/// `#`, `%`). Also encodes `/` so content-types like `"image/png"` round-trip
+/// cleanly through the `ct=` parameter without needing extra path-segment
+/// splitting logic on the receiving end.
+fn encode_query_value(value: &str) -> String {
+    use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
+    const QUERY_VALUE: &AsciiSet = &CONTROLS
+        .add(b' ')
+        .add(b'"')
+        .add(b'#')
+        .add(b'%')
+        .add(b'&')
+        .add(b'+')
+        .add(b'/')
+        .add(b'=')
+        .add(b'?')
+        .add(b'@')
+        .add(b'[')
+        .add(b']')
+        .add(b'^')
+        .add(b'`')
+        .add(b'{')
+        .add(b'|')
+        .add(b'}')
+        .add(b'<')
+        .add(b'>');
+    utf8_percent_encode(value, QUERY_VALUE).to_string()
 }
 
 /// Compute the canonical signature for `(key, expiry)`.
@@ -791,15 +947,27 @@ pub(crate) fn verify_with_rotation(
 
 // ── Serving route ──────────────────────────────────────────────
 
-/// Build the axum router that serves signed local-blob URLs.
+/// Build the axum router that serves signed local-blob URLs and accepts
+/// direct PUT uploads.
 ///
 /// This is mounted by the framework at the configured `mount_path`.
+///
+/// Routes mounted:
+/// - `GET {mount_path}/{*key}?exp=…&sig=…` — serve a presigned blob
+/// - `PUT {mount_path}/{*key}?upload=1&ct=…&exp=…&sig=…` — accept a direct upload
 pub fn serve_router(store: &LocalBlobStore) -> axum::Router<crate::AppState> {
     use axum::extract::{Path, Query};
     use axum::response::IntoResponse;
 
     #[derive(Debug, serde::Deserialize)]
     struct SignedQuery {
+        exp: u64,
+        sig: String,
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    struct UploadQuery {
+        ct: String,
         exp: u64,
         sig: String,
     }
@@ -833,7 +1001,32 @@ pub fn serve_router(store: &LocalBlobStore) -> axum::Router<crate::AppState> {
         }
     };
 
-    axum::Router::new().route(&mount, axum::routing::get(handler))
+    let store_for_upload = store.clone();
+    let upload_handler = move |Path(blob_key): Path<String>,
+                               Query(q): Query<UploadQuery>,
+                               body: bytes::Bytes| {
+        let store = store_for_upload.clone();
+        async move {
+            if let Err(err) = verify_upload_with_rotation(
+                &store.inner.signing_key,
+                &store.inner.previous_signing_keys,
+                &blob_key,
+                &q.ct,
+                q.exp,
+                &q.sig,
+            ) {
+                return (StatusCode::FORBIDDEN, err.to_string()).into_response();
+            }
+            match store.put(&blob_key, &q.ct, body).await {
+                Ok(_blob) => StatusCode::OK.into_response(),
+                Err(err) => err.into_autumn_error().into_response(),
+            }
+        }
+    };
+
+    axum::Router::new()
+        .route(&mount, axum::routing::get(handler))
+        .route(&mount, axum::routing::put(upload_handler))
 }
 
 #[cfg(test)]
@@ -1647,5 +1840,244 @@ mod tests {
             result.is_err(),
             "expired URL must be rejected even with valid previous key"
         );
+    }
+
+    // ── RED: upload token signing ───────────────────────────────────────────
+
+    #[test]
+    fn sign_upload_differs_from_sign_download() {
+        let key = b"shared-key";
+        let blob_key = "docs/report.pdf";
+        let content_type = "application/pdf";
+        let exp = 9_999_999_999u64;
+        let upload_sig = sign_upload(key, blob_key, content_type, exp);
+        let download_sig = sign(key, blob_key, exp);
+        assert_ne!(
+            upload_sig, download_sig,
+            "upload and download tokens must not be interchangeable"
+        );
+    }
+
+    #[test]
+    fn verify_upload_accepts_valid_token() {
+        let key = b"secret";
+        let blob_key = "img/photo.jpg";
+        let content_type = "image/jpeg";
+        let exp = u64::MAX / 2;
+        let sig = sign_upload(key, blob_key, content_type, exp);
+        verify_upload(key, blob_key, content_type, exp, &sig).unwrap();
+    }
+
+    #[test]
+    fn verify_upload_rejects_wrong_content_type() {
+        let key = b"secret";
+        let blob_key = "img/photo.jpg";
+        let exp = u64::MAX / 2;
+        let sig = sign_upload(key, blob_key, "image/jpeg", exp);
+        let err = verify_upload(key, blob_key, "image/png", exp, &sig).unwrap_err();
+        assert!(matches!(err, BlobStoreError::Signature(_)));
+    }
+
+    #[test]
+    fn verify_upload_rejects_expired_token() {
+        let key = b"secret";
+        let exp = 1u64; // ancient past
+        let sig = sign_upload(key, "k.png", "image/png", exp);
+        let err = verify_upload(key, "k.png", "image/png", exp, &sig).unwrap_err();
+        assert!(matches!(err, BlobStoreError::Signature(_)));
+    }
+
+    #[test]
+    fn upload_token_rejects_download_sig_replay() {
+        // A download signature must not be accepted as an upload token.
+        let key = b"secret";
+        let blob_key = "img/photo.jpg";
+        let exp = u64::MAX / 2;
+        let download_sig = sign(key, blob_key, exp); // download-style token
+        let err = verify_upload(key, blob_key, "image/jpeg", exp, &download_sig).unwrap_err();
+        assert!(
+            matches!(err, BlobStoreError::Signature(_)),
+            "download token must not pass upload verification"
+        );
+    }
+
+    #[tokio::test]
+    async fn presign_put_url_contains_upload_marker_and_sig() {
+        let dir = temp_root();
+        let s = store(dir.path());
+        let result = s
+            .presign_put("img/photo.jpg", "image/jpeg", Duration::from_secs(300))
+            .await
+            .unwrap();
+        assert_eq!(result.method, "PUT");
+        assert!(
+            result.url.contains("upload=1"),
+            "URL missing upload=1 marker: {}",
+            result.url
+        );
+        assert!(result.url.contains("&sig="), "URL missing sig: {}", result.url);
+        assert!(result.url.contains("&exp="), "URL missing exp: {}", result.url);
+        assert!(result.url.contains("&ct="), "URL missing ct: {}", result.url);
+        assert!(
+            result.url.starts_with("/_blobs/img/photo.jpg"),
+            "URL must start with mount_path/key: {}",
+            result.url
+        );
+    }
+
+    #[tokio::test]
+    async fn presign_put_upload_token_does_not_verify_as_download() {
+        // The upload URL's sig= value must not be accepted by the download verify.
+        let dir = temp_root();
+        let key = SigningKey::new(b"shared-signing-key".to_vec());
+        let s = LocalBlobStore::new(
+            "test",
+            dir.path(),
+            "/_blobs",
+            Duration::from_secs(60),
+            key.clone(),
+            vec![],
+        )
+        .unwrap();
+        let result = s
+            .presign_put("docs/report.pdf", "application/pdf", Duration::from_secs(120))
+            .await
+            .unwrap();
+
+        // Extract sig and exp from the upload URL
+        let url = &result.url;
+        let sig = url
+            .split("&sig=")
+            .nth(1)
+            .expect("sig param missing");
+        let exp_str = url
+            .split("&exp=")
+            .nth(1)
+            .and_then(|s| s.split('&').next())
+            .expect("exp param missing");
+        let exp: u64 = exp_str.parse().unwrap();
+
+        // The upload sig must not verify as a download token
+        let download_result = verify_with_rotation(
+            &key,
+            &[],
+            "docs/report.pdf",
+            exp,
+            sig,
+        );
+        assert!(
+            download_result.is_err(),
+            "upload token signature must not pass download verification"
+        );
+    }
+
+    // ── RED: direct upload PUT route ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn direct_put_round_trip_via_serving_route() {
+        use autumn_web::reexports::axum::body::Body;
+        use http::{Method, Request, StatusCode};
+        use tower::ServiceExt as _;
+
+        let dir = temp_root();
+        let signing_key = SigningKey::new(b"test-upload-key".to_vec());
+        let s = LocalBlobStore::new(
+            "test",
+            dir.path().to_path_buf(),
+            "/_blobs",
+            Duration::from_secs(300),
+            signing_key,
+            vec![],
+        )
+        .unwrap();
+
+        let result = s
+            .presign_put("test/upload.png", "image/png", Duration::from_secs(120))
+            .await
+            .unwrap();
+
+        let arc: std::sync::Arc<dyn crate::storage::BlobStore> = std::sync::Arc::new(s.clone());
+        let state = crate::AppState::for_test()
+            .with_extension(crate::storage::BlobStoreState::new(arc));
+        let router = serve_router(&s).with_state(state);
+
+        let request = Request::builder()
+            .method(Method::PUT)
+            .uri(&result.url)
+            .body(Body::from(b"PNG_DATA_BYTES".as_ref()))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "PUT upload should return 200"
+        );
+
+        // Confirm blob landed in the store
+        let bytes = s.get("test/upload.png").await.unwrap();
+        assert_eq!(&bytes[..], b"PNG_DATA_BYTES");
+    }
+
+    #[tokio::test]
+    async fn direct_put_rejects_tampered_sig() {
+        use autumn_web::reexports::axum::body::Body;
+        use http::{Method, Request, StatusCode};
+        use tower::ServiceExt as _;
+
+        let dir = temp_root();
+        let s = store(dir.path());
+        let result = s
+            .presign_put("img/x.png", "image/png", Duration::from_secs(60))
+            .await
+            .unwrap();
+
+        let tampered = if result.url.ends_with('a') {
+            format!("{}b", &result.url[..result.url.len() - 1])
+        } else {
+            format!("{}a", &result.url[..result.url.len() - 1])
+        };
+
+        let arc: std::sync::Arc<dyn crate::storage::BlobStore> = std::sync::Arc::new(s.clone());
+        let state = crate::AppState::for_test()
+            .with_extension(crate::storage::BlobStoreState::new(arc));
+        let router = serve_router(&s).with_state(state);
+
+        let request = Request::builder()
+            .method(Method::PUT)
+            .uri(&tampered)
+            .body(Body::from(b"bytes".as_ref()))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn encode_query_value_encodes_special_chars() {
+        // Content-types with `/` should be encoded in query values
+        let encoded = encode_query_value("image/png");
+        assert!(encoded.contains("%2F") || encoded == "image%2Fpng");
+        // Spaces must be encoded
+        assert!(encode_query_value("text plain").contains("%20"));
+    }
+
+    #[test]
+    fn verify_upload_with_rotation_accepts_previous_key() {
+        let old_key = SigningKey::new(b"old-upload-key".to_vec());
+        let new_key = SigningKey::new(b"new-upload-key".to_vec());
+        let exp = u64::MAX / 2;
+        let sig = sign_upload(old_key.as_bytes(), "k.png", "image/png", exp);
+        verify_upload_with_rotation(&new_key, &[old_key], "k.png", "image/png", exp, &sig)
+            .unwrap();
+    }
+
+    #[test]
+    fn verify_upload_with_rotation_rejects_expired() {
+        let key = SigningKey::new(b"k".to_vec());
+        let exp = 1u64;
+        let sig = sign_upload(key.as_bytes(), "k.png", "image/png", exp);
+        let err =
+            verify_upload_with_rotation(&key, &[], "k.png", "image/png", exp, &sig).unwrap_err();
+        assert!(matches!(err, BlobStoreError::Signature(_)));
     }
 }

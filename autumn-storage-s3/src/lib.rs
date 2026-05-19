@@ -33,8 +33,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use autumn_web::storage::{
-    Blob, BlobFuture, BlobMeta, BlobStore, BlobStoreError, ByteStream, StorageS3Config,
-    validate_key,
+    Blob, BlobFuture, BlobMeta, BlobStore, BlobStoreError, ByteStream, PresignPutResult,
+    StorageS3Config, validate_key,
 };
 use aws_credential_types::Credentials;
 use aws_sdk_s3::Client;
@@ -507,6 +507,40 @@ impl BlobStore for S3BlobStore {
             Ok(req.uri().to_string())
         })
     }
+
+    fn presign_put<'a>(
+        &'a self,
+        key: &'a str,
+        content_type: &'a str,
+        expires_in: Duration,
+    ) -> BlobFuture<'a, PresignPutResult> {
+        Box::pin(async move {
+            validate_key(key)?;
+            let presigning = PresigningConfig::expires_in(expires_in)
+                .map_err(|e| BlobStoreError::backend(e.to_string()))?;
+            let req = self
+                .presign_client
+                .put_object()
+                .bucket(&self.options.bucket)
+                .key(key)
+                .content_type(content_type)
+                .presigned(presigning)
+                .await
+                .map_err(|e| BlobStoreError::backend(e.to_string()))?;
+
+            let headers: std::collections::HashMap<String, String> = req
+                .headers()
+                .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                .collect();
+
+            Ok(PresignPutResult {
+                url: req.uri().to_string(),
+                method: "PUT".to_owned(),
+                headers,
+                expires_in,
+            })
+        })
+    }
 }
 
 #[cfg(test)]
@@ -833,5 +867,81 @@ mod tests {
     fn implements_send_sync_clone() {
         fn assert_impl<T: Send + Sync + Clone>() {}
         assert_impl::<S3BlobStore>();
+    }
+
+    // ── RED: presign_put for S3 ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn presign_put_returns_put_method() {
+        let store = test_store();
+        let result = store
+            .presign_put("uploads/report.pdf", "application/pdf", Duration::from_secs(300))
+            .await
+            .unwrap();
+        assert_eq!(result.method, "PUT");
+    }
+
+    #[tokio::test]
+    async fn presign_put_url_uses_expected_bucket_and_key() {
+        let store = test_store();
+        let result = store
+            .presign_put("docs/file.txt", "text/plain", Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert!(
+            result.url.contains("docs/file.txt"),
+            "URL must contain the key: {}",
+            result.url
+        );
+        assert!(
+            result.url.contains("test-bucket"),
+            "URL must contain the bucket: {}",
+            result.url
+        );
+    }
+
+    #[tokio::test]
+    async fn presign_put_url_contains_sigv4_parameters() {
+        let store = test_store();
+        let result = store
+            .presign_put("img/photo.jpg", "image/jpeg", Duration::from_secs(900))
+            .await
+            .unwrap();
+        assert!(
+            result.url.contains("X-Amz-Signature") || result.url.contains("x-amz-signature"),
+            "S3 presigned PUT URL must contain SigV4 signature: {}",
+            result.url
+        );
+    }
+
+    #[tokio::test]
+    async fn presign_put_rejects_invalid_key() {
+        let store = test_store();
+        let err = store
+            .presign_put("../escape", "text/plain", Duration::from_secs(60))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BlobStoreError::InvalidInput(_)));
+    }
+
+    #[tokio::test]
+    async fn presign_put_and_presigned_url_produce_different_tokens() {
+        // A presigned GET URL and a presigned PUT URL for the same key must
+        // produce structurally different tokens — they cannot be substituted
+        // for each other.
+        let store = test_store();
+        let get_url = store
+            .presigned_url("shared/key.txt", Duration::from_secs(60))
+            .await
+            .unwrap();
+        let put_result = store
+            .presign_put("shared/key.txt", "text/plain", Duration::from_secs(60))
+            .await
+            .unwrap();
+        // Different operation, different signature.
+        assert_ne!(
+            get_url, put_result.url,
+            "GET and PUT presigned URLs for the same key must differ"
+        );
     }
 }
