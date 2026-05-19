@@ -81,11 +81,7 @@ mod tests {
 
     #[test]
     fn direct_upload_input_contains_required_attributes() {
-        let markup = direct_upload_input(
-            "cover_image",
-            "/uploads/presign",
-            Some("image/*"),
-        );
+        let markup = direct_upload_input("cover_image", "/uploads/presign", Some("image/*"));
         let html = markup.into_string();
         assert!(html.contains("data-controller=\"direct-upload\""));
         assert!(html.contains("data-direct-upload-url=\"/uploads/presign\""));
@@ -93,7 +89,10 @@ mod tests {
         assert!(html.contains("type=\"file\""));
         assert!(html.contains("accept=\"image/*\""));
         assert!(html.contains("autumn-upload-progress"));
-        assert!(html.contains("direct upload requires javascript") || html.contains("Direct upload requires JavaScript"));
+        assert!(
+            html.contains("direct upload requires javascript")
+                || html.contains("Direct upload requires JavaScript")
+        );
     }
 
     #[test]

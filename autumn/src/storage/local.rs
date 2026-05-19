@@ -17,7 +17,10 @@ use http::StatusCode;
 use sha2::{Digest, Sha256};
 
 use super::blob::{Blob, BlobMeta};
-use super::{BlobFuture, BlobStore, BlobStoreError, ByteStream, direct_upload::PresignPutResult, validate_key};
+use super::{
+    BlobFuture, BlobStore, BlobStoreError, ByteStream, direct_upload::PresignPutResult,
+    validate_key,
+};
 
 /// HMAC signing key used by the local backend.
 ///
@@ -544,7 +547,9 @@ pub fn verify_upload(
 ) -> Result<(), BlobStoreError> {
     let expected = sign_upload(signing_key, blob_key, content_type, expires_at);
     if !constant_time_eq(expected.as_bytes(), signature.as_bytes()) {
-        return Err(BlobStoreError::Signature("upload token signature mismatch".into()));
+        return Err(BlobStoreError::Signature(
+            "upload token signature mismatch".into(),
+        ));
     }
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -581,7 +586,9 @@ pub(crate) fn verify_upload_with_rotation(
             return Ok(());
         }
     }
-    Err(BlobStoreError::Signature("upload token signature mismatch".into()))
+    Err(BlobStoreError::Signature(
+        "upload token signature mismatch".into(),
+    ))
 }
 
 /// Percent-encode a value for use in a URL query parameter.
@@ -1021,12 +1028,10 @@ pub fn serve_router(store: &LocalBlobStore) -> axum::Router<crate::AppState> {
 
             use futures::StreamExt;
             let stream = body.into_data_stream();
-            let byte_stream = Box::pin(
-                stream.map(|item| match item {
-                    Ok(bytes) => Ok(bytes),
-                    Err(e) => Err(crate::storage::BlobStoreError::Io(e.to_string())),
-                })
-            );
+            let byte_stream = Box::pin(stream.map(|item| match item {
+                Ok(bytes) => Ok(bytes),
+                Err(e) => Err(crate::storage::BlobStoreError::Io(e.to_string())),
+            }));
 
             match store.put_stream(&blob_key, &q.ct, byte_stream).await {
                 Ok(_blob) => StatusCode::OK.into_response(),
@@ -1926,9 +1931,21 @@ mod tests {
             "URL missing upload=1 marker: {}",
             result.url
         );
-        assert!(result.url.contains("&sig="), "URL missing sig: {}", result.url);
-        assert!(result.url.contains("&exp="), "URL missing exp: {}", result.url);
-        assert!(result.url.contains("&ct="), "URL missing ct: {}", result.url);
+        assert!(
+            result.url.contains("&sig="),
+            "URL missing sig: {}",
+            result.url
+        );
+        assert!(
+            result.url.contains("&exp="),
+            "URL missing exp: {}",
+            result.url
+        );
+        assert!(
+            result.url.contains("&ct="),
+            "URL missing ct: {}",
+            result.url
+        );
         assert!(
             result.url.starts_with("/_blobs/img/photo.jpg"),
             "URL must start with mount_path/key: {}",
@@ -1951,16 +1968,17 @@ mod tests {
         )
         .unwrap();
         let result = s
-            .presign_put("docs/report.pdf", "application/pdf", Duration::from_secs(120))
+            .presign_put(
+                "docs/report.pdf",
+                "application/pdf",
+                Duration::from_secs(120),
+            )
             .await
             .unwrap();
 
         // Extract sig and exp from the upload URL
         let url = &result.url;
-        let sig = url
-            .split("&sig=")
-            .nth(1)
-            .expect("sig param missing");
+        let sig = url.split("&sig=").nth(1).expect("sig param missing");
         let exp_str = url
             .split("&exp=")
             .nth(1)
@@ -1969,13 +1987,7 @@ mod tests {
         let exp: u64 = exp_str.parse().unwrap();
 
         // The upload sig must not verify as a download token
-        let download_result = verify_with_rotation(
-            &key,
-            &[],
-            "docs/report.pdf",
-            exp,
-            sig,
-        );
+        let download_result = verify_with_rotation(&key, &[], "docs/report.pdf", exp, sig);
         assert!(
             download_result.is_err(),
             "upload token signature must not pass download verification"
@@ -2008,8 +2020,8 @@ mod tests {
             .unwrap();
 
         let arc: std::sync::Arc<dyn crate::storage::BlobStore> = std::sync::Arc::new(s.clone());
-        let state = crate::AppState::for_test()
-            .with_extension(crate::storage::BlobStoreState::new(arc));
+        let state =
+            crate::AppState::for_test().with_extension(crate::storage::BlobStoreState::new(arc));
         let router = serve_router(&s).with_state(state);
 
         let request = Request::builder()
@@ -2050,8 +2062,8 @@ mod tests {
         };
 
         let arc: std::sync::Arc<dyn crate::storage::BlobStore> = std::sync::Arc::new(s.clone());
-        let state = crate::AppState::for_test()
-            .with_extension(crate::storage::BlobStoreState::new(arc));
+        let state =
+            crate::AppState::for_test().with_extension(crate::storage::BlobStoreState::new(arc));
         let router = serve_router(&s).with_state(state);
 
         let request = Request::builder()
@@ -2078,8 +2090,7 @@ mod tests {
         let new_key = SigningKey::new(b"new-upload-key".to_vec());
         let exp = u64::MAX / 2;
         let sig = sign_upload(old_key.as_bytes(), "k.png", "image/png", exp);
-        verify_upload_with_rotation(&new_key, &[old_key], "k.png", "image/png", exp, &sig)
-            .unwrap();
+        verify_upload_with_rotation(&new_key, &[old_key], "k.png", "image/png", exp, &sig).unwrap();
     }
 
     #[test]

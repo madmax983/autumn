@@ -144,7 +144,12 @@ mod tests {
         fn put<'a>(&'a self, _: &'a str, _: &'a str, _: Bytes) -> BlobFuture<'a, Blob> {
             Box::pin(async { Err(BlobStoreError::Unsupported("noop".into())) })
         }
-        fn put_stream<'a>(&'a self, _: &'a str, _: &'a str, _: ByteStream<'a>) -> BlobFuture<'a, Blob> {
+        fn put_stream<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a str,
+            _: ByteStream<'a>,
+        ) -> BlobFuture<'a, Blob> {
             Box::pin(async { Err(BlobStoreError::Unsupported("noop".into())) })
         }
         fn get<'a>(&'a self, _: &'a str) -> BlobFuture<'a, Bytes> {
@@ -176,7 +181,12 @@ mod tests {
         fn put<'a>(&'a self, _: &'a str, _: &'a str, _: Bytes) -> BlobFuture<'a, Blob> {
             Box::pin(async { Err(BlobStoreError::Unsupported("noop".into())) })
         }
-        fn put_stream<'a>(&'a self, _: &'a str, _: &'a str, _: ByteStream<'a>) -> BlobFuture<'a, Blob> {
+        fn put_stream<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a str,
+            _: ByteStream<'a>,
+        ) -> BlobFuture<'a, Blob> {
             Box::pin(async { Err(BlobStoreError::Unsupported("noop".into())) })
         }
         fn get<'a>(&'a self, _: &'a str) -> BlobFuture<'a, Bytes> {
@@ -203,7 +213,9 @@ mod tests {
                 etag: Some("abc123".into()),
             },
         };
-        let blob = complete_direct_upload(&store, "avatars/me.png").await.unwrap();
+        let blob = complete_direct_upload(&store, "avatars/me.png")
+            .await
+            .unwrap();
         assert_eq!(blob.provider_id, "test");
         assert_eq!(blob.key, "avatars/me.png");
         assert_eq!(blob.content_type, "image/png");
@@ -214,7 +226,9 @@ mod tests {
     #[tokio::test]
     async fn complete_direct_upload_returns_not_found_when_missing() {
         let store = NotFoundStore;
-        let err = complete_direct_upload(&store, "missing/file.png").await.unwrap_err();
+        let err = complete_direct_upload(&store, "missing/file.png")
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, BlobStoreError::NotFound(_)),
             "expected NotFound, got {err:?}"

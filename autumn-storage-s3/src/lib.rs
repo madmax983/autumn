@@ -875,7 +875,11 @@ mod tests {
     async fn presign_put_returns_put_method() {
         let store = test_store();
         let result = store
-            .presign_put("uploads/report.pdf", "application/pdf", Duration::from_secs(300))
+            .presign_put(
+                "uploads/report.pdf",
+                "application/pdf",
+                Duration::from_secs(300),
+            )
             .await
             .unwrap();
         assert_eq!(result.method, "PUT");

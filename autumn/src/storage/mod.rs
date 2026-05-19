@@ -815,7 +815,12 @@ mod tests {
         fn put<'a>(&'a self, _: &'a str, _: &'a str, _: bytes::Bytes) -> BlobFuture<'a, Blob> {
             Box::pin(async { Err(BlobStoreError::Unsupported("noop".into())) })
         }
-        fn put_stream<'a>(&'a self, _: &'a str, _: &'a str, _: ByteStream<'a>) -> BlobFuture<'a, Blob> {
+        fn put_stream<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a str,
+            _: ByteStream<'a>,
+        ) -> BlobFuture<'a, Blob> {
             Box::pin(async { Err(BlobStoreError::Unsupported("noop".into())) })
         }
         fn get<'a>(&'a self, _: &'a str) -> BlobFuture<'a, bytes::Bytes> {
@@ -851,14 +856,15 @@ mod tests {
         let r = PresignPutResult {
             url: "https://example.com/upload".into(),
             method: "PUT".into(),
-            headers: std::collections::HashMap::from([
-                ("Content-Type".into(), "image/png".into()),
-            ]),
+            headers: std::collections::HashMap::from([("Content-Type".into(), "image/png".into())]),
             expires_in: Duration::from_secs(300),
         };
         assert_eq!(r.url, "https://example.com/upload");
         assert_eq!(r.method, "PUT");
-        assert_eq!(r.headers.get("Content-Type").map(String::as_str), Some("image/png"));
+        assert_eq!(
+            r.headers.get("Content-Type").map(String::as_str),
+            Some("image/png")
+        );
         assert_eq!(r.expires_in, Duration::from_secs(300));
     }
 }
