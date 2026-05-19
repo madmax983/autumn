@@ -55,17 +55,19 @@ fn edit_credentials(env: &str, base_dir: &Path) -> Result<(), CredentialsError> 
     let tmp_path = tmp_dir.join(format!("autumn-credentials-{env}.toml"));
 
     {
-        let mut f = std::fs::File::create(&tmp_path)?;
+        #[cfg(unix)]
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut f = options.open(&tmp_path)?;
         f.write_all(&plaintext)?;
     }
 
     let editor = resolve_editor();
-    let status = std::process::Command::new(&editor)
-        .arg(&tmp_path)
-        .status()
-        .map_err(|e| {
-            std::io::Error::other(format!("cannot launch editor '{editor}': {e}"))
-        })?;
+    let status = launch_editor(&editor, &tmp_path)
+        .map_err(|e| std::io::Error::other(format!("cannot launch editor '{editor}': {e}")))?;
 
     if !status.success() {
         zero_file(&tmp_path);
@@ -76,7 +78,7 @@ fn edit_credentials(env: &str, base_dir: &Path) -> Result<(), CredentialsError> 
 
     let new_plaintext = std::fs::read(&tmp_path)?;
 
-    toml::from_str::<toml::Table>(&String::from_utf8(new_plaintext.clone()).map_err(|_| {
+    toml::from_str::<toml::Table>(std::str::from_utf8(&new_plaintext).map_err(|_| {
         std::io::Error::new(std::io::ErrorKind::InvalidData, "file is not valid UTF-8")
     })?)
     .map_err(|e| {
@@ -173,13 +175,35 @@ fn resolve_editor() -> String {
     }
 }
 
+fn launch_editor(
+    editor: &str,
+    file: &std::path::Path,
+) -> std::io::Result<std::process::ExitStatus> {
+    let mut parts = editor.split_whitespace();
+    let program = parts.next().unwrap_or("vi");
+    let extra_args: Vec<&str> = parts.collect();
+    std::process::Command::new(program)
+        .args(extra_args)
+        .arg(file)
+        .status()
+}
+
 fn zero_file(path: &PathBuf) {
-    if let Ok(meta) = std::fs::metadata(path) {
-        let len = usize::try_from(meta.len()).unwrap_or(usize::MAX);
-        if len > 0 {
-            let zeros = vec![0u8; len];
-            let _ = std::fs::write(path, &zeros);
+    use std::io::Write;
+    if let (Ok(meta), Ok(mut f)) = (
+        std::fs::metadata(path),
+        std::fs::OpenOptions::new().write(true).open(path),
+    ) {
+        let mut remaining = usize::try_from(meta.len()).unwrap_or(usize::MAX);
+        let chunk = [0u8; 4096];
+        while remaining > 0 {
+            let n = remaining.min(chunk.len());
+            if f.write_all(&chunk[..n]).is_err() {
+                break;
+            }
+            remaining -= n;
         }
+        let _ = f.flush();
     }
 }
 
@@ -198,7 +222,7 @@ fn default_credentials_template(env: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use autumn_web::credentials::{MasterKey, decrypt, encrypt};
+    use autumn_web::credentials::{MasterKey, encrypt};
     use tempfile::TempDir;
 
     fn setup_credentials(tmp: &TempDir, env: &str, content: &str) -> MasterKey {
@@ -206,7 +230,8 @@ mod tests {
         let ct = encrypt(&key, content.as_bytes());
         std::fs::create_dir_all(tmp.path().join("config/credentials")).unwrap();
         std::fs::write(
-            tmp.path().join(format!("config/credentials/{env}.toml.enc")),
+            tmp.path()
+                .join(format!("config/credentials/{env}.toml.enc")),
             &ct,
         )
         .unwrap();
@@ -234,17 +259,14 @@ mod tests {
 
     #[test]
     fn resolve_editor_falls_back_to_platform_default() {
-        temp_env::with_vars(
-            [("VISUAL", None::<&str>), ("EDITOR", None::<&str>)],
-            || {
-                let editor = resolve_editor();
-                if cfg!(windows) {
-                    assert_eq!(editor, "notepad");
-                } else {
-                    assert_eq!(editor, "vi");
-                }
-            },
-        );
+        temp_env::with_vars([("VISUAL", None::<&str>), ("EDITOR", None::<&str>)], || {
+            let editor = resolve_editor();
+            if cfg!(windows) {
+                assert_eq!(editor, "notepad");
+            } else {
+                assert_eq!(editor, "vi");
+            }
+        });
     }
 
     #[test]
@@ -278,7 +300,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("secret.txt");
         std::fs::write(&path, b"super secret data 12345").unwrap();
-        zero_file(&path.to_path_buf());
+        zero_file(&path);
         let after = std::fs::read(&path).unwrap();
         assert!(after.iter().all(|&b| b == 0), "file should be zeroed");
     }

@@ -2225,8 +2225,7 @@ mod tests {
 
     #[test]
     fn parse_credentials_show_with_reveal() {
-        let cli =
-            Cli::try_parse_from(["autumn", "credentials", "show", "--reveal"]).unwrap();
+        let cli = Cli::try_parse_from(["autumn", "credentials", "show", "--reveal"]).unwrap();
         let Commands::Credentials(CredentialsCommands::Show { reveal, .. }) = cli.command else {
             panic!("expected credentials show");
         };

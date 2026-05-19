@@ -161,7 +161,13 @@ pub fn generate_with(name: &str, parent_dir: &Path, opts: GenerateOptions) -> Re
 
 fn scaffold_credentials(project_dir: &Path, name: &str) -> Result<(), NewError> {
     let master_key = MasterKey::generate();
-    fs::write(project_dir.join("config/master.key"), master_key.to_hex())?;
+    let key_path = project_dir.join("config/master.key");
+    fs::write(&key_path, master_key.to_hex())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600))?;
+    }
 
     let template = format!(
         "# Encrypted credentials for '{name}'\n\
@@ -829,8 +835,7 @@ mod tests {
     fn gitignore_includes_master_key() {
         let tmp = TempDir::new().unwrap();
         generate("gi-key-app", tmp.path()).unwrap();
-        let content =
-            fs::read_to_string(tmp.path().join("gi-key-app/.gitignore")).unwrap();
+        let content = fs::read_to_string(tmp.path().join("gi-key-app/.gitignore")).unwrap();
         assert!(
             content.contains("config/master.key"),
             ".gitignore must exclude config/master.key, got:\n{content}"
@@ -841,8 +846,7 @@ mod tests {
     fn gitignore_does_not_exclude_enc_files() {
         let tmp = TempDir::new().unwrap();
         generate("gi-enc-app", tmp.path()).unwrap();
-        let content =
-            fs::read_to_string(tmp.path().join("gi-enc-app/.gitignore")).unwrap();
+        let content = fs::read_to_string(tmp.path().join("gi-enc-app/.gitignore")).unwrap();
         assert!(
             !content.contains("*.enc"),
             ".gitignore must NOT exclude .enc files (they're safe to commit), got:\n{content}"
@@ -851,18 +855,17 @@ mod tests {
 
     #[test]
     fn development_enc_file_is_decryptable_with_master_key() {
+        use autumn_web::credentials::{MasterKey, decrypt};
         let tmp = TempDir::new().unwrap();
         generate("roundtrip-cred-app", tmp.path()).unwrap();
         let p = tmp.path().join("roundtrip-cred-app");
-        let key_hex =
-            fs::read_to_string(p.join("config/master.key")).unwrap();
-        use autumn_web::credentials::{MasterKey, decrypt};
+        let key_hex = fs::read_to_string(p.join("config/master.key")).unwrap();
         let key = MasterKey::from_hex_pub(key_hex.trim()).expect("master.key should be valid hex");
         let ct = fs::read(p.join("config/credentials/development.toml.enc")).unwrap();
         let pt = decrypt(&key, &ct).expect("development.toml.enc should decrypt with master.key");
         let s = String::from_utf8(pt).unwrap();
         assert!(
-            s.contains("stripe_secret_key") || s.contains("#"),
+            s.contains("stripe_secret_key") || s.contains('#'),
             "decrypted content should have placeholder comments"
         );
     }
@@ -875,6 +878,10 @@ mod tests {
         generate("app-b", tmp2.path()).unwrap();
         let k1 = fs::read_to_string(tmp1.path().join("app-a/config/master.key")).unwrap();
         let k2 = fs::read_to_string(tmp2.path().join("app-b/config/master.key")).unwrap();
-        assert_ne!(k1.trim(), k2.trim(), "each project must get a unique master key");
+        assert_ne!(
+            k1.trim(),
+            k2.trim(),
+            "each project must get a unique master key"
+        );
     }
 }

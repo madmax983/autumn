@@ -35,9 +35,7 @@ const KEY_HEX_LEN: usize = KEY_LEN * 2;
 #[derive(Debug, Error)]
 pub enum CredentialsError {
     /// No master key was found in any expected location.
-    #[error(
-        "no master key found; tried: AUTUMN_MASTER_KEY env var, config/master.key file"
-    )]
+    #[error("no master key found; tried: AUTUMN_MASTER_KEY env var, config/master.key file")]
     NoKeyFound,
 
     /// A key source was found but the decryption operation failed.
@@ -99,11 +97,10 @@ impl MasterKey {
                 len: hex_str.len(),
             });
         }
-        let decoded =
-            hex::decode(hex_str).map_err(|_| CredentialsError::InvalidKeyFormat {
-                key_source: key_source.clone(),
-                len: hex_str.len(),
-            })?;
+        let decoded = hex::decode(hex_str).map_err(|_| CredentialsError::InvalidKeyFormat {
+            key_source: key_source.clone(),
+            len: hex_str.len(),
+        })?;
         let mut bytes = [0u8; KEY_LEN];
         bytes.copy_from_slice(&decoded);
         Ok(Self {
@@ -353,8 +350,7 @@ fn load_credentials_with_env(
     let key = resolve_master_key_with_env(base_dir, env)?;
     let ciphertext = std::fs::read(&enc_path)?;
     let plaintext = decrypt(&key, &ciphertext)?;
-    let toml_str = String::from_utf8(plaintext)
-        .map_err(|_| CredentialsError::FileTruncated)?;
+    let toml_str = String::from_utf8(plaintext).map_err(|_| CredentialsError::FileTruncated)?;
     let table: toml::Table = toml::from_str(&toml_str)?;
 
     Ok(CredentialsStore { table })
@@ -409,7 +405,7 @@ mod tests {
     fn nonce_is_12_bytes_after_version() {
         let key = fresh_key();
         let ct = encrypt(&key, b"hello");
-        assert!(ct.len() >= 1 + NONCE_LEN, "ciphertext too short");
+        assert!(ct.len() > NONCE_LEN, "ciphertext too short");
     }
 
     // ── roundtrip ─────────────────────────────────────────────────────────────
@@ -570,8 +566,7 @@ mod tests {
 
     #[test]
     fn credentials_store_get_string() {
-        let table: toml::Table =
-            toml::from_str("stripe_key = \"sk_test_abc\"\n").unwrap();
+        let table: toml::Table = toml::from_str("stripe_key = \"sk_test_abc\"\n").unwrap();
         let store = CredentialsStore { table };
         let val: Option<String> = store.get("stripe_key");
         assert_eq!(val.as_deref(), Some("sk_test_abc"));
@@ -592,8 +587,7 @@ mod tests {
 
     #[test]
     fn credentials_store_keys_lists_top_level() {
-        let table: toml::Table =
-            toml::from_str("a = \"x\"\nb = \"y\"\n").unwrap();
+        let table: toml::Table = toml::from_str("a = \"x\"\nb = \"y\"\n").unwrap();
         let store = CredentialsStore { table };
         let mut keys: Vec<&str> = store.keys().collect();
         keys.sort_unstable();

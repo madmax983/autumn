@@ -5076,18 +5076,11 @@ path = "/api-spec.json"
         let key = MasterKey::generate();
         let ct = encrypt(&key, b"stripe_key = \"sk_test_xyz\"\n");
         std::fs::create_dir_all(tmp.path().join("config/credentials")).unwrap();
-        std::fs::write(
-            tmp.path().join("config/credentials/dev.toml.enc"),
-            &ct,
-        )
-        .unwrap();
+        std::fs::write(tmp.path().join("config/credentials/dev.toml.enc"), &ct).unwrap();
 
         let env = MockEnv::new()
             .with("AUTUMN_MASTER_KEY", &key.to_hex())
-            .with(
-                "AUTUMN_MANIFEST_DIR",
-                tmp.path().to_str().unwrap(),
-            );
+            .with("AUTUMN_MANIFEST_DIR", tmp.path().to_str().unwrap());
         let config = AutumnConfig::load_with_env(&env).unwrap();
         let val: Option<String> = config.credentials().get("stripe_key");
         assert_eq!(val.as_deref(), Some("sk_test_xyz"));
