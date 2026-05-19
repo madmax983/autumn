@@ -809,7 +809,7 @@ mod tests {
 
     struct NoOpStore;
     impl BlobStore for NoOpStore {
-        fn provider_id(&self) -> &str {
+        fn provider_id(&self) -> &'static str {
             "noop"
         }
         fn put<'a>(&'a self, _: &'a str, _: &'a str, _: bytes::Bytes) -> BlobFuture<'a, Blob> {

@@ -140,7 +140,7 @@ mod tests {
     }
 
     impl BlobStore for AlwaysFoundStore {
-        fn provider_id(&self) -> &str {
+        fn provider_id(&self) -> &'static str {
             "test"
         }
         fn put<'a>(&'a self, _: &'a str, _: &'a str, _: Bytes) -> BlobFuture<'a, Blob> {
@@ -177,7 +177,7 @@ mod tests {
     struct NotFoundStore;
 
     impl BlobStore for NotFoundStore {
-        fn provider_id(&self) -> &str {
+        fn provider_id(&self) -> &'static str {
             "test"
         }
         fn put<'a>(&'a self, _: &'a str, _: &'a str, _: Bytes) -> BlobFuture<'a, Blob> {
