@@ -824,27 +824,28 @@ impl InterceptedChannelsBackend {
 }
 
 #[cfg(feature = "ws")]
+fn run_chain(
+    topic: &str,
+    msg: &ChannelMessage,
+    interceptors: &[Arc<dyn crate::interceptor::ChannelsInterceptor>],
+    inner: &dyn ChannelsBackend,
+    idx: usize,
+) -> Result<usize, ChannelPublishError> {
+    if idx < interceptors.len() {
+        let interceptor = &interceptors[idx];
+        let next =
+            |t: &str, m: &ChannelMessage| run_chain(t, m, interceptors, inner, idx + 1);
+        interceptor.intercept_publish(topic, msg, &next)
+    } else {
+        inner.publish(topic, msg.clone())
+    }
+}
+
+#[cfg(feature = "ws")]
 impl ChannelsBackend for InterceptedChannelsBackend {
     fn publish(&self, topic: &str, msg: ChannelMessage) -> Result<usize, ChannelPublishError> {
         let inner = &self.inner;
         let interceptors = &self.interceptors;
-
-        fn run_chain(
-            topic: &str,
-            msg: &ChannelMessage,
-            interceptors: &[Arc<dyn crate::interceptor::ChannelsInterceptor>],
-            inner: &dyn ChannelsBackend,
-            idx: usize,
-        ) -> Result<usize, ChannelPublishError> {
-            if idx < interceptors.len() {
-                let interceptor = &interceptors[idx];
-                let next =
-                    |t: &str, m: &ChannelMessage| run_chain(t, m, interceptors, inner, idx + 1);
-                interceptor.intercept_publish(topic, msg, &next)
-            } else {
-                inner.publish(topic, msg.clone())
-            }
-        }
 
         run_chain(topic, &msg, interceptors, &**inner, 0)
     }

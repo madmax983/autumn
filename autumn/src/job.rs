@@ -1493,6 +1493,16 @@ impl JobClient {
     }
 }
 
+/// Starts the background job execution runtime.
+///
+/// This initializes the configured job worker backend (local, redis, or postgres)
+/// and launches background worker tasks that run until the shutdown cancellation token is triggered.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - There are duplicate job names registered in the workspace
+/// - Redis or Postgres connection/initialization fails (if those backends are selected)
 pub fn start_runtime(
     jobs: Vec<JobInfo>,
     state: &AppState,

@@ -1,3 +1,4 @@
+#[cfg(feature = "oauth2")]
 use std::sync::Arc;
 
 #[cfg(feature = "mail")]
@@ -63,6 +64,11 @@ pub trait DbConnectionInterceptor: Send + Sync + 'static {
 
 #[cfg(feature = "ws")]
 pub trait ChannelsInterceptor: Send + Sync + 'static {
+    /// Intercepts a channel message publication.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ChannelPublishError`](crate::channels::ChannelPublishError) if publication fails.
     fn intercept_publish(
         &self,
         topic: &str,

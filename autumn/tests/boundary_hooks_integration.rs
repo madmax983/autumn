@@ -2,11 +2,23 @@ use autumn_web::app::app;
 use std::sync::Arc;
 
 // We expect these traits to be exposed under autumn_web::interceptor
-use autumn_web::interceptor::{
-    ChannelsInterceptor, DbConnectionInterceptor, HttpInterceptor, JobInterceptor, MailInterceptor,
-};
+use autumn_web::interceptor::JobInterceptor;
 
+#[cfg(feature = "mail")]
+use autumn_web::interceptor::MailInterceptor;
+
+#[cfg(feature = "db")]
+use autumn_web::interceptor::DbConnectionInterceptor;
+
+#[cfg(feature = "ws")]
+use autumn_web::interceptor::ChannelsInterceptor;
+
+#[cfg(feature = "oauth2")]
+use autumn_web::interceptor::HttpInterceptor;
+
+#[cfg(feature = "mail")]
 struct DummyMailInterceptor;
+#[cfg(feature = "mail")]
 impl MailInterceptor for DummyMailInterceptor {
     fn intercept<'a>(
         &'a self,
@@ -54,7 +66,9 @@ impl JobInterceptor for DummyJobInterceptor {
     }
 }
 
+#[cfg(feature = "db")]
 struct DummyDbInterceptor;
+#[cfg(feature = "db")]
 impl DbConnectionInterceptor for DummyDbInterceptor {
     fn intercept_checkout<'a>(
         &'a self,
@@ -79,22 +93,26 @@ impl DbConnectionInterceptor for DummyDbInterceptor {
     }
 }
 
+#[cfg(feature = "ws")]
 struct DummyChannelsInterceptor;
+#[cfg(feature = "ws")]
 impl ChannelsInterceptor for DummyChannelsInterceptor {
     fn intercept_publish(
         &self,
-        _topic: &str,
-        _msg: &autumn_web::channels::ChannelMessage,
+        topic: &str,
+        msg: &autumn_web::channels::ChannelMessage,
         next: &dyn Fn(
             &str,
             &autumn_web::channels::ChannelMessage,
         ) -> Result<usize, autumn_web::channels::ChannelPublishError>,
     ) -> Result<usize, autumn_web::channels::ChannelPublishError> {
-        next(_topic, _msg)
+        next(topic, msg)
     }
 }
 
+#[cfg(feature = "oauth2")]
 struct DummyHttpInterceptor;
+#[cfg(feature = "oauth2")]
 impl HttpInterceptor for DummyHttpInterceptor {
     fn intercept<'a>(
         &'a self,
@@ -119,12 +137,29 @@ impl HttpInterceptor for DummyHttpInterceptor {
 
 #[test]
 fn app_builder_registers_interceptors() {
-    let builder = app()
-        .with_mail_interceptor(DummyMailInterceptor)
-        .with_job_interceptor(DummyJobInterceptor)
-        .with_db_interceptor(DummyDbInterceptor)
-        .with_channels_interceptor(DummyChannelsInterceptor)
-        .with_http_interceptor(DummyHttpInterceptor);
+    let mut builder = app();
+
+    #[cfg(feature = "mail")]
+    {
+        builder = builder.with_mail_interceptor(DummyMailInterceptor);
+    }
+
+    builder = builder.with_job_interceptor(DummyJobInterceptor);
+
+    #[cfg(feature = "db")]
+    {
+        builder = builder.with_db_interceptor(DummyDbInterceptor);
+    }
+
+    #[cfg(feature = "ws")]
+    {
+        builder = builder.with_channels_interceptor(DummyChannelsInterceptor);
+    }
+
+    #[cfg(feature = "oauth2")]
+    {
+        builder = builder.with_http_interceptor(DummyHttpInterceptor);
+    }
 
     let _ = builder;
 }
@@ -200,9 +235,6 @@ async fn job_interceptor_intercepts_enqueue_and_execute() {
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    let _guard = global_job_runtime_test_lock().lock().await;
-    clear_global_job_client();
-
     static ENQUEUES: AtomicUsize = AtomicUsize::new(0);
     static EXECUTES: AtomicUsize = AtomicUsize::new(0);
 
@@ -253,6 +285,9 @@ async fn job_interceptor_intercepts_enqueue_and_execute() {
     > {
         Box::pin(async move { Ok(()) })
     }
+
+    let _guard = global_job_runtime_test_lock().lock().await;
+    clear_global_job_client();
 
     let state = AppState::for_test();
     state.insert_extension(Arc::new(RecordingJobInterceptor) as Arc<dyn JobInterceptor>);
