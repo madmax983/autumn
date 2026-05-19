@@ -60,12 +60,13 @@ use std::task::{Context, Poll};
 
 use axum::body::Body;
 use axum::response::IntoResponse;
+use futures::stream::StreamExt as _;
 use http::header::{
     CACHE_CONTROL, CONTENT_LOCATION, DATE, ETAG, EXPIRES, IF_MODIFIED_SINCE, IF_NONE_MATCH,
     LAST_MODIFIED, SET_COOKIE, VARY,
 };
 use http::{HeaderMap, HeaderValue, Response, StatusCode};
-use http_body_util::{BodyExt, Limited};
+use http_body_util::BodyExt;
 use sha2::Digest as _;
 use tower::{Layer, Service};
 
@@ -609,112 +610,143 @@ where
 
         Box::pin(async move {
             let response = fut.await?;
-
-            // Only process GET 200 responses.
             if !is_get || response.status() != StatusCode::OK {
                 return Ok(response);
             }
-
-            // If the handler already set an ETag, check If-None-Match against it
-            // before buffering the body.
-            if let Some(existing_etag) = response.headers().get(ETAG).cloned() {
-                if let Some(ref inm) = if_none_match {
-                    let existing_tag = existing_etag.to_str().unwrap_or("");
-                    // Use weak comparison: strip W/ prefix and quotes.
-                    let tag = existing_tag
-                        .strip_prefix("W/")
-                        .unwrap_or(existing_tag)
-                        .trim_matches('"');
-                    let candidate_etag = ETag::strong(tag.to_owned());
-                    if candidate_etag.matches_if_none_match(inm) {
-                        let (parts, _body) = response.into_parts();
-                        let mut not_modified = not_modified_response(&candidate_etag, None);
-                        for name in [
-                            CACHE_CONTROL,
-                            VARY,
-                            CONTENT_LOCATION,
-                            DATE,
-                            EXPIRES,
-                            LAST_MODIFIED,
-                        ] {
-                            for v in parts.headers.get_all(&name) {
-                                not_modified.headers_mut().append(name.clone(), v.clone());
-                            }
-                        }
-                        not_modified.headers_mut().remove(SET_COOKIE);
-                        // Preserve the original ETag header value (strong/weak as set).
-                        not_modified.headers_mut().insert(ETAG, existing_etag);
-                        return Ok(not_modified);
-                    }
-                }
-                return Ok(response);
-            }
-
-            let (mut parts, body) = response.into_parts();
-
-            // Content-Length upfront guard: skip ETag on known-large bodies
-            // without consuming any bytes (fast path, avoids all buffering).
-            if parts
-                .headers
-                .get(http::header::CONTENT_LENGTH)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<usize>().ok())
-                .is_some_and(|len| len > EtagLayer::MAX_BODY_BYTES)
-            {
-                return Ok(Response::from_parts(parts, body));
-            }
-
-            // Use Limited to enforce the cap during collection — prevents OOM on
-            // streaming bodies that don't advertise Content-Length.
-            let bytes = match Limited::new(body, EtagLayer::MAX_BODY_BYTES + 1)
-                .collect()
-                .await
-            {
-                Ok(c) => c.to_bytes(),
-                Err(_) => {
-                    // Body exceeded the limit or errored mid-stream. Pass through
-                    // the response without an ETag rather than risking OOM or masking
-                    // the original failure. The Content-Length guard covers the common
-                    // case; this path only triggers for streaming bodies without CL.
-                    return Ok(Response::from_parts(parts, Body::empty()));
-                }
-            };
-
-            // Derive a weak ETag from body bytes.
-            let etag = {
-                let mut hasher = DefaultHasher::new();
-                bytes.hash(&mut hasher);
-                ETag::weak(format!("{:016x}", hasher.finish()))
-            };
-
-            // Check If-None-Match.
-            if if_none_match
-                .as_deref()
-                .is_some_and(|inm| etag.matches_if_none_match(inm))
-            {
-                // Preserve RFC 7232 §4.1 headers in the 304, including all repeated values.
-                let mut not_modified = not_modified_response(&etag, None);
-                for name in [
-                    CACHE_CONTROL,
-                    VARY,
-                    CONTENT_LOCATION,
-                    DATE,
-                    EXPIRES,
-                    LAST_MODIFIED,
-                ] {
-                    for v in parts.headers.get_all(&name) {
-                        not_modified.headers_mut().append(name.clone(), v.clone());
-                    }
-                }
-                // Strip Set-Cookie from 304 to avoid stale auth state on intermediaries.
-                not_modified.headers_mut().remove(SET_COOKIE);
-                return Ok(not_modified);
-            }
-
-            parts.headers.insert(ETAG, etag.header_value());
-            Ok(Response::from_parts(parts, Body::from(bytes)))
+            Ok(apply_etag(response, if_none_match.as_deref()).await)
         })
     }
+}
+
+/// Copy RFC 7232 §4.1 preservation headers from `src` to a 304 `dst`.
+fn copy_304_headers(src: &http::HeaderMap, dst: &mut Response<Body>) {
+    for name in [
+        CACHE_CONTROL,
+        VARY,
+        CONTENT_LOCATION,
+        DATE,
+        EXPIRES,
+        LAST_MODIFIED,
+    ] {
+        for v in src.get_all(&name) {
+            dst.headers_mut().append(name.clone(), v.clone());
+        }
+    }
+}
+
+/// Core `ETag` logic applied to a confirmed `GET 200` response.
+async fn apply_etag(response: Response<Body>, if_none_match: Option<&str>) -> Response<Body> {
+    // If the handler already set an ETag, check If-None-Match against it
+    // before buffering the body.
+    if let Some(existing_etag) = response.headers().get(ETAG).cloned() {
+        if let Some(inm) = if_none_match {
+            let existing_tag = existing_etag.to_str().unwrap_or("");
+            let tag = existing_tag
+                .strip_prefix("W/")
+                .unwrap_or(existing_tag)
+                .trim_matches('"');
+            let candidate_etag = ETag::strong(tag.to_owned());
+            if candidate_etag.matches_if_none_match(inm) {
+                let (parts, _body) = response.into_parts();
+                let mut not_modified = not_modified_response(&candidate_etag, None);
+                copy_304_headers(&parts.headers, &mut not_modified);
+                not_modified.headers_mut().remove(SET_COOKIE);
+                not_modified.headers_mut().insert(ETAG, existing_etag);
+                return not_modified;
+            }
+        }
+        return response;
+    }
+
+    let (mut parts, mut body) = response.into_parts();
+
+    // Content-Length upfront guard: skip ETag on known-large bodies.
+    if parts
+        .headers
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<usize>().ok())
+        .is_some_and(|len| len > EtagLayer::MAX_BODY_BYTES)
+    {
+        return Response::from_parts(parts, body);
+    }
+
+    // Manual bounded collection with overflow-safe reconstruction.
+    let mut buf = bytes::BytesMut::new();
+    let mut overflow_chunk: Option<bytes::Bytes> = None;
+    let mut stream_errored = false;
+
+    loop {
+        match BodyExt::frame(&mut body).await {
+            None => break,
+            Some(Err(_)) => {
+                stream_errored = true;
+                break;
+            }
+            Some(Ok(frame)) => {
+                if let Ok(data) = frame.into_data() {
+                    if buf.len() + data.len() > EtagLayer::MAX_BODY_BYTES {
+                        overflow_chunk = Some(data);
+                        break;
+                    }
+                    buf.extend_from_slice(&data);
+                }
+            }
+        }
+    }
+
+    if stream_errored {
+        return Response::from_parts(parts, Body::from(buf.freeze()));
+    }
+    if let Some(overflow) = overflow_chunk {
+        return Response::from_parts(parts, rebuild_oversized_body(buf.freeze(), overflow, body));
+    }
+
+    let bytes = buf.freeze();
+    let etag = {
+        let mut hasher = DefaultHasher::new();
+        bytes.hash(&mut hasher);
+        ETag::weak(format!("{:016x}", hasher.finish()))
+    };
+
+    if if_none_match.is_some_and(|inm| etag.matches_if_none_match(inm)) {
+        let mut not_modified = not_modified_response(&etag, None);
+        copy_304_headers(&parts.headers, &mut not_modified);
+        not_modified.headers_mut().remove(SET_COOKIE);
+        return not_modified;
+    }
+
+    parts.headers.insert(ETAG, etag.header_value());
+    Response::from_parts(parts, Body::from(bytes))
+}
+
+// ── body helpers ──────────────────────────────────────────────────────────────
+
+/// Reconstruct a streaming `Body` from bytes already consumed from it plus its
+/// remaining frames, used by `EtagLayer` when the body exceeds `MAX_BODY_BYTES`.
+///
+/// Avoids silently replacing large streamed responses with an empty body by
+/// chaining: `prefix` (frames collected before the limit was hit) +
+/// `overflow` (the frame that tripped the limit) + `remaining` (the rest of
+/// the original stream).
+fn rebuild_oversized_body(prefix: bytes::Bytes, overflow: bytes::Bytes, remaining: Body) -> Body {
+    let preamble = futures::stream::iter(vec![
+        Ok::<bytes::Bytes, axum::Error>(prefix),
+        Ok::<bytes::Bytes, axum::Error>(overflow),
+    ]);
+    let tail = futures::stream::unfold(remaining, |mut b| async move {
+        loop {
+            match BodyExt::frame(&mut b).await {
+                None | Some(Err(_)) => return None,
+                Some(Ok(frame)) => {
+                    if let Ok(data) = frame.into_data() {
+                        return Some((Ok::<bytes::Bytes, axum::Error>(data), b));
+                    }
+                }
+            }
+        }
+    });
+    Body::from_stream(preamble.chain(tail))
 }
 
 // ── not_modified helpers ───────────────────────────────────────────────────────
