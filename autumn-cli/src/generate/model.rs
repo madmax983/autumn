@@ -115,7 +115,13 @@ pub fn plan_model_with_options(
     let model_file = models_dir.join(format!("{snake_name}.rs"));
     plan.create(
         model_file,
-        render_model_file(&pascal_name, &table, &fields, &metadata, options.soft_delete),
+        render_model_file(
+            &pascal_name,
+            &table,
+            &fields,
+            &metadata,
+            options.soft_delete,
+        ),
     );
 
     let mod_path = models_dir.join("mod.rs");

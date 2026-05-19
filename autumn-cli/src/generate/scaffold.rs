@@ -97,7 +97,12 @@ pub fn plan_scaffold_with_options(
     let repos_dir = project_root.join("src").join("repositories");
     plan.create(
         repos_dir.join(format!("{snake_name}.rs")),
-        render_repository_file(&pascal_name, &snake_name, &queries, options.model.soft_delete),
+        render_repository_file(
+            &pascal_name,
+            &snake_name,
+            &queries,
+            options.model.soft_delete,
+        ),
     );
     let repo_mod_path = repos_dir.join("mod.rs");
     plan.modify(

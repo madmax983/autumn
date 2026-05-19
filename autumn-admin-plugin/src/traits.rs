@@ -265,9 +265,7 @@ pub trait AdminModel: Send + Sync + 'static {
     /// `false`, so models that opt in must override this method.
     fn restore<'a>(
         &'a self,
-        _pool: &'a diesel_async::pooled_connection::deadpool::Pool<
-            diesel_async::AsyncPgConnection,
-        >,
+        _pool: &'a diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
         _id: i64,
     ) -> AdminFuture<'a, ()> {
         Box::pin(async move {
@@ -285,9 +283,7 @@ pub trait AdminModel: Send + Sync + 'static {
     /// `false`.
     fn purge<'a>(
         &'a self,
-        _pool: &'a diesel_async::pooled_connection::deadpool::Pool<
-            diesel_async::AsyncPgConnection,
-        >,
+        _pool: &'a diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
         _id: i64,
     ) -> AdminFuture<'a, ()> {
         Box::pin(async move {
@@ -305,9 +301,7 @@ pub trait AdminModel: Send + Sync + 'static {
     /// `false`.
     fn list_deleted<'a>(
         &'a self,
-        _pool: &'a diesel_async::pooled_connection::deadpool::Pool<
-            diesel_async::AsyncPgConnection,
-        >,
+        _pool: &'a diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
         _params: ListParams,
     ) -> AdminFuture<'a, ListResult> {
         Box::pin(async move {
@@ -942,7 +936,10 @@ mod tests {
             .execute_action(&pool, "restore", vec![10, 20])
             .await
             .expect("restore action should succeed on soft-delete model");
-        assert_eq!(count, 2, "restore action must return count of restored records");
+        assert_eq!(
+            count, 2,
+            "restore action must return count of restored records"
+        );
         assert_eq!(*model.restored.lock().unwrap(), vec![10, 20]);
     }
 
