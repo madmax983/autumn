@@ -8,7 +8,7 @@
 //!    [`PresignPutResult::method`] and [`PresignPutResult::headers`].
 //!    For [`LocalBlobStore`](super::LocalBlobStore) this is an HMAC-signed
 //!    route on the Autumn app itself (`/_blobs/<key>?...`). For S3 backends
-//!    it is a real AWS SigV4 presigned URL.
+//!    it is a real AWS `SigV4` presigned URL.
 //! 3. App route (CSRF-protected) calls [`complete_direct_upload`] to confirm
 //!    the upload landed and receive a [`Blob`](super::Blob) handle to store in
 //!    the database.
@@ -106,14 +106,16 @@ pub async fn complete_direct_upload(
     store: &dyn BlobStore,
     key: &str,
 ) -> Result<Blob, BlobStoreError> {
-    match store.head(key).await? {
-        Some(meta) => Ok(blob_from_meta(store.provider_id(), key, meta)),
-        None => Err(BlobStoreError::NotFound(format!(
-            "direct upload incomplete or upload has expired: \
-             key {key:?} not found in storage; \
-             ensure the browser PUT completed before calling complete_direct_upload"
-        ))),
-    }
+    store.head(key).await?.map_or_else(
+        || {
+            Err(BlobStoreError::NotFound(format!(
+                "direct upload incomplete or upload has expired: \
+                 key {key:?} not found in storage; \
+                 ensure the browser PUT completed before calling complete_direct_upload"
+            )))
+        },
+        |meta| Ok(blob_from_meta(store.provider_id(), key, meta)),
+    )
 }
 
 fn blob_from_meta(provider_id: &str, key: &str, meta: BlobMeta) -> Blob {
