@@ -998,10 +998,17 @@ async fn run_job_handler(
         Err(panic) => return JobExecutionOutcome::Panicked(format_job_panic(panic.as_ref())),
     };
 
-    let future = if let Some(interceptor) = &interceptor {
-        interceptor.intercept_execute(name, &payload, next)
-    } else {
-        next
+    let interceptor_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if let Some(interceptor) = &interceptor {
+            interceptor.intercept_execute(name, &payload, next)
+        } else {
+            next
+        }
+    }));
+
+    let future = match interceptor_res {
+        Ok(future) => future,
+        Err(panic) => return JobExecutionOutcome::Panicked(format_job_panic(panic.as_ref())),
     };
 
     match std::panic::AssertUnwindSafe(future).catch_unwind().await {
@@ -4624,6 +4631,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_job_handler_catches_interceptor_setup_panics() {
+        struct PanickingJobInterceptor;
+        impl crate::interceptor::JobInterceptor for PanickingJobInterceptor {
+            fn intercept_enqueue<'a>(
+                &'a self,
+                _name: &'a str,
+                _payload: &'a serde_json::Value,
+                next: std::pin::Pin<
+                    Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send + 'a>,
+                >,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send + 'a>,
+            > {
+                next
+            }
+
+            fn intercept_execute<'a>(
+                &'a self,
+                _name: &'a str,
+                _payload: &'a serde_json::Value,
+                _next: std::pin::Pin<
+                    Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send + 'a>,
+                >,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send + 'a>,
+            > {
+                panic!("interceptor execution setup panicked")
+            }
+        }
+
+        fn success_handler(
+            _state: AppState,
+            _payload: Value,
+        ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'static>> {
+            Box::pin(async move { Ok(()) })
+        }
+
+        let state = AppState::for_test().with_profile("dev");
+        state.insert_extension(
+            Arc::new(PanickingJobInterceptor) as Arc<dyn crate::interceptor::JobInterceptor>
+        );
+
+        let outcome =
+            run_job_handler("test_job", success_handler, state, serde_json::json!({})).await;
+
+        assert_eq!(
+            outcome,
+            JobExecutionOutcome::Panicked(
+                "job handler panicked: interceptor execution setup panicked".to_string()
+            )
+        );
+    }
+
+    #[tokio::test]
     async fn local_enqueue_p99_is_under_5ms() {
         let _guard = global_job_runtime_test_lock().lock().await;
         clear_global_job_client();
@@ -7473,6 +7534,7 @@ mod tests {
                 default_max_attempts: 3,
                 default_initial_backoff_ms: 100,
                 per_job_defaults: HashMap::from([("test_job".to_string(), (3_u32, 100_u64))]),
+                interceptor: None,
             };
             rt.block_on(async {
                 client
