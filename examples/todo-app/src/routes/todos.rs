@@ -338,12 +338,15 @@ pub async fn detail(
 ) -> AutumnResult<impl IntoResponse> {
     let todo = Todo::find(*id, &mut db).await?;
 
-    // ETag: hash of (created_at_unix, completed flag).
-    // Deterministic: same state ⇒ same ETag on every replica.
+    // ETag: hash of (created_at_unix, completed flag, csrf_token).
+    // Including the CSRF token ensures that CSRF rotation invalidates the
+    // cached response, so clients never replay a stale hidden token.
+    let csrf_tok = csrf.as_ref().map(CsrfToken::token).unwrap_or_default();
     let etag_input = format!(
-        "{}-{}",
+        "{}-{}-{}",
         todo.created_at.and_utc().timestamp(),
-        todo.completed
+        todo.completed,
+        csrf_tok
     );
     let fw = fresh_when(&headers, etag_input.as_str());
 

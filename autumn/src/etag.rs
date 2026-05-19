@@ -327,8 +327,12 @@ impl FreshWhen {
             && let Some(ref ims_str) = self.raw_if_modified_since
             && let Some(lm) = self.last_modified
         {
+            // Truncate to whole seconds: http_date() emits second-level precision,
+            // so a sub-second lm would compare as earlier than the IMS round-trip
+            // value and yield a spurious stale result.
+            let lm_secs = chrono::DateTime::from_timestamp(lm.timestamp(), 0).unwrap_or(lm);
             self.is_fresh = parse_http_date(ims_str)
-                .is_some_and(|parsed| std::time::SystemTime::from(lm) <= parsed);
+                .is_some_and(|parsed| std::time::SystemTime::from(lm_secs) <= parsed);
         }
         self
     }
@@ -347,6 +351,13 @@ impl FreshWhen {
             for name in [CACHE_CONTROL, VARY, CONTENT_LOCATION, DATE, EXPIRES] {
                 for v in r.headers().get_all(&name) {
                     not_modified.headers_mut().append(name.clone(), v.clone());
+                }
+            }
+            // Copy Last-Modified from the response only when not already set via
+            // the .last_modified() builder (to avoid duplicate values).
+            if self.last_modified.is_none() {
+                for v in r.headers().get_all(LAST_MODIFIED) {
+                    not_modified.headers_mut().append(LAST_MODIFIED, v.clone());
                 }
             }
             not_modified
@@ -577,7 +588,14 @@ where
                     if candidate_etag.matches_if_none_match(inm) {
                         let (parts, _body) = response.into_parts();
                         let mut not_modified = not_modified_response(&candidate_etag, None);
-                        for name in [CACHE_CONTROL, VARY, CONTENT_LOCATION, DATE, EXPIRES] {
+                        for name in [
+                            CACHE_CONTROL,
+                            VARY,
+                            CONTENT_LOCATION,
+                            DATE,
+                            EXPIRES,
+                            LAST_MODIFIED,
+                        ] {
                             for v in parts.headers.get_all(&name) {
                                 not_modified.headers_mut().append(name.clone(), v.clone());
                             }
@@ -635,7 +653,14 @@ where
             {
                 // Preserve RFC 7232 §4.1 headers in the 304, including all repeated values.
                 let mut not_modified = not_modified_response(&etag, None);
-                for name in [CACHE_CONTROL, VARY, CONTENT_LOCATION, DATE, EXPIRES] {
+                for name in [
+                    CACHE_CONTROL,
+                    VARY,
+                    CONTENT_LOCATION,
+                    DATE,
+                    EXPIRES,
+                    LAST_MODIFIED,
+                ] {
                     for v in parts.headers.get_all(&name) {
                         not_modified.headers_mut().append(name.clone(), v.clone());
                     }
@@ -668,7 +693,14 @@ pub fn build_not_modified(
     last_modified: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Response<Body> {
     let mut response = not_modified_response(etag, last_modified);
-    for name in [CACHE_CONTROL, VARY, CONTENT_LOCATION, DATE, EXPIRES] {
+    for name in [
+        CACHE_CONTROL,
+        VARY,
+        CONTENT_LOCATION,
+        DATE,
+        EXPIRES,
+        LAST_MODIFIED,
+    ] {
         for v in original_headers.get_all(&name) {
             response.headers_mut().append(name.clone(), v.clone());
         }
