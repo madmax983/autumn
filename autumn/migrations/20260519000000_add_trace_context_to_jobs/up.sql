@@ -1,0 +1,2 @@
+ALTER TABLE autumn_jobs ADD COLUMN IF NOT EXISTS traceparent TEXT;
+ALTER TABLE autumn_jobs ADD COLUMN IF NOT EXISTS tracestate  TEXT;

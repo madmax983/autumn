@@ -700,22 +700,30 @@ impl Mailer {
             let mailer = self.clone();
             let deferred = mail.clone();
             let mut f_opt: Option<(Self, Mail)> = Some((mailer, deferred));
+            // Capture the caller's span now; the after-commit callback runs in a
+            // fresh task with no request span, so spawn_mail_delivery would see an
+            // empty span and lose trace correlation without this.
+            let deliver_span = tracing::Span::current();
 
             crate::db::AFTER_COMMIT_REGISTRY
                 .try_with(|registry| {
                     let (m, m_mail) = f_opt.take().expect("once");
+                    let span = deliver_span.clone();
                     let boxed: crate::db::CommitCallback = Box::new(move || {
-                        Box::pin(async move {
-                            if let Some(queue) = m.delivery_queue.clone() {
-                                queue.enqueue(m_mail).await.map_err(|e| {
-                                    crate::AutumnError::internal_server_error_msg(e.to_string())
-                                })
-                            } else {
-                                m.spawn_mail_delivery(m_mail).map_err(|e| {
-                                    crate::AutumnError::internal_server_error_msg(e.to_string())
-                                })
-                            }
-                        })
+                        Box::pin(tracing::Instrument::instrument(
+                            async move {
+                                if let Some(queue) = m.delivery_queue.clone() {
+                                    queue.enqueue(m_mail).await.map_err(|e| {
+                                        crate::AutumnError::internal_server_error_msg(e.to_string())
+                                    })
+                                } else {
+                                    m.spawn_mail_delivery(m_mail).map_err(|e| {
+                                        crate::AutumnError::internal_server_error_msg(e.to_string())
+                                    })
+                                }
+                            },
+                            span,
+                        ))
                     });
                     registry.lock().expect("registry lock").push(boxed);
                 })
@@ -753,19 +761,26 @@ impl Mailer {
                 "deliver_later requires an active Tokio runtime".to_owned(),
             )
         })?;
+        let parent_span = tracing::Span::current();
         if let Some(queue) = self.delivery_queue.clone() {
-            handle.spawn(async move {
-                if let Err(error) = queue.enqueue(mail).await {
-                    tracing::error!(error = %error, "durable mail enqueue failed");
-                }
-            });
+            handle.spawn(tracing::Instrument::instrument(
+                async move {
+                    if let Err(error) = queue.enqueue(mail).await {
+                        tracing::error!(error = %error, "durable mail enqueue failed");
+                    }
+                },
+                parent_span,
+            ));
         } else {
             let mailer = self.clone();
-            handle.spawn(async move {
-                if let Err(error) = mailer.send(mail).await {
-                    tracing::error!(error = %error, "background mail delivery failed");
-                }
-            });
+            handle.spawn(tracing::Instrument::instrument(
+                async move {
+                    if let Err(error) = mailer.send(mail).await {
+                        tracing::error!(error = %error, "background mail delivery failed");
+                    }
+                },
+                parent_span,
+            ));
         }
         Ok(())
     }
@@ -2066,6 +2081,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deliver_later_without_queue_sends_via_transport_directly() {
+        // When no delivery queue is configured, `spawn_mail_delivery` falls back to
+        // calling `mailer.send()` in a background task.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct TrackingSend(Arc<AtomicBool>);
+        impl MailTransport for TrackingSend {
+            fn send<'a>(
+                &'a self,
+                _mail: Mail,
+            ) -> Pin<Box<dyn Future<Output = Result<(), MailError>> + Send + 'a>> {
+                self.0.store(true, Ordering::SeqCst);
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        let sent = Arc::new(AtomicBool::new(false));
+        let mailer = Mailer::with_transport(TrackingSend(sent.clone()));
+
+        mailer
+            .try_deliver_later(sample_mail())
+            .expect("should succeed without queue");
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            sent.load(Ordering::SeqCst),
+            "mail should have been sent directly via transport"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn deferred_deliver_later_without_queue_sends_after_commit() {
+        // After-commit callback with no queue falls back to `spawn_mail_delivery`
+        // which calls `mailer.send()` in a spawned task.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct TrackingSend(Arc<AtomicBool>);
+        impl MailTransport for TrackingSend {
+            fn send<'a>(
+                &'a self,
+                _mail: Mail,
+            ) -> Pin<Box<dyn Future<Output = Result<(), MailError>> + Send + 'a>> {
+                self.0.store(true, Ordering::SeqCst);
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        let sent = Arc::new(AtomicBool::new(false));
+        let mailer = Mailer::with_transport(TrackingSend(sent.clone()));
+        let registry = std::sync::Arc::new(std::sync::Mutex::new(
+            Vec::<crate::db::CommitCallback>::new(),
+        ));
+
+        crate::db::AFTER_COMMIT_REGISTRY
+            .scope(registry.clone(), async {
+                mailer
+                    .try_deliver_later(sample_mail())
+                    .expect("should succeed");
+            })
+            .await;
+
+        drain_after_commit_callbacks_for_test(&registry).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        assert!(
+            sent.load(Ordering::SeqCst),
+            "mail should have been sent after commit via direct transport"
+        );
+    }
+
+    #[tokio::test]
     async fn mailer_with_transport_starts_without_delivery_queue() {
         let mailer = Mailer::with_transport(NoopTransport);
         assert!(
@@ -2345,6 +2434,121 @@ mod tests {
 
         install_mailer(&state, &config, false)
             .expect("static-build mode should not enforce the deliver_later guard");
+    }
+
+    #[test]
+    fn spawn_mail_delivery_inherits_parent_span() {
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::sync::{Arc, Mutex};
+
+        struct CapturingQueue(Arc<Mutex<Option<tracing::span::Id>>>);
+        impl MailDeliveryQueue for CapturingQueue {
+            fn enqueue<'a>(
+                &'a self,
+                _mail: Mail,
+            ) -> Pin<Box<dyn Future<Output = Result<(), MailError>> + Send + 'a>> {
+                let captured = self.0.clone();
+                Box::pin(async move {
+                    *captured.lock().unwrap() = tracing::Span::current().id();
+                    Ok(())
+                })
+            }
+        }
+
+        let captured_span_id: Arc<Mutex<Option<tracing::span::Id>>> = Arc::new(Mutex::new(None));
+
+        let mailer = Mailer::builder()
+            .delivery_queue(CapturingQueue(captured_span_id.clone()))
+            .build()
+            .expect("mailer with queue should build");
+        let mail = sample_mail();
+
+        // The subscriber must remain active for the entire duration — spanning
+        // both the enqueue call and the spawned task's execution — so that
+        // `tracing::Span::current()` inside the task sees the same span tree
+        // that was active when `try_deliver_later` was called.
+        tracing::subscriber::with_default(tracing_subscriber::registry(), || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build runtime");
+
+            let outer = tracing::info_span!("deliver_later_outer");
+            let outer_id = outer.id();
+
+            rt.block_on(async {
+                {
+                    let _guard = outer.enter();
+                    mailer
+                        .try_deliver_later(mail)
+                        .expect("deliver_later must not fail");
+                }
+
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            });
+
+            let in_task = captured_span_id.lock().unwrap().clone();
+            assert_eq!(
+                in_task, outer_id,
+                "delivery task must run inside the span that called deliver_later"
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn spawn_mail_delivery_logs_error_when_queue_fails() {
+        use std::future::Future;
+        use std::pin::Pin;
+
+        struct AlwaysFailQueue;
+        impl MailDeliveryQueue for AlwaysFailQueue {
+            fn enqueue<'a>(
+                &'a self,
+                _mail: Mail,
+            ) -> Pin<Box<dyn Future<Output = Result<(), MailError>> + Send + 'a>> {
+                Box::pin(async { Err(MailError::RuntimeUnavailable("always fails".to_owned())) })
+            }
+        }
+
+        let mailer = Mailer::builder()
+            .delivery_queue(AlwaysFailQueue)
+            .build()
+            .expect("build");
+
+        mailer
+            .try_deliver_later(sample_mail())
+            .expect("should schedule");
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    #[tokio::test]
+    async fn spawn_mail_delivery_logs_error_when_transport_fails() {
+        use std::future::Future;
+        use std::pin::Pin;
+
+        struct AlwaysFailTransport;
+        impl MailTransport for AlwaysFailTransport {
+            fn send<'a>(
+                &'a self,
+                _mail: Mail,
+            ) -> Pin<Box<dyn Future<Output = Result<(), MailError>> + Send + 'a>> {
+                Box::pin(async {
+                    Err(MailError::RuntimeUnavailable(
+                        "transport offline".to_owned(),
+                    ))
+                })
+            }
+        }
+
+        let mailer = Mailer::with_transport(AlwaysFailTransport);
+
+        mailer
+            .try_deliver_later(sample_mail())
+            .expect("should schedule");
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 
     #[test]

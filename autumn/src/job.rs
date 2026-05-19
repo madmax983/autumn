@@ -63,6 +63,13 @@ struct QueuedJob {
     attempt: u32,
     max_attempts: u32,
     initial_backoff_ms: u64,
+    /// W3C `traceparent` serialized at enqueue time.  `None` when the
+    /// `telemetry-otlp` feature is disabled or no active span was present.
+    #[cfg(feature = "telemetry-otlp")]
+    traceparent: Option<String>,
+    /// W3C `tracestate` serialized at enqueue time.
+    #[cfg(feature = "telemetry-otlp")]
+    tracestate: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -787,6 +794,14 @@ struct RedisJobRecord {
     claimed_at_ms: Option<u64>,
     #[serde(default)]
     last_error: Option<String>,
+    /// W3C `traceparent` captured when the job was enqueued.
+    #[cfg(feature = "telemetry-otlp")]
+    #[serde(default)]
+    traceparent: Option<String>,
+    /// W3C `tracestate` captured when the job was enqueued.
+    #[cfg(feature = "telemetry-otlp")]
+    #[serde(default)]
+    tracestate: Option<String>,
 }
 
 #[cfg(all(feature = "redis", test))]
@@ -886,6 +901,82 @@ static GLOBAL_JOB_CLIENT: OnceLock<RwLock<Option<Arc<JobClient>>>> = OnceLock::n
 pub(crate) fn global_job_runtime_test_lock() -> &'static tokio::sync::Mutex<()> {
     static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+// ── W3C Trace Context helpers ────────────────────────────────────────────────
+//
+// These are compiled only when `telemetry-otlp` is enabled.  The inject/
+// extract helpers use a plain `HashMap` as the carrier so no HTTP crate is
+// required here.
+
+/// Serialize the current active span's W3C trace context into portable
+/// strings `(traceparent, tracestate)`.  Returns `(None, None)` when no
+/// global propagator is installed or no active span exists.
+#[cfg(feature = "telemetry-otlp")]
+fn capture_job_trace_context() -> (Option<String>, Option<String>) {
+    use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+
+    let cx = tracing::Span::current().context();
+    let mut map = std::collections::HashMap::<String, String>::new();
+    opentelemetry::global::get_text_map_propagator(|propagator| {
+        propagator.inject_context(&cx, &mut JobMapInjector(&mut map));
+    });
+    (map.remove("traceparent"), map.remove("tracestate"))
+}
+
+/// Reconstruct an OpenTelemetry [`Context`](opentelemetry::Context) from
+/// serialized W3C `traceparent` / `tracestate` strings captured at enqueue
+/// time.  Returns `None` when the `traceparent` is absent or unparseable so
+/// the caller can fall back to a fresh root span instead of propagating a
+/// broken context.
+#[cfg(feature = "telemetry-otlp")]
+fn restore_job_trace_context(
+    traceparent: Option<&str>,
+    tracestate: Option<&str>,
+) -> Option<opentelemetry::Context> {
+    use opentelemetry::trace::TraceContextExt as _;
+
+    let tp = traceparent?;
+    let mut map = std::collections::HashMap::<String, String>::new();
+    map.insert("traceparent".to_owned(), tp.to_owned());
+    if let Some(ts) = tracestate {
+        map.insert("tracestate".to_owned(), ts.to_owned());
+    }
+    let cx = opentelemetry::global::get_text_map_propagator(|propagator| {
+        propagator.extract(&JobMapExtractor(&map))
+    });
+    if cx.span().span_context().is_valid() {
+        Some(cx)
+    } else {
+        None
+    }
+}
+
+#[cfg(feature = "telemetry-otlp")]
+struct JobMapExtractor<'a>(&'a std::collections::HashMap<String, String>);
+
+#[cfg(feature = "telemetry-otlp")]
+impl opentelemetry::propagation::Extractor for JobMapExtractor<'_> {
+    fn get(&self, key: &str) -> Option<&str> {
+        self.0.get(key).map(String::as_str)
+    }
+    fn keys(&self) -> Vec<&str> {
+        self.0.keys().map(String::as_str).collect()
+    }
+}
+
+#[cfg(feature = "telemetry-otlp")]
+struct JobMapInjector<'a>(&'a mut std::collections::HashMap<String, String>);
+
+#[cfg(feature = "telemetry-otlp")]
+impl opentelemetry::propagation::Injector for JobMapInjector<'_> {
+    fn set(&mut self, key: &str, value: String) {
+        self.0.insert(key.to_owned(), value);
+    }
+}
+
+fn build_job_consumer_span(name: &str, attempt: u32) -> tracing::Span {
+    tracing::info_span!("job.execute", "otel.kind" = "consumer", job.name = %name, job.attempt = attempt)
 }
 
 async fn run_job_handler(
@@ -1104,6 +1195,8 @@ impl JobClient {
             .record_enqueue(id.clone(), name, payload.clone(), 1, job_max_attempts);
 
         let result = if let Some(sender) = &self.local_sender {
+            #[cfg(feature = "telemetry-otlp")]
+            let (traceparent, tracestate) = capture_job_trace_context();
             sender
                 .send(QueuedJob {
                     id: id.clone(),
@@ -1112,6 +1205,10 @@ impl JobClient {
                     attempt: 1,
                     max_attempts: job_max_attempts,
                     initial_backoff_ms: job_backoff_ms,
+                    #[cfg(feature = "telemetry-otlp")]
+                    traceparent,
+                    #[cfg(feature = "telemetry-otlp")]
+                    tracestate,
                 })
                 .await
                 .map_err(|e| {
@@ -1191,6 +1288,11 @@ impl JobClient {
         // Keep a copy for the debug log in the eager path (name is moved into f_opt).
         let name_for_log = name.clone();
 
+        // Capture the caller's span now so that capture_job_trace_context() inside
+        // client.enqueue() sees the originating request span even when the callback
+        // runs in the after-commit task, which has no request span of its own.
+        let enqueue_span = tracing::Span::current();
+
         let mut f_opt = Some(move || {
             let client = client.clone();
             let name = name.clone();
@@ -1202,7 +1304,9 @@ impl JobClient {
         crate::db::AFTER_COMMIT_REGISTRY
             .try_with(|registry| {
                 let f = f_opt.take().expect("closure only entered once");
-                let boxed: crate::db::CommitCallback = Box::new(move || Box::pin(f()));
+                let span = enqueue_span.clone();
+                let boxed: crate::db::CommitCallback =
+                    Box::new(move || Box::pin(tracing::Instrument::instrument(f(), span)));
                 registry.lock().expect("registry lock").push(boxed);
             })
             .ok();
@@ -1292,6 +1396,8 @@ impl JobClient {
             .record_enqueue(id.clone(), name, payload.clone(), 1, job_max_attempts);
 
         let result = if let Some(sender) = &self.local_sender {
+            #[cfg(feature = "telemetry-otlp")]
+            let (traceparent, tracestate) = capture_job_trace_context();
             sender
                 .send(QueuedJob {
                     id: id.clone(),
@@ -1300,6 +1406,10 @@ impl JobClient {
                     attempt: 1,
                     max_attempts: job_max_attempts,
                     initial_backoff_ms: job_backoff_ms,
+                    #[cfg(feature = "telemetry-otlp")]
+                    traceparent,
+                    #[cfg(feature = "telemetry-otlp")]
+                    tracestate,
                 })
                 .await
                 .map_err(|e| {
@@ -1492,7 +1602,17 @@ async fn execute_local_job(
         250
     };
 
-    match run_job_handler(handler, state.clone(), job.payload.clone()).await {
+    let job_span = build_job_consumer_span(&job.name, job.attempt);
+    #[cfg(feature = "telemetry-otlp")]
+    if let Some(cx) =
+        restore_job_trace_context(job.traceparent.as_deref(), job.tracestate.as_deref())
+    {
+        use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+        let _ = job_span.set_parent(cx);
+    }
+    let f = run_job_handler(handler, state.clone(), job.payload.clone());
+    let outcome = tracing::Instrument::instrument(f, job_span).await;
+    match outcome {
         JobExecutionOutcome::Succeeded => {
             state.job_registry.record_success(&job.name);
             job_admin.record_success(&job.id);
@@ -1509,6 +1629,10 @@ async fn execute_local_job(
                 let id = job.id.clone();
                 let name = job.name.clone();
                 let payload = job.payload;
+                #[cfg(feature = "telemetry-otlp")]
+                let traceparent = job.traceparent;
+                #[cfg(feature = "telemetry-otlp")]
+                let tracestate = job.tracestate;
                 let delay = backoff_ms.saturating_mul(2_u64.saturating_pow(job.attempt - 1));
                 tokio::spawn(async move {
                     tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
@@ -1522,6 +1646,10 @@ async fn execute_local_job(
                             attempt: job.attempt + 1,
                             max_attempts,
                             initial_backoff_ms: backoff_ms,
+                            #[cfg(feature = "telemetry-otlp")]
+                            traceparent,
+                            #[cfg(feature = "telemetry-otlp")]
+                            tracestate,
                         })
                         .await;
                 });
@@ -1672,6 +1800,8 @@ impl RedisClient {
         default_max_attempts: u32,
         default_initial_backoff_ms: u64,
     ) -> AutumnResult<()> {
+        #[cfg(feature = "telemetry-otlp")]
+        let (traceparent, tracestate) = capture_job_trace_context();
         let mut connection = self.connection.clone();
         let msg = RedisJobRecord {
             id: id.clone(),
@@ -1686,6 +1816,10 @@ impl RedisClient {
             claimed_by: None,
             claimed_at_ms: None,
             last_error: None,
+            #[cfg(feature = "telemetry-otlp")]
+            traceparent,
+            #[cfg(feature = "telemetry-otlp")]
+            tracestate,
         };
         let encoded = encode_redis_record(&msg)?;
         let record_key = redis_record_key(&self.record_prefix, &id);
@@ -2792,7 +2926,7 @@ async fn dead_letter_invalid_redis_job(
 }
 
 #[cfg(feature = "redis")]
-#[allow(clippy::cognitive_complexity)]
+#[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
 async fn process_redis_job_record(
     connection: &mut redis::aio::ConnectionManager,
     mut record: RedisJobRecord,
@@ -2858,7 +2992,16 @@ async fn process_redis_job_record(
         return;
     }
 
-    match run_job_handler(handler, state.clone(), record.payload.clone()).await {
+    let job_span = build_job_consumer_span(&record.name, record.attempt);
+    #[cfg(feature = "telemetry-otlp")]
+    if let Some(cx) =
+        restore_job_trace_context(record.traceparent.as_deref(), record.tracestate.as_deref())
+    {
+        use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+        let _ = job_span.set_parent(cx);
+    }
+    let f = run_job_handler(handler, state.clone(), record.payload.clone());
+    match tracing::Instrument::instrument(f, job_span).await {
         JobExecutionOutcome::Succeeded => {
             match ack_redis_success(connection, worker_config, &record).await {
                 Ok(true) => {
@@ -3198,11 +3341,19 @@ const PG_WORKER_IDLE_SLEEP: std::time::Duration = std::time::Duration::from_mill
 #[cfg(feature = "db")]
 const PG_MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Columns returned by every SELECT from `autumn_jobs`.
-#[cfg(feature = "db")]
+/// Columns returned by every SELECT from `autumn_jobs` when OTLP is disabled.
+#[cfg(all(feature = "db", not(feature = "telemetry-otlp")))]
 const PG_JOB_SELECT_COLS: &str = "id, name, payload::TEXT AS payload, status, attempt, \
     max_attempts, initial_backoff_ms, enqueued_at, started_at, finished_at, \
     claimed_by, claimed_at, last_error";
+
+/// Columns returned by every SELECT from `autumn_jobs` when OTLP is enabled.
+/// Includes the nullable `traceparent` and `tracestate` columns added by the
+/// `add_trace_context_to_jobs` migration.
+#[cfg(all(feature = "db", feature = "telemetry-otlp"))]
+const PG_JOB_SELECT_COLS: &str = "id, name, payload::TEXT AS payload, status, attempt, \
+    max_attempts, initial_backoff_ms, enqueued_at, started_at, finished_at, \
+    claimed_by, claimed_at, last_error, traceparent, tracestate";
 
 /// A job row read from the `autumn_jobs` Postgres table.
 #[cfg(feature = "db")]
@@ -3235,6 +3386,14 @@ struct PgJobRow {
     claimed_at: Option<chrono::DateTime<chrono::Utc>>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
     last_error: Option<String>,
+    /// W3C `traceparent` captured at enqueue time.
+    #[cfg(feature = "telemetry-otlp")]
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    traceparent: Option<String>,
+    /// W3C `tracestate` captured at enqueue time.
+    #[cfg(feature = "telemetry-otlp")]
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    tracestate: Option<String>,
 }
 
 #[cfg(feature = "db")]
@@ -3285,6 +3444,8 @@ async fn pg_enqueue_job(
 ) -> AutumnResult<()> {
     use diesel_async::RunQueryDsl as _;
 
+    #[cfg(feature = "telemetry-otlp")]
+    let (traceparent, tracestate) = capture_job_trace_context();
     let mut conn = pool
         .get()
         .await
@@ -3292,7 +3453,8 @@ async fn pg_enqueue_job(
     let payload_str = serde_json::to_string(&payload).map_err(|e| {
         AutumnError::internal_server_error_msg(format!("serialize job payload: {e}"))
     })?;
-    diesel::sql_query(
+    #[cfg(not(feature = "telemetry-otlp"))]
+    let query = diesel::sql_query(
         "INSERT INTO autumn_jobs \
          (id, name, payload, status, attempt, max_attempts, initial_backoff_ms, enqueued_at, run_at) \
          VALUES ($1, $2, $3::JSONB, 'enqueued', 1, $4, $5, NOW(), NOW())",
@@ -3301,11 +3463,26 @@ async fn pg_enqueue_job(
     .bind::<diesel::sql_types::Text, _>(name)
     .bind::<diesel::sql_types::Text, _>(payload_str)
     .bind::<diesel::sql_types::Integer, _>(i32::try_from(max_attempts).unwrap_or(i32::MAX))
+    .bind::<diesel::sql_types::BigInt, _>(i64::try_from(initial_backoff_ms).unwrap_or(i64::MAX));
+    #[cfg(feature = "telemetry-otlp")]
+    let query = diesel::sql_query(
+        "INSERT INTO autumn_jobs \
+         (id, name, payload, status, attempt, max_attempts, initial_backoff_ms, \
+          enqueued_at, run_at, traceparent, tracestate) \
+         VALUES ($1, $2, $3::JSONB, 'enqueued', 1, $4, $5, NOW(), NOW(), $6, $7)",
+    )
+    .bind::<diesel::sql_types::Text, _>(id)
+    .bind::<diesel::sql_types::Text, _>(name)
+    .bind::<diesel::sql_types::Text, _>(payload_str)
+    .bind::<diesel::sql_types::Integer, _>(i32::try_from(max_attempts).unwrap_or(i32::MAX))
     .bind::<diesel::sql_types::BigInt, _>(i64::try_from(initial_backoff_ms).unwrap_or(i64::MAX))
-    .execute(&mut *conn)
-    .await
-    .map(|_| ())
-    .map_err(|e| AutumnError::internal_server_error_msg(format!("pg job enqueue failed: {e}")))
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(traceparent)
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(tracestate);
+    query
+        .execute(&mut *conn)
+        .await
+        .map(|_| ())
+        .map_err(|e| AutumnError::internal_server_error_msg(format!("pg job enqueue failed: {e}")))
 }
 
 /// Insert a job into `autumn_jobs` using an **already-open connection**.
@@ -3324,10 +3501,13 @@ async fn pg_enqueue_on_conn(
 ) -> AutumnResult<()> {
     use diesel_async::RunQueryDsl as _;
 
+    #[cfg(feature = "telemetry-otlp")]
+    let (traceparent, tracestate) = capture_job_trace_context();
     let payload_str = serde_json::to_string(&payload).map_err(|e| {
         AutumnError::internal_server_error_msg(format!("serialize job payload: {e}"))
     })?;
-    diesel::sql_query(
+    #[cfg(not(feature = "telemetry-otlp"))]
+    let query = diesel::sql_query(
         "INSERT INTO autumn_jobs \
          (id, name, payload, status, attempt, max_attempts, initial_backoff_ms, enqueued_at, run_at) \
          VALUES ($1, $2, $3::JSONB, 'enqueued', 1, $4, $5, NOW(), NOW())",
@@ -3336,11 +3516,26 @@ async fn pg_enqueue_on_conn(
     .bind::<diesel::sql_types::Text, _>(name)
     .bind::<diesel::sql_types::Text, _>(payload_str)
     .bind::<diesel::sql_types::Integer, _>(i32::try_from(max_attempts).unwrap_or(i32::MAX))
+    .bind::<diesel::sql_types::BigInt, _>(i64::try_from(initial_backoff_ms).unwrap_or(i64::MAX));
+    #[cfg(feature = "telemetry-otlp")]
+    let query = diesel::sql_query(
+        "INSERT INTO autumn_jobs \
+         (id, name, payload, status, attempt, max_attempts, initial_backoff_ms, \
+          enqueued_at, run_at, traceparent, tracestate) \
+         VALUES ($1, $2, $3::JSONB, 'enqueued', 1, $4, $5, NOW(), NOW(), $6, $7)",
+    )
+    .bind::<diesel::sql_types::Text, _>(id)
+    .bind::<diesel::sql_types::Text, _>(name)
+    .bind::<diesel::sql_types::Text, _>(payload_str)
+    .bind::<diesel::sql_types::Integer, _>(i32::try_from(max_attempts).unwrap_or(i32::MAX))
     .bind::<diesel::sql_types::BigInt, _>(i64::try_from(initial_backoff_ms).unwrap_or(i64::MAX))
-    .execute(conn)
-    .await
-    .map(|_| ())
-    .map_err(|e| AutumnError::internal_server_error_msg(format!("pg job enqueue failed: {e}")))
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(traceparent)
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(tracestate);
+    query
+        .execute(conn)
+        .await
+        .map(|_| ())
+        .map_err(|e| AutumnError::internal_server_error_msg(format!("pg job enqueue failed: {e}")))
 }
 
 /// Atomically claim the next ready job with `SELECT … FOR UPDATE SKIP LOCKED`.
@@ -3581,7 +3776,16 @@ async fn pg_execute_job(
         return;
     };
 
-    match run_job_handler(handler, state.clone(), payload).await {
+    let job_span = build_job_consumer_span(&row.name, attempt);
+    #[cfg(feature = "telemetry-otlp")]
+    if let Some(cx) =
+        restore_job_trace_context(row.traceparent.as_deref(), row.tracestate.as_deref())
+    {
+        use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+        let _ = job_span.set_parent(cx);
+    }
+    let f = run_job_handler(handler, state.clone(), payload);
+    match tracing::Instrument::instrument(f, job_span).await {
         JobExecutionOutcome::Succeeded => {
             let ack = pg_ack_success(pool, &row.id, worker_id).await;
             record_pg_row_lifecycle_ack_result(
@@ -4395,6 +4599,10 @@ mod tests {
                 attempt: 1,
                 max_attempts: 3,
                 initial_backoff_ms: 1,
+                #[cfg(feature = "telemetry-otlp")]
+                traceparent: None,
+                #[cfg(feature = "telemetry-otlp")]
+                tracestate: None,
             },
             &jobs_by_name,
             &tx,
@@ -4446,6 +4654,10 @@ mod tests {
                 attempt: 1,
                 max_attempts: 2,
                 initial_backoff_ms: 1,
+                #[cfg(feature = "telemetry-otlp")]
+                traceparent: None,
+                #[cfg(feature = "telemetry-otlp")]
+                tracestate: None,
             },
             &jobs_by_name,
             &tx,
@@ -4499,6 +4711,10 @@ mod tests {
                 attempt: 1,
                 max_attempts: 1,
                 initial_backoff_ms: 1,
+                #[cfg(feature = "telemetry-otlp")]
+                traceparent: None,
+                #[cfg(feature = "telemetry-otlp")]
+                tracestate: None,
             },
             &jobs_by_name,
             &tx,
@@ -4547,6 +4763,10 @@ mod tests {
                 attempt: 1,
                 max_attempts: 2,
                 initial_backoff_ms: 60_000,
+                #[cfg(feature = "telemetry-otlp")]
+                traceparent: None,
+                #[cfg(feature = "telemetry-otlp")]
+                tracestate: None,
             },
             &jobs_by_name,
             &tx,
@@ -4591,6 +4811,10 @@ mod tests {
             claimed_by: None,
             claimed_at_ms: None,
             last_error: None,
+            #[cfg(feature = "telemetry-otlp")]
+            traceparent: None,
+            #[cfg(feature = "telemetry-otlp")]
+            tracestate: None,
         }
     }
 
@@ -4907,6 +5131,10 @@ mod tests {
                 claimed_by: None,
                 claimed_at_ms: None,
                 last_error: None,
+                #[cfg(feature = "telemetry-otlp")]
+                traceparent: None,
+                #[cfg(feature = "telemetry-otlp")]
+                tracestate: None,
             },
             running: RedisJobRecord {
                 id: "job-running".to_string(),
@@ -4921,6 +5149,10 @@ mod tests {
                 claimed_by: Some("worker-a".to_string()),
                 claimed_at_ms: Some(now.saturating_sub(2_000)),
                 last_error: None,
+                #[cfg(feature = "telemetry-otlp")]
+                traceparent: None,
+                #[cfg(feature = "telemetry-otlp")]
+                tracestate: None,
             },
             completed: RedisJobRecord {
                 id: "job-completed".to_string(),
@@ -4935,6 +5167,10 @@ mod tests {
                 claimed_by: None,
                 claimed_at_ms: None,
                 last_error: None,
+                #[cfg(feature = "telemetry-otlp")]
+                traceparent: None,
+                #[cfg(feature = "telemetry-otlp")]
+                tracestate: None,
             },
             failed_retry: RedisJobRecord {
                 id: "job-failed-retry".to_string(),
@@ -4949,6 +5185,10 @@ mod tests {
                 claimed_by: None,
                 claimed_at_ms: None,
                 last_error: Some("smtp refused recipient".to_string()),
+                #[cfg(feature = "telemetry-otlp")]
+                traceparent: None,
+                #[cfg(feature = "telemetry-otlp")]
+                tracestate: None,
             },
             failed_discard: RedisJobRecord {
                 id: "job-failed-discard".to_string(),
@@ -4963,6 +5203,10 @@ mod tests {
                 claimed_by: None,
                 claimed_at_ms: None,
                 last_error: Some("endpoint returned 410".to_string()),
+                #[cfg(feature = "telemetry-otlp")]
+                traceparent: None,
+                #[cfg(feature = "telemetry-otlp")]
+                tracestate: None,
             },
         }
     }
@@ -5873,6 +6117,10 @@ mod tests {
                 attempt: 1,
                 max_attempts: 1,
                 initial_backoff_ms: 1,
+                #[cfg(feature = "telemetry-otlp")]
+                traceparent: None,
+                #[cfg(feature = "telemetry-otlp")]
+                tracestate: None,
             },
             &jobs_by_name,
             &tx,
@@ -5934,6 +6182,10 @@ mod tests {
                 claimed_by: Some("worker".to_owned()),
                 claimed_at: None,
                 last_error: None,
+                #[cfg(feature = "telemetry-otlp")]
+                traceparent: None,
+                #[cfg(feature = "telemetry-otlp")]
+                tracestate: None,
             }
         }
 
@@ -6828,5 +7080,317 @@ mod tests {
         );
         let job = received.unwrap().expect("channel should not be closed");
         assert_eq!(job.name, "test_job");
+    }
+
+    // ── W3C Trace Context propagation tests ─────────────────────────────────
+
+    /// Tests in this module verify the trace-context data model and helper
+    /// functions introduced to propagate W3C `traceparent` / `tracestate`
+    /// across job queue boundaries.  They are gated on `telemetry-otlp`
+    /// because the propagation helpers and struct fields are only compiled in
+    /// when that feature is enabled.
+    #[cfg(feature = "telemetry-otlp")]
+    mod trace_propagation {
+        use super::*;
+
+        /// Compile-time structural check: `QueuedJob` must expose
+        /// `traceparent` and `tracestate` fields when `telemetry-otlp` is
+        /// enabled so the in-process queue can carry the W3C context.
+        #[test]
+        fn queued_job_has_trace_context_fields() {
+            let _job = QueuedJob {
+                id: "t".to_string(),
+                name: "t".to_string(),
+                payload: serde_json::json!({}),
+                attempt: 1,
+                max_attempts: 1,
+                initial_backoff_ms: 0,
+                traceparent: Some(
+                    "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01".to_string(),
+                ),
+                tracestate: None,
+            };
+        }
+
+        #[test]
+        fn restore_job_trace_context_parses_valid_traceparent() {
+            use opentelemetry::trace::TraceContextExt as _;
+            use opentelemetry_sdk::propagation::TraceContextPropagator;
+
+            opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
+            let cx = restore_job_trace_context(
+                Some("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"),
+                None,
+            )
+            .expect("valid traceparent should parse into an OTel context");
+
+            let span = cx.span();
+            let sc = span.span_context();
+            assert!(sc.is_valid(), "restored span context must be valid");
+            assert_eq!(
+                sc.trace_id().to_string(),
+                "0af7651916cd43dd8448eb211c80319c",
+            );
+            assert_eq!(sc.span_id().to_string(), "b7ad6b7169203331");
+        }
+
+        #[test]
+        fn restore_job_trace_context_returns_none_when_traceparent_absent() {
+            use opentelemetry_sdk::propagation::TraceContextPropagator;
+            opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
+            assert!(
+                restore_job_trace_context(None, None).is_none(),
+                "absent traceparent must yield None"
+            );
+        }
+
+        #[test]
+        fn restore_job_trace_context_returns_none_for_invalid_traceparent() {
+            use opentelemetry_sdk::propagation::TraceContextPropagator;
+            opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
+            assert!(
+                restore_job_trace_context(Some("not-a-real-traceparent"), None).is_none(),
+                "malformed traceparent must yield None"
+            );
+        }
+
+        #[cfg(feature = "redis")]
+        #[test]
+        fn redis_record_has_trace_context_fields() {
+            let _record = RedisJobRecord {
+                id: "r".to_string(),
+                name: "j".to_string(),
+                payload: serde_json::json!({}),
+                attempt: 1,
+                max_attempts: 1,
+                initial_backoff_ms: 0,
+                enqueued_at_ms: None,
+                started_at_ms: None,
+                finished_at_ms: None,
+                claimed_by: None,
+                claimed_at_ms: None,
+                last_error: None,
+                traceparent: Some(
+                    "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01".to_string(),
+                ),
+                tracestate: None,
+            };
+        }
+
+        #[cfg(feature = "redis")]
+        #[test]
+        fn redis_record_missing_trace_context_deserializes_as_none() {
+            let old_json = r#"{"id":"x","name":"y","payload":{},"attempt":1,"max_attempts":3,"initial_backoff_ms":250}"#;
+            let record: RedisJobRecord = serde_json::from_str(old_json)
+                .expect("old-format record without traceparent must deserialize");
+            assert!(
+                record.traceparent.is_none(),
+                "missing field must default to None"
+            );
+            assert!(
+                record.tracestate.is_none(),
+                "missing field must default to None"
+            );
+        }
+
+        #[cfg(feature = "telemetry-otlp")]
+        #[test]
+        fn job_map_injector_set_inserts_key_value() {
+            use opentelemetry::propagation::Injector as _;
+            let mut map = std::collections::HashMap::new();
+            let mut injector = JobMapInjector(&mut map);
+            injector.set(
+                "traceparent",
+                "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01".to_owned(),
+            );
+            assert_eq!(
+                map.get("traceparent").map(String::as_str),
+                Some("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"),
+            );
+        }
+
+        #[cfg(feature = "telemetry-otlp")]
+        #[test]
+        fn capture_job_trace_context_returns_none_when_no_active_span() {
+            use opentelemetry_sdk::propagation::TraceContextPropagator;
+            opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
+            let (tp, ts) = capture_job_trace_context();
+            assert!(tp.is_none(), "no traceparent expected without active span");
+            assert!(ts.is_none(), "no tracestate expected without active span");
+        }
+
+        #[cfg(feature = "telemetry-otlp")]
+        #[tokio::test]
+        async fn execute_local_job_with_traceparent_restores_context() {
+            use opentelemetry_sdk::propagation::TraceContextPropagator;
+            opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
+
+            let state = AppState::for_test().with_profile("dev");
+            state.job_registry().register("noop");
+            state.job_registry().record_enqueue("noop");
+
+            let mut jobs = HashMap::new();
+            jobs.insert(
+                "noop".to_string(),
+                JobInfo {
+                    name: "noop".to_string(),
+                    max_attempts: 1,
+                    initial_backoff_ms: 0,
+                    handler: |_state, _payload| Box::pin(async { Ok(()) }),
+                },
+            );
+            let jobs_by_name = Arc::new(RwLock::new(jobs));
+            let (tx, _rx) = mpsc::channel(1);
+            let job_admin = JobAdminMemoryBackend::new_for_test(32);
+            let job_id = job_admin.record_enqueue_for_test("noop", serde_json::json!({}), 1, 1);
+
+            execute_local_job(
+                QueuedJob {
+                    id: job_id,
+                    name: "noop".to_string(),
+                    payload: serde_json::json!({}),
+                    attempt: 1,
+                    max_attempts: 1,
+                    initial_backoff_ms: 0,
+                    traceparent: Some(
+                        "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01".to_string(),
+                    ),
+                    tracestate: None,
+                },
+                &jobs_by_name,
+                &tx,
+                &state,
+                &job_admin,
+            )
+            .await;
+
+            let snapshot = state.job_registry().snapshot();
+            assert_eq!(
+                snapshot.get("noop").map(|s| s.total_successes),
+                Some(1),
+                "job with traceparent must execute successfully"
+            );
+        }
+
+        #[cfg(feature = "redis")]
+        #[test]
+        fn redis_record_trace_context_survives_json_roundtrip() {
+            use opentelemetry::trace::TraceContextExt as _;
+            use opentelemetry_sdk::propagation::TraceContextPropagator;
+
+            opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
+            let original = RedisJobRecord {
+                id: "r".to_string(),
+                name: "j".to_string(),
+                payload: serde_json::json!({}),
+                attempt: 1,
+                max_attempts: 1,
+                initial_backoff_ms: 0,
+                enqueued_at_ms: None,
+                started_at_ms: None,
+                finished_at_ms: None,
+                claimed_by: None,
+                claimed_at_ms: None,
+                last_error: None,
+                traceparent: Some(
+                    "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01".to_string(),
+                ),
+                tracestate: None,
+            };
+            let encoded = serde_json::to_string(&original).expect("encode");
+            let decoded: RedisJobRecord = serde_json::from_str(&encoded).expect("decode");
+            let cx = restore_job_trace_context(
+                decoded.traceparent.as_deref(),
+                decoded.tracestate.as_deref(),
+            )
+            .expect("roundtrip traceparent must restore to a valid context");
+            assert_eq!(
+                cx.span().span_context().trace_id().to_string(),
+                "0af7651916cd43dd8448eb211c80319c",
+            );
+        }
+
+        #[test]
+        fn job_map_extractor_keys_returns_all_keys() {
+            use opentelemetry::propagation::Extractor as _;
+            let mut map = std::collections::HashMap::new();
+            map.insert("traceparent".to_owned(), "00-abc-def-01".to_owned());
+            map.insert("tracestate".to_owned(), "vendor=val".to_owned());
+            let extractor = JobMapExtractor(&map);
+            let mut keys = extractor.keys();
+            keys.sort();
+            assert_eq!(keys, vec!["traceparent", "tracestate"]);
+        }
+
+        #[test]
+        fn restore_job_trace_context_with_tracestate_parses_correctly() {
+            use opentelemetry::trace::TraceContextExt as _;
+            use opentelemetry_sdk::propagation::TraceContextPropagator;
+            opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
+            let cx = restore_job_trace_context(
+                Some("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"),
+                Some("vendor=value"),
+            )
+            .expect("valid traceparent with tracestate should parse");
+            assert!(cx.span().span_context().is_valid());
+        }
+
+        #[test]
+        fn capture_job_trace_context_returns_some_when_active_otel_span() {
+            use opentelemetry::trace::TracerProvider as _;
+            use opentelemetry_sdk::propagation::TraceContextPropagator;
+            use opentelemetry_sdk::trace::SdkTracerProvider;
+            use tracing_subscriber::prelude::*;
+
+            opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
+            let provider = SdkTracerProvider::builder().build();
+            let tracer = provider.tracer("test");
+            let sub = tracing_subscriber::registry()
+                .with(tracing_opentelemetry::layer().with_tracer(tracer));
+
+            tracing::subscriber::with_default(sub, || {
+                let span = tracing::info_span!("capture_test");
+                let _guard = span.enter();
+                let (tp, _ts) = capture_job_trace_context();
+                assert!(
+                    tp.is_some(),
+                    "traceparent must be Some when an OTel-linked span is active"
+                );
+            });
+        }
+
+        #[test]
+        fn enqueue_after_commit_span_is_included_in_queued_job() {
+            use opentelemetry_sdk::propagation::TraceContextPropagator;
+            opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            let (tx, mut rx) = mpsc::channel(16);
+            let client = JobClient {
+                local_sender: Some(tx),
+                #[cfg(feature = "redis")]
+                redis: None,
+                #[cfg(feature = "db")]
+                pg_pool: None,
+                registry: crate::actuator::JobRegistry::new(),
+                job_admin: JobAdminMemoryBackend::new_for_test(32),
+                default_max_attempts: 3,
+                default_initial_backoff_ms: 100,
+                per_job_defaults: HashMap::from([("test_job".to_string(), (3_u32, 100_u64))]),
+            };
+            rt.block_on(async {
+                client
+                    .enqueue_after_commit("test_job", serde_json::json!({}))
+                    .await
+                    .expect("outside tx enqueues immediately");
+                let job = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
+                    .await
+                    .expect("job should arrive")
+                    .expect("channel open");
+                assert_eq!(job.name, "test_job");
+            });
+        }
     }
 }
