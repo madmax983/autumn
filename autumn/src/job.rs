@@ -7193,6 +7193,85 @@ mod tests {
             );
         }
 
+        #[cfg(feature = "telemetry-otlp")]
+        #[test]
+        fn job_map_injector_set_inserts_key_value() {
+            use opentelemetry::propagation::Injector as _;
+            let mut map = std::collections::HashMap::new();
+            let mut injector = JobMapInjector(&mut map);
+            injector.set(
+                "traceparent",
+                "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01".to_owned(),
+            );
+            assert_eq!(
+                map.get("traceparent").map(String::as_str),
+                Some("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"),
+            );
+        }
+
+        #[cfg(feature = "telemetry-otlp")]
+        #[test]
+        fn capture_job_trace_context_returns_none_when_no_active_span() {
+            use opentelemetry_sdk::propagation::TraceContextPropagator;
+            opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
+            let (tp, ts) = capture_job_trace_context();
+            assert!(tp.is_none(), "no traceparent expected without active span");
+            assert!(ts.is_none(), "no tracestate expected without active span");
+        }
+
+        #[cfg(feature = "telemetry-otlp")]
+        #[tokio::test]
+        async fn execute_local_job_with_traceparent_restores_context() {
+            use opentelemetry_sdk::propagation::TraceContextPropagator;
+            opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
+
+            let state = AppState::for_test().with_profile("dev");
+            state.job_registry().register("noop");
+            state.job_registry().record_enqueue("noop");
+
+            let mut jobs = HashMap::new();
+            jobs.insert(
+                "noop".to_string(),
+                JobInfo {
+                    name: "noop".to_string(),
+                    max_attempts: 1,
+                    initial_backoff_ms: 0,
+                    handler: |_state, _payload| Box::pin(async { Ok(()) }),
+                },
+            );
+            let jobs_by_name = Arc::new(RwLock::new(jobs));
+            let (tx, _rx) = mpsc::channel(1);
+            let job_admin = JobAdminMemoryBackend::new_for_test(32);
+            let job_id = job_admin.record_enqueue_for_test("noop", serde_json::json!({}), 1, 1);
+
+            execute_local_job(
+                QueuedJob {
+                    id: job_id,
+                    name: "noop".to_string(),
+                    payload: serde_json::json!({}),
+                    attempt: 1,
+                    max_attempts: 1,
+                    initial_backoff_ms: 0,
+                    traceparent: Some(
+                        "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01".to_string(),
+                    ),
+                    tracestate: None,
+                },
+                &jobs_by_name,
+                &tx,
+                &state,
+                &job_admin,
+            )
+            .await;
+
+            let snapshot = state.job_registry().snapshot();
+            assert_eq!(
+                snapshot.get("noop").map(|s| s.total_successes),
+                Some(1),
+                "job with traceparent must execute successfully"
+            );
+        }
+
         #[cfg(feature = "redis")]
         #[test]
         fn redis_record_trace_context_survives_json_roundtrip() {
