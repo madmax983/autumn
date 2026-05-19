@@ -81,7 +81,7 @@ pub enum FieldKind {
     Bytea,
     /// `Blob` stored as `JSONB` — a file attachment with direct-upload support.
     ///
-    /// Maps to a Postgres `JSONB` column that stores the [`autumn_web::storage::Blob`]
+    /// Maps to a Postgres `JSONB` column that stores the `autumn_web::storage::Blob`
     /// metadata (key, content-type, byte-size, etag). The bytes themselves live
     /// in the configured storage backend (local disk or S3-compatible).
     ///
