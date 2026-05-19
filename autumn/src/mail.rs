@@ -2081,6 +2081,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deliver_later_without_queue_sends_via_transport_directly() {
+        // When no delivery queue is configured, `spawn_mail_delivery` falls back to
+        // calling `mailer.send()` in a background task.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct TrackingSend(Arc<AtomicBool>);
+        impl MailTransport for TrackingSend {
+            fn send<'a>(
+                &'a self,
+                _mail: Mail,
+            ) -> Pin<Box<dyn Future<Output = Result<(), MailError>> + Send + 'a>> {
+                self.0.store(true, Ordering::SeqCst);
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        let sent = Arc::new(AtomicBool::new(false));
+        let mailer = Mailer::with_transport(TrackingSend(sent.clone()));
+
+        mailer
+            .try_deliver_later(sample_mail())
+            .expect("should succeed without queue");
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            sent.load(Ordering::SeqCst),
+            "mail should have been sent directly via transport"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn deferred_deliver_later_without_queue_sends_after_commit() {
+        // After-commit callback with no queue falls back to `spawn_mail_delivery`
+        // which calls `mailer.send()` in a spawned task.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct TrackingSend(Arc<AtomicBool>);
+        impl MailTransport for TrackingSend {
+            fn send<'a>(
+                &'a self,
+                _mail: Mail,
+            ) -> Pin<Box<dyn Future<Output = Result<(), MailError>> + Send + 'a>> {
+                self.0.store(true, Ordering::SeqCst);
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        let sent = Arc::new(AtomicBool::new(false));
+        let mailer = Mailer::with_transport(TrackingSend(sent.clone()));
+        let registry = std::sync::Arc::new(std::sync::Mutex::new(
+            Vec::<crate::db::CommitCallback>::new(),
+        ));
+
+        crate::db::AFTER_COMMIT_REGISTRY
+            .scope(registry.clone(), async {
+                mailer
+                    .try_deliver_later(sample_mail())
+                    .expect("should succeed");
+            })
+            .await;
+
+        drain_after_commit_callbacks_for_test(&registry).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        assert!(
+            sent.load(Ordering::SeqCst),
+            "mail should have been sent after commit via direct transport"
+        );
+    }
+
+    #[tokio::test]
     async fn mailer_with_transport_starts_without_delivery_queue() {
         let mailer = Mailer::with_transport(NoopTransport);
         assert!(
