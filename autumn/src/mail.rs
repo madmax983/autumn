@@ -753,19 +753,28 @@ impl Mailer {
                 "deliver_later requires an active Tokio runtime".to_owned(),
             )
         })?;
+        let parent_span = tracing::Span::current();
         if let Some(queue) = self.delivery_queue.clone() {
-            handle.spawn(async move {
-                if let Err(error) = queue.enqueue(mail).await {
-                    tracing::error!(error = %error, "durable mail enqueue failed");
+            use tracing::Instrument as _;
+            handle.spawn(
+                async move {
+                    if let Err(error) = queue.enqueue(mail).await {
+                        tracing::error!(error = %error, "durable mail enqueue failed");
+                    }
                 }
-            });
+                .instrument(parent_span),
+            );
         } else {
             let mailer = self.clone();
-            handle.spawn(async move {
-                if let Err(error) = mailer.send(mail).await {
-                    tracing::error!(error = %error, "background mail delivery failed");
+            use tracing::Instrument as _;
+            handle.spawn(
+                async move {
+                    if let Err(error) = mailer.send(mail).await {
+                        tracing::error!(error = %error, "background mail delivery failed");
+                    }
                 }
-            });
+                .instrument(parent_span),
+            );
         }
         Ok(())
     }
@@ -2345,6 +2354,62 @@ mod tests {
 
         install_mailer(&state, &config, false)
             .expect("static-build mode should not enforce the deliver_later guard");
+    }
+
+    /// When `deliver_later` is called inside an active tracing span the
+    /// spawned delivery task must run within that same span so log records
+    /// and OTel child spans created inside the task share the same trace.
+    #[tokio::test]
+    async fn spawn_mail_delivery_inherits_parent_span() {
+        use std::sync::{Arc, Mutex};
+        use std::future::Future;
+        use std::pin::Pin;
+
+        let captured_span_id: Arc<Mutex<Option<tracing::span::Id>>> =
+            Arc::new(Mutex::new(None));
+        let cap = captured_span_id.clone();
+
+        struct CapturingQueue(Arc<Mutex<Option<tracing::span::Id>>>);
+        impl MailDeliveryQueue for CapturingQueue {
+            fn enqueue<'a>(
+                &'a self,
+                _mail: Mail,
+            ) -> Pin<Box<dyn Future<Output = Result<(), MailError>> + Send + 'a>> {
+                let captured = self.0.clone();
+                Box::pin(async move {
+                    *captured.lock().unwrap() = tracing::Span::current().id().clone();
+                    Ok(())
+                })
+            }
+        }
+
+        let mailer = Mailer::builder()
+            .with_delivery_queue(CapturingQueue(cap.clone()))
+            .build()
+            .expect("mailer with queue should build");
+        let mail = sample_mail();
+
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer().with_writer(std::io::sink));
+
+        let parent_span_id: Option<tracing::span::Id> = tracing::subscriber::with_default(
+            subscriber,
+            || {
+                let outer = tracing::info_span!("deliver_later_outer");
+                let id = outer.id().clone();
+                let _guard = outer.enter();
+                mailer.try_deliver_later(mail).expect("deliver_later must not fail");
+                id
+            },
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let in_task = captured_span_id.lock().unwrap().clone();
+        assert_eq!(
+            in_task, parent_span_id,
+            "delivery task must run inside the span that called deliver_later"
+        );
     }
 
     #[test]

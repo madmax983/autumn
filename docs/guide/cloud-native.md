@@ -80,6 +80,59 @@ With the `telemetry-otlp` cargo feature enabled and `telemetry.enabled = true`:
   span tagged with `db.system=postgresql` whose scope covers the lifetime
   of the pooled connection — Diesel activity performed through it appears
   as a child of the request span in Jaeger / Tempo / Datadog.
+- **Job and mailer trace propagation.** `#[job]` and `#[mailer]` boundaries
+  now carry the W3C `traceparent` / `tracestate` into their durable payloads.
+  See below.
+
+### Trace context across job and mailer boundaries
+
+By default a distributed trace dies at any queue boundary: the HTTP request
+span ends, the worker picks up the job on a different replica minutes later,
+and your APM shows two disconnected traces with no link between them.
+
+With `telemetry-otlp` enabled, Autumn serializes the active `traceparent` (and
+optional `tracestate`) into every job payload at enqueue time, and then
+re-parents the `job.execute` span to that context when the job is dequeued:
+
+```
+HTTP request span (web replica)
+ └─ enqueue SendWelcomeEmail
+     └─ job.execute SendWelcomeEmail   ← worker replica, seconds later
+         └─ … your job logic …
+```
+
+This works across all three backends:
+
+| Backend | Where the context is stored |
+|---|---|
+| `local` | In-process channel (`QueuedJob.traceparent`) |
+| `redis` | JSON payload field (`traceparent`) — old workers that predate this change see an unknown field and ignore it |
+| `postgres` | Columns `traceparent` / `tracestate` on `autumn_jobs` — add them via the bundled migration `20260519000000_add_trace_context_to_jobs` |
+
+The `job.execute` span carries the `otel.kind = consumer` attribute so APM
+tools render it as a messaging consumer span.
+
+`#[mailer]` methods that call `deliver_later` inherit the current tracing span
+for the spawned delivery task, so log records emitted during background
+delivery remain correlated with the request that triggered them.
+
+**Migration step for Postgres jobs.** If your app uses
+`jobs.backend = "postgres"` and you upgrade to a version that includes this
+change, run the migration before deploying new workers:
+
+```shell
+autumn migrate run
+```
+
+or apply it manually:
+
+```sql
+ALTER TABLE autumn_jobs ADD COLUMN IF NOT EXISTS traceparent TEXT;
+ALTER TABLE autumn_jobs ADD COLUMN IF NOT EXISTS tracestate  TEXT;
+```
+
+Workers compiled **without** `telemetry-otlp` skip the columns in their
+`SELECT` and `INSERT` statements and are unaffected.
 
 ## Harvest Backends
 
@@ -659,6 +712,7 @@ Before calling an Autumn app "cloud ready", verify:
 - migrations run before web rollout via a dedicated migration job
 - destructive/irreversible migrations follow the expand/contract pattern
 - background jobs use the right runtime model
+- `autumn_jobs` has `traceparent` / `tracestate` columns if using the Postgres backend with `telemetry-otlp`
 - multi-replica write paths use `#[lock_version]` (optimistic) or `with_lock` (pessimistic) to prevent lost updates
 - the generated container image builds without manual template surgery
 - `server.prestop_grace_secs` is tuned to match your load balancer's deregistration propagation time
