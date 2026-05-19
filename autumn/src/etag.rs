@@ -757,8 +757,9 @@ mod tests {
 
     #[test]
     fn tuple_into_etag_is_deterministic() {
-        use chrono::NaiveDateTime;
-        let dt = NaiveDateTime::from_timestamp_opt(1_000_000, 0).unwrap();
+        let dt = chrono::DateTime::from_timestamp(1_000_000, 0)
+            .unwrap()
+            .naive_utc();
         let e1: ETag = (dt, 3_i64).into_etag();
         let e2: ETag = (dt, 3_i64).into_etag();
         assert_eq!(e1, e2);
@@ -767,8 +768,9 @@ mod tests {
 
     #[test]
     fn tuple_etag_differs_when_lock_version_differs() {
-        use chrono::NaiveDateTime;
-        let dt = NaiveDateTime::from_timestamp_opt(1_000_000, 0).unwrap();
+        let dt = chrono::DateTime::from_timestamp(1_000_000, 0)
+            .unwrap()
+            .naive_utc();
         let e1: ETag = (dt, 1_i64).into_etag();
         let e2: ETag = (dt, 2_i64).into_etag();
         assert_ne!(e1, e2);
@@ -776,9 +778,12 @@ mod tests {
 
     #[test]
     fn tuple_etag_differs_when_timestamp_differs() {
-        use chrono::NaiveDateTime;
-        let dt1 = NaiveDateTime::from_timestamp_opt(1_000_000, 0).unwrap();
-        let dt2 = NaiveDateTime::from_timestamp_opt(1_000_001, 0).unwrap();
+        let dt1 = chrono::DateTime::from_timestamp(1_000_000, 0)
+            .unwrap()
+            .naive_utc();
+        let dt2 = chrono::DateTime::from_timestamp(1_000_001, 0)
+            .unwrap()
+            .naive_utc();
         let e1: ETag = (dt1, 1_i64).into_etag();
         let e2: ETag = (dt2, 1_i64).into_etag();
         assert_ne!(e1, e2);
