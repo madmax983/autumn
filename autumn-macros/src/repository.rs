@@ -1014,9 +1014,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 ::core::option::Option::Some(__autumn_idempotency.next_mutation_discriminator());
                         }
 
-                        // Load current record for before_delete context
+                        // Load current record for before_delete context.
+                        // Apply the same soft-delete predicate as the mutation so
+                        // hooks only run when the row is actually deletable.
                         let record = #table_ident::table
                             .find(id)
+                            #sd_filter
                             .for_update()
                             .first::<#model_name>(conn)
                             .await
@@ -3263,6 +3266,30 @@ mod tests {
         assert!(
             section.contains("is_null"),
             "delete_by_id soft-delete UPDATE must add deleted_at IS NULL guard: {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_soft_delete_hooked_prefetch_applies_sd_filter() {
+        // With hooks, the prefetch SELECT must include deleted_at IS NULL so
+        // before_delete only fires for actually-deletable rows.
+        let generated = repository_macro(
+            quote! { Post, soft_delete, hooks = PostHooks },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        // Locate the prefetch (before_delete context load) inside the
+        // transaction block — search for the for_update call site.
+        let prefetch_pos = generated
+            .find("for_update")
+            .expect("hooked delete must generate a for_update prefetch");
+        // The is_null filter must appear BEFORE for_update in the chain.
+        let preamble = &generated[..prefetch_pos];
+        let last_is_null = preamble.rfind("is_null");
+        assert!(
+            last_is_null.is_some(),
+            "hooked prefetch must apply deleted_at IS NULL before for_update: {preamble}"
         );
     }
 
