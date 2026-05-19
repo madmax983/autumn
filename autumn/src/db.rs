@@ -213,6 +213,13 @@ pub trait DbState {
     fn read_pool(&self) -> Option<&Pool<AsyncPgConnection>> {
         self.replica_pool().or_else(|| self.pool())
     }
+
+    /// Returns any registered database connection checkout interceptors.
+    fn db_interceptors(
+        &self,
+    ) -> Vec<std::sync::Arc<dyn crate::interceptor::DbConnectionInterceptor>> {
+        Vec::new()
+    }
 }
 
 /// Error type for pool creation failures.
@@ -344,7 +351,7 @@ pub fn create_topology(config: &DatabaseConfig) -> Result<Option<DatabaseTopolog
 // ── Db extractor ─────────────────────────────────────────────
 
 /// Connection type managed by the deadpool pool.
-type PooledConnection = diesel_async::pooled_connection::deadpool::Object<AsyncPgConnection>;
+pub type PooledConnection = diesel_async::pooled_connection::deadpool::Object<AsyncPgConnection>;
 
 struct TxDepthGuard<'a> {
     depth: &'a mut usize,
@@ -550,14 +557,26 @@ where
             otel.kind = "client",
             db.system = "postgresql",
         );
-        let conn = async {
+        let interceptors = state.db_interceptors();
+
+        let mut checkout_future: std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<PooledConnection, AutumnError>> + Send + '_,
+            >,
+        > = Box::pin(async {
             pool.get().await.map_err(|e| {
                 tracing::error!("Failed to acquire database connection: {e}");
                 AutumnError::service_unavailable_msg(e.to_string())
             })
+        });
+        for interceptor in &interceptors {
+            let ctx = crate::interceptor::DbCheckoutContext {
+                pool_name: "primary".to_string(),
+            };
+            checkout_future = interceptor.intercept_checkout(ctx, checkout_future);
         }
-        .instrument(span.clone())
-        .await?;
+
+        let conn = checkout_future.instrument(span.clone()).await?;
 
         Ok(Self {
             conn,

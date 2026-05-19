@@ -528,6 +528,14 @@ impl DbState for AppState {
     {
         Self::read_pool(self)
     }
+
+    fn db_interceptors(
+        &self,
+    ) -> Vec<std::sync::Arc<dyn crate::interceptor::DbConnectionInterceptor>> {
+        self.extension::<Arc<dyn crate::interceptor::DbConnectionInterceptor>>()
+            .map(|arc| vec![(*arc).clone()])
+            .unwrap_or_default()
+    }
 }
 
 impl crate::probe::ProvideProbeState for AppState {

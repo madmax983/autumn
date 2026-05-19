@@ -109,6 +109,15 @@ pub fn app() -> AppBuilder {
         mail_previews: Vec::new(),
         declared_routes: Vec::new(),
         idempotency_enabled: false,
+        #[cfg(feature = "mail")]
+        mail_interceptor: None,
+        job_interceptor: None,
+        #[cfg(feature = "db")]
+        db_interceptor: None,
+        #[cfg(feature = "ws")]
+        channels_interceptor: None,
+        #[cfg(feature = "oauth2")]
+        http_interceptor: None,
     }
 }
 
@@ -272,6 +281,15 @@ pub struct AppBuilder {
     /// loaded `AutumnConfig` before router assembly so that startup validation
     /// and `apply_middleware` both see `config.idempotency.enabled = true`.
     idempotency_enabled: bool,
+    #[cfg(feature = "mail")]
+    mail_interceptor: Option<Arc<dyn crate::interceptor::MailInterceptor>>,
+    job_interceptor: Option<Arc<dyn crate::interceptor::JobInterceptor>>,
+    #[cfg(feature = "db")]
+    db_interceptor: Option<Arc<dyn crate::interceptor::DbConnectionInterceptor>>,
+    #[cfg(feature = "ws")]
+    channels_interceptor: Option<Arc<dyn crate::interceptor::ChannelsInterceptor>>,
+    #[cfg(feature = "oauth2")]
+    http_interceptor: Option<Arc<dyn crate::interceptor::HttpInterceptor>>,
 }
 
 /// Boxed builder closure that constructs a durable
@@ -967,6 +985,55 @@ impl AppBuilder {
         self.extensions.get(&TypeId::of::<T>())?.downcast_ref::<T>()
     }
 
+    #[cfg(feature = "mail")]
+    #[must_use]
+    pub fn with_mail_interceptor(
+        mut self,
+        interceptor: impl crate::interceptor::MailInterceptor,
+    ) -> Self {
+        self.mail_interceptor = Some(Arc::new(interceptor));
+        self
+    }
+
+    #[must_use]
+    pub fn with_job_interceptor(
+        mut self,
+        interceptor: impl crate::interceptor::JobInterceptor,
+    ) -> Self {
+        self.job_interceptor = Some(Arc::new(interceptor));
+        self
+    }
+
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn with_db_interceptor(
+        mut self,
+        interceptor: impl crate::interceptor::DbConnectionInterceptor,
+    ) -> Self {
+        self.db_interceptor = Some(Arc::new(interceptor));
+        self
+    }
+
+    #[cfg(feature = "ws")]
+    #[must_use]
+    pub fn with_channels_interceptor(
+        mut self,
+        interceptor: impl crate::interceptor::ChannelsInterceptor,
+    ) -> Self {
+        self.channels_interceptor = Some(Arc::new(interceptor));
+        self
+    }
+
+    #[cfg(feature = "oauth2")]
+    #[must_use]
+    pub fn with_http_interceptor(
+        mut self,
+        interceptor: impl crate::interceptor::HttpInterceptor,
+    ) -> Self {
+        self.http_interceptor = Some(Arc::new(interceptor));
+        self
+    }
+
     /// Register a pre-loaded i18n translation bundle.
     ///
     /// Most apps prefer [`Self::i18n_auto`] which loads from the
@@ -1518,6 +1585,15 @@ impl AppBuilder {
             mail_previews,
             declared_routes: _,
             idempotency_enabled,
+            #[cfg(feature = "mail")]
+            mail_interceptor,
+            job_interceptor,
+            #[cfg(feature = "db")]
+            db_interceptor,
+            #[cfg(feature = "ws")]
+            channels_interceptor,
+            #[cfg(feature = "oauth2")]
+            http_interceptor,
         } = self;
 
         let all_routes = routes;
@@ -1650,6 +1726,31 @@ impl AppBuilder {
             #[cfg(feature = "ws")]
             channels_backend,
         );
+        #[cfg(feature = "mail")]
+        if let Some(interceptor) = mail_interceptor {
+            state.insert_extension(interceptor);
+        }
+        if let Some(interceptor) = job_interceptor {
+            state.insert_extension(interceptor);
+        }
+        #[cfg(feature = "db")]
+        if let Some(interceptor) = db_interceptor {
+            state.insert_extension(interceptor);
+        }
+        #[cfg(feature = "ws")]
+        if let Some(interceptor) = channels_interceptor {
+            state.insert_extension(interceptor.clone());
+            state.channels = crate::channels::Channels::with_shared_backend(std::sync::Arc::new(
+                crate::channels::InterceptedChannelsBackend::new(
+                    state.channels.backend().clone(),
+                    vec![interceptor],
+                ),
+            ));
+        }
+        #[cfg(feature = "oauth2")]
+        if let Some(interceptor) = http_interceptor {
+            state.insert_extension(interceptor);
+        }
         #[cfg(feature = "db")]
         configure_replica_migration_check(&state, replica_migration_check);
         #[cfg(feature = "db")]
@@ -2019,6 +2120,15 @@ impl AppBuilder {
             mail_previews,
             declared_routes: _,
             idempotency_enabled,
+            #[cfg(feature = "mail")]
+                mail_interceptor: _,
+            job_interceptor: _,
+            #[cfg(feature = "db")]
+                db_interceptor: _,
+            #[cfg(feature = "ws")]
+                channels_interceptor: _,
+            #[cfg(feature = "oauth2")]
+                http_interceptor: _,
         } = self;
 
         let all_routes = routes;

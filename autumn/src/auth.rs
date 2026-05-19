@@ -848,15 +848,113 @@ async fn validate_and_decode_id_token(
 }
 
 #[cfg(feature = "oauth2")]
-fn oauth_http_client() -> crate::AutumnResult<reqwest::Client> {
-    reqwest::Client::builder()
+#[derive(Clone)]
+pub struct HttpClient {
+    inner: reqwest::Client,
+}
+
+#[cfg(feature = "oauth2")]
+pub struct HttpRequestBuilder {
+    client: reqwest::Client,
+    builder: reqwest::RequestBuilder,
+}
+
+#[cfg(feature = "oauth2")]
+impl HttpClient {
+    pub fn new(inner: reqwest::Client) -> Self {
+        Self { inner }
+    }
+
+    pub fn post(&self, url: &str) -> HttpRequestBuilder {
+        HttpRequestBuilder {
+            client: self.inner.clone(),
+            builder: self.inner.post(url),
+        }
+    }
+
+    pub fn get(&self, url: &str) -> HttpRequestBuilder {
+        HttpRequestBuilder {
+            client: self.inner.clone(),
+            builder: self.inner.get(url),
+        }
+    }
+}
+
+#[cfg(feature = "oauth2")]
+impl HttpRequestBuilder {
+    pub fn header<K, V>(mut self, key: K, value: V) -> Self
+    where
+        reqwest::header::HeaderName: TryFrom<K>,
+        <reqwest::header::HeaderName as TryFrom<K>>::Error: Into<http::Error>,
+        reqwest::header::HeaderValue: TryFrom<V>,
+        <reqwest::header::HeaderValue as TryFrom<V>>::Error: Into<http::Error>,
+    {
+        self.builder = self.builder.header(key, value);
+        self
+    }
+
+    pub fn bearer_auth<T>(mut self, token: T) -> Self
+    where
+        T: std::fmt::Display,
+    {
+        self.builder = self.builder.bearer_auth(token);
+        self
+    }
+
+    pub fn form<T: serde::Serialize + ?Sized>(mut self, form: &T) -> Self {
+        self.builder = self.builder.form(form);
+        self
+    }
+
+    pub async fn send(self) -> Result<reqwest::Response, reqwest::Error> {
+        let req = self.builder.build()?;
+        let interceptors = crate::interceptor::ACTIVE_HTTP_INTERCEPTORS
+            .try_with(|i| i.clone())
+            .unwrap_or_default();
+        run_http_chain(req, interceptors, self.client.clone(), 0).await
+    }
+}
+
+#[cfg(feature = "oauth2")]
+fn run_http_chain(
+    req: reqwest::Request,
+    interceptors: Vec<Arc<dyn crate::interceptor::HttpInterceptor>>,
+    client: reqwest::Client,
+    idx: usize,
+) -> std::pin::Pin<
+    Box<
+        dyn std::future::Future<Output = Result<reqwest::Response, reqwest::Error>>
+            + Send
+            + 'static,
+    >,
+> {
+    Box::pin(async move {
+        if idx < interceptors.len() {
+            let interceptor = interceptors[idx].clone();
+            let next_interceptors = interceptors.clone();
+            let next_client = client.clone();
+            let next_fn = move |r: reqwest::Request| {
+                run_http_chain(r, next_interceptors.clone(), next_client.clone(), idx + 1)
+            };
+            let fut = interceptor.intercept(req, &next_fn);
+            fut.await
+        } else {
+            client.execute(req).await
+        }
+    })
+}
+
+#[cfg(feature = "oauth2")]
+fn oauth_http_client() -> crate::AutumnResult<HttpClient> {
+    let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(OAUTH_HTTP_TIMEOUT_SECS))
         .build()
         .map_err(|e| {
             crate::AutumnError::service_unavailable_msg(format!(
                 "failed to build oauth http client: {e}"
             ))
-        })
+        })?;
+    Ok(HttpClient::new(client))
 }
 
 impl Default for AuthConfig {

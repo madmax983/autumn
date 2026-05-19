@@ -53,6 +53,7 @@ pub struct JobClient {
     default_max_attempts: u32,
     default_initial_backoff_ms: u64,
     per_job_defaults: HashMap<String, (u32, u64)>,
+    pub interceptor: Option<Arc<dyn crate::interceptor::JobInterceptor>>,
 }
 
 #[derive(Debug)]
@@ -897,8 +898,7 @@ struct RedisWorkerConfig {
 
 static GLOBAL_JOB_CLIENT: OnceLock<RwLock<Option<Arc<JobClient>>>> = OnceLock::new();
 
-#[cfg(test)]
-pub(crate) fn global_job_runtime_test_lock() -> &'static tokio::sync::Mutex<()> {
+pub fn global_job_runtime_test_lock() -> &'static tokio::sync::Mutex<()> {
     static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
@@ -980,15 +980,28 @@ fn build_job_consumer_span(name: &str, attempt: u32) -> tracing::Span {
 }
 
 async fn run_job_handler(
+    name: &str,
     handler: JobHandler,
     state: AppState,
     payload: Value,
 ) -> JobExecutionOutcome {
-    let future = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        (handler)(state, payload)
-    })) {
+    let interceptor = state
+        .extension::<Arc<dyn crate::interceptor::JobInterceptor>>()
+        .map(|arc| (*arc).clone());
+
+    let future_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        (handler)(state.clone(), payload.clone())
+    }));
+
+    let next = match future_res {
         Ok(future) => future,
         Err(panic) => return JobExecutionOutcome::Panicked(format_job_panic(panic.as_ref())),
+    };
+
+    let future = if let Some(interceptor) = &interceptor {
+        interceptor.intercept_execute(name, &payload, next)
+    } else {
+        next
     };
 
     match std::panic::AssertUnwindSafe(future).catch_unwind().await {
@@ -1027,7 +1040,7 @@ pub(crate) fn init_global_job_client(client: JobClient) {
     let _ = GLOBAL_JOB_CLIENT.set(RwLock::new(Some(Arc::new(client))));
 }
 
-pub(crate) fn clear_global_job_client() {
+pub fn clear_global_job_client() {
     if let Some(lock) = GLOBAL_JOB_CLIENT.get() {
         if let Ok(mut guard) = lock.write() {
             *guard = None;
@@ -1194,37 +1207,55 @@ impl JobClient {
         self.job_admin
             .record_enqueue(id.clone(), name, payload.clone(), 1, job_max_attempts);
 
-        let result = if let Some(sender) = &self.local_sender {
-            #[cfg(feature = "telemetry-otlp")]
-            let (traceparent, tracestate) = capture_job_trace_context();
-            sender
-                .send(QueuedJob {
-                    id: id.clone(),
-                    name: name.to_string(),
-                    payload,
-                    attempt: 1,
-                    max_attempts: job_max_attempts,
-                    initial_backoff_ms: job_backoff_ms,
-                    #[cfg(feature = "telemetry-otlp")]
-                    traceparent,
-                    #[cfg(feature = "telemetry-otlp")]
-                    tracestate,
-                })
+        let payload_clone = payload.clone();
+        let actual_enqueue = async move {
+            let result = if let Some(sender) = &self.local_sender {
+                #[cfg(feature = "telemetry-otlp")]
+                let (traceparent, tracestate) = capture_job_trace_context();
+                sender
+                    .send(QueuedJob {
+                        id: id.clone(),
+                        name: name.to_string(),
+                        payload: payload_clone.clone(),
+                        attempt: 1,
+                        max_attempts: job_max_attempts,
+                        initial_backoff_ms: job_backoff_ms,
+                        #[cfg(feature = "telemetry-otlp")]
+                        traceparent,
+                        #[cfg(feature = "telemetry-otlp")]
+                        tracestate,
+                    })
+                    .await
+                    .map_err(|e| {
+                        AutumnError::internal_server_error(std::io::Error::other(format!(
+                            "failed to enqueue job: {e}"
+                        )))
+                    })
+            } else {
+                self.enqueue_durable(
+                    id.clone(),
+                    name,
+                    payload_clone.clone(),
+                    job_max_attempts,
+                    job_backoff_ms,
+                )
                 .await
-                .map_err(|e| {
-                    AutumnError::internal_server_error(std::io::Error::other(format!(
-                        "failed to enqueue job: {e}"
-                    )))
-                })
-        } else {
-            self.enqueue_durable(id.clone(), name, payload, job_max_attempts, job_backoff_ms)
-                .await
+            };
+            if result.is_err() {
+                self.registry.record_cancel(name);
+                self.job_admin.record_cancelled(&id);
+            }
+            result
         };
-        if result.is_err() {
-            self.registry.record_cancel(name);
-            self.job_admin.record_cancelled(&id);
+
+        if let Some(interceptor) = &self.interceptor {
+            let interceptor = (*interceptor).clone();
+            interceptor
+                .intercept_enqueue(name, &payload, Box::pin(actual_enqueue))
+                .await
+        } else {
+            actual_enqueue.await
         }
-        result
     }
 
     /// Enqueue a job that fires **only after the surrounding transaction commits**.
@@ -1387,49 +1418,82 @@ impl JobClient {
         // transaction commits, so we cannot safely update process-local counters
         // here — the row may disappear on rollback while the counter persists.
         if self.pg_pool.is_some() {
-            return pg_enqueue_on_conn(conn, id, name, payload, job_max_attempts, job_backoff_ms)
-                .await;
+            let actual_enqueue = pg_enqueue_on_conn(
+                conn,
+                id,
+                name,
+                payload.clone(),
+                job_max_attempts,
+                job_backoff_ms,
+            );
+            return if let Some(interceptor) = &self.interceptor {
+                let interceptor = (*interceptor).clone();
+                interceptor
+                    .intercept_enqueue(name, &payload, Box::pin(actual_enqueue))
+                    .await
+            } else {
+                actual_enqueue.await
+            };
         }
 
         self.registry.record_enqueue(name);
         self.job_admin
             .record_enqueue(id.clone(), name, payload.clone(), 1, job_max_attempts);
 
-        let result = if let Some(sender) = &self.local_sender {
-            #[cfg(feature = "telemetry-otlp")]
-            let (traceparent, tracestate) = capture_job_trace_context();
-            sender
-                .send(QueuedJob {
-                    id: id.clone(),
-                    name: name.to_string(),
-                    payload,
-                    attempt: 1,
-                    max_attempts: job_max_attempts,
-                    initial_backoff_ms: job_backoff_ms,
-                    #[cfg(feature = "telemetry-otlp")]
-                    traceparent,
-                    #[cfg(feature = "telemetry-otlp")]
-                    tracestate,
-                })
+        #[cfg(feature = "telemetry-otlp")]
+        let (traceparent, tracestate) = capture_job_trace_context();
+
+        let payload_clone = payload.clone();
+        let actual_enqueue = async move {
+            let result = if let Some(sender) = &self.local_sender {
+                sender
+                    .send(QueuedJob {
+                        id: id.clone(),
+                        name: name.to_string(),
+                        payload: payload_clone.clone(),
+                        attempt: 1,
+                        max_attempts: job_max_attempts,
+                        initial_backoff_ms: job_backoff_ms,
+                        #[cfg(feature = "telemetry-otlp")]
+                        traceparent,
+                        #[cfg(feature = "telemetry-otlp")]
+                        tracestate,
+                    })
+                    .await
+                    .map_err(|e| {
+                        AutumnError::internal_server_error(std::io::Error::other(format!(
+                            "failed to enqueue job: {e}"
+                        )))
+                    })
+            } else {
+                self.enqueue_durable(
+                    id.clone(),
+                    name,
+                    payload_clone.clone(),
+                    job_max_attempts,
+                    job_backoff_ms,
+                )
                 .await
-                .map_err(|e| {
-                    AutumnError::internal_server_error(std::io::Error::other(format!(
-                        "failed to enqueue job: {e}"
-                    )))
-                })
-        } else {
-            self.enqueue_durable(id.clone(), name, payload, job_max_attempts, job_backoff_ms)
-                .await
+            };
+            if result.is_err() {
+                self.registry.record_cancel(name);
+                self.job_admin.record_cancelled(&id);
+            }
+            result
         };
-        if result.is_err() {
-            self.registry.record_cancel(name);
-            self.job_admin.record_cancelled(&id);
+
+        if let Some(interceptor) = &self.interceptor {
+            let interceptor = (*interceptor).clone();
+            interceptor
+                .intercept_enqueue(name, &payload, Box::pin(actual_enqueue))
+                .await
+        } else {
+            actual_enqueue.await
         }
-        result
     }
 }
 
-pub(crate) fn start_runtime(
+pub fn start_runtime(
     jobs: Vec<JobInfo>,
     state: &AppState,
     shutdown: &tokio_util::sync::CancellationToken,
@@ -1533,6 +1597,9 @@ pub(crate) fn start_local_runtime(
         default_max_attempts,
         default_initial_backoff_ms,
         per_job_defaults,
+        interceptor: state
+            .extension::<Arc<dyn crate::interceptor::JobInterceptor>>()
+            .map(|arc| (*arc).clone()),
     };
     init_global_job_client(client);
 
@@ -1610,7 +1677,7 @@ async fn execute_local_job(
         use tracing_opentelemetry::OpenTelemetrySpanExt as _;
         let _ = job_span.set_parent(cx);
     }
-    let f = run_job_handler(handler, state.clone(), job.payload.clone());
+    let f = run_job_handler(&job.name, handler, state.clone(), job.payload.clone());
     let outcome = tracing::Instrument::instrument(f, job_span).await;
     match outcome {
         JobExecutionOutcome::Succeeded => {
@@ -3000,7 +3067,7 @@ async fn process_redis_job_record(
         use tracing_opentelemetry::OpenTelemetrySpanExt as _;
         let _ = job_span.set_parent(cx);
     }
-    let f = run_job_handler(handler, state.clone(), record.payload.clone());
+    let f = run_job_handler(&record.name, handler, state.clone(), record.payload.clone());
     match tracing::Instrument::instrument(f, job_span).await {
         JobExecutionOutcome::Succeeded => {
             match ack_redis_success(connection, worker_config, &record).await {
@@ -3127,6 +3194,9 @@ fn start_redis_runtime(
         default_max_attempts: config.max_attempts,
         default_initial_backoff_ms: config.initial_backoff_ms,
         per_job_defaults,
+        interceptor: state
+            .extension::<Arc<dyn crate::interceptor::JobInterceptor>>()
+            .map(|arc| (*arc).clone()),
     });
 
     let worker_count = config.workers.max(1);
@@ -3784,7 +3854,7 @@ async fn pg_execute_job(
         use tracing_opentelemetry::OpenTelemetrySpanExt as _;
         let _ = job_span.set_parent(cx);
     }
-    let f = run_job_handler(handler, state.clone(), payload);
+    let f = run_job_handler(&row.name, handler, state.clone(), payload);
     match tracing::Instrument::instrument(f, job_span).await {
         JobExecutionOutcome::Succeeded => {
             let ack = pg_ack_success(pool, &row.id, worker_id).await;
@@ -4167,6 +4237,9 @@ fn start_postgres_runtime(
         default_max_attempts: config.max_attempts,
         default_initial_backoff_ms: config.initial_backoff_ms,
         per_job_defaults,
+        interceptor: state
+            .extension::<Arc<dyn crate::interceptor::JobInterceptor>>()
+            .map(|arc| (*arc).clone()),
     });
 
     let visibility_timeout_ms = config.postgres.visibility_timeout_ms;
@@ -4365,6 +4438,7 @@ mod tests {
             default_max_attempts: 5,
             default_initial_backoff_ms: 250,
             per_job_defaults: HashMap::from([("send_email".to_string(), (5, 250))]),
+            interceptor: None,
         });
 
         let failed_id = backend.record_enqueue_for_test(
@@ -4425,6 +4499,7 @@ mod tests {
             default_max_attempts: 5,
             default_initial_backoff_ms: 250,
             per_job_defaults: HashMap::from([("send_email".to_string(), (5, 250))]),
+            interceptor: None,
         });
 
         let failed_id =
@@ -4476,6 +4551,7 @@ mod tests {
             default_max_attempts: 5,
             default_initial_backoff_ms: 250,
             per_job_defaults: HashMap::from([("send_email".to_string(), (5, 250))]),
+            interceptor: None,
         });
 
         let failed_id =
@@ -4524,8 +4600,13 @@ mod tests {
     #[tokio::test]
     async fn run_job_handler_reports_immediate_panics() {
         let state = AppState::for_test().with_profile("dev");
-        let outcome =
-            run_job_handler(instantly_panicking_handler, state, serde_json::json!({})).await;
+        let outcome = run_job_handler(
+            "test_job",
+            instantly_panicking_handler,
+            state,
+            serde_json::json!({}),
+        )
+        .await;
         assert_eq!(
             outcome,
             JobExecutionOutcome::Panicked("job handler panicked: panic before future".to_string())
@@ -5787,6 +5868,7 @@ mod tests {
             default_max_attempts: 3,
             default_initial_backoff_ms: 250,
             per_job_defaults: HashMap::new(),
+            interceptor: None,
         });
         assert!(global_job_client().is_some());
 
@@ -6093,7 +6175,8 @@ mod tests {
     #[tokio::test]
     async fn run_job_handler_reports_async_panics() {
         let state = AppState::for_test().with_profile("dev");
-        let outcome = run_job_handler(panicking_handler, state, serde_json::json!({})).await;
+        let outcome =
+            run_job_handler("test_job", panicking_handler, state, serde_json::json!({})).await;
         assert_eq!(
             outcome,
             JobExecutionOutcome::Panicked("job handler panicked: forced panic".to_string())
@@ -7014,6 +7097,7 @@ mod tests {
             default_max_attempts: 3,
             default_initial_backoff_ms: 100,
             per_job_defaults: HashMap::from([("test_job".to_string(), (3_u32, 100_u64))]),
+            interceptor: None,
         };
         (client, rx)
     }

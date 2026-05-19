@@ -177,6 +177,15 @@ pub struct TestApp {
     /// the value derived from
     /// [`SecurityConfig::forbidden_response`](crate::security::SecurityConfig::forbidden_response).
     forbidden_response_override: Option<crate::authorization::ForbiddenResponse>,
+    #[cfg(feature = "mail")]
+    mail_interceptor: Option<std::sync::Arc<dyn crate::interceptor::MailInterceptor>>,
+    job_interceptor: Option<std::sync::Arc<dyn crate::interceptor::JobInterceptor>>,
+    #[cfg(feature = "db")]
+    db_interceptor: Option<std::sync::Arc<dyn crate::interceptor::DbConnectionInterceptor>>,
+    #[cfg(feature = "ws")]
+    channels_interceptor: Option<std::sync::Arc<dyn crate::interceptor::ChannelsInterceptor>>,
+    #[cfg(feature = "oauth2")]
+    http_interceptor: Option<std::sync::Arc<dyn crate::interceptor::HttpInterceptor>>,
 }
 
 type TestPolicyRegistration = Box<dyn FnOnce(&crate::authorization::PolicyRegistry) + Send>;
@@ -205,6 +214,15 @@ impl TestApp {
             replica_pool: None,
             policy_registrations: Vec::new(),
             forbidden_response_override: None,
+            #[cfg(feature = "mail")]
+            mail_interceptor: None,
+            job_interceptor: None,
+            #[cfg(feature = "db")]
+            db_interceptor: None,
+            #[cfg(feature = "ws")]
+            channels_interceptor: None,
+            #[cfg(feature = "oauth2")]
+            http_interceptor: None,
         }
     }
 
@@ -355,6 +373,55 @@ impl TestApp {
         self
     }
 
+    #[cfg(feature = "mail")]
+    #[must_use]
+    pub fn with_mail_interceptor(
+        mut self,
+        interceptor: impl crate::interceptor::MailInterceptor,
+    ) -> Self {
+        self.mail_interceptor = Some(std::sync::Arc::new(interceptor));
+        self
+    }
+
+    #[must_use]
+    pub fn with_job_interceptor(
+        mut self,
+        interceptor: impl crate::interceptor::JobInterceptor,
+    ) -> Self {
+        self.job_interceptor = Some(std::sync::Arc::new(interceptor));
+        self
+    }
+
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn with_db_interceptor(
+        mut self,
+        interceptor: impl crate::interceptor::DbConnectionInterceptor,
+    ) -> Self {
+        self.db_interceptor = Some(std::sync::Arc::new(interceptor));
+        self
+    }
+
+    #[cfg(feature = "ws")]
+    #[must_use]
+    pub fn with_channels_interceptor(
+        mut self,
+        interceptor: impl crate::interceptor::ChannelsInterceptor,
+    ) -> Self {
+        self.channels_interceptor = Some(std::sync::Arc::new(interceptor));
+        self
+    }
+
+    #[cfg(feature = "oauth2")]
+    #[must_use]
+    pub fn with_http_interceptor(
+        mut self,
+        interceptor: impl crate::interceptor::HttpInterceptor,
+    ) -> Self {
+        self.http_interceptor = Some(std::sync::Arc::new(interceptor));
+        self
+    }
+
     /// Override the default test configuration.
     #[must_use]
     pub fn config(mut self, config: AutumnConfig) -> Self {
@@ -391,8 +458,9 @@ impl TestApp {
     pub fn build(self) -> TestClient {
         // Reset the global cache to prevent cross-test contamination.
         crate::cache::clear_global_cache();
+
         let probes = crate::probe::ProbeState::ready_for_test();
-        let state = AppState {
+        let mut state = AppState {
             extensions: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
@@ -425,6 +493,38 @@ impl TestApp {
             register(state.policy_registry());
         }
         crate::app::install_webhook_registry(&state, &self.config);
+
+        #[cfg(feature = "mail")]
+        if let Some(interceptor) = self.mail_interceptor {
+            state.insert_extension(interceptor);
+        }
+        if let Some(interceptor) = self.job_interceptor {
+            state.insert_extension(interceptor);
+        }
+        #[cfg(feature = "db")]
+        if let Some(interceptor) = self.db_interceptor {
+            state.insert_extension(interceptor);
+        }
+        #[cfg(feature = "ws")]
+        if let Some(interceptor) = self.channels_interceptor {
+            state.insert_extension(interceptor.clone());
+            state.channels = crate::channels::Channels::with_shared_backend(std::sync::Arc::new(
+                crate::channels::InterceptedChannelsBackend::new(
+                    state.channels.backend().clone(),
+                    vec![interceptor],
+                ),
+            ));
+        }
+        #[cfg(feature = "oauth2")]
+        if let Some(interceptor) = self.http_interceptor {
+            state.insert_extension(interceptor);
+        }
+
+        #[cfg(feature = "mail")]
+        {
+            crate::mail::install_mailer(&state, &self.config.mail, false)
+                .expect("Failed to configure test mailer");
+        }
 
         let router = crate::router::try_build_router_inner(
             self.routes,

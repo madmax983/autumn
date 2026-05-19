@@ -1599,6 +1599,27 @@ fn lettre_message(mail: &Mail) -> Result<Message, MailError> {
     }
 }
 
+struct InterceptedMailTransport {
+    inner: Arc<dyn MailTransport>,
+    interceptor: Arc<dyn crate::interceptor::MailInterceptor>,
+}
+
+impl MailTransport for InterceptedMailTransport {
+    fn send<'a>(
+        &'a self,
+        mail: Mail,
+    ) -> Pin<Box<dyn Future<Output = Result<(), MailError>> + Send + 'a>> {
+        Box::pin(async move {
+            let next = self.inner.send(mail.clone());
+            self.interceptor.intercept(&mail, next).await
+        })
+    }
+
+    fn is_disabled(&self) -> bool {
+        self.inner.is_disabled()
+    }
+}
+
 /// Install the configured mailer into app state.
 ///
 /// Picks up a runtime-installed [`MailDeliveryQueueHandle`] from
@@ -1619,6 +1640,13 @@ pub(crate) fn install_mailer(
     enforce_durable_guard: bool,
 ) -> AutumnResult<()> {
     let mut mailer = Mailer::from_config(config).map_err(AutumnError::service_unavailable)?;
+
+    if let Some(interceptor) = state.extension::<Arc<dyn crate::interceptor::MailInterceptor>>() {
+        mailer.transport = Arc::new(InterceptedMailTransport {
+            inner: Arc::clone(&mailer.transport),
+            interceptor: (*interceptor).clone(),
+        });
+    }
 
     let in_production = matches!(state.profile(), "prod" | "production");
     let transport_sends_mail = config.transport != Transport::Disabled;
