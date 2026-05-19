@@ -44,6 +44,10 @@ struct RepoConfig {
     /// keyset filter.  When absent it falls back to an id-only cursor which is
     /// correct whenever `cursor_key` values are monotonically correlated with `id`.
     cursor_key_type: Option<syn::Path>,
+    /// Enable soft-delete mode: `delete_by_id` sets `deleted_at = now()` instead
+    /// of issuing `DELETE FROM`, and all default finders filter out soft-deleted
+    /// rows. Requires the model table to have a `deleted_at TIMESTAMP NULL` column.
+    soft_delete: bool,
 }
 
 fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
@@ -56,6 +60,7 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
     let mut scope_type: Option<Ident> = None;
     let mut cursor_key: Option<String> = None;
     let mut cursor_key_type: Option<syn::Path> = None;
+    let mut soft_delete = false;
 
     syn::meta::parser(|meta| {
         // `hooks = Ident` must be checked before the catch-all model_name case,
@@ -92,12 +97,15 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
             let value: syn::Path = meta.value()?.parse()?;
             cursor_key_type = Some(value);
             Ok(())
+        } else if meta.path.is_ident("soft_delete") {
+            soft_delete = true;
+            Ok(())
         } else if meta.path.get_ident().is_some() && model_name.is_none() {
             model_name = Some(meta.path.get_ident().unwrap().clone());
             Ok(())
         } else {
             Err(meta.error(
-                "expected model name, table = \"...\", hooks = Type, commit_hooks = true, api = \"/path\", policy = Type, scope = Type, cursor_key = field, or cursor_key_type = Type",
+                "expected model name, table = \"...\", hooks = Type, commit_hooks = true, api = \"/path\", policy = Type, scope = Type, cursor_key = field, cursor_key_type = Type, or soft_delete",
             ))
         }
     })
@@ -127,6 +135,7 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
         scope_type,
         cursor_key,
         cursor_key_type,
+        soft_delete,
     })
 }
 
@@ -171,6 +180,7 @@ fn generate_derived_query(
     query: &DerivedQuery,
     table_ident: &Ident,
     model_name: &Ident,
+    soft_delete: bool,
 ) -> TokenStream {
     let field_idents: Vec<Ident> = query.fields.iter().map(|f| format_ident!("{f}")).collect();
     let param_names: Vec<Ident> = query.fields.iter().map(|f| format_ident!("{f}")).collect();
@@ -184,12 +194,20 @@ fn generate_derived_query(
         })
         .collect();
 
+    // Soft-delete repositories exclude archived rows in all derived find/count/exists queries.
+    let soft_delete_filter = if soft_delete {
+        quote! { .filter(#table_ident::deleted_at.is_null()) }
+    } else {
+        quote! {}
+    };
+
     match query.prefix.as_str() {
         "find" => {
             quote! {
                 let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
                 #table_ident::table
                     #(#filters)*
+                    #soft_delete_filter
                     .load::<#model_name>(&mut conn)
                     .await
                     .map_err(::autumn_web::AutumnError::from)
@@ -200,6 +218,7 @@ fn generate_derived_query(
                 let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
                 #table_ident::table
                     #(#filters)*
+                    #soft_delete_filter
                     .count()
                     .get_result::<i64>(&mut conn)
                     .await
@@ -221,7 +240,7 @@ fn generate_derived_query(
                 let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
                 ::autumn_web::reexports::diesel::select(
                     ::autumn_web::reexports::diesel::dsl::exists(
-                        #table_ident::table #(#filters)*
+                        #table_ident::table #(#filters)* #soft_delete_filter
                     )
                 )
                 .get_result::<bool>(&mut conn)
@@ -262,6 +281,13 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let vis = &trait_def.vis;
     let commit_hooks_enabled = config.hooks_type.is_some() && config.commit_hooks;
 
+    // Soft-delete filter fragment: appended to every finder when soft_delete is true.
+    let sd_filter = if config.soft_delete {
+        quote! { .filter(#table_ident::deleted_at.is_null()) }
+    } else {
+        quote! {}
+    };
+
     // Parse derived query methods from trait body
     let mut derived_trait_methods = Vec::new();
     let mut derived_impl_methods = Vec::new();
@@ -300,7 +326,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                 let params = &user_params;
 
-                let body = generate_derived_query(&query, &table_ident, model_name);
+                let body =
+                    generate_derived_query(&query, &table_ident, model_name, config.soft_delete);
 
                 derived_trait_methods.push(quote! {
                     fn #fn_ident(&self, #(#params),*) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<#return_type>> + Send;
@@ -915,6 +942,39 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         };
 
         // ── delete (hooked) ───────────────────────────────
+        //
+        // The core mutation differs for soft-delete repositories:
+        // - hard delete: `DELETE FROM table WHERE id = $1`
+        // - soft delete: `UPDATE table SET deleted_at = now() WHERE id = $1`
+        // Both paths still fire before_delete / after_delete_commit hooks.
+        let hooked_delete_mutation_stmt = if config.soft_delete {
+            quote! {
+                let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
+                let __autumn_deleted = ::autumn_web::reexports::diesel::update(#table_ident::table.find(id))
+                    .set(#table_ident::deleted_at.eq(::core::option::Option::Some(__now)))
+                    .execute(conn)
+                    .await
+                    .map_err(::autumn_web::AutumnError::from)?;
+                if __autumn_deleted == 0 {
+                    return Err(::autumn_web::AutumnError::not_found_msg(
+                        format!("{} with id {} not found", stringify!(#model_name), id)
+                    ));
+                }
+            }
+        } else {
+            quote! {
+                let __autumn_deleted = ::autumn_web::reexports::diesel::delete(#table_ident::table.find(id))
+                    .execute(conn)
+                    .await
+                    .map_err(::autumn_web::AutumnError::from)?;
+                if __autumn_deleted == 0 {
+                    return Err(::autumn_web::AutumnError::not_found_msg(
+                        format!("{} with id {} not found", stringify!(#model_name), id)
+                    ));
+                }
+            }
+        };
+
         let delete_body = if commit_hooks_enabled {
             quote! {
                 use ::autumn_web::reexports::diesel::prelude::*;
@@ -951,15 +1011,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                         self.hooks.before_delete(&mut ctx, &record).await?;
 
-                        let __autumn_deleted = ::autumn_web::reexports::diesel::delete(#table_ident::table.find(id))
-                            .execute(conn)
-                            .await
-                            .map_err(::autumn_web::AutumnError::from)?;
-                        if __autumn_deleted == 0 {
-                            return Err(::autumn_web::AutumnError::not_found_msg(
-                                format!("{} with id {} not found", stringify!(#model_name), id)
-                            ));
-                        }
+                        #hooked_delete_mutation_stmt
 
                         let __autumn_commit_hook_record = record.__autumn_commit_hook_to_value()?;
                         ::autumn_web::__private::enqueue_repository_commit_hook_on_conn(
@@ -1010,15 +1062,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                             self.hooks.before_delete(&mut ctx, &record).await?;
 
-                            let __autumn_deleted = ::autumn_web::reexports::diesel::delete(#table_ident::table.find(id))
-                                .execute(conn)
-                                .await
-                                .map_err(::autumn_web::AutumnError::from)?;
-                            if __autumn_deleted == 0 {
-                                return Err(::autumn_web::AutumnError::not_found_msg(
-                                    format!("{} with id {} not found", stringify!(#model_name), id)
-                                ));
-                            }
+                            #hooked_delete_mutation_stmt
 
                             Ok(())
                         }
@@ -1137,15 +1181,35 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         };
 
-        let delete_body = quote! {
-            use ::autumn_web::reexports::diesel::prelude::*;
-            use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-            let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
-            ::autumn_web::reexports::diesel::delete(#table_ident::table.find(id))
-                .execute(&mut conn)
-                .await
-                .map_err(::autumn_web::AutumnError::from)?;
-            Ok(())
+        let delete_body = if config.soft_delete {
+            quote! {
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
+                let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                let __count = ::autumn_web::reexports::diesel::update(#table_ident::table.find(id))
+                    .set(#table_ident::deleted_at.eq(::core::option::Option::Some(__now)))
+                    .execute(&mut conn)
+                    .await
+                    .map_err(::autumn_web::AutumnError::from)?;
+                if __count == 0 {
+                    return Err(::autumn_web::AutumnError::not_found_msg(
+                        format!("{} with id {} not found", stringify!(#model_name), id)
+                    ));
+                }
+                Ok(())
+            }
+        } else {
+            quote! {
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                ::autumn_web::reexports::diesel::delete(#table_ident::table.find(id))
+                    .execute(&mut conn)
+                    .await
+                    .map_err(::autumn_web::AutumnError::from)?;
+                Ok(())
+            }
         };
 
         (
@@ -1194,11 +1258,13 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             use ::autumn_web::reexports::diesel_async::RunQueryDsl;
             let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
             let total: i64 = #table_ident::table
+                #sd_filter
                 .count()
                 .get_result::<i64>(&mut conn)
                 .await
                 .map_err(::autumn_web::AutumnError::from)?;
             let items: ::std::vec::Vec<#model_name> = #table_ident::table
+                #sd_filter
                 .order(#table_ident::id.desc())
                 .limit(req.limit())
                 .offset(req.offset())
@@ -2095,6 +2161,78 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {}
     };
 
+    // Soft-delete extra trait/impl methods: restore, purge, with_deleted, only_deleted.
+    let soft_delete_trait_methods = if config.soft_delete {
+        quote! {
+            fn restore(&self, id: i64) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<()>> + Send;
+            fn purge(&self, id: i64) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<()>> + Send;
+            fn with_deleted(&self) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<Vec<#model_name>>> + Send;
+            fn only_deleted(&self) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<Vec<#model_name>>> + Send;
+        }
+    } else {
+        quote! {}
+    };
+
+    let soft_delete_impl_methods = if config.soft_delete {
+        quote! {
+            async fn restore(&self, id: i64) -> ::autumn_web::AutumnResult<()> {
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                let __count = ::autumn_web::reexports::diesel::update(#table_ident::table.find(id))
+                    .set(#table_ident::deleted_at.eq(::core::option::Option::None::<::autumn_web::reexports::chrono::NaiveDateTime>))
+                    .execute(&mut conn)
+                    .await
+                    .map_err(::autumn_web::AutumnError::from)?;
+                if __count == 0 {
+                    return Err(::autumn_web::AutumnError::not_found_msg(
+                        format!("{} with id {} not found", stringify!(#model_name), id)
+                    ));
+                }
+                Ok(())
+            }
+
+            async fn purge(&self, id: i64) -> ::autumn_web::AutumnResult<()> {
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                let __count = ::autumn_web::reexports::diesel::delete(#table_ident::table.find(id))
+                    .execute(&mut conn)
+                    .await
+                    .map_err(::autumn_web::AutumnError::from)?;
+                if __count == 0 {
+                    return Err(::autumn_web::AutumnError::not_found_msg(
+                        format!("{} with id {} not found", stringify!(#model_name), id)
+                    ));
+                }
+                Ok(())
+            }
+
+            async fn with_deleted(&self) -> ::autumn_web::AutumnResult<Vec<#model_name>> {
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                #table_ident::table
+                    .load::<#model_name>(&mut conn)
+                    .await
+                    .map_err(::autumn_web::AutumnError::from)
+            }
+
+            async fn only_deleted(&self) -> ::autumn_web::AutumnResult<Vec<#model_name>> {
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                #table_ident::table
+                    .filter(#table_ident::deleted_at.is_not_null())
+                    .load::<#model_name>(&mut conn)
+                    .await
+                    .map_err(::autumn_web::AutumnError::from)
+            }
+        }
+    } else {
+        quote! {}
+    };
+
     // Generate the trait, impl, and extractor.
     //
     // Key design decisions:
@@ -2116,6 +2254,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             #pagination_trait_method
             #cursor_page_trait_method
             #(#derived_trait_methods)*
+            #soft_delete_trait_methods
         }
 
         /// Postgres implementation of the repository.
@@ -2201,6 +2340,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             #pagination_impl_method
             #cursor_page_impl_method
             #(#derived_impl_methods)*
+            #soft_delete_impl_methods
         }
 
         impl #pg_name {
@@ -2819,6 +2959,163 @@ mod tests {
         assert!(
             !generated.contains("cursor_page"),
             "cursor_page() must only be generated when cursor_key is declared: {generated}"
+        );
+    }
+
+    // ── Soft-delete generation (issue #689) ───────────────────────
+
+    #[test]
+    fn parse_repo_args_recognizes_soft_delete_flag() {
+        let tokens: proc_macro2::TokenStream = "Post, soft_delete".parse().unwrap();
+        let config = parse_repo_args(tokens).unwrap();
+        assert_eq!(config.model_name.to_string(), "Post");
+        assert!(
+            config.soft_delete,
+            "soft_delete flag must be stored on RepoConfig"
+        );
+    }
+
+    #[test]
+    fn soft_delete_config_is_false_by_default() {
+        let tokens: proc_macro2::TokenStream = "Post".parse().unwrap();
+        let config = parse_repo_args(tokens).unwrap();
+        assert!(
+            !config.soft_delete,
+            "soft_delete must default to false when not specified"
+        );
+    }
+
+    #[test]
+    fn soft_delete_combined_with_api() {
+        let tokens: proc_macro2::TokenStream =
+            r#"Post, soft_delete, api = "/api/posts""#.parse().unwrap();
+        let config = parse_repo_args(tokens).unwrap();
+        assert!(config.soft_delete);
+        assert_eq!(config.api_path.as_deref(), Some("/api/posts"));
+    }
+
+    #[test]
+    fn soft_delete_combined_with_hooks() {
+        let tokens: proc_macro2::TokenStream =
+            "Post, soft_delete, hooks = PostHooks".parse().unwrap();
+        let config = parse_repo_args(tokens).unwrap();
+        assert!(config.soft_delete);
+        assert!(config.hooks_type.is_some());
+    }
+
+    #[test]
+    fn repository_macro_soft_delete_generates_restore_and_purge_methods() {
+        let generated = repository_macro(
+            quote! { Post, soft_delete },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("fn restore"),
+            "soft_delete must generate a restore() method in the trait: {generated}"
+        );
+        assert!(
+            generated.contains("fn purge"),
+            "soft_delete must generate a purge() method in the trait: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_soft_delete_generates_with_deleted_and_only_deleted() {
+        let generated = repository_macro(
+            quote! { Post, soft_delete },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("fn with_deleted"),
+            "soft_delete must generate a with_deleted() method: {generated}"
+        );
+        assert!(
+            generated.contains("fn only_deleted"),
+            "soft_delete must generate an only_deleted() method: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_soft_delete_delete_uses_update_not_hard_delete() {
+        let generated = repository_macro(
+            quote! { Post, soft_delete },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        // The delete_by_id body must issue UPDATE, not DELETE FROM
+        assert!(
+            generated.contains("deleted_at"),
+            "soft_delete delete_by_id must reference deleted_at column: {generated}"
+        );
+        // Must not issue a hard DELETE in delete_by_id (purge is separate)
+        // The only DELETE FROM is in purge().
+        let delete_count = generated.matches("diesel :: delete").count();
+        let purge_count = generated.matches("fn purge").count();
+        assert!(
+            delete_count <= purge_count + 1,
+            "soft_delete delete_by_id must not issue a hard DELETE; only purge() should: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_soft_delete_find_all_filters_deleted_at_is_null() {
+        let generated = repository_macro(
+            quote! { Post, soft_delete },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("deleted_at") && generated.contains("is_null"),
+            "soft_delete find_all must filter rows where deleted_at IS NULL: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_without_soft_delete_does_not_generate_restore_or_purge() {
+        let generated =
+            repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
+
+        assert!(
+            !generated.contains("fn restore"),
+            "non-soft-delete repository must not generate restore(): {generated}"
+        );
+        assert!(
+            !generated.contains("fn purge"),
+            "non-soft-delete repository must not generate purge(): {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_soft_delete_purge_issues_hard_delete() {
+        let generated = repository_macro(
+            quote! { Post, soft_delete },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("diesel :: delete"),
+            "purge() must issue a hard DELETE FROM: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_soft_delete_only_deleted_filters_is_not_null() {
+        let generated = repository_macro(
+            quote! { Post, soft_delete },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("is_not_null"),
+            "only_deleted() must filter rows where deleted_at IS NOT NULL: {generated}"
         );
     }
 }

@@ -105,6 +105,7 @@ pub fn merge_config_with_cli(
                 indexes,
                 validations,
                 defaults,
+                soft_delete: false,
             },
             queries,
         },
