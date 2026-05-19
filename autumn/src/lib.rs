@@ -130,6 +130,7 @@ pub(crate) mod router;
 pub use hooks::{
     DraftField, FieldDiff, MutationContext, MutationHooks, MutationOp, NoHooks, Patch, UpdateDraft,
 };
+pub mod etag;
 #[cfg(feature = "flash")]
 pub mod flash;
 #[cfg(feature = "htmx")]

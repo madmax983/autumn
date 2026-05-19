@@ -59,6 +59,7 @@ system-info = []
 autumn-macros = { version = "0.4.0", path = "../autumn-macros" }
 axum.workspace = true
 bytes = "1"
+http-body = "1"
 http-body-util = "0.1"
 bcrypt.workspace = true
 deadpool = { version = "0.13", default-features = false, features = ["managed", "rt_tokio_1"], optional = true }
