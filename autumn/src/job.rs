@@ -1234,7 +1234,7 @@ impl JobClient {
     /// rolls back, the job is never enqueued.
     ///
     /// The deferred enqueue callback runs in-process after commit. Use
-    /// [`enqueue_in_tx`](crate::job::enqueue_in_tx) / `enqueue_on_conn` with the
+    /// [`enqueue_in_tx`] / `enqueue_on_conn` with the
     /// Postgres backend when the job row itself must be committed atomically
     /// with the domain write.
     ///

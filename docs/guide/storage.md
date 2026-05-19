@@ -262,13 +262,160 @@ The S3 plugin lives in its own crate (`autumn-storage-s3`) so apps
 that don't need S3 don't pull in the AWS SDK tree. Peer plugins for
 other providers (GCS, Azure, B2) follow the same pattern.
 
+## Direct uploads
+
+Large files (video, high-res images, bulk CSV) can bypass the Autumn process
+entirely and go straight from the browser to the storage backend. The pattern:
+
+1. **Presign** — your CSRF-protected endpoint calls `store.presign_put(key,
+   content_type, expires_in)` and returns the `PresignPutResult` to the browser.
+2. **Upload** — browser `PUT`s directly to the presigned URL.
+3. **Confirm** — browser calls your completion endpoint; the endpoint calls
+   `autumn_web::storage::complete_direct_upload(&*store, key).await?` which does a
+   `HEAD` to verify the object exists, then returns a `Blob` that your handler
+   can store in the database.
+
+### Security model
+
+The presigned PUT URL authorises **only the upload byte-transfer** — it does not
+grant any application privilege. Binding the blob to a model (inserting the `Blob`
+JSONB into your database) requires passing through your completion endpoint, which
+should be protected with CSRF and session checks as usual. A user who intercepts a
+presigned URL gains nothing except the ability to overwrite the object at that key
+during the expiry window.
+
+Upload tokens (signed by `sign_upload`) are distinct from download tokens (signed
+by `sign_download`) — the local backend verifies them separately, so a valid
+download token cannot be replayed as an upload token.
+
+### Local backend
+
+The local backend exposes `PUT /_blobs/{key}?upload=1&ct=...&exp=...&sig=...`.
+Everything works in `dev` with no extra config.
+
+### S3 backend
+
+The S3 backend issues real AWS SigV4 presigned PUT URLs. Ensure your bucket CORS
+policy allows `PUT` from your app's origin if you call from browser JavaScript:
+
+```json
+[{
+  "AllowedHeaders": ["Content-Type"],
+  "AllowedMethods": ["PUT"],
+  "AllowedOrigins": ["https://your-app.example.com"],
+  "MaxAgeSeconds": 3600
+}]
+```
+
+### Worked example
+
+```rust,ignore
+use std::time::Duration;
+use autumn_web::security::CsrfToken;
+use autumn_web::storage::{BlobStoreState, PresignPutResult, complete_direct_upload};
+use autumn_web::{AutumnResult, Json, secured, State, post};
+use serde::{Deserialize, Serialize};
+
+#[derive(Deserialize)]
+struct PresignRequest {
+    content_type: String,
+    key: String,
+}
+
+#[derive(Serialize)]
+struct PresignResponse {
+    url: String,
+    method: String,
+    headers: std::collections::HashMap<String, String>,
+    expires_in_secs: u64,
+}
+
+/// CSRF-protected endpoint that hands out a presigned PUT URL.
+#[secured]
+#[post("/uploads/presign")]
+async fn presign(
+    _csrf: CsrfToken,                   // ensures caller has a valid session
+    State(blobs): State<BlobStoreState>,
+    Json(req): Json<PresignRequest>,
+) -> AutumnResult<Json<PresignResponse>> {
+    let store = blobs.store();
+    let result: PresignPutResult = store
+        .presign_put(&req.key, &req.content_type, Duration::from_secs(300))
+        .await?;
+    Ok(Json(PresignResponse {
+        url: result.url,
+        method: result.method,
+        headers: result.headers,
+        expires_in_secs: result.expires_in.as_secs(),
+    }))
+}
+
+#[derive(Deserialize)]
+struct CompleteRequest { key: String }
+
+/// CSRF-protected endpoint that confirms the upload and records the Blob.
+#[secured]
+#[post("/uploads/complete")]
+async fn complete(
+    _csrf: CsrfToken,
+    State(blobs): State<BlobStoreState>,
+    mut db: Db,
+    Json(req): Json<CompleteRequest>,
+) -> AutumnResult<Json<serde_json::Value>> {
+    let store = blobs.store();
+    // HEAD-checks the object; returns NotFound if the browser didn't
+    // actually upload yet or if the upload expired.
+    let blob = complete_direct_upload(&**store, &req.key).await?;
+
+    // Bind the blob to the user's record (app's own CSRF already enforced above).
+    diesel::update(users::table.find(current_user_id))
+        .set(users::avatar.eq(Some(blob)))
+        .execute(&mut *db)
+        .await?;
+
+    Ok(Json(serde_json::json!({ "status": "ok" })))
+}
+```
+
+### Maud form helper
+
+If your Maud templates use a standard `<input type="file">` with htmx for
+progressive enhancement, the `autumn_web::storage::form_helper` module (feature
+`maud`) provides a pre-wired input:
+
+```rust,ignore
+use autumn_web::storage::form_helper::direct_upload_input;
+
+html! {
+    (direct_upload_input("avatar", &presign_url, Some("image/*")))
+}
+```
+
+Renders a file input with `data-controller="direct-upload"` for Stimulus-style JS
+enhancement and an accessible progress bar placeholder. When JavaScript is unavailable,
+users see a notice explaining the dependency. To provide a fallback upload path for
+no-JS users, wrap the component in a `<noscript>` block with an alternative
+`enctype="multipart/form-data"` form and handler.
+
+### Orphan handling
+
+Blobs are "orphaned" when the user uploads a file but never completes the
+confirmation step. The framework uses the **bind-step-promotes** model:
+
+- The blob exists in storage as soon as the browser's PUT succeeds.
+- It becomes owned when your completion handler calls `complete_direct_upload`
+  and records the returned `Blob` JSONB value in the database.
+- Unbound blobs (started upload, never completed) remain in storage until
+  your lifecycle / expiry policy removes them.
+
+Recommended: set a bucket lifecycle rule (S3) or a cron sweeper (local) to
+delete objects with a well-known "orphan" prefix after a short window (e.g.,
+`tmp/` prefix, 24 h expiry).
+
 ## What's out of scope (for now)
 
 - **Image processing / resizing.** Track separately. `image` and
   `imageproc` have their own dependency surfaces.
-- **Direct-to-S3 browser uploads (presigned PUT).** Useful eventually;
-  the first slice keeps bytes flowing through the autumn process so
-  the multipart MIME / size-cap policies still apply.
 - **Native non-S3 backends (GCS, Azure Blob, B2 native).** Anyone
   whose object store speaks S3 is covered by `autumn-storage-s3`. Native
   backends are a future plugin-crate extension.
