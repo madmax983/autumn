@@ -5,7 +5,7 @@
 //! the same five files every time they add a resource.
 //!
 //! Three subcommands live here:
-//! - [`model::run`] — model + migration + schema entry
+//! - [`model::plan_model_with_options`] — model + migration + schema entry
 //! - [`migration::run`] — migration only (with optional add/remove DSL)
 //! - [`scaffold::run`] — model + repository + HTML routes + smoke test +
 //!   `routes![]` registration

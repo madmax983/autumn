@@ -204,14 +204,33 @@ pub trait AdminModel: Send + Sync + 'static {
     /// Field metadata for this model.
     fn fields(&self) -> Vec<AdminField>;
 
-    /// Available bulk actions (default: just "Delete selected").
+    /// Available bulk actions.
+    ///
+    /// Defaults to "Delete selected". When `supports_soft_delete()` returns
+    /// `true`, also includes "Restore selected" and "Purge selected" so that
+    /// the admin route validator can dispatch those action names.
     fn actions(&self) -> Vec<AdminAction> {
-        vec![AdminAction {
+        let mut acts = vec![AdminAction {
             name: "delete",
             label: "Delete selected".to_owned(),
             style: ActionStyle::Danger,
             confirm: true,
-        }]
+        }];
+        if self.supports_soft_delete() {
+            acts.push(AdminAction {
+                name: "restore",
+                label: "Restore selected".to_owned(),
+                style: ActionStyle::Default,
+                confirm: false,
+            });
+            acts.push(AdminAction {
+                name: "purge",
+                label: "Purge selected".to_owned(),
+                style: ActionStyle::Danger,
+                confirm: true,
+            });
+        }
+        acts
     }
 
     // ── CRUD operations ─────────────────────────────────────────
@@ -252,6 +271,67 @@ pub trait AdminModel: Send + Sync + 'static {
         id: i64,
     ) -> AdminFuture<'_, ()>;
 
+    /// Whether this model supports soft-delete (defaults to `false`).
+    ///
+    /// When `true`, the admin panel shows a Trash tab with restore/purge.
+    fn supports_soft_delete(&self) -> bool {
+        false
+    }
+
+    /// Restore a soft-deleted record (set `deleted_at = NULL`).
+    ///
+    /// The default returns `AdminError::Other` when `supports_soft_delete()` is
+    /// `false`, so models that opt in must override this method.
+    fn restore<'a>(
+        &'a self,
+        _pool: &'a diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+        _id: i64,
+    ) -> AdminFuture<'a, ()> {
+        Box::pin(async move {
+            Err(AdminError::Other(
+                "this model does not support soft delete; \
+                 override supports_soft_delete() to return true and implement restore()"
+                    .to_owned(),
+            ))
+        })
+    }
+
+    /// Permanently delete (purge) a soft-deleted record.
+    ///
+    /// The default returns `AdminError::Other` when `supports_soft_delete()` is
+    /// `false`.
+    fn purge<'a>(
+        &'a self,
+        _pool: &'a diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+        _id: i64,
+    ) -> AdminFuture<'a, ()> {
+        Box::pin(async move {
+            Err(AdminError::Other(
+                "this model does not support soft delete; \
+                 override supports_soft_delete() to return true and implement purge()"
+                    .to_owned(),
+            ))
+        })
+    }
+
+    /// List soft-deleted records (where `deleted_at IS NOT NULL`).
+    ///
+    /// The default returns `AdminError::Other` when `supports_soft_delete()` is
+    /// `false`.
+    fn list_deleted<'a>(
+        &'a self,
+        _pool: &'a diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+        _params: ListParams,
+    ) -> AdminFuture<'a, ListResult> {
+        Box::pin(async move {
+            Err(AdminError::Other(
+                "this model does not support soft delete; \
+                 override supports_soft_delete() to return true and implement list_deleted()"
+                    .to_owned(),
+            ))
+        })
+    }
+
     /// Execute a bulk action on the given IDs.
     fn execute_action(
         &self,
@@ -259,10 +339,10 @@ pub trait AdminModel: Send + Sync + 'static {
         action: &str,
         ids: Vec<i64>,
     ) -> AdminFuture<'_, u64> {
-        // Default implementation: dispatch the built-in `"delete"` action
-        // by calling `self.delete` for each id. Any other action name
-        // returns an error so it doesn't silently no-op — overriders that
-        // declare custom actions must implement them here.
+        // Default implementation: dispatch the built-in `"delete"`, `"restore"`,
+        // and `"purge"` actions. Any other action name returns an error so it
+        // doesn't silently no-op — overriders that declare custom actions must
+        // implement them here.
         //
         // We clone the pool (deadpool::Pool is Arc-backed, cheap) so the
         // returned future only borrows from `&self` and avoids the
@@ -276,6 +356,22 @@ pub trait AdminModel: Send + Sync + 'static {
                     let mut count: u64 = 0;
                     for id in ids {
                         self.delete(&pool, id).await?;
+                        count += 1;
+                    }
+                    Ok(count)
+                }
+                "restore" => {
+                    let mut count: u64 = 0;
+                    for id in ids {
+                        self.restore(&pool, id).await?;
+                        count += 1;
+                    }
+                    Ok(count)
+                }
+                "purge" => {
+                    let mut count: u64 = 0;
+                    for id in ids {
+                        self.purge(&pool, id).await?;
                         count += 1;
                     }
                     Ok(count)
@@ -513,6 +609,126 @@ mod tests {
         }
     }
 
+    /// Test fixture: an `AdminModel` that supports soft delete and records
+    /// which ids were restored/purged. Overrides `supports_soft_delete()` and
+    /// the three soft-delete methods.
+    #[derive(Default)]
+    struct SoftDeleteModel {
+        restored: Mutex<Vec<i64>>,
+        purged: Mutex<Vec<i64>>,
+    }
+
+    impl AdminModel for SoftDeleteModel {
+        fn slug(&self) -> &'static str {
+            "soft"
+        }
+        fn display_name(&self) -> &'static str {
+            "Soft"
+        }
+        fn display_name_plural(&self) -> &'static str {
+            "Softs"
+        }
+        fn fields(&self) -> Vec<AdminField> {
+            vec![]
+        }
+        fn list(
+            &self,
+            _pool: &diesel_async::pooled_connection::deadpool::Pool<
+                diesel_async::AsyncPgConnection,
+            >,
+            _params: ListParams,
+        ) -> AdminFuture<'_, ListResult> {
+            Box::pin(async {
+                Ok(ListResult {
+                    records: vec![],
+                    total: 0,
+                    page: 1,
+                    per_page: 25,
+                })
+            })
+        }
+        fn get(
+            &self,
+            _pool: &diesel_async::pooled_connection::deadpool::Pool<
+                diesel_async::AsyncPgConnection,
+            >,
+            _id: i64,
+        ) -> AdminFuture<'_, Option<Value>> {
+            Box::pin(async { Ok(None) })
+        }
+        fn create(
+            &self,
+            _pool: &diesel_async::pooled_connection::deadpool::Pool<
+                diesel_async::AsyncPgConnection,
+            >,
+            data: Value,
+        ) -> AdminFuture<'_, Value> {
+            Box::pin(async move { Ok(data) })
+        }
+        fn update(
+            &self,
+            _pool: &diesel_async::pooled_connection::deadpool::Pool<
+                diesel_async::AsyncPgConnection,
+            >,
+            _id: i64,
+            data: Value,
+        ) -> AdminFuture<'_, Value> {
+            Box::pin(async move { Ok(data) })
+        }
+        fn delete(
+            &self,
+            _pool: &diesel_async::pooled_connection::deadpool::Pool<
+                diesel_async::AsyncPgConnection,
+            >,
+            _id: i64,
+        ) -> AdminFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+        fn supports_soft_delete(&self) -> bool {
+            true
+        }
+        fn restore<'a>(
+            &'a self,
+            _pool: &'a diesel_async::pooled_connection::deadpool::Pool<
+                diesel_async::AsyncPgConnection,
+            >,
+            id: i64,
+        ) -> AdminFuture<'a, ()> {
+            Box::pin(async move {
+                self.restored.lock().unwrap().push(id);
+                Ok(())
+            })
+        }
+        fn purge<'a>(
+            &'a self,
+            _pool: &'a diesel_async::pooled_connection::deadpool::Pool<
+                diesel_async::AsyncPgConnection,
+            >,
+            id: i64,
+        ) -> AdminFuture<'a, ()> {
+            Box::pin(async move {
+                self.purged.lock().unwrap().push(id);
+                Ok(())
+            })
+        }
+        fn list_deleted<'a>(
+            &'a self,
+            _pool: &'a diesel_async::pooled_connection::deadpool::Pool<
+                diesel_async::AsyncPgConnection,
+            >,
+            _params: ListParams,
+        ) -> AdminFuture<'a, ListResult> {
+            Box::pin(async {
+                Ok(ListResult {
+                    records: vec![],
+                    total: 0,
+                    page: 1,
+                    per_page: 25,
+                })
+            })
+        }
+    }
+
     /// Build a `Pool` whose manager would fail to connect — the test models
     /// never call `pool.get()`, so the pool itself just sits unused.
     fn dummy_pool()
@@ -659,5 +875,132 @@ mod tests {
         // Other kinds remain editable by default.
         let text = AdminField::new("name", AdminFieldKind::Text);
         assert!(text.editable);
+    }
+
+    // ── Soft-delete admin support (issue #689) ────────────────────
+
+    #[test]
+    fn admin_model_supports_soft_delete_defaults_to_false() {
+        let model = DeletingModel {
+            deleted: Mutex::new(vec![]),
+            fail_on: None,
+        };
+        assert!(
+            !model.supports_soft_delete(),
+            "AdminModel::supports_soft_delete() must default to false"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_model_restore_returns_error_when_soft_delete_not_supported() {
+        let model = DeletingModel {
+            deleted: Mutex::new(vec![]),
+            fail_on: None,
+        };
+        let pool = dummy_pool();
+        let err = model
+            .restore(&pool, 1)
+            .await
+            .expect_err("restore must error when supports_soft_delete() is false");
+        assert!(
+            matches!(err, AdminError::Other(_)),
+            "restore on non-soft-delete model must return AdminError::Other: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_model_purge_returns_error_when_soft_delete_not_supported() {
+        let model = DeletingModel {
+            deleted: Mutex::new(vec![]),
+            fail_on: None,
+        };
+        let pool = dummy_pool();
+        let err = model
+            .purge(&pool, 1)
+            .await
+            .expect_err("purge must error when supports_soft_delete() is false");
+        assert!(
+            matches!(err, AdminError::Other(_)),
+            "purge on non-soft-delete model must return AdminError::Other: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_model_list_deleted_returns_error_when_soft_delete_not_supported() {
+        let model = DeletingModel {
+            deleted: Mutex::new(vec![]),
+            fail_on: None,
+        };
+        let pool = dummy_pool();
+        let params = ListParams {
+            page: 1,
+            per_page: 25,
+            ..Default::default()
+        };
+        let err = model
+            .list_deleted(&pool, params)
+            .await
+            .expect_err("list_deleted must error when supports_soft_delete() is false");
+        assert!(
+            matches!(err, AdminError::Other(_)),
+            "list_deleted on non-soft-delete model must return AdminError::Other: {err:?}"
+        );
+    }
+
+    #[test]
+    fn default_actions_returns_only_delete_when_soft_delete_not_supported() {
+        let model = DeletingModel {
+            deleted: Mutex::new(vec![]),
+            fail_on: None,
+        };
+        let acts = model.actions();
+        assert_eq!(
+            acts.len(),
+            1,
+            "default model must advertise exactly one action"
+        );
+        assert_eq!(acts[0].name, "delete");
+    }
+
+    #[test]
+    fn actions_includes_restore_and_purge_when_soft_delete_supported() {
+        let model = SoftDeleteModel::default();
+        let acts = model.actions();
+        let names: Vec<&str> = acts.iter().map(|a| a.name).collect();
+        assert!(
+            names.contains(&"restore"),
+            "soft-delete model must advertise restore action; got: {names:?}"
+        );
+        assert!(
+            names.contains(&"purge"),
+            "soft-delete model must advertise purge action; got: {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_action_restore_dispatches_to_restore_method() {
+        let model = SoftDeleteModel::default();
+        let pool = dummy_pool();
+        let count = model
+            .execute_action(&pool, "restore", vec![10, 20])
+            .await
+            .expect("restore action should succeed on soft-delete model");
+        assert_eq!(
+            count, 2,
+            "restore action must return count of restored records"
+        );
+        assert_eq!(*model.restored.lock().unwrap(), vec![10, 20]);
+    }
+
+    #[tokio::test]
+    async fn execute_action_purge_dispatches_to_purge_method() {
+        let model = SoftDeleteModel::default();
+        let pool = dummy_pool();
+        let count = model
+            .execute_action(&pool, "purge", vec![5])
+            .await
+            .expect("purge action should succeed on soft-delete model");
+        assert_eq!(count, 1, "purge action must return count of purged records");
+        assert_eq!(*model.purged.lock().unwrap(), vec![5]);
     }
 }

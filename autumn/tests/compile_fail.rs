@@ -107,6 +107,10 @@ fn compile_pass_tests() {
     t.pass("tests/compile-pass/model_lock_version.rs");
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/repository_lock_version.rs");
+
+    // Soft delete (requires db feature)
+    #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/repository_soft_delete.rs");
 }
 
 #[cfg(feature = "db")]

@@ -442,6 +442,9 @@ enum GenerateCommands {
         name: String,
         /// Field DSL tokens, each `name:Type`.
         fields: Vec<String>,
+        /// Add a `deleted_at` column and use soft-delete in the repository.
+        #[arg(long)]
+        soft_delete: bool,
         /// Print the file plan and exit without writing anything.
         #[arg(long)]
         dry_run: bool,
@@ -567,6 +570,9 @@ enum GenerateCommands {
         /// CLI flags take precedence over values in the config file.
         #[arg(long, value_name = "PATH")]
         config: Option<std::path::PathBuf>,
+        /// Add a `deleted_at` column and use soft-delete in the repository.
+        #[arg(long)]
+        soft_delete: bool,
         /// Print the file plan and exit without writing anything.
         #[arg(long)]
         dry_run: bool,
@@ -811,14 +817,37 @@ fn run_release_command(cmd: ReleaseCommands) {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn run_generate_command(cmd: GenerateCommands) {
     match cmd {
         GenerateCommands::Model {
             name,
             fields,
+            soft_delete,
             dry_run,
             force,
-        } => generate::model::run(&name, &fields, generate::Flags { dry_run, force }),
+        } => {
+            let options = generate::model::ModelOptions {
+                soft_delete,
+                ..Default::default()
+            };
+            let timestamp = generate::timestamp_now();
+            match generate::model::plan_model_with_options(
+                &std::env::current_dir().unwrap_or_default(),
+                &name,
+                &fields,
+                &timestamp,
+                &options,
+            )
+            .and_then(|p| p.execute(generate::Flags { dry_run, force }))
+            {
+                Ok(()) => {}
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
         GenerateCommands::Migration {
             name,
             fields,
@@ -869,6 +898,7 @@ fn run_generate_command(cmd: GenerateCommands) {
             default,
             query,
             config,
+            soft_delete,
             dry_run,
             force,
         } => {
@@ -897,6 +927,7 @@ fn run_generate_command(cmd: GenerateCommands) {
                 &validate,
                 &default,
                 &query,
+                soft_delete,
             );
             generate::scaffold::run(&name, &fields, generate::Flags { dry_run, force }, &options);
         }
@@ -1185,6 +1216,7 @@ mod tests {
             fields,
             dry_run,
             force,
+            ..
         }) = cli.command
         else {
             panic!("expected generate model");
