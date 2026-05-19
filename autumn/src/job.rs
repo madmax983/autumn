@@ -7385,13 +7385,10 @@ mod tests {
                     .enqueue_after_commit("test_job", serde_json::json!({}))
                     .await
                     .expect("outside tx enqueues immediately");
-                let job = tokio::time::timeout(
-                    std::time::Duration::from_millis(100),
-                    rx.recv(),
-                )
-                .await
-                .expect("job should arrive")
-                .expect("channel open");
+                let job = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
+                    .await
+                    .expect("job should arrive")
+                    .expect("channel open");
                 assert_eq!(job.name, "test_job");
             });
         }
