@@ -3,6 +3,7 @@
 //! These routes render Maud templates styled with Tailwind CSS and
 //! use htmx attributes for interactive toggle/delete behaviour.
 
+use autumn_web::etag::fresh_when;
 use autumn_web::extract::Path;
 use autumn_web::form::{ChangesetForm, method_input};
 use autumn_web::pagination::{Page, PageRequest};
@@ -315,16 +316,34 @@ fn detail_view(todo: &Todo, csrf_token: Option<&str>) -> Markup {
 
 /// Show a single todo by ID.
 ///
-/// The page renders a plain HTML `<form method="post">` carrying a hidden
+/// Uses [`fresh_when`] for conditional-GET support: if the client already
+/// holds a matching ETag the handler returns `304 Not Modified` with an empty
+/// body, saving a full render + transport round-trip on every repeat visit or
+/// htmx poll.
+///
+/// The ETag is derived from the todo's `created_at` timestamp and its
+/// `completed` flag, so it changes whenever the todo is toggled.
+///
+/// The page also renders a plain `<form method="post">` carrying a hidden
 /// `_method=DELETE` field as a no-JavaScript fallback alongside the
 /// htmx-driven delete button on the list view. Both paths hit the same
-/// declared `#[delete("/todos/{id}")]` handler — Autumn's method-override
-/// middleware rewrites the transport `POST` to `DELETE` before route
-/// matching.
+/// `#[delete("/todos/{id}")]` handler — Autumn's method-override middleware
+/// rewrites the transport `POST` to `DELETE` before route matching.
 #[get("/todos/{id}")]
-pub async fn detail(id: Path<i64>, mut db: Db, csrf: Option<CsrfToken>) -> AutumnResult<Markup> {
+pub async fn detail(
+    id: Path<i64>,
+    headers: http::HeaderMap,
+    mut db: Db,
+    csrf: Option<CsrfToken>,
+) -> AutumnResult<impl IntoResponse> {
     let todo = Todo::find(*id, &mut db).await?;
-    Ok(detail_view(&todo, csrf.as_ref().map(CsrfToken::token)))
+
+    // ETag: hash of (created_at_unix, completed flag).
+    // Deterministic: same state ⇒ same ETag on every replica.
+    let etag_input = format!("{}-{}", todo.created_at.and_utc().timestamp(), todo.completed);
+    let fw = fresh_when(&headers, etag_input.as_str());
+
+    Ok(fw.or(detail_view(&todo, csrf.as_ref().map(CsrfToken::token))))
 }
 
 /// Create a new todo from a form submission.

@@ -11,6 +11,7 @@ path = "src/bin/seed.rs"
 [dependencies]
 autumn-web = { path = "../../autumn", features = ["seed"] }
 chrono = { version = "0.4", features = ["serde"] }
+http = "1"
 diesel = { version = "2", features = ["postgres", "chrono"] }
 diesel-async = { version = "0.8", features = ["postgres"] }
 pq-sys = { version = "0.7", features = ["bundled_without_openssl"] }

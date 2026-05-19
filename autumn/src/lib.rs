@@ -135,6 +135,7 @@ pub mod flash;
 #[cfg(feature = "htmx")]
 pub(crate) mod htmx;
 pub(crate) mod logging;
+pub mod etag;
 pub mod middleware;
 pub mod openapi;
 pub mod pagination;

@@ -921,6 +921,34 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         },
     );
 
+    // Generate `pub fn etag(&self) -> ::autumn_web::etag::ETag` only when the
+    // model carries a `#[lock_version]` field.  For models without one, the
+    // method is omitted entirely — it would be meaningless.
+    let etag_method: TokenStream = lock_version_field.map_or_else(
+        || quote! {},
+        |lv_field| {
+            let ident = lv_field.ident.as_ref().unwrap();
+            quote! {
+                /// Derive an ETag from this model's lock version.
+                ///
+                /// Use with `autumn_web::etag::fresh_when` for one-liner
+                /// conditional-GET support:
+                ///
+                /// ```rust,ignore
+                /// let fw = fresh_when(&headers, post.etag());
+                /// Ok(fw.or(html! { ... }))
+                /// ```
+                ///
+                /// The ETag is deterministic: same `lock_version` ⇒ same ETag
+                /// on every replica, with no dependence on wall clock or RNG.
+                #[inline]
+                pub fn etag(&self) -> ::autumn_web::etag::ETag {
+                    ::autumn_web::etag::IntoETag::into_etag(self.#ident as i64)
+                }
+            }
+        },
+    );
+
     // Compute schema bodies for OpenApiSchema impls.
     // all_fields is Vec<&Field>; emit_schema_fn_body expects &[&&Field].
     let all_field_refs: Vec<&&Field> = all_fields.iter().collect();
@@ -1309,6 +1337,8 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             pub fn __autumn_lock_version_actual(&self) -> ::core::option::Option<i64> {
                 #lock_version_actual_body
             }
+
+            #etag_method
         }
 
         impl #update_name {
@@ -1584,5 +1614,72 @@ mod tests {
     fn infer_table_name_multi_word() {
         let ident = syn::Ident::new("BlogPost", proc_macro2::Span::call_site());
         assert_eq!(infer_table_name(&ident), "blog_posts");
+    }
+
+    // ── RED: etag() derivation from #[lock_version] ────────────────────────
+
+    #[test]
+    fn lock_version_model_emits_etag_method() {
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub title: String,
+                    #[lock_version]
+                    pub lock_version: i64,
+                }
+            },
+        );
+        let generated = output.to_string();
+        assert!(
+            generated.contains("pub fn etag"),
+            "model with #[lock_version] must emit `pub fn etag`: {generated}"
+        );
+    }
+
+    #[test]
+    fn model_without_lock_version_does_not_emit_etag_method() {
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub title: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+        assert!(
+            !generated.contains("pub fn etag"),
+            "model without #[lock_version] must NOT emit `pub fn etag`: {generated}"
+        );
+    }
+
+    #[test]
+    fn etag_method_calls_into_etag_on_lock_version_field() {
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub title: String,
+                    #[lock_version]
+                    pub lock_version: i64,
+                }
+            },
+        );
+        let generated = output.to_string();
+        assert!(
+            generated.contains("IntoETag") || generated.contains("into_etag"),
+            "etag() must call IntoETag::into_etag on the lock_version field: {generated}"
+        );
+        assert!(
+            generated.contains("lock_version"),
+            "etag() method body must reference the lock_version field: {generated}"
+        );
     }
 }
