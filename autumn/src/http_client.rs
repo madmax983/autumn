@@ -1499,4 +1499,135 @@ mod tests {
             "explicit retries() call must allow non-idempotent methods to retry"
         );
     }
+
+    // TEST 33: log_request covers the sensitive-header redaction path.
+    #[test]
+    fn log_request_completes_with_sensitive_headers() {
+        let url = reqwest::Url::parse("https://api.example.com/v1/resource?q=1").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("content-type"),
+            HeaderValue::from_static("application/json"),
+        );
+        headers.insert(
+            HeaderName::from_static("authorization"),
+            HeaderValue::from_static("Bearer sk_test_xxx"),
+        );
+        // Should complete without panicking; authorization is redacted from span.
+        log_request("POST", &url, 201, Duration::from_millis(12), &headers);
+    }
+
+    // TEST 34: inject_trace_context passthrough (without telemetry-otlp feature).
+    #[test]
+    fn inject_trace_context_passthrough_without_telemetry() {
+        let inner = reqwest::Client::new();
+        let builder = inner.get("https://example.com");
+        // Without telemetry-otlp the function is a no-op; verify it doesn't panic.
+        let _b = inject_trace_context(builder);
+    }
+
+    // TEST 35: Real GET request exercises inject_trace_context, log_request, and
+    // the success branch of the retry loop.
+    #[tokio::test]
+    async fn real_get_request_covers_network_path() {
+        use axum::{Router, routing::get};
+
+        let app = Router::new().route("/ping", get(|| async { "pong" }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let client = Client::new();
+        let resp = client
+            .get(format!("http://127.0.0.1:{}/ping", addr.port()))
+            .header("x-request-id", "test-35")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status().as_u16(), 200);
+        assert!(resp.url().is_some());
+        assert_eq!(resp.text(), "pong");
+    }
+
+    // TEST 36: Real POST with JSON body covers the body-sending code path.
+    #[tokio::test]
+    async fn real_post_with_json_body_covers_body_path() {
+        use axum::{Json, Router, routing::post};
+        use serde_json::Value;
+
+        let app = Router::new().route(
+            "/echo",
+            post(|Json(body): Json<Value>| async move { Json(body) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let client = Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/echo", addr.port()))
+            .json(&serde_json::json!({"hello": "world"}))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status().as_u16(), 200);
+        let body: Value = resp.json().unwrap();
+        assert_eq!(body["hello"], "world");
+    }
+
+    // TEST 37: GET with one 503 then 200 covers the retry-sleep and 5xx-retry paths.
+    #[tokio::test]
+    async fn real_get_retries_on_503_then_succeeds() {
+        use axum::{Router, routing::get};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering as SeqOrdering};
+
+        let hit = Arc::new(AtomicU32::new(0));
+        let hit2 = hit.clone();
+        let app = Router::new().route(
+            "/flaky",
+            get(move || {
+                let c = hit2.clone();
+                async move {
+                    if c.fetch_add(1, SeqOrdering::SeqCst) == 0 {
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE
+                    } else {
+                        axum::http::StatusCode::OK
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        // retries(1): 2 total attempts, 100 ms sleep between them.
+        let resp = Client::new()
+            .get(format!("http://127.0.0.1:{}/flaky", addr.port()))
+            .retries(1)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status().as_u16(), 200);
+        assert_eq!(hit.load(Ordering::SeqCst), 2);
+    }
+
+    // TEST 38: text_body sets a plain-text body.
+    #[test]
+    fn text_body_sets_body() {
+        let client = Client::new();
+        let builder = client.post("https://example.com").text_body("hello");
+        assert_eq!(builder.body, Some(bytes::Bytes::from_static(b"hello")));
+    }
+
+    // TEST 39: ClientError::NoMock displays correctly.
+    #[test]
+    fn client_error_display() {
+        let err = ClientError::NoMock("GET".to_owned(), "/path".to_owned());
+        assert!(err.to_string().contains("GET"));
+        assert!(err.to_string().contains("/path"));
+    }
 }
