@@ -2342,8 +2342,7 @@ mod tests {
     #[test]
     fn parse_generate_mailer_with_dry_run() {
         let cli =
-            Cli::try_parse_from(["autumn", "generate", "mailer", "Welcome", "--dry-run"])
-                .unwrap();
+            Cli::try_parse_from(["autumn", "generate", "mailer", "Welcome", "--dry-run"]).unwrap();
         let Commands::Generate(GenerateCommands::Mailer { dry_run, force, .. }) = cli.command
         else {
             panic!("expected generate mailer");
@@ -2355,8 +2354,7 @@ mod tests {
     #[test]
     fn parse_generate_mailer_with_force() {
         let cli =
-            Cli::try_parse_from(["autumn", "generate", "mailer", "Welcome", "--force"])
-                .unwrap();
+            Cli::try_parse_from(["autumn", "generate", "mailer", "Welcome", "--force"]).unwrap();
         let Commands::Generate(GenerateCommands::Mailer { dry_run, force, .. }) = cli.command
         else {
             panic!("expected generate mailer");
@@ -2367,8 +2365,7 @@ mod tests {
 
     #[test]
     fn parse_generate_mailer_snake_case_name() {
-        let cli =
-            Cli::try_parse_from(["autumn", "generate", "mailer", "welcome_email"]).unwrap();
+        let cli = Cli::try_parse_from(["autumn", "generate", "mailer", "welcome_email"]).unwrap();
         let Commands::Generate(GenerateCommands::Mailer { name, .. }) = cli.command else {
             panic!("expected generate mailer");
         };
