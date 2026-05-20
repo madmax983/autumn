@@ -2497,6 +2497,15 @@ impl AppBuilder {
             cache_backend,
             #[cfg(feature = "mail")]
             mail_delivery_queue_factory,
+            #[cfg(feature = "mail")]
+            mail_interceptor,
+            job_interceptor,
+            #[cfg(feature = "db")]
+            db_interceptor,
+            #[cfg(feature = "ws")]
+            channels_interceptor,
+            #[cfg(feature = "oauth2")]
+            http_interceptor,
             ..
         } = self;
 
@@ -2567,6 +2576,31 @@ impl AppBuilder {
             #[cfg(feature = "ws")]
             channels_backend,
         );
+        #[cfg(feature = "mail")]
+        if let Some(interceptor) = mail_interceptor {
+            state.insert_extension(interceptor);
+        }
+        if let Some(interceptor) = job_interceptor {
+            state.insert_extension(interceptor);
+        }
+        #[cfg(feature = "db")]
+        if let Some(interceptor) = db_interceptor {
+            state.insert_extension(interceptor);
+        }
+        #[cfg(feature = "ws")]
+        if let Some(interceptor) = channels_interceptor {
+            state.insert_extension(interceptor.clone());
+            state.channels = crate::channels::Channels::with_shared_backend(std::sync::Arc::new(
+                crate::channels::InterceptedChannelsBackend::new(
+                    state.channels.backend().clone(),
+                    vec![interceptor],
+                ),
+            ));
+        }
+        #[cfg(feature = "oauth2")]
+        if let Some(interceptor) = http_interceptor {
+            state.insert_extension(interceptor);
+        }
         #[cfg(feature = "db")]
         configure_replica_migration_check(&state, replica_migration_check);
         #[cfg(feature = "db")]
