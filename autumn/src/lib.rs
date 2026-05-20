@@ -132,6 +132,14 @@ pub use hooks::{
     DraftField, FieldDiff, MutationContext, MutationHooks, MutationOp, NoHooks, Patch, UpdateDraft,
 };
 pub mod etag;
+/// Traced outbound HTTP client with retries and test mocks.
+///
+/// See [`http_client::Client`] for the full API. The module is exposed as
+/// `autumn_web::http` so handler code can write `use autumn_web::http::Client`.
+#[cfg(feature = "http-client")]
+pub mod http_client;
+#[cfg(feature = "http-client")]
+pub use http_client as http;
 #[cfg(feature = "flash")]
 pub mod flash;
 #[cfg(feature = "htmx")]
