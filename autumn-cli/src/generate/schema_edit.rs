@@ -431,6 +431,194 @@ fn leading_indent(body: &str) -> String {
         .unwrap_or_else(|| "            ".to_owned())
 }
 
+// ── Mail preview wiring ───────────────────────────────────────────────────
+
+/// Insert or augment a `.mail_previews(mail_previews![...])` call in the app
+/// builder chain inside `src/main.rs`.
+///
+/// - If `mail_previews![` already exists, `mailer_type` is appended to its
+///   type list (idempotent when already present).
+/// - Otherwise, a new `.mail_previews(mail_previews![mailer_type])` call is
+///   inserted immediately before the first `.run()` line in the builder chain.
+///
+/// Returns `existing` unchanged when neither injection point can be found.
+#[must_use]
+pub fn add_mail_preview_to_app(existing: &str, mailer_type: &str) -> String {
+    const PREVIEW_MACRO: &str = "mail_previews![";
+    existing.find(PREVIEW_MACRO).map_or_else(
+        || insert_mail_previews_call(existing, mailer_type),
+        |macro_start| {
+            augment_mail_previews_list(existing, macro_start + PREVIEW_MACRO.len(), mailer_type)
+        },
+    )
+}
+
+/// Append `mailer_type` inside an already-present `mail_previews![...]`.
+fn augment_mail_previews_list(existing: &str, body_start: usize, mailer_type: &str) -> String {
+    let rest = &existing[body_start..];
+    let Some(end_offset) = rest.find(']') else {
+        return existing.to_owned();
+    };
+    let body = &rest[..end_offset];
+
+    // Idempotency: skip if type is already registered.
+    if body.split(',').map(str::trim).any(|t| t == mailer_type) {
+        return existing.to_owned();
+    }
+
+    let separator = if body.trim().is_empty() { "" } else { ", " };
+    let new_body = format!("{}{}{}", body.trim_end(), separator, mailer_type);
+    [
+        &existing[..body_start],
+        &new_body,
+        &existing[body_start + end_offset..],
+    ]
+    .concat()
+}
+
+/// Insert `.mail_previews(mail_previews![mailer_type])` before `.run()`.
+fn insert_mail_previews_call(existing: &str, mailer_type: &str) -> String {
+    let mut out = String::with_capacity(existing.len() + 80);
+    let mut inserted = false;
+    for line in existing.split('\n') {
+        let trimmed = line.trim_start();
+        if !inserted && trimmed.starts_with(".run()") {
+            let indent_len = line.len() - trimmed.len();
+            let indent = &line[..indent_len];
+            out.push_str(indent);
+            out.push_str(".mail_previews(mail_previews![");
+            out.push_str(mailer_type);
+            out.push_str("])\n");
+            inserted = true;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    // split('\n') always produces a trailing empty slice for strings ending
+    // with '\n', so we have one extra '\n'. Trim it if the original didn't
+    // end with a newline.
+    if !existing.ends_with('\n') && out.ends_with('\n') {
+        out.pop();
+    }
+    // Remove the extra trailing newline produced by the final empty segment.
+    if existing.ends_with('\n') && out.ends_with("\n\n") {
+        out.pop();
+    }
+    out
+}
+
+// ── Cargo.toml: feature injection ────────────────────────────────────────
+
+/// Ensure the `autumn-web` dependency in `Cargo.toml` includes `feature`.
+///
+/// Handles the three most common forms of the dependency declaration:
+///
+///   1. `autumn-web = "x.y.z"` → `autumn-web = { version = "x.y.z", features = ["mail"] }`
+///   2. `autumn-web = { version = "x.y.z" }` → adds `features = ["mail"]`
+///   3. `autumn-web = { ..., features = ["other"] }` → appends `"mail"` to the list
+///
+/// Idempotent: a second call with the same feature is a no-op.
+/// Returns `existing` unchanged when the `autumn-web` dep cannot be found.
+#[must_use]
+pub fn ensure_autumn_web_feature(existing: &str, feature: &str) -> String {
+    let feature_quoted = format!("\"{feature}\"");
+    let lines: Vec<&str> = existing.lines().collect();
+    let mut in_deps = false;
+
+    for (i, &line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if is_dependencies_header(trimmed) {
+            in_deps = true;
+            continue;
+        }
+        if in_deps && is_toml_table_header(trimmed) {
+            in_deps = false;
+            continue;
+        }
+        if !in_deps {
+            continue;
+        }
+        // Only inspect lines that start with `autumn-web`.
+        let after_ws = line.trim_start();
+        if !after_ws.starts_with("autumn-web") {
+            continue;
+        }
+        // Idempotency check.
+        if line.contains(&feature_quoted) {
+            return existing.to_owned();
+        }
+        let new_line = rewrite_dep_with_feature(line, feature);
+        let mut out = String::with_capacity(existing.len() + 32);
+        for (j, &l) in lines.iter().enumerate() {
+            out.push_str(if j == i { &new_line } else { l });
+            out.push('\n');
+        }
+        if !existing.ends_with('\n') {
+            out.pop();
+        }
+        return out;
+    }
+    existing.to_owned()
+}
+
+/// Rewrite a single `autumn-web = …` TOML line to include `feature`.
+fn rewrite_dep_with_feature(line: &str, feature: &str) -> String {
+    let feature_quoted = format!("\"{feature}\"");
+    let trimmed = line.trim();
+
+    // Form 1: autumn-web = "x.y.z"
+    if let Some(rest) = trimmed.strip_prefix("autumn-web") {
+        let rest = rest.trim_start_matches([' ', '=', '\t']);
+        if rest.starts_with('"')
+            && let Some(version) = rest.strip_prefix('"').and_then(|r| r.strip_suffix('"'))
+        {
+            let indent_len = line.len() - line.trim_start().len();
+            let indent = &line[..indent_len];
+            return format!(
+                "{indent}autumn-web = {{ version = \"{version}\", features = [{feature_quoted}] }}"
+            );
+        }
+    }
+
+    // Form 2/3: autumn-web = { ... features = [...] ... }
+    if let Some(open) = line.find("features")
+        && let Some(bracket_start) = line[open..].find('[')
+    {
+        let abs_start = open + bracket_start;
+        if let Some(bracket_end_rel) = line[abs_start..].find(']') {
+            let abs_end = abs_start + bracket_end_rel;
+            let body = &line[abs_start + 1..abs_end];
+            let separator = if body.trim().is_empty() { "" } else { ", " };
+            return format!(
+                "{}{}{}{}",
+                &line[..abs_end],
+                separator,
+                feature_quoted,
+                &line[abs_end..]
+            );
+        }
+    }
+
+    // Form 2b: autumn-web = { version = "x.y.z" } — no features key yet.
+    // Insert features before the closing `}`.
+    if let Some(close) = line.rfind('}') {
+        let before = line[..close].trim_end();
+        let after = &line[close..];
+        return format!("{before}, features = [{feature_quoted}]{after}");
+    }
+
+    line.to_owned()
+}
+
+fn is_dependencies_header(trimmed: &str) -> bool {
+    trimmed == "[dependencies]"
+        || trimmed.starts_with("[dependencies]") && trimmed[13..].trim_start().starts_with('#')
+}
+
+fn is_toml_table_header(trimmed: &str) -> bool {
+    trimmed.starts_with('[') && !trimmed.starts_with("[dependencies.")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -729,5 +917,162 @@ async fn main() {\n\
         let original = "fn main() {\n    routes![]\n}\n";
         let updated = ensure_routes_entries(original, &["foo".into()]);
         assert!(updated.contains("foo"));
+    }
+
+    // ── add_mail_preview_to_app ───────────────────────────────────────────
+
+    fn app_main() -> &'static str {
+        "use autumn_web::prelude::*;\n\
+         \n\
+         #[autumn_web::main]\n\
+         async fn main() {\n\
+             autumn_web::app()\n\
+                 .routes(routes![index])\n\
+                 .run()\n\
+                 .await;\n\
+         }\n"
+    }
+
+    #[test]
+    fn add_mail_preview_inserts_before_run() {
+        let updated = add_mail_preview_to_app(app_main(), "mailers::welcome::WelcomeMailer");
+        assert!(
+            updated.contains("mail_previews![mailers::welcome::WelcomeMailer]"),
+            "must insert mail_previews call: {updated}"
+        );
+        let preview_pos = updated.find("mail_previews").unwrap();
+        let run_pos = updated.find(".run()").unwrap();
+        assert!(
+            preview_pos < run_pos,
+            "mail_previews must appear before .run(): {updated}"
+        );
+    }
+
+    #[test]
+    fn add_mail_preview_idempotent() {
+        let first = add_mail_preview_to_app(app_main(), "mailers::welcome::WelcomeMailer");
+        let second = add_mail_preview_to_app(&first, "mailers::welcome::WelcomeMailer");
+        assert_eq!(first, second, "second call must be a no-op");
+    }
+
+    #[test]
+    fn add_mail_preview_augments_existing_call() {
+        let after_first = add_mail_preview_to_app(app_main(), "mailers::welcome::WelcomeMailer");
+        let after_second = add_mail_preview_to_app(&after_first, "mailers::notify::NotifyMailer");
+        assert!(after_second.contains("mailers::welcome::WelcomeMailer"));
+        assert!(after_second.contains("mailers::notify::NotifyMailer"));
+        assert_eq!(
+            after_second.matches("mail_previews![").count(),
+            1,
+            "must not duplicate the mail_previews![] call: {after_second}"
+        );
+    }
+
+    #[test]
+    fn add_mail_preview_preserves_run_await() {
+        let updated = add_mail_preview_to_app(app_main(), "mailers::welcome::WelcomeMailer");
+        assert!(updated.contains(".run()"), ".run() must still be present");
+        assert!(updated.contains(".await;"), ".await must still be present");
+    }
+
+    // ── ensure_autumn_web_feature ─────────────────────────────────────────
+
+    #[test]
+    fn ensure_feature_transforms_bare_string_dep() {
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = \"0.6\"\n";
+        let updated = ensure_autumn_web_feature(cargo, "mail");
+        assert!(
+            updated.contains("\"mail\""),
+            "must add mail feature: {updated}"
+        );
+        assert!(
+            updated.contains("version"),
+            "must preserve version: {updated}"
+        );
+    }
+
+    #[test]
+    fn ensure_feature_idempotent_bare_string() {
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = \"0.6\"\n";
+        let once = ensure_autumn_web_feature(cargo, "mail");
+        let twice = ensure_autumn_web_feature(&once, "mail");
+        assert_eq!(once, twice, "second call must be a no-op");
+    }
+
+    #[test]
+    fn ensure_feature_adds_to_existing_features_list() {
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\n\
+                     autumn-web = { version = \"0.6\", features = [\"db\"] }\n";
+        let updated = ensure_autumn_web_feature(cargo, "mail");
+        assert!(updated.contains("\"mail\""));
+        assert!(updated.contains("\"db\""), "must preserve existing feature");
+    }
+
+    #[test]
+    fn ensure_feature_adds_features_key_when_absent() {
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\n\
+                     autumn-web = { version = \"0.6\" }\n";
+        let updated = ensure_autumn_web_feature(cargo, "mail");
+        assert!(
+            updated.contains("\"mail\""),
+            "must add features key: {updated}"
+        );
+    }
+
+    #[test]
+    fn ensure_feature_idempotent_inline_table() {
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\n\
+                     autumn-web = { version = \"0.6\", features = [\"mail\"] }\n";
+        let updated = ensure_autumn_web_feature(cargo, "mail");
+        assert_eq!(cargo, updated, "already-present feature must be a no-op");
+    }
+
+    #[test]
+    fn ensure_feature_ignores_unrelated_deps() {
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\n\
+                     serde = \"1\"\nautumn-web = \"0.6\"\ntracing = \"0.1\"\n";
+        let updated = ensure_autumn_web_feature(cargo, "mail");
+        assert!(
+            updated.contains("serde = \"1\""),
+            "unrelated dep must be preserved"
+        );
+        assert!(updated.contains("\"mail\""));
+    }
+
+    #[test]
+    fn ensure_feature_returns_unchanged_when_autumn_web_absent() {
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nserde = \"1\"\n";
+        let updated = ensure_autumn_web_feature(cargo, "mail");
+        assert_eq!(cargo, updated, "no autumn-web dep → must be a no-op");
+    }
+
+    #[test]
+    fn ensure_feature_dep_without_closing_brace_uses_fallback() {
+        // Malformed line — none of the three forms match, fallback returns unchanged.
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = malformed\n";
+        let updated = ensure_autumn_web_feature(cargo, "mail");
+        // The function should not panic; it falls back to the existing line.
+        assert!(updated.contains("autumn-web = malformed"));
+    }
+
+    #[test]
+    fn add_mail_preview_unclosed_bracket_returns_unchanged() {
+        // Malformed source: `mail_previews![` with no closing `]`.
+        let src = "app()\n    .mail_previews(mail_previews![Foo)\n    .run()\n    .await;\n";
+        let updated = add_mail_preview_to_app(src, "Bar");
+        // Must not panic; returns the original string unchanged.
+        assert_eq!(src, updated);
+    }
+
+    #[test]
+    fn add_mail_preview_no_run_returns_string_with_preview_appended() {
+        // Source with no `.run()` call — insertion is skipped, function still returns.
+        let src = "app()\n    .routes(routes![index])\n";
+        let updated = add_mail_preview_to_app(src, "mailers::welcome::WelcomeMailer");
+        // No `.run()` means we can't find an insertion point; original is returned.
+        assert!(
+            !updated.contains("mail_previews"),
+            "no insertion point → no insertion"
+        );
     }
 }

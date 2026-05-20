@@ -7318,7 +7318,7 @@ mod tests {
             map.insert("tracestate".to_owned(), "vendor=val".to_owned());
             let extractor = JobMapExtractor(&map);
             let mut keys = extractor.keys();
-            keys.sort();
+            keys.sort_unstable();
             assert_eq!(keys, vec!["traceparent", "tracestate"]);
         }
 

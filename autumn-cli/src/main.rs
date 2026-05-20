@@ -480,6 +480,35 @@ enum GenerateCommands {
         #[arg(long)]
         force: bool,
     },
+    /// Scaffold a `#[mailer]` struct, HTML+text templates, preview
+    /// registration, and a smoke test.
+    ///
+    /// Creates:
+    ///   - `src/mailers/<snake>.rs`        — mailer struct + `#[mailer]` impl
+    ///   - `templates/mailers/<snake>.html` — HTML template placeholder
+    ///   - `templates/mailers/<snake>.txt`  — plain-text template placeholder
+    ///   - `src/mailers/mod.rs`             — created/updated with `pub mod`
+    ///   - `tests/<snake>_mailer.rs`        — smoke test
+    ///   - `src/main.rs`                   — wired into dev preview registry
+    ///   - `Cargo.toml`                    — `"mail"` feature added to autumn-web
+    ///
+    /// The `#[mailer]` macro generates `send_<name>` (async) and
+    /// `deliver_later_<name>` (fire-and-forget) from each method in the impl.
+    ///
+    /// Example:
+    ///
+    ///   autumn generate mailer Welcome
+    #[command(verbatim_doc_comment)]
+    Mailer {
+        /// Mailer name (`PascalCase` or `snake_case`, e.g. `Welcome`).
+        name: String,
+        /// Print the file plan and exit without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Overwrite existing files instead of erroring on collision.
+        #[arg(long)]
+        force: bool,
+    },
     /// Generate a complete browser authentication flow: signup, login, logout,
     /// account/profile, forgot-password, and reset-password.
     ///
@@ -859,6 +888,11 @@ fn run_generate_command(cmd: GenerateCommands) {
             dry_run,
             force,
         } => generate::task::run(&name, generate::Flags { dry_run, force }),
+        GenerateCommands::Mailer {
+            name,
+            dry_run,
+            force,
+        } => generate::mailer::run(&name, generate::Flags { dry_run, force }),
         GenerateCommands::Auth {
             name,
             dry_run,
@@ -2285,5 +2319,61 @@ mod tests {
     #[test]
     fn parse_credentials_without_subcommand_is_error() {
         assert!(Cli::try_parse_from(["autumn", "credentials"]).is_err());
+    }
+
+    // ── autumn generate mailer tests ───────────────────────────────────────
+
+    #[test]
+    fn parse_generate_mailer_with_pascal_name() {
+        let cli = Cli::try_parse_from(["autumn", "generate", "mailer", "Welcome"]).unwrap();
+        let Commands::Generate(GenerateCommands::Mailer {
+            name,
+            dry_run,
+            force,
+        }) = cli.command
+        else {
+            panic!("expected generate mailer");
+        };
+        assert_eq!(name, "Welcome");
+        assert!(!dry_run);
+        assert!(!force);
+    }
+
+    #[test]
+    fn parse_generate_mailer_with_dry_run() {
+        let cli =
+            Cli::try_parse_from(["autumn", "generate", "mailer", "Welcome", "--dry-run"]).unwrap();
+        let Commands::Generate(GenerateCommands::Mailer { dry_run, force, .. }) = cli.command
+        else {
+            panic!("expected generate mailer");
+        };
+        assert!(dry_run);
+        assert!(!force);
+    }
+
+    #[test]
+    fn parse_generate_mailer_with_force() {
+        let cli =
+            Cli::try_parse_from(["autumn", "generate", "mailer", "Welcome", "--force"]).unwrap();
+        let Commands::Generate(GenerateCommands::Mailer { dry_run, force, .. }) = cli.command
+        else {
+            panic!("expected generate mailer");
+        };
+        assert!(!dry_run);
+        assert!(force);
+    }
+
+    #[test]
+    fn parse_generate_mailer_snake_case_name() {
+        let cli = Cli::try_parse_from(["autumn", "generate", "mailer", "welcome_email"]).unwrap();
+        let Commands::Generate(GenerateCommands::Mailer { name, .. }) = cli.command else {
+            panic!("expected generate mailer");
+        };
+        assert_eq!(name, "welcome_email");
+    }
+
+    #[test]
+    fn parse_generate_mailer_without_name_is_error() {
+        assert!(Cli::try_parse_from(["autumn", "generate", "mailer"]).is_err());
     }
 }
