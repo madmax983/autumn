@@ -513,7 +513,8 @@ impl TestApp {
         crate::cache::clear_global_cache();
 
         let probes = crate::probe::ProbeState::ready_for_test();
-        let state = AppState {
+        #[allow(unused_mut)]
+        let mut state = AppState {
             extensions: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
@@ -546,6 +547,11 @@ impl TestApp {
             register(state.policy_registry());
         }
         crate::app::install_webhook_registry(&state, &self.config);
+
+        // Install AutumnConfig so DbState::statement_timeout / slow_query_threshold
+        // read the test-supplied config rather than always returning defaults.
+        #[cfg(feature = "db")]
+        state.insert_extension(self.config.clone());
 
         #[cfg(feature = "mail")]
         if let Some(interceptor) = self.mail_interceptor {

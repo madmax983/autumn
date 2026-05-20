@@ -18,7 +18,7 @@ mod db_telemetry_tests {
     struct SharedDb {
         _container: testcontainers::ContainerAsync<Postgres>,
         pool: Pool<AsyncPgConnection>,
-        url: String,
+        _url: String,
     }
 
     static SHARED_DB: OnceCell<SharedDb> = OnceCell::const_new();
@@ -44,7 +44,7 @@ mod db_telemetry_tests {
                 SharedDb {
                     _container: container,
                     pool,
-                    url,
+                    _url: url,
                 }
             })
             .await
@@ -90,16 +90,19 @@ mod db_telemetry_tests {
         config.database.statement_timeout = statement_timeout;
         config.database.slow_query_threshold = slow_threshold;
 
+        let mut routes = routes![sleep_default, sleep_override, quick_query];
+        for r in &mut routes {
+            if r.name == "sleep_override" {
+                r.handler = r.handler.clone().layer(::axum::Extension(StatementTimeout(
+                    Duration::from_millis(100),
+                )));
+            }
+        }
+
         // Custom route extensions for the override path
         TestApp::new()
-            .routes(routes![
-                sleep_default,
-                sleep_override.layer(axum::Extension(StatementTimeout(Duration::from_millis(
-                    100
-                )))),
-                quick_query
-            ])
-            .with_config(config)
+            .routes(routes)
+            .config(config)
             .with_db(pool)
             .build()
     }

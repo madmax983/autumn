@@ -428,20 +428,30 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         };
 
+        // Shared timeout + route extraction — used by both hooks and no-hooks
+        // branches so the logic lives in exactly one place.
+        let timeout_route_init = quote! {
+            use ::autumn_web::db::DbState as _;
+            // Postgres statement_timeout is a signed 32-bit integer (ms).
+            const __AUTUMN_PG_TIMEOUT_MAX_MS: u64 = i32::MAX as u64;
+            let __autumn_timeout_ms: u64 = _parts
+                .extensions
+                .get::<::autumn_web::db::StatementTimeout>()
+                .map(|t| t.0.as_millis() as u64)
+                .or_else(|| state.statement_timeout().map(|d| d.as_millis() as u64))
+                .unwrap_or(0u64)
+                .min(__AUTUMN_PG_TIMEOUT_MAX_MS);
+            let __autumn_slow_threshold = state.slow_query_threshold();
+            let __autumn_route: ::std::option::Option<::std::string::String> = _parts
+                .extensions
+                .get::<::autumn_web::reexports::axum::extract::MatchedPath>()
+                .map(|p| p.as_str().to_owned());
+        };
+
         let extractor_init = if commit_hooks_enabled {
             quote! {
                 #pg_name::__autumn_register_repository_commit_hooks();
-                let __autumn_timeout_ms = _parts
-                    .extensions
-                    .get::<::autumn_web::db::StatementTimeout>()
-                    .map(|t| t.0.as_millis() as u64)
-                    .or_else(|| state.statement_timeout().map(|d| d.as_millis() as u64))
-                    .unwrap_or(0u64);
-                let __autumn_slow_threshold = state.slow_query_threshold();
-                let __autumn_route = _parts
-                    .extensions
-                    .get::<::autumn_web::reexports::axum::extract::MatchedPath>()
-                    .map(|p| p.as_str().to_owned());
+                #timeout_route_init
                 Ok(#pg_name {
                     pool,
                     hooks: <#hooks_ident as ::autumn_web::hooks::RepositoryHooksDefault>::autumn_default(),
@@ -456,17 +466,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         } else {
             quote! {
-                let __autumn_timeout_ms = _parts
-                    .extensions
-                    .get::<::autumn_web::db::StatementTimeout>()
-                    .map(|t| t.0.as_millis() as u64)
-                    .or_else(|| state.statement_timeout().map(|d| d.as_millis() as u64))
-                    .unwrap_or(0u64);
-                let __autumn_slow_threshold = state.slow_query_threshold();
-                let __autumn_route = _parts
-                    .extensions
-                    .get::<::autumn_web::reexports::axum::extract::MatchedPath>()
-                    .map(|p| p.as_str().to_owned());
+                #timeout_route_init
                 Ok(#pg_name {
                     pool,
                     hooks: <#hooks_ident as ::autumn_web::hooks::RepositoryHooksDefault>::autumn_default(),
@@ -1176,14 +1176,18 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         };
 
         let extractor_init = quote! {
-            let __autumn_timeout_ms = _parts
+            use ::autumn_web::db::DbState as _;
+            // Postgres statement_timeout is a signed 32-bit integer (ms).
+            const __AUTUMN_PG_TIMEOUT_MAX_MS: u64 = i32::MAX as u64;
+            let __autumn_timeout_ms: u64 = _parts
                 .extensions
                 .get::<::autumn_web::db::StatementTimeout>()
                 .map(|t| t.0.as_millis() as u64)
                 .or_else(|| state.statement_timeout().map(|d| d.as_millis() as u64))
-                .unwrap_or(0u64);
+                .unwrap_or(0u64)
+                .min(__AUTUMN_PG_TIMEOUT_MAX_MS);
             let __autumn_slow_threshold = state.slow_query_threshold();
-            let __autumn_route = _parts
+            let __autumn_route: ::std::option::Option<::std::string::String> = _parts
                 .extensions
                 .get::<::autumn_web::reexports::axum::extract::MatchedPath>()
                 .map(|p| p.as_str().to_owned());
@@ -2492,8 +2496,18 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 >,
             > {
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl as _;
-                let mut conn = self.__autumn_acquire_conn().await?;
+                let mut conn = self.pool.get().await.map_err(|e| {
+                    ::autumn_web::reexports::tracing::error!(
+                        "repository: failed to acquire database connection: {e}"
+                    );
+                    ::autumn_web::AutumnError::service_unavailable_msg(
+                        ::std::format!("Database connection error: {e}")
+                    )
+                })?;
                 let timeout_ms = self.__autumn_statement_timeout_ms;
+                // Postgres statement_timeout is a signed 32-bit integer; cap to be safe.
+                let timeout_ms = timeout_ms.min(i32::MAX as u64);
+
                 ::autumn_web::reexports::diesel::sql_query(
                     ::std::format!("SET statement_timeout = {timeout_ms}")
                 )
@@ -2509,6 +2523,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 })?;
                 ::core::result::Result::Ok(conn)
             }
+
 
             /// Returns the route label for metrics, e.g. `"GET /users"`.
             #[doc(hidden)]

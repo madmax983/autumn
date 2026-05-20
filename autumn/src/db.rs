@@ -260,68 +260,86 @@ pub trait DbState {
 /// ```
 #[must_use]
 pub fn scrub_sql(sql: &str) -> String {
+    /// Returns true for every char that can legally precede a bare numeric
+    /// literal in SQL — whitespace, comparison, arithmetic, and structural chars.
+    #[inline]
+    const fn is_separator(c: char) -> bool {
+        matches!(
+            c,
+            ' ' | '\t' | '\n'          // whitespace
+            | '=' | '<' | '>'          // comparison
+            | '!' | '+' | '-'          // arithmetic / negation (signed literals)
+            | '*' | '/' | '%'          // arithmetic operators
+            | '(' | ',' // structure
+        )
+    }
+
     let mut out = String::with_capacity(sql.len());
-    let bytes = sql.as_bytes();
-    let mut i = 0;
+    // Tracks whether the last character written was a separator, so a digit
+    // at the current position starts a standalone literal rather than being
+    // part of an identifier like `table1` or `col2`.
+    let mut prev_is_sep = true; // treat start-of-input as a separator boundary
 
-    while i < bytes.len() {
-        // Single-quoted string literal
-        if bytes[i] == b'\'' {
+    let mut chars = sql.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        // ── Single-quoted string literal ─────────────────────────────────
+        if c == '\'' {
             out.push_str("'?'");
-            i += 1;
-            while i < bytes.len() {
-                if bytes[i] == b'\'' {
-                    // Handle escaped single quotes ('')
-                    if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
-                        i += 2;
-                    } else {
-                        i += 1;
-                        break;
+            prev_is_sep = false;
+            loop {
+                match chars.next() {
+                    None => break,
+                    Some('\'') => {
+                        if chars.peek() == Some(&'\'') {
+                            // Escaped quote ('') — consume both, stay inside string
+                            chars.next();
+                        } else {
+                            // Closing quote
+                            break;
+                        }
                     }
-                } else {
-                    i += 1;
+                    Some(_) => {}
                 }
             }
             continue;
         }
 
-        // Postgres $N positional parameter — pass through unchanged
-        if bytes[i] == b'$' {
+        // ── Postgres $N positional parameter ─────────────────────────────
+        if c == '$' {
             out.push('$');
-            i += 1;
-            while i < bytes.len() && bytes[i].is_ascii_digit() {
-                out.push(bytes[i] as char);
-                i += 1;
+            prev_is_sep = false;
+            while chars.peek().is_some_and(char::is_ascii_digit) {
+                if let Some(digit) = chars.next() {
+                    out.push(digit);
+                }
             }
             continue;
         }
 
-        // Unquoted numeric literal (integer or decimal) — only replace when
-        // preceded by whitespace, `=`, `(`, or `,` to avoid stomping on
-        // identifiers like `table1` or column aliases.
-        if bytes[i].is_ascii_digit() {
-            let prev_is_separator = i == 0 || {
-                let p = bytes[i - 1];
-                p == b' ' || p == b'\t' || p == b'\n' || p == b'=' || p == b'(' || p == b','
-            };
-            if prev_is_separator {
-                out.push('?');
-                while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
-                    i += 1;
-                }
-                continue;
+        // ── Unquoted numeric literal ──────────────────────────────────────
+        // Only scrub when preceded by a separator to avoid stomping on
+        // identifiers like `table1`, `col2`, or `alias99`.
+        if c.is_ascii_digit() && prev_is_sep {
+            out.push('?');
+            // Consume rest of the integer or decimal literal
+            while chars
+                .peek()
+                .is_some_and(|d| d.is_ascii_digit() || *d == '.')
+            {
+                chars.next();
             }
+            prev_is_sep = false;
+            continue;
         }
 
-        out.push(bytes[i] as char);
-        i += 1;
+        // ── Regular character ─────────────────────────────────────────────
+        out.push(c);
+        prev_is_sep = is_separator(c);
     }
 
     out
 }
-
-/// Postgres `SQLState` code for "`query_canceled`" (`statement_timeout` exceeded).
-const PG_SQLSTATE_QUERY_CANCELED: &str = "57014";
 
 /// Instrument a database query: time it, log slow queries with a scrubbed SQL
 /// fingerprint, record metrics, and map Postgres `57014` (statement timeout)
@@ -391,15 +409,19 @@ where
 }
 
 /// Check whether a Diesel error wraps a Postgres `57014` `query_canceled` error.
+///
+/// Prefers downcasting through the source chain to find a
+/// [`tokio_postgres::Error`] and checking its SQL state code directly,
+/// which is more robust than string-matching error messages.
 fn is_query_canceled(err: &diesel::result::Error) -> bool {
-    // Walk the source chain looking for a tokio_postgres::Error with code 57014
     let mut source: Option<&(dyn std::error::Error + 'static)> = Some(err);
 
     while let Some(e) = source {
-        let msg = e.to_string();
-        if msg.contains(PG_SQLSTATE_QUERY_CANCELED)
-            || msg.contains("query_canceled")
-            || msg.contains("statement timeout")
+        // Prefer downcasting to tokio_postgres::Error so we can check the
+        // SQL state code directly rather than matching on message text.
+        if e.downcast_ref::<tokio_postgres::Error>()
+            .and_then(|pg_err| pg_err.code())
+            == Some(&tokio_postgres::error::SqlState::QUERY_CANCELED)
         {
             return true;
         }
@@ -732,6 +754,7 @@ where
         parts: &mut axum::http::request::Parts,
         state: &S,
     ) -> Result<Self, Self::Rejection> {
+        const PG_TIMEOUT_MAX_MS: u64 = i32::MAX as u64;
         use diesel_async::RunQueryDsl as _;
 
         let pool = state
@@ -771,10 +794,16 @@ where
         let mut conn = checkout_future.instrument(span.clone()).await?;
 
         let timeout_override = parts.extensions.get::<StatementTimeout>().copied();
+        // Postgres statement_timeout is a signed 32-bit integer (milliseconds).
+        // Cap at i32::MAX to avoid a confusing 503 for very large configured values.
         let timeout_ms = timeout_override
             .map(|t| t.0)
             .or_else(|| state.statement_timeout())
-            .map_or(0u64, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+            .map_or(0u64, |d| {
+                u64::try_from(d.as_millis())
+                    .unwrap_or(PG_TIMEOUT_MAX_MS)
+                    .min(PG_TIMEOUT_MAX_MS)
+            });
 
         diesel::sql_query(format!("SET statement_timeout = {timeout_ms}"))
             .execute(&mut conn)

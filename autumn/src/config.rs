@@ -3083,14 +3083,20 @@ pub fn parse_duration_str(s: &str) -> Result<std::time::Duration, String> {
         let val = val_str
             .parse::<u64>()
             .map_err(|e| format!("invalid duration integer: {e}"))?;
-        return Ok(std::time::Duration::from_secs(val * 60));
+        let secs = val.checked_mul(60).ok_or_else(|| {
+            format!("duration overflow: '{s}' exceeds maximum representable value")
+        })?;
+        return Ok(std::time::Duration::from_secs(secs));
     }
 
     if let Some(val_str) = s.strip_suffix('h') {
         let val = val_str
             .parse::<u64>()
             .map_err(|e| format!("invalid duration integer: {e}"))?;
-        return Ok(std::time::Duration::from_secs(val * 3600));
+        let secs = val.checked_mul(3600).ok_or_else(|| {
+            format!("duration overflow: '{s}' exceeds maximum representable value")
+        })?;
+        return Ok(std::time::Duration::from_secs(secs));
     }
 
     Err(format!("invalid duration format: '{s}'"))
@@ -5312,7 +5318,7 @@ path = "/api-spec.json"
         );
         assert_eq!(
             parse_duration_str("1000").unwrap(),
-            std::time::Duration::from_millis(1000)
+            std::time::Duration::from_secs(1)
         );
         assert!(parse_duration_str("abc").is_err());
         assert!(parse_duration_str("").is_err());

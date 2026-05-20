@@ -461,8 +461,7 @@ impl HttpInterceptor for RecordingHttpInterceptor {
     > {
         assert_eq!(req.url().as_str(), "http://127.0.0.1:54321/token");
         HTTP_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let fut = next(req);
-        Box::pin(async move { fut.await })
+        next(req)
     }
 }
 
