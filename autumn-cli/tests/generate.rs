@@ -1318,7 +1318,10 @@ fn generate_mailer_creates_all_expected_files() {
     let mailer = fs::read_to_string(project.join("src/mailers/welcome.rs")).unwrap();
     assert!(mailer.contains("pub struct WelcomeMailer"));
     assert!(mailer.contains("#[mailer]"));
-    assert!(mailer.contains("#[mailer_preview]"));
+    assert!(
+        !mailer.contains("#[mailer_preview]"),
+        "#[mailer_preview] must live in previews/, not in the mailer file itself"
+    );
     assert!(
         mailer.contains("pub fn welcome("),
         "must expose a method the #[mailer] macro can expand"
@@ -1327,6 +1330,26 @@ fn generate_mailer_creates_all_expected_files() {
         mailer.contains("deliver_later"),
         "file comment must describe the deliver_later API"
     );
+
+    // Separate preview file.
+    assert!(
+        project.join("src/mailers/previews/welcome.rs").is_file(),
+        "src/mailers/previews/welcome.rs must exist"
+    );
+    let preview = fs::read_to_string(project.join("src/mailers/previews/welcome.rs")).unwrap();
+    assert!(preview.contains("#[mailer_preview]"), "preview file must have #[mailer_preview]");
+    assert!(
+        preview.contains("welcome_preview"),
+        "preview file must define a preview method"
+    );
+
+    // Previews mod.rs.
+    assert!(
+        project.join("src/mailers/previews/mod.rs").is_file(),
+        "src/mailers/previews/mod.rs must exist"
+    );
+    let previews_mod = fs::read_to_string(project.join("src/mailers/previews/mod.rs")).unwrap();
+    assert!(previews_mod.contains("pub mod welcome;"));
 
     // HTML template.
     assert!(
@@ -1352,6 +1375,7 @@ fn generate_mailer_creates_all_expected_files() {
     );
     let mod_rs = fs::read_to_string(project.join("src/mailers/mod.rs")).unwrap();
     assert!(mod_rs.contains("pub mod welcome;"));
+    assert!(mod_rs.contains("pub mod previews;"), "mod.rs must declare pub mod previews");
 
     // Smoke test.
     assert!(
@@ -1409,6 +1433,10 @@ fn generate_mailer_dry_run_writes_nothing() {
         "dry run must not create the mailer file"
     );
     assert!(
+        !project.join("src/mailers/previews/welcome.rs").exists(),
+        "dry run must not create the preview file"
+    );
+    assert!(
         !project.join("templates/mailers/welcome.html").exists(),
         "dry run must not create html template"
     );
@@ -1448,6 +1476,10 @@ fn generate_mailer_force_overwrites_existing() {
     assert!(
         content.contains("WelcomeMailer"),
         "--force must regenerate the mailer file"
+    );
+    assert!(
+        project.join("src/mailers/previews/welcome.rs").exists(),
+        "--force must also create the preview file"
     );
 }
 

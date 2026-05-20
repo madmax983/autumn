@@ -445,11 +445,12 @@ fn leading_indent(body: &str) -> String {
 #[must_use]
 pub fn add_mail_preview_to_app(existing: &str, mailer_type: &str) -> String {
     const PREVIEW_MACRO: &str = "mail_previews![";
-    if let Some(macro_start) = existing.find(PREVIEW_MACRO) {
-        augment_mail_previews_list(existing, macro_start + PREVIEW_MACRO.len(), mailer_type)
-    } else {
-        insert_mail_previews_call(existing, mailer_type)
-    }
+    existing.find(PREVIEW_MACRO).map_or_else(
+        || insert_mail_previews_call(existing, mailer_type),
+        |macro_start| {
+            augment_mail_previews_list(existing, macro_start + PREVIEW_MACRO.len(), mailer_type)
+        },
+    )
 }
 
 /// Append `mailer_type` inside an already-present `mail_previews![...]`.
@@ -568,33 +569,33 @@ fn rewrite_dep_with_feature(line: &str, feature: &str) -> String {
     // Form 1: autumn-web = "x.y.z"
     if let Some(rest) = trimmed.strip_prefix("autumn-web") {
         let rest = rest.trim_start_matches([' ', '=', '\t']);
-        if rest.starts_with('"') {
-            if let Some(version) = rest.strip_prefix('"').and_then(|r| r.strip_suffix('"')) {
-                let indent_len = line.len() - line.trim_start().len();
-                let indent = &line[..indent_len];
-                return format!(
-                    "{indent}autumn-web = {{ version = \"{version}\", features = [{feature_quoted}] }}"
-                );
-            }
+        if rest.starts_with('"')
+            && let Some(version) = rest.strip_prefix('"').and_then(|r| r.strip_suffix('"'))
+        {
+            let indent_len = line.len() - line.trim_start().len();
+            let indent = &line[..indent_len];
+            return format!(
+                "{indent}autumn-web = {{ version = \"{version}\", features = [{feature_quoted}] }}"
+            );
         }
     }
 
     // Form 2/3: autumn-web = { ... features = [...] ... }
-    if let Some(open) = line.find("features") {
-        if let Some(bracket_start) = line[open..].find('[') {
-            let abs_start = open + bracket_start;
-            if let Some(bracket_end_rel) = line[abs_start..].find(']') {
-                let abs_end = abs_start + bracket_end_rel;
-                let body = &line[abs_start + 1..abs_end];
-                let separator = if body.trim().is_empty() { "" } else { ", " };
-                return format!(
-                    "{}{}{}{}",
-                    &line[..abs_end],
-                    separator,
-                    feature_quoted,
-                    &line[abs_end..]
-                );
-            }
+    if let Some(open) = line.find("features")
+        && let Some(bracket_start) = line[open..].find('[')
+    {
+        let abs_start = open + bracket_start;
+        if let Some(bracket_end_rel) = line[abs_start..].find(']') {
+            let abs_end = abs_start + bracket_end_rel;
+            let body = &line[abs_start + 1..abs_end];
+            let separator = if body.trim().is_empty() { "" } else { ", " };
+            return format!(
+                "{}{}{}{}",
+                &line[..abs_end],
+                separator,
+                feature_quoted,
+                &line[abs_end..]
+            );
         }
     }
 
