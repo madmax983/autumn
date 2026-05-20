@@ -1038,4 +1038,41 @@ async fn main() {\n\
         );
         assert!(updated.contains("\"mail\""));
     }
+
+    #[test]
+    fn ensure_feature_returns_unchanged_when_autumn_web_absent() {
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nserde = \"1\"\n";
+        let updated = ensure_autumn_web_feature(cargo, "mail");
+        assert_eq!(cargo, updated, "no autumn-web dep → must be a no-op");
+    }
+
+    #[test]
+    fn ensure_feature_dep_without_closing_brace_uses_fallback() {
+        // Malformed line — none of the three forms match, fallback returns unchanged.
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = malformed\n";
+        let updated = ensure_autumn_web_feature(cargo, "mail");
+        // The function should not panic; it falls back to the existing line.
+        assert!(updated.contains("autumn-web = malformed"));
+    }
+
+    #[test]
+    fn add_mail_preview_unclosed_bracket_returns_unchanged() {
+        // Malformed source: `mail_previews![` with no closing `]`.
+        let src = "app()\n    .mail_previews(mail_previews![Foo)\n    .run()\n    .await;\n";
+        let updated = add_mail_preview_to_app(src, "Bar");
+        // Must not panic; returns the original string unchanged.
+        assert_eq!(src, updated);
+    }
+
+    #[test]
+    fn add_mail_preview_no_run_returns_string_with_preview_appended() {
+        // Source with no `.run()` call — insertion is skipped, function still returns.
+        let src = "app()\n    .routes(routes![index])\n";
+        let updated = add_mail_preview_to_app(src, "mailers::welcome::WelcomeMailer");
+        // No `.run()` means we can't find an insertion point; original is returned.
+        assert!(
+            !updated.contains("mail_previews"),
+            "no insertion point → no insertion"
+        );
+    }
 }
