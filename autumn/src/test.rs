@@ -513,6 +513,7 @@ impl TestApp {
         crate::cache::clear_global_cache();
 
         let probes = crate::probe::ProbeState::ready_for_test();
+        #[cfg_attr(not(feature = "ws"), allow(unused_mut))]
         let mut state = AppState {
             extensions: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),

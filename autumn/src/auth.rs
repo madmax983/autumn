@@ -2621,7 +2621,87 @@ mod tests {
     }
 }
 
-// ── API token tests ───────────────────────────────────────────────────────────
+// ── HttpRequestBuilder interceptor task-local scope tests ────────────────────
+
+#[cfg(feature = "oauth2")]
+#[cfg(test)]
+mod http_interceptor_task_local_tests {
+    use crate::interceptor::{ACTIVE_HTTP_INTERCEPTORS, HttpInterceptor, HttpInterceptorFuture};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    struct FlagInterceptor {
+        fired: Arc<AtomicBool>,
+    }
+
+    impl HttpInterceptor for FlagInterceptor {
+        fn intercept<'a>(
+            &'a self,
+            req: reqwest::Request,
+            next: &'a dyn Fn(reqwest::Request) -> HttpInterceptorFuture<'a>,
+        ) -> HttpInterceptorFuture<'a> {
+            self.fired.store(true, Ordering::SeqCst);
+            // Delegate to next so the caller gets a real (likely connection-refused)
+            // error back — we discard it in the test with `let _ = ...`.
+            next(req)
+        }
+    }
+
+    /// Proves the task-local scope contract: when `ACTIVE_HTTP_INTERCEPTORS` is
+    /// set via `.scope()` (as `run_one_off_task_mode` must do), the interceptor
+    /// fires on every `HttpRequestBuilder::send` call within that scope.
+    #[tokio::test]
+    async fn http_request_builder_send_fires_interceptor_inside_scope() {
+        let fired = Arc::new(AtomicBool::new(false));
+        let interceptor: Arc<dyn HttpInterceptor> = Arc::new(FlagInterceptor {
+            fired: Arc::clone(&fired),
+        });
+
+        let client = reqwest::Client::new();
+        let http_client = super::HttpClient::new(client);
+
+        ACTIVE_HTTP_INTERCEPTORS
+            .scope(vec![interceptor], async {
+                let _ = http_client
+                    .get("http://127.0.0.1:54321/noreply")
+                    .send()
+                    .await;
+            })
+            .await;
+
+        assert!(
+            fired.load(Ordering::SeqCst),
+            "interceptor must fire when ACTIVE_HTTP_INTERCEPTORS scope is established"
+        );
+    }
+
+    /// Proves the regression: without a scope, the interceptor is silently
+    /// skipped. The fix in `run_one_off_task_mode` wraps the task handler in
+    /// `ACTIVE_HTTP_INTERCEPTORS.scope(...)` so that registered interceptors are
+    /// always active during task execution.
+    #[tokio::test]
+    async fn http_request_builder_send_skips_interceptor_outside_scope() {
+        let fired = Arc::new(AtomicBool::new(false));
+        let _interceptor: Arc<dyn HttpInterceptor> = Arc::new(FlagInterceptor {
+            fired: Arc::clone(&fired),
+        });
+
+        // Intentionally do NOT establish a scope — simulating pre-fix task mode.
+        let client = reqwest::Client::new();
+        let http_client = super::HttpClient::new(client);
+        let _ = http_client
+            .get("http://127.0.0.1:54321/noreply")
+            .send()
+            .await;
+
+        assert!(
+            !fired.load(Ordering::SeqCst),
+            "interceptor must NOT fire when ACTIVE_HTTP_INTERCEPTORS scope is absent"
+        );
+    }
+}
 
 #[cfg(test)]
 mod api_token_tests {

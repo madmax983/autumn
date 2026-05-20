@@ -2661,6 +2661,21 @@ impl AppBuilder {
 
         tracing::info!(task = %task_name, "Running one-off task");
         let span = tracing::info_span!("one_off_task", task = %task_name);
+        #[cfg(feature = "oauth2")]
+        let result = {
+            use crate::interceptor::{ACTIVE_HTTP_INTERCEPTORS, HttpInterceptor};
+            let interceptors: Vec<std::sync::Arc<dyn HttpInterceptor>> = state
+                .extension::<std::sync::Arc<dyn HttpInterceptor>>()
+                .map(|interceptor_arc| vec![(*interceptor_arc).clone()])
+                .unwrap_or_default();
+            ACTIVE_HTTP_INTERCEPTORS
+                .scope(
+                    interceptors,
+                    (task_handler)(state.clone(), args).instrument(span),
+                )
+                .await
+        };
+        #[cfg(not(feature = "oauth2"))]
         let result = (task_handler)(state.clone(), args).instrument(span).await;
 
         task_shutdown.cancel();
