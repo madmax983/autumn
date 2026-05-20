@@ -776,12 +776,12 @@ pub struct HttpClientConfig {
 }
 
 #[cfg(feature = "http-client")]
-fn default_http_timeout_secs() -> u64 {
+const fn default_http_timeout_secs() -> u64 {
     30
 }
 
 #[cfg(feature = "http-client")]
-fn default_http_max_retries() -> u32 {
+const fn default_http_max_retries() -> u32 {
     3
 }
 

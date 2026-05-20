@@ -422,17 +422,6 @@ impl TestApp {
             .get_or_insert_with(|| std::sync::Arc::new(crate::http_client::MockRegistry::new()))
             .clone();
 
-        // Resolve base URL from config (if any) so the mock builder can log it.
-        let base_url = self
-            .config
-            .http
-            .client
-            .base_urls
-            .get(alias)
-            .cloned()
-            .unwrap_or_default();
-        let _ = base_url; // stored for future use (URL-based matching)
-
         crate::http_client::MockSetupBuilder {
             registry,
             alias: alias.to_owned(),

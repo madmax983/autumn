@@ -55,7 +55,7 @@ async fn create_charge(
         .post("/v1/charges")
         .header(
             "authorization",
-            &format!(
+            format!(
                 "Bearer {}",
                 std::env::var("STRIPE_SECRET_KEY").unwrap_or_else(|_| "sk_test_xxx".into())
             ),
@@ -101,17 +101,14 @@ mod tests {
         let mut app = TestApp::new().routes(routes![create_charge]);
 
         // Register a canned Stripe response — no network required.
-        let mock = app
-            .http_mock("stripe")
-            .post("/v1/charges")
-            .respond_with(
-                200,
-                json!({
-                    "id": "ch_test_123",
-                    "amount": 1000,
-                    "status": "succeeded"
-                }),
-            );
+        let mock = app.http_mock("stripe").post("/v1/charges").respond_with(
+            200,
+            json!({
+                "id": "ch_test_123",
+                "amount": 1000,
+                "status": "succeeded"
+            }),
+        );
 
         let client = app.build();
 
@@ -132,17 +129,14 @@ mod tests {
     async fn create_charge_returns_stripe_body() {
         let mut app = TestApp::new().routes(routes![create_charge]);
 
-        let _mock = app
-            .http_mock("stripe")
-            .post("/v1/charges")
-            .respond_with(
-                200,
-                json!({
-                    "id": "ch_abc",
-                    "amount": 500,
-                    "status": "succeeded"
-                }),
-            );
+        let _mock = app.http_mock("stripe").post("/v1/charges").respond_with(
+            200,
+            json!({
+                "id": "ch_abc",
+                "amount": 500,
+                "status": "succeeded"
+            }),
+        );
 
         let client = app.build();
         let resp = client

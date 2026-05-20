@@ -50,8 +50,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::Method;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -86,12 +86,12 @@ pub struct Response {
 
 impl Response {
     /// HTTP status code.
-    pub fn status(&self) -> reqwest::StatusCode {
+    pub const fn status(&self) -> reqwest::StatusCode {
         self.status
     }
 
     /// Response headers (sensitive values are **not** redacted here).
-    pub fn headers(&self) -> &HeaderMap {
+    pub const fn headers(&self) -> &HeaderMap {
         &self.headers
     }
 
@@ -101,7 +101,7 @@ impl Response {
     }
 
     /// URL that was ultimately requested (after redirects, if any).
-    pub fn url(&self) -> Option<&reqwest::Url> {
+    pub const fn url(&self) -> Option<&reqwest::Url> {
         self.url.as_ref()
     }
 
@@ -151,7 +151,7 @@ impl Default for RetryPolicy {
 /// Internal mock entry stored by [`MockRegistry`].
 pub(crate) struct MockEntry {
     pub(crate) method: Option<Method>,
-    /// URL path to match (suffix-match against the full URL string).
+    /// URL path to match against the path component of the outbound URL.
     pub(crate) path: String,
     /// Optional alias that must match the `Client`'s alias.
     pub(crate) alias: Option<String>,
@@ -177,7 +177,8 @@ pub struct MockRegistry {
 
 impl MockRegistry {
     /// Create an empty registry.
-    pub fn new() -> Self {
+    #[must_use]
+    pub const fn new() -> Self {
         Self {
             entries: Mutex::new(Vec::new()),
         }
@@ -199,30 +200,39 @@ impl MockRegistry {
         url: &str,
         alias: Option<&str>,
     ) -> Option<MockResponse> {
-        let entries = self.entries.lock().expect("mock registry lock poisoned");
-        for entry in entries.iter() {
-            let method_ok = entry
-                .method
-                .as_ref()
-                .map_or(true, |m| m == method);
-            // Path match: the registered path is a suffix of the full URL string.
-            let path_ok = url.ends_with(entry.path.as_str())
-                || url.contains(entry.path.as_str());
-            // Alias match: if the entry specifies an alias, the client alias must match.
-            let alias_ok = entry
-                .alias
-                .as_deref()
-                .map_or(true, |a| alias.map_or(false, |b| a == b));
+        // Extract the URL path component for precise matching.
+        // For full URLs (https://…) we parse and use the path segment.
+        // For relative paths we use the raw string as-is.
+        let url_path_owned: Option<String> =
+            reqwest::Url::parse(url).ok().map(|u| u.path().to_owned());
+        let url_path = url_path_owned.as_deref().unwrap_or(url);
 
-            if method_ok && path_ok && alias_ok {
-                entry.call_count.fetch_add(1, Ordering::SeqCst);
-                return Some(MockResponse {
-                    status: entry.status,
-                    body: entry.body.clone(),
-                });
-            }
-        }
-        None
+        // Hold the lock only for the search; release before fetching metadata.
+        let found = {
+            let entries = self.entries.lock().expect("mock registry lock poisoned");
+            entries.iter().find_map(|entry| {
+                let method_ok = entry.method.as_ref().is_none_or(|m| m == method);
+                // Path match: exact equality OR suffix at a segment boundary.
+                let path_ok = url_path == entry.path.as_str()
+                    || url_path
+                        .strip_suffix(entry.path.as_str())
+                        .is_some_and(|prefix| prefix.is_empty() || prefix.ends_with('/'));
+                let alias_ok = entry
+                    .alias
+                    .as_deref()
+                    .is_none_or(|a| alias.is_some_and(|b| a == b));
+                if method_ok && path_ok && alias_ok {
+                    Some((entry.call_count.clone(), entry.status, entry.body.clone()))
+                } else {
+                    None
+                }
+            })
+        };
+
+        found.map(|(call_count, status, body)| {
+            call_count.fetch_add(1, Ordering::SeqCst);
+            MockResponse { status, body }
+        })
     }
 }
 
@@ -254,18 +264,14 @@ impl MockHandle {
     pub fn expect_called(&self, expected: usize) {
         let actual = self.call_count.load(Ordering::SeqCst);
         assert_eq!(
-            actual,
-            expected,
+            actual, expected,
             "http mock for {} {} {} expected {} call(s) but got {}",
-            self.alias,
-            self.method,
-            self.path,
-            expected,
-            actual,
+            self.alias, self.method, self.path, expected, actual,
         );
     }
 
     /// Return the raw call count without asserting.
+    #[must_use]
     pub fn call_count(&self) -> usize {
         self.call_count.load(Ordering::SeqCst)
     }
@@ -285,30 +291,35 @@ pub struct MockSetupBuilder {
 
 impl MockSetupBuilder {
     /// Match `GET <path>`.
+    #[must_use]
     pub fn get(mut self, path: &str) -> Self {
         self.method = Some(Method::GET);
         self.path = Some(path.to_owned());
         self
     }
     /// Match `POST <path>`.
+    #[must_use]
     pub fn post(mut self, path: &str) -> Self {
         self.method = Some(Method::POST);
         self.path = Some(path.to_owned());
         self
     }
     /// Match `PUT <path>`.
+    #[must_use]
     pub fn put(mut self, path: &str) -> Self {
         self.method = Some(Method::PUT);
         self.path = Some(path.to_owned());
         self
     }
     /// Match `PATCH <path>`.
+    #[must_use]
     pub fn patch(mut self, path: &str) -> Self {
         self.method = Some(Method::PATCH);
         self.path = Some(path.to_owned());
         self
     }
     /// Match `DELETE <path>`.
+    #[must_use]
     pub fn delete(mut self, path: &str) -> Self {
         self.method = Some(Method::DELETE);
         self.path = Some(path.to_owned());
@@ -319,13 +330,13 @@ impl MockSetupBuilder {
     ///
     /// `status` is the HTTP status code to return.
     /// `body` is serialised as JSON and returned as the response body.
+    #[must_use]
     pub fn respond_with(self, status: u16, body: serde_json::Value) -> MockHandle {
         let path = self.path.clone().unwrap_or_default();
         let method_str = self
             .method
             .as_ref()
-            .map(|m| m.to_string())
-            .unwrap_or_else(|| "*".to_owned());
+            .map_or_else(|| "*".to_owned(), ToString::to_string);
         let call_count = Arc::new(AtomicUsize::new(0));
 
         self.registry.register(MockEntry {
@@ -346,6 +357,7 @@ impl MockSetupBuilder {
     }
 
     /// Convenience variant that returns the given status with an empty body.
+    #[must_use]
     pub fn respond_with_status(self, status: u16) -> MockHandle {
         self.respond_with(status, serde_json::Value::Null)
     }
@@ -393,13 +405,20 @@ pub struct Client {
 impl Client {
     /// Create a new client with default settings (30 s timeout, 3 retries on
     /// idempotent methods).
+    #[must_use]
     pub fn new() -> Self {
         Self::with_timeout(Duration::from_secs(30))
     }
 
     /// Create a client with a custom per-request timeout.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the underlying TLS backend cannot be initialised (should not
+    /// happen with the default `rustls-tls` feature).
+    #[must_use]
     pub fn with_timeout(timeout: Duration) -> Self {
-        let inner = reqwest::Client::builder()
+        let inner = reqwest::ClientBuilder::new()
             .timeout(timeout)
             .build()
             .expect("failed to build reqwest client");
@@ -413,8 +432,14 @@ impl Client {
     }
 
     /// Create a client from `[http.client]` framework configuration.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the underlying TLS backend cannot be initialised (should not
+    /// happen with the default `rustls-tls` feature).
+    #[must_use]
     pub fn from_config(config: &crate::config::HttpClientConfig) -> Self {
-        let inner = reqwest::Client::builder()
+        let inner = reqwest::ClientBuilder::new()
             .timeout(Duration::from_secs(config.timeout_secs))
             .build()
             .expect("failed to build reqwest client");
@@ -442,6 +467,7 @@ impl Client {
     /// will prepend that URL to all relative paths. Mocks registered for the
     /// alias via [`TestApp::http_mock`](crate::test::TestApp::http_mock) will
     /// match requests made through this named client.
+    #[must_use]
     pub fn named(&self, alias: &str) -> Self {
         Self {
             inner: self.inner.clone(),
@@ -453,6 +479,7 @@ impl Client {
     }
 
     /// Set (or override) the base URL prepended to relative request paths.
+    #[must_use]
     pub fn with_base_url(&self, base_url: impl Into<String>) -> Self {
         Self {
             inner: self.inner.clone(),
@@ -465,18 +492,17 @@ impl Client {
 
     fn build_request(&self, method: Method, url: impl AsRef<str>) -> RequestBuilder {
         let url_str = url.as_ref();
-        let full_url =
-            if url_str.starts_with("http://") || url_str.starts_with("https://") {
-                url_str.to_owned()
-            } else if let Some(base) = &self.base_url {
-                format!(
-                    "{}/{}",
-                    base.trim_end_matches('/'),
-                    url_str.trim_start_matches('/')
-                )
-            } else {
-                url_str.to_owned()
-            };
+        let full_url = if url_str.starts_with("http://") || url_str.starts_with("https://") {
+            url_str.to_owned()
+        } else if let Some(base) = &self.base_url {
+            format!(
+                "{}/{}",
+                base.trim_end_matches('/'),
+                url_str.trim_start_matches('/')
+            )
+        } else {
+            url_str.to_owned()
+        };
 
         RequestBuilder {
             client: self.inner.clone(),
@@ -487,26 +513,32 @@ impl Client {
             retry_policy: self.retry_policy.clone(),
             mock: self.mock.clone(),
             alias: self.alias.clone(),
+            pending_error: None,
         }
     }
 
     /// Build a `GET` request.
+    #[must_use]
     pub fn get(&self, url: impl AsRef<str>) -> RequestBuilder {
         self.build_request(Method::GET, url)
     }
     /// Build a `POST` request.
+    #[must_use]
     pub fn post(&self, url: impl AsRef<str>) -> RequestBuilder {
         self.build_request(Method::POST, url)
     }
     /// Build a `PUT` request.
+    #[must_use]
     pub fn put(&self, url: impl AsRef<str>) -> RequestBuilder {
         self.build_request(Method::PUT, url)
     }
     /// Build a `PATCH` request.
+    #[must_use]
     pub fn patch(&self, url: impl AsRef<str>) -> RequestBuilder {
         self.build_request(Method::PATCH, url)
     }
     /// Build a `DELETE` request.
+    #[must_use]
     pub fn delete(&self, url: impl AsRef<str>) -> RequestBuilder {
         self.build_request(Method::DELETE, url)
     }
@@ -527,11 +559,7 @@ impl axum::extract::FromRequestParts<crate::AppState> for Client {
     ) -> Result<Self, std::convert::Infallible> {
         // Prefer per-handler config from extensions; fall back to defaults.
         let config = state.extension::<crate::config::HttpConfig>();
-        let mut client = if let Some(cfg) = config {
-            Client::from_config(&cfg.client)
-        } else {
-            Client::new()
-        };
+        let mut client = config.map_or_else(Self::new, |cfg| Self::from_config(&cfg.client));
 
         // In test builds the mock registry is installed by TestApp::build().
         if let Some(ext) = state.extension::<HttpMockRegistryExt>() {
@@ -550,10 +578,13 @@ pub struct RequestBuilder {
     method: Method,
     url: String,
     extra_headers: HeaderMap,
-    body: Option<Vec<u8>>,
+    /// Request body. `Bytes` gives O(1) clones across retry attempts.
+    body: Option<Bytes>,
     retry_policy: RetryPolicy,
     mock: Option<Arc<MockRegistry>>,
     alias: Option<String>,
+    /// Captures errors from `json()` or invalid headers to surface in `send()`.
+    pending_error: Option<ClientError>,
 }
 
 impl RequestBuilder {
@@ -561,44 +592,63 @@ impl RequestBuilder {
     ///
     /// Headers named `authorization`, `cookie`, or `set-cookie` are accepted
     /// normally but are **redacted** in tracing events and log output.
+    /// Invalid header names or values emit a `tracing::warn!` and are skipped.
+    #[must_use]
     pub fn header(mut self, name: impl AsRef<str>, value: impl AsRef<str>) -> Self {
-        if let (Ok(n), Ok(v)) = (
-            HeaderName::from_bytes(name.as_ref().as_bytes()),
-            HeaderValue::from_str(value.as_ref()),
+        let name_str = name.as_ref();
+        let value_str = value.as_ref();
+        match (
+            HeaderName::from_bytes(name_str.as_bytes()),
+            HeaderValue::from_str(value_str),
         ) {
-            self.extra_headers.insert(n, v);
+            (Ok(n), Ok(v)) => {
+                self.extra_headers.insert(n, v);
+            }
+            (Err(e), _) => {
+                tracing::warn!(header.name = name_str, error = %e, "invalid header name — header skipped");
+            }
+            (_, Err(e)) => {
+                tracing::warn!(header.name = name_str, error = %e, "invalid header value — header skipped");
+            }
         }
         self
     }
 
     /// Serialise `body` as JSON and set `Content-Type: application/json`.
+    ///
+    /// Serialisation errors are captured and returned when [`send`](Self::send)
+    /// is called rather than being silently discarded.
+    #[must_use]
     pub fn json<T: Serialize>(mut self, body: &T) -> Self {
         match serde_json::to_vec(body) {
             Ok(bytes) => {
-                self.body = Some(bytes);
+                self.body = Some(Bytes::from(bytes));
                 self = self.header("content-type", "application/json");
             }
             Err(e) => {
-                tracing::error!("http client: failed to serialize JSON body: {e}");
+                self.pending_error = Some(ClientError::Json(e));
             }
         }
         self
     }
 
     /// Set a plain-text body.
+    #[must_use]
     pub fn text_body(mut self, body: impl Into<String>) -> Self {
-        self.body = Some(body.into().into_bytes());
+        self.body = Some(Bytes::from(body.into().into_bytes()));
         self
     }
 
     /// Override the maximum retry count for this request.
-    pub fn retries(mut self, max: u32) -> Self {
+    #[must_use]
+    pub const fn retries(mut self, max: u32) -> Self {
         self.retry_policy.max_retries = max;
         self
     }
 
     /// Disable retries for this request.
-    pub fn no_retry(mut self) -> Self {
+    #[must_use]
+    pub const fn no_retry(mut self) -> Self {
         self.retry_policy.max_retries = 0;
         self
     }
@@ -607,10 +657,21 @@ impl RequestBuilder {
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError::Request`] for transport errors that exhaust all
-    /// retry attempts, or [`ClientError::NoMock`] if the request is made in a
-    /// test context without a matching mock entry registered.
+    /// Returns [`ClientError::Json`] if a prior `.json()` call failed to
+    /// serialise the body.  Returns [`ClientError::Request`] for transport
+    /// errors that exhaust all retry attempts.  Returns [`ClientError::NoMock`]
+    /// if the request is made in a test context without a matching mock entry.
+    ///
+    /// # Panics
+    ///
+    /// Contains an internal `unreachable!()` that guards against a logic error
+    /// in the retry loop; it cannot be reached in practice.
     pub async fn send(self) -> Result<Response, ClientError> {
+        // Surface any error captured during builder construction.
+        if let Some(err) = self.pending_error {
+            return Err(err);
+        }
+
         // ── Mock short-circuit ──────────────────────────────────────────────
         if let Some(ref mock) = self.mock {
             match mock.find_match(&self.method, &self.url, self.alias.as_deref()) {
@@ -650,15 +711,12 @@ impl RequestBuilder {
 
         // ── Real network request with retries ───────────────────────────────
         let start = Instant::now();
-        let max_attempts = if is_idempotent_method(&self.method)
-            || !self.retry_policy.retry_idempotent_only
-        {
-            self.retry_policy.max_retries + 1
-        } else {
-            1
-        };
-
-        let mut last_err: Option<reqwest::Error> = None;
+        let max_attempts =
+            if is_idempotent_method(&self.method) || !self.retry_policy.retry_idempotent_only {
+                self.retry_policy.max_retries + 1
+            } else {
+                1
+            };
 
         for attempt in 0..max_attempts {
             if attempt > 0 {
@@ -693,13 +751,11 @@ impl RequestBuilder {
                         } else {
                             tokio::time::sleep(Duration::from_secs(1)).await;
                         }
-                        last_err = None;
                         continue;
                     }
 
                     // 5xx transient gateway errors → retry if attempts remain.
                     if is_retryable_status(status.as_u16()) && attempt + 1 < max_attempts {
-                        last_err = None;
                         continue;
                     }
 
@@ -720,43 +776,42 @@ impl RequestBuilder {
                         url: Some(url_used),
                     });
                 }
-                Err(e) if (e.is_connect() || e.is_timeout()) && attempt + 1 < max_attempts => {
-                    last_err = Some(e);
-                }
+                // Retry on connect/timeout errors while attempts remain.
+                Err(_) if attempt + 1 < max_attempts => {}
                 Err(e) => return Err(ClientError::Request(e)),
             }
         }
 
-        Err(ClientError::Request(
-            last_err.expect("retry loop exited without response or error"),
-        ))
+        // The retry loop always returns inside the last attempt; this is unreachable.
+        unreachable!("retry loop exited without returning a result — this is a bug")
     }
 }
 
 // ── Internal helpers ─────────────────────────────────────────────────────────
 
-fn is_idempotent_method(method: &Method) -> bool {
+const fn is_idempotent_method(method: &Method) -> bool {
     matches!(
         *method,
-        Method::GET
-            | Method::HEAD
-            | Method::PUT
-            | Method::DELETE
-            | Method::OPTIONS
-            | Method::TRACE
+        Method::GET | Method::HEAD | Method::PUT | Method::DELETE | Method::OPTIONS | Method::TRACE
     )
 }
 
-fn is_retryable_status(status: u16) -> bool {
-    matches!(status, 502 | 503 | 504)
+const fn is_retryable_status(status: u16) -> bool {
+    matches!(status, 502..=504)
 }
 
 fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
-    headers
-        .get("retry-after")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<u64>().ok())
-        .map(Duration::from_secs)
+    let value = headers.get("retry-after")?.to_str().ok()?;
+    // Integer seconds (most common form).
+    if let Ok(secs) = value.parse::<u64>() {
+        return Some(Duration::from_secs(secs));
+    }
+    // HTTP-date format per RFC 9110 (e.g. "Tue, 01 Jan 2030 00:00:00 GMT").
+    let dt = chrono::DateTime::parse_from_rfc2822(value).ok()?;
+    let now = chrono::Utc::now();
+    let future = dt.with_timezone(&chrono::Utc);
+    let secs = u64::try_from((future - now).num_seconds().max(0)).unwrap_or(0);
+    Some(Duration::from_secs(secs))
 }
 
 const REDACTED_HEADERS: &[&str] = &["authorization", "cookie", "set-cookie"];
@@ -780,7 +835,7 @@ fn log_request(
     // Collect non-sensitive header names for the span (values are omitted).
     let sent_headers: Vec<&str> = headers
         .keys()
-        .map(|k| k.as_str())
+        .map(HeaderName::as_str)
         .filter(|k| !is_sensitive_header(k))
         .collect();
 
@@ -789,7 +844,7 @@ fn log_request(
         http.host = host,
         http.path = path,
         http.status = status,
-        http.elapsed_ms = elapsed.as_millis() as u64,
+        http.elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
         http.sent_headers = ?sent_headers,
         "outbound request"
     );
@@ -798,6 +853,7 @@ fn log_request(
 /// Inject the active span's W3C `traceparent` / `tracestate` headers into the
 /// request builder.  No-ops when the `telemetry-otlp` feature is disabled or
 /// when there is no active span with a valid context.
+#[allow(clippy::missing_const_for_fn)]
 fn inject_trace_context(builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
     #[cfg(not(feature = "telemetry-otlp"))]
     {
@@ -805,6 +861,7 @@ fn inject_trace_context(builder: reqwest::RequestBuilder) -> reqwest::RequestBui
     }
     #[cfg(feature = "telemetry-otlp")]
     {
+        use std::collections::HashMap;
         use tracing_opentelemetry::OpenTelemetrySpanExt as _;
         let cx = tracing::Span::current().context();
         let mut map = HashMap::<String, String>::new();
@@ -822,7 +879,7 @@ fn inject_trace_context(builder: reqwest::RequestBuilder) -> reqwest::RequestBui
 }
 
 #[cfg(feature = "telemetry-otlp")]
-struct TraceHeaderInjector<'a>(&'a mut HashMap<String, String>);
+struct TraceHeaderInjector<'a>(&'a mut std::collections::HashMap<String, String>);
 
 #[cfg(feature = "telemetry-otlp")]
 impl opentelemetry::propagation::Injector for TraceHeaderInjector<'_> {
@@ -1019,9 +1076,7 @@ mod tests {
             call_count: call_count.clone(),
         });
 
-        let client = Client::new()
-            .with_mock(registry)
-            .named("stripe");
+        let client = Client::new().with_mock(registry).named("stripe");
 
         let resp = client
             .post("https://api.stripe.com/charges")
@@ -1145,7 +1200,7 @@ mod tests {
     #[test]
     fn named_client_preserves_mock_registry() {
         let registry = Arc::new(MockRegistry::new());
-        let client = Client::new().with_mock(registry.clone());
+        let client = Client::new().with_mock(registry);
         let named = client.named("stripe");
         assert!(named.mock.is_some());
         assert_eq!(named.alias.as_deref(), Some("stripe"));
@@ -1199,7 +1254,7 @@ mod tests {
     #[test]
     fn mock_registry_ext_round_trips_through_state() {
         let registry = Arc::new(MockRegistry::new());
-        let ext = HttpMockRegistryExt(registry.clone());
+        let ext = HttpMockRegistryExt(registry);
         let state = crate::AppState::for_test();
         state.insert_extension(ext);
         let retrieved = state.extension::<HttpMockRegistryExt>();
