@@ -403,16 +403,17 @@ async fn main() {
             mailer.contains("pub struct WelcomeMailer"),
             "mailer file must define the struct"
         );
-        assert!(mailer.contains("#[mailer]"), "must have #[mailer] attribute");
+        assert!(
+            mailer.contains("#[mailer]"),
+            "must have #[mailer] attribute"
+        );
         assert!(
             !mailer.contains("#[mailer_preview]"),
             "mailer file must NOT contain #[mailer_preview] — it lives in previews/"
         );
 
-        let preview = fs::read_to_string(
-            tmp.path().join("src/mailers/previews/welcome.rs"),
-        )
-        .unwrap();
+        let preview =
+            fs::read_to_string(tmp.path().join("src/mailers/previews/welcome.rs")).unwrap();
         assert!(
             preview.contains("#[mailer_preview]"),
             "preview file must have #[mailer_preview] attribute"
@@ -446,8 +447,7 @@ async fn main() {
             .execute(Flags::default())
             .unwrap();
 
-        let html =
-            fs::read_to_string(tmp.path().join("templates/mailers/welcome.html")).unwrap();
+        let html = fs::read_to_string(tmp.path().join("templates/mailers/welcome.html")).unwrap();
         assert!(
             html.contains("WelcomeMailer"),
             "html template must reference the mailer name"
@@ -566,9 +566,11 @@ async fn main() {
             .execute(Flags::default())
             .unwrap();
 
-        let test =
-            fs::read_to_string(tmp.path().join("tests/welcome_mailer.rs")).unwrap();
-        assert!(test.contains("WelcomeMailer"), "smoke test must reference the mailer struct");
+        let test = fs::read_to_string(tmp.path().join("tests/welcome_mailer.rs")).unwrap();
+        assert!(
+            test.contains("WelcomeMailer"),
+            "smoke test must reference the mailer struct"
+        );
         assert!(
             test.contains("welcome_mailer_renders_both_bodies")
                 || test.contains("renders_both_bodies"),
@@ -608,8 +610,7 @@ async fn main() {
     #[test]
     fn dry_run_writes_no_new_files() {
         let tmp = project_with_main(default_main());
-        let original_main =
-            fs::read_to_string(tmp.path().join("src/main.rs")).unwrap();
+        let original_main = fs::read_to_string(tmp.path().join("src/main.rs")).unwrap();
         plan_mailer(tmp.path(), "Welcome")
             .unwrap()
             .execute(Flags {
@@ -687,8 +688,7 @@ async fn main() {
             .unwrap();
 
         assert!(tmp.path().join("src/mailers/welcome_email.rs").exists());
-        let content =
-            fs::read_to_string(tmp.path().join("src/mailers/welcome_email.rs")).unwrap();
+        let content = fs::read_to_string(tmp.path().join("src/mailers/welcome_email.rs")).unwrap();
         assert!(
             content.contains("WelcomeEmailMailer"),
             "PascalCase struct must include both words"
@@ -730,7 +730,10 @@ async fn main() {
         let mod_rs = fs::read_to_string(tmp.path().join("src/mailers/mod.rs")).unwrap();
         assert!(mod_rs.contains("pub mod welcome;"));
         assert!(mod_rs.contains("pub mod notification;"));
-        assert!(mod_rs.contains("pub mod previews;"), "previews module must appear once");
+        assert!(
+            mod_rs.contains("pub mod previews;"),
+            "previews module must appear once"
+        );
         assert_eq!(
             mod_rs.matches("pub mod previews;").count(),
             1,

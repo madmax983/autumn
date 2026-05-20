@@ -612,8 +612,7 @@ fn rewrite_dep_with_feature(line: &str, feature: &str) -> String {
 
 fn is_dependencies_header(trimmed: &str) -> bool {
     trimmed == "[dependencies]"
-        || trimmed.starts_with("[dependencies]")
-            && trimmed[13..].trim_start().starts_with('#')
+        || trimmed.starts_with("[dependencies]") && trimmed[13..].trim_start().starts_with('#')
 }
 
 fn is_toml_table_header(trimmed: &str) -> bool {
@@ -951,19 +950,15 @@ async fn main() {\n\
 
     #[test]
     fn add_mail_preview_idempotent() {
-        let first =
-            add_mail_preview_to_app(app_main(), "mailers::welcome::WelcomeMailer");
-        let second =
-            add_mail_preview_to_app(&first, "mailers::welcome::WelcomeMailer");
+        let first = add_mail_preview_to_app(app_main(), "mailers::welcome::WelcomeMailer");
+        let second = add_mail_preview_to_app(&first, "mailers::welcome::WelcomeMailer");
         assert_eq!(first, second, "second call must be a no-op");
     }
 
     #[test]
     fn add_mail_preview_augments_existing_call() {
-        let after_first =
-            add_mail_preview_to_app(app_main(), "mailers::welcome::WelcomeMailer");
-        let after_second =
-            add_mail_preview_to_app(&after_first, "mailers::notify::NotifyMailer");
+        let after_first = add_mail_preview_to_app(app_main(), "mailers::welcome::WelcomeMailer");
+        let after_second = add_mail_preview_to_app(&after_first, "mailers::notify::NotifyMailer");
         assert!(after_second.contains("mailers::welcome::WelcomeMailer"));
         assert!(after_second.contains("mailers::notify::NotifyMailer"));
         assert_eq!(
@@ -975,8 +970,7 @@ async fn main() {\n\
 
     #[test]
     fn add_mail_preview_preserves_run_await() {
-        let updated =
-            add_mail_preview_to_app(app_main(), "mailers::welcome::WelcomeMailer");
+        let updated = add_mail_preview_to_app(app_main(), "mailers::welcome::WelcomeMailer");
         assert!(updated.contains(".run()"), ".run() must still be present");
         assert!(updated.contains(".await;"), ".await must still be present");
     }
@@ -985,8 +979,7 @@ async fn main() {\n\
 
     #[test]
     fn ensure_feature_transforms_bare_string_dep() {
-        let cargo =
-            "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = \"0.6\"\n";
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = \"0.6\"\n";
         let updated = ensure_autumn_web_feature(cargo, "mail");
         assert!(
             updated.contains("\"mail\""),
@@ -1000,8 +993,7 @@ async fn main() {\n\
 
     #[test]
     fn ensure_feature_idempotent_bare_string() {
-        let cargo =
-            "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = \"0.6\"\n";
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = \"0.6\"\n";
         let once = ensure_autumn_web_feature(cargo, "mail");
         let twice = ensure_autumn_web_feature(&once, "mail");
         assert_eq!(once, twice, "second call must be a no-op");
@@ -1040,7 +1032,10 @@ async fn main() {\n\
         let cargo = "[package]\nname=\"x\"\n\n[dependencies]\n\
                      serde = \"1\"\nautumn-web = \"0.6\"\ntracing = \"0.1\"\n";
         let updated = ensure_autumn_web_feature(cargo, "mail");
-        assert!(updated.contains("serde = \"1\""), "unrelated dep must be preserved");
+        assert!(
+            updated.contains("serde = \"1\""),
+            "unrelated dep must be preserved"
+        );
         assert!(updated.contains("\"mail\""));
     }
 }
