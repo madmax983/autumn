@@ -1,6 +1,6 @@
 //! Traced outbound HTTP client with retries and test mocks.
 //!
-//! Exposes [`Client`] as `autumn_web::http::Client` — a thin `reqwest`-backed
+//! Exposes [`Client`](crate::http_client::Client) as `autumn_web::http::Client` — a thin `reqwest`-backed
 //! outbound HTTP client that propagates the active span's `traceparent` /
 //! `tracestate` headers, retries transient failures, and is mockable in tests
 //! via [`TestApp::http_mock`](crate::test::TestApp::http_mock).
