@@ -1035,6 +1035,38 @@ fn format_job_panic(panic: &(dyn std::any::Any + Send)) -> String {
     format!("job handler panicked: {detail}")
 }
 
+fn format_enqueue_panic(panic: &(dyn std::any::Any + Send)) -> AutumnError {
+    let detail = panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&'static str>().copied())
+        .unwrap_or("non-string panic payload");
+    AutumnError::internal_server_error(std::io::Error::other(format!(
+        "job enqueue panicked: {detail}"
+    )))
+}
+
+async fn run_enqueue_interceptor(
+    interceptor: Arc<dyn crate::interceptor::JobInterceptor>,
+    name: &str,
+    payload: &Value,
+    actual_enqueue: std::pin::Pin<
+        Box<dyn std::future::Future<Output = AutumnResult<()>> + Send + '_>,
+    >,
+) -> AutumnResult<()> {
+    let setup_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        interceptor.intercept_enqueue(name, payload, actual_enqueue)
+    }));
+    let fut = match setup_res {
+        Ok(f) => f,
+        Err(panic) => return Err(format_enqueue_panic(panic.as_ref())),
+    };
+    match std::panic::AssertUnwindSafe(fut).catch_unwind().await {
+        Ok(res) => res,
+        Err(panic) => Err(format_enqueue_panic(panic.as_ref())),
+    }
+}
+
 /// Retrieves the global initialized job client.
 ///
 /// Returns `None` if the job runtime hasn't been started yet.
@@ -1265,9 +1297,7 @@ impl JobClient {
 
         if let Some(interceptor) = &self.interceptor {
             let interceptor = (*interceptor).clone();
-            interceptor
-                .intercept_enqueue(name, &payload, Box::pin(actual_enqueue))
-                .await
+            run_enqueue_interceptor(interceptor, name, &payload, Box::pin(actual_enqueue)).await
         } else {
             actual_enqueue.await
         }
@@ -1443,9 +1473,7 @@ impl JobClient {
             );
             return if let Some(interceptor) = &self.interceptor {
                 let interceptor = (*interceptor).clone();
-                interceptor
-                    .intercept_enqueue(name, &payload, Box::pin(actual_enqueue))
-                    .await
+                run_enqueue_interceptor(interceptor, name, &payload, Box::pin(actual_enqueue)).await
             } else {
                 actual_enqueue.await
             };
@@ -1499,9 +1527,7 @@ impl JobClient {
 
         if let Some(interceptor) = &self.interceptor {
             let interceptor = (*interceptor).clone();
-            interceptor
-                .intercept_enqueue(name, &payload, Box::pin(actual_enqueue))
-                .await
+            run_enqueue_interceptor(interceptor, name, &payload, Box::pin(actual_enqueue)).await
         } else {
             actual_enqueue.await
         }
@@ -4758,6 +4784,122 @@ mod tests {
         );
 
         assert_eq!(SYNC_CALLS.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn job_client_enqueue_catches_interceptor_setup_panic() {
+        struct PanickingEnqueueInterceptor;
+        impl crate::interceptor::JobInterceptor for PanickingEnqueueInterceptor {
+            fn intercept_enqueue<'a>(
+                &'a self,
+                _name: &'a str,
+                _payload: &'a serde_json::Value,
+                _next: std::pin::Pin<
+                    Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send + 'a>,
+                >,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send + 'a>,
+            > {
+                panic!("interceptor enqueue setup panicked")
+            }
+
+            fn intercept_execute<'a>(
+                &'a self,
+                _name: &'a str,
+                _payload: &'a serde_json::Value,
+                next: std::pin::Pin<
+                    Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send + 'a>,
+                >,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send + 'a>,
+            > {
+                next
+            }
+        }
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let client = JobClient {
+            local_sender: Some(tx),
+            #[cfg(feature = "redis")]
+            redis: None,
+            #[cfg(feature = "db")]
+            pg_pool: None,
+            registry: crate::actuator::JobRegistry::new(),
+            job_admin: JobAdminMemoryBackend::new_for_test(32),
+            default_max_attempts: 3,
+            default_initial_backoff_ms: 100,
+            per_job_defaults: std::collections::HashMap::from([(
+                "test_job".to_string(),
+                (3_u32, 100_u64),
+            )]),
+            interceptor: Some(Arc::new(PanickingEnqueueInterceptor)),
+        };
+
+        let res = client.enqueue("test_job", serde_json::json!({})).await;
+        assert!(res.is_err());
+        let err_msg = res.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("job enqueue panicked: interceptor enqueue setup panicked"),
+            "expected panic error message, got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn job_client_enqueue_catches_interceptor_async_panic() {
+        struct AsyncPanickingEnqueueInterceptor;
+        impl crate::interceptor::JobInterceptor for AsyncPanickingEnqueueInterceptor {
+            fn intercept_enqueue<'a>(
+                &'a self,
+                _name: &'a str,
+                _payload: &'a serde_json::Value,
+                _next: std::pin::Pin<
+                    Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send + 'a>,
+                >,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send + 'a>,
+            > {
+                Box::pin(async move { panic!("interceptor enqueue async panicked") })
+            }
+
+            fn intercept_execute<'a>(
+                &'a self,
+                _name: &'a str,
+                _payload: &'a serde_json::Value,
+                next: std::pin::Pin<
+                    Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send + 'a>,
+                >,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send + 'a>,
+            > {
+                next
+            }
+        }
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let client = JobClient {
+            local_sender: Some(tx),
+            #[cfg(feature = "redis")]
+            redis: None,
+            #[cfg(feature = "db")]
+            pg_pool: None,
+            registry: crate::actuator::JobRegistry::new(),
+            job_admin: JobAdminMemoryBackend::new_for_test(32),
+            default_max_attempts: 3,
+            default_initial_backoff_ms: 100,
+            per_job_defaults: std::collections::HashMap::from([(
+                "test_job".to_string(),
+                (3_u32, 100_u64),
+            )]),
+            interceptor: Some(Arc::new(AsyncPanickingEnqueueInterceptor)),
+        };
+
+        let res = client.enqueue("test_job", serde_json::json!({})).await;
+        assert!(res.is_err());
+        let err_msg = res.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("job enqueue panicked: interceptor enqueue async panicked"),
+            "expected panic error message, got: {err_msg}"
+        );
     }
 
     #[tokio::test]
