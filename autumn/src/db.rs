@@ -258,22 +258,65 @@ pub trait DbState {
 /// assert_eq!(scrub_sql("SELECT * FROM t WHERE x = $1"),
 ///            "SELECT * FROM t WHERE x = $1");
 /// ```
+/// Consumes the body of an E-string escape literal and its closing `'`.
+///
+/// Called after the opening `'` has already been consumed. Handles
+/// `\'` backslash-escaped quotes so they do not prematurely close the string.
+fn consume_estring_body(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    loop {
+        match chars.next() {
+            None | Some('\'') => break,
+            Some('\\') => {
+                chars.next(); // skip the character after the backslash
+            }
+            Some(_) => {}
+        }
+    }
+}
+
+/// Consumes the body of a dollar-quoted string and its closing `$tag$`.
+///
+/// Called after the opening `$tag$` delimiter has already been consumed.
+/// Uses a simple sliding-window match — sufficient for valid SQL.
+fn consume_dollar_quoted_body(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    tag: &str,
+) {
+    let closing: Vec<char> = format!("${tag}$").chars().collect();
+    let clen = closing.len();
+    let mut match_count = 0usize;
+    for sc in chars.by_ref() {
+        if sc == closing[match_count] {
+            match_count += 1;
+            if match_count == clen {
+                break; // Found the closing delimiter.
+            }
+        } else {
+            match_count = 0;
+            // The current char may start a new partial match.
+            if sc == closing[0] {
+                match_count = 1;
+            }
+        }
+    }
+}
+
+/// Returns true for every char that can legally precede a bare numeric
+/// literal in SQL — whitespace, comparison, arithmetic, and structural chars.
+#[inline]
+const fn is_separator(c: char) -> bool {
+    matches!(
+        c,
+        ' ' | '\t' | '\n'          // whitespace
+        | '=' | '<' | '>'          // comparison
+        | '!' | '+' | '-'          // arithmetic / negation (signed literals)
+        | '*' | '/' | '%'          // arithmetic operators
+        | '(' | ','               // structure
+    )
+}
+
 #[must_use]
 pub fn scrub_sql(sql: &str) -> String {
-    /// Returns true for every char that can legally precede a bare numeric
-    /// literal in SQL — whitespace, comparison, arithmetic, and structural chars.
-    #[inline]
-    const fn is_separator(c: char) -> bool {
-        matches!(
-            c,
-            ' ' | '\t' | '\n'          // whitespace
-            | '=' | '<' | '>'          // comparison
-            | '!' | '+' | '-'          // arithmetic / negation (signed literals)
-            | '*' | '/' | '%'          // arithmetic operators
-            | '(' | ',' // structure
-        )
-    }
-
     let mut out = String::with_capacity(sql.len());
     // Tracks whether the last character written was a separator, so a digit
     // at the current position starts a standalone literal rather than being
@@ -283,6 +326,17 @@ pub fn scrub_sql(sql: &str) -> String {
     let mut chars = sql.chars().peekable();
 
     while let Some(c) = chars.next() {
+        // ── E-string literal  E'...' / e'...'  (backslash-escape aware) ──
+        // Must be checked before the single-quote handler so we consume the
+        // `E` prefix and don't leave it in the fingerprint.
+        if (c == 'E' || c == 'e') && chars.peek() == Some(&'\'') {
+            chars.next(); // consume the opening '
+            out.push_str("'?'");
+            prev_is_sep = false;
+            consume_estring_body(&mut chars);
+            continue;
+        }
+
         // ── Single-quoted string literal ─────────────────────────────────
         if c == '\'' {
             out.push_str("'?'");
@@ -305,14 +359,57 @@ pub fn scrub_sql(sql: &str) -> String {
             continue;
         }
 
-        // ── Postgres $N positional parameter ─────────────────────────────
+        // ── Dollar sign: positional parameter or dollar-quoted string ─────
         if c == '$' {
-            out.push('$');
-            prev_is_sep = false;
-            while chars.peek().is_some_and(char::is_ascii_digit) {
-                if let Some(digit) = chars.next() {
-                    out.push(digit);
+            let next_ch = chars.peek().copied();
+
+            // Positional parameter $N — pass through verbatim.
+            if next_ch.is_some_and(|nc| nc.is_ascii_digit()) {
+                out.push('$');
+                prev_is_sep = false;
+                while chars.peek().is_some_and(char::is_ascii_digit) {
+                    if let Some(d) = chars.next() {
+                        out.push(d);
+                    }
                 }
+                continue;
+            }
+
+            // Dollar-quoted string: $$ (anonymous) or $tag$ (tagged).
+            // Collect the optional tag, looking for the second `$`.
+            let mut tag = String::new();
+            let mut found_closing_dollar = false;
+
+            if next_ch == Some('$') {
+                // Anonymous $$: consume the second `$`.
+                chars.next();
+                found_closing_dollar = true;
+            } else if next_ch.is_some_and(|nc| nc.is_alphabetic() || nc == '_') {
+                // Accumulate tag chars until we hit `$` or a non-identifier char.
+                while let Some(&tc) = chars.peek() {
+                    if tc == '$' {
+                        chars.next(); // consume the closing `$` of the opening tag
+                        found_closing_dollar = true;
+                        break;
+                    } else if tc.is_alphanumeric() || tc == '_' {
+                        tag.push(tc);
+                        chars.next();
+                    } else {
+                        // Not a valid tag character — not a dollar-quoted string.
+                        break;
+                    }
+                }
+            }
+
+            if found_closing_dollar {
+                out.push_str("'?'");
+                prev_is_sep = false;
+                consume_dollar_quoted_body(&mut chars, &tag);
+            } else {
+                // Not a recognisable dollar form — emit $ and any partial tag.
+                out.push('$');
+                out.push_str(&tag);
+                prev_is_sep = false;
             }
             continue;
         }
@@ -322,12 +419,19 @@ pub fn scrub_sql(sql: &str) -> String {
         // identifiers like `table1`, `col2`, or `alias99`.
         if c.is_ascii_digit() && prev_is_sep {
             out.push('?');
-            // Consume rest of the integer or decimal literal
-            while chars
-                .peek()
-                .is_some_and(|d| d.is_ascii_digit() || *d == '.')
-            {
+            // Consume integer/decimal digits.
+            while chars.peek().is_some_and(|d| d.is_ascii_digit() || *d == '.') {
                 chars.next();
+            }
+            // Consume optional scientific-notation exponent: e/E [+/-] <digits>.
+            if chars.peek().is_some_and(|e| *e == 'e' || *e == 'E') {
+                chars.next(); // consume 'e'/'E'
+                if chars.peek().is_some_and(|s| *s == '+' || *s == '-') {
+                    chars.next(); // consume optional sign
+                }
+                while chars.peek().is_some_and(char::is_ascii_digit) {
+                    chars.next();
+                }
             }
             prev_is_sep = false;
             continue;
@@ -1509,5 +1613,88 @@ mod tests {
     #[test]
     fn scrub_sql_empty_string() {
         assert_eq!(super::scrub_sql(""), "");
+    }
+
+    // ── Bug fixes: exponent suffix, dollar-quoted strings, E-string escapes ──
+
+    #[test]
+    fn scrub_sql_scientific_notation_integer_exponent() {
+        // 1e6 should be fully redacted to ? (the "e6" part is the exponent)
+        assert_eq!(
+            super::scrub_sql("SELECT * FROM t WHERE n = 1e6"),
+            "SELECT * FROM t WHERE n = ?"
+        );
+    }
+
+    #[test]
+    fn scrub_sql_scientific_notation_float_exponent() {
+        // 2.5E-4 should be fully redacted: digit + decimal + E + sign + digit(s)
+        assert_eq!(
+            super::scrub_sql("SELECT * FROM t WHERE n = 2.5E-4"),
+            "SELECT * FROM t WHERE n = ?"
+        );
+    }
+
+    #[test]
+    fn scrub_sql_scientific_notation_uppercase_positive_exponent() {
+        // 3E+10 — uppercase E with explicit + sign
+        assert_eq!(
+            super::scrub_sql("SELECT * FROM t WHERE n = 3E+10"),
+            "SELECT * FROM t WHERE n = ?"
+        );
+    }
+
+    #[test]
+    fn scrub_sql_dollar_quoted_anonymous() {
+        // $$...$$ dollar-quoted string: content must be fully redacted
+        assert_eq!(
+            super::scrub_sql("SELECT $$secret value$$"),
+            "SELECT '?'"
+        );
+    }
+
+    #[test]
+    fn scrub_sql_dollar_quoted_with_tag() {
+        // $tag$...$tag$ — tagged dollar-quoted string
+        assert_eq!(
+            super::scrub_sql("SELECT $body$hello world$body$"),
+            "SELECT '?'"
+        );
+    }
+
+    #[test]
+    fn scrub_sql_dollar_quoted_does_not_affect_positional_params() {
+        // $1, $2 positional params must still pass through unmodified
+        assert_eq!(
+            super::scrub_sql("SELECT $1, $2 FROM $$secret$$ WHERE id = $3"),
+            "SELECT $1, $2 FROM '?' WHERE id = $3"
+        );
+    }
+
+    #[test]
+    fn scrub_sql_estring_backslash_escaped_quote() {
+        // E'it\'s secret' — backslash-escaped quote inside E'' string
+        assert_eq!(
+            super::scrub_sql(r"SELECT E'it\'s secret' FROM t"),
+            "SELECT '?' FROM t"
+        );
+    }
+
+    #[test]
+    fn scrub_sql_estring_uppercase() {
+        // Uppercase E prefix variant E'...'
+        assert_eq!(
+            super::scrub_sql("SELECT E'hello world' FROM t"),
+            "SELECT '?' FROM t"
+        );
+    }
+
+    #[test]
+    fn scrub_sql_estring_multiple_backslash_escapes() {
+        // Multiple backslash sequences inside one E'' literal
+        assert_eq!(
+            super::scrub_sql(r"SELECT E'line1\nline2' FROM t"),
+            "SELECT '?' FROM t"
+        );
     }
 }
