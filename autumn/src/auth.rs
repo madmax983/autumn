@@ -861,10 +861,12 @@ pub struct HttpRequestBuilder {
 
 #[cfg(feature = "oauth2")]
 impl HttpClient {
-    pub fn new(inner: reqwest::Client) -> Self {
+    #[must_use]
+    pub const fn new(inner: reqwest::Client) -> Self {
         Self { inner }
     }
 
+    #[must_use]
     pub fn post(&self, url: &str) -> HttpRequestBuilder {
         HttpRequestBuilder {
             client: self.inner.clone(),
@@ -872,6 +874,7 @@ impl HttpClient {
         }
     }
 
+    #[must_use]
     pub fn get(&self, url: &str) -> HttpRequestBuilder {
         HttpRequestBuilder {
             client: self.inner.clone(),
@@ -882,6 +885,7 @@ impl HttpClient {
 
 #[cfg(feature = "oauth2")]
 impl HttpRequestBuilder {
+    #[must_use]
     pub fn header<K, V>(mut self, key: K, value: V) -> Self
     where
         reqwest::header::HeaderName: TryFrom<K>,
@@ -893,6 +897,7 @@ impl HttpRequestBuilder {
         self
     }
 
+    #[must_use]
     pub fn bearer_auth<T>(mut self, token: T) -> Self
     where
         T: std::fmt::Display,
@@ -901,15 +906,22 @@ impl HttpRequestBuilder {
         self
     }
 
+    #[must_use]
     pub fn form<T: serde::Serialize + ?Sized>(mut self, form: &T) -> Self {
         self.builder = self.builder.form(form);
         self
     }
 
+    /// Sends the request through the interceptor chain.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `reqwest::Error` if building the request, sending the request, or
+    /// intercepting the call fails.
     pub async fn send(self) -> Result<reqwest::Response, reqwest::Error> {
         let req = self.builder.build()?;
         let interceptors = crate::interceptor::ACTIVE_HTTP_INTERCEPTORS
-            .try_with(|i| i.clone())
+            .try_with(Clone::clone)
             .unwrap_or_default();
         run_http_chain(req, interceptors, self.client.clone(), 0).await
     }
