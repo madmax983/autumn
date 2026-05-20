@@ -201,12 +201,19 @@ impl MockRegistry {
         url: &str,
         alias: Option<&str>,
     ) -> Option<MockResponse> {
-        // Extract the URL path component for precise matching.
-        // For full URLs (https://…) we parse and use the path segment.
-        // For relative paths we use the raw string as-is.
-        let url_path_owned: Option<String> =
-            reqwest::Url::parse(url).ok().map(|u| u.path().to_owned());
-        let url_path = url_path_owned.as_deref().unwrap_or(url);
+        // Extract the URL path component for matching, stripping query and fragment.
+        // For full URLs (https://…) reqwest::Url::parse gives us the clean path.
+        // For relative paths we strip manually so "?query" doesn't break matching.
+        // Extract the path without query/fragment. For full URLs reqwest parses
+        // cleanly; for relative strings we strip manually.
+        let url_path_owned: String = reqwest::Url::parse(url).map_or_else(
+            |_| {
+                let s = url.split_once('?').map_or(url, |(p, _)| p);
+                s.split_once('#').map_or(s, |(p, _)| p).to_owned()
+            },
+            |parsed| parsed.path().to_owned(),
+        );
+        let url_path = url_path_owned.as_str();
 
         // Hold the lock only for the search; release before fetching metadata.
         let found = {
@@ -214,10 +221,17 @@ impl MockRegistry {
             entries.iter().find_map(|entry| {
                 let method_ok = entry.method.as_ref().is_none_or(|m| m == method);
                 // Path match: exact equality OR suffix at a segment boundary.
+                // When the mock path starts with '/' the leading slash IS the
+                // segment separator, so a non-empty prefix is also valid
+                // (e.g. mock "/charges" matches URL path "/v1/charges").
                 let path_ok = url_path == entry.path.as_str()
                     || url_path
                         .strip_suffix(entry.path.as_str())
-                        .is_some_and(|prefix| prefix.is_empty() || prefix.ends_with('/'));
+                        .is_some_and(|prefix| {
+                            prefix.is_empty()
+                                || prefix.ends_with('/')
+                                || entry.path.starts_with('/')
+                        });
                 let alias_ok = entry
                     .alias
                     .as_deref()
@@ -681,9 +695,13 @@ impl RequestBuilder {
     }
 
     /// Override the maximum retry count for this request.
+    ///
+    /// Also clears the idempotent-only flag so non-idempotent methods such as
+    /// `POST` and `PATCH` are retried when the caller explicitly requests it.
     #[must_use]
     pub const fn retries(mut self, max: u32) -> Self {
         self.retry_policy.max_retries = max;
+        self.retry_policy.retry_idempotent_only = false;
         self
     }
 
@@ -802,7 +820,10 @@ impl RequestBuilder {
                         continue;
                     }
 
-                    let body = resp.bytes().await.map_err(ClientError::Request)?;
+                    let body = resp
+                        .bytes()
+                        .await
+                        .map_err(|e| ClientError::Request(e.without_url()))?;
                     let elapsed = start.elapsed();
                     log_request(
                         self.method.as_str(),
@@ -822,7 +843,7 @@ impl RequestBuilder {
                 // Only retry transient connect/timeout errors; non-transient errors
                 // (e.g. malformed URL) fail immediately.
                 Err(e) if (e.is_connect() || e.is_timeout()) && attempt + 1 < max_attempts => {}
-                Err(e) => return Err(ClientError::Request(e)),
+                Err(e) => return Err(ClientError::Request(e.without_url())),
             }
         }
 
@@ -1412,5 +1433,70 @@ mod tests {
         assert_eq!(resp.status().as_u16(), 503);
         // Mock was called exactly once — no retry for non-idempotent method.
         assert_eq!(call_count.load(Ordering::SeqCst), 1);
+    }
+
+    // TEST 30: find_match strips query string from relative URLs before comparing.
+    #[tokio::test]
+    async fn mock_strips_query_from_url_before_matching() {
+        let registry = Arc::new(MockRegistry::new());
+        let call_count = Arc::new(AtomicUsize::new(0));
+        registry.register(MockEntry {
+            method: Some(Method::GET),
+            path: "/v1/charges".to_owned(),
+            alias: None,
+            status: 200,
+            body: Some(serde_json::json!({"ok": true})),
+            call_count: call_count.clone(),
+        });
+
+        // The URL has a query string; the mock is registered without one.
+        let client = Client::new().with_mock(registry);
+        let resp = client
+            .get("https://api.stripe.com/v1/charges?expand[]=balance_transaction")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status().as_u16(), 200);
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+    }
+
+    // TEST 31: suffix match works when mock path starts with '/' and URL has a prefix.
+    #[tokio::test]
+    async fn mock_suffix_match_with_leading_slash_path() {
+        let registry = Arc::new(MockRegistry::new());
+        let call_count = Arc::new(AtomicUsize::new(0));
+        // Register only the leaf segment (with leading slash).
+        registry.register(MockEntry {
+            method: Some(Method::POST),
+            path: "/charges".to_owned(),
+            alias: None,
+            status: 201,
+            body: Some(serde_json::json!({"matched": true})),
+            call_count: call_count.clone(),
+        });
+
+        let client = Client::new().with_mock(registry);
+        // Full URL path is /v1/charges; mock path is /charges.
+        let resp = client
+            .post("https://api.stripe.com/v1/charges")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status().as_u16(), 201);
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+    }
+
+    // TEST 32: retries() clears retry_idempotent_only so POST actually retries.
+    #[test]
+    fn retries_clears_idempotent_only_flag() {
+        let client = Client::new();
+        let builder = client.post("https://example.com").retries(2);
+        assert_eq!(builder.retry_policy.max_retries, 2);
+        assert!(
+            !builder.retry_policy.retry_idempotent_only,
+            "explicit retries() call must allow non-idempotent methods to retry"
+        );
     }
 }
