@@ -1295,3 +1295,180 @@ fn generate_scaffold_repository_exposes_page_method() {
         "scaffold repository must declare a public PostRepository trait: {repo}"
     );
 }
+
+// ── autumn generate mailer ────────────────────────────────────────────────────
+
+#[test]
+fn generate_mailer_creates_all_expected_files() {
+    let (_tmp, project) = fresh_project("mailer-app");
+    let (stdout, _stderr) =
+        run_autumn(&project, &["generate", "mailer", "Welcome"]);
+
+    // Basic output sanity.
+    assert!(
+        stdout.contains("welcome.rs") || stdout.contains("Created"),
+        "output should mention created files: {stdout}"
+    );
+
+    // Mailer source file.
+    assert!(
+        project.join("src/mailers/welcome.rs").is_file(),
+        "src/mailers/welcome.rs must exist"
+    );
+    let mailer = fs::read_to_string(project.join("src/mailers/welcome.rs")).unwrap();
+    assert!(mailer.contains("pub struct WelcomeMailer"));
+    assert!(mailer.contains("#[mailer]"));
+    assert!(mailer.contains("#[mailer_preview]"));
+    assert!(
+        mailer.contains("pub fn welcome("),
+        "must expose a method the #[mailer] macro can expand"
+    );
+    assert!(
+        mailer.contains("deliver_later"),
+        "file comment must describe the deliver_later API"
+    );
+
+    // HTML template.
+    assert!(
+        project.join("templates/mailers/welcome.html").is_file(),
+        "templates/mailers/welcome.html must exist"
+    );
+    let html = fs::read_to_string(project.join("templates/mailers/welcome.html")).unwrap();
+    assert!(html.contains("WelcomeMailer"), "html template must reference the mailer");
+    assert!(html.contains("<!DOCTYPE html>"), "html template must be valid HTML");
+
+    // Text template.
+    assert!(
+        project.join("templates/mailers/welcome.txt").is_file(),
+        "templates/mailers/welcome.txt must exist"
+    );
+    let txt = fs::read_to_string(project.join("templates/mailers/welcome.txt")).unwrap();
+    assert!(txt.contains("WelcomeMailer"), "text template must reference the mailer");
+
+    // Module index.
+    assert!(
+        project.join("src/mailers/mod.rs").is_file(),
+        "src/mailers/mod.rs must exist"
+    );
+    let mod_rs = fs::read_to_string(project.join("src/mailers/mod.rs")).unwrap();
+    assert!(mod_rs.contains("pub mod welcome;"));
+
+    // Smoke test.
+    assert!(
+        project.join("tests/welcome_mailer.rs").is_file(),
+        "tests/welcome_mailer.rs must exist"
+    );
+    let test = fs::read_to_string(project.join("tests/welcome_mailer.rs")).unwrap();
+    assert!(test.contains("WelcomeMailer"));
+    assert!(
+        test.contains("renders_both_bodies"),
+        "smoke test must assert both bodies render"
+    );
+    assert!(
+        test.contains("html.contains") || test.contains("html body"),
+        "smoke test must assert the html body"
+    );
+    assert!(
+        test.contains("text.contains") || test.contains("text body"),
+        "smoke test must assert the text body"
+    );
+
+    // main.rs wiring.
+    let main = fs::read_to_string(project.join("src/main.rs")).unwrap();
+    assert!(main.contains("mod mailers;"), "main.rs must declare mod mailers");
+    assert!(
+        main.contains("mail_previews!["),
+        "main.rs must include mail_previews![] call"
+    );
+    assert!(
+        main.contains("mailers::welcome::WelcomeMailer"),
+        "main.rs must reference the mailer type"
+    );
+
+    // Cargo.toml: mail feature.
+    let cargo = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+    assert!(
+        cargo.contains("\"mail\""),
+        "Cargo.toml must include the mail feature for autumn-web: {cargo}"
+    );
+}
+
+#[test]
+fn generate_mailer_dry_run_writes_nothing() {
+    let (_tmp, project) = fresh_project("mailer-dry-app");
+    let (stdout, _) = run_autumn(
+        &project,
+        &["generate", "mailer", "Welcome", "--dry-run"],
+    );
+    assert!(
+        stdout.contains("Dry run"),
+        "dry run must print Dry run header: {stdout}"
+    );
+    assert!(
+        !project.join("src/mailers/welcome.rs").exists(),
+        "dry run must not create the mailer file"
+    );
+    assert!(
+        !project.join("templates/mailers/welcome.html").exists(),
+        "dry run must not create html template"
+    );
+    assert!(
+        !project.join("templates/mailers/welcome.txt").exists(),
+        "dry run must not create txt template"
+    );
+}
+
+#[test]
+fn generate_mailer_collision_without_force_fails() {
+    let (_tmp, project) = fresh_project("mailer-collide-app");
+    run_autumn(&project, &["generate", "mailer", "Welcome"]);
+    let (_, stderr, code) = run_autumn_failing(
+        &project,
+        &["generate", "mailer", "Welcome"],
+    );
+    assert_eq!(code, Some(1), "second run without --force must exit 1");
+    assert!(
+        stderr.contains("would overwrite") || stderr.contains("welcome.rs"),
+        "must report collision: {stderr}"
+    );
+}
+
+#[test]
+fn generate_mailer_force_overwrites_existing() {
+    let (_tmp, project) = fresh_project("mailer-force-app");
+    run_autumn(&project, &["generate", "mailer", "Welcome"]);
+    // Corrupt the mailer file so we can detect the overwrite.
+    let path = project.join("src/mailers/welcome.rs");
+    fs::write(&path, "// corrupted").unwrap();
+    run_autumn(
+        &project,
+        &["generate", "mailer", "Welcome", "--force"],
+    );
+    let content = fs::read_to_string(&path).unwrap();
+    assert!(
+        content.contains("WelcomeMailer"),
+        "--force must regenerate the mailer file"
+    );
+}
+
+#[test]
+fn generate_mailer_preview_registry_wired_into_main() {
+    let (_tmp, project) = fresh_project("mailer-preview-app");
+    run_autumn(&project, &["generate", "mailer", "Welcome"]);
+
+    let main = fs::read_to_string(project.join("src/main.rs")).unwrap();
+
+    // The preview registry wiring must appear before `.run()`.
+    let preview_pos = main
+        .find("mail_previews![")
+        .expect("mail_previews![] must be present in main.rs");
+    let run_pos = main.find(".run()").expect(".run() must still be present");
+    assert!(
+        preview_pos < run_pos,
+        "mail_previews![] must be wired before .run() in the builder chain"
+    );
+    assert!(
+        main.contains("mailers::welcome::WelcomeMailer"),
+        "preview registry must reference the generated mailer type"
+    );
+}
