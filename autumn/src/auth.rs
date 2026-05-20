@@ -848,15 +848,125 @@ async fn validate_and_decode_id_token(
 }
 
 #[cfg(feature = "oauth2")]
-fn oauth_http_client() -> crate::AutumnResult<reqwest::Client> {
-    reqwest::Client::builder()
+#[derive(Clone)]
+pub struct HttpClient {
+    inner: reqwest::Client,
+}
+
+#[cfg(feature = "oauth2")]
+pub struct HttpRequestBuilder {
+    client: reqwest::Client,
+    builder: reqwest::RequestBuilder,
+}
+
+#[cfg(feature = "oauth2")]
+impl HttpClient {
+    #[must_use]
+    pub const fn new(inner: reqwest::Client) -> Self {
+        Self { inner }
+    }
+
+    #[must_use]
+    pub fn post(&self, url: &str) -> HttpRequestBuilder {
+        HttpRequestBuilder {
+            client: self.inner.clone(),
+            builder: self.inner.post(url),
+        }
+    }
+
+    #[must_use]
+    pub fn get(&self, url: &str) -> HttpRequestBuilder {
+        HttpRequestBuilder {
+            client: self.inner.clone(),
+            builder: self.inner.get(url),
+        }
+    }
+}
+
+#[cfg(feature = "oauth2")]
+impl HttpRequestBuilder {
+    #[must_use]
+    pub fn header<K, V>(mut self, key: K, value: V) -> Self
+    where
+        reqwest::header::HeaderName: TryFrom<K>,
+        <reqwest::header::HeaderName as TryFrom<K>>::Error: Into<http::Error>,
+        reqwest::header::HeaderValue: TryFrom<V>,
+        <reqwest::header::HeaderValue as TryFrom<V>>::Error: Into<http::Error>,
+    {
+        self.builder = self.builder.header(key, value);
+        self
+    }
+
+    #[must_use]
+    pub fn bearer_auth<T>(mut self, token: T) -> Self
+    where
+        T: std::fmt::Display,
+    {
+        self.builder = self.builder.bearer_auth(token);
+        self
+    }
+
+    #[must_use]
+    pub fn form<T: serde::Serialize + ?Sized>(mut self, form: &T) -> Self {
+        self.builder = self.builder.form(form);
+        self
+    }
+
+    /// Sends the request through the interceptor chain.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `reqwest::Error` if building the request, sending the request, or
+    /// intercepting the call fails.
+    pub async fn send(self) -> Result<reqwest::Response, reqwest::Error> {
+        let req = self.builder.build()?;
+        let interceptors = crate::interceptor::ACTIVE_HTTP_INTERCEPTORS
+            .try_with(Clone::clone)
+            .unwrap_or_default();
+        run_http_chain(req, interceptors, self.client.clone(), 0).await
+    }
+}
+
+#[cfg(feature = "oauth2")]
+fn run_http_chain(
+    req: reqwest::Request,
+    interceptors: Vec<Arc<dyn crate::interceptor::HttpInterceptor>>,
+    client: reqwest::Client,
+    idx: usize,
+) -> std::pin::Pin<
+    Box<
+        dyn std::future::Future<Output = Result<reqwest::Response, reqwest::Error>>
+            + Send
+            + 'static,
+    >,
+> {
+    Box::pin(async move {
+        if idx < interceptors.len() {
+            let interceptor = interceptors[idx].clone();
+            let next_interceptors = interceptors.clone();
+            let next_client = client.clone();
+            let next_fn = move |r: reqwest::Request| {
+                run_http_chain(r, next_interceptors.clone(), next_client.clone(), idx + 1)
+            };
+            let fut = interceptor.intercept(req, &next_fn);
+            fut.await
+        } else {
+            client.execute(req).await
+        }
+    })
+}
+
+#[cfg(feature = "oauth2")]
+fn oauth_http_client() -> crate::AutumnResult<HttpClient> {
+    let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(OAUTH_HTTP_TIMEOUT_SECS))
         .build()
         .map_err(|e| {
             crate::AutumnError::service_unavailable_msg(format!(
                 "failed to build oauth http client: {e}"
             ))
-        })
+        })?;
+    Ok(HttpClient::new(client))
 }
 
 impl Default for AuthConfig {
@@ -2511,7 +2621,87 @@ mod tests {
     }
 }
 
-// ── API token tests ───────────────────────────────────────────────────────────
+// ── HttpRequestBuilder interceptor task-local scope tests ────────────────────
+
+#[cfg(feature = "oauth2")]
+#[cfg(test)]
+mod http_interceptor_task_local_tests {
+    use crate::interceptor::{ACTIVE_HTTP_INTERCEPTORS, HttpInterceptor, HttpInterceptorFuture};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    struct FlagInterceptor {
+        fired: Arc<AtomicBool>,
+    }
+
+    impl HttpInterceptor for FlagInterceptor {
+        fn intercept<'a>(
+            &'a self,
+            req: reqwest::Request,
+            next: &'a dyn Fn(reqwest::Request) -> HttpInterceptorFuture<'a>,
+        ) -> HttpInterceptorFuture<'a> {
+            self.fired.store(true, Ordering::SeqCst);
+            // Delegate to next so the caller gets a real (likely connection-refused)
+            // error back — we discard it in the test with `let _ = ...`.
+            next(req)
+        }
+    }
+
+    /// Proves the task-local scope contract: when `ACTIVE_HTTP_INTERCEPTORS` is
+    /// set via `.scope()` (as `run_one_off_task_mode` must do), the interceptor
+    /// fires on every `HttpRequestBuilder::send` call within that scope.
+    #[tokio::test]
+    async fn http_request_builder_send_fires_interceptor_inside_scope() {
+        let fired = Arc::new(AtomicBool::new(false));
+        let interceptor: Arc<dyn HttpInterceptor> = Arc::new(FlagInterceptor {
+            fired: Arc::clone(&fired),
+        });
+
+        let client = reqwest::Client::new();
+        let http_client = super::HttpClient::new(client);
+
+        ACTIVE_HTTP_INTERCEPTORS
+            .scope(vec![interceptor], async {
+                let _ = http_client
+                    .get("http://127.0.0.1:54321/noreply")
+                    .send()
+                    .await;
+            })
+            .await;
+
+        assert!(
+            fired.load(Ordering::SeqCst),
+            "interceptor must fire when ACTIVE_HTTP_INTERCEPTORS scope is established"
+        );
+    }
+
+    /// Proves the regression: without a scope, the interceptor is silently
+    /// skipped. The fix in `run_one_off_task_mode` wraps the task handler in
+    /// `ACTIVE_HTTP_INTERCEPTORS.scope(...)` so that registered interceptors are
+    /// always active during task execution.
+    #[tokio::test]
+    async fn http_request_builder_send_skips_interceptor_outside_scope() {
+        let fired = Arc::new(AtomicBool::new(false));
+        let _interceptor: Arc<dyn HttpInterceptor> = Arc::new(FlagInterceptor {
+            fired: Arc::clone(&fired),
+        });
+
+        // Intentionally do NOT establish a scope — simulating pre-fix task mode.
+        let client = reqwest::Client::new();
+        let http_client = super::HttpClient::new(client);
+        let _ = http_client
+            .get("http://127.0.0.1:54321/noreply")
+            .send()
+            .await;
+
+        assert!(
+            !fired.load(Ordering::SeqCst),
+            "interceptor must NOT fire when ACTIVE_HTTP_INTERCEPTORS scope is absent"
+        );
+    }
+}
 
 #[cfg(test)]
 mod api_token_tests {

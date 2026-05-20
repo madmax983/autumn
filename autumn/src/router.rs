@@ -346,6 +346,12 @@ fn build_router_pre_state(
             .layer(axum::middleware::from_fn(dev::inject_live_reload));
     }
 
+    #[cfg(feature = "oauth2")]
+    let router = router.layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        http_interceptor_middleware,
+    ));
+
     Ok(router)
 }
 
@@ -1809,6 +1815,24 @@ fn mount_swagger_ui_routes(
         }),
     );
     router
+}
+
+#[cfg(feature = "oauth2")]
+async fn http_interceptor_middleware(
+    state: axum::extract::State<AppState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use crate::interceptor::{ACTIVE_HTTP_INTERCEPTORS, HttpInterceptor};
+    if let Some(interceptor_arc) = state.extension::<Arc<dyn HttpInterceptor>>() {
+        let interceptor = (*interceptor_arc).clone();
+        let interceptors = vec![interceptor];
+        ACTIVE_HTTP_INTERCEPTORS
+            .scope(interceptors, async move { next.run(req).await })
+            .await
+    } else {
+        next.run(req).await
+    }
 }
 
 #[cfg(test)]

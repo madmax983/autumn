@@ -1599,6 +1599,29 @@ fn lettre_message(mail: &Mail) -> Result<Message, MailError> {
     }
 }
 
+struct InterceptedMailTransport {
+    inner: Arc<dyn MailTransport>,
+    interceptor: Arc<dyn crate::interceptor::MailInterceptor>,
+}
+
+impl MailTransport for InterceptedMailTransport {
+    fn send<'a>(
+        &'a self,
+        mail: Mail,
+    ) -> Pin<Box<dyn Future<Output = Result<(), MailError>> + Send + 'a>> {
+        Box::pin(async move {
+            let inner = Arc::clone(&self.inner);
+            let mail_for_next = mail.clone();
+            let next = Box::pin(async move { inner.send(mail_for_next).await });
+            self.interceptor.intercept(&mail, next).await
+        })
+    }
+
+    fn is_disabled(&self) -> bool {
+        self.inner.is_disabled()
+    }
+}
+
 /// Install the configured mailer into app state.
 ///
 /// Picks up a runtime-installed [`MailDeliveryQueueHandle`] from
@@ -1619,6 +1642,13 @@ pub(crate) fn install_mailer(
     enforce_durable_guard: bool,
 ) -> AutumnResult<()> {
     let mut mailer = Mailer::from_config(config).map_err(AutumnError::service_unavailable)?;
+
+    if let Some(interceptor) = state.extension::<Arc<dyn crate::interceptor::MailInterceptor>>() {
+        mailer.transport = Arc::new(InterceptedMailTransport {
+            inner: Arc::clone(&mailer.transport),
+            interceptor: (*interceptor).clone(),
+        });
+    }
 
     let in_production = matches!(state.profile(), "prod" | "production");
     let transport_sends_mail = config.transport != Transport::Disabled;
@@ -2570,5 +2600,64 @@ mod tests {
             !installed.has_durable_delivery_queue(),
             "disabled transport must suppress queue attachment so deliver_later is a no-op"
         );
+    }
+
+    #[tokio::test]
+    async fn intercepted_mail_transport_short_circuit_prevents_sync_execution() {
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        static TRANSPORT_CALLS: AtomicU32 = AtomicU32::new(0);
+
+        struct CountingTransport;
+        impl MailTransport for CountingTransport {
+            fn send<'a>(
+                &'a self,
+                _mail: Mail,
+            ) -> Pin<Box<dyn Future<Output = Result<(), MailError>> + Send + 'a>> {
+                TRANSPORT_CALLS.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move { Ok(()) })
+            }
+
+            fn is_disabled(&self) -> bool {
+                false
+            }
+        }
+
+        struct ShortCircuitMailInterceptor;
+        impl crate::interceptor::MailInterceptor for ShortCircuitMailInterceptor {
+            fn intercept<'a>(
+                &'a self,
+                _mail: &'a Mail,
+                _next: Pin<Box<dyn Future<Output = Result<(), MailError>> + Send + 'a>>,
+            ) -> Pin<Box<dyn Future<Output = Result<(), MailError>> + Send + 'a>> {
+                Box::pin(async move {
+                    Err(MailError::RuntimeUnavailable(
+                        "blocked by interceptor".to_owned(),
+                    ))
+                })
+            }
+        }
+
+        let transport = Arc::new(CountingTransport);
+        let interceptor = Arc::new(ShortCircuitMailInterceptor);
+        let intercepted = InterceptedMailTransport {
+            inner: transport,
+            interceptor,
+        };
+
+        let mail = Mail::builder()
+            .to("test@example.com")
+            .subject("test")
+            .text("body")
+            .build()
+            .unwrap();
+
+        TRANSPORT_CALLS.store(0, Ordering::SeqCst);
+
+        let res = intercepted.send(mail).await;
+        assert!(res.is_err());
+        assert_eq!(TRANSPORT_CALLS.load(Ordering::SeqCst), 0);
     }
 }

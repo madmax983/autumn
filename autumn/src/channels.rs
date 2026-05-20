@@ -802,7 +802,81 @@ impl ChannelsBackend for RedisChannelsBackend {
     }
 }
 
+#[cfg(feature = "ws")]
+#[derive(Clone)]
+pub struct InterceptedChannelsBackend {
+    inner: Arc<dyn ChannelsBackend>,
+    interceptors: Vec<Arc<dyn crate::interceptor::ChannelsInterceptor>>,
+}
+
+#[cfg(feature = "ws")]
+impl InterceptedChannelsBackend {
+    #[must_use]
+    pub fn new(
+        inner: Arc<dyn ChannelsBackend>,
+        interceptors: Vec<Arc<dyn crate::interceptor::ChannelsInterceptor>>,
+    ) -> Self {
+        Self {
+            inner,
+            interceptors,
+        }
+    }
+}
+
+#[cfg(feature = "ws")]
+fn run_chain(
+    topic: &str,
+    msg: &ChannelMessage,
+    interceptors: &[Arc<dyn crate::interceptor::ChannelsInterceptor>],
+    inner: &dyn ChannelsBackend,
+    idx: usize,
+) -> Result<usize, ChannelPublishError> {
+    if idx < interceptors.len() {
+        let interceptor = &interceptors[idx];
+        let next = |t: &str, m: &ChannelMessage| run_chain(t, m, interceptors, inner, idx + 1);
+        interceptor.intercept_publish(topic, msg, &next)
+    } else {
+        inner.publish(topic, msg.clone())
+    }
+}
+
+#[cfg(feature = "ws")]
+impl ChannelsBackend for InterceptedChannelsBackend {
+    fn publish(&self, topic: &str, msg: ChannelMessage) -> Result<usize, ChannelPublishError> {
+        let inner = &self.inner;
+        let interceptors = &self.interceptors;
+
+        run_chain(topic, &msg, interceptors, &**inner, 0)
+    }
+
+    fn ensure_topic(&self, topic: &str) -> Arc<broadcast::Sender<ChannelMessage>> {
+        self.inner.ensure_topic(topic)
+    }
+
+    fn subscribe(&self, topic: &str) -> Subscriber {
+        self.inner.subscribe(topic)
+    }
+
+    fn channel_count(&self) -> usize {
+        self.inner.channel_count()
+    }
+
+    fn gc(&self) {
+        self.inner.gc();
+    }
+
+    fn snapshot(&self) -> HashMap<String, ChannelStats> {
+        self.inner.snapshot()
+    }
+}
+
 impl Channels {
+    /// Return the underlying backend.
+    #[must_use]
+    pub fn backend(&self) -> &Arc<dyn ChannelsBackend> {
+        &self.backend
+    }
+
     /// Create a new local channel registry with the given buffer capacity.
     #[must_use]
     pub fn new(capacity: usize) -> Self {
