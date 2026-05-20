@@ -45,6 +45,7 @@
 //! }
 //! ```
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -357,9 +358,33 @@ impl MockSetupBuilder {
     }
 
     /// Convenience variant that returns the given status with an empty body.
+    ///
+    /// Unlike [`respond_with`](Self::respond_with), this stores `body: None` so
+    /// the mock response truly has zero body bytes (not the JSON literal `null`).
     #[must_use]
     pub fn respond_with_status(self, status: u16) -> MockHandle {
-        self.respond_with(status, serde_json::Value::Null)
+        let path = self.path.clone().unwrap_or_default();
+        let method_str = self
+            .method
+            .as_ref()
+            .map_or_else(|| "*".to_owned(), ToString::to_string);
+        let call_count = Arc::new(AtomicUsize::new(0));
+
+        self.registry.register(MockEntry {
+            method: self.method,
+            path: path.clone(),
+            alias: Some(self.alias.clone()),
+            status,
+            body: None,
+            call_count: call_count.clone(),
+        });
+
+        MockHandle {
+            alias: self.alias,
+            method: method_str,
+            path,
+            call_count,
+        }
     }
 }
 
@@ -397,6 +422,8 @@ pub struct Client {
     alias: Option<String>,
     /// Base URL prepended to relative paths.
     base_url: Option<String>,
+    /// Alias → base URL map loaded from `[http.client.base_urls]` config.
+    base_urls: HashMap<String, String>,
     retry_policy: RetryPolicy,
     /// When present (test builds), matching requests bypass the network.
     mock: Option<Arc<MockRegistry>>,
@@ -426,6 +453,7 @@ impl Client {
             inner,
             alias: None,
             base_url: None,
+            base_urls: HashMap::new(),
             retry_policy: RetryPolicy::default(),
             mock: None,
         }
@@ -447,6 +475,7 @@ impl Client {
             inner,
             alias: None,
             base_url: None,
+            base_urls: config.base_urls.clone(),
             retry_policy: RetryPolicy {
                 max_retries: config.max_retries,
                 retry_idempotent_only: true,
@@ -469,10 +498,16 @@ impl Client {
     /// match requests made through this named client.
     #[must_use]
     pub fn named(&self, alias: &str) -> Self {
+        let base_url = self
+            .base_urls
+            .get(alias)
+            .cloned()
+            .or_else(|| self.base_url.clone());
         Self {
             inner: self.inner.clone(),
             alias: Some(alias.to_owned()),
-            base_url: self.base_url.clone(),
+            base_url,
+            base_urls: self.base_urls.clone(),
             retry_policy: self.retry_policy.clone(),
             mock: self.mock.clone(),
         }
@@ -485,6 +520,7 @@ impl Client {
             inner: self.inner.clone(),
             alias: self.alias.clone(),
             base_url: Some(base_url.into()),
+            base_urls: self.base_urls.clone(),
             retry_policy: self.retry_policy.clone(),
             mock: self.mock.clone(),
         }
@@ -557,8 +593,13 @@ impl axum::extract::FromRequestParts<crate::AppState> for Client {
         _parts: &mut http::request::Parts,
         state: &crate::AppState,
     ) -> Result<Self, std::convert::Infallible> {
-        // Prefer per-handler config from extensions; fall back to defaults.
-        let config = state.extension::<crate::config::HttpConfig>();
+        // Check for an explicit HttpConfig extension first (inserted by TestApp::build());
+        // in production, fall back to the full AutumnConfig's http section.
+        let config = state.extension::<crate::config::HttpConfig>().or_else(|| {
+            state
+                .extension::<crate::config::AutumnConfig>()
+                .map(|c| std::sync::Arc::new(c.http.clone()))
+        });
         let mut client = config.map_or_else(Self::new, |cfg| Self::from_config(&cfg.client));
 
         // In test builds the mock registry is installed by TestApp::build().
@@ -713,7 +754,7 @@ impl RequestBuilder {
         let start = Instant::now();
         let max_attempts =
             if is_idempotent_method(&self.method) || !self.retry_policy.retry_idempotent_only {
-                self.retry_policy.max_retries + 1
+                self.retry_policy.max_retries.saturating_add(1)
             } else {
                 1
             };
