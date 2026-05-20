@@ -761,7 +761,9 @@ impl RequestBuilder {
 
         for attempt in 0..max_attempts {
             if attempt > 0 {
-                let delay = Duration::from_millis(100 * 2_u64.pow(attempt - 1));
+                // Cap the exponent to prevent u64 overflow when max_retries is large.
+                let exp = (attempt - 1).min(10);
+                let delay = Duration::from_millis(100 * (1_u64 << exp));
                 tokio::time::sleep(delay).await;
             }
 
@@ -817,8 +819,9 @@ impl RequestBuilder {
                         url: Some(url_used),
                     });
                 }
-                // Retry on connect/timeout errors while attempts remain.
-                Err(_) if attempt + 1 < max_attempts => {}
+                // Only retry transient connect/timeout errors; non-transient errors
+                // (e.g. malformed URL) fail immediately.
+                Err(e) if (e.is_connect() || e.is_timeout()) && attempt + 1 < max_attempts => {}
                 Err(e) => return Err(ClientError::Request(e)),
             }
         }
@@ -1300,5 +1303,114 @@ mod tests {
         state.insert_extension(ext);
         let retrieved = state.extension::<HttpMockRegistryExt>();
         assert!(retrieved.is_some());
+    }
+
+    // TEST 25: named() resolves base URL from base_urls map in config.
+    #[test]
+    fn named_client_resolves_base_url_from_config() {
+        let mut base_urls = std::collections::HashMap::new();
+        base_urls.insert("stripe".to_owned(), "https://api.stripe.com".to_owned());
+        let config = HttpClientConfig {
+            timeout_secs: 30,
+            max_retries: 3,
+            base_urls,
+        };
+        let client = Client::from_config(&config);
+        let stripe = client.named("stripe");
+        assert_eq!(stripe.base_url.as_deref(), Some("https://api.stripe.com"));
+        assert_eq!(stripe.alias.as_deref(), Some("stripe"));
+
+        // Unknown alias falls back to client-level base_url (None in this case).
+        let other = client.named("sendgrid");
+        assert!(other.base_url.is_none());
+    }
+
+    // TEST 26: from_request_parts uses AutumnConfig.http when no HttpConfig extension.
+    #[tokio::test]
+    async fn client_extracts_from_autumn_config_in_state() {
+        use axum::extract::FromRequestParts;
+        let mut cfg = crate::config::AutumnConfig::default();
+        cfg.http.client.max_retries = 7;
+        let state = crate::AppState::for_test();
+        state.insert_extension(cfg);
+
+        let mut parts = axum::http::Request::new(axum::body::Body::empty())
+            .into_parts()
+            .0;
+        let client = Client::from_request_parts(&mut parts, &state)
+            .await
+            .unwrap();
+        assert_eq!(client.retry_policy.max_retries, 7);
+    }
+
+    // TEST 27: respond_with_status produces a truly empty body (not JSON null).
+    #[tokio::test]
+    async fn respond_with_status_produces_empty_body() {
+        let registry = Arc::new(MockRegistry::new());
+        let builder = MockSetupBuilder {
+            registry: registry.clone(),
+            alias: "svc".to_owned(),
+            method: None,
+            path: None,
+        };
+        let _handle = builder.delete("/items/1").respond_with_status(204);
+
+        let client = Client::new().with_mock(registry).named("svc");
+        let resp = client
+            .delete("https://svc.example.com/items/1")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status().as_u16(), 204);
+        assert_eq!(
+            resp.bytes(),
+            bytes::Bytes::new(),
+            "body must be empty, not \"null\""
+        );
+    }
+
+    // TEST 28: parse_retry_after handles HTTP-date format.
+    #[test]
+    fn retry_after_http_date_parsing() {
+        let mut headers = HeaderMap::new();
+        // A date far in the future to ensure the computed seconds > 0.
+        headers.insert(
+            reqwest::header::HeaderName::from_static("retry-after"),
+            HeaderValue::from_static("Tue, 01 Jan 2030 00:00:00 GMT"),
+        );
+        let duration = parse_retry_after(&headers);
+        assert!(duration.is_some(), "should parse HTTP-date Retry-After");
+        assert!(
+            duration.unwrap().as_secs() > 0,
+            "future date should yield positive delay"
+        );
+    }
+
+    // TEST 29: non-idempotent POST with retries disabled makes only one attempt.
+    #[tokio::test]
+    async fn non_idempotent_post_no_retry() {
+        let registry = Arc::new(MockRegistry::new());
+        let call_count = Arc::new(AtomicUsize::new(0));
+        registry.register(MockEntry {
+            method: Some(Method::POST),
+            path: "/endpoint".to_owned(),
+            alias: None,
+            status: 503,
+            body: None,
+            call_count: call_count.clone(),
+        });
+
+        // With retry_idempotent_only=true (default), POST should NOT retry.
+        let client = Client::new().with_mock(registry);
+        let resp = client
+            .post("https://example.com/endpoint")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status().as_u16(), 503);
+        // Mock was called exactly once — no retry for non-idempotent method.
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
     }
 }

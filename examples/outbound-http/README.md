@@ -12,6 +12,10 @@ cover mocked calls, call-count assertions, the `NoMock` guard, and routing.
 - Rust 1.88.0+
 - (Optional) A Stripe sandbox key in `STRIPE_SECRET_KEY` for real calls
 
+The included `autumn.toml` configures the Stripe base URL via
+`[http.client.base_urls]` so `client.named("stripe")` resolves relative paths
+like `/v1/charges` to the correct host.
+
 ## Quick start
 
 Run the server:

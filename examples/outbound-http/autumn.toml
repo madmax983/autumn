@@ -1,0 +1,2 @@
+[http.client.base_urls]
+stripe = "https://api.stripe.com"
