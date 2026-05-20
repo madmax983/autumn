@@ -989,14 +989,22 @@ async fn run_job_handler(
         .extension::<Arc<dyn crate::interceptor::JobInterceptor>>()
         .map(|arc| (*arc).clone());
 
-    let future_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        (handler)(state.clone(), payload.clone())
-    }));
+    let payload_for_handler = payload.clone();
+    // Defer the handler invocation into a lazy Pin<Box<dyn Future>>
+    let next = Box::pin(async move {
+        let future_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            (handler)(state, payload_for_handler)
+        }));
 
-    let next = match future_res {
-        Ok(future) => future,
-        Err(panic) => return JobExecutionOutcome::Panicked(format_job_panic(panic.as_ref())),
-    };
+        let future = match future_res {
+            Ok(f) => f,
+            Err(panic) => {
+                std::panic::resume_unwind(panic);
+            }
+        };
+
+        future.await
+    });
 
     let interceptor_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         if let Some(interceptor) = &interceptor {
@@ -4682,6 +4690,74 @@ mod tests {
                 "job handler panicked: interceptor execution setup panicked".to_string()
             )
         );
+    }
+
+    #[tokio::test]
+    async fn run_job_handler_interceptor_short_circuit_prevents_sync_execution() {
+        struct ShortCircuitInterceptor;
+        impl crate::interceptor::JobInterceptor for ShortCircuitInterceptor {
+            fn intercept_enqueue<'a>(
+                &'a self,
+                _name: &'a str,
+                _payload: &'a serde_json::Value,
+                next: std::pin::Pin<
+                    Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send + 'a>,
+                >,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send + 'a>,
+            > {
+                next
+            }
+
+            fn intercept_execute<'a>(
+                &'a self,
+                _name: &'a str,
+                _payload: &'a serde_json::Value,
+                _next: std::pin::Pin<
+                    Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send + 'a>,
+                >,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send + 'a>,
+            > {
+                Box::pin(async move {
+                    Err(crate::AutumnError::bad_request_msg(
+                        "blocked by interceptor",
+                    ))
+                })
+            }
+        }
+
+        static SYNC_CALLS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+        fn side_effect_handler(
+            _state: AppState,
+            _payload: Value,
+        ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'static>> {
+            SYNC_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move { Ok(()) })
+        }
+
+        let state = AppState::for_test().with_profile("dev");
+        state.insert_extension(
+            Arc::new(ShortCircuitInterceptor) as Arc<dyn crate::interceptor::JobInterceptor>
+        );
+
+        SYNC_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
+
+        let outcome = run_job_handler(
+            "test_job",
+            side_effect_handler,
+            state,
+            serde_json::json!({}),
+        )
+        .await;
+
+        assert_eq!(
+            outcome,
+            JobExecutionOutcome::Failed("blocked by interceptor".to_string())
+        );
+
+        assert_eq!(SYNC_CALLS.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
