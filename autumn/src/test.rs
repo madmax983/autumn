@@ -460,7 +460,7 @@ impl TestApp {
         crate::cache::clear_global_cache();
 
         let probes = crate::probe::ProbeState::ready_for_test();
-        let mut state = AppState {
+        let state = AppState {
             extensions: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),

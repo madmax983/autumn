@@ -26,6 +26,7 @@
 //! ```
 
 use axum::extract::FromRequestParts;
+use diesel;
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::deadpool::Pool;
@@ -220,6 +221,191 @@ pub trait DbState {
     ) -> Vec<std::sync::Arc<dyn crate::interceptor::DbConnectionInterceptor>> {
         Vec::new()
     }
+
+    /// Returns the global statement timeout, if configured.
+    fn statement_timeout(&self) -> Option<std::time::Duration> {
+        None
+    }
+
+    /// Returns the slow query threshold.
+    fn slow_query_threshold(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(500)
+    }
+}
+
+// ── SQL telemetry helpers ─────────────────────────────────────────────────────
+
+/// Scrub a SQL string to remove literal parameter values.
+///
+/// Replaces values with `?` placeholders to prevent PII leakage in
+/// slow-query logs while still surfacing the query shape for performance
+/// analysis.
+///
+/// Rules:
+/// - Single-quoted string literals `'...'` → `'?'`
+/// - Unquoted integer/float literals → `?`
+/// - Postgres `$N` positional parameters are left untouched
+///
+/// # Examples
+///
+/// ```
+/// use autumn_web::db::scrub_sql;
+///
+/// assert_eq!(scrub_sql("SELECT * FROM users WHERE name = 'Alice'"),
+///            "SELECT * FROM users WHERE name = '?'");
+/// assert_eq!(scrub_sql("SELECT * FROM orders WHERE id = 42"),
+///            "SELECT * FROM orders WHERE id = ?");
+/// assert_eq!(scrub_sql("SELECT * FROM t WHERE x = $1"),
+///            "SELECT * FROM t WHERE x = $1");
+/// ```
+#[must_use]
+pub fn scrub_sql(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        // Single-quoted string literal
+        if bytes[i] == b'\'' {
+            out.push_str("'?'");
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'\'' {
+                    // Handle escaped single quotes ('')
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                        i += 2;
+                    } else {
+                        i += 1;
+                        break;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            continue;
+        }
+
+        // Postgres $N positional parameter — pass through unchanged
+        if bytes[i] == b'$' {
+            out.push('$');
+            i += 1;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                out.push(bytes[i] as char);
+                i += 1;
+            }
+            continue;
+        }
+
+        // Unquoted numeric literal (integer or decimal) — only replace when
+        // preceded by whitespace, `=`, `(`, or `,` to avoid stomping on
+        // identifiers like `table1` or column aliases.
+        if bytes[i].is_ascii_digit() {
+            let prev_is_separator = i == 0 || {
+                let p = bytes[i - 1];
+                p == b' ' || p == b'\t' || p == b'\n' || p == b'=' || p == b'(' || p == b','
+            };
+            if prev_is_separator {
+                out.push('?');
+                while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
+                    i += 1;
+                }
+                continue;
+            }
+        }
+
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+
+    out
+}
+
+/// Postgres `SQLState` code for "`query_canceled`" (`statement_timeout` exceeded).
+const PG_SQLSTATE_QUERY_CANCELED: &str = "57014";
+
+/// Instrument a database query: time it, log slow queries with a scrubbed SQL
+/// fingerprint, record metrics, and map Postgres `57014` (statement timeout)
+/// to [`AutumnError::query_timeout`].
+///
+/// # Parameters
+/// - `sql`: The raw SQL string for slow-query fingerprinting (scrubbed before logging).
+/// - `route_key`: Label string used for metrics, e.g. `"GET /users"`.
+/// - `slow_threshold`: Queries taking longer than this emit a `WARN` log.
+/// - `metrics`: The [`crate::middleware::MetricsCollector`] to record into.
+/// - `query`: The async closure that actually executes the query.
+///
+/// # Returns
+/// The result of `query()`, with Postgres `57014` mapped to
+/// [`AutumnError::query_timeout`].
+///
+/// # Errors
+/// Returns [`AutumnError`] from the underlying query, or [`AutumnError::query_timeout`]
+/// when Postgres cancels the statement due to `statement_timeout`.
+pub async fn run_instrumented<F, Fut, T>(
+    sql: &str,
+    route_key: &str,
+    slow_threshold: std::time::Duration,
+    metrics: &crate::middleware::metrics::MetricsCollector,
+    query: F,
+) -> Result<T, AutumnError>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<T, diesel::result::Error>>,
+{
+    let start = std::time::Instant::now();
+    let result = query().await;
+    let elapsed = start.elapsed();
+    let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+
+    // Record metrics regardless of success/failure
+    let verb = sql.split_whitespace().next().unwrap_or("?");
+    let metric_key = format!("{route_key} {verb}");
+    metrics.record_db_query(&metric_key, elapsed_ms);
+
+    // Log slow queries with scrubbed SQL
+    if elapsed >= slow_threshold {
+        let fingerprint = scrub_sql(sql);
+        tracing::warn!(
+            route = %route_key,
+            sql = %fingerprint,
+            duration_ms = elapsed_ms,
+            "slow database query"
+        );
+    }
+
+    // Map result — translate Postgres 57014 to query_timeout
+    result.map_err(|db_err| {
+        if is_query_canceled(&db_err) {
+            tracing::warn!(
+                route = %route_key,
+                duration_ms = elapsed_ms,
+                "database query cancelled: statement_timeout exceeded"
+            );
+            AutumnError::query_timeout(format!(
+                "Database query timed out after {elapsed_ms}ms (statement_timeout exceeded)"
+            ))
+        } else {
+            AutumnError::from(db_err)
+        }
+    })
+}
+
+/// Check whether a Diesel error wraps a Postgres `57014` `query_canceled` error.
+fn is_query_canceled(err: &diesel::result::Error) -> bool {
+    // Walk the source chain looking for a tokio_postgres::Error with code 57014
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(err);
+
+    while let Some(e) = source {
+        let msg = e.to_string();
+        if msg.contains(PG_SQLSTATE_QUERY_CANCELED)
+            || msg.contains("query_canceled")
+            || msg.contains("statement timeout")
+        {
+            return true;
+        }
+        source = e.source();
+    }
+    false
 }
 
 /// Error type for pool creation failures.
@@ -395,6 +581,10 @@ impl Drop for TxDepthGuard<'_> {
 ///     Ok("database is reachable")
 /// }
 /// ```
+/// Extension/extractor struct for route-level statement timeout override.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StatementTimeout(pub std::time::Duration);
+
 pub struct Db {
     conn: PooledConnection,
     /// Span covering the full checkout-to-release window. Dropped when
@@ -539,9 +729,11 @@ where
     type Rejection = AutumnError;
 
     async fn from_request_parts(
-        _parts: &mut axum::http::request::Parts,
+        parts: &mut axum::http::request::Parts,
         state: &S,
     ) -> Result<Self, Self::Rejection> {
+        use diesel_async::RunQueryDsl as _;
+
         let pool = state
             .pool()
             .ok_or_else(|| AutumnError::service_unavailable_msg("Database not configured"))?;
@@ -576,7 +768,21 @@ where
             checkout_future = interceptor.intercept_checkout(ctx, checkout_future);
         }
 
-        let conn = checkout_future.instrument(span.clone()).await?;
+        let mut conn = checkout_future.instrument(span.clone()).await?;
+
+        let timeout_override = parts.extensions.get::<StatementTimeout>().copied();
+        let timeout_ms = timeout_override
+            .map(|t| t.0)
+            .or_else(|| state.statement_timeout())
+            .map_or(0u64, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+
+        diesel::sql_query(format!("SET statement_timeout = {timeout_ms}"))
+            .execute(&mut conn)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to set database statement_timeout to {timeout_ms}ms: {e}");
+                AutumnError::service_unavailable_msg(format!("Database initialization error: {e}"))
+            })?;
 
         Ok(Self {
             conn,
@@ -1218,5 +1424,61 @@ mod tests {
             new_topology.replica().is_some(),
             "from_pools must preserve the replica pool"
         );
+    }
+
+    // ── scrub_sql tests ───────────────────────────────────────────────────────
+
+    #[test]
+    fn scrub_sql_strips_string_literals() {
+        assert_eq!(
+            super::scrub_sql("SELECT * FROM users WHERE name = 'Alice'"),
+            "SELECT * FROM users WHERE name = '?'"
+        );
+    }
+
+    #[test]
+    fn scrub_sql_strips_numeric_literals() {
+        assert_eq!(
+            super::scrub_sql("SELECT * FROM orders WHERE id = 42"),
+            "SELECT * FROM orders WHERE id = ?"
+        );
+    }
+
+    #[test]
+    fn scrub_sql_preserves_pg_positional_params() {
+        assert_eq!(
+            super::scrub_sql("SELECT * FROM t WHERE x = $1 AND y = $2"),
+            "SELECT * FROM t WHERE x = $1 AND y = $2"
+        );
+    }
+
+    #[test]
+    fn scrub_sql_does_not_stomp_identifiers() {
+        // "table1" should not be replaced because it's not preceded by a separator
+        assert_eq!(
+            super::scrub_sql("SELECT * FROM table1 WHERE active = true"),
+            "SELECT * FROM table1 WHERE active = true"
+        );
+    }
+
+    #[test]
+    fn scrub_sql_multiple_literals_in_one_query() {
+        assert_eq!(
+            super::scrub_sql("INSERT INTO users (name, age) VALUES ('Bob', 30)"),
+            "INSERT INTO users (name, age) VALUES ('?', ?)"
+        );
+    }
+
+    #[test]
+    fn scrub_sql_handles_escaped_single_quotes() {
+        assert_eq!(
+            super::scrub_sql("SELECT * FROM t WHERE s = 'it''s a test'"),
+            "SELECT * FROM t WHERE s = '?'"
+        );
+    }
+
+    #[test]
+    fn scrub_sql_empty_string() {
+        assert_eq!(super::scrub_sql(""), "");
     }
 }

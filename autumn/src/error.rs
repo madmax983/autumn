@@ -520,6 +520,32 @@ impl AutumnError {
         Self::conflict(StringError(msg.into()))
     }
 
+    /// Create a `503 Service Unavailable` error indicating that a database
+    /// query was cancelled due to a statement timeout (Postgres `57014`).
+    ///
+    /// The problem details payload carries `"autumn.query_timeout"` as the
+    /// machine-readable code, which allows clients to distinguish a transient
+    /// timeout from other 503 conditions and apply appropriate retry logic.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use autumn_web::error::AutumnError;
+    /// use http::StatusCode;
+    ///
+    /// let err = AutumnError::query_timeout("query exceeded statement_timeout");
+    /// assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
+    /// ```
+    pub fn query_timeout(msg: impl Into<String>) -> Self {
+        Self {
+            inner: Box::new(StringError(msg.into())),
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            details: None,
+            problem_type: Some("https://autumn.dev/problems/query-timeout"),
+            cache_idempotency_response: false,
+        }
+    }
+
     /// Returns the HTTP status code associated with this error.
     ///
     /// # Examples
@@ -610,6 +636,20 @@ pub(crate) fn problem_details(
         detail
     };
 
+    // When an explicit problem type URI is provided, derive the machine-readable
+    // code from its path segment (last path component, hyphens → underscores,
+    // prefixed with "autumn."). This avoids having to enumerate every error type
+    // in a separate match table.
+    //
+    // Example: "https://autumn.dev/problems/query-timeout" → "autumn.query_timeout"
+    let code = explicit_type.map_or_else(
+        || problem_code_for(status, has_validation_errors).to_owned(),
+        |etype| {
+            let slug = etype.rsplit('/').next().unwrap_or(etype);
+            format!("autumn.{}", slug.replace('-', "_"))
+        },
+    );
+
     ProblemDetails {
         type_uri: explicit_type
             .unwrap_or_else(|| problem_type_for(status, has_validation_errors))
@@ -618,7 +658,7 @@ pub(crate) fn problem_details(
         status: status.as_u16(),
         detail: safe_detail,
         instance,
-        code: problem_code_for(status, has_validation_errors).to_owned(),
+        code,
         request_id,
         errors: validation_errors(details),
     }

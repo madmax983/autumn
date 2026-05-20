@@ -2339,6 +2339,17 @@ pub struct DatabaseConfig {
     /// explicit migration job (`autumn migrate`) instead.
     #[serde(default)]
     pub auto_migrate_in_production: bool,
+
+    /// Optional database statement timeout.
+    #[serde(deserialize_with = "deserialize_option_duration", default)]
+    pub statement_timeout: Option<std::time::Duration>,
+
+    /// Slow query threshold. Default: `500ms`.
+    #[serde(
+        deserialize_with = "deserialize_duration",
+        default = "default_slow_query_threshold"
+    )]
+    pub slow_query_threshold: std::time::Duration,
 }
 
 impl DatabaseConfig {
@@ -2856,6 +2867,8 @@ impl Default for DatabaseConfig {
             replica_fallback: ReplicaFallback::default(),
             connect_timeout_secs: default_connect_timeout(),
             auto_migrate_in_production: false,
+            statement_timeout: None,
+            slow_query_threshold: default_slow_query_threshold(),
         }
     }
 }
@@ -2957,6 +2970,105 @@ impl ConfigLoader for TomlEnvConfigLoader {
     async fn load(&self) -> Result<AutumnConfig, ConfigError> {
         AutumnConfig::load_with_env(&OsEnv)
     }
+}
+
+const fn default_slow_query_threshold() -> std::time::Duration {
+    std::time::Duration::from_millis(500)
+}
+
+/// Parses a duration string like "500ms", "5s", "2m", "1h",
+/// or a plain integer representing milliseconds.
+///
+/// # Errors
+/// Returns a `String` describing the parse failure when the input is empty,
+/// has an unrecognised suffix, or contains a non-numeric value.
+pub fn parse_duration_str(s: &str) -> Result<std::time::Duration, String> {
+    if s.is_empty() {
+        return Err("duration string is empty".to_owned());
+    }
+
+    // Check if it's a plain integer
+    if let Ok(ms) = s.parse::<u64>() {
+        return Ok(std::time::Duration::from_millis(ms));
+    }
+
+    // Try parsing suffix
+    if let Some(val_str) = s.strip_suffix("ms") {
+        let val = val_str
+            .parse::<u64>()
+            .map_err(|e| format!("invalid duration integer: {e}"))?;
+        return Ok(std::time::Duration::from_millis(val));
+    }
+
+    if let Some(val_str) = s.strip_suffix('s') {
+        let val = val_str
+            .parse::<u64>()
+            .map_err(|e| format!("invalid duration integer: {e}"))?;
+        return Ok(std::time::Duration::from_secs(val));
+    }
+
+    if let Some(val_str) = s.strip_suffix('m') {
+        let val = val_str
+            .parse::<u64>()
+            .map_err(|e| format!("invalid duration integer: {e}"))?;
+        return Ok(std::time::Duration::from_secs(val * 60));
+    }
+
+    if let Some(val_str) = s.strip_suffix('h') {
+        let val = val_str
+            .parse::<u64>()
+            .map_err(|e| format!("invalid duration integer: {e}"))?;
+        return Ok(std::time::Duration::from_secs(val * 3600));
+    }
+
+    Err(format!("invalid duration format: '{s}'"))
+}
+
+/// Deserialises a TOML/JSON value into a [`std::time::Duration`].
+///
+/// Accepts either a string (`"500ms"`, `"5s"`, `"2m"`, `"1h"`) or a bare
+/// integer (interpreted as milliseconds).
+///
+/// # Errors
+/// Returns a deserialisation error if the value is not a valid duration.
+pub fn deserialize_duration<'de, D>(deserializer: D) -> Result<std::time::Duration, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum DurationOrStr {
+        String(String),
+        Integer(u64),
+    }
+
+    match DurationOrStr::deserialize(deserializer)? {
+        DurationOrStr::String(s) => parse_duration_str(&s).map_err(serde::de::Error::custom),
+        DurationOrStr::Integer(i) => Ok(std::time::Duration::from_millis(i)),
+    }
+}
+
+/// Deserialises an optional TOML/JSON value into <code>Option&lt;[std::time::Duration]&gt;</code>.
+///
+/// Accepts either a string (`"500ms"`, `"5s"`, `"2m"`, `"1h"`), a bare
+/// integer (milliseconds), or `null`/absent to mean no timeout.
+///
+/// # Errors
+/// Returns a deserialisation error if the value is present but invalid.
+pub fn deserialize_option_duration<'de, D>(
+    deserializer: D,
+) -> Result<Option<std::time::Duration>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    struct Wrapper(#[serde(deserialize_with = "deserialize_duration")] std::time::Duration);
+
+    Option::<Wrapper>::deserialize(deserializer).map(|opt| opt.map(|w| w.0))
 }
 
 #[cfg(test)]
@@ -5106,5 +5218,57 @@ path = "/api-spec.json"
             matches!(err, ConfigError::Credentials(_)),
             "bad master key should produce ConfigError::Credentials, got {err:?}"
         );
+    }
+
+    #[test]
+    fn test_parse_duration_str() {
+        assert_eq!(
+            parse_duration_str("500ms").unwrap(),
+            std::time::Duration::from_millis(500)
+        );
+        assert_eq!(
+            parse_duration_str("5s").unwrap(),
+            std::time::Duration::from_secs(5)
+        );
+        assert_eq!(
+            parse_duration_str("2m").unwrap(),
+            std::time::Duration::from_secs(120)
+        );
+        assert_eq!(
+            parse_duration_str("1h").unwrap(),
+            std::time::Duration::from_secs(3600)
+        );
+        assert_eq!(
+            parse_duration_str("1000").unwrap(),
+            std::time::Duration::from_millis(1000)
+        );
+        assert!(parse_duration_str("abc").is_err());
+        assert!(parse_duration_str("").is_err());
+    }
+
+    #[test]
+    fn test_database_config_duration_deserialization() {
+        #[derive(Debug, Deserialize)]
+        struct TestConfig {
+            #[serde(deserialize_with = "deserialize_option_duration", default)]
+            timeout: Option<std::time::Duration>,
+            #[serde(deserialize_with = "deserialize_duration")]
+            threshold: std::time::Duration,
+        }
+
+        let toml_str = r#"
+            timeout = "2s"
+            threshold = "100ms"
+        "#;
+        let parsed: TestConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(parsed.timeout, Some(std::time::Duration::from_secs(2)));
+        assert_eq!(parsed.threshold, std::time::Duration::from_millis(100));
+
+        let toml_str_null = r#"
+            threshold = "500"
+        "#;
+        let parsed_null: TestConfig = toml::from_str(toml_str_null).unwrap();
+        assert_eq!(parsed_null.timeout, None);
+        assert_eq!(parsed_null.threshold, std::time::Duration::from_millis(500));
     }
 }

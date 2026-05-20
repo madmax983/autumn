@@ -29,6 +29,7 @@ pub struct MetricsCollector {
 #[derive(Debug, Default)]
 struct Shard {
     by_route: HashMap<String, RouteMetrics>,
+    by_query: HashMap<String, RouteMetrics>,
 }
 
 #[derive(Debug)]
@@ -235,6 +236,26 @@ impl MetricsCollector {
         }
     }
 
+    /// Record a database query's duration.
+    pub fn record_db_query(&self, key: &str, latency_ms: u64) {
+        // Hash key to determine shard index using FNV-1a
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in key.bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0100_0000_01b3);
+        }
+        let shard_idx = usize::try_from(hash % (SHARD_COUNT as u64)).unwrap_or_default();
+
+        if let Ok(mut shard) = self.inner.shards[shard_idx].write() {
+            let entry = shard.by_query.entry(key.to_owned()).or_default();
+            entry.count += 1;
+            if entry.latencies_ms.len() >= MAX_LATENCY_SAMPLES {
+                entry.latencies_ms.pop_front();
+            }
+            entry.latencies_ms.push_back(latency_ms);
+        }
+    }
+
     fn increment_active(&self) {
         self.inner.requests_active.fetch_add(1, Ordering::Relaxed);
     }
@@ -254,6 +275,7 @@ impl MetricsCollector {
             .unwrap_or_default();
 
         let mut by_route = HashMap::new();
+        let mut db_queries = HashMap::new();
         for shard_lock in &self.inner.shards {
             if let Ok(shard) = shard_lock.read() {
                 for (k, v) in &shard.by_route {
@@ -261,6 +283,18 @@ impl MetricsCollector {
                     by_route.insert(
                         k.clone(),
                         RouteSnapshot {
+                            count: v.count,
+                            p50_ms: pcts.p50,
+                            p95_ms: pcts.p95,
+                            p99_ms: pcts.p99,
+                        },
+                    );
+                }
+                for (k, v) in &shard.by_query {
+                    let pcts = compute_percentiles(&v.latencies_ms);
+                    db_queries.insert(
+                        k.clone(),
+                        DbQueryMetric {
                             count: v.count,
                             p50_ms: pcts.p50,
                             p95_ms: pcts.p95,
@@ -297,6 +331,7 @@ impl MetricsCollector {
                 misses: self.inner.idempotency_misses.load(Ordering::Relaxed),
                 conflicts: self.inner.idempotency_conflicts.load(Ordering::Relaxed),
             },
+            db_queries,
         }
     }
 }
@@ -307,6 +342,15 @@ impl Default for MetricsCollector {
     }
 }
 
+/// Serializable DB query snapshot returned in the `/actuator/metrics` JSON object under "`db_queries`".
+#[derive(Serialize, Clone, Debug)]
+pub struct DbQueryMetric {
+    pub count: u64,
+    pub p50_ms: u64,
+    pub p95_ms: u64,
+    pub p99_ms: u64,
+}
+
 /// Serializable metrics snapshot returned by `/actuator/metrics`.
 #[derive(Serialize)]
 pub struct MetricsSnapshot {
@@ -314,6 +358,9 @@ pub struct MetricsSnapshot {
     pub http: HttpMetrics,
     /// Idempotency-key middleware counters (zero when middleware is not enabled).
     pub idempotency: IdempotencyMetricsSnapshot,
+    /// Database queries tracked.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub db_queries: HashMap<String, DbQueryMetric>,
 }
 
 /// Idempotency-key middleware counters.

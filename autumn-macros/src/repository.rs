@@ -204,7 +204,8 @@ fn generate_derived_query(
     match query.prefix.as_str() {
         "find" => {
             quote! {
-                let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                let mut conn = self.__autumn_acquire_conn().await?;
+
                 #table_ident::table
                     #(#filters)*
                     #soft_delete_filter
@@ -215,7 +216,8 @@ fn generate_derived_query(
         }
         "count" => {
             quote! {
-                let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                let mut conn = self.__autumn_acquire_conn().await?;
+
                 #table_ident::table
                     #(#filters)*
                     #soft_delete_filter
@@ -229,7 +231,7 @@ fn generate_derived_query(
             if soft_delete {
                 quote! {
                     let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
-                    let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                    let mut conn = self.__autumn_acquire_conn().await?;
                     ::autumn_web::reexports::diesel::update(
                         #table_ident::table #(#filters)* .filter(#table_ident::deleted_at.is_null())
                     )
@@ -241,8 +243,9 @@ fn generate_derived_query(
                 }
             } else {
                 quote! {
-                    let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                    let mut conn = self.__autumn_acquire_conn().await?;
                     ::autumn_web::reexports::diesel::delete(#table_ident::table #(#filters)*)
+
                         .execute(&mut conn)
                         .await
                         .map_err(::autumn_web::AutumnError::from)?;
@@ -252,7 +255,8 @@ fn generate_derived_query(
         }
         "exists" => {
             quote! {
-                let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                let mut conn = self.__autumn_acquire_conn().await?;
+
                 ::autumn_web::reexports::diesel::select(
                     ::autumn_web::reexports::diesel::dsl::exists(
                         #table_ident::table #(#filters)* #soft_delete_filter
@@ -401,6 +405,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             >,
             hooks: #hooks_ident,
             #idempotency_struct_field
+            /// Statement timeout to apply on every connection checkout (ms). 0 = no limit.
+            __autumn_statement_timeout_ms: u64,
+            /// Slow-query logging threshold.
+            __autumn_slow_threshold: ::std::time::Duration,
+            /// Route path from `MatchedPath` for metrics labels.
+            __autumn_route: ::std::option::Option<::std::string::String>,
         };
 
         let clone_impl = quote! {
@@ -410,6 +420,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         pool: self.pool.clone(),
                         hooks: <#hooks_ident as ::autumn_web::hooks::RepositoryHooksClone>::autumn_clone(&self.hooks),
                         #idempotency_clone_field
+                        __autumn_statement_timeout_ms: self.__autumn_statement_timeout_ms,
+                        __autumn_slow_threshold: self.__autumn_slow_threshold,
+                        __autumn_route: self.__autumn_route.clone(),
                     }
                 }
             }
@@ -418,6 +431,17 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         let extractor_init = if commit_hooks_enabled {
             quote! {
                 #pg_name::__autumn_register_repository_commit_hooks();
+                let __autumn_timeout_ms = _parts
+                    .extensions
+                    .get::<::autumn_web::db::StatementTimeout>()
+                    .map(|t| t.0.as_millis() as u64)
+                    .or_else(|| state.statement_timeout().map(|d| d.as_millis() as u64))
+                    .unwrap_or(0u64);
+                let __autumn_slow_threshold = state.slow_query_threshold();
+                let __autumn_route = _parts
+                    .extensions
+                    .get::<::autumn_web::reexports::axum::extract::MatchedPath>()
+                    .map(|p| p.as_str().to_owned());
                 Ok(#pg_name {
                     pool,
                     hooks: <#hooks_ident as ::autumn_web::hooks::RepositoryHooksDefault>::autumn_default(),
@@ -425,13 +449,30 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         .extensions
                         .get::<::autumn_web::idempotency::IdempotencyContext>()
                         .cloned(),
+                    __autumn_statement_timeout_ms: __autumn_timeout_ms,
+                    __autumn_slow_threshold,
+                    __autumn_route,
                 })
             }
         } else {
             quote! {
+                let __autumn_timeout_ms = _parts
+                    .extensions
+                    .get::<::autumn_web::db::StatementTimeout>()
+                    .map(|t| t.0.as_millis() as u64)
+                    .or_else(|| state.statement_timeout().map(|d| d.as_millis() as u64))
+                    .unwrap_or(0u64);
+                let __autumn_slow_threshold = state.slow_query_threshold();
+                let __autumn_route = _parts
+                    .extensions
+                    .get::<::autumn_web::reexports::axum::extract::MatchedPath>()
+                    .map(|p| p.as_str().to_owned());
                 Ok(#pg_name {
                     pool,
                     hooks: <#hooks_ident as ::autumn_web::hooks::RepositoryHooksDefault>::autumn_default(),
+                    __autumn_statement_timeout_ms: __autumn_timeout_ms,
+                    __autumn_slow_threshold,
+                    __autumn_route,
                 })
             }
         };
@@ -546,7 +587,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 use ::autumn_web::hooks::{MutationContext, MutationOp, MutationHooks};
 
             Self::__autumn_register_repository_commit_hooks();
-            let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+            let mut conn = self.__autumn_acquire_conn().await?;
             let (record, mut ctx, __autumn_commit_hook_id, __autumn_commit_hook_owner, __autumn_commit_hook_record) = conn
                 .transaction::<(#model_name, MutationContext, ::std::string::String, ::std::string::String, ::autumn_web::reexports::serde_json::Value), ::autumn_web::AutumnError, _>(|conn| {
                     async move {
@@ -667,7 +708,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
                 use ::autumn_web::hooks::{MutationContext, MutationOp, MutationHooks};
 
-                let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                let mut conn = self.__autumn_acquire_conn().await?;
                 let (record, mut ctx) = conn
                     .transaction::<(#model_name, MutationContext), ::autumn_web::AutumnError, _>(|conn| {
                         async move {
@@ -706,7 +747,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             use ::autumn_web::repository::{AutumnLockVersionModelExt as _, AutumnLockVersionUpdateExt as _};
 
             Self::__autumn_register_repository_commit_hooks();
-            let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+            let mut conn = self.__autumn_acquire_conn().await?;
             let (record, mut ctx, __autumn_commit_hook_id, __autumn_commit_hook_owner, __autumn_commit_hook_record) = conn
                 .transaction::<(#model_name, MutationContext, ::std::string::String, ::std::string::String, ::autumn_web::reexports::serde_json::Value), ::autumn_web::AutumnError, _>(|conn| {
                     async move {
@@ -880,7 +921,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 use ::autumn_web::hooks::{MutationContext, MutationOp, MutationHooks, UpdateDraft};
                 use ::autumn_web::repository::{AutumnLockVersionModelExt as _, AutumnLockVersionUpdateExt as _};
 
-                let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                let mut conn = self.__autumn_acquire_conn().await?;
                 let (record, mut ctx) = conn
                     .transaction::<(#model_name, MutationContext), ::autumn_web::AutumnError, _>(|conn| {
                         async move {
@@ -1001,7 +1042,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 use ::autumn_web::hooks::{MutationContext, MutationOp, MutationHooks};
 
             Self::__autumn_register_repository_commit_hooks();
-            let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+            let mut conn = self.__autumn_acquire_conn().await?;
             conn
                 .transaction::<(), ::autumn_web::AutumnError, _>(|conn| {
                     async move {
@@ -1063,7 +1104,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
                 use ::autumn_web::hooks::{MutationContext, MutationOp, MutationHooks};
 
-                let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                let mut conn = self.__autumn_acquire_conn().await?;
                 conn
                     .transaction::<(), ::autumn_web::AutumnError, _>(|conn| {
                         async move {
@@ -1112,6 +1153,13 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             pool: ::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Pool<
                 ::autumn_web::reexports::diesel_async::AsyncPgConnection,
             >,
+            /// Statement timeout to apply on every connection checkout (ms).
+            /// `0` means no timeout (Postgres default).
+            __autumn_statement_timeout_ms: u64,
+            /// Slow-query logging threshold.
+            __autumn_slow_threshold: ::std::time::Duration,
+            /// Route path from `MatchedPath` for metrics labels.
+            __autumn_route: ::std::option::Option<::std::string::String>,
         };
 
         let clone_impl = quote! {
@@ -1119,19 +1167,38 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 fn clone(&self) -> Self {
                     Self {
                         pool: self.pool.clone(),
+                        __autumn_statement_timeout_ms: self.__autumn_statement_timeout_ms,
+                        __autumn_slow_threshold: self.__autumn_slow_threshold,
+                        __autumn_route: self.__autumn_route.clone(),
                     }
                 }
             }
         };
 
         let extractor_init = quote! {
-            Ok(#pg_name { pool })
+            let __autumn_timeout_ms = _parts
+                .extensions
+                .get::<::autumn_web::db::StatementTimeout>()
+                .map(|t| t.0.as_millis() as u64)
+                .or_else(|| state.statement_timeout().map(|d| d.as_millis() as u64))
+                .unwrap_or(0u64);
+            let __autumn_slow_threshold = state.slow_query_threshold();
+            let __autumn_route = _parts
+                .extensions
+                .get::<::autumn_web::reexports::axum::extract::MatchedPath>()
+                .map(|p| p.as_str().to_owned());
+            Ok(#pg_name {
+                pool,
+                __autumn_statement_timeout_ms: __autumn_timeout_ms,
+                __autumn_slow_threshold,
+                __autumn_route,
+            })
         };
 
         let save_body = quote! {
             use ::autumn_web::reexports::diesel::prelude::*;
             use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-            let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+            let mut conn = self.__autumn_acquire_conn().await?;
             ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                 .values(new)
                 .get_result::<#model_name>(&mut conn)
@@ -1143,7 +1210,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             use ::autumn_web::reexports::diesel::prelude::*;
             use ::autumn_web::reexports::diesel_async::RunQueryDsl;
             use ::autumn_web::repository::{AutumnLockVersionModelExt as _, AutumnLockVersionUpdateExt as _};
-            let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+            let mut conn = self.__autumn_acquire_conn().await?;
 
             if let ::core::option::Option::Some(expected_version) =
                 changes.__autumn_lock_version_expected()
@@ -1206,7 +1273,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 use ::autumn_web::reexports::diesel::prelude::*;
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
                 let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
-                let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                let mut conn = self.__autumn_acquire_conn().await?;
+
                 let __count = ::autumn_web::reexports::diesel::update(
                     #table_ident::table.find(id).filter(#table_ident::deleted_at.is_null())
                 )
@@ -1225,8 +1293,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             quote! {
                 use ::autumn_web::reexports::diesel::prelude::*;
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                let mut conn = self.__autumn_acquire_conn().await?;
                 ::autumn_web::reexports::diesel::delete(#table_ident::table.find(id))
+
                     .execute(&mut conn)
                     .await
                     .map_err(::autumn_web::AutumnError::from)?;
@@ -1278,7 +1347,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         ) -> ::autumn_web::AutumnResult<::autumn_web::pagination::Page<#model_name>> {
             use ::autumn_web::reexports::diesel::prelude::*;
             use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-            let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+            let mut conn = self.__autumn_acquire_conn().await?;
+
             let total: i64 = #table_ident::table
                 #sd_filter
                 .count()
@@ -1336,7 +1406,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 ) -> ::autumn_web::AutumnResult<::autumn_web::pagination::CursorPage<#model_name>> {
                     use ::autumn_web::reexports::diesel::prelude::*;
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                    let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                    let mut conn = self.__autumn_acquire_conn().await?;
                     let mut query = #table_ident::table.into_boxed();
                     if let ::core::option::Option::Some((after_k, after_id)) =
                         req.decode::<(#key_type, i64)>()
@@ -1378,7 +1448,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 ) -> ::autumn_web::AutumnResult<::autumn_web::pagination::CursorPage<#model_name>> {
                     use ::autumn_web::reexports::diesel::prelude::*;
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                    let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                    let mut conn = self.__autumn_acquire_conn().await?;
                     let mut query = #table_ident::table.into_boxed();
                     if let ::core::option::Option::Some(after_id) = req.decode::<i64>() {
                         query = query.filter(#table_ident::id.lt(after_id));
@@ -2207,7 +2277,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             async fn restore(&self, id: i64) -> ::autumn_web::AutumnResult<()> {
                 use ::autumn_web::reexports::diesel::prelude::*;
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                let mut conn = self.__autumn_acquire_conn().await?;
                 let __count = ::autumn_web::reexports::diesel::update(#table_ident::table.find(id))
                     .set(#table_ident::deleted_at.eq(::core::option::Option::None::<::autumn_web::reexports::chrono::NaiveDateTime>))
                     .execute(&mut conn)
@@ -2224,7 +2294,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             async fn purge(&self, id: i64) -> ::autumn_web::AutumnResult<()> {
                 use ::autumn_web::reexports::diesel::prelude::*;
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                let mut conn = self.__autumn_acquire_conn().await?;
                 let __count = ::autumn_web::reexports::diesel::delete(#table_ident::table.find(id))
                     .execute(&mut conn)
                     .await
@@ -2240,7 +2310,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             async fn with_deleted(&self) -> ::autumn_web::AutumnResult<Vec<#model_name>> {
                 use ::autumn_web::reexports::diesel::prelude::*;
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                let mut conn = self.__autumn_acquire_conn().await?;
                 #table_ident::table
                     .load::<#model_name>(&mut conn)
                     .await
@@ -2250,7 +2320,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             async fn only_deleted(&self) -> ::autumn_web::AutumnResult<Vec<#model_name>> {
                 use ::autumn_web::reexports::diesel::prelude::*;
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                let mut conn = self.__autumn_acquire_conn().await?;
                 #table_ident::table
                     .filter(#table_ident::deleted_at.is_not_null())
                     .load::<#model_name>(&mut conn)
@@ -2264,7 +2334,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             ) -> ::autumn_web::AutumnResult<::autumn_web::pagination::Page<#model_name>> {
                 use ::autumn_web::reexports::diesel::prelude::*;
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                let mut conn = self.__autumn_acquire_conn().await?;
                 let total: i64 = #table_ident::table
                     .filter(#table_ident::deleted_at.is_not_null())
                     .count()
@@ -2337,7 +2407,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             async fn find_by_id(&self, id: i64) -> ::autumn_web::AutumnResult<Option<#model_name>> {
                 use ::autumn_web::reexports::diesel::prelude::*;
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                let mut conn = self.__autumn_acquire_conn().await?;
                 #table_ident::table
                     .find(id)
                     #sd_filter
@@ -2347,16 +2417,18 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     .map_err(::autumn_web::AutumnError::from)
             }
 
+
             async fn find_all(&self) -> ::autumn_web::AutumnResult<Vec<#model_name>> {
                 use ::autumn_web::reexports::diesel::prelude::*;
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                let mut conn = self.__autumn_acquire_conn().await?;
                 #table_ident::table
                     #sd_filter
                     .load::<#model_name>(&mut conn)
                     .await
                     .map_err(::autumn_web::AutumnError::from)
             }
+
 
             async fn save(&self, new: &#new_name) -> ::autumn_web::AutumnResult<#model_name> {
                 #save_body
@@ -2373,7 +2445,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             async fn count(&self) -> ::autumn_web::AutumnResult<i64> {
                 use ::autumn_web::reexports::diesel::prelude::*;
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                let mut conn = self.__autumn_acquire_conn().await?;
                 #table_ident::table
                     #sd_filter
                     .count()
@@ -2382,10 +2454,11 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     .map_err(::autumn_web::AutumnError::from)
             }
 
+
             async fn exists_by_id(&self, id: i64) -> ::autumn_web::AutumnResult<bool> {
                 use ::autumn_web::reexports::diesel::prelude::*;
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                let mut conn = self.__autumn_acquire_conn().await?;
                 ::autumn_web::reexports::diesel::select(
                     ::autumn_web::reexports::diesel::dsl::exists(
                         #table_ident::table.find(id) #sd_filter
@@ -2396,6 +2469,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 .map_err(::autumn_web::AutumnError::from)
             }
 
+
             #pagination_impl_method
             #cursor_page_impl_method
             #(#derived_impl_methods)*
@@ -2405,9 +2479,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         impl #pg_name {
             #hook_support_methods
 
-            /// Acquire a database connection from the repository's
-            /// pool. Used by `#[repository(scope = ...)]`-generated
-            /// list endpoints; not part of the public surface.
+            /// Acquire a database connection from the repository's pool, applying
+            /// the configured statement timeout (if any). Used by
+            /// `#[repository(scope = ...)]`-generated list endpoints and all CRUD
+            /// methods; not part of the public surface.
             #[doc(hidden)]
             pub async fn __autumn_acquire_conn(
                 &self,
@@ -2416,7 +2491,30 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     ::autumn_web::reexports::diesel_async::AsyncPgConnection,
                 >,
             > {
-                self.pool.get().await.map_err(::autumn_web::AutumnError::from)
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl as _;
+                let mut conn = self.__autumn_acquire_conn().await?;
+                let timeout_ms = self.__autumn_statement_timeout_ms;
+                ::autumn_web::reexports::diesel::sql_query(
+                    ::std::format!("SET statement_timeout = {timeout_ms}")
+                )
+                .execute(&mut conn)
+                .await
+                .map_err(|e| {
+                    ::autumn_web::reexports::tracing::error!(
+                        "repository: failed to set statement_timeout to {timeout_ms}ms: {e}"
+                    );
+                    ::autumn_web::AutumnError::service_unavailable_msg(
+                        ::std::format!("Database initialization error: {e}")
+                    )
+                })?;
+                ::core::result::Result::Ok(conn)
+            }
+
+            /// Returns the route label for metrics, e.g. `"GET /users"`.
+            #[doc(hidden)]
+            #[inline]
+            fn __autumn_route_label(&self) -> &str {
+                self.__autumn_route.as_deref().unwrap_or("unknown")
             }
 
             /// Pessimistic lock helper: SELECT FOR UPDATE the row with
@@ -2438,7 +2536,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 use ::autumn_web::reexports::diesel_async::AsyncConnection;
                 use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
 
-                let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                let mut conn = self.__autumn_acquire_conn().await?;
                 conn.transaction::<T, ::autumn_web::AutumnError, _>(|conn| {
                     async move {
                         let row = #table_ident::table
