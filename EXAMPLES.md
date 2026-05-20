@@ -157,6 +157,21 @@ blocks publishing `autumn-web` or `autumn-cli`.
 
 ---
 
+### `examples/outbound-http` - Traced Outbound HTTP Client
+
+<!-- catalog:example name=outbound-http tier=supported -->
+
+| Field | Value |
+|-------|-------|
+| **Persona** | Developer integrating third-party APIs (Stripe, SendGrid, etc.) |
+| **Journey** | Call an external HTTP API from a handler with automatic retries and trace propagation; assert call counts in integration tests using `TestApp::http_mock` |
+| **Key capabilities** | `Client` extractor, `[http.client]` config, `TestApp::http_mock`, `MockHandle::expect_called`, W3C trace propagation |
+| **Prerequisites** | Rust 1.88.0+ |
+| **Run command** | `cargo run -p outbound-http` |
+| **Success proof** | `cargo test -p outbound-http` passes all four mock-harness integration tests |
+
+---
+
 ### `examples/signed-webhooks` - Signed Webhook Intake
 
 <!-- catalog:example name=signed-webhooks tier=supported -->
