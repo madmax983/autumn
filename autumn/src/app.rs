@@ -2120,6 +2120,7 @@ impl AppBuilder {
             mail_previews,
             declared_routes: _,
             idempotency_enabled,
+            #[cfg(feature = "mail")]
             mail_interceptor,
             job_interceptor,
             #[cfg(feature = "db")]
