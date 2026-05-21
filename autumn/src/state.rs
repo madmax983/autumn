@@ -508,6 +508,10 @@ impl AppState {
 
 #[cfg(feature = "db")]
 impl DbState for AppState {
+    fn metrics(&self) -> Option<&crate::middleware::MetricsCollector> {
+        Some(&self.metrics)
+    }
+
     fn pool(
         &self,
     ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>

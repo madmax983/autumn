@@ -81,6 +81,7 @@ pub trait ChannelsInterceptor: Send + Sync + 'static {
 }
 
 #[cfg(feature = "oauth2")]
+#[allow(clippy::type_complexity)]
 pub trait HttpInterceptor: Send + Sync + 'static {
     fn intercept<'a>(
         &'a self,

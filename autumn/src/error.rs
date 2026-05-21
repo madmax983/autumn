@@ -783,10 +783,23 @@ fn server_error_detail(status: StatusCode) -> String {
 
 impl IntoResponse for AutumnError {
     fn into_response(self) -> Response {
-        let status = self.status;
+        let mut status = self.status;
         let message = self.inner.to_string();
+        let mut problem_type = self.problem_type;
+
+        // Automatically map database query cancellation (statement timeout) to 503 Service Unavailable
+        let err_str = message.to_lowercase();
+        if err_str.contains("57014")
+            || err_str.contains("query_canceled")
+            || err_str.contains("canceling statement due to statement timeout")
+            || err_str.contains("statement timeout")
+            || err_str.contains("query canceled")
+        {
+            status = StatusCode::SERVICE_UNAVAILABLE;
+            problem_type = Some("https://autumn.dev/problems/query-timeout");
+        }
+
         let details = self.details.clone();
-        let problem_type = self.problem_type;
         let cache_idempotency_response = self.cache_idempotency_response;
 
         // Stash error metadata for exception filters to inspect without

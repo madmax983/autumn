@@ -437,8 +437,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             let __autumn_timeout_ms: u64 = _parts
                 .extensions
                 .get::<::autumn_web::db::StatementTimeout>()
-                .map(|t| t.0.as_millis() as u64)
-                .or_else(|| state.statement_timeout().map(|d| d.as_millis() as u64))
+                .map(|t| ::std::convert::TryFrom::try_from(t.0.as_millis()).unwrap_or(u64::MAX))
+                .or_else(|| state.statement_timeout().map(|d| ::std::convert::TryFrom::try_from(d.as_millis()).unwrap_or(u64::MAX)))
                 .unwrap_or(0u64)
                 .min(__AUTUMN_PG_TIMEOUT_MAX_MS);
             let __autumn_slow_threshold = state.slow_query_threshold();
@@ -1182,8 +1182,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             let __autumn_timeout_ms: u64 = _parts
                 .extensions
                 .get::<::autumn_web::db::StatementTimeout>()
-                .map(|t| t.0.as_millis() as u64)
-                .or_else(|| state.statement_timeout().map(|d| d.as_millis() as u64))
+                .map(|t| ::std::convert::TryFrom::try_from(t.0.as_millis()).unwrap_or(u64::MAX))
+                .or_else(|| state.statement_timeout().map(|d| ::std::convert::TryFrom::try_from(d.as_millis()).unwrap_or(u64::MAX)))
                 .unwrap_or(0u64)
                 .min(__AUTUMN_PG_TIMEOUT_MAX_MS);
             let __autumn_slow_threshold = state.slow_query_threshold();

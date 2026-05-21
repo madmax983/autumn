@@ -80,6 +80,14 @@ mod db_telemetry_tests {
         Ok(Json(serde_json::json!({"status": "ok"})))
     }
 
+    #[get("/sleep-extreme")]
+    async fn sleep_extreme(mut db: Db) -> AutumnResult<Json<serde_json::Value>> {
+        diesel::sql_query("SELECT pg_sleep(0.1)")
+            .execute(&mut *db)
+            .await?;
+        Ok(Json(serde_json::json!({"status": "ok"})))
+    }
+
     // Helper to build test client with config
     fn build_client(
         pool: Pool<AsyncPgConnection>,
@@ -90,11 +98,17 @@ mod db_telemetry_tests {
         config.database.statement_timeout = statement_timeout;
         config.database.slow_query_threshold = slow_threshold;
 
-        let mut routes = routes![sleep_default, sleep_override, quick_query];
+        let mut routes = routes![sleep_default, sleep_override, quick_query, sleep_extreme];
         for r in &mut routes {
             if r.name == "sleep_override" {
                 r.handler = r.handler.clone().layer(::axum::Extension(StatementTimeout(
                     Duration::from_millis(100),
+                )));
+            } else if r.name == "sleep_extreme" {
+                r.handler = r.handler.clone().layer(::axum::Extension(StatementTimeout(
+                    Duration::from_millis(u64::MAX)
+                        .checked_add(Duration::from_millis(50))
+                        .unwrap(),
                 )));
             }
         }
@@ -170,5 +184,14 @@ mod db_telemetry_tests {
                     "Expected a metrics entry for GET /sleep-default"
                 );
             });
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn test_extreme_statement_timeout_clamping() {
+        let pool = setup().await;
+        let client = build_client(pool, None, Duration::from_millis(500));
+        let resp = client.get("/sleep-extreme").send().await;
+        resp.assert_ok();
     }
 }

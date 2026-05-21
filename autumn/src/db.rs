@@ -203,6 +203,11 @@ pub trait DbState {
     /// Returns the database connection pool, if configured.
     fn pool(&self) -> Option<&Pool<AsyncPgConnection>>;
 
+    /// Returns the metrics collector, if configured.
+    fn metrics(&self) -> Option<&crate::middleware::MetricsCollector> {
+        None
+    }
+
     /// Returns the read/replica connection pool, if configured.
     fn replica_pool(&self) -> Option<&Pool<AsyncPgConnection>> {
         None
@@ -265,7 +270,14 @@ pub trait DbState {
 fn consume_estring_body(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
     loop {
         match chars.next() {
-            None | Some('\'') => break,
+            None => break,
+            Some('\'') => {
+                if chars.peek() == Some(&'\'') {
+                    chars.next(); // consume the doubled quote
+                } else {
+                    break;
+                }
+            }
             Some('\\') => {
                 chars.next(); // skip the character after the backslash
             }
@@ -278,10 +290,7 @@ fn consume_estring_body(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
 ///
 /// Called after the opening `$tag$` delimiter has already been consumed.
 /// Uses a simple sliding-window match — sufficient for valid SQL.
-fn consume_dollar_quoted_body(
-    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
-    tag: &str,
-) {
+fn consume_dollar_quoted_body(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, tag: &str) {
     let closing: Vec<char> = format!("${tag}$").chars().collect();
     let clen = closing.len();
     let mut match_count = 0usize;
@@ -311,7 +320,7 @@ const fn is_separator(c: char) -> bool {
         | '=' | '<' | '>'          // comparison
         | '!' | '+' | '-'          // arithmetic / negation (signed literals)
         | '*' | '/' | '%'          // arithmetic operators
-        | '(' | ','               // structure
+        | '(' | ',' // structure
     )
 }
 
@@ -417,10 +426,18 @@ pub fn scrub_sql(sql: &str) -> String {
         // ── Unquoted numeric literal ──────────────────────────────────────
         // Only scrub when preceded by a separator to avoid stomping on
         // identifiers like `table1`, `col2`, or `alias99`.
-        if c.is_ascii_digit() && prev_is_sep {
+        let is_leading_dot =
+            c == '.' && prev_is_sep && chars.peek().is_some_and(char::is_ascii_digit);
+        if (c.is_ascii_digit() && prev_is_sep) || is_leading_dot {
             out.push('?');
-            // Consume integer/decimal digits.
-            while chars.peek().is_some_and(|d| d.is_ascii_digit() || *d == '.') {
+            if is_leading_dot {
+                chars.next(); // consume the leading dot
+            }
+            // Consume integer/decimal digits, underscores, and dots.
+            while chars
+                .peek()
+                .is_some_and(|d| d.is_ascii_digit() || *d == '.' || *d == '_')
+            {
                 chars.next();
             }
             // Consume optional scientific-notation exponent: e/E [+/-] <digits>.
@@ -518,14 +535,30 @@ where
 /// [`tokio_postgres::Error`] and checking its SQL state code directly,
 /// which is more robust than string-matching error messages.
 fn is_query_canceled(err: &diesel::result::Error) -> bool {
+    // Robust string-matching first to catch wrapped/unwrapped representations
+    let err_str = err.to_string().to_lowercase();
+    if err_str.contains("57014")
+        || err_str.contains("query_canceled")
+        || err_str.contains("canceling statement due to statement timeout")
+        || err_str.contains("statement timeout")
+        || err_str.contains("query canceled")
+    {
+        return true;
+    }
+
     let mut source: Option<&(dyn std::error::Error + 'static)> = Some(err);
 
     while let Some(e) = source {
-        // Prefer downcasting to tokio_postgres::Error so we can check the
-        // SQL state code directly rather than matching on message text.
+        // Try downcasting to tokio_postgres::Error
         if e.downcast_ref::<tokio_postgres::Error>()
             .and_then(|pg_err| pg_err.code())
             == Some(&tokio_postgres::error::SqlState::QUERY_CANCELED)
+        {
+            return true;
+        }
+        // Try downcasting to tokio_postgres::error::DbError
+        if e.downcast_ref::<tokio_postgres::error::DbError>()
+            .is_some_and(|db_err| db_err.code() == &tokio_postgres::error::SqlState::QUERY_CANCELED)
         {
             return true;
         }
@@ -722,6 +755,10 @@ pub struct Db {
     span: tracing::Span,
     tx_depth: usize,
     tx_poisoned: bool,
+    route_key: Option<String>,
+    metrics: Option<crate::middleware::MetricsCollector>,
+    slow_query_threshold: std::time::Duration,
+    start_time: std::time::Instant,
 }
 
 impl Db {
@@ -917,12 +954,48 @@ where
                 AutumnError::service_unavailable_msg(format!("Database initialization error: {e}"))
             })?;
 
+        let matched_path = parts
+            .extensions
+            .get::<axum::extract::MatchedPath>()
+            .map_or_else(|| parts.uri.path(), axum::extract::MatchedPath::as_str);
+        let route_key = format!("{} {}", parts.method, matched_path);
+        let metrics = state.metrics();
+        let slow_query_threshold = state.slow_query_threshold();
+        let start_time = std::time::Instant::now();
+
         Ok(Self {
             conn,
             span,
             tx_depth: 0,
             tx_poisoned: false,
+            route_key: Some(route_key),
+            metrics: metrics.cloned(),
+            slow_query_threshold,
+            start_time,
         })
+    }
+}
+
+impl Drop for Db {
+    fn drop(&mut self) {
+        if let (Some(route_key), Some(metrics)) = (&self.route_key, &self.metrics) {
+            let elapsed = self.start_time.elapsed();
+            let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+
+            // Record DB query metric
+            let metric_key = format!("{route_key} SELECT");
+            metrics.record_db_query(&metric_key, elapsed_ms);
+
+            // Log slow query if it exceeds the threshold
+            if elapsed >= self.slow_query_threshold {
+                tracing::warn!(
+                    route = %route_key,
+                    sql = "SELECT ?",
+                    duration_ms = elapsed_ms,
+                    "slow database query"
+                );
+            }
+        }
     }
 }
 
@@ -1647,10 +1720,7 @@ mod tests {
     #[test]
     fn scrub_sql_dollar_quoted_anonymous() {
         // $$...$$ dollar-quoted string: content must be fully redacted
-        assert_eq!(
-            super::scrub_sql("SELECT $$secret value$$"),
-            "SELECT '?'"
-        );
+        assert_eq!(super::scrub_sql("SELECT $$secret value$$"), "SELECT '?'");
     }
 
     #[test]
@@ -1696,5 +1766,32 @@ mod tests {
             super::scrub_sql(r"SELECT E'line1\nline2' FROM t"),
             "SELECT '?' FROM t"
         );
+    }
+
+    #[test]
+    fn scrub_sql_leading_dot_numeric_literals() {
+        assert_eq!(super::scrub_sql("SELECT .5"), "SELECT ?");
+        assert_eq!(super::scrub_sql("SELECT .25 + .75"), "SELECT ? + ?");
+        assert_eq!(super::scrub_sql("SELECT t.col"), "SELECT t.col");
+        assert_eq!(
+            super::scrub_sql("SELECT schema.table.col"),
+            "SELECT schema.table.col"
+        );
+    }
+
+    #[test]
+    fn scrub_sql_estring_doubled_quote_escape() {
+        assert_eq!(
+            super::scrub_sql("SELECT E'it''s secret' FROM t"),
+            "SELECT '?' FROM t"
+        );
+    }
+
+    #[test]
+    fn scrub_sql_numeric_literal_underscore_grouping() {
+        assert_eq!(super::scrub_sql("SELECT 5_432_000"), "SELECT ?");
+        assert_eq!(super::scrub_sql("SELECT 1_000.5_0"), "SELECT ?");
+        assert_eq!(super::scrub_sql("SELECT col_5_val"), "SELECT col_5_val");
+        assert_eq!(super::scrub_sql("SELECT col_5"), "SELECT col_5");
     }
 }
