@@ -1180,13 +1180,12 @@ mod tests {
 
     #[tokio::test]
     async fn session_layer_sets_cookie_on_new_session() {
-        use crate::state::AppState;
         async fn handler(session: Session) -> String {
             session.insert("visited", "true").await;
             "ok".to_owned()
         }
 
-        let state = AppState {
+        let state = crate::state::AppState {
             extensions: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
