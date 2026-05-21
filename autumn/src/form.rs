@@ -932,7 +932,7 @@ mod tests {
     #[test]
     fn into_valid_returns_ok_when_valid() {
         let cs = Changeset::new(42_i32);
-        assert_eq!(cs.into_valid().unwrap(), 42);
+        assert_eq!(cs.into_valid().expect("should not fail"), 42);
     }
 
     #[test]
@@ -1543,7 +1543,7 @@ mod tests {
                 .route("/test", post(handler))
                 .oneshot(urlencoded_req("/test", "name=Alice"))
                 .await
-                .unwrap();
+                .expect("should not fail");
             assert_body(resp, "valid=true").await;
         }
 
@@ -1556,7 +1556,7 @@ mod tests {
                 .route("/test", post(handler))
                 .oneshot(urlencoded_req("/test", "name=ab"))
                 .await
-                .unwrap();
+                .expect("should not fail");
             assert_body(resp, "valid=false").await;
         }
 
@@ -1569,7 +1569,7 @@ mod tests {
                 .route("/test", post(handler))
                 .oneshot(urlencoded_req("/test", "name=ab"))
                 .await
-                .unwrap();
+                .expect("should not fail");
             let body = body_text(resp).await;
             assert!(!body.is_empty(), "expected errors, got empty string");
         }
@@ -1583,7 +1583,7 @@ mod tests {
                 .route("/test", post(handler))
                 .oneshot(urlencoded_req("/test", "other=value"))
                 .await
-                .unwrap();
+                .expect("should not fail");
             assert_ne!(resp.status(), axum::http::StatusCode::OK);
         }
 
@@ -1596,7 +1596,7 @@ mod tests {
                 .route("/test", post(handler))
                 .oneshot(urlencoded_req("/test", "name=Alice"))
                 .await
-                .unwrap();
+                .expect("should not fail");
             assert_body(resp, "none").await;
         }
 
@@ -1611,7 +1611,7 @@ mod tests {
                 .uri("/test")
                 .header("Content-Type", "application/x-www-form-urlencoded")
                 .body(Body::from("name=Alice"))
-                .unwrap();
+                .expect("should not fail");
             req.extensions_mut()
                 .insert(CsrfToken::new("secret-tok".to_string()));
 
@@ -1632,7 +1632,7 @@ mod tests {
                 .route("/test", post(handler))
                 .oneshot(multipart_req("/test", "name", "Alice"))
                 .await
-                .unwrap();
+                .expect("should not fail");
             assert_body(resp, "valid=true name=Alice").await;
         }
 
@@ -1646,7 +1646,7 @@ mod tests {
                 .route("/test", post(handler))
                 .oneshot(multipart_req("/test", "name", "ab"))
                 .await
-                .unwrap();
+                .expect("should not fail");
             assert_body(resp, "valid=false").await;
         }
 
@@ -1658,7 +1658,7 @@ mod tests {
                 .uri(uri)
                 .header("Content-Type", "application/x-www-form-urlencoded")
                 .body(Body::from(body))
-                .unwrap()
+                .expect("should not fail")
         }
 
         #[cfg(feature = "multipart")]
@@ -1678,14 +1678,14 @@ mod tests {
                     format!("multipart/form-data; boundary={boundary}"),
                 )
                 .body(Body::from(body))
-                .unwrap()
+                .expect("should not fail")
         }
 
         async fn body_text(resp: axum::response::Response) -> String {
             let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
                 .await
-                .unwrap();
-            String::from_utf8(bytes.to_vec()).unwrap()
+                .expect("should not fail");
+            String::from_utf8(bytes.to_vec()).expect("should not fail")
         }
 
         async fn assert_body(resp: axum::response::Response, expected: &str) {

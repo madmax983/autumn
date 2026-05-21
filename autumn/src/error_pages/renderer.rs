@@ -76,3 +76,49 @@ pub trait ErrorPageRenderer: Send + Sync + 'static {
     /// to provide a single template for all error codes.
     fn render_error(&self, ctx: &ErrorContext) -> Markup;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::StatusCode;
+    use maud::html;
+
+    struct DummyRenderer;
+
+    impl ErrorPageRenderer for DummyRenderer {
+        fn render_error(&self, ctx: &ErrorContext) -> Markup {
+            html! {
+                div {
+                    "Dummy: " (ctx.status.as_u16())
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn default_renderer_fallbacks_to_render_error() {
+        let renderer = DummyRenderer;
+        let ctx = ErrorContext {
+            status: StatusCode::NOT_FOUND,
+            message: "Not found".to_string(),
+            path: "/missing".to_string(),
+            request_id: None,
+            details: None,
+            is_dev: false,
+        };
+
+        // These default method implementations should simply delegate to render_error
+        let not_found = renderer.render_404(&ctx).into_string();
+        assert_eq!(not_found, "<div>Dummy: 404</div>");
+
+        let mut ctx_500 = ctx.clone();
+        ctx_500.status = StatusCode::INTERNAL_SERVER_ERROR;
+        let internal_server = renderer.render_500(&ctx_500).into_string();
+        assert_eq!(internal_server, "<div>Dummy: 500</div>");
+
+        let mut ctx_422 = ctx;
+        ctx_422.status = StatusCode::UNPROCESSABLE_ENTITY;
+        let unprocessable = renderer.render_422(&ctx_422).into_string();
+        assert_eq!(unprocessable, "<div>Dummy: 422</div>");
+    }
+}
