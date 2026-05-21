@@ -226,7 +226,6 @@ pub trait DbState {
     ) -> Vec<std::sync::Arc<dyn crate::interceptor::DbConnectionInterceptor>> {
         Vec::new()
     }
-
     /// Returns the global statement timeout, if configured.
     fn statement_timeout(&self) -> Option<std::time::Duration> {
         None

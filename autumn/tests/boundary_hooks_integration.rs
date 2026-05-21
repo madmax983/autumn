@@ -445,20 +445,8 @@ impl HttpInterceptor for RecordingHttpInterceptor {
     fn intercept<'a>(
         &'a self,
         req: reqwest::Request,
-        next: &'a dyn Fn(
-            reqwest::Request,
-        ) -> std::pin::Pin<
-            Box<
-                dyn std::future::Future<Output = Result<reqwest::Response, reqwest::Error>>
-                    + Send
-                    + 'a,
-            >,
-        >,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = Result<reqwest::Response, reqwest::Error>> + Send + 'a,
-        >,
-    > {
+        next: &'a dyn Fn(reqwest::Request) -> autumn_web::interceptor::HttpInterceptorFuture<'a>,
+    ) -> autumn_web::interceptor::HttpInterceptorFuture<'a> {
         assert_eq!(req.url().as_str(), "http://127.0.0.1:54321/token");
         HTTP_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         next(req)

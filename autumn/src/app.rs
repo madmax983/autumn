@@ -2120,15 +2120,14 @@ impl AppBuilder {
             mail_previews,
             declared_routes: _,
             idempotency_enabled,
-            #[cfg(feature = "mail")]
-                mail_interceptor: _,
-            job_interceptor: _,
+            mail_interceptor,
+            job_interceptor,
             #[cfg(feature = "db")]
-                db_interceptor: _,
+            db_interceptor,
             #[cfg(feature = "ws")]
-                channels_interceptor: _,
+            channels_interceptor,
             #[cfg(feature = "oauth2")]
-                http_interceptor: _,
+            http_interceptor,
         } = self;
 
         let all_routes = routes;
@@ -2236,6 +2235,31 @@ impl AppBuilder {
             #[cfg(feature = "ws")]
             channels_backend,
         );
+        #[cfg(feature = "mail")]
+        if let Some(interceptor) = mail_interceptor {
+            state.insert_extension(interceptor);
+        }
+        if let Some(interceptor) = job_interceptor {
+            state.insert_extension(interceptor);
+        }
+        #[cfg(feature = "db")]
+        if let Some(interceptor) = db_interceptor {
+            state.insert_extension(interceptor);
+        }
+        #[cfg(feature = "ws")]
+        if let Some(interceptor) = channels_interceptor {
+            state.insert_extension(interceptor.clone());
+            state.channels = crate::channels::Channels::with_shared_backend(std::sync::Arc::new(
+                crate::channels::InterceptedChannelsBackend::new(
+                    state.channels.backend().clone(),
+                    vec![interceptor],
+                ),
+            ));
+        }
+        #[cfg(feature = "oauth2")]
+        if let Some(interceptor) = http_interceptor {
+            state.insert_extension(interceptor);
+        }
         #[cfg(feature = "db")]
         configure_replica_migration_check(&state, replica_migration_check);
         #[cfg(feature = "db")]
@@ -2472,6 +2496,15 @@ impl AppBuilder {
             cache_backend,
             #[cfg(feature = "mail")]
             mail_delivery_queue_factory,
+            #[cfg(feature = "mail")]
+            mail_interceptor,
+            job_interceptor,
+            #[cfg(feature = "db")]
+            db_interceptor,
+            #[cfg(feature = "ws")]
+            channels_interceptor,
+            #[cfg(feature = "oauth2")]
+            http_interceptor,
             ..
         } = self;
 
@@ -2542,6 +2575,31 @@ impl AppBuilder {
             #[cfg(feature = "ws")]
             channels_backend,
         );
+        #[cfg(feature = "mail")]
+        if let Some(interceptor) = mail_interceptor {
+            state.insert_extension(interceptor);
+        }
+        if let Some(interceptor) = job_interceptor {
+            state.insert_extension(interceptor);
+        }
+        #[cfg(feature = "db")]
+        if let Some(interceptor) = db_interceptor {
+            state.insert_extension(interceptor);
+        }
+        #[cfg(feature = "ws")]
+        if let Some(interceptor) = channels_interceptor {
+            state.insert_extension(interceptor.clone());
+            state.channels = crate::channels::Channels::with_shared_backend(std::sync::Arc::new(
+                crate::channels::InterceptedChannelsBackend::new(
+                    state.channels.backend().clone(),
+                    vec![interceptor],
+                ),
+            ));
+        }
+        #[cfg(feature = "oauth2")]
+        if let Some(interceptor) = http_interceptor {
+            state.insert_extension(interceptor);
+        }
         #[cfg(feature = "db")]
         configure_replica_migration_check(&state, replica_migration_check);
         #[cfg(feature = "db")]
@@ -2602,6 +2660,21 @@ impl AppBuilder {
 
         tracing::info!(task = %task_name, "Running one-off task");
         let span = tracing::info_span!("one_off_task", task = %task_name);
+        #[cfg(feature = "oauth2")]
+        let result = {
+            use crate::interceptor::{ACTIVE_HTTP_INTERCEPTORS, HttpInterceptor};
+            let interceptors: Vec<std::sync::Arc<dyn HttpInterceptor>> = state
+                .extension::<std::sync::Arc<dyn HttpInterceptor>>()
+                .map(|interceptor_arc| vec![(*interceptor_arc).clone()])
+                .unwrap_or_default();
+            ACTIVE_HTTP_INTERCEPTORS
+                .scope(
+                    interceptors,
+                    (task_handler)(state.clone(), args).instrument(span),
+                )
+                .await
+        };
+        #[cfg(not(feature = "oauth2"))]
         let result = (task_handler)(state.clone(), args).instrument(span).await;
 
         task_shutdown.cancel();
