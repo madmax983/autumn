@@ -860,6 +860,13 @@ pub struct HttpRequestBuilder {
 }
 
 #[cfg(feature = "oauth2")]
+#[allow(
+    clippy::must_use_candidate,
+    clippy::missing_const_for_fn,
+    clippy::return_self_not_must_use,
+    clippy::missing_errors_doc,
+    clippy::redundant_closure_for_method_calls
+)]
 impl HttpClient {
     #[must_use]
     pub const fn new(inner: reqwest::Client) -> Self {
@@ -884,6 +891,13 @@ impl HttpClient {
 }
 
 #[cfg(feature = "oauth2")]
+#[allow(
+    clippy::must_use_candidate,
+    clippy::missing_const_for_fn,
+    clippy::return_self_not_must_use,
+    clippy::missing_errors_doc,
+    clippy::redundant_closure_for_method_calls
+)]
 impl HttpRequestBuilder {
     #[must_use]
     pub fn header<K, V>(mut self, key: K, value: V) -> Self

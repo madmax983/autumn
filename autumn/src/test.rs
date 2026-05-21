@@ -548,6 +548,11 @@ impl TestApp {
         }
         crate::app::install_webhook_registry(&state, &self.config);
 
+        // Install AutumnConfig so DbState::statement_timeout / slow_query_threshold
+        // read the test-supplied config rather than always returning defaults.
+        #[cfg(feature = "db")]
+        state.insert_extension(self.config.clone());
+
         #[cfg(feature = "mail")]
         if let Some(interceptor) = self.mail_interceptor {
             state.insert_extension(interceptor);

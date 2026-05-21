@@ -508,6 +508,10 @@ impl AppState {
 
 #[cfg(feature = "db")]
 impl DbState for AppState {
+    fn metrics(&self) -> Option<&crate::middleware::MetricsCollector> {
+        Some(&self.metrics)
+    }
+
     fn pool(
         &self,
     ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>
@@ -535,6 +539,17 @@ impl DbState for AppState {
         self.extension::<Arc<dyn crate::interceptor::DbConnectionInterceptor>>()
             .map(|arc| vec![(*arc).clone()])
             .unwrap_or_default()
+    }
+    fn statement_timeout(&self) -> Option<std::time::Duration> {
+        self.extension::<crate::config::AutumnConfig>()
+            .and_then(|cfg| cfg.database.statement_timeout)
+    }
+
+    fn slow_query_threshold(&self) -> std::time::Duration {
+        self.extension::<crate::config::AutumnConfig>().map_or_else(
+            || std::time::Duration::from_millis(500),
+            |cfg| cfg.database.slow_query_threshold,
+        )
     }
 }
 

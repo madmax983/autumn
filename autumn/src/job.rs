@@ -1254,14 +1254,19 @@ impl JobClient {
         self.job_admin
             .record_enqueue(id.clone(), name, payload.clone(), 1, job_max_attempts);
 
+        let started = ::std::sync::Arc::new(::std::sync::atomic::AtomicBool::new(false));
+        let started_clone = started.clone();
+
+        let id_for_enqueue = id.clone();
         let payload_clone = payload.clone();
         let actual_enqueue = async move {
+            started_clone.store(true, ::std::sync::atomic::Ordering::SeqCst);
             let result = if let Some(sender) = &self.local_sender {
                 #[cfg(feature = "telemetry-otlp")]
                 let (traceparent, tracestate) = capture_job_trace_context();
                 sender
                     .send(QueuedJob {
-                        id: id.clone(),
+                        id: id_for_enqueue.clone(),
                         name: name.to_string(),
                         payload: payload_clone.clone(),
                         attempt: 1,
@@ -1280,7 +1285,7 @@ impl JobClient {
                     })
             } else {
                 self.enqueue_durable(
-                    id.clone(),
+                    id_for_enqueue.clone(),
                     name,
                     payload_clone.clone(),
                     job_max_attempts,
@@ -1290,17 +1295,23 @@ impl JobClient {
             };
             if result.is_err() {
                 self.registry.record_cancel(name);
-                self.job_admin.record_cancelled(&id);
+                self.job_admin.record_cancelled(&id_for_enqueue);
             }
             result
         };
 
-        if let Some(interceptor) = &self.interceptor {
+        let res = if let Some(interceptor) = &self.interceptor {
             let interceptor = (*interceptor).clone();
             run_enqueue_interceptor(interceptor, name, &payload, Box::pin(actual_enqueue)).await
         } else {
             actual_enqueue.await
+        };
+
+        if !started.load(::std::sync::atomic::Ordering::SeqCst) {
+            self.registry.record_cancel(name);
+            self.job_admin.record_cancelled(&id);
         }
+        res
     }
 
     /// Enqueue a job that fires **only after the surrounding transaction commits**.
@@ -1483,15 +1494,20 @@ impl JobClient {
         self.job_admin
             .record_enqueue(id.clone(), name, payload.clone(), 1, job_max_attempts);
 
+        let started = ::std::sync::Arc::new(::std::sync::atomic::AtomicBool::new(false));
+        let started_clone = started.clone();
+
         #[cfg(feature = "telemetry-otlp")]
         let (traceparent, tracestate) = capture_job_trace_context();
 
+        let id_for_enqueue = id.clone();
         let payload_clone = payload.clone();
         let actual_enqueue = async move {
+            started_clone.store(true, ::std::sync::atomic::Ordering::SeqCst);
             let result = if let Some(sender) = &self.local_sender {
                 sender
                     .send(QueuedJob {
-                        id: id.clone(),
+                        id: id_for_enqueue.clone(),
                         name: name.to_string(),
                         payload: payload_clone.clone(),
                         attempt: 1,
@@ -1510,7 +1526,7 @@ impl JobClient {
                     })
             } else {
                 self.enqueue_durable(
-                    id.clone(),
+                    id_for_enqueue.clone(),
                     name,
                     payload_clone.clone(),
                     job_max_attempts,
@@ -1520,17 +1536,23 @@ impl JobClient {
             };
             if result.is_err() {
                 self.registry.record_cancel(name);
-                self.job_admin.record_cancelled(&id);
+                self.job_admin.record_cancelled(&id_for_enqueue);
             }
             result
         };
 
-        if let Some(interceptor) = &self.interceptor {
+        let res = if let Some(interceptor) = &self.interceptor {
             let interceptor = (*interceptor).clone();
             run_enqueue_interceptor(interceptor, name, &payload, Box::pin(actual_enqueue)).await
         } else {
             actual_enqueue.await
+        };
+
+        if !started.load(::std::sync::atomic::Ordering::SeqCst) {
+            self.registry.record_cancel(name);
+            self.job_admin.record_cancelled(&id);
         }
+        res
     }
 }
 
@@ -4935,6 +4957,80 @@ mod tests {
             p99 < std::time::Duration::from_millis(5),
             "expected p99 enqueue latency < 5ms, got {p99:?}",
         );
+
+        shutdown.cancel();
+        clear_global_job_client();
+    }
+
+    #[tokio::test]
+    async fn test_interceptor_rejection_rolls_back_enqueue_bookkeeping() {
+        struct RejectingInterceptor;
+        impl crate::interceptor::JobInterceptor for RejectingInterceptor {
+            fn intercept_enqueue<'a>(
+                &'a self,
+                _name: &'a str,
+                _payload: &'a serde_json::Value,
+                _next: std::pin::Pin<
+                    Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send + 'a>,
+                >,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send + 'a>,
+            > {
+                Box::pin(async move {
+                    Err(crate::AutumnError::bad_request_msg(
+                        "blocked by interceptor",
+                    ))
+                })
+            }
+
+            fn intercept_execute<'a>(
+                &'a self,
+                _name: &'a str,
+                _payload: &'a serde_json::Value,
+                next: std::pin::Pin<
+                    Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send + 'a>,
+                >,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send + 'a>,
+            > {
+                next
+            }
+        }
+
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+
+        let state = AppState::for_test().with_profile("dev");
+        state.insert_extension(
+            Arc::new(RejectingInterceptor) as Arc<dyn crate::interceptor::JobInterceptor>
+        );
+
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        start_local_runtime(
+            vec![JobInfo {
+                name: "noop".to_string(),
+                max_attempts: 3,
+                initial_backoff_ms: 10,
+                handler: |_state, _payload| Box::pin(async move { Ok(()) }),
+            }],
+            &state,
+            &shutdown,
+            1,
+            5,
+            250,
+        );
+
+        let res = enqueue("noop", serde_json::json!({})).await;
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err().to_string(), "blocked by interceptor");
+
+        // The bookkeeping must be rolled back!
+        let snapshot = state.job_registry().snapshot();
+        assert_eq!(snapshot["noop"].queued, 0);
+
+        let admin = job_admin_backend(&state).unwrap();
+        let admin_snapshot = admin.snapshot(JobAdminQuery::default()).await.unwrap();
+        assert_eq!(admin_snapshot.enqueued.total, 0);
 
         shutdown.cancel();
         clear_global_job_client();

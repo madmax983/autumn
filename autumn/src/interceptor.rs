@@ -79,7 +79,6 @@ pub trait ChannelsInterceptor: Send + Sync + 'static {
         ) -> Result<usize, crate::channels::ChannelPublishError>,
     ) -> Result<usize, crate::channels::ChannelPublishError>;
 }
-
 #[cfg(feature = "oauth2")]
 pub type HttpInterceptorFuture<'a> = std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<reqwest::Response, reqwest::Error>> + Send + 'a>,
