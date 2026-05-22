@@ -58,12 +58,29 @@ use std::sync::{Arc, RwLock};
 
 use http::StatusCode;
 
-use crate::session::Session;
-
 /// Boxed future returned by [`Policy`] and [`Scope`] methods so the
 /// traits remain object-safe (`dyn Policy<R>` works regardless of
 /// rust edition).
 pub type BoxFuture<'a, T> = Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+
+/// Trait to abstract the state requirement for the `authorization` module.
+/// This breaks the circular dependency between the authorization module and the central `AppState`.
+pub trait AuthorizationState {
+    /// Returns the active authentication session key.
+    fn auth_session_key(&self) -> &str;
+
+    /// Returns the global policy registry.
+    fn policy_registry(&self) -> &PolicyRegistry;
+
+    /// Returns the configured forbidden response behavior.
+    fn forbidden_response(&self) -> ForbiddenResponse;
+
+    /// Returns the database connection pool, if configured.
+    #[cfg(feature = "db")]
+    fn pool(
+        &self,
+    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>;
+}
 
 // ── PolicyContext ────────────────────────────────────────────────
 
@@ -78,9 +95,9 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn std::future::Future<Output = T> + Send +
 #[derive(Clone)]
 pub struct PolicyContext {
     /// The full per-request [`Session`]. Read raw values via
-    /// [`Session::get`] when a policy needs data beyond the
+    /// [`crate::session::Session::get`] when a policy needs data beyond the
     /// canonical user-id and role keys.
-    pub session: Session,
+    pub session: crate::session::Session,
 
     /// The authenticated user id, if any. Mirrors the configured
     /// session auth key (default: `"user_id"`).
@@ -113,7 +130,7 @@ impl PolicyContext {
     /// don't go through `AppState`. Production code paths construct
     /// a [`PolicyContext`] via [`from_request`](Self::from_request)
     /// instead.
-    pub async fn from_session(session: &Session, auth_session_key: &str) -> Self {
+    pub async fn from_session(session: &crate::session::Session, auth_session_key: &str) -> Self {
         let user_id = session.get(auth_session_key).await;
         let role = session.get("role").await;
         let roles = role.into_iter().collect();
@@ -130,7 +147,10 @@ impl PolicyContext {
     /// Build a fully-populated [`PolicyContext`] from `AppState` +
     /// `Session`. Used by the `#[authorize]` macro and
     /// `#[repository(policy = ...)]`-generated handlers.
-    pub async fn from_request(state: &crate::AppState, session: &Session) -> Self {
+    pub async fn from_request(
+        state: &(impl AuthorizationState + Send + Sync),
+        session: &crate::session::Session,
+    ) -> Self {
         let mut ctx = Self::from_session(session, state.auth_session_key()).await;
         ctx.policy_registry = state.policy_registry().clone();
         #[cfg(feature = "db")]
@@ -396,9 +416,9 @@ impl<T: Send + Sync + 'static> Scoped for T {}
 /// Process-wide registry of resource → policy and resource →
 /// scope bindings.
 ///
-/// Stored on [`AppState`](crate::AppState) so handlers and
+/// Stored on `AppState` so handlers and
 /// `#[repository]`-generated endpoints can resolve a policy by
-/// resource type via [`AppState::policy::<R>`](crate::AppState::policy).
+/// resource type.
 #[derive(Clone, Default)]
 pub struct PolicyRegistry {
     inner: Arc<RwLock<RegistryInner>>,
@@ -611,7 +631,7 @@ impl<'de> serde::Deserialize<'de> for ForbiddenResponse {
 ///
 /// async fn delete_post(
 ///     state: AppState,
-///     session: Session,
+///     session: crate::session::Session,
 ///     mut db: Db,
 ///     post: Post,
 /// ) -> AutumnResult<()> {
@@ -621,8 +641,8 @@ impl<'de> serde::Deserialize<'de> for ForbiddenResponse {
 /// }
 /// ```
 pub async fn authorize<R>(
-    state: &crate::AppState,
-    session: &Session,
+    state: &(impl AuthorizationState + Send + Sync),
+    session: &crate::session::Session,
     action: &str,
     resource: &R,
 ) -> crate::AutumnResult<()>
@@ -651,8 +671,8 @@ where
 /// the public API** — call [`authorize`] from user code.
 #[doc(hidden)]
 pub async fn __check_policy<R>(
-    state: &crate::AppState,
-    session: &Session,
+    state: &(impl AuthorizationState + Send + Sync),
+    session: &crate::session::Session,
     action: &str,
     resource: &R,
 ) -> crate::AutumnResult<()>
@@ -673,8 +693,8 @@ where
 /// alias for older macro output.
 #[doc(hidden)]
 pub async fn __check_policy_create<R>(
-    state: &crate::AppState,
-    session: &Session,
+    state: &(impl AuthorizationState + Send + Sync),
+    session: &crate::session::Session,
 ) -> crate::AutumnResult<()>
 where
     R: Send + Sync + 'static,
@@ -692,8 +712,8 @@ where
 /// only `autumn-web` is upgraded.
 #[doc(hidden)]
 pub async fn __check_policy_create_payload<R>(
-    state: &crate::AppState,
-    session: &Session,
+    state: &(impl AuthorizationState + Send + Sync),
+    session: &crate::session::Session,
     payload: &serde_json::Value,
 ) -> crate::AutumnResult<()>
 where
@@ -713,8 +733,8 @@ where
 /// Returns the configured deny response when the policy denies.
 /// Returns `500` when no policy is registered for `R`.
 pub async fn authorize_create<R>(
-    state: &crate::AppState,
-    session: &Session,
+    state: &(impl AuthorizationState + Send + Sync),
+    session: &crate::session::Session,
 ) -> crate::AutumnResult<()>
 where
     R: Send + Sync + 'static,
@@ -749,8 +769,8 @@ where
 /// Returns the configured deny response when the policy denies.
 /// Returns `500` when no policy is registered for `R`.
 pub async fn authorize_create_payload<R>(
-    state: &crate::AppState,
-    session: &Session,
+    state: &(impl AuthorizationState + Send + Sync),
+    session: &crate::session::Session,
     payload: &serde_json::Value,
 ) -> crate::AutumnResult<()>
 where
@@ -805,7 +825,7 @@ mod tests {
     }
 
     fn ctx(user_id: Option<&str>, role: Option<&str>) -> PolicyContext {
-        let session = Session::new_for_test(String::new(), HashMap::new());
+        let session = crate::session::Session::new_for_test(String::new(), HashMap::new());
         PolicyContext {
             session,
             user_id: user_id.map(str::to_owned),
@@ -1059,7 +1079,7 @@ mod tests {
             .with_auth_session_key("user_id")
     }
 
-    fn session_with(user_id: Option<&str>, role: Option<&str>) -> Session {
+    fn session_with(user_id: Option<&str>, role: Option<&str>) -> crate::session::Session {
         let mut data = HashMap::new();
         if let Some(u) = user_id {
             data.insert("user_id".to_owned(), u.to_owned());
@@ -1067,7 +1087,7 @@ mod tests {
         if let Some(r) = role {
             data.insert("role".to_owned(), r.to_owned());
         }
-        Session::new_for_test(String::new(), data)
+        crate::session::Session::new_for_test(String::new(), data)
     }
 
     #[tokio::test]

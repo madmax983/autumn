@@ -507,6 +507,29 @@ impl AppState {
 }
 
 #[cfg(feature = "db")]
+impl crate::authorization::AuthorizationState for AppState {
+    fn auth_session_key(&self) -> &str {
+        self.auth_session_key()
+    }
+
+    fn policy_registry(&self) -> &crate::authorization::PolicyRegistry {
+        self.policy_registry()
+    }
+
+    fn forbidden_response(&self) -> crate::authorization::ForbiddenResponse {
+        self.forbidden_response()
+    }
+
+    #[cfg(feature = "db")]
+    fn pool(
+        &self,
+    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>
+    {
+        self.pool()
+    }
+}
+
+#[cfg(feature = "db")]
 impl DbState for AppState {
     fn metrics(&self) -> Option<&crate::middleware::MetricsCollector> {
         Some(&self.metrics)
