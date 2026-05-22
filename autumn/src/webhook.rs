@@ -1008,23 +1008,7 @@ async fn verify_request(
     let json_body = serde_json::from_slice::<serde_json::Value>(&body).ok();
     let delivery_id = resolve_delivery_id(&endpoint.config, headers, json_body.as_ref());
     if endpoint.config.replay_protection {
-        let delivery_id = delivery_id
-            .as_deref()
-            .ok_or(WebhookVerifyError::MissingDeliveryId)?;
-        let replay_key = format!(
-            "{}:{}:{delivery_id}",
-            endpoint.config.provider.as_str(),
-            endpoint.config.name
-        );
-        let window = Duration::from_secs(endpoint.config.replay_window_secs);
-        if !registry
-            .replay_store
-            .check_and_insert(&replay_key, received_at, window)
-            .await
-            .map_err(|error| WebhookVerifyError::ReplayStoreUnavailable(error.to_string()))?
-        {
-            return Err(WebhookVerifyError::DuplicateDelivery);
-        }
+        verify_replay_protection(registry, endpoint, delivery_id.as_deref(), received_at).await?;
     }
 
     Ok(SignedWebhook {
@@ -1035,6 +1019,34 @@ async fn verify_request(
         received_at,
         raw_body: body,
     })
+}
+
+
+async fn verify_replay_protection(
+    registry: &WebhookRegistry,
+    endpoint: &ResolvedWebhookEndpoint,
+    delivery_id: Option<&str>,
+    received_at: SystemTime,
+) -> Result<(), WebhookVerifyError> {
+    let delivery_id = delivery_id.ok_or(WebhookVerifyError::MissingDeliveryId)?;
+    let replay_key = format!(
+        "{}:{}:{delivery_id}",
+        endpoint.config.provider.as_str(),
+        endpoint.config.name
+    );
+    let window = Duration::from_secs(endpoint.config.replay_window_secs);
+
+    let is_new = registry
+        .replay_store
+        .check_and_insert(&replay_key, received_at, window)
+        .await
+        .map_err(|error| WebhookVerifyError::ReplayStoreUnavailable(error.to_string()))?;
+
+    if !is_new {
+        return Err(WebhookVerifyError::DuplicateDelivery);
+    }
+
+    Ok(())
 }
 
 fn verify_stripe(
@@ -1109,18 +1121,7 @@ fn verify_body_hmac(
     explicit_prefix: Option<&str>,
     received_at: SystemTime,
 ) -> Result<(), WebhookVerifyError> {
-    if let Some(timestamp_header) = endpoint.config.timestamp_header.as_deref()
-        && endpoint.config.provider != WebhookProvider::Slack
-    {
-        let timestamp = required_header(headers, timestamp_header)?
-            .parse::<i64>()
-            .map_err(|_| WebhookVerifyError::MalformedTimestamp)?;
-        verify_timestamp(
-            timestamp,
-            received_at,
-            endpoint.config.timestamp_tolerance_secs,
-        )?;
-    }
+    verify_hmac_timestamp_if_required(endpoint, headers, received_at)?;
 
     let mut signature = required_header(headers, signature_header(endpoint))?;
     let prefix = explicit_prefix.or(endpoint.config.signature_prefix.as_deref());
@@ -1135,6 +1136,30 @@ fn verify_body_hmac(
     } else {
         Err(WebhookVerifyError::SignatureMismatch)
     }
+}
+
+fn verify_hmac_timestamp_if_required(
+    endpoint: &ResolvedWebhookEndpoint,
+    headers: &HeaderMap,
+    received_at: SystemTime,
+) -> Result<(), WebhookVerifyError> {
+    let Some(timestamp_header) = endpoint.config.timestamp_header.as_deref() else {
+        return Ok(());
+    };
+
+    if endpoint.config.provider == WebhookProvider::Slack {
+        return Ok(());
+    }
+
+    let timestamp = required_header(headers, timestamp_header)?
+        .parse::<i64>()
+        .map_err(|_| WebhookVerifyError::MalformedTimestamp)?;
+
+    verify_timestamp(
+        timestamp,
+        received_at,
+        endpoint.config.timestamp_tolerance_secs,
+    )
 }
 
 fn signature_header(endpoint: &ResolvedWebhookEndpoint) -> &str {
@@ -1161,21 +1186,25 @@ fn parse_stripe_signature(header: &str) -> Result<(i64, Vec<&str>), WebhookVerif
         let Some((key, value)) = part.split_once('=') else {
             return Err(WebhookVerifyError::MalformedSignature);
         };
+
+        let trimmed_value = value.trim();
         match key.trim() {
             "t" => {
                 timestamp = Some(
-                    value
-                        .trim()
+                    trimmed_value
                         .parse::<i64>()
                         .map_err(|_| WebhookVerifyError::MalformedTimestamp)?,
                 );
             }
-            "v1" => signatures.push(value.trim()),
+            "v1" => signatures.push(trimmed_value),
             _ => {}
         }
     }
 
-    let timestamp = timestamp.ok_or(WebhookVerifyError::MalformedTimestamp)?;
+    let Some(timestamp) = timestamp else {
+        return Err(WebhookVerifyError::MalformedTimestamp);
+    };
+
     if signatures.is_empty() {
         return Err(WebhookVerifyError::MalformedSignature);
     }
@@ -1211,11 +1240,13 @@ fn resolve_delivery_id(
         .as_deref()
         .and_then(|header| optional_header(headers, header));
 
+    if header.is_some() {
+        return header;
+    }
+
     match config.provider {
-        WebhookProvider::Slack => header
-            .or_else(|| slack_delivery_id(json_body))
-            .or_else(|| json_string_field(json_body, "id")),
-        _ => header.or_else(|| json_string_field(json_body, "id")),
+        WebhookProvider::Slack => slack_delivery_id(json_body).or_else(|| json_string_field(json_body, "id")),
+        _ => json_string_field(json_body, "id"),
     }
 }
 
@@ -1224,11 +1255,13 @@ fn resolve_event_type(
     headers: &HeaderMap,
     json_body: Option<&serde_json::Value>,
 ) -> Option<String> {
-    config
-        .event_type_header
-        .as_deref()
-        .and_then(|header| optional_header(headers, header))
-        .or_else(|| json_string_field(json_body, "type"))
+    if let Some(header_name) = config.event_type_header.as_deref()
+        && let Some(event_type) = optional_header(headers, header_name)
+    {
+        return Some(event_type);
+    }
+
+    json_string_field(json_body, "type")
         .or_else(|| nested_json_string_field(json_body, "event", "type"))
 }
 
@@ -1241,17 +1274,19 @@ fn optional_header(headers: &HeaderMap, name: &str) -> Option<String> {
 }
 
 fn slack_delivery_id(json_body: Option<&serde_json::Value>) -> Option<String> {
-    json_string_field(json_body, "event_id").or_else(|| {
-        let value = json_body?;
-        if value.get("type").and_then(serde_json::Value::as_str) == Some("url_verification") {
-            value
-                .get("challenge")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned)
-        } else {
-            None
-        }
-    })
+    if let Some(event_id) = json_string_field(json_body, "event_id") {
+        return Some(event_id);
+    }
+
+    let value = json_body?;
+    if value.get("type").and_then(serde_json::Value::as_str) == Some("url_verification") {
+        return value
+            .get("challenge")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+    }
+
+    None
 }
 
 fn json_string_field(value: Option<&serde_json::Value>, field: &str) -> Option<String> {
