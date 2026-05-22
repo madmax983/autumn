@@ -681,7 +681,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         },
     );
 
-    let upsert_columns: Vec<TokenStream> = fields_for_new
+    let mut upsert_columns: Vec<TokenStream> = fields_for_new
         .iter()
         .map(|f| {
             let ident = f.ident.as_ref().unwrap();
@@ -690,6 +690,13 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         })
         .collect();
+
+    if let Some(lv_field) = lock_version_field {
+        let ident = lv_field.ident.as_ref().unwrap();
+        upsert_columns.push(quote! {
+            #table_ident::#ident.eq(#table_ident::#ident + 1)
+        });
+    }
 
     let mut changeset_fields: Vec<TokenStream> = fields_for_new
         .iter()
@@ -1297,11 +1304,23 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         }
 
+        impl ::autumn_web::repository::AutumnColumnCountExt for #name {
+            fn __autumn_column_count(&self) -> usize {
+                Self::__AUTUMN_COLUMN_COUNT
+            }
+        }
+
         impl #new_name {
             pub const __AUTUMN_COLUMN_COUNT: usize = #new_column_count;
 
             #[doc(hidden)]
             pub fn __autumn_column_count(&self) -> usize {
+                Self::__AUTUMN_COLUMN_COUNT
+            }
+        }
+
+        impl ::autumn_web::repository::AutumnColumnCountExt for #new_name {
+            fn __autumn_column_count(&self) -> usize {
                 Self::__AUTUMN_COLUMN_COUNT
             }
         }

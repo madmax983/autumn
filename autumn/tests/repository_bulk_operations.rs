@@ -57,6 +57,114 @@ pub struct LockRecord {
 #[autumn_web::repository(LockRecord, table = "test_lock_records")]
 pub trait LockRecordRepository {}
 
+// ── Schema & models for zero-column writable safety (Task 2) ──────────────────
+
+diesel::table! {
+    test_zero_col_records (id) {
+        id -> Int8,
+        dummy -> Text,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, diesel::Queryable, diesel::Selectable, diesel::Insertable, diesel::AsChangeset, serde::Serialize, serde::Deserialize)]
+#[diesel(table_name = test_zero_col_records)]
+pub struct ZeroColRecord {
+    pub id: i64,
+    pub dummy: String,
+}
+
+#[derive(Debug, Clone, diesel::Insertable, serde::Serialize, serde::Deserialize)]
+#[diesel(table_name = test_zero_col_records)]
+pub struct NewZeroColRecord {
+    pub dummy: String,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct UpdateZeroColRecord {
+    #[serde(default)]
+    pub dummy: ::autumn_web::hooks::Patch<String>,
+}
+
+#[doc(hidden)]
+#[derive(Debug, Clone, diesel::AsChangeset)]
+#[diesel(table_name = test_zero_col_records)]
+pub struct __ZeroColRecordChangeset {
+    pub dummy: Option<String>,
+}
+
+impl UpdateZeroColRecord {
+    pub fn __to_changeset(&self) -> __ZeroColRecordChangeset {
+        __ZeroColRecordChangeset {
+            dummy: match &self.dummy {
+                ::autumn_web::hooks::Patch::Set(v) => Some(v.clone()),
+                _ => None,
+            },
+        }
+    }
+}
+
+impl ::autumn_web::repository::AutumnColumnCountExt for ZeroColRecord {
+    fn __autumn_column_count(&self) -> usize {
+        0
+    }
+}
+
+impl ::autumn_web::repository::AutumnColumnCountExt for NewZeroColRecord {
+    fn __autumn_column_count(&self) -> usize {
+        0
+    }
+}
+
+impl ::autumn_web::tenancy::ModelTenantIdMeta for ZeroColRecord {
+    const HAS_MANUAL_TENANT_ID: bool = false;
+    fn try_set_tenant_id(&mut self, _tenant_id: &str) {}
+}
+
+impl ::autumn_web::tenancy::ModelTenantIdMeta for NewZeroColRecord {
+    const HAS_MANUAL_TENANT_ID: bool = false;
+    fn try_set_tenant_id(&mut self, _tenant_id: &str) {}
+}
+
+impl ZeroColRecord {
+    pub fn __autumn_lock_version_actual(&self) -> ::core::option::Option<i64> {
+        None
+    }
+
+    pub fn __autumn_upsert_set() -> impl ::autumn_web::reexports::diesel::query_builder::AsChangeset<
+        Target = crate::test_zero_col_records::table,
+        Changeset = impl ::autumn_web::reexports::diesel::query_builder::QueryFragment<::autumn_web::reexports::diesel::pg::Pg> + ::core::marker::Send + ::core::marker::Sync + 'static
+    > + ::core::marker::Send + ::core::marker::Sync + 'static {
+        use ::autumn_web::reexports::diesel::ExpressionMethods as _;
+        use crate::test_zero_col_records::dsl::*;
+        (dummy.eq(::autumn_web::reexports::diesel::pg::upsert::excluded(dummy)),)
+    }
+}
+
+#[autumn_web::repository(ZeroColRecord, table = "test_zero_col_records")]
+pub trait ZeroColRecordRepository {}
+
+// ── Schema & models for Tenant scoped bulk operations (Task 3 & 4) ────────────
+
+diesel::table! {
+    test_tenant_bulk_records (id) {
+        id -> Int8,
+        name -> Text,
+        tenant_id -> Text,
+    }
+}
+
+#[autumn_web::model(table = "test_tenant_bulk_records")]
+pub struct TenantBulkRecord {
+    #[id]
+    pub id: i64,
+    pub name: String,
+    #[default]
+    pub tenant_id: String,
+}
+
+#[autumn_web::repository(TenantBulkRecord, table = "test_tenant_bulk_records", tenant_scoped)]
+pub trait TenantBulkRecordRepository {}
+
 // ── Schema & models with hooks ───────────────────────────────────────────────
 
 diesel::table! {
@@ -149,6 +257,14 @@ async fn setup_pool() -> (
         .execute(&mut conn)
         .await
         .expect("create test_lock_records");
+    diesel::sql_query("CREATE TABLE IF NOT EXISTS test_zero_col_records (id BIGSERIAL PRIMARY KEY, dummy TEXT NOT NULL)")
+        .execute(&mut conn)
+        .await
+        .expect("create test_zero_col_records");
+    diesel::sql_query("CREATE TABLE IF NOT EXISTS test_tenant_bulk_records (id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL, tenant_id TEXT NOT NULL)")
+        .execute(&mut conn)
+        .await
+        .expect("create test_tenant_bulk_records");
 
     (pool, container)
 }
@@ -175,6 +291,25 @@ const fn build_hooked_repo(pool: Pool<AsyncPgConnection>) -> PgHookedRecordRepos
     PgHookedRecordRepository {
         pool,
         hooks: HookedRecordHooks,
+        __autumn_statement_timeout_ms: 0,
+        __autumn_slow_threshold: std::time::Duration::from_millis(500),
+        __autumn_route: None,
+    }
+}
+
+const fn build_zero_col_repo(pool: Pool<AsyncPgConnection>) -> PgZeroColRecordRepository {
+    PgZeroColRecordRepository {
+        pool,
+        __autumn_statement_timeout_ms: 0,
+        __autumn_slow_threshold: std::time::Duration::from_millis(500),
+        __autumn_route: None,
+    }
+}
+
+const fn build_tenant_bulk_repo(pool: Pool<AsyncPgConnection>) -> PgTenantBulkRecordRepository {
+    PgTenantBulkRecordRepository {
+        pool,
+        across_tenants: false,
         __autumn_statement_timeout_ms: 0,
         __autumn_slow_threshold: std::time::Duration::from_millis(500),
         __autumn_route: None,
@@ -416,4 +551,95 @@ async fn test_bulk_ops_optimistic_locking() {
         assert_eq!(row.name, "Lock Updated");
         assert_eq!(row.lock_version, 2);
     }
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn test_zero_col_bulk_insert() {
+    let (pool, _container) = setup_pool().await;
+    let repo = build_zero_col_repo(pool);
+
+    let new_records = vec![
+        NewZeroColRecord { dummy: "A".to_string() },
+        NewZeroColRecord { dummy: "B".to_string() },
+    ];
+    let inserted = repo.save_many(&new_records).await.unwrap();
+    assert_eq!(inserted.len(), 2);
+    assert!(inserted[0].id > 0);
+    assert!(inserted[1].id > inserted[0].id);
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn test_tenant_scoped_upsert_many_mismatch() {
+    use autumn_web::tenancy::with_tenant;
+
+    let (pool, _container) = setup_pool().await;
+    let repo = build_tenant_bulk_repo(pool);
+
+    // 1. Create a record for tenant-a
+    let record_a = with_tenant("tenant-a".to_string(), async {
+        repo.save(&NewTenantBulkRecord {
+            name: "A".to_string(),
+        })
+        .await
+        .unwrap()
+    })
+    .await;
+
+    // 2. Try to upsert the same ID under tenant-b context
+    let stale_or_mismatched = with_tenant("tenant-b".to_string(), async {
+        let mut to_upsert = record_a.clone();
+        to_upsert.name = "B".to_string(); // Try to overwrite it or update it
+
+        repo.upsert_many(&[to_upsert]).await
+    })
+    .await;
+
+    // This must return a conflict/bad_request error due to tenant mismatch
+    assert!(stale_or_mismatched.is_err(), "Expected tenant mismatch error, but it succeeded!");
+    let err_str = stale_or_mismatched.unwrap_err().to_string();
+    assert!(
+        err_str.contains("Tenant conflict") || err_str.contains("potential cross-tenant conflict"),
+        "Expected cross-tenant conflict error, got: {err_str}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn test_lock_version_upsert_many_conflict() {
+    let (pool, _container) = setup_pool().await;
+    let repo = build_lock_repo(pool);
+
+    // 1. Save initial lock records
+    let inserted = repo.save_many(&[
+        NewLockRecord {
+            name: "Lock A".to_string(),
+        }
+    ])
+    .await
+    .unwrap();
+    assert_eq!(inserted.len(), 1);
+    let original = inserted[0].clone();
+    assert_eq!(original.lock_version, 1);
+
+    // 2. Perform a successful upsert with correct lock version
+    let mut to_upsert = original.clone();
+    to_upsert.name = "Lock A (Updated)".to_string();
+    let upserted = repo.upsert_many(&[to_upsert.clone()]).await.unwrap();
+    assert_eq!(upserted.len(), 1);
+    assert_eq!(upserted[0].name, "Lock A (Updated)");
+    assert_eq!(upserted[0].lock_version, 2); // DB increments it!
+
+    // 3. Stale upsert with outdated lock version should fail with Conflict
+    let mut stale_upsert = original.clone(); // Has lock_version = 1, but actual in DB is 2
+    stale_upsert.name = "Lock A (Stale)".to_string();
+    let stale_res = repo.upsert_many(&[stale_upsert]).await;
+
+    assert!(stale_res.is_err(), "Expected stale lock version conflict, but it succeeded!");
+    let err_str = stale_res.unwrap_err().to_string();
+    assert!(
+        err_str.contains("conflict") || err_str.contains("Conflict"),
+        "Expected conflict error, got: {err_str}"
+    );
 }

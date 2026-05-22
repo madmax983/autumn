@@ -71,11 +71,8 @@ impl<T: ?Sized> AutumnLockVersionUpdateExt for T {}
 
 #[doc(hidden)]
 pub trait AutumnColumnCountExt {
-    fn __autumn_column_count(&self) -> usize {
-        30
-    }
+    fn __autumn_column_count(&self) -> usize;
 }
-impl<T: ?Sized> AutumnColumnCountExt for T {}
 
 #[doc(hidden)]
 pub trait AutumnUpsertSetExt {
