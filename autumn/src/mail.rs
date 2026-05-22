@@ -997,10 +997,10 @@ impl SmtpTransport {
                     "mail.smtp.password_env is required when mail.smtp.username is set".to_owned(),
                 )
             })?;
-            let password = std::env::var(&password_env).map_err(|error| {
-                MailError::InvalidMessage(format!(
-                    "mail.smtp.password_env={password_env:?} could not be resolved: {error}"
-                ))
+            let password = std::env::var(&password_env).map_err(|_| {
+                MailError::InvalidMessage(
+                    "mail.smtp.password_env could not be resolved".to_owned()
+                )
             })?;
             builder = builder.credentials(Credentials::new(username, password));
         }
@@ -1809,6 +1809,8 @@ mod tests {
 
     #[test]
     fn smtp_transport_rejects_missing_password_env_when_username_is_set() {
+        // Eris regression test: the original password environment variable name should not be logged.
+        // It's checked here as a proxy for the value, as the actual failure is when the env lookup fails.
         let missing_key = format!(
             "AUTUMN_TEST_MISSING_SMTP_PASSWORD_{}_{}",
             std::process::id(),
@@ -1824,7 +1826,9 @@ mod tests {
             panic!("missing password env should fail at startup");
         };
 
-        assert!(error.to_string().contains(&missing_key));
+        let err_string = error.to_string();
+        assert!(err_string.contains("mail.smtp.password_env could not be resolved"));
+        assert!(!err_string.contains(&missing_key));
     }
 
     #[test]

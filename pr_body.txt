@@ -1,0 +1,5 @@
+🎯 **What:** The application was leaking the raw SMTP password environment variable content when it failed to resolve properly by interpolating the error object into the InvalidMessage result.
+
+⚠️ **Risk:** If a malicious actor could force an environment resolution failure, or if logs containing these errors were exposed or ingested into a centralized logging platform, the raw SMTP credentials would be exposed in cleartext, leading to potential unauthorized access to the configured mail server.
+
+🛡️ **Solution:** Removed the {password_env:?} interpolation and the underlying `{error}` from the map_err closure in `SmtpTransport::new`, opting instead for a static, generic error message ("mail.smtp.password_env could not be resolved"). Also updated the corresponding integration test to assert against this secure static message instead of the raw variable name.
