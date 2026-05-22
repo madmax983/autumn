@@ -1,0 +1,48 @@
+warning: unused import: `autumn_web::prelude::*`
+  --> tests/compile-fail/repository_bulk_upsert_many_hooks.rs:13:5
+   |
+13 | use autumn_web::prelude::*;
+   |     ^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `MutationContext`
+  --> tests/compile-fail/repository_bulk_upsert_many_hooks.rs:14:25
+   |
+14 | use autumn_web::hooks::{MutationContext, MutationHooks};
+   |                         ^^^^^^^^^^^^^^^
+
+error[E0277]: the trait bound `DummyHooks: RepositoryHooksDefault` is not satisfied
+  --> tests/compile-fail/repository_bulk_upsert_many_hooks.rs:31:57
+   |
+31 | #[autumn_web::repository(Item, table = "items", hooks = DummyHooks)]
+   |                                                         ^^^^^^^^^^ the trait `std::default::Default` is not implemented for `DummyHooks`
+   |
+   = note: required for `DummyHooks` to implement `RepositoryHooksDefault`
+help: consider annotating `DummyHooks` with `#[derive(Default)]`
+   |
+23 + #[derive(Default)]
+24 | pub struct DummyHooks;
+   |
+
+error[E0599]: no method named `upsert_many` found for struct `PgItemRepository` in the current scope
+  --> tests/compile-fail/repository_bulk_upsert_many_hooks.rs:42:18
+   |
+31 | #[autumn_web::repository(Item, table = "items", hooks = DummyHooks)]
+   | -------------------------------------------------------------------- method `upsert_many` not found for this struct
+...
+42 |     let _ = repo.upsert_many(&records).await;
+   |                  ^^^^^^^^^^^ method not found in `PgItemRepository`
+
+error[E0277]: the trait bound `DummyHooks: RepositoryHooksClone` is not satisfied
+  --> tests/compile-fail/repository_bulk_upsert_many_hooks.rs:31:57
+   |
+31 | #[autumn_web::repository(Item, table = "items", hooks = DummyHooks)]
+   |                                                         ^^^^^^^^^^ the trait `Clone` is not implemented for `DummyHooks`
+   |
+   = note: required for `DummyHooks` to implement `RepositoryHooksClone`
+help: consider annotating `DummyHooks` with `#[derive(Clone)]`
+   |
+23 + #[derive(Clone)]
+24 | pub struct DummyHooks;
+   |

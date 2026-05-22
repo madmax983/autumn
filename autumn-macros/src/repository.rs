@@ -507,6 +507,11 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         delete_body,
         hook_support_methods,
         hook_inventory_registration,
+        save_many_body,
+        save_many_skip_invalid_body,
+        update_many_body,
+        delete_many_body,
+        upsert_many_body,
     ) = if let Some(ref hooks_ident) = config.hooks_type {
         // ΓöÇΓöÇ Struct fields with hooks ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
         let idempotency_struct_field = if commit_hooks_enabled {
@@ -1893,6 +1898,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         };
 
+        let save_many_body = quote! { todo!() };
+        let save_many_skip_invalid_body = quote! { todo!() };
+        let update_many_body = quote! { todo!() };
+        let delete_many_body = quote! { todo!() };
+        let upsert_many_body = quote! { todo!() };
+
         (
             struct_fields,
             clone_impl,
@@ -1902,6 +1913,11 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             delete_body,
             hook_support_methods,
             hook_inventory_registration,
+            save_many_body,
+            save_many_skip_invalid_body,
+            update_many_body,
+            delete_many_body,
+            upsert_many_body,
         )
     } else {
         // ΓöÇΓöÇ No hooks: existing zero-cost path ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
@@ -2254,6 +2270,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         };
 
+        let save_many_body = quote! { todo!() };
+        let save_many_skip_invalid_body = quote! { todo!() };
+        let update_many_body = quote! { todo!() };
+        let delete_many_body = quote! { todo!() };
+        let upsert_many_body = quote! { todo!() };
+
         (
             struct_fields,
             clone_impl,
@@ -2263,6 +2285,11 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             delete_body,
             quote! {},
             quote! {},
+            save_many_body,
+            save_many_skip_invalid_body,
+            update_many_body,
+            delete_many_body,
+            upsert_many_body,
         )
     };
 
@@ -3709,10 +3736,36 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
+    let upsert_many_trait_method = if config.hooks_type.is_none() {
+        quote! {
+            fn upsert_many(&self, records: &[#model_name]) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<Vec<#model_name>>> + Send;
+        }
+    } else {
+        quote! {}
+    };
+
+    let bulk_trait_methods = quote! {
+        fn save_many(&self, new: &[#new_name]) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<Vec<#model_name>>> + Send;
+        fn save_many_skip_invalid(&self, new: &[#new_name]) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<(Vec<#model_name>, Vec<(usize, ::autumn_web::AutumnError)>)>> + Send;
+        fn update_many(&self, ids: &[i64], changes: &#update_name) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<Vec<#model_name>>> + Send;
+        fn delete_many(&self, ids: &[i64]) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<()>> + Send;
+        #upsert_many_trait_method
+    };
+
+    let upsert_many_impl_method = if config.hooks_type.is_none() {
+        quote! {
+            async fn upsert_many(&self, records: &[#model_name]) -> ::autumn_web::AutumnResult<Vec<#model_name>> {
+                #upsert_many_body
+            }
+        }
+    } else {
+        quote! {}
+    };
+
     // Generate the trait, impl, and extractor.
     //
     // Key design decisions:
-    // - Native async fn (no #[async_trait]) ΓÇö Rust 1.75+ supports this
+    // - Native async fn (no #[async_trait]) — Rust 1.75+ supports this
     // - Trait methods use `-> impl Future` for object safety with Send bound
     // - Uses diesel-async RunQueryDsl for async .load()/.first() etc.
     // - Table/New/Update types must be in scope where the macro is invoked
@@ -3731,6 +3784,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             #cursor_page_trait_method
             #(#derived_trait_methods)*
             #soft_delete_trait_methods
+            #bulk_trait_methods
         }
 
         /// Postgres implementation of the repository.
@@ -3800,6 +3854,24 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             #cursor_page_impl_method
             #(#derived_impl_methods)*
             #soft_delete_impl_methods
+
+            async fn save_many(&self, new: &[#new_name]) -> ::autumn_web::AutumnResult<Vec<#model_name>> {
+                #save_many_body
+            }
+
+            async fn save_many_skip_invalid(&self, new: &[#new_name]) -> ::autumn_web::AutumnResult<(Vec<#model_name>, Vec<(usize, ::autumn_web::AutumnError)>)> {
+                #save_many_skip_invalid_body
+            }
+
+            async fn update_many(&self, ids: &[i64], changes: &#update_name) -> ::autumn_web::AutumnResult<Vec<#model_name>> {
+                #update_many_body
+            }
+
+            async fn delete_many(&self, ids: &[i64]) -> ::autumn_web::AutumnResult<()> {
+                #delete_many_body
+            }
+
+            #upsert_many_impl_method
         }
 
         impl #pg_name {
