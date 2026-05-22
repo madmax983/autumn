@@ -998,9 +998,7 @@ impl SmtpTransport {
                 )
             })?;
             let password = std::env::var(&password_env).map_err(|_| {
-                MailError::InvalidMessage(
-                    "mail.smtp.password_env could not be resolved".to_owned()
-                )
+                MailError::InvalidMessage("mail.smtp.password_env could not be resolved".to_owned())
             })?;
             builder = builder.credentials(Credentials::new(username, password));
         }
