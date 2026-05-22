@@ -1398,6 +1398,176 @@ mod tests {
         assert!(matches!(limiter.backend, BucketBackend::Memory(_)));
     }
 
+    #[cfg(feature = "redis")]
+    #[tokio::test]
+    async fn redis_decide_returns_none_when_outage_fail_open() {
+        use super::super::config::RateLimitBackendFailure;
+        let client = redis::Client::open("redis://127.0.0.1:0/").unwrap();
+        let connection = redis::aio::ConnectionManager::new_lazy_with_config(
+            client,
+            redis::aio::ConnectionManagerConfig::new(),
+        )
+        .unwrap();
+        let store = RedisStore::new(
+            connection,
+            "test_prefix".to_string(),
+            RateLimitBackendFailure::FailOpen,
+        );
+        let result = store.decide("test", 10.0, 1.0).await;
+        assert!(result.is_none());
+    }
+
+    #[cfg(feature = "redis")]
+    #[tokio::test]
+    async fn redis_decide_returns_denied_when_outage_fail_closed() {
+        use super::super::config::RateLimitBackendFailure;
+        let client = redis::Client::open("redis://127.0.0.1:0/").unwrap();
+        let connection = redis::aio::ConnectionManager::new_lazy_with_config(
+            client,
+            redis::aio::ConnectionManagerConfig::new(),
+        )
+        .unwrap();
+        let store = RedisStore::new(
+            connection,
+            "test_prefix".to_string(),
+            RateLimitBackendFailure::FailClosed,
+        );
+        let result = store.decide("test", 10.0, 1.0).await;
+        assert!(matches!(
+            result,
+            Some(Decision::Denied {
+                retry_after_secs: 1
+            })
+        ));
+    }
+
+    #[test]
+    fn client_ip_ignores_invalid_ip_in_x_forwarded_for() {
+        let config = RateLimitConfig {
+            enabled: true,
+            trust_forwarded_headers: true,
+            trusted_proxies: vec!["203.0.113.10".to_owned()],
+            ..Default::default()
+        };
+        let limiter = Limiter::from_config(&config);
+
+        let peer_ip: Option<IpAddr> = Some("203.0.113.10".parse().unwrap());
+        // An invalid IP "not_an_ip" should be skipped. The next is 198.51.100.77.
+        // Wait, if it skips "not_an_ip", it continues to loop and parse 198.51.100.77.
+        let result = limiter.client_ip_from_x_forwarded_for("198.51.100.77, not_an_ip", peer_ip);
+        assert_eq!(result, Some("198.51.100.77".to_string()));
+    }
+
+    #[test]
+    fn proxy_contains_network_bits_shifted() {
+        let proxy = TrustedProxy::parse("192.168.0.0/16").unwrap();
+        // mutant: (u32::from(network) >> shift) == (u32::from(candidate) >> shift)
+        // If we change `>>` to `<<` or `==` to `!=`, the following asserts will fail:
+        assert!(proxy.contains("192.168.1.1".parse().unwrap()));
+        assert!(!proxy.contains("10.0.0.1".parse().unwrap()));
+
+        let proxy6 = TrustedProxy::parse("2001:db8::/32").unwrap();
+        assert!(proxy6.contains("2001:db8::1".parse().unwrap()));
+        assert!(!proxy6.contains("2001:db9::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn rate_limit_layer_from_config() {
+        let config = RateLimitConfig {
+            enabled: true,
+            requests_per_second: 10.0,
+            burst: 5,
+            trust_forwarded_headers: true,
+            trusted_proxies: vec!["10.0.0.0/8".to_string()],
+            ..Default::default()
+        };
+        let layer = RateLimitLayer::from_config(&config);
+        assert!(layer.limiter.trust_forwarded_headers);
+        assert_eq!(layer.limiter.burst, 5.0);
+    }
+
+    #[test]
+    fn rate_limit_layer_layer_returns_service() {
+        use tower::Layer;
+        let config = RateLimitConfig {
+            enabled: true,
+            requests_per_second: 10.0,
+            burst: 5,
+            ..Default::default()
+        };
+        let layer = RateLimitLayer::from_config(&config);
+
+        let dummy_service = tower::service_fn(|_req: Request<axum::body::Body>| async {
+            Ok::<_, std::convert::Infallible>(Response::new(axum::body::Body::empty()))
+        });
+
+        let service = layer.layer(dummy_service);
+        assert_eq!(service.limiter.burst, 5.0);
+    }
+
+    #[test]
+    fn client_ip_none_when_all_proxies_are_invalid_and_no_peer() {
+        let config = RateLimitConfig {
+            enabled: true,
+            trust_forwarded_headers: true,
+            trusted_proxies: vec!["203.0.113.10".to_owned()],
+            ..Default::default()
+        };
+        let limiter = Limiter::from_config(&config);
+
+        let result = limiter.client_ip_from_x_forwarded_for("not_an_ip, still_not_an_ip", None);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn client_ip_skips_empty_entries() {
+        let config = RateLimitConfig {
+            enabled: true,
+            trust_forwarded_headers: true,
+            trusted_proxies: vec!["203.0.113.10".to_owned()],
+            ..Default::default()
+        };
+        let limiter = Limiter::from_config(&config);
+
+        let result = limiter.client_ip_from_x_forwarded_for(" , ,   ", None);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn rate_limit_service_poll_ready_passes_through_pending() {
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+        use tower::Layer;
+        use tower::Service;
+
+        #[derive(Clone)]
+        struct PendingService;
+        impl Service<Request<axum::body::Body>> for PendingService {
+            type Response = Response<axum::body::Body>;
+            type Error = std::convert::Infallible;
+            type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+            fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                Poll::Pending
+            }
+            fn call(&mut self, _req: Request<axum::body::Body>) -> Self::Future {
+                Box::pin(async { Ok(Response::new(axum::body::Body::empty())) })
+            }
+        }
+
+        let config = RateLimitConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let layer = RateLimitLayer::from_config(&config);
+        let mut service = layer.layer(PendingService);
+
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(service.poll_ready(&mut cx).is_pending());
+    }
+
     #[tokio::test]
     async fn is_trusted_proxy_returns_false_for_untrusted_ip() {
         let config = RateLimitConfig {
