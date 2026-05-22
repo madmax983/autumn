@@ -1021,7 +1021,6 @@ async fn verify_request(
     })
 }
 
-
 async fn verify_replay_protection(
     registry: &WebhookRegistry,
     endpoint: &ResolvedWebhookEndpoint,
@@ -1245,7 +1244,9 @@ fn resolve_delivery_id(
     }
 
     match config.provider {
-        WebhookProvider::Slack => slack_delivery_id(json_body).or_else(|| json_string_field(json_body, "id")),
+        WebhookProvider::Slack => {
+            slack_delivery_id(json_body).or_else(|| json_string_field(json_body, "id"))
+        }
         _ => json_string_field(json_body, "id"),
     }
 }
