@@ -31,6 +31,7 @@ db = [
     "dep:libsqlite3-sys",
     "dep:pq-sys",
     "dep:scoped-futures",
+    "dep:tokio-postgres",
     "diesel/postgres",
     "diesel/chrono",
 ]
@@ -69,6 +70,7 @@ pq-sys = { workspace = true, optional = true }
 diesel-async = { workspace = true, optional = true }
 diesel_migrations = { workspace = true, optional = true }
 scoped-futures = { version = "0.1.4", optional = true }
+tokio-postgres = { version = "0.7", optional = true }
 futures.workspace = true
 http.workspace = true
 indexmap.workspace = true

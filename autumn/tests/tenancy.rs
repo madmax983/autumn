@@ -78,6 +78,9 @@ async fn test_tenant_scoping_isolation() {
     let repo = PgTenantPostRepository {
         pool,
         across_tenants: false,
+        __autumn_statement_timeout_ms: 0,
+        __autumn_slow_threshold: ::std::time::Duration::from_millis(100),
+        __autumn_route: ::core::option::Option::None,
     };
 
     // Save record for tenant A
@@ -149,6 +152,9 @@ async fn test_unscoped_query_without_context_fails() {
     let repo = PgTenantPostRepository {
         pool,
         across_tenants: false,
+        __autumn_statement_timeout_ms: 0,
+        __autumn_slow_threshold: ::std::time::Duration::from_millis(100),
+        __autumn_route: ::core::option::Option::None,
     };
 
     // Scoped methods should fail when run unscoped without context
@@ -185,6 +191,9 @@ async fn test_escape_hatch_across_tenants() {
     let repo = PgTenantPostRepository {
         pool,
         across_tenants: false,
+        __autumn_statement_timeout_ms: 0,
+        __autumn_slow_threshold: ::std::time::Duration::from_millis(100),
+        __autumn_route: ::core::option::Option::None,
     };
 
     with_tenant("tenant-a".to_string(), async {

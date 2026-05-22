@@ -1,12 +1,12 @@
-//! `#[repository(Model)]` proc macro implementation.
+﻿//! `#[repository(Model)]` proc macro implementation.
 //!
 //! Generates a concrete `PgXxxRepository` struct with:
 //! - Auto-generated CRUD (`find_by_id`, `find_all`, save, update, `delete_by_id`, count, `exists_by_id`)
 //! - Derived queries parsed from trait method names (`find_by_field`, `count_by_field`, etc.)
 //! - `FromRequestParts` extractor impl
 //!
-//! Uses native async fn in traits (Rust 1.75+) — no `async_trait` crate needed.
-//! Uses `diesel-async` `RunQueryDsl` for async queries — no sync `interact()`.
+//! Uses native async fn in traits (Rust 1.75+) ΓÇö no `async_trait` crate needed.
+//! Uses `diesel-async` `RunQueryDsl` for async queries ΓÇö no sync `interact()`.
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
@@ -213,7 +213,7 @@ fn generate_derived_query_for_source(
     match query.prefix.as_str() {
         "find" => {
             quote! {
-                let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                let mut conn = self.__autumn_acquire_conn().await?;
                 #query_source
                     #(#filters)*
                     #soft_delete_filter
@@ -224,7 +224,7 @@ fn generate_derived_query_for_source(
         }
         "count" => {
             quote! {
-                let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                let mut conn = self.__autumn_acquire_conn().await?;
                 #query_source
                     #(#filters)*
                     #soft_delete_filter
@@ -238,7 +238,7 @@ fn generate_derived_query_for_source(
             if soft_delete {
                 quote! {
                     let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
-                    let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                    let mut conn = self.__autumn_acquire_conn().await?;
                     ::autumn_web::reexports::diesel::update(
                         #query_source #(#filters)* .filter(#table_ident::deleted_at.is_null())
                     )
@@ -250,7 +250,7 @@ fn generate_derived_query_for_source(
                 }
             } else {
                 quote! {
-                    let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                    let mut conn = self.__autumn_acquire_conn().await?;
                     ::autumn_web::reexports::diesel::delete(#query_source #(#filters)*)
                         .execute(&mut conn)
                         .await
@@ -261,7 +261,7 @@ fn generate_derived_query_for_source(
         }
         "exists" => {
             quote! {
-                let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                let mut conn = self.__autumn_acquire_conn().await?;
                 ::autumn_web::reexports::diesel::select(
                     ::autumn_web::reexports::diesel::dsl::exists(
                         #query_source #(#filters)* #soft_delete_filter
@@ -421,12 +421,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     }
 
-    // ── Build struct fields, extractor init, and CRUD bodies ──────────────
+    // ΓöÇΓöÇ Build struct fields, extractor init, and CRUD bodies ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
     //
     // When `hooks_type` is present, the struct gains a `hooks` field,
     // the extractor initialises it with `Default::default()`, and the
     // save / update / delete methods are wrapped in a transactional
-    // hook lifecycle (before_* → persist).
+    // hook lifecycle (before_* ΓåÆ persist).
     //
     // When absent, the generated code is identical to the pre-hooks version
     // (zero-cost path).
@@ -468,6 +468,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         hooks: <#hooks_ident as ::autumn_web::hooks::RepositoryHooksClone>::autumn_clone(&self.hooks),
                         #idempotency_clone_field
                         across_tenants: true,
+                        __autumn_statement_timeout_ms: self.__autumn_statement_timeout_ms,
+                        __autumn_slow_threshold: self.__autumn_slow_threshold,
+                        __autumn_route: self.__autumn_route.clone(),
                     }
                 }
             }
@@ -480,6 +483,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     Self {
                         pool: self.pool.clone(),
                         across_tenants: true,
+                        __autumn_statement_timeout_ms: self.__autumn_statement_timeout_ms,
+                        __autumn_slow_threshold: self.__autumn_slow_threshold,
+                        __autumn_route: self.__autumn_route.clone(),
                     }
                 }
             }
@@ -498,7 +504,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         hook_support_methods,
         hook_inventory_registration,
     ) = if let Some(ref hooks_ident) = config.hooks_type {
-        // ── Struct fields with hooks ───────────────────────
+        // ΓöÇΓöÇ Struct fields with hooks ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
         let idempotency_struct_field = if commit_hooks_enabled {
             quote! {
                 idempotency: ::core::option::Option<::autumn_web::idempotency::IdempotencyContext>,
@@ -521,6 +527,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             hooks: #hooks_ident,
             #idempotency_struct_field
             #tenant_struct_field
+            /// Statement timeout to apply on every connection checkout (ms). 0 = no limit.
+            __autumn_statement_timeout_ms: u64,
+            /// Slow-query logging threshold.
+            __autumn_slow_threshold: ::std::time::Duration,
+            /// Route path from `MatchedPath` for metrics labels.
+            __autumn_route: ::std::option::Option<::std::string::String>,
         };
 
         let clone_impl = quote! {
@@ -531,14 +543,36 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         hooks: <#hooks_ident as ::autumn_web::hooks::RepositoryHooksClone>::autumn_clone(&self.hooks),
                         #idempotency_clone_field
                         #tenant_clone_field
+                        __autumn_statement_timeout_ms: self.__autumn_statement_timeout_ms,
+                        __autumn_slow_threshold: self.__autumn_slow_threshold,
+                        __autumn_route: self.__autumn_route.clone(),
                     }
                 }
             }
         };
 
+        let timeout_route_init = quote! {
+            use ::autumn_web::db::DbState as _;
+            // Postgres statement_timeout is a signed 32-bit integer (ms).
+            const __AUTUMN_PG_TIMEOUT_MAX_MS: u64 = i32::MAX as u64;
+            let __autumn_timeout_ms: u64 = _parts
+                .extensions
+                .get::<::autumn_web::db::StatementTimeout>()
+                .map(|t| ::std::convert::TryFrom::try_from(t.0.as_millis()).unwrap_or(u64::MAX))
+                .or_else(|| state.statement_timeout().map(|d| ::std::convert::TryFrom::try_from(d.as_millis()).unwrap_or(u64::MAX)))
+                .unwrap_or(0u64)
+                .min(__AUTUMN_PG_TIMEOUT_MAX_MS);
+            let __autumn_slow_threshold = state.slow_query_threshold();
+            let __autumn_route: ::std::option::Option<::std::string::String> = _parts
+                .extensions
+                .get::<::autumn_web::reexports::axum::extract::MatchedPath>()
+                .map(|p| p.as_str().to_owned());
+        };
+
         let extractor_init = if commit_hooks_enabled {
             quote! {
                 #pg_name::__autumn_register_repository_commit_hooks();
+                #timeout_route_init
                 Ok(#pg_name {
                     pool,
                     hooks: <#hooks_ident as ::autumn_web::hooks::RepositoryHooksDefault>::autumn_default(),
@@ -547,14 +581,21 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         .get::<::autumn_web::idempotency::IdempotencyContext>()
                         .cloned(),
                     #tenant_init_field
+                    __autumn_statement_timeout_ms: __autumn_timeout_ms,
+                    __autumn_slow_threshold,
+                    __autumn_route,
                 })
             }
         } else {
             quote! {
+                #timeout_route_init
                 Ok(#pg_name {
                     pool,
                     hooks: <#hooks_ident as ::autumn_web::hooks::RepositoryHooksDefault>::autumn_default(),
                     #tenant_init_field
+                    __autumn_statement_timeout_ms: __autumn_timeout_ms,
+                    __autumn_slow_threshold,
+                    __autumn_route,
                 })
             }
         };
@@ -659,8 +700,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             quote! {}
         };
 
-        // ── save (hooked) ─────────────────────────────────
-        // ── save (hooked) ─────────────────────────────────
+        // ΓöÇΓöÇ save (hooked) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+        // ΓöÇΓöÇ save (hooked) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
         let save_body = if config.tenant_scoped {
             if commit_hooks_enabled {
                 quote! {
@@ -678,7 +719,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         ::core::option::Option::Some(t)
                     };
                     Self::__autumn_register_repository_commit_hooks();
-                    let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                    let mut conn = self.__autumn_acquire_conn().await?;
                     let (record, mut ctx, __autumn_commit_hook_id, __autumn_commit_hook_owner, __autumn_commit_hook_record) = conn
                         .transaction::<(#model_name, MutationContext, ::std::string::String, ::std::string::String, ::autumn_web::reexports::serde_json::Value), ::autumn_web::AutumnError, _>(|conn| {
                             async move {
@@ -813,7 +854,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             .ok_or_else(|| ::autumn_web::AutumnError::internal_server_error_msg("Query scoped to tenant, but no tenant context was established"))?;
                         ::core::option::Option::Some(t)
                     };
-                    let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                    let mut conn = self.__autumn_acquire_conn().await?;
                     let (record, mut ctx) = conn
                         .transaction::<(#model_name, MutationContext), ::autumn_web::AutumnError, _>(|conn| {
                             async move {
@@ -856,7 +897,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     use ::autumn_web::hooks::{MutationContext, MutationOp, MutationHooks};
 
                     Self::__autumn_register_repository_commit_hooks();
-                    let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                    let mut conn = self.__autumn_acquire_conn().await?;
                     let (record, mut ctx, __autumn_commit_hook_id, __autumn_commit_hook_owner, __autumn_commit_hook_record) = conn
                         .transaction::<(#model_name, MutationContext, ::std::string::String, ::std::string::String, ::autumn_web::reexports::serde_json::Value), ::autumn_web::AutumnError, _>(|conn| {
                             async move {
@@ -977,7 +1018,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
                     use ::autumn_web::hooks::{MutationContext, MutationOp, MutationHooks};
 
-                    let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                    let mut conn = self.__autumn_acquire_conn().await?;
                     let (record, mut ctx) = conn
                         .transaction::<(#model_name, MutationContext), ::autumn_web::AutumnError, _>(|conn| {
                             async move {
@@ -1005,7 +1046,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         };
 
-        // ── update (hooked) ───────────────────────────────
+        // ΓöÇΓöÇ update (hooked) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
         let draft_ext_trait = format_ident!("{}DraftExt", model_name);
         let update_body = if config.tenant_scoped {
             if commit_hooks_enabled {
@@ -1026,7 +1067,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     };
 
                     Self::__autumn_register_repository_commit_hooks();
-                    let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                    let mut conn = self.__autumn_acquire_conn().await?;
                     let (record, mut ctx, __autumn_commit_hook_id, __autumn_commit_hook_owner, __autumn_commit_hook_record) = conn
                         .transaction::<(#model_name, MutationContext, ::std::string::String, ::std::string::String, ::autumn_web::reexports::serde_json::Value), ::autumn_web::AutumnError, _>(|conn| {
                             async move {
@@ -1223,7 +1264,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         ::core::option::Option::Some(t)
                     };
 
-                    let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                    let mut conn = self.__autumn_acquire_conn().await?;
                     let (record, mut ctx) = conn
                         .transaction::<(#model_name, MutationContext), ::autumn_web::AutumnError, _>(|conn| {
                             async move {
@@ -1328,7 +1369,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     use ::autumn_web::repository::{AutumnLockVersionModelExt as _, AutumnLockVersionUpdateExt as _};
 
                     Self::__autumn_register_repository_commit_hooks();
-                    let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                    let mut conn = self.__autumn_acquire_conn().await?;
                     let (record, mut ctx, __autumn_commit_hook_id, __autumn_commit_hook_owner, __autumn_commit_hook_record) = conn
                         .transaction::<(#model_name, MutationContext, ::std::string::String, ::std::string::String, ::autumn_web::reexports::serde_json::Value), ::autumn_web::AutumnError, _>(|conn| {
                             async move {
@@ -1502,7 +1543,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     use ::autumn_web::hooks::{MutationContext, MutationOp, MutationHooks, UpdateDraft};
                     use ::autumn_web::repository::{AutumnLockVersionModelExt as _, AutumnLockVersionUpdateExt as _};
 
-                    let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                    let mut conn = self.__autumn_acquire_conn().await?;
                     let (record, mut ctx) = conn
                         .transaction::<(#model_name, MutationContext), ::autumn_web::AutumnError, _>(|conn| {
                             async move {
@@ -1579,7 +1620,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         };
 
-        // ── delete (hooked) ───────────────────────────────
+        // ΓöÇΓöÇ delete (hooked) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
         //
         // The core mutation differs for soft-delete repositories:
         // - hard delete: `DELETE FROM table WHERE id = $1`
@@ -1635,7 +1676,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                     #tenant_id_setup
                     Self::__autumn_register_repository_commit_hooks();
-                    let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                    let mut conn = self.__autumn_acquire_conn().await?;
                     conn
                         .transaction::<(), ::autumn_web::AutumnError, _>(|conn| {
                             async move {
@@ -1698,7 +1739,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     use ::autumn_web::hooks::{MutationContext, MutationOp, MutationHooks};
 
                     #tenant_id_setup
-                    let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                    let mut conn = self.__autumn_acquire_conn().await?;
                     conn
                         .transaction::<(), ::autumn_web::AutumnError, _>(|conn| {
                             async move {
@@ -1739,7 +1780,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 use ::autumn_web::hooks::{MutationContext, MutationOp, MutationHooks};
 
                 Self::__autumn_register_repository_commit_hooks();
-                let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                let mut conn = self.__autumn_acquire_conn().await?;
                 conn
                     .transaction::<(), ::autumn_web::AutumnError, _>(|conn| {
                         async move {
@@ -1795,7 +1836,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
                 use ::autumn_web::hooks::{MutationContext, MutationOp, MutationHooks};
 
-                let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                let mut conn = self.__autumn_acquire_conn().await?;
                 conn
                     .transaction::<(), ::autumn_web::AutumnError, _>(|conn| {
                         async move {
@@ -1835,13 +1876,19 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             hook_inventory_registration,
         )
     } else {
-        // ── No hooks: existing zero-cost path ─────────────
+        // ΓöÇΓöÇ No hooks: existing zero-cost path ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
         let struct_fields = quote! {
             pool: ::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Pool<
                 ::autumn_web::reexports::diesel_async::AsyncPgConnection,
             >,
             #tenant_struct_field
+            /// Statement timeout to apply on every connection checkout (ms). 0 = no limit.
+            __autumn_statement_timeout_ms: u64,
+            /// Slow-query logging threshold.
+            __autumn_slow_threshold: ::std::time::Duration,
+            /// Route path from `MatchedPath` for metrics labels.
+            __autumn_route: ::std::option::Option<::std::string::String>,
         };
 
         let clone_impl = quote! {
@@ -1850,15 +1897,40 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     Self {
                         pool: self.pool.clone(),
                         #tenant_clone_field
+                        __autumn_statement_timeout_ms: self.__autumn_statement_timeout_ms,
+                        __autumn_slow_threshold: self.__autumn_slow_threshold,
+                        __autumn_route: self.__autumn_route.clone(),
                     }
                 }
             }
         };
 
+        let timeout_route_init = quote! {
+            use ::autumn_web::db::DbState as _;
+            // Postgres statement_timeout is a signed 32-bit integer (ms).
+            const __AUTUMN_PG_TIMEOUT_MAX_MS: u64 = i32::MAX as u64;
+            let __autumn_timeout_ms: u64 = _parts
+                .extensions
+                .get::<::autumn_web::db::StatementTimeout>()
+                .map(|t| ::std::convert::TryFrom::try_from(t.0.as_millis()).unwrap_or(u64::MAX))
+                .or_else(|| state.statement_timeout().map(|d| ::std::convert::TryFrom::try_from(d.as_millis()).unwrap_or(u64::MAX)))
+                .unwrap_or(0u64)
+                .min(__AUTUMN_PG_TIMEOUT_MAX_MS);
+            let __autumn_slow_threshold = state.slow_query_threshold();
+            let __autumn_route: ::std::option::Option<::std::string::String> = _parts
+                .extensions
+                .get::<::autumn_web::reexports::axum::extract::MatchedPath>()
+                .map(|p| p.as_str().to_owned());
+        };
+
         let extractor_init = quote! {
+            #timeout_route_init
             Ok(#pg_name {
                 pool,
                 #tenant_init_field
+                __autumn_statement_timeout_ms: __autumn_timeout_ms,
+                __autumn_slow_threshold,
+                __autumn_route,
             })
         };
 
@@ -1873,7 +1945,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         .ok_or_else(|| ::autumn_web::AutumnError::internal_server_error_msg("Query scoped to tenant, but no tenant context was established"))?;
                     ::core::option::Option::Some(t)
                 };
-                let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                let mut conn = self.__autumn_acquire_conn().await?;
                 if let ::core::option::Option::Some(ref t) = tenant_id {
                     ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                         .values((new, #table_ident::tenant_id.eq(t)))
@@ -1891,7 +1963,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             quote! {
                 use ::autumn_web::reexports::diesel::prelude::*;
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                let mut conn = self.__autumn_acquire_conn().await?;
                 ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                     .values(new)
                     .get_result::<#model_name>(&mut conn)
@@ -1912,7 +1984,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         .ok_or_else(|| ::autumn_web::AutumnError::internal_server_error_msg("Query scoped to tenant, but no tenant context was established"))?;
                     ::core::option::Option::Some(t)
                 };
-                let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                let mut conn = self.__autumn_acquire_conn().await?;
 
                 if let ::core::option::Option::Some(expected_version) =
                     changes.__autumn_lock_version_expected()
@@ -1991,7 +2063,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 use ::autumn_web::reexports::diesel::prelude::*;
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
                 use ::autumn_web::repository::{AutumnLockVersionModelExt as _, AutumnLockVersionUpdateExt as _};
-                let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                let mut conn = self.__autumn_acquire_conn().await?;
 
                 if let ::core::option::Option::Some(expected_version) =
                     changes.__autumn_lock_version_expected()
@@ -2062,7 +2134,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl;
                     #tenant_id_setup
                     let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
-                    let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                    let mut conn = self.__autumn_acquire_conn().await?;
                     let delete_query = #table_ident::table.find(id).filter(#table_ident::deleted_at.is_null());
                     let __count = if let ::core::option::Option::Some(ref t) = tenant_id {
                         ::autumn_web::reexports::diesel::update(delete_query.filter(#table_ident::tenant_id.eq(t)))
@@ -2088,7 +2160,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     use ::autumn_web::reexports::diesel::prelude::*;
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl;
                     #tenant_id_setup
-                    let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                    let mut conn = self.__autumn_acquire_conn().await?;
                     let delete_query = #table_ident::table.find(id);
                     let __count = if let ::core::option::Option::Some(ref t) = tenant_id {
                         ::autumn_web::reexports::diesel::delete(delete_query.filter(#table_ident::tenant_id.eq(t)))
@@ -2113,7 +2185,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 use ::autumn_web::reexports::diesel::prelude::*;
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
                 let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
-                let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                let mut conn = self.__autumn_acquire_conn().await?;
                 let delete_query = #table_ident::table.find(id).filter(#table_ident::deleted_at.is_null());
                 let __count = ::autumn_web::reexports::diesel::update(delete_query)
                     .set(#table_ident::deleted_at.eq(::core::option::Option::Some(__now)))
@@ -2131,7 +2203,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             quote! {
                 use ::autumn_web::reexports::diesel::prelude::*;
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                let mut conn = self.__autumn_acquire_conn().await?;
                 let delete_query = #table_ident::table.find(id);
                 let __count = ::autumn_web::reexports::diesel::delete(delete_query)
                     .execute(&mut conn)
@@ -2164,7 +2236,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {}
     };
 
-    // ── Pagination methods (`page` always; `cursor_page` when cursor_key is declared) ──
+    // ΓöÇΓöÇ Pagination methods (`page` always; `cursor_page` when cursor_key is declared) ΓöÇΓöÇ
     //
     // `page` executes a COUNT(*) + a LIMIT/OFFSET query and wraps the result in
     // `Page<Model>`. `cursor_page` uses keyset pagination on the primary key `id`
@@ -2198,7 +2270,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         .ok_or_else(|| ::autumn_web::AutumnError::internal_server_error_msg("Query scoped to tenant, but no tenant context was established"))?;
                     ::core::option::Option::Some(t)
                 };
-                let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                let mut conn = self.__autumn_acquire_conn().await?;
 
                 let query = #table_ident::table;
                 if let ::core::option::Option::Some(ref t) = tenant_id {
@@ -2248,7 +2320,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             ) -> ::autumn_web::AutumnResult<::autumn_web::pagination::Page<#model_name>> {
                 use ::autumn_web::reexports::diesel::prelude::*;
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                let mut conn = self.__autumn_acquire_conn().await?;
                 let total: i64 = #table_ident::table
                     #sd_filter
                     .count()
@@ -2308,7 +2380,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         let trait_method = quote! {
             /// Fetch one page of records using keyset (cursor) pagination.
             ///
-            /// The cursor token is opaque — encode / decode it via
+            /// The cursor token is opaque ΓÇö encode / decode it via
             /// [`::autumn_web::pagination::CursorRequest`].  The result is a
             /// [`::autumn_web::pagination::CursorPage`] containing a
             /// `next_cursor` token for the following page.
@@ -2316,7 +2388,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<::autumn_web::pagination::CursorPage<#model_name>>> + Send;
         };
         let impl_method = if let Some(ref key_type) = config.cursor_key_type {
-            // Full two-part keyset filter — always correct regardless of whether
+            // Full two-part keyset filter ΓÇö always correct regardless of whether
             // cursor_key and id are monotonically correlated.
             quote! {
                 async fn cursor_page(
@@ -2325,7 +2397,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 ) -> ::autumn_web::AutumnResult<::autumn_web::pagination::CursorPage<#model_name>> {
                     use ::autumn_web::reexports::diesel::prelude::*;
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                    let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                    let mut conn = self.__autumn_acquire_conn().await?;
                     let mut query = #table_ident::table.into_boxed();
                     #tenant_query_filter
                     if let ::core::option::Option::Some((after_k, after_id)) =
@@ -2359,7 +2431,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 }
             }
         } else {
-            // id-only cursor — correct when cursor_key and id are monotonically
+            // id-only cursor ΓÇö correct when cursor_key and id are monotonically
             // correlated (the common case for created_at + auto-increment id).
             quote! {
                 async fn cursor_page(
@@ -2368,7 +2440,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 ) -> ::autumn_web::AutumnResult<::autumn_web::pagination::CursorPage<#model_name>> {
                     use ::autumn_web::reexports::diesel::prelude::*;
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                    let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                    let mut conn = self.__autumn_acquire_conn().await?;
                     let mut query = #table_ident::table.into_boxed();
                     #tenant_query_filter
                     if let ::core::option::Option::Some(after_id) = req.decode::<i64>() {
@@ -2399,7 +2471,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         (quote! {}, quote! {})
     };
 
-    // ── Build API handlers (when `api = "/path"` is present) ────────────
+    // ΓöÇΓöÇ Build API handlers (when `api = "/path"` is present) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
     let api_handlers = if let Some(ref api_path) = config.api_path {
         let prefix = to_snake_case(&model_name.to_string());
 
@@ -2525,7 +2597,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         // List endpoint behavior, in order of precedence:
         //
         // 1. `scope = SomeScope`: invoke the registered scope (the
-        //    most efficient form — the scope filters at the SQL level
+        //    most efficient form ΓÇö the scope filters at the SQL level
         //    via Diesel).
         // 2. `policy = SomePolicy` without `scope`: load every
         //    record, then filter through `Policy::can_show` per row.
@@ -2575,7 +2647,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         };
         // Inject session + state extractors when *either* a scope
-        // or a policy is configured — both code paths above need
+        // or a policy is configured ΓÇö both code paths above need
         // them.
         let list_session_state_args = if config.scope_type.is_some() || has_policy {
             quote! {
@@ -2621,7 +2693,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             quote! { ::core::option::Option::None }
         };
         // Companion probe for `scope = ...`. ONLY attached to the
-        // `_api_list` route's metadata — the other auto-generated
+        // `_api_list` route's metadata ΓÇö the other auto-generated
         // routes (`*_api_get` / `*_api_create` / `*_api_update` /
         // `*_api_delete`) never call `scope.list`, so flagging them
         // for missing scope registration would fire the prod fail-
@@ -2917,7 +2989,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         };
 
         quote! {
-            // ── Auto-generated REST API handlers ─────────────────
+            // ΓöÇΓöÇ Auto-generated REST API handlers ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
             #policy_type_assertion
             #scope_type_assertion
@@ -3149,7 +3221,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 }
             }
 
-            // ── Path helpers for API routes ───────────────────────
+            // ΓöÇΓöÇ Path helpers for API routes ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
             #[doc(hidden)]
             #vis fn #list_path_fn() -> ::std::string::String {
@@ -3210,7 +3282,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     use ::autumn_web::reexports::diesel::prelude::*;
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl;
                     #tenant_id_setup
-                    let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                    let mut conn = self.__autumn_acquire_conn().await?;
                     let query = #table_ident::table.find(id);
                     let __count = if let ::core::option::Option::Some(ref t) = tenant_id {
                         ::autumn_web::reexports::diesel::update(query.filter(#table_ident::tenant_id.eq(t)))
@@ -3236,7 +3308,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     use ::autumn_web::reexports::diesel::prelude::*;
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl;
                     #tenant_id_setup
-                    let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                    let mut conn = self.__autumn_acquire_conn().await?;
                     let query = #table_ident::table.find(id);
                     let __count = if let ::core::option::Option::Some(ref t) = tenant_id {
                         ::autumn_web::reexports::diesel::delete(query.filter(#table_ident::tenant_id.eq(t)))
@@ -3260,7 +3332,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     use ::autumn_web::reexports::diesel::prelude::*;
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl;
                     #tenant_id_setup
-                    let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                    let mut conn = self.__autumn_acquire_conn().await?;
                     let query = #table_ident::table;
                     if let ::core::option::Option::Some(ref t) = tenant_id {
                         query.filter(#table_ident::tenant_id.eq(t))
@@ -3278,7 +3350,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     use ::autumn_web::reexports::diesel::prelude::*;
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl;
                     #tenant_id_setup
-                    let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                    let mut conn = self.__autumn_acquire_conn().await?;
                     let query = #table_ident::table.filter(#table_ident::deleted_at.is_not_null());
                     if let ::core::option::Option::Some(ref t) = tenant_id {
                         query.filter(#table_ident::tenant_id.eq(t))
@@ -3299,7 +3371,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     use ::autumn_web::reexports::diesel::prelude::*;
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl;
                     #tenant_id_setup
-                    let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                    let mut conn = self.__autumn_acquire_conn().await?;
                     let query = #table_ident::table.filter(#table_ident::deleted_at.is_not_null());
                     if let ::core::option::Option::Some(ref t) = tenant_id {
                         let total: i64 = query
@@ -3341,7 +3413,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 async fn restore(&self, id: i64) -> ::autumn_web::AutumnResult<()> {
                     use ::autumn_web::reexports::diesel::prelude::*;
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                    let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                    let mut conn = self.__autumn_acquire_conn().await?;
                     let query = #table_ident::table.find(id);
                     let __count = ::autumn_web::reexports::diesel::update(query)
                         .set(#table_ident::deleted_at.eq(::core::option::Option::None::<::autumn_web::reexports::chrono::NaiveDateTime>))
@@ -3359,7 +3431,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 async fn purge(&self, id: i64) -> ::autumn_web::AutumnResult<()> {
                     use ::autumn_web::reexports::diesel::prelude::*;
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                    let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                    let mut conn = self.__autumn_acquire_conn().await?;
                     let query = #table_ident::table.find(id);
                     let __count = ::autumn_web::reexports::diesel::delete(query)
                         .execute(&mut conn)
@@ -3376,7 +3448,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 async fn with_deleted(&self) -> ::autumn_web::AutumnResult<Vec<#model_name>> {
                     use ::autumn_web::reexports::diesel::prelude::*;
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                    let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                    let mut conn = self.__autumn_acquire_conn().await?;
                     let query = #table_ident::table;
                     query
                         .load::<#model_name>(&mut conn)
@@ -3387,7 +3459,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 async fn only_deleted(&self) -> ::autumn_web::AutumnResult<Vec<#model_name>> {
                     use ::autumn_web::reexports::diesel::prelude::*;
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                    let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                    let mut conn = self.__autumn_acquire_conn().await?;
                     let query = #table_ident::table.filter(#table_ident::deleted_at.is_not_null());
                     query
                         .load::<#model_name>(&mut conn)
@@ -3401,7 +3473,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 ) -> ::autumn_web::AutumnResult<::autumn_web::pagination::Page<#model_name>> {
                     use ::autumn_web::reexports::diesel::prelude::*;
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                    let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                    let mut conn = self.__autumn_acquire_conn().await?;
                     let query = #table_ident::table.filter(#table_ident::deleted_at.is_not_null());
                     let total: i64 = query
                         .count()
@@ -3579,7 +3651,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // Generate the trait, impl, and extractor.
     //
     // Key design decisions:
-    // - Native async fn (no #[async_trait]) — Rust 1.75+ supports this
+    // - Native async fn (no #[async_trait]) ΓÇö Rust 1.75+ supports this
     // - Trait methods use `-> impl Future` for object safety with Send bound
     // - Uses diesel-async RunQueryDsl for async .load()/.first() etc.
     // - Table/New/Update types must be in scope where the macro is invoked
@@ -3626,14 +3698,14 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             async fn find_by_id(&self, id: i64) -> ::autumn_web::AutumnResult<Option<#model_name>> {
                 use ::autumn_web::reexports::diesel::prelude::*;
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                let mut conn = self.__autumn_acquire_conn().await?;
                 #find_by_id_impl
             }
 
             async fn find_all(&self) -> ::autumn_web::AutumnResult<Vec<#model_name>> {
                 use ::autumn_web::reexports::diesel::prelude::*;
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                let mut conn = self.__autumn_acquire_conn().await?;
                 #find_all_impl
             }
 
@@ -3652,14 +3724,14 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             async fn count(&self) -> ::autumn_web::AutumnResult<i64> {
                 use ::autumn_web::reexports::diesel::prelude::*;
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                let mut conn = self.__autumn_acquire_conn().await?;
                 #count_impl
             }
 
             async fn exists_by_id(&self, id: i64) -> ::autumn_web::AutumnResult<bool> {
                 use ::autumn_web::reexports::diesel::prelude::*;
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                let mut conn = self.__autumn_acquire_conn().await?;
                 #exists_by_id_impl
             }
 
@@ -3684,7 +3756,40 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     ::autumn_web::reexports::diesel_async::AsyncPgConnection,
                 >,
             > {
-                self.pool.get().await.map_err(::autumn_web::AutumnError::from)
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl as _;
+                let mut conn = self.pool.get().await.map_err(|e| {
+                    ::autumn_web::reexports::tracing::error!(
+                        "repository: failed to acquire database connection: {e}"
+                    );
+                    ::autumn_web::AutumnError::service_unavailable_msg(
+                        ::std::format!("Database connection error: {e}")
+                    )
+                })?;
+                let timeout_ms = self.__autumn_statement_timeout_ms;
+                // Postgres statement_timeout is a signed 32-bit integer; cap to be safe.
+                let timeout_ms = timeout_ms.min(i32::MAX as u64);
+
+                ::autumn_web::reexports::diesel::sql_query(
+                    ::std::format!("SET statement_timeout = {timeout_ms}")
+                )
+                .execute(&mut conn)
+                .await
+                .map_err(|e| {
+                    ::autumn_web::reexports::tracing::error!(
+                        "repository: failed to set statement_timeout to {timeout_ms}ms: {e}"
+                    );
+                    ::autumn_web::AutumnError::service_unavailable_msg(
+                        ::std::format!("Database initialization error: {e}")
+                    )
+                })?;
+                ::core::result::Result::Ok(conn)
+            }
+
+            /// Returns the route label for metrics, e.g. `"GET /users"`.
+            #[doc(hidden)]
+            #[inline]
+            fn __autumn_route_label(&self) -> &str {
+                self.__autumn_route.as_deref().unwrap_or("unknown")
             }
 
             /// Pessimistic lock helper: SELECT FOR UPDATE the row with
@@ -3706,7 +3811,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 use ::autumn_web::reexports::diesel_async::AsyncConnection;
                 use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
 
-                let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                let mut conn = self.__autumn_acquire_conn().await?;
                 conn.transaction::<T, ::autumn_web::AutumnError, _>(|conn| {
                     async move {
                         let row = #table_ident::table
@@ -4152,7 +4257,7 @@ mod tests {
         assert_eq!(to_snake_case("widget"), "widget");
     }
 
-    // ── Pagination method generation (issue #681) ──────────────────
+    // ΓöÇΓöÇ Pagination method generation (issue #681) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn parse_repo_args_with_cursor_key() {
@@ -4271,7 +4376,7 @@ mod tests {
             generated.contains("lt") && generated.contains("eq") && generated.contains("and"),
             "cursor_key_type must cause a two-part keyset filter: {generated}"
         );
-        // Concrete type — no inference placeholder.
+        // Concrete type ΓÇö no inference placeholder.
         assert!(
             generated.contains("NaiveDateTime"),
             "cursor_key_type must appear in the decode call: {generated}"
@@ -4289,7 +4394,7 @@ mod tests {
         );
     }
 
-    // ── Soft-delete generation (issue #689) ───────────────────────
+    // ΓöÇΓöÇ Soft-delete generation (issue #689) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn parse_repo_args_recognizes_soft_delete_flag() {
@@ -4548,7 +4653,7 @@ mod tests {
         .to_string();
 
         // Locate the prefetch (before_delete context load) inside the
-        // transaction block — search for the for_update call site.
+        // transaction block ΓÇö search for the for_update call site.
         let prefetch_pos = generated
             .find("for_update")
             .expect("hooked delete must generate a for_update prefetch");
@@ -4615,7 +4720,7 @@ mod tests {
         );
     }
 
-    // ── Tenant Scoped generation (issue #695) ───────────────────
+    // ΓöÇΓöÇ Tenant Scoped generation (issue #695) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn parse_repo_args_recognizes_tenant_scoped_flag() {
