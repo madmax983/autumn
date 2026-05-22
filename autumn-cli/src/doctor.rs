@@ -168,7 +168,12 @@ pub fn check_signing_secret_impl(secret: Option<&str>, is_production: bool) -> C
 }
 
 pub fn check_trusted_hosts_impl(hosts: &[String], is_production: bool) -> CheckResult {
-    if hosts.is_empty() {
+    let normalized: Vec<String> = hosts
+        .iter()
+        .map(|h| h.trim().to_owned())
+        .filter(|h| !h.is_empty())
+        .collect();
+    if normalized.is_empty() {
         return if is_production {
             CheckResult {
                 name: "trusted_hosts",
@@ -191,7 +196,7 @@ pub fn check_trusted_hosts_impl(hosts: &[String], is_production: bool) -> CheckR
         };
     }
 
-    if hosts.len() == 1 && hosts[0] == "*" {
+    if normalized.iter().any(|h| h == "*") {
         return CheckResult {
             name: "trusted_hosts",
             status: CheckStatus::Warn,
@@ -205,7 +210,7 @@ pub fn check_trusted_hosts_impl(hosts: &[String], is_production: bool) -> CheckR
         status: CheckStatus::Pass,
         detail: Some(format!(
             "trusted hosts configured ({} entries)",
-            hosts.len()
+            normalized.len()
         )),
         hint: None,
     }
@@ -1163,15 +1168,12 @@ fn resolve_optional_signing_secret() -> Option<String> {
 
 fn resolve_trusted_hosts() -> Vec<String> {
     if let Ok(val) = std::env::var("AUTUMN_SECURITY__TRUSTED_HOSTS__HOSTS") {
-        let parsed: Vec<String> = val
+        return val
             .split(',')
             .map(str::trim)
             .filter(|v| !v.is_empty())
             .map(std::borrow::ToOwned::to_owned)
             .collect();
-        if !parsed.is_empty() {
-            return parsed;
-        }
     }
     std::fs::read_to_string("autumn.toml")
         .ok()
@@ -1396,6 +1398,13 @@ mod tests {
     #[test]
     fn trusted_hosts_warn_on_wildcard() {
         let result = check_trusted_hosts_impl(&["*".to_owned()], true);
+        assert_eq!(result.name, "trusted_hosts");
+        assert!(matches!(result.status, CheckStatus::Warn));
+    }
+
+    #[test]
+    fn trusted_hosts_warn_on_wildcard_when_mixed_with_other_entries() {
+        let result = check_trusted_hosts_impl(&["example.com".to_owned(), "*".to_owned()], true);
         assert_eq!(result.name, "trusted_hosts");
         assert!(matches!(result.status, CheckStatus::Warn));
     }

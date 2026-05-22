@@ -1165,10 +1165,9 @@ fn apply_middleware(
         };
 
     router = apply_cors_middleware(router, config);
-    let trusted_hosts = config.security.trusted_hosts.hosts.clone();
-    let profile = config.profile.clone().unwrap_or_else(|| "dev".to_string());
+    let trusted_host_policy = TrustedHostPolicy::from_config(config);
     router = router.layer(axum::middleware::from_fn(move |req, next| {
-        trusted_host_middleware(req, next, trusted_hosts.clone(), profile.clone())
+        trusted_host_middleware(req, next, trusted_host_policy.clone())
     }));
     router = apply_csrf_middleware(router, config, signing_keys_opt.clone());
     // Method-override rejection filter. The outer `MethodOverrideLayer`
@@ -1278,57 +1277,21 @@ fn apply_middleware(
 async fn trusted_host_middleware(
     req: Request<axum::body::Body>,
     next: Next,
-    trusted_hosts: Vec<String>,
-    profile: String,
+    policy: TrustedHostPolicy,
 ) -> axum::response::Response {
     let path = req.uri().path();
-    if ["/actuator/health", "/live", "/ready", "/startup"].contains(&path) {
+    if policy.probe_bypass_paths.contains(path) {
         return next.run(req).await;
     }
     let host = req
         .headers()
         .get(http::header::HOST)
         .and_then(|v| v.to_str().ok())
-        .unwrap_or_default()
-        .split(':')
-        .next()
-        .unwrap_or_default()
-        .trim_matches('[')
-        .trim_matches(']')
-        .to_ascii_lowercase();
-    let mut allowed = trusted_hosts.clone();
-    if profile == "dev" || profile == "development" {
-        allowed.extend(
-            ["localhost", "127.0.0.1", "::1"]
-                .iter()
-                .map(|s| s.to_string()),
-        );
-    }
-    let wildcard = allowed.iter().any(|h| h == "*");
-    let listed = |candidate: &str| {
-        allowed.iter().any(|rule| {
-            let r = rule.to_ascii_lowercase();
-            if let Some(suffix) = r.strip_prefix('.') {
-                candidate == suffix || candidate.ends_with(&format!(".{suffix}"))
-            } else {
-                candidate == r
-            }
-        })
-    };
-    let is_release_profile = profile == "prod" || profile == "production";
-    let is_loopback = matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1");
-
-    let ok = if wildcard {
-        true
-    } else if is_release_profile && is_loopback {
-        listed(host.as_str())
-    } else {
-        listed(host.as_str())
-    };
-    if ok {
+        .and_then(extract_host_without_port);
+    if host.is_some_and(|host| policy.allows_host(host)) {
         next.run(req).await
     } else {
-        tracing::warn!(host = %host, "trusted host rejected request");
+        tracing::warn!(host = ?host, "trusted host rejected request");
         let body = crate::error::problem_details_json_string(
             StatusCode::BAD_REQUEST,
             "Invalid Host header",
@@ -1345,6 +1308,24 @@ async fn trusted_host_middleware(
         )
             .into_response()
     }
+}
+
+fn extract_host_without_port(header: &str) -> Option<&str> {
+    let host = header.trim();
+    if host.is_empty() {
+        return None;
+    }
+    if host.starts_with('[') {
+        let end = host.find(']')?;
+        return host.get(1..end).filter(|v| !v.is_empty());
+    }
+    let (candidate, _) = host.rsplit_once(':').unwrap_or((host, ""));
+    let normalized = if host.contains(':') && candidate.contains(':') {
+        host
+    } else {
+        candidate
+    };
+    (!normalized.is_empty()).then_some(normalized)
 }
 
 /// Build the router with optional static-file-first serving.
@@ -3211,5 +3192,112 @@ mod trusted_host_tests {
             .await
             .expect("request should complete");
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn trusted_host_accepts_bracketed_ipv6_loopback_in_dev() {
+        let cfg = AutumnConfig::default();
+        let router = build_router(vec![], &cfg, crate::state::AppState::for_tests());
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/nope")
+                    .header("host", "[::1]:3000")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn trusted_host_bypasses_custom_probe_path_only() {
+        let mut cfg = AutumnConfig::default();
+        cfg.security.trusted_hosts.hosts = vec!["example.com".into()];
+        cfg.health.path = "/healthz".into();
+        cfg.health.startup_path = "/startupz".into();
+        cfg.health.ready_path = "/readyz".into();
+        cfg.health.live_path = "/livez".into();
+        let router = build_router(vec![], &cfg, crate::state::AppState::for_tests());
+
+        let bypassed = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .header("host", "evil.com")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(bypassed.status(), StatusCode::OK);
+
+        let not_bypassed = router
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .header("host", "evil.com")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(not_bypassed.status(), StatusCode::BAD_REQUEST);
+    }
+}
+#[derive(Clone, Debug)]
+struct TrustedHostPolicy {
+    rules: Arc<Vec<String>>,
+    allow_any: bool,
+    probe_bypass_paths: Arc<std::collections::HashSet<String>>,
+}
+
+impl TrustedHostPolicy {
+    fn from_config(config: &AutumnConfig) -> Self {
+        let mut rules: Vec<String> = config
+            .security
+            .trusted_hosts
+            .hosts
+            .iter()
+            .map(|h| h.trim().to_ascii_lowercase())
+            .filter(|h| !h.is_empty())
+            .collect();
+        if matches!(config.profile.as_deref(), Some("dev" | "development")) {
+            rules.extend(
+                ["localhost", "127.0.0.1", "::1"]
+                    .into_iter()
+                    .map(std::borrow::ToOwned::to_owned),
+            );
+        }
+        let allow_any = rules.iter().any(|h| h == "*");
+        let probe_bypass_paths = std::collections::HashSet::from([
+            config.health.path.clone(),
+            config.health.live_path.clone(),
+            config.health.ready_path.clone(),
+            config.health.startup_path.clone(),
+        ]);
+        Self {
+            rules: Arc::new(rules),
+            allow_any,
+            probe_bypass_paths: Arc::new(probe_bypass_paths),
+        }
+    }
+
+    fn allows_host(&self, host: &str) -> bool {
+        if self.allow_any {
+            return true;
+        }
+        self.rules.iter().any(|rule| {
+            if let Some(suffix) = rule.strip_prefix('.') {
+                host == suffix
+                    || host
+                        .strip_suffix(suffix)
+                        .is_some_and(|prefix| prefix.ends_with('.'))
+            } else {
+                host == rule
+            }
+        })
     }
 }

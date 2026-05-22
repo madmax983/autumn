@@ -3436,14 +3436,21 @@ fn fail_fast_on_invalid_trusted_hosts(config: &AutumnConfig) {
     if !is_production {
         return;
     }
-    let hosts = &config.security.trusted_hosts.hosts;
+    let hosts: Vec<String> = config
+        .security
+        .trusted_hosts
+        .hosts
+        .iter()
+        .map(|h| h.trim().to_owned())
+        .filter(|h| !h.is_empty())
+        .collect();
     if hosts.is_empty() {
         eprintln!(
             "[security.trusted_hosts] is required in production; set hosts = [\"example.com\"] or explicit entries"
         );
         std::process::exit(1);
     }
-    if hosts.len() == 1 && hosts[0] == "*" {
+    if hosts.iter().any(|h| h == "*") {
         tracing::warn!("trusted host validation disabled via wildcard '*' in production");
     }
 }
