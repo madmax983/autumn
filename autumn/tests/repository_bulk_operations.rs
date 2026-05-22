@@ -66,7 +66,18 @@ diesel::table! {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, diesel::Queryable, diesel::Selectable, diesel::Insertable, diesel::AsChangeset, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    diesel::Queryable,
+    diesel::Selectable,
+    diesel::Insertable,
+    diesel::AsChangeset,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 #[diesel(table_name = test_zero_col_records)]
 pub struct ZeroColRecord {
     pub id: i64,
@@ -132,10 +143,16 @@ impl ZeroColRecord {
 
     pub fn __autumn_upsert_set() -> impl ::autumn_web::reexports::diesel::query_builder::AsChangeset<
         Target = crate::test_zero_col_records::table,
-        Changeset = impl ::autumn_web::reexports::diesel::query_builder::QueryFragment<::autumn_web::reexports::diesel::pg::Pg> + ::core::marker::Send + ::core::marker::Sync + 'static
-    > + ::core::marker::Send + ::core::marker::Sync + 'static {
-        use ::autumn_web::reexports::diesel::ExpressionMethods as _;
+        Changeset = impl ::autumn_web::reexports::diesel::query_builder::QueryFragment<
+            ::autumn_web::reexports::diesel::pg::Pg,
+        > + ::core::marker::Send
+                    + ::core::marker::Sync
+                    + 'static,
+    > + ::core::marker::Send
+    + ::core::marker::Sync
+    + 'static {
         use crate::test_zero_col_records::dsl::*;
+        use ::autumn_web::reexports::diesel::ExpressionMethods as _;
         (dummy.eq(::autumn_web::reexports::diesel::pg::upsert::excluded(dummy)),)
     }
 }
@@ -560,8 +577,12 @@ async fn test_zero_col_bulk_insert() {
     let repo = build_zero_col_repo(pool);
 
     let new_records = vec![
-        NewZeroColRecord { dummy: "A".to_string() },
-        NewZeroColRecord { dummy: "B".to_string() },
+        NewZeroColRecord {
+            dummy: "A".to_string(),
+        },
+        NewZeroColRecord {
+            dummy: "B".to_string(),
+        },
     ];
     let inserted = repo.save_many(&new_records).await.unwrap();
     assert_eq!(inserted.len(), 2);
@@ -597,7 +618,10 @@ async fn test_tenant_scoped_upsert_many_mismatch() {
     .await;
 
     // This must return a conflict/bad_request error due to tenant mismatch
-    assert!(stale_or_mismatched.is_err(), "Expected tenant mismatch error, but it succeeded!");
+    assert!(
+        stale_or_mismatched.is_err(),
+        "Expected tenant mismatch error, but it succeeded!"
+    );
     let err_str = stale_or_mismatched.unwrap_err().to_string();
     assert!(
         err_str.contains("Tenant conflict") || err_str.contains("potential cross-tenant conflict"),
@@ -612,13 +636,12 @@ async fn test_lock_version_upsert_many_conflict() {
     let repo = build_lock_repo(pool);
 
     // 1. Save initial lock records
-    let inserted = repo.save_many(&[
-        NewLockRecord {
+    let inserted = repo
+        .save_many(&[NewLockRecord {
             name: "Lock A".to_string(),
-        }
-    ])
-    .await
-    .unwrap();
+        }])
+        .await
+        .unwrap();
     assert_eq!(inserted.len(), 1);
     let original = inserted[0].clone();
     assert_eq!(original.lock_version, 1);
@@ -636,7 +659,10 @@ async fn test_lock_version_upsert_many_conflict() {
     stale_upsert.name = "Lock A (Stale)".to_string();
     let stale_res = repo.upsert_many(&[stale_upsert]).await;
 
-    assert!(stale_res.is_err(), "Expected stale lock version conflict, but it succeeded!");
+    assert!(
+        stale_res.is_err(),
+        "Expected stale lock version conflict, but it succeeded!"
+    );
     let err_str = stale_res.unwrap_err().to_string();
     assert!(
         err_str.contains("conflict") || err_str.contains("Conflict"),
