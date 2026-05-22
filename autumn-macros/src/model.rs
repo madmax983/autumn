@@ -641,6 +641,33 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
+    let model_tenant_id_meta_impl = tenant_id_field.as_ref().map_or_else(
+        || {
+            quote! {
+                impl ::autumn_web::tenancy::ModelTenantIdMeta for #new_name {
+                    const HAS_MANUAL_TENANT_ID: bool = false;
+                    fn try_set_tenant_id(&mut self, _tenant_id: &str) {}
+                }
+            }
+        },
+        |f| {
+            let is_option = is_option_type(&f.ty);
+            let set_field = if is_option {
+                quote! { self.tenant_id = ::core::option::Option::Some(tenant_id.to_string()); }
+            } else {
+                quote! { self.tenant_id = tenant_id.to_string(); }
+            };
+            quote! {
+                impl ::autumn_web::tenancy::ModelTenantIdMeta for #new_name {
+                    const HAS_MANUAL_TENANT_ID: bool = true;
+                    fn try_set_tenant_id(&mut self, tenant_id: &str) {
+                        #set_field
+                    }
+                }
+            }
+        },
+    );
+
     let mut changeset_fields: Vec<TokenStream> = fields_for_new
         .iter()
         .map(|f| {
@@ -1230,6 +1257,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
 
         #can_set_tenant_id_impl
+        #model_tenant_id_meta_impl
 
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
         #vis enum #field_enum_name {

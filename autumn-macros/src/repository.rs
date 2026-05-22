@@ -742,7 +742,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                                 let record = if let ::core::option::Option::Some(ref t) = tenant_id {
                                     ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
-                                        .values((&input, #table_ident::tenant_id.eq(t)))
+                                        .values(::autumn_web::tenancy::TenantInsertable::tenant_values(input.clone(), t))
                                         .get_result::<#model_name>(conn)
                                         .await
                                 } else {
@@ -869,7 +869,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                                 let record = if let ::core::option::Option::Some(ref t) = tenant_id {
                                     ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
-                                        .values((&input, #table_ident::tenant_id.eq(t)))
+                                        .values(::autumn_web::tenancy::TenantInsertable::tenant_values(input.clone(), t))
                                         .get_result::<#model_name>(conn)
                                         .await
                                 } else {
@@ -1976,7 +1976,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let mut conn = self.__autumn_acquire_conn().await?;
                 if let ::core::option::Option::Some(ref t) = tenant_id {
                     ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
-                        .values((new, #table_ident::tenant_id.eq(t)))
+                        .values(::autumn_web::tenancy::TenantInsertable::tenant_values(new.clone(), t))
                         .get_result::<#model_name>(&mut conn)
                         .await
                 } else {
@@ -2505,6 +2505,31 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         (trait_method, impl_method)
     } else {
         (quote! {}, quote! {})
+    };
+
+    let tenant_scoped_traits = if config.tenant_scoped {
+        quote! {
+            impl ::autumn_web::tenancy::HasTenantIdColumn for #table_ident::table {
+                type Column = #table_ident::tenant_id;
+                fn column() -> Self::Column {
+                    #table_ident::tenant_id
+                }
+            }
+
+            impl<'a> ::autumn_web::tenancy::TenantInsertable<'a, #table_ident::table> for #new_name {
+                type Values = <::autumn_web::tenancy::TenantInsertableValuesSelector<'a, Self, #table_ident::table, { <Self as ::autumn_web::tenancy::ModelTenantIdMeta>::HAS_MANUAL_TENANT_ID }> as ::autumn_web::tenancy::GetInsertableValues>::Values;
+
+                fn tenant_values(self, tenant_id: &'a str) -> Self::Values {
+                    ::autumn_web::tenancy::GetInsertableValues::get_values(::autumn_web::tenancy::TenantInsertableValuesSelector::<'a, Self, #table_ident::table, { <Self as ::autumn_web::tenancy::ModelTenantIdMeta>::HAS_MANUAL_TENANT_ID }> {
+                        inner: self,
+                        tenant_id,
+                        _marker: ::core::marker::PhantomData,
+                    })
+                }
+            }
+        }
+    } else {
+        quote! {}
     };
 
     // ΓöÇΓöÇ Build API handlers (when `api = "/path"` is present) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
@@ -3871,6 +3896,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         #hook_inventory_registration
 
         #api_handlers
+
+        #tenant_scoped_traits
     }
 }
 

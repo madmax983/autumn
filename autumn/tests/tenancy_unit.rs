@@ -376,3 +376,51 @@ async fn jwt_audience_missing_claim_fails() {
         "Expected audience rejection for missing aud claim, got: {err}"
     );
 }
+
+/// When polling a response body wrapped in `TenantPropagatingBody`, the
+/// `CURRENT_TENANT` task-local context must be re-established for the duration
+/// of the poll.
+#[tokio::test]
+async fn tenant_propagating_body_sets_context_during_poll() {
+    use autumn_web::tenancy::{CURRENT_TENANT, TenantPropagatingBody};
+    use bytes::Bytes;
+    use http_body::{Body as HttpBody, Frame};
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    // A body that checks CURRENT_TENANT inside poll_frame
+    struct ContextCheckBody {
+        done: bool,
+    }
+    impl HttpBody for ContextCheckBody {
+        type Data = Bytes;
+        type Error = std::convert::Infallible;
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            if self.done {
+                return Poll::Ready(None);
+            }
+            self.done = true;
+            let tenant = CURRENT_TENANT.try_with(Clone::clone).ok().flatten();
+            assert_eq!(
+                tenant.as_deref(),
+                Some("acme"),
+                "tenant must be visible during poll_frame"
+            );
+            Poll::Ready(Some(Ok(Frame::data(Bytes::from("data")))))
+        }
+    }
+
+    let body = ContextCheckBody { done: false };
+    let mut wrapped = TenantPropagatingBody {
+        inner: body,
+        tenant_id: "acme".to_string(),
+    };
+    // Poll it outside any CURRENT_TENANT scope (which would fail without the wrapper)
+    let waker = futures::task::noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    let res = Pin::new(&mut wrapped).poll_frame(&mut cx);
+    assert!(res.is_ready());
+}

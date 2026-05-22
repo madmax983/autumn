@@ -4,7 +4,11 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
+use http_body::Body as HttpBody;
+use pin_project_lite::pin_project;
 use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 // 1. Task-local storage for CURRENT_TENANT
 tokio::task_local! {
@@ -228,16 +232,13 @@ pub async fn extract_tenant_from_parts(
             // validation is enabled so legacy tokens without an `aud` claim
             // cannot bypass the check.
             if let Some(ref expected_aud) = config.tenancy.jwt_audience {
-                let aud_ok = token_data
-                    .claims
-                    .get("aud")
-                    .is_some_and(|v| match v {
-                        serde_json::Value::String(s) => s == expected_aud,
-                        serde_json::Value::Array(arr) => arr
-                            .iter()
-                            .any(|e| e.as_str() == Some(expected_aud.as_str())),
-                        _ => false,
-                    });
+                let aud_ok = token_data.claims.get("aud").is_some_and(|v| match v {
+                    serde_json::Value::String(s) => s == expected_aud,
+                    serde_json::Value::Array(arr) => arr
+                        .iter()
+                        .any(|e| e.as_str() == Some(expected_aud.as_str())),
+                    _ => false,
+                });
                 if !aud_ok {
                     return Err(crate::AutumnError::unauthorized_msg(
                         "JWT audience validation failed: missing or invalid aud claim",
@@ -293,7 +294,117 @@ pub async fn tenancy_middleware(
     };
 
     let request = Request::from_parts(parts, body);
-    CURRENT_TENANT
+    let tenant_id_clone = tenant_id.clone();
+    let response = CURRENT_TENANT
         .scope(Some(tenant_id), next.run(request))
-        .await
+        .await;
+
+    let (parts, body) = response.into_parts();
+    let wrapped = TenantPropagatingBody {
+        inner: body,
+        tenant_id: tenant_id_clone,
+    };
+    Response::from_parts(parts, axum::body::Body::new(wrapped))
+}
+
+pin_project! {
+    /// A response body wrapper that re-establishes the tenant context
+    /// for each poll of the inner body, so lazy/streaming bodies can
+    /// access tenant-scoped repositories during their polling phase.
+    pub struct TenantPropagatingBody<B> {
+        #[pin]
+        pub inner: B,
+        pub tenant_id: String,
+    }
+}
+
+impl<B> HttpBody for TenantPropagatingBody<B>
+where
+    B: HttpBody,
+{
+    type Data = B::Data;
+    type Error = B::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        let this = self.project();
+        let tenant_id = this.tenant_id.clone();
+        CURRENT_TENANT.sync_scope(Some(tenant_id), || this.inner.poll_frame(cx))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+/// A trait implemented by model insertable helper types to dynamically set tenant ID.
+///
+/// This sets or appends the tenant ID before database insertion. This avoids SQL duplicate
+/// column errors when a model already has a manual (non-default) `tenant_id` field.
+#[cfg(feature = "db")]
+pub trait TenantInsertable<'a, Table> {
+    type Values;
+    fn tenant_values(self, tenant_id: &'a str) -> Self::Values;
+}
+
+/// Metadata about a model's `tenant_id` struct field.
+#[cfg(feature = "db")]
+pub trait ModelTenantIdMeta {
+    /// True if the struct has a manual `tenant_id` field.
+    const HAS_MANUAL_TENANT_ID: bool;
+    /// Sets the tenant ID field on the struct if it has one.
+    fn try_set_tenant_id(&mut self, tenant_id: &str);
+}
+
+/// A trait that bridges a Diesel table to its `tenant_id` column.
+#[cfg(feature = "db")]
+pub trait HasTenantIdColumn {
+    type Column: ::diesel::Expression<SqlType = ::diesel::sql_types::Text>;
+    fn column() -> Self::Column;
+}
+
+/// A selector helper to choose between different insertable values.
+#[cfg(feature = "db")]
+pub struct TenantInsertableValuesSelector<'a, T, Table, const HAS_MANUAL: bool> {
+    pub inner: T,
+    pub tenant_id: &'a str,
+    pub _marker: std::marker::PhantomData<Table>,
+}
+
+/// A trait implemented by selector variants to get the actual insertable values.
+#[cfg(feature = "db")]
+pub trait GetInsertableValues {
+    type Values;
+    fn get_values(self) -> Self::Values;
+}
+
+#[cfg(feature = "db")]
+impl<T, Table> GetInsertableValues for TenantInsertableValuesSelector<'_, T, Table, true>
+where
+    T: ModelTenantIdMeta,
+{
+    type Values = T;
+    fn get_values(mut self) -> Self::Values {
+        self.inner.try_set_tenant_id(self.tenant_id);
+        self.inner
+    }
+}
+
+#[cfg(feature = "db")]
+impl<'a, T, Table> GetInsertableValues for TenantInsertableValuesSelector<'a, T, Table, false>
+where
+    Table: HasTenantIdColumn,
+    Table::Column: ::diesel::ExpressionMethods,
+{
+    type Values = (T, ::diesel::dsl::Eq<Table::Column, &'a str>);
+    fn get_values(self) -> Self::Values {
+        use ::diesel::ExpressionMethods;
+        (self.inner, Table::column().eq(self.tenant_id))
+    }
 }

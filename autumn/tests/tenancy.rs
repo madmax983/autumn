@@ -30,6 +30,40 @@ pub trait TenantPostRepository {
     fn find_by_title(title: String) -> Vec<TenantPost>;
 }
 
+mod manual_schema {
+    ::autumn_web::reexports::diesel::table! {
+        manual_tenant_posts (id) {
+            id -> Int8,
+            title -> Text,
+            tenant_id -> Text,
+        }
+    }
+}
+
+use manual_schema::manual_tenant_posts;
+
+#[autumn_web::model(table = "manual_tenant_posts")]
+pub struct ManualTenantPost {
+    #[id]
+    pub id: i64,
+    pub title: String,
+    pub tenant_id: String,
+}
+
+#[autumn_web::repository(ManualTenantPost, table = "manual_tenant_posts", tenant_scoped)]
+pub trait ManualTenantPostRepository {}
+
+#[test]
+fn test_manual_tenant_id_insertable() {
+    use autumn_web::tenancy::TenantInsertable;
+    let post = NewManualTenantPost {
+        title: "Hello".to_string(),
+        tenant_id: String::new(),
+    };
+    let with_tenant = post.tenant_values("my-tenant");
+    assert_eq!(with_tenant.tenant_id, "my-tenant");
+}
+
 // Helper to set up the DB table.
 async fn setup_db(
     pool: &autumn_web::reexports::diesel_async::pooled_connection::deadpool::Pool<
