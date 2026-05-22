@@ -119,7 +119,7 @@ hex = "0.4"
 lettre = { version = "0.11.21", default-features = false, features = ["builder", "smtp-transport", "tokio1-rustls-tls"], optional = true }
 
 [dev-dependencies]
-diesel = { version = "2", features = ["chrono"] }
+diesel = { version = "2", features = ["chrono", "postgres"] }
 filetime = "0.2"
 http.workspace = true
 serde_json = "1"

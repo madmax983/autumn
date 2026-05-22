@@ -4,8 +4,8 @@
 
 #![cfg(feature = "db")]
 
+use autumn_web::hooks::{MutationContext, MutationHooks, Patch, UpdateDraft};
 use autumn_web::prelude::*;
-use autumn_web::hooks::{MutationContext, MutationHooks, MutationOp, UpdateDraft, Patch};
 use diesel::prelude::*;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::deadpool::Pool;
@@ -24,7 +24,7 @@ diesel::table! {
 }
 
 #[autumn_web::model(table = "test_bulk_records")]
-#[derive(PartialEq)]
+#[derive(PartialEq, Eq)]
 pub struct BulkRecord {
     #[id]
     pub id: i64,
@@ -46,7 +46,7 @@ diesel::table! {
 }
 
 #[autumn_web::model(table = "test_hooked_records")]
-#[derive(PartialEq)]
+#[derive(PartialEq, Eq)]
 pub struct HookedRecord {
     #[id]
     pub id: i64,
@@ -82,7 +82,9 @@ impl MutationHooks for HookedRecordHooks {
         draft: &mut UpdateDraft<HookedRecord>,
     ) -> AutumnResult<()> {
         if draft.after.name == "invalid_update" {
-            return Err(autumn_web::AutumnError::bad_request_msg("invalid name on update"));
+            return Err(autumn_web::AutumnError::bad_request_msg(
+                "invalid name on update",
+            ));
         }
         if draft.after.name == "hook_modified_update" {
             draft.after.value = 777;
@@ -95,19 +97,6 @@ impl MutationHooks for HookedRecordHooks {
 pub trait HookedRecordRepository {}
 
 // ── Setup & helpers ─────────────────────────────────────────────────────────
-
-const CREATE_TABLES_SQL: &str = r"
-    CREATE TABLE IF NOT EXISTS test_bulk_records (
-        id BIGSERIAL PRIMARY KEY,
-        name TEXT NOT NULL,
-        value INT NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS test_hooked_records (
-        id BIGSERIAL PRIMARY KEY,
-        name TEXT NOT NULL,
-        value INT NOT NULL
-    );
-";
 
 async fn setup_pool() -> (
     Pool<AsyncPgConnection>,
@@ -126,15 +115,19 @@ async fn setup_pool() -> (
     let pool = Pool::builder(manager).max_size(5).build().expect("pool");
 
     let mut conn = pool.get().await.expect("conn");
-    diesel::sql_query(CREATE_TABLES_SQL)
+    diesel::sql_query("CREATE TABLE IF NOT EXISTS test_bulk_records (id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL, value INT NOT NULL)")
         .execute(&mut conn)
         .await
-        .expect("create tables");
+        .expect("create test_bulk_records");
+    diesel::sql_query("CREATE TABLE IF NOT EXISTS test_hooked_records (id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL, value INT NOT NULL)")
+        .execute(&mut conn)
+        .await
+        .expect("create test_hooked_records");
 
     (pool, container)
 }
 
-fn build_bulk_repo(pool: Pool<AsyncPgConnection>) -> PgBulkRecordRepository {
+const fn build_bulk_repo(pool: Pool<AsyncPgConnection>) -> PgBulkRecordRepository {
     PgBulkRecordRepository {
         pool,
         __autumn_statement_timeout_ms: 0,
@@ -143,7 +136,7 @@ fn build_bulk_repo(pool: Pool<AsyncPgConnection>) -> PgBulkRecordRepository {
     }
 }
 
-fn build_hooked_repo(pool: Pool<AsyncPgConnection>) -> PgHookedRecordRepository {
+const fn build_hooked_repo(pool: Pool<AsyncPgConnection>) -> PgHookedRecordRepository {
     PgHookedRecordRepository {
         pool,
         hooks: HookedRecordHooks,
@@ -163,9 +156,18 @@ async fn test_bulk_ops_without_hooks() {
 
     // 1. save_many
     let new_records = vec![
-        NewBulkRecord { name: "A".to_string(), value: 10 },
-        NewBulkRecord { name: "B".to_string(), value: 20 },
-        NewBulkRecord { name: "C".to_string(), value: 30 },
+        NewBulkRecord {
+            name: "A".to_string(),
+            value: 10,
+        },
+        NewBulkRecord {
+            name: "B".to_string(),
+            value: 20,
+        },
+        NewBulkRecord {
+            name: "C".to_string(),
+            value: 30,
+        },
     ];
     let inserted = repo.save_many(&new_records).await.unwrap();
     assert_eq!(inserted.len(), 3);
@@ -191,7 +193,7 @@ async fn test_bulk_ops_without_hooks() {
     let mut upsert_records = inserted.clone();
     upsert_records[0].name = "Upserted A".to_string(); // Existing row update
     upsert_records[0].value = 500;
-    
+
     // Create a new record representation with a custom/new ID for insertion
     let mut conn = repo.pool.get().await.unwrap();
     let max_id: i64 = test_bulk_records::table
@@ -209,7 +211,7 @@ async fn test_bulk_ops_without_hooks() {
 
     let upserted = repo.upsert_many(&upsert_records).await.unwrap();
     assert_eq!(upserted.len(), 4);
-    
+
     let db_rows = repo.find_all().await.unwrap();
     assert_eq!(db_rows.len(), 4);
     let row_a = db_rows.iter().find(|r| r.id == inserted[0].id).unwrap();
@@ -235,8 +237,14 @@ async fn test_bulk_ops_with_hooks() {
 
     // 1. save_many (happy path and modified hook path)
     let new_records = vec![
-        NewHookedRecord { name: "Normal".to_string(), value: 10 },
-        NewHookedRecord { name: "hook_modified".to_string(), value: 20 },
+        NewHookedRecord {
+            name: "Normal".to_string(),
+            value: 10,
+        },
+        NewHookedRecord {
+            name: "hook_modified".to_string(),
+            value: 20,
+        },
     ];
     let inserted = repo.save_many(&new_records).await.unwrap();
     assert_eq!(inserted.len(), 2);
@@ -247,8 +255,14 @@ async fn test_bulk_ops_with_hooks() {
 
     // 2. save_many (failure path - aborts whole transaction)
     let bad_records = vec![
-        NewHookedRecord { name: "Valid".to_string(), value: 30 },
-        NewHookedRecord { name: "invalid".to_string(), value: 40 }, // triggers Err in before_create hook
+        NewHookedRecord {
+            name: "Valid".to_string(),
+            value: 30,
+        },
+        NewHookedRecord {
+            name: "invalid".to_string(),
+            value: 40,
+        }, // triggers Err in before_create hook
     ];
     let err = repo.save_many(&bad_records).await.unwrap_err();
     assert!(err.to_string().contains("invalid name"));
@@ -260,9 +274,18 @@ async fn test_bulk_ops_with_hooks() {
 
     // 3. save_many_skip_invalid (happy path with invalid filtering and DB constraint fallback)
     let mix_records = vec![
-        NewHookedRecord { name: "Valid Mix 1".to_string(), value: 100 },
-        NewHookedRecord { name: "invalid".to_string(), value: 200 }, // failed hook
-        NewHookedRecord { name: "Valid Mix 2".to_string(), value: 300 },
+        NewHookedRecord {
+            name: "Valid Mix 1".to_string(),
+            value: 100,
+        },
+        NewHookedRecord {
+            name: "invalid".to_string(),
+            value: 200,
+        }, // failed hook
+        NewHookedRecord {
+            name: "Valid Mix 2".to_string(),
+            value: 300,
+        },
     ];
     let (successes, failures) = repo.save_many_skip_invalid(&mix_records).await.unwrap();
     assert_eq!(successes.len(), 2);
@@ -293,7 +316,11 @@ async fn test_bulk_ops_with_hooks() {
 
     // Verify transaction rolled back (still "hook_modified_update" with value 777)
     let db_rows_after = repo.find_all().await.unwrap();
-    assert!(db_rows_after.iter().all(|r| r.value == 777 || r.value == 100 || r.value == 300));
+    assert!(
+        db_rows_after
+            .iter()
+            .all(|r| r.value == 777 || r.value == 100 || r.value == 300)
+    );
 
     // 6. delete_many
     let all_ids: Vec<i64> = db_rows_after.iter().map(|r| r.id).collect();

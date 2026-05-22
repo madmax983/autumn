@@ -1898,11 +1898,724 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         };
 
-        let save_many_body = quote! { todo!() };
-        let save_many_skip_invalid_body = quote! { todo!() };
-        let update_many_body = quote! { todo!() };
-        let delete_many_body = quote! { todo!() };
-        let upsert_many_body = quote! { todo!() };
+        let save_many_body = {
+            let tenant_id_setup = if config.tenant_scoped {
+                quote! {
+                    let tenant_id = if self.across_tenants {
+                        ::autumn_web::tenancy::CURRENT_TENANT.try_with(|t| t.clone()).ok().flatten()
+                    } else {
+                        let t = ::autumn_web::tenancy::CURRENT_TENANT.try_with(|t| t.clone()).ok().flatten()
+                            .ok_or_else(|| ::autumn_web::AutumnError::internal_server_error_msg("Query scoped to tenant, but no tenant context was established"))?;
+                        ::core::option::Option::Some(t)
+                    };
+                    let tenant_id = tenant_id.as_ref();
+                }
+            } else {
+                quote! {}
+            };
+
+            let insert_expr = if config.tenant_scoped {
+                quote! {
+                    if let ::core::option::Option::Some(t) = tenant_id {
+                        let values: Vec<_> = chunk.iter().cloned().map(|item| ::autumn_web::tenancy::TenantInsertable::tenant_values(item, t)).collect();
+                        ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                            .values(&values)
+                            .get_results::<#model_name>(conn)
+                            .await
+                    } else {
+                        ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                            .values(chunk)
+                            .get_results::<#model_name>(conn)
+                            .await
+                    }
+                }
+            } else {
+                quote! {
+                    ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                        .values(chunk)
+                        .get_results::<#model_name>(conn)
+                        .await
+                }
+            };
+
+            if commit_hooks_enabled {
+                quote! {
+                    use ::autumn_web::reexports::diesel::prelude::*;
+                    use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                    use ::autumn_web::reexports::diesel_async::AsyncConnection;
+                    use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
+                    use ::autumn_web::hooks::{MutationContext, MutationOp, MutationHooks};
+
+                    if new.is_empty() {
+                        return Ok(Vec::new());
+                    }
+
+                    #tenant_id_setup
+                    Self::__autumn_register_repository_commit_hooks();
+
+                    let mut inputs = new.to_vec();
+                    let mut contexts = Vec::new();
+                    for input in &mut inputs {
+                        let mut ctx = MutationContext::new(MutationOp::Create);
+                        let mut __autumn_commit_hook_discriminator: ::core::option::Option<::std::string::String> =
+                            ::core::option::Option::None;
+                        if let ::core::option::Option::Some(__autumn_idempotency) = &self.idempotency {
+                            ctx.set_idempotency_key(__autumn_idempotency.scoped_key());
+                        }
+                        self.hooks.before_create(&mut ctx, input).await?;
+                        contexts.push(ctx);
+                    }
+
+                    let mut conn = self.__autumn_acquire_conn().await?;
+                    let contexts_ref = &contexts;
+                    let (inserted_records, hook_infos) = conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| {
+                        async move {
+                            let mut inserted_records = Vec::new();
+                            let mut hook_infos = Vec::new();
+                            let mut offset = 0;
+                            for chunk in inputs.chunks(1000) {
+                                let chunk_inserted = #insert_expr
+                                    .map_err(::autumn_web::AutumnError::from)?;
+
+                                for (idx, record) in chunk_inserted.iter().enumerate() {
+                                    let global_idx = offset + idx;
+                                    let ctx = &contexts_ref[global_idx];
+                                    let mut __autumn_commit_hook_discriminator: ::core::option::Option<::std::string::String> =
+                                        ::core::option::Option::None;
+                                    if let ::core::option::Option::Some(__autumn_idempotency) = &self.idempotency {
+                                        __autumn_commit_hook_discriminator =
+                                            ::core::option::Option::Some(__autumn_idempotency.next_mutation_discriminator());
+                                    }
+
+                                    let __autumn_commit_hook_record = record.__autumn_commit_hook_to_value()?;
+                                    let (__autumn_commit_hook_id, __autumn_commit_hook_owner) = ::autumn_web::__private::enqueue_repository_commit_hook_pending_on_conn(
+                                        conn,
+                                        Self::__autumn_repository_commit_hook_key(),
+                                        "create",
+                                        ctx.idempotency_key.as_deref(),
+                                        __autumn_commit_hook_discriminator.as_deref(),
+                                        ctx,
+                                        &__autumn_commit_hook_record,
+                                    )
+                                    .await?;
+                                    hook_infos.push((__autumn_commit_hook_id, __autumn_commit_hook_owner, __autumn_commit_hook_record));
+                                }
+                                inserted_records.extend(chunk_inserted);
+                                offset += chunk.len();
+                            }
+                            Ok((inserted_records, hook_infos))
+                        }
+                        .scope_boxed()
+                    })
+                    .await?;
+
+                    ::core::mem::drop(conn);
+
+                    // Run after_create hooks outside of transaction
+                    for (idx, record) in inserted_records.iter().enumerate() {
+                        let mut ctx = contexts[idx].clone();
+                        let (hook_id, hook_owner, hook_record) = &hook_infos[idx];
+
+                        let __autumn_pending_heartbeat =
+                            ::autumn_web::__private::start_repository_commit_hook_pending_finalizer_heartbeat(
+                                self.pool.clone(),
+                                hook_id.clone(),
+                                hook_owner.clone(),
+                            );
+                        let __autumn_after_create = ::autumn_web::__private::catch_repository_after_hook_unwind(
+                            self.hooks.after_create(&mut ctx, record)
+                        )
+                        .await;
+                        match __autumn_after_create {
+                            ::core::result::Result::Ok(::core::result::Result::Ok(())) => {}
+                            ::core::result::Result::Ok(::core::result::Result::Err(__autumn_error)) => {
+                                let __autumn_error_message = ::std::format!("{__autumn_error}");
+                                ::autumn_web::__private::mark_repository_commit_hook_after_hook_failed(
+                                    &self.pool,
+                                    hook_id,
+                                    hook_owner,
+                                    __autumn_error_message,
+                                )
+                                .await;
+                                __autumn_pending_heartbeat.cancel();
+                                return ::core::result::Result::Err(
+                                    ::autumn_web::idempotency::__cache_committed_error_response(__autumn_error)
+                                );
+                            }
+                            ::core::result::Result::Err(__autumn_panic) => {
+                                ::autumn_web::__private::mark_repository_commit_hook_after_hook_failed(
+                                    &self.pool,
+                                    hook_id,
+                                    hook_owner,
+                                    "after_create panicked",
+                                )
+                                .await;
+                                __autumn_pending_heartbeat.cancel();
+                                if self.idempotency.is_some() {
+                                    return ::core::result::Result::Err(
+                                        ::autumn_web::idempotency::__cache_committed_error_response(
+                                            ::autumn_web::AutumnError::internal_server_error_msg("after_create panicked")
+                                        )
+                                    );
+                                }
+                                ::std::panic::resume_unwind(__autumn_panic);
+                            }
+                        }
+                        let __autumn_finalize_result = ::autumn_web::__private::finalize_repository_commit_hook_after_hook(
+                            &self.pool,
+                            hook_id,
+                            hook_owner,
+                            &ctx,
+                            hook_record,
+                        )
+                        .await;
+                        __autumn_pending_heartbeat.cancel();
+                        match __autumn_finalize_result {
+                            ::core::result::Result::Ok(()) => {
+                                ::autumn_web::__private::kick_repository_commit_hook_dispatcher(&self.pool);
+                            }
+                            ::core::result::Result::Err(__autumn_error) => {
+                                ::autumn_web::reexports::tracing::warn!(
+                                    hook_id = %hook_id,
+                                    error = %__autumn_error,
+                                    "failed to finalize repository create commit hook after mutation commit; failing request closed"
+                                );
+                                return ::core::result::Result::Err(
+                                    ::autumn_web::idempotency::__cache_committed_error_response(__autumn_error)
+                                );
+                            }
+                        }
+                    }
+
+                    Ok(inserted_records)
+                }
+            } else {
+                quote! {
+                    use ::autumn_web::reexports::diesel::prelude::*;
+                    use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                    use ::autumn_web::reexports::diesel_async::AsyncConnection;
+                    use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
+                    use ::autumn_web::hooks::{MutationContext, MutationOp, MutationHooks};
+
+                    if new.is_empty() {
+                        return Ok(Vec::new());
+                    }
+
+                    #tenant_id_setup
+
+                    let mut inputs = new.to_vec();
+                    let mut contexts = Vec::new();
+                    for input in &mut inputs {
+                        let mut ctx = MutationContext::new(MutationOp::Create);
+                        self.hooks.before_create(&mut ctx, input).await?;
+                        contexts.push(ctx);
+                    }
+
+                    let mut conn = self.__autumn_acquire_conn().await?;
+                    let inserted_records = conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| {
+                        async move {
+                            let mut inserted = Vec::new();
+                            for chunk in inputs.chunks(1000) {
+                                let chunk_inserted = #insert_expr
+                                    .map_err(::autumn_web::AutumnError::from)?;
+                                inserted.extend(chunk_inserted);
+                            }
+                            Ok(inserted)
+                        }
+                        .scope_boxed()
+                    })
+                    .await?;
+
+                    ::core::mem::drop(conn);
+
+                    // Run after_create hooks outside of transaction
+                    for (idx, record) in inserted_records.iter().enumerate() {
+                        let mut ctx = contexts[idx].clone();
+                        self.hooks.after_create(&mut ctx, record).await?;
+                    }
+
+                    Ok(inserted_records)
+                }
+            }
+        };
+
+        let save_many_skip_invalid_body = {
+            let tenant_id_setup = if config.tenant_scoped {
+                quote! {
+                    let tenant_id = if self.across_tenants {
+                        ::autumn_web::tenancy::CURRENT_TENANT.try_with(|t| t.clone()).ok().flatten()
+                    } else {
+                        let t = ::autumn_web::tenancy::CURRENT_TENANT.try_with(|t| t.clone()).ok().flatten()
+                            .ok_or_else(|| ::autumn_web::AutumnError::internal_server_error_msg("Query scoped to tenant, but no tenant context was established"))?;
+                        ::core::option::Option::Some(t)
+                    };
+                    let tenant_id = tenant_id.as_ref();
+                }
+            } else {
+                quote! {}
+            };
+
+            let insert_expr = if config.tenant_scoped {
+                quote! {
+                    if let ::core::option::Option::Some(t) = tenant_id {
+                        let values: Vec<_> = chunk.iter().map(|item| ::autumn_web::tenancy::TenantInsertable::tenant_values(item.0.clone(), t)).collect();
+                        ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                            .values(&values)
+                            .get_results::<#model_name>(conn)
+                            .await
+                    } else {
+                        let values: Vec<_> = chunk.iter().map(|item| item.0.clone()).collect();
+                        ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                            .values(&values)
+                            .get_results::<#model_name>(conn)
+                            .await
+                    }
+                }
+            } else {
+                quote! {
+                    let values: Vec<_> = chunk.iter().map(|item| item.0.clone()).collect();
+                    ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                        .values(&values)
+                        .get_results::<#model_name>(conn)
+                        .await
+                }
+            };
+
+            let row_insert_expr = if config.tenant_scoped {
+                quote! {
+                    if let ::core::option::Option::Some(t) = tenant_id {
+                        let values = ::autumn_web::tenancy::TenantInsertable::tenant_values(item.0.clone(), t);
+                        ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                            .values(&values)
+                            .get_result::<#model_name>(conn)
+                            .await
+                    } else {
+                        ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                            .values(&item.0)
+                            .get_result::<#model_name>(conn)
+                            .await
+                    }
+                }
+            } else {
+                quote! {
+                    ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                        .values(&item.0)
+                        .get_result::<#model_name>(conn)
+                        .await
+                }
+            };
+
+            let idempotency_setup = if commit_hooks_enabled {
+                quote! {
+                    if let ::core::option::Option::Some(__autumn_idempotency) = &self.idempotency {
+                        ctx.set_idempotency_key(__autumn_idempotency.scoped_key());
+                    }
+                }
+            } else {
+                quote! {}
+            };
+
+            quote! {
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                use ::autumn_web::reexports::diesel_async::AsyncConnection;
+                use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
+                use ::autumn_web::hooks::{MutationContext, MutationOp, MutationHooks};
+
+                if new.is_empty() {
+                    return Ok((Vec::new(), Vec::new()));
+                }
+
+                #tenant_id_setup
+                let mut conn = self.__autumn_acquire_conn().await?;
+                let mut successes = Vec::new();
+                let mut failures = Vec::new();
+
+                // 1. Run before_create hooks sequentially
+                let mut valid_items = Vec::new();
+                for (idx, original_item) in new.iter().enumerate() {
+                    let mut item = original_item.clone();
+                    let mut ctx = MutationContext::new(MutationOp::Create);
+                    #idempotency_setup
+                    match self.hooks.before_create(&mut ctx, &mut item).await {
+                        Ok(()) => {
+                            valid_items.push((item, ctx, idx));
+                        }
+                        Err(err) => {
+                            failures.push((idx, err));
+                        }
+                    }
+                }
+
+                // 2. Insert valid items in chunks
+                for chunk in valid_items.chunks(1000) {
+                    let batch_res = conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| {
+                        async move {
+                            #insert_expr
+                                .map_err(::autumn_web::AutumnError::from)
+                        }
+                        .scope_boxed()
+                    })
+                    .await;
+
+                    match batch_res {
+                        Ok(inserted_chunk) => {
+                            // Run after_create hooks outside of transaction
+                            for (idx, record) in inserted_chunk.into_iter().enumerate() {
+                                let mut ctx = chunk[idx].1.clone();
+                                if let Err(err) = self.hooks.after_create(&mut ctx, &record).await {
+                                    failures.push((chunk[idx].2, err));
+                                } else {
+                                    successes.push(record);
+                                }
+                            }
+                        }
+                        Err(_err) => {
+                            // Fallback to row-by-row insertion in nested transactions
+                            for item in chunk {
+                                let row_res = conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| {
+                                    async move {
+                                        #row_insert_expr
+                                            .map_err(::autumn_web::AutumnError::from)
+                                    }
+                                    .scope_boxed()
+                                })
+                                .await;
+
+                                match row_res {
+                                    Ok(record) => {
+                                        let mut ctx = item.1.clone();
+                                        if let Err(err) = self.hooks.after_create(&mut ctx, &record).await {
+                                            failures.push((item.2, err));
+                                        } else {
+                                            successes.push(record);
+                                        }
+                                    }
+                                    Err(err) => {
+                                        failures.push((item.2, err));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Ok((successes, failures))
+            }
+        };
+
+        let update_many_body = {
+            let draft_ext_trait = format_ident!("{}DraftExt", model_name);
+
+            let tenant_id_setup = if config.tenant_scoped {
+                quote! {
+                    let tenant_id = if self.across_tenants {
+                        ::core::option::Option::None
+                    } else {
+                        let t = ::autumn_web::tenancy::CURRENT_TENANT.try_with(|t| t.clone()).ok().flatten()
+                            .ok_or_else(|| ::autumn_web::AutumnError::internal_server_error_msg("Query scoped to tenant, but no tenant context was established"))?;
+                        ::core::option::Option::Some(t)
+                    };
+                    let tenant_id = tenant_id.as_ref();
+                }
+            } else {
+                quote! {}
+            };
+
+            let load_expr = if config.tenant_scoped {
+                quote! {
+                    if let ::core::option::Option::Some(t) = tenant_id {
+                        load_query.filter(#table_ident::tenant_id.eq(t)).for_update().load::<#model_name>(conn).await
+                    } else {
+                        load_query.for_update().load::<#model_name>(conn).await
+                    }
+                }
+            } else {
+                quote! {
+                    load_query.for_update().load::<#model_name>(conn).await
+                }
+            };
+
+            let tenant_assign = if config.tenant_scoped {
+                quote! {
+                    if let ::core::option::Option::Some(t) = tenant_id {
+                        draft.after.tenant_id = t.clone();
+                    }
+                }
+            } else {
+                quote! {}
+            };
+
+            let update_expr = if config.tenant_scoped {
+                quote! {
+                    if let ::core::option::Option::Some(t) = tenant_id {
+                        ::autumn_web::reexports::diesel::update(update_target.filter(#table_ident::tenant_id.eq(t)))
+                            .set(&proposed)
+                            .get_result::<#model_name>(conn)
+                            .await
+                    } else {
+                        ::autumn_web::reexports::diesel::update(update_target)
+                            .set(&proposed)
+                            .get_result::<#model_name>(conn)
+                            .await
+                    }
+                }
+            } else {
+                quote! {
+                    ::autumn_web::reexports::diesel::update(update_target)
+                        .set(&proposed)
+                        .get_result::<#model_name>(conn)
+                        .await
+                }
+            };
+
+            let idempotency_setup = if commit_hooks_enabled {
+                quote! {
+                    if let ::core::option::Option::Some(__autumn_idempotency) = &self.idempotency {
+                        ctx.set_idempotency_key(__autumn_idempotency.scoped_key());
+                    }
+                }
+            } else {
+                quote! {}
+            };
+
+            quote! {
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                use ::autumn_web::reexports::diesel_async::AsyncConnection;
+                use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
+                use ::autumn_web::hooks::{MutationContext, MutationOp, MutationHooks, UpdateDraft};
+
+                if ids.is_empty() {
+                    return Ok(Vec::new());
+                }
+
+                #tenant_id_setup
+                let mut conn = self.__autumn_acquire_conn().await?;
+                let (updated_records, contexts) = conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| {
+                    async move {
+                        let mut current_rows = Vec::new();
+                        for chunk in ids.chunks(1000) {
+                            let load_query = #table_ident::table.filter(#table_ident::id.eq_any(chunk));
+                            let chunk_rows = #load_expr
+                                .map_err(::autumn_web::AutumnError::from)?;
+                            current_rows.extend(chunk_rows);
+                        }
+
+                        let mut proposed_rows = Vec::new();
+                        let mut contexts = Vec::new();
+                        for current in &current_rows {
+                            let mut ctx = MutationContext::new(MutationOp::Update);
+                            #idempotency_setup
+
+                            let mut draft = <UpdateDraft<#model_name> as #draft_ext_trait>::from_patch(current, changes)?;
+                            #tenant_assign
+                            self.hooks.before_update(&mut ctx, &mut draft).await?;
+                            #tenant_assign
+
+                            proposed_rows.push(draft.into_after());
+                            contexts.push(ctx);
+                        }
+
+                        let mut updated_records = Vec::new();
+                        for proposed in proposed_rows {
+                            let update_target = #table_ident::table.find(proposed.id);
+                            let updated = #update_expr
+                                .map_err(::autumn_web::AutumnError::from)?;
+                            updated_records.push(updated);
+                        }
+
+                        Ok((updated_records, contexts))
+                    }
+                    .scope_boxed()
+                })
+                .await?;
+
+                ::core::mem::drop(conn);
+
+                // Run after_update hooks outside of transaction
+                for (idx, record) in updated_records.iter().enumerate() {
+                    let mut ctx = contexts[idx].clone();
+                    self.hooks.after_update(&mut ctx, record).await?;
+                }
+
+                Ok(updated_records)
+            }
+        };
+
+        let delete_many_body = {
+            let tenant_id_setup = if config.tenant_scoped {
+                quote! {
+                    let tenant_id = if self.across_tenants {
+                        ::core::option::Option::None
+                    } else {
+                        let t = ::autumn_web::tenancy::CURRENT_TENANT.try_with(|t| t.clone()).ok().flatten()
+                            .ok_or_else(|| ::autumn_web::AutumnError::internal_server_error_msg("Query scoped to tenant, but no tenant context was established"))?;
+                        ::core::option::Option::Some(t)
+                    };
+                    let tenant_id = tenant_id.as_ref();
+                }
+            } else {
+                quote! {}
+            };
+
+            let load_expr = if config.tenant_scoped {
+                quote! {
+                    if let ::core::option::Option::Some(t) = tenant_id {
+                        load_query.filter(#table_ident::tenant_id.eq(t)).for_update().load::<#model_name>(conn).await
+                    } else {
+                        load_query.for_update().load::<#model_name>(conn).await
+                    }
+                }
+            } else {
+                quote! {
+                    load_query.for_update().load::<#model_name>(conn).await
+                }
+            };
+
+            let delete_expr = if config.soft_delete {
+                if config.tenant_scoped {
+                    quote! {
+                        let query = #table_ident::table.filter(#table_ident::id.eq_any(chunk)).filter(#table_ident::deleted_at.is_null());
+                        if let ::core::option::Option::Some(t) = tenant_id {
+                            ::autumn_web::reexports::diesel::update(query.filter(#table_ident::tenant_id.eq(t)))
+                                .set(#table_ident::deleted_at.eq(::core::option::Option::Some(__now)))
+                                .execute(conn)
+                                .await
+                        } else {
+                            ::autumn_web::reexports::diesel::update(query)
+                                .set(#table_ident::deleted_at.eq(::core::option::Option::Some(__now)))
+                                .execute(conn)
+                                .await
+                        }
+                    }
+                } else {
+                    quote! {
+                        ::autumn_web::reexports::diesel::update(#table_ident::table.filter(#table_ident::id.eq_any(chunk)).filter(#table_ident::deleted_at.is_null()))
+                            .set(#table_ident::deleted_at.eq(::core::option::Option::Some(__now)))
+                            .execute(conn)
+                            .await
+                    }
+                }
+            } else {
+                if config.tenant_scoped {
+                    quote! {
+                        let query = #table_ident::table.filter(#table_ident::id.eq_any(chunk));
+                        if let ::core::option::Option::Some(t) = tenant_id {
+                            ::autumn_web::reexports::diesel::delete(query.filter(#table_ident::tenant_id.eq(t)))
+                                .execute(conn)
+                                .await
+                        } else {
+                            ::autumn_web::reexports::diesel::delete(query)
+                                .execute(conn)
+                                .await
+                        }
+                    }
+                } else {
+                    quote! {
+                        ::autumn_web::reexports::diesel::delete(#table_ident::table.filter(#table_ident::id.eq_any(chunk)))
+                            .execute(conn)
+                            .await
+                    }
+                }
+            };
+
+            let idempotency_setup = if commit_hooks_enabled {
+                quote! {
+                    if let ::core::option::Option::Some(__autumn_idempotency) = &self.idempotency {
+                        ctx.set_idempotency_key(__autumn_idempotency.scoped_key());
+                    }
+                }
+            } else {
+                quote! {}
+            };
+
+            let delete_commit_hook_setup = if commit_hooks_enabled {
+                quote! {
+                    let mut __autumn_commit_hook_discriminator: ::core::option::Option<::std::string::String> =
+                        ::core::option::Option::None;
+                    if let ::core::option::Option::Some(__autumn_idempotency) = &self.idempotency {
+                        __autumn_commit_hook_discriminator =
+                            ::core::option::Option::Some(__autumn_idempotency.next_mutation_discriminator());
+                    }
+
+                    let __autumn_commit_hook_record = record.__autumn_commit_hook_to_value()?;
+                    ::autumn_web::__private::enqueue_repository_commit_hook_on_conn(
+                        conn,
+                        Self::__autumn_repository_commit_hook_key(),
+                        "delete",
+                        ctx.idempotency_key.as_deref(),
+                        __autumn_commit_hook_discriminator.as_deref(),
+                        &ctx,
+                        &__autumn_commit_hook_record,
+                    )
+                    .await?;
+                }
+            } else {
+                quote! {}
+            };
+
+            let kick_dispatcher = if commit_hooks_enabled {
+                quote! {
+                    ::autumn_web::__private::kick_repository_commit_hook_dispatcher(&self.pool);
+                }
+            } else {
+                quote! {}
+            };
+
+            quote! {
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                use ::autumn_web::reexports::diesel_async::AsyncConnection;
+                use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
+                use ::autumn_web::hooks::{MutationContext, MutationOp, MutationHooks};
+
+                if ids.is_empty() {
+                    return Ok(());
+                }
+
+                #tenant_id_setup
+                let mut conn = self.__autumn_acquire_conn().await?;
+                let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
+
+                conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| {
+                    async move {
+                        let mut current_rows = Vec::new();
+                        for chunk in ids.chunks(1000) {
+                            let load_query = #table_ident::table.filter(#table_ident::id.eq_any(chunk));
+                            let chunk_rows = #load_expr
+                                .map_err(::autumn_web::AutumnError::from)?;
+                            current_rows.extend(chunk_rows);
+                        }
+
+                        for record in &current_rows {
+                            let mut ctx = MutationContext::new(MutationOp::Delete);
+                            #idempotency_setup
+                            self.hooks.before_delete(&mut ctx, record).await?;
+                            #delete_commit_hook_setup
+                        }
+
+                        for chunk in ids.chunks(1000) {
+                            #delete_expr
+                                .map_err(::autumn_web::AutumnError::from)?;
+                        }
+
+                        Ok(())
+                    }
+                    .scope_boxed()
+                })
+                .await?;
+
+                ::core::mem::drop(conn);
+                #kick_dispatcher
+
+                Ok(())
+            }
+        };
+
+        let upsert_many_body = quote! {
+            unreachable!("upsert_many is not available when hooks are configured")
+        };
 
         (
             struct_fields,
@@ -2270,11 +2983,362 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         };
 
-        let save_many_body = quote! { todo!() };
-        let save_many_skip_invalid_body = quote! { todo!() };
-        let update_many_body = quote! { todo!() };
-        let delete_many_body = quote! { todo!() };
-        let upsert_many_body = quote! { todo!() };
+        let save_many_body = if config.tenant_scoped {
+            quote! {
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                if new.is_empty() {
+                    return Ok(Vec::new());
+                }
+                let tenant_id = if self.across_tenants {
+                    ::autumn_web::tenancy::CURRENT_TENANT.try_with(|t| t.clone()).ok().flatten()
+                } else {
+                    let t = ::autumn_web::tenancy::CURRENT_TENANT.try_with(|t| t.clone()).ok().flatten()
+                        .ok_or_else(|| ::autumn_web::AutumnError::internal_server_error_msg("Query scoped to tenant, but no tenant context was established"))?;
+                    ::core::option::Option::Some(t)
+                };
+                let tenant_id = tenant_id.as_ref();
+                let mut conn = self.__autumn_acquire_conn().await?;
+                let mut inserted = Vec::new();
+                for chunk in new.chunks(1000) {
+                    let chunk_inserted = if let ::core::option::Option::Some(t) = tenant_id {
+                        let values: Vec<_> = chunk.iter().cloned().map(|item| ::autumn_web::tenancy::TenantInsertable::tenant_values(item, t)).collect();
+                        ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                            .values(&values)
+                            .get_results::<#model_name>(&mut conn)
+                            .await
+                    } else {
+                        ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                            .values(chunk)
+                            .get_results::<#model_name>(&mut conn)
+                            .await
+                    }
+                    .map_err(::autumn_web::AutumnError::from)?;
+                    inserted.extend(chunk_inserted);
+                }
+                Ok(inserted)
+            }
+        } else {
+            quote! {
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                if new.is_empty() {
+                    return Ok(Vec::new());
+                }
+                let mut conn = self.__autumn_acquire_conn().await?;
+                let mut inserted = Vec::new();
+                for chunk in new.chunks(1000) {
+                    let chunk_inserted = ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                        .values(chunk)
+                        .get_results::<#model_name>(&mut conn)
+                        .await
+                        .map_err(::autumn_web::AutumnError::from)?;
+                    inserted.extend(chunk_inserted);
+                }
+                Ok(inserted)
+            }
+        };
+
+        let save_many_skip_invalid_body = {
+            let tenant_id_setup = if config.tenant_scoped {
+                quote! {
+                    let tenant_id = if self.across_tenants {
+                        ::autumn_web::tenancy::CURRENT_TENANT.try_with(|t| t.clone()).ok().flatten()
+                    } else {
+                        let t = ::autumn_web::tenancy::CURRENT_TENANT.try_with(|t| t.clone()).ok().flatten()
+                            .ok_or_else(|| ::autumn_web::AutumnError::internal_server_error_msg("Query scoped to tenant, but no tenant context was established"))?;
+                        ::core::option::Option::Some(t)
+                    };
+                    let tenant_id = tenant_id.as_ref();
+                }
+            } else {
+                quote! {}
+            };
+
+            let insert_expr = if config.tenant_scoped {
+                quote! {
+                    if let ::core::option::Option::Some(t) = tenant_id {
+                        let values: Vec<_> = chunk.iter().cloned().map(|item| ::autumn_web::tenancy::TenantInsertable::tenant_values(item, t)).collect();
+                        ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                            .values(&values)
+                            .get_results::<#model_name>(&mut conn)
+                            .await
+                    } else {
+                        ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                            .values(chunk)
+                            .get_results::<#model_name>(&mut conn)
+                            .await
+                    }
+                }
+            } else {
+                quote! {
+                    ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                        .values(chunk)
+                        .get_results::<#model_name>(&mut conn)
+                        .await
+                }
+            };
+
+            let row_insert_expr = if config.tenant_scoped {
+                quote! {
+                    if let ::core::option::Option::Some(t) = tenant_id {
+                        let values = ::autumn_web::tenancy::TenantInsertable::tenant_values(item.clone(), t);
+                        ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                            .values(&values)
+                            .get_result::<#model_name>(conn)
+                            .await
+                    } else {
+                        ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                            .values(item)
+                            .get_result::<#model_name>(conn)
+                            .await
+                    }
+                }
+            } else {
+                quote! {
+                    ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                        .values(item)
+                        .get_result::<#model_name>(conn)
+                        .await
+                }
+            };
+
+            quote! {
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                use ::autumn_web::reexports::diesel_async::AsyncConnection;
+                use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
+
+                if new.is_empty() {
+                    return Ok((Vec::new(), Vec::new()));
+                }
+
+                #tenant_id_setup
+                let mut conn = self.__autumn_acquire_conn().await?;
+                let mut successes = Vec::new();
+                let mut failures = Vec::new();
+
+                let mut offset = 0;
+                for chunk in new.chunks(1000) {
+                    let batch_res = #insert_expr;
+                    match batch_res {
+                        Ok(results) => {
+                            successes.extend(results);
+                        }
+                        Err(_err) => {
+                            // Fallback to row-by-row insertion for this chunk
+                            for (idx, item) in chunk.iter().enumerate() {
+                                let global_idx = offset + idx;
+                                let res = conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| {
+                                    async move {
+                                        #row_insert_expr
+                                            .map_err(::autumn_web::AutumnError::from)
+                                    }
+                                    .scope_boxed()
+                                })
+                                .await;
+                                match res {
+                                    Ok(model) => successes.push(model),
+                                    Err(err) => failures.push((global_idx, err)),
+                                }
+                            }
+                        }
+                    }
+                    offset += chunk.len();
+                }
+                Ok((successes, failures))
+            }
+        };
+
+        let update_many_body = {
+            let tenant_id_setup = if config.tenant_scoped {
+                quote! {
+                    let tenant_id = if self.across_tenants {
+                        ::core::option::Option::None
+                    } else {
+                        let t = ::autumn_web::tenancy::CURRENT_TENANT.try_with(|t| t.clone()).ok().flatten()
+                            .ok_or_else(|| ::autumn_web::AutumnError::internal_server_error_msg("Query scoped to tenant, but no tenant context was established"))?;
+                        ::core::option::Option::Some(t)
+                    };
+                    let tenant_id = tenant_id.as_ref();
+                }
+            } else {
+                quote! {}
+            };
+
+            let set_tenant_expr = if config.tenant_scoped {
+                quote! {
+                    let mut diesel_changeset = changes.__to_changeset();
+                    if let ::core::option::Option::Some(t) = tenant_id {
+                        use ::autumn_web::repository::CanSetTenantId as _;
+                        diesel_changeset.set_tenant_id(t.clone());
+                    }
+                }
+            } else {
+                quote! {
+                    let diesel_changeset = changes.__to_changeset();
+                }
+            };
+
+            let update_expr = if config.tenant_scoped {
+                quote! {
+                    if let ::core::option::Option::Some(t) = tenant_id {
+                        ::autumn_web::reexports::diesel::update(#table_ident::table.filter(#table_ident::id.eq_any(chunk)).filter(#table_ident::tenant_id.eq(t)))
+                            .set(&diesel_changeset)
+                            .get_results::<#model_name>(&mut conn)
+                            .await
+                    } else {
+                        ::autumn_web::reexports::diesel::update(#table_ident::table.filter(#table_ident::id.eq_any(chunk)))
+                            .set(&diesel_changeset)
+                            .get_results::<#model_name>(&mut conn)
+                            .await
+                    }
+                }
+            } else {
+                quote! {
+                    ::autumn_web::reexports::diesel::update(#table_ident::table.filter(#table_ident::id.eq_any(chunk)))
+                        .set(&diesel_changeset)
+                        .get_results::<#model_name>(&mut conn)
+                        .await
+                }
+            };
+
+            quote! {
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+
+                if ids.is_empty() {
+                    return Ok(Vec::new());
+                }
+
+                #tenant_id_setup
+                #set_tenant_expr
+                let mut conn = self.__autumn_acquire_conn().await?;
+                let mut updated = Vec::new();
+
+                for chunk in ids.chunks(1000) {
+                    let chunk_updated = #update_expr
+                        .map_err(::autumn_web::AutumnError::from)?;
+                    updated.extend(chunk_updated);
+                }
+                Ok(updated)
+            }
+        };
+
+        let delete_many_body = {
+            let tenant_id_setup = if config.tenant_scoped {
+                quote! {
+                    let tenant_id = if self.across_tenants {
+                        ::core::option::Option::None
+                    } else {
+                        let t = ::autumn_web::tenancy::CURRENT_TENANT.try_with(|t| t.clone()).ok().flatten()
+                            .ok_or_else(|| ::autumn_web::AutumnError::internal_server_error_msg("Query scoped to tenant, but no tenant context was established"))?;
+                        ::core::option::Option::Some(t)
+                    };
+                    let tenant_id = tenant_id.as_ref();
+                }
+            } else {
+                quote! {}
+            };
+
+            let delete_expr = if config.soft_delete {
+                if config.tenant_scoped {
+                    quote! {
+                        let query = #table_ident::table.filter(#table_ident::id.eq_any(chunk)).filter(#table_ident::deleted_at.is_null());
+                        if let ::core::option::Option::Some(t) = tenant_id {
+                            ::autumn_web::reexports::diesel::update(query.filter(#table_ident::tenant_id.eq(t)))
+                                .set(#table_ident::deleted_at.eq(::core::option::Option::Some(__now)))
+                                .execute(&mut conn)
+                                .await
+                        } else {
+                            ::autumn_web::reexports::diesel::update(query)
+                                .set(#table_ident::deleted_at.eq(::core::option::Option::Some(__now)))
+                                .execute(&mut conn)
+                                .await
+                        }
+                    }
+                } else {
+                    quote! {
+                        ::autumn_web::reexports::diesel::update(#table_ident::table.filter(#table_ident::id.eq_any(chunk)).filter(#table_ident::deleted_at.is_null()))
+                            .set(#table_ident::deleted_at.eq(::core::option::Option::Some(__now)))
+                            .execute(&mut conn)
+                            .await
+                    }
+                }
+            } else {
+                if config.tenant_scoped {
+                    quote! {
+                        let query = #table_ident::table.filter(#table_ident::id.eq_any(chunk));
+                        if let ::core::option::Option::Some(t) = tenant_id {
+                            ::autumn_web::reexports::diesel::delete(query.filter(#table_ident::tenant_id.eq(t)))
+                                .execute(&mut conn)
+                                .await
+                        } else {
+                            ::autumn_web::reexports::diesel::delete(query)
+                                .execute(&mut conn)
+                                .await
+                        }
+                    }
+                } else {
+                    quote! {
+                        ::autumn_web::reexports::diesel::delete(#table_ident::table.filter(#table_ident::id.eq_any(chunk)))
+                            .execute(&mut conn)
+                            .await
+                    }
+                }
+            };
+
+            quote! {
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+
+                if ids.is_empty() {
+                    return Ok(());
+                }
+
+                #tenant_id_setup
+                let mut conn = self.__autumn_acquire_conn().await?;
+                let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
+
+                for chunk in ids.chunks(1000) {
+                    #delete_expr
+                        .map_err(::autumn_web::AutumnError::from)?;
+                }
+                Ok(())
+            }
+        };
+
+        let upsert_many_body = quote! {
+            use ::autumn_web::reexports::diesel::prelude::*;
+            use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+            use ::autumn_web::reexports::diesel_async::AsyncConnection;
+            use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
+
+            if records.is_empty() {
+                return Ok(Vec::new());
+            }
+
+            let mut conn = self.__autumn_acquire_conn().await?;
+            conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| {
+                async move {
+                    let mut upserted = Vec::new();
+                    for record in records {
+                        let res = ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                            .values(record.clone())
+                            .on_conflict(#table_ident::id)
+                            .do_update()
+                            .set(record.clone())
+                            .get_result::<#model_name>(conn)
+                            .await
+                            .map_err(::autumn_web::AutumnError::from)?;
+                        upserted.push(res);
+                    }
+                    Ok(upserted)
+                }
+                .scope_boxed()
+            })
+            .await
+        };
 
         (
             struct_fields,
@@ -3738,7 +4802,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let upsert_many_trait_method = if config.hooks_type.is_none() {
         quote! {
-            fn upsert_many(&self, records: &[#model_name]) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<Vec<#model_name>>> + Send;
+            fn upsert_many(&self, records: &[#model_name]) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<Vec<#model_name>>> + Send
+            where
+                #model_name: ::autumn_web::reexports::diesel::Insertable<#table_ident::table>,
+                #model_name: ::autumn_web::reexports::diesel::query_builder::AsChangeset<Target = #table_ident::table>;
         }
     } else {
         quote! {}
@@ -3754,7 +4821,11 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let upsert_many_impl_method = if config.hooks_type.is_none() {
         quote! {
-            async fn upsert_many(&self, records: &[#model_name]) -> ::autumn_web::AutumnResult<Vec<#model_name>> {
+            async fn upsert_many(&self, records: &[#model_name]) -> ::autumn_web::AutumnResult<Vec<#model_name>>
+            where
+                #model_name: ::autumn_web::reexports::diesel::Insertable<#table_ident::table>,
+                #model_name: ::autumn_web::reexports::diesel::query_builder::AsChangeset<Target = #table_ident::table>
+            {
                 #upsert_many_body
             }
         }
