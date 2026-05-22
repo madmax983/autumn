@@ -3116,7 +3116,7 @@ mod trusted_host_tests {
     async fn trusted_host_allows_matching_and_blocks_nonmatching() {
         let mut cfg = AutumnConfig::default();
         cfg.security.trusted_hosts.hosts = vec!["example.com".into(), ".example.com".into()];
-        let state = crate::state::AppState::for_tests();
+        let state = crate::state::AppState::for_test();
         let router = build_router(vec![], &cfg, state);
 
         let ok = router
@@ -3149,7 +3149,7 @@ mod trusted_host_tests {
     async fn trusted_host_wildcard_allows_any_host() {
         let mut cfg = AutumnConfig::default();
         cfg.security.trusted_hosts.hosts = vec!["*".into()];
-        let router = build_router(vec![], &cfg, crate::state::AppState::for_tests());
+        let router = build_router(vec![], &cfg, crate::state::AppState::for_test());
         let response = router
             .oneshot(
                 Request::builder()
@@ -3167,7 +3167,7 @@ mod trusted_host_tests {
     async fn trusted_host_bypasses_probe_paths() {
         let mut cfg = AutumnConfig::default();
         cfg.security.trusted_hosts.hosts = vec!["example.com".into()];
-        let router = build_router(vec![], &cfg, crate::state::AppState::for_tests());
+        let router = build_router(vec![], &cfg, crate::state::AppState::for_test());
         let response = router
             .oneshot(
                 Request::builder()
@@ -3185,7 +3185,7 @@ mod trusted_host_tests {
     async fn trusted_host_bypasses_actuator_health_path() {
         let mut cfg = AutumnConfig::default();
         cfg.security.trusted_hosts.hosts = vec!["example.com".into()];
-        let router = build_router(vec![], &cfg, crate::state::AppState::for_tests());
+        let router = build_router(vec![], &cfg, crate::state::AppState::for_test());
         let response = router
             .oneshot(
                 Request::builder()
@@ -3204,7 +3204,7 @@ mod trusted_host_tests {
         let mut cfg = AutumnConfig::default();
         cfg.profile = Some("prod".into());
         cfg.security.trusted_hosts.hosts = vec!["example.com".into()];
-        let router = build_router(vec![], &cfg, crate::state::AppState::for_tests());
+        let router = build_router(vec![], &cfg, crate::state::AppState::for_test());
         let response = router
             .oneshot(
                 Request::builder()
@@ -3221,7 +3221,7 @@ mod trusted_host_tests {
     #[tokio::test]
     async fn trusted_host_accepts_bracketed_ipv6_loopback_in_dev() {
         let cfg = AutumnConfig::default();
-        let router = build_router(vec![], &cfg, crate::state::AppState::for_tests());
+        let router = build_router(vec![], &cfg, crate::state::AppState::for_test());
         let response = router
             .oneshot(
                 Request::builder()
@@ -3239,7 +3239,7 @@ mod trusted_host_tests {
     async fn trusted_host_matching_is_case_insensitive() {
         let mut cfg = AutumnConfig::default();
         cfg.security.trusted_hosts.hosts = vec!["example.com".into()];
-        let router = build_router(vec![], &cfg, crate::state::AppState::for_tests());
+        let router = build_router(vec![], &cfg, crate::state::AppState::for_test());
         let response = router
             .oneshot(
                 Request::builder()
@@ -3257,7 +3257,7 @@ mod trusted_host_tests {
     async fn trusted_host_rejects_malformed_port() {
         let mut cfg = AutumnConfig::default();
         cfg.security.trusted_hosts.hosts = vec!["example.com".into()];
-        let router = build_router(vec![], &cfg, crate::state::AppState::for_tests());
+        let router = build_router(vec![], &cfg, crate::state::AppState::for_test());
         let response = router
             .oneshot(
                 Request::builder()
@@ -3279,7 +3279,7 @@ mod trusted_host_tests {
         cfg.health.startup_path = "/startupz".into();
         cfg.health.ready_path = "/readyz".into();
         cfg.health.live_path = "/livez".into();
-        let router = build_router(vec![], &cfg, crate::state::AppState::for_tests());
+        let router = build_router(vec![], &cfg, crate::state::AppState::for_test());
 
         let bypassed = router
             .clone()
@@ -3351,14 +3351,15 @@ impl TrustedHostPolicy {
             return true;
         }
         self.rules.iter().any(|rule| {
-            if let Some(suffix) = rule.strip_prefix('.') {
-                host == suffix
-                    || host
-                        .strip_suffix(suffix)
-                        .is_some_and(|prefix| prefix.ends_with('.'))
-            } else {
-                host == rule
-            }
+            rule.strip_prefix('.').map_or_else(
+                || host == rule,
+                |suffix| {
+                    host == suffix
+                        || host
+                            .strip_suffix(suffix)
+                            .is_some_and(|prefix| prefix.ends_with('.'))
+                },
+            )
         })
     }
 }
