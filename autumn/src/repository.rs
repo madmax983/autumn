@@ -75,16 +75,29 @@ pub trait AutumnColumnCountExt {
 }
 
 #[doc(hidden)]
+pub trait AutumnColumnCountSpecific {
+    fn __autumn_column_count(&self) -> usize;
+}
+impl<T: AutumnColumnCountExt> AutumnColumnCountSpecific for T {
+    fn __autumn_column_count(&self) -> usize {
+        self.__autumn_column_count()
+    }
+}
+
+#[doc(hidden)]
+pub trait AutumnColumnCountFallback {
+    fn __autumn_column_count(&self) -> usize;
+}
+impl<T: ?Sized> AutumnColumnCountFallback for &T {
+    fn __autumn_column_count(&self) -> usize {
+        30
+    }
+}
+
+#[doc(hidden)]
 pub trait AutumnUpsertSetExt {
     type UpsertSet;
     fn __autumn_upsert_set() -> Self::UpsertSet;
-}
-impl<T: ?Sized> AutumnUpsertSetExt for T {
-    type UpsertSet = ();
-    #[allow(clippy::unused_unit, clippy::semicolon_if_nothing_returned)]
-    fn __autumn_upsert_set() -> Self::UpsertSet {
-        ()
-    }
 }
 
 /// Extension trait to override `tenant_id` on changesets in tenant-scoped updates.

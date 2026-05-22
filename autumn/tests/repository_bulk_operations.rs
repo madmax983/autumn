@@ -3,6 +3,7 @@
 //! **Requires Docker** to be running.
 
 #![cfg(feature = "db")]
+#![allow(clippy::must_use_candidate, clippy::missing_const_for_fn)]
 
 use autumn_web::hooks::{MutationContext, MutationHooks, Patch, UpdateDraft};
 use autumn_web::prelude::*;

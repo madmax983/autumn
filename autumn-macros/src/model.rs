@@ -614,32 +614,37 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // Build Diesel-compatible changeset bridge (private struct with Option<T> fields)
     let changeset_name = format_ident!("__{}Changeset", name);
 
-    let tenant_id_field = fields_for_new
+    let tenant_id_field = all_fields
         .iter()
-        .find(|f| f.ident.as_ref().is_some_and(|id| id == "tenant_id"));
+        .find(|f| f.ident.as_ref().is_some_and(|id| id == "tenant_id"))
+        .copied();
 
-    #[allow(clippy::option_if_let_else)]
-    let can_set_tenant_id_impl = match tenant_id_field {
-        Some(f) => {
-            let is_option = is_option_type(&f.ty);
-            let val = if is_option {
-                quote! { ::core::option::Option::Some(::core::option::Option::Some(t)) }
-            } else {
-                quote! { ::core::option::Option::Some(t) }
-            };
-            quote! {
-                impl ::autumn_web::repository::CanSetTenantId for #changeset_name {
-                    fn set_tenant_id(&mut self, t: ::std::string::String) {
-                        self.tenant_id = #val;
-                    }
+    let new_has_tenant_id = fields_for_new
+        .iter()
+        .any(|f| f.ident.as_ref().is_some_and(|id| id == "tenant_id"));
+
+    let can_set_tenant_id_impl = if new_has_tenant_id {
+        let f = fields_for_new
+            .iter()
+            .find(|f| f.ident.as_ref().is_some_and(|id| id == "tenant_id"))
+            .unwrap();
+        let is_option = is_option_type(&f.ty);
+        let val = if is_option {
+            quote! { ::core::option::Option::Some(::core::option::Option::Some(t)) }
+        } else {
+            quote! { ::core::option::Option::Some(t) }
+        };
+        quote! {
+            impl ::autumn_web::repository::CanSetTenantId for #changeset_name {
+                fn set_tenant_id(&mut self, t: ::std::string::String) {
+                    self.tenant_id = #val;
                 }
             }
         }
-        None => {
-            quote! {
-                impl ::autumn_web::repository::CanSetTenantId for #changeset_name {
-                    fn set_tenant_id(&mut self, _t: ::std::string::String) {}
-                }
+    } else {
+        quote! {
+            impl ::autumn_web::repository::CanSetTenantId for #changeset_name {
+                fn set_tenant_id(&mut self, _t: ::std::string::String) {}
             }
         }
     };
@@ -664,11 +669,18 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             } else {
                 quote! { self.tenant_id = tenant_id.to_string(); }
             };
+
+            let new_set_field = if new_has_tenant_id {
+                set_field.clone()
+            } else {
+                quote! {}
+            };
+
             quote! {
                 impl ::autumn_web::tenancy::ModelTenantIdMeta for #new_name {
-                    const HAS_MANUAL_TENANT_ID: bool = true;
+                    const HAS_MANUAL_TENANT_ID: bool = #new_has_tenant_id;
                     fn try_set_tenant_id(&mut self, tenant_id: &str) {
-                        #set_field
+                        #new_set_field
                     }
                 }
                 impl ::autumn_web::tenancy::ModelTenantIdMeta for #name {
@@ -690,6 +702,12 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         })
         .collect();
+
+    if upsert_columns.is_empty() {
+        upsert_columns.push(quote! {
+            #table_ident::id.eq(::autumn_web::reexports::diesel::pg::upsert::excluded(#table_ident::id))
+        });
+    }
 
     if let Some(lv_field) = lock_version_field {
         let ident = lv_field.ident.as_ref().unwrap();
@@ -1304,23 +1322,11 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         }
 
-        impl ::autumn_web::repository::AutumnColumnCountExt for #name {
-            fn __autumn_column_count(&self) -> usize {
-                Self::__AUTUMN_COLUMN_COUNT
-            }
-        }
-
         impl #new_name {
             pub const __AUTUMN_COLUMN_COUNT: usize = #new_column_count;
 
             #[doc(hidden)]
             pub fn __autumn_column_count(&self) -> usize {
-                Self::__AUTUMN_COLUMN_COUNT
-            }
-        }
-
-        impl ::autumn_web::repository::AutumnColumnCountExt for #new_name {
-            fn __autumn_column_count(&self) -> usize {
                 Self::__AUTUMN_COLUMN_COUNT
             }
         }

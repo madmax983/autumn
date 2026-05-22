@@ -30,6 +30,7 @@ fn to_snake_case(name: &str) -> String {
     result
 }
 
+#[allow(clippy::struct_excessive_bools)]
 struct RepoConfig {
     model_name: Ident,
     table_name: String,
@@ -51,6 +52,7 @@ struct RepoConfig {
     /// Enable row-level multi-tenancy: automatically scopes all queries to the
     /// active tenant context.
     tenant_scoped: bool,
+    no_upsert_trait: bool,
 }
 
 fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
@@ -65,6 +67,7 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
     let mut cursor_key_type: Option<syn::Path> = None;
     let mut soft_delete = false;
     let mut tenant_scoped = false;
+    let mut no_upsert_trait = false;
 
     syn::meta::parser(|meta| {
         // `hooks = Ident` must be checked before the catch-all model_name case,
@@ -107,12 +110,15 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
         } else if meta.path.is_ident("tenant_scoped") {
             tenant_scoped = true;
             Ok(())
+        } else if meta.path.is_ident("no_upsert_trait") {
+            no_upsert_trait = true;
+            Ok(())
         } else if meta.path.get_ident().is_some() && model_name.is_none() {
             model_name = Some(meta.path.get_ident().unwrap().clone());
             Ok(())
         } else {
             Err(meta.error(
-                "expected model name, table = \"...\", hooks = Type, commit_hooks = true, api = \"/path\", policy = Type, scope = Type, cursor_key = field, cursor_key_type = Type, soft_delete, or tenant_scoped",
+                "expected model name, table = \"...\", hooks = Type, commit_hooks = true, api = \"/path\", policy = Type, scope = Type, cursor_key = field, cursor_key_type = Type, soft_delete, tenant_scoped, or no_upsert_trait",
             ))
         }
     })
@@ -144,6 +150,7 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
         cursor_key_type,
         soft_delete,
         tenant_scoped,
+        no_upsert_trait,
     })
 }
 
@@ -1949,7 +1956,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     use ::autumn_web::reexports::diesel_async::AsyncConnection;
                     use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
                     use ::autumn_web::hooks::{MutationContext, MutationOp, MutationHooks};
-                    use ::autumn_web::repository::AutumnColumnCountExt as _;
+                    use ::autumn_web::repository::AutumnColumnCountSpecific as _;
+                    use ::autumn_web::repository::AutumnColumnCountFallback as _;
 
                     if new.is_empty() {
                         return Ok(Vec::new());
@@ -2125,7 +2133,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     use ::autumn_web::reexports::diesel_async::AsyncConnection;
                     use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
                     use ::autumn_web::hooks::{MutationContext, MutationOp, MutationHooks};
-                    use ::autumn_web::repository::AutumnColumnCountExt as _;
+                    use ::autumn_web::repository::AutumnColumnCountSpecific as _;
+                    use ::autumn_web::repository::AutumnColumnCountFallback as _;
 
                     if new.is_empty() {
                         return Ok(Vec::new());
@@ -2427,7 +2436,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                                     ::core::option::Option::Some(__autumn_idempotency.next_mutation_discriminator());
                                             }
                                             let __autumn_commit_hook_record = record.__autumn_commit_hook_to_value()?;
-                                            let __autumn_hook_info = ::autumn_web::__private::enqueue_repository_commit_hook_on_conn(
+                                            let __autumn_hook_info = ::autumn_web::__private::enqueue_repository_commit_hook_pending_on_conn(
                                                 conn,
                                                 Self::__autumn_repository_commit_hook_key(),
                                                 "create",
@@ -2613,7 +2622,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 use ::autumn_web::reexports::diesel_async::AsyncConnection;
                 use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
                 use ::autumn_web::hooks::{MutationContext, MutationOp, MutationHooks};
-                use ::autumn_web::repository::AutumnColumnCountExt as _;
+                use ::autumn_web::repository::AutumnColumnCountSpecific as _;
+                use ::autumn_web::repository::AutumnColumnCountFallback as _;
 
                 if new.is_empty() {
                     return Ok((Vec::new(), Vec::new()));
@@ -3534,7 +3544,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             quote! {
                 use ::autumn_web::reexports::diesel::prelude::*;
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                use ::autumn_web::repository::AutumnColumnCountExt as _;
+                use ::autumn_web::repository::AutumnColumnCountSpecific as _;
+                use ::autumn_web::repository::AutumnColumnCountFallback as _;
                 if new.is_empty() {
                     return Ok(Vec::new());
                 }
@@ -3572,7 +3583,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             quote! {
                 use ::autumn_web::reexports::diesel::prelude::*;
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                use ::autumn_web::repository::AutumnColumnCountExt as _;
+                use ::autumn_web::repository::AutumnColumnCountSpecific as _;
+                use ::autumn_web::repository::AutumnColumnCountFallback as _;
                 if new.is_empty() {
                     return Ok(Vec::new());
                 }
@@ -3661,7 +3673,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
                 use ::autumn_web::reexports::diesel_async::AsyncConnection;
                 use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
-                use ::autumn_web::repository::AutumnColumnCountExt as _;
+                use ::autumn_web::repository::AutumnColumnCountSpecific as _;
+                use ::autumn_web::repository::AutumnColumnCountFallback as _;
 
                 if new.is_empty() {
                     return Ok((Vec::new(), Vec::new()));
@@ -4083,8 +4096,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
                 use ::autumn_web::reexports::diesel_async::AsyncConnection;
                 use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
-                use ::autumn_web::repository::AutumnColumnCountExt as _;
+                use ::autumn_web::repository::AutumnColumnCountSpecific as _;
+                use ::autumn_web::repository::AutumnColumnCountFallback as _;
                 use ::autumn_web::repository::AutumnUpsertSetExt as _;
+                use ::autumn_web::repository::AutumnLockVersionModelExt as _;
 
                 if records.is_empty() {
                     return Ok(Vec::new());
@@ -5610,8 +5625,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {
             fn upsert_many(&self, records: &[#model_name]) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<Vec<#model_name>>> + Send
             where
-                #model_name: ::autumn_web::reexports::diesel::Insertable<#table_ident::table>,
-                #model_name: ::autumn_web::reexports::diesel::query_builder::AsChangeset<Target = #table_ident::table>;
+                #model_name: ::autumn_web::reexports::diesel::Insertable<#table_ident::table>;
         }
     } else {
         quote! {}
@@ -5629,14 +5643,30 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {
             async fn upsert_many(&self, records: &[#model_name]) -> ::autumn_web::AutumnResult<Vec<#model_name>>
             where
-                #model_name: ::autumn_web::reexports::diesel::Insertable<#table_ident::table>,
-                #model_name: ::autumn_web::reexports::diesel::query_builder::AsChangeset<Target = #table_ident::table>
+                #model_name: ::autumn_web::reexports::diesel::Insertable<#table_ident::table>
             {
                 #upsert_many_body
             }
         }
     } else {
         quote! {}
+    };
+
+    let upsert_set_ext_impl = if config.no_upsert_trait {
+        quote! {}
+    } else {
+        quote! {
+            impl ::autumn_web::repository::AutumnUpsertSetExt for #model_name {
+                type UpsertSet = ::autumn_web::reexports::diesel::dsl::Eq<
+                    #table_ident::id,
+                    #table_ident::id,
+                >;
+                fn __autumn_upsert_set() -> Self::UpsertSet {
+                    use ::autumn_web::reexports::diesel::ExpressionMethods as _;
+                    #table_ident::id.eq(#table_ident::id)
+                }
+            }
+        }
     };
 
     // Generate the trait, impl, and extractor.
@@ -5847,6 +5877,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         #api_handlers
 
         #tenant_scoped_traits
+
+        #upsert_set_ext_impl
     }
 }
 
