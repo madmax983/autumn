@@ -34,6 +34,9 @@ fn compile_fail_tests() {
     // would otherwise only fail at request time with `500`.
     #[cfg(feature = "db")]
     t.compile_fail("tests/compile-fail/repository_invalid_policy_type.rs");
+
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/repository_bulk_upsert_many_hooks.rs");
 }
 
 #[test]
