@@ -189,6 +189,32 @@ this file. Pass them as environment variables at runtime:
 priority layer — see the
 [config reference](getting-started.md#environment-variable-overrides).
 
+## Trusted hosts (Host-header allow-list)
+
+Autumn supports a host allow-list to prevent host-header rebinding and cache-poisoning style attacks.
+
+```toml
+[security.trusted_hosts]
+hosts = ["app.example.com", ".example.com"]
+```
+
+- `app.example.com` matches exactly that hostname.
+- `.example.com` matches both `example.com` and any subdomain like `api.example.com`.
+- `hosts = ["*"]` disables host filtering (escape hatch; not recommended for production).
+
+In `prod`/`production` profile, startup fails when `security.trusted_hosts.hosts` is empty.
+Health/probe routes (`/actuator/health`, `/live`, `/ready`, `/startup`) intentionally bypass host checks so orchestration probes remain reliable.
+
+### Runnable repro
+
+```bash
+# Expected: 400 + application/problem+json
+curl -i http://localhost:3000/ -H 'Host: evil.example'
+
+# Expected: normal route response
+curl -i http://localhost:3000/ -H 'Host: app.example.com'
+```
+
 ---
 
 ## Deploy to fly.io

@@ -392,6 +392,16 @@ pub struct SecurityConfig {
     /// secret via `AUTUMN_SECURITY__SIGNING_SECRET`.
     #[serde(default)]
     pub signing_secret: SigningSecretConfig,
+
+    /// Trusted Host header allow-list.
+    #[serde(default)]
+    pub trusted_hosts: TrustedHostsConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TrustedHostsConfig {
+    #[serde(default)]
+    pub hosts: Vec<String>,
 }
 
 /// Security response headers configuration.

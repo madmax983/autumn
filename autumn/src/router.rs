@@ -22,7 +22,7 @@ use crate::route::Route;
 use crate::state::AppState;
 use axum::middleware::Next;
 use axum::response::IntoResponse;
-use http::StatusCode;
+use http::{Request, StatusCode};
 use thiserror::Error;
 
 pub const DEFAULT_FAVICON_PATH: &str = "/favicon.ico";
@@ -1165,6 +1165,11 @@ fn apply_middleware(
         };
 
     router = apply_cors_middleware(router, config);
+    let trusted_hosts = config.security.trusted_hosts.hosts.clone();
+    let profile = config.profile.clone().unwrap_or_else(|| "dev".to_string());
+    router = router.layer(axum::middleware::from_fn(move |req, next| {
+        trusted_host_middleware(req, next, trusted_hosts.clone(), profile.clone())
+    }));
     router = apply_csrf_middleware(router, config, signing_keys_opt.clone());
     // Method-override rejection filter. The outer `MethodOverrideLayer`
     // (applied at the `axum::serve` boundary so it can rewrite the
@@ -1268,6 +1273,78 @@ fn apply_middleware(
         .layer(crate::middleware::MetricsLayer::new(state.metrics.clone()));
 
     Ok(router)
+}
+
+async fn trusted_host_middleware(
+    req: Request<axum::body::Body>,
+    next: Next,
+    trusted_hosts: Vec<String>,
+    profile: String,
+) -> axum::response::Response {
+    let path = req.uri().path();
+    if ["/actuator/health", "/live", "/ready", "/startup"].contains(&path) {
+        return next.run(req).await;
+    }
+    let host = req
+        .headers()
+        .get(http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .split(':')
+        .next()
+        .unwrap_or_default()
+        .trim_matches('[')
+        .trim_matches(']')
+        .to_ascii_lowercase();
+    let mut allowed = trusted_hosts.clone();
+    if profile == "dev" || profile == "development" {
+        allowed.extend(
+            ["localhost", "127.0.0.1", "::1"]
+                .iter()
+                .map(|s| s.to_string()),
+        );
+    }
+    let wildcard = allowed.iter().any(|h| h == "*");
+    let listed = |candidate: &str| {
+        allowed.iter().any(|rule| {
+            let r = rule.to_ascii_lowercase();
+            if let Some(suffix) = r.strip_prefix('.') {
+                candidate == suffix || candidate.ends_with(&format!(".{suffix}"))
+            } else {
+                candidate == r
+            }
+        })
+    };
+    let is_release_profile = profile == "prod" || profile == "production";
+    let is_loopback = matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1");
+
+    let ok = if wildcard {
+        true
+    } else if is_release_profile && is_loopback {
+        listed(host.as_str())
+    } else {
+        listed(host.as_str())
+    };
+    if ok {
+        next.run(req).await
+    } else {
+        tracing::warn!(host = %host, "trusted host rejected request");
+        let body = crate::error::problem_details_json_string(
+            StatusCode::BAD_REQUEST,
+            "Invalid Host header",
+            None,
+            None,
+            None,
+            None,
+            true,
+        );
+        (
+            StatusCode::BAD_REQUEST,
+            [(http::header::CONTENT_TYPE, "application/problem+json")],
+            body,
+        )
+            .into_response()
+    }
 }
 
 /// Build the router with optional static-file-first serving.
@@ -3038,5 +3115,101 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+}
+
+#[cfg(test)]
+mod trusted_host_tests {
+    use super::*;
+    use axum::body::Body;
+    use http::Request;
+    use tower::util::ServiceExt;
+
+    #[tokio::test]
+    async fn trusted_host_allows_matching_and_blocks_nonmatching() {
+        let mut cfg = AutumnConfig::default();
+        cfg.security.trusted_hosts.hosts = vec!["example.com".into(), ".example.com".into()];
+        let state = crate::state::AppState::for_tests();
+        let router = build_router(vec![], &cfg, state);
+
+        let ok = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/nope")
+                    .header("host", "api.example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::NOT_FOUND);
+
+        let blocked = router
+            .oneshot(
+                Request::builder()
+                    .uri("/nope")
+                    .header("host", "evil.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(blocked.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn trusted_host_wildcard_allows_any_host() {
+        let mut cfg = AutumnConfig::default();
+        cfg.security.trusted_hosts.hosts = vec!["*".into()];
+        let router = build_router(vec![], &cfg, crate::state::AppState::for_tests());
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/nope")
+                    .header("host", "anything.example")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn trusted_host_bypasses_probe_paths() {
+        let mut cfg = AutumnConfig::default();
+        cfg.security.trusted_hosts.hosts = vec!["example.com".into()];
+        let router = build_router(vec![], &cfg, crate::state::AppState::for_tests());
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/health")
+                    .header("host", "evil.com")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn trusted_host_release_rejects_loopback_unless_listed() {
+        let mut cfg = AutumnConfig::default();
+        cfg.profile = Some("prod".into());
+        cfg.security.trusted_hosts.hosts = vec!["example.com".into()];
+        let router = build_router(vec![], &cfg, crate::state::AppState::for_tests());
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/nope")
+                    .header("host", "localhost")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 }
