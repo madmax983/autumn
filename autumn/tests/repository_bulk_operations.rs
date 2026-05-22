@@ -35,6 +35,28 @@ pub struct BulkRecord {
 #[autumn_web::repository(BulkRecord, table = "test_bulk_records")]
 pub trait BulkRecordRepository {}
 
+// ── Schema & models for LockRecord (optimistic locking) ──────────────────────
+
+diesel::table! {
+    test_lock_records (id) {
+        id -> Int8,
+        name -> Text,
+        lock_version -> Int8,
+    }
+}
+
+#[autumn_web::model(table = "test_lock_records")]
+pub struct LockRecord {
+    #[id]
+    pub id: i64,
+    pub name: String,
+    #[lock_version]
+    pub lock_version: i64,
+}
+
+#[autumn_web::repository(LockRecord, table = "test_lock_records")]
+pub trait LockRecordRepository {}
+
 // ── Schema & models with hooks ───────────────────────────────────────────────
 
 diesel::table! {
@@ -123,8 +145,21 @@ async fn setup_pool() -> (
         .execute(&mut conn)
         .await
         .expect("create test_hooked_records");
+    diesel::sql_query("CREATE TABLE IF NOT EXISTS test_lock_records (id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL, lock_version INT8 NOT NULL DEFAULT 1)")
+        .execute(&mut conn)
+        .await
+        .expect("create test_lock_records");
 
     (pool, container)
+}
+
+const fn build_lock_repo(pool: Pool<AsyncPgConnection>) -> PgLockRecordRepository {
+    PgLockRecordRepository {
+        pool,
+        __autumn_statement_timeout_ms: 0,
+        __autumn_slow_threshold: std::time::Duration::from_millis(500),
+        __autumn_route: None,
+    }
 }
 
 const fn build_bulk_repo(pool: Pool<AsyncPgConnection>) -> PgBulkRecordRepository {
@@ -327,4 +362,58 @@ async fn test_bulk_ops_with_hooks() {
     repo.delete_many(&all_ids).await.unwrap();
     let after_delete = repo.find_all().await.unwrap();
     assert!(after_delete.is_empty());
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn test_bulk_ops_optimistic_locking() {
+    let (pool, _container) = setup_pool().await;
+    let repo = build_lock_repo(pool);
+
+    // 1. Save initial lock records (lock_version defaults to 1 in DB)
+    let new_records = vec![
+        NewLockRecord {
+            name: "Lock A".to_string(),
+        },
+        NewLockRecord {
+            name: "Lock B".to_string(),
+        },
+    ];
+    let inserted = repo.save_many(&new_records).await.unwrap();
+    assert_eq!(inserted.len(), 2);
+    assert_eq!(inserted[0].lock_version, 1);
+    assert_eq!(inserted[1].lock_version, 1);
+
+    // 2. Successful bulk update: match expected lock version (1)
+    let ids = vec![inserted[0].id, inserted[1].id];
+    let changes = UpdateLockRecord {
+        name: Patch::Set("Lock Updated".to_string()),
+        lock_version: 1, // Matches!
+    };
+    let updated = repo.update_many(&ids, &changes).await.unwrap();
+    assert_eq!(updated.len(), 2);
+    assert_eq!(updated[0].name, "Lock Updated");
+    assert_eq!(updated[0].lock_version, 2); // Auto-incremented in DB!
+    assert_eq!(updated[1].name, "Lock Updated");
+    assert_eq!(updated[1].lock_version, 2);
+
+    // 3. Failed bulk update: mismatch in expected lock version
+    let bad_changes = UpdateLockRecord {
+        name: Patch::Set("Lock Failed Update".to_string()),
+        lock_version: 1, // Expected 1, but actual is 2!
+    };
+    let err = repo.update_many(&ids, &bad_changes).await.unwrap_err();
+    let err_str = err.to_string();
+    assert!(
+        err_str.contains("conflict") || err_str.contains("Conflict"),
+        "Expected conflict error, got: {err_str}"
+    );
+
+    // Verify database rows did not change and transaction rolled back
+    let final_rows = repo.find_all().await.unwrap();
+    assert_eq!(final_rows.len(), 2);
+    for row in &final_rows {
+        assert_eq!(row.name, "Lock Updated");
+        assert_eq!(row.lock_version, 2);
+    }
 }

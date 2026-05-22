@@ -69,6 +69,27 @@ pub trait AutumnLockVersionUpdateExt {
 impl<T: ?Sized> AutumnLockVersionModelExt for T {}
 impl<T: ?Sized> AutumnLockVersionUpdateExt for T {}
 
+#[doc(hidden)]
+pub trait AutumnColumnCountExt {
+    fn __autumn_column_count(&self) -> usize {
+        30
+    }
+}
+impl<T: ?Sized> AutumnColumnCountExt for T {}
+
+#[doc(hidden)]
+pub trait AutumnUpsertSetExt {
+    type UpsertSet;
+    fn __autumn_upsert_set() -> Self::UpsertSet;
+}
+impl<T: ?Sized> AutumnUpsertSetExt for T {
+    type UpsertSet = ();
+    #[allow(clippy::unused_unit, clippy::semicolon_if_nothing_returned)]
+    fn __autumn_upsert_set() -> Self::UpsertSet {
+        ()
+    }
+}
+
 /// Extension trait to override `tenant_id` on changesets in tenant-scoped updates.
 pub trait CanSetTenantId {
     fn set_tenant_id(&mut self, tenant_id: String);

@@ -192,9 +192,11 @@ pub mod __private {
     pub use crate::repository_commit_hooks::{
         RepositoryCommitHookDescriptor, catch_repository_after_hook_unwind,
         discard_repository_commit_hook_pending, enqueue_repository_commit_hook_on_conn,
-        enqueue_repository_commit_hook_pending_on_conn, finalize_repository_commit_hook_after_hook,
-        kick_repository_commit_hook_dispatcher, mark_repository_commit_hook_after_hook_failed,
-        register_repository_commit_hook_runner,
+        enqueue_repository_commit_hook_pending_on_conn,
+        enqueue_repository_commit_hooks_bulk_on_conn,
+        enqueue_repository_commit_hooks_pending_bulk_on_conn,
+        finalize_repository_commit_hook_after_hook, kick_repository_commit_hook_dispatcher,
+        mark_repository_commit_hook_after_hook_failed, register_repository_commit_hook_runner,
         start_repository_commit_hook_pending_finalizer_heartbeat,
     };
 

@@ -608,6 +608,9 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // Trait name for draft extension methods
     let draft_ext_name = format_ident!("{name}DraftExt");
 
+    let column_count = all_fields.len();
+    let new_column_count = fields_for_new.len();
+
     // Build Diesel-compatible changeset bridge (private struct with Option<T> fields)
     let changeset_name = format_ident!("__{}Changeset", name);
 
@@ -648,6 +651,10 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     const HAS_MANUAL_TENANT_ID: bool = false;
                     fn try_set_tenant_id(&mut self, _tenant_id: &str) {}
                 }
+                impl ::autumn_web::tenancy::ModelTenantIdMeta for #name {
+                    const HAS_MANUAL_TENANT_ID: bool = false;
+                    fn try_set_tenant_id(&mut self, _tenant_id: &str) {}
+                }
             }
         },
         |f| {
@@ -664,9 +671,25 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         #set_field
                     }
                 }
+                impl ::autumn_web::tenancy::ModelTenantIdMeta for #name {
+                    const HAS_MANUAL_TENANT_ID: bool = true;
+                    fn try_set_tenant_id(&mut self, tenant_id: &str) {
+                        #set_field
+                    }
+                }
             }
         },
     );
+
+    let upsert_columns: Vec<TokenStream> = fields_for_new
+        .iter()
+        .map(|f| {
+            let ident = f.ident.as_ref().unwrap();
+            quote! {
+                #table_ident::#ident.eq(::autumn_web::reexports::diesel::upsert::excluded(#table_ident::#ident))
+            }
+        })
+        .collect();
 
     let mut changeset_fields: Vec<TokenStream> = fields_for_new
         .iter()
@@ -1253,6 +1276,33 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 #changeset_name {
                     #(#changeset_conversions,)*
                 }
+            }
+        }
+
+        impl #name {
+            pub const __AUTUMN_COLUMN_COUNT: usize = #column_count;
+
+            #[doc(hidden)]
+            pub fn __autumn_column_count(&self) -> usize {
+                Self::__AUTUMN_COLUMN_COUNT
+            }
+
+            #[doc(hidden)]
+            pub fn __autumn_upsert_set() -> impl ::autumn_web::reexports::diesel::query_builder::AsChangeset<
+                Target = #table_ident::table,
+                Changeset = impl ::autumn_web::reexports::diesel::query_builder::QueryFragment<::autumn_web::reexports::diesel::pg::Pg> + ::core::marker::Send + ::core::marker::Sync + 'static
+            > + ::core::marker::Send + ::core::marker::Sync + 'static {
+                use ::autumn_web::reexports::diesel::ExpressionMethods as _;
+                (#(#upsert_columns,)*)
+            }
+        }
+
+        impl #new_name {
+            pub const __AUTUMN_COLUMN_COUNT: usize = #new_column_count;
+
+            #[doc(hidden)]
+            pub fn __autumn_column_count(&self) -> usize {
+                Self::__AUTUMN_COLUMN_COUNT
             }
         }
 

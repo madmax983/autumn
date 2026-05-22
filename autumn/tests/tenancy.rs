@@ -367,3 +367,162 @@ async fn test_across_tenants_save_without_tenant_id_on_new_struct_works() {
     assert_eq!(saved.title, "Across Tenant Save");
     assert_eq!(saved.tenant_id, "tenant-c");
 }
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+#[allow(clippy::too_many_lines, clippy::similar_names)]
+async fn test_bulk_ops_tenant_scoping() {
+    let container = testcontainers_modules::postgres::Postgres::default()
+        .start()
+        .await
+        .expect("failed to start Postgres container");
+    let host = container.get_host().await.unwrap();
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+
+    let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+        diesel_async::AsyncPgConnection,
+    >::new(&url);
+    let pool = diesel_async::pooled_connection::deadpool::Pool::builder(manager)
+        .max_size(5)
+        .build()
+        .unwrap();
+
+    setup_db(&pool).await;
+
+    let repo = PgTenantPostRepository {
+        pool,
+        across_tenants: false,
+        __autumn_statement_timeout_ms: 0,
+        __autumn_slow_threshold: ::std::time::Duration::from_millis(100),
+        __autumn_route: ::core::option::Option::None,
+    };
+
+    // 1. save_many under tenant-a context
+    let posts_a = with_tenant("tenant-a".to_string(), async {
+        let new_posts = vec![
+            NewTenantPost {
+                title: "Post A1".to_string(),
+            },
+            NewTenantPost {
+                title: "Post A2".to_string(),
+            },
+        ];
+        repo.save_many(&new_posts).await.unwrap()
+    })
+    .await;
+    assert_eq!(posts_a.len(), 2);
+    assert_eq!(posts_a[0].tenant_id, "tenant-a");
+    assert_eq!(posts_a[1].tenant_id, "tenant-a");
+
+    // 2. save_many under tenant-b context
+    let posts_b = with_tenant("tenant-b".to_string(), async {
+        let new_posts = vec![
+            NewTenantPost {
+                title: "Post B1".to_string(),
+            },
+            NewTenantPost {
+                title: "Post B2".to_string(),
+            },
+        ];
+        repo.save_many(&new_posts).await.unwrap()
+    })
+    .await;
+    assert_eq!(posts_b.len(), 2);
+    assert_eq!(posts_b[0].tenant_id, "tenant-b");
+    assert_eq!(posts_b[1].tenant_id, "tenant-b");
+
+    // 3. update_many under tenant-a context
+    // We try to update both tenant-a and tenant-b posts, but only tenant-a posts should change!
+    let all_ids = vec![posts_a[0].id, posts_b[0].id];
+    let changes = UpdateTenantPost {
+        title: autumn_web::hooks::Patch::Set("Scoped Update".to_string()),
+    };
+
+    let updated = with_tenant("tenant-a".to_string(), async {
+        repo.update_many(&all_ids, &changes).await.unwrap()
+    })
+    .await;
+    // PgTenantPostRepository update_many returns the records updated. Only post A1 should be returned!
+    assert_eq!(updated.len(), 1);
+    assert_eq!(updated[0].id, posts_a[0].id);
+    assert_eq!(updated[0].title, "Scoped Update");
+
+    // 4. Verify DB state using across_tenants()
+    let all_posts = repo.across_tenants().find_all().await.unwrap();
+    assert_eq!(all_posts.len(), 4);
+
+    let post_a1 = all_posts.iter().find(|p| p.id == posts_a[0].id).unwrap();
+    assert_eq!(post_a1.title, "Scoped Update");
+    assert_eq!(post_a1.tenant_id, "tenant-a");
+
+    let post_b1 = all_posts.iter().find(|p| p.id == posts_b[0].id).unwrap();
+    assert_eq!(post_b1.title, "Post B1"); // Remains unchanged because it's tenant-b!
+    assert_eq!(post_b1.tenant_id, "tenant-b");
+
+    // 5. upsert_many under tenant-a context
+    // We try to upsert:
+    // - One existing tenant-a post (update its title)
+    // - One new post (gets created under tenant-a)
+    // - One existing tenant-b post (which should be blocked/ignored)
+    let upsert_records = vec![
+        TenantPost {
+            id: posts_a[1].id,
+            title: "Upserted A2".to_string(),
+            tenant_id: "tenant-a".to_string(),
+        },
+        TenantPost {
+            id: posts_b[1].id, // Try to hijack/update tenant-b post
+            title: "Hijacked B2".to_string(),
+            tenant_id: "tenant-a".to_string(),
+        },
+        TenantPost {
+            id: 9999, // A new record
+            title: "New Scoped Post".to_string(),
+            tenant_id: String::new(), // Will be overridden to tenant-a
+        },
+    ];
+
+    let upserted = with_tenant("tenant-a".to_string(), async {
+        repo.upsert_many(&upsert_records).await.unwrap()
+    })
+    .await;
+
+    // The returned upserted list should only contain:
+    // - The updated post A2
+    // - The newly created post 9999
+    // And NOT post B2 (which is ignored by conflict filter)
+    assert_eq!(upserted.len(), 2);
+    assert!(
+        upserted
+            .iter()
+            .any(|p| p.id == posts_a[1].id && p.title == "Upserted A2")
+    );
+    assert!(
+        upserted
+            .iter()
+            .any(|p| p.id == 9999 && p.title == "New Scoped Post" && p.tenant_id == "tenant-a")
+    );
+
+    // Verify DB state across all tenants
+    let all_posts_final = repo.across_tenants().find_all().await.unwrap();
+    let post_b2_final = all_posts_final
+        .iter()
+        .find(|p| p.id == posts_b[1].id)
+        .unwrap();
+    assert_eq!(post_b2_final.title, "Post B2"); // Unchanged! No hijack.
+    assert_eq!(post_b2_final.tenant_id, "tenant-b");
+
+    // 6. delete_many under tenant-a context
+    // Try to delete one tenant-a and one tenant-b post. Only tenant-a post should be deleted.
+    with_tenant("tenant-a".to_string(), async {
+        repo.delete_many(&[posts_a[1].id, posts_b[1].id])
+            .await
+            .unwrap();
+    })
+    .await;
+
+    let all_posts_after_delete = repo.across_tenants().find_all().await.unwrap();
+    assert!(all_posts_after_delete.iter().any(|p| p.id == posts_b[1].id)); // tenant-b post remains!
+    assert!(!all_posts_after_delete.iter().any(|p| p.id == posts_a[1].id)); // tenant-a post is deleted!
+}
