@@ -163,6 +163,7 @@ pub mod sse;
 pub mod static_gen;
 #[cfg(feature = "storage")]
 pub mod storage;
+pub mod tenancy;
 
 pub mod form;
 pub mod job;
