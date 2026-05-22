@@ -222,6 +222,29 @@ pub async fn extract_tenant_from_parts(
                 crate::AutumnError::unauthorized_msg(format!("JWT validation failed: {e}"))
             })?;
 
+            // `jsonwebtoken`'s `set_audience` validates the `aud` value when
+            // the claim is *present*, but silently accepts tokens that omit the
+            // `aud` field entirely. Explicitly reject those when audience
+            // validation is enabled so legacy tokens without an `aud` claim
+            // cannot bypass the check.
+            if let Some(ref expected_aud) = config.tenancy.jwt_audience {
+                let aud_ok = token_data
+                    .claims
+                    .get("aud")
+                    .is_some_and(|v| match v {
+                        serde_json::Value::String(s) => s == expected_aud,
+                        serde_json::Value::Array(arr) => arr
+                            .iter()
+                            .any(|e| e.as_str() == Some(expected_aud.as_str())),
+                        _ => false,
+                    });
+                if !aud_ok {
+                    return Err(crate::AutumnError::unauthorized_msg(
+                        "JWT audience validation failed: missing or invalid aud claim",
+                    ));
+                }
+            }
+
             let tenant = token_data
                 .claims
                 .get(&config.tenancy.jwt_claim)

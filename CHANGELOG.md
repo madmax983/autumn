@@ -19,6 +19,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 To opt out of the generated `page` method: implement your own list handler using `repo.find_all()` or a custom Diesel query.  The `find_all` method is unchanged.
 
+### Fixed
+
+- **tenancy:** Normalize hostnames to lowercase in subdomain mode for DNS case-insensitivity
+- **tenancy:** Add `jwt_audience` config field; enable audience validation when configured
+
+
 ## [0.4.0] - 2026-05-12
 
 ### Added

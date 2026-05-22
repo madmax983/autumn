@@ -346,3 +346,33 @@ async fn jwt_audience_mismatch_fails() {
         "Expected audience rejection, got: {err}"
     );
 }
+
+/// When `jwt_audience` is configured but the JWT has **no** `aud` claim at all
+/// (e.g. a legacy token issuer), extraction must fail. This covers the case
+/// where the token simply omits the audience field rather than providing the
+/// wrong value.
+#[tokio::test]
+async fn jwt_audience_missing_claim_fails() {
+    let mut config = AutumnConfig::default();
+    config.tenancy.enabled = true;
+    config.tenancy.source = "jwt".to_string();
+    config.tenancy.jwt_claim = "company".to_string();
+    config.tenancy.jwt_secret = Some("secret".to_string());
+    config.tenancy.jwt_audience = Some("my-api".to_string());
+
+    // Token has aud: None — skip_serializing_if means the field is absent
+    let token = generate_jwt_with_audience("acme", "secret", None);
+    let req = Request::builder()
+        .header("Authorization", format!("Bearer {token}"))
+        .body(())
+        .unwrap();
+    let (mut parts, ()) = req.into_parts();
+    let err = extract_tenant_from_parts(&mut parts, &config)
+        .await
+        .unwrap_err();
+    let err_str = err.to_string().to_lowercase();
+    assert!(
+        err_str.contains("audience") || err_str.contains("unauthorized"),
+        "Expected audience rejection for missing aud claim, got: {err}"
+    );
+}
