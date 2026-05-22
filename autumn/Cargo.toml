@@ -21,7 +21,7 @@ htmx = []
 multipart = ["axum/multipart"]
 tailwind = []
 http-client = ["dep:reqwest"]
-oauth2 = ["http-client", "dep:jsonwebtoken"]
+oauth2 = ["http-client"]
 openapi = ["dep:serde_yaml"]
 db = [
     "dep:deadpool",
@@ -109,7 +109,7 @@ subtle = "2.6.1"
 url = "2.5.8"
 percent-encoding = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
-jsonwebtoken = { version = "10.1.0", optional = true }
+jsonwebtoken = { version = "10.1.0", default-features = false, features = ["rust_crypto"] }
 lru = "0.18.0"
 hmac = "0.12"
 sha2 = "0.10"

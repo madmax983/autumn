@@ -1,12 +1,12 @@
-﻿//! `#[repository(Model)]` proc macro implementation.
+//! `#[repository(Model)]` proc macro implementation.
 //!
 //! Generates a concrete `PgXxxRepository` struct with:
 //! - Auto-generated CRUD (`find_by_id`, `find_all`, save, update, `delete_by_id`, count, `exists_by_id`)
 //! - Derived queries parsed from trait method names (`find_by_field`, `count_by_field`, etc.)
 //! - `FromRequestParts` extractor impl
 //!
-//! Uses native async fn in traits (Rust 1.75+) ΓÇö no `async_trait` crate needed.
-//! Uses `diesel-async` `RunQueryDsl` for async queries ΓÇö no sync `interact()`.
+//! Uses native async fn in traits (Rust 1.75+) - no `async_trait` crate needed.
+//! Uses `diesel-async` `RunQueryDsl` for async queries - no sync `interact()`.
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
@@ -330,7 +330,11 @@ fn generate_derived_query(
     }
 }
 
-#[allow(clippy::too_many_lines, clippy::option_if_let_else, clippy::large_stack_frames)]
+#[allow(
+    clippy::too_many_lines,
+    clippy::option_if_let_else,
+    clippy::large_stack_frames
+)]
 #[allow(clippy::cognitive_complexity)]
 pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let config = match parse_repo_args(attr) {
@@ -1109,7 +1113,13 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     }
 
                                     let mut draft = <UpdateDraft<#model_name> as #draft_ext_trait>::from_patch(&current, changes)?;
+                                    if let ::core::option::Option::Some(ref t) = tenant_id {
+                                        draft.after.tenant_id = t.clone();
+                                    }
                                     self.hooks.before_update(&mut ctx, &mut draft).await?;
+                                    if let ::core::option::Option::Some(ref t) = tenant_id {
+                                        draft.after.tenant_id = t.clone();
+                                    }
 
                                     let proposed = draft.into_after();
                                     let update_target = #table_ident::table.find(id);
@@ -1139,7 +1149,13 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     ))?;
 
                                     let mut draft = <UpdateDraft<#model_name> as #draft_ext_trait>::from_patch(&current, changes)?;
+                                    if let ::core::option::Option::Some(ref t) = tenant_id {
+                                        draft.after.tenant_id = t.clone();
+                                    }
                                     self.hooks.before_update(&mut ctx, &mut draft).await?;
+                                    if let ::core::option::Option::Some(ref t) = tenant_id {
+                                        draft.after.tenant_id = t.clone();
+                                    }
 
                                     let proposed = draft.into_after();
                                     let update_target = #table_ident::table.find(id);
@@ -1299,7 +1315,13 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     }
 
                                     let mut draft = <UpdateDraft<#model_name> as #draft_ext_trait>::from_patch(&current, changes)?;
+                                    if let ::core::option::Option::Some(ref t) = tenant_id {
+                                        draft.after.tenant_id = t.clone();
+                                    }
                                     self.hooks.before_update(&mut ctx, &mut draft).await?;
+                                    if let ::core::option::Option::Some(ref t) = tenant_id {
+                                        draft.after.tenant_id = t.clone();
+                                    }
 
                                     let proposed = draft.into_after();
                                     let update_target = #table_ident::table.find(id);
@@ -1329,7 +1351,13 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     ))?;
 
                                     let mut draft = <UpdateDraft<#model_name> as #draft_ext_trait>::from_patch(&current, changes)?;
+                                    if let ::core::option::Option::Some(ref t) = tenant_id {
+                                        draft.after.tenant_id = t.clone();
+                                    }
                                     self.hooks.before_update(&mut ctx, &mut draft).await?;
+                                    if let ::core::option::Option::Some(ref t) = tenant_id {
+                                        draft.after.tenant_id = t.clone();
+                                    }
 
                                     let proposed = draft.into_after();
                                     let update_target = #table_ident::table.find(id);
@@ -2023,7 +2051,11 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 }
                             }
 
-                            let diesel_changeset = changes.__to_changeset();
+                            let mut diesel_changeset = changes.__to_changeset();
+                            if let ::core::option::Option::Some(ref t) = tenant_id {
+                                use ::autumn_web::repository::CanSetTenantId as _;
+                                diesel_changeset.set_tenant_id(t.clone());
+                            }
                             let update_target = #table_ident::table.find(id);
                             if let ::core::option::Option::Some(ref t) = tenant_id {
                                 ::autumn_web::reexports::diesel::update(update_target.filter(#table_ident::tenant_id.eq(t)))
@@ -2042,7 +2074,11 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     })
                     .await
                 } else {
-                    let diesel_changeset = changes.__to_changeset();
+                    let mut diesel_changeset = changes.__to_changeset();
+                    if let ::core::option::Option::Some(ref t) = tenant_id {
+                        use ::autumn_web::repository::CanSetTenantId as _;
+                        diesel_changeset.set_tenant_id(t.clone());
+                    }
                     let update_target = #table_ident::table.find(id);
                     if let ::core::option::Option::Some(ref t) = tenant_id {
                         ::autumn_web::reexports::diesel::update(update_target.filter(#table_ident::tenant_id.eq(t)))

@@ -217,3 +217,72 @@ async fn test_escape_hatch_across_tenants() {
     let all = repo.across_tenants().find_all().await.unwrap();
     assert_eq!(all.len(), 2);
 }
+
+// 4. Test that client attempts to update tenant_id in scoped updates are overridden/blocked
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn test_immutable_tenant_id_on_update() {
+    let container = testcontainers_modules::postgres::Postgres::default()
+        .start()
+        .await
+        .expect("failed to start Postgres container");
+    let host = container.get_host().await.unwrap();
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+
+    let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+        diesel_async::AsyncPgConnection,
+    >::new(&url);
+    let pool = diesel_async::pooled_connection::deadpool::Pool::builder(manager)
+        .max_size(5)
+        .build()
+        .unwrap();
+
+    setup_db(&pool).await;
+
+    let repo = PgTenantPostRepository {
+        pool,
+        across_tenants: false,
+        __autumn_statement_timeout_ms: 0,
+        __autumn_slow_threshold: ::std::time::Duration::from_millis(100),
+        __autumn_route: ::core::option::Option::None,
+    };
+
+    // Save record for tenant A
+    let post_a = with_tenant("tenant-a".to_string(), async {
+        repo.save(&NewTenantPost {
+            title: "Post A".to_string(),
+        })
+        .await
+        .unwrap()
+    })
+    .await;
+    assert_eq!(post_a.tenant_id, "tenant-a");
+
+    // Try to update post_a's title
+    let updated = with_tenant("tenant-a".to_string(), async {
+        let changes = UpdateTenantPost {
+            title: ::autumn_web::hooks::Patch::Set("Post A Updated".to_string()),
+        };
+        repo.update(post_a.id, &changes).await.unwrap()
+    })
+    .await;
+
+    // The returned record should still have tenant_id "tenant-a", not "tenant-b"
+    assert_eq!(updated.tenant_id, "tenant-a");
+    assert_eq!(updated.title, "Post A Updated");
+
+    // Assert that the record still belongs to tenant-a, not tenant-b
+    with_tenant("tenant-b".to_string(), async {
+        let not_found = repo.find_by_id(post_a.id).await.unwrap();
+        assert!(not_found.is_none());
+    })
+    .await;
+
+    with_tenant("tenant-a".to_string(), async {
+        let found = repo.find_by_id(post_a.id).await.unwrap().unwrap();
+        assert_eq!(found.tenant_id, "tenant-a");
+        assert_eq!(found.title, "Post A Updated");
+    })
+    .await;
+}

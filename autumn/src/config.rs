@@ -3169,13 +3169,25 @@ pub struct TenancyConfig {
     #[serde(default = "default_tenancy_header_name")]
     pub header_name: String,
 
-    /// Session key to lookup if source is "session". Default: "tenant_id".
+    /// Session key to lookup if source is "session". Default: "`tenant_id`".
     #[serde(default = "default_tenancy_session_key")]
     pub session_key: String,
 
-    /// JWT claim to lookup if source is "jwt". Default: "tenant_id".
+    /// JWT claim to lookup if source is "jwt". Default: "`tenant_id`".
     #[serde(default = "default_tenancy_jwt_claim")]
     pub jwt_claim: String,
+
+    /// JWT secret key used to verify the JWT signature.
+    #[serde(default)]
+    pub jwt_secret: Option<String>,
+
+    /// Expected JWT issuer to validate.
+    #[serde(default)]
+    pub jwt_issuer: Option<String>,
+
+    /// Optional base domain for subdomain tenancy.
+    #[serde(default)]
+    pub base_domain: Option<String>,
 }
 
 fn default_tenancy_source() -> String {
@@ -3202,6 +3214,9 @@ impl Default for TenancyConfig {
             header_name: default_tenancy_header_name(),
             session_key: default_tenancy_session_key(),
             jwt_claim: default_tenancy_jwt_claim(),
+            jwt_secret: None,
+            jwt_issuer: None,
+            base_domain: None,
         }
     }
 }
