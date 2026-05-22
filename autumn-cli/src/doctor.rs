@@ -1175,24 +1175,43 @@ fn resolve_trusted_hosts() -> Vec<String> {
             .map(std::borrow::ToOwned::to_owned)
             .collect();
     }
-    std::fs::read_to_string("autumn.toml")
+    let table = read_autumn_toml_table().unwrap_or_default();
+    let profile = std::env::var("AUTUMN_ENV")
         .ok()
-        .and_then(|c| toml::from_str::<toml::Table>(&c).ok())
-        .and_then(|t| {
-            t.get("security")
-                .and_then(|s| s.get("trusted_hosts"))
-                .and_then(|th| th.get("hosts"))
-                .and_then(toml::Value::as_array)
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(toml::Value::as_str)
-                        .map(str::trim)
-                        .filter(|v| !v.is_empty())
-                        .map(std::borrow::ToOwned::to_owned)
-                        .collect::<Vec<_>>()
-                })
-        })
+        .or_else(|| std::env::var("AUTUMN_PROFILE").ok())
         .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+
+    let parse_hosts = |root: &toml::Table| {
+        root.get("security")
+            .and_then(|s| s.get("trusted_hosts"))
+            .and_then(|th| th.get("hosts"))
+            .and_then(toml::Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(toml::Value::as_str)
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .map(std::borrow::ToOwned::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+
+    if !profile.is_empty()
+        && let Some(profile_table) = table
+            .get("profile")
+            .and_then(|v| v.get(&profile))
+            .and_then(toml::Value::as_table)
+    {
+        let profile_hosts = parse_hosts(profile_table);
+        if !profile_hosts.is_empty() {
+            return profile_hosts;
+        }
+    }
+
+    parse_hosts(&table)
 }
 
 /// Resolve whether the active profile is production from the environment or
