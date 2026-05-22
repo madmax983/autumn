@@ -320,3 +320,50 @@ async fn test_immutable_tenant_id_on_update() {
     })
     .await;
 }
+
+// 5. Test that across_tenants().save(...) works with a framework-managed tenant_id (omitted from New*)
+// when a CURRENT_TENANT is established, resolving and inserting the correct tenant_id.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn test_across_tenants_save_without_tenant_id_on_new_struct_works() {
+    let container = testcontainers_modules::postgres::Postgres::default()
+        .start()
+        .await
+        .expect("failed to start Postgres container");
+    let host = container.get_host().await.unwrap();
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+
+    let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+        diesel_async::AsyncPgConnection,
+    >::new(&url);
+    let pool = diesel_async::pooled_connection::deadpool::Pool::builder(manager)
+        .max_size(5)
+        .build()
+        .unwrap();
+
+    setup_db(&pool).await;
+
+    let repo = PgTenantPostRepository {
+        pool,
+        across_tenants: false,
+        __autumn_statement_timeout_ms: 0,
+        __autumn_slow_threshold: ::std::time::Duration::from_millis(100),
+        __autumn_route: ::core::option::Option::None,
+    };
+
+    // Under `across_tenants()`, we can save a `NewTenantPost` (which does NOT have a tenant_id field)
+    // if a CURRENT_TENANT is established, it should correctly resolve and use that tenant_id.
+    let saved = with_tenant("tenant-c".to_string(), async {
+        repo.across_tenants()
+            .save(&NewTenantPost {
+                title: "Across Tenant Save".to_string(),
+            })
+            .await
+            .unwrap()
+    })
+    .await;
+
+    assert_eq!(saved.title, "Across Tenant Save");
+    assert_eq!(saved.tenant_id, "tenant-c");
+}

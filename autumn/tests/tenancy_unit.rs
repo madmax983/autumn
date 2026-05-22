@@ -377,6 +377,32 @@ async fn jwt_audience_missing_claim_fails() {
     );
 }
 
+/// Slicing Authorization at index 7 when index 7 is inside a multi-byte UTF-8 char
+/// (like `é`) must not panic, but must return a clean unauthorized error.
+#[tokio::test]
+async fn jwt_malformed_bearer_boundary_handling_does_not_panic() {
+    let mut config = AutumnConfig::default();
+    config.tenancy.enabled = true;
+    config.tenancy.source = "jwt".to_string();
+    config.tenancy.jwt_claim = "company".to_string();
+    config.tenancy.jwt_secret = Some("secret".to_string());
+
+    let req = Request::builder()
+        .header("Authorization", "aaaaaaé...")
+        .body(())
+        .unwrap();
+    let (mut parts, ()) = req.into_parts();
+    let err = extract_tenant_from_parts(&mut parts, &config)
+        .await
+        .unwrap_err();
+    let err_str = err.to_string();
+    assert!(
+        err_str.contains("Invalid Authorization header format")
+            || err_str.contains("Invalid UTF-8"),
+        "Expected clean unauthorized error, got: {err_str}"
+    );
+}
+
 /// When polling a response body wrapped in `TenantPropagatingBody`, the
 /// `CURRENT_TENANT` task-local context must be re-established for the duration
 /// of the poll.

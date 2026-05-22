@@ -1206,9 +1206,7 @@ fn apply_middleware(
         tracing::debug!(count = custom_layer_count, "Custom Tower layers applied");
     }
 
-    // Apply framework middleware. Exception filters wrap outermost so they
-    // see all error responses regardless of scoping or interceptors.
-    let mut router = router.layer(RequestIdLayer).layer(security_headers);
+    let mut router = router;
 
     if config.tenancy.enabled {
         router = router.layer(axum::middleware::from_fn_with_state(
@@ -1217,6 +1215,8 @@ fn apply_middleware(
         ));
         tracing::debug!("Multi-tenancy middleware enabled");
     }
+
+    let router = router.layer(RequestIdLayer).layer(security_headers);
 
     let router = crate::session::apply_session_layer(
         router,

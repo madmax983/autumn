@@ -196,7 +196,10 @@ pub async fn extract_tenant_from_parts(
                 crate::AutumnError::unauthorized_msg("Invalid UTF-8 in Authorization header")
             })?;
 
-            if auth_str.len() < 7 || !auth_str[..7].eq_ignore_ascii_case("bearer ") {
+            if auth_str.len() < 7
+                || !auth_str.is_char_boundary(7)
+                || !auth_str[..7].eq_ignore_ascii_case("bearer ")
+            {
                 return Err(crate::AutumnError::unauthorized_msg(
                     "Invalid Authorization header format. Expected Bearer <token>",
                 ));
