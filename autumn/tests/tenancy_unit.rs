@@ -10,6 +10,8 @@ struct Claims {
     company: String,
     exp: usize,
     iss: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    aud: Option<String>,
 }
 
 // Helper to generate a signed JWT
@@ -19,6 +21,25 @@ fn generate_jwt(tenant: &str, secret: &str, expired: bool, issuer: Option<&str>)
         company: tenant.to_owned(),
         exp: if expired { 1 } else { 10_000_000_000 },
         iss: issuer.map(std::borrow::ToOwned::to_owned),
+        aud: None,
+    };
+    let header = Header::new(Algorithm::HS256);
+    encode(
+        &header,
+        &my_claims,
+        &EncodingKey::from_secret(secret.as_bytes()),
+    )
+    .unwrap()
+}
+
+// Helper to generate a JWT with an audience claim
+fn generate_jwt_with_audience(tenant: &str, secret: &str, audience: Option<&str>) -> String {
+    let my_claims = Claims {
+        sub: "1234567890".to_owned(),
+        company: tenant.to_owned(),
+        exp: 10_000_000_000,
+        iss: None,
+        aud: audience.map(std::borrow::ToOwned::to_owned),
     };
     let header = Header::new(Algorithm::HS256);
     encode(
@@ -228,4 +249,100 @@ async fn test_subdomain_mode_custom_base_domain() {
         .await
         .unwrap_err();
     assert!(err3.to_string().contains("domain") || err3.to_string().contains("subdomain"));
+}
+
+// ── New TDD tests for issue #695 ──────────────────────────────────────────
+
+/// A mixed-case host like `Tenant1.Example.COM` should match `base_domain`
+/// `"example.com"` and return tenant `"tenant1"` (lowercased).
+#[tokio::test]
+async fn mixed_case_host_matches_base_domain() {
+    let mut config = AutumnConfig::default();
+    config.tenancy.enabled = true;
+    config.tenancy.source = "subdomain".to_string();
+    config.tenancy.base_domain = Some("example.com".to_string());
+
+    let req = Request::builder()
+        .header("Host", "Tenant1.Example.COM")
+        .body(())
+        .unwrap();
+    let (mut parts, ()) = req.into_parts();
+    let tenant = extract_tenant_from_parts(&mut parts, &config)
+        .await
+        .expect("mixed-case host should match case-insensitively");
+    assert_eq!(tenant, "tenant1");
+}
+
+/// The apex domain `EXAMPLE.COM` with `base_domain` `"example.com"` should be
+/// rejected (apex not allowed), not succeed.
+#[tokio::test]
+async fn apex_mixed_case_rejected() {
+    let mut config = AutumnConfig::default();
+    config.tenancy.enabled = true;
+    config.tenancy.source = "subdomain".to_string();
+    config.tenancy.base_domain = Some("example.com".to_string());
+
+    let req = Request::builder()
+        .header("Host", "EXAMPLE.COM")
+        .body(())
+        .unwrap();
+    let (mut parts, ()) = req.into_parts();
+    let err = extract_tenant_from_parts(&mut parts, &config)
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("apex") || err.to_string().contains("subdomain"),
+        "Expected apex rejection, got: {err}"
+    );
+}
+
+/// When `jwt_audience` is configured and the JWT carries a matching `aud`
+/// claim, extraction should succeed.
+#[tokio::test]
+async fn jwt_audience_valid_passes() {
+    let mut config = AutumnConfig::default();
+    config.tenancy.enabled = true;
+    config.tenancy.source = "jwt".to_string();
+    config.tenancy.jwt_claim = "company".to_string();
+    config.tenancy.jwt_secret = Some("secret".to_string());
+    config.tenancy.jwt_audience = Some("my-api".to_string());
+
+    let token = generate_jwt_with_audience("acme", "secret", Some("my-api"));
+    let req = Request::builder()
+        .header("Authorization", format!("Bearer {token}"))
+        .body(())
+        .unwrap();
+    let (mut parts, ()) = req.into_parts();
+    let tenant = extract_tenant_from_parts(&mut parts, &config)
+        .await
+        .expect("JWT with matching audience should succeed");
+    assert_eq!(tenant, "acme");
+}
+
+/// When `jwt_audience` is configured and the JWT carries a *different* `aud`
+/// claim, extraction must fail with a 401-style error.
+#[tokio::test]
+async fn jwt_audience_mismatch_fails() {
+    let mut config = AutumnConfig::default();
+    config.tenancy.enabled = true;
+    config.tenancy.source = "jwt".to_string();
+    config.tenancy.jwt_claim = "company".to_string();
+    config.tenancy.jwt_secret = Some("secret".to_string());
+    config.tenancy.jwt_audience = Some("my-api".to_string());
+
+    // Token carries audience "wrong-api" — should be rejected
+    let token = generate_jwt_with_audience("acme", "secret", Some("wrong-api"));
+    let req = Request::builder()
+        .header("Authorization", format!("Bearer {token}"))
+        .body(())
+        .unwrap();
+    let (mut parts, ()) = req.into_parts();
+    let err = extract_tenant_from_parts(&mut parts, &config)
+        .await
+        .unwrap_err();
+    let err_str = err.to_string().to_lowercase();
+    assert!(
+        err_str.contains("audience") || err_str.contains("unauthorized"),
+        "Expected audience rejection, got: {err}"
+    );
 }

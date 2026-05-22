@@ -94,25 +94,29 @@ pub async fn extract_tenant_from_parts(
                 ));
             }
 
+            // DNS hostnames are case-insensitive; normalise to lowercase
+            // before any matching so that e.g. `Tenant1.Example.COM` works.
+            let host_lower = host_only.to_lowercase();
+
             if let Some(ref base_domain) = config.tenancy.base_domain {
-                let base_domain_clean = base_domain.trim();
-                if !host_only.ends_with(base_domain_clean) {
+                let base_domain_clean = base_domain.trim().to_lowercase();
+                if !host_lower.ends_with(base_domain_clean.as_str()) {
                     return Err(crate::AutumnError::bad_request_msg(format!(
                         "Host does not match base domain: {base_domain_clean}"
                     )));
                 }
-                if host_only.len() <= base_domain_clean.len() {
+                if host_lower.len() <= base_domain_clean.len() {
                     return Err(crate::AutumnError::bad_request_msg(
                         "Apex domain not allowed in subdomain mode",
                     ));
                 }
-                let prefix_len = host_only.len() - base_domain_clean.len();
-                if !host_only[..prefix_len].ends_with('.') {
+                let prefix_len = host_lower.len() - base_domain_clean.len();
+                if !host_lower[..prefix_len].ends_with('.') {
                     return Err(crate::AutumnError::bad_request_msg(
                         "Invalid subdomain format",
                     ));
                 }
-                let subdomain_part = &host_only[..prefix_len - 1];
+                let subdomain_part = &host_lower[..prefix_len - 1];
                 let tenant = subdomain_part.split('.').next().ok_or_else(|| {
                     crate::AutumnError::bad_request_msg("Unable to extract subdomain tenant")
                 })?;
@@ -123,7 +127,7 @@ pub async fn extract_tenant_from_parts(
                 }
                 Ok(tenant.to_string())
             } else {
-                let labels: Vec<&str> = host_only.split('.').filter(|s| !s.is_empty()).collect();
+                let labels: Vec<&str> = host_lower.split('.').filter(|s| !s.is_empty()).collect();
                 if labels.is_empty() {
                     return Err(crate::AutumnError::bad_request_msg("Empty host header"));
                 }
@@ -203,7 +207,11 @@ pub async fn extract_tenant_from_parts(
             if let Some(ref iss) = config.tenancy.jwt_issuer {
                 validation.set_issuer(::std::slice::from_ref(iss));
             }
-            validation.validate_aud = false;
+            if let Some(ref aud) = config.tenancy.jwt_audience {
+                validation.set_audience(&[aud.as_str()]);
+            } else {
+                validation.validate_aud = false;
+            }
 
             let token_data = ::jsonwebtoken::decode::<serde_json::Value>(
                 token,

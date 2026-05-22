@@ -3185,6 +3185,12 @@ pub struct TenancyConfig {
     #[serde(default)]
     pub jwt_issuer: Option<String>,
 
+    /// Expected JWT audience (`aud` claim) to validate.
+    /// When set, audience checking is enabled; when `None`, audience checking
+    /// is skipped for backward compatibility.
+    #[serde(default)]
+    pub jwt_audience: Option<String>,
+
     /// Optional base domain for subdomain tenancy.
     #[serde(default)]
     pub base_domain: Option<String>,
@@ -3216,6 +3222,7 @@ impl Default for TenancyConfig {
             jwt_claim: default_tenancy_jwt_claim(),
             jwt_secret: None,
             jwt_issuer: None,
+            jwt_audience: None,
             base_domain: None,
         }
     }
