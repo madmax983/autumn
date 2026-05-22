@@ -611,6 +611,63 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // Build Diesel-compatible changeset bridge (private struct with Option<T> fields)
     let changeset_name = format_ident!("__{}Changeset", name);
 
+    let tenant_id_field = fields_for_new
+        .iter()
+        .find(|f| f.ident.as_ref().is_some_and(|id| id == "tenant_id"));
+
+    #[allow(clippy::option_if_let_else)]
+    let can_set_tenant_id_impl = match tenant_id_field {
+        Some(f) => {
+            let is_option = is_option_type(&f.ty);
+            let val = if is_option {
+                quote! { ::core::option::Option::Some(::core::option::Option::Some(t)) }
+            } else {
+                quote! { ::core::option::Option::Some(t) }
+            };
+            quote! {
+                impl ::autumn_web::repository::CanSetTenantId for #changeset_name {
+                    fn set_tenant_id(&mut self, t: ::std::string::String) {
+                        self.tenant_id = #val;
+                    }
+                }
+            }
+        }
+        None => {
+            quote! {
+                impl ::autumn_web::repository::CanSetTenantId for #changeset_name {
+                    fn set_tenant_id(&mut self, _t: ::std::string::String) {}
+                }
+            }
+        }
+    };
+
+    let model_tenant_id_meta_impl = tenant_id_field.as_ref().map_or_else(
+        || {
+            quote! {
+                impl ::autumn_web::tenancy::ModelTenantIdMeta for #new_name {
+                    const HAS_MANUAL_TENANT_ID: bool = false;
+                    fn try_set_tenant_id(&mut self, _tenant_id: &str) {}
+                }
+            }
+        },
+        |f| {
+            let is_option = is_option_type(&f.ty);
+            let set_field = if is_option {
+                quote! { self.tenant_id = ::core::option::Option::Some(tenant_id.to_string()); }
+            } else {
+                quote! { self.tenant_id = tenant_id.to_string(); }
+            };
+            quote! {
+                impl ::autumn_web::tenancy::ModelTenantIdMeta for #new_name {
+                    const HAS_MANUAL_TENANT_ID: bool = true;
+                    fn try_set_tenant_id(&mut self, tenant_id: &str) {
+                        #set_field
+                    }
+                }
+            }
+        },
+    );
+
     let mut changeset_fields: Vec<TokenStream> = fields_for_new
         .iter()
         .map(|f| {
@@ -1198,6 +1255,9 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 }
             }
         }
+
+        #can_set_tenant_id_impl
+        #model_tenant_id_meta_impl
 
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
         #vis enum #field_enum_name {

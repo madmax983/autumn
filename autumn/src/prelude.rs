@@ -144,6 +144,8 @@ pub use crate::auth::Auth;
 pub use crate::auth::RequireApiToken;
 /// Session extractor for accessing per-user session data.
 pub use crate::session::Session;
+/// Tenant extractor and context helpers.
+pub use crate::tenancy::{Tenant, with_tenant};
 
 // ── Authorization ────────────────────────────────────────────────
 /// Record-level authorization primitives. See

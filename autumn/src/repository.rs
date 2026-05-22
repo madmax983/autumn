@@ -69,6 +69,11 @@ pub trait AutumnLockVersionUpdateExt {
 impl<T: ?Sized> AutumnLockVersionModelExt for T {}
 impl<T: ?Sized> AutumnLockVersionUpdateExt for T {}
 
+/// Extension trait to override `tenant_id` on changesets in tenant-scoped updates.
+pub trait CanSetTenantId {
+    fn set_tenant_id(&mut self, tenant_id: String);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -669,6 +669,10 @@ pub struct AutumnConfig {
     #[serde(default)]
     pub cache: CacheConfig,
 
+    /// Row-level multi-tenancy settings.
+    #[serde(default)]
+    pub tenancy: TenancyConfig,
+
     /// HTTP idempotency-key middleware settings.
     #[serde(default)]
     pub idempotency: IdempotencyConfig,
@@ -3147,6 +3151,81 @@ where
     struct Wrapper(#[serde(deserialize_with = "deserialize_duration")] std::time::Duration);
 
     Option::<Wrapper>::deserialize(deserializer).map(|opt| opt.map(|w| w.0))
+}
+
+/// Row-level multi-tenancy configuration.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TenancyConfig {
+    /// Whether row-level multi-tenancy is enabled.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Source configuration from which the tenant ID is extracted.
+    /// Values can be "header" (default), "subdomain", "session", "jwt".
+    #[serde(default = "default_tenancy_source")]
+    pub source: String,
+
+    /// Header name to lookup if source is "header". Default: "x-tenant-id".
+    #[serde(default = "default_tenancy_header_name")]
+    pub header_name: String,
+
+    /// Session key to lookup if source is "session". Default: "`tenant_id`".
+    #[serde(default = "default_tenancy_session_key")]
+    pub session_key: String,
+
+    /// JWT claim to lookup if source is "jwt". Default: "`tenant_id`".
+    #[serde(default = "default_tenancy_jwt_claim")]
+    pub jwt_claim: String,
+
+    /// JWT secret key used to verify the JWT signature.
+    #[serde(default)]
+    pub jwt_secret: Option<String>,
+
+    /// Expected JWT issuer to validate.
+    #[serde(default)]
+    pub jwt_issuer: Option<String>,
+
+    /// Expected JWT audience (`aud` claim) to validate.
+    /// When set, audience checking is enabled; when `None`, audience checking
+    /// is skipped for backward compatibility.
+    #[serde(default)]
+    pub jwt_audience: Option<String>,
+
+    /// Optional base domain for subdomain tenancy.
+    #[serde(default)]
+    pub base_domain: Option<String>,
+}
+
+fn default_tenancy_source() -> String {
+    "header".to_string()
+}
+
+fn default_tenancy_header_name() -> String {
+    "x-tenant-id".to_string()
+}
+
+fn default_tenancy_session_key() -> String {
+    "tenant_id".to_string()
+}
+
+fn default_tenancy_jwt_claim() -> String {
+    "tenant_id".to_string()
+}
+
+impl Default for TenancyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            source: default_tenancy_source(),
+            header_name: default_tenancy_header_name(),
+            session_key: default_tenancy_session_key(),
+            jwt_claim: default_tenancy_jwt_claim(),
+            jwt_secret: None,
+            jwt_issuer: None,
+            jwt_audience: None,
+            base_domain: None,
+        }
+    }
 }
 
 #[cfg(test)]
