@@ -1591,12 +1591,10 @@ pub fn build_cors_layer(cors: &crate::config::CorsConfig) -> tower_http::cors::C
         let origins: Vec<http::HeaderValue> = cors
             .allowed_origins
             .iter()
-            .filter_map(|o| match o.parse() {
-                Ok(v) => Some(v),
-                Err(e) => {
+            .filter_map(|o| {
+                o.parse().map_err(|e| {
                     tracing::warn!(origin = %o, error = %e, "CORS: ignoring malformed allowed_origin");
-                    None
-                }
+                }).ok()
             })
             .collect();
         CorsLayer::new().allow_origin(origins)
@@ -1605,24 +1603,20 @@ pub fn build_cors_layer(cors: &crate::config::CorsConfig) -> tower_http::cors::C
     let methods: Vec<http::Method> = cors
         .allowed_methods
         .iter()
-        .filter_map(|m| match m.parse() {
-            Ok(v) => Some(v),
-            Err(e) => {
+        .filter_map(|m| {
+            m.parse().map_err(|e| {
                 tracing::warn!(method = %m, error = %e, "CORS: ignoring malformed allowed_method");
-                None
-            }
+            }).ok()
         })
         .collect();
 
     let headers: Vec<HeaderName> = cors
         .allowed_headers
         .iter()
-        .filter_map(|h| match h.parse() {
-            Ok(v) => Some(v),
-            Err(e) => {
+        .filter_map(|h| {
+            h.parse().map_err(|e| {
                 tracing::warn!(header = %h, error = %e, "CORS: ignoring malformed allowed_header");
-                None
-            }
+            }).ok()
         })
         .collect();
 
