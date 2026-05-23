@@ -1713,7 +1713,7 @@ fn collect_openapi_docs(
     // effective path is `prefix + route.path`; we materialize these into
     // fresh `ApiDoc`s so the rendered spec reflects the actual URL the
     // user will call.
-    let mut docs: Vec<crate::openapi::ApiDoc> = Vec::new();
+    let mut docs: Vec<crate::openapi::ApiDoc> = Vec::with_capacity(route_list.len() + scoped_groups.iter().map(|g| g.routes.len()).sum::<usize>());
     for route in route_list {
         docs.push(route.api_doc.clone());
     }
