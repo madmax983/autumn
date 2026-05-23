@@ -397,8 +397,13 @@ fn origin_matches_request(origin: &str, headers: &http::HeaderMap) -> bool {
     };
 
     let expected_host = headers
-        .get("x-forwarded-host")
-        .and_then(|v| v.to_str().ok())
+        .get_all("x-forwarded-host")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|s| s.split(','))
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .last()
         .or_else(|| {
             headers
                 .get(http::header::HOST)
