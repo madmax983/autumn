@@ -1983,10 +1983,11 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                     let mut conn = self.__autumn_acquire_conn().await?;
                     let contexts_ref = &contexts;
-                    let (inserted_records, hook_infos) = conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| {
+                    let (inserted_records, hook_infos, global_indices) = conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| {
                         async move {
                             let mut inserted_records = Vec::new();
                             let mut hook_infos = Vec::new();
+                            let mut global_indices = Vec::new();
                             let mut offset = 0;
                             let cols = (&new[0]).__autumn_column_count() + #tenant_extra;
                             let chunk_size = if cols == 0 { 1000 } else { (65535usize / cols).min(1000).max(1) };
@@ -2015,6 +2016,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                         });
                                     matched[idx] = true;
                                     mapped_indices.push(idx);
+                                }
+
+                                for &mapped_idx in &mapped_indices {
+                                    global_indices.push(offset + mapped_idx);
                                 }
 
                                 let hook_inputs: Vec<_> = chunk_inserted.iter().enumerate().map(|(idx, _)| {
@@ -2046,7 +2051,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 inserted_records.extend(chunk_inserted);
                                 offset += chunk.len();
                             }
-                            Ok((inserted_records, hook_infos))
+                            Ok((inserted_records, hook_infos, global_indices))
                         }
                         .scope_boxed()
                     })
@@ -2059,7 +2064,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                     // Run after_create hooks outside of transaction
                     for (idx, record) in inserted_records.iter().enumerate() {
-                        let mut ctx = contexts[idx].clone();
+                        let global_idx = global_indices[idx];
+                        let mut ctx = contexts[global_idx].clone();
                         let (hook_id, hook_owner, hook_record) = &hook_infos[idx];
 
                         let __autumn_pending_heartbeat =
@@ -3926,8 +3932,6 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 }
             };
 
-
-
             quote! {
                 use ::autumn_web::reexports::diesel::prelude::*;
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
@@ -4154,7 +4158,15 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
             let size_check = if config.tenant_scoped {
                 quote! {
-                    if upserted.len() != records.len() {
+                    if has_lock && upserted.len() != records.len() {
+                        return Err(::autumn_web::AutumnError::conflict_msg(
+                            format!(
+                                "Conflict: only {} of {} records were upserted (potential lock-version/optimistic lock or tenant conflict)",
+                                upserted.len(),
+                                records.len()
+                            )
+                        ));
+                    } else if !has_lock && upserted.is_empty() && !records.is_empty() {
                         return Err(::autumn_web::AutumnError::bad_request_msg(
                             format!(
                                 "Tenant conflict: only {} of {} records were upserted (potential cross-tenant conflict)",
@@ -4166,7 +4178,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 }
             } else {
                 quote! {
-                    if upserted.len() != records.len() {
+                    if has_lock && upserted.len() != records.len() {
                         return Err(::autumn_web::AutumnError::conflict_msg(
                             format!(
                                 "Conflict: only {} of {} records were upserted (potential lock-version/optimistic lock conflict)",
@@ -4194,6 +4206,22 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     return Ok(Vec::new());
                 }
 
+                let mut unique_ids = ::std::collections::HashSet::new();
+                for record in records.iter() {
+                    if !unique_ids.insert(record.id) {
+                        return Err(::autumn_web::AutumnError::bad_request_msg(
+                            format!("Duplicate record ID detected in bulk upsert: {}", record.id)
+                        ));
+                    }
+                }
+
+                let mut has_lock = false;
+                if let ::core::option::Option::Some(first_rec) = records.first() {
+                    if first_rec.__autumn_lock_version_actual().is_some() {
+                        has_lock = true;
+                    }
+                }
+
                 #tenant_id_setup
                 let mut conn = self.__autumn_acquire_conn().await?;
 
@@ -4207,18 +4235,20 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             let existing_rows = #load_expr
                                 .map_err(::autumn_web::AutumnError::from)?;
 
-                            for existing in &existing_rows {
-                                if let ::core::option::Option::Some(db_lock) = existing.__autumn_lock_version_actual() {
-                                    if let ::core::option::Option::Some(incoming) = chunk.iter().find(|r| r.id == existing.id) {
-                                        if let ::core::option::Option::Some(incoming_lock) = incoming.__autumn_lock_version_actual() {
-                                            if incoming_lock != db_lock {
-                                                return Err(::autumn_web::AutumnError::conflict(
-                                                    ::autumn_web::RepositoryError::Conflict {
-                                                        id: existing.id,
-                                                        expected_version: incoming_lock,
-                                                        actual_version: ::core::option::Option::Some(db_lock),
-                                                    },
-                                                ));
+                            if has_lock {
+                                for existing in &existing_rows {
+                                    if let ::core::option::Option::Some(db_lock) = existing.__autumn_lock_version_actual() {
+                                        if let ::core::option::Option::Some(incoming) = chunk.iter().find(|r| r.id == existing.id) {
+                                            if let ::core::option::Option::Some(incoming_lock) = incoming.__autumn_lock_version_actual() {
+                                                if incoming_lock != db_lock {
+                                                    return Err(::autumn_web::AutumnError::conflict(
+                                                        ::autumn_web::RepositoryError::Conflict {
+                                                            id: existing.id,
+                                                            expected_version: incoming_lock,
+                                                            actual_version: ::core::option::Option::Some(db_lock),
+                                                        },
+                                                    ));
+                                                }
                                             }
                                         }
                                     }
