@@ -2007,23 +2007,14 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     hook_records.push((__autumn_commit_hook_record, __autumn_commit_hook_discriminator));
                                 }
 
-                                let mut matched = vec![false; chunk.len()];
-                                let mut mapped_indices = Vec::with_capacity(chunk_inserted.len());
-                                for record in &chunk_inserted {
-                                    let idx = #model_name::__autumn_correlate_new(chunk, record, &mut matched)
-                                        .unwrap_or_else(|| {
-                                            matched.iter().position(|&m| !m).unwrap_or(0)
-                                        });
-                                    matched[idx] = true;
-                                    mapped_indices.push(idx);
-                                }
+                                let mapped_indices: Vec<usize> = (0..chunk_inserted.len()).collect();
 
                                 for &mapped_idx in &mapped_indices {
                                     global_indices.push(offset + mapped_idx);
                                 }
 
                                 let hook_inputs: Vec<_> = chunk_inserted.iter().enumerate().map(|(idx, _)| {
-                                    let mapped_idx = mapped_indices[idx];
+                                    let mapped_idx = idx;
                                     let global_idx = offset + mapped_idx;
                                     let ctx = &contexts_ref[global_idx];
                                     let (ref record_val, ref discriminator) = hook_records[idx];
@@ -2192,16 +2183,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                     ::core::mem::drop(conn);
 
-                    let mut matched = vec![false; inputs.len()];
-                    let mut mapped_indices = Vec::with_capacity(inserted_records.len());
-                    for record in &inserted_records {
-                        let idx = #model_name::__autumn_correlate_new(&inputs, record, &mut matched)
-                            .unwrap_or_else(|| {
-                                matched.iter().position(|&m| !m).unwrap_or(0)
-                            });
-                        matched[idx] = true;
-                        mapped_indices.push(idx);
-                    }
+                    let mapped_indices: Vec<usize> = (0..inserted_records.len()).collect();
 
                     let mut __autumn_first_err: ::core::option::Option<::autumn_web::AutumnError> = ::core::option::Option::None;
                     // Run after_create hooks outside of transaction
@@ -2335,20 +2317,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     hook_records.push((__autumn_commit_hook_record, __autumn_commit_hook_discriminator));
                                 }
 
-                                let chunk_models: Vec<_> = chunk.iter().map(|item| item.0.clone()).collect();
-                                let mut matched = vec![false; chunk.len()];
-                                let mut mapped_indices = Vec::with_capacity(chunk_inserted.len());
-                                for record in &chunk_inserted {
-                                    let idx = #model_name::__autumn_correlate_new(&chunk_models, record, &mut matched)
-                                        .unwrap_or_else(|| {
-                                            matched.iter().position(|&m| !m).unwrap_or(0)
-                                        });
-                                    matched[idx] = true;
-                                    mapped_indices.push(idx);
-                                }
+                                let mapped_indices: Vec<usize> = (0..chunk_inserted.len()).collect();
 
                                 let hook_inputs: Vec<_> = chunk_inserted.iter().enumerate().map(|(idx, _)| {
-                                    let mapped_idx = mapped_indices[idx];
+                                    let mapped_idx = idx;
                                     let ctx = &chunk[mapped_idx].1;
                                     let (ref record_val, ref discriminator) = hook_records[idx];
                                     (
@@ -2607,17 +2579,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                         match batch_res {
                             Ok(inserted_chunk) => {
-                                let chunk_models: Vec<_> = chunk.iter().map(|item| item.0.clone()).collect();
-                                let mut matched = vec![false; chunk.len()];
-                                let mut mapped_indices = Vec::with_capacity(inserted_chunk.len());
-                                for record in &inserted_chunk {
-                                    let idx = #model_name::__autumn_correlate_new(&chunk_models, record, &mut matched)
-                                        .unwrap_or_else(|| {
-                                            matched.iter().position(|&m| !m).unwrap_or(0)
-                                        });
-                                    matched[idx] = true;
-                                    mapped_indices.push(idx);
-                                }
+                                let mapped_indices: Vec<usize> = (0..inserted_chunk.len()).collect();
 
                                 for (idx, record) in inserted_chunk.into_iter().enumerate() {
                                     let mapped_idx = mapped_indices[idx];
