@@ -1280,16 +1280,25 @@ async fn trusted_host_middleware(
     policy: TrustedHostPolicy,
 ) -> axum::response::Response {
     let path = req.uri().path();
-    if policy.probe_bypass_paths.contains(path) {
+    if (req.method() == http::Method::GET || req.method() == http::Method::HEAD)
+        && policy.probe_bypass_paths.contains(path)
+    {
         return next.run(req).await;
     }
     let host = req
-        .headers()
-        .get(http::header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .or_else(|| req.uri().authority().map(http::uri::Authority::as_str))
+        .uri()
+        .authority()
+        .map(http::uri::Authority::as_str)
+        .or_else(|| {
+            req.headers()
+                .get(http::header::HOST)
+                .and_then(|v| v.to_str().ok())
+        })
         .and_then(extract_host_without_port)
         .map(str::to_ascii_lowercase);
+    if host.is_none() && policy.allow_missing_host {
+        return next.run(req).await;
+    }
     if host.as_deref().is_some_and(|host| policy.allows_host(host)) {
         next.run(req).await
     } else {
@@ -3326,11 +3335,31 @@ mod trusted_host_tests {
             .expect("request should complete");
         assert_eq!(not_bypassed.status(), StatusCode::BAD_REQUEST);
     }
+
+    #[tokio::test]
+    async fn trusted_host_does_not_bypass_non_get_probe_path_requests() {
+        let mut cfg = AutumnConfig::default();
+        cfg.security.trusted_hosts.hosts = vec!["example.com".into()];
+        let router = build_router(vec![], &cfg, crate::state::AppState::for_test());
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/health")
+                    .header("host", "evil.com")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
 }
 #[derive(Clone, Debug)]
 struct TrustedHostPolicy {
     rules: Arc<Vec<String>>,
     allow_any: bool,
+    allow_missing_host: bool,
     probe_bypass_paths: Arc<std::collections::HashSet<String>>,
 }
 
@@ -3344,7 +3373,8 @@ impl TrustedHostPolicy {
             .map(|h| h.trim().to_ascii_lowercase())
             .filter(|h| !h.is_empty())
             .collect();
-        if !matches!(config.profile.as_deref(), Some("prod" | "production")) {
+        let is_production = matches!(config.profile.as_deref(), Some("prod" | "production"));
+        if !is_production {
             rules.extend(
                 ["localhost", "127.0.0.1", "::1"]
                     .into_iter()
@@ -3362,6 +3392,7 @@ impl TrustedHostPolicy {
         Self {
             rules: Arc::new(rules),
             allow_any,
+            allow_missing_host: !is_production,
             probe_bypass_paths: Arc::new(probe_bypass_paths),
         }
     }
