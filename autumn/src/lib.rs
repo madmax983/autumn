@@ -99,7 +99,6 @@ pub mod idempotency;
 /// `autumn_web::t!(locale, "key")` usage.
 #[cfg(feature = "i18n")]
 pub use crate::i18n::t;
-pub mod interceptor;
 #[cfg(feature = "mail")]
 pub mod mail;
 #[cfg(feature = "db")]
