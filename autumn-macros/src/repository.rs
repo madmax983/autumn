@@ -363,6 +363,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let update_name = format_ident!("Update{model_name}");
     let vis = &trait_def.vis;
     let commit_hooks_enabled = config.hooks_type.is_some() && config.commit_hooks;
+    let tenant_extra = usize::from(config.tenant_scoped);
 
     // Soft-delete filter fragment: appended to every finder when soft_delete is true.
     let sd_filter = if config.soft_delete {
@@ -1958,6 +1959,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     use ::autumn_web::hooks::{MutationContext, MutationOp, MutationHooks};
                     use ::autumn_web::repository::AutumnColumnCountSpecific as _;
                     use ::autumn_web::repository::AutumnColumnCountFallback as _;
+                    use ::autumn_web::repository::AutumnCorrelateExt as _;
 
                     if new.is_empty() {
                         return Ok(Vec::new());
@@ -1986,7 +1988,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             let mut inserted_records = Vec::new();
                             let mut hook_infos = Vec::new();
                             let mut offset = 0;
-                            let cols = (&new[0]).__autumn_column_count();
+                            let cols = (&new[0]).__autumn_column_count() + #tenant_extra;
                             let chunk_size = if cols == 0 { 1000 } else { (65535usize / cols).min(1000).max(1) };
                             for chunk in inputs.chunks(chunk_size) {
                                 let chunk_inserted = (#insert_expr)
@@ -2004,8 +2006,20 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     hook_records.push((__autumn_commit_hook_record, __autumn_commit_hook_discriminator));
                                 }
 
+                                let mut matched = vec![false; chunk.len()];
+                                let mut mapped_indices = Vec::with_capacity(chunk_inserted.len());
+                                for record in &chunk_inserted {
+                                    let idx = #model_name::__autumn_correlate_new(chunk, record, &mut matched)
+                                        .unwrap_or_else(|| {
+                                            matched.iter().position(|&m| !m).unwrap_or(0)
+                                        });
+                                    matched[idx] = true;
+                                    mapped_indices.push(idx);
+                                }
+
                                 let hook_inputs: Vec<_> = chunk_inserted.iter().enumerate().map(|(idx, _)| {
-                                    let global_idx = offset + idx;
+                                    let mapped_idx = mapped_indices[idx];
+                                    let global_idx = offset + mapped_idx;
                                     let ctx = &contexts_ref[global_idx];
                                     let (ref record_val, ref discriminator) = hook_records[idx];
                                     (
@@ -2015,6 +2029,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                         record_val,
                                     )
                                 }).collect();
+
 
                                 let chunk_hook_infos = ::autumn_web::__private::enqueue_repository_commit_hooks_pending_bulk_on_conn(
                                     conn,
@@ -2135,6 +2150,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     use ::autumn_web::hooks::{MutationContext, MutationOp, MutationHooks};
                     use ::autumn_web::repository::AutumnColumnCountSpecific as _;
                     use ::autumn_web::repository::AutumnColumnCountFallback as _;
+                    use ::autumn_web::repository::AutumnCorrelateExt as _;
 
                     if new.is_empty() {
                         return Ok(Vec::new());
@@ -2151,12 +2167,13 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     }
 
                     let mut conn = self.__autumn_acquire_conn().await?;
+                    let inputs_ref = &inputs;
                     let inserted_records = conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| {
                         async move {
                             let mut inserted = Vec::new();
-                            let cols = (&new[0]).__autumn_column_count();
+                            let cols = (&new[0]).__autumn_column_count() + #tenant_extra;
                             let chunk_size = if cols == 0 { 1000 } else { (65535usize / cols).min(1000).max(1) };
-                            for chunk in inputs.chunks(chunk_size) {
+                            for chunk in inputs_ref.chunks(chunk_size) {
                                 let chunk_inserted = (#insert_expr)
                                     .map_err(::autumn_web::AutumnError::from)?;
                                 inserted.extend(chunk_inserted);
@@ -2169,10 +2186,22 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                     ::core::mem::drop(conn);
 
+                    let mut matched = vec![false; inputs.len()];
+                    let mut mapped_indices = Vec::with_capacity(inserted_records.len());
+                    for record in &inserted_records {
+                        let idx = #model_name::__autumn_correlate_new(&inputs, record, &mut matched)
+                            .unwrap_or_else(|| {
+                                matched.iter().position(|&m| !m).unwrap_or(0)
+                            });
+                        matched[idx] = true;
+                        mapped_indices.push(idx);
+                    }
+
                     let mut __autumn_first_err: ::core::option::Option<::autumn_web::AutumnError> = ::core::option::Option::None;
                     // Run after_create hooks outside of transaction
                     for (idx, record) in inserted_records.iter().enumerate() {
-                        let mut ctx = contexts[idx].clone();
+                        let orig_idx = mapped_indices[idx];
+                        let mut ctx = contexts[orig_idx].clone();
                         if let ::core::result::Result::Err(err) = self.hooks.after_create(&mut ctx, record).await {
                             if __autumn_first_err.is_none() {
                                 __autumn_first_err = ::core::option::Option::Some(err);
@@ -2279,7 +2308,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     if valid_items.is_empty() {
                         return Ok((successes, failures));
                     }
-                    let cols = (&valid_items[0].0).__autumn_column_count();
+                    let cols = (&valid_items[0].0).__autumn_column_count() + #tenant_extra;
                     let chunk_size = if cols == 0 { 1000 } else { (65535usize / cols).min(1000).max(1) };
                     let mut offset = 0;
                     for chunk in valid_items.chunks(chunk_size) {
@@ -2300,8 +2329,21 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     hook_records.push((__autumn_commit_hook_record, __autumn_commit_hook_discriminator));
                                 }
 
+                                let chunk_models: Vec<_> = chunk.iter().map(|item| item.0.clone()).collect();
+                                let mut matched = vec![false; chunk.len()];
+                                let mut mapped_indices = Vec::with_capacity(chunk_inserted.len());
+                                for record in &chunk_inserted {
+                                    let idx = #model_name::__autumn_correlate_new(&chunk_models, record, &mut matched)
+                                        .unwrap_or_else(|| {
+                                            matched.iter().position(|&m| !m).unwrap_or(0)
+                                        });
+                                    matched[idx] = true;
+                                    mapped_indices.push(idx);
+                                }
+
                                 let hook_inputs: Vec<_> = chunk_inserted.iter().enumerate().map(|(idx, _)| {
-                                    let ctx = &chunk[idx].1;
+                                    let mapped_idx = mapped_indices[idx];
+                                    let ctx = &chunk[mapped_idx].1;
                                     let (ref record_val, ref discriminator) = hook_records[idx];
                                     (
                                         ctx.idempotency_key.clone(),
@@ -2324,17 +2366,19 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     hook_infos.push((info.0, info.1, hook_records[idx].0.clone()));
                                 }
 
-                                Ok((chunk_inserted, hook_infos))
+                                Ok((chunk_inserted, hook_infos, mapped_indices))
                             }
                             .scope_boxed()
                         })
                         .await;
 
                         match batch_res {
-                            Ok((inserted_chunk, hook_infos)) => {
+                            Ok((inserted_chunk, hook_infos, mapped_indices)) => {
                                 for (idx, record) in inserted_chunk.into_iter().enumerate() {
-                                    let mut ctx = chunk[idx].1.clone();
+                                    let mapped_idx = mapped_indices[idx];
+                                    let mut ctx = chunk[mapped_idx].1.clone();
                                     let (hook_id, hook_owner, hook_record) = &hook_infos[idx];
+
 
                                     let __autumn_pending_heartbeat =
                                         ::autumn_web::__private::start_repository_commit_hook_pending_finalizer_heartbeat(
@@ -2537,7 +2581,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     if valid_items.is_empty() {
                         return Ok((successes, failures));
                     }
-                    let cols = (&valid_items[0].0).__autumn_column_count();
+                    let cols = (&valid_items[0].0).__autumn_column_count() + #tenant_extra;
                     let chunk_size = if cols == 0 { 1000 } else { (65535usize / cols).min(1000).max(1) };
                     for chunk in valid_items.chunks(chunk_size) {
                         let batch_res = conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| {
@@ -2551,8 +2595,21 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                         match batch_res {
                             Ok(inserted_chunk) => {
+                                let chunk_models: Vec<_> = chunk.iter().map(|item| item.0.clone()).collect();
+                                let mut matched = vec![false; chunk.len()];
+                                let mut mapped_indices = Vec::with_capacity(inserted_chunk.len());
+                                for record in &inserted_chunk {
+                                    let idx = #model_name::__autumn_correlate_new(&chunk_models, record, &mut matched)
+                                        .unwrap_or_else(|| {
+                                            matched.iter().position(|&m| !m).unwrap_or(0)
+                                        });
+                                    matched[idx] = true;
+                                    mapped_indices.push(idx);
+                                }
+
                                 for (idx, record) in inserted_chunk.into_iter().enumerate() {
-                                    let mut ctx = chunk[idx].1.clone();
+                                    let mapped_idx = mapped_indices[idx];
+                                    let mut ctx = chunk[mapped_idx].1.clone();
                                     if let ::core::result::Result::Err(err) = self.hooks.after_create(&mut ctx, &record).await {
                                         ::autumn_web::reexports::tracing::warn!(
                                             error = %err,
@@ -3559,7 +3616,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let tenant_id = tenant_id.as_ref();
                 let mut conn = self.__autumn_acquire_conn().await?;
                 let mut inserted = Vec::new();
-                let cols = (&new[0]).__autumn_column_count();
+                let cols = (&new[0]).__autumn_column_count() + #tenant_extra;
                 let chunk_size = if cols == 0 { 1000 } else { (65535usize / cols).min(1000).max(1) };
                 for chunk in new.chunks(chunk_size) {
                     let chunk_inserted = if let ::core::option::Option::Some(t) = tenant_id {
@@ -3590,7 +3647,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 }
                 let mut conn = self.__autumn_acquire_conn().await?;
                 let mut inserted = Vec::new();
-                let cols = (&new[0]).__autumn_column_count();
+                let cols = (&new[0]).__autumn_column_count() + #tenant_extra;
                 let chunk_size = if cols == 0 { 1000 } else { (65535usize / cols).min(1000).max(1) };
                 for chunk in new.chunks(chunk_size) {
                     let chunk_inserted = ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
@@ -3686,7 +3743,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let mut failures = Vec::new();
 
                 let mut offset = 0;
-                let cols = (&new[0]).__autumn_column_count();
+                let cols = (&new[0]).__autumn_column_count() + #tenant_extra;
                 let chunk_size = if cols == 0 { 1000 } else { (65535usize / cols).min(1000).max(1) };
                 for chunk in new.chunks(chunk_size) {
                     let batch_res = conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| {
@@ -4038,41 +4095,14 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 }
             };
 
-            let upsert_expr = if config.tenant_scoped {
-                quote! {
-                    let chunk_upserted = if let ::core::option::Option::Some(ref t) = tenant_id {
-                        ::autumn_web::reexports::diesel::query_dsl::methods::FilterDsl::filter(
-                            ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
-                                .values(chunk)
-                                .on_conflict(#table_ident::id)
-                                .do_update()
-                                .set(#model_name::__autumn_upsert_set()),
-                            #table_ident::tenant_id.eq(t.clone())
-                        )
-                        .get_results::<#model_name>(conn)
-                        .await
-                    } else {
-                        ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
-                            .values(chunk)
-                            .on_conflict(#table_ident::id)
-                            .do_update()
-                            .set(#model_name::__autumn_upsert_set())
-                            .get_results::<#model_name>(conn)
-                            .await
-                    }
-                    .map_err(::autumn_web::AutumnError::from)?;
-                }
-            } else {
-                quote! {
-                    let chunk_upserted = ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
-                        .values(chunk)
-                        .on_conflict(#table_ident::id)
-                        .do_update()
-                        .set(#model_name::__autumn_upsert_set())
-                        .get_results::<#model_name>(conn)
-                        .await
-                        .map_err(::autumn_web::AutumnError::from)?;
-                }
+            let upsert_expr = quote! {
+                let chunk_upserted = #model_name::__autumn_execute_upsert(
+                    chunk,
+                    tenant_id.map(|t| t.as_str()),
+                    conn,
+                )
+                .await
+                .map_err(::autumn_web::AutumnError::from)?;
             };
 
             let size_check = if config.tenant_scoped {
@@ -4100,6 +4130,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 use ::autumn_web::repository::AutumnColumnCountFallback as _;
                 use ::autumn_web::repository::AutumnUpsertSetExt as _;
                 use ::autumn_web::repository::AutumnLockVersionModelExt as _;
+                use ::autumn_web::repository::AutumnUpsertExecutionExt as _;
+
 
                 if records.is_empty() {
                     return Ok(Vec::new());
@@ -4111,7 +4143,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| {
                     async move {
                         let mut upserted = Vec::new();
-                        let cols = (&records[0]).__autumn_column_count();
+                        let cols = (&records[0]).__autumn_column_count() + #tenant_extra;
                         let chunk_size = if cols == 0 { 1000 } else { (65535usize / cols).min(1000).max(1) };
                         for chunk in records.chunks(chunk_size) {
                             let chunk_ids: Vec<_> = chunk.iter().map(|r| r.id).collect();
@@ -5669,6 +5701,72 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
+    let upsert_execution_ext_impl = if config.no_upsert_trait {
+        quote! {}
+    } else {
+        let tenant_filter = if config.tenant_scoped {
+            quote! {
+                if let ::core::option::Option::Some(t) = tenant_id {
+                    let stmt = ::autumn_web::reexports::diesel::query_dsl::methods::FilterDsl::filter(stmt, #table_ident::tenant_id.eq(t.to_string()));
+                    stmt.get_results::<#model_name>(conn).await
+                } else {
+                    stmt.get_results::<#model_name>(conn).await
+                }
+            }
+        } else {
+            quote! {
+                stmt.get_results::<#model_name>(conn).await
+            }
+        };
+
+        quote! {
+            impl ::autumn_web::repository::AutumnUpsertExecutionExt for #model_name {
+                type Model = #model_name;
+                async fn __autumn_execute_upsert(
+                    chunk: &[#model_name],
+                    tenant_id: ::core::option::Option<&str>,
+                    conn: &mut ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+                ) -> ::core::result::Result<::std::vec::Vec<#model_name>, ::autumn_web::reexports::diesel::result::Error> {
+                    use ::autumn_web::reexports::diesel::prelude::*;
+                    use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+
+                    let stmt = ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                        .values(chunk)
+                        .on_conflict(#table_ident::id)
+                        .do_update()
+                        .set(<#model_name as ::autumn_web::repository::AutumnUpsertSetExt>::__autumn_upsert_set());
+
+                    #tenant_filter
+                }
+            }
+        }
+    };
+
+    let correlate_ext_impl = if config.no_upsert_trait {
+        quote! {}
+    } else {
+        quote! {
+            impl ::autumn_web::repository::AutumnCorrelateExt for #model_name {
+                type NewModel = #new_name;
+                fn __autumn_correlate_new(
+                    inputs: &[Self::NewModel],
+                    _record: &Self,
+                    matched: &mut [bool],
+                ) -> ::core::option::Option<usize> {
+                    matched.iter().position(|&m| !m)
+                }
+
+                fn __autumn_correlate_model(
+                    inputs: &[Self],
+                    _record: &Self,
+                    matched: &mut [bool],
+                ) -> ::core::option::Option<usize> {
+                    matched.iter().position(|&m| !m)
+                }
+            }
+        }
+    };
+
     // Generate the trait, impl, and extractor.
     //
     // Key design decisions:
@@ -5879,6 +5977,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         #tenant_scoped_traits
 
         #upsert_set_ext_impl
+
+        #upsert_execution_ext_impl
+
+        #correlate_ext_impl
     }
 }
 

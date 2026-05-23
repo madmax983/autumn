@@ -100,6 +100,35 @@ pub trait AutumnUpsertSetExt {
     fn __autumn_upsert_set() -> Self::UpsertSet;
 }
 
+#[doc(hidden)]
+pub trait AutumnUpsertExecutionExt {
+    type Model;
+    fn __autumn_execute_upsert<'a>(
+        chunk: &'a [Self::Model],
+        tenant_id: ::core::option::Option<&'a str>,
+        conn: &'a mut ::diesel_async::AsyncPgConnection,
+    ) -> impl ::std::future::Future<
+        Output = ::core::result::Result<::std::vec::Vec<Self::Model>, ::diesel::result::Error>,
+    > + Send
+    + 'a;
+}
+
+#[doc(hidden)]
+pub trait AutumnCorrelateExt: Sized {
+    type NewModel: Sized;
+    fn __autumn_correlate_new(
+        inputs: &[Self::NewModel],
+        record: &Self,
+        matched: &mut [bool],
+    ) -> ::core::option::Option<usize>;
+
+    fn __autumn_correlate_model(
+        inputs: &[Self],
+        record: &Self,
+        matched: &mut [bool],
+    ) -> ::core::option::Option<usize>;
+}
+
 /// Extension trait to override `tenant_id` on changesets in tenant-scoped updates.
 pub trait CanSetTenantId {
     fn set_tenant_id(&mut self, tenant_id: String);

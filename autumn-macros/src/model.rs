@@ -716,6 +716,57 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         });
     }
 
+    let has_tenant_id = tenant_id_field.is_some();
+    let execute_upsert_body = if has_tenant_id {
+        lock_version_field.map_or_else(
+            || quote! {
+                if let ::core::option::Option::Some(t) = tenant_id {
+                    let stmt = ::autumn_web::reexports::diesel::query_dsl::methods::FilterDsl::filter(stmt, #table_ident::tenant_id.eq(t.to_string()));
+                    stmt.get_results::<Self>(conn).await
+                } else {
+                    stmt.get_results::<Self>(conn).await
+                }
+            },
+            |lv_field| {
+                let lv_ident = lv_field.ident.as_ref().unwrap();
+                quote! {
+                    let lv_cond = #table_ident::#lv_ident.eq(::autumn_web::reexports::diesel::pg::upsert::excluded(#table_ident::#lv_ident));
+                    if let ::core::option::Option::Some(t) = tenant_id {
+                        let stmt = ::autumn_web::reexports::diesel::query_dsl::methods::FilterDsl::filter(stmt, lv_cond.and(#table_ident::tenant_id.eq(t.to_string())));
+                        stmt.get_results::<Self>(conn).await
+                    } else {
+                        let stmt = ::autumn_web::reexports::diesel::query_dsl::methods::FilterDsl::filter(stmt, lv_cond);
+                        stmt.get_results::<Self>(conn).await
+                    }
+                }
+            },
+        )
+    } else {
+        lock_version_field.map_or_else(
+            || quote! {
+                stmt.get_results::<Self>(conn).await
+            },
+            |lv_field| {
+                let lv_ident = lv_field.ident.as_ref().unwrap();
+                quote! {
+                    let lv_cond = #table_ident::#lv_ident.eq(::autumn_web::reexports::diesel::pg::upsert::excluded(#table_ident::#lv_ident));
+                    let stmt = ::autumn_web::reexports::diesel::query_dsl::methods::FilterDsl::filter(stmt, lv_cond);
+                    stmt.get_results::<Self>(conn).await
+                }
+            },
+        )
+    };
+
+    let compare_fields = fields_for_new.iter().map(|f| {
+        let ident = &f.ident;
+        quote! { input.#ident == record.#ident }
+    });
+    let compare_expr = if fields_for_new.is_empty() {
+        quote! { true }
+    } else {
+        quote! { #(#compare_fields)&&* }
+    };
+
     let mut changeset_fields: Vec<TokenStream> = fields_for_new
         .iter()
         .map(|f| {
@@ -1320,7 +1371,60 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 use ::autumn_web::reexports::diesel::ExpressionMethods as _;
                 (#(#upsert_columns,)*)
             }
+
+            #[doc(hidden)]
+            pub async fn __autumn_execute_upsert(
+                chunk: &[Self],
+                tenant_id: ::core::option::Option<&str>,
+                conn: &mut ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+            ) -> ::core::result::Result<::std::vec::Vec<Self>, ::autumn_web::reexports::diesel::result::Error> {
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+
+                let stmt = ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                    .values(chunk)
+                    .on_conflict(#table_ident::id)
+                    .do_update()
+                    .set(Self::__autumn_upsert_set());
+
+                #execute_upsert_body
+            }
+
+
+
+            #[doc(hidden)]
+            pub fn __autumn_correlate_new(
+                inputs: &[#new_name],
+                record: &Self,
+                matched: &mut [bool],
+            ) -> ::core::option::Option<usize> {
+                for (i, input) in inputs.iter().enumerate() {
+                    if !matched[i] {
+                        if #compare_expr {
+                            return ::core::option::Option::Some(i);
+                        }
+                    }
+                }
+                ::core::option::Option::None
+            }
+
+            #[doc(hidden)]
+            pub fn __autumn_correlate_model(
+                inputs: &[Self],
+                record: &Self,
+                matched: &mut [bool],
+            ) -> ::core::option::Option<usize> {
+                for (i, input) in inputs.iter().enumerate() {
+                    if !matched[i] {
+                        if #compare_expr {
+                            return ::core::option::Option::Some(i);
+                        }
+                    }
+                }
+                ::core::option::Option::None
+            }
         }
+
 
         impl #new_name {
             pub const __AUTUMN_COLUMN_COUNT: usize = #new_column_count;
