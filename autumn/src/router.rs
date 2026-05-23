@@ -1287,6 +1287,7 @@ async fn trusted_host_middleware(
         .headers()
         .get(http::header::HOST)
         .and_then(|v| v.to_str().ok())
+        .or_else(|| req.uri().authority().map(http::uri::Authority::as_str))
         .and_then(extract_host_without_port)
         .map(str::to_ascii_lowercase);
     if host.as_deref().is_some_and(|host| policy.allows_host(host)) {
@@ -3201,8 +3202,10 @@ mod trusted_host_tests {
 
     #[tokio::test]
     async fn trusted_host_release_rejects_loopback_unless_listed() {
-        let mut cfg = AutumnConfig::default();
-        cfg.profile = Some("prod".into());
+        let mut cfg = AutumnConfig {
+            profile: Some("prod".into()),
+            ..AutumnConfig::default()
+        };
         cfg.security.trusted_hosts.hosts = vec!["example.com".into()];
         let router = build_router(vec![], &cfg, crate::state::AppState::for_test());
         let response = router
@@ -3216,6 +3219,23 @@ mod trusted_host_tests {
             .await
             .expect("request should complete");
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn trusted_host_uses_uri_authority_when_host_header_missing() {
+        let mut cfg = AutumnConfig::default();
+        cfg.security.trusted_hosts.hosts = vec!["example.com".into()];
+        let router = build_router(vec![], &cfg, crate::state::AppState::for_test());
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("http://EXAMPLE.COM/nope")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
