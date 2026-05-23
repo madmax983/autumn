@@ -2339,6 +2339,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/_autumn/mail/messages/detail.eml")
+                    .header("host", "example.com")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -2374,6 +2375,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/_autumn/mail")
+                    .header("host", "example.com")
                     .body(Body::empty())
                     .unwrap(),
             )
