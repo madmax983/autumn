@@ -2225,7 +2225,7 @@ mod tests {
 
     #[cfg(feature = "mail")]
     fn dev_mail_preview_config(dir: &std::path::Path) -> AutumnConfig {
-        AutumnConfig {
+        let mut config = AutumnConfig {
             profile: Some("dev".to_owned()),
             mail: crate::mail::MailConfig {
                 transport: crate::mail::Transport::File,
@@ -2233,7 +2233,9 @@ mod tests {
                 ..Default::default()
             },
             ..Default::default()
-        }
+        };
+        config.security.trusted_hosts.hosts = vec!["example.com".to_owned()];
+        config
     }
 
     #[cfg(feature = "mail")]
