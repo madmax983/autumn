@@ -1292,7 +1292,10 @@ async fn trusted_host_middleware(
         .and_then(|v| v.to_str().ok());
     let raw_host = authority.or(host_header);
     let parsed_host = raw_host.and_then(extract_host_without_port);
-    let host = parsed_host.map(str::to_ascii_lowercase);
+    let host = parsed_host
+        .map(str::to_ascii_lowercase)
+        .map(|h| h.trim_end_matches('.').to_owned())
+        .filter(|h| !h.is_empty());
     let host_source_present = raw_host.is_some();
     if host.is_none() && !host_source_present && policy.allow_missing_host {
         return next.run(req).await;
@@ -2298,6 +2301,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/_autumn/mail")
+                    .header("host", "example.com")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -3297,6 +3301,24 @@ mod trusted_host_tests {
             .await
             .expect("request should complete");
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn trusted_host_accepts_trailing_dot_fqdn() {
+        let mut cfg = AutumnConfig::default();
+        cfg.security.trusted_hosts.hosts = vec!["example.com".into()];
+        let router = build_router(vec![], &cfg, crate::state::AppState::for_test());
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/nope")
+                    .header("host", "example.com.")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
