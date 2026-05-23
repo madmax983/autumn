@@ -1285,18 +1285,16 @@ async fn trusted_host_middleware(
     {
         return next.run(req).await;
     }
-    let host = req
-        .uri()
-        .authority()
-        .map(http::uri::Authority::as_str)
-        .or_else(|| {
-            req.headers()
-                .get(http::header::HOST)
-                .and_then(|v| v.to_str().ok())
-        })
-        .and_then(extract_host_without_port)
-        .map(str::to_ascii_lowercase);
-    if host.is_none() && policy.allow_missing_host {
+    let authority = req.uri().authority().map(http::uri::Authority::as_str);
+    let host_header = req
+        .headers()
+        .get(http::header::HOST)
+        .and_then(|v| v.to_str().ok());
+    let raw_host = authority.or(host_header);
+    let parsed_host = raw_host.and_then(extract_host_without_port);
+    let host = parsed_host.map(str::to_ascii_lowercase);
+    let host_source_present = raw_host.is_some();
+    if host.is_none() && !host_source_present && policy.allow_missing_host {
         return next.run(req).await;
     }
     if host.as_deref().is_some_and(|host| policy.allows_host(host)) {
@@ -2254,6 +2252,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/_autumn/mail")
+                    .header("host", "example.com")
                     .body(Body::empty())
                     .unwrap(),
             )
