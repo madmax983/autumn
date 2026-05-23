@@ -1,3 +1,56 @@
+//! Interceptors for framework-internal actions.
+//!
+//! Interceptors provide a way to wrap and observe core framework operations, similar to
+//! how middleware wraps HTTP requests. They are incredibly useful for instrumenting
+//! performance tracing, altering behavior conditionally, or integrating third-party observability
+//! tools into Autumn's underlying subsystems without altering the framework source code.
+//!
+//! Available interceptors depending on configured features:
+//! - [`JobInterceptor`]: Wraps background job enqueue and execution.
+//! - `DbConnectionInterceptor`: Wraps database pool checkouts.
+//! - `MailInterceptor`: Wraps email delivery attempts.
+//! - `ChannelsInterceptor`: Wraps WebSocket topic publications.
+//! - `HttpInterceptor`: Wraps outbound OAuth2/OIDC HTTP requests.
+//!
+//! # Examples
+//!
+//! To implement an interceptor, implement its specific trait and return a Boxed Future:
+//!
+//! ```rust,ignore
+//! use autumn_web::interceptor::JobInterceptor;
+//! use autumn_web::AutumnResult;
+//! use std::pin::Pin;
+//! use std::future::Future;
+//!
+//! pub struct MyMetricsInterceptor;
+//!
+//! impl JobInterceptor for MyMetricsInterceptor {
+//!     fn intercept_enqueue<'a>(
+//!         &'a self,
+//!         name: &'a str,
+//!         payload: &'a serde_json::Value,
+//!         next: Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'a>>,
+//!     ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'a>> {
+//!         Box::pin(async move {
+//!             println!("Enqueuing job: {}", name);
+//!             let result = next.await;
+//!             println!("Job enqueued: {}", name);
+//!             result
+//!         })
+//!     }
+//!
+//!     fn intercept_execute<'a>(
+//!         &'a self,
+//!         name: &'a str,
+//!         payload: &'a serde_json::Value,
+//!         next: Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'a>>,
+//!     ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'a>> {
+//!         Box::pin(async move {
+//!             next.await
+//!         })
+//!     }
+//! }
+//! ```
 #[cfg(feature = "oauth2")]
 use std::sync::Arc;
 
@@ -14,6 +67,14 @@ pub trait MailInterceptor: Send + Sync + 'static {
     >;
 }
 
+/// Middleware trait for intercepting background job enqueuing and execution.
+///
+/// This allows observing job workflows, emitting metrics, or short-circuiting job
+/// dispatch without altering application business logic.
+///
+/// # Examples
+///
+/// Check the module level docs for an implementation example.
 pub trait JobInterceptor: Send + Sync + 'static {
     fn intercept_enqueue<'a>(
         &'a self,
