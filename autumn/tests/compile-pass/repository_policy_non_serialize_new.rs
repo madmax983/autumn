@@ -63,6 +63,7 @@ impl Policy<Widget> for WidgetPolicy {}
     Widget,
     api = "/api/widgets",
     policy = WidgetPolicy,
+    no_upsert_trait,
 )]
 pub trait WidgetRepository {}
 

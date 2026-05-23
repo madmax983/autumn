@@ -158,7 +158,7 @@ impl ZeroColRecord {
     }
 }
 
-#[autumn_web::repository(ZeroColRecord, table = "test_zero_col_records")]
+#[autumn_web::repository(ZeroColRecord, table = "test_zero_col_records", no_upsert_trait)]
 pub trait ZeroColRecordRepository {}
 
 // ── Schema & models for Tenant scoped bulk operations (Task 3 & 4) ────────────

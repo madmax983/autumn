@@ -716,6 +716,45 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         });
     }
 
+    let mut upsert_types: Vec<TokenStream> = fields_for_new
+        .iter()
+        .map(|f| {
+            let ident = f.ident.as_ref().unwrap();
+            quote! {
+                ::autumn_web::reexports::diesel::dsl::Eq<
+                    #table_ident::#ident,
+                    ::autumn_web::reexports::diesel::upsert::Excluded<#table_ident::#ident>
+                >
+            }
+        })
+        .collect();
+
+    if upsert_types.is_empty() {
+        upsert_types.push(quote! {
+            ::autumn_web::reexports::diesel::dsl::Eq<
+                #table_ident::id,
+                ::autumn_web::reexports::diesel::upsert::Excluded<#table_ident::id>
+            >
+        });
+    }
+
+    if let Some(lv_field) = lock_version_field {
+        let ident = lv_field.ident.as_ref().unwrap();
+        let ty = &lv_field.ty;
+        upsert_types.push(quote! {
+            ::autumn_web::reexports::diesel::dsl::Eq<
+                #table_ident::#ident,
+                ::autumn_web::reexports::diesel::helper_types::Add<
+                    #table_ident::#ident,
+                    ::autumn_web::reexports::diesel::expression::bound::Bound<
+                        <#table_ident::#ident as ::autumn_web::reexports::diesel::Expression>::SqlType,
+                        #ty
+                    >
+                >
+            >
+        });
+    }
+
     let has_tenant_id = tenant_id_field.is_some();
     let execute_upsert_body = if has_tenant_id {
         lock_version_field.map_or_else(
@@ -1413,7 +1452,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 inputs: &[Self],
                 record: &Self,
                 matched: &mut [bool],
-            ) -> ::core::option::Option<usize> {
+                ) -> ::core::option::Option<usize> {
                 for (i, input) in inputs.iter().enumerate() {
                     if !matched[i] {
                         if #compare_expr {
@@ -1422,6 +1461,47 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     }
                 }
                 ::core::option::Option::None
+            }
+        }
+
+        impl ::autumn_web::repository::AutumnUpsertSetExt for #name {
+            type UpsertSet = ::autumn_web::reexports::diesel::dsl::Eq<
+                #table_ident::id,
+                #table_ident::id,
+            >;
+            fn __autumn_upsert_set() -> Self::UpsertSet {
+                use ::autumn_web::reexports::diesel::ExpressionMethods as _;
+                #table_ident::id.eq(#table_ident::id)
+            }
+        }
+
+        impl ::autumn_web::repository::AutumnUpsertExecutionExt for #name {
+            type Model = Self;
+            async fn __autumn_execute_upsert(
+                chunk: &[Self::Model],
+                tenant_id: ::core::option::Option<&str>,
+                conn: &mut ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+            ) -> ::core::result::Result<::std::vec::Vec<Self::Model>, ::autumn_web::reexports::diesel::result::Error> {
+                Self::__autumn_execute_upsert(chunk, tenant_id, conn).await
+            }
+        }
+
+        impl ::autumn_web::repository::AutumnCorrelateExt for #name {
+            type NewModel = #new_name;
+            fn __autumn_correlate_new(
+                inputs: &[Self::NewModel],
+                record: &Self,
+                matched: &mut [bool],
+            ) -> ::core::option::Option<usize> {
+                Self::__autumn_correlate_new(inputs, record, matched)
+            }
+
+            fn __autumn_correlate_model(
+                inputs: &[Self],
+                record: &Self,
+                matched: &mut [bool],
+            ) -> ::core::option::Option<usize> {
+                Self::__autumn_correlate_model(inputs, record, matched)
             }
         }
 

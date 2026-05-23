@@ -2409,6 +2409,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                                     "failed to finalize repository create commit hook after mutation commit"
                                                 );
                                             }
+                                            successes.push(record);
                                         }
                                         ::core::result::Result::Ok(::core::result::Result::Err(__autumn_error)) => {
                                             let __autumn_error_message = ::std::format!("{__autumn_error}");
@@ -2425,6 +2426,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                                 error = %__autumn_error,
                                                 "after_create hook failed during skip-invalid inserts"
                                             );
+                                            failures.push((chunk[mapped_idx].2, __autumn_error));
                                         }
                                         ::core::result::Result::Err(__autumn_panic) => {
                                             ::autumn_web::__private::mark_repository_commit_hook_after_hook_failed(
@@ -2439,10 +2441,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                                 hook_id = %hook_id,
                                                 "after_create hook panicked during skip-invalid inserts"
                                             );
+                                            failures.push((chunk[mapped_idx].2, ::autumn_web::AutumnError::internal_server_error_msg("after_create hook panicked")));
                                         }
                                     }
-
-                                    successes.push(record);
                                 }
                             }
                             Err(batch_err) => {
@@ -2529,6 +2530,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                                             "failed to finalize repository create commit hook after mutation commit"
                                                         );
                                                     }
+                                                    successes.push(record);
                                                 }
                                                 ::core::result::Result::Ok(::core::result::Result::Err(__autumn_error)) => {
                                                     let __autumn_error_message = ::std::format!("{__autumn_error}");
@@ -2545,6 +2547,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                                         error = %__autumn_error,
                                                         "after_create hook failed during skip-invalid inserts"
                                                     );
+                                                    failures.push((item.2, __autumn_error));
                                                 }
                                                 ::core::result::Result::Err(__autumn_panic) => {
                                                     ::autumn_web::__private::mark_repository_commit_hook_after_hook_failed(
@@ -2559,10 +2562,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                                         hook_id = %hook_id,
                                                         "after_create hook panicked during skip-invalid inserts"
                                                     );
+                                                    failures.push((item.2, ::autumn_web::AutumnError::internal_server_error_msg("after_create hook panicked")));
                                                 }
                                             }
-
-                                            successes.push(record);
                                         }
                                         Err(err) => {
                                             failures.push((item.2, err));
@@ -2610,13 +2612,28 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 for (idx, record) in inserted_chunk.into_iter().enumerate() {
                                     let mapped_idx = mapped_indices[idx];
                                     let mut ctx = chunk[mapped_idx].1.clone();
-                                    if let ::core::result::Result::Err(err) = self.hooks.after_create(&mut ctx, &record).await {
-                                        ::autumn_web::reexports::tracing::warn!(
-                                            error = %err,
-                                            "after_create hook failed during skip-invalid inserts"
-                                        );
+                                    let __autumn_after_create = ::autumn_web::__private::catch_repository_after_hook_unwind(
+                                        self.hooks.after_create(&mut ctx, &record)
+                                    )
+                                    .await;
+                                    match __autumn_after_create {
+                                        ::core::result::Result::Ok(::core::result::Result::Ok(())) => {
+                                            successes.push(record);
+                                        }
+                                        ::core::result::Result::Ok(::core::result::Result::Err(err)) => {
+                                            ::autumn_web::reexports::tracing::warn!(
+                                                error = %err,
+                                                "after_create hook failed during skip-invalid inserts"
+                                            );
+                                            failures.push((chunk[mapped_idx].2, err));
+                                        }
+                                        ::core::result::Result::Err(_panic) => {
+                                            ::autumn_web::reexports::tracing::warn!(
+                                                "after_create hook panicked during skip-invalid inserts"
+                                            );
+                                            failures.push((chunk[mapped_idx].2, ::autumn_web::AutumnError::internal_server_error_msg("after_create hook panicked")));
+                                        }
                                     }
-                                    successes.push(record);
                                 }
                             }
                             Err(batch_err) => {
@@ -2654,13 +2671,28 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     match row_res {
                                         Ok(record) => {
                                             let mut ctx = item.1.clone();
-                                            if let ::core::result::Result::Err(err) = self.hooks.after_create(&mut ctx, &record).await {
-                                                ::autumn_web::reexports::tracing::warn!(
-                                                    error = %err,
-                                                    "after_create hook failed during skip-invalid inserts"
-                                                );
+                                            let __autumn_after_create = ::autumn_web::__private::catch_repository_after_hook_unwind(
+                                                self.hooks.after_create(&mut ctx, &record)
+                                            )
+                                            .await;
+                                            match __autumn_after_create {
+                                                ::core::result::Result::Ok(::core::result::Result::Ok(())) => {
+                                                    successes.push(record);
+                                                }
+                                                ::core::result::Result::Ok(::core::result::Result::Err(err)) => {
+                                                    ::autumn_web::reexports::tracing::warn!(
+                                                        error = %err,
+                                                        "after_create hook failed during skip-invalid inserts"
+                                                    );
+                                                    failures.push((item.2, err));
+                                                }
+                                                ::core::result::Result::Err(_panic) => {
+                                                    ::autumn_web::reexports::tracing::warn!(
+                                                        "after_create hook panicked during skip-invalid inserts"
+                                                    );
+                                                    failures.push((item.2, ::autumn_web::AutumnError::internal_server_error_msg("after_create hook panicked")));
+                                                }
                                             }
-                                            successes.push(record);
                                         }
                                         Err(err) => {
                                             failures.push((item.2, err));
@@ -5653,7 +5685,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
-    let upsert_many_trait_method = if config.hooks_type.is_none() {
+    let upsert_many_trait_method = if config.hooks_type.is_none() && !config.no_upsert_trait {
         quote! {
             fn upsert_many(&self, records: &[#model_name]) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<Vec<#model_name>>> + Send
             where
@@ -5671,7 +5703,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         #upsert_many_trait_method
     };
 
-    let upsert_many_impl_method = if config.hooks_type.is_none() {
+    let upsert_many_impl_method = if config.hooks_type.is_none() && !config.no_upsert_trait {
         quote! {
             async fn upsert_many(&self, records: &[#model_name]) -> ::autumn_web::AutumnResult<Vec<#model_name>>
             where
@@ -5684,88 +5716,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {}
     };
 
-    let upsert_set_ext_impl = if config.no_upsert_trait {
-        quote! {}
-    } else {
-        quote! {
-            impl ::autumn_web::repository::AutumnUpsertSetExt for #model_name {
-                type UpsertSet = ::autumn_web::reexports::diesel::dsl::Eq<
-                    #table_ident::id,
-                    #table_ident::id,
-                >;
-                fn __autumn_upsert_set() -> Self::UpsertSet {
-                    use ::autumn_web::reexports::diesel::ExpressionMethods as _;
-                    #table_ident::id.eq(#table_ident::id)
-                }
-            }
-        }
-    };
-
-    let upsert_execution_ext_impl = if config.no_upsert_trait {
-        quote! {}
-    } else {
-        let tenant_filter = if config.tenant_scoped {
-            quote! {
-                if let ::core::option::Option::Some(t) = tenant_id {
-                    let stmt = ::autumn_web::reexports::diesel::query_dsl::methods::FilterDsl::filter(stmt, #table_ident::tenant_id.eq(t.to_string()));
-                    stmt.get_results::<#model_name>(conn).await
-                } else {
-                    stmt.get_results::<#model_name>(conn).await
-                }
-            }
-        } else {
-            quote! {
-                stmt.get_results::<#model_name>(conn).await
-            }
-        };
-
-        quote! {
-            impl ::autumn_web::repository::AutumnUpsertExecutionExt for #model_name {
-                type Model = #model_name;
-                async fn __autumn_execute_upsert(
-                    chunk: &[#model_name],
-                    tenant_id: ::core::option::Option<&str>,
-                    conn: &mut ::autumn_web::reexports::diesel_async::AsyncPgConnection,
-                ) -> ::core::result::Result<::std::vec::Vec<#model_name>, ::autumn_web::reexports::diesel::result::Error> {
-                    use ::autumn_web::reexports::diesel::prelude::*;
-                    use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-
-                    let stmt = ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
-                        .values(chunk)
-                        .on_conflict(#table_ident::id)
-                        .do_update()
-                        .set(<#model_name as ::autumn_web::repository::AutumnUpsertSetExt>::__autumn_upsert_set());
-
-                    #tenant_filter
-                }
-            }
-        }
-    };
-
-    let correlate_ext_impl = if config.no_upsert_trait {
-        quote! {}
-    } else {
-        quote! {
-            impl ::autumn_web::repository::AutumnCorrelateExt for #model_name {
-                type NewModel = #new_name;
-                fn __autumn_correlate_new(
-                    inputs: &[Self::NewModel],
-                    _record: &Self,
-                    matched: &mut [bool],
-                ) -> ::core::option::Option<usize> {
-                    matched.iter().position(|&m| !m)
-                }
-
-                fn __autumn_correlate_model(
-                    inputs: &[Self],
-                    _record: &Self,
-                    matched: &mut [bool],
-                ) -> ::core::option::Option<usize> {
-                    matched.iter().position(|&m| !m)
-                }
-            }
-        }
-    };
+    let upsert_set_ext_impl = quote! {};
+    let upsert_execution_ext_impl = quote! {};
+    let correlate_ext_impl = quote! {};
 
     // Generate the trait, impl, and extractor.
     //
