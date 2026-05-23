@@ -76,20 +76,20 @@ pub trait AutumnColumnCountExt {
 
 #[doc(hidden)]
 pub trait AutumnColumnCountSpecific {
-    fn __autumn_column_count(&self) -> usize;
+    fn __autumn_column_count(self) -> usize;
 }
-impl<T: AutumnColumnCountExt> AutumnColumnCountSpecific for T {
-    fn __autumn_column_count(&self) -> usize {
+impl<T: AutumnColumnCountExt> AutumnColumnCountSpecific for &T {
+    fn __autumn_column_count(self) -> usize {
         self.__autumn_column_count()
     }
 }
 
 #[doc(hidden)]
 pub trait AutumnColumnCountFallback {
-    fn __autumn_column_count(&self) -> usize;
+    fn __autumn_column_count(self) -> usize;
 }
-impl<T: ?Sized> AutumnColumnCountFallback for &T {
-    fn __autumn_column_count(&self) -> usize {
+impl<T: ?Sized> AutumnColumnCountFallback for &&T {
+    fn __autumn_column_count(self) -> usize {
         30
     }
 }

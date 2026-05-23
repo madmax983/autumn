@@ -2954,7 +2954,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     async move {
                         let mut current_rows = Vec::new();
                         for chunk in ids.chunks(1000) {
-                            let load_query = #table_ident::table.filter(#table_ident::id.eq_any(chunk));
+                            let load_query = #table_ident::table.filter(#table_ident::id.eq_any(chunk))
+                                .order(#table_ident::id.asc());
                             let chunk_rows = #load_expr
                                 .map_err(::autumn_web::AutumnError::from)?;
                             current_rows.extend(chunk_rows);
@@ -3200,7 +3201,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     async move {
                         let mut current_rows = Vec::new();
                         for chunk in ids.chunks(1000) {
-                            let load_query = #table_ident::table.filter(#table_ident::id.eq_any(chunk));
+                            let load_query = #table_ident::table.filter(#table_ident::id.eq_any(chunk))
+                                .order(#table_ident::id.asc());
                             let chunk_rows = #load_expr
                                 .map_err(::autumn_web::AutumnError::from)?;
                             current_rows.extend(chunk_rows);
@@ -3915,7 +3917,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             // Load existing to verify versions
                             let mut current_rows = Vec::new();
                             for chunk in ids.chunks(1000) {
-                                let load_query = #table_ident::table.filter(#table_ident::id.eq_any(chunk));
+                                let load_query = #table_ident::table.filter(#table_ident::id.eq_any(chunk))
+                                    .order(#table_ident::id.asc());
                                 let chunk_rows = #load_expr
                                     .map_err(::autumn_web::AutumnError::from)?;
                                 current_rows.extend(chunk_rows);
