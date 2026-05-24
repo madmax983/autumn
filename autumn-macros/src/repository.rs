@@ -5763,6 +5763,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             const _: () = {
                 fn assert_searchable<T: ::autumn_web::repository::AutumnSearchableModel>() {}
                 let _ = assert_searchable::<#model_name>;
+                if !<#model_name as ::autumn_web::repository::AutumnSearchableModel>::IS_SEARCHABLE {
+                    ::core::panic!("The backing model is not marked with #[searchable] or has no searchable fields configured, but its repository has `searchable = true` enabled.");
+                }
             };
         }
     } else {

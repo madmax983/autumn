@@ -12,8 +12,8 @@ use super::emit::Plan;
 use super::naming::pascal_to_snake;
 use super::schema_edit::{
     MigrationShape, add_columns_down_sql, add_columns_up_sql, add_search_down_sql,
-    add_search_up_sql, detect_migration_shape, parse_model_search_config, remove_columns_down_sql,
-    remove_columns_up_sql, singularize,
+    add_search_up_sql, detect_migration_shape, parse_model_search_config_for_table,
+    remove_columns_down_sql, remove_columns_up_sql, singularize,
 };
 use super::{Flags, GenerateError, ensure_project_root, timestamp_now};
 
@@ -50,28 +50,42 @@ pub fn plan_migration(
         ),
         MigrationShape::AddSearch { ref table } => {
             let singular = singularize(table);
-            let model_file_path = project_root
+            let first_candidate = project_root
                 .join("src/models")
                 .join(format!("{singular}.rs"));
-            if model_file_path.exists() {
-                let content =
-                    std::fs::read_to_string(&model_file_path).map_err(GenerateError::Io)?;
-                if let Some((language, fts_fields)) = parse_model_search_config(&content) {
-                    (
-                        add_search_up_sql(table, &language, &fts_fields),
-                        add_search_down_sql(table),
-                    )
-                } else {
-                    return Err(GenerateError::Config(format!(
-                        "Model file '{}' exists but has no #[searchable] fields configured",
-                        model_file_path.display()
-                    )));
-                }
+            let second_candidate = project_root.join("src/models.rs");
+
+            let (model_file_path, content) = if first_candidate.exists() {
+                (
+                    first_candidate.clone(),
+                    std::fs::read_to_string(&first_candidate).map_err(GenerateError::Io)?,
+                )
+            } else if second_candidate.exists() {
+                (
+                    second_candidate.clone(),
+                    std::fs::read_to_string(&second_candidate).map_err(GenerateError::Io)?,
+                )
             } else {
                 return Err(GenerateError::Config(format!(
-                    "Missing model file for table '{}'. Expected to find it at '{}'",
+                    "Missing model file for table '{}'. Expected to find it at '{}' or '{}'",
                     table,
-                    model_file_path.display()
+                    first_candidate.display(),
+                    second_candidate.display()
+                )));
+            };
+
+            if let Some((language, fts_fields)) =
+                parse_model_search_config_for_table(&content, table)
+            {
+                (
+                    add_search_up_sql(table, &language, &fts_fields),
+                    add_search_down_sql(table),
+                )
+            } else {
+                return Err(GenerateError::Config(format!(
+                    "Model file '{}' exists but has no #[searchable] fields configured for table '{}'",
+                    model_file_path.display(),
+                    table
                 )));
             }
         }

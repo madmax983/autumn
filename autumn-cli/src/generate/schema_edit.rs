@@ -741,22 +741,43 @@ pub fn singularize(s: &str) -> String {
 fn strip_comments(src: &str) -> String {
     let mut result = String::with_capacity(src.len());
     let mut chars = src.chars().peekable();
+    let mut in_string = false;
+    let mut escaped = false;
     while let Some(ch) = chars.next() {
-        if ch == '/' && chars.peek() == Some(&'/') {
-            chars.next();
-            while let Some(next_ch) = chars.next() {
-                if next_ch == '\n' {
-                    result.push('\n');
-                    break;
+        if escaped {
+            result.push(ch);
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && in_string {
+            result.push(ch);
+            escaped = true;
+            continue;
+        }
+        if ch == '"' {
+            in_string = !in_string;
+            result.push(ch);
+            continue;
+        }
+        if !in_string {
+            if ch == '/' && chars.peek() == Some(&'/') {
+                chars.next();
+                while let Some(next_ch) = chars.next() {
+                    if next_ch == '\n' {
+                        result.push('\n');
+                        break;
+                    }
                 }
-            }
-        } else if ch == '/' && chars.peek() == Some(&'*') {
-            chars.next();
-            while let Some(next_ch) = chars.next() {
-                if next_ch == '*' && chars.peek() == Some(&'/') {
-                    chars.next();
-                    break;
+            } else if ch == '/' && chars.peek() == Some(&'*') {
+                chars.next();
+                while let Some(next_ch) = chars.next() {
+                    if next_ch == '*' && chars.peek() == Some(&'/') {
+                        chars.next();
+                        break;
+                    }
                 }
+            } else {
+                result.push(ch);
             }
         } else {
             result.push(ch);
@@ -768,14 +789,61 @@ fn strip_comments(src: &str) -> String {
 /// Scan a model file content to extract the `#[searchable]` language and field weights.
 #[must_use]
 pub fn parse_model_search_config(content: &str) -> Option<(String, Vec<(String, char)>)> {
+    parse_model_search_config_for_table(content, "")
+}
+
+/// Scan a model file content to extract the `#[searchable]` language and field weights for a specific table.
+#[must_use]
+pub fn parse_model_search_config_for_table(
+    content: &str,
+    table: &str,
+) -> Option<(String, Vec<(String, char)>)> {
     let clean_content = strip_comments(content);
     let mut language = "simple".to_string();
     let mut fields = Vec::new();
 
-    // 1. Locate the model struct position anchored by #[model] or #[autumn_web::model]
-    let mut model_pos = clean_content.find("#[model");
+    // 1. Locate the model struct position anchored by #[model] or #[autumn_web::model] for the given table
+    let mut model_pos = None;
+    if !table.is_empty() {
+        // Try to find #[model(...table = "table"...)]
+        let mut rest = clean_content.as_str();
+        while let Some(pos) = rest.find("#[model") {
+            let offset = clean_content.len() - rest.len() + pos;
+            if let Some(close_bracket) = rest[pos..].find(']') {
+                let attr_content = &rest[pos..pos + close_bracket];
+                // Check if this attribute mentions our table
+                if attr_content.contains(&format!("table = \"{table}\""))
+                    || attr_content.contains(&format!("table=\"{table}\""))
+                {
+                    model_pos = Some(offset);
+                    break;
+                }
+            }
+            rest = &rest[pos + "#[model".len()..];
+        }
+        if model_pos.is_none() {
+            let mut rest = clean_content.as_str();
+            while let Some(pos) = rest.find("#[autumn_web::model") {
+                let offset = clean_content.len() - rest.len() + pos;
+                if let Some(close_bracket) = rest[pos..].find(']') {
+                    let attr_content = &rest[pos..pos + close_bracket];
+                    if attr_content.contains(&format!("table = \"{table}\""))
+                        || attr_content.contains(&format!("table=\"{table}\""))
+                    {
+                        model_pos = Some(offset);
+                        break;
+                    }
+                }
+                rest = &rest[pos + "#[autumn_web::model".len()..];
+            }
+        }
+    }
+
     if model_pos.is_none() {
-        model_pos = clean_content.find("#[autumn_web::model");
+        model_pos = clean_content.find("#[model");
+        if model_pos.is_none() {
+            model_pos = clean_content.find("#[autumn_web::model");
+        }
     }
 
     let struct_pos = if let Some(m_pos) = model_pos {
@@ -1612,5 +1680,52 @@ pub struct Page {
         let (lang, fields) = parse_model_search_config(content).unwrap();
         assert_eq!(lang, "english");
         assert_eq!(fields, vec![("title".to_string(), 'A')]);
+    }
+
+    #[test]
+    fn test_strip_comments_in_string_literals() {
+        let content = r#"
+        let url = "https://example.com/api"; // this is a comment
+        /* block comment */
+        let regex = r"//[a-z]+";
+        "#;
+        let stripped = strip_comments(content);
+        assert!(stripped.contains("https://example.com/api"));
+        assert!(!stripped.contains("this is a comment"));
+        assert!(!stripped.contains("block comment"));
+    }
+
+    #[test]
+    fn test_parse_model_search_config_for_table_multi() {
+        let content = r#"
+#[autumn_web::model(table = "posts")]
+#[searchable(language = "english")]
+pub struct Post {
+    #[id]
+    pub id: i64,
+    #[searchable(weight = "A")]
+    pub title: String,
+}
+
+#[autumn_web::model(table = "comments")]
+#[searchable(language = "spanish")]
+pub struct Comment {
+    #[id]
+    pub id: i64,
+    #[searchable(weight = "B")]
+    pub body: String,
+}
+"#;
+        // Verify post scanning
+        let (post_lang, post_fields) =
+            parse_model_search_config_for_table(content, "posts").unwrap();
+        assert_eq!(post_lang, "english");
+        assert_eq!(post_fields, vec![("title".to_string(), 'A')]);
+
+        // Verify comment scanning
+        let (comment_lang, comment_fields) =
+            parse_model_search_config_for_table(content, "comments").unwrap();
+        assert_eq!(comment_lang, "spanish");
+        assert_eq!(comment_fields, vec![("body".to_string(), 'B')]);
     }
 }
