@@ -1329,7 +1329,22 @@ fn extract_host_without_port(header: &str) -> Option<&str> {
     }
     if host.starts_with('[') {
         let end = host.find(']')?;
-        return host.get(1..end).filter(|v| !v.is_empty());
+        let literal = host.get(1..end)?;
+        if literal.is_empty() || literal.parse::<std::net::IpAddr>().is_err() {
+            return None;
+        }
+
+        let remainder = host.get(end + 1..)?;
+        if remainder.is_empty() {
+            return Some(literal);
+        }
+
+        let maybe_port = remainder.strip_prefix(':')?;
+        if !maybe_port.is_empty() && maybe_port.chars().all(|c| c.is_ascii_digit()) {
+            return Some(literal);
+        }
+
+        return None;
     }
     let Some((candidate, maybe_port)) = host.rsplit_once(':') else {
         return Some(host);
@@ -1338,7 +1353,10 @@ fn extract_host_without_port(header: &str) -> Option<&str> {
         // unbracketed IPv6 literal; keep host verbatim
         return Some(host);
     }
-    if maybe_port.chars().all(|c| c.is_ascii_digit()) && !candidate.is_empty() {
+    if !maybe_port.is_empty()
+        && maybe_port.chars().all(|c| c.is_ascii_digit())
+        && !candidate.is_empty()
+    {
         Some(candidate)
     } else {
         None
@@ -3307,6 +3325,41 @@ mod trusted_host_tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
+    #[tokio::test]
+    async fn trusted_host_rejects_empty_port_suffix() {
+        let mut cfg = AutumnConfig::default();
+        cfg.security.trusted_hosts.hosts = vec!["example.com".into()];
+        let router = build_router(vec![], &cfg, crate::state::AppState::for_test());
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/nope")
+                    .header("host", "example.com:")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn trusted_host_rejects_bracketed_reg_name() {
+        let mut cfg = AutumnConfig::default();
+        cfg.security.trusted_hosts.hosts = vec!["example.com".into()];
+        let router = build_router(vec![], &cfg, crate::state::AppState::for_test());
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/nope")
+                    .header("host", "[example.com]")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
     #[tokio::test]
     async fn trusted_host_accepts_trailing_dot_fqdn() {
         let mut cfg = AutumnConfig::default();
