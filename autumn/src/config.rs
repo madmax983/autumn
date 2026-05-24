@@ -2513,6 +2513,14 @@ pub struct LogConfig {
     /// Log output format. Default: [`LogFormat::Auto`].
     #[serde(default)]
     pub format: LogFormat,
+
+    /// Additional sensitive parameter keys to scrub from logs/traces.
+    #[serde(default)]
+    pub filter_parameters: Vec<String>,
+
+    /// Explicitly remove default sensitive keys from the built-in deny-list.
+    #[serde(default)]
+    pub unfilter_parameters: Vec<String>,
 }
 
 /// Log output format.
@@ -2959,6 +2967,8 @@ impl Default for LogConfig {
         Self {
             level: default_log_level(),
             format: LogFormat::default(),
+            filter_parameters: Vec::new(),
+            unfilter_parameters: Vec::new(),
         }
     }
 }
