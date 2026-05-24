@@ -125,26 +125,26 @@ pub enum MigrationShape {
 /// of SQL to emit.
 #[must_use]
 pub fn detect_migration_shape(pascal_name: &str) -> MigrationShape {
-    if let Some(rest) = pascal_name.strip_prefix("AddSearchTo") {
-        if split_on_keyword(rest, "To").is_none() {
-            return MigrationShape::AddSearch {
-                table: normalize_table_name(rest),
-            };
-        }
+    if let Some(rest) = pascal_name.strip_prefix("AddSearchTo")
+        && rest.chars().next().is_some_and(char::is_uppercase)
+    {
+        return MigrationShape::AddSearch {
+            table: normalize_table_name(rest),
+        };
     }
-    if let Some(rest) = pascal_name.strip_prefix("AddSearchableTo") {
-        if split_on_keyword(rest, "To").is_none() {
-            return MigrationShape::AddSearch {
-                table: normalize_table_name(rest),
-            };
-        }
+    if let Some(rest) = pascal_name.strip_prefix("AddSearchableTo")
+        && rest.chars().next().is_some_and(char::is_uppercase)
+    {
+        return MigrationShape::AddSearch {
+            table: normalize_table_name(rest),
+        };
     }
-    if let Some(rest) = pascal_name.strip_prefix("AddSearchVectorTo") {
-        if split_on_keyword(rest, "To").is_none() {
-            return MigrationShape::AddSearch {
-                table: normalize_table_name(rest),
-            };
-        }
+    if let Some(rest) = pascal_name.strip_prefix("AddSearchVectorTo")
+        && rest.chars().next().is_some_and(char::is_uppercase)
+    {
+        return MigrationShape::AddSearch {
+            table: normalize_table_name(rest),
+        };
     }
 
     if let Some(rest) = pascal_name.strip_prefix("Add")
@@ -688,6 +688,9 @@ pub fn add_search_down_sql(table: &str) -> String {
 }
 
 pub fn singularize(s: &str) -> String {
+    if s == "series" {
+        return "series".to_string();
+    }
     if let Some(stripped) = s.strip_suffix("people") {
         return format!("{stripped}person");
     }
@@ -702,7 +705,11 @@ pub fn singularize(s: &str) -> String {
     }
 
     if let Some(stripped) = s.strip_suffix("ies") {
-        format!("{stripped}y")
+        if s.ends_with("movies") || s.ends_with("cookies") || s.ends_with("zombies") {
+            format!("{stripped}ie")
+        } else {
+            format!("{stripped}y")
+        }
     } else if let Some(stripped) = s.strip_suffix("es") {
         if s.ends_with("ches")
             || s.ends_with("shes")
@@ -785,12 +792,12 @@ pub fn parse_model_search_config(content: &str) -> Option<(String, Vec<(String, 
     // 2. Restrict FTS language search to the struct-level #[searchable] attribute (preceding our struct)
     let before_struct = &clean_content[..struct_pos];
     let mut rest_before = before_struct;
-    while let Some(pos) = rest_before.find("#[searchable") {
+    while let Some(pos) = rest_before.rfind("#[searchable") {
         let next_char = rest_before.as_bytes().get(pos + "#[searchable".len());
         let is_boundary =
-            next_char.map_or(true, |&c| c == b']' || c == b'(' || c.is_ascii_whitespace());
+            next_char.is_none_or(|&c| c == b']' || c == b'(' || c.is_ascii_whitespace());
         if !is_boundary {
-            rest_before = &rest_before[pos + "#[searchable".len()..];
+            rest_before = &rest_before[..pos];
             continue;
         }
         let attr_chunk = &rest_before[pos..];
@@ -841,7 +848,7 @@ pub fn parse_model_search_config(content: &str) -> Option<(String, Vec<(String, 
         // Enforce word boundaries on the #[searchable] prefix check
         let next_char = rest.as_bytes().get(pos + "#[searchable".len());
         let is_boundary =
-            next_char.map_or(true, |&c| c == b']' || c == b'(' || c.is_ascii_whitespace());
+            next_char.is_none_or(|&c| c == b']' || c == b'(' || c.is_ascii_whitespace());
         if !is_boundary {
             rest = &rest[pos + "#[searchable".len()..];
             continue;
@@ -892,10 +899,14 @@ pub fn parse_model_search_config(content: &str) -> Option<(String, Vec<(String, 
                 }
                 if let Some(colon) = parts.find(':') {
                     let field_name = parts[..colon].trim().to_string();
-                    if !field_name.is_empty()
-                        && field_name.chars().all(|c| c.is_alphanumeric() || c == '_')
+                    let mut clean_field = field_name.as_str();
+                    if let Some(stripped) = clean_field.strip_prefix("r#") {
+                        clean_field = stripped;
+                    }
+                    if !clean_field.is_empty()
+                        && clean_field.chars().all(|c| c.is_alphanumeric() || c == '_')
                     {
-                        fields.push((field_name, weight));
+                        fields.push((clean_field.to_string(), weight));
                     }
                 }
             }
@@ -1535,5 +1546,71 @@ pub struct HelperTwo {
             MigrationShape::AddColumns { table } => assert_eq!(table, "posts"),
             other => panic!("expected AddColumns, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_singularize_movies_and_series() {
+        assert_eq!(singularize("movies"), "movie");
+        assert_eq!(singularize("series"), "series");
+        assert_eq!(singularize("cookies"), "cookie");
+        assert_eq!(singularize("zombies"), "zombie");
+    }
+
+    #[test]
+    fn test_detect_migration_shape_internal_to() {
+        match detect_migration_shape("AddSearchToTopToBottoms") {
+            MigrationShape::AddSearch { table } => assert_eq!(table, "top_to_bottoms"),
+            other => panic!("expected AddSearch, got {other:?}"),
+        }
+        match detect_migration_shape("AddSearchToToDoItems") {
+            MigrationShape::AddSearch { table } => assert_eq!(table, "to_do_items"),
+            other => panic!("expected AddSearch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_model_search_config_raw_identifiers() {
+        let content = r#"
+#[autumn_web::model(table = "items")]
+pub struct Item {
+    #[id]
+    pub id: i64,
+    #[searchable]
+    pub r#type: String,
+    #[searchable(weight = "B")]
+    pub r#match: String,
+}
+"#;
+        let (lang, fields) = parse_model_search_config(content).unwrap();
+        assert_eq!(lang, "simple");
+        assert_eq!(
+            fields,
+            vec![("type".to_string(), 'D'), ("match".to_string(), 'B')]
+        );
+    }
+
+    #[test]
+    fn test_parse_model_search_config_reverse_lookup() {
+        // Helper struct before the model has a #[searchable(language = "french")] attribute.
+        // We want to make sure the model struct parses its own #[searchable(language = "english")]
+        // because it is closest (reverse scanning), not the earlier one.
+        let content = r#"
+#[searchable(language = "french")]
+pub struct HelperOne {
+    pub a: i32,
+}
+
+#[autumn_web::model(table = "pages")]
+#[searchable(language = "english")]
+pub struct Page {
+    #[id]
+    pub id: i64,
+    #[searchable(weight = "A")]
+    pub title: String,
+}
+"#;
+        let (lang, fields) = parse_model_search_config(content).unwrap();
+        assert_eq!(lang, "english");
+        assert_eq!(fields, vec![("title".to_string(), 'A')]);
     }
 }

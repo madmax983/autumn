@@ -5816,7 +5816,6 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     sql.push_str(" AND tenant_id = $3");
                 }
                 sql.push_str(" ORDER BY ts_rank_cd(search_vector, websearch_to_tsquery($1::regconfig, $2)) DESC, id DESC");
-                sql.push_str(" LIMIT 100");
 
                 let ids = if #config_tenant_scoped {
                     if let ::core::option::Option::Some(ref t) = tenant_id {
