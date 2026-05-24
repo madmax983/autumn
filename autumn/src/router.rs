@@ -3361,6 +3361,24 @@ mod trusted_host_tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
     #[tokio::test]
+    async fn trusted_host_configured_trailing_dot_matches_normalized_host() {
+        let mut cfg = AutumnConfig::default();
+        cfg.security.trusted_hosts.hosts = vec!["example.com.".into()];
+        let router = build_router(vec![], &cfg, crate::state::AppState::for_test());
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/nope")
+                    .header("host", "example.com")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
     async fn trusted_host_accepts_trailing_dot_fqdn() {
         let mut cfg = AutumnConfig::default();
         cfg.security.trusted_hosts.hosts = vec!["example.com".into()];
@@ -3449,6 +3467,7 @@ impl TrustedHostPolicy {
             .hosts
             .iter()
             .map(|h| h.trim().to_ascii_lowercase())
+            .map(|h| h.trim_end_matches('.').to_owned())
             .filter(|h| !h.is_empty())
             .collect();
         let is_production = matches!(config.profile.as_deref(), Some("prod" | "production"));
