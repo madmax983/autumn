@@ -203,18 +203,12 @@ async fn validation_errors_keep_field_level_problem_details() {
 }
 
 #[tokio::test]
-#[allow(clippy::field_reassign_with_default)]
 async fn production_500_problem_details_do_not_leak_internal_detail() {
-    let mut config = AutumnConfig::default();
-    config.profile = Some("prod".to_owned());
-    config.security.trusted_hosts.hosts = vec!["example.com".to_owned()];
-
-    let client = TestApp::new().config(config).routes(routes![boom]).build();
+    let client = TestApp::new().profile("prod").routes(routes![boom]).build();
 
     let response = client
         .get("/boom")
         .header("accept", "application/json")
-        .header("host", "example.com")
         .send()
         .await;
 

@@ -2036,11 +2036,6 @@ impl AutumnConfig {
             "AUTUMN_SECURITY__SIGNING_SECRET",
             &mut self.security.signing_secret.secret,
         );
-        parse_env_csv(
-            env,
-            "AUTUMN_SECURITY__TRUSTED_HOSTS__HOSTS",
-            &mut self.security.trusted_hosts.hosts,
-        );
 
         self.security.webhooks.apply_env_overrides_with_env(env);
     }

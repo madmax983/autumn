@@ -1649,7 +1649,6 @@ impl AppBuilder {
         // 4d. Validate signing secret — production must have a stable, private,
         // entropy-meeting secret before the server binds. Dev/test are exempt.
         fail_fast_on_invalid_signing_secret(&config);
-        fail_fast_on_invalid_trusted_hosts(&config);
 
         // 4e. Signed webhook configs must resolve to usable key material
         // before the app binds. Missing secrets should fail before a real
@@ -2192,7 +2191,6 @@ impl AppBuilder {
         // builds don't run migrations against a doomed boot either.
         fail_fast_on_invalid_session_config(&config, session_store.is_some());
         fail_fast_on_invalid_signing_secret(&config);
-        fail_fast_on_invalid_trusted_hosts(&config);
 
         // Preflight the configured BlobStore the same way `run()` does.
         // Static routes can read presigned URLs out of `BlobStoreState`
@@ -2540,7 +2538,6 @@ impl AppBuilder {
 
         fail_fast_on_invalid_session_config(&config, session_store.is_some());
         fail_fast_on_invalid_signing_secret(&config);
-        fail_fast_on_invalid_trusted_hosts(&config);
 
         #[cfg(feature = "storage")]
         let storage_bootstrap = blob_store.map_or_else(
@@ -3428,30 +3425,6 @@ fn fail_fast_on_invalid_webhook_config(config: &AutumnConfig) {
     if let Err(error) = config.security.webhooks.validate(is_production) {
         eprintln!("Invalid signed webhook configuration: {error}");
         std::process::exit(1);
-    }
-}
-
-fn fail_fast_on_invalid_trusted_hosts(config: &AutumnConfig) {
-    let is_production = matches!(config.profile.as_deref(), Some("prod" | "production"));
-    if !is_production {
-        return;
-    }
-    let hosts: Vec<String> = config
-        .security
-        .trusted_hosts
-        .hosts
-        .iter()
-        .map(|h| h.trim().to_owned())
-        .filter(|h| !h.is_empty())
-        .collect();
-    if hosts.is_empty() {
-        eprintln!(
-            "[security.trusted_hosts] is required in production; set hosts = [\"example.com\"] or explicit entries"
-        );
-        std::process::exit(1);
-    }
-    if hosts.iter().any(|h| h == "*") {
-        tracing::warn!("trusted host validation disabled via wildcard '*' in production");
     }
 }
 

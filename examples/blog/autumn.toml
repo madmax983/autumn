@@ -12,9 +12,6 @@ format = "Pretty"
 [health]
 path = "/health"
 
-[security.trusted_hosts]
-hosts = ["localhost", "127.0.0.1", "::1"]
-
 [i18n]
 default_locale = "en"
 supported_locales = ["en", "es"]

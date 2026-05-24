@@ -167,55 +167,6 @@ pub fn check_signing_secret_impl(secret: Option<&str>, is_production: bool) -> C
     }
 }
 
-pub fn check_trusted_hosts_impl(hosts: &[String], is_production: bool) -> CheckResult {
-    let normalized: Vec<String> = hosts
-        .iter()
-        .map(|h| h.trim().to_owned())
-        .filter(|h| !h.is_empty())
-        .collect();
-    if normalized.is_empty() {
-        return if is_production {
-            CheckResult {
-                name: "trusted_hosts",
-                status: CheckStatus::Fail,
-                detail: Some("trusted hosts list is empty in production".into()),
-                hint: Some(
-                    "Set [security.trusted_hosts] hosts = [\"example.com\"] or \
-                     AUTUMN_SECURITY__TRUSTED_HOSTS__HOSTS",
-                ),
-            }
-        } else {
-            CheckResult {
-                name: "trusted_hosts",
-                status: CheckStatus::Warn,
-                detail: Some("trusted hosts list is empty".into()),
-                hint: Some(
-                    "Set [security.trusted_hosts] hosts to prevent Host-header rebinding attacks",
-                ),
-            }
-        };
-    }
-
-    if normalized.iter().any(|h| h == "*") {
-        return CheckResult {
-            name: "trusted_hosts",
-            status: CheckStatus::Warn,
-            detail: Some("trusted hosts wildcard '*' disables host-header allow-listing".into()),
-            hint: Some("Prefer explicit hosts in production to fail closed"),
-        };
-    }
-
-    CheckResult {
-        name: "trusted_hosts",
-        status: CheckStatus::Pass,
-        detail: Some(format!(
-            "trusted hosts configured ({} entries)",
-            normalized.len()
-        )),
-        hint: None,
-    }
-}
-
 // ─── Pure helper functions (fully unit-testable) ──────────────────────────────
 
 pub const fn glyph(status: &CheckStatus) -> &'static str {
@@ -1166,54 +1117,6 @@ fn resolve_optional_signing_secret() -> Option<String> {
         })
 }
 
-fn resolve_trusted_hosts() -> Vec<String> {
-    if let Ok(val) = std::env::var("AUTUMN_SECURITY__TRUSTED_HOSTS__HOSTS") {
-        return val
-            .split(',')
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .map(std::borrow::ToOwned::to_owned)
-            .collect();
-    }
-    let table = read_autumn_toml_table().unwrap_or_default();
-    let profile = std::env::var("AUTUMN_ENV")
-        .ok()
-        .or_else(|| std::env::var("AUTUMN_PROFILE").ok())
-        .unwrap_or_default()
-        .trim()
-        .to_ascii_lowercase();
-
-    let parse_hosts = |root: &toml::Table| {
-        root.get("security")
-            .and_then(|s| s.get("trusted_hosts"))
-            .and_then(|th| th.get("hosts"))
-            .and_then(toml::Value::as_array)
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(toml::Value::as_str)
-                    .map(str::trim)
-                    .filter(|v| !v.is_empty())
-                    .map(std::borrow::ToOwned::to_owned)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default()
-    };
-
-    if !profile.is_empty()
-        && let Some(profile_table) = table
-            .get("profile")
-            .and_then(|v| v.get(&profile))
-            .and_then(toml::Value::as_table)
-    {
-        let profile_hosts = parse_hosts(profile_table);
-        if !profile_hosts.is_empty() {
-            return profile_hosts;
-        }
-    }
-
-    parse_hosts(&table)
-}
-
 /// Resolve whether the active profile is production from the environment or
 /// `autumn.toml`.
 fn resolve_is_production() -> bool {
@@ -1277,7 +1180,6 @@ pub fn run(opts: DoctorOptions) {
     let port = resolve_server_port();
     let tailwind = tailwind_enabled();
     let signing_secret = resolve_optional_signing_secret();
-    let trusted_hosts = resolve_trusted_hosts();
     let is_production = resolve_is_production();
 
     // ── Phase 2: build tasks in display order ────────────────────────────────
@@ -1344,9 +1246,6 @@ pub fn run(opts: DoctorOptions) {
     tasks.push(Box::new(move || {
         check_signing_secret_impl(signing_secret.as_deref(), is_production)
     }));
-    tasks.push(Box::new(move || {
-        check_trusted_hosts_impl(&trusted_hosts, is_production)
-    }));
 
     // 9. Stale artifacts (warn only, never fail)
     tasks.push(Box::new(check_stale_artifacts));
@@ -1405,27 +1304,6 @@ mod tests {
     #[test]
     fn glyph_fail() {
         assert_eq!(glyph(&CheckStatus::Fail), "❌");
-    }
-
-    #[test]
-    fn trusted_hosts_fail_in_production_when_empty() {
-        let result = check_trusted_hosts_impl(&[], true);
-        assert_eq!(result.name, "trusted_hosts");
-        assert!(matches!(result.status, CheckStatus::Fail));
-    }
-
-    #[test]
-    fn trusted_hosts_warn_on_wildcard() {
-        let result = check_trusted_hosts_impl(&["*".to_owned()], true);
-        assert_eq!(result.name, "trusted_hosts");
-        assert!(matches!(result.status, CheckStatus::Warn));
-    }
-
-    #[test]
-    fn trusted_hosts_warn_on_wildcard_when_mixed_with_other_entries() {
-        let result = check_trusted_hosts_impl(&["example.com".to_owned(), "*".to_owned()], true);
-        assert_eq!(result.name, "trusted_hosts");
-        assert!(matches!(result.status, CheckStatus::Warn));
     }
 
     // ── compute_summary ──────────────────────────────────────────────────────
