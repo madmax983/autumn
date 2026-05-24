@@ -107,6 +107,24 @@ fn normalize_key(key: &str) -> Option<String> {
     }
 }
 
+
+pub fn normalized_opt_out_defaults(opt_out_defaults: &[String]) -> Vec<String> {
+    let defaults: BTreeSet<String> = DEFAULT_FILTER_KEYS
+        .iter()
+        .filter_map(|key| normalize_key(key))
+        .collect();
+
+    let mut result: Vec<String> = opt_out_defaults
+        .iter()
+        .filter_map(|key| normalize_key(key))
+        .filter(|key| defaults.contains(key))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    result.sort();
+    result
+}
+
 pub fn scrub(value: &Value) -> Value {
     ParameterFilter::default().scrub_json(value)
 }
@@ -147,6 +165,13 @@ mod tests {
         let filter = ParameterFilter::new(&["".to_owned()], &[]);
         assert!(!filter.matches_key("email"));
         assert!(!filter.matches_key("anything"));
+    }
+
+    #[test]
+    fn reports_opted_out_defaults() {
+        let opts = vec!["PASSWORD".to_owned(), "missing".to_owned(), "apiKey".to_owned()];
+        let normalized = normalized_opt_out_defaults(&opts);
+        assert_eq!(normalized, vec!["apikey".to_owned(), "password".to_owned()]);
     }
 
     #[test]
