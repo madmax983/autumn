@@ -1114,6 +1114,31 @@ impl DatabasePoolProvider for DieselDeadpoolPoolProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_query_canceled_detects_string_matches() {
+        let errs = vec![
+            diesel::result::Error::DeserializationError("Error 57014: connection closed".into()),
+            diesel::result::Error::DeserializationError("query_canceled".into()),
+            diesel::result::Error::DeserializationError(
+                "canceling statement due to statement timeout".into(),
+            ),
+            diesel::result::Error::DeserializationError("statement timeout occurred".into()),
+            diesel::result::Error::DeserializationError("the query canceled".into()),
+        ];
+
+        for err in errs {
+            assert!(
+                is_query_canceled(&err),
+                "expected '{err}' to be detected as canceled",
+            );
+        }
+
+        let not_canceled =
+            diesel::result::Error::DeserializationError("just a normal error".into());
+        assert!(!is_query_canceled(&not_canceled));
+    }
+
     use crate::config::DatabaseConfig;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
