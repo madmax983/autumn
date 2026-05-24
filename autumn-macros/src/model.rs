@@ -454,7 +454,9 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         Err(err) => return err.to_compile_error(),
     };
     let is_searchable = searchable_lang.is_some();
-    let search_language = searchable_lang.clone().unwrap_or_else(|| "simple".to_string());
+    let search_language = searchable_lang
+        .clone()
+        .unwrap_or_else(|| "simple".to_string());
     let filtered_outer_attrs: Vec<&syn::Attribute> = outer_attrs
         .iter()
         .filter(|a| !a.path().is_ident("searchable"))
@@ -479,8 +481,9 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             if weight.len() != 1 {
                 return syn::Error::new_spanned(
                     field_ident,
-                    "searchable weight must be a single character (A, B, C, or D)"
-                ).to_compile_error();
+                    "searchable weight must be a single character (A, B, C, or D)",
+                )
+                .to_compile_error();
             }
             let weight_char = weight.chars().next().unwrap();
             search_field_names.push(field_ident.to_string());

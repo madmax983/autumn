@@ -115,6 +115,8 @@ pub enum MigrationShape {
     AddColumns { table: String },
     /// `RemoveXxxYyyFromZZZ` — emit `ALTER TABLE … DROP COLUMN` per field.
     RemoveColumns { table: String },
+    /// `AddSearchTo<Table>` or `AddSearchableTo<Table>` or `AddSearchVectorTo<Table>`
+    AddSearch { table: String },
     /// Anything else — emit empty `up.sql` / `down.sql` files.
     Empty,
 }
@@ -123,6 +125,22 @@ pub enum MigrationShape {
 /// of SQL to emit.
 #[must_use]
 pub fn detect_migration_shape(pascal_name: &str) -> MigrationShape {
+    if let Some(rest) = pascal_name.strip_prefix("AddSearchTo") {
+        return MigrationShape::AddSearch {
+            table: normalize_table_name(rest),
+        };
+    }
+    if let Some(rest) = pascal_name.strip_prefix("AddSearchableTo") {
+        return MigrationShape::AddSearch {
+            table: normalize_table_name(rest),
+        };
+    }
+    if let Some(rest) = pascal_name.strip_prefix("AddSearchVectorTo") {
+        return MigrationShape::AddSearch {
+            table: normalize_table_name(rest),
+        };
+    }
+
     if let Some(rest) = pascal_name.strip_prefix("Add")
         && let Some((_, table)) = split_on_keyword(rest, "To")
     {
@@ -619,6 +637,143 @@ fn is_toml_table_header(trimmed: &str) -> bool {
     trimmed.starts_with('[') && !trimmed.starts_with("[dependencies.")
 }
 
+/// SQL for adding a stored generated `search_vector` column and GIN index.
+#[must_use]
+pub fn add_search_up_sql(table: &str, language: &str, fields: &[(String, char)]) -> String {
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "-- autumn-safety: potentially-blocking \n\
+         -- adding stored generated column will backfill existing rows"
+    );
+
+    let mut expr = String::new();
+    for (i, (field, weight)) in fields.iter().enumerate() {
+        if i > 0 {
+            expr.push_str(" || ");
+        }
+        let _ = write!(
+            expr,
+            "setweight(to_tsvector('{language}'::regconfig, coalesce({field}, '')), '{weight}')"
+        );
+    }
+
+    let _ = writeln!(
+        out,
+        "ALTER TABLE {table} ADD COLUMN search_vector tsvector GENERATED ALWAYS AS ({expr}) STORED;"
+    );
+    let _ = writeln!(
+        out,
+        "CREATE INDEX idx_{table}_search_vector ON {table} USING gin(search_vector);"
+    );
+    out
+}
+
+/// `down.sql` companion to [`add_search_up_sql`].
+#[must_use]
+pub fn add_search_down_sql(table: &str) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "DROP INDEX IF EXISTS idx_{table}_search_vector;");
+    let _ = writeln!(
+        out,
+        "ALTER TABLE {table} DROP COLUMN IF EXISTS search_vector;"
+    );
+    out
+}
+
+/// Strip plural endings to guess the model name from a table name.
+#[must_use]
+pub fn singularize(s: &str) -> String {
+    if let Some(stripped) = s.strip_suffix("ies") {
+        format!("{stripped}y")
+    } else if let Some(stripped) = s.strip_suffix("es") {
+        if s.ends_with("ches")
+            || s.ends_with("shes")
+            || s.ends_with("xes")
+            || s.ends_with("ses")
+            || s.ends_with("zes")
+        {
+            stripped.to_owned()
+        } else {
+            format!("{stripped}e")
+        }
+    } else if let Some(stripped) = s.strip_suffix('s') {
+        stripped.to_owned()
+    } else {
+        s.to_owned()
+    }
+}
+
+/// Scan a model file content to extract the `#[searchable]` language and field weights.
+#[must_use]
+pub fn parse_model_search_config(content: &str) -> Option<(String, Vec<(String, char)>)> {
+    let mut language = "simple".to_string();
+    let mut fields = Vec::new();
+
+    if let Some(pos) = content.find("language = \"") {
+        let start = pos + "language = \"".len();
+        if let Some(end) = content[start..].find('"') {
+            language = content[start..start + end].to_string();
+        }
+    }
+
+    let mut rest = content;
+    while let Some(pos) = rest.find("#[searchable") {
+        let attr_chunk = &rest[pos..];
+        let mut weight = 'D';
+        if let Some(w_pos) = attr_chunk.find("weight = \"") {
+            let w_start = w_pos + "weight = \"".len();
+            if let Some(w_end) = attr_chunk[w_start..].find('"') {
+                let w_str = &attr_chunk[w_start..w_start + w_end];
+                if let Some(ch) = w_str.chars().next() {
+                    weight = ch;
+                }
+            }
+        }
+
+        if let Some(close_bracket) = attr_chunk.find(']') {
+            let after_attr = &attr_chunk[close_bracket + 1..];
+            let mut line_to_parse = "";
+            for line in after_attr.lines() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() || trimmed.starts_with("#[") || trimmed.starts_with("//") {
+                    continue;
+                }
+                line_to_parse = trimmed;
+                break;
+            }
+
+            if !line_to_parse.is_empty() {
+                let mut parts = line_to_parse;
+                if let Some(stripped_pub) = parts.strip_prefix("pub") {
+                    parts = stripped_pub.trim();
+                    if let Some(stripped_paren) = parts.strip_prefix('(') {
+                        if let Some(close_paren) = stripped_paren.find(')') {
+                            parts = stripped_paren[close_paren + 1..].trim();
+                        }
+                    }
+                }
+                if let Some(colon) = parts.find(':') {
+                    let field_name = parts[..colon].trim().to_string();
+                    if !field_name.is_empty()
+                        && field_name.chars().all(|c| c.is_alphanumeric() || c == '_')
+                    {
+                        fields.push((field_name, weight));
+                    }
+                }
+            }
+        }
+
+        rest = &rest[pos + "#[searchable".len()..];
+    }
+
+    if fields.is_empty() {
+        None
+    } else {
+        Some((language, fields))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1073,6 +1228,37 @@ async fn main() {\n\
         assert!(
             !updated.contains("mail_previews"),
             "no insertion point → no insertion"
+        );
+    }
+
+    #[test]
+    fn test_singularize_simple() {
+        assert_eq!(singularize("posts"), "post");
+        assert_eq!(singularize("categories"), "category");
+        assert_eq!(singularize("wishes"), "wish");
+        assert_eq!(singularize("test_search_records"), "test_search_record");
+    }
+
+    #[test]
+    fn test_parse_model_search_config_simple() {
+        let content = r#"
+#[autumn_web::model(table = "test_search_records")]
+#[searchable(language = "english")]
+#[derive(PartialEq, Eq)]
+pub struct SearchRecord {
+    #[id]
+    pub id: i64,
+    #[searchable(weight = "A")]
+    pub title: String,
+    #[searchable(weight = "B")]
+    pub body: String,
+}
+"#;
+        let (lang, fields) = parse_model_search_config(content).unwrap();
+        assert_eq!(lang, "english");
+        assert_eq!(
+            fields,
+            vec![("title".to_string(), 'A'), ("body".to_string(), 'B'),]
         );
     }
 }

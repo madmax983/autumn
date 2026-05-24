@@ -13,6 +13,8 @@ use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
 
+use testcontainers::ImageExt;
+
 diesel::table! {
     test_search_records (id) {
         id -> Int8,
@@ -41,6 +43,7 @@ async fn setup_pool() -> (
     testcontainers::ContainerAsync<Postgres>,
 ) {
     let container = Postgres::default()
+        .with_tag("16-alpine")
         .start()
         .await
         .expect("failed to start postgres container");
@@ -62,7 +65,7 @@ async fn setup_pool() -> (
                 setweight(to_tsvector('english', coalesce(title, '')), 'A') || \
                 setweight(to_tsvector('english', coalesce(body, '')), 'B') \
             ) STORED\
-         )"
+         )",
     )
     .execute(&mut conn)
     .await
@@ -70,7 +73,7 @@ async fn setup_pool() -> (
 
     diesel::sql_query(
         "CREATE INDEX IF NOT EXISTS idx_test_search_records_search_vector \
-         ON test_search_records USING gin(search_vector)"
+         ON test_search_records USING gin(search_vector)",
     )
     .execute(&mut conn)
     .await
@@ -97,20 +100,30 @@ async fn test_search_basic_and_ranking() {
     let repo = build_repo(pool);
 
     // Save test documents
-    let doc1 = repo.save(&NewSearchRecord {
-        title: "Rust programming language".to_string(),
-        body: "A systems programming language focused on safety, speed, and concurrency.".to_string(),
-    }).await.unwrap();
+    let doc1 = repo
+        .save(&NewSearchRecord {
+            title: "Rust programming language".to_string(),
+            body: "A systems programming language focused on safety, speed, and concurrency."
+                .to_string(),
+        })
+        .await
+        .unwrap();
 
-    let doc2 = repo.save(&NewSearchRecord {
-        title: "Web development in Go".to_string(),
-        body: "Go is a great language for fast web servers and microservices.".to_string(),
-    }).await.unwrap();
+    let doc2 = repo
+        .save(&NewSearchRecord {
+            title: "Web development in Go".to_string(),
+            body: "Go is a great language for fast web servers and microservices.".to_string(),
+        })
+        .await
+        .unwrap();
 
-    let doc3 = repo.save(&NewSearchRecord {
-        title: "Postgres database optimization".to_string(),
-        body: "How to use indexes and analyze queries in Postgres databases.".to_string(),
-    }).await.unwrap();
+    let doc3 = repo
+        .save(&NewSearchRecord {
+            title: "Postgres database optimization".to_string(),
+            body: "How to use indexes and analyze queries in Postgres databases.".to_string(),
+        })
+        .await
+        .unwrap();
 
     // 1. Basic search
     let results = repo.search("programming").await.unwrap();
@@ -119,10 +132,13 @@ async fn test_search_basic_and_ranking() {
 
     // 2. Weight precedence (title match with weight 'A' should rank higher than body match with weight 'B')
     // We add another doc where "language" is in the body, whereas doc1 has it in the title.
-    let doc4 = repo.save(&NewSearchRecord {
-        title: "Some Python info".to_string(),
-        body: "Python is a popular programming language.".to_string(),
-    }).await.unwrap();
+    let doc4 = repo
+        .save(&NewSearchRecord {
+            title: "Some Python info".to_string(),
+            body: "Python is a popular programming language.".to_string(),
+        })
+        .await
+        .unwrap();
 
     let results_weight = repo.search("programming").await.unwrap();
     assert_eq!(results_weight.len(), 2);
@@ -144,10 +160,13 @@ async fn test_search_basic_and_ranking() {
     assert!(!results_exclude.iter().any(|r| r.id == doc2.id)); // Go excluded
 
     // 4. Unicode matching
-    let doc_unicode = repo.save(&NewSearchRecord {
-        title: "Café und Tee".to_string(),
-        body: "Guten Morgen Österreich und Zürich.".to_string(),
-    }).await.unwrap();
+    let doc_unicode = repo
+        .save(&NewSearchRecord {
+            title: "Café und Tee".to_string(),
+            body: "Guten Morgen Österreich und Zürich.".to_string(),
+        })
+        .await
+        .unwrap();
 
     let results_unicode = repo.search("Zürich").await.unwrap();
     assert_eq!(results_unicode.len(), 1);
@@ -164,7 +183,74 @@ async fn test_search_basic_and_ranking() {
     // 6. Pagination stability
     let page_req = autumn_web::pagination::PageRequest::new(1, 1);
     let page = repo.search_page("programming", &page_req).await.unwrap();
-    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.content.len(), 1);
     assert_eq!(page.total_elements, 2);
-    assert_eq!(page.items[0].id, doc1.id);
+    assert_eq!(page.content[0].id, doc1.id);
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn test_explain_scan_verification() {
+    let (pool, _container) = setup_pool().await;
+    let repo = build_repo(pool.clone());
+
+    // Generate 10k mock rows to make the planner favor index scan over sequential scan
+    let mut batch = Vec::with_capacity(10000);
+    for i in 0..10000 {
+        batch.push(NewSearchRecord {
+            title: format!("Record title number {i}"),
+            body: if i == 5000 {
+                "This is the rare golden record containing rustacean".to_string()
+            } else {
+                "This is a common record with standard text".to_string()
+            },
+        });
+    }
+
+    // Insert in chunks of 2,000 to be fast and safe from parameter limit
+    for chunk in batch.chunks(2000) {
+        repo.save_many(chunk).await.unwrap();
+    }
+
+    #[derive(diesel::QueryableByName)]
+    struct ExplainRow {
+        #[diesel(column_name = "QUERY PLAN", sql_type = diesel::sql_types::Text)]
+        query_plan: String,
+    }
+
+    let mut conn = pool.get().await.expect("conn");
+    diesel::sql_query("ANALYZE test_search_records")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+    diesel::sql_query("SET enable_seqscan = off")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+    let explain_rows: Vec<ExplainRow> = diesel::sql_query(
+        "EXPLAIN SELECT id FROM test_search_records \
+         WHERE search_vector @@ websearch_to_tsquery('english'::regconfig, 'rustacean')",
+    )
+    .load::<ExplainRow>(&mut conn)
+    .await
+    .unwrap();
+
+    let mut plan = String::new();
+    for row in explain_rows {
+        plan.push_str(&row.query_plan);
+        plan.push('\n');
+    }
+
+    println!("Query Plan:\n{plan}");
+    // Verify GIN index scan is utilized and Sequential Scan is avoided
+    assert!(
+        !plan.contains("Seq Scan"),
+        "Sequential Scan was used instead of GIN Index Scan!"
+    );
+    assert!(
+        plan.contains("Bitmap Index Scan") || plan.contains("Index Scan") || plan.contains("GIN"),
+        "FTS index was not utilized!"
+    );
 }

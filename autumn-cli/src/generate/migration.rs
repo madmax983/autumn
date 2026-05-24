@@ -11,8 +11,9 @@ use super::dsl::parse_fields;
 use super::emit::Plan;
 use super::naming::pascal_to_snake;
 use super::schema_edit::{
-    MigrationShape, add_columns_down_sql, add_columns_up_sql, detect_migration_shape,
-    remove_columns_down_sql, remove_columns_up_sql,
+    MigrationShape, add_columns_down_sql, add_columns_up_sql, add_search_down_sql,
+    add_search_up_sql, detect_migration_shape, parse_model_search_config, remove_columns_down_sql,
+    remove_columns_up_sql, singularize,
 };
 use super::{Flags, GenerateError, ensure_project_root, timestamp_now};
 
@@ -47,6 +48,33 @@ pub fn plan_migration(
             remove_columns_up_sql(table, &fields),
             remove_columns_down_sql(table, &fields),
         ),
+        MigrationShape::AddSearch { ref table } => {
+            let singular = singularize(table);
+            let model_file_path = project_root
+                .join("src/models")
+                .join(format!("{singular}.rs"));
+            if model_file_path.exists() {
+                let content =
+                    std::fs::read_to_string(&model_file_path).map_err(GenerateError::Io)?;
+                if let Some((language, fts_fields)) = parse_model_search_config(&content) {
+                    (
+                        add_search_up_sql(table, &language, &fts_fields),
+                        add_search_down_sql(table),
+                    )
+                } else {
+                    return Err(GenerateError::Config(format!(
+                        "Model file '{}' exists but has no #[searchable] fields configured",
+                        model_file_path.display()
+                    )));
+                }
+            } else {
+                return Err(GenerateError::Config(format!(
+                    "Missing model file for table '{}'. Expected to find it at '{}'",
+                    table,
+                    model_file_path.display()
+                )));
+            }
+        }
         _ => (String::new(), String::new()),
     };
 
@@ -195,5 +223,46 @@ mod tests {
         )
         .unwrap();
         assert!(up.contains("ALTER TABLE posts ADD COLUMN title TEXT NOT NULL"));
+    }
+
+    #[test]
+    fn add_search_migration_emits_fts_columns_and_indices() {
+        let tmp = project();
+        let models_dir = tmp.path().join("src/models");
+        fs::create_dir_all(&models_dir).unwrap();
+        let model_src = r#"
+#[autumn_web::model(table = "posts")]
+#[searchable(language = "english")]
+pub struct Post {
+    #[id]
+    pub id: i64,
+    #[searchable(weight = "A")]
+    pub title: String,
+    #[searchable(weight = "B")]
+    pub body: String,
+}
+"#;
+        fs::write(models_dir.join("post.rs"), model_src).unwrap();
+
+        let plan = plan_migration(tmp.path(), "AddSearchToPosts", &[], "20260427000000").unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let up = fs::read_to_string(
+            tmp.path()
+                .join("migrations/20260427000000_add_search_to_posts/up.sql"),
+        )
+        .unwrap();
+        let down = fs::read_to_string(
+            tmp.path()
+                .join("migrations/20260427000000_add_search_to_posts/down.sql"),
+        )
+        .unwrap();
+
+        assert!(up.contains("ALTER TABLE posts ADD COLUMN search_vector tsvector GENERATED ALWAYS AS (setweight(to_tsvector('english'::regconfig, coalesce(title, '')), 'A') || setweight(to_tsvector('english'::regconfig, coalesce(body, '')), 'B')) STORED;"));
+        assert!(
+            up.contains("CREATE INDEX idx_posts_search_vector ON posts USING gin(search_vector);")
+        );
+        assert!(down.contains("DROP INDEX IF EXISTS idx_posts_search_vector;"));
+        assert!(down.contains("ALTER TABLE posts DROP COLUMN IF EXISTS search_vector;"));
     }
 }
