@@ -75,6 +75,7 @@ pub mod authorization;
 pub mod cache;
 #[cfg(feature = "ws")]
 pub mod channels;
+pub mod chaos;
 #[cfg(feature = "ws")]
 pub use channels::{
     Broadcast, BroadcastError, BroadcastPayload, ChannelBackendConfigError, ChannelMessage,
