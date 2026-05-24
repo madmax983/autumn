@@ -486,6 +486,13 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 .to_compile_error();
             }
             let weight_char = weight.chars().next().unwrap();
+            if !['A', 'B', 'C', 'D'].contains(&weight_char) {
+                return syn::Error::new_spanned(
+                    field_ident,
+                    "searchable weight must be A, B, C, or D",
+                )
+                .to_compile_error();
+            }
             search_field_names.push(field_ident.to_string());
             search_field_weights.push(weight_char);
         }

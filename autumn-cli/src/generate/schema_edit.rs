@@ -126,16 +126,25 @@ pub enum MigrationShape {
 #[must_use]
 pub fn detect_migration_shape(pascal_name: &str) -> MigrationShape {
     if let Some(rest) = pascal_name.strip_prefix("AddSearchTo") {
+        if rest.contains("To") {
+            return MigrationShape::Empty;
+        }
         return MigrationShape::AddSearch {
             table: normalize_table_name(rest),
         };
     }
     if let Some(rest) = pascal_name.strip_prefix("AddSearchableTo") {
+        if rest.contains("To") {
+            return MigrationShape::Empty;
+        }
         return MigrationShape::AddSearch {
             table: normalize_table_name(rest),
         };
     }
     if let Some(rest) = pascal_name.strip_prefix("AddSearchVectorTo") {
+        if rest.contains("To") {
+            return MigrationShape::Empty;
+        }
         return MigrationShape::AddSearch {
             table: normalize_table_name(rest),
         };
@@ -654,7 +663,7 @@ pub fn add_search_up_sql(table: &str, language: &str, fields: &[(String, char)])
         }
         let _ = write!(
             expr,
-            "setweight(to_tsvector('{language}'::regconfig, coalesce({field}, '')), '{weight}')"
+            "setweight(to_tsvector('{language}'::regconfig, coalesce({field}::text, '')), '{weight}')"
         );
     }
 
@@ -693,7 +702,17 @@ pub fn singularize(s: &str) -> String {
             || s.ends_with("ses")
             || s.ends_with("zes")
         {
-            stripped.to_owned()
+            if s.ends_with("statuses") || s.ends_with("aliases") || s.ends_with("buses") {
+                stripped.to_owned()
+            } else if s.ends_with("cases")
+                || s.ends_with("databases")
+                || s.ends_with("phases")
+                || s.ends_with("uses")
+            {
+                format!("{stripped}e")
+            } else {
+                stripped.to_owned()
+            }
         } else {
             format!("{stripped}e")
         }
@@ -704,34 +723,96 @@ pub fn singularize(s: &str) -> String {
     }
 }
 
+fn strip_comments(src: &str) -> String {
+    let mut result = String::with_capacity(src.len());
+    let mut chars = src.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '/' && chars.peek() == Some(&'/') {
+            chars.next();
+            while let Some(next_ch) = chars.next() {
+                if next_ch == '\n' {
+                    result.push('\n');
+                    break;
+                }
+            }
+        } else if ch == '/' && chars.peek() == Some(&'*') {
+            chars.next();
+            while let Some(next_ch) = chars.next() {
+                if next_ch == '*' && chars.peek() == Some(&'/') {
+                    chars.next();
+                    break;
+                }
+            }
+        } else {
+            result.push(ch);
+        }
+    }
+    result
+}
+
 /// Scan a model file content to extract the `#[searchable]` language and field weights.
 #[must_use]
 pub fn parse_model_search_config(content: &str) -> Option<(String, Vec<(String, char)>)> {
+    let clean_content = strip_comments(content);
     let mut language = "simple".to_string();
     let mut fields = Vec::new();
 
-    if let Some(pos) = content.find("language = \"") {
-        let start = pos + "language = \"".len();
-        if let Some(end) = content[start..].find('"') {
-            language = content[start..start + end].to_string();
-        }
-    }
-
-    let mut rest = content;
-    while let Some(pos) = rest.find("#[searchable") {
-        let attr_chunk = &rest[pos..];
-        let mut weight = 'D';
-        if let Some(w_pos) = attr_chunk.find("weight = \"") {
-            let w_start = w_pos + "weight = \"".len();
-            if let Some(w_end) = attr_chunk[w_start..].find('"') {
-                let w_str = &attr_chunk[w_start..w_start + w_end];
-                if let Some(ch) = w_str.chars().next() {
-                    weight = ch;
+    // Restrict FTS language search to the struct-level #[searchable] attribute (preceding `struct`)
+    if let Some(struct_pos) = clean_content.find("struct ") {
+        let before_struct = &clean_content[..struct_pos];
+        if let Some(pos) = before_struct.find("#[searchable") {
+            let attr_chunk = &before_struct[pos..];
+            if let Some(close_bracket) = attr_chunk.find(']') {
+                let attr_content = &attr_chunk[..close_bracket];
+                if let Some(lang_pos) = attr_content.find("language") {
+                    let after_lang = &attr_content[lang_pos + "language".len()..];
+                    if let Some(eq_pos) = after_lang.find('=') {
+                        let after_eq = &after_lang[eq_pos + 1..];
+                        if let Some(quote_start) = after_eq.find('"') {
+                            let after_quote = &after_eq[quote_start + 1..];
+                            if let Some(quote_end) = after_quote.find('"') {
+                                language = after_quote[..quote_end].to_string();
+                            }
+                        }
+                    }
                 }
             }
         }
+    }
+
+    let mut rest = &clean_content[..];
+    while let Some(pos) = rest.find("#[searchable") {
+        // Enforce word boundaries on the #[searchable] prefix check
+        let next_char = rest.as_bytes().get(pos + "#[searchable".len());
+        let is_boundary =
+            next_char.map_or(true, |&c| c == b']' || c == b'(' || c.is_ascii_whitespace());
+        if !is_boundary {
+            rest = &rest[pos + "#[searchable".len()..];
+            continue;
+        }
+
+        let attr_chunk = &rest[pos..];
+        let mut weight = 'D';
 
         if let Some(close_bracket) = attr_chunk.find(']') {
+            let attr_content = &attr_chunk[..close_bracket];
+            // Restrict weight search purely to the current attribute block contents
+            if let Some(w_pos) = attr_content.find("weight") {
+                let after_weight = &attr_content[w_pos + "weight".len()..];
+                if let Some(eq_pos) = after_weight.find('=') {
+                    let after_eq = &after_weight[eq_pos + 1..];
+                    if let Some(quote_start) = after_eq.find('"') {
+                        let after_quote = &after_eq[quote_start + 1..];
+                        if let Some(quote_end) = after_quote.find('"') {
+                            let w_str = &after_quote[..quote_end];
+                            if let Some(ch) = w_str.chars().next() {
+                                weight = ch;
+                            }
+                        }
+                    }
+                }
+            }
+
             let after_attr = &attr_chunk[close_bracket + 1..];
             let mut line_to_parse = "";
             for line in after_attr.lines() {
@@ -1260,5 +1341,90 @@ pub struct SearchRecord {
             fields,
             vec![("title".to_string(), 'A'), ("body".to_string(), 'B'),]
         );
+    }
+
+    #[test]
+    fn test_parse_model_search_config_robustness() {
+        // 1. Check space-less language parsing
+        let content_spaceless = r#"
+#[autumn_web::model(table = "test_search_records")]
+#[searchable(language="english")]
+pub struct SearchRecord {
+    #[id]
+    pub id: i64,
+    #[searchable]
+    pub title: String,
+}
+"#;
+        let (lang, fields) = parse_model_search_config(content_spaceless).unwrap();
+        assert_eq!(lang, "english");
+        assert_eq!(fields, vec![("title".to_string(), 'D')]);
+
+        // 2. Check unweighted vs weighted weight inheritance leakage
+        let content_leakage = r#"
+#[autumn_web::model(table = "test_search_records")]
+#[searchable(language = "simple")]
+pub struct SearchRecord {
+    #[id]
+    pub id: i64,
+    #[searchable]
+    pub title: String,
+    #[searchable(weight = "B")]
+    pub body: String,
+}
+"#;
+        let (_, fields) = parse_model_search_config(content_leakage).unwrap();
+        assert_eq!(
+            fields,
+            vec![
+                ("title".to_string(), 'D'), // title MUST NOT inherit B from body!
+                ("body".to_string(), 'B'),
+            ]
+        );
+
+        // 3. Check comment stripping (both block and line comments containing #[searchable])
+        let content_comments = r#"
+#[autumn_web::model(table = "test_search_records")]
+#[searchable(language = "english")]
+pub struct SearchRecord {
+    #[id]
+    pub id: i64,
+    // #[searchable(weight = "A")]
+    // pub old_title: String,
+    /*
+    #[searchable(weight = "C")]
+    pub commented_out: String,
+    */
+    #[searchable(weight = "B")]
+    pub body: String,
+}
+"#;
+        let (_, fields) = parse_model_search_config(content_comments).unwrap();
+        assert_eq!(fields, vec![("body".to_string(), 'B')]);
+
+        // 4. Check prefix collisions like searchable_fields
+        let content_collision = r#"
+#[autumn_web::model(table = "test_search_records")]
+#[searchable_fields]
+pub struct SearchRecord {
+    #[id]
+    pub id: i64,
+    #[searchable(weight = "A")]
+    pub title: String,
+}
+"#;
+        let (_, fields) = parse_model_search_config(content_collision).unwrap();
+        assert_eq!(fields, vec![("title".to_string(), 'A')]);
+    }
+
+    #[test]
+    fn test_singularize_ses_words() {
+        assert_eq!(singularize("cases"), "case");
+        assert_eq!(singularize("databases"), "database");
+        assert_eq!(singularize("phases"), "phase");
+        assert_eq!(singularize("uses"), "use");
+        assert_eq!(singularize("statuses"), "status");
+        assert_eq!(singularize("aliases"), "alias");
+        assert_eq!(singularize("buses"), "bus");
     }
 }
