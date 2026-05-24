@@ -134,6 +134,13 @@ pub trait CanSetTenantId {
     fn set_tenant_id(&mut self, tenant_id: String);
 }
 
+/// Metadata trait implemented for model structs to expose FTS configuration.
+pub trait AutumnSearchableModel {
+    const IS_SEARCHABLE: bool;
+    const SEARCH_LANGUAGE: &'static str;
+    const SEARCH_FIELDS: &'static [(&'static str, char)];
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
