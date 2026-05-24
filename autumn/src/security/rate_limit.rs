@@ -856,6 +856,104 @@ mod tests {
     }
 
     #[test]
+    fn trusted_proxy_contains_edge_cases() {
+        let proxy_any_v4 = TrustedProxy::parse("0.0.0.0/0").unwrap();
+        assert!(proxy_any_v4.contains(IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 1))));
+        assert!(!proxy_any_v4.contains(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)));
+
+        let proxy_any_v6 = TrustedProxy::parse("::/0").unwrap();
+        assert!(proxy_any_v6.contains(IpAddr::V6(std::net::Ipv6Addr::new(
+            0x2001, 0xdb8, 0, 0, 0, 0, 0, 1
+        ))));
+        assert!(!proxy_any_v6.contains(IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 1))));
+
+        assert!(TrustedProxy::parse("192.168.1.1/33").is_none());
+        assert!(TrustedProxy::parse("2001:db8::1/129").is_none());
+
+        let proxy_exact_v4 = TrustedProxy::parse("192.168.1.1/32").unwrap();
+        assert!(proxy_exact_v4.contains(IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 1))));
+        assert!(!proxy_exact_v4.contains(IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 2))));
+    }
+
+    #[test]
+    fn trusted_proxy_contains_subnets() {
+        let proxy_v4 = TrustedProxy::parse("192.168.0.0/16").unwrap();
+        assert!(proxy_v4.contains(IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 1))));
+        assert!(proxy_v4.contains(IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 255, 255))));
+        assert!(!proxy_v4.contains(IpAddr::V4(std::net::Ipv4Addr::new(192, 169, 1, 1))));
+
+        let proxy_v6 = TrustedProxy::parse("2001:db8::/32").unwrap();
+        assert!(proxy_v6.contains(IpAddr::V6(std::net::Ipv6Addr::new(
+            0x2001, 0xdb8, 0x1234, 0, 0, 0, 0, 1
+        ))));
+        assert!(!proxy_v6.contains(IpAddr::V6(std::net::Ipv6Addr::new(
+            0x2001, 0xdb9, 0, 0, 0, 0, 0, 1
+        ))));
+    }
+
+    #[test]
+    fn client_ip_from_x_forwarded_for_ignores_empty_segments() {
+        let mut req = Request::builder().uri("/").body(()).unwrap();
+        req.extensions_mut()
+            .insert(ConnectInfo(std::net::SocketAddr::new(
+                IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)),
+                12345,
+            )));
+
+        let config = RateLimitConfig {
+            trust_forwarded_headers: true,
+            trusted_proxies: vec!["10.0.0.1".to_string()],
+            ..Default::default()
+        };
+
+        let limiter = Limiter::from_config(&config);
+
+        req.headers_mut().insert(
+            "x-forwarded-for",
+            axum::http::HeaderValue::from_static("192.168.1.1, , ,"),
+        );
+
+        let ip = limiter.client_ip(&req);
+        assert_eq!(ip, Some("192.168.1.1".to_string()));
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "redis")]
+    async fn build_backend_redis_config_returns_redis() {
+        let config = RateLimitConfig {
+            backend: RateLimitBackend::Redis,
+            redis: crate::security::RateLimitRedisConfig {
+                url: Some("redis://127.0.0.1:0/".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let backend = Limiter::build_backend(&config);
+        assert!(matches!(backend, BucketBackend::Redis(_)));
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "redis")]
+    async fn build_backend_memory_config_with_valid_redis_url_does_not_build_redis() {
+        let config = RateLimitConfig {
+            backend: RateLimitBackend::Memory,
+            redis: crate::security::RateLimitRedisConfig {
+                url: Some("redis://127.0.0.1/".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let backend = Limiter::build_backend(&config);
+
+        assert!(
+            matches!(backend, BucketBackend::Memory(_)),
+            "Backend should be Memory but was not. Did it incorrectly build Redis?"
+        );
+    }
+
+    #[test]
     fn trusted_proxy_contains_ipv6() {
         let proxy = TrustedProxy::parse("2001:db8::/32").unwrap();
         assert!(proxy.contains("2001:db8:1234::1".parse().unwrap()));
