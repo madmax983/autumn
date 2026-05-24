@@ -18,6 +18,8 @@ use schema::widgets;
 
 #[derive(autumn_web::reexports::diesel::Queryable)]
 #[derive(autumn_web::reexports::diesel::Selectable)]
+#[derive(autumn_web::reexports::diesel::Insertable)]
+#[derive(autumn_web::reexports::diesel::AsChangeset)]
 #[derive(serde::Serialize, serde::Deserialize)]
 #[diesel(table_name = widgets)]
 pub struct Widget {
@@ -61,6 +63,7 @@ impl Policy<Widget> for WidgetPolicy {}
     Widget,
     api = "/api/widgets",
     policy = WidgetPolicy,
+    no_upsert_trait,
 )]
 pub trait WidgetRepository {}
 

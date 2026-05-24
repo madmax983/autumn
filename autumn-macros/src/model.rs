@@ -608,35 +608,43 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // Trait name for draft extension methods
     let draft_ext_name = format_ident!("{name}DraftExt");
 
+    let column_count = all_fields.len();
+    let new_column_count = fields_for_new.len();
+
     // Build Diesel-compatible changeset bridge (private struct with Option<T> fields)
     let changeset_name = format_ident!("__{}Changeset", name);
 
-    let tenant_id_field = fields_for_new
+    let tenant_id_field = all_fields
         .iter()
-        .find(|f| f.ident.as_ref().is_some_and(|id| id == "tenant_id"));
+        .find(|f| f.ident.as_ref().is_some_and(|id| id == "tenant_id"))
+        .copied();
 
-    #[allow(clippy::option_if_let_else)]
-    let can_set_tenant_id_impl = match tenant_id_field {
-        Some(f) => {
-            let is_option = is_option_type(&f.ty);
-            let val = if is_option {
-                quote! { ::core::option::Option::Some(::core::option::Option::Some(t)) }
-            } else {
-                quote! { ::core::option::Option::Some(t) }
-            };
-            quote! {
-                impl ::autumn_web::repository::CanSetTenantId for #changeset_name {
-                    fn set_tenant_id(&mut self, t: ::std::string::String) {
-                        self.tenant_id = #val;
-                    }
+    let new_has_tenant_id = fields_for_new
+        .iter()
+        .any(|f| f.ident.as_ref().is_some_and(|id| id == "tenant_id"));
+
+    let can_set_tenant_id_impl = if new_has_tenant_id {
+        let f = fields_for_new
+            .iter()
+            .find(|f| f.ident.as_ref().is_some_and(|id| id == "tenant_id"))
+            .unwrap();
+        let is_option = is_option_type(&f.ty);
+        let val = if is_option {
+            quote! { ::core::option::Option::Some(::core::option::Option::Some(t)) }
+        } else {
+            quote! { ::core::option::Option::Some(t) }
+        };
+        quote! {
+            impl ::autumn_web::repository::CanSetTenantId for #changeset_name {
+                fn set_tenant_id(&mut self, t: ::std::string::String) {
+                    self.tenant_id = #val;
                 }
             }
         }
-        None => {
-            quote! {
-                impl ::autumn_web::repository::CanSetTenantId for #changeset_name {
-                    fn set_tenant_id(&mut self, _t: ::std::string::String) {}
-                }
+    } else {
+        quote! {
+            impl ::autumn_web::repository::CanSetTenantId for #changeset_name {
+                fn set_tenant_id(&mut self, _t: ::std::string::String) {}
             }
         }
     };
@@ -645,6 +653,10 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         || {
             quote! {
                 impl ::autumn_web::tenancy::ModelTenantIdMeta for #new_name {
+                    const HAS_MANUAL_TENANT_ID: bool = false;
+                    fn try_set_tenant_id(&mut self, _tenant_id: &str) {}
+                }
+                impl ::autumn_web::tenancy::ModelTenantIdMeta for #name {
                     const HAS_MANUAL_TENANT_ID: bool = false;
                     fn try_set_tenant_id(&mut self, _tenant_id: &str) {}
                 }
@@ -657,8 +669,21 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             } else {
                 quote! { self.tenant_id = tenant_id.to_string(); }
             };
+
+            let new_set_field = if new_has_tenant_id {
+                set_field.clone()
+            } else {
+                quote! {}
+            };
+
             quote! {
                 impl ::autumn_web::tenancy::ModelTenantIdMeta for #new_name {
+                    const HAS_MANUAL_TENANT_ID: bool = #new_has_tenant_id;
+                    fn try_set_tenant_id(&mut self, tenant_id: &str) {
+                        #new_set_field
+                    }
+                }
+                impl ::autumn_web::tenancy::ModelTenantIdMeta for #name {
                     const HAS_MANUAL_TENANT_ID: bool = true;
                     fn try_set_tenant_id(&mut self, tenant_id: &str) {
                         #set_field
@@ -667,6 +692,119 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         },
     );
+
+    let mut upsert_columns: Vec<TokenStream> = fields_for_new
+        .iter()
+        .map(|f| {
+            let ident = f.ident.as_ref().unwrap();
+            quote! {
+                #table_ident::#ident.eq(::autumn_web::reexports::diesel::upsert::excluded(#table_ident::#ident))
+            }
+        })
+        .collect();
+
+    if upsert_columns.is_empty() {
+        upsert_columns.push(quote! {
+            #table_ident::id.eq(::autumn_web::reexports::diesel::pg::upsert::excluded(#table_ident::id))
+        });
+    }
+
+    if let Some(lv_field) = lock_version_field {
+        let ident = lv_field.ident.as_ref().unwrap();
+        upsert_columns.push(quote! {
+            #table_ident::#ident.eq(#table_ident::#ident + 1)
+        });
+    }
+
+    let mut upsert_types: Vec<TokenStream> = fields_for_new
+        .iter()
+        .map(|f| {
+            let ident = f.ident.as_ref().unwrap();
+            quote! {
+                ::autumn_web::reexports::diesel::dsl::Eq<
+                    #table_ident::#ident,
+                    ::autumn_web::reexports::diesel::upsert::Excluded<#table_ident::#ident>
+                >
+            }
+        })
+        .collect();
+
+    if upsert_types.is_empty() {
+        upsert_types.push(quote! {
+            ::autumn_web::reexports::diesel::dsl::Eq<
+                #table_ident::id,
+                ::autumn_web::reexports::diesel::upsert::Excluded<#table_ident::id>
+            >
+        });
+    }
+
+    if let Some(lv_field) = lock_version_field {
+        let ident = lv_field.ident.as_ref().unwrap();
+        let ty = &lv_field.ty;
+        upsert_types.push(quote! {
+            ::autumn_web::reexports::diesel::dsl::Eq<
+                #table_ident::#ident,
+                ::autumn_web::reexports::diesel::helper_types::Add<
+                    #table_ident::#ident,
+                    ::autumn_web::reexports::diesel::expression::bound::Bound<
+                        <#table_ident::#ident as ::autumn_web::reexports::diesel::Expression>::SqlType,
+                        #ty
+                    >
+                >
+            >
+        });
+    }
+
+    let has_tenant_id = tenant_id_field.is_some();
+    let execute_upsert_body = if has_tenant_id {
+        lock_version_field.map_or_else(
+            || quote! {
+                if let ::core::option::Option::Some(t) = tenant_id {
+                    let stmt = ::autumn_web::reexports::diesel::query_dsl::methods::FilterDsl::filter(stmt, #table_ident::tenant_id.eq(t.to_string()));
+                    stmt.get_results::<Self>(conn).await
+                } else {
+                    stmt.get_results::<Self>(conn).await
+                }
+            },
+            |lv_field| {
+                let lv_ident = lv_field.ident.as_ref().unwrap();
+                quote! {
+                    let lv_cond = #table_ident::#lv_ident.eq(::autumn_web::reexports::diesel::pg::upsert::excluded(#table_ident::#lv_ident));
+                    if let ::core::option::Option::Some(t) = tenant_id {
+                        let stmt = ::autumn_web::reexports::diesel::query_dsl::methods::FilterDsl::filter(stmt, lv_cond.and(#table_ident::tenant_id.eq(t.to_string())));
+                        stmt.get_results::<Self>(conn).await
+                    } else {
+                        let stmt = ::autumn_web::reexports::diesel::query_dsl::methods::FilterDsl::filter(stmt, lv_cond);
+                        stmt.get_results::<Self>(conn).await
+                    }
+                }
+            },
+        )
+    } else {
+        lock_version_field.map_or_else(
+            || quote! {
+                stmt.get_results::<Self>(conn).await
+            },
+            |lv_field| {
+                let lv_ident = lv_field.ident.as_ref().unwrap();
+                quote! {
+                    let lv_cond = #table_ident::#lv_ident.eq(::autumn_web::reexports::diesel::pg::upsert::excluded(#table_ident::#lv_ident));
+                    let stmt = ::autumn_web::reexports::diesel::query_dsl::methods::FilterDsl::filter(stmt, lv_cond);
+                    stmt.get_results::<Self>(conn).await
+                }
+            },
+        )
+    };
+
+    let compare_fields = fields_for_new.iter().map(|f| {
+        let ident = &f.ident;
+        quote! { input.#ident == record.#ident }
+    });
+    let compare_expr = if fields_for_new.is_empty() {
+        quote! { true }
+    } else {
+        quote! { #(#compare_fields)&&* }
+    };
 
     let mut changeset_fields: Vec<TokenStream> = fields_for_new
         .iter()
@@ -1213,7 +1351,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     quote! {
-        #[derive(Debug, Clone, ::diesel::Queryable, ::diesel::Selectable, ::diesel::AsChangeset)]
+        #[derive(Debug, Clone, ::diesel::Queryable, ::diesel::Selectable, ::diesel::AsChangeset, ::diesel::Insertable)]
         #[derive(::serde::Serialize, ::serde::Deserialize)]
         #[diesel(table_name = #table_ident)]
         #(#outer_attrs)*
@@ -1253,6 +1391,127 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 #changeset_name {
                     #(#changeset_conversions,)*
                 }
+            }
+        }
+
+        impl #name {
+            pub const __AUTUMN_COLUMN_COUNT: usize = #column_count;
+
+            #[doc(hidden)]
+            pub fn __autumn_column_count(&self) -> usize {
+                Self::__AUTUMN_COLUMN_COUNT
+            }
+
+            #[doc(hidden)]
+            pub fn __autumn_upsert_set() -> impl ::autumn_web::reexports::diesel::query_builder::AsChangeset<
+                Target = #table_ident::table,
+                Changeset = impl ::autumn_web::reexports::diesel::query_builder::QueryFragment<::autumn_web::reexports::diesel::pg::Pg> + ::core::marker::Send + ::core::marker::Sync + 'static
+            > + ::core::marker::Send + ::core::marker::Sync + 'static {
+                use ::autumn_web::reexports::diesel::ExpressionMethods as _;
+                (#(#upsert_columns,)*)
+            }
+
+            #[doc(hidden)]
+            pub async fn __autumn_execute_upsert(
+                chunk: &[Self],
+                tenant_id: ::core::option::Option<&str>,
+                conn: &mut ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+            ) -> ::core::result::Result<::std::vec::Vec<Self>, ::autumn_web::reexports::diesel::result::Error> {
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+
+                let stmt = ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                    .values(chunk)
+                    .on_conflict(#table_ident::id)
+                    .do_update()
+                    .set(Self::__autumn_upsert_set());
+
+                #execute_upsert_body
+            }
+
+
+
+            #[doc(hidden)]
+            pub fn __autumn_correlate_new(
+                inputs: &[#new_name],
+                record: &Self,
+                matched: &mut [bool],
+            ) -> ::core::option::Option<usize> {
+                for (i, input) in inputs.iter().enumerate() {
+                    if !matched[i] {
+                        if #compare_expr {
+                            return ::core::option::Option::Some(i);
+                        }
+                    }
+                }
+                ::core::option::Option::None
+            }
+
+            #[doc(hidden)]
+            pub fn __autumn_correlate_model(
+                inputs: &[Self],
+                record: &Self,
+                matched: &mut [bool],
+                ) -> ::core::option::Option<usize> {
+                for (i, input) in inputs.iter().enumerate() {
+                    if !matched[i] {
+                        if #compare_expr {
+                            return ::core::option::Option::Some(i);
+                        }
+                    }
+                }
+                ::core::option::Option::None
+            }
+        }
+
+        impl ::autumn_web::repository::AutumnUpsertSetExt for #name {
+            type UpsertSet = ::autumn_web::reexports::diesel::dsl::Eq<
+                #table_ident::id,
+                #table_ident::id,
+            >;
+            fn __autumn_upsert_set() -> Self::UpsertSet {
+                use ::autumn_web::reexports::diesel::ExpressionMethods as _;
+                #table_ident::id.eq(#table_ident::id)
+            }
+        }
+
+        impl ::autumn_web::repository::AutumnUpsertExecutionExt for #name {
+            type Model = Self;
+            async fn __autumn_execute_upsert(
+                chunk: &[Self::Model],
+                tenant_id: ::core::option::Option<&str>,
+                conn: &mut ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+            ) -> ::core::result::Result<::std::vec::Vec<Self::Model>, ::autumn_web::reexports::diesel::result::Error> {
+                Self::__autumn_execute_upsert(chunk, tenant_id, conn).await
+            }
+        }
+
+        impl ::autumn_web::repository::AutumnCorrelateExt for #name {
+            type NewModel = #new_name;
+            fn __autumn_correlate_new(
+                inputs: &[Self::NewModel],
+                record: &Self,
+                matched: &mut [bool],
+            ) -> ::core::option::Option<usize> {
+                Self::__autumn_correlate_new(inputs, record, matched)
+            }
+
+            fn __autumn_correlate_model(
+                inputs: &[Self],
+                record: &Self,
+                matched: &mut [bool],
+            ) -> ::core::option::Option<usize> {
+                Self::__autumn_correlate_model(inputs, record, matched)
+            }
+        }
+
+
+        impl #new_name {
+            pub const __AUTUMN_COLUMN_COUNT: usize = #new_column_count;
+
+            #[doc(hidden)]
+            pub fn __autumn_column_count(&self) -> usize {
+                Self::__AUTUMN_COLUMN_COUNT
             }
         }
 

@@ -583,6 +583,13 @@ impl AutumnError {
         }
         chain
     }
+
+    /// Try to downcast the inner error to a specific type.
+    #[must_use]
+    pub fn downcast_ref<T: std::error::Error + 'static>(&self) -> Option<&T> {
+        let err: &(dyn std::error::Error + 'static) = self.inner.as_ref();
+        err.downcast_ref::<T>()
+    }
 }
 
 impl std::fmt::Display for AutumnError {

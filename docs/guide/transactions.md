@@ -246,3 +246,11 @@ may need manual recovery.
 | Crash-safe email triggered by a DB write | Insert a durable outbox row in the transaction; use a mail queue/worker to drain it |
 | Repository create/update/delete side effect | `after_create_commit` / `after_update_commit` / `after_delete_commit` hook with `commit_hooks = true` |
 | Custom side effect on commit | `register_after_commit` inside `db.tx` |
+
+## Bulk Repository Operations & Transactions
+
+All generated bulk methods (`save_many`, `update_many`, `delete_many`, `upsert_many`) fully integrate with Autumn's transaction boundaries:
+
+- **Atomic Execution**: On repositories with hooks configured, the entire batch query and hook execution are wrapped in an atomic database transaction. If any individual record hook fails or if the database returns an error, the entire operation is automatically rolled back.
+- **Participation in `db.tx`**: If a bulk operation is called inside a `db.tx` block, it automatically participates in that outer transaction. No new nested transaction is started, conforming to Autumn's nesting policy.
+- **Durable Commit Hooks**: If commit hooks are enabled (`commit_hooks = true`), post-commit hooks like `after_create_commit` will be staged during bulk writes and executed sequentially only when the surrounding database transaction successfully commits.

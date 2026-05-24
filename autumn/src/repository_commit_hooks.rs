@@ -395,6 +395,160 @@ where
         })
 }
 
+/// Insert multiple generated repository commit hook rows in a staged state in a single query.
+///
+/// # Errors
+///
+/// Returns an error when any context or record cannot be serialized, or when
+/// Postgres rejects the staged insert.
+pub async fn enqueue_repository_commit_hooks_pending_bulk_on_conn<C, R>(
+    conn: &mut diesel_async::AsyncPgConnection,
+    handler_key: &str,
+    hook_name: &str,
+    inputs: &[(Option<String>, Option<String>, &C, &R)],
+) -> AutumnResult<Vec<(String, String)>>
+where
+    C: Serialize + Sync + ?Sized,
+    R: Serialize + Sync + ?Sized,
+{
+    const SQL: &str = "INSERT INTO autumn_repository_commit_hooks \
+         (id, handler_key, hook_name, context, record, status, attempt, \
+          max_attempts, initial_backoff_ms, enqueued_at, run_at, claimed_by, claimed_at) \
+         SELECT \
+             t.id, t.handler_key, t.hook_name, t.context::JSONB, t.record::JSONB, \
+             'pending_after_hook', 1, 5, 1000, NOW(), NOW(), t.claimed_by, NOW() \
+         FROM UNNEST($1::TEXT[], $2::TEXT[], $3::TEXT[], $4::TEXT[], $5::TEXT[], $6::TEXT[]) \
+           AS t(id, handler_key, hook_name, context, record, claimed_by) \
+         ON CONFLICT (id) DO UPDATE \
+          SET handler_key = EXCLUDED.handler_key, hook_name = EXCLUDED.hook_name, \
+              context = EXCLUDED.context, record = EXCLUDED.record, \
+              status = 'pending_after_hook', attempt = 1, \
+              max_attempts = EXCLUDED.max_attempts, \
+              initial_backoff_ms = EXCLUDED.initial_backoff_ms, \
+              enqueued_at = EXCLUDED.enqueued_at, run_at = EXCLUDED.run_at, \
+              claimed_by = EXCLUDED.claimed_by, claimed_at = EXCLUDED.claimed_at, \
+              started_at = NULL, finished_at = NULL, last_error = NULL \
+          WHERE autumn_repository_commit_hooks.status IN ('pending_after_hook', 'after_hook_failed')";
+
+    if inputs.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut ids = Vec::with_capacity(inputs.len());
+    let mut handler_keys = Vec::with_capacity(inputs.len());
+    let mut hook_names = Vec::with_capacity(inputs.len());
+    let mut contexts = Vec::with_capacity(inputs.len());
+    let mut records = Vec::with_capacity(inputs.len());
+    let mut owners = Vec::with_capacity(inputs.len());
+    let mut results = Vec::with_capacity(inputs.len());
+
+    let owner = repository_commit_hook_pending_owner_id();
+
+    for &(ref idempotency_key, ref idempotency_discriminator, context, record) in inputs {
+        let (context_str, record_str) = serialize_repository_commit_hook_payloads(context, record)?;
+        let id = repository_commit_hook_id(
+            idempotency_key.as_deref(),
+            idempotency_discriminator.as_deref(),
+            handler_key,
+            hook_name,
+            &record_str,
+        );
+
+        ids.push(id.clone());
+        handler_keys.push(handler_key.to_string());
+        hook_names.push(hook_name.to_string());
+        contexts.push(context_str);
+        records.push(record_str);
+        owners.push(owner.clone());
+        results.push((id, owner.clone()));
+    }
+
+    diesel::sql_query(SQL)
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(ids)
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(handler_keys)
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(hook_names)
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(contexts)
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(records)
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(owners)
+        .execute(conn)
+        .await
+        .map(|_| results)
+        .map_err(|error| {
+            AutumnError::internal_server_error_msg(format!(
+                "repository commit hook bulk staging failed: {error}"
+            ))
+        })
+}
+
+/// Insert multiple generated repository commit hook rows directly in an enqueued state in a single query.
+///
+/// # Errors
+///
+/// Returns an error when any context or record cannot be serialized, or when
+/// Postgres rejects the staged insert.
+pub async fn enqueue_repository_commit_hooks_bulk_on_conn<C, R>(
+    conn: &mut diesel_async::AsyncPgConnection,
+    handler_key: &str,
+    hook_name: &str,
+    inputs: &[(Option<String>, Option<String>, &C, &R)],
+) -> AutumnResult<()>
+where
+    C: Serialize + Sync + ?Sized,
+    R: Serialize + Sync + ?Sized,
+{
+    const SQL: &str = "INSERT INTO autumn_repository_commit_hooks \
+         (id, handler_key, hook_name, context, record, status, attempt, \
+          max_attempts, initial_backoff_ms, enqueued_at, run_at) \
+         SELECT \
+             t.id, t.handler_key, t.hook_name, t.context::JSONB, t.record::JSONB, \
+             'enqueued', 1, 5, 1000, NOW(), NOW() \
+         FROM UNNEST($1::TEXT[], $2::TEXT[], $3::TEXT[], $4::TEXT[], $5::TEXT[]) \
+           AS t(id, handler_key, hook_name, context, record) \
+         ON CONFLICT (id) DO NOTHING";
+
+    if inputs.is_empty() {
+        return Ok(());
+    }
+
+    let mut ids = Vec::with_capacity(inputs.len());
+    let mut handler_keys = Vec::with_capacity(inputs.len());
+    let mut hook_names = Vec::with_capacity(inputs.len());
+    let mut contexts = Vec::with_capacity(inputs.len());
+    let mut records = Vec::with_capacity(inputs.len());
+
+    for &(ref idempotency_key, ref idempotency_discriminator, context, record) in inputs {
+        let (context_str, record_str) = serialize_repository_commit_hook_payloads(context, record)?;
+        let id = repository_commit_hook_id(
+            idempotency_key.as_deref(),
+            idempotency_discriminator.as_deref(),
+            handler_key,
+            hook_name,
+            &record_str,
+        );
+
+        ids.push(id);
+        handler_keys.push(handler_key.to_string());
+        hook_names.push(hook_name.to_string());
+        contexts.push(context_str);
+        records.push(record_str);
+    }
+
+    diesel::sql_query(SQL)
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(ids)
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(handler_keys)
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(hook_names)
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(contexts)
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(records)
+        .execute(conn)
+        .await
+        .map(|_| ())
+        .map_err(|error| {
+            AutumnError::internal_server_error_msg(format!(
+                "repository commit hook bulk enqueue failed: {error}"
+            ))
+        })
+}
+
 /// Promote a staged create/update commit hook after the regular after hook
 /// succeeds, rewriting the row with the finalized mutation context.
 ///
