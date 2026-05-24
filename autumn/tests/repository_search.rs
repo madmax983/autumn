@@ -3,7 +3,11 @@
 //! **Requires Docker** to be running.
 
 #![cfg(feature = "db")]
-#![allow(clippy::must_use_candidate, clippy::missing_const_for_fn)]
+#![allow(
+    clippy::must_use_candidate,
+    clippy::missing_const_for_fn,
+    unused_imports
+)]
 
 use autumn_web::prelude::*;
 use diesel::prelude::*;
@@ -191,6 +195,12 @@ async fn test_search_basic_and_ranking() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn test_explain_scan_verification() {
+    #[derive(diesel::QueryableByName)]
+    struct ExplainRow {
+        #[diesel(column_name = "QUERY PLAN", sql_type = diesel::sql_types::Text)]
+        query_plan: String,
+    }
+
     let (pool, _container) = setup_pool().await;
     let repo = build_repo(pool.clone());
 
@@ -210,12 +220,6 @@ async fn test_explain_scan_verification() {
     // Insert in chunks of 2,000 to be fast and safe from parameter limit
     for chunk in batch.chunks(2000) {
         repo.save_many(chunk).await.unwrap();
-    }
-
-    #[derive(diesel::QueryableByName)]
-    struct ExplainRow {
-        #[diesel(column_name = "QUERY PLAN", sql_type = diesel::sql_types::Text)]
-        query_plan: String,
     }
 
     let mut conn = pool.get().await.expect("conn");
@@ -253,4 +257,105 @@ async fn test_explain_scan_verification() {
         plan.contains("Bitmap Index Scan") || plan.contains("Index Scan") || plan.contains("GIN"),
         "FTS index was not utilized!"
     );
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn test_search_special_characters() {
+    let (pool, _container) = setup_pool().await;
+    let repo = build_repo(pool);
+
+    // Save record with special characters in body
+    let doc = repo
+        .save(&NewSearchRecord {
+            title: "Special characters test".to_string(),
+            body: "Rust's syntax uses & references, | pipes, and : colons.".to_string(),
+        })
+        .await
+        .unwrap();
+
+    // Verify FTS search handles special characters gracefully
+    // These queries shouldn't crash Postgres or throw syntax errors.
+    let results = repo.search("Rust's").await.unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].id, doc.id);
+
+    // Assert searching other special characters returns safely (even if ignored or cleaned)
+    let _ = repo.search("&").await.unwrap();
+    let _ = repo.search("|").await.unwrap();
+    let _ = repo.search(":").await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn test_search_migration_backfill() {
+    #[derive(diesel::QueryableByName, PartialEq, Debug)]
+    struct BackfilledRow {
+        #[diesel(column_name = "id", sql_type = diesel::sql_types::BigInt)]
+        id: i64,
+        #[diesel(column_name = "title", sql_type = diesel::sql_types::Text)]
+        title: String,
+    }
+
+    let (pool, _container) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+
+    // 1. Create table without FTS column
+    diesel::sql_query(
+        "CREATE TABLE test_backfill_records (\
+            id BIGSERIAL PRIMARY KEY, \
+            title TEXT NOT NULL, \
+            body TEXT NOT NULL \
+         )",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("create test_backfill_records");
+
+    // 2. Pre-populate with existing rows
+    diesel::sql_query(
+        "INSERT INTO test_backfill_records (title, body) VALUES \
+         ('Legacy document', 'This is pre-existing data that needs to be backfilled.')",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("insert pre-existing rows");
+
+    // 3. Run the FTS migration (adds generated column and GIN index)
+    diesel::sql_query(
+        "ALTER TABLE test_backfill_records ADD COLUMN search_vector tsvector GENERATED ALWAYS AS (\
+            setweight(to_tsvector('english', coalesce(title, '')), 'A') || \
+            setweight(to_tsvector('english', coalesce(body, '')), 'B') \
+         ) STORED",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("alter table to add search_vector");
+
+    diesel::sql_query(
+        "CREATE INDEX idx_test_backfill_records_search_vector \
+         ON test_backfill_records USING gin(search_vector)",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("create GIN index on search_vector");
+
+    // 4. Query the backfilled records and assert we can search them successfully
+
+    let results: Vec<BackfilledRow> = diesel::sql_query(
+        "SELECT id, title FROM test_backfill_records \
+         WHERE search_vector @@ websearch_to_tsquery('english'::regconfig, 'backfilled')",
+    )
+    .load::<BackfilledRow>(&mut conn)
+    .await
+    .expect("query backfilled search");
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].title, "Legacy document");
+
+    // Cleanup
+    diesel::sql_query("DROP TABLE test_backfill_records")
+        .execute(&mut conn)
+        .await
+        .unwrap();
 }

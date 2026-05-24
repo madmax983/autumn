@@ -46,6 +46,37 @@ pub fn status_badge(status: &str) -> Markup {
     }
 }
 
+pub fn pages_list_snippet(pages: &[Page]) -> Markup {
+    html! {
+        ul id="search-results" class="space-y-3" {
+            @for p in pages {
+                li class="p-4 bg-white rounded shadow flex justify-between items-center" {
+                    div {
+                        a href=(paths::show(p.slug.clone()))
+                          class="text-emerald-700 font-medium hover:underline" {
+                            (p.title)
+                          }
+                        " "
+                        (status_badge(&p.status))
+                    }
+                    div class="text-sm text-gray-400" {
+                        (p.updated_at.format("%Y-%m-%d %H:%M"))
+                    }
+                }
+            }
+            @if pages.is_empty() {
+                li class="text-gray-400 text-center py-8" { "No pages found. Create one!" }
+            }
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct SearchParams {
+    #[serde(default)]
+    pub q: String,
+}
+
 #[get("/")]
 pub async fn list(repo: PgPageRepository) -> AutumnResult<Markup> {
     let pages = repo.find_all().await?;
@@ -57,30 +88,34 @@ pub async fn list(repo: PgPageRepository) -> AutumnResult<Markup> {
                 a href=(paths::new_form())
                   class="bg-emerald-600 text-white px-4 py-2 rounded hover:bg-emerald-700" {
                     "+ New Page"
+                  }
+            }
+            div class="mb-6 bg-white p-4 rounded shadow flex items-center" {
+                input type="search" name="q" placeholder="Search pages..."
+                      hx-get="/search" hx-trigger="keyup changed delay:300ms, search"
+                      hx-target="#search-results" hx-indicator="#search-indicator"
+                      class="flex-grow border rounded px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-emerald-500";
+                span id="search-indicator" class="htmx-indicator ml-3 text-sm text-gray-400 hidden" {
+                    "Searching..."
                 }
             }
-            ul class="space-y-3" {
-                @for p in &pages {
-                    li class="p-4 bg-white rounded shadow flex justify-between items-center" {
-                        div {
-                            a href=(paths::show(p.slug.clone()))
-                              class="text-emerald-700 font-medium hover:underline" {
-                                (p.title)
-                            }
-                            " "
-                            (status_badge(&p.status))
-                        }
-                        div class="text-sm text-gray-400" {
-                            (p.updated_at.format("%Y-%m-%d %H:%M"))
-                        }
-                    }
-                }
-                @if pages.is_empty() {
-                    li class="text-gray-400 text-center py-8" { "No pages yet. Create one!" }
-                }
-            }
+            (pages_list_snippet(&pages))
         },
     ))
+}
+
+#[get("/search")]
+pub async fn search(
+    repo: PgPageRepository,
+    Query(params): Query<SearchParams>,
+) -> AutumnResult<Markup> {
+    let term = params.q.trim();
+    let pages = if term.is_empty() {
+        repo.find_all().await?
+    } else {
+        repo.search(term).await?
+    };
+    Ok(pages_list_snippet(&pages))
 }
 
 #[get("/pages/{slug}")]
@@ -342,7 +377,9 @@ pub async fn history(
     ))
 }
 
-autumn_web::paths![list, show, new_form, create, edit_form, update, history];
+autumn_web::paths![
+    list, show, new_form, create, edit_form, update, history, search
+];
 
 /// Look up a page by slug, returning 404 if not found.
 async fn find_page_by_slug(repo: &PgPageRepository, slug: &str) -> AutumnResult<Page> {
