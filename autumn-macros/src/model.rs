@@ -94,12 +94,18 @@ fn parse_model_searchable_lang(attrs: &[syn::Attribute]) -> syn::Result<Option<S
     Ok(None)
 }
 
+enum FieldSearchable {
+    NotSearchable,
+    SearchableDefault,
+    SearchableWithWeight(String),
+}
+
 /// Parse the field-level weight from `#[searchable(weight = "...")]`
-fn parse_field_searchable_weight(field: &syn::Field) -> syn::Result<Option<Option<String>>> {
+fn parse_field_searchable_weight(field: &syn::Field) -> syn::Result<FieldSearchable> {
     for attr in &field.attrs {
         if attr.path().is_ident("searchable") {
             if matches!(attr.meta, syn::Meta::Path(_)) {
-                return Ok(Some(None));
+                return Ok(FieldSearchable::SearchableDefault);
             }
             let mut weight = None;
             attr.parse_nested_meta(|meta| {
@@ -111,10 +117,13 @@ fn parse_field_searchable_weight(field: &syn::Field) -> syn::Result<Option<Optio
                     Err(meta.error("unsupported field searchable attribute"))
                 }
             })?;
-            return Ok(Some(weight));
+            return Ok(weight.map_or(
+                FieldSearchable::SearchableDefault,
+                FieldSearchable::SearchableWithWeight,
+            ));
         }
     }
-    Ok(None)
+    Ok(FieldSearchable::NotSearchable)
 }
 
 #[derive(Clone, Copy)]
@@ -454,9 +463,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         Err(err) => return err.to_compile_error(),
     };
     let is_searchable = searchable_lang.is_some();
-    let search_language = searchable_lang
-        .clone()
-        .unwrap_or_else(|| "simple".to_string());
+    let search_language = searchable_lang.unwrap_or_else(|| "simple".to_string());
     let filtered_outer_attrs: Vec<&syn::Attribute> = outer_attrs
         .iter()
         .filter(|a| !a.path().is_ident("searchable"))
@@ -472,29 +479,35 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut search_field_weights = Vec::new();
 
     for field in &all_fields {
-        if let Some(weight_opt) = match parse_field_searchable_weight(field) {
-            Ok(w) => w,
+        match parse_field_searchable_weight(field) {
+            Ok(FieldSearchable::NotSearchable) => {}
+            Ok(weight_type) => {
+                let field_ident = field.ident.as_ref().unwrap();
+                let weight = match weight_type {
+                    FieldSearchable::SearchableWithWeight(w) => w,
+                    FieldSearchable::SearchableDefault | FieldSearchable::NotSearchable => {
+                        "D".to_string()
+                    }
+                };
+                if weight.len() != 1 {
+                    return syn::Error::new_spanned(
+                        field_ident,
+                        "searchable weight must be a single character (A, B, C, or D)",
+                    )
+                    .to_compile_error();
+                }
+                let weight_char = weight.chars().next().unwrap();
+                if !['A', 'B', 'C', 'D'].contains(&weight_char) {
+                    return syn::Error::new_spanned(
+                        field_ident,
+                        "searchable weight must be A, B, C, or D",
+                    )
+                    .to_compile_error();
+                }
+                search_field_names.push(field_ident.to_string());
+                search_field_weights.push(weight_char);
+            }
             Err(err) => return err.to_compile_error(),
-        } {
-            let field_ident = field.ident.as_ref().unwrap();
-            let weight = weight_opt.unwrap_or_else(|| "D".to_string());
-            if weight.len() != 1 {
-                return syn::Error::new_spanned(
-                    field_ident,
-                    "searchable weight must be a single character (A, B, C, or D)",
-                )
-                .to_compile_error();
-            }
-            let weight_char = weight.chars().next().unwrap();
-            if !['A', 'B', 'C', 'D'].contains(&weight_char) {
-                return syn::Error::new_spanned(
-                    field_ident,
-                    "searchable weight must be A, B, C, or D",
-                )
-                .to_compile_error();
-            }
-            search_field_names.push(field_ident.to_string());
-            search_field_weights.push(weight_char);
         }
     }
 
