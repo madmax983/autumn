@@ -23,6 +23,7 @@ pub const DEFAULT_FILTER_KEYS: &[&str] = &[
 #[derive(Debug, Clone)]
 pub struct ParameterFilter {
     keys: BTreeSet<String>,
+    normalized_keys: BTreeSet<String>,
 }
 
 impl Default for ParameterFilter {
@@ -33,16 +34,35 @@ impl Default for ParameterFilter {
 
 impl ParameterFilter {
     pub fn new(additional: &[String], opt_out_defaults: &[String]) -> Self {
+        let opt_out_defaults: BTreeSet<String> = opt_out_defaults
+            .iter()
+            .filter_map(|key| normalize_key(key))
+            .collect();
+
         let mut keys = BTreeSet::new();
         for key in DEFAULT_FILTER_KEYS {
-            if !opt_out_defaults.iter().any(|v| v.eq_ignore_ascii_case(key)) {
+            let Some(normalized_default) = normalize_key(key) else {
+                continue;
+            };
+            if !opt_out_defaults.contains(&normalized_default) {
                 keys.insert(key.to_ascii_lowercase());
             }
         }
         for key in additional {
-            keys.insert(key.to_ascii_lowercase());
+            if let Some(key) = normalize_key(key) {
+                keys.insert(key);
+            }
         }
-        Self { keys }
+
+        let normalized_keys = keys
+            .iter()
+            .filter_map(|k| normalize_key(k))
+            .collect::<BTreeSet<_>>();
+
+        Self {
+            keys,
+            normalized_keys,
+        }
     }
 
     pub fn scrub_json(&self, value: &Value) -> Value {
@@ -66,8 +86,24 @@ impl ParameterFilter {
     }
 
     pub fn matches_key(&self, key: &str) -> bool {
-        let k = key.to_ascii_lowercase();
-        self.keys.iter().any(|item| item == &k || k.contains(item))
+        let Some(normalized) = normalize_key(key) else {
+            return false;
+        };
+        self.keys.contains(&normalized) || self.normalized_keys.contains(&normalized)
+    }
+}
+
+fn normalize_key(key: &str) -> Option<String> {
+    let normalized: String = key
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .flat_map(char::to_lowercase)
+        .collect();
+
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
     }
 }
 
@@ -89,11 +125,12 @@ mod tests {
     }
 
     #[test]
-    fn case_insensitive_and_substring_match() {
+    fn matching_is_case_insensitive_and_exact() {
         let filter = ParameterFilter::default();
         assert!(filter.matches_key("PASSWORD"));
-        assert!(filter.matches_key("customer_password"));
-        assert!(filter.matches_key("auth_token_v2"));
+        assert!(!filter.matches_key("customer_password"));
+        assert!(!filter.matches_key("assignment"));
+        assert!(!filter.matches_key("broken"));
     }
 
     #[test]
@@ -103,5 +140,21 @@ mod tests {
         let out = filter.scrub_json(&payload);
         assert_eq!(out["password"], "open");
         assert_eq!(out["pin"], FILTERED_PLACEHOLDER);
+    }
+
+    #[test]
+    fn empty_custom_key_does_not_scrub_everything() {
+        let filter = ParameterFilter::new(&["".to_owned()], &[]);
+        assert!(!filter.matches_key("email"));
+        assert!(!filter.matches_key("anything"));
+    }
+
+    #[test]
+    fn api_key_variants_match_after_normalization() {
+        let filter = ParameterFilter::default();
+        assert!(filter.matches_key("api_key"));
+        assert!(filter.matches_key("apiKey"));
+        assert!(filter.matches_key("apikey"));
+        assert!(filter.matches_key("API-KEY"));
     }
 }
