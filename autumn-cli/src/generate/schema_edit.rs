@@ -126,28 +126,25 @@ pub enum MigrationShape {
 #[must_use]
 pub fn detect_migration_shape(pascal_name: &str) -> MigrationShape {
     if let Some(rest) = pascal_name.strip_prefix("AddSearchTo") {
-        if rest.contains("To") {
-            return MigrationShape::Empty;
+        if split_on_keyword(rest, "To").is_none() {
+            return MigrationShape::AddSearch {
+                table: normalize_table_name(rest),
+            };
         }
-        return MigrationShape::AddSearch {
-            table: normalize_table_name(rest),
-        };
     }
     if let Some(rest) = pascal_name.strip_prefix("AddSearchableTo") {
-        if rest.contains("To") {
-            return MigrationShape::Empty;
+        if split_on_keyword(rest, "To").is_none() {
+            return MigrationShape::AddSearch {
+                table: normalize_table_name(rest),
+            };
         }
-        return MigrationShape::AddSearch {
-            table: normalize_table_name(rest),
-        };
     }
     if let Some(rest) = pascal_name.strip_prefix("AddSearchVectorTo") {
-        if rest.contains("To") {
-            return MigrationShape::Empty;
+        if split_on_keyword(rest, "To").is_none() {
+            return MigrationShape::AddSearch {
+                table: normalize_table_name(rest),
+            };
         }
-        return MigrationShape::AddSearch {
-            table: normalize_table_name(rest),
-        };
     }
 
     if let Some(rest) = pascal_name.strip_prefix("Add")
@@ -690,9 +687,20 @@ pub fn add_search_down_sql(table: &str) -> String {
     out
 }
 
-/// Strip plural endings to guess the model name from a table name.
-#[must_use]
 pub fn singularize(s: &str) -> String {
+    if let Some(stripped) = s.strip_suffix("people") {
+        return format!("{stripped}person");
+    }
+    if let Some(stripped) = s.strip_suffix("children") {
+        return format!("{stripped}child");
+    }
+    if let Some(stripped) = s.strip_suffix("men") {
+        return format!("{stripped}man");
+    }
+    if let Some(stripped) = s.strip_suffix("women") {
+        return format!("{stripped}woman");
+    }
+
     if let Some(stripped) = s.strip_suffix("ies") {
         format!("{stripped}y")
     } else if let Some(stripped) = s.strip_suffix("es") {
@@ -757,30 +765,78 @@ pub fn parse_model_search_config(content: &str) -> Option<(String, Vec<(String, 
     let mut language = "simple".to_string();
     let mut fields = Vec::new();
 
-    // Restrict FTS language search to the struct-level #[searchable] attribute (preceding `struct`)
-    if let Some(struct_pos) = clean_content.find("struct ") {
-        let before_struct = &clean_content[..struct_pos];
-        if let Some(pos) = before_struct.find("#[searchable") {
-            let attr_chunk = &before_struct[pos..];
-            if let Some(close_bracket) = attr_chunk.find(']') {
-                let attr_content = &attr_chunk[..close_bracket];
-                if let Some(lang_pos) = attr_content.find("language") {
-                    let after_lang = &attr_content[lang_pos + "language".len()..];
-                    if let Some(eq_pos) = after_lang.find('=') {
-                        let after_eq = &after_lang[eq_pos + 1..];
-                        if let Some(quote_start) = after_eq.find('"') {
-                            let after_quote = &after_eq[quote_start + 1..];
-                            if let Some(quote_end) = after_quote.find('"') {
-                                language = after_quote[..quote_end].to_string();
-                            }
+    // 1. Locate the model struct position anchored by #[model] or #[autumn_web::model]
+    let mut model_pos = clean_content.find("#[model");
+    if model_pos.is_none() {
+        model_pos = clean_content.find("#[autumn_web::model");
+    }
+
+    let struct_pos = if let Some(m_pos) = model_pos {
+        if let Some(struct_offset) = clean_content[m_pos..].find("struct ") {
+            m_pos + struct_offset
+        } else {
+            return None;
+        }
+    } else {
+        // Fallback to first struct in file if #[model] attribute is completely missing
+        clean_content.find("struct ")?
+    };
+
+    // 2. Restrict FTS language search to the struct-level #[searchable] attribute (preceding our struct)
+    let before_struct = &clean_content[..struct_pos];
+    let mut rest_before = before_struct;
+    while let Some(pos) = rest_before.find("#[searchable") {
+        let next_char = rest_before.as_bytes().get(pos + "#[searchable".len());
+        let is_boundary =
+            next_char.map_or(true, |&c| c == b']' || c == b'(' || c.is_ascii_whitespace());
+        if !is_boundary {
+            rest_before = &rest_before[pos + "#[searchable".len()..];
+            continue;
+        }
+        let attr_chunk = &rest_before[pos..];
+        if let Some(close_bracket) = attr_chunk.find(']') {
+            let attr_content = &attr_chunk[..close_bracket];
+            if let Some(lang_pos) = attr_content.find("language") {
+                let after_lang = &attr_content[lang_pos + "language".len()..];
+                if let Some(eq_pos) = after_lang.find('=') {
+                    let after_eq = &after_lang[eq_pos + 1..];
+                    if let Some(quote_start) = after_eq.find('"') {
+                        let after_quote = &after_eq[quote_start + 1..];
+                        if let Some(quote_end) = after_quote.find('"') {
+                            language = after_quote[..quote_end].to_string();
                         }
                     }
                 }
             }
         }
+        break;
     }
 
-    let mut rest = &clean_content[..];
+    // 3. Extract the target model's struct body definition by matching structural braces
+    let mut struct_body = "";
+    if let Some(open_brace_offset) = clean_content[struct_pos..].find('{') {
+        let open_brace_pos = struct_pos + open_brace_offset;
+        let mut brace_count = 1;
+        let mut close_brace_pos = None;
+        let struct_body_chars = clean_content[open_brace_pos + 1..].char_indices();
+        for (idx, ch) in struct_body_chars {
+            if ch == '{' {
+                brace_count += 1;
+            } else if ch == '}' {
+                brace_count -= 1;
+                if brace_count == 0 {
+                    close_brace_pos = Some(open_brace_pos + 1 + idx);
+                    break;
+                }
+            }
+        }
+        if let Some(end_pos) = close_brace_pos {
+            struct_body = &clean_content[open_brace_pos + 1..end_pos];
+        }
+    }
+
+    // 4. Restrict FTS fields loop to scan only inside the struct body
+    let mut rest = struct_body;
     while let Some(pos) = rest.find("#[searchable") {
         // Enforce word boundaries on the #[searchable] prefix check
         let next_char = rest.as_bytes().get(pos + "#[searchable".len());
@@ -1426,5 +1482,58 @@ pub struct SearchRecord {
         assert_eq!(singularize("statuses"), "status");
         assert_eq!(singularize("aliases"), "alias");
         assert_eq!(singularize("buses"), "bus");
+    }
+
+    #[test]
+    fn test_singularize_irregular_plurals() {
+        assert_eq!(singularize("people"), "person");
+        assert_eq!(singularize("salespeople"), "salesperson");
+        assert_eq!(singularize("children"), "child");
+        assert_eq!(singularize("supermen"), "superman");
+        assert_eq!(singularize("women"), "woman");
+    }
+
+    #[test]
+    fn test_parse_model_search_config_helper_structs() {
+        let content = r#"
+pub struct HelperOne {
+    pub a: i32,
+}
+
+#[autumn_web::model(table = "pages")]
+#[searchable(language = "english")]
+pub struct Page {
+    #[id]
+    pub id: i64,
+    #[searchable(weight = "A")]
+    pub title: String,
+}
+
+pub struct HelperTwo {
+    #[searchable(weight = "B")]
+    pub b: String,
+}
+"#;
+        let (lang, fields) = parse_model_search_config(content).unwrap();
+        assert_eq!(lang, "english");
+        assert_eq!(fields, vec![("title".to_string(), 'A')]);
+    }
+
+    #[test]
+    fn test_detect_migration_shape_to_tables() {
+        // Tables starting with "To" should match FTS
+        match detect_migration_shape("AddSearchToTodos") {
+            MigrationShape::AddSearch { table } => assert_eq!(table, "todos"),
+            other => panic!("expected AddSearch, got {other:?}"),
+        }
+        match detect_migration_shape("AddSearchToTopics") {
+            MigrationShape::AddSearch { table } => assert_eq!(table, "topics"),
+            other => panic!("expected AddSearch, got {other:?}"),
+        }
+        // Normal column additions starting with AddSearch should fall through to AddColumns
+        match detect_migration_shape("AddSearchTokenToPosts") {
+            MigrationShape::AddColumns { table } => assert_eq!(table, "posts"),
+            other => panic!("expected AddColumns, got {other:?}"),
+        }
     }
 }

@@ -5758,6 +5758,17 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {}
     };
 
+    let search_compile_check = if config.searchable {
+        quote! {
+            const _: () = {
+                fn assert_searchable<T: ::autumn_web::repository::AutumnSearchableModel>() {}
+                let _ = assert_searchable::<#model_name>;
+            };
+        }
+    } else {
+        quote! {}
+    };
+
     let search_impl_methods = if config.searchable {
         let tenant_id_setup = if config.tenant_scoped {
             quote! {
@@ -6212,6 +6223,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         #upsert_execution_ext_impl
 
         #correlate_ext_impl
+
+        #search_compile_check
     }
 }
 

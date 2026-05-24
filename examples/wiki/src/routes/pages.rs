@@ -93,7 +93,7 @@ pub async fn list(repo: PgPageRepository) -> AutumnResult<Markup> {
             div class="mb-6 bg-white p-4 rounded shadow flex items-center" {
                 input type="search" name="q" placeholder="Search pages..."
                       hx-get="/search" hx-trigger="keyup changed delay:300ms, search"
-                      hx-target="#search-results" hx-indicator="#search-indicator"
+                      hx-target="#search-results" hx-swap="outerHTML" hx-indicator="#search-indicator"
                       class="flex-grow border rounded px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-emerald-500";
                 span id="search-indicator" class="htmx-indicator ml-3 text-sm text-gray-400 hidden" {
                     "Searching..."
