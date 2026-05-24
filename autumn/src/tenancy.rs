@@ -1,3 +1,19 @@
+//! Multi-tenancy support and request scoping.
+//!
+//! This module provides middleware and task-local state for determining
+//! and storing the active tenant context for a given request.
+//!
+//! The tenant ID can be extracted from various sources such as:
+//! - Subdomains (e.g., `tenant1.example.com`)
+//! - Path segments
+//! - HTTP Headers
+//! - JWT claims
+//!
+//! Once extracted, the tenant ID is stored in a task-local variable
+//! ([`CURRENT_TENANT`]) making it ambiently available to the
+//! `#[model]` repository macros and other downstream layers without
+//! requiring it to be explicitly passed as a parameter everywhere.
+
 use axum::{
     extract::State,
     http::Request,
@@ -36,7 +52,20 @@ impl axum::extract::FromRequestParts<crate::AppState> for Tenant {
     }
 }
 
-// Helper to run in-test tenancy contexts
+/// Helper to run a future within a specific tenant context.
+///
+/// This is primarily used in tests to mock the current tenant ID
+/// or in background jobs where a request context is not available.
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// use autumn_web::tenancy::with_tenant;
+///
+/// let result = with_tenant("tenant-123".to_string(), async {
+///     // Code running here will see "tenant-123" as the current tenant
+/// }).await;
+/// ```
 pub async fn with_tenant<F, R>(tenant_id: String, future: F) -> R
 where
     F: Future<Output = R>,
@@ -275,7 +304,15 @@ pub async fn extract_tenant_from_parts(
     }
 }
 
-// Tenancy middleware for Axum requests
+/// Axum middleware that extracts and injects the tenant context.
+///
+/// This middleware intercepts incoming requests, extracts the tenant ID
+/// based on the configured strategy (e.g., subdomain, header, JWT), and
+/// injects it into a task-local variable where it can be accessed by
+/// downstream handlers and repositories.
+///
+/// It also wraps the response body to ensure the tenant context is
+/// preserved when polling streaming responses.
 pub async fn tenancy_middleware(
     State(state): State<crate::AppState>,
     request: Request<axum::body::Body>,

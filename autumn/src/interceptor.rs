@@ -1,7 +1,17 @@
+//! Global interceptor traits for instrumenting framework actions.
+//!
+//! Interceptors allow you to wrap core framework behaviors (like sending emails
+//! or enqueuing jobs) with custom logic, such as observability spans, metric
+//! recording, or global error handling.
+
 #[cfg(feature = "oauth2")]
 use std::sync::Arc;
 
 #[cfg(feature = "mail")]
+/// Trait for intercepting outbound email delivery.
+///
+/// Implementers can inspect or modify the [`Mail`](crate::mail::Mail) before it is sent,
+/// or execute logic before and after the delivery attempt (e.g. for metrics).
 pub trait MailInterceptor: Send + Sync + 'static {
     fn intercept<'a>(
         &'a self,
@@ -14,6 +24,10 @@ pub trait MailInterceptor: Send + Sync + 'static {
     >;
 }
 
+/// Trait for intercepting background job enqueue and execution.
+///
+/// Implementers can observe or wrap the lifecycle of background jobs,
+/// which is useful for distributed tracing or custom logging.
 pub trait JobInterceptor: Send + Sync + 'static {
     fn intercept_enqueue<'a>(
         &'a self,
@@ -35,11 +49,16 @@ pub trait JobInterceptor: Send + Sync + 'static {
 }
 
 #[derive(Debug, Clone)]
+/// Context provided when a database connection is checked out.
 pub struct DbCheckoutContext {
     pub pool_name: String,
 }
 
 #[cfg(feature = "db")]
+/// Trait for intercepting database connection pool checkouts.
+///
+/// Implementers can observe connection acquisition, which is useful
+/// for measuring queue wait times or injecting session-level settings.
 pub trait DbConnectionInterceptor: Send + Sync + 'static {
     fn intercept_checkout<'a>(
         &'a self,
@@ -63,6 +82,10 @@ pub trait DbConnectionInterceptor: Send + Sync + 'static {
 }
 
 #[cfg(feature = "ws")]
+/// Trait for intercepting WebSocket channel publications.
+///
+/// Implementers can inspect or modify messages before they are broadcast,
+/// or enforce authorization checks on published topics.
 pub trait ChannelsInterceptor: Send + Sync + 'static {
     /// Intercepts a channel message publication.
     ///
@@ -85,6 +108,10 @@ pub type HttpInterceptorFuture<'a> = std::pin::Pin<
 >;
 
 #[cfg(feature = "oauth2")]
+/// Trait for intercepting outbound HTTP requests made by the framework.
+///
+/// Primarily used by the `oauth2` feature to inject tracing headers
+/// or sign outbound requests.
 pub trait HttpInterceptor: Send + Sync + 'static {
     fn intercept<'a>(
         &'a self,

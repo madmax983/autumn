@@ -1,3 +1,20 @@
+//! Idempotency middleware for preventing duplicate mutations.
+//!
+//! This module provides the `IdempotencyLayer` which prevents duplicate
+//! processing of state-mutating requests (e.g. POST, PATCH) when a client
+//! retries an operation due to a network timeout.
+//!
+//! It achieves this by storing the response from the first request
+//! associated with an `Idempotency-Key` header and replaying that
+//! exact response if the same key is seen again, without executing the
+//! underlying handler a second time.
+//!
+//! # Warning on Body Streaming
+//!
+//! Because the middleware needs to hash the request body to detect conflicts,
+//! **the entire request body is buffered into memory**. This makes it unsuitable
+//! for endpoints that accept massive file uploads.
+
 use bytes::Bytes;
 use futures::StreamExt as FuturesStreamExt;
 
