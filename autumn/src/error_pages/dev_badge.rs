@@ -24,6 +24,10 @@ pub struct DevBadgeContext {
     pub request_id: Option<String>,
     /// Optional file/line info if available.
     pub source_location: Option<String>,
+    /// Optional query string.
+    pub query: Option<String>,
+    /// Scrubbed request headers.
+    pub headers: serde_json::Value,
 }
 
 /// Generate the dev error badge HTML snippet.
@@ -41,6 +45,8 @@ pub fn dev_error_badge_html(ctx: &DevBadgeContext) -> Markup {
     let path = &ctx.path;
     let request_id = ctx.request_id.as_deref().unwrap_or("n/a");
     let source_loc = ctx.source_location.as_deref().unwrap_or("");
+    let query = ctx.query.as_deref().unwrap_or("n/a");
+    let headers = ctx.headers.to_string();
 
     html! {
         (PreEscaped(DEV_BADGE_STYLES))
@@ -84,6 +90,14 @@ pub fn dev_error_badge_html(ctx: &DevBadgeContext) -> Markup {
                     div class="autumn-dev-overlay-section" {
                         div class="autumn-dev-overlay-label" { "Request ID" }
                         div class="autumn-dev-overlay-value autumn-dev-mono" { (request_id) }
+                    }
+                    div class="autumn-dev-overlay-section" {
+                        div class="autumn-dev-overlay-label" { "Query" }
+                        div class="autumn-dev-overlay-value autumn-dev-mono" { (query) }
+                    }
+                    div class="autumn-dev-overlay-section" {
+                        div class="autumn-dev-overlay-label" { "Headers" }
+                        div class="autumn-dev-overlay-value autumn-dev-mono" { (headers) }
                     }
                     @if !source_loc.is_empty() {
                         div class="autumn-dev-overlay-section" {
