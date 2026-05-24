@@ -396,9 +396,14 @@ fn origin_matches_request(origin: &str, headers: &http::HeaderMap) -> bool {
         return false;
     };
 
+    #[allow(clippy::double_ended_iterator_last)]
     let expected_host = headers
-        .get("x-forwarded-host")
-        .and_then(|v| v.to_str().ok())
+        .get_all("x-forwarded-host")
+        .into_iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|s| s.split(','))
+        .map(str::trim)
+        .last()
         .or_else(|| {
             headers
                 .get(http::header::HOST)
@@ -412,14 +417,17 @@ fn origin_matches_request(origin: &str, headers: &http::HeaderMap) -> bool {
     }
 
     if let Some(scheme) = headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
+        .get_all("x-forwarded-proto")
+        .into_iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|s| s.split(','))
+        .map(str::trim)
+        .next()
     {
         // Multiple `X-Forwarded-Proto` values can be chained by
         // intermediaries; the leftmost (client-facing) is the one
         // that matters here.
-        let outermost = scheme.split(',').next().unwrap_or(scheme).trim();
-        return outermost.eq_ignore_ascii_case(origin_scheme);
+        return scheme.eq_ignore_ascii_case(origin_scheme);
     }
 
     // No scheme signal: host:port match is the best we can do.

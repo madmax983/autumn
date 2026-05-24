@@ -10,6 +10,7 @@ pub mod csrf_path_traversal;
 pub mod csrf_timing;
 pub mod ctf;
 pub mod fallback_middleware_bypass;
+pub mod method_override_xfh_bypass;
 pub mod rate_limit_xff_bypass;
 pub mod session_exhaustion;
 pub mod session_fixation;
