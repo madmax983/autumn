@@ -1267,7 +1267,14 @@ fn apply_middleware(
     //   SecurityHeaders -> RequestId -> [user layers, non-static build] ->
     //   RateLimit -> CSRF -> CORS -> handler
     let router = router
-        .layer(crate::middleware::error_page_filter::ErrorPageContextLayer)
+        .layer(
+            crate::middleware::error_page_filter::ErrorPageContextLayer {
+                parameter_filter: crate::log::filter::ParameterFilter::new(
+                    &config.log.filter_parameters,
+                    &config.log.unfilter_parameters,
+                ),
+            },
+        )
         .layer(ExceptionFilterLayer::new(all_filters))
         .layer(crate::middleware::MetricsLayer::new(state.metrics.clone()));
 

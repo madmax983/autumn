@@ -71,19 +71,25 @@ pub struct ErrorPageRequestContext {
 /// This layer runs before the exception filter and stores [`WantsHtml`]
 /// and [`ErrorPageRequestContext`] in the response extensions.
 #[derive(Clone)]
-pub struct ErrorPageContextLayer;
+pub struct ErrorPageContextLayer {
+    pub parameter_filter: crate::log::filter::ParameterFilter,
+}
 
 impl<S> tower::Layer<S> for ErrorPageContextLayer {
     type Service = ErrorPageContextService<S>;
 
     fn layer(&self, inner: S) -> Self::Service {
-        ErrorPageContextService { inner }
+        ErrorPageContextService {
+            inner,
+            parameter_filter: self.parameter_filter.clone(),
+        }
     }
 }
 
 #[derive(Clone)]
 pub struct ErrorPageContextService<S> {
     inner: S,
+    parameter_filter: crate::log::filter::ParameterFilter,
 }
 
 impl<S, ReqBody> tower::Service<axum::http::Request<ReqBody>> for ErrorPageContextService<S>
@@ -110,7 +116,7 @@ where
             .map(std::string::ToString::to_string);
 
         let query = uri.query().map(str::to_owned);
-        let headers = scrub_headers(req.headers());
+        let headers = scrub_headers(req.headers(), &self.parameter_filter);
 
         ErrorPageContextFuture {
             inner: self.inner.call(req),
@@ -250,15 +256,17 @@ pub fn accept_prefers_html(headers: &axum::http::HeaderMap) -> bool {
     }
 }
 
-
-fn scrub_headers(headers: &axum::http::HeaderMap) -> serde_json::Value {
+fn scrub_headers(
+    headers: &axum::http::HeaderMap,
+    parameter_filter: &crate::log::filter::ParameterFilter,
+) -> serde_json::Value {
     let mut map = serde_json::Map::new();
     for (name, value) in headers {
         let key = name.as_str().to_owned();
         let val = value.to_str().unwrap_or("<non-utf8>").to_owned();
         map.insert(key, serde_json::Value::String(val));
     }
-    crate::log::filter::scrub(&serde_json::Value::Object(map))
+    parameter_filter.scrub_json(&serde_json::Value::Object(map))
 }
 
 /// 404 fallback handler for unmatched routes.
@@ -476,7 +484,9 @@ mod tests {
                 }),
             )
             .fallback(fallback_404_handler)
-            .layer(ErrorPageContextLayer)
+            .layer(ErrorPageContextLayer {
+                parameter_filter: crate::log::filter::ParameterFilter::default(),
+            })
             .layer(ExceptionFilterLayer::new(filters))
     }
 
@@ -655,7 +665,9 @@ mod tests {
                 "/err",
                 get(|| async { Err::<String, AutumnError>(AutumnError::not_found_msg("nope")) }),
             )
-            .layer(ErrorPageContextLayer)
+            .layer(ErrorPageContextLayer {
+                parameter_filter: crate::log::filter::ParameterFilter::default(),
+            })
             .layer(ExceptionFilterLayer::new(filters));
 
         let resp = app
@@ -707,7 +719,9 @@ mod tests {
                 "/err",
                 get(|| async { Err::<String, AutumnError>(AutumnError::not_found_msg("nope")) }),
             )
-            .layer(ErrorPageContextLayer)
+            .layer(ErrorPageContextLayer {
+                parameter_filter: crate::log::filter::ParameterFilter::default(),
+            })
             .layer(ExceptionFilterLayer::new(filters));
 
         let resp = app
@@ -831,7 +845,6 @@ mod tests {
     }
 
     #[tokio::test]
-
     #[tokio::test]
     async fn dev_badge_scrubs_sensitive_headers_on_form_post() {
         let app = test_router_with_error_pages(true);
@@ -857,6 +870,47 @@ mod tests {
 
         assert!(body_str.contains("\"authorization\":\"[FILTERED]\""));
         assert!(body_str.contains("Query"));
+    }
+
+    #[tokio::test]
+    async fn dev_badge_uses_configured_custom_filter_parameters() {
+        let renderer = error_pages::default_renderer();
+        let error_page_filter = ErrorPageFilter {
+            renderer,
+            is_dev: true,
+        };
+        let filters: Vec<Arc<dyn crate::middleware::ExceptionFilter>> =
+            vec![Arc::new(error_page_filter)];
+
+        let app = Router::new()
+            .fallback(fallback_404_handler)
+            .layer(ErrorPageContextLayer {
+                parameter_filter: crate::log::filter::ParameterFilter::new(
+                    &["pin".to_owned()],
+                    &[],
+                ),
+            })
+            .layer(ExceptionFilterLayer::new(filters));
+
+        let response = tower::ServiceExt::oneshot(
+            app,
+            Request::builder()
+                .method("POST")
+                .uri("/nope")
+                .header("accept", "text/html")
+                .header("pin", "1234")
+                .body(Body::from("x=1"))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("bytes");
+        let body_str = String::from_utf8(body.to_vec()).expect("utf8");
+
+        assert!(body_str.contains("\"pin\":\"[FILTERED]\""));
     }
 
     async fn fallback_404_handler_keeps_non_get_favicon_requests_as_not_found() {

@@ -107,7 +107,6 @@ fn normalize_key(key: &str) -> Option<String> {
     }
 }
 
-
 pub fn normalized_opt_out_defaults(opt_out_defaults: &[String]) -> Vec<String> {
     let defaults: BTreeSet<String> = DEFAULT_FILTER_KEYS
         .iter()
@@ -169,7 +168,11 @@ mod tests {
 
     #[test]
     fn reports_opted_out_defaults() {
-        let opts = vec!["PASSWORD".to_owned(), "missing".to_owned(), "apiKey".to_owned()];
+        let opts = vec![
+            "PASSWORD".to_owned(),
+            "missing".to_owned(),
+            "apiKey".to_owned(),
+        ];
         let normalized = normalized_opt_out_defaults(&opts);
         assert_eq!(normalized, vec!["apikey".to_owned(), "password".to_owned()]);
     }

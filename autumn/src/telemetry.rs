@@ -225,7 +225,8 @@ pub fn init(
         eprintln!("Warning: {warning}");
     }
 
-    let opted_out_defaults = crate::log::filter::normalized_opt_out_defaults(&log.unfilter_parameters);
+    let opted_out_defaults =
+        crate::log::filter::normalized_opt_out_defaults(&log.unfilter_parameters);
     if !opted_out_defaults.is_empty() {
         eprintln!(
             "Warning: log.unfilter_parameters opted out built-in sensitive keys: {}",
