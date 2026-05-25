@@ -494,6 +494,22 @@ pub struct HeadersConfig {
     /// Example: `"camera=(), microphone=(), geolocation=()"`.
     #[serde(default)]
     pub permissions_policy: String,
+
+    /// Per-request CSP nonce configuration.
+    ///
+    /// When enabled, a fresh cryptographically-random nonce is generated for
+    /// every request and injected into `script-src` and `style-src` of the
+    /// default `Content-Security-Policy`. The nonce is also available via the
+    /// [`CspNonce`] extractor for use in templates.
+    ///
+    /// Apps that set an explicit `content_security_policy` string opt out of
+    /// automatic nonce injection automatically — their custom CSP is used
+    /// verbatim, but the nonce is still generated and available via the
+    /// extractor.
+    ///
+    /// [`CspNonce`]: crate::security::CspNonce
+    #[serde(default)]
+    pub csp_nonce: CspNonceConfig,
 }
 
 impl Default for HeadersConfig {
@@ -508,6 +524,7 @@ impl Default for HeadersConfig {
             content_security_policy: default_content_security_policy(),
             referrer_policy: default_referrer_policy(),
             permissions_policy: String::new(),
+            csp_nonce: CspNonceConfig::default(),
         }
     }
 }
@@ -846,6 +863,35 @@ impl Default for UploadConfig {
             allowed_mime_types: Vec::new(),
         }
     }
+}
+
+/// Per-request Content Security Policy nonce configuration.
+///
+/// When `enabled = true`, the security-headers middleware generates a fresh
+/// cryptographically-random nonce (≥128 bits, URL-safe base64) for every
+/// request. The nonce is:
+///
+/// 1. Injected into `script-src` and `style-src` of the **default** CSP as
+///    `'nonce-<value>'`, replacing `'unsafe-inline'`.
+/// 2. Inserted into request extensions so handlers can extract it via
+///    [`CspNonce`](crate::security::CspNonce).
+///
+/// Apps that override `content_security_policy` with an explicit string
+/// automatically opt out of nonce injection for the header — the custom CSP
+/// is used verbatim — but the nonce is still generated and available via the
+/// extractor for template use.
+///
+/// # `autumn.toml` example
+///
+/// ```toml
+/// [security.headers.csp_nonce]
+/// enabled = true
+/// ```
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct CspNonceConfig {
+    /// Enable per-request CSP nonce generation. Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 // ── Default value functions ────────────────────────────────────────
@@ -1430,5 +1476,41 @@ mod tests {
         let sig = keys.sign(b"msg");
         assert_eq!(sig.len(), 64, "HMAC-SHA256 hex is 64 chars");
         assert!(sig.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    // ── CspNonceConfig (RED phase) ────────────────────────────────────────────
+
+    #[test]
+    fn csp_nonce_config_defaults_to_disabled() {
+        let config = CspNonceConfig::default();
+        assert!(!config.enabled);
+    }
+
+    #[test]
+    fn headers_config_csp_nonce_defaults_to_disabled() {
+        let config = HeadersConfig::default();
+        assert!(!config.csp_nonce.enabled);
+    }
+
+    #[test]
+    fn csp_nonce_config_can_be_enabled_via_toml() {
+        let toml_str = r#"
+            [csp_nonce]
+            enabled = true
+        "#;
+        let config: HeadersConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.csp_nonce.enabled);
+    }
+
+    #[test]
+    fn csp_nonce_config_deserialize_standalone() {
+        let config: CspNonceConfig = toml::from_str("enabled = true").unwrap();
+        assert!(config.enabled);
+    }
+
+    #[test]
+    fn csp_nonce_config_disabled_by_default_in_standalone() {
+        let config: CspNonceConfig = toml::from_str("").unwrap();
+        assert!(!config.enabled);
     }
 }
