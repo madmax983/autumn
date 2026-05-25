@@ -727,14 +727,12 @@ pub fn singularize(s: &str) -> String {
         return "woman".to_string();
     }
     if s.ends_with("men") && !is_false_men {
-        if let Some(stripped) = s.strip_suffix("men") {
-            return format!("{stripped}man");
-        }
+        let stripped = s.strip_suffix("men").unwrap();
+        return format!("{stripped}man");
     }
     if s.ends_with("women") {
-        if let Some(stripped) = s.strip_suffix("women") {
-            return format!("{stripped}woman");
-        }
+        let stripped = s.strip_suffix("women").unwrap();
+        return format!("{stripped}woman");
     }
 
     if let Some(stripped) = s.strip_suffix("ies") {
@@ -750,20 +748,20 @@ pub fn singularize(s: &str) -> String {
             || s.ends_with("ses")
             || s.ends_with("zes")
         {
-            if s.ends_with("statuses") || s.ends_with("aliases") || s.ends_with("buses") {
-                stripped.to_owned()
-            } else if s.ends_with("sses") {
-                stripped.to_owned()
-            } else if s.ends_with("lenses") {
+            if s.ends_with("statuses")
+                || s.ends_with("aliases")
+                || s.ends_with("buses")
+                || s.ends_with("sses")
+                || s.ends_with("lenses")
+            {
                 stripped.to_owned()
             } else if s.ends_with("ases")
                 || s.ends_with("ises")
                 || s.ends_with("oses")
                 || s.ends_with("uses")
                 || s.ends_with("yses")
+                || s.ends_with("ses")
             {
-                format!("{stripped}e")
-            } else if s.ends_with("ses") {
                 format!("{stripped}e")
             } else {
                 stripped.to_owned()
@@ -819,9 +817,7 @@ fn strip_comments(src: &str) -> String {
                 j += 1;
             }
             if j < chars.len() && chars[j] == '"' {
-                for idx in i..=j {
-                    result.push(chars[idx]);
-                }
+                result.extend(&chars[i..=j]);
                 i = j + 1;
 
                 let mut closed = false;
@@ -861,12 +857,10 @@ fn strip_comments(src: &str) -> String {
             while i < chars.len() {
                 let ch = chars[i];
                 result.push(ch);
-                if ch == '\\' {
-                    if i + 1 < chars.len() {
-                        result.push(chars[i + 1]);
-                        i += 2;
-                        continue;
-                    }
+                if ch == '\\' && i + 1 < chars.len() {
+                    result.push(chars[i + 1]);
+                    i += 2;
+                    continue;
                 }
                 if ch == '"' {
                     i += 1;
@@ -916,8 +910,7 @@ fn is_matching_table_attr(attr_content: &str, table: &str) -> bool {
                 }
 
                 // 2. Try raw string literal (e.g. r"table" or r#"table"#)
-                if after_eq.starts_with('r') {
-                    let after_r = &after_eq[1..];
+                if let Some(after_r) = after_eq.strip_prefix('r') {
                     let mut hash_count = 0;
                     let bytes = after_r.as_bytes();
                     while hash_count < bytes.len() && bytes[hash_count] == b'#' {
@@ -1130,11 +1123,9 @@ pub fn parse_model_search_config_for_table(
                 i += 1;
                 while i < chars.len() {
                     let ch = chars[i];
-                    if ch == '\\' {
-                        if i + 1 < chars.len() {
-                            i += 2;
-                            continue;
-                        }
+                    if ch == '\\' && i + 1 < chars.len() {
+                        i += 2;
+                        continue;
                     }
                     if ch == '"' {
                         i += 1;

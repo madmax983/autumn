@@ -67,15 +67,14 @@ pub fn plan_migration(
             }
 
             let models_dir = project_root.join("src/models");
-            if models_dir.is_dir() {
-                if let Ok(entries) = std::fs::read_dir(&models_dir) {
-                    for entry in entries.flatten() {
-                        let path = entry.path();
-                        if path.is_file() && path.extension().is_some_and(|ext| ext == "rs") {
-                            if !candidates.contains(&path) {
-                                candidates.push(path);
-                            }
-                        }
+            if let Ok(entries) = std::fs::read_dir(models_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_file()
+                        && path.extension().is_some_and(|ext| ext == "rs")
+                        && !candidates.contains(&path)
+                    {
+                        candidates.push(path);
                     }
                 }
             }
@@ -95,22 +94,19 @@ pub fn plan_migration(
                 }
             }
 
-            let (language, fts_fields) = if let Some((_path, language, fts_fields)) = found_config {
-                (language, fts_fields)
-            } else if tried_files.is_empty() {
-                return Err(GenerateError::Config(format!(
-                    "Missing model files for table '{}'. Expected src/models/{}.rs or src/models.rs.",
-                    table, singular
-                )));
-            } else {
+            let Some((_path, language, fts_fields)) = found_config else {
+                if tried_files.is_empty() {
+                    return Err(GenerateError::Config(format!(
+                        "Missing model files for table '{table}'. Expected src/models/{singular}.rs or src/models.rs."
+                    )));
+                }
                 let files_str = tried_files
                     .iter()
                     .map(|p| p.to_string_lossy().to_string())
                     .collect::<Vec<_>>()
                     .join(", ");
                 return Err(GenerateError::Config(format!(
-                    "No #[searchable] fields configured for table '{}' in any of the checked files: [{}]",
-                    table, files_str
+                    "No #[searchable] fields configured for table '{table}' in any of the checked files: [{files_str}]"
                 )));
             };
 
