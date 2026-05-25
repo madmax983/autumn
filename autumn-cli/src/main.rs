@@ -7,6 +7,7 @@ mod dev;
 mod doctor;
 mod export;
 mod generate;
+mod maintenance;
 mod migrate;
 mod monitor;
 mod new;
@@ -70,6 +71,11 @@ enum Commands {
     Migrate {
         #[command(subcommand)]
         action: Option<MigrateCommands>,
+        /// Enable maintenance mode before running migrations and disable it
+        /// after a successful run. If migrations fail, maintenance mode stays
+        /// on so no corrupt traffic reaches the database.
+        #[arg(long)]
+        with_maintenance: bool,
     },
     /// Live monitoring dashboard for a running Autumn application
     Monitor {
@@ -277,6 +283,21 @@ enum Commands {
     #[command(subcommand, verbatim_doc_comment)]
     Credentials(CredentialsCommands),
 
+    /// Enable or disable maintenance mode without restarting the process.
+    ///
+    /// Writes (or removes) a JSON flag file that the running app polls every
+    /// 500 ms. Within one second every replica responds 503 to non-bypassed
+    /// HTTP traffic while health-check routes stay green.
+    ///
+    /// # Examples
+    ///
+    ///   autumn maintenance on --message "Migrating database"
+    ///   autumn maintenance on --readonly
+    ///   autumn maintenance on --allow-ips 10.0.0.0/8
+    ///   autumn maintenance off
+    #[command(subcommand, verbatim_doc_comment)]
+    Maintenance(MaintenanceCommands),
+
     /// Print every mounted route — method, path, handler, source, middleware.
     ///
     /// Compiles the application (debug profile) and introspects its route
@@ -355,6 +376,43 @@ enum MigrateCommands {
     ///   autumn migrate check
     #[command(verbatim_doc_comment)]
     Check,
+}
+
+/// Subcommands for `autumn maintenance`.
+#[derive(Subcommand)]
+enum MaintenanceCommands {
+    /// Enable maintenance mode: write the flag file so running replicas return 503.
+    ///
+    /// Exits 0 on success. The running app detects the flag within 500 ms.
+    ///
+    /// # Examples
+    ///
+    ///   autumn maintenance on
+    ///   autumn maintenance on --message "Upgrading database schema"
+    ///   autumn maintenance on --readonly
+    ///   autumn maintenance on --allow-ips 10.0.0.0/8 --bypass-header X-Dev-Bypass:mytoken
+    #[command(verbatim_doc_comment)]
+    On {
+        /// Human-readable message shown to users in the 503 response body.
+        #[arg(long, value_name = "MSG")]
+        message: Option<String>,
+        /// CIDR block or IP address whose requests bypass maintenance.
+        /// Repeatable: `--allow-ips 10.0.0.0/8 --allow-ips 172.16.0.1`
+        #[arg(long, value_name = "CIDR")]
+        allow_ips: Vec<String>,
+        /// Allow GET, HEAD, OPTIONS through while blocking writes.
+        #[arg(long)]
+        readonly: bool,
+        /// Bypass header in NAME:VALUE format.
+        /// Requests carrying this header+value bypass the 503.
+        /// Example: `--bypass-header X-Autumn-Maintenance-Bypass:mytoken`
+        #[arg(long, value_name = "NAME:VALUE")]
+        bypass_header: Option<String>,
+    },
+    /// Disable maintenance mode: remove the flag file so replicas resume normal traffic.
+    ///
+    /// Exits 0 on success (or when maintenance was already off).
+    Off,
 }
 
 /// Subcommands for `autumn token`.
@@ -624,14 +682,42 @@ fn run_command(command: Commands) {
             package,
             show_config,
         } => dev::run(package.as_deref(), show_config),
-        Commands::Migrate { action } => {
+        Commands::Migrate {
+            action,
+            with_maintenance,
+        } => {
             let action = match action {
                 Some(MigrateCommands::Status) => migrate::MigrateAction::Status,
                 Some(MigrateCommands::Check) => migrate::MigrateAction::Check,
                 None => migrate::MigrateAction::Run,
             };
-            migrate::run(action);
+            migrate::run(action, with_maintenance);
         }
+        Commands::Maintenance(cmd) => match cmd {
+            MaintenanceCommands::On {
+                message,
+                allow_ips,
+                readonly,
+                bypass_header,
+            } => {
+                let parsed_bypass = bypass_header.as_deref().map(|s| {
+                    maintenance::parse_bypass_header(s).unwrap_or_else(|e| {
+                        eprintln!("autumn maintenance on: {e}");
+                        std::process::exit(1);
+                    })
+                });
+                maintenance::run_on(maintenance::MaintenanceOnOptions {
+                    message: message.as_deref(),
+                    allow_ips: &allow_ips,
+                    readonly,
+                    bypass_header: parsed_bypass,
+                    flag_file: None,
+                });
+            }
+            MaintenanceCommands::Off => {
+                maintenance::run_off(None);
+            }
+        },
         Commands::Monitor { url, interval } => monitor::run(&url, interval),
         Commands::Export { url, output } => export::run(&url, &output),
         Commands::New {
@@ -1141,7 +1227,10 @@ mod tests {
     #[test]
     fn parse_migrate_subcommand() {
         let cli = Cli::try_parse_from(["autumn", "migrate"]).unwrap();
-        assert!(matches!(cli.command, Commands::Migrate { action: None }));
+        assert!(matches!(
+            cli.command,
+            Commands::Migrate { action: None, .. }
+        ));
     }
 
     #[test]
@@ -1150,7 +1239,8 @@ mod tests {
         assert!(matches!(
             cli.command,
             Commands::Migrate {
-                action: Some(MigrateCommands::Status)
+                action: Some(MigrateCommands::Status),
+                ..
             }
         ));
     }
@@ -1161,7 +1251,8 @@ mod tests {
         assert!(matches!(
             cli.command,
             Commands::Migrate {
-                action: Some(MigrateCommands::Check)
+                action: Some(MigrateCommands::Check),
+                ..
             }
         ));
     }
@@ -1169,7 +1260,10 @@ mod tests {
     #[test]
     fn parse_migrate_no_subcommand_runs_migrations() {
         let cli = Cli::try_parse_from(["autumn", "migrate"]).unwrap();
-        assert!(matches!(cli.command, Commands::Migrate { action: None }));
+        assert!(matches!(
+            cli.command,
+            Commands::Migrate { action: None, .. }
+        ));
     }
 
     #[test]
@@ -2375,5 +2469,141 @@ mod tests {
     #[test]
     fn parse_generate_mailer_without_name_is_error() {
         assert!(Cli::try_parse_from(["autumn", "generate", "mailer"]).is_err());
+    }
+
+    // ── autumn maintenance tests ───────────────────────────────────────────────
+
+    #[test]
+    fn parse_maintenance_on_defaults() {
+        let cli = Cli::try_parse_from(["autumn", "maintenance", "on"]).unwrap();
+        let Commands::Maintenance(MaintenanceCommands::On {
+            message,
+            allow_ips,
+            readonly,
+            bypass_header,
+        }) = cli.command
+        else {
+            panic!("expected maintenance on");
+        };
+        assert!(message.is_none());
+        assert!(allow_ips.is_empty());
+        assert!(!readonly);
+        assert!(bypass_header.is_none());
+    }
+
+    #[test]
+    fn parse_maintenance_on_with_message() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "maintenance",
+            "on",
+            "--message",
+            "Upgrading database",
+        ])
+        .unwrap();
+        let Commands::Maintenance(MaintenanceCommands::On { message, .. }) = cli.command else {
+            panic!("expected maintenance on");
+        };
+        assert_eq!(message.as_deref(), Some("Upgrading database"));
+    }
+
+    #[test]
+    fn parse_maintenance_on_readonly() {
+        let cli = Cli::try_parse_from(["autumn", "maintenance", "on", "--readonly"]).unwrap();
+        let Commands::Maintenance(MaintenanceCommands::On { readonly, .. }) = cli.command else {
+            panic!("expected maintenance on");
+        };
+        assert!(readonly);
+    }
+
+    #[test]
+    fn parse_maintenance_on_with_allow_ips() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "maintenance",
+            "on",
+            "--allow-ips",
+            "10.0.0.0/8",
+            "--allow-ips",
+            "192.168.1.1",
+        ])
+        .unwrap();
+        let Commands::Maintenance(MaintenanceCommands::On { allow_ips, .. }) = cli.command else {
+            panic!("expected maintenance on");
+        };
+        assert_eq!(allow_ips, vec!["10.0.0.0/8", "192.168.1.1"]);
+    }
+
+    #[test]
+    fn parse_maintenance_on_with_bypass_header() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "maintenance",
+            "on",
+            "--bypass-header",
+            "X-Bypass:secret",
+        ])
+        .unwrap();
+        let Commands::Maintenance(MaintenanceCommands::On { bypass_header, .. }) = cli.command
+        else {
+            panic!("expected maintenance on");
+        };
+        assert_eq!(bypass_header.as_deref(), Some("X-Bypass:secret"));
+    }
+
+    #[test]
+    fn parse_maintenance_off() {
+        let cli = Cli::try_parse_from(["autumn", "maintenance", "off"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Maintenance(MaintenanceCommands::Off)
+        ));
+    }
+
+    #[test]
+    fn parse_maintenance_without_subcommand_is_error() {
+        assert!(Cli::try_parse_from(["autumn", "maintenance"]).is_err());
+    }
+
+    #[test]
+    fn parse_migrate_with_maintenance() {
+        let cli =
+            Cli::try_parse_from(["autumn", "migrate", "--with-maintenance"]).unwrap();
+        let Commands::Migrate {
+            with_maintenance, ..
+        } = cli.command
+        else {
+            panic!("expected migrate");
+        };
+        assert!(with_maintenance);
+    }
+
+    #[test]
+    fn parse_migrate_without_maintenance_defaults_false() {
+        let cli = Cli::try_parse_from(["autumn", "migrate"]).unwrap();
+        let Commands::Migrate {
+            with_maintenance, ..
+        } = cli.command
+        else {
+            panic!("expected migrate");
+        };
+        assert!(!with_maintenance);
+    }
+
+    #[test]
+    fn parse_migrate_with_maintenance_before_subcommand() {
+        // --with-maintenance is a flag on the parent Migrate command;
+        // it must appear before the subcommand name.
+        let cli =
+            Cli::try_parse_from(["autumn", "migrate", "--with-maintenance", "status"]).unwrap();
+        let Commands::Migrate {
+            action,
+            with_maintenance,
+        } = cli.command
+        else {
+            panic!("expected migrate");
+        };
+        assert!(matches!(action, Some(MigrateCommands::Status)));
+        assert!(with_maintenance);
     }
 }
