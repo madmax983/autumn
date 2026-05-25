@@ -237,11 +237,16 @@ where
                     }
                     if !is_304 {
                         if let Some(nonce) = this.dynamic_nonce.take() {
-                            let rewritten_csp =
-                                inject_nonce_into_csp(this.base_csp, &nonce, this.csp_nonce_directives);
+                            let rewritten_csp = inject_nonce_into_csp(
+                                this.base_csp,
+                                &nonce,
+                                this.csp_nonce_directives,
+                            );
                             if let Ok(val) = HeaderValue::from_str(&rewritten_csp) {
-                                resp_headers
-                                    .insert(HeaderName::from_static("content-security-policy"), val);
+                                resp_headers.insert(
+                                    HeaderName::from_static("content-security-policy"),
+                                    val,
+                                );
                             }
                         }
                     }
@@ -701,7 +706,9 @@ mod tests {
         let rewritten = inject_nonce_into_csp(base, &nonce, &directives);
         assert_eq!(
             rewritten,
-            format!("default-src 'self'; script-src 'self' 'nonce-{nonce}'; style-src 'self' 'nonce-{nonce}'")
+            format!(
+                "default-src 'self'; script-src 'self' 'nonce-{nonce}'; style-src 'self' 'nonce-{nonce}'"
+            )
         );
 
         // Case insensitivity checks
@@ -709,7 +716,9 @@ mod tests {
         let rewritten_mixed = inject_nonce_into_csp(base_mixed, &nonce, &directives);
         assert_eq!(
             rewritten_mixed,
-            format!("default-src 'self'; Script-Src 'self' 'nonce-{nonce}'; STYLE-SRC 'self' 'nonce-{nonce}'")
+            format!(
+                "default-src 'self'; Script-Src 'self' 'nonce-{nonce}'; STYLE-SRC 'self' 'nonce-{nonce}'"
+            )
         );
     }
 
@@ -751,7 +760,9 @@ mod tests {
             "csp: {csp}"
         );
         assert!(
-            csp.contains(&format!("style-src 'self' 'unsafe-inline' 'nonce-{nonce_str}'")),
+            csp.contains(&format!(
+                "style-src 'self' 'unsafe-inline' 'nonce-{nonce_str}'"
+            )),
             "csp: {csp}"
         );
     }
@@ -808,14 +819,17 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
-        
+
         let csp = response
             .headers()
             .get("content-security-policy")
             .unwrap()
             .to_str()
             .unwrap();
-        assert!(!csp.contains("'nonce-"), "csp should not contain nonce on 304: {csp}");
+        assert!(
+            !csp.contains("'nonce-"),
+            "csp should not contain nonce on 304: {csp}"
+        );
         assert!(csp.contains("default-src 'self'"), "csp: {csp}");
     }
 }
