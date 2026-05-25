@@ -755,11 +755,22 @@ pub fn singularize(s: &str) -> String {
                 || s.ends_with("lenses")
             {
                 stripped.to_owned()
+            } else if s.ends_with("yses") {
+                format!("{stripped}is")
+            } else if s == "crises" {
+                "crisis".to_string()
+            } else if s == "diagnoses" {
+                "diagnosis".to_string()
+            } else if s == "neuroses" {
+                "neurosis".to_string()
+            } else if s == "bases" {
+                "basis".to_string()
+            } else if s == "oases" {
+                "oasis".to_string()
             } else if s.ends_with("ases")
                 || s.ends_with("ises")
                 || s.ends_with("oses")
                 || s.ends_with("uses")
-                || s.ends_with("yses")
                 || s.ends_with("ses")
             {
                 format!("{stripped}e")
@@ -978,16 +989,34 @@ fn extract_diesel_column_name(attr: &str) -> Option<String> {
     }
 
     // 2. Try raw string literal e.g. r#"headline"# or r"headline"
-    let after_r = after_eq.strip_prefix('r')?;
-    let mut hash_count = 0;
-    let bytes = after_r.as_bytes();
-    while hash_count < bytes.len() && bytes[hash_count] == b'#' {
-        hash_count += 1;
+    if let Some(after_r) = after_eq.strip_prefix('r') {
+        let mut hash_count = 0;
+        let bytes = after_r.as_bytes();
+        while hash_count < bytes.len() && bytes[hash_count] == b'#' {
+            hash_count += 1;
+        }
+        let after_hashes = &after_r[hash_count..];
+        if let Some(stripped_quote) = after_hashes.strip_prefix('"') {
+            if let Some(quote_end) = stripped_quote.find('"') {
+                return Some(stripped_quote[..quote_end].to_string());
+            }
+        }
     }
-    let after_hashes = &after_r[hash_count..];
-    let stripped_quote = after_hashes.strip_prefix('"')?;
-    let quote_end = stripped_quote.find('"')?;
-    Some(stripped_quote[..quote_end].to_string())
+
+    // 3. Try unquoted identifier form e.g. column_name = headline
+    let mut id_chars = String::new();
+    for c in after_eq.chars() {
+        if c.is_alphanumeric() || c == '_' {
+            id_chars.push(c);
+        } else {
+            break;
+        }
+    }
+    if !id_chars.is_empty() {
+        return Some(id_chars);
+    }
+
+    None
 }
 
 #[must_use]
@@ -2281,5 +2310,45 @@ pub struct Comment {
         let (_, comments_fields) =
             parse_model_search_config_for_table(content_multi, "comments").unwrap();
         assert_eq!(comments_fields[0].0, "body");
+    }
+
+    #[test]
+    fn test_extract_diesel_column_name_identifier() {
+        let content_diesel = r##"
+#[autumn_web::model(table = "posts")]
+pub struct Post {
+    #[id]
+    pub id: i64,
+    #[searchable(weight = "A")]
+    #[diesel(column_name = headline)]
+    pub title: String,
+    #[diesel(column_name = content_body)]
+    #[searchable(weight = "B")]
+    pub body: String,
+}
+"##;
+        let (_, fields) = parse_model_search_config_for_table(content_diesel, "posts").unwrap();
+        assert_eq!(
+            fields,
+            vec![
+                ("headline".to_string(), 'A'),
+                ("content_body".to_string(), 'B')
+            ]
+        );
+    }
+
+    #[test]
+    fn test_singularize_greek_origin_nouns() {
+        assert_eq!(singularize("analyses"), "analysis");
+        assert_eq!(singularize("crises"), "crisis");
+        assert_eq!(singularize("diagnoses"), "diagnosis");
+        assert_eq!(singularize("neuroses"), "neurosis");
+        assert_eq!(singularize("bases"), "basis");
+        assert_eq!(singularize("oases"), "oasis");
+
+        // English-origin standard plurals ending in ases/ises
+        assert_eq!(singularize("databases"), "database");
+        assert_eq!(singularize("phases"), "phase");
+        assert_eq!(singularize("premises"), "premise");
     }
 }
