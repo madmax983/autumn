@@ -1005,10 +1005,7 @@ fn extract_diesel_column_name(attr: &str) -> Option<String> {
     }
 
     // 3. Try unquoted identifier form e.g. column_name = headline or column_name = r#type
-    let mut after_ident = after_eq;
-    if let Some(stripped_raw) = after_eq.strip_prefix("r#") {
-        after_ident = stripped_raw;
-    }
+    let after_ident = after_eq.strip_prefix("r#").unwrap_or(after_eq);
 
     let mut id_chars = String::new();
     for c in after_ident.chars() {
@@ -1027,15 +1024,11 @@ fn extract_diesel_column_name(attr: &str) -> Option<String> {
 
 fn has_attribute_boundary(rest: &str, pos: usize, keyword: &str) -> bool {
     let after = &rest[pos + keyword.len()..];
-    if let Some(c) = after.chars().next() {
-        c == '(' || c == ']' || c.is_whitespace()
-    } else {
-        true
-    }
+    after.chars().next().is_none_or(|c| c == '(' || c == ']' || c.is_whitespace())
 }
 
 #[must_use]
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::collapsible_if)]
 pub fn parse_model_search_config_for_table(
     content: &str,
     table: &str,
