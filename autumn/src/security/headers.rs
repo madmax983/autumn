@@ -819,15 +819,14 @@ mod tests {
 
     #[tokio::test]
     async fn csp_nonce_extractor_returns_nonempty_value() {
-        let config = HeadersConfig {
-            csp_nonce: CspNonceConfig { enabled: true },
-            ..Default::default()
-        };
-
         async fn handler(nonce: CspNonce) -> String {
             nonce.value().to_owned()
         }
 
+        let config = HeadersConfig {
+            csp_nonce: CspNonceConfig { enabled: true },
+            ..Default::default()
+        };
         let app = Router::new()
             .route("/", get(handler))
             .layer(SecurityHeadersLayer::from_config(&config));
@@ -847,15 +846,14 @@ mod tests {
 
     #[tokio::test]
     async fn csp_nonce_extractor_value_matches_csp_header_nonce() {
-        let config = HeadersConfig {
-            csp_nonce: CspNonceConfig { enabled: true },
-            ..Default::default()
-        };
-
         async fn handler(nonce: CspNonce) -> String {
             nonce.value().to_owned()
         }
 
+        let config = HeadersConfig {
+            csp_nonce: CspNonceConfig { enabled: true },
+            ..Default::default()
+        };
         let app = Router::new()
             .route("/", get(handler))
             .layer(SecurityHeadersLayer::from_config(&config));
@@ -885,15 +883,16 @@ mod tests {
 
     #[tokio::test]
     async fn csp_nonce_is_128_bit_url_safe_base64() {
-        let config = HeadersConfig {
-            csp_nonce: CspNonceConfig { enabled: true },
-            ..Default::default()
-        };
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 
         async fn handler(nonce: CspNonce) -> String {
             nonce.value().to_owned()
         }
 
+        let config = HeadersConfig {
+            csp_nonce: CspNonceConfig { enabled: true },
+            ..Default::default()
+        };
         let app = Router::new()
             .route("/", get(handler))
             .layer(SecurityHeadersLayer::from_config(&config));
@@ -906,8 +905,6 @@ mod tests {
         let (_, body) = response.into_parts();
         let body_bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
         let nonce_value = std::str::from_utf8(&body_bytes).unwrap();
-
-        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
         let decoded = URL_SAFE_NO_PAD
             .decode(nonce_value)
             .unwrap_or_else(|_| panic!("nonce must be URL-safe base64, got: {nonce_value}"));
@@ -921,12 +918,11 @@ mod tests {
 
     #[tokio::test]
     async fn optional_nonce_extractor_none_when_disabled() {
-        let config = HeadersConfig::default(); // csp_nonce.enabled = false
-
         async fn handler(nonce: Option<CspNonce>) -> String {
             nonce.map(|n| n.value().to_owned()).unwrap_or_default()
         }
 
+        let config = HeadersConfig::default(); // csp_nonce.enabled = false
         let app = Router::new()
             .route("/", get(handler))
             .layer(SecurityHeadersLayer::from_config(&config));

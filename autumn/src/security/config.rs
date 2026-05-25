@@ -16,6 +16,11 @@
 //! x_frame_options = "DENY"
 //! content_security_policy = "default-src 'self'"
 //!
+//! # Enable per-request CSP nonces — removes 'unsafe-inline' from the default
+//! # style-src and makes the nonce available via the CspNonce extractor.
+//! [security.headers.csp_nonce]
+//! enabled = true
+//!
 //! [security.csrf]
 //! enabled = true
 //!
@@ -32,6 +37,7 @@
 //! | `AUTUMN_SECURITY__HEADERS__X_FRAME_OPTIONS` | `security.headers.x_frame_options` | `String` |
 //! | `AUTUMN_SECURITY__HEADERS__HSTS_MAX_AGE_SECS` | `security.headers.hsts_max_age_secs` | `u64` |
 //! | `AUTUMN_SECURITY__HEADERS__CONTENT_SECURITY_POLICY` | `security.headers.content_security_policy` | `String` |
+//! | `AUTUMN_SECURITY__HEADERS__CSP_NONCE__ENABLED` | `security.headers.csp_nonce.enabled` | `bool` |
 //! | `AUTUMN_SECURITY__CSRF__ENABLED` | `security.csrf.enabled` | `bool` |
 //! | `AUTUMN_SECURITY__RATE_LIMIT__ENABLED` | `security.rate_limit.enabled` | `bool` |
 //! | `AUTUMN_SECURITY__RATE_LIMIT__REQUESTS_PER_SECOND` | `security.rate_limit.requests_per_second` | `f64` |
@@ -1494,10 +1500,10 @@ mod tests {
 
     #[test]
     fn csp_nonce_config_can_be_enabled_via_toml() {
-        let toml_str = r#"
+        let toml_str = r"
             [csp_nonce]
             enabled = true
-        "#;
+        ";
         let config: HeadersConfig = toml::from_str(toml_str).unwrap();
         assert!(config.csp_nonce.enabled);
     }

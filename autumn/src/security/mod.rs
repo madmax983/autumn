@@ -41,6 +41,10 @@
 //! referrer_policy = "strict-origin-when-cross-origin"
 //! permissions_policy = ""              # set to enable Permissions-Policy
 //!
+//! # Per-request CSP nonces — removes 'unsafe-inline', enables CspNonce extractor
+//! [security.headers.csp_nonce]
+//! enabled = true
+//!
 //! [security.csrf]
 //! enabled = true                       # auto-enabled in prod
 //! token_header = "X-CSRF-Token"
@@ -79,6 +83,22 @@
 //!             input type="text" name="title";
 //!             button { "Submit" }
 //!         }
+//!     }
+//! }
+//! ```
+//!
+//! For CSP nonces in inline scripts and styles
+//! (requires `security.headers.csp_nonce.enabled = true`):
+//!
+//! ```rust,ignore
+//! use autumn_web::prelude::*;
+//! use autumn_web::security::CspNonce;
+//!
+//! #[get("/page")]
+//! async fn page(nonce: CspNonce) -> Markup {
+//!     html! {
+//!         script nonce=(nonce.value()) { "console.log('ready')" }
+//!         style  nonce=(nonce.value()) { "body { margin: 0 }" }
 //!     }
 //! }
 //! ```
