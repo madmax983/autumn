@@ -41,14 +41,14 @@ mod traits;
 pub use registry::AdminRegistry;
 pub use traits::{
     AdminAction, AdminError, AdminField, AdminFieldKind, AdminFuture, AdminModel, ListParams,
-    ListResult, SortDirection,
+    ListResult, SelectOption, SortDirection,
 };
 
 /// Common downstream imports for implementing admin models.
 pub mod prelude {
     pub use crate::{
         AdminError, AdminField, AdminFieldKind, AdminFuture, AdminModel, ListParams, ListResult,
-        SortDirection,
+        SelectOption, SortDirection,
     };
 }
 
