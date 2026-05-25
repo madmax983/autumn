@@ -332,8 +332,10 @@ impl ErrorPageFilter {
                 .extensions()
                 .get::<ErrorPageRequestContext>()
                 .and_then(|ctx| ctx.headers.as_ref())
-                .map(|h| scrub_headers(h, &self.parameter_filter))
-                .unwrap_or(serde_json::json!({})),
+                .map_or_else(
+                    || serde_json::json!({}),
+                    |h| scrub_headers(h, &self.parameter_filter),
+                ),
         };
         let badge = dev_badge::dev_error_badge_html(&badge_ctx).into_string();
         if let Some(pos) = html_body.rfind("</body>") {
@@ -847,7 +849,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[tokio::test]
     async fn dev_badge_scrubs_sensitive_headers_on_form_post() {
         let app = test_router_with_error_pages(true);
 
@@ -911,6 +912,7 @@ mod tests {
         assert!(body_str.contains("\"pin\":\"[FILTERED]\""));
     }
 
+    #[tokio::test]
     async fn fallback_404_handler_keeps_non_get_favicon_requests_as_not_found() {
         let response = fallback_404_handler(
             axum::http::Method::POST,

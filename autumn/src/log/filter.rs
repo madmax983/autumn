@@ -33,6 +33,7 @@ impl Default for ParameterFilter {
 }
 
 impl ParameterFilter {
+    #[must_use]
     pub fn new(additional: &[String], opt_out_defaults: &[String]) -> Self {
         let opt_out_defaults: BTreeSet<String> = opt_out_defaults
             .iter()
@@ -65,6 +66,7 @@ impl ParameterFilter {
         }
     }
 
+    #[must_use]
     pub fn scrub_json(&self, value: &Value) -> Value {
         match value {
             Value::Object(map) => Value::Object(self.scrub_map(map)),
@@ -85,6 +87,7 @@ impl ParameterFilter {
         out
     }
 
+    #[must_use]
     pub fn matches_key(&self, key: &str) -> bool {
         let Some(normalized) = normalize_key(key) else {
             return false;
@@ -107,6 +110,7 @@ fn normalize_key(key: &str) -> Option<String> {
     }
 }
 
+#[must_use]
 pub fn normalized_opt_out_defaults(opt_out_defaults: &[String]) -> Vec<String> {
     let defaults: BTreeSet<String> = DEFAULT_FILTER_KEYS
         .iter()
@@ -124,6 +128,7 @@ pub fn normalized_opt_out_defaults(opt_out_defaults: &[String]) -> Vec<String> {
     result
 }
 
+#[must_use]
 pub fn scrub(value: &Value) -> Value {
     ParameterFilter::default().scrub_json(value)
 }
@@ -161,7 +166,7 @@ mod tests {
 
     #[test]
     fn empty_custom_key_does_not_scrub_everything() {
-        let filter = ParameterFilter::new(&["".to_owned()], &[]);
+        let filter = ParameterFilter::new(&[String::new()], &[]);
         assert!(!filter.matches_key("email"));
         assert!(!filter.matches_key("anything"));
     }

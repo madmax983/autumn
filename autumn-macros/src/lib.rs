@@ -1,3 +1,4 @@
+#![allow(clippy::collapsible_else_if)]
 //! # Autumn Macros
 //!
 //! Proc macros for the Autumn web framework.
