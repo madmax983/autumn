@@ -687,6 +687,7 @@ pub fn add_search_down_sql(table: &str) -> String {
     out
 }
 
+#[allow(clippy::option_if_let_else)]
 pub fn singularize(s: &str) -> String {
     if s == "series" {
         return "series".to_string();
@@ -738,6 +739,7 @@ pub fn singularize(s: &str) -> String {
     }
 }
 
+#[allow(clippy::while_let_on_iterator)]
 fn strip_comments(src: &str) -> String {
     let mut result = String::with_capacity(src.len());
     let mut chars = src.chars().peekable();
@@ -759,25 +761,23 @@ fn strip_comments(src: &str) -> String {
             result.push(ch);
             continue;
         }
-        if !in_string {
-            if ch == '/' && chars.peek() == Some(&'/') {
-                chars.next();
-                while let Some(next_ch) = chars.next() {
-                    if next_ch == '\n' {
-                        result.push('\n');
-                        break;
-                    }
+        if in_string {
+            result.push(ch);
+        } else if ch == '/' && chars.peek() == Some(&'/') {
+            chars.next();
+            while let Some(next_ch) = chars.next() {
+                if next_ch == '\n' {
+                    result.push('\n');
+                    break;
                 }
-            } else if ch == '/' && chars.peek() == Some(&'*') {
-                chars.next();
-                while let Some(next_ch) = chars.next() {
-                    if next_ch == '*' && chars.peek() == Some(&'/') {
-                        chars.next();
-                        break;
-                    }
+            }
+        } else if ch == '/' && chars.peek() == Some(&'*') {
+            chars.next();
+            while let Some(next_ch) = chars.next() {
+                if next_ch == '*' && chars.peek() == Some(&'/') {
+                    chars.next();
+                    break;
                 }
-            } else {
-                result.push(ch);
             }
         } else {
             result.push(ch);
@@ -788,12 +788,14 @@ fn strip_comments(src: &str) -> String {
 
 /// Scan a model file content to extract the `#[searchable]` language and field weights.
 #[must_use]
+#[allow(dead_code)]
 pub fn parse_model_search_config(content: &str) -> Option<(String, Vec<(String, char)>)> {
     parse_model_search_config_for_table(content, "")
 }
 
 /// Scan a model file content to extract the `#[searchable]` language and field weights for a specific table.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn parse_model_search_config_for_table(
     content: &str,
     table: &str,
@@ -959,10 +961,10 @@ pub fn parse_model_search_config_for_table(
                 let mut parts = line_to_parse;
                 if let Some(stripped_pub) = parts.strip_prefix("pub") {
                     parts = stripped_pub.trim();
-                    if let Some(stripped_paren) = parts.strip_prefix('(') {
-                        if let Some(close_paren) = stripped_paren.find(')') {
-                            parts = stripped_paren[close_paren + 1..].trim();
-                        }
+                    if let Some(stripped_paren) = parts.strip_prefix('(')
+                        && let Some(close_paren) = stripped_paren.find(')')
+                    {
+                        parts = stripped_paren[close_paren + 1..].trim();
                     }
                 }
                 if let Some(colon) = parts.find(':') {
