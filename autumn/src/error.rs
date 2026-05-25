@@ -1113,4 +1113,25 @@ mod tests {
         assert_eq!(hx_trigger, r#"{"autumn:conflict":true}"#);
         Ok(())
     }
+
+    #[test]
+    fn test_problem_code_for_fallback_val() {
+        let status = axum::http::StatusCode::from_u16(599).unwrap();
+        // Since 599 is a server error, it returns "autumn.server_error"
+        assert_eq!(
+            super::problem_code_for(status, false),
+            "autumn.server_error"
+        );
+        // We can test the actual fallback with 199
+        let status = axum::http::StatusCode::from_u16(199).unwrap();
+        assert_eq!(super::problem_code_for(status, false), "autumn.error");
+    }
+
+    #[test]
+    fn test_default_reason_fallback_val() {
+        let status = axum::http::StatusCode::from_u16(599).unwrap();
+        // default_reason isn't accessible, we test it through `.canonical_reason()` indirectly
+        // Actually, we can just test `problem_title_for` which is accessible and relies on it!
+        assert_eq!(super::problem_title_for(status, false), "Error");
+    }
 }
