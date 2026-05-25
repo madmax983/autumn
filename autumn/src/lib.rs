@@ -102,6 +102,7 @@ pub use crate::i18n::t;
 pub mod interceptor;
 #[cfg(feature = "mail")]
 pub mod mail;
+pub mod maintenance;
 #[cfg(feature = "db")]
 pub mod migrate;
 pub mod plugin;

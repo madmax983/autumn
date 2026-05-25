@@ -19,6 +19,7 @@
 pub(crate) mod dev;
 pub(crate) mod error_page_filter;
 pub(crate) mod exception_filter;
+pub mod maintenance;
 pub(crate) mod method_override;
 pub(crate) mod metrics;
 pub(crate) mod request_id;
@@ -26,6 +27,7 @@ pub(crate) mod request_id;
 pub(crate) mod trace_context;
 
 pub use exception_filter::{AutumnErrorInfo, ExceptionFilter, ExceptionFilterLayer};
+pub use maintenance::{DEFAULT_HEALTH_PREFIX, MaintenanceLayer, MaintenanceService};
 pub use method_override::{
     DEFAULT_METHOD_OVERRIDE_FIELD, MethodOverrideConfig, MethodOverrideLayer,
     MethodOverrideRejection, MethodOverrideService, OverriddenMethod,

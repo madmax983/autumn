@@ -38,7 +38,7 @@ pub enum MigrateAction {
 }
 
 /// Run the migrate command.
-pub fn run(action: MigrateAction) {
+pub fn run(action: MigrateAction, with_maintenance: bool) {
     eprintln!("\u{1F342} autumn migrate\n");
 
     if action == MigrateAction::Check {
@@ -56,17 +56,98 @@ pub fn run(action: MigrateAction) {
     // 3. Check that diesel CLI is available
     check_diesel_cli();
 
-    // 4. Execute the appropriate diesel command
+    // 4. Enable maintenance mode if requested
+    if with_maintenance && action == MigrateAction::Run {
+        enable_maintenance_for_migrate();
+    }
+
+    // 5. Execute the appropriate diesel command
     match action {
         MigrateAction::Run => {
-            run_migrations(&database_url, &migrations_dir);
-            run_framework_migrations(&database_url);
+            run_migrations_with_maintenance(&database_url, &migrations_dir, with_maintenance);
         }
         MigrateAction::Status => {
             show_status(&database_url, &migrations_dir);
             show_framework_status(&database_url);
         }
         MigrateAction::Check => unreachable!("handled above"),
+    }
+}
+
+/// Enable maintenance mode before a migrate run.
+fn enable_maintenance_for_migrate() {
+    use autumn_web::maintenance::{MAINTENANCE_FLAG_FILE, MaintenanceConfig, MaintenanceState};
+    let path = std::path::Path::new(MAINTENANCE_FLAG_FILE);
+    let config = MaintenanceConfig {
+        message: Some("Database migration in progress. Please try again in a moment.".to_owned()),
+        ..Default::default()
+    };
+    match MaintenanceState::save_to_file(path, &config) {
+        Ok(()) => eprintln!("  \u{26A0}\u{FE0F}  Maintenance mode ENABLED (--with-maintenance)"),
+        Err(e) => {
+            eprintln!("\u{274C} Failed to enable maintenance mode: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Disable maintenance mode after a successful migrate run.
+fn disable_maintenance_after_migrate() {
+    use autumn_web::maintenance::{MAINTENANCE_FLAG_FILE, MaintenanceState};
+    let path = std::path::Path::new(MAINTENANCE_FLAG_FILE);
+    match MaintenanceState::remove_flag_file(path) {
+        Ok(_) => eprintln!("  \u{2713} Maintenance mode DISABLED — normal traffic resuming"),
+        Err(e) => eprintln!("\u{26A0}\u{FE0F}  Could not remove maintenance flag: {e}"),
+    }
+}
+
+fn run_migrations_with_maintenance(
+    database_url: &str,
+    migrations_dir: &str,
+    with_maintenance: bool,
+) {
+    eprintln!("  Running pending migrations...\n");
+    let dir = std::path::Path::new(migrations_dir);
+    let status = Command::new("diesel")
+        .args(["migration", "run", "--migration-dir"])
+        .arg(dir)
+        .env("DATABASE_URL", database_url)
+        .status();
+
+    let success = match status {
+        Ok(s) if s.success() => {
+            eprintln!("\n\u{2713} Migrations applied successfully.");
+            true
+        }
+        Ok(_) => {
+            eprintln!(
+                "\n\u{274C} Migration failed in {}. Check the error output above.",
+                dir.display()
+            );
+            false
+        }
+        Err(e) => {
+            eprintln!("\u{274C} Failed to run diesel migration run: {e}");
+            false
+        }
+    };
+
+    if success {
+        run_framework_migrations(database_url);
+        if with_maintenance {
+            // Only disable maintenance when everything succeeded
+            disable_maintenance_after_migrate();
+        }
+    } else {
+        if with_maintenance {
+            eprintln!();
+            eprintln!(
+                "  \u{26A0}\u{FE0F}  Migration failed — maintenance mode left ON for safety."
+            );
+            eprintln!("      Fix the migration then run `autumn migrate` to retry.");
+            eprintln!("      Run `autumn maintenance off` to re-open traffic manually.");
+        }
+        std::process::exit(1);
     }
 }
 
@@ -294,12 +375,6 @@ fn check_diesel_cli() {
     }
 }
 
-/// Run pending migrations via `diesel migration run`.
-fn run_migrations(database_url: &str, migrations_dir: &str) {
-    eprintln!("  Running pending migrations...\n");
-    run_diesel_migration_run(database_url, Path::new(migrations_dir), "Migrations");
-}
-
 fn run_framework_migrations(database_url: &str) {
     eprintln!("  Running pending Autumn framework migrations...\n");
 
@@ -328,34 +403,6 @@ where
     F: FnOnce(&str, EmbeddedMigrations) -> Result<MigrationResult, MigrationError>,
 {
     run_pending(database_url, FRAMEWORK_MIGRATIONS)
-}
-
-fn run_diesel_migration_run(database_url: &str, migrations_dir: &Path, label: &str) {
-    let status = Command::new("diesel")
-        .args(["migration", "run", "--migration-dir"])
-        .arg(migrations_dir)
-        .env("DATABASE_URL", database_url)
-        .status();
-
-    match status {
-        Ok(s) if s.success() => {
-            eprintln!("\n\u{2713} {label} applied successfully.");
-        }
-        Ok(_) => {
-            eprintln!(
-                "\n\u{2717} Migration failed in {}. Check the error output above for the failing SQL.",
-                migrations_dir.display()
-            );
-            std::process::exit(1);
-        }
-        Err(e) => {
-            eprintln!(
-                "\u{2717} Failed to run diesel migration run for {}: {e}",
-                migrations_dir.display()
-            );
-            std::process::exit(1);
-        }
-    }
 }
 
 /// Show migration status via `diesel migration pending`.

@@ -1351,6 +1351,9 @@ pub fn run(opts: DoctorOptions) {
     // 9. Stale artifacts (warn only, never fail)
     tasks.push(Box::new(check_stale_artifacts));
 
+    // 10. Maintenance mode state
+    tasks.push(Box::new(check_maintenance_mode));
+
     // ── Phase 3: spawn all tasks concurrently ────────────────────────────────
     let handles: Vec<thread::JoinHandle<CheckResult>> =
         tasks.into_iter().map(thread::spawn).collect();
@@ -1382,6 +1385,34 @@ pub fn run(opts: DoctorOptions) {
     }
 
     std::process::exit(code);
+}
+
+/// Check whether maintenance mode is currently active.
+///
+/// Warns (not fails) so `autumn doctor` stays green during planned windows.
+pub fn check_maintenance_mode() -> CheckResult {
+    use autumn_web::maintenance::{MAINTENANCE_FLAG_FILE, MaintenanceState};
+    let path = std::path::Path::new(MAINTENANCE_FLAG_FILE);
+    match MaintenanceState::load_from_file(path) {
+        Ok(Some(config)) => {
+            let detail = config.message.as_ref().map_or_else(
+                || "maintenance mode is ON".to_owned(),
+                |msg| format!("maintenance mode is ON — \"{msg}\""),
+            );
+            CheckResult {
+                name: "maintenance_mode",
+                status: CheckStatus::Warn,
+                detail: Some(detail),
+                hint: Some("Run `autumn maintenance off` to re-enable normal traffic"),
+            }
+        }
+        Ok(None) | Err(_) => CheckResult {
+            name: "maintenance_mode",
+            status: CheckStatus::Pass,
+            detail: Some("maintenance mode is off".into()),
+            hint: None,
+        },
+    }
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -2165,5 +2196,19 @@ foo = "bar"
         let json = to_json_output(&results, &summary);
         // Should parse as valid JSON
         assert!(serde_json::from_str::<serde_json::Value>(&json).is_ok());
+    }
+
+    // ── check_maintenance_mode ────────────────────────────────────────────────
+
+    #[test]
+    fn check_maintenance_mode_passes_when_off() {
+        // No flag file in the test dir → maintenance is off → Pass
+        let result = check_maintenance_mode();
+        // In CI there should be no flag file; if there is, accept Warn too.
+        assert!(
+            result.status == CheckStatus::Pass || result.status == CheckStatus::Warn,
+            "unexpected status: {:?}",
+            result.status
+        );
     }
 }

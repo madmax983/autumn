@@ -181,6 +181,17 @@ impl DevReloadState {
 pub fn run(package: Option<&str>, show_config: bool) {
     eprintln!("\u{1F342} autumn dev\n");
 
+    // Warn when maintenance mode is currently active so the operator is not
+    // surprised by 503 responses during local development.
+    if let Some(config) = crate::maintenance::check_status(None) {
+        eprintln!("  \u{26A0}\u{FE0F}  MAINTENANCE MODE IS ON");
+        if let Some(msg) = &config.message {
+            eprintln!("     Message: {msg}");
+        }
+        eprintln!("     Run `autumn maintenance off` to disable.");
+        eprintln!();
+    }
+
     // Register SIGINT handler so Ctrl+C triggers a graceful shutdown instead
     // of immediately terminating the process (and leaving the child running).
     if let Err(err) = ctrlc::set_handler(move || {
