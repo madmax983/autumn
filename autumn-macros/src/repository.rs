@@ -5745,6 +5745,24 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let config_soft_delete = config.soft_delete;
     let config_tenant_scoped = config.tenant_scoped;
 
+    let second_stage_soft_delete_filter = if config_soft_delete {
+        quote! {
+            records_query = records_query.filter(#table_ident::deleted_at.is_null());
+        }
+    } else {
+        quote! {}
+    };
+
+    let second_stage_tenant_filter = if config_tenant_scoped {
+        quote! {
+            if let ::core::option::Option::Some(ref t) = tenant_id {
+                records_query = records_query.filter(#table_ident::tenant_id.eq(t.clone()));
+            }
+        }
+    } else {
+        quote! {}
+    };
+
     let search_trait_methods = if config.searchable {
         quote! {
             fn search(&self, query: &str) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<Vec<#model_name>>> + Send;
@@ -5851,8 +5869,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     return Ok(Vec::new());
                 }
 
-                let records = #table_ident::table
+                let mut records_query = #table_ident::table
                     .filter(#table_ident::id.eq_any(&id_list))
+                    .into_boxed();
+                #second_stage_soft_delete_filter
+                #second_stage_tenant_filter
+                let records = records_query
                     .load::<#model_name>(&mut conn)
                     .await?;
 
@@ -5986,8 +6008,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     return Ok(::autumn_web::pagination::Page::new(Vec::new(), total, req));
                 }
 
-                let records = #table_ident::table
+                let mut records_query = #table_ident::table
                     .filter(#table_ident::id.eq_any(&id_list))
+                    .into_boxed();
+                #second_stage_soft_delete_filter
+                #second_stage_tenant_filter
+                let records = records_query
                     .load::<#model_name>(&mut conn)
                     .await?;
 

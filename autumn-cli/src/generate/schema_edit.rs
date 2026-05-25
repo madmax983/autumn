@@ -770,7 +770,22 @@ pub fn singularize(s: &str) -> String {
             format!("{stripped}e")
         }
     } else if let Some(stripped) = s.strip_suffix('s') {
-        stripped.to_owned()
+        if s.ends_with("ss")
+            || s == "news"
+            || s == "status"
+            || s == "alias"
+            || s == "bus"
+            || s == "lens"
+            || s == "virus"
+            || s == "canvas"
+            || s == "analysis"
+            || s == "basis"
+            || s == "crisis"
+        {
+            s.to_owned()
+        } else {
+            stripped.to_owned()
+        }
     } else {
         s.to_owned()
     }
@@ -937,6 +952,32 @@ fn is_matching_table_attr(attr_content: &str, table: &str) -> bool {
         rest = &rest[pos + "table".len()..];
     }
     false
+}
+
+fn extract_diesel_column_name(attr: &str) -> Option<String> {
+    let pos = attr.find("column_name")?;
+    let after_col = &attr[pos + "column_name".len()..];
+    let trimmed = after_col.trim_start();
+    let stripped_eq = trimmed.strip_prefix('=')?;
+    let after_eq = stripped_eq.trim_start();
+
+    // 1. Try standard double quotes
+    if let Some(stripped_quote) = after_eq.strip_prefix('"') {
+        let quote_end = stripped_quote.find('"')?;
+        return Some(stripped_quote[..quote_end].to_string());
+    }
+
+    // 2. Try raw string literal e.g. r#"headline"# or r"headline"
+    let after_r = after_eq.strip_prefix('r')?;
+    let mut hash_count = 0;
+    let bytes = after_r.as_bytes();
+    while hash_count < bytes.len() && bytes[hash_count] == b'#' {
+        hash_count += 1;
+    }
+    let after_hashes = &after_r[hash_count..];
+    let stripped_quote = after_hashes.strip_prefix('"')?;
+    let quote_end = stripped_quote.find('"')?;
+    Some(stripped_quote[..quote_end].to_string())
 }
 
 #[must_use]
@@ -1197,9 +1238,14 @@ pub fn parse_model_search_config_for_table(
 
             let after_attr = &attr_chunk[close_bracket + 1..];
             let mut line_to_parse = "";
+            let mut field_attributes = Vec::new();
             for line in after_attr.lines() {
                 let trimmed = line.trim();
-                if trimmed.is_empty() || trimmed.starts_with("#[") || trimmed.starts_with("//") {
+                if trimmed.is_empty() || trimmed.starts_with("//") {
+                    continue;
+                }
+                if trimmed.starts_with("#[") {
+                    field_attributes.push(trimmed);
                     continue;
                 }
                 line_to_parse = trimmed;
@@ -1225,7 +1271,35 @@ pub fn parse_model_search_config_for_table(
                     if !clean_field.is_empty()
                         && clean_field.chars().all(|c| c.is_alphanumeric() || c == '_')
                     {
-                        fields.push((clean_field.to_string(), weight));
+                        let mut final_col_name = clean_field.to_string();
+
+                        // 1. Scan attributes *before* #[searchable]
+                        let before_searchable_attr = &rest[..pos];
+                        let prev_term_pos = before_searchable_attr
+                            .rfind(|c| c == ';' || c == ',' || c == '{')
+                            .map(|idx| idx + 1)
+                            .unwrap_or(0);
+                        let field_prefix = &before_searchable_attr[prev_term_pos..];
+
+                        if let Some(d_pos) = field_prefix.find("#[diesel") {
+                            let sub_chunk = &field_prefix[d_pos..];
+                            if let Some(cb) = sub_chunk.find(']') {
+                                let attr_content = &sub_chunk[..cb];
+                                if let Some(custom_col) = extract_diesel_column_name(attr_content) {
+                                    final_col_name = custom_col;
+                                }
+                            }
+                        }
+
+                        // 2. Scan attributes *after* #[searchable] but before field declaration
+                        for attr in &field_attributes {
+                            if let Some(custom_col) = extract_diesel_column_name(attr) {
+                                final_col_name = custom_col;
+                                break;
+                            }
+                        }
+
+                        fields.push((final_col_name, weight));
                     }
                 }
             }
@@ -2109,5 +2183,43 @@ pub struct Post {
         let (_, fields) =
             parse_model_search_config_for_table(content_invalid_weight, "posts").unwrap();
         assert_eq!(fields, vec![("title".to_string(), 'D')]);
+    }
+
+    #[test]
+    fn test_singularize_singular_table_names_ending_in_s() {
+        assert_eq!(singularize("news"), "news");
+        assert_eq!(singularize("status"), "status");
+        assert_eq!(singularize("alias"), "alias");
+        assert_eq!(singularize("bus"), "bus");
+        assert_eq!(singularize("lens"), "lens");
+        assert_eq!(singularize("virus"), "virus");
+        assert_eq!(singularize("canvas"), "canvas");
+        assert_eq!(singularize("addresses"), "address");
+        assert_eq!(singularize("address"), "address");
+    }
+
+    #[test]
+    fn test_parse_model_search_config_diesel_column_name() {
+        let content_diesel = r##"
+#[autumn_web::model(table = "posts")]
+pub struct Post {
+    #[id]
+    pub id: i64,
+    #[searchable(weight = "A")]
+    #[diesel(column_name = "headline")]
+    pub title: String,
+    #[diesel(column_name = r#"content_body"#)]
+    #[searchable(weight = "B")]
+    pub body: String,
+}
+"##;
+        let (_, fields) = parse_model_search_config_for_table(content_diesel, "posts").unwrap();
+        assert_eq!(
+            fields,
+            vec![
+                ("headline".to_string(), 'A'),
+                ("content_body".to_string(), 'B')
+            ]
+        );
     }
 }
