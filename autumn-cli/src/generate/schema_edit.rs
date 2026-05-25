@@ -756,7 +756,12 @@ pub fn singularize(s: &str) -> String {
                 stripped.to_owned()
             } else if s.ends_with("lenses") {
                 stripped.to_owned()
-            } else if s.ends_with("ases") || s.ends_with("ises") || s.ends_with("oses") || s.ends_with("uses") || s.ends_with("yses") {
+            } else if s.ends_with("ases")
+                || s.ends_with("ises")
+                || s.ends_with("oses")
+                || s.ends_with("uses")
+                || s.ends_with("yses")
+            {
                 format!("{stripped}e")
             } else if s.ends_with("ses") {
                 format!("{stripped}e")
@@ -890,7 +895,11 @@ pub fn parse_model_search_config(content: &str) -> Option<(String, Vec<(String, 
 fn is_matching_table_attr(attr_content: &str, table: &str) -> bool {
     let mut rest = attr_content;
     while let Some(pos) = rest.find("table") {
-        let prev_char = if pos > 0 { rest.as_bytes().get(pos - 1) } else { None };
+        let prev_char = if pos > 0 {
+            rest.as_bytes().get(pos - 1)
+        } else {
+            None
+        };
         let next_char = rest.as_bytes().get(pos + "table".len());
         let is_prev_boundary = prev_char.is_none_or(|&c| !c.is_ascii_alphanumeric() && c != b'_');
         let is_next_boundary = next_char.is_none_or(|&c| !c.is_ascii_alphanumeric() && c != b'_');
@@ -965,7 +974,8 @@ pub fn parse_model_search_config_for_table(
                 let offset = clean_content.len() - search_rest.len() + pos;
                 let after_struct = &search_rest[pos + "struct ".len()..];
                 if let Some(first_word) = after_struct.split_whitespace().next() {
-                    let clean_name = first_word.trim_end_matches(|c: char| !c.is_alphanumeric() && c != '_');
+                    let clean_name =
+                        first_word.trim_end_matches(|c: char| !c.is_alphanumeric() && c != '_');
                     if clean_name == struct_name {
                         found_struct_pos = Some(offset);
                         break;
@@ -1965,4 +1975,3 @@ pub struct Comment {
         assert_eq!(singularize("cases"), "case");
     }
 }
-
