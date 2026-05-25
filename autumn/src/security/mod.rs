@@ -96,5 +96,5 @@ pub use config::{
 #[cfg(feature = "redis")]
 pub use config::{RateLimitBackendFailure, RateLimitRedisConfig};
 pub use csrf::{CsrfFormField, CsrfLayer, CsrfToken};
-pub use headers::SecurityHeadersLayer;
+pub use headers::{CspNonce, SecurityHeadersLayer};
 pub use rate_limit::RateLimitLayer;

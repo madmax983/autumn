@@ -8,7 +8,7 @@ use autumn_web::extract::Path;
 use autumn_web::form::{ChangesetForm, method_input};
 use autumn_web::pagination::{Page, PageRequest};
 use autumn_web::prelude::{HxRequest, IntoResponse, StatusCode, Validate};
-use autumn_web::security::CsrfToken;
+use autumn_web::security::{CspNonce, CsrfToken};
 use autumn_web::{AutumnError, AutumnResult, Db, Markup, Redirect, delete, get, html, post};
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
@@ -40,7 +40,7 @@ pub struct TodoForm {
 // ── Helpers ──────────────────────────────────────────────────────
 
 /// Base HTML layout wrapping page content.
-fn layout(title: &str, content: Markup) -> Markup {
+fn layout(title: &str, nonce: Option<&CspNonce>, content: Markup) -> Markup {
     html! {
         (autumn_web::PreEscaped("<!DOCTYPE html>"))
         html lang="en" {
@@ -50,6 +50,13 @@ fn layout(title: &str, content: Markup) -> Markup {
                 title { (title) }
                 link rel="stylesheet" href="/static/css/autumn.css";
                 script src="/static/js/htmx.min.js" {}
+                // Nonce-protected inline script and style demonstrating Phase 2 compliance
+                script nonce=[nonce.map(|n| n.nonce())] {
+                    "console.log('Autumn App Initialized with CSP Nonce:', '" (nonce.map(|n| n.nonce()).unwrap_or_default()) "');"
+                }
+                style nonce=[nonce.map(|n| n.nonce())] {
+                    "body { display: block; }"
+                }
             }
             body class="bg-stone-50 min-h-screen font-sans text-stone-800 antialiased" {
                 div class="max-w-xl mx-auto py-12 px-6" {
@@ -193,12 +200,14 @@ async fn list_page(
     mut db: Db,
     page_req: &PageRequest,
     pending: &ChangesetForm<TodoForm>,
+    nonce: Option<&CspNonce>,
 ) -> AutumnResult<Markup> {
     let page_data = Todo::page(page_req, &mut db).await?;
     let done_count = page_data.content.iter().filter(|t| t.completed).count();
 
     Ok(layout(
         "Autumn Todo App",
+        nonce,
         html! {
             header class="mb-10" {
                 h1 class="text-2xl font-semibold tracking-tight text-stone-900" {
@@ -251,11 +260,11 @@ pub async fn index() -> Redirect {
 /// Accepts `?page=N&size=M` query parameters via the [`PageRequest`] extractor.
 /// Defaults to 20 items per page ordered newest-first.
 #[get("/todos")]
-pub async fn list(page: PageRequest, db: Db) -> AutumnResult<Markup> {
+pub async fn list(page: PageRequest, db: Db, nonce: Option<CspNonce>) -> AutumnResult<Markup> {
     let blank = ChangesetForm::without_csrf(TodoForm {
         title: String::new(),
     });
-    list_page(db, &page, &blank).await
+    list_page(db, &page, &blank, nonce.as_ref()).await
 }
 
 /// Render the detail page body for a todo.
@@ -264,9 +273,10 @@ pub async fn list(page: PageRequest, db: Db) -> AutumnResult<Markup> {
 /// can be unit-tested without spinning up a database. The `csrf_token`
 /// parameter mirrors what `#[get("/todos/{id}")]` receives in real
 /// requests: `None` when CSRF protection is disabled (e.g. dev profile).
-fn detail_view(todo: &Todo, csrf_token: Option<&str>) -> Markup {
+fn detail_view(todo: &Todo, csrf_token: Option<&str>, nonce: Option<&CspNonce>) -> Markup {
     layout(
         &format!("Todo: {}", todo.title),
+        nonce,
         html! {
             a href=(paths::list())
                class="inline-flex items-center gap-1 text-sm text-stone-500 \
@@ -335,6 +345,7 @@ pub async fn detail(
     headers: http::HeaderMap,
     mut db: Db,
     csrf: Option<CsrfToken>,
+    nonce: Option<CspNonce>,
 ) -> AutumnResult<impl IntoResponse> {
     let todo = Todo::find(*id, &mut db).await?;
 
@@ -350,7 +361,11 @@ pub async fn detail(
     );
     let fw = fresh_when(&headers, etag_input.as_str());
 
-    Ok(fw.or(detail_view(&todo, csrf.as_ref().map(CsrfToken::token))))
+    Ok(fw.or(detail_view(
+        &todo,
+        csrf.as_ref().map(CsrfToken::token),
+        nonce.as_ref(),
+    )))
 }
 
 /// Create a new todo from a form submission.
@@ -358,7 +373,11 @@ pub async fn detail(
 /// On validation failure the list page is re-rendered with inline errors (422).
 /// On success a new row is inserted and the browser redirects to the list.
 #[post("/todos")]
-pub async fn create(db: Db, form: ChangesetForm<TodoForm>) -> AutumnResult<impl IntoResponse> {
+pub async fn create(
+    nonce: Option<CspNonce>,
+    db: Db,
+    form: ChangesetForm<TodoForm>,
+) -> AutumnResult<impl IntoResponse> {
     match form.into_valid() {
         Ok(f) => {
             let mut db = db;
@@ -372,7 +391,7 @@ pub async fn create(db: Db, form: ChangesetForm<TodoForm>) -> AutumnResult<impl 
         }
         Err(form) => {
             let page_req = PageRequest::default();
-            let markup = list_page(db, &page_req, &form).await?;
+            let markup = list_page(db, &page_req, &form, nonce.as_ref()).await?;
             Ok((StatusCode::UNPROCESSABLE_ENTITY, markup).into_response())
         }
     }
@@ -446,7 +465,7 @@ mod tests {
 
     #[test]
     fn test_layout_generates_html() {
-        let markup = layout("Test Title", html! { p { "Test Content" } });
+        let markup = layout("Test Title", None, html! { p { "Test Content" } });
         let html = markup.into_string();
         assert!(html.contains("Test Title"));
         assert!(html.contains("Test Content"));
@@ -530,7 +549,7 @@ mod tests {
             completed: false,
             created_at: chrono::DateTime::from_timestamp(0, 0).unwrap().naive_utc(),
         };
-        let html = detail_view(&todo, Some("csrf-tok-xyz")).into_string();
+        let html = detail_view(&todo, Some("csrf-tok-xyz"), None).into_string();
         assert!(html.contains(r#"method="post""#), "{html}");
         assert!(html.contains(r#"action="/todos/42""#), "{html}");
         assert!(html.contains(r#"name="_method""#), "{html}");
@@ -547,9 +566,23 @@ mod tests {
             completed: true,
             created_at: chrono::DateTime::from_timestamp(0, 0).unwrap().naive_utc(),
         };
-        let html = detail_view(&todo, None).into_string();
+        let html = detail_view(&todo, None, None).into_string();
         assert!(html.contains(r#"name="_method""#), "{html}");
         assert!(!html.contains(r#"name="_csrf""#), "{html}");
+    }
+
+    #[test]
+    fn detail_view_renders_csp_nonce_script_and_style() {
+        let todo = Todo {
+            id: 42,
+            title: "Write docs".into(),
+            completed: false,
+            created_at: chrono::DateTime::from_timestamp(0, 0).unwrap().naive_utc(),
+        };
+        let nonce = CspNonce::new("xyz123nonce".to_owned());
+        let html = detail_view(&todo, None, Some(&nonce)).into_string();
+        assert!(html.contains(r#"script nonce="xyz123nonce""#), "{html}");
+        assert!(html.contains(r#"style nonce="xyz123nonce""#), "{html}");
     }
 
     #[test]

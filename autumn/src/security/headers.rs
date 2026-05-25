@@ -36,7 +36,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use axum::http::{HeaderValue, Request, Response};
+use axum::extract::{FromRequestParts, OptionalFromRequestParts};
+use axum::http::{HeaderValue, Request, Response, StatusCode};
 use http::header::HeaderName;
 use pin_project_lite::pin_project;
 use tower::{Layer, Service};
@@ -115,14 +116,26 @@ impl ComputedHeaders {
 #[derive(Clone, Debug)]
 pub struct SecurityHeadersLayer {
     headers: Arc<ComputedHeaders>,
+    csp_nonce_enabled: bool,
+    csp_nonce_directives: Vec<String>,
+    base_csp: String,
 }
 
 impl SecurityHeadersLayer {
     /// Create a new layer from the given headers configuration.
     #[must_use]
     pub fn from_config(config: &HeadersConfig) -> Self {
+        let is_default_csp =
+            config.content_security_policy == super::config::default_content_security_policy();
+        let csp_nonce_enabled = config.csp_nonce.enabled
+            && !config.content_security_policy.is_empty()
+            && is_default_csp;
+
         Self {
             headers: Arc::new(ComputedHeaders::from_config(config)),
+            csp_nonce_enabled,
+            csp_nonce_directives: config.csp_nonce.directives.clone(),
+            base_csp: config.content_security_policy.clone(),
         }
     }
 }
@@ -134,6 +147,9 @@ impl<S> Layer<S> for SecurityHeadersLayer {
         SecurityHeadersService {
             inner,
             headers: Arc::clone(&self.headers),
+            csp_nonce_enabled: self.csp_nonce_enabled,
+            csp_nonce_directives: self.csp_nonce_directives.clone(),
+            base_csp: self.base_csp.clone(),
         }
     }
 }
@@ -145,6 +161,9 @@ impl<S> Layer<S> for SecurityHeadersLayer {
 pub struct SecurityHeadersService<S> {
     inner: S,
     headers: Arc<ComputedHeaders>,
+    csp_nonce_enabled: bool,
+    csp_nonce_directives: Vec<String>,
+    base_csp: String,
 }
 
 impl<S, ReqBody, ResBody> Service<Request<ReqBody>> for SecurityHeadersService<S>
@@ -159,10 +178,24 @@ where
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
+    fn call(&mut self, mut req: Request<ReqBody>) -> Self::Future {
+        let dynamic_nonce = if self.csp_nonce_enabled {
+            let mut bytes = [0u8; 16];
+            getrandom::getrandom(&mut bytes)
+                .expect("failed to generate random bytes for CSP nonce");
+            let nonce = base64_encode(&bytes);
+            req.extensions_mut().insert(CspNonce(nonce.clone()));
+            Some(nonce)
+        } else {
+            None
+        };
+
         SecurityHeadersFuture {
             inner: self.inner.call(req),
             headers: Some(Arc::clone(&self.headers)),
+            dynamic_nonce,
+            csp_nonce_directives: self.csp_nonce_directives.clone(),
+            base_csp: self.base_csp.clone(),
         }
     }
 }
@@ -173,6 +206,9 @@ pin_project! {
         #[pin]
         inner: F,
         headers: Option<Arc<ComputedHeaders>>,
+        dynamic_nonce: Option<String>,
+        csp_nonce_directives: Vec<String>,
+        base_csp: String,
     }
 }
 
@@ -189,7 +225,18 @@ where
                 if let Some(computed) = this.headers.take() {
                     let resp_headers = response.headers_mut();
                     for (name, value) in &computed.pairs {
+                        if name == "content-security-policy" && this.dynamic_nonce.is_some() {
+                            continue;
+                        }
                         resp_headers.insert(name.clone(), value.clone());
+                    }
+                    if let Some(nonce) = this.dynamic_nonce.take() {
+                        let rewritten_csp =
+                            inject_nonce_into_csp(this.base_csp, &nonce, this.csp_nonce_directives);
+                        if let Ok(val) = HeaderValue::from_str(&rewritten_csp) {
+                            resp_headers
+                                .insert(HeaderName::from_static("content-security-policy"), val);
+                        }
                     }
                 }
                 Poll::Ready(Ok(response))
@@ -198,6 +245,124 @@ where
             Poll::Pending => Poll::Pending,
         }
     }
+}
+
+/// A Content-Security-Policy (CSP) nonce extracted from the request.
+///
+/// Use this as a handler parameter or in Maud templates to access the
+/// per-request cryptographically secure random nonce.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CspNonce(String);
+
+impl CspNonce {
+    /// Create a new `CspNonce`.
+    #[must_use]
+    pub const fn new(s: String) -> Self {
+        Self(s)
+    }
+
+    /// Returns the CSP nonce string value.
+    #[must_use]
+    pub fn nonce(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for CspNonce {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl<S> FromRequestParts<S> for CspNonce
+where
+    S: Send + Sync,
+{
+    type Rejection = (StatusCode, &'static str);
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        parts.extensions.get::<Self>().cloned().ok_or((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "CSP nonce not found in request extensions. Is SecurityHeadersLayer configured with csp_nonce enabled?",
+        ))
+    }
+}
+
+impl<S> OptionalFromRequestParts<S> for CspNonce
+where
+    S: Send + Sync,
+{
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Option<Self>, Self::Rejection> {
+        Ok(parts.extensions.get::<Self>().cloned())
+    }
+}
+
+/// Helper function to base64 encode bytes.
+fn base64_encode(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    let mut chunks = input.chunks_exact(3);
+    for chunk in &mut chunks {
+        let n = (u32::from(chunk[0]) << 16) | (u32::from(chunk[1]) << 8) | u32::from(chunk[2]);
+        out.push(ALPHABET[((n >> 18) & 0x3F) as usize] as char);
+        out.push(ALPHABET[((n >> 12) & 0x3F) as usize] as char);
+        out.push(ALPHABET[((n >> 6) & 0x3F) as usize] as char);
+        out.push(ALPHABET[(n & 0x3F) as usize] as char);
+    }
+    let rem = chunks.remainder();
+    match rem.len() {
+        1 => {
+            let n = u32::from(rem[0]) << 16;
+            out.push(ALPHABET[((n >> 18) & 0x3F) as usize] as char);
+            out.push(ALPHABET[((n >> 12) & 0x3F) as usize] as char);
+            out.push('=');
+            out.push('=');
+        }
+        2 => {
+            let n = (u32::from(rem[0]) << 16) | (u32::from(rem[1]) << 8);
+            out.push(ALPHABET[((n >> 18) & 0x3F) as usize] as char);
+            out.push(ALPHABET[((n >> 12) & 0x3F) as usize] as char);
+            out.push(ALPHABET[((n >> 6) & 0x3F) as usize] as char);
+            out.push('=');
+        }
+        _ => {}
+    }
+    out
+}
+
+/// Injects the generated nonce into the specified directives of a CSP string.
+pub fn inject_nonce_into_csp(csp: &str, nonce: &str, directives: &[String]) -> String {
+    let parts: Vec<String> = csp
+        .split(';')
+        .map(|part| {
+            let trimmed = part.trim();
+            if trimmed.is_empty() {
+                return String::new();
+            }
+            let mut words = trimmed.split_whitespace();
+            words.next().map_or_else(
+                || trimmed.to_owned(),
+                |directive| {
+                    if directives.iter().any(|d| d == directive) {
+                        format!("{trimmed} 'nonce-{nonce}'")
+                    } else {
+                        trimmed.to_owned()
+                    }
+                },
+            )
+        })
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    parts.join("; ")
 }
 
 #[cfg(test)]
@@ -504,5 +669,101 @@ mod tests {
             poll.is_pending(),
             "poll_ready should pass through Pending from inner service"
         );
+    }
+
+    #[test]
+    fn test_base64_encode() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn test_inject_nonce_into_csp() {
+        let base = "default-src 'self'; script-src 'self'; style-src 'self'";
+        let directives = vec!["script-src".to_owned(), "style-src".to_owned()];
+        let rewritten = inject_nonce_into_csp(base, "123456", &directives);
+        assert_eq!(
+            rewritten,
+            "default-src 'self'; script-src 'self' 'nonce-123456'; style-src 'self' 'nonce-123456'"
+        );
+    }
+
+    #[tokio::test]
+    async fn middleware_generates_and_injects_nonce() {
+        let config = HeadersConfig::default(); // csp_nonce is enabled by default!
+        let app = Router::new()
+            .route(
+                "/",
+                get(|nonce: CspNonce| async move { nonce.nonce().to_owned() }),
+            )
+            .layer(SecurityHeadersLayer::from_config(&config));
+
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Assert CSP header contains this nonce (read headers first!)
+        let csp = response
+            .headers()
+            .get("content-security-policy")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+
+        // Assert nonce is valid (base64, >= 128 bits i.e. >= 22 base64 chars without padding)
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let nonce_str = String::from_utf8(body.to_vec()).unwrap();
+        assert!(nonce_str.len() >= 22, "nonce: {nonce_str}");
+
+        assert!(
+            csp.contains(&format!("script-src 'self' 'nonce-{nonce_str}'")),
+            "csp: {csp}"
+        );
+        assert!(
+            csp.contains(&format!("style-src 'self' 'nonce-{nonce_str}'")),
+            "csp: {csp}"
+        );
+    }
+
+    #[tokio::test]
+    async fn middleware_opt_out_custom_csp() {
+        let config = HeadersConfig {
+            content_security_policy: "default-src 'self'; script-src 'self'".to_owned(),
+            ..Default::default()
+        };
+        let app = Router::new()
+            .route(
+                "/",
+                get(|nonce: Option<CspNonce>| async move {
+                    assert!(nonce.is_none());
+                    "ok"
+                }),
+            )
+            .layer(SecurityHeadersLayer::from_config(&config));
+
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let csp = response
+            .headers()
+            .get("content-security-policy")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(csp, "default-src 'self'; script-src 'self'");
     }
 }

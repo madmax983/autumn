@@ -494,6 +494,10 @@ pub struct HeadersConfig {
     /// Example: `"camera=(), microphone=(), geolocation=()"`.
     #[serde(default)]
     pub permissions_policy: String,
+
+    /// Content-Security-Policy nonce generation configuration.
+    #[serde(default)]
+    pub csp_nonce: CspNonceConfig,
 }
 
 impl Default for HeadersConfig {
@@ -508,8 +512,44 @@ impl Default for HeadersConfig {
             content_security_policy: default_content_security_policy(),
             referrer_policy: default_referrer_policy(),
             permissions_policy: String::new(),
+            csp_nonce: CspNonceConfig::default(),
         }
     }
+}
+
+/// Content-Security-Policy (CSP) nonce generation configuration.
+///
+/// Toggles the generation of per-request cryptographically secure random nonces
+/// and specifies which directives receive them.
+///
+/// # Defaults
+///
+/// | Field | Default |
+/// |-------|---------|
+/// | `enabled` | `true` |
+/// | `directives` | `["script-src", "style-src"]` |
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct CspNonceConfig {
+    /// Enable generation of per-request CSP nonces. Default: `true`.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// Directives that should receive the generated nonce. Default: `["script-src", "style-src"]`.
+    #[serde(default = "default_csp_nonce_directives")]
+    pub directives: Vec<String>,
+}
+
+impl Default for CspNonceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            directives: default_csp_nonce_directives(),
+        }
+    }
+}
+
+fn default_csp_nonce_directives() -> Vec<String> {
+    vec!["script-src".to_owned(), "style-src".to_owned()]
 }
 
 /// CSRF (Cross-Site Request Forgery) protection configuration.
@@ -888,7 +928,7 @@ fn default_referrer_policy() -> String {
 pub fn default_content_security_policy() -> String {
     "default-src 'self'; \
      img-src 'self' data:; \
-     style-src 'self' 'unsafe-inline'; \
+     style-src 'self'; \
      script-src 'self'; \
      connect-src 'self'; \
      form-action 'self'; \
@@ -1430,5 +1470,28 @@ mod tests {
         let sig = keys.sign(b"msg");
         assert_eq!(sig.len(), 64, "HMAC-SHA256 hex is 64 chars");
         assert!(sig.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn csp_nonce_config_defaults() {
+        let config = HeadersConfig::default();
+        assert!(config.csp_nonce.enabled);
+        assert_eq!(
+            config.csp_nonce.directives,
+            vec!["script-src".to_owned(), "style-src".to_owned()]
+        );
+    }
+
+    #[test]
+    fn csp_nonce_config_deserialize() {
+        let toml_str = r#"
+            x_frame_options = "DENY"
+            [csp_nonce]
+            enabled = false
+            directives = ["script-src"]
+        "#;
+        let config: HeadersConfig = toml::from_str(toml_str).unwrap();
+        assert!(!config.csp_nonce.enabled);
+        assert_eq!(config.csp_nonce.directives, vec!["script-src".to_owned()]);
     }
 }

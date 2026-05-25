@@ -153,6 +153,8 @@ pub use crate::tenancy::{Tenant, with_tenant};
 pub use crate::authorization::{Policy, PolicyContext, Scope, ScopeQuery, Scoped};
 
 // ── Security ───────────────────────────────────────────────────
+/// CSP nonce extractor for embedding in script and style tags.
+pub use crate::security::CspNonce;
 /// Configured CSRF form field name; use alongside [`CsrfToken`] to honour
 /// custom `security.csrf.form_field` values in hand-written templates.
 pub use crate::security::CsrfFormField;
