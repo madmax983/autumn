@@ -1238,8 +1238,14 @@ fn apply_middleware(
         .as_deref()
         .map_or(cfg!(debug_assertions), |p| p == "dev");
     let renderer = error_page_renderer.unwrap_or_else(error_pages::default_renderer);
-    let error_page_filter =
-        crate::middleware::error_page_filter::ErrorPageFilter { renderer, is_dev };
+    let error_page_filter = crate::middleware::error_page_filter::ErrorPageFilter {
+        renderer,
+        is_dev,
+        parameter_filter: crate::log::filter::ParameterFilter::new(
+            &config.log.filter_parameters,
+            &config.log.unfilter_parameters,
+        ),
+    };
 
     // Combine the Problem Details normalizer and error page filter with user
     // exception filters. Problem Details runs first so HTML negotiation can

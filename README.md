@@ -196,6 +196,7 @@ See [EXAMPLES.md](EXAMPLES.md) for the full catalog with personas, journeys, pre
 - [Operating Background Jobs](docs/guide/operating-background-jobs.md) - admin dashboard and recovery actions for `#[job]`
 - [Mail Guide](docs/guide/mail.md)
 - [Cloud-Native Guide](docs/guide/cloud-native.md)
+- [Logging & PII](docs/guide/logging-pii.md)
 - [Todo Tutorial](docs/guide/tutorial/index.md)
 - [Autumn Harvest Architecture Notes](docs/autumn-workflow-architecture.md)
 - [API Reference](https://docs.rs/autumn-web)

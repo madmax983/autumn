@@ -25,6 +25,7 @@ use crate::middleware::exception_filter::{AutumnErrorInfo, ExceptionFilter};
 pub struct ErrorPageFilter {
     pub renderer: SharedRenderer,
     pub is_dev: bool,
+    pub parameter_filter: crate::log::filter::ParameterFilter,
 }
 
 impl ExceptionFilter for ErrorPageFilter {
@@ -44,7 +45,7 @@ impl ExceptionFilter for ErrorPageFilter {
                 .into_string();
 
         if self.is_dev {
-            Self::inject_dev_badge(&mut html_body, error, &ctx);
+            self.inject_dev_badge(&mut html_body, error, &ctx, &response);
         }
 
         Self::build_html_response(error, html_body)
@@ -61,6 +62,8 @@ pub struct WantsHtml(pub bool);
 pub struct ErrorPageRequestContext {
     pub uri: axum::http::Uri,
     pub request_id: Option<String>,
+    pub query: Option<String>,
+    pub headers: Option<axum::http::HeaderMap>,
 }
 
 /// Tower layer that annotates requests with Accept header preference
@@ -107,11 +110,16 @@ where
             .get::<crate::middleware::RequestId>()
             .map(std::string::ToString::to_string);
 
+        let query = uri.query().map(str::to_owned);
+        let headers = Some(req.headers().clone());
+
         ErrorPageContextFuture {
             inner: self.inner.call(req),
             wants_html,
             uri,
             request_id,
+            query,
+            headers,
         }
     }
 }
@@ -123,6 +131,8 @@ pin_project_lite::pin_project! {
         wants_html: bool,
         uri: axum::http::Uri,
         request_id: Option<String>,
+        query: Option<String>,
+        headers: Option<axum::http::HeaderMap>,
     }
 }
 
@@ -152,6 +162,8 @@ where
                 response.extensions_mut().insert(ErrorPageRequestContext {
                     uri: this.uri.clone(),
                     request_id,
+                    query: this.query.clone(),
+                    headers: this.headers.clone(),
                 });
                 std::task::Poll::Ready(Ok(response))
             }
@@ -239,6 +251,19 @@ pub fn accept_prefers_html(headers: &axum::http::HeaderMap) -> bool {
     }
 }
 
+fn scrub_headers(
+    headers: &axum::http::HeaderMap,
+    parameter_filter: &crate::log::filter::ParameterFilter,
+) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    for (name, value) in headers {
+        let key = name.as_str().to_owned();
+        let val = value.to_str().unwrap_or("<non-utf8>").to_owned();
+        map.insert(key, serde_json::Value::String(val));
+    }
+    parameter_filter.scrub_json(&serde_json::Value::Object(map))
+}
+
 /// 404 fallback handler for unmatched routes.
 ///
 /// This is mounted as the router's fallback so unmatched routes get proper
@@ -281,7 +306,13 @@ impl ErrorPageFilter {
         }
     }
 
-    fn inject_dev_badge(html_body: &mut String, error: &AutumnErrorInfo, ctx: &ErrorContext) {
+    fn inject_dev_badge(
+        &self,
+        html_body: &mut String,
+        error: &AutumnErrorInfo,
+        ctx: &ErrorContext,
+        response: &Response,
+    ) {
         let badge_ctx = DevBadgeContext {
             status_code: error.status.as_u16(),
             status_reason: error
@@ -293,6 +324,18 @@ impl ErrorPageFilter {
             path: ctx.path.clone(),
             request_id: ctx.request_id.clone(),
             source_location: None,
+            query: response
+                .extensions()
+                .get::<ErrorPageRequestContext>()
+                .and_then(|ctx| ctx.query.clone()),
+            headers: response
+                .extensions()
+                .get::<ErrorPageRequestContext>()
+                .and_then(|ctx| ctx.headers.as_ref())
+                .map_or_else(
+                    || serde_json::json!({}),
+                    |h| scrub_headers(h, &self.parameter_filter),
+                ),
         };
         let badge = dev_badge::dev_error_badge_html(&badge_ctx).into_string();
         if let Some(pos) = html_body.rfind("</body>") {
@@ -426,7 +469,11 @@ mod tests {
     /// Helper: build a router with the error page filter and context layer.
     fn test_router_with_error_pages(is_dev: bool) -> Router {
         let renderer = error_pages::default_renderer();
-        let error_page_filter = ErrorPageFilter { renderer, is_dev };
+        let error_page_filter = ErrorPageFilter {
+            renderer,
+            is_dev,
+            parameter_filter: crate::log::filter::ParameterFilter::default(),
+        };
         let filters: Vec<Arc<dyn crate::middleware::ExceptionFilter>> =
             vec![Arc::new(error_page_filter)];
 
@@ -615,6 +662,7 @@ mod tests {
         let error_page_filter = ErrorPageFilter {
             renderer,
             is_dev: false,
+            parameter_filter: crate::log::filter::ParameterFilter::default(),
         };
         let filters: Vec<Arc<dyn crate::middleware::ExceptionFilter>> =
             vec![Arc::new(error_page_filter)];
@@ -667,6 +715,7 @@ mod tests {
         let error_page_filter = ErrorPageFilter {
             renderer,
             is_dev: false,
+            parameter_filter: crate::log::filter::ParameterFilter::default(),
         };
         let filters: Vec<Arc<dyn crate::middleware::ExceptionFilter>> =
             vec![Arc::new(error_page_filter)];
@@ -797,6 +846,72 @@ mod tests {
             .await
             .unwrap();
         assert!(body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dev_badge_scrubs_sensitive_headers_on_form_post() {
+        let app = test_router_with_error_pages(true);
+
+        let response = tower::ServiceExt::oneshot(
+            app,
+            Request::builder()
+                .method("POST")
+                .uri("/nope?debug=true")
+                .header("accept", "text/html")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("authorization", "Bearer super-secret-token")
+                .body(Body::from("password=hunter2&email=user@example.com"))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("bytes");
+        let body_str = String::from_utf8(body.to_vec()).expect("utf8");
+
+        assert!(body_str.contains("authorization"));
+        assert!(body_str.contains("[FILTERED]"));
+        assert!(body_str.contains("Query"));
+    }
+
+    #[tokio::test]
+    async fn dev_badge_uses_configured_custom_filter_parameters() {
+        let renderer = error_pages::default_renderer();
+        let error_page_filter = ErrorPageFilter {
+            renderer,
+            is_dev: true,
+            parameter_filter: crate::log::filter::ParameterFilter::new(&["pin".to_owned()], &[]),
+        };
+        let filters: Vec<Arc<dyn crate::middleware::ExceptionFilter>> =
+            vec![Arc::new(error_page_filter)];
+
+        let app = Router::new()
+            .fallback(fallback_404_handler)
+            .layer(ErrorPageContextLayer)
+            .layer(ExceptionFilterLayer::new(filters));
+
+        let response = tower::ServiceExt::oneshot(
+            app,
+            Request::builder()
+                .method("POST")
+                .uri("/nope")
+                .header("accept", "text/html")
+                .header("pin", "1234")
+                .body(Body::from("x=1"))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("bytes");
+        let body_str = String::from_utf8(body.to_vec()).expect("utf8");
+
+        assert!(body_str.contains("pin"));
+        assert!(body_str.contains("[FILTERED]"));
     }
 
     #[tokio::test]

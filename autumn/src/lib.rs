@@ -144,6 +144,7 @@ pub use http_client as http;
 pub mod flash;
 #[cfg(feature = "htmx")]
 pub(crate) mod htmx;
+pub mod log;
 pub(crate) mod logging;
 pub mod middleware;
 pub mod openapi;
