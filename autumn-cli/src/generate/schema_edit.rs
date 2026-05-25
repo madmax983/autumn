@@ -805,6 +805,8 @@ fn strip_comments(src: &str) -> String {
             if i < chars.len() {
                 result.push('\n');
                 i += 1;
+            } else {
+                result.push(' ');
             }
             continue;
         }
@@ -812,14 +814,22 @@ fn strip_comments(src: &str) -> String {
         // 2. Check for block comment
         if i + 1 < chars.len() && chars[i] == '/' && chars[i + 1] == '*' {
             i += 2;
-            while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '/') {
-                i += 1;
+            let mut depth = 1;
+            while i + 1 < chars.len() && depth > 0 {
+                if chars[i] == '/' && chars[i + 1] == '*' {
+                    depth += 1;
+                    i += 2;
+                } else if chars[i] == '*' && chars[i + 1] == '/' {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
             }
-            if i + 1 < chars.len() {
-                i += 2;
-            } else {
+            if depth > 0 {
                 i = chars.len();
             }
+            result.push(' ');
             continue;
         }
 
@@ -1072,9 +1082,13 @@ pub fn parse_model_search_config_for_table(
     }
 
     if model_pos.is_none() {
-        model_pos = clean_content.find("#[model");
-        if model_pos.is_none() {
-            model_pos = clean_content.find("#[autumn_web::model");
+        if table.is_empty() {
+            model_pos = clean_content.find("#[model");
+            if model_pos.is_none() {
+                model_pos = clean_content.find("#[autumn_web::model");
+            }
+        } else {
+            return None;
         }
     }
 
@@ -2221,5 +2235,51 @@ pub struct Post {
                 ("content_body".to_string(), 'B')
             ]
         );
+    }
+
+    #[test]
+    fn test_strip_comments_nested_block() {
+        let content = "pub /* outer /* inner */ still outer */ struct Post {}";
+        let stripped = strip_comments(content);
+        assert_eq!(stripped.trim(), "pub   struct Post {}");
+    }
+
+    #[test]
+    fn test_strip_comments_token_boundary() {
+        let content = "pub/*comment*/struct Post";
+        let stripped = strip_comments(content);
+        assert_eq!(stripped.trim(), "pub struct Post");
+    }
+
+    #[test]
+    fn test_parse_model_search_config_strict_fallback() {
+        let content_multi = r#"
+#[autumn_web::model(table = "posts")]
+pub struct Post {
+    #[id]
+    pub id: i64,
+    #[searchable]
+    pub title: String,
+}
+
+#[autumn_web::model(table = "comments")]
+pub struct Comment {
+    #[id]
+    pub id: i64,
+    #[searchable]
+    pub body: String,
+}
+"#;
+        // Non-existent table should return None instead of falling back to the first struct (Post)
+        assert!(parse_model_search_config_for_table(content_multi, "users").is_none());
+
+        // Valid tables should still match perfectly
+        let (_, posts_fields) =
+            parse_model_search_config_for_table(content_multi, "posts").unwrap();
+        assert_eq!(posts_fields[0].0, "title");
+
+        let (_, comments_fields) =
+            parse_model_search_config_for_table(content_multi, "comments").unwrap();
+        assert_eq!(comments_fields[0].0, "body");
     }
 }

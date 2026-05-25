@@ -95,7 +95,7 @@ pub async fn list(repo: PgPageRepository) -> AutumnResult<Markup> {
                       hx-get="/search" hx-trigger="keyup changed delay:300ms, search"
                       hx-target="#search-results" hx-swap="outerHTML" hx-indicator="#search-indicator"
                       class="flex-grow border rounded px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-emerald-500";
-                span id="search-indicator" class="htmx-indicator ml-3 text-sm text-gray-400 hidden" {
+                span id="search-indicator" class="htmx-indicator ml-3 text-sm text-gray-400" {
                     "Searching..."
                 }
             }

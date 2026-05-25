@@ -67,17 +67,22 @@ pub fn plan_migration(
             }
 
             let models_dir = project_root.join("src/models");
-            if let Ok(entries) = std::fs::read_dir(models_dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.is_file()
-                        && path.extension().is_some_and(|ext| ext == "rs")
-                        && !candidates.contains(&path)
-                    {
-                        candidates.push(path);
+            fn collect_rs_files_recursive(dir: &Path, candidates: &mut Vec<std::path::PathBuf>) {
+                if let Ok(entries) = std::fs::read_dir(dir) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.is_dir() {
+                            collect_rs_files_recursive(&path, candidates);
+                        } else if path.is_file()
+                            && path.extension().is_some_and(|ext| ext == "rs")
+                            && !candidates.contains(&path)
+                        {
+                            candidates.push(path);
+                        }
                     }
                 }
             }
+            collect_rs_files_recursive(&models_dir, &mut candidates);
 
             let mut found_config = None;
             let mut tried_files = Vec::new();
