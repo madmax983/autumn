@@ -1004,9 +1004,14 @@ fn extract_diesel_column_name(attr: &str) -> Option<String> {
         }
     }
 
-    // 3. Try unquoted identifier form e.g. column_name = headline
+    // 3. Try unquoted identifier form e.g. column_name = headline or column_name = r#type
+    let mut after_ident = after_eq;
+    if let Some(stripped_raw) = after_eq.strip_prefix("r#") {
+        after_ident = stripped_raw;
+    }
+
     let mut id_chars = String::new();
-    for c in after_eq.chars() {
+    for c in after_ident.chars() {
         if c.is_alphanumeric() || c == '_' {
             id_chars.push(c);
         } else {
@@ -1018,6 +1023,15 @@ fn extract_diesel_column_name(attr: &str) -> Option<String> {
     }
 
     None
+}
+
+fn has_attribute_boundary(rest: &str, pos: usize, keyword: &str) -> bool {
+    let after = &rest[pos + keyword.len()..];
+    if let Some(c) = after.chars().next() {
+        c == '(' || c == ']' || c.is_whitespace()
+    } else {
+        true
+    }
 }
 
 #[must_use]
@@ -1039,11 +1053,13 @@ pub fn parse_model_search_config_for_table(
         let mut rest = clean_content.as_str();
         while let Some(pos) = rest.find("#[model") {
             let offset = clean_content.len() - rest.len() + pos;
-            if let Some(close_bracket) = rest[pos..].find(']') {
-                let attr_content = &rest[pos..pos + close_bracket];
-                if is_matching_table_attr(attr_content, table) {
-                    model_pos = Some(offset);
-                    break;
+            if has_attribute_boundary(rest, pos, "#[model") {
+                if let Some(close_bracket) = rest[pos..].find(']') {
+                    let attr_content = &rest[pos..pos + close_bracket];
+                    if is_matching_table_attr(attr_content, table) {
+                        model_pos = Some(offset);
+                        break;
+                    }
                 }
             }
             rest = &rest[pos + "#[model".len()..];
@@ -1053,11 +1069,13 @@ pub fn parse_model_search_config_for_table(
             let mut rest = clean_content.as_str();
             while let Some(pos) = rest.find("#[autumn_web::model") {
                 let offset = clean_content.len() - rest.len() + pos;
-                if let Some(close_bracket) = rest[pos..].find(']') {
-                    let attr_content = &rest[pos..pos + close_bracket];
-                    if is_matching_table_attr(attr_content, table) {
-                        model_pos = Some(offset);
-                        break;
+                if has_attribute_boundary(rest, pos, "#[autumn_web::model") {
+                    if let Some(close_bracket) = rest[pos..].find(']') {
+                        let attr_content = &rest[pos..pos + close_bracket];
+                        if is_matching_table_attr(attr_content, table) {
+                            model_pos = Some(offset);
+                            break;
+                        }
                     }
                 }
                 rest = &rest[pos + "#[autumn_web::model".len()..];
@@ -1087,8 +1105,27 @@ pub fn parse_model_search_config_for_table(
 
             if let Some(s_pos) = found_struct_pos {
                 let before_struct = &clean_content[..s_pos];
-                let m_pos_opt = before_struct.rfind("#[model");
-                let aw_pos_opt = before_struct.rfind("#[autumn_web::model");
+
+                let mut m_pos_opt = None;
+                let mut rest_before = before_struct;
+                while let Some(p) = rest_before.rfind("#[model") {
+                    if has_attribute_boundary(rest_before, p, "#[model") {
+                        m_pos_opt = Some(p);
+                        break;
+                    }
+                    rest_before = &rest_before[..p];
+                }
+
+                let mut aw_pos_opt = None;
+                let mut rest_before_aw = before_struct;
+                while let Some(p) = rest_before_aw.rfind("#[autumn_web::model") {
+                    if has_attribute_boundary(rest_before_aw, p, "#[autumn_web::model") {
+                        aw_pos_opt = Some(p);
+                        break;
+                    }
+                    rest_before_aw = &rest_before_aw[..p];
+                }
+
                 let best_pos = match (m_pos_opt, aw_pos_opt) {
                     (Some(p1), Some(p2)) => Some(std::cmp::max(p1, p2)),
                     (Some(p), None) | (None, Some(p)) => Some(p),
@@ -1113,9 +1150,23 @@ pub fn parse_model_search_config_for_table(
 
     if model_pos.is_none() {
         if table.is_empty() {
-            model_pos = clean_content.find("#[model");
+            let mut rest = clean_content.as_str();
+            while let Some(pos) = rest.find("#[model") {
+                if has_attribute_boundary(rest, pos, "#[model") {
+                    model_pos = Some(clean_content.len() - rest.len() + pos);
+                    break;
+                }
+                rest = &rest[pos + "#[model".len()..];
+            }
             if model_pos.is_none() {
-                model_pos = clean_content.find("#[autumn_web::model");
+                let mut rest = clean_content.as_str();
+                while let Some(pos) = rest.find("#[autumn_web::model") {
+                    if has_attribute_boundary(rest, pos, "#[autumn_web::model") {
+                        model_pos = Some(clean_content.len() - rest.len() + pos);
+                        break;
+                    }
+                    rest = &rest[pos + "#[autumn_web::model".len()..];
+                }
             }
         } else {
             return None;
@@ -2350,5 +2401,48 @@ pub struct Post {
         assert_eq!(singularize("databases"), "database");
         assert_eq!(singularize("phases"), "phase");
         assert_eq!(singularize("premises"), "premise");
+    }
+
+    #[test]
+    fn test_extract_diesel_column_name_raw_identifier() {
+        let content_diesel = r#"
+#[autumn_web::model(table = "posts")]
+pub struct Post {
+    #[id]
+    pub id: i64,
+    #[searchable(weight = "A")]
+    #[diesel(column_name = r#headline)]
+    pub title: String,
+    #[diesel(column_name = r#content_body)]
+    #[searchable(weight = "B")]
+    pub body: String,
+}
+"#;
+        let (_, fields) = parse_model_search_config_for_table(content_diesel, "posts").unwrap();
+        assert_eq!(
+            fields,
+            vec![
+                ("headline".to_string(), 'A'),
+                ("content_body".to_string(), 'B')
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_model_search_config_model_helper_collision() {
+        let content_collision = r#"
+#[model_helper(table = "posts")]
+pub struct Helper {}
+
+#[autumn_web::model(table = "posts")]
+pub struct Post {
+    #[id]
+    pub id: i64,
+    #[searchable]
+    pub title: String,
+}
+"#;
+        let (_, fields) = parse_model_search_config_for_table(content_collision, "posts").unwrap();
+        assert_eq!(fields[0].0, "title");
     }
 }

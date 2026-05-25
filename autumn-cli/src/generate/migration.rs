@@ -83,7 +83,15 @@ pub fn plan_migration(
             }
 
             let models_dir = project_root.join("src/models");
-            collect_rs_files_recursive(&models_dir, &mut candidates);
+            let mut other_candidates = Vec::new();
+            collect_rs_files_recursive(&models_dir, &mut other_candidates);
+            other_candidates.sort();
+
+            for path in other_candidates {
+                if !candidates.contains(&path) {
+                    candidates.push(path);
+                }
+            }
 
             let mut found_config = None;
             let mut tried_files = Vec::new();
