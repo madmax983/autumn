@@ -698,11 +698,43 @@ pub fn singularize(s: &str) -> String {
     if let Some(stripped) = s.strip_suffix("children") {
         return format!("{stripped}child");
     }
-    if let Some(stripped) = s.strip_suffix("men") {
-        return format!("{stripped}man");
+
+    let is_false_men = s == "specimen"
+        || s == "regimen"
+        || s == "abdomen"
+        || s == "lumen"
+        || s == "omen"
+        || s == "semen"
+        || s == "hymen"
+        || s == "acumen"
+        || s == "bitumen"
+        || s == "stamen"
+        || s.ends_with("specimen")
+        || s.ends_with("regimen")
+        || s.ends_with("abdomen")
+        || s.ends_with("lumen")
+        || s.ends_with("omen")
+        || s.ends_with("semen")
+        || s.ends_with("hymen")
+        || s.ends_with("acumen")
+        || s.ends_with("bitumen")
+        || s.ends_with("stamen");
+
+    if s == "men" {
+        return "man".to_string();
     }
-    if let Some(stripped) = s.strip_suffix("women") {
-        return format!("{stripped}woman");
+    if s == "women" {
+        return "woman".to_string();
+    }
+    if s.ends_with("men") && !is_false_men {
+        if let Some(stripped) = s.strip_suffix("men") {
+            return format!("{stripped}man");
+        }
+    }
+    if s.ends_with("women") {
+        if let Some(stripped) = s.strip_suffix("women") {
+            return format!("{stripped}woman");
+        }
     }
 
     if let Some(stripped) = s.strip_suffix("ies") {
@@ -720,11 +752,13 @@ pub fn singularize(s: &str) -> String {
         {
             if s.ends_with("statuses") || s.ends_with("aliases") || s.ends_with("buses") {
                 stripped.to_owned()
-            } else if s.ends_with("cases")
-                || s.ends_with("databases")
-                || s.ends_with("phases")
-                || s.ends_with("uses")
-            {
+            } else if s.ends_with("sses") {
+                stripped.to_owned()
+            } else if s.ends_with("lenses") {
+                stripped.to_owned()
+            } else if s.ends_with("ases") || s.ends_with("ises") || s.ends_with("oses") || s.ends_with("uses") || s.ends_with("yses") {
+                format!("{stripped}e")
+            } else if s.ends_with("ses") {
                 format!("{stripped}e")
             } else {
                 stripped.to_owned()
@@ -739,49 +773,108 @@ pub fn singularize(s: &str) -> String {
     }
 }
 
-#[allow(clippy::while_let_on_iterator)]
 fn strip_comments(src: &str) -> String {
+    let chars: Vec<char> = src.chars().collect();
     let mut result = String::with_capacity(src.len());
-    let mut chars = src.chars().peekable();
-    let mut in_string = false;
-    let mut escaped = false;
-    while let Some(ch) = chars.next() {
-        if escaped {
-            result.push(ch);
-            escaped = false;
+    let mut i = 0;
+    while i < chars.len() {
+        // 1. Check for single-line comment
+        if i + 1 < chars.len() && chars[i] == '/' && chars[i + 1] == '/' {
+            i += 2;
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
+            }
+            if i < chars.len() {
+                result.push('\n');
+                i += 1;
+            }
             continue;
         }
-        if ch == '\\' && in_string {
-            result.push(ch);
-            escaped = true;
+
+        // 2. Check for block comment
+        if i + 1 < chars.len() && chars[i] == '/' && chars[i + 1] == '*' {
+            i += 2;
+            while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '/') {
+                i += 1;
+            }
+            if i + 1 < chars.len() {
+                i += 2;
+            } else {
+                i = chars.len();
+            }
             continue;
         }
-        if ch == '"' {
-            in_string = !in_string;
-            result.push(ch);
-            continue;
+
+        // 3. Check for raw string literal: r"..." or r#"..."# or r##"..."##
+        if chars[i] == 'r' && i + 1 < chars.len() {
+            let mut hash_count = 0;
+            let mut j = i + 1;
+            while j < chars.len() && chars[j] == '#' {
+                hash_count += 1;
+                j += 1;
+            }
+            if j < chars.len() && chars[j] == '"' {
+                for idx in i..=j {
+                    result.push(chars[idx]);
+                }
+                i = j + 1;
+
+                let mut closed = false;
+                while i < chars.len() {
+                    if chars[i] == '"' {
+                        let mut match_hashes = true;
+                        for h in 0..hash_count {
+                            if i + 1 + h >= chars.len() || chars[i + 1 + h] != '#' {
+                                match_hashes = false;
+                                break;
+                            }
+                        }
+                        if match_hashes {
+                            result.push('"');
+                            for _ in 0..hash_count {
+                                result.push('#');
+                            }
+                            i += 1 + hash_count;
+                            closed = true;
+                            break;
+                        }
+                    }
+                    result.push(chars[i]);
+                    i += 1;
+                }
+                if !closed {
+                    i = chars.len();
+                }
+                continue;
+            }
         }
-        if in_string {
-            result.push(ch);
-        } else if ch == '/' && chars.peek() == Some(&'/') {
-            chars.next();
-            while let Some(next_ch) = chars.next() {
-                if next_ch == '\n' {
-                    result.push('\n');
+
+        // 4. Check for standard double-quoted string
+        if chars[i] == '"' {
+            result.push('"');
+            i += 1;
+            while i < chars.len() {
+                let ch = chars[i];
+                result.push(ch);
+                if ch == '\\' {
+                    if i + 1 < chars.len() {
+                        result.push(chars[i + 1]);
+                        i += 2;
+                        continue;
+                    }
+                }
+                if ch == '"' {
+                    i += 1;
                     break;
                 }
+                i += 1;
             }
-        } else if ch == '/' && chars.peek() == Some(&'*') {
-            chars.next();
-            while let Some(next_ch) = chars.next() {
-                if next_ch == '*' && chars.peek() == Some(&'/') {
-                    chars.next();
-                    break;
-                }
-            }
-        } else {
-            result.push(ch);
+            continue;
         }
+
+        // 5. Normal character
+        result.push(chars[i]);
+        i += 1;
     }
     result
 }
@@ -794,6 +887,29 @@ pub fn parse_model_search_config(content: &str) -> Option<(String, Vec<(String, 
 }
 
 /// Scan a model file content to extract the `#[searchable]` language and field weights for a specific table.
+fn is_matching_table_attr(attr_content: &str, table: &str) -> bool {
+    let mut rest = attr_content;
+    while let Some(pos) = rest.find("table") {
+        let prev_char = if pos > 0 { rest.as_bytes().get(pos - 1) } else { None };
+        let next_char = rest.as_bytes().get(pos + "table".len());
+        let is_prev_boundary = prev_char.is_none_or(|&c| !c.is_ascii_alphanumeric() && c != b'_');
+        let is_next_boundary = next_char.is_none_or(|&c| !c.is_ascii_alphanumeric() && c != b'_');
+        if is_prev_boundary && is_next_boundary {
+            let after_table = &rest[pos + "table".len()..];
+            let trimmed = after_table.trim_start();
+            if let Some(stripped_eq) = trimmed.strip_prefix('=') {
+                let after_eq = stripped_eq.trim_start();
+                let expected_value = format!("\"{table}\"");
+                if after_eq.starts_with(&expected_value) {
+                    return true;
+                }
+            }
+        }
+        rest = &rest[pos + "table".len()..];
+    }
+    false
+}
+
 #[must_use]
 #[allow(clippy::too_many_lines)]
 pub fn parse_model_search_config_for_table(
@@ -806,6 +922,8 @@ pub fn parse_model_search_config_for_table(
 
     // 1. Locate the model struct position anchored by #[model] or #[autumn_web::model] for the given table
     let mut model_pos = None;
+    let mut struct_pos = None;
+
     if !table.is_empty() {
         // Try to find #[model(...table = "table"...)]
         let mut rest = clean_content.as_str();
@@ -813,30 +931,71 @@ pub fn parse_model_search_config_for_table(
             let offset = clean_content.len() - rest.len() + pos;
             if let Some(close_bracket) = rest[pos..].find(']') {
                 let attr_content = &rest[pos..pos + close_bracket];
-                // Check if this attribute mentions our table
-                if attr_content.contains(&format!("table = \"{table}\""))
-                    || attr_content.contains(&format!("table=\"{table}\""))
-                {
+                if is_matching_table_attr(attr_content, table) {
                     model_pos = Some(offset);
                     break;
                 }
             }
             rest = &rest[pos + "#[model".len()..];
         }
+
         if model_pos.is_none() {
             let mut rest = clean_content.as_str();
             while let Some(pos) = rest.find("#[autumn_web::model") {
                 let offset = clean_content.len() - rest.len() + pos;
                 if let Some(close_bracket) = rest[pos..].find(']') {
                     let attr_content = &rest[pos..pos + close_bracket];
-                    if attr_content.contains(&format!("table = \"{table}\""))
-                        || attr_content.contains(&format!("table=\"{table}\""))
-                    {
+                    if is_matching_table_attr(attr_content, table) {
                         model_pos = Some(offset);
                         break;
                     }
                 }
                 rest = &rest[pos + "#[autumn_web::model".len()..];
+            }
+        }
+
+        // Try PascalCase struct name fallback
+        if model_pos.is_none() {
+            let singular = singularize(table);
+            let struct_name = super::naming::snake_to_pascal(&singular);
+
+            let mut search_rest = clean_content.as_str();
+            let mut found_struct_pos = None;
+            while let Some(pos) = search_rest.find("struct ") {
+                let offset = clean_content.len() - search_rest.len() + pos;
+                let after_struct = &search_rest[pos + "struct ".len()..];
+                if let Some(first_word) = after_struct.split_whitespace().next() {
+                    let clean_name = first_word.trim_end_matches(|c: char| !c.is_alphanumeric() && c != '_');
+                    if clean_name == struct_name {
+                        found_struct_pos = Some(offset);
+                        break;
+                    }
+                }
+                search_rest = &search_rest[pos + "struct ".len()..];
+            }
+
+            if let Some(s_pos) = found_struct_pos {
+                let before_struct = &clean_content[..s_pos];
+                let m_pos_opt = before_struct.rfind("#[model");
+                let aw_pos_opt = before_struct.rfind("#[autumn_web::model");
+                let best_pos = match (m_pos_opt, aw_pos_opt) {
+                    (Some(p1), Some(p2)) => Some(std::cmp::max(p1, p2)),
+                    (Some(p), None) | (None, Some(p)) => Some(p),
+                    (None, None) => None,
+                };
+
+                if let Some(pos) = best_pos {
+                    let in_between = &before_struct[pos..];
+                    let has_other_struct = in_between.find("struct").is_some_and(|idx| {
+                        let bytes = in_between.as_bytes();
+                        let next_char = bytes.get(idx + "struct".len());
+                        next_char.is_none_or(|&c| c.is_ascii_whitespace())
+                    });
+                    if !has_other_struct {
+                        model_pos = Some(pos);
+                        struct_pos = Some(s_pos);
+                    }
+                }
             }
         }
     }
@@ -848,14 +1007,15 @@ pub fn parse_model_search_config_for_table(
         }
     }
 
-    let struct_pos = if let Some(m_pos) = model_pos {
+    let struct_pos = if let Some(s_pos) = struct_pos {
+        s_pos
+    } else if let Some(m_pos) = model_pos {
         if let Some(struct_offset) = clean_content[m_pos..].find("struct ") {
             m_pos + struct_offset
         } else {
             return None;
         }
     } else {
-        // Fallback to first struct in file if #[model] attribute is completely missing
         clean_content.find("struct ")?
     };
 
@@ -1730,4 +1890,79 @@ pub struct Comment {
         assert_eq!(comment_lang, "spanish");
         assert_eq!(comment_fields, vec![("body".to_string(), 'B')]);
     }
+
+    #[test]
+    fn test_strip_comments_raw_strings() {
+        let content = r###"
+        let r1 = r#"quote " inside raw"#;
+        let r2 = r##"// not comment inside raw block"##;
+        let r3 = r#"/* not block comment */"#;
+        "###;
+        let stripped = strip_comments(content);
+        assert!(stripped.contains("r#\"quote \" inside raw\"#"));
+        assert!(stripped.contains("r##\"// not comment inside raw block\"##"));
+        assert!(stripped.contains("r#\"/* not block comment */\"#"));
+    }
+
+    #[test]
+    fn test_parse_model_search_config_spacing_insensitivity() {
+        let content_spacing = r#"
+#[autumn_web::model( table  =   "posts" )]
+#[searchable(language = "english")]
+pub struct Post {
+    #[id]
+    pub id: i64,
+    #[searchable(weight = "A")]
+    pub title: String,
 }
+"#;
+        let (lang, fields) = parse_model_search_config_for_table(content_spacing, "posts").unwrap();
+        assert_eq!(lang, "english");
+        assert_eq!(fields, vec![("title".to_string(), 'A')]);
+    }
+
+    #[test]
+    fn test_parse_model_search_config_pascal_fallback() {
+        let content = r#"
+#[autumn_web::model]
+#[searchable(language = "english")]
+pub struct Post {
+    #[id]
+    pub id: i64,
+    #[searchable(weight = "A")]
+    pub title: String,
+}
+
+#[autumn_web::model]
+#[searchable(language = "spanish")]
+pub struct Comment {
+    #[id]
+    pub id: i64,
+    #[searchable(weight = "B")]
+    pub body: String,
+}
+"#;
+        let (lang, fields) = parse_model_search_config_for_table(content, "comments").unwrap();
+        assert_eq!(lang, "spanish");
+        assert_eq!(fields, vec![("body".to_string(), 'B')]);
+    }
+
+    #[test]
+    fn test_singularize_specimens_and_gentlemen() {
+        assert_eq!(singularize("specimens"), "specimen");
+        assert_eq!(singularize("regimens"), "regimen");
+        assert_eq!(singularize("gentlemen"), "gentleman");
+        assert_eq!(singularize("firemen"), "fireman");
+    }
+
+    #[test]
+    fn test_singularize_ses_trailing_e() {
+        assert_eq!(singularize("houses"), "house");
+        assert_eq!(singularize("phrases"), "phrase");
+        assert_eq!(singularize("guesses"), "guess");
+        assert_eq!(singularize("lenses"), "lens");
+        assert_eq!(singularize("databases"), "database");
+        assert_eq!(singularize("cases"), "case");
+    }
+}
+

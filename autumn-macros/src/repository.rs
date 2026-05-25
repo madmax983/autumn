@@ -5766,6 +5766,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 if !<#model_name as ::autumn_web::repository::AutumnSearchableModel>::IS_SEARCHABLE {
                     ::core::panic!("The backing model is not marked with #[searchable] or has no searchable fields configured, but its repository has `searchable = true` enabled.");
                 }
+                if <#model_name as ::autumn_web::repository::AutumnSearchableModel>::SEARCH_FIELDS.is_empty() {
+                    ::core::panic!("The backing model is marked with #[searchable] but has zero searchable fields configured, but its repository has `searchable = true` enabled.");
+                }
             };
         }
     } else {
