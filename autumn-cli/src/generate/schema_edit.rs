@@ -908,9 +908,36 @@ fn is_matching_table_attr(attr_content: &str, table: &str) -> bool {
             let trimmed = after_table.trim_start();
             if let Some(stripped_eq) = trimmed.strip_prefix('=') {
                 let after_eq = stripped_eq.trim_start();
+
+                // 1. Try normal string literal
                 let expected_value = format!("\"{table}\"");
                 if after_eq.starts_with(&expected_value) {
                     return true;
+                }
+
+                // 2. Try raw string literal (e.g. r"table" or r#"table"#)
+                if after_eq.starts_with('r') {
+                    let after_r = &after_eq[1..];
+                    let mut hash_count = 0;
+                    let bytes = after_r.as_bytes();
+                    while hash_count < bytes.len() && bytes[hash_count] == b'#' {
+                        hash_count += 1;
+                    }
+                    let after_hashes = &after_r[hash_count..];
+                    let expected_raw = format!("\"{table}\"");
+                    if after_hashes.starts_with(&expected_raw) {
+                        let after_quote = &after_hashes[expected_raw.len()..];
+                        let mut match_close = true;
+                        for h in 0..hash_count {
+                            if after_quote.as_bytes().get(h) != Some(&b'#') {
+                                match_close = false;
+                                break;
+                            }
+                        }
+                        if match_close {
+                            return true;
+                        }
+                    }
                 }
             }
         }
@@ -1063,22 +1090,78 @@ pub fn parse_model_search_config_for_table(
     let mut struct_body = "";
     if let Some(open_brace_offset) = clean_content[struct_pos..].find('{') {
         let open_brace_pos = struct_pos + open_brace_offset;
+        let chars: Vec<char> = clean_content[open_brace_pos + 1..].chars().collect();
         let mut brace_count = 1;
-        let mut close_brace_pos = None;
-        let struct_body_chars = clean_content[open_brace_pos + 1..].char_indices();
-        for (idx, ch) in struct_body_chars {
-            if ch == '{' {
+        let mut close_brace_offset = None;
+        let mut i = 0;
+        while i < chars.len() {
+            // Check for raw string literal: r"..." or r#"..."#
+            if chars[i] == 'r' && i + 1 < chars.len() {
+                let mut hash_count = 0;
+                let mut j = i + 1;
+                while j < chars.len() && chars[j] == '#' {
+                    hash_count += 1;
+                    j += 1;
+                }
+                if j < chars.len() && chars[j] == '"' {
+                    i = j + 1;
+                    while i < chars.len() {
+                        if chars[i] == '"' {
+                            let mut match_hashes = true;
+                            for h in 0..hash_count {
+                                if i + 1 + h >= chars.len() || chars[i + 1 + h] != '#' {
+                                    match_hashes = false;
+                                    break;
+                                }
+                            }
+                            if match_hashes {
+                                i += 1 + hash_count;
+                                break;
+                            }
+                        }
+                        i += 1;
+                    }
+                    continue;
+                }
+            }
+
+            // Check for standard double-quoted string
+            if chars[i] == '"' {
+                i += 1;
+                while i < chars.len() {
+                    let ch = chars[i];
+                    if ch == '\\' {
+                        if i + 1 < chars.len() {
+                            i += 2;
+                            continue;
+                        }
+                    }
+                    if ch == '"' {
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+
+            // Check for structural braces
+            if chars[i] == '{' {
                 brace_count += 1;
-            } else if ch == '}' {
+            } else if chars[i] == '}' {
                 brace_count -= 1;
                 if brace_count == 0 {
-                    close_brace_pos = Some(open_brace_pos + 1 + idx);
+                    close_brace_offset = Some(i);
                     break;
                 }
             }
+            i += 1;
         }
-        if let Some(end_pos) = close_brace_pos {
-            struct_body = &clean_content[open_brace_pos + 1..end_pos];
+
+        if let Some(offset) = close_brace_offset {
+            let consumed: String = chars[..offset].iter().collect();
+            let consumed_len = consumed.len();
+            struct_body = &clean_content[open_brace_pos + 1..open_brace_pos + 1 + consumed_len];
         }
     }
 
@@ -1109,7 +1192,12 @@ pub fn parse_model_search_config_for_table(
                         if let Some(quote_end) = after_quote.find('"') {
                             let w_str = &after_quote[..quote_end];
                             if let Some(ch) = w_str.chars().next() {
-                                weight = ch;
+                                let upper = ch.to_ascii_uppercase();
+                                if upper == 'A' || upper == 'B' || upper == 'C' || upper == 'D' {
+                                    weight = upper;
+                                } else {
+                                    weight = 'D';
+                                }
                             }
                         }
                     }
@@ -1973,5 +2061,62 @@ pub struct Comment {
         assert_eq!(singularize("lenses"), "lens");
         assert_eq!(singularize("databases"), "database");
         assert_eq!(singularize("cases"), "case");
+    }
+
+    #[test]
+    fn test_parse_model_search_config_raw_string_table_attr() {
+        let content_raw_table = r##"
+#[autumn_web::model(table = r#"raw_posts"#)]
+#[searchable(language = "english")]
+pub struct Post {
+    #[id]
+    pub id: i64,
+    #[searchable(weight = "A")]
+    pub title: String,
+}
+"##;
+        let (lang, fields) =
+            parse_model_search_config_for_table(content_raw_table, "raw_posts").unwrap();
+        assert_eq!(lang, "english");
+        assert_eq!(fields, vec![("title".to_string(), 'A')]);
+    }
+
+    #[test]
+    fn test_parse_model_search_config_braces_in_attributes() {
+        let content_braces = r#"
+#[autumn_web::model(table = "posts")]
+#[searchable(language = "english")]
+pub struct Post {
+    #[id]
+    pub id: i64,
+    #[searchable(weight = "A")]
+    #[validate(custom = "foo } bar")]
+    pub title: String,
+    #[searchable(weight = "B")]
+    pub body: String,
+}
+"#;
+        let (_, fields) = parse_model_search_config_for_table(content_braces, "posts").unwrap();
+        assert_eq!(
+            fields,
+            vec![("title".to_string(), 'A'), ("body".to_string(), 'B')]
+        );
+    }
+
+    #[test]
+    fn test_parse_model_search_config_invalid_weight_fallback() {
+        let content_invalid_weight = r#"
+#[autumn_web::model(table = "posts")]
+#[searchable(language = "english")]
+pub struct Post {
+    #[id]
+    pub id: i64,
+    #[searchable(weight = "Z")]
+    pub title: String,
+}
+"#;
+        let (_, fields) =
+            parse_model_search_config_for_table(content_invalid_weight, "posts").unwrap();
+        assert_eq!(fields, vec![("title".to_string(), 'D')]);
     }
 }

@@ -50,44 +50,74 @@ pub fn plan_migration(
         ),
         MigrationShape::AddSearch { ref table } => {
             let singular = singularize(table);
-            let first_candidate = project_root
+
+            // Collect all potential model file candidates in order of preference
+            let mut candidates = Vec::new();
+
+            let first_cand = project_root
                 .join("src/models")
                 .join(format!("{singular}.rs"));
-            let second_candidate = project_root.join("src/models.rs");
+            if first_cand.exists() {
+                candidates.push(first_cand);
+            }
 
-            let (model_file_path, content) = if first_candidate.exists() {
-                (
-                    first_candidate.clone(),
-                    std::fs::read_to_string(&first_candidate).map_err(GenerateError::Io)?,
-                )
-            } else if second_candidate.exists() {
-                (
-                    second_candidate.clone(),
-                    std::fs::read_to_string(&second_candidate).map_err(GenerateError::Io)?,
-                )
-            } else {
+            let second_cand = project_root.join("src/models.rs");
+            if second_cand.exists() {
+                candidates.push(second_cand);
+            }
+
+            let models_dir = project_root.join("src/models");
+            if models_dir.is_dir() {
+                if let Ok(entries) = std::fs::read_dir(&models_dir) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.is_file() && path.extension().is_some_and(|ext| ext == "rs") {
+                            if !candidates.contains(&path) {
+                                candidates.push(path);
+                            }
+                        }
+                    }
+                }
+            }
+
+            let mut found_config = None;
+            let mut tried_files = Vec::new();
+
+            for path in candidates {
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    if let Some((language, fts_fields)) =
+                        parse_model_search_config_for_table(&content, table)
+                    {
+                        found_config = Some((path, language, fts_fields));
+                        break;
+                    }
+                    tried_files.push(path);
+                }
+            }
+
+            let (language, fts_fields) = if let Some((_path, language, fts_fields)) = found_config {
+                (language, fts_fields)
+            } else if tried_files.is_empty() {
                 return Err(GenerateError::Config(format!(
-                    "Missing model file for table '{}'. Expected to find it at '{}' or '{}'",
-                    table,
-                    first_candidate.display(),
-                    second_candidate.display()
+                    "Missing model files for table '{}'. Expected src/models/{}.rs or src/models.rs.",
+                    table, singular
+                )));
+            } else {
+                let files_str = tried_files
+                    .iter()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(GenerateError::Config(format!(
+                    "No #[searchable] fields configured for table '{}' in any of the checked files: [{}]",
+                    table, files_str
                 )));
             };
 
-            if let Some((language, fts_fields)) =
-                parse_model_search_config_for_table(&content, table)
-            {
-                (
-                    add_search_up_sql(table, &language, &fts_fields),
-                    add_search_down_sql(table),
-                )
-            } else {
-                return Err(GenerateError::Config(format!(
-                    "Model file '{}' exists but has no #[searchable] fields configured for table '{}'",
-                    model_file_path.display(),
-                    table
-                )));
-            }
+            (
+                add_search_up_sql(table, &language, &fts_fields),
+                add_search_down_sql(table),
+            )
         }
         _ => (String::new(), String::new()),
     };
