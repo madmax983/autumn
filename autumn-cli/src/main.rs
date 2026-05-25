@@ -706,7 +706,7 @@ fn run_command(command: Commands) {
                         std::process::exit(1);
                     })
                 });
-                maintenance::run_on(maintenance::MaintenanceOnOptions {
+                maintenance::run_on(&maintenance::MaintenanceOnOptions {
                     message: message.as_deref(),
                     allow_ips: &allow_ips,
                     readonly,

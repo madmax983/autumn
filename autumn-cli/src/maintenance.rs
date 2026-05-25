@@ -29,7 +29,7 @@ pub struct MaintenanceOnOptions<'a> {
 }
 
 /// Enable maintenance mode: write the flag file and print confirmation.
-pub fn run_on(opts: MaintenanceOnOptions<'_>) {
+pub fn run_on(opts: &MaintenanceOnOptions<'_>) {
     let path = resolved_flag_path(opts.flag_file);
 
     let config = MaintenanceConfig {
@@ -110,9 +110,7 @@ pub fn parse_bypass_header(arg: &str) -> Result<(&str, &str), String> {
 }
 
 fn resolved_flag_path(override_: Option<&Path>) -> PathBuf {
-    override_
-        .map(Path::to_owned)
-        .unwrap_or_else(|| PathBuf::from(MAINTENANCE_FLAG_FILE))
+    override_.map_or_else(|| PathBuf::from(MAINTENANCE_FLAG_FILE), Path::to_owned)
 }
 
 #[cfg(test)]
@@ -143,7 +141,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("maintenance.json");
 
-        run_on(MaintenanceOnOptions {
+        run_on(&MaintenanceOnOptions {
             message: Some("testing"),
             allow_ips: &[],
             readonly: false,
@@ -161,7 +159,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("maintenance.json");
 
-        run_on(MaintenanceOnOptions {
+        run_on(&MaintenanceOnOptions {
             message: Some("deploying"),
             allow_ips: &["10.0.0.0/8".into()],
             readonly: true,

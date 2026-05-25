@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 pub const MAINTENANCE_FLAG_FILE: &str = "tmp/autumn-maintenance.json";
 
 /// Configuration for an active maintenance window.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MaintenanceConfig {
     /// Human-readable message shown to users during maintenance.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -38,17 +38,6 @@ pub struct MaintenanceConfig {
     /// Requests carrying this header with the matching value bypass the 503.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bypass_header: Option<(String, String)>,
-}
-
-impl Default for MaintenanceConfig {
-    fn default() -> Self {
-        Self {
-            message: None,
-            allow_ips: Vec::new(),
-            readonly: false,
-            bypass_header: None,
-        }
-    }
 }
 
 /// In-process maintenance state, cheaply cloneable across threads.
@@ -67,6 +56,10 @@ impl MaintenanceState {
     }
 
     /// Returns `true` when maintenance mode is currently active.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal `RwLock` is poisoned (a thread panicked while holding the lock).
     #[must_use]
     pub fn is_active(&self) -> bool {
         self.0
@@ -76,6 +69,10 @@ impl MaintenanceState {
     }
 
     /// Returns the active [`MaintenanceConfig`], or `None` when off.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal `RwLock` is poisoned (a thread panicked while holding the lock).
     #[must_use]
     pub fn get(&self) -> Option<MaintenanceConfig> {
         self.0
@@ -85,11 +82,19 @@ impl MaintenanceState {
     }
 
     /// Enable maintenance mode with the given config.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal `RwLock` is poisoned (a thread panicked while holding the lock).
     pub fn enable(&self, config: MaintenanceConfig) {
         *self.0.write().expect("maintenance state lock poisoned") = Some(config);
     }
 
     /// Disable maintenance mode.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal `RwLock` is poisoned (a thread panicked while holding the lock).
     pub fn disable(&self) {
         *self.0.write().expect("maintenance state lock poisoned") = None;
     }
@@ -97,7 +102,11 @@ impl MaintenanceState {
     /// Load state from a JSON flag file written by `autumn maintenance on`.
     ///
     /// Returns `Ok(None)` when the file does not exist (maintenance is off).
-    /// Returns `Err` only for read or parse errors other than "not found".
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` for I/O errors other than `NotFound`, or when the file
+    /// content is not valid JSON for [`MaintenanceConfig`].
     pub fn load_from_file(path: &Path) -> std::io::Result<Option<MaintenanceConfig>> {
         match std::fs::read_to_string(path) {
             Ok(s) => {
@@ -113,21 +122,27 @@ impl MaintenanceState {
     /// Write a [`MaintenanceConfig`] to the flag file.
     ///
     /// Creates parent directories (e.g. `tmp/`) if they do not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the directory cannot be created, the config cannot be
+    /// serialised to JSON, or the file cannot be written.
     pub fn save_to_file(path: &Path, config: &MaintenanceConfig) -> std::io::Result<()> {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)?;
         }
-        let json = serde_json::to_string_pretty(config)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let json = serde_json::to_string_pretty(config).map_err(std::io::Error::other)?;
         std::fs::write(path, json)
     }
 
     /// Delete the flag file, turning maintenance off.
     ///
     /// Returns `Ok(true)` when the file was deleted, `Ok(false)` when it was
-    /// already absent, and `Err` for other filesystem errors.
+    /// already absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` for filesystem errors other than `NotFound`.
     pub fn remove_flag_file(path: &Path) -> std::io::Result<bool> {
         match std::fs::remove_file(path) {
             Ok(()) => Ok(true),
@@ -147,21 +162,20 @@ pub fn ip_in_allow_list(client_ip: &IpAddr, allow_ips: &[String]) -> bool {
         if let Some((prefix, bits)) = entry.split_once('/') {
             if let (Ok(network_ip), Ok(prefix_len)) =
                 (prefix.parse::<IpAddr>(), bits.parse::<u8>())
+                && ip_in_cidr(client_ip, &network_ip, prefix_len)
             {
-                if ip_in_cidr(client_ip, &network_ip, prefix_len) {
-                    return true;
-                }
-            }
-        } else if let Ok(allowed) = entry.parse::<IpAddr>() {
-            if client_ip == &allowed {
                 return true;
             }
+        } else if let Ok(allowed) = entry.parse::<IpAddr>()
+            && client_ip == &allowed
+        {
+            return true;
         }
     }
     false
 }
 
-fn ip_in_cidr(ip: &IpAddr, network: &IpAddr, prefix_len: u8) -> bool {
+const fn ip_in_cidr(ip: &IpAddr, network: &IpAddr, prefix_len: u8) -> bool {
     match (ip, network) {
         (IpAddr::V4(ip), IpAddr::V4(net)) => {
             if prefix_len > 32 {

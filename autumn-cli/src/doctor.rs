@@ -1395,11 +1395,10 @@ pub fn check_maintenance_mode() -> CheckResult {
     let path = std::path::Path::new(MAINTENANCE_FLAG_FILE);
     match MaintenanceState::load_from_file(path) {
         Ok(Some(config)) => {
-            let detail = if let Some(msg) = &config.message {
-                format!("maintenance mode is ON — \"{msg}\"")
-            } else {
-                "maintenance mode is ON".to_owned()
-            };
+            let detail = config.message.as_ref().map_or_else(
+                || "maintenance mode is ON".to_owned(),
+                |msg| format!("maintenance mode is ON — \"{msg}\""),
+            );
             CheckResult {
                 name: "maintenance_mode",
                 status: CheckStatus::Warn,

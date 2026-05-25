@@ -112,21 +112,19 @@ impl<S> MaintenanceService<S> {
         }
 
         // 2. Bypass header.
-        if let Some((header_name, expected_value)) = &config.bypass_header {
-            if let Some(val) = req.headers().get(header_name.as_str()) {
-                if val.as_bytes() == expected_value.as_bytes() {
-                    return None;
-                }
-            }
+        if let Some((header_name, expected_value)) = &config.bypass_header
+            && let Some(val) = req.headers().get(header_name.as_str())
+            && val.as_bytes() == expected_value.as_bytes()
+        {
+            return None;
         }
 
         // 3. IP allow-list.
-        if !config.allow_ips.is_empty() {
-            if let Some(client_ip) = extract_client_ip(req) {
-                if ip_in_allow_list(&client_ip, &config.allow_ips) {
-                    return None;
-                }
-            }
+        if !config.allow_ips.is_empty()
+            && let Some(client_ip) = extract_client_ip(req)
+            && ip_in_allow_list(&client_ip, &config.allow_ips)
+        {
+            return None;
         }
 
         // 4. Read-only mode: safe methods pass through.
@@ -154,12 +152,12 @@ where
     }
 
     fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
-        if let Some(config) = self.state.get() {
-            if let Some(response) = self.gate_request(&req, &config) {
-                return MaintenanceFuture::ShortCircuit {
-                    response: Some(response),
-                };
-            }
+        if let Some(config) = self.state.get()
+            && let Some(response) = self.gate_request(&req, &config)
+        {
+            return MaintenanceFuture::ShortCircuit {
+                response: Some(response),
+            };
         }
         MaintenanceFuture::Forward {
             inner: self.inner.call(req),
@@ -198,29 +196,26 @@ where
 /// Extract the client IP from a request, preferring proxy-forwarded headers.
 fn extract_client_ip<B>(req: &Request<B>) -> Option<IpAddr> {
     // X-Forwarded-For: <client>, <proxy1>, <proxy2>
-    if let Some(xff) = req.headers().get("x-forwarded-for") {
-        if let Ok(s) = xff.to_str() {
-            if let Some(first) = s.split(',').next() {
-                if let Ok(ip) = first.trim().parse::<IpAddr>() {
-                    return Some(ip);
-                }
-            }
-        }
+    if let Some(xff) = req.headers().get("x-forwarded-for")
+        && let Ok(s) = xff.to_str()
+        && let Some(first) = s.split(',').next()
+        && let Ok(ip) = first.trim().parse::<IpAddr>()
+    {
+        return Some(ip);
     }
 
     // X-Real-Ip (set by nginx)
-    if let Some(xri) = req.headers().get("x-real-ip") {
-        if let Ok(s) = xri.to_str() {
-            if let Ok(ip) = s.trim().parse::<IpAddr>() {
-                return Some(ip);
-            }
-        }
+    if let Some(xri) = req.headers().get("x-real-ip")
+        && let Ok(s) = xri.to_str()
+        && let Ok(ip) = s.trim().parse::<IpAddr>()
+    {
+        return Some(ip);
     }
 
     // SocketAddr extension set by Axum's ConnectInfo
     req.extensions()
         .get::<std::net::SocketAddr>()
-        .map(|addr| addr.ip())
+        .map(std::net::SocketAddr::ip)
 }
 
 /// Build a 503 response with the appropriate content type.
@@ -642,10 +637,18 @@ mod tests {
 
     // ── Layer behaviour ───────────────────────────────────────────────────────
 
-    #[test]
-    fn maintenance_layer_is_clone() {
+    #[tokio::test]
+    async fn maintenance_layer_clone_shares_state() {
         let state = MaintenanceState::new();
-        let layer = MaintenanceLayer::new(state);
-        let _clone = layer.clone();
+        let layer = MaintenanceLayer::new(state.clone());
+
+        // The cloned layer wraps the same underlying Arc, so enabling
+        // maintenance through `state` is visible through the clone.
+        let app = Router::new()
+            .route("/", get(|| async { "ok" }))
+            .layer(layer.clone());
+
+        state.enable(MaintenanceConfig::default());
+        assert_eq!(response_status(app, "/").await, StatusCode::SERVICE_UNAVAILABLE);
     }
 }
