@@ -41,6 +41,10 @@
 //! referrer_policy = "strict-origin-when-cross-origin"
 //! permissions_policy = ""              # set to enable Permissions-Policy
 //!
+//! # Per-request CSP nonces — removes 'unsafe-inline', enables CspNonce extractor
+//! [security.headers.csp_nonce]
+//! enabled = true
+//!
 //! [security.csrf]
 //! enabled = true                       # auto-enabled in prod
 //! token_header = "X-CSRF-Token"
@@ -82,6 +86,22 @@
 //!     }
 //! }
 //! ```
+//!
+//! For CSP nonces in inline scripts and styles
+//! (requires `security.headers.csp_nonce.enabled = true`):
+//!
+//! ```rust,ignore
+//! use autumn_web::prelude::*;
+//! use autumn_web::security::CspNonce;
+//!
+//! #[get("/page")]
+//! async fn page(nonce: CspNonce) -> Markup {
+//!     html! {
+//!         script nonce=(nonce.value()) { "console.log('ready')" }
+//!         style  nonce=(nonce.value()) { "body { margin: 0 }" }
+//!     }
+//! }
+//! ```
 
 pub(crate) mod config;
 pub(crate) mod csrf;
@@ -90,11 +110,11 @@ pub(crate) mod rate_limit;
 
 // Re-export commonly used types at the module level.
 pub use config::{
-    CsrfConfig, HeadersConfig, RateLimitBackend, RateLimitConfig, SecurityConfig, UploadConfig,
-    default_content_security_policy,
+    CspNonceConfig, CsrfConfig, HeadersConfig, RateLimitBackend, RateLimitConfig, SecurityConfig,
+    UploadConfig, default_content_security_policy,
 };
 #[cfg(feature = "redis")]
 pub use config::{RateLimitBackendFailure, RateLimitRedisConfig};
 pub use csrf::{CsrfFormField, CsrfLayer, CsrfToken};
-pub use headers::SecurityHeadersLayer;
+pub use headers::{CspNonce, SecurityHeadersLayer};
 pub use rate_limit::RateLimitLayer;
