@@ -248,6 +248,8 @@ mod tests {
             path: "/test".into(),
             request_id: Some("req-abc".into()),
             source_location: None,
+            query: None,
+            headers: serde_json::json!({}),
         }
     }
 

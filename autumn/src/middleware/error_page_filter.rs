@@ -25,6 +25,7 @@ use crate::middleware::exception_filter::{AutumnErrorInfo, ExceptionFilter};
 pub struct ErrorPageFilter {
     pub renderer: SharedRenderer,
     pub is_dev: bool,
+    pub parameter_filter: crate::log::filter::ParameterFilter,
 }
 
 impl ExceptionFilter for ErrorPageFilter {
@@ -44,7 +45,7 @@ impl ExceptionFilter for ErrorPageFilter {
                 .into_string();
 
         if self.is_dev {
-            Self::inject_dev_badge(&mut html_body, error, &ctx);
+            Self::inject_dev_badge(&mut html_body, error, &ctx, &response);
         }
 
         Self::build_html_response(error, html_body)
@@ -62,7 +63,7 @@ pub struct ErrorPageRequestContext {
     pub uri: axum::http::Uri,
     pub request_id: Option<String>,
     pub query: Option<String>,
-    pub headers: serde_json::Value,
+    pub headers: Option<axum::http::HeaderMap>,
 }
 
 /// Tower layer that annotates requests with Accept header preference
@@ -71,25 +72,19 @@ pub struct ErrorPageRequestContext {
 /// This layer runs before the exception filter and stores [`WantsHtml`]
 /// and [`ErrorPageRequestContext`] in the response extensions.
 #[derive(Clone)]
-pub struct ErrorPageContextLayer {
-    pub parameter_filter: crate::log::filter::ParameterFilter,
-}
+pub struct ErrorPageContextLayer;
 
 impl<S> tower::Layer<S> for ErrorPageContextLayer {
     type Service = ErrorPageContextService<S>;
 
     fn layer(&self, inner: S) -> Self::Service {
-        ErrorPageContextService {
-            inner,
-            parameter_filter: self.parameter_filter.clone(),
-        }
+        ErrorPageContextService { inner }
     }
 }
 
 #[derive(Clone)]
 pub struct ErrorPageContextService<S> {
     inner: S,
-    parameter_filter: crate::log::filter::ParameterFilter,
 }
 
 impl<S, ReqBody> tower::Service<axum::http::Request<ReqBody>> for ErrorPageContextService<S>
@@ -116,7 +111,7 @@ where
             .map(std::string::ToString::to_string);
 
         let query = uri.query().map(str::to_owned);
-        let headers = scrub_headers(req.headers(), &self.parameter_filter);
+        let headers = Some(req.headers().clone());
 
         ErrorPageContextFuture {
             inner: self.inner.call(req),
@@ -137,7 +132,7 @@ pin_project_lite::pin_project! {
         uri: axum::http::Uri,
         request_id: Option<String>,
         query: Option<String>,
-        headers: serde_json::Value,
+        headers: Option<axum::http::HeaderMap>,
     }
 }
 
@@ -311,7 +306,12 @@ impl ErrorPageFilter {
         }
     }
 
-    fn inject_dev_badge(html_body: &mut String, error: &AutumnErrorInfo, ctx: &ErrorContext) {
+    fn inject_dev_badge(
+        html_body: &mut String,
+        error: &AutumnErrorInfo,
+        ctx: &ErrorContext,
+        response: &Response,
+    ) {
         let badge_ctx = DevBadgeContext {
             status_code: error.status.as_u16(),
             status_reason: error
@@ -330,7 +330,8 @@ impl ErrorPageFilter {
             headers: response
                 .extensions()
                 .get::<ErrorPageRequestContext>()
-                .map(|ctx| ctx.headers.clone())
+                .and_then(|ctx| ctx.headers.as_ref())
+                .map(|h| scrub_headers(h, &self.parameter_filter))
                 .unwrap_or(serde_json::json!({})),
         };
         let badge = dev_badge::dev_error_badge_html(&badge_ctx).into_string();
@@ -465,7 +466,11 @@ mod tests {
     /// Helper: build a router with the error page filter and context layer.
     fn test_router_with_error_pages(is_dev: bool) -> Router {
         let renderer = error_pages::default_renderer();
-        let error_page_filter = ErrorPageFilter { renderer, is_dev };
+        let error_page_filter = ErrorPageFilter {
+            renderer,
+            is_dev,
+            parameter_filter: crate::log::filter::ParameterFilter::default(),
+        };
         let filters: Vec<Arc<dyn crate::middleware::ExceptionFilter>> =
             vec![Arc::new(error_page_filter)];
 
@@ -484,9 +489,7 @@ mod tests {
                 }),
             )
             .fallback(fallback_404_handler)
-            .layer(ErrorPageContextLayer {
-                parameter_filter: crate::log::filter::ParameterFilter::default(),
-            })
+            .layer(ErrorPageContextLayer)
             .layer(ExceptionFilterLayer::new(filters))
     }
 
@@ -656,6 +659,7 @@ mod tests {
         let error_page_filter = ErrorPageFilter {
             renderer,
             is_dev: false,
+            parameter_filter: crate::log::filter::ParameterFilter::default(),
         };
         let filters: Vec<Arc<dyn crate::middleware::ExceptionFilter>> =
             vec![Arc::new(error_page_filter)];
@@ -665,9 +669,7 @@ mod tests {
                 "/err",
                 get(|| async { Err::<String, AutumnError>(AutumnError::not_found_msg("nope")) }),
             )
-            .layer(ErrorPageContextLayer {
-                parameter_filter: crate::log::filter::ParameterFilter::default(),
-            })
+            .layer(ErrorPageContextLayer)
             .layer(ExceptionFilterLayer::new(filters));
 
         let resp = app
@@ -710,6 +712,7 @@ mod tests {
         let error_page_filter = ErrorPageFilter {
             renderer,
             is_dev: false,
+            parameter_filter: crate::log::filter::ParameterFilter::default(),
         };
         let filters: Vec<Arc<dyn crate::middleware::ExceptionFilter>> =
             vec![Arc::new(error_page_filter)];
@@ -719,9 +722,7 @@ mod tests {
                 "/err",
                 get(|| async { Err::<String, AutumnError>(AutumnError::not_found_msg("nope")) }),
             )
-            .layer(ErrorPageContextLayer {
-                parameter_filter: crate::log::filter::ParameterFilter::default(),
-            })
+            .layer(ErrorPageContextLayer)
             .layer(ExceptionFilterLayer::new(filters));
 
         let resp = app
@@ -878,18 +879,14 @@ mod tests {
         let error_page_filter = ErrorPageFilter {
             renderer,
             is_dev: true,
+            parameter_filter: crate::log::filter::ParameterFilter::new(&["pin".to_owned()], &[]),
         };
         let filters: Vec<Arc<dyn crate::middleware::ExceptionFilter>> =
             vec![Arc::new(error_page_filter)];
 
         let app = Router::new()
             .fallback(fallback_404_handler)
-            .layer(ErrorPageContextLayer {
-                parameter_filter: crate::log::filter::ParameterFilter::new(
-                    &["pin".to_owned()],
-                    &[],
-                ),
-            })
+            .layer(ErrorPageContextLayer)
             .layer(ExceptionFilterLayer::new(filters));
 
         let response = tower::ServiceExt::oneshot(

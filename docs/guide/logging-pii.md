@@ -1,7 +1,8 @@
 # Logging & PII
 
-Autumn includes a parameter scrubber for structured payloads so sensitive keys are
-redacted before logging/tracing surfaces emit them.
+Autumn includes a parameter scrubber for structured payloads. Today, it is wired
+into dev HTML error-badge request context rendering (headers/query) and helper APIs.
+It is **not yet globally applied to every tracing/log event payload**.
 
 ## Built-in defaults
 
