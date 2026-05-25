@@ -17,6 +17,22 @@ use super::schema_edit::{
 };
 use super::{Flags, GenerateError, ensure_project_root, timestamp_now};
 
+fn collect_rs_files_recursive(dir: &Path, candidates: &mut Vec<std::path::PathBuf>) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_rs_files_recursive(&path, candidates);
+            } else if path.is_file()
+                && path.extension().is_some_and(|ext| ext == "rs")
+                && !candidates.contains(&path)
+            {
+                candidates.push(path);
+            }
+        }
+    }
+}
+
 /// Compute the file actions for `autumn generate migration`.
 ///
 /// # Errors
@@ -67,21 +83,6 @@ pub fn plan_migration(
             }
 
             let models_dir = project_root.join("src/models");
-            fn collect_rs_files_recursive(dir: &Path, candidates: &mut Vec<std::path::PathBuf>) {
-                if let Ok(entries) = std::fs::read_dir(dir) {
-                    for entry in entries.flatten() {
-                        let path = entry.path();
-                        if path.is_dir() {
-                            collect_rs_files_recursive(&path, candidates);
-                        } else if path.is_file()
-                            && path.extension().is_some_and(|ext| ext == "rs")
-                            && !candidates.contains(&path)
-                        {
-                            candidates.push(path);
-                        }
-                    }
-                }
-            }
             collect_rs_files_recursive(&models_dir, &mut candidates);
 
             let mut found_config = None;

@@ -687,7 +687,7 @@ pub fn add_search_down_sql(table: &str) -> String {
     out
 }
 
-#[allow(clippy::option_if_let_else)]
+#[allow(clippy::option_if_let_else, clippy::too_many_lines)]
 pub fn singularize(s: &str) -> String {
     if s == "series" {
         return "series".to_string();
@@ -975,6 +975,7 @@ fn is_matching_table_attr(attr_content: &str, table: &str) -> bool {
     false
 }
 
+#[allow(clippy::collapsible_if)]
 fn extract_diesel_column_name(attr: &str) -> Option<String> {
     let pos = attr.find("column_name")?;
     let after_col = &attr[pos + "column_name".len()..];
@@ -1319,9 +1320,8 @@ pub fn parse_model_search_config_for_table(
                         // 1. Scan attributes *before* #[searchable]
                         let before_searchable_attr = &rest[..pos];
                         let prev_term_pos = before_searchable_attr
-                            .rfind(|c| c == ';' || c == ',' || c == '{')
-                            .map(|idx| idx + 1)
-                            .unwrap_or(0);
+                            .rfind([';', ',', '{'])
+                            .map_or(0, |idx| idx + 1);
                         let field_prefix = &before_searchable_attr[prev_term_pos..];
 
                         if let Some(d_pos) = field_prefix.find("#[diesel") {
@@ -2314,7 +2314,7 @@ pub struct Comment {
 
     #[test]
     fn test_extract_diesel_column_name_identifier() {
-        let content_diesel = r##"
+        let content_diesel = r#"
 #[autumn_web::model(table = "posts")]
 pub struct Post {
     #[id]
@@ -2326,7 +2326,7 @@ pub struct Post {
     #[searchable(weight = "B")]
     pub body: String,
 }
-"##;
+"#;
         let (_, fields) = parse_model_search_config_for_table(content_diesel, "posts").unwrap();
         assert_eq!(
             fields,
