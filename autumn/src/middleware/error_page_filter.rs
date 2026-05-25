@@ -45,7 +45,7 @@ impl ExceptionFilter for ErrorPageFilter {
                 .into_string();
 
         if self.is_dev {
-            Self::inject_dev_badge(&mut html_body, error, &ctx, &response);
+            self.inject_dev_badge(&mut html_body, error, &ctx, &response);
         }
 
         Self::build_html_response(error, html_body)
@@ -307,6 +307,7 @@ impl ErrorPageFilter {
     }
 
     fn inject_dev_badge(
+        &self,
         html_body: &mut String,
         error: &AutumnErrorInfo,
         ctx: &ErrorContext,
