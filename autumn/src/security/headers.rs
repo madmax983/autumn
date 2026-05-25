@@ -208,8 +208,7 @@ impl ComputedHeaders {
         // Apps that set an explicit `content_security_policy` opt out automatically:
         // their custom value is used verbatim and the nonce is still generated
         // (for the extractor) but not written into the header.
-        let using_default_csp =
-            config.content_security_policy == default_content_security_policy();
+        let using_default_csp = config.content_security_policy == default_content_security_policy();
         let nonce_csp_template = if config.csp_nonce.enabled && using_default_csp {
             Some(Arc::from(nonce_aware_default_csp().as_str()))
         } else {
@@ -342,10 +341,8 @@ where
                     {
                         let csp_value = template.replace(NONCE_PLACEHOLDER, &nonce);
                         if let Ok(val) = HeaderValue::from_str(&csp_value) {
-                            resp_headers.insert(
-                                HeaderName::from_static("content-security-policy"),
-                                val,
-                            );
+                            resp_headers
+                                .insert(HeaderName::from_static("content-security-policy"), val);
                         }
                     }
                 }
