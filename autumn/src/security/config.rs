@@ -530,19 +530,27 @@ impl Default for HeadersConfig {
 /// | `directives` | `["script-src", "style-src"]` |
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct CspNonceConfig {
-    /// Enable generation of per-request CSP nonces. Default: `true`.
-    #[serde(default = "default_true")]
-    pub enabled: bool,
+    /// Enable generation of per-request CSP nonces.
+    pub enabled: Option<bool>,
 
     /// Directives that should receive the generated nonce. Default: `["script-src", "style-src"]`.
     #[serde(default = "default_csp_nonce_directives")]
     pub directives: Vec<String>,
 }
 
+impl CspNonceConfig {
+    /// Returns whether CSP nonces should be generated, given whether the Content-Security-Policy
+    /// is the default policy or a custom one.
+    #[must_use]
+    pub fn is_enabled(&self, is_default_csp: bool) -> bool {
+        self.enabled.unwrap_or(is_default_csp)
+    }
+}
+
 impl Default for CspNonceConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: None,
             directives: default_csp_nonce_directives(),
         }
     }
@@ -928,7 +936,7 @@ fn default_referrer_policy() -> String {
 pub fn default_content_security_policy() -> String {
     "default-src 'self'; \
      img-src 'self' data:; \
-     style-src 'self'; \
+     style-src 'self' 'unsafe-inline'; \
      script-src 'self'; \
      connect-src 'self'; \
      form-action 'self'; \
@@ -1475,7 +1483,8 @@ mod tests {
     #[test]
     fn csp_nonce_config_defaults() {
         let config = HeadersConfig::default();
-        assert!(config.csp_nonce.enabled);
+        assert!(config.csp_nonce.is_enabled(true));
+        assert!(!config.csp_nonce.is_enabled(false));
         assert_eq!(
             config.csp_nonce.directives,
             vec!["script-src".to_owned(), "style-src".to_owned()]
@@ -1491,7 +1500,16 @@ mod tests {
             directives = ["script-src"]
         "#;
         let config: HeadersConfig = toml::from_str(toml_str).unwrap();
-        assert!(!config.csp_nonce.enabled);
+        assert!(!config.csp_nonce.is_enabled(true));
+        assert!(!config.csp_nonce.is_enabled(false));
         assert_eq!(config.csp_nonce.directives, vec!["script-src".to_owned()]);
+
+        let toml_str_explicit = r#"
+            content_security_policy = "default-src 'none'"
+            [csp_nonce]
+            enabled = true
+        "#;
+        let config_explicit: HeadersConfig = toml::from_str(toml_str_explicit).unwrap();
+        assert!(config_explicit.csp_nonce.is_enabled(false));
     }
 }

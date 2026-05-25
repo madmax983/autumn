@@ -1978,6 +1978,16 @@ impl AutumnConfig {
             "AUTUMN_SECURITY__HEADERS__PERMISSIONS_POLICY",
             &mut self.security.headers.permissions_policy,
         );
+        parse_env_option_bool(
+            env,
+            "AUTUMN_SECURITY__HEADERS__CSP_NONCE__ENABLED",
+            &mut self.security.headers.csp_nonce.enabled,
+        );
+        parse_env_csv(
+            env,
+            "AUTUMN_SECURITY__HEADERS__CSP_NONCE__DIRECTIVES",
+            &mut self.security.headers.csp_nonce.directives,
+        );
 
         // CSRF
         parse_env_bool(
@@ -4051,6 +4061,27 @@ path = "/healthz"
         assert_eq!(
             config.security.rate_limit.trusted_proxies,
             vec!["10.0.0.10", "203.0.113.0/24"]
+        );
+    }
+
+    #[test]
+    fn env_override_csp_nonce_settings() {
+        let env = MockEnv::new()
+            .with("AUTUMN_SECURITY__HEADERS__CSP_NONCE__ENABLED", "true")
+            .with(
+                "AUTUMN_SECURITY__HEADERS__CSP_NONCE__DIRECTIVES",
+                "script-src, style-src, img-src",
+            );
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.security.headers.csp_nonce.enabled, Some(true));
+        assert_eq!(
+            config.security.headers.csp_nonce.directives,
+            vec![
+                "script-src".to_string(),
+                "style-src".to_string(),
+                "img-src".to_string()
+            ]
         );
     }
 

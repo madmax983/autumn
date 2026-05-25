@@ -117,8 +117,8 @@ impl ComputedHeaders {
 pub struct SecurityHeadersLayer {
     headers: Arc<ComputedHeaders>,
     csp_nonce_enabled: bool,
-    csp_nonce_directives: Vec<String>,
-    base_csp: String,
+    csp_nonce_directives: Arc<[String]>,
+    base_csp: Arc<str>,
 }
 
 impl SecurityHeadersLayer {
@@ -127,15 +127,14 @@ impl SecurityHeadersLayer {
     pub fn from_config(config: &HeadersConfig) -> Self {
         let is_default_csp =
             config.content_security_policy == super::config::default_content_security_policy();
-        let csp_nonce_enabled = config.csp_nonce.enabled
-            && !config.content_security_policy.is_empty()
-            && is_default_csp;
+        let csp_nonce_enabled = config.csp_nonce.is_enabled(is_default_csp)
+            && !config.content_security_policy.is_empty();
 
         Self {
             headers: Arc::new(ComputedHeaders::from_config(config)),
             csp_nonce_enabled,
-            csp_nonce_directives: config.csp_nonce.directives.clone(),
-            base_csp: config.content_security_policy.clone(),
+            csp_nonce_directives: config.csp_nonce.directives.clone().into(),
+            base_csp: config.content_security_policy.clone().into(),
         }
     }
 }
@@ -148,8 +147,8 @@ impl<S> Layer<S> for SecurityHeadersLayer {
             inner,
             headers: Arc::clone(&self.headers),
             csp_nonce_enabled: self.csp_nonce_enabled,
-            csp_nonce_directives: self.csp_nonce_directives.clone(),
-            base_csp: self.base_csp.clone(),
+            csp_nonce_directives: Arc::clone(&self.csp_nonce_directives),
+            base_csp: Arc::clone(&self.base_csp),
         }
     }
 }
@@ -162,8 +161,8 @@ pub struct SecurityHeadersService<S> {
     inner: S,
     headers: Arc<ComputedHeaders>,
     csp_nonce_enabled: bool,
-    csp_nonce_directives: Vec<String>,
-    base_csp: String,
+    csp_nonce_directives: Arc<[String]>,
+    base_csp: Arc<str>,
 }
 
 impl<S, ReqBody, ResBody> Service<Request<ReqBody>> for SecurityHeadersService<S>
@@ -181,11 +180,13 @@ where
     fn call(&mut self, mut req: Request<ReqBody>) -> Self::Future {
         let dynamic_nonce = if self.csp_nonce_enabled {
             let mut bytes = [0u8; 16];
-            getrandom::getrandom(&mut bytes)
-                .expect("failed to generate random bytes for CSP nonce");
-            let nonce = base64_encode(&bytes);
-            req.extensions_mut().insert(CspNonce(nonce.clone()));
-            Some(nonce)
+            if getrandom::getrandom(&mut bytes).is_ok() {
+                let nonce = base64_encode(&bytes);
+                req.extensions_mut().insert(CspNonce(nonce.clone()));
+                Some(nonce)
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -194,8 +195,8 @@ where
             inner: self.inner.call(req),
             headers: Some(Arc::clone(&self.headers)),
             dynamic_nonce,
-            csp_nonce_directives: self.csp_nonce_directives.clone(),
-            base_csp: self.base_csp.clone(),
+            csp_nonce_directives: Arc::clone(&self.csp_nonce_directives),
+            base_csp: Arc::clone(&self.base_csp),
         }
     }
 }
@@ -207,8 +208,8 @@ pin_project! {
         inner: F,
         headers: Option<Arc<ComputedHeaders>>,
         dynamic_nonce: Option<String>,
-        csp_nonce_directives: Vec<String>,
-        base_csp: String,
+        csp_nonce_directives: Arc<[String]>,
+        base_csp: Arc<str>,
     }
 }
 
@@ -223,19 +224,25 @@ where
         match this.inner.poll(cx) {
             Poll::Ready(Ok(mut response)) => {
                 if let Some(computed) = this.headers.take() {
+                    let is_304 = response.status() == StatusCode::NOT_MODIFIED;
                     let resp_headers = response.headers_mut();
                     for (name, value) in &computed.pairs {
                         if name == "content-security-policy" && this.dynamic_nonce.is_some() {
+                            if is_304 {
+                                resp_headers.insert(name.clone(), value.clone());
+                            }
                             continue;
                         }
                         resp_headers.insert(name.clone(), value.clone());
                     }
-                    if let Some(nonce) = this.dynamic_nonce.take() {
-                        let rewritten_csp =
-                            inject_nonce_into_csp(this.base_csp, &nonce, this.csp_nonce_directives);
-                        if let Ok(val) = HeaderValue::from_str(&rewritten_csp) {
-                            resp_headers
-                                .insert(HeaderName::from_static("content-security-policy"), val);
+                    if !is_304 {
+                        if let Some(nonce) = this.dynamic_nonce.take() {
+                            let rewritten_csp =
+                                inject_nonce_into_csp(this.base_csp, &nonce, this.csp_nonce_directives);
+                            if let Ok(val) = HeaderValue::from_str(&rewritten_csp) {
+                                resp_headers
+                                    .insert(HeaderName::from_static("content-security-policy"), val);
+                            }
                         }
                     }
                 }
@@ -351,7 +358,7 @@ pub fn inject_nonce_into_csp(csp: &str, nonce: &str, directives: &[String]) -> S
             words.next().map_or_else(
                 || trimmed.to_owned(),
                 |directive| {
-                    if directives.iter().any(|d| d == directive) {
+                    if directives.iter().any(|d| d.eq_ignore_ascii_case(directive)) {
                         format!("{trimmed} 'nonce-{nonce}'")
                     } else {
                         trimmed.to_owned()
@@ -686,10 +693,23 @@ mod tests {
     fn test_inject_nonce_into_csp() {
         let base = "default-src 'self'; script-src 'self'; style-src 'self'";
         let directives = vec!["script-src".to_owned(), "style-src".to_owned()];
-        let rewritten = inject_nonce_into_csp(base, "123456", &directives);
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time before UNIX_EPOCH")
+            .as_nanos()
+            .to_string();
+        let rewritten = inject_nonce_into_csp(base, &nonce, &directives);
         assert_eq!(
             rewritten,
-            "default-src 'self'; script-src 'self' 'nonce-123456'; style-src 'self' 'nonce-123456'"
+            format!("default-src 'self'; script-src 'self' 'nonce-{nonce}'; style-src 'self' 'nonce-{nonce}'")
+        );
+
+        // Case insensitivity checks
+        let base_mixed = "default-src 'self'; Script-Src 'self'; STYLE-SRC 'self'";
+        let rewritten_mixed = inject_nonce_into_csp(base_mixed, &nonce, &directives);
+        assert_eq!(
+            rewritten_mixed,
+            format!("default-src 'self'; Script-Src 'self' 'nonce-{nonce}'; STYLE-SRC 'self' 'nonce-{nonce}'")
         );
     }
 
@@ -731,7 +751,7 @@ mod tests {
             "csp: {csp}"
         );
         assert!(
-            csp.contains(&format!("style-src 'self' 'nonce-{nonce_str}'")),
+            csp.contains(&format!("style-src 'self' 'unsafe-inline' 'nonce-{nonce_str}'")),
             "csp: {csp}"
         );
     }
@@ -765,5 +785,37 @@ mod tests {
             .to_str()
             .unwrap();
         assert_eq!(csp, "default-src 'self'; script-src 'self'");
+    }
+
+    #[tokio::test]
+    async fn middleware_skips_nonce_on_304() {
+        let config = HeadersConfig::default();
+        let app = Router::new()
+            .route(
+                "/",
+                get(|| async {
+                    Response::builder()
+                        .status(StatusCode::NOT_MODIFIED)
+                        .body(Body::empty())
+                        .unwrap()
+                }),
+            )
+            .layer(SecurityHeadersLayer::from_config(&config));
+
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+        
+        let csp = response
+            .headers()
+            .get("content-security-policy")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(!csp.contains("'nonce-"), "csp should not contain nonce on 304: {csp}");
+        assert!(csp.contains("default-src 'self'"), "csp: {csp}");
     }
 }
