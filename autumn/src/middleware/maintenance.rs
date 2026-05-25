@@ -105,7 +105,11 @@ impl<S> MaintenanceService<S> {
     ///
     /// Returns `Some(503 response)` when the request should be blocked, or
     /// `None` when it should pass through to the inner service.
-    fn gate_request<B>(&self, req: &Request<B>, config: &MaintenanceConfig) -> Option<Response<Body>> {
+    fn gate_request<B>(
+        &self,
+        req: &Request<B>,
+        config: &MaintenanceConfig,
+    ) -> Option<Response<Body>> {
         // 1. Actuator/health routes always pass through.
         if req.uri().path().starts_with(self.health_prefix.as_str()) {
             return None;
@@ -220,9 +224,10 @@ fn extract_client_ip<B>(req: &Request<B>) -> Option<IpAddr> {
 
 /// Build a 503 response with the appropriate content type.
 fn build_503_response<B>(req: &Request<B>, config: &MaintenanceConfig) -> Response<Body> {
-    let message = config.message.as_deref().unwrap_or(
-        "The service is temporarily unavailable. Please try again later.",
-    );
+    let message = config
+        .message
+        .as_deref()
+        .unwrap_or("The service is temporarily unavailable. Please try again later.");
 
     let wants_json = req
         .headers()
@@ -267,10 +272,10 @@ fn build_503_response<B>(req: &Request<B>, config: &MaintenanceConfig) -> Respon
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::maintenance::MaintenanceConfig;
     use axum::Router;
     use axum::body::Body;
     use axum::routing::get;
-    use crate::maintenance::MaintenanceConfig;
     use tower::ServiceExt; // for oneshot
 
     fn make_app(state: MaintenanceState) -> Router {
@@ -304,7 +309,10 @@ mod tests {
         let state = MaintenanceState::new();
         state.enable(MaintenanceConfig::default());
         let app = make_app(state);
-        assert_eq!(response_status(app, "/").await, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response_status(app, "/").await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 
     #[tokio::test]
@@ -348,7 +356,10 @@ mod tests {
             .await
             .unwrap();
         let html = String::from_utf8(body.to_vec()).unwrap();
-        assert!(html.contains("Service Temporarily Unavailable"), "body: {html}");
+        assert!(
+            html.contains("Service Temporarily Unavailable"),
+            "body: {html}"
+        );
     }
 
     #[tokio::test]
@@ -370,7 +381,10 @@ mod tests {
 
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         let ct = resp.headers().get(CONTENT_TYPE).unwrap().to_str().unwrap();
-        assert!(ct.contains("application/problem+json"), "expected problem+json, got {ct}");
+        assert!(
+            ct.contains("application/problem+json"),
+            "expected problem+json, got {ct}"
+        );
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
@@ -425,7 +439,10 @@ mod tests {
             .await
             .unwrap();
         let html = String::from_utf8(body.to_vec()).unwrap();
-        assert!(html.contains("Deploying v2.0"), "custom message absent: {html}");
+        assert!(
+            html.contains("Deploying v2.0"),
+            "custom message absent: {html}"
+        );
     }
 
     // ── Actuator / health bypass ──────────────────────────────────────────────
@@ -449,11 +466,12 @@ mod tests {
         let app = Router::new()
             .route("/health", get(|| async { "ok" }))
             .route("/", get(|| async { "root" }))
-            .layer(
-                MaintenanceLayer::new(state).with_health_prefix("/health"),
-            );
+            .layer(MaintenanceLayer::new(state).with_health_prefix("/health"));
 
-        assert_eq!(response_status(app.clone(), "/health").await, StatusCode::OK);
+        assert_eq!(
+            response_status(app.clone(), "/health").await,
+            StatusCode::OK
+        );
         assert_eq!(
             response_status(app, "/").await,
             StatusCode::SERVICE_UNAVAILABLE
@@ -516,7 +534,10 @@ mod tests {
             ..Default::default()
         });
         let app = make_app(state);
-        assert_eq!(response_status(app, "/").await, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response_status(app, "/").await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 
     // ── IP allow-list bypass ──────────────────────────────────────────────────
@@ -649,6 +670,9 @@ mod tests {
             .layer(layer.clone());
 
         state.enable(MaintenanceConfig::default());
-        assert_eq!(response_status(app, "/").await, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response_status(app, "/").await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 }

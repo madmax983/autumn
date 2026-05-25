@@ -1391,7 +1391,7 @@ pub fn run(opts: DoctorOptions) {
 ///
 /// Warns (not fails) so `autumn doctor` stays green during planned windows.
 pub fn check_maintenance_mode() -> CheckResult {
-    use autumn_web::maintenance::{MaintenanceState, MAINTENANCE_FLAG_FILE};
+    use autumn_web::maintenance::{MAINTENANCE_FLAG_FILE, MaintenanceState};
     let path = std::path::Path::new(MAINTENANCE_FLAG_FILE);
     match MaintenanceState::load_from_file(path) {
         Ok(Some(config)) => {

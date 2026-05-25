@@ -2567,8 +2567,7 @@ mod tests {
 
     #[test]
     fn parse_migrate_with_maintenance() {
-        let cli =
-            Cli::try_parse_from(["autumn", "migrate", "--with-maintenance"]).unwrap();
+        let cli = Cli::try_parse_from(["autumn", "migrate", "--with-maintenance"]).unwrap();
         let Commands::Migrate {
             with_maintenance, ..
         } = cli.command

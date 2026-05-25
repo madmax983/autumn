@@ -16,7 +16,7 @@
 
 use std::path::{Path, PathBuf};
 
-use autumn_web::maintenance::{MaintenanceConfig, MaintenanceState, MAINTENANCE_FLAG_FILE};
+use autumn_web::maintenance::{MAINTENANCE_FLAG_FILE, MaintenanceConfig, MaintenanceState};
 
 /// Options for `autumn maintenance on`.
 pub struct MaintenanceOnOptions<'a> {
@@ -172,7 +172,10 @@ mod tests {
         assert!(config.readonly);
         assert_eq!(config.allow_ips, vec!["10.0.0.0/8"]);
         assert_eq!(
-            config.bypass_header.as_ref().map(|(n, v)| (n.as_str(), v.as_str())),
+            config
+                .bypass_header
+                .as_ref()
+                .map(|(n, v)| (n.as_str(), v.as_str())),
             Some(("X-Bypass", "tok"))
         );
     }

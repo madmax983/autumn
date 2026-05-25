@@ -76,7 +76,7 @@ pub fn run(action: MigrateAction, with_maintenance: bool) {
 
 /// Enable maintenance mode before a migrate run.
 fn enable_maintenance_for_migrate() {
-    use autumn_web::maintenance::{MaintenanceConfig, MaintenanceState, MAINTENANCE_FLAG_FILE};
+    use autumn_web::maintenance::{MAINTENANCE_FLAG_FILE, MaintenanceConfig, MaintenanceState};
     let path = std::path::Path::new(MAINTENANCE_FLAG_FILE);
     let config = MaintenanceConfig {
         message: Some("Database migration in progress. Please try again in a moment.".to_owned()),
@@ -93,7 +93,7 @@ fn enable_maintenance_for_migrate() {
 
 /// Disable maintenance mode after a successful migrate run.
 fn disable_maintenance_after_migrate() {
-    use autumn_web::maintenance::{MaintenanceState, MAINTENANCE_FLAG_FILE};
+    use autumn_web::maintenance::{MAINTENANCE_FLAG_FILE, MaintenanceState};
     let path = std::path::Path::new(MAINTENANCE_FLAG_FILE);
     match MaintenanceState::remove_flag_file(path) {
         Ok(_) => eprintln!("  \u{2713} Maintenance mode DISABLED — normal traffic resuming"),
@@ -101,7 +101,11 @@ fn disable_maintenance_after_migrate() {
     }
 }
 
-fn run_migrations_with_maintenance(database_url: &str, migrations_dir: &str, with_maintenance: bool) {
+fn run_migrations_with_maintenance(
+    database_url: &str,
+    migrations_dir: &str,
+    with_maintenance: bool,
+) {
     eprintln!("  Running pending migrations...\n");
     let dir = std::path::Path::new(migrations_dir);
     let status = Command::new("diesel")
@@ -137,7 +141,9 @@ fn run_migrations_with_maintenance(database_url: &str, migrations_dir: &str, wit
     } else {
         if with_maintenance {
             eprintln!();
-            eprintln!("  \u{26A0}\u{FE0F}  Migration failed — maintenance mode left ON for safety.");
+            eprintln!(
+                "  \u{26A0}\u{FE0F}  Migration failed — maintenance mode left ON for safety."
+            );
             eprintln!("      Fix the migration then run `autumn migrate` to retry.");
             eprintln!("      Run `autumn maintenance off` to re-open traffic manually.");
         }

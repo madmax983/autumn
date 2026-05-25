@@ -160,8 +160,7 @@ impl MaintenanceState {
 pub fn ip_in_allow_list(client_ip: &IpAddr, allow_ips: &[String]) -> bool {
     for entry in allow_ips {
         if let Some((prefix, bits)) = entry.split_once('/') {
-            if let (Ok(network_ip), Ok(prefix_len)) =
-                (prefix.parse::<IpAddr>(), bits.parse::<u8>())
+            if let (Ok(network_ip), Ok(prefix_len)) = (prefix.parse::<IpAddr>(), bits.parse::<u8>())
                 && ip_in_cidr(client_ip, &network_ip, prefix_len)
             {
                 return true;
@@ -385,6 +384,9 @@ mod tests {
     fn ip_in_allow_list_invalid_entry_skipped() {
         let ip: IpAddr = "192.168.1.1".parse().unwrap();
         // Invalid CIDR entries are silently skipped; only valid ones checked
-        assert!(!ip_in_allow_list(&ip, &["not-an-ip".into(), "999.999.999.999".into()]));
+        assert!(!ip_in_allow_list(
+            &ip,
+            &["not-an-ip".into(), "999.999.999.999".into()]
+        ));
     }
 }
