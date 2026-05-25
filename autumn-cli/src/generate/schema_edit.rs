@@ -1024,7 +1024,10 @@ fn extract_diesel_column_name(attr: &str) -> Option<String> {
 
 fn has_attribute_boundary(rest: &str, pos: usize, keyword: &str) -> bool {
     let after = &rest[pos + keyword.len()..];
-    after.chars().next().is_none_or(|c| c == '(' || c == ']' || c.is_whitespace())
+    after
+        .chars()
+        .next()
+        .is_none_or(|c| c == '(' || c == ']' || c.is_whitespace())
 }
 
 #[must_use]
