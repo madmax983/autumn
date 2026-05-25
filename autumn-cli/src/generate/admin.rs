@@ -1638,9 +1638,14 @@ pub struct Post {
         );
         // Verify the option values are present.
         assert!(admin.contains("\"low\""), "option value 'low' must appear");
-        assert!(admin.contains("\"medium\""), "option value 'medium' must appear");
-        assert!(admin.contains("\"high\""), "option value 'high' must appear");
-
+        assert!(
+            admin.contains("\"medium\""),
+            "option value 'medium' must appear"
+        );
+        assert!(
+            admin.contains("\"high\""),
+            "option value 'high' must appear"
+        );
     }
 
     #[test]
