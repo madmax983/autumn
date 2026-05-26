@@ -416,6 +416,18 @@ mod tests {
         use crate::markdown::RenderOptions;
         use crate::static_gen::{StaticRouteMeta, render_static_routes};
 
+        // Defined before any `let` statements to satisfy `items_after_statements`.
+        fn doc_params(
+            _: axum::Router,
+        ) -> Pin<Box<dyn Future<Output = Vec<StaticParams>> + Send>> {
+            Box::pin(async {
+                vec![
+                    crate::static_params! { "slug" => "getting-started" },
+                    crate::static_params! { "slug" => "api-reference" },
+                ]
+            })
+        }
+
         let registry = Arc::new(
             MarkdownRegistry::from_embedded(&[GETTING_STARTED, API_REFERENCE]).unwrap(),
         );
@@ -429,32 +441,17 @@ mod tests {
                 move |axum::extract::Path(slug): axum::extract::Path<String>| {
                     let r = r.clone();
                     async move {
-                        match r.get(&slug) {
-                            Some(page) => {
+                        r.get(&slug).map_or_else(
+                            || (axum::http::StatusCode::NOT_FOUND, "not found".to_owned()),
+                            |page| {
                                 let rendered = render(&page.body, RenderOptions::default());
                                 (axum::http::StatusCode::OK, rendered.html)
-                            }
-                            None => (
-                                axum::http::StatusCode::NOT_FOUND,
-                                "not found".to_owned(),
-                            ),
-                        }
+                            },
+                        )
                     }
                 }
             }),
         );
-
-        // params function enumerating all doc slugs (fn pointer, not closure).
-        fn doc_params(
-            _: axum::Router,
-        ) -> Pin<Box<dyn Future<Output = Vec<StaticParams>> + Send>> {
-            Box::pin(async {
-                vec![
-                    crate::static_params! { "slug" => "getting-started" },
-                    crate::static_params! { "slug" => "api-reference" },
-                ]
-            })
-        }
 
         let meta = StaticRouteMeta {
             path: "/docs/{slug}",
