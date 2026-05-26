@@ -8,7 +8,11 @@ use std::collections::btree_map::{BTreeMap, Entry};
 
 use crate::traits::AdminModel;
 
-const RESERVED_MODEL_SLUGS: &[&str] = &["jobs", "config"];
+// "config" is NOT reserved here: the /config route is only mounted when
+// with_runtime_config is enabled.  The collision check for that case is
+// deferred to AdminPlugin::build() so deployments without runtime-config
+// can freely use a model with slug "config".
+const RESERVED_MODEL_SLUGS: &[&str] = &["jobs"];
 
 /// Holds all registered admin models, keyed by their URL slug.
 ///
@@ -204,12 +208,14 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "reserved model slug 'config'")]
-    fn reserved_config_slug_panics() {
+    fn config_slug_allowed_without_runtime_config() {
+        // "config" is only a conflict when the runtime-config routes are
+        // enabled; registering it without them must succeed.
         let mut registry = AdminRegistry::new();
         registry.register(DummyModel {
             slug: "config",
             name: "Config",
         });
+        assert_eq!(registry.model_count(), 1);
     }
 }

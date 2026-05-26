@@ -176,8 +176,14 @@ impl Plugin for AdminPlugin {
             require_role,
             runtime_config,
         } = self;
-        let registry = Arc::new(registry);
         let has_config = runtime_config.is_some();
+        // "config" slug only conflicts when the runtime-config routes are mounted.
+        assert!(
+            !(has_config && registry.get("config").is_some()),
+            "autumn-admin: model slug 'config' conflicts with the mounted runtime-config \
+             routes; rename the model or don't call with_runtime_config",
+        );
+        let registry = Arc::new(registry);
         let router = routes::admin_router(
             Arc::clone(&registry),
             &prefix,

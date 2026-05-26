@@ -101,16 +101,18 @@ pub fn run_set(opts: &SetOptions) {
     check_psql();
     let actor = opts.actor.as_deref().unwrap_or("cli");
 
-    // Lock the existing row (if any), upsert, and record the audit row all in one
-    // CTE statement so no concurrent write can slip between the old-value read and
-    // the upsert under READ COMMITTED.
+    // Acquire a per-key advisory lock before reading the prior value so that
+    // concurrent writers on a brand-new key are serialised: T2 blocks here
+    // until T1 commits, and the next statement then sees T1's committed row
+    // under READ COMMITTED's per-statement snapshot.  The CTE's FOR UPDATE
+    // covers existing-key races; the advisory lock covers new-key races.
     let sql = "BEGIN; \
+        SELECT pg_advisory_xact_lock(1, hashtext(:'key')); \
         WITH \
             prior AS ( \
                 SELECT raw_value \
                 FROM autumn_runtime_config_values \
                 WHERE key = :'key' \
-                FOR UPDATE \
             ), \
             upsert AS ( \
                 INSERT INTO autumn_runtime_config_values (key, raw_value, updated_at) \
