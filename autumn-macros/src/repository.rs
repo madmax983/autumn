@@ -355,6 +355,101 @@ fn generate_derived_query(
     }
 }
 
+/// Generate the token stream for a version-history INSERT into
+/// `_autumn_version_history`. This is emitted inside an already-open
+/// transaction so no extra nesting is needed.
+///
+/// Parameters:
+/// - `table_name_str` — the literal string table name (e.g. `"posts"`)
+/// - `op` — `"insert"`, `"update"`, or `"delete"`
+/// - `with_ctx` — when `true` a `MutationContext` variable named `ctx`
+///   is in scope; actor / `request_id` are taken from it.
+///   When `false` the actor is hard-coded to `"system"` and `request_id` is `NULL`.
+/// - `record_expr` — token stream for the record value (implements `Serialize`)
+/// - `before_expr` — token stream for the "before" record value for updates
+///   (same type; ignored for inserts/deletes).
+/// - `conn_ident` — identifier of the `&mut AsyncPgConnection`-like variable
+fn vh_insert_ts(
+    table_name_str: &str,
+    op: &str,
+    with_ctx: bool,
+    record_expr: &TokenStream,
+    before_expr: Option<&TokenStream>,
+    conn_ident: &TokenStream,
+) -> TokenStream {
+    let actor_ts = if with_ctx {
+        quote! { ctx.actor.as_deref().unwrap_or("system") }
+    } else {
+        quote! { "system" }
+    };
+    let request_id_ts = if with_ctx {
+        quote! { ctx.request_id.as_deref() }
+    } else {
+        quote! { ::core::option::Option::None::<&str> }
+    };
+
+    let changes_ts = match op {
+        "insert" => quote! {
+            {
+                let __vh_json = ::autumn_web::reexports::serde_json::to_value(#record_expr)
+                    .unwrap_or(::autumn_web::reexports::serde_json::Value::Object(Default::default()));
+                let __vh_changes = ::autumn_web::version_history::compute_insert_changes(&__vh_json, &[]);
+                ::autumn_web::reexports::serde_json::to_string(&__vh_changes)
+                    .unwrap_or_else(|_| "[]".to_string())
+            }
+        },
+        "delete" => quote! {
+            {
+                let __vh_json = ::autumn_web::reexports::serde_json::to_value(#record_expr)
+                    .unwrap_or(::autumn_web::reexports::serde_json::Value::Object(Default::default()));
+                let __vh_changes = ::autumn_web::version_history::compute_delete_changes(&__vh_json, &[]);
+                ::autumn_web::reexports::serde_json::to_string(&__vh_changes)
+                    .unwrap_or_else(|_| "[]".to_string())
+            }
+        },
+        _ => {
+            // "update" — needs before and after
+            let before = before_expr.unwrap_or(record_expr);
+            quote! {
+                {
+                    let __vh_before_json = ::autumn_web::reexports::serde_json::to_value(#before)
+                        .unwrap_or(::autumn_web::reexports::serde_json::Value::Object(Default::default()));
+                    let __vh_after_json = ::autumn_web::reexports::serde_json::to_value(#record_expr)
+                        .unwrap_or(::autumn_web::reexports::serde_json::Value::Object(Default::default()));
+                    let __vh_changes = ::autumn_web::version_history::compute_diff(&__vh_before_json, &__vh_after_json, &[]);
+                    ::autumn_web::reexports::serde_json::to_string(&__vh_changes)
+                        .unwrap_or_else(|_| "[]".to_string())
+                }
+            }
+        }
+    };
+
+    let table_name_ts = table_name_str.to_string();
+
+    quote! {
+        {
+            let __vh_changes_str: ::std::string::String = #changes_ts;
+            let __vh_record_id: i64 = #record_expr.id;
+            let __vh_actor: &str = #actor_ts;
+            let __vh_request_id: ::core::option::Option<&str> = #request_id_ts;
+            ::autumn_web::reexports::diesel::sql_query(
+                "INSERT INTO _autumn_version_history \
+                 (table_name, record_id, op, actor, request_id, changes) \
+                 VALUES ($1, $2, $3, $4, $5, $6::jsonb)"
+            )
+            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(#table_name_ts)
+            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(__vh_record_id)
+            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(#op)
+            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__vh_actor)
+            .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__vh_request_id)
+            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__vh_changes_str)
+            .execute(#conn_ident)
+            .await
+            .map_err(::autumn_web::AutumnError::from)?;
+        }
+    }
+}
+
 #[allow(
     clippy::too_many_lines,
     clippy::option_if_let_else,
@@ -1045,6 +1140,49 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                     Ok(record)
                 }
+            } else if config.versioned {
+                let vh_insert = vh_insert_ts(
+                    table_name,
+                    "insert",
+                    true,
+                    &quote! { record },
+                    None,
+                    &quote! { conn },
+                );
+                quote! {
+                    use ::autumn_web::reexports::diesel::prelude::*;
+                    use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                    use ::autumn_web::reexports::diesel_async::AsyncConnection;
+                    use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
+                    use ::autumn_web::hooks::{MutationContext, MutationOp, MutationHooks};
+
+                    let mut conn = self.__autumn_acquire_conn().await?;
+                    let (record, mut ctx) = conn
+                        .transaction::<(#model_name, MutationContext), ::autumn_web::AutumnError, _>(|conn| {
+                            async move {
+                                let mut input = new.clone();
+                                let mut ctx = MutationContext::new(MutationOp::Create);
+
+                                self.hooks.before_create(&mut ctx, &mut input).await?;
+
+                                let record = ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                                    .values(&input)
+                                    .get_result::<#model_name>(conn)
+                                    .await
+                                    .map_err(::autumn_web::AutumnError::from)?;
+
+                                #vh_insert
+
+                                Ok((record, ctx))
+                            }
+                            .scope_boxed()
+                        })
+                        .await?;
+                    ::core::mem::drop(conn);
+                    self.hooks.after_create(&mut ctx, &record).await?;
+
+                    Ok(record)
+                }
             } else {
                 quote! {
                     use ::autumn_web::reexports::diesel::prelude::*;
@@ -1593,6 +1731,103 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                     Ok(record)
                 }
+            } else if config.versioned {
+                let vh_insert = vh_insert_ts(
+                    table_name,
+                    "update",
+                    true,
+                    &quote! { record },
+                    Some(&quote! { __vh_before }),
+                    &quote! { conn },
+                );
+                quote! {
+                    use ::autumn_web::reexports::diesel::prelude::*;
+                    use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                    use ::autumn_web::reexports::diesel_async::AsyncConnection;
+                    use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
+                    use ::autumn_web::hooks::{MutationContext, MutationOp, MutationHooks, UpdateDraft};
+                    use ::autumn_web::repository::{AutumnLockVersionModelExt as _, AutumnLockVersionUpdateExt as _};
+
+                    let mut conn = self.__autumn_acquire_conn().await?;
+                    let (record, mut ctx) = conn
+                        .transaction::<(#model_name, MutationContext), ::autumn_web::AutumnError, _>(|conn| {
+                            async move {
+                                let mut ctx = MutationContext::new(MutationOp::Update);
+                                let (record, __vh_before): (#model_name, #model_name) = if let ::core::option::Option::Some(expected_version) =
+                                    changes.__autumn_lock_version_expected()
+                                {
+                                    let current = #table_ident::table
+                                        .find(id)
+                                        .for_update()
+                                        .first::<#model_name>(conn)
+                                        .await
+                                        .optional()
+                                        .map_err(::autumn_web::AutumnError::from)?
+                                        .ok_or_else(|| ::autumn_web::AutumnError::not_found_msg(
+                                            format!("{} with id {} not found", stringify!(#model_name), id)
+                                        ))?;
+
+                                    if let ::core::option::Option::Some(actual_version) =
+                                        current.__autumn_lock_version_actual()
+                                    {
+                                        if actual_version != expected_version {
+                                            return Err(::autumn_web::AutumnError::conflict(
+                                                ::autumn_web::RepositoryError::Conflict {
+                                                    id,
+                                                    expected_version,
+                                                    actual_version: ::core::option::Option::Some(actual_version),
+                                                },
+                                            ));
+                                        }
+                                    }
+
+                                    let __vh_before = current.clone();
+                                    let mut draft = <UpdateDraft<#model_name> as #draft_ext_trait>::from_patch(&current, changes)?;
+                                    self.hooks.before_update(&mut ctx, &mut draft).await?;
+
+                                    let proposed = draft.into_after();
+                                    let updated = ::autumn_web::reexports::diesel::update(#table_ident::table.find(id))
+                                        .set(&proposed)
+                                        .get_result::<#model_name>(conn)
+                                        .await
+                                        .map_err(::autumn_web::AutumnError::from)?;
+                                    (updated, __vh_before)
+                                } else {
+                                    let current = #table_ident::table
+                                        .find(id)
+                                        .first::<#model_name>(conn)
+                                        .await
+                                        .optional()
+                                        .map_err(::autumn_web::AutumnError::from)?
+                                        .ok_or_else(|| ::autumn_web::AutumnError::not_found_msg(
+                                            format!("{} with id {} not found", stringify!(#model_name), id)
+                                        ))?;
+
+                                    let __vh_before = current.clone();
+                                    let mut draft = <UpdateDraft<#model_name> as #draft_ext_trait>::from_patch(&current, changes)?;
+                                    self.hooks.before_update(&mut ctx, &mut draft).await?;
+
+                                    let proposed = draft.into_after();
+                                    let updated = ::autumn_web::reexports::diesel::update(#table_ident::table.find(id))
+                                        .set(&proposed)
+                                        .get_result::<#model_name>(conn)
+                                        .await
+                                        .map_err(::autumn_web::AutumnError::from)?;
+                                    (updated, __vh_before)
+                                };
+
+                                #vh_insert
+
+                                Ok((record, ctx))
+                            }
+                            .scope_boxed()
+                        })
+                        .await?;
+                    ::core::mem::drop(conn);
+                    self.hooks.after_update(&mut ctx, &record).await?;
+
+                    Ok(record)
+                }
             } else {
                 quote! {
                     use ::autumn_web::reexports::diesel::prelude::*;
@@ -1884,6 +2119,51 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     .await?;
                 ::core::mem::drop(conn);
                 ::autumn_web::__private::kick_repository_commit_hook_dispatcher(&self.pool);
+
+                Ok(())
+            }
+        } else if config.versioned {
+            let vh_insert = vh_insert_ts(
+                table_name,
+                "delete",
+                true,
+                &quote! { record },
+                None,
+                &quote! { conn },
+            );
+            quote! {
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                use ::autumn_web::reexports::diesel_async::AsyncConnection;
+                use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
+                use ::autumn_web::hooks::{MutationContext, MutationOp, MutationHooks};
+
+                let mut conn = self.__autumn_acquire_conn().await?;
+                conn
+                    .transaction::<(), ::autumn_web::AutumnError, _>(|conn| {
+                        async move {
+                            let mut ctx = MutationContext::new(MutationOp::Delete);
+
+                            let load_query = #table_ident::table.find(id);
+                            let record = load_query.for_update().first::<#model_name>(conn).await
+                            .optional()
+                            .map_err(::autumn_web::AutumnError::from)?
+                            .ok_or_else(|| ::autumn_web::AutumnError::not_found_msg(
+                                format!("{} with id {} not found", stringify!(#model_name), id)
+                            ))?;
+
+                            self.hooks.before_delete(&mut ctx, &record).await?;
+
+                            #hooked_delete_mutation_stmt
+
+                            #vh_insert
+
+                            Ok(())
+                        }
+                        .scope_boxed()
+                    })
+                    .await?;
+                ::core::mem::drop(conn);
 
                 Ok(())
             }
@@ -3354,6 +3634,32 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 }
                 .map_err(::autumn_web::AutumnError::from)
             }
+        } else if config.versioned {
+            let vh_insert = vh_insert_ts(
+                table_name,
+                "insert",
+                false,
+                &quote! { record },
+                None,
+                &quote! { conn },
+            );
+            quote! {
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                use ::autumn_web::reexports::diesel_async::AsyncConnection;
+                use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
+                let mut conn = self.__autumn_acquire_conn().await?;
+                conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| async move {
+                    let record = ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                        .values(new)
+                        .get_result::<#model_name>(conn)
+                        .await
+                        .map_err(::autumn_web::AutumnError::from)?;
+                    #vh_insert
+                    Ok(record)
+                }.scope_boxed())
+                .await
+            }
         } else {
             quote! {
                 use ::autumn_web::reexports::diesel::prelude::*;
@@ -3460,6 +3766,71 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     }
                     .map_err(::autumn_web::AutumnError::from)
                 }
+            }
+        } else if config.versioned {
+            let vh_insert = vh_insert_ts(
+                table_name,
+                "update",
+                false,
+                &quote! { record },
+                Some(&quote! { current }),
+                &quote! { conn },
+            );
+            quote! {
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                use ::autumn_web::reexports::diesel_async::AsyncConnection;
+                use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
+                use ::autumn_web::repository::{AutumnLockVersionModelExt as _, AutumnLockVersionUpdateExt as _};
+                let mut conn = self.__autumn_acquire_conn().await?;
+
+                conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| {
+                    async move {
+                        let load_query = #table_ident::table.find(id);
+                        let current = if let ::core::option::Option::Some(expected_version) =
+                            changes.__autumn_lock_version_expected()
+                        {
+                            let c = load_query.for_update().first::<#model_name>(conn).await
+                                .optional()
+                                .map_err(::autumn_web::AutumnError::from)?
+                                .ok_or_else(|| ::autumn_web::AutumnError::not_found_msg(
+                                    format!("{} with id {} not found", stringify!(#model_name), id)
+                                ))?;
+                            if let ::core::option::Option::Some(actual_version) =
+                                c.__autumn_lock_version_actual()
+                            {
+                                if actual_version != expected_version {
+                                    return Err(::autumn_web::AutumnError::conflict(
+                                        ::autumn_web::RepositoryError::Conflict {
+                                            id,
+                                            expected_version,
+                                            actual_version: ::core::option::Option::Some(actual_version),
+                                        },
+                                    ));
+                                }
+                            }
+                            c
+                        } else {
+                            load_query.first::<#model_name>(conn).await
+                                .optional()
+                                .map_err(::autumn_web::AutumnError::from)?
+                                .ok_or_else(|| ::autumn_web::AutumnError::not_found_msg(
+                                    format!("{} with id {} not found", stringify!(#model_name), id)
+                                ))?
+                        };
+                        let diesel_changeset = changes.__to_changeset();
+                        let update_target = #table_ident::table.find(id);
+                        let record = ::autumn_web::reexports::diesel::update(update_target)
+                            .set(&diesel_changeset)
+                            .get_result::<#model_name>(conn)
+                            .await
+                            .map_err(::autumn_web::AutumnError::from)?;
+                        #vh_insert
+                        Ok(record)
+                    }
+                    .scope_boxed()
+                })
+                .await
             }
         } else {
             quote! {
@@ -3601,6 +3972,40 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     ));
                 }
                 Ok(())
+            }
+        } else if config.versioned {
+            let vh_insert = vh_insert_ts(
+                table_name,
+                "delete",
+                false,
+                &quote! { record },
+                None,
+                &quote! { conn },
+            );
+            quote! {
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                use ::autumn_web::reexports::diesel_async::AsyncConnection;
+                use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
+                let mut conn = self.__autumn_acquire_conn().await?;
+                conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| async move {
+                    let record = #table_ident::table.find(id)
+                        .for_update()
+                        .first::<#model_name>(conn)
+                        .await
+                        .optional()
+                        .map_err(::autumn_web::AutumnError::from)?
+                        .ok_or_else(|| ::autumn_web::AutumnError::not_found_msg(
+                            format!("{} with id {} not found", stringify!(#model_name), id)
+                        ))?;
+                    ::autumn_web::reexports::diesel::delete(#table_ident::table.find(id))
+                        .execute(conn)
+                        .await
+                        .map_err(::autumn_web::AutumnError::from)?;
+                    #vh_insert
+                    Ok(())
+                }.scope_boxed())
+                .await
             }
         } else {
             quote! {
@@ -6072,36 +6477,138 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     use ::autumn_web::reexports::diesel::prelude::*;
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl as _;
 
-                    let table_name = #table_name;
+                    // Private helper struct that can be deserialized from a raw SQL row.
+                    #[derive(::autumn_web::reexports::diesel::QueryableByName)]
+                    struct __AutumnVersionHistoryRow {
+                        #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
+                        id: i64,
+                        #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                        table_name: ::std::string::String,
+                        #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
+                        record_id: i64,
+                        #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                        op: ::std::string::String,
+                        #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                        actor: ::std::string::String,
+                        #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>)]
+                        request_id: ::core::option::Option<::std::string::String>,
+                        #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                        changes: ::std::string::String,
+                        #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Timestamptz)]
+                        recorded_at: ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
+                    }
+
+                    #[derive(::autumn_web::reexports::diesel::QueryableByName)]
+                    struct __AutumnVersionHistoryCount {
+                        #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
+                        count: i64,
+                    }
+
+                    let __table_name: &str = #table_name;
                     let (limit, offset) = filter.limit_offset();
                     let page = filter.page();
                     let per_page = filter.per_page();
 
                     let mut conn = self.__autumn_acquire_conn().await?;
 
-                    // Count query
-                    let count_sql = if filter.from.is_some() || filter.to.is_some() {
-                        format!(
-                            "SELECT COUNT(*) FROM _autumn_version_history \
+                    // Execute count query, optionally filtered by timestamp range.
+                    let total: u64 = if filter.from.is_some() || filter.to.is_some() {
+                        let rows = ::autumn_web::reexports::diesel::sql_query(
+                            "SELECT COUNT(*)::bigint AS count \
+                             FROM _autumn_version_history \
                              WHERE table_name = $1 AND record_id = $2 \
                              AND ($3::timestamptz IS NULL OR recorded_at >= $3) \
                              AND ($4::timestamptz IS NULL OR recorded_at <= $4)"
                         )
+                        .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__table_name)
+                        .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
+                        .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Timestamptz>, _>(filter.from)
+                        .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Timestamptz>, _>(filter.to)
+                        .get_results::<__AutumnVersionHistoryCount>(&mut conn)
+                        .await
+                        .map_err(::autumn_web::AutumnError::from)?;
+                        rows.into_iter().next().map(|r| r.count).unwrap_or(0).max(0) as u64
                     } else {
-                        format!(
-                            "SELECT COUNT(*) FROM _autumn_version_history \
+                        let rows = ::autumn_web::reexports::diesel::sql_query(
+                            "SELECT COUNT(*)::bigint AS count \
+                             FROM _autumn_version_history \
                              WHERE table_name = $1 AND record_id = $2"
                         )
+                        .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__table_name)
+                        .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
+                        .get_results::<__AutumnVersionHistoryCount>(&mut conn)
+                        .await
+                        .map_err(::autumn_web::AutumnError::from)?;
+                        rows.into_iter().next().map(|r| r.count).unwrap_or(0).max(0) as u64
                     };
-                    let _ = count_sql; // used in full implementation
 
-                    // For now, return a structurally valid empty page.
-                    // Full SQL is emitted in the autumn-harvest migration; the
-                    // actual DB query runs here via diesel::sql_query when the
-                    // _autumn_version_history table exists.
+                    // Execute the entries query.
+                    let raw_rows: Vec<__AutumnVersionHistoryRow> = if filter.from.is_some() || filter.to.is_some() {
+                        ::autumn_web::reexports::diesel::sql_query(
+                            "SELECT id, table_name, record_id, op, actor, request_id, \
+                             changes::text AS changes, recorded_at \
+                             FROM _autumn_version_history \
+                             WHERE table_name = $1 AND record_id = $2 \
+                             AND ($3::timestamptz IS NULL OR recorded_at >= $3) \
+                             AND ($4::timestamptz IS NULL OR recorded_at <= $4) \
+                             ORDER BY recorded_at ASC, id ASC \
+                             LIMIT $5 OFFSET $6"
+                        )
+                        .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__table_name)
+                        .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
+                        .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Timestamptz>, _>(filter.from)
+                        .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Timestamptz>, _>(filter.to)
+                        .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
+                        .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
+                        .get_results::<__AutumnVersionHistoryRow>(&mut conn)
+                        .await
+                        .map_err(::autumn_web::AutumnError::from)?
+                    } else {
+                        ::autumn_web::reexports::diesel::sql_query(
+                            "SELECT id, table_name, record_id, op, actor, request_id, \
+                             changes::text AS changes, recorded_at \
+                             FROM _autumn_version_history \
+                             WHERE table_name = $1 AND record_id = $2 \
+                             ORDER BY recorded_at ASC, id ASC \
+                             LIMIT $3 OFFSET $4"
+                        )
+                        .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__table_name)
+                        .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
+                        .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
+                        .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
+                        .get_results::<__AutumnVersionHistoryRow>(&mut conn)
+                        .await
+                        .map_err(::autumn_web::AutumnError::from)?
+                    };
+
+                    // Map raw rows to VersionEntry.
+                    let entries: Vec<::autumn_web::version_history::VersionEntry> = raw_rows
+                        .into_iter()
+                        .map(|row| {
+                            let op = match row.op.as_str() {
+                                "insert" => ::autumn_web::version_history::VersionOp::Insert,
+                                "delete" => ::autumn_web::version_history::VersionOp::Delete,
+                                _ => ::autumn_web::version_history::VersionOp::Update,
+                            };
+                            let changes: Vec<::autumn_web::version_history::ColumnChange> =
+                                ::autumn_web::reexports::serde_json::from_str(&row.changes)
+                                    .unwrap_or_default();
+                            ::autumn_web::version_history::VersionEntry {
+                                id: row.id,
+                                table_name: row.table_name,
+                                record_id: row.record_id,
+                                op,
+                                actor: row.actor,
+                                request_id: row.request_id,
+                                changes,
+                                recorded_at: row.recorded_at,
+                            }
+                        })
+                        .collect();
+
                     Ok(::autumn_web::version_history::VersionPage {
-                        entries: vec![],
-                        total: 0,
+                        entries,
+                        total,
                         page,
                         per_page,
                     })

@@ -224,10 +224,17 @@ impl VersionFilter {
     }
 
     /// LIMIT/OFFSET for SQL queries.
+    ///
+    /// Uses saturating arithmetic so an astronomically large `page` value
+    /// from query parameters cannot overflow: the offset is capped at
+    /// `i64::MAX` (far beyond any realistic table size).
     #[must_use]
     pub fn limit_offset(&self) -> (i64, i64) {
         let per = self.per_page().cast_signed();
-        let offset = ((self.page() - 1) * self.per_page()).cast_signed();
+        let offset = (self.page() - 1)
+            .saturating_mul(self.per_page())
+            .min(i64::MAX as u64)
+            .cast_signed();
         (per, offset)
     }
 }
