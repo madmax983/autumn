@@ -4,6 +4,7 @@ mod build;
 mod check;
 mod credentials;
 mod dev;
+mod dev_loop_bench;
 mod doctor;
 mod export;
 mod generate;
@@ -328,6 +329,43 @@ enum Commands {
         /// Hide framework-internal routes (`/actuator/*`, probes, htmx assets).
         #[arg(long)]
         user_only: bool,
+    },
+
+    /// Measure and gate dev-loop latency for `autumn dev`.
+    ///
+    /// Reports p50, p95, and maximum end-to-end latency for each change
+    /// class (Rust edit, CSS/Tailwind edit, static asset, config edit, etc.)
+    /// and compares the results against the accepted budget defined in
+    /// `docs/guide/dev-loop-latency.md`.
+    ///
+    /// Use `--dry-run` to print the budget table without starting a server.
+    /// Use `--fail-on-regression` in CI to exit 1 when a budget is exceeded.
+    ///
+    /// # Examples
+    ///
+    ///   autumn dev-loop-bench --dry-run
+    ///   autumn dev-loop-bench --example examples/hello --runs 5 --output report.json
+    ///   autumn dev-loop-bench --fail-on-regression
+    #[command(name = "dev-loop-bench", verbatim_doc_comment)]
+    DevLoopBench {
+        /// Example project to benchmark (path relative to workspace root).
+        #[arg(long, default_value = "examples/hello")]
+        example: String,
+        /// Number of measurement runs per change class.
+        #[arg(long, default_value = "5")]
+        runs: u32,
+        /// Write the machine-readable JSON report to this file path.
+        #[arg(long, value_name = "PATH")]
+        output: Option<String>,
+        /// Emit machine-readable JSON to stdout instead of the human summary.
+        #[arg(long)]
+        json: bool,
+        /// Exit 1 if any change class exceeds its latency budget.
+        #[arg(long)]
+        fail_on_regression: bool,
+        /// Print the budget table and exit without starting a server.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -834,6 +872,26 @@ fn run_command(command: Commands) {
                 credentials::run_show(&credentials::ShowOptions { env, reveal });
             }
         },
+        Commands::DevLoopBench {
+            example,
+            runs,
+            output,
+            json,
+            fail_on_regression,
+            dry_run,
+        } => {
+            let exit_code = dev_loop_bench::run(
+                &example,
+                runs,
+                output.as_deref(),
+                json,
+                fail_on_regression,
+                dry_run,
+            );
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
+        }
     }
 }
 
@@ -2604,5 +2662,91 @@ mod tests {
         };
         assert!(matches!(action, Some(MigrateCommands::Status)));
         assert!(with_maintenance);
+    }
+
+    #[test]
+    fn parse_dev_loop_bench_defaults() {
+        let cli = Cli::try_parse_from(["autumn", "dev-loop-bench"]).unwrap();
+        let Commands::DevLoopBench {
+            example,
+            runs,
+            output,
+            json,
+            fail_on_regression,
+            dry_run,
+        } = cli.command
+        else {
+            panic!("expected dev-loop-bench");
+        };
+        assert_eq!(example, "examples/hello");
+        assert_eq!(runs, 5);
+        assert!(output.is_none());
+        assert!(!json);
+        assert!(!fail_on_regression);
+        assert!(!dry_run);
+    }
+
+    #[test]
+    fn parse_dev_loop_bench_dry_run() {
+        let cli = Cli::try_parse_from(["autumn", "dev-loop-bench", "--dry-run"]).unwrap();
+        let Commands::DevLoopBench { dry_run, .. } = cli.command else {
+            panic!("expected dev-loop-bench");
+        };
+        assert!(dry_run);
+    }
+
+    #[test]
+    fn parse_dev_loop_bench_custom_example_and_runs() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "dev-loop-bench",
+            "--example",
+            "examples/todo-app",
+            "--runs",
+            "10",
+        ])
+        .unwrap();
+        let Commands::DevLoopBench { example, runs, .. } = cli.command else {
+            panic!("expected dev-loop-bench");
+        };
+        assert_eq!(example, "examples/todo-app");
+        assert_eq!(runs, 10);
+    }
+
+    #[test]
+    fn parse_dev_loop_bench_fail_on_regression() {
+        let cli =
+            Cli::try_parse_from(["autumn", "dev-loop-bench", "--fail-on-regression"]).unwrap();
+        let Commands::DevLoopBench {
+            fail_on_regression, ..
+        } = cli.command
+        else {
+            panic!("expected dev-loop-bench");
+        };
+        assert!(fail_on_regression);
+    }
+
+    #[test]
+    fn parse_dev_loop_bench_json_output() {
+        let cli = Cli::try_parse_from(["autumn", "dev-loop-bench", "--json"]).unwrap();
+        let Commands::DevLoopBench { json, .. } = cli.command else {
+            panic!("expected dev-loop-bench");
+        };
+        assert!(json);
+    }
+
+    #[test]
+    fn parse_dev_loop_bench_output_path() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "dev-loop-bench",
+            "--output",
+            "report.json",
+        ])
+        .unwrap();
+        let Commands::DevLoopBench { output, .. } = cli.command else {
+            panic!("expected dev-loop-bench");
+        };
+        assert_eq!(output.as_deref(), Some("report.json"));
     }
 }
