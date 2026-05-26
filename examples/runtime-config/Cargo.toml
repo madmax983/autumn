@@ -1,0 +1,11 @@
+[package]
+name = "runtime-config"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+autumn-web = { path = "../../autumn" }
+
+[lints.rust]
+unsafe_code = "forbid"

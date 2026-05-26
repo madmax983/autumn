@@ -174,6 +174,7 @@ pub mod tenancy;
 
 pub mod form;
 pub mod job;
+pub mod runtime_config;
 #[cfg(feature = "seed")]
 pub mod seed;
 pub mod task;

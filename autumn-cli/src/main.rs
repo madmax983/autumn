@@ -2,6 +2,7 @@ use clap::{Parser, Subcommand};
 
 mod build;
 mod check;
+mod config;
 mod credentials;
 mod dev;
 mod dev_loop_bench;
@@ -269,6 +270,27 @@ enum Commands {
         format: String,
     },
 
+    /// Inspect and mutate live runtime configuration values.
+    ///
+    /// Runtime config values are typed, schema-validated knobs that change
+    /// without a redeploy.  They are stored in `autumn_runtime_config_values`
+    /// and every mutation is audited in `autumn_runtime_config_changes`.
+    ///
+    /// The database URL is resolved from `autumn.toml` or the
+    /// `AUTUMN_DATABASE__PRIMARY_URL` / `AUTUMN_DATABASE__URL` / `DATABASE_URL`
+    /// environment variables.
+    ///
+    /// # Examples
+    ///
+    ///   autumn config list
+    ///   autumn config get max_upload_mb
+    ///   autumn config set max_upload_mb 200
+    ///   autumn config unset max_upload_mb
+    ///   autumn config history max_upload_mb
+    ///   autumn config history max_upload_mb --limit 50
+    #[command(subcommand, verbatim_doc_comment)]
+    Config(ConfigCommands),
+
     /// Manage encrypted credentials for the current Autumn project.
     ///
     /// Secrets are stored in `config/credentials/<env>.toml.enc` encrypted with
@@ -366,6 +388,63 @@ enum Commands {
         /// Print the budget table and exit without starting a server.
         #[arg(long)]
         dry_run: bool,
+    },
+}
+
+/// Subcommands for `autumn config`.
+#[derive(Subcommand)]
+enum ConfigCommands {
+    /// List all active config overrides.
+    ///
+    /// Prints key, current value, and last-updated timestamp for every key
+    /// that has been set via `autumn config set`.  Keys using their compile-time
+    /// default are not shown.
+    List,
+    /// Print the stored override for a single config key.
+    ///
+    /// Exits with a non-zero code and a clear message when the key has no
+    /// active override (i.e. the application is using the compile-time default).
+    Get {
+        /// Config key name (must be declared in the application schema).
+        key: String,
+    },
+    /// Set a runtime config key to a new value.
+    ///
+    /// The value is stored as-is; type validation is performed by the running
+    /// application when it reads the key. To check that a value is valid before
+    /// setting it, verify the declared type in the application schema.
+    ///
+    /// Every set records actor, old value, and new value in the change log.
+    Set {
+        /// Config key name.
+        key: String,
+        /// New raw value (must be parseable as the key's declared type).
+        value: String,
+        /// Actor identifier stored in the change log (e.g. your email).
+        #[arg(long, value_name = "ACTOR")]
+        actor: Option<String>,
+    },
+    /// Revert a config key to its compile-time default.
+    ///
+    /// Removes the active override so the running application falls back to
+    /// the value declared in its `ConfigRegistry`.
+    Unset {
+        /// Config key name.
+        key: String,
+        /// Actor identifier stored in the change log.
+        #[arg(long, value_name = "ACTOR")]
+        actor: Option<String>,
+    },
+    /// Show the change history for a config key.
+    ///
+    /// Prints actor, old value, new value, and timestamp for the most recent
+    /// changes, newest first.
+    History {
+        /// Config key name.
+        key: String,
+        /// Maximum number of history entries to return (default: 20).
+        #[arg(long, default_value = "20", value_name = "N")]
+        limit: usize,
     },
 }
 
@@ -870,6 +949,19 @@ fn run_command(command: Commands) {
             }
             CredentialsCommands::Show { env, reveal } => {
                 credentials::run_show(&credentials::ShowOptions { env, reveal });
+            }
+        },
+        Commands::Config(cmd) => match cmd {
+            ConfigCommands::List => config::run_list(&config::ListOptions),
+            ConfigCommands::Get { key } => config::run_get(&config::GetOptions { key }),
+            ConfigCommands::Set { key, value, actor } => {
+                config::run_set(&config::SetOptions { key, value, actor });
+            }
+            ConfigCommands::Unset { key, actor } => {
+                config::run_unset(&config::UnsetOptions { key, actor });
+            }
+            ConfigCommands::History { key, limit } => {
+                config::run_history(&config::HistoryOptions { key, limit });
             }
         },
         Commands::DevLoopBench {
@@ -2743,5 +2835,132 @@ mod tests {
             panic!("expected dev-loop-bench");
         };
         assert_eq!(output.as_deref(), Some("report.json"));
+    }
+
+    // ── autumn config tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_config_list() {
+        let cli = Cli::try_parse_from(["autumn", "config", "list"]).unwrap();
+        assert!(matches!(cli.command, Commands::Config(ConfigCommands::List)));
+    }
+
+    #[test]
+    fn parse_config_get() {
+        let cli = Cli::try_parse_from(["autumn", "config", "get", "max_upload_mb"]).unwrap();
+        let Commands::Config(ConfigCommands::Get { key }) = cli.command else {
+            panic!("expected config get");
+        };
+        assert_eq!(key, "max_upload_mb");
+    }
+
+    #[test]
+    fn parse_config_get_requires_key() {
+        assert!(Cli::try_parse_from(["autumn", "config", "get"]).is_err());
+    }
+
+    #[test]
+    fn parse_config_set() {
+        let cli =
+            Cli::try_parse_from(["autumn", "config", "set", "max_upload_mb", "200"]).unwrap();
+        let Commands::Config(ConfigCommands::Set { key, value, actor }) = cli.command else {
+            panic!("expected config set");
+        };
+        assert_eq!(key, "max_upload_mb");
+        assert_eq!(value, "200");
+        assert!(actor.is_none());
+    }
+
+    #[test]
+    fn parse_config_set_with_actor() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "config",
+            "set",
+            "max_upload_mb",
+            "200",
+            "--actor",
+            "ops@example.com",
+        ])
+        .unwrap();
+        let Commands::Config(ConfigCommands::Set { actor, .. }) = cli.command else {
+            panic!("expected config set");
+        };
+        assert_eq!(actor.as_deref(), Some("ops@example.com"));
+    }
+
+    #[test]
+    fn parse_config_set_requires_key_and_value() {
+        assert!(Cli::try_parse_from(["autumn", "config", "set"]).is_err());
+        assert!(Cli::try_parse_from(["autumn", "config", "set", "key"]).is_err());
+    }
+
+    #[test]
+    fn parse_config_unset() {
+        let cli = Cli::try_parse_from(["autumn", "config", "unset", "max_upload_mb"]).unwrap();
+        let Commands::Config(ConfigCommands::Unset { key, actor }) = cli.command else {
+            panic!("expected config unset");
+        };
+        assert_eq!(key, "max_upload_mb");
+        assert!(actor.is_none());
+    }
+
+    #[test]
+    fn parse_config_unset_with_actor() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "config",
+            "unset",
+            "max_upload_mb",
+            "--actor",
+            "alice",
+        ])
+        .unwrap();
+        let Commands::Config(ConfigCommands::Unset { actor, .. }) = cli.command else {
+            panic!("expected config unset");
+        };
+        assert_eq!(actor.as_deref(), Some("alice"));
+    }
+
+    #[test]
+    fn parse_config_unset_requires_key() {
+        assert!(Cli::try_parse_from(["autumn", "config", "unset"]).is_err());
+    }
+
+    #[test]
+    fn parse_config_history() {
+        let cli = Cli::try_parse_from(["autumn", "config", "history", "max_upload_mb"]).unwrap();
+        let Commands::Config(ConfigCommands::History { key, limit }) = cli.command else {
+            panic!("expected config history");
+        };
+        assert_eq!(key, "max_upload_mb");
+        assert_eq!(limit, 20, "default limit should be 20");
+    }
+
+    #[test]
+    fn parse_config_history_with_limit() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "config",
+            "history",
+            "max_upload_mb",
+            "--limit",
+            "50",
+        ])
+        .unwrap();
+        let Commands::Config(ConfigCommands::History { limit, .. }) = cli.command else {
+            panic!("expected config history");
+        };
+        assert_eq!(limit, 50);
+    }
+
+    #[test]
+    fn parse_config_history_requires_key() {
+        assert!(Cli::try_parse_from(["autumn", "config", "history"]).is_err());
+    }
+
+    #[test]
+    fn parse_config_without_subcommand_is_error() {
+        assert!(Cli::try_parse_from(["autumn", "config"]).is_err());
     }
 }
