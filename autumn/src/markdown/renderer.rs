@@ -20,6 +20,7 @@ use crate::markdown::types::{RenderOptions, RenderedMarkdown, TocItem};
 /// assert!(out.html.contains(r#"id="hello""#));
 /// assert_eq!(out.toc[0].text, "Hello");
 /// ```
+#[must_use]
 pub fn render(body: &str, options: RenderOptions) -> RenderedMarkdown {
     let mut pulldown_opts = Options::empty();
     if options.enable_tables {
@@ -85,7 +86,7 @@ pub fn render(body: &str, options: RenderOptions) -> RenderedMarkdown {
     RenderedMarkdown { html, toc }
 }
 
-fn heading_level_to_u8(level: HeadingLevel) -> u8 {
+const fn heading_level_to_u8(level: HeadingLevel) -> u8 {
     match level {
         HeadingLevel::H1 => 1,
         HeadingLevel::H2 => 2,
@@ -108,11 +109,12 @@ fn heading_level_to_u8(level: HeadingLevel) -> u8 {
 /// assert_eq!(heading_id("Hello, World!"), "hello-world");
 /// assert_eq!(heading_id("Getting Started"), "getting-started");
 /// ```
+#[must_use]
 pub fn heading_id(text: &str) -> String {
     let words: Vec<String> = text
         .split(|c: char| !c.is_ascii_alphanumeric())
         .filter(|s| !s.is_empty())
-        .map(|s| s.to_ascii_lowercase())
+        .map(str::to_ascii_lowercase)
         .collect();
     words.join("-")
 }

@@ -49,7 +49,7 @@ pub struct TocItem {
 }
 
 /// Options controlling the Markdown renderer behaviour.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct RenderOptions {
     /// Render GFM tables (default: `true`).
     pub enable_tables: bool,

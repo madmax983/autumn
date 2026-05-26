@@ -80,12 +80,14 @@ impl MarkdownRegistry {
     }
 
     /// Retrieve a page by slug, returning `None` if no such page exists.
+    #[must_use]
     pub fn get(&self, slug: &str) -> Option<&MarkdownPage> {
         self.pages.get(slug)
     }
 
     /// All pages sorted by `frontmatter.order` ascending, then by slug
     /// as a tiebreaker.
+    #[must_use]
     pub fn all_sorted(&self) -> Vec<&MarkdownPage> {
         let mut sorted: Vec<_> = self.pages.values().collect();
         sorted.sort_by_key(|p| (p.frontmatter.order, p.slug.as_str()));
@@ -108,6 +110,7 @@ impl MarkdownRegistry {
     /// #[static_get("/docs/{slug}", params = doc_params)]
     /// async fn show_doc(Path(slug): Path<String>) -> AutumnResult<Markup> { ... }
     /// ```
+    #[must_use]
     pub fn static_params(&self) -> Vec<StaticParams> {
         self.all_sorted()
             .into_iter()
@@ -120,11 +123,13 @@ impl MarkdownRegistry {
     }
 
     /// Number of pages in the registry.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.pages.len()
     }
 
     /// Returns `true` if the registry contains no pages.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.pages.is_empty()
     }
