@@ -631,17 +631,33 @@ fn edit_value_expr(field: &Field) -> String {
     }
 }
 
+/// Render the match expression for nullable fields in the update handler.
+///
+/// ⚡ Bolt optimization: Eliminates multiple intermediate heap allocations
+/// (individual Strings, the collected Vec, and the joined String) by pre-allocating
+/// a single buffer and pushing strings sequentially.
 fn render_nullable_field_match(fields: &[Field]) -> String {
-    let names = fields
+    let mut names_iter = fields
         .iter()
         .filter(|field| field.nullable)
-        .map(|field| format!("\"{}\"", field.name))
-        .collect::<Vec<_>>();
-    if names.is_empty() {
-        "false".to_owned()
-    } else {
-        format!("matches!(name, {})", names.join(" | "))
+        .map(|field| field.name.as_str());
+
+    let Some(first) = names_iter.next() else {
+        return "false".to_owned();
+    };
+
+    let mut match_expr = String::with_capacity(64);
+    match_expr.push_str("matches!(name, \"");
+    match_expr.push_str(first);
+    match_expr.push('"');
+
+    for name in names_iter {
+        match_expr.push_str(" | \"");
+        match_expr.push_str(name);
+        match_expr.push('"');
     }
+    match_expr.push(')');
+    match_expr
 }
 
 /// Render the column-update tuple body for the `update` handler. Emits
