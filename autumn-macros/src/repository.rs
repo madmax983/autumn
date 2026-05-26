@@ -4618,9 +4618,18 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         let delete_many_body = {
             let vh_delete_load_before = if config.versioned {
+                // Soft-delete preload must mirror the actual delete filter so that
+                // already-deleted rows are not snapshotted as newly deleted.
+                let soft_delete_filter = if config.soft_delete {
+                    quote! { .filter(#table_ident::deleted_at.is_null()) }
+                } else {
+                    quote! {}
+                };
                 let load_chunk = if config.tenant_scoped {
                     quote! {
-                        let load_query = #table_ident::table.filter(#table_ident::id.eq_any(chunk));
+                        let load_query = #table_ident::table
+                            .filter(#table_ident::id.eq_any(chunk))
+                            #soft_delete_filter;
                         let chunk_rows = if let ::core::option::Option::Some(t) = tenant_id {
                             load_query.filter(#table_ident::tenant_id.eq(t)).for_update().load::<#model_name>(conn).await
                         } else {
@@ -4630,14 +4639,22 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     }
                 } else {
                     quote! {
-                        let load_query = #table_ident::table.filter(#table_ident::id.eq_any(chunk));
+                        let load_query = #table_ident::table
+                            .filter(#table_ident::id.eq_any(chunk))
+                            #soft_delete_filter;
                         let chunk_rows = load_query.for_update().load::<#model_name>(conn).await
                             .map_err(::autumn_web::AutumnError::from)?;
                     }
                 };
                 quote! {
+                    // Deduplicate IDs so that duplicate inputs don't produce
+                    // duplicate history entries across chunk boundaries.
+                    let __vh_unique_ids: Vec<i64> = {
+                        let mut __seen = ::std::collections::HashSet::new();
+                        ids.iter().filter(|&&id| __seen.insert(id)).copied().collect()
+                    };
                     let mut __vh_deleted_records: Vec<#model_name> = Vec::new();
-                    for chunk in ids.chunks(1000) {
+                    for chunk in __vh_unique_ids.chunks(1000) {
                         #load_chunk
                         __vh_deleted_records.extend(chunk_rows);
                     }
@@ -4753,6 +4770,11 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let vh_ins = vh_insert_ts(table_name, "insert", false, &quote! { r }, None, &quote! { conn }, model_name);
                 let vh_upd = vh_insert_ts(table_name, "update", false, &quote! { r }, Some(&quote! { before_rec }), &quote! { conn }, model_name);
                 quote! {
+                    // Classification is based on the pre-upsert snapshot. Under
+                    // concurrent inserts of the same ID between the SELECT FOR UPDATE
+                    // and the upsert, the history op may be logged as "insert" when
+                    // the DB actually took the update path. Fixing this correctly
+                    // requires PostgreSQL-specific xmax inspection.
                     for r in &chunk_upserted {
                         if let ::core::option::Option::Some(before_rec) = __vh_before_map.get(&r.id) {
                             #vh_upd
