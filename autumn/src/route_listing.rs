@@ -489,6 +489,27 @@ mod tests {
         assert_eq!(infos[1].path, "/z");
     }
 
+    #[test]
+    fn append_dev_reload_routes_appends_when_dev_enabled() {
+        temp_env::with_vars(
+            [
+                ("AUTUMN_DEV_RELOAD", Some("1")),
+                ("AUTUMN_DEV_RELOAD_STATE", Some("state.json")),
+                ("AUTUMN_ENV", Some("development")),
+            ],
+            || {
+                let mut infos = Vec::new();
+                append_dev_reload_routes(&mut infos);
+                assert!(!infos.is_empty(), "expected dev routes when enabled");
+                let paths: Vec<&str> = infos.iter().map(|i| i.path.as_str()).collect();
+                assert!(paths.contains(&crate::middleware::dev::LIVE_RELOAD_PATH));
+                assert!(paths.contains(&crate::middleware::dev::LIVE_RELOAD_SCRIPT_PATH));
+                assert_eq!(infos[0].source, RouteSource::Framework);
+                assert_eq!(infos[1].source, RouteSource::Framework);
+            },
+        );
+    }
+
     // ── RouteSource serialization ──────────────────────────────────────────
 
     #[test]
