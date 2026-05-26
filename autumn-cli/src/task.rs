@@ -11,6 +11,7 @@ pub struct TaskOptions<'a> {
     pub bin: Option<&'a str>,
     pub profile: &'a str,
     pub list: bool,
+    pub ui: bool,
     pub name: Option<&'a str>,
     pub args: &'a [String],
 }
@@ -27,7 +28,9 @@ pub fn run(opts: &TaskOptions<'_>) {
     crate::routes::compile_binary(opts.package, opts.bin);
     let binary = crate::routes::find_binary(opts.package, opts.bin);
 
-    if opts.list {
+    if opts.ui {
+        crate::task_tui::run(opts, &binary);
+    } else if opts.list {
         list_tasks(&binary, opts);
     } else {
         run_task(&binary, opts);
