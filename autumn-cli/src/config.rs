@@ -140,7 +140,7 @@ pub fn run_history(opts: &HistoryOptions) {
 
 // ── Database URL resolution (mirrors token.rs) ────────────────────────────────
 
-pub(crate) fn resolve_database_url() -> String {
+pub fn resolve_database_url() -> String {
     let config_table = read_autumn_toml_table();
     if let Some(url) =
         resolve_primary_database_url_from_sources(|key| std::env::var(key), config_table.as_ref())
@@ -166,7 +166,7 @@ fn read_autumn_toml_table() -> Option<toml::Table> {
         .and_then(|contents| toml::from_str::<toml::Table>(&contents).ok())
 }
 
-pub(crate) fn resolve_primary_database_url_from_sources<F>(
+pub fn resolve_primary_database_url_from_sources<F>(
     env_var: F,
     table: Option<&toml::Table>,
 ) -> Option<String>
@@ -275,7 +275,6 @@ mod tests {
     #[test]
     fn resolve_falls_back_to_legacy_env_var() {
         let env = |key: &str| match key {
-            "AUTUMN_DATABASE__PRIMARY_URL" => Err(std::env::VarError::NotPresent),
             "AUTUMN_DATABASE__URL" => Ok("postgres://legacy".to_owned()),
             _ => Err(std::env::VarError::NotPresent),
         };

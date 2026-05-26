@@ -187,6 +187,21 @@ blocks publishing `autumn-web` or `autumn-cli`.
 
 ---
 
+### `examples/runtime-config` — Live-Tunable Config Store
+
+<!-- catalog:example name=runtime-config tier=supported -->
+
+| Field | Value |
+|-------|-------|
+| **Persona** | Operator tuning production knobs without a redeploy |
+| **Journey** | Declare typed config keys with defaults and validators; read, update, and revert values live via an HTTP API backed by `InMemoryConfigStore` |
+| **Key capabilities** | `ConfigRegistry`, `ConfigKeySchema`, `ConfigValue`, `ConfigValidator`, `InMemoryConfigStore`, `RuntimeConfigService`, typed get/set/unset/list |
+| **Prerequisites** | Rust 1.88.0+ |
+| **Run command** | `cargo run -p runtime-config` |
+| **Success proof** | `curl http://localhost:3000/config` returns a JSON list of all keys; `curl -X POST "http://localhost:3000/config/rate_limit_rps?value=50.0"` and a subsequent GET show the updated value |
+
+---
+
 ## Journey Map
 
 The table below maps each example to a distinct learning journey so evaluators
@@ -204,6 +219,7 @@ can pick the closest starting point without overlap.
 | Custom config loading | `custom_config_loader` | Replace the default config loader with a custom `ConfigLoader` |
 | WebSocket / SSE | `ws-echo` | Echo, fan-out channels, SSE, Redis multi-replica pub/sub |
 | Signed intake | `signed-webhooks` | Provider-shaped webhook HMAC verification and replay rejection |
+| Live config | `runtime-config` | Typed, validated, live-tunable config keys — no restart required |
 
 ---
 

@@ -283,11 +283,11 @@ enum Commands {
     /// # Examples
     ///
     ///   autumn config list
-    ///   autumn config get max_upload_mb
-    ///   autumn config set max_upload_mb 200
-    ///   autumn config unset max_upload_mb
-    ///   autumn config history max_upload_mb
-    ///   autumn config history max_upload_mb --limit 50
+    ///   autumn config get `max_upload_mb`
+    ///   autumn config set `max_upload_mb` 200
+    ///   autumn config unset `max_upload_mb`
+    ///   autumn config history `max_upload_mb`
+    ///   autumn config history `max_upload_mb` --limit 50
     #[command(subcommand, verbatim_doc_comment)]
     Config(ConfigCommands),
 

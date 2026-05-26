@@ -839,7 +839,7 @@ async fn config_set(
     flash: Flash,
     axum::extract::Form(form): axum::extract::Form<HashMap<String, String>>,
 ) -> AutumnResult<Response> {
-    let value = form.get("value").map(String::as_str).unwrap_or("");
+    let value = form.get("value").map_or("", String::as_str);
     match svc.set(&key, value, Some("admin-ui")) {
         Ok(()) => flash.success(format!("Updated {key} = {value}")).await,
         Err(e) => flash.error(format!("Failed to set {key}: {e}")).await,

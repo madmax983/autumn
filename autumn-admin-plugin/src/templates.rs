@@ -494,6 +494,7 @@ fn csrf_hidden_input(csrf_token: &str, csrf_form_field: &str) -> Markup {
 }
 
 /// Render the built-in jobs admin dashboard.
+#[allow(clippy::too_many_arguments)]
 pub fn jobs_page(
     registry: &AdminRegistry,
     snapshot: &JobAdminSnapshot,
@@ -1224,7 +1225,7 @@ pub fn model_form_page(
 // ── Runtime config page ─────────────────────────────────────────────
 
 /// Render the runtime config management page.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub fn config_page(
     registry: &AdminRegistry,
     entries: &[ConfigEntry],
@@ -1442,8 +1443,7 @@ fn format_timestamp(ts: u64) -> String {
     use chrono::{DateTime, Utc};
     let secs = i64::try_from(ts).unwrap_or(i64::MAX);
     DateTime::from_timestamp(secs, 0)
-        .map(|dt: DateTime<Utc>| dt.format("%Y-%m-%d %H:%M:%S").to_string())
-        .unwrap_or_else(|| ts.to_string())
+        .map_or_else(|| ts.to_string(), |dt: DateTime<Utc>| dt.format("%Y-%m-%d %H:%M:%S").to_string())
 }
 
 // ── Rendering helpers ───────────────────────────────────────────────
