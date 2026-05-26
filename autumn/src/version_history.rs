@@ -322,10 +322,7 @@ pub fn compute_diff(
 ///
 /// Sensitive columns appear as [`ColumnChange::sensitive`].
 #[must_use]
-pub fn compute_insert_changes(
-    record: &serde_json::Value,
-    sensitive: &[&str],
-) -> Vec<ColumnChange> {
+pub fn compute_insert_changes(record: &serde_json::Value, sensitive: &[&str]) -> Vec<ColumnChange> {
     let Some(obj) = record.as_object() else {
         return vec![];
     };
@@ -344,10 +341,7 @@ pub fn compute_insert_changes(
 ///
 /// Sensitive columns appear as [`ColumnChange::sensitive`].
 #[must_use]
-pub fn compute_delete_changes(
-    record: &serde_json::Value,
-    sensitive: &[&str],
-) -> Vec<ColumnChange> {
+pub fn compute_delete_changes(record: &serde_json::Value, sensitive: &[&str]) -> Vec<ColumnChange> {
     let Some(obj) = record.as_object() else {
         return vec![];
     };
@@ -433,7 +427,11 @@ mod tests {
 
     #[test]
     fn column_change_new_not_sensitive() {
-        let c = ColumnChange::new("title", Some(serde_json::json!("old")), Some(serde_json::json!("new")));
+        let c = ColumnChange::new(
+            "title",
+            Some(serde_json::json!("old")),
+            Some(serde_json::json!("new")),
+        );
         assert_eq!(c.column, "title");
         assert!(!c.sensitive);
         assert_eq!(c.before, Some(serde_json::json!("old")));
@@ -465,7 +463,11 @@ mod tests {
 
     #[test]
     fn column_change_serde_roundtrip() {
-        let c = ColumnChange::new("body", Some(serde_json::json!("old")), Some(serde_json::json!("new")));
+        let c = ColumnChange::new(
+            "body",
+            Some(serde_json::json!("old")),
+            Some(serde_json::json!("new")),
+        );
         let json = serde_json::to_string(&c).unwrap();
         let back: ColumnChange = serde_json::from_str(&json).unwrap();
         assert_eq!(back, c);
@@ -533,31 +535,51 @@ mod tests {
 
     #[test]
     fn version_filter_page_zero_clamps_to_one() {
-        let f = VersionFilter { page: 0, per_page: 10, ..Default::default() };
+        let f = VersionFilter {
+            page: 0,
+            per_page: 10,
+            ..Default::default()
+        };
         assert_eq!(f.page(), 1);
     }
 
     #[test]
     fn version_filter_per_page_zero_clamps_to_one() {
-        let f = VersionFilter { page: 1, per_page: 0, ..Default::default() };
+        let f = VersionFilter {
+            page: 1,
+            per_page: 0,
+            ..Default::default()
+        };
         assert_eq!(f.per_page(), 1);
     }
 
     #[test]
     fn version_filter_per_page_over_100_clamps_to_100() {
-        let f = VersionFilter { page: 1, per_page: 500, ..Default::default() };
+        let f = VersionFilter {
+            page: 1,
+            per_page: 500,
+            ..Default::default()
+        };
         assert_eq!(f.per_page(), 100);
     }
 
     #[test]
     fn version_filter_limit_offset_first_page() {
-        let f = VersionFilter { page: 1, per_page: 25, ..Default::default() };
+        let f = VersionFilter {
+            page: 1,
+            per_page: 25,
+            ..Default::default()
+        };
         assert_eq!(f.limit_offset(), (25, 0));
     }
 
     #[test]
     fn version_filter_limit_offset_second_page() {
-        let f = VersionFilter { page: 2, per_page: 10, ..Default::default() };
+        let f = VersionFilter {
+            page: 2,
+            per_page: 10,
+            ..Default::default()
+        };
         assert_eq!(f.limit_offset(), (10, 10));
     }
 
@@ -576,43 +598,78 @@ mod tests {
 
     #[test]
     fn version_page_total_pages_exact() {
-        let p = VersionPage { entries: vec![], total: 20, page: 1, per_page: 10 };
+        let p = VersionPage {
+            entries: vec![],
+            total: 20,
+            page: 1,
+            per_page: 10,
+        };
         assert_eq!(p.total_pages(), 2);
     }
 
     #[test]
     fn version_page_total_pages_partial() {
-        let p = VersionPage { entries: vec![], total: 21, page: 1, per_page: 10 };
+        let p = VersionPage {
+            entries: vec![],
+            total: 21,
+            page: 1,
+            per_page: 10,
+        };
         assert_eq!(p.total_pages(), 3);
     }
 
     #[test]
     fn version_page_total_pages_zero_per_page() {
-        let p = VersionPage { entries: vec![], total: 10, page: 1, per_page: 0 };
+        let p = VersionPage {
+            entries: vec![],
+            total: 10,
+            page: 1,
+            per_page: 0,
+        };
         assert_eq!(p.total_pages(), 0);
     }
 
     #[test]
     fn version_page_has_next_page() {
-        let p = VersionPage { entries: vec![], total: 30, page: 1, per_page: 10 };
+        let p = VersionPage {
+            entries: vec![],
+            total: 30,
+            page: 1,
+            per_page: 10,
+        };
         assert!(p.has_next_page());
     }
 
     #[test]
     fn version_page_no_next_page_on_last() {
-        let p = VersionPage { entries: vec![], total: 30, page: 3, per_page: 10 };
+        let p = VersionPage {
+            entries: vec![],
+            total: 30,
+            page: 3,
+            per_page: 10,
+        };
         assert!(!p.has_next_page());
     }
 
     #[test]
     fn version_page_has_prev_page() {
-        let p = VersionPage { entries: vec![], total: 30, page: 2, per_page: 10 };
+        let p = VersionPage {
+            entries: vec![],
+            total: 30,
+            page: 2,
+            per_page: 10,
+        };
         assert!(p.has_prev_page());
     }
 
     #[test]
     fn version_page_no_prev_page_on_first() {
-        let p = VersionPage { entries: vec![], total: 30, page: 1, per_page: 10 };
+        let p = VersionPage {
+            entries: vec![],
+            total: 30,
+            page: 1,
+            per_page: 10,
+        };
         assert!(!p.has_prev_page());
     }
 
@@ -625,9 +682,18 @@ mod tests {
         let changes = compute_diff(&before, &after, &[]);
         let cols: Vec<&str> = changes.iter().map(|c| c.column.as_str()).collect();
         // Only changed columns appear
-        assert!(cols.contains(&"title"), "title should be in changes: {cols:?}");
-        assert!(cols.contains(&"published"), "published should be in changes: {cols:?}");
-        assert!(!cols.contains(&"body"), "unchanged body must not appear: {cols:?}");
+        assert!(
+            cols.contains(&"title"),
+            "title should be in changes: {cols:?}"
+        );
+        assert!(
+            cols.contains(&"published"),
+            "published should be in changes: {cols:?}"
+        );
+        assert!(
+            !cols.contains(&"body"),
+            "unchanged body must not appear: {cols:?}"
+        );
     }
 
     #[test]
@@ -643,9 +709,18 @@ mod tests {
         let before = serde_json::json!({"title": "old", "password_digest": "hash1"});
         let after = serde_json::json!({"title": "new", "password_digest": "hash2"});
         let changes = compute_diff(&before, &after, &["password_digest"]);
-        let pass_change = changes.iter().find(|c| c.column == "password_digest").unwrap();
-        assert!(pass_change.sensitive, "password_digest should be marked sensitive");
-        assert!(pass_change.before.is_none(), "sensitive before must be null");
+        let pass_change = changes
+            .iter()
+            .find(|c| c.column == "password_digest")
+            .unwrap();
+        assert!(
+            pass_change.sensitive,
+            "password_digest should be marked sensitive"
+        );
+        assert!(
+            pass_change.before.is_none(),
+            "sensitive before must be null"
+        );
         assert!(pass_change.after.is_none(), "sensitive after must be null");
     }
 
@@ -687,7 +762,10 @@ mod tests {
     fn compute_insert_changes_sensitive_columns_omitted() {
         let record = serde_json::json!({"id": 1, "password_digest": "hashed"});
         let changes = compute_insert_changes(&record, &["password_digest"]);
-        let pass = changes.iter().find(|c| c.column == "password_digest").unwrap();
+        let pass = changes
+            .iter()
+            .find(|c| c.column == "password_digest")
+            .unwrap();
         assert!(pass.sensitive);
         assert!(pass.before.is_none());
         assert!(pass.after.is_none());
@@ -722,9 +800,15 @@ mod tests {
     fn versioned_record_default_sensitive_columns_is_empty() {
         struct Dummy;
         impl VersionedRecord for Dummy {
-            fn version_table_name() -> &'static str { "dummies" }
-            fn version_record_id(&self) -> i64 { 1 }
-            fn version_column_values(&self) -> serde_json::Value { serde_json::json!({}) }
+            fn version_table_name() -> &'static str {
+                "dummies"
+            }
+            fn version_record_id(&self) -> i64 {
+                1
+            }
+            fn version_column_values(&self) -> serde_json::Value {
+                serde_json::json!({})
+            }
         }
         assert!(Dummy::version_sensitive_columns().is_empty());
     }
@@ -733,9 +817,15 @@ mod tests {
     fn versioned_record_custom_sensitive_columns() {
         struct SecureModel;
         impl VersionedRecord for SecureModel {
-            fn version_table_name() -> &'static str { "secure_models" }
-            fn version_record_id(&self) -> i64 { 99 }
-            fn version_column_values(&self) -> serde_json::Value { serde_json::json!({}) }
+            fn version_table_name() -> &'static str {
+                "secure_models"
+            }
+            fn version_record_id(&self) -> i64 {
+                99
+            }
+            fn version_column_values(&self) -> serde_json::Value {
+                serde_json::json!({})
+            }
             fn version_sensitive_columns() -> &'static [&'static str] {
                 &["password_digest", "api_key"]
             }

@@ -7788,10 +7788,7 @@ mod tests {
     fn parse_repo_args_versioned_false_explicitly() {
         let tokens: proc_macro2::TokenStream = "Post, versioned = false".parse().unwrap();
         let config = parse_repo_args(tokens).unwrap();
-        assert!(
-            !config.versioned,
-            "versioned = false must remain false"
-        );
+        assert!(!config.versioned, "versioned = false must remain false");
     }
 
     #[test]
@@ -7812,11 +7809,8 @@ mod tests {
     fn repository_macro_non_versioned_does_not_regress() {
         // Repositories that do not opt in must compile and run unchanged.
         // Verify the generated output does not contain any history code.
-        let generated = repository_macro(
-            quote! { Post },
-            quote! { pub trait PostRepository {} },
-        )
-        .to_string();
+        let generated =
+            repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
 
         // The basic CRUD methods must still be present
         assert!(

@@ -645,10 +645,7 @@ async fn model_history(
         )));
     }
 
-    let page: u64 = params
-        .get("page")
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(1);
+    let page: u64 = params.get("page").and_then(|p| p.parse().ok()).unwrap_or(1);
     let per_page: u64 = params
         .get("per_page")
         .and_then(|p| p.parse().ok())
