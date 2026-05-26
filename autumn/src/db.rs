@@ -1631,6 +1631,36 @@ mod tests {
         );
     }
 
+    #[test]
+    fn after_commit_panic_message_extracts_static_str() {
+        let payload: &'static str = "a static string panic";
+        let any_payload: &(dyn std::any::Any + Send) = &payload;
+        assert_eq!(
+            super::after_commit_panic_message(any_payload),
+            "a static string panic"
+        );
+    }
+
+    #[test]
+    fn after_commit_panic_message_extracts_owned_string() {
+        let payload: String = "an owned string panic".to_string();
+        let any_payload: &(dyn std::any::Any + Send) = &payload;
+        assert_eq!(
+            super::after_commit_panic_message(any_payload),
+            "an owned string panic"
+        );
+    }
+
+    #[test]
+    fn after_commit_panic_message_handles_non_string_payload() {
+        let payload: i32 = 42;
+        let any_payload: &(dyn std::any::Any + Send) = &payload;
+        assert_eq!(
+            super::after_commit_panic_message(any_payload),
+            "non-string panic payload"
+        );
+    }
+
     // ── scrub_sql tests ───────────────────────────────────────────────────────
 
     #[test]
