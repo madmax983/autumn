@@ -33,7 +33,10 @@ async fn main() {
             repositories::page_api_create,
             repositories::page_api_update,
             repositories::page_api_delete,
+            routes::docs::show,
+            routes::docs::index,
         ])
+        .static_routes(static_routes![routes::docs::show])
         .run()
         .await;
 }

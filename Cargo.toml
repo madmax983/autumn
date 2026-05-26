@@ -63,6 +63,8 @@ testcontainers-modules = { version = "0.15", features = ["postgres", "redis", "m
 # graph used by integration tests.
 time = { version = ">=0.3, <0.4" }
 
+pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }
+
 # Proc macro
 syn = { version = "2", features = ["full"] }
 quote = "1"

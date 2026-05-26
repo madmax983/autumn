@@ -1,8 +1,9 @@
 # Autumn Wiki Example
 
-A small wiki showing how Autumn's mutation hooks and generated repositories fit
-together when you need lifecycle logic, revision history, and a JSON API
-without hand-writing the CRUD boilerplate twice.
+A small wiki showing how Autumn's mutation hooks, generated repositories, and
+Markdown documentation primitives fit together when you need lifecycle logic,
+revision history, and a JSON API without hand-writing the CRUD boilerplate
+twice.
 
 ## What it demonstrates
 
@@ -12,6 +13,8 @@ without hand-writing the CRUD boilerplate twice.
 - Maud templates for a server-rendered editing flow
 - Embedded migrations on startup
 - Framework health and actuator endpoints
+- **Markdown docs with SSG** — `autumn_web::markdown` registry, `#[static_get]`
+  pre-rendering, and embedded `.md` content files (see `src/routes/docs.rs`)
 
 ## Prerequisites
 
@@ -68,6 +71,42 @@ behavior automatically.
 | POST | `/api/v1/pages` | Create a page |
 | PUT | `/api/v1/pages/{id}` | Update a page |
 | DELETE | `/api/v1/pages/{id}` | Delete a page |
+
+### Docs (Markdown + SSG)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/docs` | Documentation index (all pages sorted by `order`) |
+| GET | `/docs/{slug}` | Rendered Markdown page with TOC |
+
+The docs routes use `autumn_web::markdown`:
+
+```rust
+// ~10 lines of glue; layout markup excluded
+static REGISTRY: OnceLock<MarkdownRegistry> = OnceLock::new();
+
+fn docs() -> &'static MarkdownRegistry {
+    REGISTRY.get_or_init(|| {
+        MarkdownRegistry::from_embedded(&[
+            MarkdownSource { slug: "getting-started", content: include_str!("../../content/getting-started.md") },
+            MarkdownSource { slug: "configuration",   content: include_str!("../../content/configuration.md") },
+        ]).expect("valid embedded docs")
+    })
+}
+
+pub async fn doc_params(_router: axum::Router) -> Vec<StaticParams> {
+    docs().static_params()
+}
+
+#[static_get("/docs/{slug}", params = doc_params)]
+pub async fn show(Path(slug): Path<String>) -> AutumnResult<Markup> { ... }
+```
+
+Pre-render to `dist/` with:
+
+```bash
+cargo run -p autumn-cli -- build -p wiki
+```
 
 ### Framework
 
