@@ -23,6 +23,8 @@ tailwind = []
 http-client = ["dep:reqwest"]
 oauth2 = ["http-client"]
 openapi = ["dep:serde_yaml"]
+# Optional Markdown rendering with frontmatter parsing and SSG integration.
+markdown = ["dep:pulldown-cmark"]
 db = [
     "dep:deadpool",
     "dep:diesel",
@@ -105,6 +107,7 @@ testcontainers = { workspace = true, optional = true }
 testcontainers-modules = { workspace = true, optional = true }
 serde_urlencoded = "0.7"
 serde_yaml = { version = "0.9", optional = true }
+pulldown-cmark = { workspace = true, optional = true }
 subtle = "2.6.1"
 base64 = "0.22"
 url = "2.5.8"
@@ -147,7 +150,7 @@ rusty-fork = "0.3.1"
 features = [
   "maud", "htmx", "tailwind", "db", "cache-moka",
   "ws", "flash", "multipart", "http-client", "oauth2", "openapi",
-  "redis", "i18n", "storage", "mail", "seed", "system-info",
+  "redis", "i18n", "storage", "mail", "seed", "system-info", "markdown",
 ]
 rustdoc-args = ["--cfg", "docsrs"]
 
