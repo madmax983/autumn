@@ -98,6 +98,11 @@ pub trait ProvideActuatorState {
     fn a11y_posture(&self) -> A11yPosture {
         A11yPosture::default()
     }
+
+    /// Returns the optional webhook outbound manager if enabled/registered.
+    fn webhook_outbound(&self) -> Option<crate::webhook_outbound::WebhookOutboundManager> {
+        None
+    }
 }
 
 // ── Shared types for AppState ──────────────────────────────────
@@ -1336,6 +1341,161 @@ pub(crate) async fn jobs_endpoint<S: ProvideActuatorState + Send + Sync + 'stati
     Json(serde_json::json!({ "jobs": jobs }))
 }
 
+/// Request body for `POST <actuator-prefix>/webhooks/replay`.
+#[derive(Deserialize)]
+pub(crate) struct ReplayRequest {
+    log_id: String,
+}
+
+/// `GET <actuator-prefix>/webhooks/dlq` -- list dead-lettered webhook logs.
+pub(crate) async fn webhooks_dlq_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
+    State(state): State<S>,
+) -> impl IntoResponse {
+    let Some(manager) = state.webhook_outbound() else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(serde_json::json!({
+                "status": "error",
+                "message": "Outbound webhook support is not configured or enabled"
+            })),
+        )
+            .into_response();
+    };
+
+    match manager.store().get_dlq_logs().await {
+        Ok(logs) => (StatusCode::OK, Json(logs)).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "status": "error",
+                "message": format!("Failed to fetch DLQ logs: {}", e)
+            })),
+        )
+            .into_response(),
+    }
+}
+
+/// `POST <actuator-prefix>/webhooks/replay` -- replay a dead-lettered webhook log.
+pub(crate) async fn webhooks_replay_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
+    State(state): State<S>,
+    Json(body): Json<ReplayRequest>,
+) -> impl IntoResponse {
+    let Some(manager) = state.webhook_outbound() else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(serde_json::json!({
+                "status": "error",
+                "message": "Outbound webhook support is not configured or enabled"
+            })),
+        )
+            .into_response();
+    };
+
+    let log_opt = match manager.store().get_delivery_log(&body.log_id).await {
+        Ok(log) => log,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "status": "error",
+                    "message": format!("Failed to retrieve log: {}", e)
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let mut log = match log_opt {
+        Some(l) => l,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "status": "error",
+                    "message": format!("Log with ID {} not found", body.log_id)
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    if !log.is_dlq {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "status": "error",
+            "message": format!("Log with ID {} is not in the Dead Letter Queue (DLQ)", body.log_id)
+        }))).into_response();
+    }
+
+    // Reset log state for re-delivery
+    log.is_dlq = false;
+    log.attempt = 1;
+    log.last_error = None;
+    log.response_status = None;
+    log.response_body = None;
+    log.timestamp = chrono::Utc::now();
+
+    let subscription_id = log.subscription_id.clone();
+
+    if let Err(e) = manager.store().log_delivery(log).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "status": "error",
+                "message": format!("Failed to update log: {}", e)
+            })),
+        )
+            .into_response();
+    }
+
+    // Reset subscription consecutive failures to allow it to retry
+    if let Err(e) = manager
+        .store()
+        .reset_subscription_failures(&subscription_id)
+        .await
+    {
+        tracing::warn!(subscription_id = %subscription_id, "Failed to reset subscription failures during replay: {}", e);
+    }
+
+    // Enqueue background delivery job
+    let job_payload = serde_json::json!({
+        "log_id": body.log_id,
+    });
+
+    if let Some(job_client) = crate::job::global_job_client() {
+        if let Err(e) = job_client
+            .enqueue("autumn_webhook_delivery", job_payload)
+            .await
+        {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "status": "error",
+                    "message": format!("Failed to enqueue job: {}", e)
+                })),
+            )
+                .into_response();
+        }
+    } else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "status": "error",
+                "message": "Global job client is not available"
+            })),
+        )
+            .into_response();
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "ok",
+            "message": format!("Replay successfully enqueued for log {}", body.log_id)
+        })),
+    )
+        .into_response()
+}
+
 // ── A11y ───────────────────────────────────────────────────────
 
 /// `GET <actuator-prefix>/a11y` -- scaffold-level accessibility posture.
@@ -1450,6 +1610,8 @@ pub(crate) fn actuator_endpoint_paths(prefix: &str, sensitive: bool) -> Vec<Stri
         paths.push(actuator_route_path(prefix, "/tasks"));
         paths.push(actuator_route_path(prefix, "/jobs"));
         paths.push(actuator_route_path(prefix, "/ui/tasks"));
+        paths.push(actuator_route_path(prefix, "/webhooks/dlq"));
+        paths.push(actuator_route_path(prefix, "/webhooks/replay"));
         #[cfg(feature = "ws")]
         {
             paths.push(actuator_route_path(prefix, "/channels"));
@@ -1530,6 +1692,14 @@ pub(crate) fn actuator_router_with_prefix<
             .route(
                 &actuator_route_path(prefix, "/ui/tasks"),
                 axum::routing::get(ui_tasks::<S>),
+            )
+            .route(
+                &actuator_route_path(prefix, "/webhooks/dlq"),
+                axum::routing::get(webhooks_dlq_endpoint::<S>),
+            )
+            .route(
+                &actuator_route_path(prefix, "/webhooks/replay"),
+                axum::routing::post(webhooks_replay_endpoint::<S>),
             );
 
         #[cfg(feature = "system-info")]

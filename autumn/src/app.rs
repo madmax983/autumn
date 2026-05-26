@@ -201,8 +201,8 @@ pub struct AppBuilder {
     /// Custom Tower layers registered via [`AppBuilder::layer`], applied
     /// inside `RequestIdLayer` on ingress so they observe the request ID.
     custom_layers: Vec<CustomLayerRegistration>,
-    startup_hooks: Vec<StartupHook>,
-    shutdown_hooks: Vec<ShutdownHook>,
+    pub(crate) startup_hooks: Vec<StartupHook>,
+    pub(crate) shutdown_hooks: Vec<ShutdownHook>,
     extensions: HashMap<TypeId, Box<dyn Any + Send>>,
     /// Plugin names that have already been applied, for duplicate detection.
     registered_plugins: HashSet<String>,

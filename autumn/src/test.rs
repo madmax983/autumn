@@ -191,6 +191,7 @@ pub struct TestApp {
     /// handler intercepts matching requests.
     #[cfg(feature = "http-client")]
     http_mock_registry: Option<std::sync::Arc<crate::http_client::MockRegistry>>,
+    state_initializers: Vec<Box<dyn FnOnce(&AppState) + Send>>,
 }
 
 type TestPolicyRegistration = Box<dyn FnOnce(&crate::authorization::PolicyRegistry) + Send>;
@@ -230,6 +231,7 @@ impl TestApp {
             http_interceptor: None,
             #[cfg(feature = "http-client")]
             http_mock_registry: None,
+            state_initializers: Vec::new(),
         }
     }
 
@@ -370,6 +372,7 @@ impl TestApp {
         TestClient {
             router,
             probes: crate::probe::ProbeState::ready_for_test(),
+            state: AppState::for_test(),
         }
     }
 
@@ -377,6 +380,31 @@ impl TestApp {
     #[must_use]
     pub fn routes(mut self, routes: Vec<Route>) -> Self {
         self.routes.extend(routes);
+        self
+    }
+
+    /// Register a callback to configure/initialize the application state before building the router.
+    #[must_use]
+    pub fn state_initializer<F>(mut self, f: F) -> Self
+    where
+        F: FnOnce(&AppState) + Send + 'static,
+    {
+        self.state_initializers.push(Box::new(f));
+        self
+    }
+
+    /// Apply a plugin directly to the test app.
+    #[must_use]
+    pub fn plugin<P: crate::plugin::Plugin>(mut self, plugin: P) -> Self {
+        let mut app_builder = crate::app();
+        app_builder = plugin.build(app_builder);
+
+        for hook in app_builder.startup_hooks {
+            self.state_initializers.push(Box::new(move |state| {
+                let fut = hook(state.clone());
+                let _ = futures::executor::block_on(fut);
+            }));
+        }
         self
     }
 
@@ -595,10 +623,14 @@ impl TestApp {
             state.insert_extension(crate::http_client::HttpMockRegistryExt(registry));
         }
 
+        for initializer in self.state_initializers {
+            initializer(&state);
+        }
+
         let router = crate::router::try_build_router_inner(
             self.routes,
             &self.config,
-            state,
+            state.clone(),
             crate::router::RouterContext {
                 exception_filters: Vec::new(),
                 scoped_groups: self.scoped_groups,
@@ -612,7 +644,11 @@ impl TestApp {
             },
         )
         .expect("failed to build test router");
-        TestClient { router, probes }
+        TestClient {
+            router,
+            probes,
+            state,
+        }
     }
 }
 
@@ -656,9 +692,16 @@ impl Default for TestApp {
 pub struct TestClient {
     router: axum::Router,
     probes: crate::probe::ProbeState,
+    pub(crate) state: AppState,
 }
 
 impl TestClient {
+    /// Returns a reference to the [`AppState`] wired into this test app's router.
+    #[must_use]
+    pub const fn state(&self) -> &AppState {
+        &self.state
+    }
+
     /// Unwrap the underlying [`axum::Router`] out of the [`TestClient`].
     pub fn into_router(self) -> axum::Router {
         self.router
