@@ -58,16 +58,25 @@ pub fn render(body: &str, options: RenderOptions) -> RenderedMarkdown {
                     j += 1;
                 }
                 let id = heading_id(&text);
-                toc.push(TocItem {
-                    level: level_u8,
-                    id: id.clone(),
-                    text,
-                });
-                // Replace the pulldown heading-start event with raw HTML that
-                // carries the generated id attribute.
-                output.push(Event::Html(CowStr::from(format!(
-                    "<h{level_u8} id=\"{id}\">"
-                ))));
+                // Only inject an id and add a TOC entry when the heading has
+                // at least one alphanumeric character.  An empty id (e.g. a
+                // punctuation-only heading like `# !!!`) would produce invalid
+                // markup `<h1 id="">` and a broken TOC link pointing to `#`.
+                if id.is_empty() {
+                    // No alphanumeric text — plain heading, no id, no TOC entry.
+                    // An empty id would produce invalid `<h1 id="">` markup and
+                    // a broken TOC link pointing to bare `#`.
+                    output.push(Event::Html(CowStr::from(format!("<h{level_u8}>"))));
+                } else {
+                    toc.push(TocItem {
+                        level: level_u8,
+                        id: id.clone(),
+                        text,
+                    });
+                    output.push(Event::Html(CowStr::from(format!(
+                        "<h{level_u8} id=\"{id}\">"
+                    ))));
+                }
                 i += 1;
             }
             Event::End(TagEnd::Heading(level)) => {
@@ -289,5 +298,16 @@ mod tests {
         let result = render(md, RenderOptions::default());
         assert_eq!(result.toc[0].text, "Hello World");
         assert!(result.html.contains(r#"id="hello-world""#));
+    }
+
+    #[test]
+    fn punctuation_only_heading_emits_no_id_and_no_toc_entry() {
+        // heading_id("!!!") returns ""; the renderer must not emit id=""
+        // or add a broken TOC entry pointing to "#".
+        let result = render("# !!!\n\nText.", RenderOptions::default());
+        assert!(!result.html.contains("id="));
+        assert!(result.toc.is_empty());
+        // The heading tag itself must still be present.
+        assert!(result.html.contains("<h1>"));
     }
 }
