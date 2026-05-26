@@ -1,3 +1,8 @@
+#![allow(
+    clippy::significant_drop_tightening,
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc
+)]
 //! Outbound signed webhook delivery with retries, DLQ, and subscription management.
 
 use chrono::{DateTime, Utc};
@@ -125,6 +130,7 @@ impl InMemoryOutboundWebhookHandler {
     }
 
     /// Helper to register a subscription in memory for testing/dev.
+    #[allow(clippy::unused_async)]
     pub async fn create_subscription(
         &self,
         sub: WebhookSubscription,
@@ -138,6 +144,7 @@ impl InMemoryOutboundWebhookHandler {
     }
 
     /// Helper to retrieve logged deliveries for testing/dev.
+    #[allow(clippy::unused_async)]
     pub async fn get_delivery_logs(&self) -> AutumnResult<Vec<WebhookDeliveryLog>> {
         let logs = self.logs.read().expect("logs read lock poisoned");
         let mut list: Vec<WebhookDeliveryLog> = logs.values().cloned().collect();
@@ -147,6 +154,7 @@ impl InMemoryOutboundWebhookHandler {
     }
 
     /// Helper to fetch a single subscription.
+    #[allow(clippy::unused_async)]
     pub async fn get_subscription(&self, id: &str) -> AutumnResult<Option<WebhookSubscription>> {
         let subs = self
             .subscriptions
@@ -190,12 +198,17 @@ impl OutboundWebhookHandler for InMemoryOutboundWebhookHandler {
             .write()
             .expect("subscriptions write lock poisoned");
         if let Some(sub) = subs.get_mut(&log.subscription_id) {
-            if log
-                .response_status
-                .map_or(false, |status| (200..300).contains(&status))
-            {
-                sub.consecutive_failures = 0;
-            } else {
+            if let Some(status) = log.response_status {
+                if (200..300).contains(&status) {
+                    sub.consecutive_failures = 0;
+                } else {
+                    sub.consecutive_failures = sub.consecutive_failures.saturating_add(1);
+                    if sub.consecutive_failures >= 50 {
+                        sub.status = WebhookSubscriptionStatus::Failed;
+                        tracing::warn!(subscription_id = %sub.id, "Webhook subscription auto-disabled due to 50 consecutive failures");
+                    }
+                }
+            } else if log.last_error.is_some() {
                 sub.consecutive_failures = sub.consecutive_failures.saturating_add(1);
                 if sub.consecutive_failures >= 50 {
                     sub.status = WebhookSubscriptionStatus::Failed;
@@ -210,11 +223,14 @@ impl OutboundWebhookHandler for InMemoryOutboundWebhookHandler {
     fn get_dlq_logs(
         &self,
     ) -> Pin<Box<dyn Future<Output = AutumnResult<Vec<WebhookDeliveryLog>>> + Send>> {
-        let logs = self.logs.read().expect("logs read lock poisoned");
-        let mut list: Vec<WebhookDeliveryLog> =
-            logs.values().filter(|l| l.is_dlq).cloned().collect();
-        list.sort_by_key(|l| l.timestamp);
-        list.reverse();
+        let list = {
+            let logs = self.logs.read().expect("logs read lock poisoned");
+            let mut list: Vec<WebhookDeliveryLog> =
+                logs.values().filter(|l| l.is_dlq).cloned().collect();
+            list.sort_by_key(|l| l.timestamp);
+            list.reverse();
+            list
+        };
         Box::pin(async move { Ok(list) })
     }
 
@@ -222,8 +238,7 @@ impl OutboundWebhookHandler for InMemoryOutboundWebhookHandler {
         &self,
         id: &str,
     ) -> Pin<Box<dyn Future<Output = AutumnResult<Option<WebhookDeliveryLog>>> + Send>> {
-        let logs = self.logs.read().expect("logs read lock poisoned");
-        let log = logs.get(id).cloned();
+        let log = self.logs.read().expect("logs read lock poisoned").get(id).cloned();
         Box::pin(async move { Ok(log) })
     }
 
@@ -231,12 +246,14 @@ impl OutboundWebhookHandler for InMemoryOutboundWebhookHandler {
         &self,
         id: &str,
     ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send>> {
-        let mut subs = self
-            .subscriptions
-            .write()
-            .expect("subscriptions write lock poisoned");
-        if let Some(sub) = subs.get_mut(id) {
-            sub.consecutive_failures = 0;
+        {
+            let mut subs = self
+                .subscriptions
+                .write()
+                .expect("subscriptions write lock poisoned");
+            if let Some(sub) = subs.get_mut(id) {
+                sub.consecutive_failures = 0;
+            }
         }
         Box::pin(async move { Ok(()) })
     }
@@ -253,7 +270,7 @@ pub type WebhookDelegate = Arc<
         + Sync,
 >;
 
-/// AppState extension for the runtime delegation hook.
+/// `AppState` extension for the runtime delegation hook.
 #[derive(Clone)]
 pub struct WebhookDelegateExt(pub WebhookDelegate);
 
@@ -276,18 +293,21 @@ impl WebhookOutboundManager {
     }
 
     /// Set a custom initial backoff for retries.
-    pub fn with_initial_backoff_ms(mut self, ms: u64) -> Self {
+    #[must_use]
+    pub const fn with_initial_backoff_ms(mut self, ms: u64) -> Self {
         self.initial_backoff_ms = ms;
         self
     }
 
     /// Access the underlying webhook handler (compatibility/actuator support).
+    #[must_use]
     pub fn store(&self) -> &Arc<dyn OutboundWebhookHandler> {
         &self.handler
     }
 
     /// Access the underlying http client.
-    pub fn client(&self) -> &Client {
+    #[must_use]
+    pub const fn client(&self) -> &Client {
         &self.client
     }
 
@@ -296,7 +316,7 @@ impl WebhookOutboundManager {
     /// # Errors
     ///
     /// Returns [`AutumnError`] if payload serialization or queueing fails.
-    pub async fn dispatch<T: Serialize>(
+    pub async fn dispatch<T: Serialize + Sync>(
         &self,
         state: &AppState,
         topic: &str,
@@ -339,8 +359,7 @@ impl WebhookOutboundManager {
             } else {
                 // Fallback: enqueue a standard background job
                 let job_payload = serde_json::json!({
-                    "subscription": sub,
-                    "log": log,
+                    "log_id": log.id,
                 });
 
                 tracing::debug!(subscription_id = %sub.id, "WebhookOutboundManager::dispatch: enqueuing fallback webhook delivery job");
@@ -349,9 +368,9 @@ impl WebhookOutboundManager {
                         .enqueue("autumn_webhook_delivery", job_payload)
                         .await?;
                 } else {
-                    tracing::warn!(
-                        "Global job client is unavailable; fallback webhook delivery job not enqueued"
-                    );
+                    return Err(AutumnError::internal_server_error_msg(
+                        "Global job client is unavailable; fallback webhook delivery job not enqueued",
+                    ));
                 }
             }
         }
@@ -361,6 +380,8 @@ impl WebhookOutboundManager {
 }
 
 /// Asynchronous background job that delivers a webhook payload (legacy fallback).
+#[must_use]
+#[allow(clippy::redundant_closure_for_method_calls, clippy::too_many_lines)]
 pub fn deliver_webhook_job(
     state: AppState,
     payload: serde_json::Value,
@@ -372,14 +393,17 @@ pub fn deliver_webhook_job(
 
         // Support both self-contained payload structure and legacy log_id lookup (for replays)
         let (sub, mut log) = if let Some(sub_val) = payload.get("subscription") {
-            let sub: WebhookSubscription = serde_json::from_value(sub_val.clone()).map_err(|e| {
-                AutumnError::bad_request_msg(format!("failed to parse subscription: {e}"))
-            })?;
-            let log: WebhookDeliveryLog = serde_json::from_value(payload.get("log").cloned().ok_or_else(|| {
-                AutumnError::bad_request_msg("missing log in job payload")
-            })?).map_err(|e| {
-                AutumnError::bad_request_msg(format!("failed to parse log: {e}"))
-            })?;
+            let sub: WebhookSubscription =
+                serde_json::from_value(sub_val.clone()).map_err(|e| {
+                    AutumnError::bad_request_msg(format!("failed to parse subscription: {e}"))
+                })?;
+            let log: WebhookDeliveryLog = serde_json::from_value(
+                payload
+                    .get("log")
+                    .cloned()
+                    .ok_or_else(|| AutumnError::bad_request_msg("missing log in job payload"))?,
+            )
+            .map_err(|e| AutumnError::bad_request_msg(format!("failed to parse log: {e}")))?;
             (sub, log)
         } else {
             let log_id = payload
@@ -390,19 +414,31 @@ pub fn deliver_webhook_job(
             tracing::debug!(log_id = %log_id, "deliver_webhook_job: starting webhook delivery via log lookup");
 
             let log_opt = manager.store().get_delivery_log(log_id).await?;
-            let log = match log_opt {
-                Some(l) => l,
-                None => {
-                    return Err(AutumnError::not_found_msg(format!(
-                        "delivery log {log_id} not found"
-                    )));
-                }
-            };
-
-            let subs = manager.store().get_subscriptions(&log.topic).await?;
-            let sub = subs.into_iter().find(|s| s.id == log.subscription_id).ok_or_else(|| {
-                AutumnError::not_found_msg(format!("subscription {} not found", log.subscription_id))
+            let mut log = log_opt.ok_or_else(|| {
+                AutumnError::not_found_msg(format!("delivery log {log_id} not found"))
             })?;
+
+            // If this log has already been attempted (i.e. is running a retry from the job runner),
+            // increment the attempt counter and write the pre-send log.
+            if log.response_status.is_some() || log.last_error.is_some() {
+                log.attempt = log.attempt.saturating_add(1);
+                log.response_status = None;
+                log.response_body = None;
+                log.last_error = None;
+                manager.store().log_delivery(log.clone()).await?;
+            }
+
+            // Load latest subscription state to respect emergency rotations/disable
+            let subs = manager.store().get_subscriptions(&log.topic).await?;
+            let sub = subs
+                .into_iter()
+                .find(|s| s.id == log.subscription_id)
+                .ok_or_else(|| {
+                    AutumnError::not_found_msg(format!(
+                        "subscription {} not found",
+                        log.subscription_id
+                    ))
+                })?;
             (sub, log)
         };
 
@@ -413,12 +449,12 @@ pub fn deliver_webhook_job(
 
         // Stripe-style payload signing: t=<timestamp>,v1=<signature>
         let timestamp = Utc::now().timestamp();
-        let signing_payload = format!("{}.{}", timestamp, log.payload);
+        let signing_payload = format!("{timestamp}.{}", log.payload);
         let signature = crate::security::config::hmac_sha256_hex(
             sub.secret.as_bytes(),
             signing_payload.as_bytes(),
         );
-        let signature_header = format!("t={},v1={}", timestamp, signature);
+        let signature_header = format!("t={timestamp},v1={signature}");
 
         let mut request_headers = HashMap::new();
         request_headers.insert("Content-Type".to_owned(), "application/json".to_owned());
@@ -434,7 +470,7 @@ pub fn deliver_webhook_job(
             .text_body(log.payload.clone());
 
         let response = req.send().await;
-        let elapsed = start.elapsed().as_millis() as u64;
+        let elapsed = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
         tracing::debug!(
             log_id = %log.id,
@@ -451,7 +487,7 @@ pub fn deliver_webhook_job(
                 let status = res.status();
                 log.response_status = Some(status.as_u16());
                 let is_success = res.is_success();
-                let body_str = res.text().to_owned();
+                let body_str = res.text();
                 log.response_body = Some(body_str);
 
                 if is_success {
@@ -460,7 +496,7 @@ pub fn deliver_webhook_job(
                     manager.store().reset_subscription_failures(&sub.id).await?;
                     Ok(())
                 } else {
-                    let status_err = format!("server returned status: {}", status);
+                    let status_err = format!("server returned status: {status}");
                     log.last_error = Some(status_err.clone());
                     manager.store().log_delivery(log.clone()).await?;
                     handle_delivery_failure(&manager, &sub, log, status_err).await
@@ -483,48 +519,21 @@ async fn handle_delivery_failure(
     error_msg: String,
 ) -> AutumnResult<()> {
     if log.attempt < log.max_attempts {
-        let attempt = log.attempt + 1;
-        let base_delay = manager.initial_backoff_ms;
-        let multiplier = 2u64.pow(attempt - 1);
-        let mut buf = [0u8; 8];
-        let jitter = if getrandom::getrandom(&mut buf).is_ok() {
-            let val = u64::from_ne_bytes(buf);
-            (val % 1000) as f64 / 100.0
-        } else {
-            5.0
-        };
-        let delay_ms = base_delay * multiplier + (jitter as u64);
-
-        log.attempt = attempt;
-        manager.store().log_delivery(log.clone()).await?;
-
-        let job_payload = serde_json::json!({
-            "subscription": sub,
-            "log": log,
-        });
-
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-            if let Some(job_client) = crate::job::global_job_client() {
-                let _ = job_client
-                    .enqueue("autumn_webhook_delivery", job_payload)
-                    .await;
-            }
-        });
-
+        // Return an error to signal the background job runner to retry this job
         Err(AutumnError::internal_server_error_msg(format!(
-            "delivery attempt failed, scheduled retry: {error_msg}"
+            "delivery attempt {} failed, scheduled retry: {error_msg}",
+            log.attempt
         )))
     } else {
         log.is_dlq = true;
         manager.store().log_delivery(log).await?;
-        Err(AutumnError::internal_server_error_msg(format!(
-            "delivery failed permanently, sent to DLQ: {error_msg}"
-        )))
+        // Return Ok(()) to mark the permanently failed job as complete and send to DLQ
+        tracing::warn!(subscription_id = %sub.id, "Webhook delivery failed permanently; sent to DLQ: {}", error_msg);
+        Ok(())
     }
 }
 
-/// AppBuilder plugin for outbound signed webhook delivery infrastructure.
+/// `AppBuilder` plugin for outbound signed webhook delivery infrastructure.
 pub struct OutboundWebhookPlugin {
     store: Arc<dyn OutboundWebhookHandler>,
     initial_backoff_ms: u64,
@@ -542,7 +551,7 @@ impl OutboundWebhookPlugin {
 
     /// Override the initial backoff retry delay.
     #[must_use]
-    pub fn with_initial_backoff_ms(mut self, ms: u64) -> Self {
+    pub const fn with_initial_backoff_ms(mut self, ms: u64) -> Self {
         self.initial_backoff_ms = ms;
         self
     }
@@ -564,8 +573,8 @@ impl crate::plugin::Plugin for OutboundWebhookPlugin {
         })
         .jobs(vec![crate::job::JobInfo {
             name: "autumn_webhook_delivery".to_string(),
-            max_attempts: 1, // Retries are handled durably via handle_delivery_failure
-            initial_backoff_ms: 1,
+            max_attempts: 10, // Retries are handled durably via the background job engine
+            initial_backoff_ms,
             handler: deliver_webhook_job,
         }])
     }

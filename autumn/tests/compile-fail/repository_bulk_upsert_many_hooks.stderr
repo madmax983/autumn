@@ -16,7 +16,7 @@ error[E0277]: the trait bound `DummyHooks: RepositoryHooksDefault` is not satisf
   --> tests/compile-fail/repository_bulk_upsert_many_hooks.rs:31:57
    |
 31 | #[autumn_web::repository(Item, table = "items", hooks = DummyHooks)]
-   |                                                         ^^^^^^^^^^ the trait `Default` is not implemented for `DummyHooks`
+   |                                                         ^^^^^^^^^^ the trait `std::default::Default` is not implemented for `DummyHooks`
    |
    = note: required for `DummyHooks` to implement `RepositoryHooksDefault`
 help: consider annotating `DummyHooks` with `#[derive(Default)]`

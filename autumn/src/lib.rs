@@ -182,6 +182,7 @@ pub use form::ChangesetForm;
 pub use form::IntoChangeset;
 pub mod validation;
 pub mod webhook;
+#[cfg(feature = "http-client")]
 pub mod webhook_outbound;
 #[cfg(feature = "ws")]
 pub mod ws;

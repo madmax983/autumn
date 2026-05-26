@@ -99,6 +99,7 @@ pub trait ProvideActuatorState {
         A11yPosture::default()
     }
 
+    #[cfg(feature = "http-client")]
     /// Returns the optional webhook outbound manager if enabled/registered.
     fn webhook_outbound(&self) -> Option<crate::webhook_outbound::WebhookOutboundManager> {
         None
@@ -1341,12 +1342,14 @@ pub(crate) async fn jobs_endpoint<S: ProvideActuatorState + Send + Sync + 'stati
     Json(serde_json::json!({ "jobs": jobs }))
 }
 
+#[cfg(feature = "http-client")]
 /// Request body for `POST <actuator-prefix>/webhooks/replay`.
 #[derive(Deserialize)]
 pub(crate) struct ReplayRequest {
     log_id: String,
 }
 
+#[cfg(feature = "http-client")]
 /// `GET <actuator-prefix>/webhooks/dlq` -- list dead-lettered webhook logs.
 pub(crate) async fn webhooks_dlq_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
     State(state): State<S>,
@@ -1375,6 +1378,7 @@ pub(crate) async fn webhooks_dlq_endpoint<S: ProvideActuatorState + Send + Sync 
     }
 }
 
+#[cfg(feature = "http-client")]
 /// `POST <actuator-prefix>/webhooks/replay` -- replay a dead-lettered webhook log.
 pub(crate) async fn webhooks_replay_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
     State(state): State<S>,
@@ -1405,18 +1409,15 @@ pub(crate) async fn webhooks_replay_endpoint<S: ProvideActuatorState + Send + Sy
         }
     };
 
-    let mut log = match log_opt {
-        Some(l) => l,
-        None => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({
-                    "status": "error",
-                    "message": format!("Log with ID {} not found", body.log_id)
-                })),
-            )
-                .into_response();
-        }
+    let Some(mut log) = log_opt else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "status": "error",
+                "message": format!("Log with ID {} not found", body.log_id)
+            })),
+        )
+            .into_response();
     };
 
     if !log.is_dlq {
@@ -1426,37 +1427,7 @@ pub(crate) async fn webhooks_replay_endpoint<S: ProvideActuatorState + Send + Sy
         }))).into_response();
     }
 
-    // Reset log state for re-delivery
-    log.is_dlq = false;
-    log.attempt = 1;
-    log.last_error = None;
-    log.response_status = None;
-    log.response_body = None;
-    log.timestamp = chrono::Utc::now();
-
-    let subscription_id = log.subscription_id.clone();
-
-    if let Err(e) = manager.store().log_delivery(log).await {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "status": "error",
-                "message": format!("Failed to update log: {}", e)
-            })),
-        )
-            .into_response();
-    }
-
-    // Reset subscription consecutive failures to allow it to retry
-    if let Err(e) = manager
-        .store()
-        .reset_subscription_failures(&subscription_id)
-        .await
-    {
-        tracing::warn!(subscription_id = %subscription_id, "Failed to reset subscription failures during replay: {}", e);
-    }
-
-    // Enqueue background delivery job
+    // Enqueue background delivery job first to prevent losing DLQ recovery path on failure
     let job_payload = serde_json::json!({
         "log_id": body.log_id,
     });
@@ -1484,6 +1455,29 @@ pub(crate) async fn webhooks_replay_endpoint<S: ProvideActuatorState + Send + Sy
             })),
         )
             .into_response();
+    }
+
+    // Reset log state for re-delivery now that it is successfully enqueued
+    log.is_dlq = false;
+    log.attempt = 1;
+    log.last_error = None;
+    log.response_status = None;
+    log.response_body = None;
+    log.timestamp = chrono::Utc::now();
+
+    let subscription_id = log.subscription_id.clone();
+
+    if let Err(e) = manager.store().log_delivery(log).await {
+        tracing::warn!(log_id = %body.log_id, "Failed to update log: {}", e);
+    }
+
+    // Reset subscription consecutive failures to allow it to retry
+    if let Err(e) = manager
+        .store()
+        .reset_subscription_failures(&subscription_id)
+        .await
+    {
+        tracing::warn!(subscription_id = %subscription_id, "Failed to reset subscription failures during replay: {}", e);
     }
 
     (
@@ -1692,15 +1686,19 @@ pub(crate) fn actuator_router_with_prefix<
             .route(
                 &actuator_route_path(prefix, "/ui/tasks"),
                 axum::routing::get(ui_tasks::<S>),
-            )
-            .route(
-                &actuator_route_path(prefix, "/webhooks/dlq"),
-                axum::routing::get(webhooks_dlq_endpoint::<S>),
-            )
-            .route(
-                &actuator_route_path(prefix, "/webhooks/replay"),
-                axum::routing::post(webhooks_replay_endpoint::<S>),
             );
+        #[cfg(feature = "http-client")]
+        {
+            router = router
+                .route(
+                    &actuator_route_path(prefix, "/webhooks/dlq"),
+                    axum::routing::get(webhooks_dlq_endpoint::<S>),
+                )
+                .route(
+                    &actuator_route_path(prefix, "/webhooks/replay"),
+                    axum::routing::post(webhooks_replay_endpoint::<S>),
+                );
+        }
 
         #[cfg(feature = "system-info")]
         {

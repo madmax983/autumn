@@ -12,7 +12,7 @@
 use autumn_web::prelude::*;
 use autumn_web::test::{TestApp, TestDb};
 use autumn_web::webhook_outbound::{
-    InMemoryOutboundWebhookStore, OutboundWebhookPlugin, OutboundWebhookStore, WebhookSubscription,
+    InMemoryOutboundWebhookStore, OutboundWebhookPlugin, WebhookSubscription,
     WebhookSubscriptionStatus,
 };
 use diesel_migrations::{EmbeddedMigrations, embed_migrations};
@@ -79,8 +79,10 @@ async fn test_reddit_registration_triggers_outbound_webhook() {
 
     // 4. Start the background job runtime for the webhook delivery job
     let shutdown = tokio_util::sync::CancellationToken::new();
-    let mut config = autumn_web::config::JobConfig::default();
-    config.backend = "postgres".to_string();
+    let config = autumn_web::config::JobConfig {
+        backend: "postgres".to_string(),
+        ..Default::default()
+    };
 
     let mut jobs = reddit_clone::jobs::registered_jobs();
     jobs.push(JobInfo {
@@ -89,7 +91,7 @@ async fn test_reddit_registration_triggers_outbound_webhook() {
         initial_backoff_ms: 1,
         handler: autumn_web::webhook_outbound::deliver_webhook_job,
     });
-    job::start_runtime(jobs, &state, &shutdown, &config).unwrap();
+    job::start_runtime(jobs, state, &shutdown, &config).unwrap();
 
     // 5. Fire a POST request to /register to trigger the user.created webhook event
     let response = app
@@ -104,10 +106,8 @@ async fn test_reddit_registration_triggers_outbound_webhook() {
     let mut logs = Vec::new();
     for _ in 0..50 {
         logs = store.get_delivery_logs().await.unwrap();
-        if let Some(log) = logs.first() {
-            if log.response_status.is_some() {
-                break;
-            }
+        if logs.first().is_some_and(|l| l.response_status.is_some()) {
+            break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }

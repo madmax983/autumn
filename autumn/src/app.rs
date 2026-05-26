@@ -184,7 +184,7 @@ type PolicyRegistration = Box<dyn FnOnce(&crate::authorization::PolicyRegistry) 
 /// }
 /// ```
 pub struct AppBuilder {
-    routes: Vec<Route>,
+    pub(crate) routes: Vec<Route>,
     /// Parallel to `routes`: registration origin for each route.
     route_sources: Vec<crate::route_listing::RouteSource>,
     /// Non-None while a plugin's `build()` is executing; routes and scoped
@@ -192,15 +192,15 @@ pub struct AppBuilder {
     current_plugin: Option<String>,
     tasks: Vec<crate::task::TaskInfo>,
     one_off_tasks: Vec<crate::task::OneOffTaskInfo>,
-    jobs: Vec<crate::job::JobInfo>,
+    pub(crate) jobs: Vec<crate::job::JobInfo>,
     pub(crate) static_metas: Vec<crate::static_gen::StaticRouteMeta>,
-    exception_filters: Vec<Arc<dyn ExceptionFilter>>,
-    scoped_groups: Vec<ScopedGroup>,
-    merge_routers: Vec<axum::Router<AppState>>,
-    nest_routers: Vec<(String, axum::Router<AppState>)>,
+    pub(crate) exception_filters: Vec<Arc<dyn ExceptionFilter>>,
+    pub(crate) scoped_groups: Vec<ScopedGroup>,
+    pub(crate) merge_routers: Vec<axum::Router<AppState>>,
+    pub(crate) nest_routers: Vec<(String, axum::Router<AppState>)>,
     /// Custom Tower layers registered via [`AppBuilder::layer`], applied
     /// inside `RequestIdLayer` on ingress so they observe the request ID.
-    custom_layers: Vec<CustomLayerRegistration>,
+    pub(crate) custom_layers: Vec<CustomLayerRegistration>,
     pub(crate) startup_hooks: Vec<StartupHook>,
     pub(crate) shutdown_hooks: Vec<ShutdownHook>,
     extensions: HashMap<TypeId, Box<dyn Any + Send>>,

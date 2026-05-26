@@ -1,3 +1,4 @@
+#![allow(clippy::type_complexity, clippy::too_many_lines)]
 //! First-party integration-testing utilities for Autumn applications.
 //!
 //! This module brings Autumn's testing story to parity with frameworks like
@@ -192,6 +193,8 @@ pub struct TestApp {
     #[cfg(feature = "http-client")]
     http_mock_registry: Option<std::sync::Arc<crate::http_client::MockRegistry>>,
     state_initializers: Vec<Box<dyn FnOnce(&AppState) + Send>>,
+    jobs: Vec<crate::job::JobInfo>,
+    exception_filters: Vec<std::sync::Arc<dyn crate::middleware::ExceptionFilter>>,
 }
 
 type TestPolicyRegistration = Box<dyn FnOnce(&crate::authorization::PolicyRegistry) + Send>;
@@ -232,6 +235,8 @@ impl TestApp {
             #[cfg(feature = "http-client")]
             http_mock_registry: None,
             state_initializers: Vec::new(),
+            jobs: Vec::new(),
+            exception_filters: Vec::new(),
         }
     }
 
@@ -368,11 +373,11 @@ impl TestApp {
     /// [`TestClient::probes`] will be in the default ready state; it is not
     /// connected to any handler in the supplied router.
     #[must_use]
-    pub fn from_router(router: axum::Router) -> TestClient {
+    pub fn from_router(router: axum::Router, state: AppState) -> TestClient {
         TestClient {
             router,
             probes: crate::probe::ProbeState::ready_for_test(),
-            state: AppState::for_test(),
+            state,
         }
     }
 
@@ -399,10 +404,19 @@ impl TestApp {
         let mut app_builder = crate::app();
         app_builder = plugin.build(app_builder);
 
+        // Merge properties from the plugin's app_builder into self:
+        self.routes.extend(app_builder.routes);
+        self.scoped_groups.extend(app_builder.scoped_groups);
+        self.merge_routers.extend(app_builder.merge_routers);
+        self.nest_routers.extend(app_builder.nest_routers);
+        self.custom_layers.extend(app_builder.custom_layers);
+        self.jobs.extend(app_builder.jobs);
+        self.exception_filters.extend(app_builder.exception_filters);
+
         for hook in app_builder.startup_hooks {
             self.state_initializers.push(Box::new(move |state| {
                 let fut = hook(state.clone());
-                let _ = futures::executor::block_on(fut);
+                futures::executor::block_on(fut).expect("Plugin startup hook failed");
             }));
         }
         self
@@ -627,12 +641,16 @@ impl TestApp {
             initializer(&state);
         }
 
+        for job in &self.jobs {
+            state.job_registry.register(&job.name);
+        }
+
         let router = crate::router::try_build_router_inner(
             self.routes,
             &self.config,
             state.clone(),
             crate::router::RouterContext {
-                exception_filters: Vec::new(),
+                exception_filters: self.exception_filters,
                 scoped_groups: self.scoped_groups,
                 merge_routers: self.merge_routers,
                 nest_routers: self.nest_routers,

@@ -114,7 +114,7 @@ async fn test_webhook_outbound_retries_and_dlq() {
     let config = autumn_web::config::JobConfig::default();
     let job_info = JobInfo {
         name: "autumn_webhook_delivery".to_owned(),
-        max_attempts: 1,
+        max_attempts: 5,
         initial_backoff_ms: 1,
         handler: autumn_web::webhook_outbound::deliver_webhook_job,
     };
@@ -189,7 +189,7 @@ async fn test_webhook_outbound_failure_caps_deactivation() {
     let config = autumn_web::config::JobConfig::default();
     let job_info = JobInfo {
         name: "autumn_webhook_delivery".to_owned(),
-        max_attempts: 1,
+        max_attempts: 5,
         initial_backoff_ms: 1,
         handler: autumn_web::webhook_outbound::deliver_webhook_job,
     };
@@ -256,7 +256,7 @@ async fn test_webhook_outbound_actuator_endpoints() {
     let config = autumn_web::config::JobConfig::default();
     let job_info = JobInfo {
         name: "autumn_webhook_delivery".to_owned(),
-        max_attempts: 1,
+        max_attempts: 5,
         initial_backoff_ms: 1,
         handler: autumn_web::webhook_outbound::deliver_webhook_job,
     };
