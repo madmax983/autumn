@@ -376,6 +376,7 @@ fn vh_insert_ts(
     record_expr: &TokenStream,
     before_expr: Option<&TokenStream>,
     conn_ident: &TokenStream,
+    model_ident: &proc_macro2::Ident,
 ) -> TokenStream {
     let actor_ts = if with_ctx {
         quote! { ctx.actor.as_deref().unwrap_or("system") }
@@ -393,7 +394,7 @@ fn vh_insert_ts(
             {
                 let __vh_json = ::autumn_web::reexports::serde_json::to_value(#record_expr)
                     .unwrap_or(::autumn_web::reexports::serde_json::Value::Object(Default::default()));
-                let __vh_changes = ::autumn_web::version_history::compute_insert_changes(&__vh_json, &[]);
+                let __vh_changes = ::autumn_web::version_history::compute_insert_changes(&__vh_json, <#model_ident as ::autumn_web::version_history::VersionedRecord>::version_sensitive_columns());
                 ::autumn_web::reexports::serde_json::to_string(&__vh_changes)
                     .unwrap_or_else(|_| "[]".to_string())
             }
@@ -402,7 +403,7 @@ fn vh_insert_ts(
             {
                 let __vh_json = ::autumn_web::reexports::serde_json::to_value(#record_expr)
                     .unwrap_or(::autumn_web::reexports::serde_json::Value::Object(Default::default()));
-                let __vh_changes = ::autumn_web::version_history::compute_delete_changes(&__vh_json, &[]);
+                let __vh_changes = ::autumn_web::version_history::compute_delete_changes(&__vh_json, <#model_ident as ::autumn_web::version_history::VersionedRecord>::version_sensitive_columns());
                 ::autumn_web::reexports::serde_json::to_string(&__vh_changes)
                     .unwrap_or_else(|_| "[]".to_string())
             }
@@ -416,7 +417,7 @@ fn vh_insert_ts(
                         .unwrap_or(::autumn_web::reexports::serde_json::Value::Object(Default::default()));
                     let __vh_after_json = ::autumn_web::reexports::serde_json::to_value(#record_expr)
                         .unwrap_or(::autumn_web::reexports::serde_json::Value::Object(Default::default()));
-                    let __vh_changes = ::autumn_web::version_history::compute_diff(&__vh_before_json, &__vh_after_json, &[]);
+                    let __vh_changes = ::autumn_web::version_history::compute_diff(&__vh_before_json, &__vh_after_json, <#model_ident as ::autumn_web::version_history::VersionedRecord>::version_sensitive_columns());
                     ::autumn_web::reexports::serde_json::to_string(&__vh_changes)
                         .unwrap_or_else(|_| "[]".to_string())
                 }
@@ -1148,6 +1149,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     &quote! { record },
                     None,
                     &quote! { conn },
+                    model_name,
                 );
                 quote! {
                     use ::autumn_web::reexports::diesel::prelude::*;
@@ -1739,6 +1741,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     &quote! { record },
                     Some(&quote! { __vh_before }),
                     &quote! { conn },
+                    model_name,
                 );
                 quote! {
                     use ::autumn_web::reexports::diesel::prelude::*;
@@ -2130,6 +2133,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 &quote! { record },
                 None,
                 &quote! { conn },
+                model_name,
             );
             quote! {
                 use ::autumn_web::reexports::diesel::prelude::*;
