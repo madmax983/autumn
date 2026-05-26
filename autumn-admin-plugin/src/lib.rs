@@ -177,6 +177,7 @@ impl Plugin for AdminPlugin {
             runtime_config,
         } = self;
         let registry = Arc::new(registry);
+        let has_config = runtime_config.is_some();
         let router = routes::admin_router(
             Arc::clone(&registry),
             &prefix,
@@ -198,7 +199,7 @@ impl Plugin for AdminPlugin {
         // Declare routes for `autumn routes` listing. The underlying Axum router
         // is added via nest() which is opaque to route enumeration, so we
         // explicitly register route metadata here.
-        let declared = admin_route_infos(&prefix);
+        let declared = admin_route_infos(&prefix, has_config);
 
         app.nest(&prefix, router).declare_plugin_routes(declared)
     }
@@ -206,20 +207,30 @@ impl Plugin for AdminPlugin {
 
 /// Generate the route metadata list for this plugin's mounted routes.
 ///
+/// `has_config` must match whether `with_runtime_config` was called; config
+/// routes are only mounted when a `RuntimeConfigService` is provided, so
+/// including them unconditionally would produce false route-collision signals.
+///
 /// Kept in sync with `routes::admin_router` — update here when routes are
 /// added or removed from the admin router.
-pub(crate) fn admin_route_infos(prefix: &str) -> Vec<RouteInfo> {
-    [
+pub(crate) fn admin_route_infos(prefix: &str, has_config: bool) -> Vec<RouteInfo> {
+    let mut entries: Vec<(&str, String)> = vec![
         ("GET", prefix.to_string()),
         ("GET", format!("{prefix}/jobs")),
         ("GET", format!("{prefix}/jobs/counters")),
         ("POST", format!("{prefix}/jobs/{{id}}/retry")),
         ("POST", format!("{prefix}/jobs/{{id}}/discard")),
         ("POST", format!("{prefix}/jobs/{{id}}/cancel")),
-        ("GET", format!("{prefix}/config")),
-        ("POST", format!("{prefix}/config/{{key}}/set")),
-        ("POST", format!("{prefix}/config/{{key}}/unset")),
-        ("GET", format!("{prefix}/config/{{key}}/history")),
+    ];
+    if has_config {
+        entries.extend([
+            ("GET", format!("{prefix}/config")),
+            ("POST", format!("{prefix}/config/{{key}}/set")),
+            ("POST", format!("{prefix}/config/{{key}}/unset")),
+            ("GET", format!("{prefix}/config/{{key}}/history")),
+        ]);
+    }
+    entries.extend([
         ("GET", format!("{prefix}/{{slug}}")),
         ("POST", format!("{prefix}/{{slug}}")),
         ("GET", format!("{prefix}/{{slug}}/new")),
@@ -229,16 +240,17 @@ pub(crate) fn admin_route_infos(prefix: &str) -> Vec<RouteInfo> {
         ("GET", format!("{prefix}/{{slug}}/{{id}}/edit")),
         ("POST", format!("{prefix}/{{slug}}/actions")),
         ("GET", format!("{prefix}{}", &*routes::ADMIN_JS_PATH)),
-    ]
-    .into_iter()
-    .map(|(method, path)| RouteInfo {
-        method: method.to_owned(),
-        path,
-        handler: format!("admin::{}", method.to_lowercase()),
-        source: autumn_web::route_listing::RouteSource::User, // overwritten by declare_plugin_routes
-        middleware: vec![],
-    })
-    .collect()
+    ]);
+    entries
+        .into_iter()
+        .map(|(method, path)| RouteInfo {
+            method: method.to_owned(),
+            path,
+            handler: format!("admin::{}", method.to_lowercase()),
+            source: autumn_web::route_listing::RouteSource::User, // overwritten by declare_plugin_routes
+            middleware: vec![],
+        })
+        .collect()
 }
 
 // ── Conformance reference tests ────────────────────────────────────────────
@@ -262,7 +274,11 @@ mod conformance_tests {
     /// attributed to the plugin. Reuses `admin_route_infos` from the outer
     /// module and overrides the source to `Plugin(PLUGIN_NAME)`.
     fn admin_routes(prefix: &str) -> Vec<RouteInfo> {
-        super::admin_route_infos(prefix)
+        admin_routes_with_config(prefix, true)
+    }
+
+    fn admin_routes_with_config(prefix: &str, has_config: bool) -> Vec<RouteInfo> {
+        super::admin_route_infos(prefix, has_config)
             .into_iter()
             .map(|mut r| {
                 r.source = RouteSource::Plugin(PLUGIN_NAME.to_owned());
@@ -320,8 +336,8 @@ mod conformance_tests {
     }
 
     #[test]
-    fn admin_plugin_declares_builtin_config_routes() {
-        let routes = admin_routes("/admin");
+    fn admin_plugin_declares_builtin_config_routes_when_enabled() {
+        let routes = admin_routes_with_config("/admin", true);
         let declared: std::collections::HashSet<(&str, &str)> = routes
             .iter()
             .map(|route| (route.method.as_str(), route.path.as_str()))
@@ -336,6 +352,27 @@ mod conformance_tests {
             assert!(
                 declared.contains(&(method, path)),
                 "missing declared admin config route {method} {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn admin_plugin_omits_config_routes_when_disabled() {
+        let routes = admin_routes_with_config("/admin", false);
+        let declared: std::collections::HashSet<(&str, &str)> = routes
+            .iter()
+            .map(|route| (route.method.as_str(), route.path.as_str()))
+            .collect();
+
+        for (method, path) in [
+            ("GET", "/admin/config"),
+            ("POST", "/admin/config/{key}/set"),
+            ("POST", "/admin/config/{key}/unset"),
+            ("GET", "/admin/config/{key}/history"),
+        ] {
+            assert!(
+                !declared.contains(&(method, path)),
+                "config route {method} {path} should not be declared when has_config=false"
             );
         }
     }

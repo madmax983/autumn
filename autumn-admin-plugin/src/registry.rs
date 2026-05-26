@@ -8,7 +8,7 @@ use std::collections::btree_map::{BTreeMap, Entry};
 
 use crate::traits::AdminModel;
 
-const RESERVED_MODEL_SLUGS: &[&str] = &["jobs"];
+const RESERVED_MODEL_SLUGS: &[&str] = &["jobs", "config"];
 
 /// Holds all registered admin models, keyed by their URL slug.
 ///
@@ -200,6 +200,16 @@ mod tests {
         registry.register(DummyModel {
             slug: "jobs",
             name: "Jobs",
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "reserved model slug 'config'")]
+    fn reserved_config_slug_panics() {
+        let mut registry = AdminRegistry::new();
+        registry.register(DummyModel {
+            slug: "config",
+            name: "Config",
         });
     }
 }
