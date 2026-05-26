@@ -281,4 +281,13 @@ mod tests {
         assert_eq!(result.toc[0].text, "Hello World");
         assert!(result.html.contains(r#"id="hello-world""#));
     }
+
+    #[test]
+    fn hard_break_in_heading_preserved_as_space() {
+        // A backslash hard-break inside a setext heading must not merge words.
+        let md = "Hello\\\nWorld\n=====\n";
+        let result = render(md, RenderOptions::default());
+        assert_eq!(result.toc[0].text, "Hello World");
+        assert!(result.html.contains(r#"id="hello-world""#));
+    }
 }

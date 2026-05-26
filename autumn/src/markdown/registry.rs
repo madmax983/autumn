@@ -445,6 +445,53 @@ mod tests {
         assert!(matches!(result, Err(MarkdownError::Io { .. })));
     }
 
+    #[test]
+    fn from_dir_skips_subdirectory_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("real-page.md"),
+            "+++\ntitle = \"Real\"\norder = 1\n+++\n\n# Real\n",
+        )
+        .unwrap();
+        // A subdirectory whose name ends in .md must be skipped.
+        std::fs::create_dir(dir.path().join("subdir.md")).unwrap();
+
+        let registry = MarkdownRegistry::from_dir(dir.path()).unwrap();
+        assert_eq!(registry.len(), 1);
+        assert!(registry.get("real-page").is_some());
+    }
+
+    #[test]
+    fn from_dir_duplicate_slug_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        // Two files with the same stem produce a duplicate slug.
+        std::fs::write(
+            dir.path().join("page.md"),
+            "+++\ntitle = \"Page A\"\norder = 1\n+++\n\n# A\n",
+        )
+        .unwrap();
+        // On most filesystems a second `page.md` cannot exist; simulate the
+        // duplicate by writing a file whose stem matches an already-inserted
+        // slug.  We achieve this via a wrapper that inserts the same slug twice
+        // using from_embedded instead, since from_dir cannot have two files with
+        // the same name in the same directory.
+        // Test the embedded path only (the from_dir duplicate path is identical code).
+        let dup = MarkdownSource {
+            slug: "page",
+            content: "+++\ntitle = \"Page B\"\norder = 2\n+++\n\n# B\n",
+        };
+        let base = MarkdownSource {
+            slug: "page",
+            content: "+++\ntitle = \"Page A\"\norder = 1\n+++\n\n# A\n",
+        };
+        let result = MarkdownRegistry::from_embedded(&[base, dup]);
+        assert!(matches!(result, Err(MarkdownError::DuplicateSlug { .. })));
+        // Also verify from_dir returns one page cleanly (no duplicate possible
+        // in a real filesystem with identical filenames).
+        let registry = MarkdownRegistry::from_dir(dir.path()).unwrap();
+        assert_eq!(registry.len(), 1);
+    }
+
     // ---- Integration test: statically renders at least two Markdown pages ----
 
     #[tokio::test]
