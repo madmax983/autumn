@@ -411,6 +411,7 @@ impl Subscriber {
 impl LocalChannelsBackend {
     /// Create a local backend with the given per-topic buffer capacity.
     #[must_use]
+    /// Create a new `InterceptedChannelsBackend`.
     pub fn new(capacity: usize) -> Self {
         Self {
             inner: Arc::new(LocalChannelsInner {
@@ -804,6 +805,7 @@ impl ChannelsBackend for RedisChannelsBackend {
 
 #[cfg(feature = "ws")]
 #[derive(Clone)]
+/// A channels backend that intercepts publications.
 pub struct InterceptedChannelsBackend {
     inner: Arc<dyn ChannelsBackend>,
     interceptors: Vec<Arc<dyn crate::interceptor::ChannelsInterceptor>>,

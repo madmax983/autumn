@@ -987,6 +987,7 @@ impl AppBuilder {
 
     #[cfg(feature = "mail")]
     #[must_use]
+    /// Set the mail interceptor.
     pub fn with_mail_interceptor(
         mut self,
         interceptor: impl crate::interceptor::MailInterceptor,
@@ -996,6 +997,7 @@ impl AppBuilder {
     }
 
     #[must_use]
+    /// Set the job interceptor.
     pub fn with_job_interceptor(
         mut self,
         interceptor: impl crate::interceptor::JobInterceptor,
@@ -1006,6 +1008,7 @@ impl AppBuilder {
 
     #[cfg(feature = "db")]
     #[must_use]
+    /// Set the db connection interceptor.
     pub fn with_db_interceptor(
         mut self,
         interceptor: impl crate::interceptor::DbConnectionInterceptor,
@@ -1016,6 +1019,7 @@ impl AppBuilder {
 
     #[cfg(feature = "ws")]
     #[must_use]
+    /// Set the channels interceptor.
     pub fn with_channels_interceptor(
         mut self,
         interceptor: impl crate::interceptor::ChannelsInterceptor,
@@ -1026,6 +1030,7 @@ impl AppBuilder {
 
     #[cfg(feature = "oauth2")]
     #[must_use]
+    /// Set the HTTP interceptor.
     pub fn with_http_interceptor(
         mut self,
         interceptor: impl crate::interceptor::HttpInterceptor,

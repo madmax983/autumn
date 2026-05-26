@@ -824,6 +824,7 @@ pub enum ChannelBackend {
     #[default]
     InProcess,
     /// Redis pub/sub fan-out across application replicas.
+    /// Redis cache.
     Redis,
 }
 
@@ -900,6 +901,7 @@ fn default_channels_redis_prefix() -> String {
 pub enum CacheBackend {
     /// In-process Moka cache (default). Each replica has an independent store.
     #[default]
+    /// In-memory cache.
     Memory,
     /// Shared Redis cache. Invalidations propagate across all replicas.
     Redis,

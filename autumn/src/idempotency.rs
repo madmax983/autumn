@@ -198,10 +198,15 @@ fn extract_replay_headers_with_policy(
 
 /// Stored response associated with an idempotency key.
 #[derive(Clone)]
+/// An idempotency record storing response data.
 pub struct IdempotencyRecord {
+    /// HTTP status code.
     pub status: u16,
+    /// HTTP headers.
     pub headers: Vec<(String, Vec<u8>)>,
+    /// Response body.
     pub body: Vec<u8>,
+    /// Request metadata.
     pub metadata: Vec<(String, Vec<u8>)>,
 }
 
@@ -285,11 +290,13 @@ impl IdempotencyContext {
     }
 
     #[must_use]
+    /// The raw idempotency key.
     pub fn key(&self) -> &str {
         &self.key
     }
 
     #[must_use]
+    /// The collision-safe, principal-scoped key.
     pub fn scoped_key(&self) -> &str {
         &self.scoped_key
     }
@@ -318,8 +325,11 @@ impl Eq for IdempotencyContext {}
 /// Cache entry wrapping a record with expiry and request body fingerprint.
 #[derive(Clone)]
 pub struct IdempotencyEntry {
+    /// The saved record.
     pub record: IdempotencyRecord,
+    /// Hash of the body.
     pub body_hash: Vec<u8>,
+    /// Expiration time.
     pub expires_at: Instant,
 }
 
@@ -335,6 +345,7 @@ pub struct IdempotencyStoreError {
 
 impl IdempotencyStoreError {
     #[must_use]
+    /// Create a backend error.
     pub fn backend(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
@@ -446,6 +457,7 @@ struct MemoryInFlightLock {
 
 impl MemoryIdempotencyStore {
     #[must_use]
+    /// Create a new memory store.
     pub fn new(default_ttl: Duration) -> Self {
         Self {
             entries: RwLock::new(HashMap::new()),
@@ -870,6 +882,7 @@ where
 pub struct IdempotencyReplayLayer;
 
 #[derive(Clone)]
+/// Idempotency replay service.
 pub struct IdempotencyReplayService<S> {
     inner: S,
 }
@@ -935,6 +948,7 @@ pub struct IdempotencyLayer {
 
 impl IdempotencyLayer {
     #[must_use]
+    /// Create a new layer with the store.
     pub fn new(store: Arc<dyn IdempotencyStore>) -> Self {
         let ttl = store.default_ttl();
         Self {
@@ -948,18 +962,21 @@ impl IdempotencyLayer {
     }
 
     #[must_use]
+    /// Override default record TTL.
     pub const fn with_ttl(mut self, ttl: Duration) -> Self {
         self.ttl = ttl;
         self
     }
 
     #[must_use]
+    /// Override default lock TTL.
     pub const fn with_in_flight_ttl(mut self, ttl: Duration) -> Self {
         self.in_flight_ttl = ttl;
         self
     }
 
     #[must_use]
+    /// Allow replays to pass through to the inner handler.
     pub const fn replay_through_inner(mut self) -> Self {
         self.replay_through_inner = true;
         self.fail_closed_on_replay = false;
@@ -967,6 +984,7 @@ impl IdempotencyLayer {
     }
 
     #[must_use]
+    /// Fail closed if reading a replay errors.
     pub const fn fail_closed_on_replay(mut self) -> Self {
         self.replay_through_inner = false;
         self.fail_closed_on_replay = true;
@@ -974,6 +992,7 @@ impl IdempotencyLayer {
     }
 
     #[must_use]
+    /// Enable metrics for the idempotency layer.
     pub fn with_metrics(mut self, metrics: crate::middleware::MetricsCollector) -> Self {
         self.metrics = Some(metrics);
         self

@@ -849,11 +849,13 @@ async fn validate_and_decode_id_token(
 
 #[cfg(feature = "oauth2")]
 #[derive(Clone)]
+/// HTTP client wrapper for oauth2 API requests.
 pub struct HttpClient {
     inner: reqwest::Client,
 }
 
 #[cfg(feature = "oauth2")]
+/// HTTP request builder for oauth2 API requests.
 pub struct HttpRequestBuilder {
     client: reqwest::Client,
     builder: reqwest::RequestBuilder,
@@ -869,11 +871,13 @@ pub struct HttpRequestBuilder {
 )]
 impl HttpClient {
     #[must_use]
+    /// Create a new `HttpRequestBuilder`.
     pub const fn new(inner: reqwest::Client) -> Self {
         Self { inner }
     }
 
     #[must_use]
+    /// Start a POST request.
     pub fn post(&self, url: &str) -> HttpRequestBuilder {
         HttpRequestBuilder {
             client: self.inner.clone(),
@@ -882,6 +886,7 @@ impl HttpClient {
     }
 
     #[must_use]
+    /// Start a GET request.
     pub fn get(&self, url: &str) -> HttpRequestBuilder {
         HttpRequestBuilder {
             client: self.inner.clone(),
@@ -900,6 +905,7 @@ impl HttpClient {
 )]
 impl HttpRequestBuilder {
     #[must_use]
+    /// Add an HTTP header.
     pub fn header<K, V>(mut self, key: K, value: V) -> Self
     where
         reqwest::header::HeaderName: TryFrom<K>,
@@ -912,6 +918,7 @@ impl HttpRequestBuilder {
     }
 
     #[must_use]
+    /// Add bearer token auth header.
     pub fn bearer_auth<T>(mut self, token: T) -> Self
     where
         T: std::fmt::Display,
@@ -921,6 +928,7 @@ impl HttpRequestBuilder {
     }
 
     #[must_use]
+    /// Add form encoded data.
     pub fn form<T: serde::Serialize + ?Sized>(mut self, form: &T) -> Self {
         self.builder = self.builder.form(form);
         self

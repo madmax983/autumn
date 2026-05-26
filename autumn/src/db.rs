@@ -324,6 +324,7 @@ const fn is_separator(c: char) -> bool {
 }
 
 #[must_use]
+/// Scrub a SQL query of sensitive parameters.
 pub fn scrub_sql(sql: &str) -> String {
     let mut out = String::with_capacity(sql.len());
     // Tracks whether the last character written was a separator, so a digit
@@ -743,6 +744,7 @@ impl Drop for TxDepthGuard<'_> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StatementTimeout(pub std::time::Duration);
 
+/// Main database extractor.
 pub struct Db {
     conn: PooledConnection,
     /// Span covering the full checkout-to-release window. Dropped when
