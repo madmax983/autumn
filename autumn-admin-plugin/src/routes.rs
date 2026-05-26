@@ -140,6 +140,9 @@ pub fn admin_router(
             .route("/config/{key}/set", routing::post(config_set))
             .route("/config/{key}/unset", routing::post(config_unset))
             .route("/config/{key}/history", routing::get(config_key_history))
+            .layer(axum::Extension(AdminAuthSessionKey(
+                auth_session_key.clone(),
+            )))
             .layer(axum::Extension(svc));
     }
 
@@ -184,6 +187,11 @@ struct HasRuntimeConfig(bool);
 /// `config.actuator.prefix`), used for dashboard links and HTMX polling.
 #[derive(Clone)]
 struct ActuatorPrefix(String);
+
+/// Typed Extension carrying the session key used to look up the authenticated
+/// user's identity, so config-mutation handlers can record a real actor.
+#[derive(Clone)]
+struct AdminAuthSessionKey(String);
 
 /// Serve the plugin's static JS with long-cache headers.
 async fn serve_admin_js() -> Response {
@@ -834,13 +842,19 @@ async fn config_list(
 /// `POST /admin/config/{key}/set` — Update a config key's value.
 async fn config_set(
     axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
+    axum::Extension(AdminAuthSessionKey(auth_session_key)): axum::Extension<AdminAuthSessionKey>,
     axum::Extension(svc): axum::Extension<Arc<RuntimeConfigService>>,
+    session: autumn_web::session::Session,
     Path(key): Path<String>,
     flash: Flash,
     axum::extract::Form(form): axum::extract::Form<HashMap<String, String>>,
 ) -> AutumnResult<Response> {
     let value = form.get("value").map_or("", String::as_str);
-    match svc.set(&key, value, Some("admin-ui")) {
+    let actor = session
+        .get(&auth_session_key)
+        .await
+        .unwrap_or_else(|| "admin-ui".to_owned());
+    match svc.set(&key, value, Some(&actor)) {
         Ok(()) => flash.success(format!("Updated {key} = {value}")).await,
         Err(e) => flash.error(format!("Failed to set {key}: {e}")).await,
     }
@@ -850,11 +864,17 @@ async fn config_set(
 /// `POST /admin/config/{key}/unset` — Revert a config key to its default.
 async fn config_unset(
     axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
+    axum::Extension(AdminAuthSessionKey(auth_session_key)): axum::Extension<AdminAuthSessionKey>,
     axum::Extension(svc): axum::Extension<Arc<RuntimeConfigService>>,
+    session: autumn_web::session::Session,
     Path(key): Path<String>,
     flash: Flash,
 ) -> AutumnResult<Response> {
-    match svc.unset(&key, Some("admin-ui")) {
+    let actor = session
+        .get(&auth_session_key)
+        .await
+        .unwrap_or_else(|| "admin-ui".to_owned());
+    match svc.unset(&key, Some(&actor)) {
         Ok(()) => flash.success(format!("Reset {key} to default")).await,
         Err(e) => flash.error(format!("Failed to reset {key}: {e}")).await,
     }

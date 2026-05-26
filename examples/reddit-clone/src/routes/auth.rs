@@ -127,7 +127,7 @@ pub async fn register(
         .get("registration_open")
         .ok()
         .and_then(|v| v.as_bool())
-        .unwrap_or(true);
+        .unwrap_or(false);
     if !open {
         return Err(AutumnError::unprocessable_msg(
             "Registrations are currently closed",

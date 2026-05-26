@@ -133,11 +133,18 @@ impl ConfigValue {
                 .parse::<i64>()
                 .map(ConfigValue::Int)
                 .map_err(|_| format!("expected {}, got '{raw}'", ConfigValueType::Int.as_str())),
-            ConfigValueType::Float => raw
-                .trim()
-                .parse::<f64>()
-                .map(ConfigValue::Float)
-                .map_err(|_| format!("expected {}, got '{raw}'", ConfigValueType::Float.as_str())),
+            ConfigValueType::Float => {
+                let f: f64 = raw.trim().parse().map_err(|_| {
+                    format!("expected {}, got '{raw}'", ConfigValueType::Float.as_str())
+                })?;
+                if f.is_finite() {
+                    Ok(Self::Float(f))
+                } else {
+                    Err(format!(
+                        "expected a finite float, got '{raw}' (NaN and infinity are not allowed)"
+                    ))
+                }
+            }
             ConfigValueType::Text => Ok(Self::Text(raw.to_owned())),
             ConfigValueType::Bool => match raw.trim().to_lowercase().as_str() {
                 "true" | "yes" | "1" | "on" => Ok(Self::Bool(true)),
@@ -1135,6 +1142,33 @@ mod tests {
     fn parse_float_from_invalid_string_returns_error() {
         let err = ConfigValue::parse_as("abc", ConfigValueType::Float).unwrap_err();
         assert!(err.contains("f64"), "should mention type: {err}");
+    }
+
+    #[test]
+    fn parse_float_rejects_nan() {
+        let err = ConfigValue::parse_as("NaN", ConfigValueType::Float).unwrap_err();
+        assert!(
+            err.contains("NaN and infinity are not allowed"),
+            "should mention NaN: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_float_rejects_infinity() {
+        let err = ConfigValue::parse_as("inf", ConfigValueType::Float).unwrap_err();
+        assert!(
+            err.contains("NaN and infinity are not allowed"),
+            "should mention inf: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_float_rejects_negative_infinity() {
+        let err = ConfigValue::parse_as("-inf", ConfigValueType::Float).unwrap_err();
+        assert!(
+            err.contains("NaN and infinity are not allowed"),
+            "should mention -inf: {err}"
+        );
     }
 
     #[test]
