@@ -660,7 +660,7 @@ pub fn add_search_up_sql(table: &str, language: &str, fields: &[(String, char)])
         }
         let _ = write!(
             expr,
-            "setweight(to_tsvector('{language}'::regconfig, coalesce({field}::text, '')), '{weight}')"
+            "setweight(to_tsvector('{language}'::regconfig, coalesce(\"{field}\"::text, '')), '{weight}')"
         );
     }
 
@@ -1330,16 +1330,65 @@ pub fn parse_model_search_config_for_table(
             let after_attr = &attr_chunk[close_bracket + 1..];
             let mut line_to_parse = "";
             let mut field_attributes = Vec::new();
-            for line in after_attr.lines() {
-                let trimmed = line.trim();
-                if trimmed.is_empty() || trimmed.starts_with("//") {
+
+            let mut chars_iter = after_attr.char_indices().peekable();
+            while let Some(&(idx, c)) = chars_iter.peek() {
+                if c.is_whitespace() {
+                    chars_iter.next();
                     continue;
                 }
-                if trimmed.starts_with("#[") {
-                    field_attributes.push(trimmed);
-                    continue;
+
+                if c == '/' {
+                    let mut temp = chars_iter.clone();
+                    temp.next(); // '/'
+                    if let Some((_, '/')) = temp.peek() {
+                        // Consume line comment until newline
+                        for (_, next_c) in chars_iter.by_ref() {
+                            if next_c == '\n' {
+                                break;
+                            }
+                        }
+                        continue;
+                    }
                 }
-                line_to_parse = trimmed;
+
+                if c == '#' {
+                    let mut temp = chars_iter.clone();
+                    temp.next(); // '#'
+                    if let Some((_, '[')) = temp.peek() {
+                        chars_iter.next(); // '#'
+                        chars_iter.next(); // '['
+
+                        let start_attr_idx = idx;
+                        let mut bracket_depth = 1;
+                        let mut end_attr_idx = None;
+
+                        for (c_idx, next_c) in chars_iter.by_ref() {
+                            if next_c == '[' {
+                                bracket_depth += 1;
+                            } else if next_c == ']' {
+                                bracket_depth -= 1;
+                                if bracket_depth == 0 {
+                                    end_attr_idx = Some(c_idx + next_c.len_utf8());
+                                    break;
+                                }
+                            }
+                        }
+
+                        if let Some(end_idx) = end_attr_idx {
+                            let attr_str = &after_attr[start_attr_idx..end_idx];
+                            field_attributes.push(attr_str);
+                            continue;
+                        }
+                    }
+                }
+
+                let rest_str = &after_attr[idx..];
+                if let Some(nl_idx) = rest_str.find('\n') {
+                    line_to_parse = rest_str[..nl_idx].trim();
+                } else {
+                    line_to_parse = rest_str.trim();
+                }
                 break;
             }
 
@@ -1364,20 +1413,69 @@ pub fn parse_model_search_config_for_table(
                     {
                         let mut final_col_name = clean_field.to_string();
 
-                        // 1. Scan attributes *before* #[searchable]
+                        // 1. Scan attributes *before* #[searchable] using balanced separator logic
                         let before_searchable_attr = &rest[..pos];
-                        let prev_term_pos = before_searchable_attr
-                            .rfind([';', ',', '{'])
-                            .map_or(0, |idx| idx + 1);
+                        let mut prev_term_pos = 0;
+                        let mut paren_depth = 0;
+                        let mut bracket_depth = 0;
+                        let chars_vec: Vec<char> = before_searchable_attr.chars().collect();
+                        let mut char_idx = chars_vec.len();
+
+                        while char_idx > 0 {
+                            char_idx -= 1;
+                            let c = chars_vec[char_idx];
+                            if c == ')' {
+                                paren_depth += 1;
+                            } else if c == '(' {
+                                if paren_depth > 0 {
+                                    paren_depth -= 1;
+                                }
+                            } else if c == ']' {
+                                bracket_depth += 1;
+                            } else if c == '[' {
+                                if bracket_depth > 0 {
+                                    bracket_depth -= 1;
+                                }
+                            } else if paren_depth == 0 && bracket_depth == 0 {
+                                if c == ';' || c == ',' || c == '{' {
+                                    let mut byte_pos = 0;
+                                    for &ch in &chars_vec[..=char_idx] {
+                                        byte_pos += ch.len_utf8();
+                                    }
+                                    prev_term_pos = byte_pos;
+                                    break;
+                                }
+                            }
+                        }
                         let field_prefix = &before_searchable_attr[prev_term_pos..];
 
-                        if let Some(d_pos) = field_prefix.find("#[diesel") {
-                            let sub_chunk = &field_prefix[d_pos..];
-                            if let Some(cb) = sub_chunk.find(']') {
+                        // Scan for ALL #[diesel...] attributes within field_prefix
+                        let mut scan_rest = field_prefix;
+                        while let Some(d_pos) = scan_rest.find("#[diesel") {
+                            let sub_chunk = &scan_rest[d_pos..];
+                            let mut inner_bracket_depth = 0;
+                            let mut closed_pos = None;
+                            for (idx, c) in sub_chunk.char_indices() {
+                                if c == '[' {
+                                    inner_bracket_depth += 1;
+                                } else if c == ']' {
+                                    if inner_bracket_depth > 0 {
+                                        inner_bracket_depth -= 1;
+                                        if inner_bracket_depth == 0 {
+                                            closed_pos = Some(idx);
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some(cb) = closed_pos {
                                 let attr_content = &sub_chunk[..cb];
                                 if let Some(custom_col) = extract_diesel_column_name(attr_content) {
                                     final_col_name = custom_col;
                                 }
+                                scan_rest = &sub_chunk[cb + 1..];
+                            } else {
+                                break;
                             }
                         }
 
@@ -1385,7 +1483,6 @@ pub fn parse_model_search_config_for_table(
                         for attr in &field_attributes {
                             if let Some(custom_col) = extract_diesel_column_name(attr) {
                                 final_col_name = custom_col;
-                                break;
                             }
                         }
 
@@ -2440,5 +2537,68 @@ pub struct Post {
 "#;
         let (_, fields) = parse_model_search_config_for_table(content_collision, "posts").unwrap();
         assert_eq!(fields[0].0, "title");
+    }
+
+    #[test]
+    fn test_parse_model_search_config_multiline_attributes() {
+        let content_diesel = r#"
+#[autumn_web::model(table = "posts")]
+pub struct Post {
+    #[id]
+    pub id: i64,
+    #[searchable(weight = "A")]
+    #[diesel(
+        sql_type = Text,
+        column_name = "headline"
+    )]
+    pub title: String,
+}
+"#;
+        let (_, fields) = parse_model_search_config_for_table(content_diesel, "posts").unwrap();
+        assert_eq!(fields, vec![("headline".to_string(), 'A')]);
+    }
+
+    #[test]
+    fn test_parse_model_search_config_preceding_comma_in_attribute() {
+        let content_diesel = r#"
+#[autumn_web::model(table = "posts")]
+pub struct Post {
+    #[id]
+    pub id: i64,
+    #[diesel(sql_type = Text, column_name = headline)]
+    #[searchable(weight = "A")]
+    pub title: String,
+}
+"#;
+        let (_, fields) = parse_model_search_config_for_table(content_diesel, "posts").unwrap();
+        assert_eq!(fields, vec![("headline".to_string(), 'A')]);
+    }
+
+    #[test]
+    fn test_parse_model_search_config_multiple_preceding_attributes() {
+        let content_diesel = r#"
+#[autumn_web::model(table = "posts")]
+pub struct Post {
+    #[id]
+    pub id: i64,
+    #[diesel(sql_type = Text)]
+    #[diesel(column_name = headline)]
+    #[searchable(weight = "A")]
+    pub title: String,
+}
+"#;
+        let (_, fields) = parse_model_search_config_for_table(content_diesel, "posts").unwrap();
+        assert_eq!(fields, vec![("headline".to_string(), 'A')]);
+    }
+
+    #[test]
+    fn test_add_search_up_sql_quotes_columns() {
+        let sql = add_search_up_sql(
+            "posts",
+            "english",
+            &[("title".to_string(), 'A'), ("body".to_string(), 'B')],
+        );
+        assert!(sql.contains("coalesce(\"title\"::text, '')"));
+        assert!(sql.contains("coalesce(\"body\"::text, '')"));
     }
 }

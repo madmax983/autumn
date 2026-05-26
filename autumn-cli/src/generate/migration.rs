@@ -312,7 +312,7 @@ pub struct Post {
         )
         .unwrap();
 
-        assert!(up.contains("ALTER TABLE posts ADD COLUMN search_vector tsvector GENERATED ALWAYS AS (setweight(to_tsvector('english'::regconfig, coalesce(title::text, '')), 'A') || setweight(to_tsvector('english'::regconfig, coalesce(body::text, '')), 'B')) STORED;"));
+        assert!(up.contains("ALTER TABLE posts ADD COLUMN search_vector tsvector GENERATED ALWAYS AS (setweight(to_tsvector('english'::regconfig, coalesce(\"title\"::text, '')), 'A') || setweight(to_tsvector('english'::regconfig, coalesce(\"body\"::text, '')), 'B')) STORED;"));
         assert!(
             up.contains("CREATE INDEX idx_posts_search_vector ON posts USING gin(search_vector);")
         );
