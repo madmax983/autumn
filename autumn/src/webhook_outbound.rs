@@ -476,6 +476,17 @@ pub fn deliver_webhook_job(
 
         if sub.status == WebhookSubscriptionStatus::Disabled {
             tracing::info!(subscription_id = %sub.id, "Webhook subscription is disabled; skipping delivery");
+            log.last_error = Some("Subscription is disabled".to_owned());
+            log.timestamp = Utc::now();
+            manager.store().log_delivery(log).await?;
+            return Ok(());
+        }
+
+        if sub.status == WebhookSubscriptionStatus::Failed {
+            tracing::info!(subscription_id = %sub.id, "Webhook subscription has failed; skipping delivery");
+            log.last_error = Some("Subscription has failed due to consecutive errors".to_owned());
+            log.timestamp = Utc::now();
+            manager.store().log_delivery(log).await?;
             return Ok(());
         }
 

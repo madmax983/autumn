@@ -434,17 +434,26 @@ impl TestApp {
         for hook in app_builder.startup_hooks {
             self.state_initializers.push(Box::new(move |state| {
                 let state_owned = state.clone();
-                let handle = std::thread::spawn(move || {
-                    let rt = tokio::runtime::Builder::new_multi_thread()
-                        .enable_all()
-                        .build()
-                        .expect("failed to build tokio runtime for test plugin startup hook");
-                    rt.block_on(hook(state_owned))
-                });
-                handle
-                    .join()
-                    .expect("Plugin startup hook thread panicked")
-                    .expect("Plugin startup hook failed");
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    let thread_handle =
+                        std::thread::spawn(move || handle.block_on(hook(state_owned)));
+                    thread_handle
+                        .join()
+                        .expect("Plugin startup hook thread panicked")
+                        .expect("Plugin startup hook failed");
+                } else {
+                    let thread_handle = std::thread::spawn(move || {
+                        let rt = tokio::runtime::Builder::new_multi_thread()
+                            .enable_all()
+                            .build()
+                            .expect("failed to build tokio runtime for test plugin startup hook");
+                        rt.block_on(hook(state_owned))
+                    });
+                    thread_handle
+                        .join()
+                        .expect("Plugin startup hook thread panicked")
+                        .expect("Plugin startup hook failed");
+                }
             }));
         }
         self
@@ -665,12 +674,24 @@ impl TestApp {
             state.insert_extension(crate::http_client::HttpMockRegistryExt(registry));
         }
 
-        for initializer in self.state_initializers {
-            initializer(&state);
-        }
-
         for job in &self.jobs {
             state.job_registry.register(&job.name);
+        }
+
+        if !self.jobs.is_empty() {
+            let shutdown = tokio_util::sync::CancellationToken::new();
+            crate::job::start_local_runtime(
+                self.jobs.clone(),
+                &state,
+                &shutdown,
+                self.config.jobs.workers,
+                self.config.jobs.max_attempts,
+                self.config.jobs.initial_backoff_ms,
+            );
+        }
+
+        for initializer in self.state_initializers {
+            initializer(&state);
         }
 
         let router = crate::router::try_build_router_inner(
