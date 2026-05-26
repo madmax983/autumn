@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use autumn_web::runtime_config::RuntimeConfigService;
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::LazyLock;
@@ -118,15 +119,31 @@ pub fn admin_router(
     actuator_prefix: String,
     auth_session_key: String,
     require_role: Option<String>,
+    config_svc: Option<Arc<RuntimeConfigService>>,
 ) -> axum::Router<AppState> {
-    let router = axum::Router::new()
+    let has_config = config_svc.is_some();
+
+    let mut router = axum::Router::new()
         // Dashboard
         .route("/", routing::get(dashboard))
         .route("/jobs", routing::get(jobs_dashboard))
         .route("/jobs/counters", routing::get(jobs_counters))
         .route("/jobs/{id}/retry", routing::post(job_retry))
         .route("/jobs/{id}/discard", routing::post(job_discard))
-        .route("/jobs/{id}/cancel", routing::post(job_cancel))
+        .route("/jobs/{id}/cancel", routing::post(job_cancel));
+
+    // Runtime config routes — registered before /{slug} so the literal
+    // "/config" path wins over the parameterized catch-all.
+    if let Some(svc) = config_svc {
+        router = router
+            .route("/config", routing::get(config_list))
+            .route("/config/{key}/set", routing::post(config_set))
+            .route("/config/{key}/unset", routing::post(config_unset))
+            .route("/config/{key}/history", routing::get(config_key_history))
+            .layer(axum::Extension(svc));
+    }
+
+    router = router
         // Model routes (dynamic dispatch via slug)
         .route("/{slug}", routing::get(model_list).post(model_create))
         .route("/{slug}/new", routing::get(model_new_form))
@@ -142,6 +159,7 @@ pub fn admin_router(
         // `AdminModel::execute_action`.
         .route("/{slug}/actions", routing::post(model_action))
         .route(&ADMIN_JS_PATH, routing::get(serve_admin_js))
+        .layer(axum::Extension(HasRuntimeConfig(has_config)))
         .layer(axum::Extension(AdminPrefix(prefix.to_owned())))
         .layer(axum::Extension(ActuatorPrefix(actuator_prefix)))
         .layer(axum::Extension(registry));
@@ -157,6 +175,10 @@ pub fn admin_router(
 /// Typed Extension carrying the admin URL prefix so handlers can build links.
 #[derive(Clone)]
 struct AdminPrefix(String);
+
+/// Typed Extension signalling whether the runtime config service is mounted.
+#[derive(Clone)]
+struct HasRuntimeConfig(bool);
 
 /// Typed Extension carrying the actuator URL prefix (the value of
 /// `config.actuator.prefix`), used for dashboard links and HTMX polling.
@@ -317,6 +339,7 @@ async fn dashboard(
     axum::Extension(registry): axum::Extension<Arc<AdminRegistry>>,
     axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
     axum::Extension(ActuatorPrefix(actuator_prefix)): axum::Extension<ActuatorPrefix>,
+    axum::Extension(HasRuntimeConfig(show_config)): axum::Extension<HasRuntimeConfig>,
     csrf: AdminCsrf,
     flash: Flash,
 ) -> AutumnResult<Response> {
@@ -345,15 +368,18 @@ async fn dashboard(
         csrf.token(),
         &prefix,
         &actuator_prefix,
+        show_config,
     )))
 }
 
 /// `GET /admin/jobs` -- built-in background jobs dashboard.
+#[allow(clippy::too_many_arguments)]
 async fn jobs_dashboard(
     State(state): State<AppState>,
     axum::Extension(registry): axum::Extension<Arc<AdminRegistry>>,
     axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
     axum::Extension(ActuatorPrefix(actuator_prefix)): axum::Extension<ActuatorPrefix>,
+    axum::Extension(HasRuntimeConfig(show_config)): axum::Extension<HasRuntimeConfig>,
     Query(query): Query<JobsQuery>,
     csrf: AdminCsrf,
     flash: Flash,
@@ -373,6 +399,7 @@ async fn jobs_dashboard(
         csrf.form_field(),
         &prefix,
         &actuator_prefix,
+        show_config,
     )))
 }
 
@@ -462,6 +489,7 @@ async fn model_list(
     axum::Extension(registry): axum::Extension<Arc<AdminRegistry>>,
     axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
     axum::Extension(ActuatorPrefix(actuator_prefix)): axum::Extension<ActuatorPrefix>,
+    axum::Extension(HasRuntimeConfig(show_config)): axum::Extension<HasRuntimeConfig>,
     Path(slug): Path<String>,
     Query(query): Query<ListQuery>,
     Query(raw_query): Query<HashMap<String, String>>,
@@ -517,6 +545,7 @@ async fn model_list(
         csrf.form_field(),
         &prefix,
         &actuator_prefix,
+        show_config,
     )))
 }
 
@@ -525,6 +554,7 @@ async fn model_new_form(
     axum::Extension(registry): axum::Extension<Arc<AdminRegistry>>,
     axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
     axum::Extension(ActuatorPrefix(actuator_prefix)): axum::Extension<ActuatorPrefix>,
+    axum::Extension(HasRuntimeConfig(show_config)): axum::Extension<HasRuntimeConfig>,
     Path(slug): Path<String>,
     csrf: AdminCsrf,
     flash: Flash,
@@ -548,6 +578,7 @@ async fn model_new_form(
         csrf.form_field(),
         &prefix,
         &actuator_prefix,
+        show_config,
     )))
 }
 
@@ -584,11 +615,13 @@ async fn model_create(
 }
 
 /// `GET /admin/{slug}/{id}` — Detail view.
+#[allow(clippy::too_many_arguments)]
 async fn model_detail(
     State(state): State<AppState>,
     axum::Extension(registry): axum::Extension<Arc<AdminRegistry>>,
     axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
     axum::Extension(ActuatorPrefix(actuator_prefix)): axum::Extension<ActuatorPrefix>,
+    axum::Extension(HasRuntimeConfig(show_config)): axum::Extension<HasRuntimeConfig>,
     Path((slug, id)): Path<(String, i64)>,
     csrf: AdminCsrf,
     flash: Flash,
@@ -619,15 +652,18 @@ async fn model_detail(
         csrf.token(),
         &prefix,
         &actuator_prefix,
+        show_config,
     )))
 }
 
 /// `GET /admin/{slug}/{id}/edit` — Edit form.
+#[allow(clippy::too_many_arguments)]
 async fn model_edit_form(
     State(state): State<AppState>,
     axum::Extension(registry): axum::Extension<Arc<AdminRegistry>>,
     axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
     axum::Extension(ActuatorPrefix(actuator_prefix)): axum::Extension<ActuatorPrefix>,
+    axum::Extension(HasRuntimeConfig(show_config)): axum::Extension<HasRuntimeConfig>,
     Path((slug, id)): Path<(String, i64)>,
     csrf: AdminCsrf,
     flash: Flash,
@@ -657,6 +693,7 @@ async fn model_edit_form(
         csrf.form_field(),
         &prefix,
         &actuator_prefix,
+        show_config,
     )))
 }
 
@@ -768,6 +805,84 @@ async fn model_delete(
         .success(format!("{} #{id} deleted.", model.display_name()))
         .await;
     Ok(StatusCode::OK.hx_redirect(&format!("{prefix}/{slug}")))
+}
+
+// ── Runtime config handlers ──────────────────────────────────────────
+
+/// `GET /admin/config` — List all runtime config keys with their values.
+async fn config_list(
+    axum::Extension(registry): axum::Extension<Arc<AdminRegistry>>,
+    axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
+    axum::Extension(ActuatorPrefix(actuator_prefix)): axum::Extension<ActuatorPrefix>,
+    axum::Extension(svc): axum::Extension<Arc<RuntimeConfigService>>,
+    csrf: AdminCsrf,
+    flash: Flash,
+) -> AutumnResult<Response> {
+    let entries = svc.list();
+    let messages = flash.consume().await;
+    Ok(render(templates::config_page(
+        &registry,
+        &entries,
+        &messages,
+        csrf.token(),
+        csrf.form_field(),
+        &prefix,
+        &actuator_prefix,
+    )))
+}
+
+/// `POST /admin/config/{key}/set` — Update a config key's value.
+async fn config_set(
+    axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
+    axum::Extension(svc): axum::Extension<Arc<RuntimeConfigService>>,
+    Path(key): Path<String>,
+    flash: Flash,
+    axum::extract::Form(form): axum::extract::Form<HashMap<String, String>>,
+) -> AutumnResult<Response> {
+    let value = form.get("value").map(String::as_str).unwrap_or("");
+    match svc.set(&key, value, Some("admin-ui")) {
+        Ok(()) => flash.success(format!("Updated {key} = {value}")).await,
+        Err(e) => flash.error(format!("Failed to set {key}: {e}")).await,
+    }
+    Ok(Redirect::to(&format!("{prefix}/config")).into_response())
+}
+
+/// `POST /admin/config/{key}/unset` — Revert a config key to its default.
+async fn config_unset(
+    axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
+    axum::Extension(svc): axum::Extension<Arc<RuntimeConfigService>>,
+    Path(key): Path<String>,
+    flash: Flash,
+) -> AutumnResult<Response> {
+    match svc.unset(&key, Some("admin-ui")) {
+        Ok(()) => flash.success(format!("Reset {key} to default")).await,
+        Err(e) => flash.error(format!("Failed to reset {key}: {e}")).await,
+    }
+    Ok(Redirect::to(&format!("{prefix}/config")).into_response())
+}
+
+/// `GET /admin/config/{key}/history` — View change history for a config key.
+#[allow(clippy::too_many_arguments)]
+async fn config_key_history(
+    axum::Extension(registry): axum::Extension<Arc<AdminRegistry>>,
+    axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
+    axum::Extension(ActuatorPrefix(actuator_prefix)): axum::Extension<ActuatorPrefix>,
+    axum::Extension(svc): axum::Extension<Arc<RuntimeConfigService>>,
+    Path(key): Path<String>,
+    csrf: AdminCsrf,
+    flash: Flash,
+) -> AutumnResult<Response> {
+    let history = svc.history(&key, 50);
+    let messages = flash.consume().await;
+    Ok(render(templates::config_history_page(
+        &registry,
+        &key,
+        &history,
+        &messages,
+        csrf.token(),
+        &prefix,
+        &actuator_prefix,
+    )))
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
@@ -934,6 +1049,7 @@ mod tests {
             "/admin",
             "/actuator".to_owned(),
             "user_id".to_owned(),
+            None,
             None,
         )
         .layer(axum::Extension(session))
