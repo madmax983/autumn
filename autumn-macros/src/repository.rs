@@ -392,7 +392,7 @@ fn vh_insert_ts(
     let changes_ts = match op {
         "insert" => quote! {
             {
-                let __vh_json = ::autumn_web::reexports::serde_json::to_value(#record_expr)
+                let __vh_json = ::autumn_web::reexports::serde_json::to_value(&#record_expr)
                     .unwrap_or(::autumn_web::reexports::serde_json::Value::Object(Default::default()));
                 let __vh_changes = ::autumn_web::version_history::compute_insert_changes(&__vh_json, <#model_ident as ::autumn_web::version_history::VersionedRecord>::version_sensitive_columns());
                 ::autumn_web::reexports::serde_json::to_string(&__vh_changes)
@@ -401,7 +401,7 @@ fn vh_insert_ts(
         },
         "delete" => quote! {
             {
-                let __vh_json = ::autumn_web::reexports::serde_json::to_value(#record_expr)
+                let __vh_json = ::autumn_web::reexports::serde_json::to_value(&#record_expr)
                     .unwrap_or(::autumn_web::reexports::serde_json::Value::Object(Default::default()));
                 let __vh_changes = ::autumn_web::version_history::compute_delete_changes(&__vh_json, <#model_ident as ::autumn_web::version_history::VersionedRecord>::version_sensitive_columns());
                 ::autumn_web::reexports::serde_json::to_string(&__vh_changes)
@@ -415,7 +415,7 @@ fn vh_insert_ts(
                 {
                     let __vh_before_json = ::autumn_web::reexports::serde_json::to_value(#before)
                         .unwrap_or(::autumn_web::reexports::serde_json::Value::Object(Default::default()));
-                    let __vh_after_json = ::autumn_web::reexports::serde_json::to_value(#record_expr)
+                    let __vh_after_json = ::autumn_web::reexports::serde_json::to_value(&#record_expr)
                         .unwrap_or(::autumn_web::reexports::serde_json::Value::Object(Default::default()));
                     let __vh_changes = ::autumn_web::version_history::compute_diff(&__vh_before_json, &__vh_after_json, <#model_ident as ::autumn_web::version_history::VersionedRecord>::version_sensitive_columns());
                     ::autumn_web::reexports::serde_json::to_string(&__vh_changes)
@@ -4424,7 +4424,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         let update_many_body = {
             let vh_update_pair = if config.versioned {
-                let vh = vh_insert_ts(table_name, "update", false, &quote! { after_rec }, Some(&quote! { *before_rec }), &quote! { conn }, model_name);
+                let vh = vh_insert_ts(table_name, "update", false, &quote! { after_rec }, Some(&quote! { before_rec }), &quote! { conn }, model_name);
                 quote! {
                     for after_rec in &chunk_updated {
                         if let ::core::option::Option::Some(before_rec) = __vh_before_map.get(&after_rec.id) {
@@ -4751,7 +4751,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         let upsert_many_body = {
             let vh_upsert_write = if config.versioned {
                 let vh_ins = vh_insert_ts(table_name, "insert", false, &quote! { r }, None, &quote! { conn }, model_name);
-                let vh_upd = vh_insert_ts(table_name, "update", false, &quote! { r }, Some(&quote! { *before_rec }), &quote! { conn }, model_name);
+                let vh_upd = vh_insert_ts(table_name, "update", false, &quote! { r }, Some(&quote! { before_rec }), &quote! { conn }, model_name);
                 quote! {
                     for r in &chunk_upserted {
                         if let ::core::option::Option::Some(before_rec) = __vh_before_map.get(&r.id) {
