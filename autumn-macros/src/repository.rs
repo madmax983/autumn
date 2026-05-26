@@ -4262,6 +4262,19 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         };
 
         let save_many_skip_invalid_body = {
+            let vh_skip_batch = if config.versioned {
+                let vh = vh_insert_ts(table_name, "insert", false, &quote! { r }, None, &quote! { conn }, model_name);
+                quote! { for r in &results { #vh } }
+            } else {
+                quote! {}
+            };
+            let vh_skip_row = if config.versioned {
+                let vh = vh_insert_ts(table_name, "insert", false, &quote! { model }, None, &quote! { conn }, model_name);
+                quote! { #vh }
+            } else {
+                quote! {}
+            };
+
             let tenant_id_setup = if config.tenant_scoped {
                 quote! {
                     let tenant_id = if self.across_tenants {
@@ -4348,8 +4361,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 for chunk in new.chunks(chunk_size) {
                     let batch_res = conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| {
                         async move {
-                            (#insert_expr_conn)
-                                .map_err(::autumn_web::AutumnError::from)
+                            let results = (#insert_expr_conn)
+                                .map_err(::autumn_web::AutumnError::from)?;
+                            #vh_skip_batch
+                            Ok(results)
                         }
                         .scope_boxed()
                     })
@@ -4386,8 +4401,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 let global_idx = offset + idx;
                                 let res = conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| {
                                     async move {
-                                        #row_insert_expr_conn
-                                            .map_err(::autumn_web::AutumnError::from)
+                                        let model = (#row_insert_expr_conn)
+                                            .map_err(::autumn_web::AutumnError::from)?;
+                                        #vh_skip_row
+                                        Ok(model)
                                     }
                                     .scope_boxed()
                                 })
@@ -4406,6 +4423,56 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         };
 
         let update_many_body = {
+            let vh_update_pair = if config.versioned {
+                let vh = vh_insert_ts(table_name, "update", false, &quote! { after_rec }, Some(&quote! { *before_rec }), &quote! { conn }, model_name);
+                quote! {
+                    for after_rec in &chunk_updated {
+                        if let ::core::option::Option::Some(before_rec) = __vh_before_map.get(&after_rec.id) {
+                            #vh
+                        }
+                    }
+                }
+            } else {
+                quote! {}
+            };
+            let vh_build_before_map_from_current = if config.versioned {
+                quote! {
+                    let __vh_before_map: ::std::collections::HashMap<i64, #model_name> =
+                        current_rows.iter().map(|r| (r.id, r.clone())).collect();
+                }
+            } else {
+                quote! {}
+            };
+            let vh_load_before_map_no_lock_expr = if config.tenant_scoped {
+                quote! {
+                    if let ::core::option::Option::Some(t) = tenant_id {
+                        load_query.filter(#table_ident::tenant_id.eq(t)).for_update().load::<#model_name>(conn).await
+                    } else {
+                        load_query.for_update().load::<#model_name>(conn).await
+                    }
+                }
+            } else {
+                quote! {
+                    load_query.for_update().load::<#model_name>(conn).await
+                }
+            };
+            let vh_load_before_map_no_lock = if config.versioned {
+                quote! {
+                    let mut __vh_before_map = ::std::collections::HashMap::<i64, #model_name>::new();
+                    for chunk in ids.chunks(1000) {
+                        let load_query = #table_ident::table.filter(#table_ident::id.eq_any(chunk))
+                            .order(#table_ident::id.asc());
+                        let chunk_rows = #vh_load_before_map_no_lock_expr
+                            .map_err(::autumn_web::AutumnError::from)?;
+                        for row in chunk_rows {
+                            __vh_before_map.insert(row.id, row);
+                        }
+                    }
+                }
+            } else {
+                quote! {}
+            };
+
             let tenant_id_setup = if config.tenant_scoped {
                 quote! {
                     let tenant_id = if self.across_tenants {
@@ -4514,10 +4581,13 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 }
                             }
 
+                            #vh_build_before_map_from_current
+
                             let mut updated = Vec::new();
                             for chunk in ids.chunks(1000) {
                                 let chunk_updated = #update_expr_conn
                                     .map_err(::autumn_web::AutumnError::from)?;
+                                #vh_update_pair
                                 updated.extend(chunk_updated);
                             }
                             Ok(updated)
@@ -4528,10 +4598,13 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 } else {
                     conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| {
                         async move {
+                            #vh_load_before_map_no_lock
+
                             let mut updated = Vec::new();
                             for chunk in ids.chunks(1000) {
                                 let chunk_updated = #update_expr_conn
                                     .map_err(::autumn_web::AutumnError::from)?;
+                                #vh_update_pair
                                 updated.extend(chunk_updated);
                             }
                             Ok(updated)
@@ -4544,6 +4617,45 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         };
 
         let delete_many_body = {
+            let vh_delete_load_before = if config.versioned {
+                let load_chunk = if config.tenant_scoped {
+                    quote! {
+                        let load_query = #table_ident::table.filter(#table_ident::id.eq_any(chunk));
+                        let chunk_rows = if let ::core::option::Option::Some(t) = tenant_id {
+                            load_query.filter(#table_ident::tenant_id.eq(t)).for_update().load::<#model_name>(conn).await
+                        } else {
+                            load_query.for_update().load::<#model_name>(conn).await
+                        }
+                        .map_err(::autumn_web::AutumnError::from)?;
+                    }
+                } else {
+                    quote! {
+                        let load_query = #table_ident::table.filter(#table_ident::id.eq_any(chunk));
+                        let chunk_rows = load_query.for_update().load::<#model_name>(conn).await
+                            .map_err(::autumn_web::AutumnError::from)?;
+                    }
+                };
+                quote! {
+                    let mut __vh_deleted_records: Vec<#model_name> = Vec::new();
+                    for chunk in ids.chunks(1000) {
+                        #load_chunk
+                        __vh_deleted_records.extend(chunk_rows);
+                    }
+                }
+            } else {
+                quote! {}
+            };
+            let vh_delete_write = if config.versioned {
+                let vh = vh_insert_ts(table_name, "delete", false, &quote! { r }, None, &quote! { conn }, model_name);
+                quote! {
+                    for r in &__vh_deleted_records {
+                        #vh
+                    }
+                }
+            } else {
+                quote! {}
+            };
+
             let tenant_id_setup = if config.tenant_scoped {
                 quote! {
                     let tenant_id = if self.across_tenants {
@@ -4622,10 +4734,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                 conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| {
                     async move {
+                        #vh_delete_load_before
                         for chunk in ids.chunks(1000) {
                             #delete_expr
                                 .map_err(::autumn_web::AutumnError::from)?;
                         }
+                        #vh_delete_write
                         Ok(())
                     }
                     .scope_boxed()
@@ -4635,6 +4749,30 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         };
 
         let upsert_many_body = {
+            let vh_upsert_write = if config.versioned {
+                let vh_ins = vh_insert_ts(table_name, "insert", false, &quote! { r }, None, &quote! { conn }, model_name);
+                let vh_upd = vh_insert_ts(table_name, "update", false, &quote! { r }, Some(&quote! { *before_rec }), &quote! { conn }, model_name);
+                quote! {
+                    for r in &chunk_upserted {
+                        if let ::core::option::Option::Some(before_rec) = __vh_before_map.get(&r.id) {
+                            #vh_upd
+                        } else {
+                            #vh_ins
+                        }
+                    }
+                }
+            } else {
+                quote! {}
+            };
+            let vh_upsert_before_collect = if config.versioned {
+                quote! {
+                    let __vh_before_map: ::std::collections::HashMap<i64, #model_name> =
+                        existing_rows.iter().map(|r| (r.id, r.clone())).collect();
+                }
+            } else {
+                quote! {}
+            };
+
             let tenant_id_setup = if config.tenant_scoped {
                 quote! {
                     let tenant_id = if self.across_tenants {
@@ -4796,7 +4934,11 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 }
                             }
 
+                            #vh_upsert_before_collect
+
                             #upsert_expr
+
+                            #vh_upsert_write
 
                             upserted.extend(chunk_upserted);
                         }
