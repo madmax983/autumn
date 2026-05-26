@@ -762,7 +762,11 @@ mod tests {
             sample_count: 5,
         };
         let r = check_budget(ChangeClass::StaticAsset, stats, &budget);
-        assert_eq!(r.p95_overage_pct, 0.0);
+        assert!(
+            r.p95_overage_pct.abs() < f64::EPSILON,
+            "overage_pct must be 0 for a passing result, got {}",
+            r.p95_overage_pct
+        );
     }
 
     #[test]
