@@ -1414,8 +1414,7 @@ mod tests {
         // Pattern `[a-z]+\$` means: one-or-more lowercase letters followed by
         // a literal `$`.  The trailing `\$` must NOT be stripped as an anchor.
         let v = ConfigValidator::Regex(r"[a-z]+\$".to_owned());
-        v.validate(&ConfigValue::Text("price$".to_owned()))
-            .unwrap();
+        v.validate(&ConfigValue::Text("price$".to_owned())).unwrap();
         let err = v
             .validate(&ConfigValue::Text("price".to_owned()))
             .unwrap_err();
@@ -1586,11 +1585,12 @@ mod tests {
     fn registry_accepts_default_that_passes_validator() {
         let mut r = ConfigRegistry::new();
         r.define(
-            ConfigKeySchema::new("threads", ConfigValueType::Int, ConfigValue::Int(4))
-                .validator(ConfigValidator::IntRange {
+            ConfigKeySchema::new("threads", ConfigValueType::Int, ConfigValue::Int(4)).validator(
+                ConfigValidator::IntRange {
                     min: Some(1),
                     max: Some(64),
-                }),
+                },
+            ),
         )
         .unwrap();
     }
