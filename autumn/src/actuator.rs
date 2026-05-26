@@ -1427,7 +1427,37 @@ pub(crate) async fn webhooks_replay_endpoint<S: ProvideActuatorState + Send + Sy
         }))).into_response();
     }
 
-    // Enqueue background delivery job first to prevent losing DLQ recovery path on failure
+    // Reset log state for re-delivery prior to enqueuing to prevent worker dequeue race
+    log.is_dlq = false;
+    log.attempt = 1;
+    log.last_error = None;
+    log.response_status = None;
+    log.response_body = None;
+    log.timestamp = chrono::Utc::now();
+
+    let subscription_id = log.subscription_id.clone();
+
+    if let Err(e) = manager.store().log_delivery(log).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "status": "error",
+                "message": format!("Failed to update delivery log state: {}", e)
+            })),
+        )
+            .into_response();
+    }
+
+    // Reset subscription consecutive failures to allow it to retry
+    if let Err(e) = manager
+        .store()
+        .reset_subscription_failures(&subscription_id)
+        .await
+    {
+        tracing::warn!(subscription_id = %subscription_id, "Failed to reset subscription failures during replay: {}", e);
+    }
+
+    // Enqueue background delivery job now that the log state is safely reset in the store
     let job_payload = serde_json::json!({
         "log_id": body.log_id,
     });
@@ -1455,29 +1485,6 @@ pub(crate) async fn webhooks_replay_endpoint<S: ProvideActuatorState + Send + Sy
             })),
         )
             .into_response();
-    }
-
-    // Reset log state for re-delivery now that it is successfully enqueued
-    log.is_dlq = false;
-    log.attempt = 1;
-    log.last_error = None;
-    log.response_status = None;
-    log.response_body = None;
-    log.timestamp = chrono::Utc::now();
-
-    let subscription_id = log.subscription_id.clone();
-
-    if let Err(e) = manager.store().log_delivery(log).await {
-        tracing::warn!(log_id = %body.log_id, "Failed to update log: {}", e);
-    }
-
-    // Reset subscription consecutive failures to allow it to retry
-    if let Err(e) = manager
-        .store()
-        .reset_subscription_failures(&subscription_id)
-        .await
-    {
-        tracing::warn!(subscription_id = %subscription_id, "Failed to reset subscription failures during replay: {}", e);
     }
 
     (
@@ -1604,8 +1611,11 @@ pub(crate) fn actuator_endpoint_paths(prefix: &str, sensitive: bool) -> Vec<Stri
         paths.push(actuator_route_path(prefix, "/tasks"));
         paths.push(actuator_route_path(prefix, "/jobs"));
         paths.push(actuator_route_path(prefix, "/ui/tasks"));
-        paths.push(actuator_route_path(prefix, "/webhooks/dlq"));
-        paths.push(actuator_route_path(prefix, "/webhooks/replay"));
+        #[cfg(feature = "http-client")]
+        {
+            paths.push(actuator_route_path(prefix, "/webhooks/dlq"));
+            paths.push(actuator_route_path(prefix, "/webhooks/replay"));
+        }
         #[cfg(feature = "ws")]
         {
             paths.push(actuator_route_path(prefix, "/channels"));

@@ -238,7 +238,12 @@ impl OutboundWebhookHandler for InMemoryOutboundWebhookHandler {
         &self,
         id: &str,
     ) -> Pin<Box<dyn Future<Output = AutumnResult<Option<WebhookDeliveryLog>>> + Send>> {
-        let log = self.logs.read().expect("logs read lock poisoned").get(id).cloned();
+        let log = self
+            .logs
+            .read()
+            .expect("logs read lock poisoned")
+            .get(id)
+            .cloned();
         Box::pin(async move { Ok(log) })
     }
 
@@ -397,13 +402,24 @@ pub fn deliver_webhook_job(
                 serde_json::from_value(sub_val.clone()).map_err(|e| {
                     AutumnError::bad_request_msg(format!("failed to parse subscription: {e}"))
                 })?;
-            let log: WebhookDeliveryLog = serde_json::from_value(
+            let mut log: WebhookDeliveryLog = serde_json::from_value(
                 payload
                     .get("log")
                     .cloned()
                     .ok_or_else(|| AutumnError::bad_request_msg("missing log in job payload"))?,
             )
             .map_err(|e| AutumnError::bad_request_msg(format!("failed to parse log: {e}")))?;
+
+            // If this log has already been attempted (i.e. is running a retry from the job runner),
+            // increment the attempt counter and write the pre-send log.
+            if log.response_status.is_some() || log.last_error.is_some() {
+                log.attempt = log.attempt.saturating_add(1);
+                log.response_status = None;
+                log.response_body = None;
+                log.last_error = None;
+                manager.store().log_delivery(log.clone()).await?;
+            }
+
             (sub, log)
         } else {
             let log_id = payload

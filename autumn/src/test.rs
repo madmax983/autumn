@@ -402,7 +402,7 @@ impl TestApp {
     #[must_use]
     pub fn plugin<P: crate::plugin::Plugin>(mut self, plugin: P) -> Self {
         let mut app_builder = crate::app();
-        app_builder = plugin.build(app_builder);
+        app_builder = app_builder.plugin(plugin);
 
         // Merge properties from the plugin's app_builder into self:
         self.routes.extend(app_builder.routes);
