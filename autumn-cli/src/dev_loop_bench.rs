@@ -989,4 +989,109 @@ mod tests {
             "all journey names must be unique"
         );
     }
+
+    // ── run() / print_budget_table / build_placeholder_results ───────────
+
+    #[test]
+    fn run_dry_run_returns_zero_and_prints_table() {
+        let exit = run("examples/hello", 5, None, false, false, true);
+        assert_eq!(exit, 0);
+    }
+
+    #[test]
+    fn run_hello_example_normal_mode_returns_zero() {
+        let exit = run("examples/hello", 3, None, false, false, false);
+        assert_eq!(exit, 0);
+    }
+
+    #[test]
+    fn run_json_flag_returns_zero() {
+        let exit = run("examples/hello", 3, None, true, false, false);
+        assert_eq!(exit, 0);
+    }
+
+    #[test]
+    fn run_todo_example_uses_db_path() {
+        // exercises the `contains("todo")` branch in build_placeholder_results
+        let exit = run("examples/todo-app", 3, None, false, false, false);
+        assert_eq!(exit, 0);
+    }
+
+    #[test]
+    fn run_blog_example_uses_db_path() {
+        // exercises the `contains("blog")` branch in build_placeholder_results
+        let exit = run("examples/blog", 3, None, false, false, false);
+        assert_eq!(exit, 0);
+    }
+
+    #[test]
+    fn run_fail_on_regression_with_passing_placeholder_still_zero() {
+        // Placeholder results are all-zero ms which always passes the budget,
+        // so --fail-on-regression must not trip with the placeholder driver.
+        let exit = run("examples/hello", 3, None, false, true, false);
+        assert_eq!(exit, 0);
+    }
+
+    #[test]
+    fn run_output_writes_valid_json_to_file() {
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let path = tmp.path().to_str().unwrap().to_string();
+        let exit = run("examples/hello", 3, Some(&path), false, false, false);
+        assert_eq!(exit, 0);
+        let content = std::fs::read_to_string(&path).expect("report file");
+        serde_json::from_str::<serde_json::Value>(&content)
+            .expect("output file must contain valid JSON");
+    }
+
+    #[test]
+    fn run_output_bad_path_still_returns_zero() {
+        // A write error on the output path is non-fatal; the command still succeeds.
+        let exit = run(
+            "examples/hello",
+            3,
+            Some("/dev/full/nonexistent/path/report.json"),
+            false,
+            false,
+            false,
+        );
+        assert_eq!(exit, 0);
+    }
+
+    // ── env var helpers ───────────────────────────────────────────────────
+
+    #[test]
+    fn chrono_utc_now_returns_set_env_var() {
+        let result = temp_env::with_var(
+            "AUTUMN_BENCH_TIMESTAMP",
+            Some("2026-05-26T00:00:00Z"),
+            chrono_utc_now,
+        );
+        assert_eq!(result, "2026-05-26T00:00:00Z");
+    }
+
+    #[test]
+    fn chrono_utc_now_fallback_is_unknown() {
+        let result = temp_env::with_var("AUTUMN_BENCH_TIMESTAMP", None::<&str>, chrono_utc_now);
+        assert_eq!(result, "unknown");
+    }
+
+    #[test]
+    fn rust_version_string_returns_set_env_var() {
+        let result = temp_env::with_var(
+            "AUTUMN_BENCH_RUST_VERSION",
+            Some("rustc 1.88.0"),
+            rust_version_string,
+        );
+        assert_eq!(result, "rustc 1.88.0");
+    }
+
+    #[test]
+    fn rust_version_string_fallback_is_unknown() {
+        let result = temp_env::with_var(
+            "AUTUMN_BENCH_RUST_VERSION",
+            None::<&str>,
+            rust_version_string,
+        );
+        assert_eq!(result, "unknown");
+    }
 }
