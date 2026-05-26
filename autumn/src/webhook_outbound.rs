@@ -66,125 +66,98 @@ pub struct WebhookDeliveryLog {
     pub timestamp: DateTime<Utc>,
 }
 
-/// Pluggable storage backend for outbound webhook subscriptions and delivery logs.
-pub trait OutboundWebhookStore: Send + Sync + 'static {
-    /// Create a new subscription.
-    fn create_subscription(
-        &self,
-        sub: WebhookSubscription,
-    ) -> Pin<Box<dyn Future<Output = AutumnResult<WebhookSubscription>> + Send>>;
-
-    /// Get a subscription by ID.
-    fn get_subscription(
-        &self,
-        id: &str,
-    ) -> Pin<Box<dyn Future<Output = AutumnResult<Option<WebhookSubscription>>> + Send>>;
-
-    /// List all registered subscriptions.
-    fn list_subscriptions(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = AutumnResult<Vec<WebhookSubscription>>> + Send>>;
-
-    /// List all active subscriptions registered for a specific event topic.
-    fn list_subscriptions_for_topic(
+/// Pluggable handler interface for outbound webhook subscriptions and delivery logs.
+pub trait OutboundWebhookHandler: Send + Sync + 'static {
+    /// Retrieve active subscriptions registered for a specific event topic.
+    fn get_subscriptions(
         &self,
         topic: &str,
     ) -> Pin<Box<dyn Future<Output = AutumnResult<Vec<WebhookSubscription>>> + Send>>;
 
-    /// Update a subscription's status.
-    fn update_subscription_status(
-        &self,
-        id: &str,
-        status: WebhookSubscriptionStatus,
-    ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send>>;
-
-    /// Increment the consecutive failure counter for a subscription and return the new count.
-    fn increment_subscription_failures(
-        &self,
-        id: &str,
-    ) -> Pin<Box<dyn Future<Output = AutumnResult<u32>> + Send>>;
-
-    /// Reset the consecutive failure counter for a subscription back to 0.
-    fn reset_subscription_failures(
-        &self,
-        id: &str,
-    ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send>>;
-
-    /// Log a webhook delivery attempt.
+    /// Log a webhook delivery attempt and handle failure counters/statuses.
     fn log_delivery(
         &self,
         log: WebhookDeliveryLog,
     ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send>>;
 
-    /// List all logged delivery attempts.
-    fn get_delivery_logs(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = AutumnResult<Vec<WebhookDeliveryLog>>> + Send>>;
-
-    /// List only permanently failed delivery attempts archived in the Dead Letter Queue.
+    /// Optional: List only permanently failed delivery attempts archived in the Dead Letter Queue.
     fn get_dlq_logs(
         &self,
-    ) -> Pin<Box<dyn Future<Output = AutumnResult<Vec<WebhookDeliveryLog>>> + Send>>;
+    ) -> Pin<Box<dyn Future<Output = AutumnResult<Vec<WebhookDeliveryLog>>> + Send>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
 
-    /// Get a specific delivery log by ID.
+    /// Optional: Get a specific delivery log by ID.
     fn get_delivery_log(
         &self,
-        id: &str,
-    ) -> Pin<Box<dyn Future<Output = AutumnResult<Option<WebhookDeliveryLog>>> + Send>>;
+        _id: &str,
+    ) -> Pin<Box<dyn Future<Output = AutumnResult<Option<WebhookDeliveryLog>>> + Send>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    /// Optional: Reset consecutive failures for a subscription.
+    fn reset_subscription_failures(
+        &self,
+        _id: &str,
+    ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send>> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
-/// Bounded, thread-safe, process-local in-memory implementation of the outbound webhook store.
+/// Legacy alias for backward compatibility.
+pub use OutboundWebhookHandler as OutboundWebhookStore;
+
+/// Bounded, thread-safe, process-local in-memory implementation of the outbound webhook handler.
 #[derive(Debug, Default)]
-pub struct InMemoryOutboundWebhookStore {
+pub struct InMemoryOutboundWebhookHandler {
     subscriptions: RwLock<HashMap<String, WebhookSubscription>>,
     logs: RwLock<HashMap<String, WebhookDeliveryLog>>,
 }
 
-impl InMemoryOutboundWebhookStore {
-    /// Create a new, empty in-memory store.
+/// Legacy alias for backward compatibility.
+pub type InMemoryOutboundWebhookStore = InMemoryOutboundWebhookHandler;
+
+impl InMemoryOutboundWebhookHandler {
+    /// Create a new, empty in-memory handler.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
-}
 
-impl OutboundWebhookStore for InMemoryOutboundWebhookStore {
-    fn create_subscription(
+    /// Helper to register a subscription in memory for testing/dev.
+    pub async fn create_subscription(
         &self,
         sub: WebhookSubscription,
-    ) -> Pin<Box<dyn Future<Output = AutumnResult<WebhookSubscription>> + Send>> {
+    ) -> AutumnResult<WebhookSubscription> {
         let mut subs = self
             .subscriptions
             .write()
             .expect("subscriptions write lock poisoned");
         subs.insert(sub.id.clone(), sub.clone());
-        Box::pin(async move { Ok(sub) })
+        Ok(sub)
     }
 
-    fn get_subscription(
-        &self,
-        id: &str,
-    ) -> Pin<Box<dyn Future<Output = AutumnResult<Option<WebhookSubscription>>> + Send>> {
+    /// Helper to retrieve logged deliveries for testing/dev.
+    pub async fn get_delivery_logs(&self) -> AutumnResult<Vec<WebhookDeliveryLog>> {
+        let logs = self.logs.read().expect("logs read lock poisoned");
+        let mut list: Vec<WebhookDeliveryLog> = logs.values().cloned().collect();
+        list.sort_by_key(|l| l.timestamp);
+        list.reverse();
+        Ok(list)
+    }
+
+    /// Helper to fetch a single subscription.
+    pub async fn get_subscription(&self, id: &str) -> AutumnResult<Option<WebhookSubscription>> {
         let subs = self
             .subscriptions
             .read()
             .expect("subscriptions read lock poisoned");
-        let sub = subs.get(id).cloned();
-        Box::pin(async move { Ok(sub) })
+        Ok(subs.get(id).cloned())
     }
+}
 
-    fn list_subscriptions(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = AutumnResult<Vec<WebhookSubscription>>> + Send>> {
-        let subs = self
-            .subscriptions
-            .read()
-            .expect("subscriptions read lock poisoned");
-        let list: Vec<WebhookSubscription> = subs.values().cloned().collect();
-        Box::pin(async move { Ok(list) })
-    }
-
-    fn list_subscriptions_for_topic(
+impl OutboundWebhookHandler for InMemoryOutboundWebhookHandler {
+    fn get_subscriptions(
         &self,
         topic: &str,
     ) -> Pin<Box<dyn Future<Output = AutumnResult<Vec<WebhookSubscription>>> + Send>> {
@@ -204,72 +177,34 @@ impl OutboundWebhookStore for InMemoryOutboundWebhookStore {
         Box::pin(async move { Ok(list) })
     }
 
-    fn update_subscription_status(
-        &self,
-        id: &str,
-        status: WebhookSubscriptionStatus,
-    ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send>> {
-        let mut subs = self
-            .subscriptions
-            .write()
-            .expect("subscriptions write lock poisoned");
-        let id = id.to_owned();
-        if let Some(sub) = subs.get_mut(&id) {
-            sub.status = status;
-        }
-        Box::pin(async move { Ok(()) })
-    }
-
-    fn increment_subscription_failures(
-        &self,
-        id: &str,
-    ) -> Pin<Box<dyn Future<Output = AutumnResult<u32>> + Send>> {
-        let mut subs = self
-            .subscriptions
-            .write()
-            .expect("subscriptions write lock poisoned");
-        let id = id.to_owned();
-        let count = if let Some(sub) = subs.get_mut(&id) {
-            sub.consecutive_failures = sub.consecutive_failures.saturating_add(1);
-            sub.consecutive_failures
-        } else {
-            0
-        };
-        Box::pin(async move { Ok(count) })
-    }
-
-    fn reset_subscription_failures(
-        &self,
-        id: &str,
-    ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send>> {
-        let mut subs = self
-            .subscriptions
-            .write()
-            .expect("subscriptions write lock poisoned");
-        let id = id.to_owned();
-        if let Some(sub) = subs.get_mut(&id) {
-            sub.consecutive_failures = 0;
-        }
-        Box::pin(async move { Ok(()) })
-    }
-
     fn log_delivery(
         &self,
         log: WebhookDeliveryLog,
     ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send>> {
         let mut logs = self.logs.write().expect("logs write lock poisoned");
-        logs.insert(log.id.clone(), log);
-        Box::pin(async move { Ok(()) })
-    }
+        logs.insert(log.id.clone(), log.clone());
 
-    fn get_delivery_logs(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = AutumnResult<Vec<WebhookDeliveryLog>>> + Send>> {
-        let logs = self.logs.read().expect("logs read lock poisoned");
-        let mut list: Vec<WebhookDeliveryLog> = logs.values().cloned().collect();
-        list.sort_by_key(|l| l.timestamp);
-        list.reverse();
-        Box::pin(async move { Ok(list) })
+        // Manage subscription consecutive failures and auto-disabling state
+        let mut subs = self
+            .subscriptions
+            .write()
+            .expect("subscriptions write lock poisoned");
+        if let Some(sub) = subs.get_mut(&log.subscription_id) {
+            if log
+                .response_status
+                .map_or(false, |status| (200..300).contains(&status))
+            {
+                sub.consecutive_failures = 0;
+            } else {
+                sub.consecutive_failures = sub.consecutive_failures.saturating_add(1);
+                if sub.consecutive_failures >= 50 {
+                    sub.status = WebhookSubscriptionStatus::Failed;
+                    tracing::warn!(subscription_id = %sub.id, "Webhook subscription auto-disabled due to 50 consecutive failures");
+                }
+            }
+        }
+
+        Box::pin(async move { Ok(()) })
     }
 
     fn get_dlq_logs(
@@ -291,21 +226,50 @@ impl OutboundWebhookStore for InMemoryOutboundWebhookStore {
         let log = logs.get(id).cloned();
         Box::pin(async move { Ok(log) })
     }
+
+    fn reset_subscription_failures(
+        &self,
+        id: &str,
+    ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send>> {
+        let mut subs = self
+            .subscriptions
+            .write()
+            .expect("subscriptions write lock poisoned");
+        if let Some(sub) = subs.get_mut(id) {
+            sub.consecutive_failures = 0;
+        }
+        Box::pin(async move { Ok(()) })
+    }
 }
+
+/// A runtime delegation callback type to bridge core autumn to autumn-harvest dynamically.
+pub type WebhookDelegate = Arc<
+    dyn Fn(
+            &AppState,
+            WebhookSubscription,
+            WebhookDeliveryLog,
+        ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// AppState extension for the runtime delegation hook.
+#[derive(Clone)]
+pub struct WebhookDelegateExt(pub WebhookDelegate);
 
 /// The runtime manager for outbound webhooks.
 #[derive(Clone)]
 pub struct WebhookOutboundManager {
-    store: Arc<dyn OutboundWebhookStore>,
+    handler: Arc<dyn OutboundWebhookHandler>,
     client: Client,
     initial_backoff_ms: u64,
 }
 
 impl WebhookOutboundManager {
-    /// Create a new webhook manager with a store.
-    pub fn new(store: Arc<dyn OutboundWebhookStore>) -> Self {
+    /// Create a new webhook manager with a handler.
+    pub fn new(handler: Arc<dyn OutboundWebhookHandler>) -> Self {
         Self {
-            store,
+            handler,
             client: Client::new(),
             initial_backoff_ms: 1000,
         }
@@ -317,9 +281,14 @@ impl WebhookOutboundManager {
         self
     }
 
-    /// Access the underlying webhook store.
-    pub fn store(&self) -> &Arc<dyn OutboundWebhookStore> {
-        &self.store
+    /// Access the underlying webhook handler (compatibility/actuator support).
+    pub fn store(&self) -> &Arc<dyn OutboundWebhookHandler> {
+        &self.handler
+    }
+
+    /// Access the underlying http client.
+    pub fn client(&self) -> &Client {
+        &self.client
     }
 
     /// Dispatch a signed webhook payload to all subscriptions interested in `topic`.
@@ -329,7 +298,7 @@ impl WebhookOutboundManager {
     /// Returns [`AutumnError`] if payload serialization or queueing fails.
     pub async fn dispatch<T: Serialize>(
         &self,
-        _state: &AppState,
+        state: &AppState,
         topic: &str,
         payload: &T,
     ) -> AutumnResult<()> {
@@ -337,7 +306,7 @@ impl WebhookOutboundManager {
             AutumnError::internal_server_error_msg(format!("failed to serialize payload: {e}"))
         })?;
 
-        let subs = self.store.list_subscriptions_for_topic(topic).await?;
+        let subs = self.handler.get_subscriptions(topic).await?;
         for sub in subs {
             if sub.status == WebhookSubscriptionStatus::Disabled {
                 continue;
@@ -360,21 +329,30 @@ impl WebhookOutboundManager {
                 timestamp: Utc::now(),
             };
 
-            self.store.log_delivery(log).await?;
+            // Register the initial attempt in local storage
+            self.handler.log_delivery(log.clone()).await?;
 
-            let job_payload = serde_json::json!({
-                "log_id": log_id,
-            });
-
-            tracing::debug!(subscription_id = %sub.id, "WebhookOutboundManager::dispatch: enqueuing webhook delivery job");
-            if let Some(job_client) = crate::job::global_job_client() {
-                job_client
-                    .enqueue("autumn_webhook_delivery", job_payload)
-                    .await?;
+            // If a delegate extension is registered, run it (delegates to Harvest workflow)
+            if let Some(delegate_ext) = state.extension::<WebhookDelegateExt>() {
+                tracing::info!(subscription_id = %sub.id, "WebhookOutboundManager::dispatch: delegating webhook delivery via runtime hook");
+                (delegate_ext.0)(state, sub, log).await?;
             } else {
-                tracing::warn!(
-                    "Global job client is unavailable; webhook delivery job not enqueued"
-                );
+                // Fallback: enqueue a standard background job
+                let job_payload = serde_json::json!({
+                    "subscription": sub,
+                    "log": log,
+                });
+
+                tracing::debug!(subscription_id = %sub.id, "WebhookOutboundManager::dispatch: enqueuing fallback webhook delivery job");
+                if let Some(job_client) = crate::job::global_job_client() {
+                    job_client
+                        .enqueue("autumn_webhook_delivery", job_payload)
+                        .await?;
+                } else {
+                    tracing::warn!(
+                        "Global job client is unavailable; fallback webhook delivery job not enqueued"
+                    );
+                }
             }
         }
 
@@ -382,42 +360,50 @@ impl WebhookOutboundManager {
     }
 }
 
-/// Asynchronous background job that delivers a webhook payload.
+/// Asynchronous background job that delivers a webhook payload (legacy fallback).
 pub fn deliver_webhook_job(
     state: AppState,
     payload: serde_json::Value,
 ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'static>> {
     Box::pin(async move {
-        let log_id = payload
-            .get("log_id")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| AutumnError::bad_request_msg("missing log_id in job payload"))?;
-
-        tracing::debug!(log_id = %log_id, "deliver_webhook_job: starting webhook delivery");
-
         let manager = state.extension::<WebhookOutboundManager>().ok_or_else(|| {
             AutumnError::internal_server_error_msg("WebhookOutboundManager not found in extensions")
         })?;
 
-        let log_opt = manager.store.get_delivery_log(log_id).await?;
-        let mut log = match log_opt {
-            Some(l) => l,
-            None => {
-                return Err(AutumnError::not_found_msg(format!(
-                    "delivery log {log_id} not found"
-                )));
-            }
-        };
+        // Support both self-contained payload structure and legacy log_id lookup (for replays)
+        let (sub, mut log) = if let Some(sub_val) = payload.get("subscription") {
+            let sub: WebhookSubscription = serde_json::from_value(sub_val.clone()).map_err(|e| {
+                AutumnError::bad_request_msg(format!("failed to parse subscription: {e}"))
+            })?;
+            let log: WebhookDeliveryLog = serde_json::from_value(payload.get("log").cloned().ok_or_else(|| {
+                AutumnError::bad_request_msg("missing log in job payload")
+            })?).map_err(|e| {
+                AutumnError::bad_request_msg(format!("failed to parse log: {e}"))
+            })?;
+            (sub, log)
+        } else {
+            let log_id = payload
+                .get("log_id")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| AutumnError::bad_request_msg("missing log_id in job payload"))?;
 
-        let sub_opt = manager.store.get_subscription(&log.subscription_id).await?;
-        let sub = match sub_opt {
-            Some(s) => s,
-            None => {
-                return Err(AutumnError::not_found_msg(format!(
-                    "subscription {} not found",
-                    log.subscription_id
-                )));
-            }
+            tracing::debug!(log_id = %log_id, "deliver_webhook_job: starting webhook delivery via log lookup");
+
+            let log_opt = manager.store().get_delivery_log(log_id).await?;
+            let log = match log_opt {
+                Some(l) => l,
+                None => {
+                    return Err(AutumnError::not_found_msg(format!(
+                        "delivery log {log_id} not found"
+                    )));
+                }
+            };
+
+            let subs = manager.store().get_subscriptions(&log.topic).await?;
+            let sub = subs.into_iter().find(|s| s.id == log.subscription_id).ok_or_else(|| {
+                AutumnError::not_found_msg(format!("subscription {} not found", log.subscription_id))
+            })?;
+            (sub, log)
         };
 
         if sub.status == WebhookSubscriptionStatus::Disabled {
@@ -451,7 +437,7 @@ pub fn deliver_webhook_job(
         let elapsed = start.elapsed().as_millis() as u64;
 
         tracing::debug!(
-            log_id = %log_id,
+            log_id = %log.id,
             status = ?response.as_ref().map(|r| r.status()),
             "deliver_webhook_job: webhook HTTP request finished"
         );
@@ -470,20 +456,20 @@ pub fn deliver_webhook_job(
 
                 if is_success {
                     log.last_error = None;
-                    manager.store.log_delivery(log).await?;
-                    manager.store.reset_subscription_failures(&sub.id).await?;
+                    manager.store().log_delivery(log).await?;
+                    manager.store().reset_subscription_failures(&sub.id).await?;
                     Ok(())
                 } else {
                     let status_err = format!("server returned status: {}", status);
                     log.last_error = Some(status_err.clone());
-                    manager.store.log_delivery(log.clone()).await?;
+                    manager.store().log_delivery(log.clone()).await?;
                     handle_delivery_failure(&manager, &sub, log, status_err).await
                 }
             }
             Err(e) => {
                 let error_str = e.to_string();
                 log.last_error = Some(error_str.clone());
-                manager.store.log_delivery(log.clone()).await?;
+                manager.store().log_delivery(log.clone()).await?;
                 handle_delivery_failure(&manager, &sub, log, error_str).await
             }
         }
@@ -496,18 +482,6 @@ async fn handle_delivery_failure(
     mut log: WebhookDeliveryLog,
     error_msg: String,
 ) -> AutumnResult<()> {
-    let consecutive_failures = manager
-        .store
-        .increment_subscription_failures(&sub.id)
-        .await?;
-    if consecutive_failures >= 50 {
-        manager
-            .store
-            .update_subscription_status(&sub.id, WebhookSubscriptionStatus::Failed)
-            .await?;
-        tracing::warn!(subscription_id = %sub.id, "Webhook subscription auto-disabled due to 50 consecutive failures");
-    }
-
     if log.attempt < log.max_attempts {
         let attempt = log.attempt + 1;
         let base_delay = manager.initial_backoff_ms;
@@ -521,12 +495,12 @@ async fn handle_delivery_failure(
         };
         let delay_ms = base_delay * multiplier + (jitter as u64);
 
-        let log_id = log.id.clone();
         log.attempt = attempt;
-        manager.store.log_delivery(log).await?;
+        manager.store().log_delivery(log.clone()).await?;
 
         let job_payload = serde_json::json!({
-            "log_id": log_id,
+            "subscription": sub,
+            "log": log,
         });
 
         tokio::spawn(async move {
@@ -543,7 +517,7 @@ async fn handle_delivery_failure(
         )))
     } else {
         log.is_dlq = true;
-        manager.store.log_delivery(log).await?;
+        manager.store().log_delivery(log).await?;
         Err(AutumnError::internal_server_error_msg(format!(
             "delivery failed permanently, sent to DLQ: {error_msg}"
         )))
@@ -552,14 +526,14 @@ async fn handle_delivery_failure(
 
 /// AppBuilder plugin for outbound signed webhook delivery infrastructure.
 pub struct OutboundWebhookPlugin {
-    store: Arc<dyn OutboundWebhookStore>,
+    store: Arc<dyn OutboundWebhookHandler>,
     initial_backoff_ms: u64,
 }
 
 impl OutboundWebhookPlugin {
     /// Create a new outbound webhook plugin using the specified store.
     #[must_use]
-    pub fn new(store: Arc<dyn OutboundWebhookStore>) -> Self {
+    pub fn new(store: Arc<dyn OutboundWebhookHandler>) -> Self {
         Self {
             store,
             initial_backoff_ms: 1000,
