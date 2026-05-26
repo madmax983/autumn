@@ -2,9 +2,7 @@
 
 use std::path::Path;
 
-use crate::markdown::types::{
-    MarkdownError, MarkdownFrontmatter, MarkdownPage, MarkdownSource,
-};
+use crate::markdown::types::{MarkdownError, MarkdownFrontmatter, MarkdownPage, MarkdownSource};
 use crate::static_gen::StaticParams;
 
 /// A registry of Markdown pages keyed by slug.
@@ -163,12 +161,11 @@ fn split_frontmatter<'a>(
             slug: slug.to_owned(),
         })?;
 
-    let close_pos =
-        after_open
-            .find("\n+++")
-            .ok_or_else(|| MarkdownError::FrontmatterMissing {
-                slug: slug.to_owned(),
-            })?;
+    let close_pos = after_open
+        .find("\n+++")
+        .ok_or_else(|| MarkdownError::FrontmatterMissing {
+            slug: slug.to_owned(),
+        })?;
 
     let toml_str = &after_open[..close_pos];
     let after_close = &after_open[close_pos + 4..]; // skip "\n+++"
@@ -269,11 +266,8 @@ mod tests {
 
     #[test]
     fn body_leading_whitespace_stripped() {
-        let page = parse_page(
-            "test".to_owned(),
-            "+++\ntitle = \"T\"\n+++\n\n\n\n# Body\n",
-        )
-        .unwrap();
+        let page =
+            parse_page("test".to_owned(), "+++\ntitle = \"T\"\n+++\n\n\n\n# Body\n").unwrap();
         assert!(page.body.starts_with("# Body"));
     }
 
@@ -281,8 +275,7 @@ mod tests {
 
     #[test]
     fn builds_registry_from_embedded() {
-        let registry =
-            MarkdownRegistry::from_embedded(&[GETTING_STARTED, API_REFERENCE]).unwrap();
+        let registry = MarkdownRegistry::from_embedded(&[GETTING_STARTED, API_REFERENCE]).unwrap();
         assert_eq!(registry.len(), 2);
         assert!(registry.get("getting-started").is_some());
         assert!(registry.get("api-reference").is_some());
@@ -306,8 +299,7 @@ mod tests {
     #[test]
     fn all_sorted_orders_by_order_field() {
         // Sources given in reverse order — sorted output must be by `order`.
-        let registry =
-            MarkdownRegistry::from_embedded(&[API_REFERENCE, GETTING_STARTED]).unwrap();
+        let registry = MarkdownRegistry::from_embedded(&[API_REFERENCE, GETTING_STARTED]).unwrap();
         let pages = registry.all_sorted();
         assert_eq!(pages[0].slug, "getting-started"); // order = 1
         assert_eq!(pages[1].slug, "api-reference"); // order = 2
@@ -331,8 +323,7 @@ mod tests {
 
     #[test]
     fn static_params_returns_one_entry_per_page() {
-        let registry =
-            MarkdownRegistry::from_embedded(&[GETTING_STARTED, API_REFERENCE]).unwrap();
+        let registry = MarkdownRegistry::from_embedded(&[GETTING_STARTED, API_REFERENCE]).unwrap();
         let params = registry.static_params();
         assert_eq!(params.len(), 2);
     }
@@ -346,8 +337,7 @@ mod tests {
 
     #[test]
     fn static_params_sorted_by_order() {
-        let registry =
-            MarkdownRegistry::from_embedded(&[API_REFERENCE, GETTING_STARTED]).unwrap();
+        let registry = MarkdownRegistry::from_embedded(&[API_REFERENCE, GETTING_STARTED]).unwrap();
         let params = registry.static_params();
         assert_eq!(params[0].get("slug").unwrap(), "getting-started");
         assert_eq!(params[1].get("slug").unwrap(), "api-reference");
@@ -399,8 +389,9 @@ mod tests {
 
     #[test]
     fn directory_not_found_returns_io_error() {
-        let result =
-            MarkdownRegistry::from_dir(std::path::Path::new("/nonexistent/path/that/does/not/exist"));
+        let result = MarkdownRegistry::from_dir(std::path::Path::new(
+            "/nonexistent/path/that/does/not/exist",
+        ));
         assert!(matches!(result, Err(MarkdownError::Io { .. })));
     }
 
@@ -412,14 +403,12 @@ mod tests {
         use std::pin::Pin;
         use std::sync::Arc;
 
-        use crate::markdown::render;
         use crate::markdown::RenderOptions;
+        use crate::markdown::render;
         use crate::static_gen::{StaticRouteMeta, render_static_routes};
 
         // Defined before any `let` statements to satisfy `items_after_statements`.
-        fn doc_params(
-            _: axum::Router,
-        ) -> Pin<Box<dyn Future<Output = Vec<StaticParams>> + Send>> {
+        fn doc_params(_: axum::Router) -> Pin<Box<dyn Future<Output = Vec<StaticParams>> + Send>> {
             Box::pin(async {
                 vec![
                     crate::static_params! { "slug" => "getting-started" },
@@ -428,9 +417,8 @@ mod tests {
             })
         }
 
-        let registry = Arc::new(
-            MarkdownRegistry::from_embedded(&[GETTING_STARTED, API_REFERENCE]).unwrap(),
-        );
+        let registry =
+            Arc::new(MarkdownRegistry::from_embedded(&[GETTING_STARTED, API_REFERENCE]).unwrap());
 
         // Build a router that renders pages from the registry.
         let reg = registry.clone();
@@ -466,12 +454,10 @@ mod tests {
         render_static_routes(router, &[meta], &dist).await.unwrap();
 
         // Both pages must be pre-rendered.
-        let html_a =
-            std::fs::read_to_string(dist.join("docs/getting-started/index.html")).unwrap();
+        let html_a = std::fs::read_to_string(dist.join("docs/getting-started/index.html")).unwrap();
         assert!(html_a.contains("Getting Started"));
 
-        let html_b =
-            std::fs::read_to_string(dist.join("docs/api-reference/index.html")).unwrap();
+        let html_b = std::fs::read_to_string(dist.join("docs/api-reference/index.html")).unwrap();
         assert!(html_b.contains("API Reference"));
     }
 }

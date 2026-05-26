@@ -155,6 +155,11 @@ pub mod prelude;
 pub use paths::PathExt;
 pub(crate) mod route;
 pub use route::{RepositoryApiMeta, Route, RouteIdempotency};
+/// First-class Markdown rendering with frontmatter parsing and SSG integration.
+///
+/// Enable with the Cargo feature `markdown`.
+#[cfg(feature = "markdown")]
+pub mod markdown;
 pub mod scheduler;
 pub mod security;
 pub mod session;
@@ -163,11 +168,6 @@ pub(crate) mod session_redis;
 pub mod sse;
 /// Static site generation support.
 pub mod static_gen;
-/// First-class Markdown rendering with frontmatter parsing and SSG integration.
-///
-/// Enable with the Cargo feature `markdown`.
-#[cfg(feature = "markdown")]
-pub mod markdown;
 #[cfg(feature = "storage")]
 pub mod storage;
 pub mod tenancy;
