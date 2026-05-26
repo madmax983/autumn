@@ -8,6 +8,8 @@
 //! See `docs/guide/dev-loop-latency.md` for the full budget matrix and the
 //! methodology used to measure end-to-end latency.
 
+use std::fmt::Write as FmtWrite;
+
 use serde::Serialize;
 
 // ── Change classes ───────────────────────────────────────────────────────────
@@ -38,7 +40,7 @@ pub enum ChangeClass {
 
 impl ChangeClass {
     /// Return a stable lowercase snake-case key for use in JSON output.
-    pub fn key(self) -> &'static str {
+    pub const fn key(self) -> &'static str {
         match self {
             Self::InitialBoot => "initial_boot",
             Self::RustRouteEditHello => "rust_route_edit_hello",
@@ -51,7 +53,7 @@ impl ChangeClass {
     }
 
     /// Return a human-readable name for the user journey this class represents.
-    pub fn journey_name(self) -> &'static str {
+    pub const fn journey_name(self) -> &'static str {
         match self {
             Self::InitialBoot => "Initial dev boot to first route",
             Self::RustRouteEditHello => "Rust route edit (examples/hello, no-DB)",
@@ -67,6 +69,8 @@ impl ChangeClass {
 // ── Budgets ──────────────────────────────────────────────────────────────────
 
 /// Accepted latency budget for one change class (all values in milliseconds).
+// The `_ms` suffix is the unit — suppress the struct-field-names lint.
+#[allow(clippy::struct_field_names)]
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct LatencyBudget {
     pub p50_ms: u64,
@@ -80,7 +84,7 @@ pub struct LatencyBudget {
 /// - CSS/static reload: p95 ≤ 1 s
 /// - Rust warm edit in `examples/hello`: p95 ≤ 5 s
 /// - Rust warm edit in a database-backed example: p95 ≤ 10 s
-pub fn budget_for(class: &ChangeClass) -> LatencyBudget {
+pub const fn budget_for(class: ChangeClass) -> LatencyBudget {
     match class {
         ChangeClass::InitialBoot => LatencyBudget {
             p50_ms: 10_000,
@@ -107,12 +111,7 @@ pub fn budget_for(class: &ChangeClass) -> LatencyBudget {
             p95_ms: 1_000,
             max_ms: 2_000,
         },
-        ChangeClass::ConfigEdit => LatencyBudget {
-            p50_ms: 3_000,
-            p95_ms: 8_000,
-            max_ms: 15_000,
-        },
-        ChangeClass::WatchDirEdit => LatencyBudget {
+        ChangeClass::ConfigEdit | ChangeClass::WatchDirEdit => LatencyBudget {
             p50_ms: 3_000,
             p95_ms: 8_000,
             max_ms: 15_000,
@@ -123,6 +122,8 @@ pub fn budget_for(class: &ChangeClass) -> LatencyBudget {
 // ── Statistics ───────────────────────────────────────────────────────────────
 
 /// Computed latency statistics for a set of timing samples.
+// The `_ms` suffix is the unit — suppress the struct-field-names lint.
+#[allow(clippy::struct_field_names)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct ClassStats {
     pub p50_ms: u64,
@@ -135,6 +136,7 @@ pub struct ClassStats {
 ///
 /// Uses the nearest-rank method: the k-th percentile of n samples is
 /// `sorted[ceil(k/100 * n) - 1]`. Returns all-zeros for an empty slice.
+/// Ceiling division is computed with integer arithmetic to avoid f64 casts.
 pub fn compute_stats(samples: &[u64]) -> ClassStats {
     if samples.is_empty() {
         return ClassStats {
@@ -149,14 +151,15 @@ pub fn compute_stats(samples: &[u64]) -> ClassStats {
     sorted.sort_unstable();
 
     let n = sorted.len();
-    let percentile = |p: f64| -> u64 {
-        let rank = (p / 100.0 * n as f64).ceil() as usize;
+    // Nearest-rank: ceil(p/100 * n) = (p * n).div_ceil(100).
+    let percentile = |p: usize| -> u64 {
+        let rank = (p * n).div_ceil(100);
         sorted[rank.min(n) - 1]
     };
 
     ClassStats {
-        p50_ms: percentile(50.0),
-        p95_ms: percentile(95.0),
+        p50_ms: percentile(50),
+        p95_ms: percentile(95),
         max_ms: *sorted.last().unwrap(),
         sample_count: n,
     }
@@ -174,7 +177,7 @@ pub struct BudgetCheckResult {
     pub passed: bool,
     pub p95_exceeded: bool,
     pub max_exceeded: bool,
-    /// Percentage above the p95 budget (0.0 when within budget).
+    /// Percentage above the p95 budget (0 when within budget).
     pub p95_overage_pct: f64,
     /// Human-readable diagnosis of the result.
     pub diagnosis: String,
@@ -195,13 +198,15 @@ pub fn check_budget(
     let max_exceeded = stats.max_ms > budget.max_ms;
     let passed = !p95_exceeded && !max_exceeded;
 
+    // Integer percentage: (over * 100) / budget.  Percentages fit in u32
+    // (max ~10000% for extreme cases), so the u32→f64 cast is lossless.
     let p95_overage_pct = if p95_exceeded {
-        ((stats.p95_ms as f64 - budget.p95_ms as f64) / budget.p95_ms as f64) * 100.0
+        let over = stats.p95_ms.saturating_sub(budget.p95_ms);
+        let pct = over.saturating_mul(100) / budget.p95_ms.max(1);
+        f64::from(u32::try_from(pct).unwrap_or(u32::MAX))
     } else {
         0.0
     };
-
-    let journey = class.journey_name();
 
     let (diagnosis, next_action) = if passed {
         (String::new(), String::new())
@@ -211,7 +216,7 @@ pub fn check_budget(
 
     BudgetCheckResult {
         change_class: class.key().to_string(),
-        journey_name: journey.to_string(),
+        journey_name: class.journey_name().to_string(),
         stats,
         budget: *budget,
         passed,
@@ -233,11 +238,14 @@ fn build_diagnostics(
     let mut parts = Vec::new();
 
     if p95_exceeded {
+        let over_pct = stats
+            .p95_ms
+            .saturating_sub(budget.p95_ms)
+            .saturating_mul(100)
+            / budget.p95_ms.max(1);
         parts.push(format!(
-            "p95 {}ms exceeds budget {}ms ({:.0}% over)",
-            stats.p95_ms,
-            budget.p95_ms,
-            ((stats.p95_ms as f64 - budget.p95_ms as f64) / budget.p95_ms as f64) * 100.0,
+            "p95 {}ms exceeds budget {}ms ({}% over)",
+            stats.p95_ms, budget.p95_ms, over_pct,
         ));
     }
     if max_exceeded {
@@ -308,9 +316,8 @@ pub struct FullReport {
 /// omits local file paths; the runner OS and Rust version supply enough
 /// context to interpret variance across environments.
 pub fn format_json_report(report: &FullReport) -> String {
-    serde_json::to_string_pretty(report).unwrap_or_else(|e| {
-        format!("{{\"error\": \"serialisation failed: {e}\"}}")
-    })
+    serde_json::to_string_pretty(report)
+        .unwrap_or_else(|e| format!("{{\"error\": \"serialisation failed: {e}\"}}"))
 }
 
 /// Format a `FullReport` as a human-readable summary.
@@ -320,40 +327,47 @@ pub fn format_json_report(report: &FullReport) -> String {
 pub fn format_human_summary(report: &FullReport) -> String {
     let mut out = String::new();
 
-    out.push_str(&format!(
-        "Autumn dev-loop latency report — {}\n",
+    writeln!(
+        out,
+        "Autumn dev-loop latency report — {}",
         report.timestamp_utc
-    ));
-    out.push_str(&format!(
-        "Runner: {}  Rust: {}  autumn-web: {}\n",
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "Runner: {}  Rust: {}  autumn-web: {}",
         report.runner_os, report.rust_version, report.autumn_version
-    ));
-    out.push_str(&format!("Example: {}\n", report.example_name));
+    )
+    .unwrap();
+    writeln!(out, "Example: {}", report.example_name).unwrap();
     out.push('\n');
 
     let col_w = 46usize;
-    out.push_str(&format!(
-        "{:<col_w$}  {:>8}  {:>8}  {:>8}  {}\n",
-        "Change class", "p50 ms", "p95 ms", "max ms", "Status"
-    ));
-    out.push_str(&"-".repeat(col_w + 40));
-    out.push('\n');
+    writeln!(
+        out,
+        "{:<col_w$}  {:>8}  {:>8}  {:>8}  Status",
+        "Change class", "p50 ms", "p95 ms", "max ms",
+    )
+    .unwrap();
+    writeln!(out, "{}", "-".repeat(col_w + 40)).unwrap();
 
     for r in &report.results {
         let status = if r.passed { "PASS" } else { "FAIL" };
-        out.push_str(&format!(
-            "{:<col_w$}  {:>8}  {:>8}  {:>8}  {}\n",
+        writeln!(
+            out,
+            "{:<col_w$}  {:>8}  {:>8}  {:>8}  {}",
             r.journey_name, r.stats.p50_ms, r.stats.p95_ms, r.stats.max_ms, status,
-        ));
+        )
+        .unwrap();
         if !r.passed {
-            out.push_str(&format!("  ↳ {}\n", r.diagnosis));
-            out.push_str(&format!("  ↳ Next: {}\n", r.next_action));
+            writeln!(out, "  ↳ {}", r.diagnosis).unwrap();
+            writeln!(out, "  ↳ Next: {}", r.next_action).unwrap();
         }
     }
 
     out.push('\n');
     let overall = if report.all_passed { "PASS" } else { "FAIL" };
-    out.push_str(&format!("Overall: {overall}\n"));
+    writeln!(out, "Overall: {overall}").unwrap();
 
     out
 }
@@ -378,9 +392,7 @@ pub fn run(
         return 0;
     }
 
-    eprintln!(
-        "autumn dev-loop-bench: measuring {example} ({runs} run(s) per change class)"
-    );
+    eprintln!("autumn dev-loop-bench: measuring {example} ({runs} run(s) per change class)");
     eprintln!("Note: live measurement requires `autumn dev` and a running HTTP server.");
     eprintln!("Use --dry-run to print the budget table without starting a server.\n");
 
@@ -443,7 +455,7 @@ fn print_budget_table() {
         ChangeClass::ConfigEdit,
         ChangeClass::WatchDirEdit,
     ] {
-        let b = budget_for(&class);
+        let b = budget_for(class);
         println!(
             "{:<col_w$}  {:>10}  {:>10}  {:>10}",
             class.journey_name(),
@@ -457,8 +469,8 @@ fn print_budget_table() {
 }
 
 fn build_placeholder_results(example: &str) -> Vec<BudgetCheckResult> {
-    let classes = if example.contains("todo") || example.contains("blog") {
-        vec![
+    let classes: &[ChangeClass] = if example.contains("todo") || example.contains("blog") {
+        &[
             ChangeClass::InitialBoot,
             ChangeClass::RustRouteEditDb,
             ChangeClass::CssTailwind,
@@ -467,7 +479,7 @@ fn build_placeholder_results(example: &str) -> Vec<BudgetCheckResult> {
             ChangeClass::WatchDirEdit,
         ]
     } else {
-        vec![
+        &[
             ChangeClass::InitialBoot,
             ChangeClass::RustRouteEditHello,
             ChangeClass::CssTailwind,
@@ -478,42 +490,24 @@ fn build_placeholder_results(example: &str) -> Vec<BudgetCheckResult> {
     };
 
     classes
-        .into_iter()
-        .map(|class| {
-            let budget = budget_for(&class);
-            // Placeholder: report zeros so CI can exercise the reporting path.
-            // Replace with live HTTP polling once the measurement driver lands.
-            let stats = ClassStats {
-                p50_ms: 0,
-                p95_ms: 0,
-                max_ms: 0,
-                sample_count: 0,
-            };
-            BudgetCheckResult {
-                change_class: class.key().to_string(),
-                journey_name: class.journey_name().to_string(),
-                stats,
-                budget,
-                passed: true,
-                p95_exceeded: false,
-                max_exceeded: false,
-                p95_overage_pct: 0.0,
-                diagnosis: String::new(),
-                next_action: String::new(),
-            }
+        .iter()
+        .map(|&class| {
+            let budget = budget_for(class);
+            // Placeholder: report zero samples so CI can exercise the reporting
+            // path. Replace with live HTTP polling once the measurement driver
+            // lands. compute_stats(&[]) → all-zeros → passes every budget.
+            let stats = compute_stats(&[]);
+            check_budget(class, stats, &budget)
         })
         .collect()
 }
 
 fn chrono_utc_now() -> String {
-    // Avoid pulling in chrono just for a timestamp; use a simple env approach.
-    std::env::var("AUTUMN_BENCH_TIMESTAMP")
-        .unwrap_or_else(|_| "unknown".to_string())
+    std::env::var("AUTUMN_BENCH_TIMESTAMP").unwrap_or_else(|_| "unknown".to_string())
 }
 
 fn rust_version_string() -> String {
-    std::env::var("AUTUMN_BENCH_RUST_VERSION")
-        .unwrap_or_else(|_| "unknown".to_string())
+    std::env::var("AUTUMN_BENCH_RUST_VERSION").unwrap_or_else(|_| "unknown".to_string())
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -579,22 +573,22 @@ mod tests {
 
     #[test]
     fn budget_css_tailwind_p95_is_1000ms() {
-        assert_eq!(budget_for(&ChangeClass::CssTailwind).p95_ms, 1000);
+        assert_eq!(budget_for(ChangeClass::CssTailwind).p95_ms, 1000);
     }
 
     #[test]
     fn budget_static_asset_p95_is_1000ms() {
-        assert_eq!(budget_for(&ChangeClass::StaticAsset).p95_ms, 1000);
+        assert_eq!(budget_for(ChangeClass::StaticAsset).p95_ms, 1000);
     }
 
     #[test]
     fn budget_rust_route_hello_p95_is_5000ms() {
-        assert_eq!(budget_for(&ChangeClass::RustRouteEditHello).p95_ms, 5_000);
+        assert_eq!(budget_for(ChangeClass::RustRouteEditHello).p95_ms, 5_000);
     }
 
     #[test]
     fn budget_rust_route_db_p95_is_10000ms() {
-        assert_eq!(budget_for(&ChangeClass::RustRouteEditDb).p95_ms, 10_000);
+        assert_eq!(budget_for(ChangeClass::RustRouteEditDb).p95_ms, 10_000);
     }
 
     #[test]
@@ -609,7 +603,7 @@ mod tests {
             ChangeClass::WatchDirEdit,
         ] {
             assert!(
-                budget_for(&class).p95_ms > 0,
+                budget_for(class).p95_ms > 0,
                 "p95 must be > 0 for {class:?}"
             );
         }
@@ -691,7 +685,7 @@ mod tests {
 
     #[test]
     fn check_budget_diagnosis_css_names_journey() {
-        let budget = budget_for(&ChangeClass::CssTailwind);
+        let budget = budget_for(ChangeClass::CssTailwind);
         let stats = ClassStats {
             p50_ms: 2000,
             p95_ms: 2000,
@@ -715,7 +709,7 @@ mod tests {
 
     #[test]
     fn check_budget_diagnosis_rust_hello_names_rust() {
-        let budget = budget_for(&ChangeClass::RustRouteEditHello);
+        let budget = budget_for(ChangeClass::RustRouteEditHello);
         let stats = ClassStats {
             p50_ms: 6000,
             p95_ms: 6000,
@@ -733,7 +727,7 @@ mod tests {
 
     #[test]
     fn check_budget_passing_result_has_empty_diagnosis() {
-        let budget = budget_for(&ChangeClass::CssTailwind);
+        let budget = budget_for(ChangeClass::CssTailwind);
         let stats = ClassStats {
             p50_ms: 100,
             p95_ms: 200,
@@ -792,7 +786,7 @@ mod tests {
     // ── format_json_report ────────────────────────────────────────────────
 
     fn make_test_report(all_passed: bool) -> FullReport {
-        let css_budget = budget_for(&ChangeClass::CssTailwind);
+        let css_budget = budget_for(ChangeClass::CssTailwind);
         let css_stats = if all_passed {
             ClassStats {
                 p50_ms: 200,
@@ -808,7 +802,7 @@ mod tests {
                 sample_count: 5,
             }
         };
-        let rust_budget = budget_for(&ChangeClass::RustRouteEditHello);
+        let rust_budget = budget_for(ChangeClass::RustRouteEditHello);
         let rust_stats = ClassStats {
             p50_ms: 1000,
             p95_ms: 2000,
@@ -861,8 +855,11 @@ mod tests {
         assert!(!results.is_empty(), "results must not be empty");
         let first = &results[0];
         assert!(first.get("change_class").is_some(), "missing change_class");
-        assert!(first.get("p50_ms").is_none() || first["stats"].get("p50_ms").is_some(), "missing p50_ms in stats");
         assert!(first.get("passed").is_some(), "missing passed");
+        assert!(
+            first["stats"].get("p50_ms").is_some(),
+            "missing p50_ms in stats"
+        );
     }
 
     #[test]
@@ -870,7 +867,10 @@ mod tests {
         let report = make_test_report(true);
         let s = format_json_report(&report);
         assert!(!s.contains("/home/"), "must not leak /home/ paths");
-        assert!(!s.contains("C:\\Users\\"), "must not leak Windows user paths");
+        assert!(
+            !s.contains("C:\\Users\\"),
+            "must not leak Windows user paths"
+        );
     }
 
     // ── format_human_summary ──────────────────────────────────────────────
@@ -959,7 +959,11 @@ mod tests {
         ];
         let keys: Vec<_> = classes.iter().map(|c| c.key()).collect();
         let unique: std::collections::HashSet<_> = keys.iter().copied().collect();
-        assert_eq!(keys.len(), unique.len(), "all change class keys must be unique");
+        assert_eq!(
+            keys.len(),
+            unique.len(),
+            "all change class keys must be unique"
+        );
     }
 
     #[test]
@@ -975,6 +979,10 @@ mod tests {
         ];
         let names: Vec<_> = classes.iter().map(|c| c.journey_name()).collect();
         let unique: std::collections::HashSet<_> = names.iter().copied().collect();
-        assert_eq!(names.len(), unique.len(), "all journey names must be unique");
+        assert_eq!(
+            names.len(),
+            unique.len(),
+            "all journey names must be unique"
+        );
     }
 }

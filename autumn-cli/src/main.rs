@@ -2737,13 +2737,8 @@ mod tests {
 
     #[test]
     fn parse_dev_loop_bench_output_path() {
-        let cli = Cli::try_parse_from([
-            "autumn",
-            "dev-loop-bench",
-            "--output",
-            "report.json",
-        ])
-        .unwrap();
+        let cli =
+            Cli::try_parse_from(["autumn", "dev-loop-bench", "--output", "report.json"]).unwrap();
         let Commands::DevLoopBench { output, .. } = cli.command else {
             panic!("expected dev-loop-bench");
         };
