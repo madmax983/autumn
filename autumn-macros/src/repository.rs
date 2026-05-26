@@ -13,6 +13,46 @@ use quote::{format_ident, quote};
 use syn::parse::Parser as _;
 use syn::{Ident, ItemTrait, LitStr, TraitItem};
 
+/// Parse `#[version_history(sensitive = ["col1", "col2"])]` from a trait's
+/// outer attributes. Accumulates columns from ALL `#[version_history(...)]`
+/// attributes (so columns may be split across multiple attributes).
+/// Returns a `syn::Error` if any attribute contains a typo or unsupported
+/// key, or if an array element is not a string literal — converting
+/// silently-missed sensitive columns into a hard compile error.
+fn parse_version_history_sensitive(attrs: &[syn::Attribute]) -> syn::Result<Vec<String>> {
+    let mut cols: Vec<String> = Vec::new();
+    for attr in attrs {
+        if attr.path().is_ident("version_history") {
+            attr.parse_nested_meta(|meta| {
+                if meta.path.is_ident("sensitive") {
+                    let value = meta.value()?;
+                    let arr: syn::ExprArray = value.parse()?;
+                    for elem in arr.elems {
+                        match elem {
+                            syn::Expr::Lit(syn::ExprLit {
+                                lit: syn::Lit::Str(s),
+                                ..
+                            }) => cols.push(s.value()),
+                            other => {
+                                return Err(syn::Error::new_spanned(
+                                    other,
+                                    "sensitive column names must be string literals (e.g. `sensitive = [\"my_col\"]`)",
+                                ));
+                            }
+                        }
+                    }
+                    Ok(())
+                } else {
+                    Err(meta.error(
+                        "unknown version_history key; expected `sensitive = [\"col\", ...]`",
+                    ))
+                }
+            })?;
+        }
+    }
+    Ok(cols)
+}
+
 use crate::model::infer_table_name;
 
 fn to_snake_case(name: &str) -> String {
@@ -59,6 +99,11 @@ struct RepoConfig {
     /// `_autumn_version_history`. Generates a `Model::history(id, &mut db, filter)`
     /// associated function on the repository.
     versioned: bool,
+    /// When `true`, suppress the auto-generated `impl VersionedRecord for Model`.
+    /// Use this when the model already has a hand-written `VersionedRecord`
+    /// implementation (custom serialization, non-`i64` primary key, etc.) to
+    /// avoid the duplicate-impl compile error (E0119).
+    no_versioned_record_impl: bool,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -77,6 +122,7 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
     let mut no_upsert_trait = false;
     let mut searchable = false;
     let mut versioned = false;
+    let mut no_versioned_record_impl = false;
 
     syn::meta::parser(|meta| {
         // `hooks = Ident` must be checked before the catch-all model_name case,
@@ -129,12 +175,15 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
             let value: syn::LitBool = meta.value()?.parse()?;
             versioned = value.value;
             Ok(())
+        } else if meta.path.is_ident("no_versioned_record_impl") {
+            no_versioned_record_impl = true;
+            Ok(())
         } else if meta.path.get_ident().is_some() && model_name.is_none() {
             model_name = Some(meta.path.get_ident().unwrap().clone());
             Ok(())
         } else {
             Err(meta.error(
-                "expected model name, table = \"...\", hooks = Type, commit_hooks = true, api = \"/path\", policy = Type, scope = Type, cursor_key = field, cursor_key_type = Type, soft_delete, tenant_scoped, no_upsert_trait, searchable, or versioned = true",
+                "expected model name, table = \"...\", hooks = Type, commit_hooks = true, api = \"/path\", policy = Type, scope = Type, cursor_key = field, cursor_key_type = Type, soft_delete, tenant_scoped, no_upsert_trait, searchable, versioned = true, or no_versioned_record_impl",
             ))
         }
     })
@@ -169,6 +218,7 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
         no_upsert_trait,
         searchable,
         versioned,
+        no_versioned_record_impl,
     })
 }
 
@@ -835,7 +885,15 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         // ── save (hooked) ─────────────────────────────────
         // Pre-compute version-history snippet for CREATE in commit_hooks paths.
         let vh_create_in_hooks = if config.versioned {
-            let vh = vh_insert_ts(table_name, "insert", true, &quote! { record }, None, &quote! { conn }, model_name);
+            let vh = vh_insert_ts(
+                table_name,
+                "insert",
+                true,
+                &quote! { record },
+                None,
+                &quote! { conn },
+                model_name,
+            );
             quote! { #vh }
         } else {
             quote! {}
@@ -1239,7 +1297,15 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         let draft_ext_trait = format_ident!("{}DraftExt", model_name);
         // Pre-compute version-history snippet for UPDATE in commit_hooks paths.
         let vh_update_in_hooks = if config.versioned {
-            let vh = vh_insert_ts(table_name, "update", true, &quote! { record }, Some(&quote! { __vh_before }), &quote! { conn }, model_name);
+            let vh = vh_insert_ts(
+                table_name,
+                "update",
+                true,
+                &quote! { record },
+                Some(&quote! { __vh_before }),
+                &quote! { conn },
+                model_name,
+            );
             quote! { #vh }
         } else {
             quote! {}
@@ -2001,7 +2067,15 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         // Pre-compute version-history snippets for DELETE in commit_hooks and no-hooks paths.
         let vh_delete_in_hooks = if config.versioned {
-            let vh = vh_insert_ts(table_name, "delete", true, &quote! { record }, None, &quote! { conn }, model_name);
+            let vh = vh_insert_ts(
+                table_name,
+                "delete",
+                true,
+                &quote! { record },
+                None,
+                &quote! { conn },
+                model_name,
+            );
             quote! { #vh }
         } else {
             quote! {}
@@ -3675,8 +3749,13 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         let save_body = if config.tenant_scoped && config.versioned {
             let vh_insert = vh_insert_ts(
-                table_name, "insert", false, &quote! { record }, None,
-                &quote! { conn }, model_name,
+                table_name,
+                "insert",
+                false,
+                &quote! { record },
+                None,
+                &quote! { conn },
+                model_name,
             );
             quote! {
                 use ::autumn_web::reexports::diesel::prelude::*;
@@ -3776,8 +3855,13 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         let update_body = if config.tenant_scoped && config.versioned {
             let vh_insert = vh_insert_ts(
-                table_name, "update", false, &quote! { record },
-                Some(&quote! { current }), &quote! { conn }, model_name,
+                table_name,
+                "update",
+                false,
+                &quote! { record },
+                Some(&quote! { current }),
+                &quote! { conn },
+                model_name,
             );
             quote! {
                 use ::autumn_web::reexports::diesel::prelude::*;
@@ -4089,8 +4173,13 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             };
             if config.soft_delete && config.versioned {
                 let vh_insert = vh_insert_ts(
-                    table_name, "delete", false, &quote! { record }, None,
-                    &quote! { conn }, model_name,
+                    table_name,
+                    "delete",
+                    false,
+                    &quote! { record },
+                    None,
+                    &quote! { conn },
+                    model_name,
                 );
                 quote! {
                     use ::autumn_web::reexports::diesel::prelude::*;
@@ -4164,8 +4253,13 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 }
             } else if config.versioned {
                 let vh_insert = vh_insert_ts(
-                    table_name, "delete", false, &quote! { record }, None,
-                    &quote! { conn }, model_name,
+                    table_name,
+                    "delete",
+                    false,
+                    &quote! { record },
+                    None,
+                    &quote! { conn },
+                    model_name,
                 );
                 quote! {
                     use ::autumn_web::reexports::diesel::prelude::*;
@@ -4359,8 +4453,13 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         let save_many_body = if config.tenant_scoped && config.versioned {
             let vh_r = vh_insert_ts(
-                table_name, "insert", false, &quote! { r }, None,
-                &quote! { conn }, model_name,
+                table_name,
+                "insert",
+                false,
+                &quote! { r },
+                None,
+                &quote! { conn },
+                model_name,
             );
             quote! {
                 use ::autumn_web::reexports::diesel::prelude::*;
@@ -4540,13 +4639,29 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         let save_many_skip_invalid_body = {
             let vh_skip_batch = if config.versioned {
-                let vh = vh_insert_ts(table_name, "insert", false, &quote! { r }, None, &quote! { conn }, model_name);
+                let vh = vh_insert_ts(
+                    table_name,
+                    "insert",
+                    false,
+                    &quote! { r },
+                    None,
+                    &quote! { conn },
+                    model_name,
+                );
                 quote! { for r in &results { #vh } }
             } else {
                 quote! {}
             };
             let vh_skip_row = if config.versioned {
-                let vh = vh_insert_ts(table_name, "insert", false, &quote! { model }, None, &quote! { conn }, model_name);
+                let vh = vh_insert_ts(
+                    table_name,
+                    "insert",
+                    false,
+                    &quote! { model },
+                    None,
+                    &quote! { conn },
+                    model_name,
+                );
                 quote! { #vh }
             } else {
                 quote! {}
@@ -4701,7 +4816,15 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         let update_many_body = {
             let vh_update_pair = if config.versioned {
-                let vh = vh_insert_ts(table_name, "update", false, &quote! { after_rec }, Some(&quote! { before_rec }), &quote! { conn }, model_name);
+                let vh = vh_insert_ts(
+                    table_name,
+                    "update",
+                    false,
+                    &quote! { after_rec },
+                    Some(&quote! { before_rec }),
+                    &quote! { conn },
+                    model_name,
+                );
                 quote! {
                     for after_rec in &chunk_updated {
                         if let ::core::option::Option::Some(before_rec) = __vh_before_map.get(&after_rec.id) {
@@ -4948,7 +5071,15 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 quote! {}
             };
             let vh_delete_write = if config.versioned {
-                let vh = vh_insert_ts(table_name, "delete", false, &quote! { r }, None, &quote! { conn }, model_name);
+                let vh = vh_insert_ts(
+                    table_name,
+                    "delete",
+                    false,
+                    &quote! { r },
+                    None,
+                    &quote! { conn },
+                    model_name,
+                );
                 quote! {
                     for r in &__vh_deleted_records {
                         #vh
@@ -5123,8 +5254,24 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         let upsert_many_body = {
             let vh_upsert_write = if config.versioned {
-                let vh_ins = vh_insert_ts(table_name, "insert", false, &quote! { r }, None, &quote! { conn }, model_name);
-                let vh_upd = vh_insert_ts(table_name, "update", false, &quote! { r }, Some(&quote! { before_rec }), &quote! { conn }, model_name);
+                let vh_ins = vh_insert_ts(
+                    table_name,
+                    "insert",
+                    false,
+                    &quote! { r },
+                    None,
+                    &quote! { conn },
+                    model_name,
+                );
+                let vh_upd = vh_insert_ts(
+                    table_name,
+                    "update",
+                    false,
+                    &quote! { r },
+                    Some(&quote! { before_rec }),
+                    &quote! { conn },
+                    model_name,
+                );
                 quote! {
                     // Classification is based on the pre-upsert snapshot. Under
                     // concurrent inserts of the same ID between the SELECT FOR UPDATE
@@ -7128,6 +7275,41 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let upsert_execution_ext_impl = quote! {};
     let correlate_ext_impl = quote! {};
 
+    // ── VersionedRecord impl (issue #700) ────────────────────────
+    // When versioned = true, generate `impl VersionedRecord for Model` so
+    // that the write paths (which call <Model as VersionedRecord>::…) compile.
+    let versioned_record_impl = if config.versioned && !config.no_versioned_record_impl {
+        let sensitive_cols = match parse_version_history_sensitive(&trait_def.attrs) {
+            Ok(cols) => cols,
+            Err(err) => return err.to_compile_error(),
+        };
+        let sensitive_ts = if sensitive_cols.is_empty() {
+            quote! { &[] }
+        } else {
+            let col_lits: Vec<_> = sensitive_cols.iter().map(|c| quote! { #c }).collect();
+            quote! { &[#(#col_lits),*] }
+        };
+        quote! {
+            impl ::autumn_web::version_history::VersionedRecord for #model_name {
+                fn version_table_name() -> &'static str {
+                    #table_name
+                }
+                fn version_record_id(&self) -> i64 {
+                    self.id
+                }
+                fn version_column_values(&self) -> ::autumn_web::reexports::serde_json::Value {
+                    ::autumn_web::reexports::serde_json::to_value(self)
+                        .unwrap_or(::autumn_web::reexports::serde_json::Value::Object(Default::default()))
+                }
+                fn version_sensitive_columns() -> &'static [&'static str] {
+                    #sensitive_ts
+                }
+            }
+        }
+    } else {
+        quote! {}
+    };
+
     // ── Versioned history (issue #700) ────────────────────────────
     // When versioned = true, generate a `version_history` associated
     // function on the repository struct that queries _autumn_version_history.
@@ -7508,6 +7690,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         #upsert_execution_ext_impl
 
         #correlate_ext_impl
+
+        #versioned_record_impl
 
         #versioned_history_impl
 
@@ -8475,6 +8659,157 @@ mod tests {
         assert!(
             generated.contains("version_history") || generated.contains("versioned"),
             "versioned = true must generate version-history-related code: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_versioned_generates_versioned_record_impl() {
+        let generated = repository_macro(
+            quote! { Post, versioned = true },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("VersionedRecord"),
+            "versioned = true must generate impl VersionedRecord for Post: {generated}"
+        );
+        assert!(
+            generated.contains("version_table_name"),
+            "generated VersionedRecord impl must include version_table_name: {generated}"
+        );
+        assert!(
+            generated.contains("version_sensitive_columns"),
+            "generated VersionedRecord impl must include version_sensitive_columns: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_versioned_sensitive_columns_parsed_from_attr() {
+        let generated = repository_macro(
+            quote! { Post, versioned = true },
+            quote! {
+                #[version_history(sensitive = ["password_digest", "reset_token"])]
+                pub trait PostRepository {}
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("password_digest"),
+            "sensitive columns must appear in the generated VersionedRecord impl: {generated}"
+        );
+        assert!(
+            generated.contains("reset_token"),
+            "all sensitive columns must appear in the generated VersionedRecord impl: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_versioned_sensitive_columns_merged_from_multiple_attrs() {
+        // Columns split across two #[version_history(...)] attrs must all appear.
+        let generated = repository_macro(
+            quote! { Post, versioned = true },
+            quote! {
+                #[version_history(sensitive = ["password_digest"])]
+                #[version_history(sensitive = ["api_key"])]
+                pub trait PostRepository {}
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("password_digest"),
+            "first attr sensitive columns must be present: {generated}"
+        );
+        assert!(
+            generated.contains("api_key"),
+            "second attr sensitive columns must be present: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_versioned_non_string_in_sensitive_is_compile_error() {
+        // A non-string element (e.g. a bare identifier instead of a quoted
+        // string) must produce a compile error rather than silently being
+        // skipped and leaving the column unredacted.
+        let generated = repository_macro(
+            quote! { Post, versioned = true },
+            quote! {
+                #[version_history(sensitive = [password_digest])]
+                pub trait PostRepository {}
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "non-string element in sensitive list must produce a compile error: {generated}"
+        );
+        // The compile_error must not also produce a working VersionedRecord impl
+        // (version_table_name is only present in the generated impl block).
+        assert!(
+            !generated.contains("version_table_name"),
+            "a compile-error output must not also contain a working impl: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_versioned_typo_in_sensitive_attr_is_compile_error() {
+        // A typo in the key name (e.g. "sensitve") must NOT silently compile
+        // and leave sensitive columns unredacted.  The macro must emit a
+        // compile_error token stream so the build fails with a clear message.
+        let generated = repository_macro(
+            quote! { Post, versioned = true },
+            quote! {
+                #[version_history(sensitve = ["password_digest"])]
+                pub trait PostRepository {}
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("compile_error") || generated.contains("unknown version_history"),
+            "typo in sensitive attribute must produce a compile error, not silently succeed: {generated}"
+        );
+        assert!(
+            !generated.contains("password_digest"),
+            "typo must not cause sensitive column to be silently omitted: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_no_versioned_record_impl_suppresses_generated_impl() {
+        // When a model already has a manual VersionedRecord impl, use
+        // no_versioned_record_impl to avoid the duplicate-impl (E0119) error.
+        let generated = repository_macro(
+            quote! { Post, versioned = true, no_versioned_record_impl },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        // version_table_name is only emitted inside the impl VersionedRecord for Model
+        // block; its absence proves the impl was suppressed.  VersionedRecord itself
+        // still appears in the write-path call sites, so we cannot check for that.
+        assert!(
+            !generated.contains("version_table_name"),
+            "no_versioned_record_impl must suppress the generated impl block: {generated}"
+        );
+        // The write paths and version_history query method must still be present.
+        assert!(
+            generated.contains("version_history"),
+            "version_history query method must still be generated: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_non_versioned_does_not_emit_versioned_record_impl() {
+        let generated =
+            repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
+
+        assert!(
+            !generated.contains("VersionedRecord"),
+            "non-versioned repository must not generate VersionedRecord impl: {generated}"
         );
     }
 
