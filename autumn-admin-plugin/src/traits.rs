@@ -472,9 +472,13 @@ pub trait AdminModel: Send + Sync + 'static {
     /// When `true`, the admin panel renders a **History** tab on the
     /// detail page. No route configuration is required from the app.
     ///
-    /// Override and return `true` in models registered with
-    /// `#[repository(Model, versioned = true)]`. The `#[repository]` macro
-    /// generates this override automatically.
+    /// Override and return `true` when using
+    /// `#[repository(Model, versioned = true)]`. The generated
+    /// `PgXxxRepository::version_history(record_id, filter)` method can be
+    /// called from [`get_history`](AdminModel::get_history) to bridge the
+    /// repository's history store into the admin panel. See
+    /// [`VersionedAdminBridge`] for a convenience wrapper that handles the
+    /// delegation automatically.
     fn has_history(&self) -> bool {
         false
     }
@@ -483,7 +487,9 @@ pub trait AdminModel: Send + Sync + 'static {
     ///
     /// The default implementation returns [`AdminError::Other`] so models
     /// that do not opt in get a clear error instead of a silent no-op.
-    /// Models with `versioned = true` must override this method.
+    /// Override this when `has_history` returns `true`, delegating to the
+    /// repository's generated `version_history` method or to
+    /// [`VersionedAdminBridge`].
     fn get_history<'a>(
         &'a self,
         _pool: &'a diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
@@ -498,6 +504,59 @@ pub trait AdminModel: Send + Sync + 'static {
                     .to_owned(),
             ))
         })
+    }
+}
+
+// ── VersionPage → AdminHistoryPage conversion ──────────────────────
+
+impl From<autumn_web::version_history::VersionEntry> for AdminHistoryEntry {
+    fn from(e: autumn_web::version_history::VersionEntry) -> Self {
+        Self {
+            id: e.id,
+            actor: e.actor,
+            op: e.op.to_string(),
+            request_id: e.request_id,
+            changes: e
+                .changes
+                .into_iter()
+                .map(|c| serde_json::to_value(&c).unwrap_or(serde_json::Value::Null))
+                .collect(),
+            recorded_at: e.recorded_at,
+        }
+    }
+}
+
+impl From<autumn_web::version_history::VersionPage> for AdminHistoryPage {
+    /// Convert a [`autumn_web::version_history::VersionPage`] returned by a
+    /// versioned repository's `version_history()` method into an
+    /// [`AdminHistoryPage`] for the admin panel.
+    ///
+    /// ```rust,ignore
+    /// fn get_history<'a>(
+    ///     &'a self, pool: &'a Pool<AsyncPgConnection>,
+    ///     record_id: i64, page: u64, per_page: u64,
+    /// ) -> AdminFuture<'a, AdminHistoryPage> {
+    ///     let pool = pool.clone();
+    ///     Box::pin(async move {
+    ///         let repo = PgPostRepository::from_pool(pool);
+    ///         let filter = autumn_web::VersionFilter { page, per_page, ..Default::default() };
+    ///         repo.version_history(record_id, filter).await
+    ///             .map(AdminHistoryPage::from)
+    ///             .map_err(|e| AdminError::Database(e.to_string()))
+    ///     })
+    /// }
+    /// ```
+    fn from(vp: autumn_web::version_history::VersionPage) -> Self {
+        Self {
+            entries: vp
+                .entries
+                .into_iter()
+                .map(AdminHistoryEntry::from)
+                .collect(),
+            total: vp.total,
+            page: vp.page,
+            per_page: vp.per_page,
+        }
     }
 }
 
@@ -1186,7 +1245,10 @@ mod tests {
     #[test]
     fn admin_field_hide_from_list_sets_list_display_false() {
         let field = AdminField::new("internal_token", AdminFieldKind::Text).hide_from_list();
-        assert!(!field.list_display, "hide_from_list() must set list_display = false");
+        assert!(
+            !field.list_display,
+            "hide_from_list() must set list_display = false"
+        );
     }
 
     #[test]
@@ -1216,5 +1278,68 @@ mod tests {
             fail_on: None,
         };
         assert_eq!(model.per_page(), 25);
+    }
+
+    #[test]
+    fn version_page_converts_to_admin_history_page() {
+        use autumn_web::version_history::{ColumnChange, VersionEntry, VersionOp, VersionPage};
+        use chrono::Utc;
+
+        let entry = VersionEntry {
+            id: 1,
+            table_name: "posts".to_owned(),
+            record_id: 42,
+            op: VersionOp::Update,
+            actor: "admin".to_owned(),
+            request_id: Some("req-1".to_owned()),
+            changes: vec![ColumnChange::new(
+                "title",
+                Some(serde_json::json!("old")),
+                Some(serde_json::json!("new")),
+            )],
+            recorded_at: Utc::now(),
+        };
+        let vp = VersionPage {
+            entries: vec![entry],
+            total: 1,
+            page: 1,
+            per_page: 25,
+        };
+
+        let ap = AdminHistoryPage::from(vp);
+        assert_eq!(ap.total, 1);
+        assert_eq!(ap.page, 1);
+        assert_eq!(ap.per_page, 25);
+        assert_eq!(ap.entries.len(), 1);
+        let e = &ap.entries[0];
+        assert_eq!(e.id, 1);
+        assert_eq!(e.actor, "admin");
+        assert_eq!(e.op, "update");
+        assert_eq!(e.request_id.as_deref(), Some("req-1"));
+        assert_eq!(e.changes.len(), 1);
+    }
+
+    #[test]
+    fn version_entry_converts_to_admin_history_entry() {
+        use autumn_web::version_history::{ColumnChange, VersionEntry, VersionOp};
+        use chrono::Utc;
+
+        let entry = VersionEntry {
+            id: 7,
+            table_name: "users".to_owned(),
+            record_id: 3,
+            op: VersionOp::Delete,
+            actor: "system".to_owned(),
+            request_id: None,
+            changes: vec![ColumnChange::sensitive("password_digest")],
+            recorded_at: Utc::now(),
+        };
+
+        let admin_entry = AdminHistoryEntry::from(entry);
+        assert_eq!(admin_entry.id, 7);
+        assert_eq!(admin_entry.actor, "system");
+        assert_eq!(admin_entry.op, "delete");
+        assert!(admin_entry.request_id.is_none());
+        assert_eq!(admin_entry.changes.len(), 1);
     }
 }
