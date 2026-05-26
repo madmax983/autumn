@@ -547,7 +547,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     }
 
-    // ΓöÇΓöÇ Build struct fields, extractor init, and CRUD bodies ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+    // ── Build struct fields, extractor init, and CRUD bodies ──────────────
     //
     // When `hooks_type` is present, the struct gains a `hooks` field,
     // the extractor initialises it with `Default::default()`, and the
@@ -635,7 +635,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         delete_many_body,
         upsert_many_body,
     ) = if let Some(ref hooks_ident) = config.hooks_type {
-        // ΓöÇΓöÇ Struct fields with hooks ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+        // ── Struct fields with hooks ───────────────────────
         let idempotency_struct_field = if commit_hooks_enabled {
             quote! {
                 idempotency: ::core::option::Option<::autumn_web::idempotency::IdempotencyContext>,
@@ -831,8 +831,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             quote! {}
         };
 
-        // ΓöÇΓöÇ save (hooked) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
-        // ΓöÇΓöÇ save (hooked) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+        // ── save (hooked) ─────────────────────────────────
+        // ── save (hooked) ─────────────────────────────────
         // Pre-compute version-history snippet for CREATE in commit_hooks paths.
         let vh_create_in_hooks = if config.versioned {
             let vh = vh_insert_ts(table_name, "insert", true, &quote! { record }, None, &quote! { conn }, model_name);
@@ -1235,7 +1235,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         };
 
-        // ΓöÇΓöÇ update (hooked) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+        // ── update (hooked) ───────────────────────────────
         let draft_ext_trait = format_ident!("{}DraftExt", model_name);
         // Pre-compute version-history snippet for UPDATE in commit_hooks paths.
         let vh_update_in_hooks = if config.versioned {
@@ -1963,7 +1963,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         };
 
-        // ΓöÇΓöÇ delete (hooked) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+        // ── delete (hooked) ───────────────────────────────
         //
         // The core mutation differs for soft-delete repositories:
         // - hard delete: `DELETE FROM table WHERE id = $1`
@@ -3615,7 +3615,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             upsert_many_body,
         )
     } else {
-        // ΓöÇΓöÇ No hooks: existing zero-cost path ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+        // ── No hooks: existing zero-cost path ─────────────
 
         let struct_fields = quote! {
             pool: ::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Pool<
@@ -4974,7 +4974,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {}
     };
 
-    // ΓöÇΓöÇ Pagination methods (`page` always; `cursor_page` when cursor_key is declared) ΓöÇΓöÇ
+    // ── Pagination methods (`page` always; `cursor_page` when cursor_key is declared) ──
     //
     // `page` executes a COUNT(*) + a LIMIT/OFFSET query and wraps the result in
     // `Page<Model>`. `cursor_page` uses keyset pagination on the primary key `id`
@@ -5246,7 +5246,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {}
     };
 
-    // ΓöÇΓöÇ Build API handlers (when `api = "/path"` is present) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+    // ── Build API handlers (when `api = "/path"` is present) ────────────
     let api_handlers = if let Some(ref api_path) = config.api_path {
         let prefix = to_snake_case(&model_name.to_string());
 
@@ -5764,7 +5764,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         };
 
         quote! {
-            // ΓöÇΓöÇ Auto-generated REST API handlers ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+            // ── Auto-generated REST API handlers ─────────────────
 
             #policy_type_assertion
             #scope_type_assertion
@@ -5996,7 +5996,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 }
             }
 
-            // ΓöÇΓöÇ Path helpers for API routes ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+            // ── Path helpers for API routes ───────────────────────
 
             #[doc(hidden)]
             #vis fn #list_path_fn() -> ::std::string::String {
@@ -7556,7 +7556,7 @@ mod tests {
         assert_eq!(to_snake_case("widget"), "widget");
     }
 
-    // ΓöÇΓöÇ Pagination method generation (issue #681) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+    // ── Pagination method generation (issue #681) ──────────────────
 
     #[test]
     fn parse_repo_args_with_cursor_key() {
@@ -7693,7 +7693,7 @@ mod tests {
         );
     }
 
-    // ΓöÇΓöÇ Soft-delete generation (issue #689) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+    // ── Soft-delete generation (issue #689) ───────────────────────
 
     #[test]
     fn parse_repo_args_recognizes_soft_delete_flag() {
@@ -8019,7 +8019,7 @@ mod tests {
         );
     }
 
-    // ΓöÇΓöÇ Tenant Scoped generation (issue #695) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+    // ── Tenant Scoped generation (issue #695) ───────────────────
 
     #[test]
     fn parse_repo_args_recognizes_tenant_scoped_flag() {
