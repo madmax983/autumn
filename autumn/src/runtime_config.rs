@@ -132,16 +132,12 @@ impl ConfigValue {
                 .trim()
                 .parse::<i64>()
                 .map(ConfigValue::Int)
-                .map_err(|_| {
-                    format!("expected {}, got '{raw}'", ConfigValueType::Int.as_str())
-                }),
+                .map_err(|_| format!("expected {}, got '{raw}'", ConfigValueType::Int.as_str())),
             ConfigValueType::Float => raw
                 .trim()
                 .parse::<f64>()
                 .map(ConfigValue::Float)
-                .map_err(|_| {
-                    format!("expected {}, got '{raw}'", ConfigValueType::Float.as_str())
-                }),
+                .map_err(|_| format!("expected {}, got '{raw}'", ConfigValueType::Float.as_str())),
             ConfigValueType::Text => Ok(Self::Text(raw.to_owned())),
             ConfigValueType::Bool => match raw.trim().to_lowercase().as_str() {
                 "true" | "yes" | "1" | "on" => Ok(Self::Bool(true)),
@@ -160,14 +156,16 @@ impl ConfigValue {
                         ConfigValueType::DurationSecs.as_str()
                     )
                 }),
-            ConfigValueType::Json => serde_json::from_str(raw)
-                .map(ConfigValue::Json)
-                .map_err(|e| {
-                    format!(
-                        "expected {}, got '{raw}': {e}",
-                        ConfigValueType::Json.as_str()
-                    )
-                }),
+            ConfigValueType::Json => {
+                serde_json::from_str(raw)
+                    .map(ConfigValue::Json)
+                    .map_err(|e| {
+                        format!(
+                            "expected {}, got '{raw}': {e}",
+                            ConfigValueType::Json.as_str()
+                        )
+                    })
+            }
         }
     }
 
@@ -187,44 +185,67 @@ impl ConfigValue {
     /// Returns the inner `i64` if this is [`ConfigValue::Int`].
     #[must_use]
     pub const fn as_int(&self) -> Option<i64> {
-        if let Self::Int(v) = self { Some(*v) } else { None }
+        if let Self::Int(v) = self {
+            Some(*v)
+        } else {
+            None
+        }
     }
 
     /// Returns the inner `f64` if this is [`ConfigValue::Float`].
     #[must_use]
     pub const fn as_float(&self) -> Option<f64> {
-        if let Self::Float(v) = self { Some(*v) } else { None }
+        if let Self::Float(v) = self {
+            Some(*v)
+        } else {
+            None
+        }
     }
 
     /// Returns the inner `&str` if this is [`ConfigValue::Text`].
     #[must_use]
     pub const fn as_text(&self) -> Option<&str> {
-        if let Self::Text(v) = self { Some(v.as_str()) } else { None }
+        if let Self::Text(v) = self {
+            Some(v.as_str())
+        } else {
+            None
+        }
     }
 
     /// Returns the inner `bool` if this is [`ConfigValue::Bool`].
     #[must_use]
     pub const fn as_bool(&self) -> Option<bool> {
-        if let Self::Bool(v) = self { Some(*v) } else { None }
+        if let Self::Bool(v) = self {
+            Some(*v)
+        } else {
+            None
+        }
     }
 
     /// Returns the duration in seconds if this is [`ConfigValue::DurationSecs`].
     #[must_use]
     pub const fn as_duration_secs(&self) -> Option<u64> {
-        if let Self::DurationSecs(v) = self { Some(*v) } else { None }
+        if let Self::DurationSecs(v) = self {
+            Some(*v)
+        } else {
+            None
+        }
     }
 
     /// Returns the `std::time::Duration` if this is [`ConfigValue::DurationSecs`].
     #[must_use]
     pub fn as_duration(&self) -> Option<std::time::Duration> {
-        self.as_duration_secs()
-            .map(std::time::Duration::from_secs)
+        self.as_duration_secs().map(std::time::Duration::from_secs)
     }
 
     /// Returns the inner [`serde_json::Value`] if this is [`ConfigValue::Json`].
     #[must_use]
     pub const fn as_json(&self) -> Option<&serde_json::Value> {
-        if let Self::Json(v) = self { Some(v) } else { None }
+        if let Self::Json(v) = self {
+            Some(v)
+        } else {
+            None
+        }
     }
 }
 
@@ -277,10 +298,14 @@ impl ConfigValidator {
                 let n = value
                     .as_int()
                     .ok_or_else(|| "IntRange validator applied to non-integer value".to_owned())?;
-                if let Some(lo) = min && n < *lo {
+                if let Some(lo) = min
+                    && n < *lo
+                {
                     return Err(format!("value {n} is below minimum {lo}"));
                 }
-                if let Some(hi) = max && n > *hi {
+                if let Some(hi) = max
+                    && n > *hi
+                {
                     return Err(format!("value {n} exceeds maximum {hi}"));
                 }
                 Ok(())
@@ -289,18 +314,22 @@ impl ConfigValidator {
                 let v = value
                     .as_float()
                     .ok_or_else(|| "FloatRange validator applied to non-float value".to_owned())?;
-                if let Some(lo) = min && v < *lo {
+                if let Some(lo) = min
+                    && v < *lo
+                {
                     return Err(format!("value {v} is below minimum {lo}"));
                 }
-                if let Some(hi) = max && v > *hi {
+                if let Some(hi) = max
+                    && v > *hi
+                {
                     return Err(format!("value {v} exceeds maximum {hi}"));
                 }
                 Ok(())
             }
             Self::AllowedValues(allowed) => {
-                let s = value
-                    .as_text()
-                    .ok_or_else(|| "AllowedValues validator applied to non-text value".to_owned())?;
+                let s = value.as_text().ok_or_else(|| {
+                    "AllowedValues validator applied to non-text value".to_owned()
+                })?;
                 if allowed.iter().any(|a| a == s) {
                     Ok(())
                 } else {
@@ -534,9 +563,9 @@ impl ConfigKeySchema {
             ));
         }
         for validator in &self.validators {
-            validator.validate(value).map_err(|reason| {
-                format!("key '{}': validation failed — {reason}", self.name)
-            })?;
+            validator
+                .validate(value)
+                .map_err(|reason| format!("key '{}': validation failed — {reason}", self.name))?;
         }
         Ok(())
     }
@@ -765,10 +794,7 @@ impl ConfigStore for InMemoryConfigStore {
         let old_value = old_raw.map(ConfigValue::Text);
         let new_value = Some(ConfigValue::Text(new_raw.clone()));
         let record = ConfigChangeRecord::now(key, old_value, new_value, actor);
-        self.values
-            .write()
-            .unwrap()
-            .insert(key.to_owned(), new_raw);
+        self.values.write().unwrap().insert(key.to_owned(), new_raw);
         self.history
             .write()
             .unwrap()
@@ -812,14 +838,7 @@ impl ConfigStore for InMemoryConfigStore {
         let guard = self.history.read().unwrap();
         guard
             .get(key)
-            .map(|records| {
-                records
-                    .iter()
-                    .rev()
-                    .take(limit)
-                    .cloned()
-                    .collect()
-            })
+            .map(|records| records.iter().rev().take(limit).cloned().collect())
             .unwrap_or_default()
     }
 }
@@ -928,24 +947,22 @@ impl RuntimeConfigService {
             .get(key)
             .ok_or_else(|| ConfigError::UnknownKey(key.to_owned()))?;
 
-        let typed =
-            ConfigValue::parse_as(raw_value, schema.value_type).map_err(|reason| {
-                ConfigError::TypeMismatch {
-                    key: key.to_owned(),
-                    reason,
-                }
-            })?;
-
-        schema.validate(&typed).map_err(|reason| {
-            ConfigError::ValidationFailed {
+        let typed = ConfigValue::parse_as(raw_value, schema.value_type).map_err(|reason| {
+            ConfigError::TypeMismatch {
                 key: key.to_owned(),
                 reason,
             }
         })?;
 
+        schema
+            .validate(&typed)
+            .map_err(|reason| ConfigError::ValidationFailed {
+                key: key.to_owned(),
+                reason,
+            })?;
+
         let old_raw = self.store.get_raw(key);
-        self.store
-            .set_raw(key, old_raw, typed.to_raw(), actor)?;
+        self.store.set_raw(key, old_raw, typed.to_raw(), actor)?;
         Ok(())
     }
 
@@ -970,11 +987,7 @@ impl RuntimeConfigService {
     /// schema default as `current`.
     #[must_use]
     pub fn list(&self) -> Vec<ConfigEntry> {
-        let overrides: HashMap<String, String> = self
-            .store
-            .list_overrides()
-            .into_iter()
-            .collect();
+        let overrides: HashMap<String, String> = self.store.list_overrides().into_iter().collect();
 
         let mut entries: Vec<ConfigEntry> = self
             .registry
@@ -1176,10 +1189,7 @@ mod tests {
     #[test]
     fn parse_json_from_valid_json_string() {
         let v = ConfigValue::parse_as(r#"{"key":"val"}"#, ConfigValueType::Json).unwrap();
-        assert_eq!(
-            v,
-            ConfigValue::Json(serde_json::json!({"key": "val"}))
-        );
+        assert_eq!(v, ConfigValue::Json(serde_json::json!({"key": "val"})));
     }
 
     #[test]
@@ -1207,10 +1217,7 @@ mod tests {
 
     #[test]
     fn as_text_returns_some_for_text() {
-        assert_eq!(
-            ConfigValue::Text("hi".to_owned()).as_text(),
-            Some("hi")
-        );
+        assert_eq!(ConfigValue::Text("hi".to_owned()).as_text(), Some("hi"));
     }
 
     #[test]
@@ -1223,7 +1230,10 @@ mod tests {
     fn to_raw_round_trips_int() {
         let v = ConfigValue::Int(99);
         let raw = v.to_raw();
-        assert_eq!(ConfigValue::parse_as(&raw, ConfigValueType::Int).unwrap(), v);
+        assert_eq!(
+            ConfigValue::parse_as(&raw, ConfigValueType::Int).unwrap(),
+            v
+        );
     }
 
     #[test]
@@ -1311,9 +1321,7 @@ mod tests {
     #[test]
     fn allowed_values_rejects_non_matching_value() {
         let v = ConfigValidator::AllowedValues(vec!["a".to_owned(), "b".to_owned()]);
-        let err = v
-            .validate(&ConfigValue::Text("c".to_owned()))
-            .unwrap_err();
+        let err = v.validate(&ConfigValue::Text("c".to_owned())).unwrap_err();
         assert!(
             err.contains("not an allowed value"),
             "should mention not allowed: {err}"
@@ -1443,7 +1451,11 @@ mod tests {
     fn registry_rejects_empty_key_name() {
         let mut r = ConfigRegistry::new();
         let err = r
-            .define(ConfigKeySchema::new("", ConfigValueType::Int, ConfigValue::Int(0)))
+            .define(ConfigKeySchema::new(
+                "",
+                ConfigValueType::Int,
+                ConfigValue::Int(0),
+            ))
             .unwrap_err();
         assert!(matches!(err, RegistryError::InvalidKeyName(_)));
     }
@@ -1491,7 +1503,9 @@ mod tests {
         store
             .set_raw("key", None, "hello".to_owned(), None)
             .unwrap();
-        store.unset_raw("key", Some("hello".to_owned()), None).unwrap();
+        store
+            .unset_raw("key", Some("hello".to_owned()), None)
+            .unwrap();
         assert!(store.get_raw("key").is_none());
     }
 
@@ -1509,7 +1523,9 @@ mod tests {
     #[test]
     fn in_memory_store_history_records_changes() {
         let store = InMemoryConfigStore::new();
-        store.set_raw("key", None, "10".to_owned(), Some("alice")).unwrap();
+        store
+            .set_raw("key", None, "10".to_owned(), Some("alice"))
+            .unwrap();
         store
             .set_raw("key", Some("10".to_owned()), "20".to_owned(), Some("bob"))
             .unwrap();
@@ -1595,10 +1611,8 @@ mod tests {
                     }),
             )
             .unwrap();
-        let svc = RuntimeConfigService::new(
-            Arc::new(registry),
-            Arc::new(InMemoryConfigStore::new()),
-        );
+        let svc =
+            RuntimeConfigService::new(Arc::new(registry), Arc::new(InMemoryConfigStore::new()));
         let err = svc.set("threads", "0", None).unwrap_err();
         assert!(
             matches!(err, ConfigError::ValidationFailed { .. }),
@@ -1720,10 +1734,8 @@ mod tests {
                 ConfigValue::Json(serde_json::Value::Null),
             ))
             .unwrap();
-        let svc = RuntimeConfigService::new(
-            Arc::new(registry),
-            Arc::new(InMemoryConfigStore::new()),
-        );
+        let svc =
+            RuntimeConfigService::new(Arc::new(registry), Arc::new(InMemoryConfigStore::new()));
         svc.set("i", "7", None).unwrap();
         svc.set("f", "1.5", None).unwrap();
         svc.set("t", "hello", None).unwrap();
@@ -1754,10 +1766,8 @@ mod tests {
                     }),
             )
             .unwrap();
-        let svc = RuntimeConfigService::new(
-            Arc::new(registry),
-            Arc::new(InMemoryConfigStore::new()),
-        );
+        let svc =
+            RuntimeConfigService::new(Arc::new(registry), Arc::new(InMemoryConfigStore::new()));
         svc.set("retries", "5", None).unwrap();
         assert_eq!(svc.get("retries").unwrap(), ConfigValue::Int(5));
         // Failing write should not change the stored value.

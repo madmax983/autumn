@@ -181,7 +181,13 @@ async fn main() {
         .expect("SVC initialised once");
 
     autumn_web::app()
-        .routes(routes![index, list_config, get_config, set_config, unset_config])
+        .routes(routes![
+            index,
+            list_config,
+            get_config,
+            set_config,
+            unset_config
+        ])
         .run()
         .await;
 }
@@ -228,7 +234,10 @@ mod tests {
         assert!(svc.set("rate_limit_rps", "0.0", None).is_err());
         assert!(svc.set("rate_limit_rps", "99999.0", None).is_err());
         // Value unchanged after rejected writes
-        assert_eq!(svc.get("rate_limit_rps").unwrap(), ConfigValue::Float(100.0));
+        assert_eq!(
+            svc.get("rate_limit_rps").unwrap(),
+            ConfigValue::Float(100.0)
+        );
     }
 
     #[test]

@@ -101,7 +101,11 @@ pub fn run_set(opts: &SetOptions) {
         &[("key", &opts.key), ("value", &opts.value), ("actor", actor)],
     );
 
-    eprintln!("\u{2713} Set '{key}' = '{value}'", key = opts.key, value = opts.value);
+    eprintln!(
+        "\u{2713} Set '{key}' = '{value}'",
+        key = opts.key,
+        value = opts.value
+    );
 }
 
 /// Run `autumn config unset <key>`.
@@ -119,7 +123,10 @@ pub fn run_unset(opts: &UnsetOptions) {
         COMMIT;";
 
     run_psql_with_vars_or_die(&url, sql, &[("key", &opts.key), ("actor", actor)]);
-    eprintln!("\u{2713} Unset '{key}' (reverted to compile-time default)", key = opts.key);
+    eprintln!(
+        "\u{2713} Unset '{key}' (reverted to compile-time default)",
+        key = opts.key
+    );
 }
 
 /// Run `autumn config history <key>`.
@@ -209,9 +216,7 @@ fn check_psql() {
         }
         _ => {
             eprintln!("\u{2717} psql not found on PATH.");
-            eprintln!(
-                "  Install PostgreSQL client tools (e.g. `apt install postgresql-client`)."
-            );
+            eprintln!("  Install PostgreSQL client tools (e.g. `apt install postgresql-client`).");
             std::process::exit(1);
         }
     }

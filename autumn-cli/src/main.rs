@@ -2842,7 +2842,10 @@ mod tests {
     #[test]
     fn parse_config_list() {
         let cli = Cli::try_parse_from(["autumn", "config", "list"]).unwrap();
-        assert!(matches!(cli.command, Commands::Config(ConfigCommands::List)));
+        assert!(matches!(
+            cli.command,
+            Commands::Config(ConfigCommands::List)
+        ));
     }
 
     #[test]
@@ -2861,8 +2864,7 @@ mod tests {
 
     #[test]
     fn parse_config_set() {
-        let cli =
-            Cli::try_parse_from(["autumn", "config", "set", "max_upload_mb", "200"]).unwrap();
+        let cli = Cli::try_parse_from(["autumn", "config", "set", "max_upload_mb", "200"]).unwrap();
         let Commands::Config(ConfigCommands::Set { key, value, actor }) = cli.command else {
             panic!("expected config set");
         };

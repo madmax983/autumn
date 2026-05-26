@@ -5,10 +5,10 @@
 //! color palette, clean cards with subtle shadows.
 
 use autumn_web::flash::FlashMessage;
-use autumn_web::runtime_config::{ConfigChangeRecord, ConfigEntry};
 use autumn_web::job::{
     JobAdminPage, JobAdminRecord, JobAdminSnapshot, JobAdminStatus, JobScheduleSummary,
 };
+use autumn_web::runtime_config::{ConfigChangeRecord, ConfigEntry};
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 use serde_json::Value;
 
@@ -1442,8 +1442,10 @@ pub fn config_history_page(
 fn format_timestamp(ts: u64) -> String {
     use chrono::{DateTime, Utc};
     let secs = i64::try_from(ts).unwrap_or(i64::MAX);
-    DateTime::from_timestamp(secs, 0)
-        .map_or_else(|| ts.to_string(), |dt: DateTime<Utc>| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+    DateTime::from_timestamp(secs, 0).map_or_else(
+        || ts.to_string(),
+        |dt: DateTime<Utc>| dt.format("%Y-%m-%d %H:%M:%S").to_string(),
+    )
 }
 
 // ── Rendering helpers ───────────────────────────────────────────────
