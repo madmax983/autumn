@@ -2775,4 +2775,214 @@ mod tests {
             "",
         );
     }
+
+    // ── Runtime config page tests ────────────────────────────────────────────
+
+    #[test]
+    fn config_page_empty_shows_no_keys_registered_message() {
+        let r = dummy_registry();
+        let html = config_page(&r, &[], &[], "tok", "_csrf", "/admin", "/actuator").into_string();
+        assert!(
+            html.contains("No config keys have been registered"),
+            "empty state message missing: {html}"
+        );
+        assert!(
+            html.contains("Runtime Config"),
+            "page title missing: {html}"
+        );
+    }
+
+    #[test]
+    fn config_page_renders_key_name_type_and_value() {
+        use autumn_web::runtime_config::{ConfigEntry, ConfigValue, ConfigValueType};
+
+        let r = dummy_registry();
+        let entries = vec![ConfigEntry {
+            name: "max_upload_mb".to_owned(),
+            value_type: ConfigValueType::Int,
+            current: ConfigValue::Int(50),
+            default: ConfigValue::Int(50),
+            is_overridden: false,
+            description: Some("Max upload in MB".to_owned()),
+        }];
+        let html =
+            config_page(&r, &entries, &[], "tok", "_csrf", "/admin", "/actuator").into_string();
+        assert!(html.contains("max_upload_mb"), "key name missing: {html}");
+        assert!(
+            html.contains("Max upload in MB"),
+            "description missing: {html}"
+        );
+        assert!(
+            html.contains(r#"action="/admin/config/max_upload_mb/set""#),
+            "set form action missing: {html}"
+        );
+        assert!(
+            html.contains(r#"href="/admin/config/max_upload_mb/history""#),
+            "history link missing: {html}"
+        );
+    }
+
+    #[test]
+    fn config_page_overridden_key_shows_unset_form() {
+        use autumn_web::runtime_config::{ConfigEntry, ConfigValue, ConfigValueType};
+
+        let r = dummy_registry();
+        let entries = vec![ConfigEntry {
+            name: "rate_limit".to_owned(),
+            value_type: ConfigValueType::Int,
+            current: ConfigValue::Int(200),
+            default: ConfigValue::Int(100),
+            is_overridden: true,
+            description: None,
+        }];
+        let html =
+            config_page(&r, &entries, &[], "tok", "_csrf", "/admin", "/actuator").into_string();
+        assert!(
+            html.contains(r#"action="/admin/config/rate_limit/unset""#),
+            "unset form should appear for overridden key: {html}"
+        );
+    }
+
+    #[test]
+    fn config_page_shows_overridden_status() {
+        use autumn_web::runtime_config::{ConfigEntry, ConfigValue, ConfigValueType};
+
+        let r = dummy_registry();
+        let entries = vec![ConfigEntry {
+            name: "rate_limit".to_owned(),
+            value_type: ConfigValueType::Int,
+            current: ConfigValue::Int(200),
+            default: ConfigValue::Int(100),
+            is_overridden: true,
+            description: None,
+        }];
+        let html =
+            config_page(&r, &entries, &[], "tok", "_csrf", "/admin", "/actuator").into_string();
+        assert!(
+            html.to_lowercase().contains("overridden"),
+            "overridden status missing: {html}"
+        );
+    }
+
+    #[test]
+    fn config_page_shows_default_status_for_unoverridden_key() {
+        use autumn_web::runtime_config::{ConfigEntry, ConfigValue, ConfigValueType};
+
+        let r = dummy_registry();
+        let entries = vec![ConfigEntry {
+            name: "feature_flag".to_owned(),
+            value_type: ConfigValueType::Bool,
+            current: ConfigValue::Bool(false),
+            default: ConfigValue::Bool(false),
+            is_overridden: false,
+            description: None,
+        }];
+        let html =
+            config_page(&r, &entries, &[], "tok", "_csrf", "/admin", "/actuator").into_string();
+        assert!(
+            html.to_lowercase().contains("default"),
+            "default status missing: {html}"
+        );
+    }
+
+    #[test]
+    fn config_page_embeds_csrf_token_in_forms() {
+        use autumn_web::runtime_config::{ConfigEntry, ConfigValue, ConfigValueType};
+
+        let r = dummy_registry();
+        let entries = vec![ConfigEntry {
+            name: "timeout_secs".to_owned(),
+            value_type: ConfigValueType::Int,
+            current: ConfigValue::Int(30),
+            default: ConfigValue::Int(30),
+            is_overridden: false,
+            description: None,
+        }];
+        let html = config_page(
+            &r,
+            &entries,
+            &[],
+            "csrf-tok-789",
+            "authenticity_token",
+            "/admin",
+            "/actuator",
+        )
+        .into_string();
+        assert!(
+            html.contains(r#"name="authenticity_token" value="csrf-tok-789""#),
+            "CSRF token not embedded in config forms: {html}"
+        );
+    }
+
+    #[test]
+    fn config_history_page_shows_empty_state() {
+        let r = dummy_registry();
+        let html = config_history_page(&r, "rate_limit", &[], &[], "tok", "/admin", "/actuator")
+            .into_string();
+        assert!(
+            html.contains("No changes recorded"),
+            "empty history message missing: {html}"
+        );
+        assert!(html.contains("rate_limit"), "key name missing: {html}");
+    }
+
+    #[test]
+    fn config_history_page_renders_change_records() {
+        use autumn_web::runtime_config::{ConfigChangeRecord, ConfigValue};
+
+        let r = dummy_registry();
+        let history = vec![ConfigChangeRecord {
+            key: "rate_limit".to_owned(),
+            old_value: Some(ConfigValue::Int(100)),
+            new_value: Some(ConfigValue::Int(200)),
+            actor: Some("ops@example.com".to_owned()),
+            timestamp_secs: 1_700_000_000,
+        }];
+        let html = config_history_page(
+            &r,
+            "rate_limit",
+            &history,
+            &[],
+            "tok",
+            "/admin",
+            "/actuator",
+        )
+        .into_string();
+        assert!(html.contains("rate_limit"), "key name missing: {html}");
+        assert!(html.contains("ops@example.com"), "actor missing: {html}");
+        assert!(html.contains("100"), "old value missing: {html}");
+        assert!(html.contains("200"), "new value missing: {html}");
+    }
+
+    #[test]
+    fn config_history_page_handles_unset_record() {
+        use autumn_web::runtime_config::{ConfigChangeRecord, ConfigValue};
+
+        let r = dummy_registry();
+        let history = vec![ConfigChangeRecord {
+            key: "flag".to_owned(),
+            old_value: Some(ConfigValue::Bool(true)),
+            new_value: None,
+            actor: None,
+            timestamp_secs: 0,
+        }];
+        let html = config_history_page(&r, "flag", &history, &[], "tok", "/admin", "/actuator")
+            .into_string();
+        assert!(html.contains("flag"), "key name missing: {html}");
+        // The null actor should render as a dash placeholder.
+        assert!(html.contains("—"), "null actor placeholder missing: {html}");
+    }
+
+    #[test]
+    fn format_timestamp_formats_unix_epoch() {
+        let s = format_timestamp(0);
+        assert!(s.contains("1970"), "epoch should format as 1970: {s}");
+    }
+
+    #[test]
+    fn format_timestamp_formats_known_instant() {
+        // 2023-11-14 22:13:20 UTC
+        let s = format_timestamp(1_700_000_000);
+        assert!(s.contains("2023"), "expected 2023 in formatted output: {s}");
+    }
 }
