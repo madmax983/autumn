@@ -302,6 +302,12 @@ impl WebhookOutboundManager {
         topic: &str,
         payload: &T,
     ) -> AutumnResult<()> {
+        let keys = {
+            let guard = state.extensions.read().unwrap();
+            guard.keys().cloned().collect::<Vec<_>>()
+        };
+        tracing::info!("WebhookOutboundManager::dispatch: state extensions: {:?}", keys);
+
         let serialized = serde_json::to_string(payload).map_err(|e| {
             AutumnError::internal_server_error_msg(format!("failed to serialize payload: {e}"))
         })?;
