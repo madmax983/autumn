@@ -115,4 +115,11 @@ pub enum MarkdownError {
         /// The problematic file name.
         name: String,
     },
+
+    /// Two pages share the same slug in the registry.
+    #[error("duplicate slug '{slug}' in registry")]
+    DuplicateSlug {
+        /// The slug that appeared more than once.
+        slug: String,
+    },
 }

@@ -22,13 +22,21 @@ impl MarkdownRegistry {
     /// # Errors
     ///
     /// Returns [`MarkdownError::FrontmatterMissing`] or
-    /// [`MarkdownError::FrontmatterInvalid`] if any source cannot be parsed.
+    /// [`MarkdownError::FrontmatterInvalid`] if any source cannot be parsed,
+    /// or [`MarkdownError::DuplicateSlug`] if two sources share a slug.
     pub fn from_embedded(sources: &[MarkdownSource]) -> Result<Self, MarkdownError> {
         let mut pages = indexmap::IndexMap::new();
         for source in sources {
             let page = parse_page(source.slug.to_owned(), source.content)?;
-            pages.insert(page.slug.clone(), page);
+            if pages.insert(page.slug.clone(), page).is_some() {
+                return Err(MarkdownError::DuplicateSlug {
+                    slug: source.slug.to_owned(),
+                });
+            }
         }
+        pages.sort_by(|_, a, _, b| {
+            (a.frontmatter.order, a.slug.as_str()).cmp(&(b.frontmatter.order, b.slug.as_str()))
+        });
         Ok(Self { pages })
     }
 
@@ -36,12 +44,13 @@ impl MarkdownRegistry {
     ///
     /// The slug for each page is derived from the file stem
     /// (e.g. `getting-started.md` → `"getting-started"`).
-    /// Files that are not `.md` are silently ignored.
+    /// Non-`.md` entries and non-file entries (subdirectories, symlinks) are
+    /// silently ignored.
     ///
     /// # Errors
     ///
     /// Returns an error if the directory cannot be read, any file cannot be
-    /// opened, or any frontmatter is missing or invalid.
+    /// opened, frontmatter is missing or invalid, or two files share a slug.
     pub fn from_dir(dir: &Path) -> Result<Self, MarkdownError> {
         let mut pages = indexmap::IndexMap::new();
 
@@ -55,6 +64,10 @@ impl MarkdownRegistry {
                 path: dir.to_owned(),
                 source,
             })?;
+            // Skip non-regular files (symlinks, subdirectories, …).
+            if !entry.file_type().is_ok_and(|t| t.is_file()) {
+                continue;
+            }
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("md") {
                 continue;
@@ -71,9 +84,13 @@ impl MarkdownRegistry {
                 source,
             })?;
             let page = parse_page(slug.clone(), &content)?;
-            pages.insert(slug, page);
+            if pages.insert(slug.clone(), page).is_some() {
+                return Err(MarkdownError::DuplicateSlug { slug });
+            }
         }
-
+        pages.sort_by(|_, a, _, b| {
+            (a.frontmatter.order, a.slug.as_str()).cmp(&(b.frontmatter.order, b.slug.as_str()))
+        });
         Ok(Self { pages })
     }
 
@@ -83,13 +100,12 @@ impl MarkdownRegistry {
         self.pages.get(slug)
     }
 
-    /// All pages sorted by `frontmatter.order` ascending, then by slug
-    /// as a tiebreaker.
+    /// All pages in sort order: `frontmatter.order` ascending, then slug as
+    /// a tiebreaker.  The registry is pre-sorted at construction so this is a
+    /// simple iterator collect with no runtime sorting overhead.
     #[must_use]
     pub fn all_sorted(&self) -> Vec<&MarkdownPage> {
-        let mut sorted: Vec<_> = self.pages.values().collect();
-        sorted.sort_by_key(|p| (p.frontmatter.order, p.slug.as_str()));
-        sorted
+        self.pages.values().collect()
     }
 
     /// Derive one [`StaticParams`] per page for use with `#[static_get]`
@@ -387,6 +403,16 @@ mod tests {
             result,
             Err(MarkdownError::FrontmatterMissing { .. })
         ));
+    }
+
+    #[test]
+    fn duplicate_slug_returns_error_from_embedded() {
+        let dup = MarkdownSource {
+            slug: "getting-started",
+            content: "+++\ntitle = \"Dup\"\norder = 99\n+++\n\n# Dup\n",
+        };
+        let result = MarkdownRegistry::from_embedded(&[GETTING_STARTED, dup]);
+        assert!(matches!(result, Err(MarkdownError::DuplicateSlug { .. })));
     }
 
     #[test]

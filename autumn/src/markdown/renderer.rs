@@ -45,11 +45,13 @@ pub fn render(body: &str, options: RenderOptions) -> RenderedMarkdown {
             Event::Start(Tag::Heading { level, .. }) => {
                 let level_u8 = heading_level_to_u8(*level);
                 // Look ahead to collect the heading's plain-text content.
-                let mut text = String::new();
+                let mut text = String::with_capacity(128);
                 let mut j = i + 1;
                 while j < raw.len() {
                     match &raw[j] {
                         Event::Text(t) | Event::Code(t) => text.push_str(t),
+                        // Preserve word boundaries across soft/hard line breaks.
+                        Event::SoftBreak | Event::HardBreak => text.push(' '),
                         Event::End(TagEnd::Heading(_)) => break,
                         _ => {}
                     }
@@ -99,8 +101,10 @@ const fn heading_level_to_u8(level: HeadingLevel) -> u8 {
 
 /// Derive a stable, URL-safe anchor ID from heading text.
 ///
-/// Lowercases all ASCII characters, splits on non-alphanumeric characters,
-/// filters empty parts, and joins with `-`.
+/// Splits on non-alphanumeric characters (Unicode-aware), lowercases the
+/// remaining parts, filters empty parts, and joins with `-`.  Non-ASCII
+/// scripts (e.g. German umlauts, CJK characters) are preserved so that
+/// anchors remain meaningful for non-English content.
 ///
 /// # Examples
 ///
@@ -108,13 +112,14 @@ const fn heading_level_to_u8(level: HeadingLevel) -> u8 {
 /// # use autumn_web::markdown::heading_id;
 /// assert_eq!(heading_id("Hello, World!"), "hello-world");
 /// assert_eq!(heading_id("Getting Started"), "getting-started");
+/// assert_eq!(heading_id("Über uns"), "über-uns");
 /// ```
 #[must_use]
 pub fn heading_id(text: &str) -> String {
     let words: Vec<String> = text
-        .split(|c: char| !c.is_ascii_alphanumeric())
+        .split(|c: char| !c.is_alphanumeric())
         .filter(|s| !s.is_empty())
-        .map(str::to_ascii_lowercase)
+        .map(str::to_lowercase)
         .collect();
     words.join("-")
 }
@@ -257,5 +262,23 @@ mod tests {
     #[test]
     fn heading_id_all_special_chars() {
         assert_eq!(heading_id("!!!"), "");
+    }
+
+    #[test]
+    fn heading_id_unicode_preserved() {
+        // Non-ASCII alphanumerics are kept and lowercased.
+        assert_eq!(heading_id("Über uns"), "über-uns");
+        assert_eq!(heading_id("日本語"), "日本語");
+    }
+
+    #[test]
+    fn soft_break_in_heading_preserved_as_space() {
+        // Setext headings may span multiple lines; the SoftBreak between lines
+        // must produce a space so adjacent words are not merged in the TOC text
+        // and the generated anchor ID.
+        let md = "Hello\nWorld\n=====\n";
+        let result = render(md, RenderOptions::default());
+        assert_eq!(result.toc[0].text, "Hello World");
+        assert!(result.html.contains(r#"id="hello-world""#));
     }
 }
