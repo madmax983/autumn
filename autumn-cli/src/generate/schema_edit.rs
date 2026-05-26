@@ -653,6 +653,16 @@ pub fn add_search_up_sql(table: &str, language: &str, fields: &[(String, char)])
          -- adding stored generated column will backfill existing rows"
     );
 
+    let safe_lang: String = language
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == '_')
+        .collect();
+    let safe_lang = if safe_lang.is_empty() {
+        "simple".to_string()
+    } else {
+        safe_lang
+    };
+
     let mut expr = String::new();
     for (i, (field, weight)) in fields.iter().enumerate() {
         if i > 0 {
@@ -660,7 +670,7 @@ pub fn add_search_up_sql(table: &str, language: &str, fields: &[(String, char)])
         }
         let _ = write!(
             expr,
-            "setweight(to_tsvector('{language}'::regconfig, coalesce(\"{field}\"::text, '')), '{weight}')"
+            "setweight(to_tsvector('{safe_lang}'::regconfig, coalesce(\"{field}\"::text, '')), '{weight}')"
         );
     }
 
@@ -733,6 +743,22 @@ pub fn singularize(s: &str) -> String {
     if s.ends_with("women") {
         let stripped = s.strip_suffix("women").unwrap();
         return format!("{stripped}woman");
+    }
+    if s.ends_with("ves") {
+        if s.ends_with("lives") {
+            return format!("{}life", s.strip_suffix("lives").unwrap());
+        }
+        if s.ends_with("knives") {
+            return format!("{}knife", s.strip_suffix("knives").unwrap());
+        }
+        if s.ends_with("wives") {
+            return format!("{}wife", s.strip_suffix("wives").unwrap());
+        }
+        if s.ends_with("ives") {
+            return s.strip_suffix('s').unwrap().to_string();
+        }
+        let stripped = s.strip_suffix("ves").unwrap();
+        return format!("{stripped}f");
     }
 
     if let Some(stripped) = s.strip_suffix("ies") {
@@ -2600,5 +2626,26 @@ pub struct Post {
         );
         assert!(sql.contains("coalesce(\"title\"::text, '')"));
         assert!(sql.contains("coalesce(\"body\"::text, '')"));
+    }
+
+    #[test]
+    fn test_singularize_ves_plurals() {
+        assert_eq!(singularize("wolves"), "wolf");
+        assert_eq!(singularize("leaves"), "leaf");
+        assert_eq!(singularize("shelves"), "shelf");
+        assert_eq!(singularize("lives"), "life");
+        assert_eq!(singularize("hives"), "hive");
+        assert_eq!(singularize("knives"), "knife");
+        assert_eq!(singularize("wives"), "wife");
+    }
+
+    #[test]
+    fn test_add_search_up_sql_sanitizes_language() {
+        let sql = add_search_up_sql(
+            "posts",
+            "english'; DROP TABLE posts;--",
+            &[("title".to_string(), 'A')],
+        );
+        assert!(sql.contains("to_tsvector('englishDROPTABLEposts'::regconfig"));
     }
 }
