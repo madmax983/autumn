@@ -655,7 +655,7 @@ pub fn add_search_up_sql(table: &str, language: &str, fields: &[(String, char)])
 
     let safe_lang: String = language
         .chars()
-        .filter(|c| c.is_alphanumeric() || *c == '_')
+        .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '.')
         .collect();
     let safe_lang = if safe_lang.is_empty() {
         "simple".to_string()
@@ -2647,5 +2647,9 @@ pub struct Post {
             &[("title".to_string(), 'A')],
         );
         assert!(sql.contains("to_tsvector('englishDROPTABLEposts'::regconfig"));
+
+        let sql_qualified =
+            add_search_up_sql("posts", "pg_catalog.english", &[("title".to_string(), 'A')]);
+        assert!(sql_qualified.contains("to_tsvector('pg_catalog.english'::regconfig"));
     }
 }

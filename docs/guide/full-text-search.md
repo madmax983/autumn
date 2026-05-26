@@ -117,20 +117,53 @@ ALTER TABLE pages DROP COLUMN IF EXISTS search_vector;
 
 ## 4. Zero-Downtime Production Deployment
 
-When applying FTS to massive, pre-existing tables in production, creating index structures blocks table writes. To execute a zero-downtime deployment:
+In PostgreSQL, adding a stored generated column via `ALTER TABLE ... ADD COLUMN ... GENERATED ALWAYS AS (...) STORED` performs a full table rewrite and holds a strict `ACCESS EXCLUSIVE` lock on the table. On large, high-traffic production tables, this blocks all read and write queries, causing significant downtime.
 
-1. **Split the Migration**: Hand-edit the migration files before running them.
-2. **Concurrent Indexing**: Add the column first, then create the index using `CREATE INDEX CONCURRENTLY` in a separate transaction:
+To perform a **true zero-downtime deployment** on large datasets, you must decouple column creation, index generation, and backfilling:
 
+### Step 1: Add a Plain Nullable `tsvector` Column
+Adding a nullable column with no default values takes a metadata-only lock that executes instantaneously, avoiding a table rewrite:
 ```sql
--- 1. Add the stored column (safely backfills rows in background)
-ALTER TABLE pages ADD COLUMN search_vector tsvector GENERATED ALWAYS AS (
-    setweight(to_tsvector('english'::regconfig, coalesce(title, '')), 'A') || 
-    setweight(to_tsvector('english'::regconfig, coalesce(body, '')), 'B')
-) STORED;
+ALTER TABLE pages ADD COLUMN search_vector tsvector;
+```
 
--- 2. Create the GIN index without blocking concurrent writes (requires outside transaction block)
+### Step 2: Set Up an Automated DB Trigger
+Create a trigger to automatically calculate the search vector on all future `INSERT` and `UPDATE` operations:
+```sql
+CREATE OR REPLACE FUNCTION pages_search_vector_trigger() 
+RETURNS trigger AS $$
+BEGIN
+  new.search_vector := 
+    setweight(to_tsvector('english'::regconfig, coalesce(new.title::text, '')), 'A') || 
+    setweight(to_tsvector('english'::regconfig, coalesce(new.body::text, '')), 'B');
+  RETURN new;
+END
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_pages_search_vector_update
+  BEFORE INSERT OR UPDATE ON pages
+  FOR EACH ROW EXECUTE FUNCTION pages_search_vector_trigger();
+```
+
+### Step 3: Create the GIN Index Concurrently
+Generate the GIN index in a separate transaction block using `CONCURRENTLY`. This builds the index in the background without blocking reads or writes:
+```sql
 CREATE INDEX CONCURRENTLY idx_pages_search_vector ON pages USING gin(search_vector);
+```
+
+### Step 4: Backfill Pre-Existing Rows in Batches
+With the trigger handling new/updated rows and the index in place, safely backfill your historical data in small, controlled batches (e.g., 5,000 rows at a time) to prevent CPU and lock exhaustion:
+```sql
+-- Run repeatedly in the background until all rows are updated:
+UPDATE pages 
+SET search_vector = 
+  setweight(to_tsvector('english'::regconfig, coalesce(title::text, '')), 'A') || 
+  setweight(to_tsvector('english'::regconfig, coalesce(body::text, '')), 'B')
+WHERE id IN (
+  SELECT id FROM pages 
+  WHERE search_vector IS NULL 
+  LIMIT 5000
+);
 ```
 
 ---
