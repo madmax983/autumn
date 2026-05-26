@@ -14,7 +14,7 @@ use serde_json::Value;
 use crate::registry::AdminRegistry;
 use crate::routes::ADMIN_JS_PATH;
 use crate::traits::{
-    AdminAction, AdminField, AdminFieldKind, ListResult, SortDirection, record_id,
+    AdminAction, AdminField, AdminFieldKind, AdminHistoryPage, ListResult, SortDirection, record_id,
 };
 
 const HTMX_JS_PATH: &str = "/static/js/htmx.min.js";
@@ -1551,6 +1551,146 @@ fn pagination_range(current: u64, total: u64) -> Vec<u64> {
         pages.push(total);
     }
     pages
+}
+
+// ── Version history pane ────────────────────────────────────────────
+
+/// Render the version history pane for an opted-in model record.
+///
+/// Called by `GET /admin/{slug}/{id}/history`. Lists entries in
+/// chronological order with actor, timestamp, and column-level diff.
+#[allow(clippy::too_many_arguments)]
+pub fn model_history_page(
+    registry: &AdminRegistry,
+    model_slug: &str,
+    model_name: &str,
+    model_name_plural: &str,
+    record_id_val: i64,
+    history: &AdminHistoryPage,
+    prefix: &str,
+    actuator_prefix: &str,
+) -> Markup {
+    let record_display = format!("{model_name} #{record_id_val}");
+    let empty_messages: &[autumn_web::flash::FlashMessage] = &[];
+    let content = html! {
+        div class="breadcrumbs" {
+            a href=(prefix) { "Admin" }
+            span class="sep" { "›" }
+            a href={ (prefix) "/" (model_slug) } { (model_name_plural) }
+            span class="sep" { "›" }
+            a href={ (prefix) "/" (model_slug) "/" (record_id_val) } { (record_display) }
+            span class="sep" { "›" }
+            span { "History" }
+        }
+
+        div class="card" {
+            div class="card-header" {
+                span class="card-title" { "Version History" }
+                small { " " (history.total) " entries" }
+            }
+
+            @if history.entries.is_empty() {
+                p class="text-muted" style="padding:1rem" { "No history entries yet." }
+            } @else {
+                table class="admin-table" {
+                    thead {
+                        tr {
+                            th { "#" }
+                            th { "Operation" }
+                            th { "Actor" }
+                            th { "Request ID" }
+                            th { "Changes" }
+                            th { "Recorded At" }
+                        }
+                    }
+                    tbody {
+                        @for entry in &history.entries {
+                            tr {
+                                td { (entry.id) }
+                                td {
+                                    span class={ "badge badge-" (entry.op) } { (entry.op) }
+                                }
+                                td { code { (entry.actor) } }
+                                td {
+                                    @if let Some(ref req_id) = entry.request_id {
+                                        code class="text-muted" { (req_id) }
+                                    } @else {
+                                        span class="text-muted" { "—" }
+                                    }
+                                }
+                                td {
+                                    @if entry.changes.is_empty() {
+                                        span class="text-muted" { "no changes" }
+                                    } @else {
+                                        details {
+                                            summary { (entry.changes.len()) " column(s)" }
+                                            ul class="change-list" {
+                                                @for change in &entry.changes {
+                                                    li {
+                                                        @if let Some(col) = change.get("column").and_then(|v| v.as_str()) {
+                                                            code { (col) }
+                                                        }
+                                                        @if change.get("sensitive").and_then(|v| v.as_bool()).unwrap_or(false) {
+                                                            span class="badge-sensitive" { " [sensitive]" }
+                                                        } @else {
+                                                            " "
+                                                            span class="text-muted" { "before: " }
+                                                            @if let Some(before) = change.get("before") {
+                                                                code { (before) }
+                                                            } @else {
+                                                                em { "null" }
+                                                            }
+                                                            " → "
+                                                            span class="text-muted" { "after: " }
+                                                            @if let Some(after) = change.get("after") {
+                                                                code { (after) }
+                                                            } @else {
+                                                                em { "null" }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                td {
+                                    time datetime=(entry.recorded_at.to_rfc3339()) {
+                                        (entry.recorded_at.format("%Y-%m-%d %H:%M:%S UTC"))
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Pagination
+                @if history.total_pages() > 1 {
+                    div class="pagination" {
+                        @if history.page > 1 {
+                            a href={ (prefix) "/" (model_slug) "/" (record_id_val) "/history?page=" (history.page - 1) }
+                                class="btn btn-secondary btn-sm" { "← Prev" }
+                        }
+                        span { " Page " (history.page) " of " (history.total_pages()) " " }
+                        @if history.has_next_page() {
+                            a href={ (prefix) "/" (model_slug) "/" (record_id_val) "/history?page=" (history.page + 1) }
+                                class="btn btn-secondary btn-sm" { "Next →" }
+                        }
+                    }
+                }
+            }
+        }
+    };
+    admin_layout(
+        registry,
+        Some(model_slug),
+        &record_display,
+        prefix,
+        actuator_prefix,
+        "",
+        empty_messages,
+        &content,
+    )
 }
 
 #[cfg(test)]

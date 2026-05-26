@@ -137,6 +137,8 @@ pub fn admin_router(
                 .delete(model_delete),
         )
         .route("/{slug}/{id}/edit", routing::get(model_edit_form))
+        // Version history pane (only reachable when model.has_history() is true)
+        .route("/{slug}/{id}/history", routing::get(model_history))
         // Bulk-action endpoint. Receives selected `ids[]` and an `action`
         // name from the list-view form; dispatches to
         // `AdminModel::execute_action`.
@@ -617,6 +619,53 @@ async fn model_detail(
         id,
         &messages,
         csrf.token(),
+        &prefix,
+        &actuator_prefix,
+    )))
+}
+
+/// `GET /admin/{slug}/{id}/history` — Version history pane.
+///
+/// Returns 404 when the model has not opted into version history
+/// (`model.has_history()` returns `false`).
+async fn model_history(
+    State(state): State<AppState>,
+    axum::Extension(registry): axum::Extension<Arc<AdminRegistry>>,
+    axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
+    axum::Extension(ActuatorPrefix(actuator_prefix)): axum::Extension<ActuatorPrefix>,
+    Path((slug, id)): Path<(String, i64)>,
+    Query(params): Query<HashMap<String, String>>,
+) -> AutumnResult<Response> {
+    let (pool, model) = resolve(&state, &registry, &slug)?;
+
+    if !model.has_history() {
+        return Err(AutumnError::not_found_msg(format!(
+            "{} does not have version history enabled",
+            model.display_name()
+        )));
+    }
+
+    let page: u64 = params
+        .get("page")
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(1);
+    let per_page: u64 = params
+        .get("per_page")
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(25);
+
+    let history = model
+        .get_history(&pool, id, page, per_page)
+        .await
+        .map_err(|e| admin_err("History", e))?;
+
+    Ok(render(templates::model_history_page(
+        &registry,
+        &slug,
+        model.display_name(),
+        model.display_name_plural(),
+        id,
+        &history,
         &prefix,
         &actuator_prefix,
     )))

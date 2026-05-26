@@ -3,6 +3,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -156,6 +157,54 @@ pub enum ActionStyle {
     Primary,
     /// Destructive/dangerous action (red).
     Danger,
+}
+
+// ── Version history ──────────────────────────────────────────────────
+
+/// A single entry in the admin History pane for an opted-in model.
+///
+/// Mirrors [`autumn_web::VersionEntry`] but is decoupled from the runtime
+/// type so the admin plugin has no compile-time dependency on the DB feature.
+#[derive(Debug, Clone)]
+pub struct AdminHistoryEntry {
+    /// Auto-incrementing PK in the history table.
+    pub id: i64,
+    /// Actor identifier (`user_id` or `"system"`).
+    pub actor: String,
+    /// Operation: `"insert"`, `"update"`, or `"delete"`.
+    pub op: String,
+    /// Request / trace correlation ID.
+    pub request_id: Option<String>,
+    /// Column-level changes, serialized as JSON for template rendering.
+    pub changes: Vec<Value>,
+    /// When this entry was recorded.
+    pub recorded_at: DateTime<Utc>,
+}
+
+/// Paginated history result for the admin History pane.
+#[derive(Debug, Clone)]
+pub struct AdminHistoryPage {
+    pub entries: Vec<AdminHistoryEntry>,
+    pub total: u64,
+    pub page: u64,
+    pub per_page: u64,
+}
+
+impl AdminHistoryPage {
+    /// Total number of pages.
+    #[must_use]
+    pub fn total_pages(&self) -> u64 {
+        if self.per_page == 0 {
+            return 0;
+        }
+        self.total.div_ceil(self.per_page)
+    }
+
+    /// Whether there is a next page.
+    #[must_use]
+    pub fn has_next_page(&self) -> bool {
+        self.page < self.total_pages()
+    }
 }
 
 // ── The core trait ──────────────────────────────────────────────────
@@ -414,6 +463,41 @@ pub trait AdminModel: Send + Sync + 'static {
         };
         let fut = self.list(pool, params);
         Box::pin(async move { fut.await.map(|r| r.total) })
+    }
+
+    // ── Version history ─────────────────────────────────────────────
+
+    /// Whether this model has automatic record version history enabled.
+    ///
+    /// When `true`, the admin panel renders a **History** tab on the
+    /// detail page. No route configuration is required from the app.
+    ///
+    /// Override and return `true` in models registered with
+    /// `#[repository(Model, versioned = true)]`. The `#[repository]` macro
+    /// generates this override automatically.
+    fn has_history(&self) -> bool {
+        false
+    }
+
+    /// Retrieve a paginated page of version history entries for a record.
+    ///
+    /// The default implementation returns [`AdminError::Other`] so models
+    /// that do not opt in get a clear error instead of a silent no-op.
+    /// Models with `versioned = true` must override this method.
+    fn get_history<'a>(
+        &'a self,
+        _pool: &'a diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+        _record_id: i64,
+        _page: u64,
+        _per_page: u64,
+    ) -> AdminFuture<'a, AdminHistoryPage> {
+        Box::pin(async move {
+            Err(AdminError::Other(
+                "this model does not have version history enabled; \
+                 use #[repository(Model, versioned = true)] to opt in"
+                    .to_owned(),
+            ))
+        })
     }
 }
 
@@ -1002,5 +1086,80 @@ mod tests {
             .expect("purge action should succeed on soft-delete model");
         assert_eq!(count, 1, "purge action must return count of purged records");
         assert_eq!(*model.purged.lock().unwrap(), vec![5]);
+    }
+
+    // ── Version history tests (issue #700) ────────────────────────
+
+    #[test]
+    fn admin_model_has_history_defaults_to_false() {
+        let model = DeletingModel {
+            deleted: Mutex::new(vec![]),
+            fail_on: None,
+        };
+        assert!(
+            !model.has_history(),
+            "AdminModel::has_history() must default to false"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_model_get_history_returns_error_when_not_opted_in() {
+        let model = DeletingModel {
+            deleted: Mutex::new(vec![]),
+            fail_on: None,
+        };
+        let pool = dummy_pool();
+        let err = model
+            .get_history(&pool, 42, 1, 25)
+            .await
+            .expect_err("get_history must error when has_history() is false");
+        assert!(
+            matches!(err, AdminError::Other(_)),
+            "get_history on non-versioned model must return AdminError::Other: {err:?}"
+        );
+    }
+
+    #[test]
+    fn admin_history_page_total_pages() {
+        let page = AdminHistoryPage {
+            entries: vec![],
+            total: 51,
+            page: 1,
+            per_page: 25,
+        };
+        assert_eq!(page.total_pages(), 3);
+    }
+
+    #[test]
+    fn admin_history_page_has_next_page() {
+        let page = AdminHistoryPage {
+            entries: vec![],
+            total: 50,
+            page: 1,
+            per_page: 25,
+        };
+        assert!(page.has_next_page());
+    }
+
+    #[test]
+    fn admin_history_page_no_next_on_last() {
+        let page = AdminHistoryPage {
+            entries: vec![],
+            total: 50,
+            page: 2,
+            per_page: 25,
+        };
+        assert!(!page.has_next_page());
+    }
+
+    #[test]
+    fn admin_history_page_zero_per_page() {
+        let page = AdminHistoryPage {
+            entries: vec![],
+            total: 10,
+            page: 1,
+            per_page: 0,
+        };
+        assert_eq!(page.total_pages(), 0);
     }
 }

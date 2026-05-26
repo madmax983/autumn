@@ -151,5 +151,9 @@ features = [
 ]
 rustdoc-args = ["--cfg", "docsrs"]
 
+[[bench]]
+name = "version_history"
+harness = false
+
 [lints]
 workspace = true

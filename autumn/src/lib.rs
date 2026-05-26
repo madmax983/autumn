@@ -121,6 +121,15 @@ pub(crate) mod repository_commit_hooks;
 #[cfg(feature = "db")]
 pub use repository::RepositoryError;
 
+/// Automatic record version history for `#[repository]` writes.
+///
+/// See [`version_history`] module documentation for the full API.
+pub mod version_history;
+pub use version_history::{
+    ColumnChange, VersionEntry, VersionFilter, VersionOp, VersionPage, VersionedRecord,
+    compute_delete_changes, compute_diff, compute_insert_changes,
+};
+
 /// Router construction and integration with Axum.
 ///
 /// This module is responsible for taking the application's configuration,
