@@ -7,6 +7,7 @@ use autumn_web::auth::{hash_password, verify_password};
 use autumn_web::extract::Path;
 use autumn_web::extract::State;
 use autumn_web::prelude::*;
+use autumn_web::webhook_outbound::WebhookOutboundManager;
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 use scoped_futures::ScopedFutureExt;
@@ -118,6 +119,7 @@ pub struct RegisterForm {
 
 #[post("/register")]
 pub async fn register(
+    State(state): State<AppState>,
     mut db: Db,
     mailer: Mailer,
     session: Session,
@@ -192,6 +194,11 @@ pub async fn register(
             .scope_boxed()
         })
         .await?;
+
+    // Dispatch the outbound webhook event on "user.created"
+    if let Some(manager) = state.extension::<WebhookOutboundManager>() {
+        manager.dispatch(&state, "user.created", &user).await?;
+    }
 
     // Log in immediately after registration
     session.rotate_id().await;
