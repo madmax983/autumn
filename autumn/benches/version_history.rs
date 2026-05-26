@@ -60,7 +60,7 @@ fn main() {
         ));
     }
     let elapsed = start.elapsed();
-    let per_op_ns = elapsed.as_nanos() / iterations as u128;
+    let per_op_ns = elapsed.as_nanos() / u128::from(iterations);
     println!(
         "compute_diff:            {per_op_ns} ns/op  ({iterations} iterations in {elapsed:?})"
     );
@@ -73,7 +73,7 @@ fn main() {
         ));
     }
     let elapsed = start.elapsed();
-    let per_op_ns = elapsed.as_nanos() / iterations as u128;
+    let per_op_ns = elapsed.as_nanos() / u128::from(iterations);
     println!(
         "compute_insert_changes:  {per_op_ns} ns/op  ({iterations} iterations in {elapsed:?})"
     );
@@ -86,7 +86,7 @@ fn main() {
         ));
     }
     let elapsed = start.elapsed();
-    let per_op_ns = elapsed.as_nanos() / iterations as u128;
+    let per_op_ns = elapsed.as_nanos() / u128::from(iterations);
     println!(
         "compute_delete_changes:  {per_op_ns} ns/op  ({iterations} iterations in {elapsed:?})"
     );
