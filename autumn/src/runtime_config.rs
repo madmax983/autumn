@@ -47,7 +47,7 @@ use std::sync::{Arc, RwLock};
 
 use serde::{Deserialize, Serialize};
 
-// ── Value types ───────────────────────────────────────────────────────────────
+// ── Value types ─────────────────────────────────────────────────────
 
 /// The type of a configuration key, used for parsing and validation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -262,7 +262,7 @@ impl std::fmt::Display for ConfigValue {
     }
 }
 
-// ── Validators ────────────────────────────────────────────────────────────────
+// ── Validators ──────────────────────────────────────────────────────
 
 /// A per-key validator applied before a write is accepted.
 ///
@@ -370,8 +370,12 @@ impl ConfigValidator {
 fn regex_matches(pattern: &str, text: &str) -> bool {
     let bytes = pattern.as_bytes();
     // Strip optional anchors — we always do a full-string match.
+    // Guard against stripping an escaped `\$` (literal dollar sign): only
+    // treat a trailing `$` as an anchor when the preceding byte is not `\`.
     let start = usize::from(bytes.first() == Some(&b'^'));
-    let end = if bytes.last() == Some(&b'$') {
+    let trailing_dollar_is_anchor = bytes.last() == Some(&b'$')
+        && bytes.get(bytes.len().saturating_sub(2)) != Some(&b'\\');
+    let end = if trailing_dollar_is_anchor {
         bytes.len() - 1
     } else {
         bytes.len()
@@ -507,7 +511,7 @@ fn re_class_matches(inner: &[u8], ch: u8) -> bool {
     if negate { !matched } else { matched }
 }
 
-// ── Schema ────────────────────────────────────────────────────────────────────
+// ── Schema ────────────────────────────────────────────────────────
 
 /// Schema declaration for a single runtime config key.
 ///
@@ -675,7 +679,7 @@ fn is_valid_key_name(name: &str) -> bool {
     chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
 }
 
-// ── Audit trail ───────────────────────────────────────────────────────────────
+// ── Audit trail ────────────────────────────────────────────────────────────
 
 /// A single mutation recorded in the config change log.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -713,7 +717,7 @@ impl ConfigChangeRecord {
     }
 }
 
-// ── ConfigStore trait ─────────────────────────────────────────────────────────
+// ── ConfigStore trait ──────────────────────────────────────────────────────────
 
 /// Error from a [`ConfigStore`] backend.
 #[derive(Debug, thiserror::Error)]
@@ -766,7 +770,7 @@ pub trait ConfigStore: Send + Sync + 'static {
     fn history(&self, key: &str, limit: usize) -> Vec<ConfigChangeRecord>;
 }
 
-// ── InMemoryConfigStore ───────────────────────────────────────────────────────
+// ── InMemoryConfigStore ───────────────────────────────────────────────────
 
 /// A thread-safe in-memory [`ConfigStore`] suitable for tests and dev mode.
 ///
@@ -872,7 +876,7 @@ pub enum ConfigError {
     Store(#[from] ConfigStoreError),
 }
 
-// ── RuntimeConfigService ──────────────────────────────────────────────────────
+// ── RuntimeConfigService ────────────────────────────────────────────────────
 
 /// A snapshot of a single config key: schema defaults + current override.
 #[derive(Debug, Clone)]
@@ -1032,13 +1036,13 @@ impl RuntimeConfigService {
     }
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
+// ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // ── helpers ───────────────────────────────────────────────────────────────
+    // ── helpers ─────────────────────────────────────────────────────
 
     fn make_registry() -> ConfigRegistry {
         let mut r = ConfigRegistry::new();
@@ -1086,7 +1090,7 @@ mod tests {
         RuntimeConfigService::new(registry, store)
     }
 
-    // ── ConfigValueType ───────────────────────────────────────────────────────
+    // ── ConfigValueType ────────────────────────────────────────────────────
 
     #[test]
     fn value_type_as_str_matches_canonical_names() {
@@ -1276,7 +1280,7 @@ mod tests {
         assert_eq!(v.to_raw(), "true");
     }
 
-    // ── ConfigValidator ───────────────────────────────────────────────────────
+    // ── ConfigValidator ────────────────────────────────────────────────────────────
 
     #[test]
     fn int_range_accepts_value_within_bounds() {
@@ -1380,7 +1384,20 @@ mod tests {
         assert!(err.contains("does not match"), "should say: {err}");
     }
 
-    // ── ConfigKeySchema ───────────────────────────────────────────────────────
+    #[test]
+    fn regex_anchor_stripping_ignores_escaped_dollar() {
+        // Pattern `[a-z]+\$` means: one-or-more lowercase letters followed by
+        // a literal `$`.  The trailing `\$` must NOT be stripped as an anchor.
+        let v = ConfigValidator::Regex(r"[a-z]+\$".to_owned());
+        v.validate(&ConfigValue::Text("price$".to_owned()))
+            .unwrap();
+        let err = v
+            .validate(&ConfigValue::Text("price".to_owned()))
+            .unwrap_err();
+        assert!(err.contains("does not match"), "{err}");
+    }
+
+    // ── ConfigKeySchema ────────────────────────────────────────────────────────────
 
     #[test]
     fn schema_validate_passes_correct_type() {
@@ -1412,7 +1429,7 @@ mod tests {
         assert!(err.contains("exceeds maximum"), "{err}");
     }
 
-    // ── ConfigRegistry ────────────────────────────────────────────────────────
+    // ── ConfigRegistry ──────────────────────────────────────────────────────────
 
     #[test]
     fn registry_define_and_lookup() {
@@ -1516,7 +1533,7 @@ mod tests {
         assert_eq!(r.len(), 6);
     }
 
-    // ── InMemoryConfigStore ───────────────────────────────────────────────────
+    // ── InMemoryConfigStore ─────────────────────────────────────────────────
 
     #[test]
     fn in_memory_store_get_raw_returns_none_when_unset() {
@@ -1813,7 +1830,7 @@ mod tests {
         );
     }
 
-    // ── regex_matches ─────────────────────────────────────────────────────────
+    // ── regex_matches ────────────────────────────────────────────────────────────
 
     #[test]
     fn regex_matches_literal_text() {
