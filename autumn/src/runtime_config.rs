@@ -373,8 +373,16 @@ fn regex_matches(pattern: &str, text: &str) -> bool {
     // Guard against stripping an escaped `\$` (literal dollar sign): only
     // treat a trailing `$` as an anchor when the preceding byte is not `\`.
     let start = usize::from(bytes.first() == Some(&b'^'));
-    let trailing_dollar_is_anchor = bytes.last() == Some(&b'$')
-        && bytes.get(bytes.len().saturating_sub(2)) != Some(&b'\\');
+    let trailing_dollar_is_anchor = bytes.last() == Some(&b'$') && {
+        // A `$` is an anchor only when preceded by an even number of backslashes
+        // (including zero). An odd count means the `$` itself is escaped.
+        let backslash_count = bytes[..bytes.len() - 1]
+            .iter()
+            .rev()
+            .take_while(|&&b| b == b'\\')
+            .count();
+        backslash_count % 2 == 0
+    };
     let end = if trailing_dollar_is_anchor {
         bytes.len() - 1
     } else {
@@ -433,10 +441,16 @@ fn re_next_atom(pat: &[u8]) -> (usize, &[u8]) {
         return (0, &[]);
     }
     if pat[0] == b'[' {
-        // Find the closing `]`.
-        if let Some(rel) = pat[1..].iter().position(|&b| b == b']') {
-            let close = rel + 1; // index of `]` in `pat`
-            return (close + 1, &pat[..=close]);
+        // Find the closing `]`, skipping over `\]` (escaped brackets).
+        let mut i = 1usize;
+        while i < pat.len() {
+            if pat[i] == b'\\' && i + 1 < pat.len() {
+                i += 2;
+            } else if pat[i] == b']' {
+                return (i + 1, &pat[..=i]);
+            } else {
+                i += 1;
+            }
         }
     }
     // Escaped character or single character.
@@ -609,6 +623,9 @@ pub enum RegistryError {
     /// The key name is empty or contains disallowed characters (only `[a-z0-9_]` allowed).
     #[error("invalid config key name '{0}': must match [a-z][a-z0-9_]*")]
     InvalidKeyName(String),
+    /// The declared default value violates one of the key's own validators.
+    #[error("config key '{key}': default value violates declared validator — {reason}")]
+    InvalidDefault { key: String, reason: String },
 }
 
 impl ConfigRegistry {
@@ -638,6 +655,14 @@ impl ConfigRegistry {
                 declared_type: schema.value_type,
                 default_type: schema.default.value_type(),
             });
+        }
+        for validator in &schema.validators {
+            if let Err(reason) = validator.validate(&schema.default) {
+                return Err(RegistryError::InvalidDefault {
+                    key: schema.name,
+                    reason,
+                });
+            }
         }
         self.keys.insert(schema.name.clone(), schema);
         Ok(())
@@ -1397,6 +1422,34 @@ mod tests {
         assert!(err.contains("does not match"), "{err}");
     }
 
+    #[test]
+    fn regex_anchor_stripping_treats_dollar_after_even_backslash_count_as_anchor() {
+        // Pattern `[a-z]+\\$`: `\\` is a literal backslash, `$` is the end anchor.
+        // Two backslashes before `$` → even count → `$` IS an anchor.
+        let v = ConfigValidator::Regex(r"[a-z]+\\$".to_owned());
+        // "price\" ends with a literal backslash and matches `[a-z]+` + `\` + end.
+        v.validate(&ConfigValue::Text(r"price\".to_owned()))
+            .unwrap();
+        // "price" has no trailing backslash, so it must NOT match.
+        v.validate(&ConfigValue::Text("price".to_owned()))
+            .unwrap_err();
+    }
+
+    #[test]
+    fn regex_char_class_handles_escaped_close_bracket() {
+        // `[A-Z\]]+` matches one or more uppercase letters or literal `]`.
+        assert!(regex_matches(r"[A-Z\]]+", "AZ]B"));
+        assert!(regex_matches(r"[A-Z\]]+", "AB]"));
+        assert!(!regex_matches(r"[A-Z\]]+", "az"));
+    }
+
+    #[test]
+    fn regex_negated_class_handles_escaped_close_bracket() {
+        // `[^\]]+` matches one or more characters that are NOT `]`.
+        assert!(regex_matches(r"[^\]]+", "hello"));
+        assert!(!regex_matches(r"[^\]]+", "he]lo"));
+    }
+
     // ── ConfigKeySchema ────────────────────────────────────────────────────────────
 
     #[test]
@@ -1509,6 +1562,37 @@ mod tests {
             ))
             .unwrap_err();
         assert!(matches!(err, RegistryError::InvalidKeyName(_)));
+    }
+
+    #[test]
+    fn registry_rejects_default_failing_validator() {
+        let mut r = ConfigRegistry::new();
+        let err = r
+            .define(
+                ConfigKeySchema::new("threads", ConfigValueType::Int, ConfigValue::Int(0))
+                    .validator(ConfigValidator::IntRange {
+                        min: Some(1),
+                        max: None,
+                    }),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, RegistryError::InvalidDefault { .. }),
+            "expected InvalidDefault, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn registry_accepts_default_that_passes_validator() {
+        let mut r = ConfigRegistry::new();
+        r.define(
+            ConfigKeySchema::new("threads", ConfigValueType::Int, ConfigValue::Int(4))
+                .validator(ConfigValidator::IntRange {
+                    min: Some(1),
+                    max: Some(64),
+                }),
+        )
+        .unwrap();
     }
 
     #[test]
