@@ -123,6 +123,17 @@ pub async fn register(
     session: Session,
     form: Form<RegisterForm>,
 ) -> AutumnResult<Redirect> {
+    let open = crate::config_svc()
+        .get("registration_open")
+        .ok()
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    if !open {
+        return Err(AutumnError::unprocessable_msg(
+            "Registrations are currently closed",
+        ));
+    }
+
     let username = form.0.username.trim().to_lowercase();
     let email = form.0.email.trim().to_owned();
     let password = form.0.password;

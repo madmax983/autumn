@@ -19,6 +19,8 @@
 //   Profiles            -> autumn.toml + autumn-dev.toml dev overrides
 //   Actuator            -> /health, /actuator/health, /actuator/info, /actuator/tasks
 //   HTML stack          -> Maud templates, htmx interactivity, Tailwind CSS
+//   Runtime config      -> ConfigRegistry + RuntimeConfigService; live-tunable posts_per_page
+//                          and registration_open without a restart (see src/config.rs)
 //
 // Run with:   cargo run -p reddit-clone   (first dev boot applies reddit migrations and
 //                                          starts the job runtime + durable live-feed relay)
@@ -37,6 +39,8 @@ const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
 
 #[autumn_web::main]
 async fn main() {
+    reddit_clone::init_config();
+
     autumn_web::app()
         .migrations(MIGRATIONS)
         .routes(routes![

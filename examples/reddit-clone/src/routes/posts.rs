@@ -16,6 +16,14 @@ use crate::models::{Post, Subreddit, User};
 use crate::schema::{comments, posts, subreddits, users};
 use crate::slugify::slugify;
 
+fn posts_per_page() -> i64 {
+    crate::config_svc()
+        .get("posts_per_page")
+        .ok()
+        .and_then(|v| v.as_int())
+        .unwrap_or(25)
+}
+
 use super::layout::{layout, time_ago, vote_controls};
 
 /// (`post_id`, title, `post_slug`, score, `comment_count`, author, `sub_name`, `sub_slug`, `created_at`)
@@ -41,7 +49,7 @@ pub async fn front_page(session: Session, csrf: CsrfToken, mut db: Db) -> Autumn
         .inner_join(users::table.on(posts::author_id.eq(users::id)))
         .inner_join(subreddits::table.on(posts::subreddit_id.eq(subreddits::id)))
         .order(posts::hot_rank.desc())
-        .limit(50)
+        .limit(posts_per_page())
         .select((
             posts::id,
             posts::title,

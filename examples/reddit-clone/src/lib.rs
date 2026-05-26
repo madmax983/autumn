@@ -1,3 +1,4 @@
+pub mod config;
 pub mod hooks;
 pub mod jobs;
 pub mod live_bus;
@@ -9,6 +10,31 @@ pub mod routes;
 pub mod schema;
 pub mod slugify;
 pub mod tasks;
+
+use std::sync::{Arc, OnceLock};
+
+use autumn_web::runtime_config::{InMemoryConfigStore, RuntimeConfigService};
+
+static CONFIG_SVC: OnceLock<Arc<RuntimeConfigService>> = OnceLock::new();
+
+/// Initialise the config service. Call once from `main` before starting the app.
+pub fn init_config() -> Arc<RuntimeConfigService> {
+    let svc = Arc::new(RuntimeConfigService::new(
+        Arc::new(config::build_registry()),
+        Arc::new(InMemoryConfigStore::new()),
+    ));
+    CONFIG_SVC
+        .set(Arc::clone(&svc))
+        .expect("config service initialised once");
+    svc
+}
+
+/// Access the global config service from route handlers.
+pub fn config_svc() -> &'static RuntimeConfigService {
+    CONFIG_SVC
+        .get()
+        .expect("RuntimeConfigService initialised in main")
+}
 
 #[cfg(test)]
 mod tests {
