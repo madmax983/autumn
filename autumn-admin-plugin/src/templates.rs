@@ -1559,7 +1559,7 @@ fn pagination_range(current: u64, total: u64) -> Vec<u64> {
 ///
 /// Called by `GET /admin/{slug}/{id}/history`. Lists entries in
 /// chronological order with actor, timestamp, and column-level diff.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub fn model_history_page(
     registry: &AdminRegistry,
     model_slug: &str,
@@ -1630,7 +1630,7 @@ pub fn model_history_page(
                                                         @if let Some(col) = change.get("column").and_then(|v| v.as_str()) {
                                                             code { (col) }
                                                         }
-                                                        @if change.get("sensitive").and_then(|v| v.as_bool()).unwrap_or(false) {
+                                                        @if change.get("sensitive").and_then(serde_json::Value::as_bool).unwrap_or(false) {
                                                             span class="badge-sensitive" { " [sensitive]" }
                                                         } @else {
                                                             " "

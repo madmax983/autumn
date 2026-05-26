@@ -193,7 +193,7 @@ pub struct AdminHistoryPage {
 impl AdminHistoryPage {
     /// Total number of pages.
     #[must_use]
-    pub fn total_pages(&self) -> u64 {
+    pub const fn total_pages(&self) -> u64 {
         if self.per_page == 0 {
             return 0;
         }
@@ -202,7 +202,7 @@ impl AdminHistoryPage {
 
     /// Whether there is a next page.
     #[must_use]
-    pub fn has_next_page(&self) -> bool {
+    pub const fn has_next_page(&self) -> bool {
         self.page < self.total_pages()
     }
 }

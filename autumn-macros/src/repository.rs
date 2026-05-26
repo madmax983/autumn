@@ -61,6 +61,7 @@ struct RepoConfig {
     versioned: bool,
 }
 
+#[allow(clippy::too_many_lines)]
 fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
     let mut model_name: Option<Ident> = None;
     let mut table_name: Option<String> = None;

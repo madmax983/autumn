@@ -46,7 +46,7 @@
 //! # Immutability
 //!
 //! There is no public API to update or delete history entries.
-//! Test-fixture teardown uses [`VersionHistoryStore::__test_clear_for_record`],
+//! Test-fixture teardown uses `VersionHistoryStore::__test_clear_for_record`,
 //! which is **not** part of the stable public API.
 
 use chrono::{DateTime, Utc};
@@ -91,7 +91,7 @@ impl std::fmt::Display for VersionOp {
 /// For inserts, `before` is `None`. For deletes, `after` is `None`.
 /// For sensitive columns that changed, both `before` and `after` are
 /// `None` (but the entry appears so the timeline is complete).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ColumnChange {
     /// The column name.
     pub column: String,
@@ -138,7 +138,7 @@ impl ColumnChange {
 /// Each insert, update, or delete on an opted-in repository produces
 /// exactly one `VersionEntry`. Entries are append-only: there is no
 /// public API to modify or delete them.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VersionEntry {
     /// Auto-incrementing primary key in the history table.
     pub id: i64,
@@ -151,7 +151,7 @@ pub struct VersionEntry {
     /// Actor identifier: authenticated user ID, or `"system"` when no
     /// session is in scope (jobs, scheduled tasks, migrations).
     pub actor: String,
-    /// Request / trace correlation ID (from [`MutationContext`]).
+    /// Request / trace correlation ID (from `MutationContext`).
     pub request_id: Option<String>,
     /// Column-level diff. For updates, only changed columns are included.
     pub changes: Vec<ColumnChange>,
@@ -226,8 +226,8 @@ impl VersionFilter {
     /// LIMIT/OFFSET for SQL queries.
     #[must_use]
     pub fn limit_offset(&self) -> (i64, i64) {
-        let per = self.per_page() as i64;
-        let offset = ((self.page() - 1) * self.per_page()) as i64;
+        let per = self.per_page().cast_signed();
+        let offset = ((self.page() - 1) * self.per_page()).cast_signed();
         (per, offset)
     }
 }
@@ -235,7 +235,7 @@ impl VersionFilter {
 // ── Paginated result ─────────────────────────────────────────────────
 
 /// A paginated page of [`VersionEntry`] records.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VersionPage {
     /// The entries for the current page, in chronological order (oldest first).
     pub entries: Vec<VersionEntry>,
@@ -250,7 +250,7 @@ pub struct VersionPage {
 impl VersionPage {
     /// Total number of pages.
     #[must_use]
-    pub fn total_pages(&self) -> u64 {
+    pub const fn total_pages(&self) -> u64 {
         if self.per_page == 0 {
             return 0;
         }
@@ -259,13 +259,13 @@ impl VersionPage {
 
     /// Whether there is a next page.
     #[must_use]
-    pub fn has_next_page(&self) -> bool {
+    pub const fn has_next_page(&self) -> bool {
         self.page < self.total_pages()
     }
 
     /// Whether there is a previous page.
     #[must_use]
-    pub fn has_prev_page(&self) -> bool {
+    pub const fn has_prev_page(&self) -> bool {
         self.page > 1
     }
 }
@@ -287,16 +287,15 @@ pub fn compute_diff(
     sensitive: &[&str],
 ) -> Vec<ColumnChange> {
     let before_obj = before.as_object();
-    let after_obj = match after.as_object() {
-        Some(o) => o,
-        None => return vec![],
+    let Some(after_obj) = after.as_object() else {
+        return vec![];
     };
 
     let mut changes = Vec::new();
     for (col, after_val) in after_obj {
         let before_val = before_obj.and_then(|o| o.get(col.as_str()));
-        let changed = before_val != Some(after_val);
-        if !changed {
+        let did_change = before_val != Some(after_val);
+        if !did_change {
             continue;
         }
         if sensitive.contains(&col.as_str()) {
@@ -320,9 +319,8 @@ pub fn compute_insert_changes(
     record: &serde_json::Value,
     sensitive: &[&str],
 ) -> Vec<ColumnChange> {
-    let obj = match record.as_object() {
-        Some(o) => o,
-        None => return vec![],
+    let Some(obj) = record.as_object() else {
+        return vec![];
     };
     obj.iter()
         .map(|(col, val)| {
@@ -343,9 +341,8 @@ pub fn compute_delete_changes(
     record: &serde_json::Value,
     sensitive: &[&str],
 ) -> Vec<ColumnChange> {
-    let obj = match record.as_object() {
-        Some(o) => o,
-        None => return vec![],
+    let Some(obj) = record.as_object() else {
+        return vec![];
     };
     obj.iter()
         .map(|(col, val)| {
@@ -387,6 +384,7 @@ pub trait VersionedRecord: Send + Sync + 'static {
     /// These columns still appear in the diff as "changed" (when they
     /// changed) but their before/after values are replaced with `null`.
     /// Defaults to an empty slice (no columns excluded).
+    #[must_use]
     fn version_sensitive_columns() -> &'static [&'static str]
     where
         Self: Sized,
