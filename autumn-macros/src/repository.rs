@@ -53,6 +53,7 @@ struct RepoConfig {
     /// active tenant context.
     tenant_scoped: bool,
     no_upsert_trait: bool,
+    searchable: bool,
 }
 
 fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
@@ -68,6 +69,7 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
     let mut soft_delete = false;
     let mut tenant_scoped = false;
     let mut no_upsert_trait = false;
+    let mut searchable = false;
 
     syn::meta::parser(|meta| {
         // `hooks = Ident` must be checked before the catch-all model_name case,
@@ -113,12 +115,15 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
         } else if meta.path.is_ident("no_upsert_trait") {
             no_upsert_trait = true;
             Ok(())
+        } else if meta.path.is_ident("searchable") {
+            searchable = true;
+            Ok(())
         } else if meta.path.get_ident().is_some() && model_name.is_none() {
             model_name = Some(meta.path.get_ident().unwrap().clone());
             Ok(())
         } else {
             Err(meta.error(
-                "expected model name, table = \"...\", hooks = Type, commit_hooks = true, api = \"/path\", policy = Type, scope = Type, cursor_key = field, cursor_key_type = Type, soft_delete, tenant_scoped, or no_upsert_trait",
+                "expected model name, table = \"...\", hooks = Type, commit_hooks = true, api = \"/path\", policy = Type, scope = Type, cursor_key = field, cursor_key_type = Type, soft_delete, tenant_scoped, no_upsert_trait, or searchable",
             ))
         }
     })
@@ -151,6 +156,7 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
         soft_delete,
         tenant_scoped,
         no_upsert_trait,
+        searchable,
     })
 }
 
@@ -5736,6 +5742,298 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {}
     };
 
+    let config_soft_delete = config.soft_delete;
+    let config_tenant_scoped = config.tenant_scoped;
+
+    let second_stage_soft_delete_filter = if config_soft_delete {
+        quote! {
+            records_query = records_query.filter(#table_ident::deleted_at.is_null());
+        }
+    } else {
+        quote! {}
+    };
+
+    let second_stage_tenant_filter = if config_tenant_scoped {
+        quote! {
+            if let ::core::option::Option::Some(ref t) = tenant_id {
+                records_query = records_query.filter(#table_ident::tenant_id.eq(t.clone()));
+            }
+        }
+    } else {
+        quote! {}
+    };
+
+    let search_trait_methods = if config.searchable {
+        quote! {
+            fn search(&self, query: &str) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<Vec<#model_name>>> + Send;
+            fn search_page(
+                &self,
+                query: &str,
+                req: &::autumn_web::pagination::PageRequest,
+            ) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<::autumn_web::pagination::Page<#model_name>>> + Send;
+        }
+    } else {
+        quote! {}
+    };
+
+    let search_compile_check = if config.searchable {
+        quote! {
+            const _: () = {
+                fn assert_searchable<T: ::autumn_web::repository::AutumnSearchableModel>() {}
+                let _ = assert_searchable::<#model_name>;
+                if !<#model_name as ::autumn_web::repository::AutumnSearchableModel>::IS_SEARCHABLE {
+                    ::core::panic!("The backing model is not marked with #[searchable] or has no searchable fields configured, but its repository has `searchable = true` enabled.");
+                }
+                if <#model_name as ::autumn_web::repository::AutumnSearchableModel>::SEARCH_FIELDS.is_empty() {
+                    ::core::panic!("The backing model is marked with #[searchable] but has zero searchable fields configured, but its repository has `searchable = true` enabled.");
+                }
+            };
+        }
+    } else {
+        quote! {}
+    };
+
+    let search_impl_methods = if config.searchable {
+        let tenant_id_setup = if config.tenant_scoped {
+            quote! {
+                let tenant_id = if self.across_tenants {
+                    ::core::option::Option::None
+                } else {
+                    let t = ::autumn_web::tenancy::CURRENT_TENANT.try_with(|t| t.clone()).ok().flatten()
+                        .ok_or_else(|| ::autumn_web::AutumnError::internal_server_error_msg("Query scoped to tenant, but no tenant context was established"))?;
+                    ::core::option::Option::Some(t)
+                };
+            }
+        } else {
+            quote! {
+                let tenant_id = ::core::option::Option::None::<::std::string::String>;
+            }
+        };
+
+        quote! {
+            async fn search(&self, query: &str) -> ::autumn_web::AutumnResult<Vec<#model_name>> {
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+
+                if query.trim().is_empty() {
+                    return Ok(Vec::new());
+                }
+
+                #[derive(::autumn_web::reexports::diesel::QueryableByName)]
+                struct SearchId {
+                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
+                    id: i64,
+                }
+
+                #tenant_id_setup
+                let mut conn = self.__autumn_acquire_conn().await?;
+                let language = <#model_name as ::autumn_web::repository::AutumnSearchableModel>::SEARCH_LANGUAGE;
+
+                let mut sql = format!(
+                    "SELECT id FROM \"{}\" WHERE search_vector @@ websearch_to_tsquery($1::regconfig, $2)",
+                    #table_name
+                );
+                if #config_soft_delete {
+                    sql.push_str(" AND deleted_at IS NULL");
+                }
+                if let ::core::option::Option::Some(ref _t) = tenant_id {
+                    sql.push_str(" AND tenant_id = $3");
+                }
+                sql.push_str(" ORDER BY ts_rank_cd(search_vector, websearch_to_tsquery($1::regconfig, $2)) DESC, id DESC");
+
+                let ids = if #config_tenant_scoped {
+                    if let ::core::option::Option::Some(ref t) = tenant_id {
+                        ::autumn_web::reexports::diesel::sql_query(sql)
+                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(language)
+                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(query)
+                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(t)
+                            .load::<SearchId>(&mut conn)
+                            .await?
+                    } else {
+                        ::autumn_web::reexports::diesel::sql_query(sql)
+                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(language)
+                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(query)
+                            .load::<SearchId>(&mut conn)
+                            .await?
+                    }
+                } else {
+                    ::autumn_web::reexports::diesel::sql_query(sql)
+                        .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(language)
+                        .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(query)
+                        .load::<SearchId>(&mut conn)
+                        .await?
+                };
+
+                let id_list: Vec<i64> = ids.into_iter().map(|s| s.id).collect();
+                if id_list.is_empty() {
+                    return Ok(Vec::new());
+                }
+
+                let mut records_query = #table_ident::table
+                    .filter(#table_ident::id.eq_any(&id_list))
+                    .into_boxed();
+                #second_stage_soft_delete_filter
+                #second_stage_tenant_filter
+                let records = records_query
+                    .load::<#model_name>(&mut conn)
+                    .await?;
+
+                let mut record_map: ::std::collections::HashMap<i64, #model_name> = records
+                    .into_iter()
+                    .map(|r| (r.id, r))
+                    .collect();
+
+                let sorted_records: Vec<#model_name> = id_list
+                    .iter()
+                    .filter_map(|id| record_map.remove(id))
+                    .collect();
+
+                Ok(sorted_records)
+            }
+
+            async fn search_page(
+                &self,
+                query: &str,
+                req: &::autumn_web::pagination::PageRequest,
+            ) -> ::autumn_web::AutumnResult<::autumn_web::pagination::Page<#model_name>> {
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+
+                if query.trim().is_empty() {
+                    return Ok(::autumn_web::pagination::Page::new(Vec::new(), 0, req));
+                }
+
+                #[derive(::autumn_web::reexports::diesel::QueryableByName)]
+                struct SearchId {
+                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
+                    id: i64,
+                }
+
+                #[derive(::autumn_web::reexports::diesel::QueryableByName)]
+                struct SearchCount {
+                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
+                    count: i64,
+                }
+
+                #tenant_id_setup
+                let mut conn = self.__autumn_acquire_conn().await?;
+                let language = <#model_name as ::autumn_web::repository::AutumnSearchableModel>::SEARCH_LANGUAGE;
+                let limit = req.limit();
+                let offset = req.offset();
+
+                let mut count_sql = format!(
+                    "SELECT COUNT(*) AS count FROM \"{}\" WHERE search_vector @@ websearch_to_tsquery($1::regconfig, $2)",
+                    #table_name
+                );
+                if #config_soft_delete {
+                    count_sql.push_str(" AND deleted_at IS NULL");
+                }
+                if let ::core::option::Option::Some(ref _t) = tenant_id {
+                    count_sql.push_str(" AND tenant_id = $3");
+                }
+
+                let total = if #config_tenant_scoped {
+                    if let ::core::option::Option::Some(ref t) = tenant_id {
+                        ::autumn_web::reexports::diesel::sql_query(count_sql)
+                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(language)
+                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(query)
+                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(t)
+                            .get_result::<SearchCount>(&mut conn)
+                            .await?
+                            .count
+                    } else {
+                        ::autumn_web::reexports::diesel::sql_query(count_sql)
+                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(language)
+                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(query)
+                            .get_result::<SearchCount>(&mut conn)
+                            .await?
+                            .count
+                    }
+                } else {
+                    ::autumn_web::reexports::diesel::sql_query(count_sql)
+                        .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(language)
+                        .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(query)
+                        .get_result::<SearchCount>(&mut conn)
+                        .await?
+                        .count
+                };
+
+                let mut select_sql = format!(
+                    "SELECT id FROM \"{}\" WHERE search_vector @@ websearch_to_tsquery($1::regconfig, $2)",
+                    #table_name
+                );
+                if #config_soft_delete {
+                    select_sql.push_str(" AND deleted_at IS NULL");
+                }
+                if let ::core::option::Option::Some(ref _t) = tenant_id {
+                    select_sql.push_str(" AND tenant_id = $3");
+                    select_sql.push_str(" ORDER BY ts_rank_cd(search_vector, websearch_to_tsquery($1::regconfig, $2)) DESC, id DESC");
+                    select_sql.push_str(" LIMIT $4 OFFSET $5");
+                } else {
+                    select_sql.push_str(" ORDER BY ts_rank_cd(search_vector, websearch_to_tsquery($1::regconfig, $2)) DESC, id DESC");
+                    select_sql.push_str(" LIMIT $3 OFFSET $4");
+                }
+
+                let ids = if #config_tenant_scoped {
+                    if let ::core::option::Option::Some(ref t) = tenant_id {
+                        ::autumn_web::reexports::diesel::sql_query(select_sql)
+                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(language)
+                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(query)
+                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(t)
+                            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
+                            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
+                            .load::<SearchId>(&mut conn)
+                            .await?
+                    } else {
+                        ::autumn_web::reexports::diesel::sql_query(select_sql)
+                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(language)
+                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(query)
+                            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
+                            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
+                            .load::<SearchId>(&mut conn)
+                            .await?
+                    }
+                } else {
+                    ::autumn_web::reexports::diesel::sql_query(select_sql)
+                        .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(language)
+                        .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(query)
+                        .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
+                        .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
+                        .load::<SearchId>(&mut conn)
+                        .await?
+                };
+
+                let id_list: Vec<i64> = ids.into_iter().map(|s| s.id).collect();
+                if id_list.is_empty() {
+                    return Ok(::autumn_web::pagination::Page::new(Vec::new(), total, req));
+                }
+
+                let mut records_query = #table_ident::table
+                    .filter(#table_ident::id.eq_any(&id_list))
+                    .into_boxed();
+                #second_stage_soft_delete_filter
+                #second_stage_tenant_filter
+                let records = records_query
+                    .load::<#model_name>(&mut conn)
+                    .await?;
+
+                let mut record_map: ::std::collections::HashMap<i64, #model_name> = records
+                    .into_iter()
+                    .map(|r| (r.id, r))
+                    .collect();
+
+                let sorted_records: Vec<#model_name> = id_list
+                    .iter()
+                    .filter_map(|id| record_map.remove(id))
+                    .collect();
+
+                Ok(::autumn_web::pagination::Page::new(sorted_records, total, req))
+            }
+        }
+    } else {
+        quote! {}
+    };
+
     let upsert_set_ext_impl = quote! {};
     let upsert_execution_ext_impl = quote! {};
     let correlate_ext_impl = quote! {};
@@ -5763,6 +6061,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             #(#derived_trait_methods)*
             #soft_delete_trait_methods
             #bulk_trait_methods
+            #search_trait_methods
         }
 
         /// Postgres implementation of the repository.
@@ -5850,6 +6149,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
 
             #upsert_many_impl_method
+            #search_impl_methods
         }
 
         impl #pg_name {
@@ -5954,6 +6254,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         #upsert_execution_ext_impl
 
         #correlate_ext_impl
+
+        #search_compile_check
     }
 }
 

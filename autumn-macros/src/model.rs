@@ -53,7 +53,7 @@ fn validate_attrs(field: &Field) -> Vec<&syn::Attribute> {
 }
 
 /// Filter out framework-specific attributes (`#[id]`, `#[indexed]`, `#[validate]`,
-/// `#[default]`, `#[factory_assoc]`, `#[lock_version]`) that shouldn't be on the query struct
+/// `#[default]`, `#[factory_assoc]`, `#[lock_version]`, `#[searchable]`) that shouldn't be on the query struct
 /// (they'd confuse Diesel derives).
 fn user_attrs(field: &Field) -> Vec<&syn::Attribute> {
     field
@@ -66,8 +66,64 @@ fn user_attrs(field: &Field) -> Vec<&syn::Attribute> {
                 && !a.path().is_ident("default")
                 && !a.path().is_ident("factory_assoc")
                 && !a.path().is_ident("lock_version")
+                && !a.path().is_ident("searchable")
         })
         .collect()
+}
+
+/// Parse the struct-level language dictionary configuration from `#[searchable(language = "...")]`
+fn parse_model_searchable_lang(attrs: &[syn::Attribute]) -> syn::Result<Option<String>> {
+    for attr in attrs {
+        if attr.path().is_ident("searchable") {
+            if matches!(attr.meta, syn::Meta::Path(_)) {
+                return Ok(Some("simple".to_string()));
+            }
+            let mut lang = None;
+            attr.parse_nested_meta(|meta| {
+                if meta.path.is_ident("language") {
+                    let value: syn::LitStr = meta.value()?.parse()?;
+                    lang = Some(value.value());
+                    Ok(())
+                } else {
+                    Err(meta.error("unsupported searchable attribute"))
+                }
+            })?;
+            return Ok(Some(lang.unwrap_or_else(|| "simple".to_string())));
+        }
+    }
+    Ok(None)
+}
+
+enum FieldSearchable {
+    NotSearchable,
+    SearchableDefault,
+    SearchableWithWeight(String),
+}
+
+/// Parse the field-level weight from `#[searchable(weight = "...")]`
+fn parse_field_searchable_weight(field: &syn::Field) -> syn::Result<FieldSearchable> {
+    for attr in &field.attrs {
+        if attr.path().is_ident("searchable") {
+            if matches!(attr.meta, syn::Meta::Path(_)) {
+                return Ok(FieldSearchable::SearchableDefault);
+            }
+            let mut weight = None;
+            attr.parse_nested_meta(|meta| {
+                if meta.path.is_ident("weight") {
+                    let value: syn::LitStr = meta.value()?.parse()?;
+                    weight = Some(value.value());
+                    Ok(())
+                } else {
+                    Err(meta.error("unsupported field searchable attribute"))
+                }
+            })?;
+            return Ok(weight.map_or(
+                FieldSearchable::SearchableDefault,
+                FieldSearchable::SearchableWithWeight,
+            ));
+        }
+    }
+    Ok(FieldSearchable::NotSearchable)
 }
 
 #[derive(Clone, Copy)]
@@ -402,11 +458,59 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let vis = &input.vis;
     let outer_attrs = &input.attrs;
 
+    let searchable_lang = match parse_model_searchable_lang(outer_attrs) {
+        Ok(lang) => lang,
+        Err(err) => return err.to_compile_error(),
+    };
+    let is_searchable = searchable_lang.is_some();
+    let search_language = searchable_lang.unwrap_or_else(|| "simple".to_string());
+    let filtered_outer_attrs: Vec<&syn::Attribute> = outer_attrs
+        .iter()
+        .filter(|a| !a.path().is_ident("searchable"))
+        .collect();
+
     let new_name = format_ident!("New{name}");
     let update_name = format_ident!("Update{name}");
 
     // Classify fields
     let all_fields: Vec<&Field> = fields.named.iter().collect();
+
+    let mut search_field_names = Vec::new();
+    let mut search_field_weights = Vec::new();
+
+    for field in &all_fields {
+        match parse_field_searchable_weight(field) {
+            Ok(FieldSearchable::NotSearchable) => {}
+            Ok(weight_type) => {
+                let field_ident = field.ident.as_ref().unwrap();
+                let weight = match weight_type {
+                    FieldSearchable::SearchableWithWeight(w) => w,
+                    FieldSearchable::SearchableDefault | FieldSearchable::NotSearchable => {
+                        "D".to_string()
+                    }
+                };
+                if weight.len() != 1 {
+                    return syn::Error::new_spanned(
+                        field_ident,
+                        "searchable weight must be a single character (A, B, C, or D)",
+                    )
+                    .to_compile_error();
+                }
+                let weight_char = weight.chars().next().unwrap();
+                if !['A', 'B', 'C', 'D'].contains(&weight_char) {
+                    return syn::Error::new_spanned(
+                        field_ident,
+                        "searchable weight must be A, B, C, or D",
+                    )
+                    .to_compile_error();
+                }
+                search_field_names.push(field_ident.to_string());
+                search_field_weights.push(weight_char);
+            }
+            Err(err) => return err.to_compile_error(),
+        }
+    }
+
     let id_fields: Vec<&&Field> = all_fields.iter().filter(|f| has_attr(f, "id")).collect();
 
     // If no explicit #[id], default to first i32/i64 field
@@ -1354,7 +1458,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         #[derive(Debug, Clone, ::diesel::Queryable, ::diesel::Selectable, ::diesel::AsChangeset, ::diesel::Insertable)]
         #[derive(::serde::Serialize, ::serde::Deserialize)]
         #[diesel(table_name = #table_ident)]
-        #(#outer_attrs)*
+        #(#filtered_outer_attrs)*
         #vis struct #name {
             #(#query_fields,)*
         }
@@ -1696,6 +1800,14 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             fn schema() -> ::serde_json::Value {
                 #update_struct_schema_body
             }
+        }
+
+        impl ::autumn_web::repository::AutumnSearchableModel for #name {
+            const IS_SEARCHABLE: bool = #is_searchable;
+            const SEARCH_LANGUAGE: &'static str = #search_language;
+            const SEARCH_FIELDS: &'static [(&'static str, char)] = &[
+                #((#search_field_names, #search_field_weights)),*
+            ];
         }
     }
 }

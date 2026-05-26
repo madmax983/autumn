@@ -1,11 +1,14 @@
 use crate::schema::{pages, revisions};
 
 #[autumn_web::model]
+#[searchable(language = "english")]
 pub struct Page {
     #[id]
     pub id: i64,
+    #[searchable(weight = "A")]
     pub title: String,
     pub slug: String,
+    #[searchable(weight = "B")]
     pub body: String,
     pub status: String,
     #[lock_version]
