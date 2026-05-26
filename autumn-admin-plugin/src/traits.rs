@@ -1162,4 +1162,59 @@ mod tests {
         };
         assert_eq!(page.total_pages(), 0);
     }
+
+    // ── SortDirection and AdminField builder coverage ─────────────
+
+    #[test]
+    fn sort_direction_as_str_returns_correct_values() {
+        assert_eq!(SortDirection::Asc.as_str(), "asc");
+        assert_eq!(SortDirection::Desc.as_str(), "desc");
+    }
+
+    #[test]
+    fn sort_direction_flipped_returns_opposite() {
+        assert_eq!(SortDirection::Asc.flipped(), SortDirection::Desc);
+        assert_eq!(SortDirection::Desc.flipped(), SortDirection::Asc);
+    }
+
+    #[test]
+    fn admin_field_readonly_sets_editable_false() {
+        let field = AdminField::new("created_at", AdminFieldKind::DateTime).readonly();
+        assert!(!field.editable, "readonly() must set editable = false");
+    }
+
+    #[test]
+    fn admin_field_hide_from_list_sets_list_display_false() {
+        let field = AdminField::new("internal_token", AdminFieldKind::Text).hide_from_list();
+        assert!(!field.list_display, "hide_from_list() must set list_display = false");
+    }
+
+    #[test]
+    fn admin_model_record_display_includes_display_name_and_id() {
+        let model = DeletingModel {
+            deleted: Mutex::new(vec![]),
+            fail_on: None,
+        };
+        let record = serde_json::json!({"id": 7, "name": "foo"});
+        assert_eq!(model.record_display(&record), "Tracked #7");
+    }
+
+    #[test]
+    fn admin_model_record_display_placeholder_when_no_id() {
+        let model = DeletingModel {
+            deleted: Mutex::new(vec![]),
+            fail_on: None,
+        };
+        let record = serde_json::json!({"name": "bar"});
+        assert_eq!(model.record_display(&record), "Tracked <no id>");
+    }
+
+    #[test]
+    fn admin_model_per_page_default_is_25() {
+        let model = DeletingModel {
+            deleted: Mutex::new(vec![]),
+            fail_on: None,
+        };
+        assert_eq!(model.per_page(), 25);
+    }
 }
