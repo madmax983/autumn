@@ -1064,6 +1064,7 @@ pub fn model_detail_page(
     csrf_token: &str,
     prefix: &str,
     actuator_prefix: &str,
+    has_history: bool,
 ) -> Markup {
     let content = html! {
         div class="breadcrumbs" {
@@ -1078,6 +1079,11 @@ pub fn model_detail_page(
             div class="card-header" {
                 span class="card-title" { (record_display) }
                 div {
+                    @if has_history {
+                        a href={ (prefix) "/" (model_slug) "/" (id) "/history" }
+                            class="btn btn-secondary" { "History" }
+                        " "
+                    }
                     a href={ (prefix) "/" (model_slug) "/" (id) "/edit" }
                         class="btn btn-primary" { "Edit" }
                     " "
@@ -2090,6 +2096,7 @@ mod tests {
             "t",
             "/admin",
             "/actuator",
+            false,
         )
         .into_string();
         assert!(
@@ -2129,6 +2136,7 @@ mod tests {
             "t",
             "/admin",
             "/actuator",
+            false,
         )
         .into_string();
         assert!(

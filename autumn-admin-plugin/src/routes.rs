@@ -621,6 +621,7 @@ async fn model_detail(
         csrf.token(),
         &prefix,
         &actuator_prefix,
+        model.has_history(),
     )))
 }
 
