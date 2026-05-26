@@ -1056,6 +1056,90 @@ fn has_attribute_boundary(rest: &str, pos: usize, keyword: &str) -> bool {
         .is_none_or(|c| c == '(' || c == ']' || c.is_whitespace())
 }
 
+fn find_real_struct_keyword(src: &str, start_byte_offset: usize) -> Option<usize> {
+    let mut chars = src.char_indices().peekable();
+    while let Some(&(idx, _)) = chars.peek() {
+        if idx < start_byte_offset {
+            chars.next();
+        } else {
+            break;
+        }
+    }
+
+    while let Some((idx, c)) = chars.next() {
+        // Skip raw string literal
+        if c == 'r' {
+            let mut temp = chars.clone();
+            let mut hash_count = 0;
+            while let Some((_, '#')) = temp.peek() {
+                hash_count += 1;
+                temp.next();
+            }
+            if let Some((_, '"')) = temp.peek() {
+                for _ in 0..hash_count {
+                    chars.next();
+                }
+                chars.next(); // opening double quote '"'
+                while let Some((_, rc)) = chars.next() {
+                    if rc == '"' {
+                        let mut match_hashes = true;
+                        let mut check_chars = chars.clone();
+                        for _ in 0..hash_count {
+                            if check_chars.peek().is_some_and(|&(_, ch)| ch == '#') {
+                                check_chars.next();
+                            } else {
+                                match_hashes = false;
+                                break;
+                            }
+                        }
+                        if match_hashes {
+                            for _ in 0..hash_count {
+                                chars.next();
+                            }
+                            break;
+                        }
+                    }
+                }
+                continue;
+            }
+        }
+
+        // Skip standard double-quoted string
+        if c == '"' {
+            while let Some((_, sc)) = chars.next() {
+                if sc == '\\' {
+                    chars.next(); // Skip next char (escaped)
+                } else if sc == '"' {
+                    break;
+                }
+            }
+            continue;
+        }
+
+        // Check if we have the word "struct"
+        if c == 's' {
+            let rest = &src[idx..];
+            if rest.starts_with("struct") {
+                let next_char = src[idx + "struct".len()..].chars().next();
+                let is_followed_by_boundary =
+                    next_char.is_none_or(|ch| !ch.is_ascii_alphanumeric() && ch != '_');
+
+                let is_preceded_by_boundary = if idx == 0 {
+                    true
+                } else {
+                    let prev_char = src[..idx].chars().next_back();
+                    prev_char.is_none_or(|ch| !ch.is_ascii_alphanumeric() && ch != '_')
+                };
+
+                if is_followed_by_boundary && is_preceded_by_boundary {
+                    return Some(idx);
+                }
+            }
+        }
+    }
+    None
+}
+
 #[must_use]
 #[allow(clippy::too_many_lines, clippy::collapsible_if)]
 pub fn parse_model_search_config_for_table(
@@ -1109,20 +1193,19 @@ pub fn parse_model_search_config_for_table(
             let singular = singularize(table);
             let struct_name = super::naming::snake_to_pascal(&singular);
 
-            let mut search_rest = clean_content.as_str();
+            let mut current_offset = 0;
             let mut found_struct_pos = None;
-            while let Some(pos) = search_rest.find("struct ") {
-                let offset = clean_content.len() - search_rest.len() + pos;
-                let after_struct = &search_rest[pos + "struct ".len()..];
+            while let Some(pos) = find_real_struct_keyword(&clean_content, current_offset) {
+                let after_struct = &clean_content[pos + "struct".len()..];
                 if let Some(first_word) = after_struct.split_whitespace().next() {
                     let clean_name =
                         first_word.trim_end_matches(|c: char| !c.is_alphanumeric() && c != '_');
                     if clean_name == struct_name {
-                        found_struct_pos = Some(offset);
+                        found_struct_pos = Some(pos);
                         break;
                     }
                 }
-                search_rest = &search_rest[pos + "struct ".len()..];
+                current_offset = pos + "struct".len();
             }
 
             if let Some(s_pos) = found_struct_pos {
@@ -1156,11 +1239,7 @@ pub fn parse_model_search_config_for_table(
 
                 if let Some(pos) = best_pos {
                     let in_between = &before_struct[pos..];
-                    let has_other_struct = in_between.find("struct").is_some_and(|idx| {
-                        let bytes = in_between.as_bytes();
-                        let next_char = bytes.get(idx + "struct".len());
-                        next_char.is_none_or(|&c| c.is_ascii_whitespace())
-                    });
+                    let has_other_struct = find_real_struct_keyword(in_between, 0).is_some();
                     if !has_other_struct {
                         model_pos = Some(pos);
                         struct_pos = Some(s_pos);
@@ -1198,13 +1277,9 @@ pub fn parse_model_search_config_for_table(
     let struct_pos = if let Some(s_pos) = struct_pos {
         s_pos
     } else if let Some(m_pos) = model_pos {
-        if let Some(struct_offset) = clean_content[m_pos..].find("struct ") {
-            m_pos + struct_offset
-        } else {
-            return None;
-        }
+        find_real_struct_keyword(&clean_content, m_pos)?
     } else {
-        clean_content.find("struct ")?
+        find_real_struct_keyword(&clean_content, 0)?
     };
 
     // 2. Restrict FTS language search to the struct-level #[searchable] attribute (preceding our struct)
@@ -1220,6 +1295,15 @@ pub fn parse_model_search_config_for_table(
         }
         let attr_chunk = &rest_before[pos..];
         if let Some(close_bracket) = attr_chunk.find(']') {
+            let end_of_attr = pos + close_bracket + 1;
+            let in_between = &before_struct[end_of_attr..];
+            if in_between.contains('}')
+                || in_between.contains(';')
+                || find_real_struct_keyword(in_between, 0).is_some()
+            {
+                // This #[searchable] belongs to a preceding model/struct, not the current one.
+                break;
+            }
             let attr_content = &attr_chunk[..close_bracket];
             if let Some(lang_pos) = attr_content.find("language") {
                 let after_lang = &attr_content[lang_pos + "language".len()..];
@@ -2651,5 +2735,49 @@ pub struct Post {
         let sql_qualified =
             add_search_up_sql("posts", "pg_catalog.english", &[("title".to_string(), 'A')]);
         assert!(sql_qualified.contains("to_tsvector('pg_catalog.english'::regconfig"));
+    }
+
+    #[test]
+    fn test_parse_model_search_config_for_table_doc_comment_struct() {
+        let content = r#"
+#[autumn_web::model(table = "posts")]
+#[doc = "This is a struct definition inside doc comment"]
+pub struct Post {
+    #[id]
+    pub id: i64,
+    #[searchable(weight = "A")]
+    pub title: String,
+}
+"#;
+        let (lang, fields) = parse_model_search_config_for_table(content, "posts").unwrap();
+        assert_eq!(lang, "simple");
+        assert_eq!(fields, vec![("title".to_string(), 'A')]);
+    }
+
+    #[test]
+    fn test_parse_model_search_config_for_table_prior_model_language_scoping() {
+        let content = r#"
+#[autumn_web::model(table = "posts")]
+#[searchable(language = "english")]
+pub struct Post {
+    #[id]
+    pub id: i64,
+    #[searchable]
+    pub title: String,
+}
+
+#[autumn_web::model(table = "comments")]
+pub struct Comment {
+    #[id]
+    pub id: i64,
+    #[searchable]
+    pub body: String,
+}
+"#;
+        // Comments struct does not have struct-level #[searchable(language = "english")],
+        // so it should fallback to "simple" and NOT inherit "english" from Post.
+        let (lang, fields) = parse_model_search_config_for_table(content, "comments").unwrap();
+        assert_eq!(lang, "simple");
+        assert_eq!(fields, vec![("body".to_string(), 'D')]);
     }
 }

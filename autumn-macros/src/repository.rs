@@ -5830,7 +5830,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let language = <#model_name as ::autumn_web::repository::AutumnSearchableModel>::SEARCH_LANGUAGE;
 
                 let mut sql = format!(
-                    "SELECT id FROM {} WHERE search_vector @@ websearch_to_tsquery($1::regconfig, $2)",
+                    "SELECT id FROM \"{}\" WHERE search_vector @@ websearch_to_tsquery($1::regconfig, $2)",
                     #table_name
                 );
                 if #config_soft_delete {
@@ -5922,7 +5922,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let offset = req.offset();
 
                 let mut count_sql = format!(
-                    "SELECT COUNT(*) AS count FROM {} WHERE search_vector @@ websearch_to_tsquery($1::regconfig, $2)",
+                    "SELECT COUNT(*) AS count FROM \"{}\" WHERE search_vector @@ websearch_to_tsquery($1::regconfig, $2)",
                     #table_name
                 );
                 if #config_soft_delete {
@@ -5959,7 +5959,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 };
 
                 let mut select_sql = format!(
-                    "SELECT id FROM {} WHERE search_vector @@ websearch_to_tsquery($1::regconfig, $2)",
+                    "SELECT id FROM \"{}\" WHERE search_vector @@ websearch_to_tsquery($1::regconfig, $2)",
                     #table_name
                 );
                 if #config_soft_delete {
