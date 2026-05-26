@@ -1,0 +1,7 @@
+# Normalise line endings for all text files on checkout.
+* text=auto
+
+# Force LF for embedded Markdown content used via include_str! so that
+# git autocrlf on Windows does not corrupt the frontmatter delimiters.
+examples/wiki/content/*.md text eol=lf
+autumn/src/**/*.md text eol=lf

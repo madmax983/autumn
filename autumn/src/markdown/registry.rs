@@ -176,8 +176,20 @@ fn split_frontmatter<'a>(
         .or_else(|| after_close.strip_prefix('\n'))
         .unwrap_or(after_close);
 
+    // Normalize CRLF → LF before TOML parsing so that embedded files checked
+    // out on Windows (where git autocrlf converts line endings) parse correctly.
+    // The toml crate rejects bare \r that results when find("\n+++") lands on
+    // the \n of a \r\n sequence, leaving a trailing \r in the TOML slice.
+    let toml_normalized;
+    let toml_for_parse: &str = if toml_str.contains('\r') {
+        toml_normalized = toml_str.replace('\r', "");
+        &toml_normalized
+    } else {
+        toml_str
+    };
+
     let frontmatter: MarkdownFrontmatter =
-        toml::from_str(toml_str).map_err(|source| MarkdownError::FrontmatterInvalid {
+        toml::from_str(toml_for_parse).map_err(|source| MarkdownError::FrontmatterInvalid {
             slug: slug.to_owned(),
             source,
         })?;
@@ -232,6 +244,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(page.frontmatter.order, 0);
+    }
+
+    #[test]
+    fn parses_crlf_frontmatter() {
+        // Simulate a file checked out on Windows with git autocrlf=true.
+        let page = parse_page(
+            "crlf".to_owned(),
+            "+++\r\ntitle = \"CRLF Page\"\r\norder = 7\r\n+++\r\n\r\n# Body\r\n",
+        )
+        .unwrap();
+        assert_eq!(page.frontmatter.title, "CRLF Page");
+        assert_eq!(page.frontmatter.order, 7);
     }
 
     #[test]
