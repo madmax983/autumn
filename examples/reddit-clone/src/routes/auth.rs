@@ -197,7 +197,10 @@ pub async fn register(
 
     // Dispatch the outbound webhook event on "user.created"
     if let Some(manager) = state.extension::<WebhookOutboundManager>() {
-        manager.dispatch(&state, "user.created", &user).await?;
+        let dispatch_result = manager.dispatch(&state, "user.created", &user).await;
+        if let Err(e) = dispatch_result {
+            tracing::error!(error = %e, "Failed to dispatch user.created webhook event");
+        }
     }
 
     // Log in immediately after registration

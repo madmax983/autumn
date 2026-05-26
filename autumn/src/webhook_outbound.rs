@@ -88,10 +88,8 @@ pub trait OutboundWebhookHandler: Send + Sync + 'static {
     /// Retrieve a specific webhook subscription by ID (regardless of status/active state).
     fn get_subscription(
         &self,
-        _id: &str,
-    ) -> Pin<Box<dyn Future<Output = AutumnResult<Option<WebhookSubscription>>> + Send>> {
-        Box::pin(async { Ok(None) })
-    }
+        id: &str,
+    ) -> Pin<Box<dyn Future<Output = AutumnResult<Option<WebhookSubscription>>> + Send>>;
 
     /// Optional: List only permanently failed delivery attempts archived in the Dead Letter Queue.
     fn get_dlq_logs(
@@ -100,13 +98,11 @@ pub trait OutboundWebhookHandler: Send + Sync + 'static {
         Box::pin(async { Ok(Vec::new()) })
     }
 
-    /// Optional: Get a specific delivery log by ID.
+    /// Get a specific delivery log by ID.
     fn get_delivery_log(
         &self,
-        _id: &str,
-    ) -> Pin<Box<dyn Future<Output = AutumnResult<Option<WebhookDeliveryLog>>> + Send>> {
-        Box::pin(async { Ok(None) })
-    }
+        id: &str,
+    ) -> Pin<Box<dyn Future<Output = AutumnResult<Option<WebhookDeliveryLog>>> + Send>>;
 
     /// Optional: Reset consecutive failures for a subscription.
     fn reset_subscription_failures(
@@ -534,14 +530,18 @@ pub fn deliver_webhook_job(
                 } else {
                     let status_err = format!("server returned status: {status}");
                     log.last_error = Some(status_err.clone());
-                    manager.store().log_delivery(log.clone()).await?;
+                    if log.attempt < log.max_attempts {
+                        manager.store().log_delivery(log.clone()).await?;
+                    }
                     handle_delivery_failure(&manager, &sub, log, status_err).await
                 }
             }
             Err(e) => {
                 let error_str = e.to_string();
                 log.last_error = Some(error_str.clone());
-                manager.store().log_delivery(log.clone()).await?;
+                if log.attempt < log.max_attempts {
+                    manager.store().log_delivery(log.clone()).await?;
+                }
                 handle_delivery_failure(&manager, &sub, log, error_str).await
             }
         }

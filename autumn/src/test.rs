@@ -412,7 +412,9 @@ impl TestApp {
         }
 
         let mut app_builder = crate::app();
-        app_builder.registered_plugins.clone_from(&self.registered_plugins);
+        app_builder
+            .registered_plugins
+            .clone_from(&self.registered_plugins);
         app_builder.extensions = self.extensions;
 
         app_builder = app_builder.plugin(plugin);
