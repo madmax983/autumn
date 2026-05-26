@@ -1605,6 +1605,49 @@ pub struct Post {
         );
     }
 
+    // Regression test for issue #782: SelectOption must be resolvable from
+    // `autumn_admin_plugin::prelude::*` so generated select adapters compile
+    // without downstream hand-patches.
+    #[test]
+    fn select_option_generated_code_uses_prelude_importable_type() {
+        let tmp = project_with_model("ticket");
+        let options = AdminOptions {
+            select: vec![SelectSpec {
+                field: "priority".into(),
+                values: vec!["low".into(), "medium".into(), "high".into()],
+            }],
+            ..Default::default()
+        };
+        let plan =
+            plan_admin_with_options(tmp.path(), "Ticket", &["priority:String".into()], &options)
+                .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let admin = fs::read_to_string(tmp.path().join("src/admin/ticket.rs")).unwrap();
+
+        // Generated file must use the glob prelude import so SelectOption is in scope.
+        assert!(
+            admin.contains("use autumn_admin_plugin::prelude::*;"),
+            "generated adapter must use prelude glob import"
+        );
+        // SelectOption must appear as a struct literal in the generated body —
+        // it is brought in by `prelude::*` once SelectOption is exported from prelude.
+        assert!(
+            admin.contains("SelectOption {"),
+            "generated adapter must emit SelectOption struct literals for select fields"
+        );
+        // Verify the option values are present.
+        assert!(admin.contains("\"low\""), "option value 'low' must appear");
+        assert!(
+            admin.contains("\"medium\""),
+            "option value 'medium' must appear"
+        );
+        assert!(
+            admin.contains("\"high\""),
+            "option value 'high' must appear"
+        );
+    }
+
     #[test]
     fn parse_select_specs_parses_field_with_values() {
         let specs = parse_select_specs(&["status=draft,published,archived".into()]).unwrap();
