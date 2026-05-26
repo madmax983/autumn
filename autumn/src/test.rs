@@ -195,6 +195,8 @@ pub struct TestApp {
     state_initializers: Vec<Box<dyn FnOnce(&AppState) + Send>>,
     jobs: Vec<crate::job::JobInfo>,
     exception_filters: Vec<std::sync::Arc<dyn crate::middleware::ExceptionFilter>>,
+    registered_plugins: std::collections::HashSet<String>,
+    extensions: std::collections::HashMap<std::any::TypeId, Box<dyn std::any::Any + Send>>,
 }
 
 type TestPolicyRegistration = Box<dyn FnOnce(&crate::authorization::PolicyRegistry) + Send>;
@@ -237,6 +239,8 @@ impl TestApp {
             state_initializers: Vec::new(),
             jobs: Vec::new(),
             exception_filters: Vec::new(),
+            registered_plugins: std::collections::HashSet::new(),
+            extensions: std::collections::HashMap::new(),
         }
     }
 
@@ -401,8 +405,20 @@ impl TestApp {
     /// Apply a plugin directly to the test app.
     #[must_use]
     pub fn plugin<P: crate::plugin::Plugin>(mut self, plugin: P) -> Self {
+        let name = plugin.name().into_owned();
+        if self.registered_plugins.contains(&name) {
+            tracing::warn!(plugin = %name, "Duplicate plugin registration in TestApp; skipping");
+            return self;
+        }
+
         let mut app_builder = crate::app();
+        app_builder.registered_plugins.clone_from(&self.registered_plugins);
+        app_builder.extensions = self.extensions;
+
         app_builder = app_builder.plugin(plugin);
+
+        self.registered_plugins = app_builder.registered_plugins;
+        self.extensions = app_builder.extensions;
 
         // Merge properties from the plugin's app_builder into self:
         self.routes.extend(app_builder.routes);
@@ -415,8 +431,18 @@ impl TestApp {
 
         for hook in app_builder.startup_hooks {
             self.state_initializers.push(Box::new(move |state| {
-                let fut = hook(state.clone());
-                futures::executor::block_on(fut).expect("Plugin startup hook failed");
+                let state_owned = state.clone();
+                let handle = std::thread::spawn(move || {
+                    let rt = tokio::runtime::Builder::new_multi_thread()
+                        .enable_all()
+                        .build()
+                        .expect("failed to build tokio runtime for test plugin startup hook");
+                    rt.block_on(hook(state_owned))
+                });
+                handle
+                    .join()
+                    .expect("Plugin startup hook thread panicked")
+                    .expect("Plugin startup hook failed");
             }));
         }
         self

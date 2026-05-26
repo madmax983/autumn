@@ -85,6 +85,14 @@ pub trait OutboundWebhookHandler: Send + Sync + 'static {
         log: WebhookDeliveryLog,
     ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send>>;
 
+    /// Retrieve a specific webhook subscription by ID (regardless of status/active state).
+    fn get_subscription(
+        &self,
+        _id: &str,
+    ) -> Pin<Box<dyn Future<Output = AutumnResult<Option<WebhookSubscription>>> + Send>> {
+        Box::pin(async { Ok(None) })
+    }
+
     /// Optional: List only permanently failed delivery attempts archived in the Dead Letter Queue.
     fn get_dlq_logs(
         &self,
@@ -183,6 +191,18 @@ impl OutboundWebhookHandler for InMemoryOutboundWebhookHandler {
             .cloned()
             .collect();
         Box::pin(async move { Ok(list) })
+    }
+
+    fn get_subscription(
+        &self,
+        id: &str,
+    ) -> Pin<Box<dyn Future<Output = AutumnResult<Option<WebhookSubscription>>> + Send>> {
+        let subs = self
+            .subscriptions
+            .read()
+            .expect("subscriptions read lock poisoned");
+        let sub = subs.get(id).cloned();
+        Box::pin(async move { Ok(sub) })
     }
 
     fn log_delivery(
@@ -445,10 +465,10 @@ pub fn deliver_webhook_job(
             }
 
             // Load latest subscription state to respect emergency rotations/disable
-            let subs = manager.store().get_subscriptions(&log.topic).await?;
-            let sub = subs
-                .into_iter()
-                .find(|s| s.id == log.subscription_id)
+            let sub = manager
+                .store()
+                .get_subscription(&log.subscription_id)
+                .await?
                 .ok_or_else(|| {
                     AutumnError::not_found_msg(format!(
                         "subscription {} not found",

@@ -203,9 +203,9 @@ pub struct AppBuilder {
     pub(crate) custom_layers: Vec<CustomLayerRegistration>,
     pub(crate) startup_hooks: Vec<StartupHook>,
     pub(crate) shutdown_hooks: Vec<ShutdownHook>,
-    extensions: HashMap<TypeId, Box<dyn Any + Send>>,
+    pub(crate) extensions: HashMap<TypeId, Box<dyn Any + Send>>,
     /// Plugin names that have already been applied, for duplicate detection.
-    registered_plugins: HashSet<String>,
+    pub(crate) registered_plugins: HashSet<String>,
     /// Custom error page renderer (overrides built-in pages).
     error_page_renderer: Option<SharedRenderer>,
     /// Embedded Diesel migrations, registered via `.migrations()`.
