@@ -15,12 +15,14 @@ use syn::{Ident, ItemTrait, LitStr, TraitItem};
 
 /// Parse `#[version_history(sensitive = ["col1", "col2"])]` from a trait's
 /// outer attributes. Returns the column names, or an empty vec if the
-/// attribute is absent or contains no `sensitive` key.
-fn parse_version_history_sensitive(attrs: &[syn::Attribute]) -> Vec<String> {
+/// attribute is absent. Returns a `syn::Error` if the attribute exists but
+/// contains a typo or unsupported key — this converts silently-missed sensitive
+/// columns (a security risk) into a hard compile error.
+fn parse_version_history_sensitive(attrs: &[syn::Attribute]) -> syn::Result<Vec<String>> {
     for attr in attrs {
         if attr.path().is_ident("version_history") {
             let mut cols: Vec<String> = Vec::new();
-            let _ = attr.parse_nested_meta(|meta| {
+            attr.parse_nested_meta(|meta| {
                 if meta.path.is_ident("sensitive") {
                     let value = meta.value()?;
                     let arr: syn::ExprArray = value.parse()?;
@@ -33,13 +35,17 @@ fn parse_version_history_sensitive(attrs: &[syn::Attribute]) -> Vec<String> {
                             cols.push(s.value());
                         }
                     }
+                    Ok(())
+                } else {
+                    Err(meta.error(
+                        "unknown version_history key; expected `sensitive = [\"col\", ...]`",
+                    ))
                 }
-                Ok(())
-            });
-            return cols;
+            })?;
+            return Ok(cols);
         }
     }
-    Vec::new()
+    Ok(Vec::new())
 }
 
 use crate::model::infer_table_name;
@@ -7258,7 +7264,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // When versioned = true, generate `impl VersionedRecord for Model` so
     // that the write paths (which call <Model as VersionedRecord>::…) compile.
     let versioned_record_impl = if config.versioned {
-        let sensitive_cols = parse_version_history_sensitive(&trait_def.attrs);
+        let sensitive_cols = match parse_version_history_sensitive(&trait_def.attrs) {
+            Ok(cols) => cols,
+            Err(err) => return err.to_compile_error(),
+        };
         let sensitive_ts = if sensitive_cols.is_empty() {
             quote! { &[] }
         } else {
@@ -8678,6 +8687,30 @@ mod tests {
         assert!(
             generated.contains("reset_token"),
             "all sensitive columns must appear in the generated VersionedRecord impl: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_versioned_typo_in_sensitive_attr_is_compile_error() {
+        // A typo in the key name (e.g. "sensitve") must NOT silently compile
+        // and leave sensitive columns unredacted.  The macro must emit a
+        // compile_error token stream so the build fails with a clear message.
+        let generated = repository_macro(
+            quote! { Post, versioned = true },
+            quote! {
+                #[version_history(sensitve = ["password_digest"])]
+                pub trait PostRepository {}
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("compile_error") || generated.contains("unknown version_history"),
+            "typo in sensitive attribute must produce a compile error, not silently succeed: {generated}"
+        );
+        assert!(
+            !generated.contains("password_digest"),
+            "typo must not cause sensitive column to be silently omitted: {generated}"
         );
     }
 
