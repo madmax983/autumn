@@ -476,9 +476,8 @@ pub trait AdminModel: Send + Sync + 'static {
     /// `#[repository(Model, versioned = true)]`. The generated
     /// `PgXxxRepository::version_history(record_id, filter)` method can be
     /// called from [`get_history`](AdminModel::get_history) to bridge the
-    /// repository's history store into the admin panel. See
-    /// [`VersionedAdminBridge`] for a convenience wrapper that handles the
-    /// delegation automatically.
+    /// repository's history store into the admin panel, then converted into an
+    /// [`AdminHistoryPage`] with `AdminHistoryPage::from`.
     fn has_history(&self) -> bool {
         false
     }
@@ -488,8 +487,8 @@ pub trait AdminModel: Send + Sync + 'static {
     /// The default implementation returns [`AdminError::Other`] so models
     /// that do not opt in get a clear error instead of a silent no-op.
     /// Override this when `has_history` returns `true`, delegating to the
-    /// repository's generated `version_history` method or to
-    /// [`VersionedAdminBridge`].
+    /// repository's generated `version_history` method and converting the
+    /// returned page into an [`AdminHistoryPage`] with `AdminHistoryPage::from`.
     fn get_history<'a>(
         &'a self,
         _pool: &'a diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,

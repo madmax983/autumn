@@ -442,8 +442,8 @@ fn vh_insert_ts(
     let changes_ts = match op {
         "insert" => quote! {
             {
-                let __vh_json = ::autumn_web::reexports::serde_json::to_value(&#record_expr)
-                    .unwrap_or(::autumn_web::reexports::serde_json::Value::Object(Default::default()));
+                use ::autumn_web::version_history::VersionedRecord as _;
+                let __vh_json = (#record_expr).version_column_values();
                 let __vh_changes = ::autumn_web::version_history::compute_insert_changes(&__vh_json, <#model_ident as ::autumn_web::version_history::VersionedRecord>::version_sensitive_columns());
                 ::autumn_web::reexports::serde_json::to_string(&__vh_changes)
                     .unwrap_or_else(|_| "[]".to_string())
@@ -451,8 +451,8 @@ fn vh_insert_ts(
         },
         "delete" => quote! {
             {
-                let __vh_json = ::autumn_web::reexports::serde_json::to_value(&#record_expr)
-                    .unwrap_or(::autumn_web::reexports::serde_json::Value::Object(Default::default()));
+                use ::autumn_web::version_history::VersionedRecord as _;
+                let __vh_json = (#record_expr).version_column_values();
                 let __vh_changes = ::autumn_web::version_history::compute_delete_changes(&__vh_json, <#model_ident as ::autumn_web::version_history::VersionedRecord>::version_sensitive_columns());
                 ::autumn_web::reexports::serde_json::to_string(&__vh_changes)
                     .unwrap_or_else(|_| "[]".to_string())
@@ -463,10 +463,9 @@ fn vh_insert_ts(
             let before = before_expr.unwrap_or(record_expr);
             quote! {
                 {
-                    let __vh_before_json = ::autumn_web::reexports::serde_json::to_value(#before)
-                        .unwrap_or(::autumn_web::reexports::serde_json::Value::Object(Default::default()));
-                    let __vh_after_json = ::autumn_web::reexports::serde_json::to_value(&#record_expr)
-                        .unwrap_or(::autumn_web::reexports::serde_json::Value::Object(Default::default()));
+                    use ::autumn_web::version_history::VersionedRecord as _;
+                    let __vh_before_json = (#before).version_column_values();
+                    let __vh_after_json = (#record_expr).version_column_values();
                     let __vh_changes = ::autumn_web::version_history::compute_diff(&__vh_before_json, &__vh_after_json, <#model_ident as ::autumn_web::version_history::VersionedRecord>::version_sensitive_columns());
                     ::autumn_web::reexports::serde_json::to_string(&__vh_changes)
                         .unwrap_or_else(|_| "[]".to_string())
@@ -480,7 +479,10 @@ fn vh_insert_ts(
     quote! {
         {
             let __vh_changes_str: ::std::string::String = #changes_ts;
-            let __vh_record_id: i64 = #record_expr.id;
+            let __vh_record_id: i64 = {
+                use ::autumn_web::version_history::VersionedRecord as _;
+                (#record_expr).version_record_id()
+            };
             let __vh_actor: &str = #actor_ts;
             let __vh_request_id: ::core::option::Option<&str> = #request_id_ts;
             ::autumn_web::reexports::diesel::sql_query(
@@ -8799,6 +8801,27 @@ mod tests {
         assert!(
             generated.contains("version_history"),
             "version_history query method must still be generated: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_no_versioned_record_impl_uses_trait_hooks_for_history_writes() {
+        // Manual VersionedRecord impls own the values written to history. The
+        // generated write paths must call those hooks instead of serializing the
+        // model directly, otherwise redaction and normalization are bypassed.
+        let generated = repository_macro(
+            quote! { Post, versioned = true, no_versioned_record_impl },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("version_column_values"),
+            "history writes must call VersionedRecord::version_column_values(): {generated}"
+        );
+        assert!(
+            generated.contains("version_record_id"),
+            "history writes must call VersionedRecord::version_record_id(): {generated}"
         );
     }
 

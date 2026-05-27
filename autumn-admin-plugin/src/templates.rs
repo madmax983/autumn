@@ -1577,6 +1577,12 @@ pub fn model_history_page(
     actuator_prefix: &str,
 ) -> Markup {
     let record_display = format!("{model_name} #{record_id_val}");
+    let history_page_href = |page: u64| {
+        format!(
+            "{prefix}/{model_slug}/{record_id_val}/history?page={page}&per_page={}",
+            history.per_page
+        )
+    };
     let empty_messages: &[autumn_web::flash::FlashMessage] = &[];
     let content = html! {
         div class="breadcrumbs" {
@@ -1674,12 +1680,12 @@ pub fn model_history_page(
                 @if history.total_pages() > 1 {
                     div class="pagination" {
                         @if history.page > 1 {
-                            a href={ (prefix) "/" (model_slug) "/" (record_id_val) "/history?page=" (history.page - 1) }
+                            a href=(history_page_href(history.page - 1))
                                 class="btn btn-secondary btn-sm" { "← Prev" }
                         }
                         span { " Page " (history.page) " of " (history.total_pages()) " " }
                         @if history.has_next_page() {
-                            a href={ (prefix) "/" (model_slug) "/" (record_id_val) "/history?page=" (history.page + 1) }
+                            a href=(history_page_href(history.page + 1))
                                 class="btn btn-secondary btn-sm" { "Next →" }
                         }
                     }
@@ -1827,6 +1833,37 @@ mod tests {
 
     fn dummy_registry() -> AdminRegistry {
         AdminRegistry::new()
+    }
+
+    #[test]
+    fn history_page_pagination_preserves_per_page() {
+        let r = dummy_registry();
+        let history = AdminHistoryPage {
+            entries: vec![crate::traits::AdminHistoryEntry {
+                id: 1,
+                actor: "system".to_owned(),
+                op: "insert".to_owned(),
+                request_id: None,
+                changes: vec![],
+                recorded_at: chrono::Utc::now(),
+            }],
+            total: 250,
+            page: 2,
+            per_page: 100,
+        };
+
+        let html =
+            model_history_page(&r, "posts", "Post", "Posts", 42, &history, "/admin", "/ops")
+                .into_string();
+
+        assert!(
+            html.contains("/admin/posts/42/history?page=1&amp;per_page=100"),
+            "previous history page link must preserve per_page: {html}"
+        );
+        assert!(
+            html.contains("/admin/posts/42/history?page=3&amp;per_page=100"),
+            "next history page link must preserve per_page: {html}"
+        );
     }
 
     #[test]
