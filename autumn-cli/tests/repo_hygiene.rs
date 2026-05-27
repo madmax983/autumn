@@ -29,6 +29,10 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
+fn normalize_hygiene_doc(content: &str) -> String {
+    content.replace("\r\n", "\n").replace("//! ", "")
+}
+
 fn workspace_package_value(root_toml: &toml::Value, key: &str) -> String {
     root_toml
         .get("workspace")
@@ -519,7 +523,7 @@ fn version_history_docs_put_sensitive_attribute_on_repository_trait() {
         let path = root.join(rel_path);
         let content = std::fs::read_to_string(&path)
             .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
-        let content = content.replace("//! ", "");
+        let content = normalize_hygiene_doc(&content);
         let attr = "#[version_history(sensitive = [\"password_digest\", \"reset_token\"])]";
         let repo = "#[repository(Post, versioned = true)]";
 
@@ -532,6 +536,16 @@ fn version_history_docs_put_sensitive_attribute_on_repository_trait() {
             "{rel_path} must not show #[version_history(...)] as an item inside the trait body",
         );
     }
+}
+
+#[test]
+fn hygiene_doc_normalization_accepts_windows_line_endings() {
+    let attr = "#[version_history(sensitive = [\"password_digest\", \"reset_token\"])]";
+    let repo = "#[repository(Post, versioned = true)]";
+    let content = format!("{attr}\r\n{repo}\r\npub trait PostRepository {{}}\r\n");
+    let content = normalize_hygiene_doc(&content);
+
+    assert!(content.contains(&format!("{attr}\n{repo}")));
 }
 
 #[test]
