@@ -680,14 +680,8 @@ impl TestApp {
 
         if !self.jobs.is_empty() {
             let shutdown = tokio_util::sync::CancellationToken::new();
-            crate::job::start_local_runtime(
-                self.jobs.clone(),
-                &state,
-                &shutdown,
-                self.config.jobs.workers,
-                self.config.jobs.max_attempts,
-                self.config.jobs.initial_backoff_ms,
-            );
+            crate::job::start_runtime(self.jobs.clone(), &state, &shutdown, &self.config.jobs)
+                .expect("Failed to start job runtime in test");
         }
 
         for initializer in self.state_initializers {

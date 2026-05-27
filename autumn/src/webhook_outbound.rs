@@ -214,21 +214,24 @@ impl OutboundWebhookHandler for InMemoryOutboundWebhookHandler {
             .write()
             .expect("subscriptions write lock poisoned");
         if let Some(sub) = subs.get_mut(&log.subscription_id) {
-            if let Some(status) = log.response_status {
-                if (200..300).contains(&status) {
-                    sub.consecutive_failures = 0;
-                } else {
+            let is_active = sub.status == WebhookSubscriptionStatus::Active;
+            if is_active {
+                if let Some(status) = log.response_status {
+                    if (200..300).contains(&status) {
+                        sub.consecutive_failures = 0;
+                    } else {
+                        sub.consecutive_failures = sub.consecutive_failures.saturating_add(1);
+                        if sub.consecutive_failures >= 50 {
+                            sub.status = WebhookSubscriptionStatus::Failed;
+                            tracing::warn!(subscription_id = %sub.id, "Webhook subscription auto-disabled due to 50 consecutive failures");
+                        }
+                    }
+                } else if log.last_error.is_some() {
                     sub.consecutive_failures = sub.consecutive_failures.saturating_add(1);
                     if sub.consecutive_failures >= 50 {
                         sub.status = WebhookSubscriptionStatus::Failed;
                         tracing::warn!(subscription_id = %sub.id, "Webhook subscription auto-disabled due to 50 consecutive failures");
                     }
-                }
-            } else if log.last_error.is_some() {
-                sub.consecutive_failures = sub.consecutive_failures.saturating_add(1);
-                if sub.consecutive_failures >= 50 {
-                    sub.status = WebhookSubscriptionStatus::Failed;
-                    tracing::warn!(subscription_id = %sub.id, "Webhook subscription auto-disabled due to 50 consecutive failures");
                 }
             }
         }
@@ -347,6 +350,7 @@ impl WebhookOutboundManager {
             AutumnError::internal_server_error_msg(format!("failed to serialize payload: {e}"))
         })?;
 
+        let mut errors = Vec::new();
         let subs = self.handler.get_subscriptions(topic).await?;
         for sub in subs {
             if sub.status == WebhookSubscriptionStatus::Disabled {
@@ -371,12 +375,17 @@ impl WebhookOutboundManager {
             };
 
             // Register the initial attempt in local storage
-            self.handler.log_delivery(log.clone()).await?;
+            if let Err(e) = self.handler.log_delivery(log.clone()).await {
+                errors.push(e);
+                continue;
+            }
 
             // If a delegate extension is registered, run it (delegates to Harvest workflow)
             if let Some(delegate_ext) = state.extension::<WebhookDelegateExt>() {
                 tracing::info!(subscription_id = %sub.id, "WebhookOutboundManager::dispatch: delegating webhook delivery via runtime hook");
-                (delegate_ext.0)(state, sub, log).await?;
+                if let Err(e) = (delegate_ext.0)(state, sub, log).await {
+                    errors.push(e);
+                }
             } else {
                 // Fallback: enqueue a standard background job
                 let job_payload = serde_json::json!({
@@ -385,15 +394,22 @@ impl WebhookOutboundManager {
 
                 tracing::debug!(subscription_id = %sub.id, "WebhookOutboundManager::dispatch: enqueuing fallback webhook delivery job");
                 if let Some(job_client) = crate::job::global_job_client() {
-                    job_client
+                    if let Err(e) = job_client
                         .enqueue("autumn_webhook_delivery", job_payload)
-                        .await?;
+                        .await
+                    {
+                        errors.push(e);
+                    }
                 } else {
-                    return Err(AutumnError::internal_server_error_msg(
+                    errors.push(AutumnError::internal_server_error_msg(
                         "Global job client is unavailable; fallback webhook delivery job not enqueued",
                     ));
                 }
             }
+        }
+
+        if !errors.is_empty() {
+            return Err(errors.remove(0));
         }
 
         Ok(())
