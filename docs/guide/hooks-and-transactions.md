@@ -561,12 +561,15 @@ repo.upsert_many(&[article_a, article_b]).await?;
 
 ### Transaction behavior
 
-**Without hooks:** all bulk methods are direct SQL — a single batch statement,
-no transaction overhead beyond what Postgres provides for a single statement.
+**Without hooks:** bulk methods still wrap their chunked SQL in an explicit
+transaction for all-or-nothing atomicity — `begin`, one or more chunk
+INSERT/UPDATE/DELETE statements, `commit`. If any chunk fails the whole batch
+rolls back. There is no extra round-trip beyond the chunked SQL itself.
 
-**With hooks:** the entire batch — all before hooks, the batch SQL, and all
-after hooks — is wrapped in a single transaction. If any hook or the SQL
-returns an error, the entire batch rolls back.
+**With hooks:** `before_*` hooks and all SQL run inside the transaction and can
+cause a rollback on error. `after_*` hooks run **after the transaction commits**
+(same as single-record mutations) — errors in `after_*` propagate to the caller
+but the batch rows are already committed and cannot be rolled back from there.
 
 ```
 save_many with hooks:
@@ -575,11 +578,11 @@ save_many with hooks:
     before_create(record_0)
     before_create(record_1)
     ...
-    INSERT INTO ... VALUES (...), (...), ...   ← single batch query
+    INSERT INTO ... VALUES (...), (...), ...   ← chunked batch inserts
     stage after_create_commit rows             ← if commit_hooks = true
   COMMIT
   (connection released)
-  after_create(record_0)                       ← post-commit, on same call stack
+  after_create(record_0)                       ← post-commit; error ≠ rollback
   after_create(record_1)
   ...
   → after_create_commit dispatched to workers
