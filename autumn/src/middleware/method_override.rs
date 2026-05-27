@@ -396,9 +396,15 @@ fn origin_matches_request(origin: &str, headers: &http::HeaderMap) -> bool {
         return false;
     };
 
+    #[allow(clippy::double_ended_iterator_last)]
     let expected_host = headers
-        .get("x-forwarded-host")
-        .and_then(|v| v.to_str().ok())
+        .get_all("x-forwarded-host")
+        .into_iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|s| s.split(','))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .last()
         .or_else(|| {
             headers
                 .get(http::header::HOST)
@@ -411,14 +417,17 @@ fn origin_matches_request(origin: &str, headers: &http::HeaderMap) -> bool {
         return false;
     }
 
-    if let Some(scheme) = headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-    {
-        // Multiple `X-Forwarded-Proto` values can be chained by
-        // intermediaries; the leftmost (client-facing) is the one
-        // that matters here.
-        let outermost = scheme.split(',').next().unwrap_or(scheme).trim();
+    #[allow(clippy::double_ended_iterator_last)]
+    let forwarded_proto = headers
+        .get_all("x-forwarded-proto")
+        .into_iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|s| s.split(','))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .last();
+
+    if let Some(outermost) = forwarded_proto {
         return outermost.eq_ignore_ascii_case(origin_scheme);
     }
 
@@ -1188,9 +1197,10 @@ mod tests {
         );
     }
 
-    /// `X-Forwarded-Proto` may carry a chained list (e.g. through
-    /// nested proxies). The leftmost (client-facing) value is what
-    /// the browser saw; that's the value we must compare against.
+    /// `X-Forwarded-Proto` may carry a chained list. The rightmost value
+    /// is the one appended by the trusted proxy closest to the app, so
+    /// we must extract the rightmost value to prevent spoofing by an attacker
+    /// who prepends their own scheme.
     #[tokio::test]
     async fn origin_scheme_match_via_chained_forwarded_proto() {
         let app = layered_router();
@@ -1202,10 +1212,9 @@ mod tests {
                     .header("content-type", "application/x-www-form-urlencoded")
                     .header("origin", "https://app.example")
                     .header("host", "app.example")
-                    // First hop saw HTTPS; later hops were HTTP between
-                    // proxy and app. Only the client-facing scheme
-                    // matters for the same-origin comparison.
-                    .header("x-forwarded-proto", "https, http")
+                    // Attacker spoofed HTTP; trusted proxy appended HTTPS.
+                    // The rightmost scheme (HTTPS) is what matters for the comparison.
+                    .header("x-forwarded-proto", "http, https")
                     .body(Body::from("_method=DELETE"))
                     .unwrap(),
             )
