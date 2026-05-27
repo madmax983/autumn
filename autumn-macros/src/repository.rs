@@ -5281,11 +5281,6 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     model_name,
                 );
                 quote! {
-                    // Classification is based on the pre-upsert snapshot. Under
-                    // concurrent inserts of the same ID between the SELECT FOR UPDATE
-                    // and the upsert, the history op may be logged as "insert" when
-                    // the DB actually took the update path. Fixing this correctly
-                    // requires PostgreSQL-specific xmax inspection.
                     for r in &chunk_upserted {
                         if let ::core::option::Option::Some(before_rec) = __vh_before_map.get(&r.id) {
                             #vh_upd
@@ -5301,6 +5296,30 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 quote! {
                     let __vh_before_map: ::std::collections::HashMap<i64, #model_name> =
                         existing_rows.iter().map(|r| (r.id, r.clone())).collect();
+                }
+            } else {
+                quote! {}
+            };
+            let vh_upsert_lock_keys = if config.versioned {
+                let table_name = table_name.clone();
+                quote! {
+                    let mut __autumn_upsert_lock_ids = chunk_ids.clone();
+                    __autumn_upsert_lock_ids.sort_unstable();
+                    __autumn_upsert_lock_ids.dedup();
+                    for __autumn_upsert_lock_id in __autumn_upsert_lock_ids {
+                        let __autumn_upsert_lock_key =
+                            ::autumn_web::repository::repository_upsert_advisory_lock_key(
+                                #table_name,
+                                __autumn_upsert_lock_id,
+                            );
+                        ::autumn_web::reexports::diesel::sql_query("SELECT pg_advisory_xact_lock($1)")
+                            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(
+                                __autumn_upsert_lock_key,
+                            )
+                            .execute(conn)
+                            .await
+                            .map_err(::autumn_web::AutumnError::from)?;
+                    }
                 }
             } else {
                 quote! {}
@@ -5444,6 +5463,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         let chunk_size = if cols == 0 { 1000 } else { (65535usize / cols).min(1000).max(1) };
                         for chunk in records.chunks(chunk_size) {
                             let chunk_ids: Vec<_> = chunk.iter().map(|r| r.id).collect();
+                            #vh_upsert_lock_keys
                             let existing_rows = #load_expr
                                 .map_err(::autumn_web::AutumnError::from)?;
 
@@ -7373,7 +7393,6 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     record_id: i64,
                     filter: ::autumn_web::version_history::VersionFilter,
                 ) -> ::autumn_web::AutumnResult<::autumn_web::version_history::VersionPage> {
-                    use ::autumn_web::reexports::diesel::prelude::*;
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl as _;
 
                     // Private helper struct that can be deserialized from a raw SQL row.
@@ -8809,6 +8828,38 @@ mod tests {
         assert!(
             lock_pos < first_pos && first_pos < history_pos,
             "versioned update must SELECT FOR UPDATE before loading the before image and writing history: {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_versioned_upsert_many_locks_keys_before_history_snapshot() {
+        let generated = repository_macro(
+            quote! { Post, versioned = true },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        let lock_pos = generated
+            .find("pg_advisory_xact_lock")
+            .expect("versioned upsert_many must lock logical upsert keys before pre-reading rows");
+        let upsert_section = &generated[lock_pos..];
+        let load_pos = upsert_section
+            .find("let existing_rows =")
+            .expect("versioned upsert_many should load existing rows before writing history");
+        let before_map_pos = upsert_section
+            .find("let __vh_before_map")
+            .expect("versioned upsert_many should snapshot before images for history");
+        let history_pos = upsert_section
+            .find("INSERT INTO _autumn_version_history")
+            .expect("versioned upsert_many should write history entries");
+
+        assert!(
+            load_pos < before_map_pos && before_map_pos < history_pos,
+            "versioned upsert_many must serialize keys before classifying insert/update history: {generated}"
+        );
+        assert!(
+            generated.contains("repository_upsert_advisory_lock_key"),
+            "versioned upsert_many must derive stable advisory lock keys through the runtime helper: {generated}"
         );
     }
 

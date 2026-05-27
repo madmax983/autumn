@@ -10,6 +10,7 @@
 //! operations — most notably optimistic-lock conflicts when two replicas
 //! write the same row concurrently.
 
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 /// Typed errors returned by generated repository methods.
@@ -141,6 +142,25 @@ pub trait AutumnSearchableModel {
     const SEARCH_FIELDS: &'static [(&'static str, char)];
 }
 
+/// Derive a stable signed 64-bit advisory lock key for repository upserts.
+///
+/// Generated versioned repositories use this before pre-reading rows for
+/// `upsert_many`, so concurrent generated upserts for the same table/id cannot
+/// classify audit history from a stale missing-row snapshot.
+#[doc(hidden)]
+#[must_use]
+pub fn repository_upsert_advisory_lock_key(table_name: &str, record_id: i64) -> i64 {
+    let mut hasher = Sha256::new();
+    hasher.update(b"repository_upsert\0");
+    hasher.update(table_name.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(record_id.to_be_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 8];
+    bytes.copy_from_slice(&digest[..8]);
+    i64::from_be_bytes(bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,5 +233,22 @@ mod tests {
             actual_version: None,
         };
         let _: &dyn std::error::Error = &err;
+    }
+
+    #[test]
+    fn repository_upsert_advisory_lock_key_is_stable_for_same_table_and_id() {
+        let a = repository_upsert_advisory_lock_key("posts", 42);
+        let b = repository_upsert_advisory_lock_key("posts", 42);
+
+        assert_eq!(a, b);
+        assert_ne!(a, 0);
+    }
+
+    #[test]
+    fn repository_upsert_advisory_lock_key_separates_table_and_id() {
+        let key = repository_upsert_advisory_lock_key("posts", 42);
+
+        assert_ne!(key, repository_upsert_advisory_lock_key("comments", 42));
+        assert_ne!(key, repository_upsert_advisory_lock_key("posts", 43));
     }
 }
