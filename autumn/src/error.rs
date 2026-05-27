@@ -1113,4 +1113,155 @@ mod tests {
         assert_eq!(hx_trigger, r#"{"autumn:conflict":true}"#);
         Ok(())
     }
+
+    #[test]
+    fn test_problem_type_for() {
+        let cases = vec![
+            (
+                StatusCode::BAD_REQUEST,
+                "https://autumn.dev/problems/bad-request",
+            ),
+            (
+                StatusCode::UNAUTHORIZED,
+                "https://autumn.dev/problems/unauthorized",
+            ),
+            (
+                StatusCode::FORBIDDEN,
+                "https://autumn.dev/problems/forbidden",
+            ),
+            (
+                StatusCode::NOT_FOUND,
+                "https://autumn.dev/problems/not-found",
+            ),
+            (StatusCode::CONFLICT, "https://autumn.dev/problems/conflict"),
+            (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "https://autumn.dev/problems/payload-too-large",
+            ),
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "https://autumn.dev/problems/unprocessable-entity",
+            ),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "https://autumn.dev/problems/internal-server-error",
+            ),
+            (
+                StatusCode::NOT_IMPLEMENTED,
+                "https://autumn.dev/problems/not-implemented",
+            ),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "https://autumn.dev/problems/service-unavailable",
+            ),
+            (StatusCode::IM_A_TEAPOT, "about:blank"),
+            (StatusCode::OK, "about:blank"),
+        ];
+
+        for (status, expected) in cases {
+            assert_eq!(problem_type_for(status, false), expected);
+        }
+
+        assert_eq!(
+            problem_type_for(StatusCode::BAD_REQUEST, true),
+            "https://autumn.dev/problems/validation-failed"
+        );
+        assert_eq!(
+            problem_type_for(StatusCode::INTERNAL_SERVER_ERROR, true),
+            "https://autumn.dev/problems/validation-failed"
+        );
+    }
+
+    #[test]
+    fn test_problem_title_for() {
+        let cases = vec![
+            (StatusCode::BAD_REQUEST, "Bad Request"),
+            (StatusCode::UNAUTHORIZED, "Unauthorized"),
+            (StatusCode::FORBIDDEN, "Forbidden"),
+            (StatusCode::NOT_FOUND, "Not Found"),
+            (StatusCode::CONFLICT, "Conflict"),
+            (StatusCode::PAYLOAD_TOO_LARGE, "Payload Too Large"),
+            (StatusCode::UNPROCESSABLE_ENTITY, "Unprocessable Entity"),
+            (StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error"),
+            (StatusCode::NOT_IMPLEMENTED, "Not Implemented"),
+            (StatusCode::SERVICE_UNAVAILABLE, "Service Unavailable"),
+            (StatusCode::IM_A_TEAPOT, "I'm a teapot"), // from canonical_reason
+            (StatusCode::OK, "OK"),
+        ];
+
+        for (status, expected) in cases {
+            assert_eq!(problem_title_for(status, false), expected);
+        }
+
+        assert_eq!(
+            problem_title_for(StatusCode::BAD_REQUEST, true),
+            "Validation Failed"
+        );
+        assert_eq!(
+            problem_title_for(StatusCode::INTERNAL_SERVER_ERROR, true),
+            "Validation Failed"
+        );
+    }
+
+    #[test]
+    fn test_problem_code_for() {
+        let cases = vec![
+            (StatusCode::BAD_REQUEST, "autumn.bad_request"),
+            (StatusCode::UNAUTHORIZED, "autumn.unauthorized"),
+            (StatusCode::FORBIDDEN, "autumn.forbidden"),
+            (StatusCode::NOT_FOUND, "autumn.not_found"),
+            (StatusCode::CONFLICT, "autumn.conflict"),
+            (StatusCode::PAYLOAD_TOO_LARGE, "autumn.payload_too_large"),
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "autumn.unprocessable_entity",
+            ),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "autumn.internal_server_error",
+            ),
+            (StatusCode::NOT_IMPLEMENTED, "autumn.not_implemented"),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "autumn.service_unavailable",
+            ),
+            (StatusCode::EXPECTATION_FAILED, "autumn.client_error"), // 417
+            (StatusCode::BAD_GATEWAY, "autumn.server_error"),        // 502
+            (StatusCode::OK, "autumn.error"),                        // Not 4xx or 5xx
+        ];
+
+        for (status, expected) in cases {
+            assert_eq!(problem_code_for(status, false), expected);
+        }
+
+        assert_eq!(
+            problem_code_for(StatusCode::BAD_REQUEST, true),
+            "autumn.validation_failed"
+        );
+        assert_eq!(
+            problem_code_for(StatusCode::INTERNAL_SERVER_ERROR, true),
+            "autumn.validation_failed"
+        );
+    }
+
+    #[test]
+    fn into_response_maps_query_timeout_to_503() {
+        let timeout_strings = vec![
+            "canceling statement due to statement timeout",
+            "57014",
+            "query_canceled",
+            "query canceled",
+            "statement timeout",
+        ];
+
+        for msg in timeout_strings {
+            let err = AutumnError::internal_server_error(TestError(msg.to_string()));
+            let response = err.into_response();
+            assert_eq!(
+                response.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Failed to map '{msg}' to 503"
+            );
+        }
+    }
 }
