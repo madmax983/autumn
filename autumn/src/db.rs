@@ -323,6 +323,103 @@ const fn is_separator(c: char) -> bool {
     )
 }
 
+fn consume_single_quoted_string(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    loop {
+        match chars.next() {
+            None => break,
+            Some('\'') => {
+                if chars.peek() == Some(&'\'') {
+                    // Escaped quote ('') — consume both, stay inside string
+                    chars.next();
+                } else {
+                    // Closing quote
+                    break;
+                }
+            }
+            Some(_) => {}
+        }
+    }
+}
+
+fn consume_dollar_quoted_string_or_param(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    out: &mut String,
+) {
+    let next_ch = chars.peek().copied();
+
+    // Positional parameter $N — pass through verbatim.
+    if next_ch.is_some_and(|nc| nc.is_ascii_digit()) {
+        out.push('$');
+        while chars.peek().is_some_and(char::is_ascii_digit) {
+            if let Some(d) = chars.next() {
+                out.push(d);
+            }
+        }
+        return;
+    }
+
+    // Dollar-quoted string: $$ (anonymous) or $tag$ (tagged).
+    // Collect the optional tag, looking for the second `$`.
+    let mut tag = String::new();
+    let mut found_closing_dollar = false;
+
+    if next_ch == Some('$') {
+        // Anonymous $$: consume the second `$`.
+        chars.next();
+        found_closing_dollar = true;
+    } else if next_ch.is_some_and(|nc| nc.is_alphabetic() || nc == '_') {
+        // Accumulate tag chars until we hit `$` or a non-identifier char.
+        while let Some(&tc) = chars.peek() {
+            if tc == '$' {
+                chars.next(); // consume the closing `$` of the opening tag
+                found_closing_dollar = true;
+                break;
+            } else if tc.is_alphanumeric() || tc == '_' {
+                tag.push(tc);
+                chars.next();
+            } else {
+                // Not a valid tag character — not a dollar-quoted string.
+                break;
+            }
+        }
+    }
+
+    if found_closing_dollar {
+        out.push_str("'?'");
+        consume_dollar_quoted_body(chars, &tag);
+    } else {
+        // Not a recognisable dollar form — emit $ and any partial tag.
+        out.push('$');
+        out.push_str(&tag);
+    }
+}
+
+fn consume_numeric_literal(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    is_leading_dot: bool,
+) {
+    if is_leading_dot {
+        chars.next(); // consume the leading dot
+    }
+    // Consume integer/decimal digits, underscores, and dots.
+    while chars
+        .peek()
+        .is_some_and(|d| d.is_ascii_digit() || *d == '.' || *d == '_')
+    {
+        chars.next();
+    }
+    // Consume optional scientific-notation exponent: e/E [+/-] <digits>.
+    if chars.peek().is_some_and(|e| *e == 'e' || *e == 'E') {
+        chars.next(); // consume 'e'/'E'
+        if chars.peek().is_some_and(|s| *s == '+' || *s == '-') {
+            chars.next(); // consume optional sign
+        }
+        while chars.peek().is_some_and(char::is_ascii_digit) {
+            chars.next();
+        }
+    }
+}
+
 #[must_use]
 pub fn scrub_sql(sql: &str) -> String {
     let mut out = String::with_capacity(sql.len());
@@ -349,76 +446,14 @@ pub fn scrub_sql(sql: &str) -> String {
         if c == '\'' {
             out.push_str("'?'");
             prev_is_sep = false;
-            loop {
-                match chars.next() {
-                    None => break,
-                    Some('\'') => {
-                        if chars.peek() == Some(&'\'') {
-                            // Escaped quote ('') — consume both, stay inside string
-                            chars.next();
-                        } else {
-                            // Closing quote
-                            break;
-                        }
-                    }
-                    Some(_) => {}
-                }
-            }
+            consume_single_quoted_string(&mut chars);
             continue;
         }
 
         // ── Dollar sign: positional parameter or dollar-quoted string ─────
         if c == '$' {
-            let next_ch = chars.peek().copied();
-
-            // Positional parameter $N — pass through verbatim.
-            if next_ch.is_some_and(|nc| nc.is_ascii_digit()) {
-                out.push('$');
-                prev_is_sep = false;
-                while chars.peek().is_some_and(char::is_ascii_digit) {
-                    if let Some(d) = chars.next() {
-                        out.push(d);
-                    }
-                }
-                continue;
-            }
-
-            // Dollar-quoted string: $$ (anonymous) or $tag$ (tagged).
-            // Collect the optional tag, looking for the second `$`.
-            let mut tag = String::new();
-            let mut found_closing_dollar = false;
-
-            if next_ch == Some('$') {
-                // Anonymous $$: consume the second `$`.
-                chars.next();
-                found_closing_dollar = true;
-            } else if next_ch.is_some_and(|nc| nc.is_alphabetic() || nc == '_') {
-                // Accumulate tag chars until we hit `$` or a non-identifier char.
-                while let Some(&tc) = chars.peek() {
-                    if tc == '$' {
-                        chars.next(); // consume the closing `$` of the opening tag
-                        found_closing_dollar = true;
-                        break;
-                    } else if tc.is_alphanumeric() || tc == '_' {
-                        tag.push(tc);
-                        chars.next();
-                    } else {
-                        // Not a valid tag character — not a dollar-quoted string.
-                        break;
-                    }
-                }
-            }
-
-            if found_closing_dollar {
-                out.push_str("'?'");
-                prev_is_sep = false;
-                consume_dollar_quoted_body(&mut chars, &tag);
-            } else {
-                // Not a recognisable dollar form — emit $ and any partial tag.
-                out.push('$');
-                out.push_str(&tag);
-                prev_is_sep = false;
-            }
+            prev_is_sep = false;
+            consume_dollar_quoted_string_or_param(&mut chars, &mut out);
             continue;
         }
 
@@ -429,27 +464,8 @@ pub fn scrub_sql(sql: &str) -> String {
             c == '.' && prev_is_sep && chars.peek().is_some_and(char::is_ascii_digit);
         if (c.is_ascii_digit() && prev_is_sep) || is_leading_dot {
             out.push('?');
-            if is_leading_dot {
-                chars.next(); // consume the leading dot
-            }
-            // Consume integer/decimal digits, underscores, and dots.
-            while chars
-                .peek()
-                .is_some_and(|d| d.is_ascii_digit() || *d == '.' || *d == '_')
-            {
-                chars.next();
-            }
-            // Consume optional scientific-notation exponent: e/E [+/-] <digits>.
-            if chars.peek().is_some_and(|e| *e == 'e' || *e == 'E') {
-                chars.next(); // consume 'e'/'E'
-                if chars.peek().is_some_and(|s| *s == '+' || *s == '-') {
-                    chars.next(); // consume optional sign
-                }
-                while chars.peek().is_some_and(char::is_ascii_digit) {
-                    chars.next();
-                }
-            }
             prev_is_sep = false;
+            consume_numeric_literal(&mut chars, is_leading_dot);
             continue;
         }
 
