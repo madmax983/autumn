@@ -82,10 +82,12 @@ Nested `db.tx` calls are **rejected at runtime**:
 Nested Db::tx calls are not supported
 ```
 
-This is intentional. If you call a repository method inside `db.tx`, it
-participates in the outer transaction — no new transaction is created, and the
-same connection is reused. You will never accidentally start a nested
-transaction by calling a repository method inside another one.
+This is intentional. Repository methods always acquire their own connection
+from the pool and manage their own internal transaction — they do not share the
+`db.tx` connection. Calling a repository method inside `db.tx` will not trigger
+the nesting error, but the two operations are on separate connections and
+separate transactions. If subsequent SQL in the `db.tx` closure fails and rolls
+back, writes already committed by the repository call are **not rolled back**.
 
 ---
 
@@ -254,15 +256,19 @@ async fn before_delete(
 
 ### `after_create` and `after_update`
 
-Called after the SQL runs, still inside the transaction boundary. Returning
-`Err` rolls back the **entire mutation**, including the SQL that already ran.
+Called **after the transaction commits and the connection is released**, but
+before the repository method returns to the caller. The data is already
+durably written. Returning `Err` propagates back to the caller as an error
+but **does not rollback the committed record**.
 
-These hooks do not receive the active database connection, so they cannot
-issue additional SQL on the same transaction. Their main uses are:
+Because these hooks run after the data is committed, they are not suitable for
+validation that should prevent a write. Use `before_*` for that. Their main
+uses are:
 
-- Business-level validation against the persisted state (reject with `Err` to rollback)
-- In-memory bookkeeping (e.g., updating a cache struct held in app state)
+- Synchronous in-process operations against committed data (e.g., updating an
+  in-memory cache that must be consistent with the just-written row)
 - Collecting cache keys via `ctx.invalidate()` so a post-commit step can act on them
+- Triggering in-process event buses or notification channels
 
 ```rust,no_run
 async fn after_create(
@@ -270,15 +276,12 @@ async fn after_create(
     ctx: &mut MutationContext,
     record: &Article,
 ) -> AutumnResult<()> {
-    // Collect cache keys to invalidate once the transaction commits.
+    // Collect cache keys to invalidate once the record is committed.
     ctx.invalidate(format!("articles:author:{}", record.author_id));
     ctx.invalidate("articles:recent");
     Ok(())
 }
 ```
-
-If you need to write to a secondary table atomically with the mutation, do
-that inside `db.tx` in the handler rather than in a hook.
 
 ---
 
@@ -289,8 +292,8 @@ that inside `db.tx` in the handler rather than in a hook.
 | `before_create` | Prevents INSERT; transaction rolls back |
 | `before_update` | Prevents UPDATE; transaction rolls back |
 | `before_delete` | Prevents DELETE; transaction rolls back |
-| `after_create` | INSERT has run but transaction rolls back |
-| `after_update` | UPDATE has run but transaction rolls back |
+| `after_create` | Called after commit; error propagates to caller, but data is **already committed** |
+| `after_update` | Called after commit; error propagates to caller, but data is **already committed** |
 | `after_create_commit` | Error is logged and counted; mutation is already committed |
 | `after_update_commit` | Error is logged and counted; mutation is already committed |
 | `after_delete_commit` | Error is logged and counted; mutation is already committed |
@@ -316,11 +319,23 @@ deserializes as `Set(v)`. Mark fields with `#[serde(default)]` to wire
 this up automatically.
 
 ```rust,no_run
-// All three states are observable in before_update:
-match draft.after.published_at {
-    Patch::Unchanged => {} // caller didn't mention it
-    Patch::Set(ts)   => {} // caller set it to a specific timestamp
-    Patch::Clear     => {} // caller explicitly cleared it (→ NULL)
+// Constructing an update request — Patch<T> is the type of UpdateModel fields:
+let update = UpdateArticle {
+    status:       Patch::Set(Status::Published),  // explicitly set
+    published_at: Patch::Set(Utc::now()),         // explicitly set
+    title:        Patch::Unchanged,               // leave as-is (default)
+    summary:      Patch::Clear,                   // explicitly clear to NULL
+    ..Default::default()
+};
+
+// Inside before_update, draft.before and draft.after are both fully
+// materialized Model values (the Patch has already been applied).
+// Use DraftField accessors to inspect transitions — not Patch matching:
+if draft.published_at().was_set() {
+    // None → Some: article is being published for the first time
+}
+if draft.published_at().was_cleared() {
+    // Some → None: published_at is being explicitly cleared
 }
 ```
 
@@ -555,38 +570,53 @@ returns an error, the entire batch rolls back.
 
 ```
 save_many with hooks:
+  (own connection acquired from pool)
   BEGIN
     before_create(record_0)
     before_create(record_1)
     ...
     INSERT INTO ... VALUES (...), (...), ...   ← single batch query
-    after_create(record_0)
-    after_create(record_1)
-    ...
     stage after_create_commit rows             ← if commit_hooks = true
   COMMIT
-  → after_create_commit runs for each record
+  (connection released)
+  after_create(record_0)                       ← post-commit, on same call stack
+  after_create(record_1)
+  ...
+  → after_create_commit dispatched to workers
 ```
 
-`update_many` and `delete_many` with hooks pay one extra round-trip: a
-`SELECT ... FOR UPDATE` to fetch the current state of each record so that
-`before_update` and `before_delete` can inspect it.
+`update_many` with hooks issues **one `UPDATE` per record** (not a single bulk
+statement) inside the transaction, plus a `SELECT ... FOR UPDATE` beforehand
+to load current state for `before_update` hooks. For N records that is
+1 SELECT + N UPDATEs, all inside a single transaction. `delete_many` follows
+the same pattern: 1 SELECT + N DELETEs.
 
-### Participating in `db.tx`
+### Isolation from `db.tx`
 
-Bulk calls inside a `db.tx` block join the outer transaction — no nested
-transaction is started.
+Repository methods (bulk or single-record) always acquire their own connection
+from the pool. They do **not** share the connection inside a `db.tx` block, and
+their internal transaction commits independently.
 
 ```rust,no_run
 db.tx(|conn| async move {
-    // Participates in the outer transaction.
-    // If either call fails, both roll back.
+    // repo.save_many acquires a SEPARATE connection from the pool and
+    // commits its own transaction. If the diesel::update below fails and
+    // db.tx rolls back, the save_many writes are NOT rolled back.
     repo.save_many(&new_articles).await?;
-    repo.update_many(&stale_ids, &update).await?;
+
+    diesel::update(summary::table)
+        .set(summary::count.eq(summary::count + new_articles.len() as i64))
+        .execute(conn)
+        .await?;
+
     Ok::<_, AutumnError>(())
 }.scope_boxed())
 .await?;
 ```
+
+For operations that must be atomic across multiple tables, write all SQL
+directly inside `db.tx` using the `conn` from the closure — do not mix
+repository calls with other SQL if atomicity is required.
 
 ### `save_many_skip_invalid`
 
@@ -643,7 +673,7 @@ atomicity is preserved across chunks.
 | Validate or normalize a record before every insert | `before_create` |
 | Derive a field from another on every update (e.g. slug from title) | `before_update` |
 | Prevent deletion based on model state | `before_delete` |
-| Write a secondary table atomically with the mutation | `db.tx` in the handler |
+| Write multiple tables atomically | `db.tx` with raw Diesel — repository methods acquire their own connection and cannot share a `db.tx` transaction |
 | Enqueue a job only if the DB write commits (no crash safety needed) | `enqueue_after_commit` inside `db.tx` |
 | Crash-safe job enqueue on Postgres | `enqueue_in_tx` / `enqueue_on_conn` |
 | Send email only if the write commits | `deliver_later` inside `db.tx` (auto-deferred) |
@@ -679,18 +709,14 @@ commit and Tokio executing the callback, the side effect is lost with no
 record of it. Use `after_*_commit` hooks with `commit_hooks = true`, or write
 a durable outbox row in the transaction, if you need guaranteed delivery.
 
-### `after_*` hook errors roll back the mutation
+### `after_*` hooks run after the transaction — validation belongs in `before_*`
 
-`after_create` and `after_update` run inside the transaction boundary. If you
-return `Err`, the entire mutation rolls back — including the `INSERT` or
-`UPDATE` that already ran at the SQL level. This is the intended behaviour for
-hard validation, but returning `Err` from a hook that performs a slow or
-unreliable operation (e.g., an HTTP call, an in-memory cache write that can
-fail) adds latency and potential rollbacks to every mutation.
-
-For side effects that are not transactionally required (notifications, cache
-invalidation), use `after_*_commit` hooks or `register_after_commit` instead,
-so a failure there does not rollback the mutation.
+`after_create` and `after_update` run **after the transaction commits**. The
+data is already in the database when these hooks fire. Returning `Err`
+propagates back to the caller as an error, but the record has already been
+written. Do not use `after_*` hooks for "this must not persist" validation —
+that logic belongs in `before_create` or `before_update`, which run before
+any SQL executes and can reject the mutation entirely.
 
 ### `before_update` pays a `SELECT FOR UPDATE` cost
 
@@ -726,13 +752,10 @@ decide: does this data need `save_many` (inserts with `before_create`) or
 
 ## Worked example — all layers together
 
-The scenario: a content platform where publishing an article must:
-
-- normalize the slug and default status on create
-- derive slug and stamp `published_at` only on the first draft→published transition
-- collect cache keys to invalidate after the publish commits
-- dispatch a durable webhook after commit
-- enqueue a low-priority summary job only if the batch publish commits
+The scenario: a content platform where publishing articles must normalize slugs,
+stamp `published_at` only on the first draft→published transition, collect cache
+keys to invalidate, dispatch a durable post-commit webhook, and enqueue a
+low-priority summary job.
 
 ```rust,no_run
 // hooks.rs
@@ -761,8 +784,7 @@ impl MutationHooks for ArticleHooks {
     }
 
     // Derive slug when title changes; stamp published_at on the first
-    // draft → published transition only (not on subsequent edits to an
-    // already-published article).
+    // draft → published transition only.
     async fn before_update(
         &self,
         ctx: &mut MutationContext,
@@ -779,10 +801,9 @@ impl MutationHooks for ArticleHooks {
         Ok(())
     }
 
-    // Mark cache keys to invalidate. after_update runs inside the transaction
-    // boundary (returning Err rolls back), but does not receive the active
-    // connection — use ctx.invalidate_keys in an after_*_commit hook to act
-    // on them once the data is durably committed.
+    // after_update runs after the transaction commits. Returning Err here
+    // propagates to the caller but does NOT rollback the committed record.
+    // Use it for in-process operations against committed data.
     async fn after_update(
         &self,
         ctx: &mut MutationContext,
@@ -793,17 +814,15 @@ impl MutationHooks for ArticleHooks {
         Ok(())
     }
 
-    // Durable post-commit webhook — at-least-once, so dispatch must be
-    // idempotent. Survives process crashes via the framework queue table.
+    // Durable post-commit webhook — at-least-once execution, so the receiver
+    // must be idempotent. This fires for every update to a published article,
+    // not just the first publish; receivers should deduplicate by record ID +
+    // updated_at or a stable event key.
     async fn after_update_commit(
         &self,
         ctx: &mut MutationContext,
         record: &Article,
     ) -> AutumnResult<()> {
-        // Only dispatch the webhook when the article was just published.
-        // Because after_*_commit only has the final record (not the before
-        // state), use published_at being newly set as the signal — if it was
-        // already set before the update, the webhook has already fired.
         if record.status == Status::Published {
             webhooks::dispatch("article.published", record).await?;
         }
@@ -819,62 +838,52 @@ impl MutationHooks for ArticleHooks {
 #[repository(Article, hooks = ArticleHooks, commit_hooks = true)]
 pub trait ArticleRepository {}
 
-// handlers.rs — publish a batch of articles, also write the author's
-// article_count atomically (requires a connection, so it lives in db.tx,
-// not in a hook), and enqueue a summary job only if the tx commits.
-async fn bulk_publish(mut db: Db, repo: ArticleRepo, ids: Vec<i64>) -> AutumnResult<()> {
-    db.tx(|conn| async move {
-        // update_many runs before_update + SQL + after_update inside this tx.
-        // after_update_commit rows are staged here, executed after COMMIT.
-        // UpdateModel fields are Patch<T> — use Patch::Set, not Some(...).
-        let published = repo.update_many(&ids, &UpdateArticle {
-            status: Patch::Set(Status::Published),
-            ..Default::default()
-        }).await?;
+// handlers.rs — publish a batch of articles.
+// repo.update_many manages its own connection and transaction; it does not
+// share the connection with any surrounding db.tx. To write other tables
+// atomically with article updates, write raw SQL in a separate db.tx instead.
+async fn bulk_publish(repo: ArticleRepo, ids: Vec<i64>) -> AutumnResult<()> {
+    // update_many: before_update per record → N individual UPDATEs → COMMIT
+    // after_update per record → after_update_commit staged → workers dispatch
+    // UpdateModel fields are Patch<T> — use Patch::Set, not Some(...).
+    repo.update_many(&ids, &UpdateArticle {
+        status: Patch::Set(Status::Published),
+        ..Default::default()
+    }).await?;
 
-        // Increment the author's article count atomically inside the same tx.
-        // This is done here (not in a hook) because it needs a DB connection.
-        let author_ids: Vec<i64> = published.iter().map(|a| a.author_id).collect();
-        diesel::update(authors::table.filter(authors::id.eq_any(&author_ids)))
-            .set(authors::article_count.eq(authors::article_count + 1))
-            .execute(conn)
-            .await?;
+    // Called outside db.tx → enqueues immediately.
+    // Use enqueue_in_tx inside a db.tx for crash-safe handoff.
+    enqueue_after_commit("bulk_publish_summary", &BulkPublishArgs { ids }).await?;
 
-        // Enqueued only if the entire tx commits. Not crash-safe on its own —
-        // acceptable here because it's a low-priority summary, not a delivery
-        // guarantee. For crash safety, use enqueue_in_tx instead.
-        enqueue_after_commit("bulk_publish_summary", &BulkPublishArgs { ids }).await?;
-
-        Ok::<_, AutumnError>(())
-    }.scope_boxed())
-    .await
+    Ok(())
 }
 ```
 
 Execution order when `bulk_publish` is called with `ids = [1, 2, 3]`:
 
 ```
+(repo acquires own connection from pool)
 BEGIN
   SELECT id, ... FROM articles WHERE id IN (1,2,3) FOR UPDATE
   before_update(article_1)  → derive slug if title changed, stamp published_at
   before_update(article_2)  → ...
   before_update(article_3)  → ...
-  UPDATE articles SET status='published', published_at=... WHERE id IN (1,2,3)
-  after_update(article_1)   → ctx.invalidate("article:1"), ctx.invalidate("articles:author:...")
-  after_update(article_2)   → ...
-  after_update(article_3)   → ...
-  UPDATE authors SET article_count = article_count + 1 WHERE id IN (...)
+  UPDATE articles SET ... WHERE id = 1     ← one UPDATE per record
+  UPDATE articles SET ... WHERE id = 2
+  UPDATE articles SET ... WHERE id = 3
   INSERT INTO autumn_repository_commit_hooks ... (3 rows)
 COMMIT
-↓
-Tokio spawns: enqueue_after_commit("bulk_publish_summary", ...)
+(connection released)
+after_update(article_1)      → ctx.invalidate("article:1", ...)  ← post-commit, pre-return
+after_update(article_2)      → ...
+after_update(article_3)      → ...
+enqueue_after_commit enqueues "bulk_publish_summary" immediately (outside tx)
 Workers claim: after_update_commit(article_1) → webhooks::dispatch(...), cache::invalidate(...)
                after_update_commit(article_2) → ...
                after_update_commit(article_3) → ...
 ```
 
-If the database returns an error at any point before `COMMIT`, everything
-above the line rolls back — no partial publishes, no phantom author-count
-increments, no stale commit-hook rows. The `enqueue_after_commit` callback is
-discarded. The `after_update_commit` rows were never committed, so workers
-never see them.
+If the transaction fails at any point before `COMMIT`, it rolls back — no
+partial publishes, no stale commit-hook rows. The `after_update` calls and
+`enqueue_after_commit` only run after the commit succeeds. The
+`after_update_commit` rows were never committed, so workers never see them.
