@@ -698,10 +698,10 @@ Nested Db::tx calls are not supported
 ```
 
 This is a runtime `Err`, not a panic — the outer transaction is still live and
-will roll back normally when the error propagates. The fix is to pass the
-connection down rather than calling `db.tx` again. If you call a repository
-method inside `db.tx`, it already participates in the outer transaction — there
-is no need to nest.
+will roll back normally when the error propagates. Repository methods each
+acquire their own pool connection, so calling one inside `db.tx` does not add
+it to the outer transaction. Nesting `db.tx` directly is the only thing
+rejected.
 
 ### `after_commit` callbacks are not crash-safe
 
@@ -726,8 +726,13 @@ any SQL executes and can reject the mutation entirely.
 Both single-record `.update()` and bulk `update_many()` perform a
 `SELECT ... FOR UPDATE` before running `before_update` hooks, because the hook
 needs the existing record state. This is an extra round-trip to the database.
-If a repository has no update hooks, this query is not issued. Do not add
-`before_update` hooks purely for documentation purposes.
+
+On repositories with **no update hooks**, the pre-update `SELECT` is skipped
+_unless_ the `UpdateModel` carries an optimistic lock-version field — in that
+case the generated code still issues `SELECT ... FOR UPDATE` to verify the
+version before writing, regardless of whether hooks are configured. Do not add
+`before_update` hooks purely to document intent; every hook invocation pays for
+the `SELECT`.
 
 ### `update_many` applies one changeset to every record
 
@@ -796,9 +801,11 @@ impl MutationHooks for ArticleHooks {
         if draft.after.title != draft.before.title {
             draft.after.slug = slugify(&draft.after.title);
         }
-        // changed_to checks both that the value changed AND equals Published,
-        // so re-saving an already-published article is a no-op here.
-        if draft.status().changed_to(&Status::Published) {
+        // Gate on both the status transition AND published_at being unset.
+        // Without the second guard, republishing a previously-published article
+        // (draft → published → draft → published) would silently overwrite the
+        // original publish timestamp.
+        if draft.status().changed_to(&Status::Published) && draft.before.published_at.is_none() {
             draft.after.published_at = Some(ctx.now);
         }
         Ok(())
