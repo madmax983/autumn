@@ -517,7 +517,7 @@ pub struct MetricsService<S> {
 
 impl<S, ReqBody, ResBody> Service<Request<ReqBody>> for MetricsService<S>
 where
-    S: Service<Request<ReqBody>, Response = Response<ResBody>>,
+    S: Service<Request<ReqBody>, Response = Response<ResBody>> + Clone,
 {
     type Response = S::Response;
     type Error = S::Error;
@@ -533,8 +533,11 @@ where
 
         self.collector.increment_active();
 
+        let clone = self.inner.clone();
+        let mut inner = std::mem::replace(&mut self.inner, clone);
+
         MetricsFuture {
-            inner: self.inner.call(req),
+            inner: inner.call(req),
             collector: Some(self.collector.clone()),
             method,
             route,
@@ -749,5 +752,19 @@ mod tests {
         let snap2 = collector.snapshot();
         let route_snap2 = snap2.http.by_route.get(&key).unwrap();
         assert_eq!(route_snap2.count, 2);
+    }
+}
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn doesn_crash(latencies in prop::collection::vec(any::<u64>(), 0..10000)) {
+            let latencies_deque: VecDeque<u64> = latencies.into();
+            compute_percentiles(&latencies_deque);
+        }
     }
 }

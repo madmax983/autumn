@@ -471,14 +471,14 @@ where
             || !is_form_urlencoded(req.headers())
             || !is_same_origin_form(req.headers())
         {
-            let mut inner = self.inner.clone();
-            std::mem::swap(&mut self.inner, &mut inner);
+            let clone = self.inner.clone();
+            let mut inner = std::mem::replace(&mut self.inner, clone);
             return Box::pin(async move { inner.call(req).await });
         }
 
         let config = Arc::clone(&self.config);
-        let mut inner = self.inner.clone();
-        std::mem::swap(&mut self.inner, &mut inner);
+        let clone = self.inner.clone();
+        let mut inner = std::mem::replace(&mut self.inner, clone);
 
         Box::pin(async move {
             // Temporarily take ownership of the body so we can buffer it
