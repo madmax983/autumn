@@ -746,7 +746,9 @@ repo.update_many(&[1, 2, 3], &UpdateArticle {
 ```
 
 There is no per-record changeset variant. If you need different changes per
-record, loop over `repo.update()` calls inside a `db.tx`.
+record and true atomicity, write the updates as raw Diesel SQL directly inside
+a `db.tx` closure using the `conn` parameter — repository methods acquire their
+own pool connections and cannot participate in an outer `db.tx` transaction.
 
 ### `upsert_many` silently bypasses hooks — and is blocked at compile time
 
