@@ -510,6 +510,51 @@ fn after_commit_docs_do_not_promise_crash_safe_delivery() {
 }
 
 #[test]
+fn version_history_docs_put_sensitive_attribute_on_repository_trait() {
+    let root = workspace_root();
+    for rel_path in [
+        "docs/guide/version-history.md",
+        "autumn/src/version_history.rs",
+    ] {
+        let path = root.join(rel_path);
+        let content = std::fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+        let content = content.replace("//! ", "");
+        let attr = "#[version_history(sensitive = [\"password_digest\", \"reset_token\"])]";
+        let repo = "#[repository(Post, versioned = true)]";
+
+        assert!(
+            content.contains(&format!("{attr}\n{repo}")),
+            "{rel_path} must put #[version_history(...)] on the repository trait, not inside its empty body",
+        );
+        assert!(
+            !content.contains(&format!("{repo}\npub trait PostRepository {{\n    {attr}")),
+            "{rel_path} must not show #[version_history(...)] as an item inside the trait body",
+        );
+    }
+}
+
+#[test]
+fn version_history_migration_has_tenant_scope_column_and_index() {
+    let root = workspace_root();
+    let migration_path =
+        root.join("autumn/migrations/20260526000000_create_version_history/up.sql");
+    let migration = std::fs::read_to_string(&migration_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", migration_path.display()));
+
+    assert!(
+        migration.contains("tenant_id   TEXT"),
+        "{} must store tenant_id so tenant-scoped history reads can fail closed",
+        migration_path.display(),
+    );
+    assert!(
+        migration.contains("(table_name, tenant_id, record_id, recorded_at ASC)"),
+        "{} must index tenant-scoped history lookups",
+        migration_path.display(),
+    );
+}
+
+#[test]
 fn benchmark_runtime_startup_applies_packaged_migrations() {
     let root = workspace_root();
 

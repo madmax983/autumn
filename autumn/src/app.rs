@@ -3774,9 +3774,10 @@ async fn setup_database(
     pool_provider: Option<PoolProviderFactory>,
     hook_queue_migration_mode: RepositoryCommitHookQueueMigrationMode,
 ) -> Result<DatabaseBootstrap, String> {
-    let migrations = migrations_with_repository_commit_hook_queue(
+    let migrations = migrations_with_repository_framework_migrations(
         migrations,
         crate::repository_commit_hooks::has_repository_commit_hook_descriptors(),
+        crate::version_history::has_versioned_repository_descriptors(),
         hook_queue_migration_mode,
     );
     let check_replica_migrations = !migrations.is_empty();
@@ -3839,6 +3840,9 @@ const REPOSITORY_COMMIT_HOOK_QUEUE_MIGRATION: &str =
     "20260515000000_create_repository_commit_hook_queue";
 
 #[cfg(feature = "db")]
+const VERSION_HISTORY_MIGRATION: &str = "20260526000000_create_version_history";
+
+#[cfg(feature = "db")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RepositoryCommitHookQueueMigrationMode {
     Runtime,
@@ -3846,23 +3850,31 @@ enum RepositoryCommitHookQueueMigrationMode {
 }
 
 #[cfg(feature = "db")]
-fn migrations_with_repository_commit_hook_queue(
+fn migrations_with_repository_framework_migrations(
     mut migrations: Vec<crate::migrate::EmbeddedMigrations>,
     hook_queue_required: bool,
+    version_history_required: bool,
     mode: RepositoryCommitHookQueueMigrationMode,
 ) -> Vec<crate::migrate::EmbeddedMigrations> {
     if hook_queue_required
         && mode == RepositoryCommitHookQueueMigrationMode::Runtime
-        && !migration_sets_include_repository_commit_hook_queue(&migrations)
+        && !migration_sets_include(&migrations, REPOSITORY_COMMIT_HOOK_QUEUE_MIGRATION)
     {
         migrations.push(crate::repository_commit_hooks::REPOSITORY_COMMIT_HOOK_MIGRATIONS);
+    }
+    if version_history_required
+        && mode == RepositoryCommitHookQueueMigrationMode::Runtime
+        && !migration_sets_include(&migrations, VERSION_HISTORY_MIGRATION)
+    {
+        migrations.push(crate::version_history::VERSION_HISTORY_MIGRATIONS);
     }
     migrations
 }
 
 #[cfg(feature = "db")]
-fn migration_sets_include_repository_commit_hook_queue(
+fn migration_sets_include(
     migrations: &[crate::migrate::EmbeddedMigrations],
+    migration_name: &str,
 ) -> bool {
     use diesel::migration::{Migration, MigrationSource as _};
     use diesel::pg::Pg;
@@ -3875,7 +3887,7 @@ fn migration_sets_include_repository_commit_hook_queue(
 
         source_migrations
             .iter()
-            .any(|migration| migration.name().to_string() == REPOSITORY_COMMIT_HOOK_QUEUE_MIGRATION)
+            .any(|migration| migration.name().to_string() == migration_name)
     })
 }
 
@@ -4989,9 +5001,10 @@ mod tests {
     #[cfg(feature = "db")]
     #[test]
     fn hooked_repository_apps_include_hook_queue_framework_migration() {
-        let migrations = migrations_with_repository_commit_hook_queue(
+        let migrations = migrations_with_repository_framework_migrations(
             vec![APP_TEST_MIGRATIONS],
             true,
+            false,
             RepositoryCommitHookQueueMigrationMode::Runtime,
         );
         let names = migration_names(&migrations);
@@ -5011,9 +5024,10 @@ mod tests {
     #[cfg(feature = "db")]
     #[test]
     fn runtime_hooked_apps_include_hook_queue_framework_migration_without_app_migrations() {
-        let migrations = migrations_with_repository_commit_hook_queue(
+        let migrations = migrations_with_repository_framework_migrations(
             Vec::new(),
             true,
+            false,
             RepositoryCommitHookQueueMigrationMode::Runtime,
         );
         let names = migration_names(&migrations);
@@ -5028,9 +5042,50 @@ mod tests {
 
     #[cfg(feature = "db")]
     #[test]
-    fn static_builds_do_not_auto_add_hook_queue_when_no_migrations_registered() {
-        let migrations = migrations_with_repository_commit_hook_queue(
+    fn versioned_repository_apps_include_version_history_framework_migration() {
+        let migrations = migrations_with_repository_framework_migrations(
+            vec![APP_TEST_MIGRATIONS],
+            false,
+            true,
+            RepositoryCommitHookQueueMigrationMode::Runtime,
+        );
+        let names = migration_names(&migrations);
+
+        assert!(
+            names.iter().any(|name| name == VERSION_HISTORY_MIGRATION),
+            "versioned repository apps must auto-register the version-history migration"
+        );
+        assert!(
+            names
+                .iter()
+                .all(|name| !name.contains("repository_commit_hook_queue")),
+            "versioned-only repository apps must not auto-register the durable hook queue: {names:?}"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn runtime_versioned_apps_include_version_history_framework_migration_without_app_migrations() {
+        let migrations = migrations_with_repository_framework_migrations(
             Vec::new(),
+            false,
+            true,
+            RepositoryCommitHookQueueMigrationMode::Runtime,
+        );
+        let names = migration_names(&migrations);
+
+        assert!(
+            names.iter().any(|name| name == VERSION_HISTORY_MIGRATION),
+            "runtime versioned repository apps must install version history even when app migrations are managed elsewhere"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn static_builds_do_not_auto_add_hook_queue_when_no_migrations_registered() {
+        let migrations = migrations_with_repository_framework_migrations(
+            Vec::new(),
+            true,
             true,
             RepositoryCommitHookQueueMigrationMode::StaticBuild,
         );
@@ -5044,8 +5099,9 @@ mod tests {
     #[cfg(feature = "db")]
     #[test]
     fn unhooked_apps_do_not_auto_add_hook_queue_framework_migration() {
-        let migrations = migrations_with_repository_commit_hook_queue(
+        let migrations = migrations_with_repository_framework_migrations(
             Vec::new(),
+            false,
             false,
             RepositoryCommitHookQueueMigrationMode::Runtime,
         );

@@ -41,6 +41,7 @@ framework migration that creates `_autumn_version_history`:
 CREATE TABLE _autumn_version_history (
     id          BIGSERIAL   PRIMARY KEY,
     table_name  TEXT        NOT NULL,
+    tenant_id   TEXT,
     record_id   BIGINT      NOT NULL,
     op          TEXT        NOT NULL CHECK (op IN ('insert', 'update', 'delete')),
     actor       TEXT        NOT NULL DEFAULT 'system',
@@ -110,10 +111,9 @@ Exclude columns from the captured diff via a `version_history` annotation on
 the repository:
 
 ```rust
+#[version_history(sensitive = ["password_digest", "reset_token"])]
 #[repository(Post, versioned = true)]
-pub trait PostRepository {
-    #[version_history(sensitive = ["password_digest", "reset_token"])]
-}
+pub trait PostRepository {}
 ```
 
 Excluded columns **still appear** in the diff as changed (so the timeline

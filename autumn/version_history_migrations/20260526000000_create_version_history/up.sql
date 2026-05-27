@@ -29,18 +29,14 @@ CREATE TABLE IF NOT EXISTS _autumn_version_history (
 ALTER TABLE _autumn_version_history
     ADD COLUMN IF NOT EXISTS tenant_id TEXT;
 
--- The primary retrieval pattern: "all history for record X in table Y, chronological".
 CREATE INDEX IF NOT EXISTS idx_autumn_version_history_record
     ON _autumn_version_history (table_name, record_id, recorded_at ASC);
 
--- Tenant-scoped history reads must not expose rows across CURRENT_TENANT.
 CREATE INDEX IF NOT EXISTS idx_autumn_version_history_tenant_record
     ON _autumn_version_history (table_name, tenant_id, record_id, recorded_at ASC);
 
--- Supports the "changes between time A and B" filter in VersionFilter::between().
 CREATE INDEX IF NOT EXISTS idx_autumn_version_history_time
     ON _autumn_version_history (table_name, recorded_at ASC);
 
--- Supports actor-based compliance queries ("all changes made by user X").
 CREATE INDEX IF NOT EXISTS idx_autumn_version_history_actor
     ON _autumn_version_history (actor, recorded_at DESC);

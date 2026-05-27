@@ -33,11 +33,9 @@
 //! # Sensitive columns
 //!
 //! ```rust,ignore
+//! #[version_history(sensitive = ["password_digest", "reset_token"])]
 //! #[repository(Post, versioned = true)]
-//! pub trait PostRepository {
-//!     // Exclude password digests and secret tokens from captured diffs.
-//!     #[version_history(sensitive = ["password_digest", "reset_token"])]
-//! }
+//! pub trait PostRepository {}
 //! ```
 //!
 //! Excluded columns still appear in the entry as changed (so the
@@ -51,6 +49,27 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+
+/// Narrow framework migration set required by `#[repository(..., versioned = true)]`.
+#[cfg(feature = "db")]
+pub const VERSION_HISTORY_MIGRATIONS: diesel_migrations::EmbeddedMigrations =
+    diesel_migrations::embed_migrations!("version_history_migrations");
+
+/// Link-time marker emitted by generated repositories that opt into version history.
+#[cfg(feature = "db")]
+#[doc(hidden)]
+pub struct VersionedRepositoryDescriptor;
+
+#[cfg(feature = "db")]
+inventory::collect!(VersionedRepositoryDescriptor);
+
+#[cfg(feature = "db")]
+pub(crate) fn has_versioned_repository_descriptors() -> bool {
+    inventory::iter::<VersionedRepositoryDescriptor>
+        .into_iter()
+        .next()
+        .is_some()
+}
 
 // ── Operation discriminant ───────────────────────────────────────────
 
@@ -391,6 +410,15 @@ pub trait VersionedRecord: Send + Sync + 'static {
         Self: Sized,
     {
         &[]
+    }
+
+    /// Tenant scope for history rows written by tenant-scoped repositories.
+    ///
+    /// Non-tenant repositories return `None`. Generated tenant-scoped
+    /// repositories override this so `version_history()` can fail closed to the
+    /// current tenant unless `across_tenants()` is used.
+    fn version_tenant_id(&self) -> Option<&str> {
+        None
     }
 }
 
@@ -811,6 +839,7 @@ mod tests {
             }
         }
         assert!(Dummy::version_sensitive_columns().is_empty());
+        assert_eq!(Dummy.version_tenant_id(), None);
     }
 
     #[test]
@@ -833,6 +862,33 @@ mod tests {
         let cols = SecureModel::version_sensitive_columns();
         assert!(cols.contains(&"password_digest"));
         assert!(cols.contains(&"api_key"));
+    }
+
+    #[test]
+    fn versioned_record_can_expose_tenant_id_for_scoped_history() {
+        struct TenantModel {
+            tenant_id: String,
+        }
+        impl VersionedRecord for TenantModel {
+            fn version_table_name() -> &'static str {
+                "tenant_models"
+            }
+            fn version_record_id(&self) -> i64 {
+                7
+            }
+            fn version_column_values(&self) -> serde_json::Value {
+                serde_json::json!({})
+            }
+            fn version_tenant_id(&self) -> Option<&str> {
+                Some(self.tenant_id.as_str())
+            }
+        }
+
+        let record = TenantModel {
+            tenant_id: "tenant-a".to_owned(),
+        };
+
+        assert_eq!(record.version_tenant_id(), Some("tenant-a"));
     }
 
     // ── Immutability / append-only guarantee ────────────────────────

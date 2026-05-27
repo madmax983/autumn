@@ -210,6 +210,8 @@ pub mod __private {
         mark_repository_commit_hook_after_hook_failed, register_repository_commit_hook_runner,
         start_repository_commit_hook_pending_finalizer_heartbeat,
     };
+    #[cfg(feature = "db")]
+    pub use crate::version_history::VersionedRepositoryDescriptor;
 
     // Shared factory creation depth — bounds cyclic `#[factory_assoc]` chains
     // across all models in a single create() chain.

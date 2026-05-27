@@ -483,14 +483,19 @@ fn vh_insert_ts(
                 use ::autumn_web::version_history::VersionedRecord as _;
                 (#record_expr).version_record_id()
             };
+            let __vh_tenant_id: ::core::option::Option<&str> = {
+                use ::autumn_web::version_history::VersionedRecord as _;
+                (#record_expr).version_tenant_id()
+            };
             let __vh_actor: &str = #actor_ts;
             let __vh_request_id: ::core::option::Option<&str> = #request_id_ts;
             ::autumn_web::reexports::diesel::sql_query(
                 "INSERT INTO _autumn_version_history \
-                 (table_name, record_id, op, actor, request_id, changes) \
-                 VALUES ($1, $2, $3, $4, $5, $6::jsonb)"
+                 (table_name, tenant_id, record_id, op, actor, request_id, changes) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)"
             )
             .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(#table_name_ts)
+            .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__vh_tenant_id)
             .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(__vh_record_id)
             .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(#op)
             .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__vh_actor)
@@ -1401,9 +1406,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 } else {
                                     let load_query = #table_ident::table.find(id);
                                     let current = if let ::core::option::Option::Some(ref t) = tenant_id {
-                                        load_query.filter(#table_ident::tenant_id.eq(t)).first::<#model_name>(conn).await
+                                        load_query.filter(#table_ident::tenant_id.eq(t)).for_update().first::<#model_name>(conn).await
                                     } else {
-                                        load_query.first::<#model_name>(conn).await
+                                        load_query.for_update().first::<#model_name>(conn).await
                                     }
                                     .optional()
                                     .map_err(::autumn_web::AutumnError::from)?
@@ -1611,9 +1616,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 } else {
                                     let load_query = #table_ident::table.find(id);
                                     let current = if let ::core::option::Option::Some(ref t) = tenant_id {
-                                        load_query.filter(#table_ident::tenant_id.eq(t)).first::<#model_name>(conn).await
+                                        load_query.filter(#table_ident::tenant_id.eq(t)).for_update().first::<#model_name>(conn).await
                                     } else {
-                                        load_query.first::<#model_name>(conn).await
+                                        load_query.for_update().first::<#model_name>(conn).await
                                     }
                                     .optional()
                                     .map_err(::autumn_web::AutumnError::from)?
@@ -1732,6 +1737,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     // Load current record
                                     let current = #table_ident::table
                                         .find(id)
+                                        .for_update()
                                         .first::<#model_name>(conn)
                                         .await
                                         .optional()
@@ -3909,9 +3915,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             c
                         } else {
                             if let ::core::option::Option::Some(ref t) = tenant_id {
-                                load_query.filter(#table_ident::tenant_id.eq(t)).first::<#model_name>(conn).await
+                                load_query.filter(#table_ident::tenant_id.eq(t)).for_update().first::<#model_name>(conn).await
                             } else {
-                                load_query.first::<#model_name>(conn).await
+                                load_query.for_update().first::<#model_name>(conn).await
                             }
                             .optional()
                             .map_err(::autumn_web::AutumnError::from)?
@@ -4082,7 +4088,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             }
                             c
                         } else {
-                            load_query.first::<#model_name>(conn).await
+                            load_query.for_update().first::<#model_name>(conn).await
                                 .optional()
                                 .map_err(::autumn_web::AutumnError::from)?
                                 .ok_or_else(|| ::autumn_web::AutumnError::not_found_msg(
@@ -5497,6 +5503,15 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let route_hook_registration = if commit_hooks_enabled {
         quote! { #pg_name::__autumn_register_repository_commit_hooks(); }
+    } else {
+        quote! {}
+    };
+    let versioned_inventory_registration = if config.versioned {
+        quote! {
+            ::autumn_web::reexports::inventory::submit! {
+                ::autumn_web::__private::VersionedRepositoryDescriptor
+            }
+        }
     } else {
         quote! {}
     };
@@ -7291,6 +7306,15 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             let col_lits: Vec<_> = sensitive_cols.iter().map(|c| quote! { #c }).collect();
             quote! { &[#(#col_lits),*] }
         };
+        let tenant_id_method = if config.tenant_scoped {
+            quote! {
+                fn version_tenant_id(&self) -> ::core::option::Option<&str> {
+                    ::core::option::Option::Some(self.tenant_id.as_str())
+                }
+            }
+        } else {
+            quote! {}
+        };
         quote! {
             impl ::autumn_web::version_history::VersionedRecord for #model_name {
                 fn version_table_name() -> &'static str {
@@ -7306,6 +7330,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 fn version_sensitive_columns() -> &'static [&'static str] {
                     #sensitive_ts
                 }
+                #tenant_id_method
             }
         }
     } else {
@@ -7315,6 +7340,23 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // ── Versioned history (issue #700) ────────────────────────────
     // When versioned = true, generate a `version_history` associated
     // function on the repository struct that queries _autumn_version_history.
+    let version_history_tenant_setup = if config.tenant_scoped {
+        quote! {
+            let __version_history_tenant_id = if self.across_tenants {
+                ::core::option::Option::None
+            } else {
+                let t = ::autumn_web::tenancy::CURRENT_TENANT.try_with(|t| t.clone()).ok().flatten()
+                    .ok_or_else(|| ::autumn_web::AutumnError::internal_server_error_msg("Query scoped to tenant, but no tenant context was established"))?;
+                ::core::option::Option::Some(t)
+            };
+            let __version_history_tenant_id = __version_history_tenant_id.as_deref();
+        }
+    } else {
+        quote! {
+            let __version_history_tenant_id: ::core::option::Option<&str> = ::core::option::Option::None;
+        }
+    };
+
     let versioned_history_impl = if config.versioned {
         quote! {
             impl #pg_name {
@@ -7365,6 +7407,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     let (limit, offset) = filter.limit_offset();
                     let page = filter.page();
                     let per_page = filter.per_page();
+                    #version_history_tenant_setup
 
                     let mut conn = self.__autumn_acquire_conn().await?;
 
@@ -7374,11 +7417,13 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             "SELECT COUNT(*)::bigint AS count \
                              FROM _autumn_version_history \
                              WHERE table_name = $1 AND record_id = $2 \
-                             AND ($3::timestamptz IS NULL OR recorded_at >= $3) \
-                             AND ($4::timestamptz IS NULL OR recorded_at <= $4)"
+                             AND ($3::text IS NULL OR tenant_id = $3) \
+                             AND ($4::timestamptz IS NULL OR recorded_at >= $4) \
+                             AND ($5::timestamptz IS NULL OR recorded_at <= $5)"
                         )
                         .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__table_name)
                         .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
+                        .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__version_history_tenant_id)
                         .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Timestamptz>, _>(filter.from)
                         .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Timestamptz>, _>(filter.to)
                         .get_results::<__AutumnVersionHistoryCount>(&mut conn)
@@ -7389,10 +7434,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         let rows = ::autumn_web::reexports::diesel::sql_query(
                             "SELECT COUNT(*)::bigint AS count \
                              FROM _autumn_version_history \
-                             WHERE table_name = $1 AND record_id = $2"
+                             WHERE table_name = $1 AND record_id = $2 \
+                             AND ($3::text IS NULL OR tenant_id = $3)"
                         )
                         .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__table_name)
                         .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
+                        .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__version_history_tenant_id)
                         .get_results::<__AutumnVersionHistoryCount>(&mut conn)
                         .await
                         .map_err(::autumn_web::AutumnError::from)?;
@@ -7406,13 +7453,15 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                              changes::text AS changes, recorded_at \
                              FROM _autumn_version_history \
                              WHERE table_name = $1 AND record_id = $2 \
-                             AND ($3::timestamptz IS NULL OR recorded_at >= $3) \
-                             AND ($4::timestamptz IS NULL OR recorded_at <= $4) \
+                             AND ($3::text IS NULL OR tenant_id = $3) \
+                             AND ($4::timestamptz IS NULL OR recorded_at >= $4) \
+                             AND ($5::timestamptz IS NULL OR recorded_at <= $5) \
                              ORDER BY recorded_at ASC, id ASC \
-                             LIMIT $5 OFFSET $6"
+                             LIMIT $6 OFFSET $7"
                         )
                         .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__table_name)
                         .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
+                        .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__version_history_tenant_id)
                         .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Timestamptz>, _>(filter.from)
                         .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Timestamptz>, _>(filter.to)
                         .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
@@ -7426,11 +7475,13 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                              changes::text AS changes, recorded_at \
                              FROM _autumn_version_history \
                              WHERE table_name = $1 AND record_id = $2 \
+                             AND ($3::text IS NULL OR tenant_id = $3) \
                              ORDER BY recorded_at ASC, id ASC \
-                             LIMIT $3 OFFSET $4"
+                             LIMIT $4 OFFSET $5"
                         )
                         .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__table_name)
                         .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
+                        .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__version_history_tenant_id)
                         .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
                         .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
                         .get_results::<__AutumnVersionHistoryRow>(&mut conn)
@@ -7682,6 +7733,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
 
         #hook_inventory_registration
+        #versioned_inventory_registration
 
         #api_handlers
 
@@ -8516,7 +8568,7 @@ mod tests {
         .to_string();
 
         // Locate the prefetch (before_delete context load) inside the
-        // transaction block ΓÇö search for the for_update call site.
+        // transaction block - search for the for_update call site.
         let prefetch_pos = generated
             .find("for_update")
             .expect("hooked delete must generate a for_update prefetch");
@@ -8665,6 +8717,20 @@ mod tests {
     }
 
     #[test]
+    fn repository_macro_versioned_registers_framework_migration_descriptor() {
+        let generated = repository_macro(
+            quote! { Post, versioned = true },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("VersionedRepositoryDescriptor"),
+            "versioned repositories must register a link-time descriptor so app startup installs the version-history migration: {generated}"
+        );
+    }
+
+    #[test]
     fn repository_macro_versioned_generates_versioned_record_impl() {
         let generated = repository_macro(
             quote! { Post, versioned = true },
@@ -8683,6 +8749,66 @@ mod tests {
         assert!(
             generated.contains("version_sensitive_columns"),
             "generated VersionedRecord impl must include version_sensitive_columns: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_tenant_scoped_versioned_stores_tenant_id_in_history() {
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, versioned = true },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("tenant_id, record_id")
+                && generated.contains("__vh_tenant_id")
+                && generated.contains("version_tenant_id"),
+            "tenant-scoped history writes must persist tenant_id for fail-closed history reads: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_tenant_scoped_version_history_filters_current_tenant() {
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, versioned = true },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("CURRENT_TENANT")
+                && generated.contains("tenant_id = $3")
+                && generated.contains("self . across_tenants"),
+            "tenant-scoped version_history must default to CURRENT_TENANT and only bypass through across_tenants(): {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_versioned_update_locks_before_history_diff_without_expected_version() {
+        let generated = repository_macro(
+            quote! { Post, versioned = true },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        let no_expected_branch = generated
+            .find("} else { load_query")
+            .expect("versioned update should have a no-expected-version load branch");
+        let section = &generated[no_expected_branch..];
+        let lock_pos = section
+            .find(". for_update ()")
+            .expect("versioned update must lock the row before computing history diff");
+        let first_pos = section
+            .find(". first :: < Post >")
+            .expect("versioned update should load the row before applying the update");
+        let history_pos = section
+            .find("INSERT INTO _autumn_version_history")
+            .expect("versioned update should write history");
+
+        assert!(
+            lock_pos < first_pos && first_pos < history_pos,
+            "versioned update must SELECT FOR UPDATE before loading the before image and writing history: {section}"
         );
     }
 
