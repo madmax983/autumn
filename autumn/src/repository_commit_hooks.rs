@@ -668,26 +668,39 @@ pub async fn mark_repository_commit_hook_after_hook_failed(
                 return;
             }
             Err(error) => {
-                if attempt == HOOK_AFTER_HOOK_FAILURE_MARK_MAX_ATTEMPTS {
-                    tracing::warn!(
-                        hook_id = %hook_id,
-                        error = %error,
-                        attempts = HOOK_AFTER_HOOK_FAILURE_MARK_MAX_ATTEMPTS,
-                        "failed to mark repository commit hook after-hook failure; giving up so the committed mutation can return"
-                    );
+                if handle_mark_failure_error(attempt, hook_id, error).await
+                    == std::ops::ControlFlow::Break(())
+                {
                     return;
                 }
-                tracing::warn!(
-                    hook_id = %hook_id,
-                    error = %error,
-                    attempt,
-                    max_attempts = HOOK_AFTER_HOOK_FAILURE_MARK_MAX_ATTEMPTS,
-                    "failed to mark repository commit hook after-hook failure; retrying"
-                );
-                tokio::time::sleep(HOOK_AFTER_HOOK_FAILURE_MARK_RETRY_SLEEP).await;
             }
         }
     }
+}
+
+async fn handle_mark_failure_error(
+    attempt: usize,
+    hook_id: &str,
+    error: crate::error::AutumnError,
+) -> std::ops::ControlFlow<(), ()> {
+    if attempt == HOOK_AFTER_HOOK_FAILURE_MARK_MAX_ATTEMPTS {
+        tracing::warn!(
+            hook_id = %hook_id,
+            error = %error,
+            attempts = HOOK_AFTER_HOOK_FAILURE_MARK_MAX_ATTEMPTS,
+            "failed to mark repository commit hook after-hook failure; giving up so the committed mutation can return"
+        );
+        return std::ops::ControlFlow::Break(());
+    }
+    tracing::warn!(
+        hook_id = %hook_id,
+        error = %error,
+        attempt,
+        max_attempts = HOOK_AFTER_HOOK_FAILURE_MARK_MAX_ATTEMPTS,
+        "failed to mark repository commit hook after-hook failure; retrying"
+    );
+    tokio::time::sleep(HOOK_AFTER_HOOK_FAILURE_MARK_RETRY_SLEEP).await;
+    std::ops::ControlFlow::Continue(())
 }
 
 async fn pg_mark_repository_commit_hook_after_hook_failed(
@@ -877,39 +890,7 @@ async fn drain_ready_repository_commit_hooks(pool: &PgPool, worker_id: &str, max
         ));
         let result = run_repository_commit_hook_row(&row).await;
 
-        match result {
-            Ok(()) => {
-                if let Err(error) =
-                    pg_ack_repository_commit_hook_success(pool, &row.id, worker_id).await
-                {
-                    tracing::warn!(
-                        hook_id = %row.id,
-                        error = %error,
-                        "failed to ack repository commit hook success"
-                    );
-                }
-            }
-            Err(error) => {
-                let failures_total = crate::db::record_after_commit_failure();
-                tracing::error!(
-                    hook_id = %row.id,
-                    handler_key = %row.handler_key,
-                    hook_name = %row.hook_name,
-                    autumn.after_commit.failures_total = failures_total,
-                    "repository after_commit hook failed: {error}"
-                );
-                if let Err(nack_error) =
-                    pg_nack_repository_commit_hook_failure(pool, &row.id, worker_id, &error, &row)
-                        .await
-                {
-                    tracing::warn!(
-                        hook_id = %row.id,
-                        error = %nack_error,
-                        "failed to record repository commit hook failure"
-                    );
-                }
-            }
-        }
+        handle_repository_commit_hook_row_result(pool, &row, worker_id, result).await;
 
         heartbeat_shutdown.cancel();
         if let Err(error) = heartbeat_task.await {
@@ -1185,28 +1166,36 @@ async fn recover_stale_repository_commit_hooks(pool: &PgPool, worker_id: &str) {
         return;
     };
 
-    if let Err(error) = diesel::sql_query(HOOK_RECOVER_STALE_RUNNING_SQL)
-        .bind::<diesel::sql_types::Text, _>(format!("stale claim recovered by {worker_id}"))
-        .bind::<diesel::sql_types::BigInt, _>(stale_after_ms)
-        .execute(&mut *conn)
-        .await
-    {
-        if is_missing_hook_table_error(&error) {
-            tracing::debug!(
-                error = %error,
-                "repository commit hook queue table is not available yet"
-            );
-        } else {
-            tracing::warn!(error = %error, "repository commit hook stale recovery failed");
-        }
-    }
+    execute_stale_recovery_query(
+        &mut conn,
+        HOOK_RECOVER_STALE_RUNNING_SQL,
+        format!("stale claim recovered by {worker_id}"),
+        stale_after_ms,
+        "repository commit hook stale recovery failed",
+    )
+    .await;
 
-    if let Err(error) = diesel::sql_query(HOOK_RECOVER_STALE_PENDING_SQL)
-        .bind::<diesel::sql_types::Text, _>(format!(
-            "stale pending after hook recovered by {worker_id}"
-        ))
+    execute_stale_recovery_query(
+        &mut conn,
+        HOOK_RECOVER_STALE_PENDING_SQL,
+        format!("stale pending after hook recovered by {worker_id}"),
+        stale_after_ms,
+        "repository commit hook stale pending recovery failed",
+    )
+    .await;
+}
+
+async fn execute_stale_recovery_query(
+    conn: &mut diesel_async::AsyncPgConnection,
+    query: &str,
+    bind_message: String,
+    stale_after_ms: i64,
+    failure_log_msg: &str,
+) {
+    if let Err(error) = diesel::sql_query(query)
+        .bind::<diesel::sql_types::Text, _>(bind_message)
         .bind::<diesel::sql_types::BigInt, _>(stale_after_ms)
-        .execute(&mut *conn)
+        .execute(conn)
         .await
     {
         if is_missing_hook_table_error(&error) {
@@ -1215,10 +1204,7 @@ async fn recover_stale_repository_commit_hooks(pool: &PgPool, worker_id: &str) {
                 "repository commit hook queue table is not available yet"
             );
         } else {
-            tracing::warn!(
-                error = %error,
-                "repository commit hook stale pending recovery failed"
-            );
+            tracing::warn!(error = %error, "{}", failure_log_msg);
         }
     }
 }
@@ -1737,5 +1723,45 @@ mod tests {
         );
 
         assert!(is_missing_hook_table_error(&error));
+    }
+}
+
+async fn handle_repository_commit_hook_row_result(
+    pool: &PgPool,
+    row: &PgRepositoryCommitHookRow,
+    worker_id: &str,
+    result: Result<(), String>,
+) {
+    match result {
+        Ok(()) => {
+            if let Err(error) =
+                pg_ack_repository_commit_hook_success(pool, &row.id, worker_id).await
+            {
+                tracing::warn!(
+                    hook_id = %row.id,
+                    error = %error,
+                    "failed to ack repository commit hook success"
+                );
+            }
+        }
+        Err(error) => {
+            let failures_total = crate::db::record_after_commit_failure();
+            tracing::error!(
+                hook_id = %row.id,
+                handler_key = %row.handler_key,
+                hook_name = %row.hook_name,
+                autumn.after_commit.failures_total = failures_total,
+                "repository after_commit hook failed: {error}"
+            );
+            if let Err(nack_error) =
+                pg_nack_repository_commit_hook_failure(pool, &row.id, worker_id, &error, row).await
+            {
+                tracing::warn!(
+                    hook_id = %row.id,
+                    error = %nack_error,
+                    "failed to record repository commit hook failure"
+                );
+            }
+        }
     }
 }
