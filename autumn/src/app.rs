@@ -282,14 +282,14 @@ pub struct AppBuilder {
     /// and `apply_middleware` both see `config.idempotency.enabled = true`.
     idempotency_enabled: bool,
     #[cfg(feature = "mail")]
-    mail_interceptor: Option<Arc<dyn crate::interceptor::MailInterceptor>>,
-    job_interceptor: Option<Arc<dyn crate::interceptor::JobInterceptor>>,
+    mail_interceptor: Option<Arc<dyn crate::mail::MailInterceptor>>,
+    job_interceptor: Option<Arc<dyn crate::job::JobInterceptor>>,
     #[cfg(feature = "db")]
-    db_interceptor: Option<Arc<dyn crate::interceptor::DbConnectionInterceptor>>,
+    db_interceptor: Option<Arc<dyn crate::db::DbConnectionInterceptor>>,
     #[cfg(feature = "ws")]
-    channels_interceptor: Option<Arc<dyn crate::interceptor::ChannelsInterceptor>>,
+    channels_interceptor: Option<Arc<dyn crate::channels::ChannelsInterceptor>>,
     #[cfg(feature = "oauth2")]
-    http_interceptor: Option<Arc<dyn crate::interceptor::HttpInterceptor>>,
+    http_interceptor: Option<Arc<dyn crate::http_client::HttpInterceptor>>,
 }
 
 /// Boxed builder closure that constructs a durable
@@ -987,19 +987,13 @@ impl AppBuilder {
 
     #[cfg(feature = "mail")]
     #[must_use]
-    pub fn with_mail_interceptor(
-        mut self,
-        interceptor: impl crate::interceptor::MailInterceptor,
-    ) -> Self {
+    pub fn with_mail_interceptor(mut self, interceptor: impl crate::mail::MailInterceptor) -> Self {
         self.mail_interceptor = Some(Arc::new(interceptor));
         self
     }
 
     #[must_use]
-    pub fn with_job_interceptor(
-        mut self,
-        interceptor: impl crate::interceptor::JobInterceptor,
-    ) -> Self {
+    pub fn with_job_interceptor(mut self, interceptor: impl crate::job::JobInterceptor) -> Self {
         self.job_interceptor = Some(Arc::new(interceptor));
         self
     }
@@ -1008,7 +1002,7 @@ impl AppBuilder {
     #[must_use]
     pub fn with_db_interceptor(
         mut self,
-        interceptor: impl crate::interceptor::DbConnectionInterceptor,
+        interceptor: impl crate::db::DbConnectionInterceptor,
     ) -> Self {
         self.db_interceptor = Some(Arc::new(interceptor));
         self
@@ -1018,7 +1012,7 @@ impl AppBuilder {
     #[must_use]
     pub fn with_channels_interceptor(
         mut self,
-        interceptor: impl crate::interceptor::ChannelsInterceptor,
+        interceptor: impl crate::channels::ChannelsInterceptor,
     ) -> Self {
         self.channels_interceptor = Some(Arc::new(interceptor));
         self
@@ -1028,7 +1022,7 @@ impl AppBuilder {
     #[must_use]
     pub fn with_http_interceptor(
         mut self,
-        interceptor: impl crate::interceptor::HttpInterceptor,
+        interceptor: impl crate::http_client::HttpInterceptor,
     ) -> Self {
         self.http_interceptor = Some(Arc::new(interceptor));
         self
@@ -2666,7 +2660,7 @@ impl AppBuilder {
         let span = tracing::info_span!("one_off_task", task = %task_name);
         #[cfg(feature = "oauth2")]
         let result = {
-            use crate::interceptor::{ACTIVE_HTTP_INTERCEPTORS, HttpInterceptor};
+            use crate::http_client::{ACTIVE_HTTP_INTERCEPTORS, HttpInterceptor};
             let interceptors: Vec<std::sync::Arc<dyn HttpInterceptor>> = state
                 .extension::<std::sync::Arc<dyn HttpInterceptor>>()
                 .map(|interceptor_arc| vec![(*interceptor_arc).clone()])

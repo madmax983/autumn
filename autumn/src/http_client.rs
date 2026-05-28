@@ -56,6 +56,25 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+#[cfg(feature = "oauth2")]
+pub type HttpInterceptorFuture<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<reqwest::Response, reqwest::Error>> + Send + 'a>,
+>;
+
+#[cfg(feature = "oauth2")]
+pub trait HttpInterceptor: Send + Sync + 'static {
+    fn intercept<'a>(
+        &'a self,
+        req: reqwest::Request,
+        next: &'a dyn Fn(reqwest::Request) -> HttpInterceptorFuture<'a>,
+    ) -> HttpInterceptorFuture<'a>;
+}
+
+#[cfg(feature = "oauth2")]
+tokio::task_local! {
+    pub static ACTIVE_HTTP_INTERCEPTORS: Vec<Arc<dyn HttpInterceptor>>;
+}
+
 // ── Error ────────────────────────────────────────────────────────────────────
 
 /// Errors produced by [`Client`] and [`RequestBuilder`].

@@ -2,19 +2,19 @@ use autumn_web::app::app;
 use std::sync::Arc;
 
 // We expect these traits to be exposed under autumn_web::interceptor
-use autumn_web::interceptor::JobInterceptor;
+use autumn_web::job::JobInterceptor;
 
 #[cfg(feature = "mail")]
-use autumn_web::interceptor::MailInterceptor;
+use autumn_web::mail::MailInterceptor;
 
 #[cfg(feature = "db")]
-use autumn_web::interceptor::DbConnectionInterceptor;
+use autumn_web::db::DbConnectionInterceptor;
 
 #[cfg(feature = "ws")]
-use autumn_web::interceptor::ChannelsInterceptor;
+use autumn_web::channels::ChannelsInterceptor;
 
 #[cfg(feature = "oauth2")]
-use autumn_web::interceptor::HttpInterceptor;
+use autumn_web::http_client::HttpInterceptor;
 
 #[cfg(feature = "mail")]
 struct DummyMailInterceptor;
@@ -72,7 +72,7 @@ struct DummyDbInterceptor;
 impl DbConnectionInterceptor for DummyDbInterceptor {
     fn intercept_checkout<'a>(
         &'a self,
-        _ctx: autumn_web::interceptor::DbCheckoutContext,
+        _ctx: autumn_web::db::DbCheckoutContext,
         next: std::pin::Pin<
             Box<
                 dyn std::future::Future<
@@ -323,8 +323,8 @@ async fn job_interceptor_intercepts_enqueue_and_execute() {
 #[tokio::test]
 async fn db_connection_interceptor_intercepts_checkout() {
     use autumn_web::db::Db;
+    use autumn_web::db::DbCheckoutContext;
     use autumn_web::get;
-    use autumn_web::interceptor::DbCheckoutContext;
     use autumn_web::test::TestApp;
     use diesel_async::AsyncPgConnection;
     use diesel_async::pooled_connection::AsyncDieselConnectionManager;
@@ -445,8 +445,8 @@ impl HttpInterceptor for RecordingHttpInterceptor {
     fn intercept<'a>(
         &'a self,
         req: reqwest::Request,
-        next: &'a dyn Fn(reqwest::Request) -> autumn_web::interceptor::HttpInterceptorFuture<'a>,
-    ) -> autumn_web::interceptor::HttpInterceptorFuture<'a> {
+        next: &'a dyn Fn(reqwest::Request) -> autumn_web::http_client::HttpInterceptorFuture<'a>,
+    ) -> autumn_web::http_client::HttpInterceptorFuture<'a> {
         assert_eq!(req.url().as_str(), "http://127.0.0.1:54321/token");
         HTTP_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         next(req)
