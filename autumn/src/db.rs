@@ -323,6 +323,22 @@ const fn is_separator(c: char) -> bool {
     )
 }
 
+/// Scrubs SQL queries by removing literals and collapsing structural elements.
+///
+/// This function normalizes a SQL query so that structurally identical queries
+/// differing only in values (e.g., `WHERE id = 1` vs `WHERE id = 2`) produce
+/// the same fingerprinted string. This prevents sensitive data leakage in logs
+/// and telemetry and enables grouping similar queries for performance analysis.
+///
+/// # Examples
+///
+/// ```rust
+/// use autumn_web::db::scrub_sql;
+///
+/// let raw = "SELECT * FROM users WHERE age > 21 AND name = 'Alice'";
+/// let scrubbed = scrub_sql(raw);
+/// assert_eq!(scrubbed, "SELECT * FROM users WHERE age > ? AND name = '?'");
+/// ```
 #[must_use]
 pub fn scrub_sql(sql: &str) -> String {
     let mut out = String::with_capacity(sql.len());
@@ -743,6 +759,28 @@ impl Drop for TxDepthGuard<'_> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StatementTimeout(pub std::time::Duration);
 
+/// A managed database connection configured with the active transaction context.
+///
+/// `Db` is the primary database interaction struct in Autumn. As an Axum extractor,
+/// it provides a ready-to-use connection from the pool. It transparently handles
+/// transaction nesting, metrics collection, and slow query logging.
+///
+/// It implements `std::ops::Deref<Target = AsyncPgConnection>`, meaning it can be
+/// passed directly to Diesel query executions.
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use autumn_web::prelude::*;
+/// use diesel_async::RunQueryDsl;
+///
+/// #[get("/ping-db")]
+/// async fn ping_db(mut db: Db) -> AutumnResult<&'static str> {
+///     // `db` dereferences to AsyncPgConnection for query execution
+///     diesel::sql_query("SELECT 1").execute(&mut *db).await?;
+///     Ok("database is reachable")
+/// }
+/// ```
 pub struct Db {
     conn: PooledConnection,
     /// Span covering the full checkout-to-release window. Dropped when
