@@ -1283,6 +1283,46 @@ fn repository_commit_hook_pending_owner_id() -> String {
     format!("repository-hook-pending-{}", uuid::Uuid::new_v4())
 }
 
+async fn handle_repository_commit_hook_row_result(
+    pool: &PgPool,
+    row: &PgRepositoryCommitHookRow,
+    worker_id: &str,
+    result: Result<(), String>,
+) {
+    match result {
+        Ok(()) => {
+            if let Err(error) =
+                pg_ack_repository_commit_hook_success(pool, &row.id, worker_id).await
+            {
+                tracing::warn!(
+                    hook_id = %row.id,
+                    error = %error,
+                    "failed to ack repository commit hook success"
+                );
+            }
+        }
+        Err(error) => {
+            let failures_total = crate::db::record_after_commit_failure();
+            tracing::error!(
+                hook_id = %row.id,
+                handler_key = %row.handler_key,
+                hook_name = %row.hook_name,
+                autumn.after_commit.failures_total = failures_total,
+                "repository after_commit hook failed: {error}"
+            );
+            if let Err(nack_error) =
+                pg_nack_repository_commit_hook_failure(pool, &row.id, worker_id, &error, row).await
+            {
+                tracing::warn!(
+                    hook_id = %row.id,
+                    error = %nack_error,
+                    "failed to record repository commit hook failure"
+                );
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1723,45 +1763,5 @@ mod tests {
         );
 
         assert!(is_missing_hook_table_error(&error));
-    }
-}
-
-async fn handle_repository_commit_hook_row_result(
-    pool: &PgPool,
-    row: &PgRepositoryCommitHookRow,
-    worker_id: &str,
-    result: Result<(), String>,
-) {
-    match result {
-        Ok(()) => {
-            if let Err(error) =
-                pg_ack_repository_commit_hook_success(pool, &row.id, worker_id).await
-            {
-                tracing::warn!(
-                    hook_id = %row.id,
-                    error = %error,
-                    "failed to ack repository commit hook success"
-                );
-            }
-        }
-        Err(error) => {
-            let failures_total = crate::db::record_after_commit_failure();
-            tracing::error!(
-                hook_id = %row.id,
-                handler_key = %row.handler_key,
-                hook_name = %row.hook_name,
-                autumn.after_commit.failures_total = failures_total,
-                "repository after_commit hook failed: {error}"
-            );
-            if let Err(nack_error) =
-                pg_nack_repository_commit_hook_failure(pool, &row.id, worker_id, &error, row).await
-            {
-                tracing::warn!(
-                    hook_id = %row.id,
-                    error = %nack_error,
-                    "failed to record repository commit hook failure"
-                );
-            }
-        }
     }
 }
