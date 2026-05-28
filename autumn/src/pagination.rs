@@ -870,6 +870,16 @@ mod tests {
     // ── PageRequest coercion ────────────────────────────────────
 
     #[test]
+    fn test_fetch_limit() {
+        let mut r = CursorRequest::new(None, 10);
+        assert_eq!(r.fetch_limit(), 11);
+        r = CursorRequest::new(None, 0);
+        assert_eq!(r.fetch_limit(), 21);
+        r = CursorRequest::new(None, 1_000_000);
+        assert_eq!(r.fetch_limit(), 101);
+    }
+
+    #[test]
     fn defaults_when_nothing_provided() {
         let r = PageRequest::default();
         assert_eq!(r.page(), 1);
@@ -1203,12 +1213,18 @@ mod tests {
 
         let exact = CursorRequest::new(None, MAX_PAGE_SIZE);
         assert_eq!(exact.size(), MAX_PAGE_SIZE);
+        assert_eq!(exact.fetch_limit(), i64::from(MAX_PAGE_SIZE) + 1);
 
         let over = CursorRequest::new(None, MAX_PAGE_SIZE + 1);
         assert_eq!(over.size(), MAX_PAGE_SIZE);
+        assert_eq!(over.fetch_limit(), i64::from(MAX_PAGE_SIZE) + 1);
 
         let under = CursorRequest::new(None, MAX_PAGE_SIZE - 1);
         assert_eq!(under.size(), MAX_PAGE_SIZE - 1);
+
+        let zero = CursorRequest::new(None, 0);
+        assert_eq!(zero.size(), DEFAULT_PAGE_SIZE);
+        assert_eq!(zero.fetch_limit(), i64::from(DEFAULT_PAGE_SIZE) + 1);
     }
 
     #[test]

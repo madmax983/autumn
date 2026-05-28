@@ -605,6 +605,18 @@ mod tests {
 }
 
 #[cfg(test)]
+mod additional_mutant_tests {
+    use super::*;
+
+    #[test]
+    fn title_not_blank_validation() {
+        assert!(title_not_blank("  ").is_err());
+        assert!(title_not_blank("").is_err());
+        assert!(title_not_blank("valid").is_ok());
+    }
+}
+
+#[cfg(test)]
 mod mutant_tests {
     #[allow(unused_imports)]
     use super::*;
