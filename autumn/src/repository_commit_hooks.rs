@@ -430,49 +430,64 @@ where
               started_at = NULL, finished_at = NULL, last_error = NULL \
           WHERE autumn_repository_commit_hooks.status IN ('pending_after_hook', 'after_hook_failed')";
 
+    struct BulkInput {
+        ids: Vec<String>,
+        handler_keys: Vec<String>,
+        hook_names: Vec<String>,
+        contexts: Vec<String>,
+        records: Vec<String>,
+        owners: Vec<String>,
+        results: Vec<(String, String)>,
+    }
+
     if inputs.is_empty() {
         return Ok(Vec::new());
     }
 
-    let mut ids = Vec::with_capacity(inputs.len());
-    let mut handler_keys = Vec::with_capacity(inputs.len());
-    let mut hook_names = Vec::with_capacity(inputs.len());
-    let mut contexts = Vec::with_capacity(inputs.len());
-    let mut records = Vec::with_capacity(inputs.len());
-    let mut owners = Vec::with_capacity(inputs.len());
-    let mut results = Vec::with_capacity(inputs.len());
-
     let owner = repository_commit_hook_pending_owner_id();
 
-    for &(ref idempotency_key, ref idempotency_discriminator, context, record) in inputs {
-        let (context_str, record_str) = serialize_repository_commit_hook_payloads(context, record)?;
-        let id = repository_commit_hook_id(
-            idempotency_key.as_deref(),
-            idempotency_discriminator.as_deref(),
-            handler_key,
-            hook_name,
-            &record_str,
-        );
+    let bulk = inputs.iter().try_fold(
+        BulkInput {
+            ids: Vec::with_capacity(inputs.len()),
+            handler_keys: Vec::with_capacity(inputs.len()),
+            hook_names: Vec::with_capacity(inputs.len()),
+            contexts: Vec::with_capacity(inputs.len()),
+            records: Vec::with_capacity(inputs.len()),
+            owners: Vec::with_capacity(inputs.len()),
+            results: Vec::with_capacity(inputs.len()),
+        },
+        |mut acc, &(ref idempotency_key, ref idempotency_discriminator, context, record)| {
+            let (context_str, record_str) =
+                serialize_repository_commit_hook_payloads(context, record)?;
+            let id = repository_commit_hook_id(
+                idempotency_key.as_deref(),
+                idempotency_discriminator.as_deref(),
+                handler_key,
+                hook_name,
+                &record_str,
+            );
 
-        ids.push(id.clone());
-        handler_keys.push(handler_key.to_string());
-        hook_names.push(hook_name.to_string());
-        contexts.push(context_str);
-        records.push(record_str);
-        owners.push(owner.clone());
-        results.push((id, owner.clone()));
-    }
+            acc.ids.push(id.clone());
+            acc.handler_keys.push(handler_key.to_string());
+            acc.hook_names.push(hook_name.to_string());
+            acc.contexts.push(context_str);
+            acc.records.push(record_str);
+            acc.owners.push(owner.clone());
+            acc.results.push((id, owner.clone()));
+            Ok::<_, AutumnError>(acc)
+        },
+    )?;
 
     diesel::sql_query(SQL)
-        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(ids)
-        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(handler_keys)
-        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(hook_names)
-        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(contexts)
-        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(records)
-        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(owners)
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(bulk.ids)
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(bulk.handler_keys)
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(bulk.hook_names)
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(bulk.contexts)
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(bulk.records)
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(bulk.owners)
         .execute(conn)
         .await
-        .map(|_| results)
+        .map(|_| bulk.results)
         .map_err(|error| {
             AutumnError::internal_server_error_msg(format!(
                 "repository commit hook bulk staging failed: {error}"
@@ -506,39 +521,52 @@ where
            AS t(id, handler_key, hook_name, context, record) \
          ON CONFLICT (id) DO NOTHING";
 
+    struct BulkEnqueueInput {
+        ids: Vec<String>,
+        handler_keys: Vec<String>,
+        hook_names: Vec<String>,
+        contexts: Vec<String>,
+        records: Vec<String>,
+    }
+
     if inputs.is_empty() {
         return Ok(());
     }
 
-    let mut ids = Vec::with_capacity(inputs.len());
-    let mut handler_keys = Vec::with_capacity(inputs.len());
-    let mut hook_names = Vec::with_capacity(inputs.len());
-    let mut contexts = Vec::with_capacity(inputs.len());
-    let mut records = Vec::with_capacity(inputs.len());
+    let bulk = inputs.iter().try_fold(
+        BulkEnqueueInput {
+            ids: Vec::with_capacity(inputs.len()),
+            handler_keys: Vec::with_capacity(inputs.len()),
+            hook_names: Vec::with_capacity(inputs.len()),
+            contexts: Vec::with_capacity(inputs.len()),
+            records: Vec::with_capacity(inputs.len()),
+        },
+        |mut acc, &(ref idempotency_key, ref idempotency_discriminator, context, record)| {
+            let (context_str, record_str) =
+                serialize_repository_commit_hook_payloads(context, record)?;
+            let id = repository_commit_hook_id(
+                idempotency_key.as_deref(),
+                idempotency_discriminator.as_deref(),
+                handler_key,
+                hook_name,
+                &record_str,
+            );
 
-    for &(ref idempotency_key, ref idempotency_discriminator, context, record) in inputs {
-        let (context_str, record_str) = serialize_repository_commit_hook_payloads(context, record)?;
-        let id = repository_commit_hook_id(
-            idempotency_key.as_deref(),
-            idempotency_discriminator.as_deref(),
-            handler_key,
-            hook_name,
-            &record_str,
-        );
-
-        ids.push(id);
-        handler_keys.push(handler_key.to_string());
-        hook_names.push(hook_name.to_string());
-        contexts.push(context_str);
-        records.push(record_str);
-    }
+            acc.ids.push(id);
+            acc.handler_keys.push(handler_key.to_string());
+            acc.hook_names.push(hook_name.to_string());
+            acc.contexts.push(context_str);
+            acc.records.push(record_str);
+            Ok::<_, AutumnError>(acc)
+        },
+    )?;
 
     diesel::sql_query(SQL)
-        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(ids)
-        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(handler_keys)
-        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(hook_names)
-        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(contexts)
-        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(records)
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(bulk.ids)
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(bulk.handler_keys)
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(bulk.hook_names)
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(bulk.contexts)
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(bulk.records)
         .execute(conn)
         .await
         .map(|_| ())
