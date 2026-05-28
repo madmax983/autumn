@@ -11,8 +11,8 @@ use std::sync::{Arc, RwLock};
 
 use axum::extract::FromRequestParts;
 use axum::extract::Request;
-use axum::http::request::Parts;
 use axum::http::StatusCode;
+use axum::http::request::Parts;
 use axum::response::{IntoResponse, Response};
 use futures::future::BoxFuture;
 
@@ -112,13 +112,10 @@ where
     type Rejection = (StatusCode, &'static str);
 
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        let store = parts
-            .extensions
-            .get::<Arc<dyn FeatureFlagStore>>()
-            .ok_or((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "FeatureFlagStore missing from request extensions",
-            ))?;
+        let store = parts.extensions.get::<Arc<dyn FeatureFlagStore>>().ok_or((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "FeatureFlagStore missing from request extensions",
+        ))?;
 
         Ok(Self {
             store: Arc::clone(store),
@@ -221,10 +218,10 @@ pub fn require_feature(feature: impl Into<String>) -> RequireFeature {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::routing::get;
-    use axum::Router;
     use axum::Extension;
+    use axum::Router;
     use axum::body::Body;
+    use axum::routing::get;
     use tower::ServiceExt;
 
     #[test]
@@ -246,13 +243,16 @@ mod tests {
         store.enable("extractor_test");
 
         let app = Router::new()
-            .route("/", get(|flags: FeatureFlag| async move {
-                if flags.is_enabled("extractor_test") {
-                    "enabled"
-                } else {
-                    "disabled"
-                }
-            }))
+            .route(
+                "/",
+                get(|flags: FeatureFlag| async move {
+                    if flags.is_enabled("extractor_test") {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }
+                }),
+            )
             .layer(Extension(Arc::new(store) as Arc<dyn FeatureFlagStore>));
 
         let response = app
@@ -266,7 +266,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
         assert_eq!(body.as_ref(), b"enabled");
     }
 
