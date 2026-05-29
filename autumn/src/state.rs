@@ -23,6 +23,8 @@ use crate::actuator;
 use crate::authorization::{ForbiddenResponse, Policy, PolicyRegistry, Scope};
 #[cfg(feature = "ws")]
 use crate::channels::Channels;
+#[cfg(feature = "ws")]
+use crate::presence::Presence;
 #[cfg(feature = "db")]
 use crate::db::DbState;
 use crate::middleware;
@@ -100,6 +102,13 @@ pub struct AppState {
     /// [`channels()`](Self::channels) for convenient access.
     #[cfg(feature = "ws")]
     pub(crate) channels: Channels,
+
+    /// Distributed presence tracker layered on top of [`Channels`].
+    ///
+    /// Available when the `ws` feature is enabled. Use
+    /// [`presence()`](Self::presence) for convenient access.
+    #[cfg(feature = "ws")]
+    pub(crate) presence: Presence,
 
     /// Cancellation token signalled during graceful shutdown.
     ///
@@ -421,6 +430,13 @@ impl AppState {
         &self.channels
     }
 
+    /// Returns a reference to the distributed presence tracker.
+    #[cfg(feature = "ws")]
+    #[must_use]
+    pub fn presence(&self) -> &Presence {
+        &self.presence
+    }
+
     /// Returns a high-level broadcast facade for raw and htmx HTML payloads.
     #[cfg(feature = "ws")]
     #[must_use]
@@ -488,6 +504,8 @@ impl AppState {
             config_props: actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: Channels::new(32),
+            #[cfg(feature = "ws")]
+            presence: Presence::new(Channels::new(32)),
             #[cfg(feature = "ws")]
             shutdown: CancellationToken::new(),
             policy_registry: PolicyRegistry::default(),

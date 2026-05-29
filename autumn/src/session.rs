@@ -1206,6 +1206,8 @@ mod tests {
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
+            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
+            #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
             policy_registry: crate::authorization::PolicyRegistry::default(),
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
@@ -1253,6 +1255,8 @@ mod tests {
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
+            #[cfg(feature = "ws")]
+            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
             policy_registry: crate::authorization::PolicyRegistry::default(),

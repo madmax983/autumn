@@ -85,6 +85,9 @@ pub use crate::{
     Broadcast, BroadcastError, ChannelMessage, ChannelStats, Channels, ChannelsBackend,
     LocalChannelsBackend,
 };
+/// Distributed presence tracking extractor and related types.
+#[cfg(feature = "ws")]
+pub use crate::{Presence, PresenceEntry, PresenceEvent, PresenceHandle};
 /// State extractor.
 pub use axum::extract::State;
 /// Trait for types that can be converted into an HTTP response.
@@ -213,6 +216,8 @@ mod tests {
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
+            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
+            #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
             policy_registry: crate::authorization::PolicyRegistry::default(),
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
@@ -235,6 +240,8 @@ mod tests {
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
+            #[cfg(feature = "ws")]
+            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
             policy_registry: crate::authorization::PolicyRegistry::default(),

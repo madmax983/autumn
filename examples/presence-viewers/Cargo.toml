@@ -1,0 +1,18 @@
+[package]
+name = "presence-viewers"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+autumn-web = { path = "../../autumn", features = ["ws"] }
+async-stream = "0.3"
+axum = { workspace = true }
+maud = { workspace = true }
+serde = { workspace = true }
+serde_json = "1"
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+
+[lints.rust]
+unsafe_code = "forbid"
