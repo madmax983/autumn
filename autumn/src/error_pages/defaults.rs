@@ -329,4 +329,15 @@ mod tests {
         assert!(s.contains("599"));
         assert!(s.contains("Error"));
     }
+
+    #[test]
+    fn test_unwrap_or_fallback() {
+        let pages = DefaultErrorPages;
+        let ctx = make_ctx(StatusCode::from_u16(599).unwrap());
+        let html = pages.render_error(&ctx);
+        let s = html.into_string();
+        // Verifies the fallback "Error" is rendered because 599 has no canonical reason
+        assert!(s.contains("Error"));
+        assert!(s.contains("599"));
+    }
 }
