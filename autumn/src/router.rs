@@ -1465,6 +1465,26 @@ pub fn try_build_router_with_static_inner(
         ));
     };
 
+    // In dev mode (autumn dev / AUTUMN_DEV_RELOAD active) do NOT mount the
+    // static-first middleware so that app routes always take priority over
+    // pre-rendered HTML in dist/. This prevents stale exports from shadowing
+    // handlers whose templates have just been edited — the exact DX trap
+    // described in issue #754. Normal /static/* assets are unaffected.
+    if crate::middleware::dev::is_enabled() {
+        tracing::warn!(
+            dist = %dist.display(),
+            "Dev mode: static export HTML in dist/ is disabled so app routes \
+             take priority. Pre-rendered pages will not be served this session. \
+             Stop `autumn dev` and run the app normally to serve static exports."
+        );
+        let app_router = try_build_router_inner(route_list, config, state, ctx)?;
+        return Ok(apply_startup_barrier(
+            app_router,
+            config,
+            &startup_barrier_state,
+        ));
+    }
+
     for (route, entry) in &layer.manifest().routes {
         tracing::debug!(
             route = %route,
@@ -3014,24 +3034,34 @@ mod tests {
         let dist = tmp.path().join("dist");
         let config = AutumnConfig::default();
 
-        let router = try_build_router_with_static(Vec::new(), &config, test_state(), Some(&dist))
-            .expect("router builds");
+        temp_env::async_with_vars(
+            [
+                ("AUTUMN_DEV_RELOAD", None::<&str>),
+                ("AUTUMN_DEV_RELOAD_STATE", None::<&str>),
+            ],
+            async move {
+                let router =
+                    try_build_router_with_static(Vec::new(), &config, test_state(), Some(&dist))
+                        .expect("router builds");
 
-        let response = router
-            .oneshot(
-                Request::builder()
-                    .uri("/about")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+                let response = router
+                    .oneshot(
+                        Request::builder()
+                            .uri("/about")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
 
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        assert_eq!(body.as_ref(), b"<h1>About</h1>");
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                assert_eq!(body.as_ref(), b"<h1>About</h1>");
+            },
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -3040,25 +3070,35 @@ mod tests {
         let dist = tmp.path().join("dist");
         let config = AutumnConfig::default();
 
-        let router = try_build_router_with_static(Vec::new(), &config, test_state(), Some(&dist))
-            .expect("router builds");
+        temp_env::async_with_vars(
+            [
+                ("AUTUMN_DEV_RELOAD", None::<&str>),
+                ("AUTUMN_DEV_RELOAD_STATE", None::<&str>),
+            ],
+            async move {
+                let router =
+                    try_build_router_with_static(Vec::new(), &config, test_state(), Some(&dist))
+                        .expect("router builds");
 
-        let response = router
-            .oneshot(
-                Request::builder()
-                    .method("HEAD")
-                    .uri("/about")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+                let response = router
+                    .oneshot(
+                        Request::builder()
+                            .method("HEAD")
+                            .uri("/about")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
 
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        assert!(body.is_empty(), "HEAD response body should be empty");
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                assert!(body.is_empty(), "HEAD response body should be empty");
+            },
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -3067,20 +3107,30 @@ mod tests {
         let dist = tmp.path().join("dist");
         let config = AutumnConfig::default();
 
-        let router = try_build_router_with_static(Vec::new(), &config, test_state(), Some(&dist))
-            .expect("router builds");
+        temp_env::async_with_vars(
+            [
+                ("AUTUMN_DEV_RELOAD", None::<&str>),
+                ("AUTUMN_DEV_RELOAD_STATE", None::<&str>),
+            ],
+            async move {
+                let router =
+                    try_build_router_with_static(Vec::new(), &config, test_state(), Some(&dist))
+                        .expect("router builds");
 
-        let response = router
-            .oneshot(
-                Request::builder()
-                    .uri("/about/")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+                let response = router
+                    .oneshot(
+                        Request::builder()
+                            .uri("/about/")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
 
-        assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(response.status(), StatusCode::OK);
+            },
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -3089,20 +3139,30 @@ mod tests {
         let dist = tmp.path().join("dist");
         let config = AutumnConfig::default();
 
-        let router = try_build_router_with_static(Vec::new(), &config, test_state(), Some(&dist))
-            .expect("router builds");
+        temp_env::async_with_vars(
+            [
+                ("AUTUMN_DEV_RELOAD", None::<&str>),
+                ("AUTUMN_DEV_RELOAD_STATE", None::<&str>),
+            ],
+            async move {
+                let router =
+                    try_build_router_with_static(Vec::new(), &config, test_state(), Some(&dist))
+                        .expect("router builds");
 
-        let response = router
-            .oneshot(
-                Request::builder()
-                    .uri("/not-in-manifest")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+                let response = router
+                    .oneshot(
+                        Request::builder()
+                            .uri("/not-in-manifest")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
 
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+                assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            },
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -3129,20 +3189,142 @@ mod tests {
         let dist = tmp.path().join("dist");
         let config = AutumnConfig::default();
 
-        let router = try_build_router_with_static(Vec::new(), &config, test_state(), Some(&dist))
-            .expect("router with ISR manifest should build");
+        temp_env::async_with_vars(
+            [
+                ("AUTUMN_DEV_RELOAD", None::<&str>),
+                ("AUTUMN_DEV_RELOAD_STATE", None::<&str>),
+            ],
+            async move {
+                let router =
+                    try_build_router_with_static(Vec::new(), &config, test_state(), Some(&dist))
+                        .expect("router with ISR manifest should build");
 
-        let response = router
-            .oneshot(
-                Request::builder()
-                    .uri("/about")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+                let response = router
+                    .oneshot(
+                        Request::builder()
+                            .uri("/about")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
 
-        assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(response.status(), StatusCode::OK);
+            },
+        )
+        .await;
+    }
+
+    // --- Dev-mode static-export shadowing tests (issue #754) ---
+
+    #[tokio::test]
+    async fn static_serving_skipped_in_dev_mode_app_routes_take_priority() {
+        // When dev mode is active (AUTUMN_DEV_RELOAD set), dist/ HTML must NOT
+        // shadow app routes. Without a registered handler the router should
+        // return 404 rather than the pre-rendered HTML.
+        let tmp = create_static_dist(None);
+        let dist = tmp.path().join("dist");
+        let config = AutumnConfig::default();
+
+        temp_env::async_with_vars(
+            [
+                ("AUTUMN_DEV_RELOAD", Some("1")),
+                ("AUTUMN_DEV_RELOAD_STATE", Some("/tmp/autumn-reload-test")),
+            ],
+            async move {
+                let router =
+                    try_build_router_with_static(Vec::new(), &config, test_state(), Some(&dist))
+                        .expect("router builds in dev mode");
+
+                let response = router
+                    .oneshot(
+                        Request::builder()
+                            .uri("/about")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+
+                assert_eq!(
+                    response.status(),
+                    StatusCode::NOT_FOUND,
+                    "static HTML must not shadow app routes in dev mode"
+                );
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn static_serving_active_outside_dev_mode() {
+        // Baseline: without dev env vars, static export HTML is still served
+        // before dynamic routes (existing non-dev behaviour must not regress).
+        let tmp = create_static_dist(None);
+        let dist = tmp.path().join("dist");
+        let config = AutumnConfig::default();
+
+        temp_env::async_with_vars(
+            [
+                ("AUTUMN_DEV_RELOAD", None::<&str>),
+                ("AUTUMN_DEV_RELOAD_STATE", None::<&str>),
+            ],
+            async move {
+                let router =
+                    try_build_router_with_static(Vec::new(), &config, test_state(), Some(&dist))
+                        .expect("router builds without dev mode");
+
+                let response = router
+                    .oneshot(
+                        Request::builder()
+                            .uri("/about")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                assert_eq!(body.as_ref(), b"<h1>About</h1>");
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn static_serving_skipped_in_dev_mode_root_route_falls_through() {
+        // The root path is a common shadowing case: dist/index.html must not
+        // be served when dev mode is active.
+        let tmp = create_static_dist(None);
+        let dist = tmp.path().join("dist");
+        let config = AutumnConfig::default();
+
+        temp_env::async_with_vars(
+            [
+                ("AUTUMN_DEV_RELOAD", Some("1")),
+                ("AUTUMN_DEV_RELOAD_STATE", Some("/tmp/autumn-reload-test")),
+            ],
+            async move {
+                let router =
+                    try_build_router_with_static(Vec::new(), &config, test_state(), Some(&dist))
+                        .expect("router builds");
+
+                let response = router
+                    .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+
+                assert_eq!(
+                    response.status(),
+                    StatusCode::NOT_FOUND,
+                    "dist/index.html must not shadow / in dev mode"
+                );
+            },
+        )
+        .await;
     }
 }
 
