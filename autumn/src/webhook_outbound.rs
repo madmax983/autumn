@@ -123,6 +123,17 @@ pub trait OutboundWebhookHandler: Send + Sync + 'static {
     ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send>> {
         Box::pin(async { Ok(()) })
     }
+
+    /// Optional: Reactivate a subscription that was auto-marked as failed.
+    ///
+    /// Manual DLQ replays need to bypass the automatic failure guard without
+    /// re-enabling subscriptions that an operator explicitly disabled.
+    fn reactivate_failed_subscription(
+        &self,
+        id: &str,
+    ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send>> {
+        self.reset_subscription_failures(id)
+    }
 }
 
 /// Legacy alias for backward compatibility.
@@ -302,6 +313,25 @@ impl OutboundWebhookHandler for InMemoryOutboundWebhookHandler {
         }
         Box::pin(async move { Ok(()) })
     }
+
+    fn reactivate_failed_subscription(
+        &self,
+        id: &str,
+    ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send>> {
+        {
+            let mut subs = self
+                .subscriptions
+                .write()
+                .expect("subscriptions write lock poisoned");
+            if let Some(sub) = subs.get_mut(id) {
+                sub.consecutive_failures = 0;
+                if sub.status == WebhookSubscriptionStatus::Failed {
+                    sub.status = WebhookSubscriptionStatus::Active;
+                }
+            }
+        }
+        Box::pin(async move { Ok(()) })
+    }
 }
 
 /// A runtime delegation callback type to bridge core autumn to autumn-harvest dynamically.
@@ -341,6 +371,11 @@ impl WebhookOutboundManager {
     #[must_use]
     pub const fn with_initial_backoff_ms(mut self, ms: u64) -> Self {
         self.initial_backoff_ms = ms;
+        self
+    }
+
+    fn with_client_from_state(mut self, state: &AppState) -> Self {
+        self.client = Client::from_state(state);
         self
     }
 
@@ -437,6 +472,17 @@ impl WebhookOutboundManager {
     }
 }
 
+fn install_outbound_webhook_manager(
+    state: &AppState,
+    store: Arc<dyn OutboundWebhookHandler>,
+    initial_backoff_ms: u64,
+) {
+    let manager = WebhookOutboundManager::new(store)
+        .with_initial_backoff_ms(initial_backoff_ms)
+        .with_client_from_state(state);
+    state.insert_extension(manager);
+}
+
 /// Asynchronous background job that delivers a webhook payload (legacy fallback).
 #[must_use]
 #[allow(clippy::redundant_closure_for_method_calls, clippy::too_many_lines)]
@@ -445,6 +491,10 @@ pub fn deliver_webhook_job(
     payload: serde_json::Value,
 ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'static>> {
     Box::pin(async move {
+        let is_replay = payload
+            .get("replay")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
         let manager = state.extension::<WebhookOutboundManager>().ok_or_else(|| {
             AutumnError::internal_server_error_msg("WebhookOutboundManager not found in extensions")
         })?;
@@ -519,12 +569,15 @@ pub fn deliver_webhook_job(
             return Ok(());
         }
 
-        if sub.status == WebhookSubscriptionStatus::Failed {
+        if sub.status == WebhookSubscriptionStatus::Failed && !is_replay {
             tracing::info!(subscription_id = %sub.id, "Webhook subscription has failed; skipping delivery");
             log.last_error = Some("Subscription has failed due to consecutive errors".to_owned());
             log.timestamp = Utc::now();
             manager.store().log_delivery(log).await?;
             return Ok(());
+        }
+        if sub.status == WebhookSubscriptionStatus::Failed {
+            tracing::info!(subscription_id = %sub.id, "Replaying webhook delivery for failed subscription");
         }
 
         // Stripe-style payload signing: t=<timestamp>,v1=<signature>
@@ -573,7 +626,7 @@ pub fn deliver_webhook_job(
                 if is_success {
                     log.last_error = None;
                     manager.store().log_delivery(log).await?;
-                    manager.store().reset_subscription_failures(&sub.id).await?;
+                    reset_subscription_after_success(&manager, &sub).await;
                     Ok(())
                 } else {
                     let status_err = format!("server returned status: {status}");
@@ -594,6 +647,23 @@ pub fn deliver_webhook_job(
             }
         }
     })
+}
+
+async fn reset_subscription_after_success(
+    manager: &WebhookOutboundManager,
+    sub: &WebhookSubscription,
+) {
+    if let Err(e) = manager
+        .store()
+        .reactivate_failed_subscription(&sub.id)
+        .await
+    {
+        tracing::warn!(
+            subscription_id = %sub.id,
+            "Webhook delivery succeeded but subscription failure state could not be reset: {}",
+            e
+        );
+    }
 }
 
 async fn handle_delivery_failure(
@@ -646,14 +716,8 @@ impl crate::plugin::Plugin for OutboundWebhookPlugin {
         let store = self.store;
         let initial_backoff_ms = self.initial_backoff_ms;
 
-        app.on_startup(move |state| {
-            let mut manager = WebhookOutboundManager::new(store.clone())
-                .with_initial_backoff_ms(initial_backoff_ms);
-            if let Some(ext) = state.extension::<crate::http_client::HttpMockRegistryExt>() {
-                manager.client = manager.client.with_mock(ext.0.clone());
-            }
-            state.insert_extension(manager);
-            async move { Ok(()) }
+        app.state_initializer(move |state| {
+            install_outbound_webhook_manager(state, store.clone(), initial_backoff_ms);
         })
         .jobs(vec![crate::job::JobInfo {
             name: "autumn_webhook_delivery".to_string(),
@@ -661,5 +725,288 @@ impl crate::plugin::Plugin for OutboundWebhookPlugin {
             initial_backoff_ms,
             handler: deliver_webhook_job,
         }])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::http_client::{HttpMockRegistryExt, MockRegistry, MockSetupBuilder};
+    use std::sync::Arc;
+
+    fn mock_builder(registry: Arc<MockRegistry>, alias: &str) -> MockSetupBuilder {
+        MockSetupBuilder {
+            registry,
+            alias: alias.to_owned(),
+            method: None,
+            path: None,
+        }
+    }
+
+    fn sample_subscription(
+        id: &str,
+        target_url: &str,
+        status: WebhookSubscriptionStatus,
+    ) -> WebhookSubscription {
+        WebhookSubscription {
+            id: id.to_owned(),
+            target_url: target_url.to_owned(),
+            event_topics: vec!["orders.created".to_owned()],
+            secret: "my_webhook_signing_secret_32_bytes!!".to_owned(),
+            status,
+            consecutive_failures: if status == WebhookSubscriptionStatus::Failed {
+                50
+            } else {
+                0
+            },
+        }
+    }
+
+    fn sample_log(id: &str, subscription_id: &str) -> WebhookDeliveryLog {
+        WebhookDeliveryLog {
+            id: id.to_owned(),
+            subscription_id: subscription_id.to_owned(),
+            topic: "orders.created".to_owned(),
+            payload: serde_json::json!({ "order_id": "ord_123" }).to_string(),
+            request_headers: HashMap::new(),
+            response_status: None,
+            response_body: None,
+            elapsed_ms: 0,
+            attempt: 1,
+            max_attempts: 5,
+            is_dlq: false,
+            last_error: None,
+            timestamp: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn outbound_webhook_plugin_installs_manager_without_startup_hook() {
+        let store = Arc::new(InMemoryOutboundWebhookHandler::new());
+        let builder = crate::app().plugin(OutboundWebhookPlugin::new(store));
+
+        assert!(
+            builder.startup_hooks.is_empty(),
+            "webhook manager must be installed before job workers start, not from a startup hook"
+        );
+        assert_eq!(builder.state_initializers.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn replay_job_sends_failed_subscription_instead_of_skipping() {
+        let state = AppState::for_test();
+        let store = Arc::new(InMemoryOutboundWebhookHandler::new());
+        let registry = Arc::new(MockRegistry::new());
+        let mock = mock_builder(registry.clone(), "http://mock-receiver/webhooks/replay")
+            .post("/webhooks/replay")
+            .respond_with(200, serde_json::json!({ "received": true }));
+        state.insert_extension(HttpMockRegistryExt(registry));
+        install_outbound_webhook_manager(&state, store.clone(), 1);
+
+        let sub = sample_subscription(
+            "sub_failed",
+            "http://mock-receiver/webhooks/replay",
+            WebhookSubscriptionStatus::Failed,
+        );
+        store.create_subscription(sub).await.unwrap();
+        store
+            .replace_delivery_log(sample_log("log_replay", "sub_failed"))
+            .await
+            .unwrap();
+
+        deliver_webhook_job(
+            state,
+            serde_json::json!({
+                "log_id": "log_replay",
+                "replay": true,
+            }),
+        )
+        .await
+        .unwrap();
+
+        mock.expect_called(1);
+        let log = store
+            .get_delivery_log("log_replay")
+            .await
+            .unwrap()
+            .expect("log should remain stored");
+        assert_eq!(log.response_status, Some(200));
+        assert!(!log.is_dlq);
+        assert!(log.last_error.is_none());
+
+        let updated_sub = store
+            .get_subscription("sub_failed")
+            .await
+            .unwrap()
+            .expect("subscription should remain stored");
+        assert_eq!(updated_sub.status, WebhookSubscriptionStatus::Active);
+        assert_eq!(updated_sub.consecutive_failures, 0);
+    }
+
+    struct ResetFailingStore {
+        inner: InMemoryOutboundWebhookHandler,
+    }
+
+    impl ResetFailingStore {
+        fn new() -> Self {
+            Self {
+                inner: InMemoryOutboundWebhookHandler::new(),
+            }
+        }
+
+        async fn create_subscription(&self, sub: WebhookSubscription) {
+            self.inner.create_subscription(sub).await.unwrap();
+        }
+
+        async fn delivery_log(&self, id: &str) -> WebhookDeliveryLog {
+            self.inner
+                .get_delivery_log(id)
+                .await
+                .unwrap()
+                .expect("delivery log should exist")
+        }
+    }
+
+    impl OutboundWebhookHandler for ResetFailingStore {
+        fn get_subscriptions(
+            &self,
+            topic: &str,
+        ) -> Pin<Box<dyn Future<Output = AutumnResult<Vec<WebhookSubscription>>> + Send>> {
+            <InMemoryOutboundWebhookHandler as OutboundWebhookHandler>::get_subscriptions(
+                &self.inner,
+                topic,
+            )
+        }
+
+        fn log_delivery(
+            &self,
+            log: WebhookDeliveryLog,
+        ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send>> {
+            <InMemoryOutboundWebhookHandler as OutboundWebhookHandler>::log_delivery(
+                &self.inner,
+                log,
+            )
+        }
+
+        fn replace_delivery_log(
+            &self,
+            log: WebhookDeliveryLog,
+        ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send>> {
+            <InMemoryOutboundWebhookHandler as OutboundWebhookHandler>::replace_delivery_log(
+                &self.inner,
+                log,
+            )
+        }
+
+        fn get_subscription(
+            &self,
+            id: &str,
+        ) -> Pin<Box<dyn Future<Output = AutumnResult<Option<WebhookSubscription>>> + Send>>
+        {
+            <InMemoryOutboundWebhookHandler as OutboundWebhookHandler>::get_subscription(
+                &self.inner,
+                id,
+            )
+        }
+
+        fn get_delivery_log(
+            &self,
+            id: &str,
+        ) -> Pin<Box<dyn Future<Output = AutumnResult<Option<WebhookDeliveryLog>>> + Send>>
+        {
+            <InMemoryOutboundWebhookHandler as OutboundWebhookHandler>::get_delivery_log(
+                &self.inner,
+                id,
+            )
+        }
+
+        fn reset_subscription_failures(
+            &self,
+            _id: &str,
+        ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send>> {
+            Box::pin(async {
+                Err(AutumnError::internal_server_error_msg(
+                    "reset backend unavailable",
+                ))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_delivery_does_not_retry_when_failure_reset_fails() {
+        let state = AppState::for_test();
+        let store = Arc::new(ResetFailingStore::new());
+        let registry = Arc::new(MockRegistry::new());
+        let mock = mock_builder(registry.clone(), "http://mock-receiver/webhooks/success")
+            .post("/webhooks/success")
+            .respond_with(200, serde_json::json!({ "received": true }));
+        state.insert_extension(HttpMockRegistryExt(registry));
+        install_outbound_webhook_manager(&state, store.clone(), 1);
+
+        let sub = sample_subscription(
+            "sub_success",
+            "http://mock-receiver/webhooks/success",
+            WebhookSubscriptionStatus::Active,
+        );
+        store.create_subscription(sub.clone()).await;
+        let log = sample_log("log_success", "sub_success");
+
+        deliver_webhook_job(
+            state,
+            serde_json::json!({
+                "subscription": sub,
+                "log": log,
+            }),
+        )
+        .await
+        .expect("accepted webhook delivery must not be retried because counter reset failed");
+
+        mock.expect_called(1);
+        let persisted = store.delivery_log("log_success").await;
+        assert_eq!(persisted.response_status, Some(200));
+        assert!(persisted.last_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn webhook_manager_uses_http_client_config_base_urls() {
+        let _guard = crate::job::global_job_runtime_test_lock().lock().await;
+        crate::job::clear_global_job_client();
+
+        let store = Arc::new(InMemoryOutboundWebhookHandler::new());
+        let plugin = OutboundWebhookPlugin::new(store.clone()).with_initial_backoff_ms(1);
+        let mut config = crate::config::AutumnConfig::default();
+        config.http.client.base_urls.insert(
+            "hook-service".to_owned(),
+            "http://mock-receiver/base".to_owned(),
+        );
+
+        let mut app_builder = crate::test::TestApp::new().config(config).plugin(plugin);
+        let mock = app_builder
+            .http_mock("hook-service")
+            .post("/base/hook-service")
+            .respond_with(200, serde_json::json!({ "received": true }));
+        let app = app_builder.build();
+        let state = app.state();
+
+        let sub = sample_subscription(
+            "sub_config",
+            "hook-service",
+            WebhookSubscriptionStatus::Active,
+        );
+        store.create_subscription(sub.clone()).await.unwrap();
+        let log = sample_log("log_config", "sub_config");
+
+        deliver_webhook_job(
+            state.clone(),
+            serde_json::json!({
+                "subscription": sub,
+                "log": log,
+            }),
+        )
+        .await
+        .unwrap();
+
+        mock.expect_called(1);
+        crate::job::clear_global_job_client();
     }
 }

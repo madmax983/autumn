@@ -504,6 +504,22 @@ impl Client {
         self
     }
 
+    /// Build a client from runtime application state.
+    pub(crate) fn from_state(state: &crate::AppState) -> Self {
+        let config = state.extension::<crate::config::HttpConfig>().or_else(|| {
+            state
+                .extension::<crate::config::AutumnConfig>()
+                .map(|c| Arc::new(c.http.clone()))
+        });
+        let mut client = config.map_or_else(Self::new, |cfg| Self::from_config(&cfg.client));
+
+        if let Some(ext) = state.extension::<HttpMockRegistryExt>() {
+            client = client.with_mock(ext.0.clone());
+        }
+
+        client
+    }
+
     /// Return a clone of this client scoped to the named alias.
     ///
     /// When a `[http.client.base_urls]` entry exists for the alias the client
@@ -607,21 +623,7 @@ impl axum::extract::FromRequestParts<crate::AppState> for Client {
         _parts: &mut http::request::Parts,
         state: &crate::AppState,
     ) -> Result<Self, std::convert::Infallible> {
-        // Check for an explicit HttpConfig extension first (inserted by TestApp::build());
-        // in production, fall back to the full AutumnConfig's http section.
-        let config = state.extension::<crate::config::HttpConfig>().or_else(|| {
-            state
-                .extension::<crate::config::AutumnConfig>()
-                .map(|c| std::sync::Arc::new(c.http.clone()))
-        });
-        let mut client = config.map_or_else(Self::new, |cfg| Self::from_config(&cfg.client));
-
-        // In test builds the mock registry is installed by TestApp::build().
-        if let Some(ext) = state.extension::<HttpMockRegistryExt>() {
-            client = client.with_mock(ext.0.clone());
-        }
-
-        Ok(client)
+        Ok(Self::from_state(state))
     }
 }
 

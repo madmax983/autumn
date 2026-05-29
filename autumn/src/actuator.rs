@@ -1353,6 +1353,7 @@ pub(crate) struct ReplayRequest {
 async fn enqueue_webhook_replay_job(log_id: &str) -> Result<(), String> {
     let job_payload = serde_json::json!({
         "log_id": log_id,
+        "replay": true,
     });
 
     let Some(job_client) = crate::job::global_job_client() else {
@@ -1495,13 +1496,13 @@ pub(crate) async fn webhooks_replay_endpoint<S: ProvideActuatorState + Send + Sy
             .into_response();
     }
 
-    // Reset subscription consecutive failures only after the replay job is queued.
+    // Reactivate auto-failed subscriptions only after the replay job is queued.
     if let Err(e) = manager
         .store()
-        .reset_subscription_failures(&subscription_id)
+        .reactivate_failed_subscription(&subscription_id)
         .await
     {
-        tracing::warn!(subscription_id = %subscription_id, "Failed to reset subscription failures during replay: {}", e);
+        tracing::warn!(subscription_id = %subscription_id, "Failed to reactivate subscription during replay: {}", e);
     }
 
     (
@@ -1976,8 +1977,8 @@ mod tests {
             target_url: "https://example.test/webhook".to_string(),
             event_topics: vec!["order.created".to_string()],
             secret: "secret".to_string(),
-            status: crate::webhook_outbound::WebhookSubscriptionStatus::Active,
-            consecutive_failures: 7,
+            status: crate::webhook_outbound::WebhookSubscriptionStatus::Failed,
+            consecutive_failures: 50,
         }
     }
 
@@ -2059,6 +2060,11 @@ mod tests {
             subscription.consecutive_failures, failures_before_replay,
             "failed enqueue must not reset subscription failure history"
         );
+        assert_eq!(
+            subscription.status,
+            crate::webhook_outbound::WebhookSubscriptionStatus::Failed,
+            "failed enqueue must not reactivate an auto-failed subscription"
+        );
 
         crate::job::clear_global_job_client();
     }
@@ -2128,6 +2134,10 @@ mod tests {
             .expect("subscription lookup")
             .expect("subscription should exist");
         assert_eq!(subscription.consecutive_failures, 0);
+        assert_eq!(
+            subscription.status,
+            crate::webhook_outbound::WebhookSubscriptionStatus::Active
+        );
 
         shutdown.cancel();
         crate::job::clear_global_job_client();

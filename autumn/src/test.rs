@@ -417,11 +417,13 @@ impl TestApp {
             .registered_plugins
             .clone_from(&self.registered_plugins);
         app_builder.extensions = self.extensions;
+        app_builder.state_initializers = std::mem::take(&mut self.state_initializers);
 
         app_builder = app_builder.plugin(plugin);
 
         self.registered_plugins = app_builder.registered_plugins;
         self.extensions = app_builder.extensions;
+        self.state_initializers = app_builder.state_initializers;
 
         // Merge properties from the plugin's app_builder into self:
         self.routes.extend(app_builder.routes);
@@ -675,6 +677,10 @@ impl TestApp {
             state.insert_extension(crate::http_client::HttpMockRegistryExt(registry));
         }
 
+        for initializer in self.state_initializers {
+            initializer(&state);
+        }
+
         for job in &self.jobs {
             state.job_registry.register(&job.name);
         }
@@ -687,10 +693,6 @@ impl TestApp {
                 .expect("Failed to start job runtime in test");
             Some(TestJobRuntime { shutdown })
         };
-
-        for initializer in self.state_initializers {
-            initializer(&state);
-        }
 
         let router = crate::router::try_build_router_inner(
             self.routes,
