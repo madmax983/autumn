@@ -2457,11 +2457,10 @@ return { id, updated }
         return Ok(None);
     };
 
-    match serde_json::from_str::<RedisJobRecord>(&body) {
-        Ok(record) => Ok(Some(record)),
+    let record = match serde_json::from_str::<RedisJobRecord>(&body) {
+        Ok(record) => record,
         Err(error) => {
             tracing::warn!(job_id = %id, error = %error, "invalid durable job record");
-            let malformed_id = id.clone();
             let malformed = serde_json::json!({
                 "id": id,
                 "error": error.to_string(),
@@ -2470,12 +2469,13 @@ return { id, updated }
             push_json_list_item(connection, &worker_config.dead_key, &malformed).await;
             let _ = redis::cmd("ZREM")
                 .arg(&worker_config.processing_key)
-                .arg(malformed_id)
+                .arg(id)
                 .query_async::<usize>(connection)
                 .await;
-            Ok(None)
+            return Ok(None);
         }
-    }
+    };
+    Ok(Some(record))
 }
 
 #[cfg(feature = "redis")]
@@ -2904,25 +2904,23 @@ fn spawn_redis_worker(
                 break;
             }
 
+            #[allow(clippy::collapsible_if)]
             if retry_promotion_throttle.take_due(std::time::Instant::now()) {
-                match promote_due_redis_retries(&mut connection, &worker_config, &state, &job_admin)
-                    .await
+                if let Err(error) =
+                    promote_due_redis_retries(&mut connection, &worker_config, &state, &job_admin)
+                        .await
                 {
-                    Ok(()) => {}
-                    Err(error) => {
-                        tracing::warn!(error = %error, "redis job worker retry promotion failed");
-                    }
+                    tracing::warn!(error = %error, "redis job worker retry promotion failed");
                 }
             }
 
+            #[allow(clippy::collapsible_if)]
             if stale_recovery_throttle.take_due(std::time::Instant::now()) {
-                match recover_stale_redis_jobs(&mut connection, &worker_config, &state, &job_admin)
-                    .await
+                if let Err(error) =
+                    recover_stale_redis_jobs(&mut connection, &worker_config, &state, &job_admin)
+                        .await
                 {
-                    Ok(()) => {}
-                    Err(error) => {
-                        tracing::warn!(error = %error, "redis job worker stale recovery failed");
-                    }
+                    tracing::warn!(error = %error, "redis job worker stale recovery failed");
                 }
             }
 
