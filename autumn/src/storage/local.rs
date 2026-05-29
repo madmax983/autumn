@@ -1259,6 +1259,34 @@ mod tests {
         assert!(matches!(err, BlobStoreError::Signature(_)));
     }
 
+    #[test]
+    fn signature_rejects_mismatch() {
+        let exp = SystemTime::now()
+            .checked_add(Duration::from_secs(60))
+            .unwrap()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let sig = sign(b"k", "blob/1.png", exp);
+        let err = verify(b"k", "blob/1.png", exp, &format!("{sig}a")).unwrap_err();
+        assert!(matches!(err, BlobStoreError::Signature(_)));
+    }
+
+    #[test]
+    fn verify_with_rotation_rejects_mismatch() {
+        let current = SigningKey::new(b"current".to_vec());
+        let prev = SigningKey::new(b"prev".to_vec());
+        let exp = SystemTime::now()
+            .checked_add(Duration::from_secs(60))
+            .unwrap()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let sig = sign(current.as_bytes(), "blob/1.png", exp);
+        let err = verify_with_rotation(&current, &[prev], "blob/1.png", exp, &format!("{sig}a")).unwrap_err();
+        assert!(matches!(err, BlobStoreError::Signature(_)));
+    }
+
     #[tokio::test]
     async fn presigned_url_includes_signature_and_exp() {
         let dir = temp_root();
