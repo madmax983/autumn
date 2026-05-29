@@ -134,6 +134,8 @@ pub fn print_table(routes: &[RouteInfo]) {
 }
 
 /// Build the table string (extracted for testability).
+/// ⚡ Bolt: Avoids intermediate allocations by passing `&str` references directly
+/// instead of cloning each field per route.
 pub fn format_table(routes: &[RouteInfo]) -> String {
     const HEADERS: [&str; 5] = ["Method", "Path", "Handler", "Source", "Middleware"];
 
@@ -143,10 +145,7 @@ pub fn format_table(routes: &[RouteInfo]) -> String {
     let mut out = String::new();
 
     // Header row
-    out.push_str(&format_row(
-        &HEADERS.map(std::borrow::ToOwned::to_owned),
-        &widths,
-    ));
+    out.push_str(&format_row(&HEADERS, &widths));
     out.push('\n');
 
     // Separator row
@@ -166,11 +165,11 @@ pub fn format_table(routes: &[RouteInfo]) -> String {
             route.middleware.join(", ")
         };
         let cells = [
-            route.method.clone(),
-            route.path.clone(),
-            route.handler.clone(),
-            route.source.clone(),
-            middleware,
+            route.method.as_str(),
+            route.path.as_str(),
+            route.handler.as_str(),
+            route.source.as_str(),
+            middleware.as_str(),
         ];
         out.push_str(&format_row(&cells, &widths));
         out.push('\n');
@@ -206,21 +205,20 @@ fn compute_column_widths(routes: &[RouteInfo], headers: &[&str; 5]) -> [usize; 5
     widths
 }
 
-fn format_row(cells: &[String; 5], widths: &[usize; 5]) -> String {
-    cells
-        .iter()
-        .zip(widths.iter())
-        .enumerate()
-        .map(|(i, (cell, &w))| {
-            if i == 0 {
-                format!("{cell:<w$}")
-            } else {
-                format!("  {cell:<w$}")
-            }
-        })
-        .collect::<String>()
-        .trim_end()
-        .to_owned()
+fn format_row(cells: &[&str; 5], widths: &[usize; 5]) -> String {
+    use std::fmt::Write;
+    let capacity = widths.iter().sum::<usize>() + (widths.len() - 1) * 2;
+    let mut out = String::with_capacity(capacity);
+    for (i, (cell, &w)) in cells.iter().zip(widths.iter()).enumerate() {
+        if i == 0 {
+            let _ = write!(&mut out, "{cell:<w$}");
+        } else {
+            let _ = write!(&mut out, "  {cell:<w$}");
+        }
+    }
+    let trimmed_len = out.trim_end().len();
+    out.truncate(trimmed_len);
+    out
 }
 
 /// Print routes as pretty JSON.
