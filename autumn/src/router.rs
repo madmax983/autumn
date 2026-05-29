@@ -3335,8 +3335,8 @@ mod tests {
         std::fs::create_dir_all(&dist).expect("mkdir dist");
 
         // Write a manifest that references a file we do NOT create.
-        let mut routes = std::collections::HashMap::new();
-        routes.insert(
+        let mut route_map = std::collections::HashMap::new();
+        route_map.insert(
             "/ghost".to_owned(),
             crate::static_gen::ManifestEntry {
                 file: "ghost/index.html".to_owned(),
@@ -3346,7 +3346,7 @@ mod tests {
         let manifest = crate::static_gen::StaticManifest {
             generated_at: "2026-05-29T00:00:00Z".to_owned(),
             autumn_version: "0.4.0".to_owned(),
-            routes,
+            routes: route_map,
         };
         let json = serde_json::to_string(&manifest).expect("serialize manifest");
         std::fs::write(dist.join("manifest.json"), json).expect("write manifest");
