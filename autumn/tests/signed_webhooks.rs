@@ -121,8 +121,8 @@ fn client_with_registry(registry: WebhookRegistry) -> autumn_web::test::TestClie
     let route = route_defs.remove(0);
     let router = axum::Router::new()
         .route(route.path, route.handler)
-        .with_state(state);
-    TestApp::from_router(router)
+        .with_state(state.clone());
+    TestApp::from_router(router, state)
 }
 
 fn endpoint(

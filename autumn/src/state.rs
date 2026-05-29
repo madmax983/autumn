@@ -638,6 +638,12 @@ impl crate::actuator::ProvideActuatorState for AppState {
     // method on your own state type — or in a custom ProvideActuatorState impl —
     // once you have verified that your pages include lang, a skip link, and
     // landmark regions.  See docs/guide/accessibility.md for details.
+
+    #[cfg(feature = "http-client")]
+    fn webhook_outbound(&self) -> Option<crate::webhook_outbound::WebhookOutboundManager> {
+        self.extension::<crate::webhook_outbound::WebhookOutboundManager>()
+            .map(|x| (*x).clone())
+    }
 }
 
 impl std::fmt::Debug for AppState {

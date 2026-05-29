@@ -45,9 +45,9 @@ async fn exception_filter_on_error_response() {
         .route("/ok", axum::routing::get(ok_handler))
         .route("/fail", axum::routing::get(fail_handler))
         .layer(layer)
-        .with_state(state);
+        .with_state(state.clone());
 
-    let app = TestApp::from_router(router);
+    let app = TestApp::from_router(router, state);
 
     let resp = app.get("/fail").send().await;
     resp.assert_status(404);
@@ -124,9 +124,9 @@ async fn scoped_middleware_applies_only_to_group() {
     let router = axum::Router::new()
         .route("/public", axum::routing::get(public_page))
         .nest("/api", sub_router)
-        .with_state(state);
+        .with_state(state.clone());
 
-    let app = TestApp::from_router(router);
+    let app = TestApp::from_router(router, state);
 
     let resp = app.get("/api/users").send().await;
     resp.assert_status(200);

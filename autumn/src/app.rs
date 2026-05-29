@@ -79,6 +79,7 @@ pub fn app() -> AppBuilder {
         nest_routers: Vec::new(),
         custom_layers: Vec::new(),
         startup_hooks: Vec::new(),
+        state_initializers: Vec::new(),
         shutdown_hooks: Vec::new(),
         extensions: HashMap::new(),
         registered_plugins: HashSet::new(),
@@ -123,6 +124,7 @@ pub fn app() -> AppBuilder {
 
 type StartupHookFuture = Pin<Box<dyn Future<Output = crate::AutumnResult<()>> + Send>>;
 type StartupHook = Box<dyn Fn(AppState) -> StartupHookFuture + Send + Sync>;
+type StateInitializer = Box<dyn FnOnce(&AppState) + Send>;
 type ShutdownHookFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 type ShutdownHook = Box<dyn Fn() -> ShutdownHookFuture + Send + Sync>;
 
@@ -184,7 +186,7 @@ type PolicyRegistration = Box<dyn FnOnce(&crate::authorization::PolicyRegistry) 
 /// }
 /// ```
 pub struct AppBuilder {
-    routes: Vec<Route>,
+    pub(crate) routes: Vec<Route>,
     /// Parallel to `routes`: registration origin for each route.
     route_sources: Vec<crate::route_listing::RouteSource>,
     /// Non-None while a plugin's `build()` is executing; routes and scoped
@@ -192,20 +194,21 @@ pub struct AppBuilder {
     current_plugin: Option<String>,
     tasks: Vec<crate::task::TaskInfo>,
     one_off_tasks: Vec<crate::task::OneOffTaskInfo>,
-    jobs: Vec<crate::job::JobInfo>,
+    pub(crate) jobs: Vec<crate::job::JobInfo>,
     pub(crate) static_metas: Vec<crate::static_gen::StaticRouteMeta>,
-    exception_filters: Vec<Arc<dyn ExceptionFilter>>,
-    scoped_groups: Vec<ScopedGroup>,
-    merge_routers: Vec<axum::Router<AppState>>,
-    nest_routers: Vec<(String, axum::Router<AppState>)>,
+    pub(crate) exception_filters: Vec<Arc<dyn ExceptionFilter>>,
+    pub(crate) scoped_groups: Vec<ScopedGroup>,
+    pub(crate) merge_routers: Vec<axum::Router<AppState>>,
+    pub(crate) nest_routers: Vec<(String, axum::Router<AppState>)>,
     /// Custom Tower layers registered via [`AppBuilder::layer`], applied
     /// inside `RequestIdLayer` on ingress so they observe the request ID.
-    custom_layers: Vec<CustomLayerRegistration>,
-    startup_hooks: Vec<StartupHook>,
-    shutdown_hooks: Vec<ShutdownHook>,
-    extensions: HashMap<TypeId, Box<dyn Any + Send>>,
+    pub(crate) custom_layers: Vec<CustomLayerRegistration>,
+    pub(crate) startup_hooks: Vec<StartupHook>,
+    pub(crate) state_initializers: Vec<StateInitializer>,
+    pub(crate) shutdown_hooks: Vec<ShutdownHook>,
+    pub(crate) extensions: HashMap<TypeId, Box<dyn Any + Send>>,
     /// Plugin names that have already been applied, for duplicate detection.
-    registered_plugins: HashSet<String>,
+    pub(crate) registered_plugins: HashSet<String>,
     /// Custom error page renderer (overrides built-in pages).
     error_page_renderer: Option<SharedRenderer>,
     /// Embedded Diesel migrations, registered via `.migrations()`.
@@ -923,6 +926,17 @@ impl AppBuilder {
         self
     }
 
+    /// Register a synchronous initializer that mutates [`AppState`] after
+    /// framework-managed extensions are installed and before job workers start.
+    #[must_use]
+    pub fn state_initializer<F>(mut self, initializer: F) -> Self
+    where
+        F: FnOnce(&AppState) + Send + 'static,
+    {
+        self.state_initializers.push(Box::new(initializer));
+        self
+    }
+
     /// Register an async shutdown hook that runs during graceful shutdown.
     ///
     /// Hooks execute in reverse registration order so later-added runtimes
@@ -1555,6 +1569,7 @@ impl AppBuilder {
             nest_routers,
             custom_layers,
             startup_hooks,
+            state_initializers,
             shutdown_hooks,
             extensions: _,
             registered_plugins: _,
@@ -1800,6 +1815,7 @@ impl AppBuilder {
         #[cfg(feature = "storage")]
         let storage_router = storage_bootstrap.and_then(|b| b.install(&state));
         install_webhook_registry(&state, &config);
+        run_state_initializers(state_initializers, &state);
 
         let env = crate::config::OsEnv;
         let dist_dir = project_dir("dist", &env);
@@ -2091,6 +2107,7 @@ impl AppBuilder {
             nest_routers: _,
             custom_layers,
             startup_hooks: _,
+            state_initializers,
             shutdown_hooks: _,
             extensions: _,
             registered_plugins: _,
@@ -2316,6 +2333,8 @@ impl AppBuilder {
         // routes the server path serves.
         #[cfg(feature = "storage")]
         let storage_router = storage_bootstrap.and_then(|b| b.install(&state));
+        install_webhook_registry(&state, &config);
+        run_state_initializers(state_initializers, &state);
 
         // Build the full router (same as production). Use the inner builder
         // so the custom session store installed via with_session_store(...)
@@ -2478,6 +2497,7 @@ impl AppBuilder {
             #[cfg(not(feature = "i18n"))]
                 custom_layers: _,
             startup_hooks,
+            state_initializers,
             shutdown_hooks,
             config_loader_factory,
             #[cfg(feature = "db")]
@@ -2640,6 +2660,7 @@ impl AppBuilder {
 
         #[cfg(feature = "storage")]
         let _storage_router = storage_bootstrap.and_then(|bootstrap| bootstrap.install(&state));
+        run_state_initializers(state_initializers, &state);
 
         let task_shutdown = tokio_util::sync::CancellationToken::new();
         if let Err(error) = initialize_job_runtime(jobs, &state, &task_shutdown, &config.jobs) {
@@ -3275,6 +3296,12 @@ async fn run_startup_hooks(hooks: &[StartupHook], state: AppState) -> crate::Aut
         hook(state.clone()).await?;
     }
     Ok(())
+}
+
+fn run_state_initializers(initializers: Vec<StateInitializer>, state: &AppState) {
+    for initializer in initializers {
+        initializer(state);
+    }
 }
 
 fn initialize_job_runtime(
@@ -4992,6 +5019,68 @@ mod tests {
                     .find(task_worker)
                     .expect("task runner path should start repository hook worker"),
             "task runner startup must initialize jobs before repository commit hooks can enqueue them"
+        );
+    }
+
+    #[test]
+    fn state_initializers_run_before_job_runtime_initialization() {
+        let source = include_str!("app.rs").replace("\r\n", "\n");
+        let server_start = source
+            .find("pub async fn run(self)")
+            .expect("normal server path should exist");
+        let build_mode_start = source
+            .find("async fn run_build_mode(self)")
+            .expect("static build path should follow server path");
+        let task_start = source
+            .find("async fn run_one_off_task_mode(self, requested_name: String)")
+            .expect("task runner path should exist");
+        let server_source = &source[server_start..build_mode_start];
+        let task_source = &source[task_start..];
+        let server_init = "initialize_job_runtime(jobs, &state, &server_shutdown, &config.jobs)";
+        let task_init = "initialize_job_runtime(jobs, &state, &task_shutdown, &config.jobs)";
+        let server_initializer = server_source
+            .find("run_state_initializers(state_initializers, &state);")
+            .expect("normal server path should run state initializers");
+        let task_initializer = task_source
+            .find("run_state_initializers(state_initializers, &state);")
+            .expect("task runner path should run state initializers");
+        let server_job = server_source
+            .find(server_init)
+            .expect("normal server path should initialize jobs");
+        let task_job = task_source
+            .find(task_init)
+            .expect("task runner path should initialize jobs");
+
+        assert!(
+            server_initializer < server_job,
+            "normal server startup must install state-initialized resources before job workers start"
+        );
+        assert!(
+            task_initializer < task_job,
+            "task runner startup must install state-initialized resources before job workers start"
+        );
+    }
+
+    #[test]
+    fn static_builds_run_state_initializers_before_router_build() {
+        let source = include_str!("app.rs").replace("\r\n", "\n");
+        let build_mode_start = source
+            .find("async fn run_build_mode(self)")
+            .expect("static build path should exist");
+        let dump_mode_start = source
+            .find("async fn run_dump_routes_mode(self)")
+            .expect("route dump path should follow static build path");
+        let build_mode_source = &source[build_mode_start..dump_mode_start];
+        let state_initializer = build_mode_source
+            .find("run_state_initializers(state_initializers, &state);")
+            .expect("static build path should run state initializers");
+        let router_build = build_mode_source
+            .find("let router = crate::router::try_build_router_inner(")
+            .expect("static build path should build a router");
+
+        assert!(
+            state_initializer < router_build,
+            "static builds must install state-initialized resources before rendering routes"
         );
     }
 

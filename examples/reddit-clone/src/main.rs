@@ -29,14 +29,19 @@
 
 use autumn_web::migrate::{EmbeddedMigrations, embed_migrations};
 use autumn_web::prelude::*;
+use autumn_web::webhook_outbound::{InMemoryOutboundWebhookStore, OutboundWebhookPlugin};
 use reddit_clone::models::Post;
 use reddit_clone::policies::PostPolicy;
 use reddit_clone::{live_events, repositories, routes, tasks};
+use std::sync::Arc;
 
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
 
 #[autumn_web::main]
 async fn main() {
+    let webhook_store = Arc::new(InMemoryOutboundWebhookStore::new());
+    let webhook_plugin = OutboundWebhookPlugin::new(webhook_store);
+
     autumn_web::app()
         .migrations(MIGRATIONS)
         .routes(routes![
@@ -81,6 +86,7 @@ async fn main() {
             tasks::prune_live_feed_events
         ])
         .jobs(reddit_clone::jobs::registered_jobs())
+        .plugin(webhook_plugin)
         .plugin(live_events::LiveFeedPlugin::new())
         .idempotent()
         .run()
