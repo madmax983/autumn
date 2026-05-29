@@ -2,7 +2,9 @@
 use std::sync::Arc;
 
 #[cfg(feature = "mail")]
+/// Mail interceptor trait.
 pub trait MailInterceptor: Send + Sync + 'static {
+    /// Intercept mail delivery.
     fn intercept<'a>(
         &'a self,
         mail: &'a crate::mail::Mail,
@@ -14,7 +16,9 @@ pub trait MailInterceptor: Send + Sync + 'static {
     >;
 }
 
+/// Job interceptor trait.
 pub trait JobInterceptor: Send + Sync + 'static {
+    /// Intercept job enqueueing.
     fn intercept_enqueue<'a>(
         &'a self,
         name: &'a str,
@@ -24,6 +28,7 @@ pub trait JobInterceptor: Send + Sync + 'static {
         >,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send + 'a>>;
 
+    /// Intercept job execution.
     fn intercept_execute<'a>(
         &'a self,
         name: &'a str,
@@ -35,12 +40,16 @@ pub trait JobInterceptor: Send + Sync + 'static {
 }
 
 #[derive(Debug, Clone)]
+/// Context for database checkout interception.
 pub struct DbCheckoutContext {
+    /// The name of the connection pool.
     pub pool_name: String,
 }
 
 #[cfg(feature = "db")]
+/// Database connection interceptor trait.
 pub trait DbConnectionInterceptor: Send + Sync + 'static {
+    /// Intercept database checkout.
     fn intercept_checkout<'a>(
         &'a self,
         ctx: DbCheckoutContext,

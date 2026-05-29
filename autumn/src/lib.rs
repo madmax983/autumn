@@ -92,6 +92,7 @@ pub mod health;
 pub mod hooks;
 #[cfg(feature = "i18n")]
 pub mod i18n;
+/// Idempotency and deduplication for API requests.
 pub mod idempotency;
 /// Translation lookup macro with compile-time key validation.
 ///
@@ -99,6 +100,7 @@ pub mod idempotency;
 /// `autumn_web::t!(locale, "key")` usage.
 #[cfg(feature = "i18n")]
 pub use crate::i18n::t;
+/// Interceptor traits for cross-cutting framework extensions.
 pub mod interceptor;
 #[cfg(feature = "mail")]
 pub mod mail;
@@ -154,6 +156,7 @@ pub use http_client as http;
 pub mod flash;
 #[cfg(feature = "htmx")]
 pub(crate) mod htmx;
+/// Logging utilities and macros.
 pub mod log;
 pub(crate) mod logging;
 pub mod middleware;
@@ -179,6 +182,7 @@ pub mod sse;
 pub mod static_gen;
 #[cfg(feature = "storage")]
 pub mod storage;
+/// Multi-tenancy support (subdomain, session, JWT).
 pub mod tenancy;
 
 pub mod form;
