@@ -1444,7 +1444,7 @@ pub(crate) async fn webhooks_replay_endpoint<S: ProvideActuatorState + Send + Sy
         }))).into_response();
     }
 
-    if let Some(response) = disabled_webhook_replay_response(&manager, &log, &body.log_id).await {
+    if let Some(response) = blocked_webhook_replay_response(&manager, &log, &body.log_id).await {
         return response;
     }
 
@@ -1524,7 +1524,7 @@ fn reset_webhook_replay_log(
 }
 
 #[cfg(feature = "http-client")]
-async fn disabled_webhook_replay_response(
+async fn blocked_webhook_replay_response(
     manager: &crate::webhook_outbound::WebhookOutboundManager,
     log: &crate::webhook_outbound::WebhookDeliveryLog,
     log_id: &str,
@@ -1545,9 +1545,23 @@ async fn disabled_webhook_replay_response(
         }
     };
 
-    if !subscription.as_ref().is_some_and(|sub| {
-        sub.status == crate::webhook_outbound::WebhookSubscriptionStatus::Disabled
-    }) {
+    let Some(subscription) = subscription else {
+        return Some(
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "status": "error",
+                    "message": format!(
+                        "Subscription {} for replay log {} was not found",
+                        log.subscription_id, log_id
+                    )
+                })),
+            )
+                .into_response(),
+        );
+    };
+
+    if subscription.status != crate::webhook_outbound::WebhookSubscriptionStatus::Disabled {
         return None;
     }
 
@@ -2174,6 +2188,74 @@ mod tests {
             .expect("subscription should exist");
         assert_eq!(subscription.status, WebhookSubscriptionStatus::Disabled);
 
+        crate::job::clear_global_job_client();
+    }
+
+    #[cfg(feature = "http-client")]
+    #[tokio::test]
+    async fn webhooks_replay_rejects_missing_subscription_without_removing_dlq() {
+        use crate::webhook_outbound::{
+            InMemoryOutboundWebhookHandler, OutboundWebhookHandler, WebhookOutboundManager,
+        };
+
+        let _guard = crate::job::global_job_runtime_test_lock().lock().await;
+        crate::job::clear_global_job_client();
+
+        let handler = Arc::new(InMemoryOutboundWebhookHandler::new());
+        let original_log = replay_test_dlq_log();
+        handler
+            .log_delivery(original_log.clone())
+            .await
+            .expect("dlq log setup");
+
+        let runtime_state = crate::AppState::for_test().with_profile("test");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        crate::job::start_runtime(
+            vec![crate::job::JobInfo {
+                name: "autumn_webhook_delivery".to_string(),
+                max_attempts: 1,
+                initial_backoff_ms: 1,
+                handler: |_state, _payload| Box::pin(async move { Ok(()) }),
+            }],
+            &runtime_state,
+            &shutdown,
+            &crate::config::JobConfig::default(),
+        )
+        .expect("job runtime should start");
+
+        let state = test_state_with_webhook_outbound(WebhookOutboundManager::new(handler.clone()));
+        let response = webhooks_replay_endpoint(
+            State(state),
+            Json(ReplayRequest {
+                log_id: original_log.id.clone(),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let stored_log = handler
+            .get_delivery_log(&original_log.id)
+            .await
+            .expect("delivery log lookup")
+            .expect("delivery log should still exist");
+        assert!(stored_log.is_dlq);
+        assert_eq!(stored_log.attempt, original_log.attempt);
+        assert_eq!(stored_log.response_status, original_log.response_status);
+        assert_eq!(stored_log.response_body, original_log.response_body);
+        assert_eq!(stored_log.last_error, original_log.last_error);
+
+        assert!(
+            handler
+                .get_subscription("sub-replay")
+                .await
+                .expect("subscription lookup")
+                .is_none(),
+            "test setup should leave the subscription missing"
+        );
+
+        shutdown.cancel();
         crate::job::clear_global_job_client();
     }
 

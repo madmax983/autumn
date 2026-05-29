@@ -90,15 +90,12 @@ pub trait OutboundWebhookHandler: Send + Sync + 'static {
 
     /// Replace a stored delivery log without treating it as a new delivery outcome.
     ///
-    /// Stores that maintain subscription counters from [`log_delivery`](Self::log_delivery)
-    /// should override this to perform a plain record replacement. The default
-    /// preserves compatibility for existing custom handlers.
+    /// Implementations must perform a plain record replacement. This must not
+    /// update subscription failure counters or auto-failure state.
     fn replace_delivery_log(
         &self,
         log: WebhookDeliveryLog,
-    ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send>> {
-        self.log_delivery(log)
-    }
+    ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send>>;
 
     /// Retrieve a specific webhook subscription by ID (regardless of status/active state).
     fn get_subscription(
@@ -531,8 +528,8 @@ pub fn deliver_webhook_job(
 
         // Support both self-contained payload structure and legacy log_id lookup (for replays)
         let (sub, mut log) = if let Some(sub_val) = payload.get("subscription") {
-            let sub: WebhookSubscription =
-                serde_json::from_value(sub_val.clone()).map_err(|e| {
+            let _payload_sub: WebhookSubscription = serde_json::from_value(sub_val.clone())
+                .map_err(|e| {
                     AutumnError::bad_request_msg(format!("failed to parse subscription: {e}"))
                 })?;
             let mut log: WebhookDeliveryLog = serde_json::from_value(
@@ -553,6 +550,7 @@ pub fn deliver_webhook_job(
                 manager.store().log_delivery(log.clone()).await?;
             }
 
+            let sub = load_current_subscription(&manager, &log).await?;
             (sub, log)
         } else {
             let log_id = payload
@@ -578,16 +576,7 @@ pub fn deliver_webhook_job(
             }
 
             // Load latest subscription state to respect emergency rotations/disable
-            let sub = manager
-                .store()
-                .get_subscription(&log.subscription_id)
-                .await?
-                .ok_or_else(|| {
-                    AutumnError::not_found_msg(format!(
-                        "subscription {} not found",
-                        log.subscription_id
-                    ))
-                })?;
+            let sub = load_current_subscription(&manager, &log).await?;
             (sub, log)
         };
 
@@ -680,6 +669,19 @@ pub fn deliver_webhook_job(
             }
         }
     })
+}
+
+async fn load_current_subscription(
+    manager: &WebhookOutboundManager,
+    log: &WebhookDeliveryLog,
+) -> AutumnResult<WebhookSubscription> {
+    manager
+        .store()
+        .get_subscription(&log.subscription_id)
+        .await?
+        .ok_or_else(|| {
+            AutumnError::not_found_msg(format!("subscription {} not found", log.subscription_id))
+        })
 }
 
 fn cap_logged_response_body(mut body: String) -> String {
@@ -782,6 +784,7 @@ mod tests {
     use super::*;
     use crate::http_client::{HttpMockRegistryExt, MockRegistry, MockSetupBuilder};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn mock_builder(registry: Arc<MockRegistry>, alias: &str) -> MockSetupBuilder {
         MockSetupBuilder {
@@ -936,6 +939,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn self_contained_delivery_uses_latest_subscription_state() {
+        let state = AppState::for_test();
+        let store = Arc::new(InMemoryOutboundWebhookHandler::new());
+        let registry = Arc::new(MockRegistry::new());
+        let stale_mock = mock_builder(registry.clone(), "http://mock-receiver/webhooks/stale")
+            .post("/webhooks/stale")
+            .respond_with(200, serde_json::json!({ "received": true }));
+        state.insert_extension(HttpMockRegistryExt(registry));
+        install_outbound_webhook_manager(&state, store.clone(), 1);
+
+        let stored_sub = sample_subscription(
+            "sub_refresh",
+            "http://mock-receiver/webhooks/current-disabled",
+            WebhookSubscriptionStatus::Disabled,
+        );
+        store.create_subscription(stored_sub).await.unwrap();
+        let stale_sub = sample_subscription(
+            "sub_refresh",
+            "http://mock-receiver/webhooks/stale",
+            WebhookSubscriptionStatus::Active,
+        );
+        let log = sample_log("log_refresh", "sub_refresh");
+
+        deliver_webhook_job(
+            state,
+            serde_json::json!({
+                "subscription": stale_sub,
+                "log": log,
+            }),
+        )
+        .await
+        .unwrap();
+
+        stale_mock.expect_called(0);
+        let stored = store
+            .get_delivery_log("log_refresh")
+            .await
+            .unwrap()
+            .expect("delivery log should exist");
+        assert_eq!(stored.response_status, None);
+        assert_eq!(
+            stored.last_error.as_deref(),
+            Some("Subscription is disabled")
+        );
+    }
+
+    #[tokio::test]
     async fn dispatch_marks_log_dlq_when_fallback_enqueue_fails() {
         let _guard = crate::job::global_job_runtime_test_lock().lock().await;
         crate::job::clear_global_job_client();
@@ -1031,6 +1081,79 @@ mod tests {
             body.len()
         );
         assert!(body.ends_with("[truncated]"));
+    }
+
+    struct CountingReplacementStore {
+        log_delivery_calls: AtomicUsize,
+    }
+
+    impl CountingReplacementStore {
+        fn new() -> Self {
+            Self {
+                log_delivery_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn log_delivery_count(&self) -> usize {
+            self.log_delivery_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl OutboundWebhookHandler for CountingReplacementStore {
+        fn get_subscriptions(
+            &self,
+            _topic: &str,
+        ) -> Pin<Box<dyn Future<Output = AutumnResult<Vec<WebhookSubscription>>> + Send>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn log_delivery(
+            &self,
+            _log: WebhookDeliveryLog,
+        ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send>> {
+            self.log_delivery_calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        }
+
+        fn replace_delivery_log(
+            &self,
+            _log: WebhookDeliveryLog,
+        ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn get_subscription(
+            &self,
+            _id: &str,
+        ) -> Pin<Box<dyn Future<Output = AutumnResult<Option<WebhookSubscription>>> + Send>>
+        {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn get_delivery_log(
+            &self,
+            _id: &str,
+        ) -> Pin<Box<dyn Future<Output = AutumnResult<Option<WebhookDeliveryLog>>> + Send>>
+        {
+            Box::pin(async { Ok(None) })
+        }
+    }
+
+    #[tokio::test]
+    async fn replace_delivery_log_is_not_a_delivery_outcome() {
+        let store = CountingReplacementStore::new();
+        let mut log = sample_log("log_replace", "sub_replace");
+        log.response_status = Some(500);
+        log.last_error = Some("server returned status: 500 Internal Server Error".to_owned());
+        log.is_dlq = true;
+
+        store.replace_delivery_log(log).await.unwrap();
+
+        assert_eq!(
+            store.log_delivery_count(),
+            0,
+            "plain delivery-log replacement must not call log_delivery"
+        );
     }
 
     struct ResetFailingStore {
