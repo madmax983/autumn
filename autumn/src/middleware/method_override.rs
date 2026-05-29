@@ -397,8 +397,13 @@ fn origin_matches_request(origin: &str, headers: &http::HeaderMap) -> bool {
     };
 
     let expected_host = headers
-        .get("x-forwarded-host")
-        .and_then(|v| v.to_str().ok())
+        .get_all("x-forwarded-host")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|s| s.split(','))
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .last()
         .or_else(|| {
             headers
                 .get(http::header::HOST)
@@ -411,14 +416,22 @@ fn origin_matches_request(origin: &str, headers: &http::HeaderMap) -> bool {
         return false;
     }
 
-    if let Some(scheme) = headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-    {
+    let scheme_joined = headers
+        .get_all("x-forwarded-proto")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect::<Vec<_>>()
+        .join(",");
+
+    if !scheme_joined.is_empty() {
         // Multiple `X-Forwarded-Proto` values can be chained by
         // intermediaries; the leftmost (client-facing) is the one
         // that matters here.
-        let outermost = scheme.split(',').next().unwrap_or(scheme).trim();
+        let outermost = scheme_joined
+            .split(',')
+            .next()
+            .unwrap_or(&scheme_joined)
+            .trim();
         return outermost.eq_ignore_ascii_case(origin_scheme);
     }
 
