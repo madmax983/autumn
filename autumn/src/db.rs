@@ -3,7 +3,7 @@
 //! This module provides async Postgres connectivity via `diesel-async` with
 //! the `deadpool` connection pool. The pool is created at startup by
 //! [`AppBuilder::run`](crate::app::AppBuilder::run) and stored in
-//! [`crate::state::AppState`].
+//! [`crate::AppState`].
 //!
 //! When no `database.primary_url` or legacy `database.url` is configured,
 //! [`create_pool`] returns `Ok(None)` and the application runs without a
@@ -221,9 +221,7 @@ pub trait DbState {
     }
 
     /// Returns any registered database connection checkout interceptors.
-    fn db_interceptors(
-        &self,
-    ) -> Vec<std::sync::Arc<dyn crate::interceptor::DbConnectionInterceptor>> {
+    fn db_interceptors(&self) -> Vec<std::sync::Arc<dyn crate::db::DbConnectionInterceptor>> {
         Vec::new()
     }
     /// Returns the global statement timeout, if configured.
@@ -743,6 +741,31 @@ impl Drop for TxDepthGuard<'_> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StatementTimeout(pub std::time::Duration);
 
+#[derive(Debug, Clone)]
+pub struct DbCheckoutContext {
+    pub pool_name: String,
+}
+
+#[cfg(feature = "db")]
+pub trait DbConnectionInterceptor: Send + Sync + 'static {
+    fn intercept_checkout<'a>(
+        &'a self,
+        ctx: DbCheckoutContext,
+        next: std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<PooledConnection, crate::AutumnError>>
+                    + Send
+                    + 'a,
+            >,
+        >,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<PooledConnection, crate::AutumnError>>
+                + Send
+                + 'a,
+        >,
+    >;
+}
 pub struct Db {
     conn: PooledConnection,
     /// Span covering the full checkout-to-release window. Dropped when
@@ -925,7 +948,7 @@ where
             })
         });
         for interceptor in &interceptors {
-            let ctx = crate::interceptor::DbCheckoutContext {
+            let ctx = crate::db::DbCheckoutContext {
                 pool_name: "primary".to_string(),
             };
             checkout_future = interceptor.intercept_checkout(ctx, checkout_future);
