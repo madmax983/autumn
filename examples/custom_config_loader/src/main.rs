@@ -44,8 +44,14 @@ impl JsonFileConfigLoader {
 }
 
 impl ConfigLoader for JsonFileConfigLoader {
+    /// Load the configuration from the JSON file using asynchronous I/O.
+    ///
+    /// This prevents blocking the Tokio runtime, which would otherwise occur if
+    /// synchronous `std::fs::read` was used. Non-blocking I/O is critical for
+    /// scalability and maintaining high responsiveness across all tasks scheduled
+    /// on the runtime.
     async fn load(&self) -> Result<AutumnConfig, ConfigError> {
-        let bytes = std::fs::read(&self.path).map_err(ConfigError::Io)?;
+        let bytes = tokio::fs::read(&self.path).await.map_err(ConfigError::Io)?;
         serde_json::from_slice(&bytes)
             .map_err(|e| ConfigError::Validation(format!("invalid JSON config: {e}")))
     }
