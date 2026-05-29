@@ -1350,6 +1350,22 @@ pub(crate) struct ReplayRequest {
 }
 
 #[cfg(feature = "http-client")]
+async fn enqueue_webhook_replay_job(log_id: &str) -> Result<(), String> {
+    let job_payload = serde_json::json!({
+        "log_id": log_id,
+    });
+
+    let Some(job_client) = crate::job::global_job_client() else {
+        return Err("Global job client is not available".to_string());
+    };
+
+    job_client
+        .enqueue("autumn_webhook_delivery", job_payload)
+        .await
+        .map_err(|e| format!("Failed to enqueue job: {e}"))
+}
+
+#[cfg(feature = "http-client")]
 /// `GET <actuator-prefix>/webhooks/dlq` -- list dead-lettered webhook logs.
 pub(crate) async fn webhooks_dlq_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
     State(state): State<S>,
@@ -1427,7 +1443,10 @@ pub(crate) async fn webhooks_replay_endpoint<S: ProvideActuatorState + Send + Sy
         }))).into_response();
     }
 
-    // Reset log state for re-delivery prior to enqueuing to prevent worker dequeue race
+    let original_log = log.clone();
+
+    // Reset log state for re-delivery prior to enqueuing to prevent worker dequeue race.
+    // If enqueue fails, restore the original DLQ record below.
     log.is_dlq = false;
     log.attempt = 1;
     log.last_error = None;
@@ -1448,43 +1467,41 @@ pub(crate) async fn webhooks_replay_endpoint<S: ProvideActuatorState + Send + Sy
             .into_response();
     }
 
-    // Reset subscription consecutive failures to allow it to retry
+    // Enqueue background delivery job now that the log state is safely reset in the store
+    if let Err(message) = enqueue_webhook_replay_job(&body.log_id).await {
+        if let Err(rollback_error) = manager.store().replace_delivery_log(original_log).await {
+            tracing::error!(
+                log_id = %body.log_id,
+                "Failed to roll back webhook replay log after enqueue failure: {}",
+                rollback_error
+            );
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "status": "error",
+                    "message": format!("{message}; failed to restore DLQ log state: {rollback_error}")
+                })),
+            )
+                .into_response();
+        }
+
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "status": "error",
+                "message": message
+            })),
+        )
+            .into_response();
+    }
+
+    // Reset subscription consecutive failures only after the replay job is queued.
     if let Err(e) = manager
         .store()
         .reset_subscription_failures(&subscription_id)
         .await
     {
         tracing::warn!(subscription_id = %subscription_id, "Failed to reset subscription failures during replay: {}", e);
-    }
-
-    // Enqueue background delivery job now that the log state is safely reset in the store
-    let job_payload = serde_json::json!({
-        "log_id": body.log_id,
-    });
-
-    if let Some(job_client) = crate::job::global_job_client() {
-        if let Err(e) = job_client
-            .enqueue("autumn_webhook_delivery", job_payload)
-            .await
-        {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "status": "error",
-                    "message": format!("Failed to enqueue job: {}", e)
-                })),
-            )
-                .into_response();
-        }
-    } else {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "status": "error",
-                "message": "Global job client is not available"
-            })),
-        )
-            .into_response();
     }
 
     (
@@ -1865,6 +1882,8 @@ mod tests {
         task_registry: TaskRegistry,
         job_registry: JobRegistry,
         config_props: ConfigProperties,
+        #[cfg(feature = "http-client")]
+        webhook_outbound: Option<crate::webhook_outbound::WebhookOutboundManager>,
         #[cfg(feature = "db")]
         pool: Option<
             diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
@@ -1897,6 +1916,10 @@ mod tests {
         fn uptime_display(&self) -> String {
             "test_uptime".to_string()
         }
+        #[cfg(feature = "http-client")]
+        fn webhook_outbound(&self) -> Option<crate::webhook_outbound::WebhookOutboundManager> {
+            self.webhook_outbound.clone()
+        }
         #[cfg(feature = "db")]
         fn pool(
             &self,
@@ -1926,6 +1949,8 @@ mod tests {
             task_registry: TaskRegistry::new(),
             job_registry: JobRegistry::new(),
             config_props: ConfigProperties::from_config(config),
+            #[cfg(feature = "http-client")]
+            webhook_outbound: None,
             #[cfg(feature = "db")]
             pool: None,
             #[cfg(feature = "ws")]
@@ -1933,6 +1958,179 @@ mod tests {
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
         }
+    }
+
+    #[cfg(feature = "http-client")]
+    fn test_state_with_webhook_outbound(
+        manager: crate::webhook_outbound::WebhookOutboundManager,
+    ) -> TestActuatorState {
+        let mut state = test_state();
+        state.webhook_outbound = Some(manager);
+        state
+    }
+
+    #[cfg(feature = "http-client")]
+    fn replay_test_subscription() -> crate::webhook_outbound::WebhookSubscription {
+        crate::webhook_outbound::WebhookSubscription {
+            id: "sub-replay".to_string(),
+            target_url: "https://example.test/webhook".to_string(),
+            event_topics: vec!["order.created".to_string()],
+            secret: "secret".to_string(),
+            status: crate::webhook_outbound::WebhookSubscriptionStatus::Active,
+            consecutive_failures: 7,
+        }
+    }
+
+    #[cfg(feature = "http-client")]
+    fn replay_test_dlq_log() -> crate::webhook_outbound::WebhookDeliveryLog {
+        crate::webhook_outbound::WebhookDeliveryLog {
+            id: "log-replay".to_string(),
+            subscription_id: "sub-replay".to_string(),
+            topic: "order.created".to_string(),
+            payload: "{\"id\":123}".to_string(),
+            request_headers: std::collections::HashMap::new(),
+            response_status: Some(503),
+            response_body: Some("unavailable".to_string()),
+            elapsed_ms: 42,
+            attempt: 5,
+            max_attempts: 5,
+            is_dlq: true,
+            last_error: Some("server returned status: 503".to_string()),
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
+    #[cfg(feature = "http-client")]
+    #[tokio::test]
+    async fn webhooks_replay_preserves_dlq_log_and_failures_when_enqueue_is_unavailable() {
+        use crate::webhook_outbound::{
+            InMemoryOutboundWebhookHandler, OutboundWebhookHandler, WebhookOutboundManager,
+        };
+
+        let _guard = crate::job::global_job_runtime_test_lock().lock().await;
+        crate::job::clear_global_job_client();
+
+        let handler = Arc::new(InMemoryOutboundWebhookHandler::new());
+        handler
+            .create_subscription(replay_test_subscription())
+            .await
+            .expect("subscription setup");
+        let original_log = replay_test_dlq_log();
+        handler
+            .log_delivery(original_log.clone())
+            .await
+            .expect("dlq log setup");
+        let failures_before_replay = handler
+            .get_subscription("sub-replay")
+            .await
+            .expect("subscription lookup")
+            .expect("subscription should exist")
+            .consecutive_failures;
+
+        let state = test_state_with_webhook_outbound(WebhookOutboundManager::new(handler.clone()));
+        let response = webhooks_replay_endpoint(
+            State(state),
+            Json(ReplayRequest {
+                log_id: original_log.id.clone(),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let stored_log = handler
+            .get_delivery_log(&original_log.id)
+            .await
+            .expect("delivery log lookup")
+            .expect("delivery log should still exist");
+        assert!(stored_log.is_dlq, "failed enqueue must keep log in DLQ");
+        assert_eq!(stored_log.attempt, original_log.attempt);
+        assert_eq!(stored_log.last_error, original_log.last_error);
+        assert_eq!(stored_log.response_status, original_log.response_status);
+        assert_eq!(stored_log.response_body, original_log.response_body);
+
+        let subscription = handler
+            .get_subscription("sub-replay")
+            .await
+            .expect("subscription lookup")
+            .expect("subscription should exist");
+        assert_eq!(
+            subscription.consecutive_failures, failures_before_replay,
+            "failed enqueue must not reset subscription failure history"
+        );
+
+        crate::job::clear_global_job_client();
+    }
+
+    #[cfg(feature = "http-client")]
+    #[tokio::test]
+    async fn webhooks_replay_resets_log_and_failures_after_enqueue_succeeds() {
+        use crate::webhook_outbound::{
+            InMemoryOutboundWebhookHandler, OutboundWebhookHandler, WebhookOutboundManager,
+        };
+
+        let _guard = crate::job::global_job_runtime_test_lock().lock().await;
+        crate::job::clear_global_job_client();
+
+        let handler = Arc::new(InMemoryOutboundWebhookHandler::new());
+        handler
+            .create_subscription(replay_test_subscription())
+            .await
+            .expect("subscription setup");
+        let original_log = replay_test_dlq_log();
+        handler
+            .log_delivery(original_log.clone())
+            .await
+            .expect("dlq log setup");
+
+        let runtime_state = crate::AppState::for_test().with_profile("test");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        crate::job::start_runtime(
+            vec![crate::job::JobInfo {
+                name: "autumn_webhook_delivery".to_string(),
+                max_attempts: 1,
+                initial_backoff_ms: 1,
+                handler: |_state, _payload| Box::pin(async move { Ok(()) }),
+            }],
+            &runtime_state,
+            &shutdown,
+            &crate::config::JobConfig::default(),
+        )
+        .expect("job runtime should start");
+
+        let state = test_state_with_webhook_outbound(WebhookOutboundManager::new(handler.clone()));
+        let response = webhooks_replay_endpoint(
+            State(state),
+            Json(ReplayRequest {
+                log_id: original_log.id.clone(),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let stored_log = handler
+            .get_delivery_log(&original_log.id)
+            .await
+            .expect("delivery log lookup")
+            .expect("delivery log should still exist");
+        assert!(!stored_log.is_dlq);
+        assert_eq!(stored_log.attempt, 1);
+        assert_eq!(stored_log.last_error, None);
+        assert_eq!(stored_log.response_status, None);
+        assert_eq!(stored_log.response_body, None);
+
+        let subscription = handler
+            .get_subscription("sub-replay")
+            .await
+            .expect("subscription lookup")
+            .expect("subscription should exist");
+        assert_eq!(subscription.consecutive_failures, 0);
+
+        shutdown.cancel();
+        crate::job::clear_global_job_client();
     }
 
     #[tokio::test]

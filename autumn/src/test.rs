@@ -382,6 +382,7 @@ impl TestApp {
             router,
             probes: crate::probe::ProbeState::ready_for_test(),
             state,
+            _job_runtime: None,
         }
     }
 
@@ -678,11 +679,14 @@ impl TestApp {
             state.job_registry.register(&job.name);
         }
 
-        if !self.jobs.is_empty() {
+        let job_runtime = if self.jobs.is_empty() {
+            None
+        } else {
             let shutdown = tokio_util::sync::CancellationToken::new();
             crate::job::start_runtime(self.jobs.clone(), &state, &shutdown, &self.config.jobs)
                 .expect("Failed to start job runtime in test");
-        }
+            Some(TestJobRuntime { shutdown })
+        };
 
         for initializer in self.state_initializers {
             initializer(&state);
@@ -709,6 +713,7 @@ impl TestApp {
             router,
             probes,
             state,
+            _job_runtime: job_runtime,
         }
     }
 }
@@ -754,6 +759,18 @@ pub struct TestClient {
     router: axum::Router,
     probes: crate::probe::ProbeState,
     pub(crate) state: AppState,
+    _job_runtime: Option<TestJobRuntime>,
+}
+
+struct TestJobRuntime {
+    shutdown: tokio_util::sync::CancellationToken,
+}
+
+impl Drop for TestJobRuntime {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+        crate::job::clear_global_job_client();
+    }
 }
 
 impl TestClient {
@@ -1252,6 +1269,28 @@ impl TestDb {
 mod tests {
     use super::*;
 
+    fn cleanup_probe_job(
+        _state: crate::state::AppState,
+        _payload: serde_json::Value,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send + 'static>,
+    > {
+        Box::pin(async move { Ok(()) })
+    }
+
+    struct CleanupJobPlugin;
+
+    impl crate::plugin::Plugin for CleanupJobPlugin {
+        fn build(self, app: crate::app::AppBuilder) -> crate::app::AppBuilder {
+            app.jobs(vec![crate::job::JobInfo {
+                name: "cleanup_probe".to_string(),
+                max_attempts: 1,
+                initial_backoff_ms: 1,
+                handler: cleanup_probe_job,
+            }])
+        }
+    }
+
     fn test_routes() -> Vec<Route> {
         use axum::routing;
 
@@ -1391,6 +1430,46 @@ mod tests {
     #[tokio::test]
     async fn test_client_default() {
         let _app = TestApp::default();
+    }
+
+    #[tokio::test]
+    async fn dropping_test_client_stops_test_started_job_runtime() {
+        let _guard = crate::job::global_job_runtime_test_lock().lock().await;
+        crate::job::clear_global_job_client();
+
+        let client = TestApp::new().plugin(CleanupJobPlugin).build();
+        let leaked_client = crate::job::global_job_client().expect("test job runtime should start");
+
+        drop(client);
+
+        assert!(
+            crate::job::global_job_client().is_none(),
+            "dropping a TestClient with jobs must clear its global job client"
+        );
+
+        let mut last_enqueue_error = None;
+        for _ in 0..25 {
+            match leaked_client
+                .enqueue("cleanup_probe", serde_json::json!({}))
+                .await
+            {
+                Ok(()) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+                Err(error) => {
+                    last_enqueue_error = Some(error.to_string());
+                    break;
+                }
+            }
+        }
+
+        assert!(
+            last_enqueue_error
+                .as_deref()
+                .is_some_and(|message| message.contains("failed to enqueue job")),
+            "captured pre-drop job client must stop accepting jobs after TestClient drop; \
+             last error: {last_enqueue_error:?}"
+        );
+
+        crate::job::clear_global_job_client();
     }
 
     /// End-to-end acceptance for issue #605: a plain `<form method="post">`

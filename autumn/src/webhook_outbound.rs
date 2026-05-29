@@ -85,6 +85,18 @@ pub trait OutboundWebhookHandler: Send + Sync + 'static {
         log: WebhookDeliveryLog,
     ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send>>;
 
+    /// Replace a stored delivery log without treating it as a new delivery outcome.
+    ///
+    /// Stores that maintain subscription counters from [`log_delivery`](Self::log_delivery)
+    /// should override this to perform a plain record replacement. The default
+    /// preserves compatibility for existing custom handlers.
+    fn replace_delivery_log(
+        &self,
+        log: WebhookDeliveryLog,
+    ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send>> {
+        self.log_delivery(log)
+    }
+
     /// Retrieve a specific webhook subscription by ID (regardless of status/active state).
     fn get_subscription(
         &self,
@@ -236,6 +248,15 @@ impl OutboundWebhookHandler for InMemoryOutboundWebhookHandler {
             }
         }
 
+        Box::pin(async move { Ok(()) })
+    }
+
+    fn replace_delivery_log(
+        &self,
+        log: WebhookDeliveryLog,
+    ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send>> {
+        let mut logs = self.logs.write().expect("logs write lock poisoned");
+        logs.insert(log.id.clone(), log);
         Box::pin(async move { Ok(()) })
     }
 
