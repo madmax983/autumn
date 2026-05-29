@@ -220,9 +220,9 @@ impl StaticFileLayer {
             let acquired = coordinator.try_acquire(&url, &window_key).await;
             if !acquired {
                 tracing::debug!(
-                    route = %url,
-                    backend = coordinator.backend(),
-                    "ISR: another replica holds the lock for this window, skipping"
+                    "ISR: another replica holds the lock for this window, skipping (route: {}, backend: {})",
+                    url,
+                    coordinator.backend()
                 );
                 return; // _guard drops here, resetting in_flight
             }
@@ -234,10 +234,10 @@ impl StaticFileLayer {
 
             match result {
                 Ok(()) => {
-                    tracing::info!(route = %url, "ISR: page regenerated");
+                    tracing::info!("ISR: page regenerated for route: {}", url);
                 }
                 Err(e) => {
-                    tracing::warn!(route = %url, error = %e, "ISR: regeneration failed");
+                    tracing::warn!("ISR: regeneration failed for route: {}, error: {}", url, e);
                 }
             }
             // _guard drops here, resetting in_flight

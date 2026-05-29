@@ -1,3 +1,4 @@
+#![allow(clippy::type_complexity, clippy::too_many_lines)]
 //! First-party integration-testing utilities for Autumn applications.
 //!
 //! This module brings Autumn's testing story to parity with frameworks like
@@ -191,6 +192,11 @@ pub struct TestApp {
     /// handler intercepts matching requests.
     #[cfg(feature = "http-client")]
     http_mock_registry: Option<std::sync::Arc<crate::http_client::MockRegistry>>,
+    state_initializers: Vec<Box<dyn FnOnce(&AppState) + Send>>,
+    jobs: Vec<crate::job::JobInfo>,
+    exception_filters: Vec<std::sync::Arc<dyn crate::middleware::ExceptionFilter>>,
+    registered_plugins: std::collections::HashSet<String>,
+    extensions: std::collections::HashMap<std::any::TypeId, Box<dyn std::any::Any + Send>>,
 }
 
 type TestPolicyRegistration = Box<dyn FnOnce(&crate::authorization::PolicyRegistry) + Send>;
@@ -230,6 +236,11 @@ impl TestApp {
             http_interceptor: None,
             #[cfg(feature = "http-client")]
             http_mock_registry: None,
+            state_initializers: Vec::new(),
+            jobs: Vec::new(),
+            exception_filters: Vec::new(),
+            registered_plugins: std::collections::HashSet::new(),
+            extensions: std::collections::HashMap::new(),
         }
     }
 
@@ -366,10 +377,12 @@ impl TestApp {
     /// [`TestClient::probes`] will be in the default ready state; it is not
     /// connected to any handler in the supplied router.
     #[must_use]
-    pub fn from_router(router: axum::Router) -> TestClient {
+    pub fn from_router(router: axum::Router, state: AppState) -> TestClient {
         TestClient {
             router,
             probes: crate::probe::ProbeState::ready_for_test(),
+            state,
+            _job_runtime: None,
         }
     }
 
@@ -377,6 +390,75 @@ impl TestApp {
     #[must_use]
     pub fn routes(mut self, routes: Vec<Route>) -> Self {
         self.routes.extend(routes);
+        self
+    }
+
+    /// Register a callback to configure/initialize the application state before building the router.
+    #[must_use]
+    pub fn state_initializer<F>(mut self, f: F) -> Self
+    where
+        F: FnOnce(&AppState) + Send + 'static,
+    {
+        self.state_initializers.push(Box::new(f));
+        self
+    }
+
+    /// Apply a plugin directly to the test app.
+    #[must_use]
+    pub fn plugin<P: crate::plugin::Plugin>(mut self, plugin: P) -> Self {
+        let name = plugin.name().into_owned();
+        if self.registered_plugins.contains(&name) {
+            tracing::warn!(plugin = %name, "Duplicate plugin registration in TestApp; skipping");
+            return self;
+        }
+
+        let mut app_builder = crate::app();
+        app_builder
+            .registered_plugins
+            .clone_from(&self.registered_plugins);
+        app_builder.extensions = self.extensions;
+        app_builder.state_initializers = std::mem::take(&mut self.state_initializers);
+
+        app_builder = app_builder.plugin(plugin);
+
+        self.registered_plugins = app_builder.registered_plugins;
+        self.extensions = app_builder.extensions;
+        self.state_initializers = app_builder.state_initializers;
+
+        // Merge properties from the plugin's app_builder into self:
+        self.routes.extend(app_builder.routes);
+        self.scoped_groups.extend(app_builder.scoped_groups);
+        self.merge_routers.extend(app_builder.merge_routers);
+        self.nest_routers.extend(app_builder.nest_routers);
+        self.custom_layers.extend(app_builder.custom_layers);
+        self.jobs.extend(app_builder.jobs);
+        self.exception_filters.extend(app_builder.exception_filters);
+
+        for hook in app_builder.startup_hooks {
+            self.state_initializers.push(Box::new(move |state| {
+                let state_owned = state.clone();
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    let thread_handle =
+                        std::thread::spawn(move || handle.block_on(hook(state_owned)));
+                    thread_handle
+                        .join()
+                        .expect("Plugin startup hook thread panicked")
+                        .expect("Plugin startup hook failed");
+                } else {
+                    let thread_handle = std::thread::spawn(move || {
+                        let rt = tokio::runtime::Builder::new_multi_thread()
+                            .enable_all()
+                            .build()
+                            .expect("failed to build tokio runtime for test plugin startup hook");
+                        rt.block_on(hook(state_owned))
+                    });
+                    thread_handle
+                        .join()
+                        .expect("Plugin startup hook thread panicked")
+                        .expect("Plugin startup hook failed");
+                }
+            }));
+        }
         self
     }
 
@@ -595,12 +677,29 @@ impl TestApp {
             state.insert_extension(crate::http_client::HttpMockRegistryExt(registry));
         }
 
+        for initializer in self.state_initializers {
+            initializer(&state);
+        }
+
+        for job in &self.jobs {
+            state.job_registry.register(&job.name);
+        }
+
+        let job_runtime = if self.jobs.is_empty() {
+            None
+        } else {
+            let shutdown = tokio_util::sync::CancellationToken::new();
+            crate::job::start_runtime(self.jobs.clone(), &state, &shutdown, &self.config.jobs)
+                .expect("Failed to start job runtime in test");
+            Some(TestJobRuntime { shutdown })
+        };
+
         let router = crate::router::try_build_router_inner(
             self.routes,
             &self.config,
-            state,
+            state.clone(),
             crate::router::RouterContext {
-                exception_filters: Vec::new(),
+                exception_filters: self.exception_filters,
                 scoped_groups: self.scoped_groups,
                 merge_routers: self.merge_routers,
                 nest_routers: self.nest_routers,
@@ -612,7 +711,12 @@ impl TestApp {
             },
         )
         .expect("failed to build test router");
-        TestClient { router, probes }
+        TestClient {
+            router,
+            probes,
+            state,
+            _job_runtime: job_runtime,
+        }
     }
 }
 
@@ -656,9 +760,28 @@ impl Default for TestApp {
 pub struct TestClient {
     router: axum::Router,
     probes: crate::probe::ProbeState,
+    pub(crate) state: AppState,
+    _job_runtime: Option<TestJobRuntime>,
+}
+
+struct TestJobRuntime {
+    shutdown: tokio_util::sync::CancellationToken,
+}
+
+impl Drop for TestJobRuntime {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+        crate::job::clear_global_job_client();
+    }
 }
 
 impl TestClient {
+    /// Returns a reference to the [`AppState`] wired into this test app's router.
+    #[must_use]
+    pub const fn state(&self) -> &AppState {
+        &self.state
+    }
+
     /// Unwrap the underlying [`axum::Router`] out of the [`TestClient`].
     pub fn into_router(self) -> axum::Router {
         self.router
@@ -1148,6 +1271,28 @@ impl TestDb {
 mod tests {
     use super::*;
 
+    fn cleanup_probe_job(
+        _state: crate::state::AppState,
+        _payload: serde_json::Value,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send + 'static>,
+    > {
+        Box::pin(async move { Ok(()) })
+    }
+
+    struct CleanupJobPlugin;
+
+    impl crate::plugin::Plugin for CleanupJobPlugin {
+        fn build(self, app: crate::app::AppBuilder) -> crate::app::AppBuilder {
+            app.jobs(vec![crate::job::JobInfo {
+                name: "cleanup_probe".to_string(),
+                max_attempts: 1,
+                initial_backoff_ms: 1,
+                handler: cleanup_probe_job,
+            }])
+        }
+    }
+
     fn test_routes() -> Vec<Route> {
         use axum::routing;
 
@@ -1287,6 +1432,46 @@ mod tests {
     #[tokio::test]
     async fn test_client_default() {
         let _app = TestApp::default();
+    }
+
+    #[tokio::test]
+    async fn dropping_test_client_stops_test_started_job_runtime() {
+        let _guard = crate::job::global_job_runtime_test_lock().lock().await;
+        crate::job::clear_global_job_client();
+
+        let client = TestApp::new().plugin(CleanupJobPlugin).build();
+        let leaked_client = crate::job::global_job_client().expect("test job runtime should start");
+
+        drop(client);
+
+        assert!(
+            crate::job::global_job_client().is_none(),
+            "dropping a TestClient with jobs must clear its global job client"
+        );
+
+        let mut last_enqueue_error = None;
+        for _ in 0..25 {
+            match leaked_client
+                .enqueue("cleanup_probe", serde_json::json!({}))
+                .await
+            {
+                Ok(()) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+                Err(error) => {
+                    last_enqueue_error = Some(error.to_string());
+                    break;
+                }
+            }
+        }
+
+        assert!(
+            last_enqueue_error
+                .as_deref()
+                .is_some_and(|message| message.contains("failed to enqueue job")),
+            "captured pre-drop job client must stop accepting jobs after TestClient drop; \
+             last error: {last_enqueue_error:?}"
+        );
+
+        crate::job::clear_global_job_client();
     }
 
     /// End-to-end acceptance for issue #605: a plain `<form method="post">`
