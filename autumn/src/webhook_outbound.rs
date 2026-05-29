@@ -15,6 +15,9 @@ use std::sync::{Arc, RwLock};
 use crate::http_client::Client;
 use crate::{AppState, AutumnError, AutumnResult};
 
+const MAX_LOGGED_RESPONSE_BODY_BYTES: usize = 16 * 1024;
+const TRUNCATED_RESPONSE_BODY_SUFFIX: &str = "\n[truncated]";
+
 /// The status of a webhook subscription.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -444,22 +447,29 @@ impl WebhookOutboundManager {
                 }
             } else {
                 // Fallback: enqueue a standard background job
-                let job_payload = serde_json::json!({
-                    "log_id": log.id,
-                });
-
                 tracing::debug!(subscription_id = %sub.id, "WebhookOutboundManager::dispatch: enqueuing fallback webhook delivery job");
                 if let Some(job_client) = crate::job::global_job_client() {
+                    let job_payload = serde_json::json!({
+                        "log_id": log.id.clone(),
+                    });
                     if let Err(e) = job_client
                         .enqueue("autumn_webhook_delivery", job_payload)
                         .await
                     {
-                        errors.push(e);
+                        errors.push(
+                            self.record_delivery_enqueue_failure(log, e.to_string())
+                                .await,
+                        );
                     }
                 } else {
-                    errors.push(AutumnError::internal_server_error_msg(
-                        "Global job client is unavailable; fallback webhook delivery job not enqueued",
-                    ));
+                    errors.push(
+                        self.record_delivery_enqueue_failure(
+                            log,
+                            "Global job client is unavailable; fallback webhook delivery job not enqueued"
+                                .to_owned(),
+                        )
+                        .await,
+                    );
                 }
             }
         }
@@ -469,6 +479,26 @@ impl WebhookOutboundManager {
         }
 
         Ok(())
+    }
+
+    async fn record_delivery_enqueue_failure(
+        &self,
+        mut log: WebhookDeliveryLog,
+        message: String,
+    ) -> AutumnError {
+        log.is_dlq = true;
+        log.last_error = Some(message.clone());
+        log.timestamp = Utc::now();
+
+        if let Err(e) = self.handler.replace_delivery_log(log).await {
+            tracing::error!(
+                error = %e,
+                "Failed to mark webhook delivery log as DLQ after enqueue failure"
+            );
+            return e;
+        }
+
+        AutumnError::internal_server_error_msg(message)
     }
 }
 
@@ -565,6 +595,9 @@ pub fn deliver_webhook_job(
             tracing::info!(subscription_id = %sub.id, "Webhook subscription is disabled; skipping delivery");
             log.last_error = Some("Subscription is disabled".to_owned());
             log.timestamp = Utc::now();
+            if is_replay {
+                log.is_dlq = true;
+            }
             manager.store().log_delivery(log).await?;
             return Ok(());
         }
@@ -620,7 +653,7 @@ pub fn deliver_webhook_job(
                 let status = res.status();
                 log.response_status = Some(status.as_u16());
                 let is_success = res.is_success();
-                let body_str = res.text();
+                let body_str = cap_logged_response_body(res.text());
                 log.response_body = Some(body_str);
 
                 if is_success {
@@ -647,6 +680,22 @@ pub fn deliver_webhook_job(
             }
         }
     })
+}
+
+fn cap_logged_response_body(mut body: String) -> String {
+    if body.len() <= MAX_LOGGED_RESPONSE_BODY_BYTES {
+        return body;
+    }
+
+    let body_budget =
+        MAX_LOGGED_RESPONSE_BODY_BYTES.saturating_sub(TRUNCATED_RESPONSE_BODY_SUFFIX.len());
+    let mut cutoff = body_budget.min(body.len());
+    while cutoff > 0 && !body.is_char_boundary(cutoff) {
+        cutoff -= 1;
+    }
+    body.truncate(cutoff);
+    body.push_str(TRUNCATED_RESPONSE_BODY_SUFFIX);
+    body
 }
 
 async fn reset_subscription_after_success(
@@ -841,6 +890,147 @@ mod tests {
             .expect("subscription should remain stored");
         assert_eq!(updated_sub.status, WebhookSubscriptionStatus::Active);
         assert_eq!(updated_sub.consecutive_failures, 0);
+    }
+
+    #[tokio::test]
+    async fn replay_job_keeps_disabled_subscription_log_in_dlq() {
+        let state = AppState::for_test();
+        let store = Arc::new(InMemoryOutboundWebhookHandler::new());
+        let registry = Arc::new(MockRegistry::new());
+        let mock = mock_builder(registry.clone(), "http://mock-receiver/webhooks/disabled")
+            .post("/webhooks/disabled")
+            .respond_with(200, serde_json::json!({ "received": true }));
+        state.insert_extension(HttpMockRegistryExt(registry));
+        install_outbound_webhook_manager(&state, store.clone(), 1);
+
+        let sub = sample_subscription(
+            "sub_disabled",
+            "http://mock-receiver/webhooks/disabled",
+            WebhookSubscriptionStatus::Disabled,
+        );
+        store.create_subscription(sub).await.unwrap();
+        store
+            .replace_delivery_log(sample_log("log_disabled_replay", "sub_disabled"))
+            .await
+            .unwrap();
+
+        deliver_webhook_job(
+            state,
+            serde_json::json!({
+                "log_id": "log_disabled_replay",
+                "replay": true,
+            }),
+        )
+        .await
+        .unwrap();
+
+        mock.expect_called(0);
+        let log = store
+            .get_delivery_log("log_disabled_replay")
+            .await
+            .unwrap()
+            .expect("log should remain stored");
+        assert!(log.is_dlq, "disabled replay must remain visible in DLQ");
+        assert_eq!(log.last_error.as_deref(), Some("Subscription is disabled"));
+        assert_eq!(log.response_status, None);
+    }
+
+    #[tokio::test]
+    async fn dispatch_marks_log_dlq_when_fallback_enqueue_fails() {
+        let _guard = crate::job::global_job_runtime_test_lock().lock().await;
+        crate::job::clear_global_job_client();
+
+        let state = AppState::for_test();
+        let store = Arc::new(InMemoryOutboundWebhookHandler::new());
+        let manager = WebhookOutboundManager::new(store.clone()).with_initial_backoff_ms(1);
+        let sub = sample_subscription(
+            "sub_enqueue_missing",
+            "http://mock-receiver/webhooks/enqueue-missing",
+            WebhookSubscriptionStatus::Active,
+        );
+        store.create_subscription(sub).await.unwrap();
+
+        let err = manager
+            .dispatch(&state, "orders.created", &serde_json::json!({ "id": 42 }))
+            .await
+            .expect_err("dispatch should report the missing fallback job runtime");
+        assert!(
+            err.to_string().contains("not enqueued"),
+            "error should describe the enqueue failure: {err}"
+        );
+
+        let logs = store.get_delivery_logs().await.unwrap();
+        assert_eq!(logs.len(), 1);
+        let log = &logs[0];
+        assert!(
+            log.is_dlq,
+            "enqueue failure must leave a replayable DLQ record"
+        );
+        assert!(
+            log.last_error
+                .as_deref()
+                .is_some_and(|msg| msg.contains("not enqueued")),
+            "DLQ log should record enqueue failure: {:?}",
+            log.last_error
+        );
+        assert_eq!(log.response_status, None);
+
+        let sub = store
+            .get_subscription("sub_enqueue_missing")
+            .await
+            .unwrap()
+            .expect("subscription should remain stored");
+        assert_eq!(sub.consecutive_failures, 0);
+    }
+
+    #[tokio::test]
+    async fn delivery_log_response_body_is_capped() {
+        let state = AppState::for_test();
+        let store = Arc::new(InMemoryOutboundWebhookHandler::new());
+        let registry = Arc::new(MockRegistry::new());
+        let large_body = "x".repeat(MAX_LOGGED_RESPONSE_BODY_BYTES + 1024);
+        let _mock = mock_builder(
+            registry.clone(),
+            "http://mock-receiver/webhooks/large-error",
+        )
+        .post("/webhooks/large-error")
+        .respond_with(500, serde_json::json!({ "error": large_body }));
+        state.insert_extension(HttpMockRegistryExt(registry));
+        install_outbound_webhook_manager(&state, store.clone(), 1);
+
+        let sub = sample_subscription(
+            "sub_large_error",
+            "http://mock-receiver/webhooks/large-error",
+            WebhookSubscriptionStatus::Active,
+        );
+        store.create_subscription(sub.clone()).await.unwrap();
+        let mut log = sample_log("log_large_error", "sub_large_error");
+        log.max_attempts = 1;
+
+        deliver_webhook_job(
+            state,
+            serde_json::json!({
+                "subscription": sub,
+                "log": log,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let stored = store
+            .get_delivery_log("log_large_error")
+            .await
+            .unwrap()
+            .expect("delivery log should exist");
+        let body = stored
+            .response_body
+            .expect("response body should be logged");
+        assert!(
+            body.len() <= MAX_LOGGED_RESPONSE_BODY_BYTES,
+            "stored response body should be capped, got {} bytes",
+            body.len()
+        );
+        assert!(body.ends_with("[truncated]"));
     }
 
     struct ResetFailingStore {

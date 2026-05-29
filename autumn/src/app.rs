@@ -2107,7 +2107,7 @@ impl AppBuilder {
             nest_routers: _,
             custom_layers,
             startup_hooks: _,
-            state_initializers: _,
+            state_initializers,
             shutdown_hooks: _,
             extensions: _,
             registered_plugins: _,
@@ -2333,6 +2333,8 @@ impl AppBuilder {
         // routes the server path serves.
         #[cfg(feature = "storage")]
         let storage_router = storage_bootstrap.and_then(|b| b.install(&state));
+        install_webhook_registry(&state, &config);
+        run_state_initializers(state_initializers, &state);
 
         // Build the full router (same as production). Use the inner builder
         // so the custom session store installed via with_session_store(...)
@@ -5014,22 +5016,29 @@ mod tests {
     #[test]
     fn state_initializers_run_before_job_runtime_initialization() {
         let source = include_str!("app.rs").replace("\r\n", "\n");
-        let initializer_positions: Vec<_> = source
-            .match_indices("run_state_initializers(state_initializers, &state);")
-            .map(|(index, _)| index)
-            .collect();
+        let server_start = source
+            .find("pub async fn run(self)")
+            .expect("normal server path should exist");
+        let build_mode_start = source
+            .find("async fn run_build_mode(self)")
+            .expect("static build path should follow server path");
+        let task_start = source
+            .find("async fn run_one_off_task_mode(self, requested_name: String)")
+            .expect("task runner path should exist");
+        let server_source = &source[server_start..build_mode_start];
+        let task_source = &source[task_start..];
         let server_init = "initialize_job_runtime(jobs, &state, &server_shutdown, &config.jobs)";
         let task_init = "initialize_job_runtime(jobs, &state, &task_shutdown, &config.jobs)";
-        let server_initializer = *initializer_positions
-            .first()
+        let server_initializer = server_source
+            .find("run_state_initializers(state_initializers, &state);")
             .expect("normal server path should run state initializers");
-        let task_initializer = *initializer_positions
-            .get(1)
+        let task_initializer = task_source
+            .find("run_state_initializers(state_initializers, &state);")
             .expect("task runner path should run state initializers");
-        let server_job = source
+        let server_job = server_source
             .find(server_init)
             .expect("normal server path should initialize jobs");
-        let task_job = source
+        let task_job = task_source
             .find(task_init)
             .expect("task runner path should initialize jobs");
 
@@ -5040,6 +5049,29 @@ mod tests {
         assert!(
             task_initializer < task_job,
             "task runner startup must install state-initialized resources before job workers start"
+        );
+    }
+
+    #[test]
+    fn static_builds_run_state_initializers_before_router_build() {
+        let source = include_str!("app.rs").replace("\r\n", "\n");
+        let build_mode_start = source
+            .find("async fn run_build_mode(self)")
+            .expect("static build path should exist");
+        let dump_mode_start = source
+            .find("async fn run_dump_routes_mode(self)")
+            .expect("route dump path should follow static build path");
+        let build_mode_source = &source[build_mode_start..dump_mode_start];
+        let state_initializer = build_mode_source
+            .find("run_state_initializers(state_initializers, &state);")
+            .expect("static build path should run state initializers");
+        let router_build = build_mode_source
+            .find("let router = crate::router::try_build_router_inner(")
+            .expect("static build path should build a router");
+
+        assert!(
+            state_initializer < router_build,
+            "static builds must install state-initialized resources before rendering routes"
         );
     }
 
