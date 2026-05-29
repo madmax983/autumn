@@ -9,6 +9,8 @@
 //! from the state. However, custom extractors can access the state via
 //! `crate::extract::State<AppState>`.
 
+use crate::session::Session;
+use http::StatusCode;
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -129,6 +131,145 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Build a fully-populated [`PolicyContext`](crate::authorization::PolicyContext) from this `AppState` +
+    /// `Session`. Used by the `#[authorize]` macro and
+    /// `#[repository(policy = ...)]`-generated handlers.
+    pub async fn policy_context(
+        &self,
+        session: &crate::session::Session,
+    ) -> crate::authorization::PolicyContext {
+        #[cfg(feature = "db")]
+        let ctx = crate::authorization::PolicyContext::from_request(
+            session,
+            self.auth_session_key(),
+            self.policy_registry().clone(),
+            self.pool().cloned(),
+        )
+        .await;
+        #[cfg(not(feature = "db"))]
+        let ctx = crate::authorization::PolicyContext::from_request(
+            session,
+            self.auth_session_key(),
+            self.policy_registry().clone(),
+        )
+        .await;
+        ctx
+    }
+
+    /// # Errors
+    /// Returns 403 Forbidden or 500 if policy not found.
+    pub async fn authorize<R>(
+        &self,
+        session: &Session,
+        action: &str,
+        resource: &R,
+    ) -> crate::AutumnResult<()>
+    where
+        R: Send + Sync + 'static,
+    {
+        let policy = self.policy_registry().policy::<R>().ok_or_else(|| {
+            crate::AutumnError::from(std::io::Error::other(format!(
+                "no policy registered for resource type {}",
+                std::any::type_name::<R>()
+            )))
+            .with_status(StatusCode::INTERNAL_SERVER_ERROR)
+        })?;
+
+        let ctx = self.policy_context(session).await;
+
+        if policy.can(action, &ctx, resource).await {
+            Ok(())
+        } else {
+            Err(self.forbidden_response().into_error())
+        }
+    }
+
+    /// # Errors
+    /// Returns 403 Forbidden or 500 if policy not found.
+    pub async fn __check_policy<R>(
+        &self,
+        session: &Session,
+        action: &str,
+        resource: &R,
+    ) -> crate::AutumnResult<()>
+    where
+        R: Send + Sync + 'static,
+    {
+        self.authorize(session, action, resource).await
+    }
+
+    /// # Errors
+    /// Returns 403 Forbidden or 500 if policy not found.
+    pub async fn __check_policy_create<R>(&self, session: &Session) -> crate::AutumnResult<()>
+    where
+        R: Send + Sync + 'static,
+    {
+        self.authorize_create::<R>(session).await
+    }
+
+    /// # Errors
+    /// Returns 403 Forbidden or 500 if policy not found.
+    pub async fn __check_policy_create_payload<R>(
+        &self,
+        session: &Session,
+        payload: &serde_json::Value,
+    ) -> crate::AutumnResult<()>
+    where
+        R: Send + Sync + 'static,
+    {
+        self.authorize_create_payload::<R>(session, payload).await
+    }
+
+    /// # Errors
+    /// Returns 403 Forbidden or 500 if policy not found.
+    pub async fn authorize_create<R>(&self, session: &Session) -> crate::AutumnResult<()>
+    where
+        R: Send + Sync + 'static,
+    {
+        let policy = self.policy_registry().policy::<R>().ok_or_else(|| {
+            crate::AutumnError::from(std::io::Error::other(format!(
+                "no policy registered for resource type {}",
+                std::any::type_name::<R>()
+            )))
+            .with_status(StatusCode::INTERNAL_SERVER_ERROR)
+        })?;
+
+        let ctx = self.policy_context(session).await;
+
+        if policy.can_create(&ctx).await {
+            Ok(())
+        } else {
+            Err(self.forbidden_response().into_error())
+        }
+    }
+
+    /// # Errors
+    /// Returns 403 Forbidden or 500 if policy not found.
+    pub async fn authorize_create_payload<R>(
+        &self,
+        session: &Session,
+        payload: &serde_json::Value,
+    ) -> crate::AutumnResult<()>
+    where
+        R: Send + Sync + 'static,
+    {
+        let policy = self.policy_registry().policy::<R>().ok_or_else(|| {
+            crate::AutumnError::from(std::io::Error::other(format!(
+                "no policy registered for resource type {}",
+                std::any::type_name::<R>()
+            )))
+            .with_status(StatusCode::INTERNAL_SERVER_ERROR)
+        })?;
+
+        let ctx = self.policy_context(session).await;
+
+        if policy.can_create_payload(&ctx, payload).await {
+            Ok(())
+        } else {
+            Err(self.forbidden_response().into_error())
+        }
+    }
+
     /// Install or replace a typed runtime extension.
     ///
     /// Integrations use this to publish typed runtime resources, such as

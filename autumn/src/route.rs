@@ -10,6 +10,7 @@
 
 use axum::routing::MethodRouter;
 use http::Method;
+use serde::{Deserialize, Serialize};
 
 use crate::openapi::ApiDoc;
 use crate::state::AppState;
@@ -129,4 +130,59 @@ pub struct Route {
 
     /// Idempotency replay behavior for this route.
     pub idempotency: RouteIdempotency,
+}
+
+/// Where a route was registered: by the user application, by a named plugin,
+/// or by the framework itself (probes, actuator, htmx assets, dev reload).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RouteSource {
+    /// Registered directly by the user application.
+    User,
+    /// Registered by a named autumn plugin (e.g. `"admin"` for autumn-admin-plugin).
+    Plugin(String),
+    /// Registered by the framework (probes, actuator, htmx assets, dev reload).
+    Framework,
+}
+
+impl std::fmt::Display for RouteSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::User => write!(f, "user"),
+            Self::Plugin(name) => write!(f, "plugin:{name}"),
+            Self::Framework => write!(f, "framework"),
+        }
+    }
+}
+
+impl Serialize for RouteSource {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for RouteSource {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        Ok(if s == "framework" {
+            Self::Framework
+        } else if let Some(name) = s.strip_prefix("plugin:") {
+            Self::Plugin(name.to_owned())
+        } else {
+            Self::User
+        })
+    }
+}
+
+/// A group of routes sharing a common path prefix and middleware layer.
+///
+/// Created by [`AppBuilder::scoped`]. The routes are mounted under the
+/// prefix with the middleware applied only to this group.
+pub struct ScopedGroup {
+    pub(crate) prefix: String,
+    pub(crate) routes: Vec<Route>,
+    /// Registration origin: user application or a named plugin.
+    pub(crate) source: RouteSource,
+    /// Closure that applies the layer to a sub-router.
+    pub(crate) apply_layer:
+        Box<dyn FnOnce(axum::Router<AppState>) -> axum::Router<AppState> + Send>,
 }

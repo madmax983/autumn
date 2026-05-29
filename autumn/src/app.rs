@@ -38,7 +38,7 @@ use crate::error_pages::{ErrorPageRenderer, SharedRenderer};
 use crate::middleware::exception_filter::ExceptionFilter;
 #[cfg(feature = "db")]
 use crate::migrate;
-use crate::route::Route;
+use crate::route::{Route, ScopedGroup};
 use crate::state::AppState;
 
 /// Create a new [`AppBuilder`].
@@ -188,7 +188,7 @@ type PolicyRegistration = Box<dyn FnOnce(&crate::authorization::PolicyRegistry) 
 pub struct AppBuilder {
     pub(crate) routes: Vec<Route>,
     /// Parallel to `routes`: registration origin for each route.
-    route_sources: Vec<crate::route_listing::RouteSource>,
+    route_sources: Vec<crate::route::RouteSource>,
     /// Non-None while a plugin's `build()` is executing; routes and scoped
     /// groups added during that window are attributed to this plugin.
     current_plugin: Option<String>,
@@ -303,20 +303,6 @@ pub(crate) type MailDeliveryQueueFactory = Box<
     dyn FnOnce(&AppState) -> crate::AutumnResult<Arc<dyn crate::mail::MailDeliveryQueue>> + Send,
 >;
 
-/// A group of routes sharing a common path prefix and middleware layer.
-///
-/// Created by [`AppBuilder::scoped`]. The routes are mounted under the
-/// prefix with the middleware applied only to this group.
-pub(crate) struct ScopedGroup {
-    pub(crate) prefix: String,
-    pub(crate) routes: Vec<Route>,
-    /// Registration origin: user application or a named plugin.
-    pub(crate) source: crate::route_listing::RouteSource,
-    /// Closure that applies the layer to a sub-router.
-    pub(crate) apply_layer:
-        Box<dyn FnOnce(axum::Router<AppState>) -> axum::Router<AppState> + Send>,
-}
-
 /// A deferred router mutator that applies a user-registered
 /// [`tower::Layer`] to the app-wide router.
 ///
@@ -424,8 +410,8 @@ impl AppBuilder {
         let source = self
             .current_plugin
             .as_ref()
-            .map_or(crate::route_listing::RouteSource::User, |name| {
-                crate::route_listing::RouteSource::Plugin(name.clone())
+            .map_or(crate::route::RouteSource::User, |name| {
+                crate::route::RouteSource::Plugin(name.clone())
             });
         for _ in &routes {
             self.route_sources.push(source.clone());
@@ -645,8 +631,8 @@ impl AppBuilder {
         let source = self
             .current_plugin
             .as_ref()
-            .map_or(crate::route_listing::RouteSource::User, |name| {
-                crate::route_listing::RouteSource::Plugin(name.clone())
+            .map_or(crate::route::RouteSource::User, |name| {
+                crate::route::RouteSource::Plugin(name.clone())
             });
         self.scoped_groups.push(ScopedGroup {
             prefix: prefix.to_owned(),
@@ -900,8 +886,8 @@ impl AppBuilder {
         let source = self
             .current_plugin
             .as_deref()
-            .map_or(crate::route_listing::RouteSource::User, |name| {
-                crate::route_listing::RouteSource::Plugin(name.to_owned())
+            .map_or(crate::route::RouteSource::User, |name| {
+                crate::route::RouteSource::Plugin(name.to_owned())
             });
         for mut route in routes {
             route.source = source.clone();
@@ -4559,7 +4545,7 @@ mod validate_repository_api_policies_tests {
         let group = ScopedGroup {
             prefix: "/scoped".to_owned(),
             routes: vec![group_route],
-            source: crate::route_listing::RouteSource::User,
+            source: crate::route::RouteSource::User,
             apply_layer: Box::new(|r| r),
         };
         let offenders = collect_unguarded_repository_writes(&[], std::slice::from_ref(&group));
@@ -4577,7 +4563,7 @@ mod validate_repository_api_policies_tests {
         let group = ScopedGroup {
             prefix: "/scoped".to_owned(),
             routes: vec![group_route],
-            source: crate::route_listing::RouteSource::User,
+            source: crate::route::RouteSource::User,
             apply_layer: Box::new(|r| r),
         };
         let registry = PolicyRegistry::default();
@@ -7701,10 +7687,7 @@ mod tests {
         let user_route = test_get_route("/home", "home");
         let builder = app().routes(vec![user_route]);
         assert_eq!(builder.route_sources.len(), 1);
-        assert_eq!(
-            builder.route_sources[0],
-            crate::route_listing::RouteSource::User
-        );
+        assert_eq!(builder.route_sources[0], crate::route::RouteSource::User);
     }
 
     #[test]
@@ -7718,7 +7701,7 @@ mod tests {
         assert_eq!(builder.route_sources.len(), 1);
         assert_eq!(
             builder.route_sources[0],
-            crate::route_listing::RouteSource::Plugin("my-plugin".to_owned())
+            crate::route::RouteSource::Plugin("my-plugin".to_owned())
         );
     }
 
@@ -7734,12 +7717,9 @@ mod tests {
         assert_eq!(builder.route_sources.len(), 2);
         assert_eq!(
             builder.route_sources[0],
-            crate::route_listing::RouteSource::Plugin("my-plugin".to_owned())
+            crate::route::RouteSource::Plugin("my-plugin".to_owned())
         );
-        assert_eq!(
-            builder.route_sources[1],
-            crate::route_listing::RouteSource::User
-        );
+        assert_eq!(builder.route_sources[1], crate::route::RouteSource::User);
     }
 
     /// A plugin that registers a route and then registers a nested plugin.
@@ -7767,12 +7747,12 @@ mod tests {
         assert_eq!(builder.route_sources.len(), 2);
         assert_eq!(
             builder.route_sources[0],
-            crate::route_listing::RouteSource::Plugin("inner".to_owned()),
+            crate::route::RouteSource::Plugin("inner".to_owned()),
             "first route should be attributed to inner plugin"
         );
         assert_eq!(
             builder.route_sources[1],
-            crate::route_listing::RouteSource::Plugin("outer".to_owned()),
+            crate::route::RouteSource::Plugin("outer".to_owned()),
             "second route should be re-attributed to outer plugin after nested build"
         );
     }

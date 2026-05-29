@@ -121,7 +121,7 @@ async fn list_my_notes(
     session: Session,
     mut db: Db,
 ) -> AutumnResult<Json<Vec<Note>>> {
-    let ctx = PolicyContext::from_request(&state, &session).await;
+    let ctx = state.policy_context(&session).await;
     let notes = Note::scope(&ctx).load(&mut db).await?;
     Ok(Json(notes))
 }

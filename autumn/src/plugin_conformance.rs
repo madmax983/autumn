@@ -20,7 +20,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::route_listing::{RouteInfo, RouteSource};
+use crate::route::RouteSource;
+use crate::route_listing::RouteInfo;
 
 // ── Configuration ──────────────────────────────────────────────────────────
 
