@@ -2085,6 +2085,36 @@ mod tests {
     }
 
     #[test]
+    fn history_page_pagination_preserves_per_page() {
+        let r = dummy_registry();
+        let history = AdminHistoryPage {
+            entries: vec![crate::traits::AdminHistoryEntry {
+                id: 1,
+                actor: "system".to_owned(),
+                op: "insert".to_owned(),
+                request_id: None,
+                changes: vec![],
+                recorded_at: chrono::Utc::now(),
+            }],
+            total: 250,
+            page: 2,
+            per_page: 100,
+        };
+
+        let html = model_history_page(&r, "posts", "Post", "Posts", 42, &history, "/admin", "/ops")
+            .into_string();
+
+        assert!(
+            html.contains("/admin/posts/42/history?page=1&amp;per_page=100"),
+            "previous history page link must preserve per_page: {html}"
+        );
+        assert!(
+            html.contains("/admin/posts/42/history?page=3&amp;per_page=100"),
+            "next history page link must preserve per_page: {html}"
+        );
+    }
+
+    #[test]
     fn dashboard_emits_csrf_meta_and_script() {
         let r = dummy_registry();
         let html = dashboard_page(&r, &[], &[], "tok-123", "/admin", "/ops", false).into_string();

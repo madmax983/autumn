@@ -368,7 +368,7 @@ pub trait ModelTenantIdMeta {
 /// A trait that bridges a Diesel table to its `tenant_id` column.
 #[cfg(feature = "db")]
 pub trait HasTenantIdColumn {
-    type Column: ::diesel::Expression<SqlType = ::diesel::sql_types::Text>;
+    type Column: ::diesel::Expression;
     fn column() -> Self::Column;
 }
 
@@ -404,6 +404,8 @@ impl<'a, T, Table> GetInsertableValues for TenantInsertableValuesSelector<'a, T,
 where
     Table: HasTenantIdColumn,
     Table::Column: ::diesel::ExpressionMethods,
+    <Table::Column as ::diesel::Expression>::SqlType: ::diesel::sql_types::SqlType,
+    &'a str: ::diesel::expression::AsExpression<<Table::Column as ::diesel::Expression>::SqlType>,
 {
     type Values = (T, ::diesel::dsl::Eq<Table::Column, &'a str>);
     fn get_values(self) -> Self::Values {

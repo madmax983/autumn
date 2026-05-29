@@ -10,8 +10,7 @@ mod schema {
 }
 
 use schema::items;
-use autumn_web::prelude::*;
-use autumn_web::hooks::{MutationContext, MutationHooks};
+use autumn_web::hooks::MutationHooks;
 
 #[autumn_web::model(table = "items")]
 pub struct Item {
@@ -20,6 +19,7 @@ pub struct Item {
     pub name: String,
 }
 
+#[derive(Clone, Default)]
 pub struct DummyHooks;
 
 impl MutationHooks for DummyHooks {

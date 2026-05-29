@@ -96,6 +96,14 @@ mod tests {
     use std::net::TcpListener;
     use std::thread;
 
+    fn test_client() -> Client {
+        Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap()
+    }
+
     fn spawn_mock_server(status_line: &str, body: &str, num_requests: usize) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -132,6 +140,7 @@ mod tests {
                         )
                     };
                     let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.flush();
                 }
             }
         });
@@ -143,7 +152,7 @@ mod tests {
     fn test_fetch_endpoint_success() {
         let url = spawn_mock_server("HTTP/1.1 200 OK", r#"{"status": "ok"}"#, 1);
 
-        let client = Client::new();
+        let client = test_client();
         let val = fetch_endpoint(&client, &url, "/test");
         assert_eq!(val["status"], "ok");
     }
@@ -155,6 +164,7 @@ mod tests {
         drop(listener); // Close so connection fails
 
         let client = Client::builder()
+            .no_proxy()
             .timeout(Duration::from_millis(100))
             .build()
             .unwrap();
@@ -166,7 +176,7 @@ mod tests {
     fn test_fetch_endpoint_404() {
         let url = spawn_mock_server("HTTP/1.1 404 NOT FOUND", "", 1);
 
-        let client = Client::new();
+        let client = test_client();
         let val = fetch_endpoint(&client, &url, "/test");
         assert!(val["error"].as_str().unwrap_or("").contains("HTTP 404"));
     }
@@ -195,13 +205,12 @@ mod tests {
     fn test_fetch_endpoint_invalid_json() {
         let url = spawn_mock_server("HTTP/1.1 200 OK", r#"{"status": "ok", "#, 1); // Invalid JSON
 
-        let client = Client::new();
+        let client = test_client();
         let val = fetch_endpoint(&client, &url, "/test");
+        let error = val["error"].as_str().unwrap_or("");
         assert!(
-            val["error"]
-                .as_str()
-                .unwrap()
-                .contains("Failed to parse JSON")
+            error.contains("Failed to parse JSON"),
+            "expected JSON parse error, got {val}"
         );
     }
 

@@ -159,6 +159,8 @@ pub fn admin_router(
         // Version history pane (only reachable when model.has_history() is true)
         .route("/{slug}/{id}/history", routing::get(model_history))
         .route("/{slug}/{id}/edit", routing::get(model_edit_form))
+        // Version history pane (only reachable when model.has_history() is true)
+        .route("/{slug}/{id}/history", routing::get(model_history))
         // Bulk-action endpoint. Receives selected `ids[]` and an `action`
         // name from the list-view form; dispatches to
         // `AdminModel::execute_action`.
@@ -1492,5 +1494,29 @@ mod tests {
         });
         let out = strip_meta_fields(input, &schema);
         assert_eq!(out, json!({"name": "legit"}));
+    }
+
+    // ── parse_form_bool coverage ──────────────────────────────────────
+
+    #[test]
+    fn parse_form_bool_recognizes_truthy_falsy_and_unknown_variants() {
+        // Truthy variants
+        assert_eq!(parse_form_bool("true"), Some(true));
+        assert_eq!(parse_form_bool("1"), Some(true));
+        assert_eq!(parse_form_bool("yes"), Some(true));
+        assert_eq!(parse_form_bool("on"), Some(true));
+        assert_eq!(parse_form_bool("TRUE"), Some(true)); // case-insensitive
+        assert_eq!(parse_form_bool("YES"), Some(true));
+        // Falsy variants
+        assert_eq!(parse_form_bool("false"), Some(false));
+        assert_eq!(parse_form_bool("0"), Some(false));
+        assert_eq!(parse_form_bool("no"), Some(false));
+        assert_eq!(parse_form_bool("off"), Some(false));
+        assert_eq!(parse_form_bool(""), Some(false));
+        assert_eq!(parse_form_bool("  "), Some(false)); // trims whitespace
+        // Unknown → None (value is left as-is by coerce_form_value)
+        assert_eq!(parse_form_bool("maybe"), None);
+        assert_eq!(parse_form_bool("y"), None);
+        assert_eq!(parse_form_bool("2"), None);
     }
 }
