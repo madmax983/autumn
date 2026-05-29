@@ -345,22 +345,36 @@ pub fn check_route_prefix(
     }
 }
 
+use std::borrow::Cow;
+
 /// Canonicalize dynamic route segments before collision detection.
 ///
 /// Both named params (`{id}`) and catch-all params (`{*rest}`) normalize to
 /// `{}`. matchit (Axum's router) treats a named param and a catch-all at the
 /// same path position as a conflict, so they must map to the same key.
-fn normalize_path_for_collision(path: &str) -> String {
-    path.split('/')
-        .map(|seg| {
-            if seg.starts_with('{') && seg.ends_with('}') {
-                "{}"
-            } else {
-                seg
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("/")
+fn normalize_path_for_collision(path: &str) -> Cow<'_, str> {
+    if !path.contains('{') {
+        return Cow::Borrowed(path);
+    }
+
+    let mut normalized = String::with_capacity(path.len());
+    let mut segments = path.split('/');
+    if let Some(first) = segments.next() {
+        if first.starts_with('{') && first.ends_with('}') {
+            normalized.push_str("{}");
+        } else {
+            normalized.push_str(first);
+        }
+    }
+    for seg in segments {
+        normalized.push('/');
+        if seg.starts_with('{') && seg.ends_with('}') {
+            normalized.push_str("{}");
+        } else {
+            normalized.push_str(seg);
+        }
+    }
+    Cow::Owned(normalized)
 }
 
 /// Detect route collisions: any two routes sharing the same (method, path) pair.
@@ -376,7 +390,7 @@ fn normalize_path_for_collision(path: &str) -> String {
 pub fn check_collisions(routes: &[RouteInfo]) -> (CheckResult, Vec<CollisionDiagnostic>) {
     use std::collections::HashMap;
 
-    let mut by_key: HashMap<(&str, String), Vec<&RouteInfo>> = HashMap::new();
+    let mut by_key: HashMap<(&str, Cow<'_, str>), Vec<&RouteInfo>> = HashMap::new();
     for route in routes {
         by_key
             .entry((
@@ -392,7 +406,7 @@ pub fn check_collisions(routes: &[RouteInfo]) -> (CheckResult, Vec<CollisionDiag
         .filter(|(_, rs)| rs.len() > 1)
         .map(|((method, path), rs)| CollisionDiagnostic {
             method: method.to_string(),
-            path,
+            path: path.into_owned(),
             contributors: rs
                 .iter()
                 .map(|r| RouteContributor {
