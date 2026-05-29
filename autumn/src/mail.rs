@@ -21,6 +21,19 @@ use thiserror::Error;
 
 use crate::{AppState, AutumnError, AutumnResult};
 
+#[cfg(feature = "mail")]
+pub trait MailInterceptor: Send + Sync + 'static {
+    fn intercept<'a>(
+        &'a self,
+        mail: &'a crate::mail::Mail,
+        next: std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), crate::mail::MailError>> + Send + 'a>,
+        >,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), crate::mail::MailError>> + Send + 'a>,
+    >;
+}
+
 /// Mail transport selected by `[mail].transport`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -1601,7 +1614,7 @@ fn lettre_message(mail: &Mail) -> Result<Message, MailError> {
 
 struct InterceptedMailTransport {
     inner: Arc<dyn MailTransport>,
-    interceptor: Arc<dyn crate::interceptor::MailInterceptor>,
+    interceptor: Arc<dyn crate::mail::MailInterceptor>,
 }
 
 impl MailTransport for InterceptedMailTransport {
@@ -1643,7 +1656,7 @@ pub(crate) fn install_mailer(
 ) -> AutumnResult<()> {
     let mut mailer = Mailer::from_config(config).map_err(AutumnError::service_unavailable)?;
 
-    if let Some(interceptor) = state.extension::<Arc<dyn crate::interceptor::MailInterceptor>>() {
+    if let Some(interceptor) = state.extension::<Arc<dyn crate::mail::MailInterceptor>>() {
         mailer.transport = Arc::new(InterceptedMailTransport {
             inner: Arc::clone(&mailer.transport),
             interceptor: (*interceptor).clone(),
@@ -2626,7 +2639,7 @@ mod tests {
         }
 
         struct ShortCircuitMailInterceptor;
-        impl crate::interceptor::MailInterceptor for ShortCircuitMailInterceptor {
+        impl crate::mail::MailInterceptor for ShortCircuitMailInterceptor {
             fn intercept<'a>(
                 &'a self,
                 _mail: &'a Mail,

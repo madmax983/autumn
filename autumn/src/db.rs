@@ -43,6 +43,34 @@ use tracing::Instrument as _;
 use crate::config::DatabaseConfig;
 use crate::error::AutumnError;
 
+#[derive(Debug, Clone)]
+pub struct DbCheckoutContext {
+    pub pool_name: String,
+}
+
+#[cfg(feature = "db")]
+pub trait DbConnectionInterceptor: Send + Sync + 'static {
+    fn intercept_checkout<'a>(
+        &'a self,
+        ctx: DbCheckoutContext,
+        next: std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<crate::db::PooledConnection, crate::AutumnError>,
+                    > + Send
+                    + 'a,
+            >,
+        >,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<crate::db::PooledConnection, crate::AutumnError>,
+                > + Send
+                + 'a,
+        >,
+    >;
+}
+
 // ── After-commit callback infrastructure ─────────────────────────────────────
 
 /// A boxed async callback registered for post-transaction execution.
@@ -221,9 +249,7 @@ pub trait DbState {
     }
 
     /// Returns any registered database connection checkout interceptors.
-    fn db_interceptors(
-        &self,
-    ) -> Vec<std::sync::Arc<dyn crate::interceptor::DbConnectionInterceptor>> {
+    fn db_interceptors(&self) -> Vec<std::sync::Arc<dyn crate::db::DbConnectionInterceptor>> {
         Vec::new()
     }
     /// Returns the global statement timeout, if configured.
@@ -925,7 +951,7 @@ where
             })
         });
         for interceptor in &interceptors {
-            let ctx = crate::interceptor::DbCheckoutContext {
+            let ctx = crate::db::DbCheckoutContext {
                 pool_name: "primary".to_string(),
             };
             checkout_future = interceptor.intercept_checkout(ctx, checkout_future);
