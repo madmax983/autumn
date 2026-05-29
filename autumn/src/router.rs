@@ -3324,6 +3324,61 @@ mod tests {
         )
         .await;
     }
+
+    #[tokio::test]
+    async fn static_serving_falls_through_when_manifest_file_missing_on_disk() {
+        // Manifest lists a route but the corresponding file has been deleted.
+        // The middleware must fall through to the dynamic router rather than
+        // error, because dist/ can be partially regenerated at any time.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dist = dir.path().join("dist");
+        std::fs::create_dir_all(&dist).expect("mkdir dist");
+
+        // Write a manifest that references a file we do NOT create.
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            "/ghost".to_owned(),
+            crate::static_gen::ManifestEntry {
+                file: "ghost/index.html".to_owned(),
+                revalidate: None,
+            },
+        );
+        let manifest = crate::static_gen::StaticManifest {
+            generated_at: "2026-05-29T00:00:00Z".to_owned(),
+            autumn_version: "0.4.0".to_owned(),
+            routes,
+        };
+        let json = serde_json::to_string(&manifest).expect("serialize manifest");
+        std::fs::write(dist.join("manifest.json"), json).expect("write manifest");
+
+        let config = AutumnConfig::default();
+
+        temp_env::async_with_vars(
+            [
+                ("AUTUMN_DEV_RELOAD", None::<&str>),
+                ("AUTUMN_DEV_RELOAD_STATE", None::<&str>),
+            ],
+            async move {
+                let router =
+                    try_build_router_with_static(Vec::new(), &config, test_state(), Some(&dist))
+                        .expect("router builds");
+
+                let response = router
+                    .oneshot(
+                        Request::builder()
+                            .uri("/ghost")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+
+                // Should fall through to dynamic router, not error.
+                assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            },
+        )
+        .await;
+    }
 }
 
 #[cfg(test)]
