@@ -2943,19 +2943,16 @@ async fn execute_task_result_with_optional_lease_ttl(
         execute_task_result(state, handler, start, name, schedule),
     )
     .await
-    .map_or_else(
-        |_| {
-            let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-            Err((
-                duration_ms,
-                format!(
-                    "scheduled task exceeded lease TTL of {}s",
-                    lease_ttl.as_secs()
-                ),
-            ))
-        },
-        std::convert::identity,
-    )
+    .unwrap_or_else(|_| {
+        let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        Err((
+            duration_ms,
+            format!(
+                "scheduled task exceeded lease TTL of {}s",
+                lease_ttl.as_secs()
+            ),
+        ))
+    })
 }
 
 /// Handle the execution of a single fixed-delay task.
