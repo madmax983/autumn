@@ -40,15 +40,15 @@ mod traits;
 
 pub use registry::AdminRegistry;
 pub use traits::{
-    AdminAction, AdminError, AdminField, AdminFieldKind, AdminFuture, AdminModel, ListParams,
-    ListResult, SelectOption, SortDirection,
+    AdminAction, AdminError, AdminField, AdminFieldKind, AdminFuture, AdminHistoryEntry,
+    AdminHistoryPage, AdminModel, ListParams, ListResult, SelectOption, SortDirection,
 };
 
 /// Common downstream imports for implementing admin models.
 pub mod prelude {
     pub use crate::{
-        AdminError, AdminField, AdminFieldKind, AdminFuture, AdminModel, ListParams, ListResult,
-        SelectOption, SortDirection,
+        AdminError, AdminField, AdminFieldKind, AdminFuture, AdminHistoryEntry, AdminHistoryPage,
+        AdminModel, ListParams, ListResult, SelectOption, SortDirection,
     };
 }
 
@@ -207,6 +207,7 @@ pub(crate) fn admin_route_infos(prefix: &str) -> Vec<RouteInfo> {
         ("POST", format!("{prefix}/{{slug}}/{{id}}")),
         ("DELETE", format!("{prefix}/{{slug}}/{{id}}")),
         ("GET", format!("{prefix}/{{slug}}/{{id}}/edit")),
+        ("GET", format!("{prefix}/{{slug}}/{{id}}/history")),
         ("POST", format!("{prefix}/{{slug}}/actions")),
         ("GET", format!("{prefix}{}", &*routes::ADMIN_JS_PATH)),
     ]

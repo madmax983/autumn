@@ -1,4 +1,5 @@
 use autumn_admin_plugin::prelude::*;
+use autumn_admin_plugin::{AdminHistoryEntry, AdminHistoryPage};
 use diesel::OptionalExtension;
 use diesel::prelude::*;
 use diesel_async::AsyncPgConnection;
@@ -243,6 +244,65 @@ impl AdminModel for PostAdmin {
                 return Err(AdminError::NotFound);
             }
             Ok(())
+        })
+    }
+
+    // ── Version history (issue #700) ─────────────────────────────────
+
+    /// Posts opt into the History pane in the admin panel.
+    ///
+    /// In an application that uses `#[repository(Post, versioned = true)]`,
+    /// this returns `true` automatically (the macro generates the override).
+    /// This example wires it manually to demonstrate the History pane UI.
+    fn has_history(&self) -> bool {
+        true
+    }
+
+    /// Return paginated version history entries for a post.
+    ///
+    /// In production this queries `_autumn_version_history` via the
+    /// generated `PgPostRepository::version_history(id, filter)` method.
+    /// This example returns stub data so the History pane is visible in the
+    /// blog's admin UI without requiring a live database.
+    fn get_history<'a>(
+        &'a self,
+        _pool: &'a Pool<AsyncPgConnection>,
+        record_id: i64,
+        page: u64,
+        per_page: u64,
+    ) -> AdminFuture<'a, AdminHistoryPage> {
+        Box::pin(async move {
+            let entries = vec![
+                AdminHistoryEntry {
+                    id: 1,
+                    actor: "admin".to_owned(),
+                    op: "insert".to_owned(),
+                    request_id: Some("req-example-1".to_owned()),
+                    changes: vec![
+                        serde_json::json!({"column": "title", "before": null, "after": "Hello World", "sensitive": false}),
+                        serde_json::json!({"column": "published", "before": null, "after": false, "sensitive": false}),
+                    ],
+                    recorded_at: chrono::Utc::now() - chrono::Duration::hours(2),
+                },
+                AdminHistoryEntry {
+                    id: 2,
+                    actor: "admin".to_owned(),
+                    op: "update".to_owned(),
+                    request_id: Some("req-example-2".to_owned()),
+                    changes: vec![
+                        serde_json::json!({"column": "published", "before": false, "after": true, "sensitive": false}),
+                    ],
+                    recorded_at: chrono::Utc::now() - chrono::Duration::hours(1),
+                },
+            ];
+            let total = entries.len() as u64;
+            let _ = record_id;
+            Ok(AdminHistoryPage {
+                entries,
+                total,
+                page,
+                per_page,
+            })
         })
     }
 }
