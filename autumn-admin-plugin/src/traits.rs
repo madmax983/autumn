@@ -3,6 +3,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -159,6 +160,51 @@ pub enum ActionStyle {
 }
 
 // ── The core trait ──────────────────────────────────────────────────
+
+// -- Version history ---------------------------------------------------------
+
+/// A single entry in the admin History pane for an opted-in model.
+#[derive(Debug, Clone)]
+pub struct AdminHistoryEntry {
+    /// Auto-incrementing primary key in the history table.
+    pub id: i64,
+    /// Actor identifier (`user_id` or `"system"`).
+    pub actor: String,
+    /// Operation: `"insert"`, `"update"`, or `"delete"`.
+    pub op: String,
+    /// Request / trace correlation ID.
+    pub request_id: Option<String>,
+    /// Column-level changes, serialized as JSON for template rendering.
+    pub changes: Vec<Value>,
+    /// When this entry was recorded.
+    pub recorded_at: DateTime<Utc>,
+}
+
+/// Paginated history result for the admin History pane.
+#[derive(Debug, Clone)]
+pub struct AdminHistoryPage {
+    pub entries: Vec<AdminHistoryEntry>,
+    pub total: u64,
+    pub page: u64,
+    pub per_page: u64,
+}
+
+impl AdminHistoryPage {
+    /// Total number of pages.
+    #[must_use]
+    pub const fn total_pages(&self) -> u64 {
+        if self.per_page == 0 {
+            return 0;
+        }
+        self.total.div_ceil(self.per_page)
+    }
+
+    /// Whether there is a next page.
+    #[must_use]
+    pub const fn has_next_page(&self) -> bool {
+        self.page < self.total_pages()
+    }
+}
 
 /// Type alias for the boxed future returned by async `AdminModel` methods.
 pub type AdminFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, AdminError>> + Send + 'a>>;
@@ -414,6 +460,32 @@ pub trait AdminModel: Send + Sync + 'static {
         };
         let fut = self.list(pool, params);
         Box::pin(async move { fut.await.map(|r| r.total) })
+    }
+
+    /// Whether this model has automatic record version history enabled.
+    ///
+    /// When `true`, the admin panel renders a **History** affordance on the
+    /// detail page and serves `/{slug}/{id}/history`.
+    fn has_history(&self) -> bool {
+        false
+    }
+
+    /// Retrieve a paginated page of version history entries for a record.
+    ///
+    /// The default implementation returns [`AdminError::Other`] so models
+    /// that do not opt in get a clear error instead of a silent no-op.
+    fn get_history<'a>(
+        &'a self,
+        _pool: &'a diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+        _record_id: i64,
+        _page: u64,
+        _per_page: u64,
+    ) -> AdminFuture<'a, AdminHistoryPage> {
+        Box::pin(async move {
+            Err(AdminError::Other(
+                "this model does not have version history enabled".to_owned(),
+            ))
+        })
     }
 }
 
