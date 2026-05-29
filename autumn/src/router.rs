@@ -1434,6 +1434,41 @@ pub fn try_build_router_with_static(
     )
 }
 
+/// Middleware helper: try to serve `req` from the static file layer; fall
+/// through to the next handler if the path is not in the manifest.
+async fn serve_static_or_fallthrough(
+    layer: Arc<crate::static_gen::StaticFileLayer>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> http::Response<axum::body::Body> {
+    let is_get = req.method() == http::Method::GET;
+    let is_head = req.method() == http::Method::HEAD;
+    if is_get || is_head {
+        let path = req.uri().path();
+        // Normalize trailing slash: /about/ → /about (but keep / as /)
+        let normalized = if path.len() > 1 && path.ends_with('/') {
+            &path[..path.len() - 1]
+        } else {
+            path
+        };
+        if let Some(file_path) = layer.resolve(normalized)
+            && let Ok(contents) = tokio::fs::read(&file_path).await
+        {
+            let body = if is_head {
+                axum::body::Body::empty()
+            } else {
+                axum::body::Body::from(contents)
+            };
+            return http::Response::builder()
+                .status(http::StatusCode::OK)
+                .header(http::header::CONTENT_TYPE, "text/html; charset=utf-8")
+                .body(body)
+                .expect("infallible response builder");
+        }
+    }
+    next.run(req).await
+}
+
 pub fn try_build_router_with_static_inner(
     route_list: Vec<Route>,
     config: &AutumnConfig,
@@ -1452,24 +1487,9 @@ pub fn try_build_router_with_static_inner(
         ));
     };
 
-    let Some(layer) = crate::static_gen::StaticFileLayer::new(dist) else {
-        tracing::debug!(
-            dist = %dist.display(),
-            "No valid manifest.json in dist dir; skipping static file layer"
-        );
-        let app_router = try_build_router_inner(route_list, config, state, ctx)?;
-        return Ok(apply_startup_barrier(
-            app_router,
-            config,
-            &startup_barrier_state,
-        ));
-    };
-
-    // In dev mode (autumn dev / AUTUMN_DEV_RELOAD active) do NOT mount the
-    // static-first middleware so that app routes always take priority over
-    // pre-rendered HTML in dist/. This prevents stale exports from shadowing
-    // handlers whose templates have just been edited — the exact DX trap
-    // described in issue #754. Normal /static/* assets are unaffected.
+    // In dev mode, skip static export HTML entirely (issue #754): app routes
+    // must take priority so edits are visible immediately. Check before
+    // StaticFileLayer::new() to skip the manifest.json read entirely.
     if crate::middleware::dev::is_enabled() {
         tracing::warn!(
             dist = %dist.display(),
@@ -1484,6 +1504,19 @@ pub fn try_build_router_with_static_inner(
             &startup_barrier_state,
         ));
     }
+
+    let Some(layer) = crate::static_gen::StaticFileLayer::new(dist) else {
+        tracing::debug!(
+            dist = %dist.display(),
+            "No valid manifest.json in dist dir; skipping static file layer"
+        );
+        let app_router = try_build_router_inner(route_list, config, state, ctx)?;
+        return Ok(apply_startup_barrier(
+            app_router,
+            config,
+            &startup_barrier_state,
+        ));
+    };
 
     for (route, entry) in &layer.manifest().routes {
         tracing::debug!(
@@ -1530,47 +1563,12 @@ pub fn try_build_router_with_static_inner(
 
     // Static-first serving: intercept GET/HEAD requests whose path appears
     // in the manifest and serve pre-built HTML directly — BEFORE the dynamic
-    // router (and session layer) runs. This preserves availability of static
-    // pages even when the session backend is unavailable.
-    //
-    // Requests not in the manifest (including non-GET/HEAD methods) fall
-    // through to the dynamic router unchanged.
-    //
-    // ISR staleness checking happens inside `resolve()`: stale pages are
-    // still served immediately while background regeneration runs
-    // (stale-while-revalidate).
-    let static_layer = layer;
+    // router (and session layer) runs. Requests not in the manifest fall
+    // through. ISR staleness is checked inside `resolve()` (stale-while-
+    // revalidate).
     let mut router: axum::Router<AppState> = inner_router.layer(axum::middleware::from_fn(
         move |req: axum::extract::Request, next: axum::middleware::Next| {
-            let static_layer = static_layer.clone();
-            async move {
-                let is_get = req.method() == http::Method::GET;
-                let is_head = req.method() == http::Method::HEAD;
-                if is_get || is_head {
-                    let path = req.uri().path();
-                    // Normalize trailing slash: /about/ → /about (but keep / as /)
-                    let normalized = if path.len() > 1 && path.ends_with('/') {
-                        &path[..path.len() - 1]
-                    } else {
-                        path
-                    };
-                    if let Some(file_path) = static_layer.resolve(normalized)
-                        && let Ok(contents) = tokio::fs::read(&file_path).await
-                    {
-                        let body = if is_head {
-                            axum::body::Body::empty()
-                        } else {
-                            axum::body::Body::from(contents)
-                        };
-                        return http::Response::builder()
-                            .status(http::StatusCode::OK)
-                            .header(http::header::CONTENT_TYPE, "text/html; charset=utf-8")
-                            .body(body)
-                            .expect("infallible response builder");
-                    }
-                }
-                next.run(req).await
-            }
+            serve_static_or_fallthrough(layer.clone(), req, next)
         },
     ));
 
