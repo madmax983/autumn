@@ -631,16 +631,30 @@ fn edit_value_expr(field: &Field) -> String {
     }
 }
 
+/// Render the `matches!` pattern for nullable fields.
+///
+/// ⚡ Bolt optimization: Replaced intermediate `Vec` allocations and separate `String`
+/// allocations with a single, mutable `String` buffer that is built up sequentially using `push_str`.
 fn render_nullable_field_match(fields: &[Field]) -> String {
-    let names = fields
-        .iter()
-        .filter(|field| field.nullable)
-        .map(|field| format!("\"{}\"", field.name))
-        .collect::<Vec<_>>();
-    if names.is_empty() {
+    let mut nullable_count = 0;
+    let mut names = String::new();
+
+    for field in fields {
+        if field.nullable {
+            if nullable_count > 0 {
+                names.push_str(" | ");
+            }
+            names.push('"');
+            names.push_str(&field.name);
+            names.push('"');
+            nullable_count += 1;
+        }
+    }
+
+    if nullable_count == 0 {
         "false".to_owned()
     } else {
-        format!("matches!(name, {})", names.join(" | "))
+        format!("matches!(name, {names})")
     }
 }
 
