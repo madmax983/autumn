@@ -422,6 +422,28 @@ pub trait VersionedRecord: Send + Sync + 'static {
     }
 }
 
+/// Extract a tenant ID from supported generated model field shapes.
+///
+/// Generated tenant-scoped `VersionedRecord` impls use this so both
+/// `tenant_id: String` and `tenant_id: Option<String>` models can opt into
+/// version history.
+#[doc(hidden)]
+pub trait VersionTenantIdValue {
+    fn version_tenant_id(&self) -> Option<&str>;
+}
+
+impl VersionTenantIdValue for String {
+    fn version_tenant_id(&self) -> Option<&str> {
+        Some(self.as_str())
+    }
+}
+
+impl VersionTenantIdValue for Option<String> {
+    fn version_tenant_id(&self) -> Option<&str> {
+        self.as_deref()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -889,6 +911,28 @@ mod tests {
         };
 
         assert_eq!(record.version_tenant_id(), Some("tenant-a"));
+    }
+
+    #[test]
+    fn version_tenant_id_value_supports_required_tenant_id() {
+        let tenant_id = "tenant-a".to_owned();
+
+        assert_eq!(
+            VersionTenantIdValue::version_tenant_id(&tenant_id),
+            Some("tenant-a")
+        );
+    }
+
+    #[test]
+    fn version_tenant_id_value_supports_optional_tenant_id() {
+        let tenant_id = Some("tenant-a".to_owned());
+        let missing: Option<String> = None;
+
+        assert_eq!(
+            VersionTenantIdValue::version_tenant_id(&tenant_id),
+            Some("tenant-a")
+        );
+        assert_eq!(VersionTenantIdValue::version_tenant_id(&missing), None);
     }
 
     // ── Immutability / append-only guarantee ────────────────────────
