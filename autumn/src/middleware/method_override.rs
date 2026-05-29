@@ -396,29 +396,41 @@ fn origin_matches_request(origin: &str, headers: &http::HeaderMap) -> bool {
         return false;
     };
 
-    let expected_host = headers
-        .get("x-forwarded-host")
-        .and_then(|v| v.to_str().ok())
-        .or_else(|| {
-            headers
-                .get(http::header::HOST)
-                .and_then(|v| v.to_str().ok())
-        });
+    let x_forwarded_hosts = headers
+        .get_all("x-forwarded-host")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let expected_host = if x_forwarded_hosts.is_empty() {
+        headers
+            .get(http::header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .map(ToOwned::to_owned)
+    } else {
+        x_forwarded_hosts.rsplit(',').next().map(str::trim).map(ToOwned::to_owned)
+    };
+
     let Some(expected_host) = expected_host else {
         return false;
     };
-    if !origin_authority.eq_ignore_ascii_case(expected_host) {
+    if !origin_authority.eq_ignore_ascii_case(&expected_host) {
         return false;
     }
 
-    if let Some(scheme) = headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-    {
+    let x_forwarded_protos = headers
+        .get_all("x-forwarded-proto")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect::<Vec<_>>()
+        .join(",");
+
+    if !x_forwarded_protos.is_empty() {
         // Multiple `X-Forwarded-Proto` values can be chained by
         // intermediaries; the leftmost (client-facing) is the one
         // that matters here.
-        let outermost = scheme.split(',').next().unwrap_or(scheme).trim();
+        let outermost = x_forwarded_protos.split(',').next().unwrap_or(x_forwarded_protos.as_str()).trim();
         return outermost.eq_ignore_ascii_case(origin_scheme);
     }
 

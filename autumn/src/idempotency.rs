@@ -464,10 +464,14 @@ impl IdempotencyStore for MemoryIdempotencyStore {
     }
 
     fn set(&self, key: &str, record: IdempotencyRecord, body_hash: Vec<u8>, ttl: Duration) {
+        let expires_at = Instant::now().checked_add(ttl).unwrap_or_else(|| {
+            // If the duration is so large it overflows, cap it to the maximum possible Instant.
+            Instant::now() + Duration::from_secs(60 * 60 * 24 * 365 * 100) // approx 100 years
+        });
         let entry = IdempotencyEntry {
             record,
             body_hash,
-            expires_at: Instant::now() + ttl,
+            expires_at,
         };
         let mut entries = self.entries.write().unwrap();
         entries.insert(key.to_owned(), entry);
@@ -500,11 +504,14 @@ impl IdempotencyStore for MemoryIdempotencyStore {
         } else {
             lock_ttl
         };
+        let expires_at = now.checked_add(ttl).unwrap_or_else(|| {
+            now + Duration::from_secs(60 * 60 * 24 * 365 * 100)
+        });
         in_flight.insert(
             key.to_owned(),
             MemoryInFlightLock {
                 owner: owner.to_owned(),
-                expires_at: now + ttl,
+                expires_at,
             },
         );
         true
