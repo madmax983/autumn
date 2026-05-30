@@ -876,7 +876,9 @@ async fn config_list(
     csrf: AdminCsrf,
     flash: Flash,
 ) -> AutumnResult<Response> {
-    let entries = svc.list();
+    let entries = svc
+        .list()
+        .map_err(|e| AutumnError::internal_server_error_msg(format!("Runtime config: {e}")))?;
     let messages = flash.consume().await;
     Ok(render(templates::config_page(
         &registry,
@@ -942,7 +944,9 @@ async fn config_key_history(
     csrf: AdminCsrf,
     flash: Flash,
 ) -> AutumnResult<Response> {
-    let history = svc.history(&key, 50);
+    let history = svc
+        .history(&key, 50)
+        .map_err(|e| AutumnError::internal_server_error_msg(format!("Runtime config: {e}")))?;
     let messages = flash.consume().await;
     Ok(render(templates::config_history_page(
         &registry,

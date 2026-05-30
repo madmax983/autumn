@@ -287,7 +287,11 @@ pub enum ConfigValidator {
     },
     /// Whitelist of allowed string values (case-sensitive).
     AllowedValues(Vec<String>),
-    /// POSIX-compatible regex pattern that the text value must fully match.
+    /// Minimal full-string pattern for text values.
+    ///
+    /// Supports `^`, `$`, `.`, `*`, `+`, `?`, character classes such as
+    /// `[a-z]`/`[^0-9]`, and literal characters. It does not implement full
+    /// POSIX or PCRE syntax such as alternation groups or counted repeats.
     Regex(String),
 }
 
@@ -770,7 +774,11 @@ pub enum ConfigStoreError {
 /// store method is called.
 pub trait ConfigStore: Send + Sync + 'static {
     /// Return the stored raw string for `key`, or `None` if unset.
-    fn get_raw(&self, key: &str) -> Option<String>;
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ConfigStoreError`] on backend failure.
+    fn get_raw(&self, key: &str) -> Result<Option<String>, ConfigStoreError>;
 
     /// Persist a new raw string value for `key`.
     ///
@@ -800,10 +808,19 @@ pub trait ConfigStore: Send + Sync + 'static {
     ) -> Result<(), ConfigStoreError>;
 
     /// Return all keys that have an active override (i.e. not using the default).
-    fn list_overrides(&self) -> Vec<(String, String)>;
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ConfigStoreError`] on backend failure.
+    fn list_overrides(&self) -> Result<Vec<(String, String)>, ConfigStoreError>;
 
     /// Return the most recent `limit` change records for `key`.
-    fn history(&self, key: &str, limit: usize) -> Vec<ConfigChangeRecord>;
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ConfigStoreError`] on backend failure.
+    fn history(&self, key: &str, limit: usize)
+    -> Result<Vec<ConfigChangeRecord>, ConfigStoreError>;
 }
 
 // ── InMemoryConfigStore ───────────────────────────────────────────────────
@@ -827,8 +844,8 @@ impl InMemoryConfigStore {
 }
 
 impl ConfigStore for InMemoryConfigStore {
-    fn get_raw(&self, key: &str) -> Option<String> {
-        self.values.read().unwrap().get(key).cloned()
+    fn get_raw(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
+        Ok(self.values.read().unwrap().get(key).cloned())
     }
 
     fn set_raw(
@@ -869,7 +886,7 @@ impl ConfigStore for InMemoryConfigStore {
         Ok(())
     }
 
-    fn list_overrides(&self) -> Vec<(String, String)> {
+    fn list_overrides(&self) -> Result<Vec<(String, String)>, ConfigStoreError> {
         let mut pairs: Vec<(String, String)> = self
             .values
             .read()
@@ -878,15 +895,19 @@ impl ConfigStore for InMemoryConfigStore {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         pairs.sort_by(|a, b| a.0.cmp(&b.0));
-        pairs
+        Ok(pairs)
     }
 
-    fn history(&self, key: &str, limit: usize) -> Vec<ConfigChangeRecord> {
+    fn history(
+        &self,
+        key: &str,
+        limit: usize,
+    ) -> Result<Vec<ConfigChangeRecord>, ConfigStoreError> {
         let guard = self.history.read().unwrap();
-        guard
+        Ok(guard
             .get(key)
             .map(|records| records.iter().rev().take(limit).cloned().collect())
-            .unwrap_or_default()
+            .unwrap_or_default())
     }
 }
 
@@ -965,7 +986,7 @@ impl RuntimeConfigService {
             .get(key)
             .ok_or_else(|| ConfigError::UnknownKey(key.to_owned()))?;
 
-        self.store.get_raw(key).map_or_else(
+        self.store.get_raw(key)?.map_or_else(
             || Ok(schema.default.clone()),
             |raw| {
                 ConfigValue::parse_as(&raw, schema.value_type).map_err(|reason| {
@@ -1008,7 +1029,7 @@ impl RuntimeConfigService {
                 reason,
             })?;
 
-        let old_raw = self.store.get_raw(key);
+        let old_raw = self.store.get_raw(key)?;
         self.store.set_raw(key, old_raw, typed.to_raw(), actor)?;
         Ok(())
     }
@@ -1023,7 +1044,7 @@ impl RuntimeConfigService {
         self.registry
             .get(key)
             .ok_or_else(|| ConfigError::UnknownKey(key.to_owned()))?;
-        let old_raw = self.store.get_raw(key);
+        let old_raw = self.store.get_raw(key)?;
         self.store.unset_raw(key, old_raw, actor)?;
         Ok(())
     }
@@ -1032,43 +1053,46 @@ impl RuntimeConfigService {
     ///
     /// Keys are sorted alphabetically. Keys with no stored override show the
     /// schema default as `current`.
-    #[must_use]
-    pub fn list(&self) -> Vec<ConfigEntry> {
-        let overrides: HashMap<String, String> = self.store.list_overrides().into_iter().collect();
+    pub fn list(&self) -> Result<Vec<ConfigEntry>, ConfigError> {
+        let overrides: HashMap<String, String> = self.store.list_overrides()?.into_iter().collect();
 
-        let mut entries: Vec<ConfigEntry> = self
-            .registry
-            .iter()
-            .map(|schema| {
-                let (current, is_overridden) = overrides.get(&schema.name).map_or_else(
-                    || (schema.default.clone(), false),
-                    |raw| {
-                        let parsed = ConfigValue::parse_as(raw, schema.value_type)
-                            .unwrap_or_else(|_| schema.default.clone());
-                        (parsed, true)
-                    },
-                );
-                ConfigEntry {
-                    name: schema.name.clone(),
-                    value_type: schema.value_type,
-                    current,
-                    default: schema.default.clone(),
-                    is_overridden,
-                    description: schema.description.clone(),
-                }
-            })
-            .collect();
+        let mut entries = Vec::new();
+        for schema in self.registry.iter() {
+            let (current, is_overridden) = if let Some(raw) = overrides.get(&schema.name) {
+                let parsed = ConfigValue::parse_as(raw, schema.value_type).map_err(|reason| {
+                    ConfigError::TypeMismatch {
+                        key: schema.name.clone(),
+                        reason,
+                    }
+                })?;
+                (parsed, true)
+            } else {
+                (schema.default.clone(), false)
+            };
+
+            entries.push(ConfigEntry {
+                name: schema.name.clone(),
+                value_type: schema.value_type,
+                current,
+                default: schema.default.clone(),
+                is_overridden,
+                description: schema.description.clone(),
+            });
+        }
 
         entries.sort_by(|a, b| a.name.cmp(&b.name));
-        entries
+        Ok(entries)
     }
 
     /// Return the most recent `limit` change records for `key`.
     ///
     /// Returns an empty vec for unknown keys (no error, just no history).
-    #[must_use]
-    pub fn history(&self, key: &str, limit: usize) -> Vec<ConfigChangeRecord> {
-        self.store.history(key, limit)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Store`] on backend failure.
+    pub fn history(&self, key: &str, limit: usize) -> Result<Vec<ConfigChangeRecord>, ConfigError> {
+        Ok(self.store.history(key, limit)?)
     }
 }
 
@@ -1124,6 +1148,46 @@ mod tests {
         let registry = Arc::new(make_registry());
         let store = Arc::new(InMemoryConfigStore::new());
         RuntimeConfigService::new(registry, store)
+    }
+
+    #[derive(Debug, Default)]
+    struct FailingReadStore;
+
+    impl ConfigStore for FailingReadStore {
+        fn get_raw(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
+            Err(ConfigStoreError::Backend("read failed".to_owned()))
+        }
+
+        fn set_raw(
+            &self,
+            _key: &str,
+            _old_raw: Option<String>,
+            _new_raw: String,
+            _actor: Option<&str>,
+        ) -> Result<(), ConfigStoreError> {
+            Ok(())
+        }
+
+        fn unset_raw(
+            &self,
+            _key: &str,
+            _old_raw: Option<String>,
+            _actor: Option<&str>,
+        ) -> Result<(), ConfigStoreError> {
+            Ok(())
+        }
+
+        fn list_overrides(&self) -> Result<Vec<(String, String)>, ConfigStoreError> {
+            Err(ConfigStoreError::Backend("list failed".to_owned()))
+        }
+
+        fn history(
+            &self,
+            _key: &str,
+            _limit: usize,
+        ) -> Result<Vec<ConfigChangeRecord>, ConfigStoreError> {
+            Err(ConfigStoreError::Backend("history failed".to_owned()))
+        }
     }
 
     // ── ConfigValueType ────────────────────────────────────────────────────
@@ -1621,14 +1685,14 @@ mod tests {
     #[test]
     fn in_memory_store_get_raw_returns_none_when_unset() {
         let store = InMemoryConfigStore::new();
-        assert!(store.get_raw("anything").is_none());
+        assert!(store.get_raw("anything").unwrap().is_none());
     }
 
     #[test]
     fn in_memory_store_set_and_get_raw_roundtrip() {
         let store = InMemoryConfigStore::new();
         store.set_raw("key", None, "42".to_owned(), None).unwrap();
-        assert_eq!(store.get_raw("key").as_deref(), Some("42"));
+        assert_eq!(store.get_raw("key").unwrap().as_deref(), Some("42"));
     }
 
     #[test]
@@ -1640,7 +1704,7 @@ mod tests {
         store
             .unset_raw("key", Some("hello".to_owned()), None)
             .unwrap();
-        assert!(store.get_raw("key").is_none());
+        assert!(store.get_raw("key").unwrap().is_none());
     }
 
     #[test]
@@ -1648,7 +1712,7 @@ mod tests {
         let store = InMemoryConfigStore::new();
         store.set_raw("zzz", None, "1".to_owned(), None).unwrap();
         store.set_raw("aaa", None, "2".to_owned(), None).unwrap();
-        let pairs = store.list_overrides();
+        let pairs = store.list_overrides().unwrap();
         assert_eq!(pairs.len(), 2);
         assert_eq!(pairs[0].0, "aaa");
         assert_eq!(pairs[1].0, "zzz");
@@ -1663,7 +1727,7 @@ mod tests {
         store
             .set_raw("key", Some("10".to_owned()), "20".to_owned(), Some("bob"))
             .unwrap();
-        let history = store.history("key", 10);
+        let history = store.history("key", 10).unwrap();
         assert_eq!(history.len(), 2);
         assert_eq!(history[0].actor.as_deref(), Some("bob"));
         assert_eq!(history[1].actor.as_deref(), Some("alice"));
@@ -1677,14 +1741,14 @@ mod tests {
                 .set_raw("key", Some(i.to_string()), (i + 1).to_string(), None)
                 .unwrap();
         }
-        let history = store.history("key", 3);
+        let history = store.history("key", 3).unwrap();
         assert_eq!(history.len(), 3);
     }
 
     #[test]
     fn in_memory_store_history_empty_for_unknown_key() {
         let store = InMemoryConfigStore::new();
-        let history = store.history("nonexistent", 10);
+        let history = store.history("nonexistent", 10).unwrap();
         assert!(history.is_empty());
     }
 
@@ -1774,7 +1838,7 @@ mod tests {
     #[test]
     fn service_list_returns_all_keys_sorted() {
         let svc = make_svc();
-        let entries = svc.list();
+        let entries = svc.list().unwrap();
         assert_eq!(entries.len(), 6);
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         let mut sorted = names.clone();
@@ -1786,16 +1850,78 @@ mod tests {
     fn service_list_marks_overridden_keys() {
         let svc = make_svc();
         svc.set("max_upload_mb", "100", None).unwrap();
-        let entries = svc.list();
+        let entries = svc.list().unwrap();
         let entry = entries.iter().find(|e| e.name == "max_upload_mb").unwrap();
         assert!(entry.is_overridden);
         assert_eq!(entry.current, ConfigValue::Int(100));
     }
 
     #[test]
+    fn service_list_returns_type_mismatch_for_invalid_override() {
+        let registry = Arc::new(make_registry());
+        let store = Arc::new(InMemoryConfigStore::new());
+        store
+            .set_raw("maintenance_mode", None, "flase".to_owned(), Some("cli"))
+            .unwrap();
+        let svc = RuntimeConfigService::new(registry, store);
+
+        let err = svc.list().unwrap_err();
+
+        assert!(
+            matches!(err, ConfigError::TypeMismatch { ref key, .. } if key == "maintenance_mode"),
+            "expected TypeMismatch for maintenance_mode, got {err}"
+        );
+    }
+
+    #[test]
+    fn service_get_returns_store_error_for_failed_read() {
+        let svc = RuntimeConfigService::new(Arc::new(make_registry()), Arc::new(FailingReadStore));
+
+        let err = svc.get("max_upload_mb").unwrap_err();
+
+        assert!(matches!(err, ConfigError::Store(_)), "got {err}");
+    }
+
+    #[test]
+    fn service_list_returns_store_error_for_failed_read() {
+        let svc = RuntimeConfigService::new(Arc::new(make_registry()), Arc::new(FailingReadStore));
+
+        let err = svc.list().unwrap_err();
+
+        assert!(matches!(err, ConfigError::Store(_)), "got {err}");
+    }
+
+    #[test]
+    fn service_set_returns_store_error_when_old_value_read_fails() {
+        let svc = RuntimeConfigService::new(Arc::new(make_registry()), Arc::new(FailingReadStore));
+
+        let err = svc.set("max_upload_mb", "100", Some("ops")).unwrap_err();
+
+        assert!(matches!(err, ConfigError::Store(_)), "got {err}");
+    }
+
+    #[test]
+    fn service_unset_returns_store_error_when_old_value_read_fails() {
+        let svc = RuntimeConfigService::new(Arc::new(make_registry()), Arc::new(FailingReadStore));
+
+        let err = svc.unset("max_upload_mb", Some("ops")).unwrap_err();
+
+        assert!(matches!(err, ConfigError::Store(_)), "got {err}");
+    }
+
+    #[test]
+    fn service_history_returns_store_error_for_failed_read() {
+        let svc = RuntimeConfigService::new(Arc::new(make_registry()), Arc::new(FailingReadStore));
+
+        let err = svc.history("max_upload_mb", 10).unwrap_err();
+
+        assert!(matches!(err, ConfigError::Store(_)), "got {err}");
+    }
+
+    #[test]
     fn service_list_does_not_mark_unset_keys_as_overridden() {
         let svc = make_svc();
-        let entries = svc.list();
+        let entries = svc.list().unwrap();
         for entry in &entries {
             assert!(
                 !entry.is_overridden,
@@ -1810,7 +1936,7 @@ mod tests {
         let svc = make_svc();
         svc.set("max_upload_mb", "100", Some("alice")).unwrap();
         svc.set("max_upload_mb", "200", Some("bob")).unwrap();
-        let history = svc.history("max_upload_mb", 10);
+        let history = svc.history("max_upload_mb", 10).unwrap();
         assert_eq!(history.len(), 2);
         assert_eq!(history[0].actor.as_deref(), Some("bob"));
         assert_eq!(history[1].actor.as_deref(), Some("alice"));
@@ -1819,7 +1945,7 @@ mod tests {
     #[test]
     fn service_history_returns_empty_for_unknown_key() {
         let svc = make_svc();
-        let history = svc.history("nonexistent", 10);
+        let history = svc.history("nonexistent", 10).unwrap();
         assert!(history.is_empty());
     }
 
