@@ -853,6 +853,29 @@ mod tests {
     use super::*;
     use axum::http::StatusCode;
 
+    #[test]
+    fn string_error_display() {
+        let err = StringError("test error message".to_string());
+        assert_eq!(err.to_string(), "test error message");
+    }
+
+    #[test]
+    fn autumn_error_display() {
+        let inner = StringError("inner error message".to_string());
+        let err = AutumnError::internal_server_error(inner);
+        assert_eq!(err.to_string(), "inner error message");
+    }
+
+    #[test]
+    fn autumn_error_debug() {
+        let inner = StringError("inner error message".to_string());
+        let err = AutumnError::internal_server_error(inner);
+        let debug_str = format!("{:?}", err);
+        assert!(debug_str.contains("AutumnError"));
+        assert!(debug_str.contains("status: 500"));
+        assert!(debug_str.contains("inner error message"));
+    }
+
     #[derive(Debug)]
     struct TestError(String);
 
