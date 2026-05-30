@@ -13,6 +13,8 @@
   // Cancel htmx requests from active-search or autocomplete inputs when the
   // typed value is non-empty but shorter than data-ac-min-length.
   // Empty inputs are NOT cancelled so the server can clear stale results.
+  // When a below-minimum request is cancelled, also clear the results container
+  // so results from a previous valid query don't remain visible.
   document.addEventListener('htmx:configRequest', function (e) {
     var elt = e.detail && e.detail.elt;
     if (!elt || !elt.dataset) return;
@@ -20,6 +22,13 @@
     var len = (elt.value || '').length;
     if (minLen > 0 && len > 0 && len < minLen) {
       e.preventDefault();
+      // Clear the htmx target so stale results from a previous valid query
+      // don't remain visible while the input is below the minimum length.
+      var targetSel = elt.getAttribute('hx-target');
+      if (targetSel) {
+        var target = document.querySelector(targetSel);
+        if (target) target.innerHTML = '';
+      }
     }
   });
 
@@ -37,6 +46,13 @@
     if (!queryInput || !valueId || !valueName || !listbox) return;
 
     function getHidden() { return document.getElementById(valueId); }
+
+    // Free-text mode: assign the name immediately so the field is always
+    // included in form submission even if the user never types in the input.
+    // This preserves any default value set on the hidden input in the HTML.
+    if (freeText) {
+      getHidden().name = valueName;
+    }
 
     function selectOption(opt) {
       var hidden = getHidden();
@@ -91,9 +107,14 @@
   }
 
   // Re-initialize after htmx swaps in new autocomplete widgets.
+  // Also check the swapped-in target itself in case it IS the wrapper
+  // (e.g. hx-swap="outerHTML" on the wrapper element).
   document.addEventListener('htmx:afterSwap', function (e) {
-    if (e.detail && e.detail.target) {
-      e.detail.target.querySelectorAll('[data-ac-value-id]').forEach(initAutocomplete);
+    if (!e.detail || !e.detail.target) return;
+    var t = e.detail.target;
+    if (t.dataset && t.dataset.acValueId) {
+      initAutocomplete(t);
     }
+    t.querySelectorAll('[data-ac-value-id]').forEach(initAutocomplete);
   });
 })();
