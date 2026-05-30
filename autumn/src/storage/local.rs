@@ -59,7 +59,8 @@ impl SigningKey {
         Self::new(bytes)
     }
 
-    fn as_bytes(&self) -> &[u8] {
+    /// Returns the raw key bytes.
+    pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
 }
@@ -548,7 +549,25 @@ pub fn verify_upload(
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    if expires_at < now {
+    verify_upload_with_now(signing_key, blob_key, content_type, expires_at, signature, now)
+}
+
+/// Clock-injectable variant of [`verify_upload`].
+///
+/// `now_unix` is the current Unix timestamp in seconds.
+///
+/// # Errors
+///
+/// Returns [`BlobStoreError::Signature`] for malformed, expired, or mismatched tokens.
+pub fn verify_upload_with_now(
+    signing_key: &[u8],
+    blob_key: &str,
+    content_type: &str,
+    expires_at: u64,
+    signature: &str,
+    now_unix: u64,
+) -> Result<(), BlobStoreError> {
+    if expires_at < now_unix {
         return Err(BlobStoreError::Signature("upload token expired".into()));
     }
     let expected = sign_upload(signing_key, blob_key, content_type, expires_at);
@@ -573,7 +592,20 @@ pub(crate) fn verify_upload_with_rotation(
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    if expires_at < now {
+    verify_upload_rotation_with_now(current, previous, blob_key, content_type, expires_at, signature, now)
+}
+
+/// Clock-injectable variant of [`verify_upload_with_rotation`].
+pub(crate) fn verify_upload_rotation_with_now(
+    current: &SigningKey,
+    previous: &[SigningKey],
+    blob_key: &str,
+    content_type: &str,
+    expires_at: u64,
+    signature: &str,
+    now_unix: u64,
+) -> Result<(), BlobStoreError> {
+    if expires_at < now_unix {
         return Err(BlobStoreError::Signature("upload token expired".into()));
     }
     let expected_current = sign_upload(current.as_bytes(), blob_key, content_type, expires_at);
@@ -654,14 +686,33 @@ pub fn verify(
     expires_at: u64,
     signature: &str,
 ) -> Result<(), BlobStoreError> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    verify_with_now(signing_key, blob_key, expires_at, signature, now)
+}
+
+/// Clock-injectable variant of [`verify`].
+///
+/// `now_unix` is the current Unix timestamp in seconds — obtain it via
+/// [`crate::time::clock_unix_secs`] when the framework clock is injected.
+///
+/// # Errors
+///
+/// Returns [`BlobStoreError::Signature`] for malformed, expired, or
+/// mismatched signatures.
+pub fn verify_with_now(
+    signing_key: &[u8],
+    blob_key: &str,
+    expires_at: u64,
+    signature: &str,
+    now_unix: u64,
+) -> Result<(), BlobStoreError> {
     let expected = sign(signing_key, blob_key, expires_at);
     if !constant_time_eq(expected.as_bytes(), signature.as_bytes()) {
         return Err(BlobStoreError::Signature("signature mismatch".into()));
     }
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
-    if expires_at < now {
+    if expires_at < now_unix {
         return Err(BlobStoreError::Signature("signed url expired".into()));
     }
     Ok(())

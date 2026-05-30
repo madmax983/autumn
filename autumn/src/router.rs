@@ -2112,6 +2112,7 @@ mod tests {
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
+            clock: std::sync::Arc::new(crate::time::SystemClock),
         }
     }
 

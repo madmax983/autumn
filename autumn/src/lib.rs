@@ -177,6 +177,7 @@ pub mod markdown;
 pub mod scheduler;
 pub mod security;
 pub mod session;
+pub mod time;
 #[cfg(feature = "redis")]
 pub(crate) mod session_redis;
 pub mod sse;

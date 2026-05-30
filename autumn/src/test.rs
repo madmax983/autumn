@@ -197,6 +197,11 @@ pub struct TestApp {
     exception_filters: Vec<std::sync::Arc<dyn crate::middleware::ExceptionFilter>>,
     registered_plugins: std::collections::HashSet<String>,
     extensions: std::collections::HashMap<std::any::TypeId, Box<dyn std::any::Any + Send>>,
+    /// Injected clock; `None` means use [`crate::time::SystemClock`].
+    clock: Option<std::sync::Arc<dyn crate::time::ClockSource>>,
+    /// Retained as `Arc<dyn Any>` so `TestClient::advance_clock` can downcast
+    /// to [`crate::time::TickingClock`] at runtime.
+    clock_as_any: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
 }
 
 type TestPolicyRegistration = Box<dyn FnOnce(&crate::authorization::PolicyRegistry) + Send>;
@@ -241,6 +246,8 @@ impl TestApp {
             exception_filters: Vec::new(),
             registered_plugins: std::collections::HashSet::new(),
             extensions: std::collections::HashMap::new(),
+            clock: None,
+            clock_as_any: None,
         }
     }
 
@@ -383,6 +390,7 @@ impl TestApp {
             probes: crate::probe::ProbeState::ready_for_test(),
             state,
             _job_runtime: None,
+            clock_as_any: None,
         }
     }
 
@@ -525,6 +533,43 @@ impl TestApp {
         self
     }
 
+    /// Inject a custom clock into the test app.
+    ///
+    /// All handlers that take a [`crate::time::Clock`] extractor will see time
+    /// as reported by `clock`. Use [`crate::time::FixedClock`] to pin time to
+    /// a known instant, or [`crate::time::TickingClock`] when you need to step
+    /// the clock forward between requests via
+    /// [`TestClient::advance_clock`].
+    ///
+    /// ```rust,no_run
+    /// use autumn_web::test::TestApp;
+    /// use autumn_web::time::{FixedClock, TickingClock};
+    /// use chrono::{TimeZone, Utc};
+    ///
+    /// // Pin to a fixed instant:
+    /// let _client = TestApp::new()
+    ///     .with_clock(FixedClock::at(Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap()))
+    ///     .build();
+    ///
+    /// // Step forward in time:
+    /// let clock = TickingClock::starting_at(Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap());
+    /// let client = TestApp::new()
+    ///     .with_clock(clock.clone())
+    ///     .build();
+    /// client.advance_clock(std::time::Duration::from_secs(3600));
+    /// ```
+    #[must_use]
+    pub fn with_clock<C>(mut self, clock: C) -> Self
+    where
+        C: crate::time::ClockSource + 'static,
+    {
+        let arc: std::sync::Arc<C> = std::sync::Arc::new(clock);
+        // Retain as dyn Any so TestClient::advance_clock can downcast to TickingClock.
+        self.clock_as_any = Some(arc.clone() as std::sync::Arc<dyn std::any::Any + Send + Sync>);
+        self.clock = Some(arc as std::sync::Arc<dyn crate::time::ClockSource>);
+        self
+    }
+
     /// Attach a database connection pool to the test app.
     #[cfg(feature = "db")]
     #[must_use]
@@ -628,6 +673,9 @@ impl TestApp {
                 .unwrap_or(self.config.security.forbidden_response),
             auth_session_key: self.config.auth.session_key.clone(),
             shared_cache: None,
+            clock: self.clock.unwrap_or_else(|| {
+                std::sync::Arc::new(crate::time::SystemClock)
+            }),
         };
 
         for register in self.policy_registrations {
@@ -725,6 +773,7 @@ impl TestApp {
             probes,
             state,
             _job_runtime: job_runtime,
+            clock_as_any: self.clock_as_any,
         }
     }
 }
@@ -771,6 +820,8 @@ pub struct TestClient {
     probes: crate::probe::ProbeState,
     pub(crate) state: AppState,
     _job_runtime: Option<TestJobRuntime>,
+    /// Retained so `advance_clock` can downcast to [`crate::time::TickingClock`].
+    clock_as_any: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
 }
 
 struct TestJobRuntime {
@@ -789,6 +840,42 @@ impl TestClient {
     #[must_use]
     pub const fn state(&self) -> &AppState {
         &self.state
+    }
+
+    /// Step the test clock forward by `duration`.
+    ///
+    /// Only effective when the app was configured with a
+    /// [`crate::time::TickingClock`] via [`TestApp::with_clock`]. Calling this
+    /// with a [`crate::time::FixedClock`] or without any custom clock is a
+    /// safe no-op — time stays where it is.
+    ///
+    /// This method only affects the wall-clock time reported by the
+    /// [`crate::time::Clock`] extractor. Tokio's runtime timer (used by
+    /// `tokio::time::sleep`, `tokio::time::Instant`, etc.) is not affected.
+    ///
+    /// ```rust,no_run
+    /// use autumn_web::test::TestApp;
+    /// use autumn_web::time::TickingClock;
+    /// use chrono::{TimeZone, Utc};
+    /// use std::time::Duration;
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// let clock = TickingClock::starting_at(Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap());
+    /// let client = TestApp::new().with_clock(clock).build();
+    ///
+    /// client.advance_clock(Duration::from_secs(86400)); // advance 1 day
+    /// # }
+    /// ```
+    pub fn advance_clock(&self, duration: std::time::Duration) {
+        if let Some(any) = &self.clock_as_any {
+            let cloned = std::sync::Arc::clone(any);
+            if let Ok(ticking) = cloned.downcast::<crate::time::TickingClock>() {
+                ticking.advance(duration);
+            }
+            // FixedClock or other types: advance_clock is a no-op.
+        }
+        // No clock installed: also a no-op.
     }
 
     /// Unwrap the underlying [`axum::Router`] out of the [`TestClient`].

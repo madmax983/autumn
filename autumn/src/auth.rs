@@ -1831,6 +1831,7 @@ mod tests {
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
+            clock: std::sync::Arc::new(crate::time::SystemClock),
         };
 
         let app = Router::new().route("/", get(handler)).with_state(state);
@@ -1892,6 +1893,7 @@ mod tests {
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
+            clock: std::sync::Arc::new(crate::time::SystemClock),
         };
 
         // Middleware that inserts a user into extensions
@@ -1961,6 +1963,7 @@ mod tests {
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
+            clock: std::sync::Arc::new(crate::time::SystemClock),
         };
 
         let app = Router::new()
@@ -2086,6 +2089,7 @@ mod tests {
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
+            clock: std::sync::Arc::new(crate::time::SystemClock),
         };
 
         let app = Router::new()
@@ -2161,6 +2165,7 @@ mod tests {
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
+            clock: std::sync::Arc::new(crate::time::SystemClock),
         };
 
         let app = Router::new()
@@ -2241,6 +2246,7 @@ mod tests {
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
             auth_session_key: "uid".to_owned(),
             shared_cache: None,
+            clock: std::sync::Arc::new(crate::time::SystemClock),
         };
 
         let app = Router::new()
@@ -2321,6 +2327,7 @@ mod tests {
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
+            clock: std::sync::Arc::new(crate::time::SystemClock),
         };
 
         let app = Router::new()
@@ -2397,6 +2404,7 @@ mod tests {
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
+            clock: std::sync::Arc::new(crate::time::SystemClock),
         };
 
         let app = Router::new()
@@ -2466,6 +2474,7 @@ mod tests {
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
+            clock: std::sync::Arc::new(crate::time::SystemClock),
         };
 
         let app = Router::new()

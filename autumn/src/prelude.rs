@@ -192,6 +192,13 @@ pub use crate::http_client::Client;
 /// Shared application state (for custom extractors).
 pub use crate::state::AppState;
 
+// ── Time ─────────────────────────────────────────────────────────
+/// Deterministic, injectable wall-clock extractor.
+///
+/// Use in handlers instead of `chrono::Utc::now()` to make time-sensitive
+/// logic testable without sleeping. Override via `TestApp::with_clock`.
+pub use crate::time::Clock;
+
 // ── Internationalization ───────────────────────────────────────
 /// Request-scoped locale extractor (resolves from query, cookie,
 /// `Accept-Language`, and default in that order).
@@ -234,6 +241,7 @@ mod tests {
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
+            clock: std::sync::Arc::new(crate::time::SystemClock),
         };
         #[cfg(not(feature = "db"))]
         let _state = AppState {
@@ -259,6 +267,7 @@ mod tests {
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
+            clock: std::sync::Arc::new(crate::time::SystemClock),
         };
         let _err: AutumnResult<()> = Ok(());
     }
