@@ -53,6 +53,9 @@ struct MetricsInner {
     /// Requests still in-flight when the drain deadline expired and were
     /// forcibly dropped. Exposed as `autumn_shutdown_aborted_requests_total`.
     shutdown_aborted_requests: AtomicU64,
+    /// Requests that exceeded the configured per-request timeout.
+    /// Exposed as `autumn_request_timeouts_total`.
+    request_timeouts_total: AtomicU64,
 }
 
 #[derive(Debug, Default)]
@@ -102,6 +105,7 @@ impl MetricsCollector {
                 idempotency_misses: AtomicU64::new(0),
                 idempotency_conflicts: AtomicU64::new(0),
                 shutdown_aborted_requests: AtomicU64::new(0),
+                request_timeouts_total: AtomicU64::new(0),
             }),
         }
     }
@@ -114,6 +118,13 @@ impl MetricsCollector {
                 .shutdown_aborted_requests
                 .fetch_add(count, Ordering::Relaxed);
         }
+    }
+
+    /// Increment the per-request timeout counter (`autumn_request_timeouts_total`).
+    pub fn record_request_timeout(&self) {
+        self.inner
+            .request_timeouts_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Increment the idempotency cache hit counter.
@@ -325,6 +336,10 @@ impl MetricsCollector {
                     .inner
                     .shutdown_aborted_requests
                     .load(Ordering::Relaxed),
+                request_timeouts_total: self
+                    .inner
+                    .request_timeouts_total
+                    .load(Ordering::Relaxed),
             },
             idempotency: IdempotencyMetricsSnapshot {
                 hits: self.inner.idempotency_hits.load(Ordering::Relaxed),
@@ -390,6 +405,9 @@ pub struct HttpMetrics {
     /// Requests forcibly dropped when the graceful-shutdown drain deadline
     /// expired (`autumn_shutdown_aborted_requests_total`).
     pub shutdown_aborted_requests_total: u64,
+    /// Requests that exceeded the configured per-request timeout
+    /// (`autumn_request_timeouts_total`).
+    pub request_timeouts_total: u64,
 }
 
 /// Percentiles for latency measurements.
@@ -749,5 +767,33 @@ mod tests {
         let snap2 = collector.snapshot();
         let route_snap2 = snap2.http.by_route.get(&key).unwrap();
         assert_eq!(route_snap2.count, 2);
+    }
+
+    // ── request_timeouts_total ─────────────────────────────────────────────
+
+    #[test]
+    fn collector_request_timeouts_starts_at_zero() {
+        let collector = MetricsCollector::new();
+        let snap = collector.snapshot();
+        assert_eq!(snap.http.request_timeouts_total, 0);
+    }
+
+    #[test]
+    fn collector_records_request_timeout() {
+        let collector = MetricsCollector::new();
+        collector.record_request_timeout();
+        collector.record_request_timeout();
+        let snap = collector.snapshot();
+        assert_eq!(snap.http.request_timeouts_total, 2);
+    }
+
+    #[test]
+    fn request_timeouts_total_independent_of_regular_requests() {
+        let collector = MetricsCollector::new();
+        collector.record("GET", "/api", 200, 5);
+        collector.record_request_timeout();
+        let snap = collector.snapshot();
+        assert_eq!(snap.http.requests_total, 1);
+        assert_eq!(snap.http.request_timeouts_total, 1);
     }
 }
