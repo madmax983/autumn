@@ -2428,7 +2428,7 @@ pub struct ServerConfig {
 
     /// Per-request timeout configuration.
     ///
-    /// Controls request-cycle timeouts for DoS protection. By default
+    /// Controls request-cycle timeouts for `DoS` protection. By default
     /// all timeouts are disabled so existing applications are unaffected.
     /// Set `request_timeout_ms` in `[server.timeouts]` to enable.
     #[serde(default)]

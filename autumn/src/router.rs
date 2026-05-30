@@ -1130,9 +1130,10 @@ fn apply_request_timeout_middleware(
         _ => return router,
     };
     let duration = std::time::Duration::from_millis(timeout_ms);
+    let is_dev = matches!(config.profile.as_deref(), Some("dev" | "development") | None);
     tracing::info!(timeout_ms, "Per-request timeout enabled");
     router.layer(axum::middleware::from_fn(move |req, next| {
-        request_timeout_handler(req, next, duration, metrics.clone())
+        request_timeout_handler(req, next, duration, metrics.clone(), is_dev)
     }))
 }
 
@@ -1141,6 +1142,7 @@ async fn request_timeout_handler(
     next: axum::middleware::Next,
     duration: std::time::Duration,
     metrics: crate::middleware::MetricsCollector,
+    is_dev: bool,
 ) -> axum::response::Response {
     let request_id = req
         .extensions()
@@ -1162,7 +1164,7 @@ async fn request_timeout_handler(
                 None,
                 request_id.as_ref().map(ToString::to_string),
                 None,
-                true,
+                is_dev,
             );
             (
                 http::StatusCode::REQUEST_TIMEOUT,
