@@ -215,6 +215,7 @@ enum Commands {
     ///   autumn flags set-rollout new_checkout 10
     ///   autumn flags allow beta_inbox user:42
     #[command(subcommand, verbatim_doc_comment)]
+    #[allow(clippy::doc_markdown)]
     Flags(FlagsCommands),
 
     /// Run accessibility (WCAG 2.1 AA) checks against rendered HTML.
@@ -609,6 +610,7 @@ enum TokenCommands {
 
 /// Subcommands for `autumn flags`.
 #[derive(Subcommand)]
+#[allow(clippy::doc_markdown)]
 enum FlagsCommands {
     /// List all feature flags and their current state.
     List,

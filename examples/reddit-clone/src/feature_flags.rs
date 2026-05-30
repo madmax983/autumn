@@ -9,14 +9,10 @@
 //! | `post_awards`     | off              | Enables the Awards widget on post pages   |
 
 use autumn_web::config::AutumnConfig;
-use autumn_web::feature_flags::{FlagStore, InMemoryFlagStore};
-
-#[cfg(feature = "db")]
-use autumn_web::feature_flags::pg::PgFlagStore;
+use autumn_web::feature_flags::{FlagStore, InMemoryFlagStore, pg::PgFlagStore};
 
 /// Build the flag store appropriate for the current environment.
 pub fn build_store(config: &AutumnConfig) -> Box<dyn FlagStore> {
-    #[cfg(feature = "db")]
     if let Some(url) = config.database.effective_primary_url() {
         let store = PgFlagStore::new(url);
         configure(&store);

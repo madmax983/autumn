@@ -2,7 +2,7 @@
 //!
 //! Registers a flag management page at `/admin/feature-flags/` with:
 //! - List view: key, enabled status, rollout %, actor allowlist, history link
-//! - Edit view: toggle enabled, set rollout_pct, manage allowlists
+//! - Edit view: toggle enabled, set `rollout_pct`, manage allowlists
 //! - History tab: per-flag audit trail from `feature_flag_changes`
 
 use serde_json::Value;
@@ -88,8 +88,7 @@ impl AdminModel for FeatureFlagAdminModel {
         record
             .get("key")
             .and_then(|v| v.as_str())
-            .map(|k| format!("Flag: {k}"))
-            .unwrap_or_else(|| "Feature Flag".to_owned())
+            .map_or_else(|| "Feature Flag".to_owned(), |k| format!("Flag: {k}"))
     }
 
     fn list(
@@ -97,7 +96,6 @@ impl AdminModel for FeatureFlagAdminModel {
         pool: &diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
         params: ListParams,
     ) -> AdminFuture<'_, ListResult> {
-        use diesel::prelude::*;
         use diesel_async::RunQueryDsl;
 
         let pool = pool.clone();
@@ -135,8 +133,8 @@ impl AdminModel for FeatureFlagAdminModel {
                  LIMIT $2 OFFSET $3",
             )
             .bind::<diesel::sql_types::Text, _>(&search_pattern)
-            .bind::<diesel::sql_types::BigInt, _>(per_page as i64)
-            .bind::<diesel::sql_types::BigInt, _>(offset as i64)
+            .bind::<diesel::sql_types::BigInt, _>(i64::try_from(per_page).unwrap_or(i64::MAX))
+            .bind::<diesel::sql_types::BigInt, _>(i64::try_from(offset).unwrap_or(0))
             .load::<FlagRow>(&mut conn)
             .await
             .map(|rows| rows.into_iter().map(FlagRow::into_json).collect())
@@ -185,7 +183,6 @@ impl AdminModel for FeatureFlagAdminModel {
         pool: &diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
         data: Value,
     ) -> AdminFuture<'_, Value> {
-        use diesel::prelude::*;
         use diesel_async::RunQueryDsl;
 
         let pool = pool.clone();
@@ -197,9 +194,9 @@ impl AdminModel for FeatureFlagAdminModel {
 
             let key = data
                 .get("key")
-                .and_then(|v| v.as_str())
+                .and_then(Value::as_str)
                 .ok_or_else(|| AdminError::Validation("'key' is required".into()))?;
-            let enabled = data.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+            let enabled = data.get("enabled").and_then(Value::as_bool).unwrap_or(false);
             // Select widget sends strings ("25"), direct API sends numbers.
             let mut rollout_pct = data
                 .get("rollout_pct")
@@ -209,21 +206,24 @@ impl AdminModel for FeatureFlagAdminModel {
                 })
                 .unwrap_or(0)
                 .clamp(0, 100);
-            // "Globally Enabled" in the admin UI means globally on for all actors.
-            // The evaluator requires rollout_pct >= 100 for that — promote if the
-            // admin checked the box but left rollout at the default 0%.
-            if enabled && rollout_pct == 0 {
-                rollout_pct = 100;
-            }
-            let description = data.get("description").and_then(|v| v.as_str());
+            let description = data.get("description").and_then(Value::as_str);
             let actor_allowlist = data
                 .get("actor_allowlist")
-                .and_then(|v| v.as_str())
+                .and_then(Value::as_str)
                 .unwrap_or("[]");
             let group_allowlist = data
                 .get("group_allowlist")
-                .and_then(|v| v.as_str())
+                .and_then(Value::as_str)
                 .unwrap_or("[]");
+
+            // "Globally Enabled" with empty allowlists means globally on for all
+            // actors — promote rollout_pct to 100 so the evaluator agrees.
+            // When non-empty allowlists are provided, don't promote: the intent
+            // is allowlist-only access, not global rollout.
+            let has_allowlist = actor_allowlist != "[]" || group_allowlist != "[]";
+            if enabled && rollout_pct == 0 && !has_allowlist {
+                rollout_pct = 100;
+            }
 
             let mutation = if enabled { "enabled" } else { "disabled" };
 
@@ -246,7 +246,7 @@ impl AdminModel for FeatureFlagAdminModel {
                     description.map(str::to_owned),
                 )
                 .bind::<diesel::sql_types::Bool, _>(enabled)
-                .bind::<diesel::sql_types::SmallInt, _>(rollout_pct as i16)
+                .bind::<diesel::sql_types::SmallInt, _>(i16::try_from(rollout_pct).unwrap_or(0))
                 .bind::<diesel::sql_types::Text, _>(actor_allowlist)
                 .bind::<diesel::sql_types::Text, _>(group_allowlist)
                 .get_result::<FlagRow>(&mut conn)
@@ -273,7 +273,6 @@ impl AdminModel for FeatureFlagAdminModel {
         id: i64,
         data: Value,
     ) -> AdminFuture<'_, Value> {
-        use diesel::prelude::*;
         use diesel_async::RunQueryDsl;
 
         let pool = pool.clone();
@@ -285,9 +284,9 @@ impl AdminModel for FeatureFlagAdminModel {
 
             let key = data
                 .get("key")
-                .and_then(|v| v.as_str())
+                .and_then(Value::as_str)
                 .ok_or_else(|| AdminError::Validation("'key' is required".into()))?;
-            let enabled = data.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+            let enabled = data.get("enabled").and_then(Value::as_bool).unwrap_or(false);
             let mut rollout_pct = data
                 .get("rollout_pct")
                 .and_then(|v| {
@@ -296,18 +295,19 @@ impl AdminModel for FeatureFlagAdminModel {
                 })
                 .unwrap_or(0)
                 .clamp(0, 100);
-            if enabled && rollout_pct == 0 {
-                rollout_pct = 100;
-            }
-            let description = data.get("description").and_then(|v| v.as_str());
+            let description = data.get("description").and_then(Value::as_str);
             let actor_allowlist = data
                 .get("actor_allowlist")
-                .and_then(|v| v.as_str())
+                .and_then(Value::as_str)
                 .unwrap_or("[]");
             let group_allowlist = data
                 .get("group_allowlist")
-                .and_then(|v| v.as_str())
+                .and_then(Value::as_str)
                 .unwrap_or("[]");
+            let has_allowlist = actor_allowlist != "[]" || group_allowlist != "[]";
+            if enabled && rollout_pct == 0 && !has_allowlist {
+                rollout_pct = 100;
+            }
 
             let mutation = if enabled { "enabled" } else { "disabled" };
 
@@ -327,7 +327,7 @@ impl AdminModel for FeatureFlagAdminModel {
                 description.map(str::to_owned),
             )
             .bind::<diesel::sql_types::Bool, _>(enabled)
-            .bind::<diesel::sql_types::SmallInt, _>(rollout_pct as i16)
+            .bind::<diesel::sql_types::SmallInt, _>(i16::try_from(rollout_pct).unwrap_or(0))
             .bind::<diesel::sql_types::Text, _>(actor_allowlist)
             .bind::<diesel::sql_types::Text, _>(group_allowlist)
             .get_result::<FlagRow>(&mut conn)
@@ -352,7 +352,6 @@ impl AdminModel for FeatureFlagAdminModel {
         pool: &diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
         id: i64,
     ) -> AdminFuture<'_, ()> {
-        use diesel::prelude::*;
         use diesel_async::RunQueryDsl;
 
         let pool = pool.clone();
@@ -430,8 +429,8 @@ impl AdminModel for FeatureFlagAdminModel {
                  LIMIT $2 OFFSET $3",
             )
             .bind::<diesel::sql_types::Text, _>(&key)
-            .bind::<diesel::sql_types::BigInt, _>(per_page as i64)
-            .bind::<diesel::sql_types::BigInt, _>(offset as i64)
+            .bind::<diesel::sql_types::BigInt, _>(i64::try_from(per_page).unwrap_or(i64::MAX))
+            .bind::<diesel::sql_types::BigInt, _>(i64::try_from(offset).unwrap_or(0))
             .load::<HistoryRow>(&mut conn)
             .await
             .unwrap_or_default()
@@ -609,9 +608,30 @@ mod tests {
         let enabled = false;
         let submitted_rollout: i64 = 0;
         let mut rollout_pct = submitted_rollout.clamp(0, 100);
-        if enabled && rollout_pct == 0 {
+        let has_allowlist = false;
+        if enabled && rollout_pct == 0 && !has_allowlist {
             rollout_pct = 100;
         }
         assert_eq!(rollout_pct, 0, "kill-switch must not promote rollout_pct");
+    }
+
+    #[test]
+    fn enabled_with_zero_rollout_and_non_empty_allowlist_is_not_promoted() {
+        // When the admin creates an allowlist-only flag (enabled=true, rollout=0%,
+        // actor_allowlist non-empty), rollout_pct must NOT be promoted to 100 —
+        // that would expose the flag to everyone instead of just listed actors.
+        let enabled = true;
+        let submitted_rollout: i64 = 0;
+        let actor_allowlist = r#"["user:42"]"#;
+        let group_allowlist = "[]";
+        let mut rollout_pct = submitted_rollout.clamp(0, 100);
+        let has_allowlist = actor_allowlist != "[]" || group_allowlist != "[]";
+        if enabled && rollout_pct == 0 && !has_allowlist {
+            rollout_pct = 100;
+        }
+        assert_eq!(
+            rollout_pct, 0,
+            "allowlist-only flag must not have rollout_pct promoted to 100"
+        );
     }
 }

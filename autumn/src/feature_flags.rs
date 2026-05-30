@@ -348,6 +348,12 @@ impl FlagStore for InMemoryFlagStore {
         actor: Option<&str>,
     ) -> Result<(), FlagStoreError> {
         self.upsert(key, |f| {
+            if !f.enabled {
+                // Re-enabling from a kill-switch via allowlist: reset rollout to 0
+                // so only the explicitly listed actors gain access, not everyone
+                // who happened to be in the previous (e.g. 100%) rollout cohort.
+                f.rollout_pct = 0;
+            }
             f.enabled = true;
             if !f.actor_allowlist.contains(&actor_id.to_owned()) {
                 f.actor_allowlist.push(actor_id.to_owned());
@@ -368,6 +374,10 @@ impl FlagStore for InMemoryFlagStore {
         actor: Option<&str>,
     ) -> Result<(), FlagStoreError> {
         self.upsert(key, |f| {
+            if !f.enabled {
+                // Same targeted-enable semantics as allow_actor.
+                f.rollout_pct = 0;
+            }
             f.enabled = true;
             if !f.group_allowlist.contains(&group.to_owned()) {
                 f.group_allowlist.push(group.to_owned());
@@ -522,6 +532,14 @@ pub mod pg {
                 .execute(conn)?;
             Ok(())
         }
+    }
+
+    #[derive(diesel::QueryableByName)]
+    struct ChangeIdRow {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        id: i64,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        key: String,
     }
 
     #[derive(diesel::QueryableByName)]
@@ -703,8 +721,11 @@ pub mod pg {
             conn.transaction::<(), diesel::result::Error, _>(|conn| {
                 Self::upsert_flag(conn, key)?;
                 diesel::sql_query(
+                    // Re-enabling from kill-switch via allowlist resets rollout_pct to 0
+                    // so only listed actors gain access, not the previous global cohort.
                     "UPDATE autumn_feature_flags \
                      SET enabled = true, \
+                         rollout_pct = CASE WHEN NOT enabled THEN 0 ELSE rollout_pct END, \
                          actor_allowlist = (
                              SELECT json_agg(DISTINCT elem) \
                              FROM (
@@ -746,8 +767,10 @@ pub mod pg {
             conn.transaction::<(), diesel::result::Error, _>(|conn| {
                 Self::upsert_flag(conn, key)?;
                 diesel::sql_query(
+                    // Re-enabling from kill-switch via group allowlist resets rollout_pct.
                     "UPDATE autumn_feature_flags \
                      SET enabled = true, \
+                         rollout_pct = CASE WHEN NOT enabled THEN 0 ELSE rollout_pct END, \
                          group_allowlist = (
                              SELECT json_agg(DISTINCT elem) \
                              FROM (
@@ -777,6 +800,45 @@ pub mod pg {
             .map_err(|e| FlagStoreError::Backend(e.to_string()))?;
             self.invalidate(key);
             Ok(())
+        }
+
+        /// Spawn a background thread that polls `feature_flag_changes` and
+        /// invalidates this store's cache whenever a remote replica writes a flag.
+        ///
+        /// Without this, the cache can only be invalidated when the TTL expires.
+        /// Call this once at startup when using `PgFlagStore` in a multi-replica
+        /// deployment:
+        ///
+        /// ```rust,ignore
+        /// let store = Arc::new(PgFlagStore::new(db_url));
+        /// PgFlagStore::spawn_poll_listener(Arc::clone(&store), Duration::from_secs(1));
+        /// ```
+        ///
+        /// The thread runs indefinitely; the returned handle can be detached.
+        pub fn spawn_poll_listener(
+            store: std::sync::Arc<Self>,
+            poll_interval: std::time::Duration,
+        ) -> std::thread::JoinHandle<()> {
+            std::thread::spawn(move || {
+                let mut last_id: i64 = 0;
+                loop {
+                    std::thread::sleep(poll_interval);
+                    if let Ok(mut conn) = store.connect() {
+                        let rows: Vec<ChangeIdRow> = diesel::sql_query(
+                            "SELECT id, key FROM feature_flag_changes \
+                             WHERE id > $1 ORDER BY id",
+                        )
+                        .bind::<diesel::sql_types::BigInt, _>(last_id)
+                        .load::<ChangeIdRow>(&mut conn)
+                        .unwrap_or_default();
+
+                        for row in rows {
+                            last_id = last_id.max(row.id);
+                            store.invalidate(&row.key);
+                        }
+                    }
+                }
+            })
         }
 
         fn history(
@@ -1410,5 +1472,48 @@ mod tests {
         svc.enable("roll_flag", None).unwrap();
         assert!(svc.is_enabled("roll_flag", None));
         assert!(svc.is_enabled("roll_flag", Some("user:1")));
+    }
+
+    // AC-1 allow_actor after kill-switch must not restore global rollout ────────
+
+    #[test]
+    fn allow_actor_after_kill_switch_does_not_restore_global_rollout() {
+        // Scenario: enable globally → disable (kill-switch) → allow_actor for
+        // one tester. The flag must be visible only to the allowlisted actor,
+        // NOT to everyone (which would happen if rollout_pct=100 were preserved).
+        let svc = make_svc();
+        svc.enable("targeted", None).unwrap(); // rollout_pct = 100
+        svc.disable("targeted", None).unwrap(); // kill-switch, rollout_pct still 100
+        svc.allow_actor("targeted", "user:42", None).unwrap(); // re-enable allowlist-only
+
+        assert!(
+            svc.is_enabled("targeted", Some("user:42")),
+            "allowlisted actor must see the flag"
+        );
+        // All non-allowlisted actors should NOT see it (rollout was reset to 0).
+        for i in [1_u32, 5, 10, 99] {
+            let actor = format!("user:{i}");
+            assert!(
+                !svc.is_enabled("targeted", Some(&actor)),
+                "non-allowlisted actor {actor} must NOT see the flag after allowlist-only re-enable"
+            );
+        }
+    }
+
+    #[test]
+    fn allow_actor_on_active_rollout_preserves_rollout_pct() {
+        // When the flag is already enabled (no kill-switch), adding an actor to the
+        // allowlist must NOT reset the existing rollout percentage.
+        let svc = make_svc();
+        svc.set_rollout("staged", 50, None).unwrap(); // enabled=true, rollout=50%
+        svc.allow_actor("staged", "user:42", None).unwrap();
+
+        // rollout_pct should still be 50, not reset to 0.
+        let store = InMemoryFlagStore::new();
+        store.set_rollout("staged", 50, None).unwrap();
+        store.allow_actor("staged", "user:42", None).unwrap();
+        let flag = store.get("staged").unwrap().unwrap();
+        assert_eq!(flag.rollout_pct, 50, "rollout_pct must be preserved when flag was already enabled");
+        assert!(flag.actor_allowlist.contains(&"user:42".to_owned()));
     }
 }
