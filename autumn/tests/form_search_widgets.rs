@@ -7,9 +7,9 @@
 #[cfg(feature = "maud")]
 mod active_search_tests {
     use autumn_web::widgets::{
-        ActiveSearchConfig, AutocompleteConfig, SearchMethod, active_search, active_search_empty_state,
-        active_search_input, active_search_results, autocomplete_empty_state, autocomplete_input,
-        autocomplete_option,
+        ActiveSearchConfig, AutocompleteConfig, SearchMethod, active_search,
+        active_search_empty_state, active_search_input, active_search_results,
+        autocomplete_empty_state, autocomplete_input, autocomplete_option,
     };
 
     // ── active_search_input: HTTP method ──────────────────────────────
@@ -80,7 +80,10 @@ mod active_search_tests {
         let config = ActiveSearchConfig::new("/search", "#results").min_length(3);
         let html = active_search_input("q", "Search", &config).into_string();
         // Maud HTML-encodes `>=` as `&gt;=`; the browser decodes it before htmx sees it
-        assert!(html.contains("this.value.length") && html.contains("3"), "{html}");
+        assert!(
+            html.contains("this.value.length") && html.contains("3"),
+            "{html}"
+        );
     }
 
     #[test]
@@ -381,13 +384,15 @@ mod active_search_tests {
         let config = AutocompleteConfig::new("/autocomplete", "tag_id").min_length(2);
         let html = autocomplete_input("tag", "Tag", &config).into_string();
         // Maud HTML-encodes `>=` as `&gt;=`; the browser decodes it before htmx sees it
-        assert!(html.contains("this.value.length") && html.contains("2"), "{html}");
+        assert!(
+            html.contains("this.value.length") && html.contains("2"),
+            "{html}"
+        );
     }
 
     #[test]
     fn autocomplete_indicator_when_configured() {
-        let config =
-            AutocompleteConfig::new("/autocomplete", "tag_id").indicator("#loader");
+        let config = AutocompleteConfig::new("/autocomplete", "tag_id").indicator("#loader");
         let html = autocomplete_input("tag", "Tag", &config).into_string();
         assert!(html.contains("hx-indicator=\"#loader\""), "{html}");
     }

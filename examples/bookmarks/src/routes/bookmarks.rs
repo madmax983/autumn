@@ -177,12 +177,10 @@ pub async fn by_tag(Path(tag): Path<String>, repo: PgBookmarkRepository) -> Autu
 
 #[get("/bookmarks/new")]
 pub async fn new_form() -> AutumnResult<Markup> {
-    let tag_ac = autumn_web::widgets::AutocompleteConfig::new(
-        "/bookmarks/tags/autocomplete",
-        "tag",
-    )
-    .placeholder("Search existing tags…")
-    .min_length(1);
+    let tag_ac =
+        autumn_web::widgets::AutocompleteConfig::new("/bookmarks/tags/autocomplete", "tag")
+            .placeholder("Search existing tags…")
+            .min_length(1);
 
     Ok(layout(
         "Add Bookmark",
@@ -310,10 +308,7 @@ pub struct SearchQuery {
 /// Wired up by [`autumn_web::widgets::active_search_input`] on the index page.
 /// Works equally well without JavaScript (direct GET form submission).
 #[get("/bookmarks/search")]
-pub async fn search(
-    Query(params): Query<SearchQuery>,
-    mut db: Db,
-) -> AutumnResult<Markup> {
+pub async fn search(Query(params): Query<SearchQuery>, mut db: Db) -> AutumnResult<Markup> {
     let q = params.q.trim();
     if q.chars().count() < 2 {
         return Ok(autumn_web::widgets::active_search_empty_state(

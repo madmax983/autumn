@@ -115,7 +115,7 @@ impl<'a> ActiveSearchConfig<'a> {
     ///
     /// - `action` — URL of the search handler
     /// - `target` — CSS selector for the results container, e.g. `"#search-results"`
-    #[must_use] 
+    #[must_use]
     pub const fn new(action: &'a str, target: &'a str) -> Self {
         Self {
             action,
@@ -277,9 +277,8 @@ fn build_trigger(debounce_ms: u32, min_length: u32, initial_load: bool) -> Strin
     } else {
         String::new()
     };
-    let mut trigger = format!(
-        "input{filter} changed delay:{debounce_ms}ms, keyup[key=='Enter']{filter}"
-    );
+    let mut trigger =
+        format!("input{filter} changed delay:{debounce_ms}ms, keyup[key=='Enter']{filter}");
     // When a minimum length is configured, also fire when the value drops below
     // the threshold so stale results are cleared via the server's empty-state response.
     if min_length > 0 {
@@ -657,23 +656,37 @@ mod tests {
 
     #[test]
     fn config_debounce_builder() {
-        assert_eq!(ActiveSearchConfig::new("/s", "#r").debounce(500).debounce_ms, 500);
+        assert_eq!(
+            ActiveSearchConfig::new("/s", "#r")
+                .debounce(500)
+                .debounce_ms,
+            500
+        );
     }
 
     #[test]
     fn config_min_length_builder() {
-        assert_eq!(ActiveSearchConfig::new("/s", "#r").min_length(3).min_length, 3);
+        assert_eq!(
+            ActiveSearchConfig::new("/s", "#r").min_length(3).min_length,
+            3
+        );
     }
 
     #[test]
     fn config_initial_load_builder() {
-        assert!(ActiveSearchConfig::new("/s", "#r").initial_load().initial_load);
+        assert!(
+            ActiveSearchConfig::new("/s", "#r")
+                .initial_load()
+                .initial_load
+        );
     }
 
     #[test]
     fn config_indicator_builder() {
         assert_eq!(
-            ActiveSearchConfig::new("/s", "#r").indicator("#spin").indicator,
+            ActiveSearchConfig::new("/s", "#r")
+                .indicator("#spin")
+                .indicator,
             Some("#spin")
         );
     }
@@ -681,7 +694,9 @@ mod tests {
     #[test]
     fn config_placeholder_builder() {
         assert_eq!(
-            ActiveSearchConfig::new("/s", "#r").placeholder("hint").placeholder,
+            ActiveSearchConfig::new("/s", "#r")
+                .placeholder("hint")
+                .placeholder,
             Some("hint")
         );
     }
@@ -689,7 +704,9 @@ mod tests {
     #[test]
     fn config_param_name_builder() {
         assert_eq!(
-            ActiveSearchConfig::new("/s", "#r").param_name("query").param_name,
+            ActiveSearchConfig::new("/s", "#r")
+                .param_name("query")
+                .param_name,
             "query"
         );
     }
@@ -739,7 +756,10 @@ mod tests {
         let config = ActiveSearchConfig::new("/search", "#results").min_length(3);
         let html = active_search_input("q", "Search", &config).into_string();
         // Maud HTML-encodes `>=` as `&gt;=`; the browser decodes it before htmx sees it
-        assert!(html.contains("this.value.length") && html.contains("3"), "{html}");
+        assert!(
+            html.contains("this.value.length") && html.contains("3"),
+            "{html}"
+        );
     }
 
     #[test]
@@ -1048,7 +1068,10 @@ mod tests {
         let config = AutocompleteConfig::new("/ac", "value_field").min_length(2);
         let html = autocomplete_input("x", "Label", &config).into_string();
         // Maud HTML-encodes `>=` as `&gt;=`; the browser decodes it before htmx sees it
-        assert!(html.contains("this.value.length") && html.contains("2"), "{html}");
+        assert!(
+            html.contains("this.value.length") && html.contains("2"),
+            "{html}"
+        );
     }
 
     #[test]
