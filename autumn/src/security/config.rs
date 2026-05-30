@@ -60,6 +60,7 @@
 //! Setting any header value to an empty string disables it (the header is
 //! not emitted). This is the escape hatch for opting out of a default.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde::Deserialize;
@@ -614,11 +615,83 @@ impl Default for CsrfConfig {
     }
 }
 
+/// Strategy for identifying which client a rate-limit bucket belongs to.
+///
+/// Controls what value is used as the bucket key for incoming requests.
+///
+/// # `autumn.toml` example
+///
+/// ```toml
+/// [security.rate_limit]
+/// enabled = true
+/// key_strategy = "authenticated_principal"
+/// ```
+///
+/// | Value | Description |
+/// |-------|-------------|
+/// | `"ip"` | Connection peer address (default). Safe against header spoofing. |
+/// | `"api_token"` | `Authorization: Bearer <token>` value. Falls back to IP when no token. |
+/// | `"authenticated_principal"` | Principal ID set by auth middleware via `RateLimitPrincipal` extension. Falls back to IP for unauthenticated requests. |
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyStrategy {
+    /// Key on client IP address (connection peer or trusted-proxy-resolved). **Default.**
+    #[default]
+    Ip,
+    /// Key on the `Authorization: Bearer` token value. Falls back to IP when absent.
+    ApiToken,
+    /// Key on the authenticated principal ID from the `RateLimitPrincipal` request
+    /// extension (set by the auth middleware). Falls back to IP for unauthenticated requests.
+    AuthenticatedPrincipal,
+}
+
+impl KeyStrategy {
+    pub(crate) fn from_env_value(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "ip" => Some(Self::Ip),
+            "api_token" => Some(Self::ApiToken),
+            "authenticated_principal" => Some(Self::AuthenticatedPrincipal),
+            _ => None,
+        }
+    }
+}
+
+/// Per-tier rate limit parameters for tiered quota configuration.
+///
+/// Declare named tiers under `[security.rate_limit.tiers.<name>]` in `autumn.toml`.
+/// Each tier gets its own token bucket with independent `requests_per_second` and
+/// `burst` values. The app maps callers to a tier via a tier-assignment hook
+/// (see [`RateLimitLayer::with_tier_hook`]).
+///
+/// # `autumn.toml` example
+///
+/// ```toml
+/// [security.rate_limit.tiers.free]
+/// requests_per_second = 1.0
+/// burst = 10
+///
+/// [security.rate_limit.tiers.pro]
+/// requests_per_second = 10.0
+/// burst = 100
+///
+/// [security.rate_limit.tiers.enterprise]
+/// requests_per_second = 100.0
+/// burst = 1000
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct RateLimitTierConfig {
+    /// Steady-state refill rate for this tier in requests per second.
+    pub requests_per_second: f64,
+    /// Maximum burst capacity (token bucket size) for this tier.
+    pub burst: u32,
+}
+
 /// Rate limiting configuration.
 ///
-/// Applies a per-client-IP token bucket to every request. When a client
-/// exceeds their bucket, the middleware returns `429 Too Many Requests`
-/// with a `Retry-After` header indicating when to retry.
+/// Applies a token bucket to every request, keyed by client IP (default)
+/// or by authenticated principal / API token. When a client exhausts their
+/// bucket, the middleware returns `429 Too Many Requests` with `Retry-After`
+/// and Problem Details (RFC 9457).
 ///
 /// # Defaults
 ///
@@ -629,6 +702,8 @@ impl Default for CsrfConfig {
 /// | `burst` | `20` |
 /// | `trust_forwarded_headers` | `false` |
 /// | `trusted_proxies` | `[]` |
+/// | `key_strategy` | `"ip"` |
+/// | `tiers` | `{}` (no tiers; all callers share the default config) |
 ///
 /// # Client IP resolution
 ///
@@ -643,6 +718,34 @@ impl Default for CsrfConfig {
 /// then walks the header from right to left, skips those trusted proxy
 /// hops, and keys the bucket on the nearest untrusted client IP.
 ///
+/// # Per-principal / API-token keying
+///
+/// Set `key_strategy = "authenticated_principal"` to key on the authenticated
+/// user identity instead of IP. Auth middleware must insert a
+/// `RateLimitPrincipal` extension on the request before the rate limiter runs.
+/// Unauthenticated requests fall through to IP-based keying — never silently
+/// unbounded.
+///
+/// Set `key_strategy = "api_token"` to key on the `Authorization: Bearer`
+/// token value. Falls back to IP when no `Authorization` header is present.
+///
+/// # Tiered quotas
+///
+/// Declare named tiers and register a tier-assignment hook at startup:
+///
+/// ```toml
+/// [security.rate_limit]
+/// key_strategy = "authenticated_principal"
+///
+/// [security.rate_limit.tiers.free]
+/// requests_per_second = 1.0
+/// burst = 10
+///
+/// [security.rate_limit.tiers.pro]
+/// requests_per_second = 10.0
+/// burst = 100
+/// ```
+///
 /// # Examples
 ///
 /// ```toml
@@ -652,6 +755,7 @@ impl Default for CsrfConfig {
 /// burst = 10
 /// trust_forwarded_headers = false
 /// trusted_proxies = ["10.0.0.10", "203.0.113.0/24"]
+/// key_strategy = "authenticated_principal"
 ///
 /// # Multi-replica: share the budget across all pods
 /// backend = "redis"
@@ -668,11 +772,16 @@ pub struct RateLimitConfig {
     pub enabled: bool,
 
     /// Steady-state refill rate in requests per second. Default: `10.0`.
+    ///
+    /// Used as the default when no tier matches. Configure per-tier values
+    /// under `[security.rate_limit.tiers.<name>]`.
     #[serde(default = "default_rps")]
     pub requests_per_second: f64,
 
     /// Maximum burst capacity (number of tokens the bucket can hold).
     /// Default: `20`.
+    ///
+    /// Used as the default when no tier matches.
     #[serde(default = "default_burst")]
     pub burst: u32,
 
@@ -695,6 +804,21 @@ pub struct RateLimitConfig {
     /// entry is invalid, forwarded headers are ignored rather than trusted.
     #[serde(default)]
     pub trusted_proxies: Vec<String>,
+
+    /// Key extraction strategy. Default: `"ip"`.
+    ///
+    /// Determines what value is used as the rate-limit bucket key.
+    /// See [`KeyStrategy`] for the available options.
+    #[serde(default)]
+    pub key_strategy: KeyStrategy,
+
+    /// Named tiers with per-tier `requests_per_second` and `burst` values.
+    ///
+    /// When a tier-assignment hook is registered and returns a tier name that
+    /// matches a key here, that tier's config is used for the caller's bucket
+    /// instead of the top-level defaults.
+    #[serde(default)]
+    pub tiers: HashMap<String, RateLimitTierConfig>,
 
     /// Bucket store backend. Default: `"memory"` (in-process, single-replica).
     ///
@@ -731,6 +855,8 @@ impl Default for RateLimitConfig {
             burst: default_burst(),
             trust_forwarded_headers: false,
             trusted_proxies: Vec::new(),
+            key_strategy: KeyStrategy::default(),
+            tiers: HashMap::new(),
             backend: RateLimitBackend::default(),
             #[cfg(feature = "redis")]
             redis: RateLimitRedisConfig::default(),

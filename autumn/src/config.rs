@@ -2158,6 +2158,15 @@ impl AutumnConfig {
             "AUTUMN_SECURITY__RATE_LIMIT__TRUSTED_PROXIES",
             &mut self.security.rate_limit.trusted_proxies,
         );
+        if let Ok(val) = env.var("AUTUMN_SECURITY__RATE_LIMIT__KEY_STRATEGY") {
+            match crate::security::config::KeyStrategy::from_env_value(&val) {
+                Some(strategy) => self.security.rate_limit.key_strategy = strategy,
+                None => eprintln!(
+                    "Warning: AUTUMN_SECURITY__RATE_LIMIT__KEY_STRATEGY={val:?} is not valid \
+                     (expected ip, api_token, or authenticated_principal), ignoring"
+                ),
+            }
+        }
         // BACKEND is always parsed so misconfiguration is surfaced even without
         // the redis feature (build_backend will warn and fall back to memory).
         if let Ok(val) = env.var("AUTUMN_SECURITY__RATE_LIMIT__BACKEND") {

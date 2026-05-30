@@ -106,15 +106,16 @@
 pub(crate) mod config;
 pub(crate) mod csrf;
 pub(crate) mod headers;
-pub(crate) mod rate_limit;
+pub mod rate_limit;
 
 // Re-export commonly used types at the module level.
 pub use config::{
-    CspNonceConfig, CsrfConfig, HeadersConfig, RateLimitBackend, RateLimitConfig, SecurityConfig,
-    UploadConfig, default_content_security_policy, hmac_sha256_hex,
+    CspNonceConfig, CsrfConfig, HeadersConfig, KeyStrategy, RateLimitBackend, RateLimitConfig,
+    RateLimitTierConfig, SecurityConfig, UploadConfig, default_content_security_policy,
+    hmac_sha256_hex,
 };
 #[cfg(feature = "redis")]
 pub use config::{RateLimitBackendFailure, RateLimitRedisConfig};
 pub use csrf::{CsrfFormField, CsrfLayer, CsrfToken};
 pub use headers::{CspNonce, SecurityHeadersLayer};
-pub use rate_limit::RateLimitLayer;
+pub use rate_limit::{RateLimitLayer, RateLimitOverride, RateLimitPrincipal};
