@@ -35,7 +35,7 @@ fn layout(title: &str, content: Markup) -> Markup {
                 title { (title) " - Bookmarks" }
                 link rel="stylesheet" href="/static/css/autumn.css";
                 script src="/static/js/htmx.min.js" {}
-                script src=(autumn_web::htmx::AUTUMN_WIDGETS_JS_PATH) defer {}
+                script src=(autumn_web::AUTUMN_WIDGETS_JS_PATH) defer {}
 
             }
             body class="bg-gray-50 min-h-screen" {
