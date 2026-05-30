@@ -290,7 +290,7 @@ async fn inspector_index_returns_html() {
 
     let router = autumn_web::inspector::inspector_router(
         buf,
-        "/_autumn/inspect".to_owned(),
+        "/_autumn/inspect",
     );
 
     let req = Request::builder()
@@ -320,7 +320,7 @@ async fn inspector_detail_returns_html() {
 
     let router = autumn_web::inspector::inspector_router(
         buf,
-        "/_autumn/inspect".to_owned(),
+        "/_autumn/inspect",
     );
 
     let req = Request::builder()
@@ -345,7 +345,7 @@ async fn inspector_detail_returns_404_for_unknown_id() {
     let buf = InspectorBuffer::new(10);
     let router = autumn_web::inspector::inspector_router(
         buf,
-        "/_autumn/inspect".to_owned(),
+        "/_autumn/inspect",
     );
 
     let req = Request::builder()

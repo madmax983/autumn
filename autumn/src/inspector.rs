@@ -59,7 +59,7 @@ pub struct RequestRecord {
     /// Request path (e.g. `"/posts"`).
     pub path: String,
     /// Matched route pattern (e.g. `"/posts/{id}"`), set by Axum's router.
-    /// `None` when the route was not matched (404) or MatchedPath was unavailable.
+    /// `None` when the route was not matched (404) or `MatchedPath` was unavailable.
     pub route: Option<String>,
     /// HTTP status code.
     pub status: u16,
@@ -81,11 +81,13 @@ pub struct RequestRecord {
 
 impl RequestRecord {
     /// Number of SQL queries issued during this request.
-    pub fn query_count(&self) -> usize {
+    #[must_use] 
+    pub const fn query_count(&self) -> usize {
         self.queries.len()
     }
 
     /// A `curl` one-liner that reproduces the method + path of this request.
+    #[must_use] 
     pub fn curl_snippet(&self) -> String {
         format!("curl -X {} 'http://localhost:3000{}'", self.method, self.path)
     }
@@ -113,6 +115,7 @@ impl InspectorBuffer {
     /// Create a new buffer with the given capacity.
     ///
     /// A capacity of `0` disables recording (all pushes are no-ops).
+    #[must_use] 
     pub fn new(capacity: usize) -> Self {
         Self {
             inner: Arc::new(Mutex::new(InspectorInner {
@@ -124,6 +127,10 @@ impl InspectorBuffer {
     }
 
     /// Push a new record. If at capacity the oldest record is dropped first.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
     pub fn push(&self, mut record: RequestRecord) {
         let mut g = self.inner.lock().expect("inspector buffer lock poisoned");
         if g.capacity == 0 {
@@ -138,6 +145,11 @@ impl InspectorBuffer {
     }
 
     /// Snapshot of all records, newest first.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    #[must_use]
     pub fn snapshot(&self) -> Vec<RequestRecord> {
         self.inner
             .lock()
@@ -149,6 +161,11 @@ impl InspectorBuffer {
     }
 
     /// Look up a single record by its ID.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    #[must_use]
     pub fn get(&self, id: u64) -> Option<RequestRecord> {
         self.inner
             .lock()
@@ -160,6 +177,11 @@ impl InspectorBuffer {
     }
 
     /// The configured capacity.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    #[must_use]
     pub fn capacity(&self) -> usize {
         self.inner
             .lock()
@@ -178,6 +200,7 @@ impl InspectorBuffer {
 /// all whitespace and converting to lower-case. This catches formatting
 /// differences between call sites while still allowing different predicates
 /// to be treated as different queries.
+#[must_use] 
 pub fn detect_n_plus_one(
     queries: &[QueryRecord],
     threshold: usize,
@@ -269,6 +292,7 @@ impl RequestInspector {
     }
 
     /// Number of queries recorded so far in this request.
+    #[must_use] 
     pub fn query_count(&self) -> usize {
         self.list.snapshot().len()
     }
@@ -286,7 +310,7 @@ impl<S: Send + Sync> FromRequestParts<S> for RequestInspector {
             .get::<RequestQueryList>()
             .cloned()
             .unwrap_or_default();
-        Ok(RequestInspector { list })
+        Ok(Self { list })
     }
 }
 
@@ -314,6 +338,7 @@ impl InspectorLayer {
     /// * `buffer` — shared ring buffer to write records into.
     /// * `n_plus_one_threshold` — minimum repetition count to trigger an N+1 warning.
     /// * `inspector_path_prefix` — path prefix of the inspector UI (excluded from recording).
+    #[must_use] 
     pub fn new(
         buffer: InspectorBuffer,
         n_plus_one_threshold: usize,
@@ -328,6 +353,7 @@ impl InspectorLayer {
     }
 
     /// Override the session cookie name used for session-ID extraction.
+    #[must_use]
     pub fn with_session_cookie_name(mut self, name: impl Into<String>) -> Self {
         self.session_cookie_name = name.into();
         self
@@ -377,12 +403,15 @@ where
     }
 
     fn call(&mut self, mut req: axum::extract::Request) -> Self::Future {
-        let path = req.uri().path().to_owned();
+        let path = req
+            .uri()
+            .path_and_query()
+            .map_or_else(|| req.uri().path().to_owned(), |pq| pq.as_str().to_owned());
 
         // Self-exclusion: don't record the inspector's own requests.
         if path.starts_with(&self.inspector_path_prefix) {
             let fut = self.inner.call(req);
-            return Box::pin(async move { fut.await });
+            return Box::pin(fut);
         }
 
         let method = req.method().to_string();
@@ -409,7 +438,7 @@ where
 
         Box::pin(async move {
             let response = fut.await?;
-            let elapsed_ms = start.elapsed().as_millis() as u64;
+            let elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
             let status = response.status().as_u16();
             let content_type = response
@@ -462,8 +491,8 @@ fn extract_session_id(
     let cookie_header = headers.get(header::COOKIE)?.to_str().ok()?;
     for pair in cookie_header.split(';') {
         let pair = pair.trim();
-        if let Some((name, value)) = pair.split_once('=') {
-            if name.trim() == cookie_name {
+        if let Some((name, value)) = pair.split_once('=')
+            && name.trim() == cookie_name {
                 let raw = value.trim();
                 // Strip HMAC signature: `{session_id}.{hmac_hex}` → `{session_id}`
                 let id = raw.split_once('.').map_or(raw, |(id, _)| id);
@@ -471,7 +500,6 @@ fn extract_session_id(
                     return Some(id.to_owned());
                 }
             }
-        }
     }
     None
 }
@@ -485,44 +513,39 @@ fn extract_session_id(
 /// * `GET {path}/requests/{id}` — request detail
 pub fn inspector_router<S>(
     buffer: InspectorBuffer,
-    path: String,
+    path: &str,
 ) -> axum::Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
-    let detail_path = format!("{}/requests/{{id}}", path);
+    let detail_path = format!("{path}/requests/{{id}}");
     let buf_index = buffer.clone();
-    let buf_detail = buffer.clone();
-    let path_clone = path.clone();
+    let buf_detail = buffer;
+    let path_for_index = path.to_owned();
+    let path_for_detail = path.to_owned();
 
     axum::Router::new()
         .route(
-            &path,
+            path,
             axum::routing::get(move || {
-                let buf = buf_index.clone();
-                let p = path_clone.clone();
-                async move { inspector_index(buf, p).await }
+                let records = buf_index.snapshot();
+                let p = path_for_index.clone();
+                async move { Html(render_index(&records, &p)) }
             }),
         )
         .route(
             &detail_path,
             axum::routing::get(move |axum::extract::Path(id): axum::extract::Path<u64>| {
-                let buf = buf_detail.clone();
-                async move { inspector_detail(buf, id).await }
+                let record = buf_detail.get(id);
+                let p = path_for_detail.clone();
+                async move {
+                    record.map_or_else(
+                        || StatusCode::NOT_FOUND.into_response(),
+                        |r| Html(render_detail(&r, &p)).into_response(),
+                    )
+                }
             }),
         )
-}
-
-async fn inspector_index(buffer: InspectorBuffer, inspector_path: String) -> impl IntoResponse {
-    let records = buffer.snapshot();
-    Html(render_index(&records, &inspector_path))
-}
-
-async fn inspector_detail(buffer: InspectorBuffer, id: u64) -> Response {
-    match buffer.get(id) {
-        Some(record) => Html(render_detail(&record)).into_response(),
-        None => StatusCode::NOT_FOUND.into_response(),
-    }
 }
 
 // ── HTML rendering ────────────────────────────────────────────────────────────
@@ -577,9 +600,11 @@ fn render_index(records: &[RequestRecord], inspector_path: &str) -> String {
     render_layout("Autumn Inspector", inspector_path, &body)
 }
 
-fn render_detail(rec: &RequestRecord) -> String {
+fn render_detail(rec: &RequestRecord, inspector_path: &str) -> String {
     let mut body = String::new();
-    body.push_str("<p><a href=\"/_autumn/inspect\">&larr; Back to request list</a></p>");
+    body.push_str("<p><a href=\"");
+    body.push_str(&escape_html(inspector_path));
+    body.push_str("\">&larr; Back to request list</a></p>");
     body.push_str("<h1>");
     body.push_str(&escape_html(&rec.method));
     body.push(' ');
@@ -660,7 +685,7 @@ fn render_detail(rec: &RequestRecord) -> String {
 
     render_layout(
         &format!("{} {}", rec.method, rec.path),
-        "/_autumn/inspect",
+        inspector_path,
         &body,
     )
 }
@@ -689,7 +714,7 @@ fn escape_html(s: &str) -> String {
     out
 }
 
-const INSPECTOR_CSS: &str = r#"
+const INSPECTOR_CSS: &str = r"
 body{margin:0;padding:24px;font-family:system-ui,-apple-system,sans-serif;color:#1f2933;background:#f6f8fa;font-size:14px}
 h1{margin:0 0 8px;font-size:22px}
 h2{margin:20px 0 8px;font-size:16px}
@@ -710,7 +735,7 @@ dl.summary dt{font-weight:600;margin-right:4px}
 dl.summary dd{margin:0}
 details{margin:12px 0;padding:10px 12px;background:#fff;border:1px solid #d9e2ec;border-radius:4px}
 summary{cursor:pointer;font-weight:600}
-"#;
+";
 
 // ── Public path constant ──────────────────────────────────────────────────────
 

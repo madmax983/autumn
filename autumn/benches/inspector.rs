@@ -87,10 +87,7 @@ fn main() {
     let iterations = 50_000u32;
 
     println!("\n─── Inspector overhead benchmark ───────────────────────────");
-    println!(
-        "{:<30} {:>8}  {}",
-        "stack", "ns/op", "total"
-    );
+    println!("{:<30} {:>8}  total", "stack", "ns/op");
     println!("{}", "─".repeat(60));
 
     let baseline = run_benchmark(&rt, "baseline (no inspector)", hello_router, iterations);
@@ -114,10 +111,7 @@ fn main() {
     let budget_ns: u128 = 1_000_000; // 1 ms
     let status = if overhead_ns < budget_ns { "✓ PASS" } else { "✗ FAIL" };
 
-    println!(
-        "Inspector overhead:         {:>8} ns/op  (budget < {budget_ns} ns)  {status}",
-        overhead_ns,
-    );
+    println!("Inspector overhead:         {overhead_ns:>8} ns/op  (budget < {budget_ns} ns)  {status}");
 
     // The benchmark itself doesn't assert — latency varies across CI machines.
     // Use the printed output for manual verification and flamegraph profiling.

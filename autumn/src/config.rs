@@ -116,6 +116,9 @@
 //! | `AUTUMN_SECURITY__WEBHOOKS__REPLAY__REDIS__URL` | `security.webhooks.replay.redis.url` | `String` |
 //! | `AUTUMN_SECURITY__WEBHOOKS__REPLAY__REDIS__KEY_PREFIX` | `security.webhooks.replay.redis.key_prefix` | `String` |
 //! | `AUTUMN_SECURITY__WEBHOOKS__REPLAY__ALLOW_MEMORY_IN_PRODUCTION` | `security.webhooks.replay.allow_memory_in_production` | `bool` |
+//! | `AUTUMN_DEV__INSPECTOR_PATH` | `dev.inspector_path` | `String` |
+//! | `AUTUMN_DEV__INSPECTOR_CAPACITY` | `dev.inspector_capacity` | `usize` |
+//! | `AUTUMN_DEV__INSPECTOR_N_PLUS_ONE_THRESHOLD` | `dev.inspector_n_plus_one_threshold` | `usize` |
 
 use std::path::{Path, PathBuf};
 
@@ -792,11 +795,11 @@ fn default_inspector_path() -> String {
     "/_autumn/inspect".to_owned()
 }
 
-fn default_inspector_capacity() -> usize {
+const fn default_inspector_capacity() -> usize {
     100
 }
 
-fn default_inspector_n_plus_one_threshold() -> usize {
+const fn default_inspector_n_plus_one_threshold() -> usize {
     5
 }
 
@@ -1636,10 +1639,29 @@ impl AutumnConfig {
         self.apply_auth_env_overrides_with_env(env);
         self.apply_security_env_overrides_with_env(env);
         self.apply_idempotency_env_overrides_with_env(env);
+        self.apply_dev_env_overrides_with_env(env);
         #[cfg(feature = "storage")]
         self.apply_storage_env_overrides_with_env(env);
         #[cfg(feature = "mail")]
         self.apply_mail_env_overrides_with_env(env);
+    }
+
+    fn apply_dev_env_overrides_with_env(&mut self, env: &dyn Env) {
+        parse_env_string(
+            env,
+            "AUTUMN_DEV__INSPECTOR_PATH",
+            &mut self.dev.inspector_path,
+        );
+        parse_env(
+            env,
+            "AUTUMN_DEV__INSPECTOR_CAPACITY",
+            &mut self.dev.inspector_capacity,
+        );
+        parse_env(
+            env,
+            "AUTUMN_DEV__INSPECTOR_N_PLUS_ONE_THRESHOLD",
+            &mut self.dev.inspector_n_plus_one_threshold,
+        );
     }
 
     fn apply_idempotency_env_overrides_with_env(&mut self, env: &dyn Env) {

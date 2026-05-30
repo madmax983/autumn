@@ -357,7 +357,7 @@ fn build_router_pre_state(
         // Mount the inspector UI routes.
         router = router.merge(crate::inspector::inspector_router(
             buf.clone(),
-            inspector_path.clone(),
+            &inspector_path,
         ));
         tracing::debug!(
             path = %inspector_path,
