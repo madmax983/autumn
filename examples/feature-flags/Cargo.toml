@@ -1,0 +1,13 @@
+[package]
+name = "feature-flags"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+autumn-web = { path = "../../autumn" }
+axum = { version = "0.8" }
+serde_json = "1"
+
+[lints.rust]
+unsafe_code = "forbid"

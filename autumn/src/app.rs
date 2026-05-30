@@ -1298,6 +1298,40 @@ impl AppBuilder {
         self
     }
 
+    /// Register a [`FlagStore`](crate::feature_flags::FlagStore) backend for
+    /// feature-flag evaluation.
+    ///
+    /// After registration, the [`Flags`](crate::feature_flags::Flags) extractor
+    /// and `#[feature_flag]` macro are available in route handlers. Without a
+    /// registered store, both return `500 Internal Server Error`.
+    ///
+    /// For tests use [`InMemoryFlagStore`](crate::feature_flags::InMemoryFlagStore);
+    /// in production use the Postgres-backed
+    /// `autumn_web::feature_flags::pg::PgFlagStore`.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use autumn_web::feature_flags::InMemoryFlagStore;
+    /// use std::sync::Arc;
+    ///
+    /// autumn_web::app()
+    ///     .with_flag_store(InMemoryFlagStore::new())
+    ///     .run()
+    ///     .await;
+    /// ```
+    #[must_use]
+    pub fn with_flag_store<S>(self, store: S) -> Self
+    where
+        S: crate::feature_flags::FlagStore,
+    {
+        let service =
+            crate::feature_flags::FeatureFlagService::new(Arc::new(store) as Arc<_>);
+        self.state_initializer(move |state| {
+            state.insert_extension(service);
+        })
+    }
+
     /// Register a durable [`MailDeliveryQueue`](crate::mail::MailDeliveryQueue) for
     /// [`Mailer::deliver_later`](crate::mail::Mailer::deliver_later).
     ///

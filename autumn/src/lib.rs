@@ -186,6 +186,7 @@ pub mod static_gen;
 pub mod storage;
 pub mod tenancy;
 
+pub mod feature_flags;
 pub mod form;
 pub mod job;
 pub mod runtime_config;
@@ -715,6 +716,26 @@ pub use auth::API_TOKEN_MIGRATIONS;
 /// }
 /// ```
 pub use autumn_macros::secured;
+
+/// Gate a route handler on a named feature flag. If the flag is disabled for
+/// the current actor the handler responds with `404 Not Found` (default) or
+/// delegates to a custom fallback specified with `fallback = my_fn`.
+///
+/// Requires a [`FeatureFlagService`](crate::feature_flags::FeatureFlagService)
+/// installed in the app's [`AppState`] extensions.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use autumn_web::prelude::*;
+///
+/// #[get("/beta")]
+/// #[feature_flag("beta_dashboard")]
+/// async fn beta_dashboard() -> Markup {
+///     html! { h1 { "Beta!" } }
+/// }
+/// ```
+pub use autumn_macros::feature_flag;
 
 /// Enforce a record-level [`Policy`](crate::authorization::Policy)
 /// before a handler runs. Coexists with [`secured`](macro@secured):

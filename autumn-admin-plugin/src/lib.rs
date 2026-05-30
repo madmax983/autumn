@@ -33,6 +33,7 @@
 //! First-party plugin: `autumn-<name>-plugin`.
 
 mod auth;
+pub mod feature_flags;
 mod registry;
 mod routes;
 mod templates;

@@ -16,6 +16,7 @@ mod api_doc;
 mod authorize;
 mod cached;
 mod collect;
+mod feature_flag;
 mod i18n;
 mod idempotency_guard;
 mod job;
@@ -413,6 +414,40 @@ pub fn one_off_tasks(input: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn secured(attr: TokenStream, item: TokenStream) -> TokenStream {
     secured::secured_macro(attr.into(), item.into()).into()
+}
+
+/// Gate a route handler on a named feature flag.
+///
+/// If the flag is disabled for the current actor, the handler responds with
+/// `404 Not Found` by default. Provide a `fallback` function to return a
+/// custom response instead.
+///
+/// The flag key is resolved against the [`FeatureFlagService`] stored in the
+/// [`AppState`] extensions. Unknown flags are treated as **disabled**
+/// (fail-closed).
+///
+/// # Forms
+///
+/// - `#[feature_flag("key")]` — return 404 when disabled
+/// - `#[feature_flag("key", fallback = my_fn)]` — call `my_fn()` when disabled
+///
+/// # Example
+///
+/// ```ignore
+/// use autumn_web::prelude::*;
+///
+/// #[get("/beta")]
+/// #[feature_flag("beta_dashboard")]
+/// async fn beta_dashboard() -> Markup {
+///     html! { h1 { "Beta Dashboard" } }
+/// }
+/// ```
+///
+/// [`FeatureFlagService`]: autumn_web::feature_flags::FeatureFlagService
+/// [`AppState`]: autumn_web::AppState
+#[proc_macro_attribute]
+pub fn feature_flag(attr: TokenStream, item: TokenStream) -> TokenStream {
+    feature_flag::feature_flag_macro(attr.into(), item.into()).into()
 }
 
 /// Enforce a record-level authorization policy on a route handler.

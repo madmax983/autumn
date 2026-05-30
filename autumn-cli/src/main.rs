@@ -8,6 +8,7 @@ mod dev;
 mod dev_loop_bench;
 mod doctor;
 mod export;
+mod flags;
 mod generate;
 mod maintenance;
 mod migrate;
@@ -195,6 +196,26 @@ enum Commands {
     ///   autumn token revoke `<RAW_TOKEN>`
     #[command(subcommand, verbatim_doc_comment)]
     Token(TokenCommands),
+
+    /// Inspect and toggle feature flags at runtime without redeploying.
+    ///
+    /// Feature flags control which actors see a feature. Mutations propagate
+    /// to all running replicas within seconds via Postgres LISTEN/NOTIFY cache
+    /// invalidation.
+    ///
+    /// The database URL is resolved from `autumn.toml`, profile overrides, or
+    /// the `AUTUMN_DATABASE__PRIMARY_URL` / `AUTUMN_DATABASE__URL` /
+    /// `DATABASE_URL` environment variables.
+    ///
+    /// # Examples
+    ///
+    ///   autumn flags list
+    ///   autumn flags enable dark_mode
+    ///   autumn flags disable dark_mode --actor ops@example.com
+    ///   autumn flags set-rollout new_checkout 10
+    ///   autumn flags allow beta_inbox user:42
+    #[command(subcommand, verbatim_doc_comment)]
+    Flags(FlagsCommands),
 
     /// Run accessibility (WCAG 2.1 AA) checks against rendered HTML.
     ///
@@ -586,6 +607,83 @@ enum TokenCommands {
     },
 }
 
+/// Subcommands for `autumn flags`.
+#[derive(Subcommand)]
+enum FlagsCommands {
+    /// List all feature flags and their current state.
+    List,
+    /// Globally enable a flag (all actors will see it as enabled).
+    ///
+    /// Creates the flag if it does not exist.
+    ///
+    /// # Example
+    ///
+    ///   autumn flags enable dark_mode
+    ///   autumn flags enable dark_mode --actor ops@example.com
+    #[command(verbatim_doc_comment)]
+    Enable {
+        /// Flag key (must be snake_case).
+        key: String,
+        /// Actor identifier stored in the change log.
+        #[arg(long, value_name = "ACTOR")]
+        actor: Option<String>,
+    },
+    /// Globally disable a flag (all actors will see it as disabled).
+    ///
+    /// Creates the flag if it does not exist.
+    ///
+    /// # Example
+    ///
+    ///   autumn flags disable dark_mode
+    #[command(verbatim_doc_comment)]
+    Disable {
+        /// Flag key.
+        key: String,
+        /// Actor identifier stored in the change log.
+        #[arg(long, value_name = "ACTOR")]
+        actor: Option<String>,
+    },
+    /// Set the percent-rollout gate for a flag (0–100).
+    ///
+    /// Actors are bucketed deterministically by (flag_name, actor_id) so a
+    /// given user never flips between cohorts on repeated requests.
+    ///
+    /// Use 0 to disable the rollout gate. Use 100 to enable for all actors.
+    ///
+    /// # Example
+    ///
+    ///   autumn flags set-rollout new_checkout 10
+    ///   autumn flags set-rollout new_checkout 50 --actor ops@example.com
+    #[command(name = "set-rollout", verbatim_doc_comment)]
+    SetRollout {
+        /// Flag key.
+        key: String,
+        /// Rollout percentage (0–100).
+        pct: u8,
+        /// Actor identifier stored in the change log.
+        #[arg(long, value_name = "ACTOR")]
+        actor: Option<String>,
+    },
+    /// Add an actor to the explicit allowlist for a flag.
+    ///
+    /// The actor will always see the flag as enabled regardless of the
+    /// global gate or rollout percentage.
+    ///
+    /// # Example
+    ///
+    ///   autumn flags allow beta_inbox user:42
+    #[command(verbatim_doc_comment)]
+    Allow {
+        /// Flag key.
+        key: String,
+        /// Actor ID to allowlist (e.g. `user:42`).
+        actor_id: String,
+        /// Actor identifier stored in the change log.
+        #[arg(long, value_name = "ACTOR")]
+        actor: Option<String>,
+    },
+}
+
 /// Subcommands for `autumn release`.
 #[derive(Subcommand)]
 enum ReleaseCommands {
@@ -963,6 +1061,29 @@ fn run_command(command: Commands) {
             }
             ConfigCommands::History { key, limit } => {
                 config::run_history(&config::HistoryOptions { key, limit });
+            }
+        },
+        Commands::Flags(cmd) => match cmd {
+            FlagsCommands::List => flags::run_list(&flags::ListOptions),
+            FlagsCommands::Enable { key, actor } => {
+                flags::run_enable(&flags::EnableOptions { key, actor });
+            }
+            FlagsCommands::Disable { key, actor } => {
+                flags::run_disable(&flags::DisableOptions { key, actor });
+            }
+            FlagsCommands::SetRollout { key, pct, actor } => {
+                flags::run_set_rollout(&flags::SetRolloutOptions { key, pct, actor });
+            }
+            FlagsCommands::Allow {
+                key,
+                actor_id,
+                actor,
+            } => {
+                flags::run_allow(&flags::AllowOptions {
+                    key,
+                    actor_id,
+                    actor,
+                });
             }
         },
         Commands::DevLoopBench {
