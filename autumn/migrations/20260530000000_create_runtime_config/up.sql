@@ -30,3 +30,4 @@ CREATE TABLE IF NOT EXISTS autumn_runtime_config_changes (
 -- Fast look-ups for `autumn config history <key>`
 CREATE INDEX IF NOT EXISTS idx_autumn_runtime_config_changes_key_time
     ON autumn_runtime_config_changes (key, changed_at DESC);
+

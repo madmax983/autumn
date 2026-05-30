@@ -1,7 +1,7 @@
 //! `autumn config` — inspect and mutate runtime configuration values.
 //!
 //! All commands connect directly to the configured Postgres database via
-//! `psql`, following the same URL-resolution strategy as `autumn token`.
+//! `psql`, following the same profile-aware URL-resolution strategy as the app.
 //!
 //! # Commands
 //!
@@ -13,8 +13,9 @@
 //! autumn config history <key>           # show the change history for a key
 //! ```
 
-use std::path::Path;
 use std::process::Command;
+
+use autumn_web::config::{AutumnConfig, Env, OsEnv};
 
 /// Options for `autumn config list`.
 pub struct ListOptions;
@@ -193,35 +194,30 @@ pub fn run_history(opts: &HistoryOptions) {
 // ── Database URL resolution (mirrors token.rs) ────────────────────────────────
 
 pub fn resolve_database_url() -> String {
-    let config_table = read_autumn_toml_table();
-    if let Some(url) =
-        resolve_primary_database_url_from_sources(|key| std::env::var(key), config_table.as_ref())
-    {
+    if let Some(url) = resolve_primary_database_url_with_env(&OsEnv) {
         return url;
     }
 
     eprintln!("\u{2717} No database URL found.");
     eprintln!(
-        "  Set database.primary_url (or database.url) in autumn.toml, \
+        "  Set database.primary_url (or database.url) in autumn.toml, autumn-<profile>.toml, \
          or set AUTUMN_DATABASE__PRIMARY_URL / AUTUMN_DATABASE__URL / DATABASE_URL."
     );
     std::process::exit(1);
 }
 
-fn read_autumn_toml_table() -> Option<toml::Table> {
-    let config_path = Path::new("autumn.toml");
-    if !config_path.exists() {
-        return None;
-    }
-    std::fs::read_to_string(config_path)
-        .ok()
-        .and_then(|contents| toml::from_str::<toml::Table>(&contents).ok())
+pub fn resolve_primary_database_url_with_env(env: &dyn Env) -> Option<String> {
+    resolve_primary_database_url_from_env_var(|key| env.var(key)).or_else(|| {
+        AutumnConfig::load_with_env(env).ok().and_then(|config| {
+            config
+                .database
+                .effective_primary_url()
+                .map(ToOwned::to_owned)
+        })
+    })
 }
 
-pub fn resolve_primary_database_url_from_sources<F>(
-    env_var: F,
-    table: Option<&toml::Table>,
-) -> Option<String>
+fn resolve_primary_database_url_from_env_var<F>(env_var: F) -> Option<String>
 where
     F: Fn(&str) -> Result<String, std::env::VarError>,
 {
@@ -235,6 +231,21 @@ where
         {
             return Some(url);
         }
+    }
+
+    None
+}
+
+#[cfg(test)]
+fn resolve_primary_database_url_from_sources<F>(
+    env_var: F,
+    table: Option<&toml::Table>,
+) -> Option<String>
+where
+    F: Fn(&str) -> Result<String, std::env::VarError>,
+{
+    if let Some(url) = resolve_primary_database_url_from_env_var(env_var) {
+        return Some(url);
     }
 
     let database = table?.get("database").and_then(toml::Value::as_table)?;
@@ -381,6 +392,27 @@ mod tests {
         let env = |_: &str| Err(std::env::VarError::NotPresent);
         let url = resolve_primary_database_url_from_sources(env, Some(&table)).unwrap();
         assert_eq!(url, "postgres://legacy-toml");
+    }
+
+    #[test]
+    fn resolve_reads_url_from_active_profile_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("autumn.toml"), "").unwrap();
+        std::fs::write(
+            tmp.path().join("autumn-dev.toml"),
+            r#"
+            [database]
+            url = "postgres://profile-file"
+            "#,
+        )
+        .unwrap();
+
+        let env = autumn_web::config::MockEnv::new()
+            .with("AUTUMN_MANIFEST_DIR", tmp.path().to_str().unwrap())
+            .with("AUTUMN_ENV", "dev");
+
+        let url = resolve_primary_database_url_with_env(&env).unwrap();
+        assert_eq!(url, "postgres://profile-file");
     }
 
     #[test]

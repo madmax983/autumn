@@ -276,9 +276,9 @@ enum Commands {
     /// without a redeploy.  They are stored in `autumn_runtime_config_values`
     /// and every mutation is audited in `autumn_runtime_config_changes`.
     ///
-    /// The database URL is resolved from `autumn.toml` or the
-    /// `AUTUMN_DATABASE__PRIMARY_URL` / `AUTUMN_DATABASE__URL` / `DATABASE_URL`
-    /// environment variables.
+    /// The database URL is resolved from `autumn.toml`, `autumn-<profile>.toml`,
+    /// or the `AUTUMN_DATABASE__PRIMARY_URL` / `AUTUMN_DATABASE__URL` /
+    /// `DATABASE_URL` environment variables.
     ///
     /// # Examples
     ///
