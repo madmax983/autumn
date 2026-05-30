@@ -1053,7 +1053,8 @@ where
 {
     // CSRF middleware (only applied when enabled)
     if config.security.csrf.enabled {
-        let mut csrf_layer = crate::security::CsrfLayer::from_config(&config.security.csrf);
+        let mut csrf_layer = crate::security::CsrfLayer::from_config(&config.security.csrf)
+            .with_max_scan_bytes(config.security.upload.max_request_size_bytes);
         if let Some(keys) = signing_keys {
             csrf_layer = csrf_layer.with_signing_keys(keys);
         }
