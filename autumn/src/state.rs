@@ -23,11 +23,11 @@ use crate::actuator;
 use crate::authorization::{ForbiddenResponse, Policy, PolicyRegistry, Scope};
 #[cfg(feature = "ws")]
 use crate::channels::Channels;
-#[cfg(feature = "ws")]
-use crate::presence::Presence;
 #[cfg(feature = "db")]
 use crate::db::DbState;
 use crate::middleware;
+#[cfg(feature = "ws")]
+use crate::presence::Presence;
 use crate::probe;
 #[cfg(feature = "ws")]
 use tokio_util::sync::CancellationToken;

@@ -56,7 +56,9 @@ struct ConnectionPresence {
 }
 
 struct PresenceInner {
-    entries: HashMap<String, HashMap<String, Vec<ConnectionPresence>>>,
+    // BTreeMap for the per-key layer so list() returns entries in stable key
+    // order — deterministic ordering prevents flaky tests and predictable UI.
+    entries: HashMap<String, std::collections::BTreeMap<String, Vec<ConnectionPresence>>>,
     ttl: Duration,
 }
 
@@ -81,18 +83,24 @@ impl PresenceInner {
             });
     }
 
-    fn remove(&mut self, topic: &str, key: &str, connection_id: u64) {
+    /// Remove the given connection.  Returns `true` if the key is now completely
+    /// absent from the topic (i.e. this was its last active connection), which
+    /// is the condition under which a `Leave` event should be broadcast.
+    fn remove(&mut self, topic: &str, key: &str, connection_id: u64) -> bool {
+        let mut key_fully_removed = false;
         if let Some(by_key) = self.entries.get_mut(topic) {
             if let Some(conns) = by_key.get_mut(key) {
                 conns.retain(|c| c.connection_id != connection_id);
                 if conns.is_empty() {
                     by_key.remove(key);
+                    key_fully_removed = true;
                 }
             }
             if by_key.is_empty() {
                 self.entries.remove(topic);
             }
         }
+        key_fully_removed
     }
 
     fn list(&self, topic: &str) -> Vec<PresenceEntry> {
@@ -321,18 +329,23 @@ impl PresenceHandle {
 
 impl Drop for PresenceHandle {
     fn drop(&mut self) {
-        {
+        let key_fully_removed = {
             let mut inner = self.inner.lock().expect("presence lock poisoned");
-            inner.remove(&self.topic, &self.key, self.connection_id);
-        }
-
-        let event = PresenceEvent::Leave {
-            key: self.key.clone(),
+            inner.remove(&self.topic, &self.key, self.connection_id)
         };
-        let json = serde_json::to_string(&event).unwrap_or_default();
-        let _ = self
-            .channels
-            .publish(&format!("presence:{}", self.topic), json);
+
+        // Only broadcast Leave when this was the last connection for the key.
+        // If the same user still has other tabs open their key remains present,
+        // so emitting a Leave would incorrectly signal they have gone offline.
+        if key_fully_removed {
+            let event = PresenceEvent::Leave {
+                key: self.key.clone(),
+            };
+            let json = serde_json::to_string(&event).unwrap_or_default();
+            let _ = self
+                .channels
+                .publish(&format!("presence:{}", self.topic), json);
+        }
     }
 }
 
@@ -458,6 +471,29 @@ mod tests {
     }
 
     // ── CHANNEL EVENT TESTS ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn no_leave_event_while_other_connections_remain() {
+        let channels = Channels::new(16);
+        let presence = Presence::new(channels.clone());
+        let mut rx = channels.subscribe("presence:room:1");
+
+        let h1 = presence.track("room:1", "alice", serde_json::json!({"tab": 1}));
+        let _h2 = presence.track("room:1", "alice", serde_json::json!({"tab": 2}));
+        // drain both join events
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await;
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await;
+
+        // Drop h1 — alice still has h2 open, so no Leave should be broadcast.
+        drop(h1);
+        let result = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await;
+        assert!(
+            result.is_err(),
+            "no Leave event should be emitted while another connection is open"
+        );
+        // Alice is still present.
+        assert_eq!(presence.list("room:1")[0].metas.len(), 1);
+    }
 
     #[tokio::test]
     async fn join_event_broadcast_on_track() {

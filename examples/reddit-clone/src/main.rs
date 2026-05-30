@@ -73,6 +73,8 @@ async fn main() {
             routes::live::live_feed_health,
             routes::live::live_feed,
             routes::live::subreddit_feed,
+            routes::live::subreddit_viewers,
+            routes::live::subreddit_viewer_stream,
             repositories::subreddit_api_list,
             repositories::subreddit_api_get,
             repositories::post_api_list,

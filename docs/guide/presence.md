@@ -154,8 +154,8 @@ by the background sweep on each surviving replica.
 
 ### Active viewers badge (htmx + SSE)
 
-The `examples/presence-viewers` example ships a full "Who is viewing this
-post?" badge. The essential pattern:
+The `examples/reddit-clone` example uses this pattern to show a "viewers on
+this subreddit" badge. The essential pattern:
 
 ```rust
 #[get("/posts/{id}/track")]
