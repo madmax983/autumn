@@ -1309,7 +1309,28 @@ impl AppBuilder {
     /// in production use the Postgres-backed
     /// `autumn_web::feature_flags::pg::PgFlagStore`.
     ///
-    /// # Example
+    /// # Sharing the store with the poll listener
+    ///
+    /// When using `PgFlagStore` in a multi-replica deployment, pass an `Arc`
+    /// clone so the app service and the poll listener share the **same** cache:
+    ///
+    /// ```rust,ignore
+    /// use std::sync::Arc;
+    /// use std::time::Duration;
+    /// use autumn_web::feature_flags::pg::PgFlagStore;
+    ///
+    /// let store = Arc::new(PgFlagStore::new(&config.database.primary_url));
+    /// PgFlagStore::spawn_poll_listener(Arc::clone(&store), Duration::from_secs(1));
+    /// autumn_web::app()
+    ///     .with_flag_store(Arc::clone(&store))
+    ///     .run()
+    ///     .await;
+    /// ```
+    ///
+    /// `Arc<PgFlagStore>` implements `FlagStore`, so the same `Arc` is
+    /// accepted directly without creating a separate cache instance.
+    ///
+    /// # Basic example
     ///
     /// ```rust,ignore
     /// use autumn_web::feature_flags::InMemoryFlagStore;

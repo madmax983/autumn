@@ -25,10 +25,16 @@ pub fn build_store(config: &AutumnConfig) -> Box<dyn FlagStore> {
 }
 
 fn configure(store: &dyn FlagStore) {
-    // 25 % rollout — stable per (flag_name, actor_id).
-    store.set_rollout("new_ui_preview", 25, Some("init")).ok();
-    // Off by default; enable with: autumn flags enable post_awards
-    store.disable("post_awards", Some("init")).ok();
+    // Seed defaults only when the flag is absent so that runtime changes
+    // (e.g. `autumn flags enable post_awards`) survive restarts/redeploys.
+    if store.get("new_ui_preview").ok().flatten().is_none() {
+        // 25 % rollout — stable per (flag_name, actor_id).
+        store.set_rollout("new_ui_preview", 25, Some("init")).ok();
+    }
+    if store.get("post_awards").ok().flatten().is_none() {
+        // Off by default; enable with: autumn flags enable post_awards
+        store.disable("post_awards", Some("init")).ok();
+    }
 }
 
 #[cfg(test)]

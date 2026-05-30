@@ -38,7 +38,7 @@ Run the bundled migration to create the `autumn_feature_flags` and
 `feature_flag_changes` tables:
 
 ```sh
-autumn db migrate
+autumn migrate
 ```
 
 ### 2. Gate a handler
