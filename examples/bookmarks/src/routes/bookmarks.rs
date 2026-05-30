@@ -35,6 +35,8 @@ fn layout(title: &str, content: Markup) -> Markup {
                 title { (title) " - Bookmarks" }
                 link rel="stylesheet" href="/static/css/autumn.css";
                 script src="/static/js/htmx.min.js" {}
+                script src=(autumn_web::htmx::AUTUMN_WIDGETS_JS_PATH) defer {}
+
             }
             body class="bg-gray-50 min-h-screen" {
                 nav class="bg-indigo-600 text-white p-4" {
@@ -180,7 +182,8 @@ pub async fn new_form() -> AutumnResult<Markup> {
     let tag_ac =
         autumn_web::widgets::AutocompleteConfig::new("/bookmarks/tags/autocomplete", "tag")
             .placeholder("Search existing tags…")
-            .min_length(1);
+            .min_length(1)
+            .free_text(); // tags are plain strings; allow typing a new tag
 
     Ok(layout(
         "Add Bookmark",

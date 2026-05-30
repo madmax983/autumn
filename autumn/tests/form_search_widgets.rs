@@ -267,9 +267,19 @@ mod active_search_tests {
         let config = AutocompleteConfig::new("/autocomplete", "tag_id");
         let html = autocomplete_input("tag", "Tag", &config).into_string();
         assert!(html.contains(r#"type="hidden""#), "{html}");
-        // The hidden input has no name in HTML; name is set by JS on first interaction
-        // to prevent duplicate-field submission when JavaScript is disabled.
+        // Hidden input has no name attribute in HTML; autumn-widgets.js sets
+        // it on first interaction to prevent duplicate submission in no-JS mode.
         assert!(html.contains(r#"id="tag-value""#), "{html}");
+    }
+
+    #[test]
+    fn autocomplete_wrapper_data_attributes_for_runtime() {
+        let config = AutocompleteConfig::new("/autocomplete", "tag_id");
+        let html = autocomplete_input("tag", "Tag", &config).into_string();
+        assert!(html.contains(r#"data-ac-value-id="tag-value""#), "{html}");
+        assert!(html.contains(r#"data-ac-value-name="tag_id""#), "{html}");
+        assert!(html.contains("data-ac-query"), "{html}");
+        assert!(html.contains("data-ac-min-length"), "{html}");
     }
 
     #[test]

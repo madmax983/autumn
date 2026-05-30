@@ -203,6 +203,14 @@ pub struct AutocompleteConfig<'a> {
     pub placeholder: Option<&'a str>,
     /// Static `(value, label)` pairs for the `<noscript>` `<select>` fallback.
     pub fallback_options: Option<&'a [(&'a str, &'a str)]>,
+    /// When `true`, the hidden field is kept in sync with whatever the user
+    /// types, so submitting without picking an option sends the typed text.
+    ///
+    /// Use this for tag-style fields where the submitted value is the text
+    /// itself (e.g. `name="tag"` with `autocomplete_option(tag, tag)`). Leave
+    /// `false` (the default) for ID-based lookups where the hidden field should
+    /// only carry a value selected from the option list.
+    pub free_text: bool,
 }
 
 impl<'a> AutocompleteConfig<'a> {
@@ -221,6 +229,7 @@ impl<'a> AutocompleteConfig<'a> {
             value_name,
             placeholder: None,
             fallback_options: None,
+            free_text: false,
         }
     }
 
@@ -263,6 +272,19 @@ impl<'a> AutocompleteConfig<'a> {
     #[must_use]
     pub const fn fallback_options(mut self, options: &'a [(&'a str, &'a str)]) -> Self {
         self.fallback_options = Some(options);
+        self
+    }
+
+    /// Enable free-text mode: the hidden field is kept in sync with whatever
+    /// the user types, so submitting without choosing an option sends the typed
+    /// text as the field value.
+    ///
+    /// Use for tag-style fields (`name="tag"`) where creating new values by
+    /// typing is allowed. Leave disabled (the default) for ID-based foreign-key
+    /// lookups where only values from the option list are valid.
+    #[must_use]
+    pub const fn free_text(mut self) -> Self {
+        self.free_text = true;
         self
     }
 }
@@ -324,6 +346,7 @@ pub fn active_search_input(id: &str, label: &str, config: &ActiveSearchConfig<'_
                 autocomplete="off"
                 aria-controls=(aria_controls)
                 placeholder=[config.placeholder]
+                data-ac-min-length=(config.min_length)
                 hx-get=[hx_get]
                 hx-post=[hx_post]
                 hx-trigger=(trigger)
@@ -353,11 +376,14 @@ pub fn active_search_results(id: &str) -> maud::Markup {
 ///
 /// Emits:
 /// - A labeled search input with htmx active-search attributes.
-/// - A results container (`id="{id}-results"`).
+/// - A results container whose `id` is derived from `config.target`.
 /// - A `<noscript>` fallback form that works without JavaScript.
 ///
-/// The results container id is `"{id}-results"`. Pass `"#{id}-results"` as
-/// `config.target` to connect the input to this container.
+/// **`config.target` must be a `#id` selector** (e.g. `"#bookmark-search-results"`).
+/// This function derives the results container `id` by stripping the leading `#`, so
+/// class selectors (`.foo`) or other forms produce an invalid HTML `id` attribute.
+/// Use [`active_search_input`] + [`active_search_results`] directly if you need a
+/// non-id htmx target.
 ///
 /// # Example
 ///
@@ -374,6 +400,12 @@ pub fn active_search_results(id: &str) -> maud::Markup {
 #[cfg(feature = "maud")]
 #[must_use]
 pub fn active_search(id: &str, label: &str, config: &ActiveSearchConfig<'_>) -> maud::Markup {
+    debug_assert!(
+        config.target.starts_with('#'),
+        "active_search: config.target must be a #id selector (e.g. \"#my-results\"), got {:?}. \
+         Use active_search_input + active_search_results directly for other selectors.",
+        config.target
+    );
     // Derive the results container ID from the configured target selector so the
     // rendered container always matches what the input's hx-target points at.
     let results_id = selector_to_id(config.target).to_string();
@@ -450,28 +482,25 @@ pub fn autocomplete_input(id: &str, label: &str, config: &AutocompleteConfig<'_>
     let options_id = format!("{id}-options");
     let trigger = build_trigger(config.debounce_ms, false);
     let target = format!("#{options_id}");
-    let vn = config.value_name;
-    // Populate the visible input and the hidden value field when a user clicks
-    // an autocomplete option. Uses event delegation on the listbox container.
-    // v.name is set here so the hidden input gains a name only via JS — preventing
-    // the duplicate-field problem when JavaScript is disabled (the <noscript><select>
-    // already carries the name).
-    let hx_on_click = format!(
-        "let o=event.target.closest('[role=option]');if(o){{let v=document.getElementById('{value_id}');v.name='{vn}';v.value=o.getAttribute('data-value');document.getElementById('{query_id}').value=o.textContent.trim();this.innerHTML='';}}"
-    );
-    // Same selection logic for keyboard users: Enter or Space activates the focused option.
-    let hx_on_keydown = format!(
-        "let o=event.target.closest('[role=option]');if(o&&(event.key==='Enter'||event.key===' ')){{event.preventDefault();let v=document.getElementById('{value_id}');v.name='{vn}';v.value=o.getAttribute('data-value');document.getElementById('{query_id}').value=o.textContent.trim();this.innerHTML='';}}"
-    );
-    // Keep the hidden field in sync with the typed text so users can submit a value
-    // they typed directly (without picking from the list). v.name is also set here so
-    // the hidden input has no name attribute in HTML and only participates in JS-mode
-    // form submission.
-    let on_input_handler =
-        format!("let v=document.getElementById('{value_id}');v.name='{vn}';v.value=this.value");
+
+    // Interaction wiring is handled by the external autumn-widgets.js script
+    // (served at /static/js/autumn-widgets.js) via data-* attributes:
+    //
+    //  data-ac-value-id   — id of the hidden input that receives the selected value
+    //  data-ac-value-name — form field name assigned to the hidden input by JS
+    //  data-ac-free-text  — present when free-text typing is allowed (see free_text())
+    //  data-ac-query      — marks the visible search input
+    //  data-ac-min-length — minimum characters before htmx fires a request
+    //
+    // The hidden input has no name attribute in HTML so no-JS form submission
+    // only sees the <noscript><select>, avoiding a duplicate-field conflict.
 
     maud::html! {
-        div id=(format!("{id}-wrapper")) {
+        div
+            id=(format!("{id}-wrapper"))
+            data-ac-value-id=(value_id)
+            data-ac-value-name=(config.value_name)
+            data-ac-free-text[config.free_text] {
             label for=(query_id) { (label) }
             input
                 type="search"
@@ -483,7 +512,8 @@ pub fn autocomplete_input(id: &str, label: &str, config: &AutocompleteConfig<'_>
                 aria-autocomplete="list"
                 aria-controls=(options_id)
                 placeholder=[config.placeholder]
-                "hx-on:input"=(on_input_handler)
+                data-ac-query
+                data-ac-min-length=(config.min_length)
                 hx-get=(config.action)
                 hx-trigger=(trigger)
                 hx-target=(target)
@@ -496,9 +526,7 @@ pub fn autocomplete_input(id: &str, label: &str, config: &AutocompleteConfig<'_>
                 id=(options_id)
                 role="listbox"
                 aria-label=(label)
-                aria-live="polite"
-                "hx-on:click"=(hx_on_click)
-                "hx-on:keydown"=(hx_on_keydown) {}
+                aria-live="polite" {}
             noscript {
                 select name=(config.value_name) aria-label=(label) {
                     option value="" { "— select —" }
@@ -515,10 +543,9 @@ pub fn autocomplete_input(id: &str, label: &str, config: &AutocompleteConfig<'_>
 
 /// Render a single autocomplete option partial returned by the server.
 ///
-/// The `data-value` attribute carries the record ID. Wire a click handler
-/// via htmx (e.g. `hx-on:click`) or a minimal inline script to populate
-/// the hidden field and the visible label from `data-value` and the element's
-/// text content.
+/// The `data-value` attribute carries the record ID (or the value to submit).
+/// The `autumn-widgets.js` runtime listens for click and keyboard events on the
+/// listbox container and uses `data-value` to populate the hidden field.
 ///
 /// # Example response fragment
 ///
@@ -944,10 +971,31 @@ mod tests {
     }
 
     #[test]
-    fn autocomplete_listbox_has_click_handler() {
+    fn autocomplete_wrapper_has_data_attributes_for_runtime() {
         let config = AutocompleteConfig::new("/ac", "value_field");
         let html = autocomplete_input("x", "Label", &config).into_string();
-        assert!(html.contains("hx-on:click"), "{html}");
+        // The external autumn-widgets.js reads these to wire up interactions.
+        assert!(html.contains(r#"data-ac-value-id="x-value""#), "{html}");
+        assert!(
+            html.contains(r#"data-ac-value-name="value_field""#),
+            "{html}"
+        );
+        assert!(html.contains("data-ac-query"), "{html}");
+        assert!(html.contains("data-ac-min-length"), "{html}");
+    }
+
+    #[test]
+    fn autocomplete_free_text_mode_sets_data_attribute() {
+        let config = AutocompleteConfig::new("/ac", "value_field").free_text();
+        let html = autocomplete_input("x", "Label", &config).into_string();
+        assert!(html.contains("data-ac-free-text"), "{html}");
+    }
+
+    #[test]
+    fn autocomplete_id_mode_no_free_text_attribute() {
+        let config = AutocompleteConfig::new("/ac", "value_field");
+        let html = autocomplete_input("x", "Label", &config).into_string();
+        assert!(!html.contains("data-ac-free-text"), "{html}");
     }
 
     #[test]
@@ -1046,8 +1094,9 @@ mod tests {
     fn autocomplete_configurable_min_length() {
         let config = AutocompleteConfig::new("/ac", "value_field").min_length(2);
         let html = autocomplete_input("x", "Label", &config).into_string();
-        // min_length is enforced server-side; no filter expression in the trigger
-        assert!(html.contains("hx-trigger"), "{html}");
+        // min_length is carried as a data attribute for the autumn-widgets.js runtime
+        // to enforce client-side (via htmx:configRequest) and server-side.
+        assert!(html.contains(r#"data-ac-min-length="2""#), "{html}");
         assert!(!html.contains("this.value.length"), "{html}");
     }
 
@@ -1073,18 +1122,14 @@ mod tests {
     }
 
     #[test]
-    fn autocomplete_listbox_has_keyboard_handler() {
+    fn autocomplete_listbox_has_no_inline_handlers() {
+        // All interaction is wired by autumn-widgets.js, not inline hx-on:* attributes.
         let config = AutocompleteConfig::new("/ac", "value_field");
         let html = autocomplete_input("x", "Label", &config).into_string();
-        assert!(html.contains("hx-on:keydown"), "{html}");
-        assert!(html.contains("Enter"), "{html}");
-    }
-
-    #[test]
-    fn autocomplete_visible_input_syncs_hidden_on_input() {
-        let config = AutocompleteConfig::new("/ac", "value_field");
-        let html = autocomplete_input("x", "Label", &config).into_string();
-        assert!(html.contains("hx-on:input"), "{html}");
+        assert!(!html.contains("hx-on:keydown"), "{html}");
+        assert!(!html.contains("hx-on:click"), "{html}");
+        assert!(!html.contains("hx-on:input"), "{html}");
+        assert!(!html.contains("oninput"), "{html}");
     }
 
     // ── autocomplete_option ────────────────────────────────────────────

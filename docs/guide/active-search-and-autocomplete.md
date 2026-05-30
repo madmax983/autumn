@@ -171,21 +171,29 @@ html! {
 Rendered HTML (abbreviated):
 
 ```html
-<div id="tag-picker-wrapper">
+<div id="tag-picker-wrapper"
+     data-ac-value-id="tag-picker-value"
+     data-ac-value-name="tag_id">
   <label for="tag-picker-query">Tag</label>
   <input type="search" id="tag-picker-query" name="q"
          role="combobox" aria-expanded="false" aria-autocomplete="list"
          aria-controls="tag-picker-options"
+         data-ac-query data-ac-min-length="1"
          hx-get="/tags/autocomplete"
          hx-trigger="input changed delay:300ms"
          hx-target="#tag-picker-options">
   <input type="hidden" id="tag-picker-value" value="">
-  <div id="tag-picker-options" role="listbox" aria-live="polite"
-       hx-on:click="let o=event.target.closest('[role=option]');if(o){…}"></div>
+  <div id="tag-picker-options" role="listbox" aria-live="polite"></div>
   <noscript>
     <select name="tag_id">…</select>
   </noscript>
 </div>
+```
+
+Option selection and input sync are handled by the `autumn-widgets.js` runtime (no inline JS, CSP-compatible). Include it once in your layout:
+
+```html
+<script src="/static/js/autumn-widgets.js" defer></script>
 ```
 
 ### Autocomplete handler
@@ -226,10 +234,25 @@ async fn tags_autocomplete(
 <div role="option" tabindex="0" data-value="42">Tag Name</div>
 ```
 
-The listbox container has a built-in `hx-on:click` delegating handler that
-fires when the user clicks an option. It copies the option's `textContent` into
-the visible input and its `data-value` into the hidden field, then clears the
-listbox. No additional wiring is needed.
+The `autumn-widgets.js` runtime handles click and keyboard (Enter/Space) selection
+on the listbox. It copies the option's `textContent` into the visible input and
+its `data-value` into the hidden field, then clears the listbox. No additional
+wiring is needed beyond including the script in your layout.
+
+### Free-text mode (tag-style fields)
+
+By default, the hidden field is **only** set when an option is selected from the
+list — typing a value and submitting without selecting leaves the field empty.
+This is the safe default for foreign-key ID fields (submitting unvalidated text
+as an ID would break form deserialization).
+
+For tag-style fields where users should be able to submit typed text directly
+(e.g. creating a new tag), enable free-text mode:
+
+```rust
+let config = AutocompleteConfig::new("/tags/autocomplete", "tag")
+    .free_text(); // keep hidden field in sync with typed text
+```
 
 ---
 

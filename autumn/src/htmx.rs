@@ -31,6 +31,22 @@ pub const HTMX_JS: &[u8] = include_bytes!("../vendor/htmx.min.js");
 /// Same-origin path where Autumn serves embedded htmx.
 pub const HTMX_JS_PATH: &str = "/static/js/htmx.min.js";
 
+/// Autumn widget runtime JavaScript, embedded at compile time.
+///
+/// Provides CSP-compatible event-listener wiring for built-in widgets
+/// (autocomplete selection, min-length enforcement). Served automatically
+/// at [`AUTUMN_WIDGETS_JS_PATH`] with immutable cache headers.
+///
+/// Reference it once in your layout template:
+///
+/// ```html
+/// <script src="/static/js/autumn-widgets.js" defer></script>
+/// ```
+pub const AUTUMN_WIDGETS_JS: &[u8] = include_bytes!("../vendor/autumn-widgets.js");
+
+/// Same-origin path where Autumn serves the widget runtime script.
+pub const AUTUMN_WIDGETS_JS_PATH: &str = "/static/js/autumn-widgets.js";
+
 /// Same-origin path where Autumn serves the htmx CSRF helper.
 ///
 /// The helper reads a CSRF token from either:
