@@ -945,6 +945,59 @@ pub mod pg {
             let store = PgFlagStore::with_cache_ttl("postgres://localhost/myapp", Duration::ZERO);
             assert_eq!(store.cached("my_flag"), CacheLookup::Miss);
         }
+
+        #[test]
+        fn pg_store_cache_hit_returns_stored_value() {
+            let store =
+                PgFlagStore::with_cache_ttl("postgres://localhost/myapp", Duration::from_secs(60));
+            store.store_cache("my_flag", Some(FlagConfig::new("my_flag")));
+            assert!(matches!(store.cached("my_flag"), CacheLookup::Hit(Some(_))));
+        }
+
+        #[test]
+        fn pg_store_cache_hit_none_for_absent_flag() {
+            let store =
+                PgFlagStore::with_cache_ttl("postgres://localhost/myapp", Duration::from_secs(60));
+            store.store_cache("absent", None);
+            assert_eq!(store.cached("absent"), CacheLookup::Hit(None));
+        }
+
+        #[test]
+        fn pg_store_cache_expired_returns_miss() {
+            let store = PgFlagStore::with_cache_ttl("postgres://localhost/myapp", Duration::ZERO);
+            store.store_cache("expired", Some(FlagConfig::new("expired")));
+            // TTL = 0 means entries expire immediately.
+            assert_eq!(store.cached("expired"), CacheLookup::Miss);
+        }
+
+        #[test]
+        fn pg_store_invalidate_removes_from_cache() {
+            let store =
+                PgFlagStore::with_cache_ttl("postgres://localhost/myapp", Duration::from_secs(60));
+            store.store_cache("flag", Some(FlagConfig::new("flag")));
+            assert!(matches!(store.cached("flag"), CacheLookup::Hit(Some(_))));
+            store.invalidate("flag");
+            assert_eq!(store.cached("flag"), CacheLookup::Miss);
+        }
+
+        #[test]
+        fn pg_store_with_cache_ttl_sets_custom_ttl() {
+            let ttl = Duration::from_secs(30);
+            let store = PgFlagStore::with_cache_ttl("postgres://localhost/myapp", ttl);
+            assert_eq!(store.cache_ttl, ttl);
+        }
+
+        #[test]
+        fn pg_store_clone_has_independent_cache() {
+            // PgFlagStore::clone() creates a fresh instance — it does NOT share the
+            // cache HashMap.  Only Arc<PgFlagStore> shares a single cache.
+            let store =
+                PgFlagStore::with_cache_ttl("postgres://localhost/myapp", Duration::from_secs(60));
+            store.store_cache("cached", Some(FlagConfig::new("cached")));
+            let cloned = store.clone();
+            // Clone starts with an empty cache, so this is a Miss.
+            assert_eq!(cloned.cached("cached"), CacheLookup::Miss);
+        }
     }
 }
 
