@@ -642,6 +642,7 @@ own release train instead of being required by core web examples.
 | Migrations             | Flyway/Liquibase       | `manage.py migrate`   | `rails db:migrate`     | `diesel migration run`          |
 | CLI                    | Spring CLI             | `manage.py`           | `rails`                | `autumn`                        |
 | Hot reload             | Spring DevTools        | Auto-reload           | `rails s`              | `autumn dev`                    |
+| Request inspector / N+1 detection | `rack-mini-profiler` + `bullet` | Django Debug Toolbar | `rack-mini-profiler` + `bullet` | `/_autumn/inspect` (dev only) |
 
 ---
 
