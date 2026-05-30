@@ -757,7 +757,7 @@ mod tests {
         let html = active_search_input("q", "Search", &config).into_string();
         // Maud HTML-encodes `>=` as `&gt;=`; the browser decodes it before htmx sees it
         assert!(
-            html.contains("this.value.length") && html.contains("3"),
+            html.contains("this.value.length") && html.contains('3'),
             "{html}"
         );
     }
@@ -1069,7 +1069,7 @@ mod tests {
         let html = autocomplete_input("x", "Label", &config).into_string();
         // Maud HTML-encodes `>=` as `&gt;=`; the browser decodes it before htmx sees it
         assert!(
-            html.contains("this.value.length") && html.contains("2"),
+            html.contains("this.value.length") && html.contains('2'),
             "{html}"
         );
     }
