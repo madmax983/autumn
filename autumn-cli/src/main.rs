@@ -419,6 +419,7 @@ enum ConfigCommands {
         /// Config key name.
         key: String,
         /// New raw value (must be parseable as the key's declared type).
+        #[arg(allow_hyphen_values = true)]
         value: String,
         /// Actor identifier stored in the change log (e.g. your email).
         #[arg(long, value_name = "ACTOR")]
@@ -2870,6 +2871,18 @@ mod tests {
         };
         assert_eq!(key, "max_upload_mb");
         assert_eq!(value, "200");
+        assert!(actor.is_none());
+    }
+
+    #[test]
+    fn parse_config_set_accepts_hyphen_prefixed_value() {
+        let cli =
+            Cli::try_parse_from(["autumn", "config", "set", "offset_seconds", "-30"]).unwrap();
+        let Commands::Config(ConfigCommands::Set { key, value, actor }) = cli.command else {
+            panic!("expected config set");
+        };
+        assert_eq!(key, "offset_seconds");
+        assert_eq!(value, "-30");
         assert!(actor.is_none());
     }
 

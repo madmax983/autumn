@@ -43,6 +43,43 @@ pub struct HistoryOptions {
     pub limit: usize,
 }
 
+const CONFIG_SET_SQL: &str = "BEGIN; \
+    SELECT pg_advisory_xact_lock(1, hashtext(:'key')); \
+    WITH \
+        prior AS ( \
+            SELECT raw_value \
+            FROM autumn_runtime_config_values \
+            WHERE key = :'key' \
+        ), \
+        upsert AS ( \
+            INSERT INTO autumn_runtime_config_values (key, raw_value, updated_at) \
+                VALUES (:'key', :'value', NOW()) \
+                ON CONFLICT (key) DO UPDATE \
+                    SET raw_value = EXCLUDED.raw_value, \
+                        updated_at = EXCLUDED.updated_at \
+        ) \
+    INSERT INTO autumn_runtime_config_changes (key, old_value, new_value, actor) \
+        VALUES ( \
+            :'key', \
+            (SELECT raw_value FROM prior), \
+            :'value', \
+            :'actor' \
+        ); \
+    COMMIT;";
+
+const CONFIG_UNSET_SQL: &str = "BEGIN; \
+    SELECT pg_advisory_xact_lock(1, hashtext(:'key')); \
+    WITH \
+        removed AS ( \
+            DELETE FROM autumn_runtime_config_values \
+            WHERE key = :'key' \
+            RETURNING raw_value \
+        ) \
+    INSERT INTO autumn_runtime_config_changes (key, old_value, new_value, actor) \
+        SELECT :'key', raw_value, NULL, :'actor' \
+        FROM removed; \
+    COMMIT;";
+
 // ── Public entry points ────────────────────────────────────────────────────────
 
 /// Run `autumn config list`.
@@ -104,35 +141,10 @@ pub fn run_set(opts: &SetOptions) {
     // Acquire a per-key advisory lock before reading the prior value so that
     // concurrent writers on a brand-new key are serialised: T2 blocks here
     // until T1 commits, and the next statement then sees T1's committed row
-    // under READ COMMITTED's per-statement snapshot.  The CTE's FOR UPDATE
-    // covers existing-key races; the advisory lock covers new-key races.
-    let sql = "BEGIN; \
-        SELECT pg_advisory_xact_lock(1, hashtext(:'key')); \
-        WITH \
-            prior AS ( \
-                SELECT raw_value \
-                FROM autumn_runtime_config_values \
-                WHERE key = :'key' \
-            ), \
-            upsert AS ( \
-                INSERT INTO autumn_runtime_config_values (key, raw_value, updated_at) \
-                    VALUES (:'key', :'value', NOW()) \
-                    ON CONFLICT (key) DO UPDATE \
-                        SET raw_value = EXCLUDED.raw_value, \
-                            updated_at = EXCLUDED.updated_at \
-            ) \
-        INSERT INTO autumn_runtime_config_changes (key, old_value, new_value, actor) \
-            VALUES ( \
-                :'key', \
-                (SELECT raw_value FROM prior), \
-                :'value', \
-                :'actor' \
-            ); \
-        COMMIT;";
-
+    // under READ COMMITTED's per-statement snapshot.
     run_psql_with_vars_or_die(
         &url,
-        sql,
+        CONFIG_SET_SQL,
         &[("key", &opts.key), ("value", &opts.value), ("actor", actor)],
     );
 
@@ -149,21 +161,13 @@ pub fn run_unset(opts: &UnsetOptions) {
     check_psql();
     let actor = opts.actor.as_deref().unwrap_or("cli");
 
-    // DELETE RETURNING captures the value at the exact moment the row is removed,
-    // so no concurrent update can produce a stale old_value in the audit row.
-    let sql = "BEGIN; \
-        WITH \
-            removed AS ( \
-                DELETE FROM autumn_runtime_config_values \
-                WHERE key = :'key' \
-                RETURNING raw_value \
-            ) \
-        INSERT INTO autumn_runtime_config_changes (key, old_value, new_value, actor) \
-            SELECT :'key', raw_value, NULL, :'actor' \
-            FROM removed; \
-        COMMIT;";
-
-    run_psql_with_vars_or_die(&url, sql, &[("key", &opts.key), ("actor", actor)]);
+    // Use the same per-key advisory lock as set before DELETE RETURNING captures
+    // old_value, keeping set/unset audit history ordered under concurrent writes.
+    run_psql_with_vars_or_die(
+        &url,
+        CONFIG_UNSET_SQL,
+        &[("key", &opts.key), ("actor", actor)],
+    );
     eprintln!(
         "\u{2713} Unset '{key}' (reverted to compile-time default)",
         key = opts.key
@@ -306,6 +310,18 @@ fn run_psql_with_vars_or_die(database_url: &str, sql: &str, vars: &[(&str, &str)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unset_sql_takes_key_advisory_lock_before_delete() {
+        let lock = CONFIG_UNSET_SQL
+            .find("pg_advisory_xact_lock(1, hashtext(:'key'))")
+            .expect("unset should acquire the per-key advisory lock");
+        let delete = CONFIG_UNSET_SQL
+            .find("DELETE FROM autumn_runtime_config_values")
+            .expect("unset should delete the override row");
+
+        assert!(lock < delete, "unset must take the key lock before DELETE");
+    }
 
     #[test]
     fn resolve_prefers_primary_url_env_var() {
