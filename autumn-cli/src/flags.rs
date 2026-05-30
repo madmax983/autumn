@@ -80,8 +80,12 @@ const SET_ROLLOUT_SQL: &str = "INSERT INTO autumn_feature_flags (key, enabled, r
 INSERT INTO feature_flag_changes (key, mutation, actor) \
     VALUES (:'key', 'rollout=' || :'pct', :'actor');";
 
-const ALLOW_SQL: &str = "INSERT INTO autumn_feature_flags (key, enabled) \
-    VALUES (:'key', TRUE) ON CONFLICT (key) DO UPDATE SET enabled = TRUE, updated_at = NOW(); \
+const ALLOW_SQL: &str = "INSERT INTO autumn_feature_flags (key, enabled, rollout_pct) \
+    VALUES (:'key', TRUE, 0) ON CONFLICT (key) DO UPDATE \
+        SET enabled = TRUE, \
+            rollout_pct = CASE WHEN NOT autumn_feature_flags.enabled THEN 0 \
+                               ELSE autumn_feature_flags.rollout_pct END, \
+            updated_at = NOW(); \
 UPDATE autumn_feature_flags \
     SET actor_allowlist = ( \
         SELECT json_agg(DISTINCT elem)::text \

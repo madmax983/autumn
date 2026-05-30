@@ -342,6 +342,18 @@ impl AdminModel for FeatureFlagAdminModel {
 
             let mutation = if enabled { "enabled" } else { "disabled" };
 
+            // Resolve the current key BEFORE updating so that, if the admin
+            // renames the flag, we can also invalidate the old key in
+            // feature_flag_changes.  Other replicas cache entries by key, so
+            // only invalidating the new key leaves the old stale entry alive.
+            let old_key: Option<String> =
+                diesel::sql_query("SELECT key FROM autumn_feature_flags WHERE id = $1")
+                    .bind::<diesel::sql_types::BigInt, _>(id)
+                    .get_result::<KeyRow>(&mut conn)
+                    .await
+                    .ok()
+                    .map(|r: KeyRow| r.key);
+
             // Target by id so a renamed key updates the correct row, not a
             // different one (or a new row via key-based upsert).
             let row = diesel::sql_query(
@@ -364,6 +376,20 @@ impl AdminModel for FeatureFlagAdminModel {
             .get_result::<FlagRow>(&mut conn)
             .await
             .map_err(|e| AdminError::Database(e.to_string()))?;
+
+            // If the key was renamed, write a 'deleted' entry for the old key
+            // so that replicas with a cached entry under the old name promptly
+            // invalidate it instead of waiting for TTL expiry.
+            if let Some(ref ok) = old_key.filter(|ok| ok != key) {
+                diesel::sql_query(
+                    "INSERT INTO feature_flag_changes (key, mutation, actor) \
+                     VALUES ($1, 'deleted', NULL)",
+                )
+                .bind::<diesel::sql_types::Text, _>(ok)
+                .execute(&mut conn)
+                .await
+                .ok();
+            }
 
             diesel::sql_query(
                 "INSERT INTO feature_flag_changes (key, mutation, actor) VALUES ($1, $2, NULL)",

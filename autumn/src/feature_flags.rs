@@ -529,7 +529,24 @@ pub mod pg {
             poll_interval: std::time::Duration,
         ) -> std::thread::JoinHandle<()> {
             std::thread::spawn(move || {
-                let mut last_id: i64 = 0;
+                // Seed last_id from the current high-water mark so the first
+                // poll doesn't replay the entire historical change log on
+                // startup.  Only changes that arrive AFTER the listener starts
+                // need to be processed — the in-process cache starts empty and
+                // will re-populate lazily on first access.
+                let mut last_id: i64 = store
+                    .connect()
+                    .ok()
+                    .and_then(|mut conn| {
+                        diesel::sql_query(
+                            "SELECT COALESCE(MAX(id), 0) AS id FROM feature_flag_changes",
+                        )
+                        .get_result::<MaxIdRow>(&mut conn)
+                        .ok()
+                        .map(|r| r.id)
+                    })
+                    .unwrap_or(0);
+
                 loop {
                     std::thread::sleep(poll_interval);
                     if let Ok(mut conn) = store.connect() {
@@ -549,6 +566,12 @@ pub mod pg {
                 }
             })
         }
+    }
+
+    #[derive(diesel::QueryableByName)]
+    struct MaxIdRow {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        id: i64,
     }
 
     #[derive(diesel::QueryableByName)]
