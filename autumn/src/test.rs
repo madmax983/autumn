@@ -403,6 +403,23 @@ impl TestApp {
         self
     }
 
+    /// Register a [`FlagStore`](crate::feature_flags::FlagStore) backend so
+    /// the [`Flags`](crate::feature_flags::Flags) extractor works in test handlers.
+    ///
+    /// Mirrors [`crate::app::AppBuilder::with_flag_store`].
+    #[must_use]
+    pub fn with_flag_store<S>(mut self, store: S) -> Self
+    where
+        S: crate::feature_flags::FlagStore,
+    {
+        use std::sync::Arc;
+        let service = crate::feature_flags::FeatureFlagService::new(Arc::new(store) as Arc<_>);
+        self.state_initializers.push(Box::new(move |state| {
+            state.insert_extension(service);
+        }));
+        self
+    }
+
     /// Apply a plugin directly to the test app.
     #[must_use]
     pub fn plugin<P: crate::plugin::Plugin>(mut self, plugin: P) -> Self {

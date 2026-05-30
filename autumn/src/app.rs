@@ -1298,6 +1298,97 @@ impl AppBuilder {
         self
     }
 
+    /// Register a [`FlagStore`](crate::feature_flags::FlagStore) backend for
+    /// feature-flag evaluation.
+    ///
+    /// After registration, the [`Flags`](crate::feature_flags::Flags) extractor
+    /// and `#[feature_flag]` macro are available in route handlers. Without a
+    /// registered store, both return `500 Internal Server Error`.
+    ///
+    /// For tests use [`InMemoryFlagStore`](crate::feature_flags::InMemoryFlagStore);
+    /// in production use the Postgres-backed
+    /// `autumn_web::feature_flags::pg::PgFlagStore`.
+    ///
+    /// # Sharing the store with the poll listener
+    ///
+    /// When using `PgFlagStore` in a multi-replica deployment, pass an `Arc`
+    /// clone so the app service and the poll listener share the **same** cache:
+    ///
+    /// ```rust,ignore
+    /// use std::sync::Arc;
+    /// use std::time::Duration;
+    /// use autumn_web::feature_flags::pg::PgFlagStore;
+    ///
+    /// let store = Arc::new(PgFlagStore::new(&config.database.primary_url));
+    /// PgFlagStore::spawn_poll_listener(Arc::clone(&store), Duration::from_secs(1));
+    /// autumn_web::app()
+    ///     .with_flag_store(Arc::clone(&store))
+    ///     .run()
+    ///     .await;
+    /// ```
+    ///
+    /// `Arc<PgFlagStore>` implements `FlagStore`, so the same `Arc` is
+    /// accepted directly without creating a separate cache instance.
+    ///
+    /// # Basic example
+    ///
+    /// ```rust,ignore
+    /// use autumn_web::feature_flags::InMemoryFlagStore;
+    /// use std::sync::Arc;
+    ///
+    /// autumn_web::app()
+    ///     .with_flag_store(InMemoryFlagStore::new())
+    ///     .run()
+    ///     .await;
+    /// ```
+    #[must_use]
+    pub fn with_flag_store<S>(self, store: S) -> Self
+    where
+        S: crate::feature_flags::FlagStore,
+    {
+        let service = crate::feature_flags::FeatureFlagService::new(Arc::new(store) as Arc<_>);
+        self.state_initializer(move |state| {
+            state.insert_extension(service);
+        })
+    }
+
+    /// Register a feature-flag store with a group-membership resolver.
+    ///
+    /// The resolver is called during flag evaluation to check whether an actor
+    /// belongs to a named group listed in a flag's `group_allowlist`. Without
+    /// registering a resolver, group gates are silently ignored.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use autumn_web::feature_flags::{InMemoryFlagStore, GroupResolver};
+    /// use std::sync::Arc;
+    ///
+    /// let resolver: GroupResolver = Arc::new(|actor_id, group| {
+    ///     group == "staff" && actor_id.starts_with("staff:")
+    /// });
+    ///
+    /// autumn_web::app()
+    ///     .with_flag_store_and_resolver(InMemoryFlagStore::new(), resolver)
+    ///     .run()
+    ///     .await;
+    /// ```
+    #[must_use]
+    pub fn with_flag_store_and_resolver<S>(
+        self,
+        store: S,
+        resolver: crate::feature_flags::GroupResolver,
+    ) -> Self
+    where
+        S: crate::feature_flags::FlagStore,
+    {
+        let service = crate::feature_flags::FeatureFlagService::new(Arc::new(store) as Arc<_>)
+            .with_group_resolver(resolver);
+        self.state_initializer(move |state| {
+            state.insert_extension(service);
+        })
+    }
+
     /// Register a durable [`MailDeliveryQueue`](crate::mail::MailDeliveryQueue) for
     /// [`Mailer::deliver_later`](crate::mail::Mailer::deliver_later).
     ///
