@@ -91,7 +91,7 @@ pub struct Clock(DateTime<Utc>);
 impl Clock {
     /// Returns the UTC instant captured when this extractor was resolved.
     #[must_use]
-    pub fn now(&self) -> DateTime<Utc> {
+    pub const fn now(&self) -> DateTime<Utc> {
         self.0
     }
 }
@@ -111,7 +111,7 @@ impl axum::extract::FromRequestParts<crate::state::AppState> for Clock {
         _parts: &mut axum::http::request::Parts,
         state: &crate::state::AppState,
     ) -> Result<Self, Self::Rejection> {
-        Ok(Clock(state.clock().now()))
+        Ok(Self(state.clock().now()))
     }
 }
 
@@ -152,7 +152,7 @@ pub struct FixedClock(DateTime<Utc>);
 impl FixedClock {
     /// Create a clock pinned to `dt`.
     #[must_use]
-    pub fn at(dt: DateTime<Utc>) -> Self {
+    pub const fn at(dt: DateTime<Utc>) -> Self {
         Self(dt)
     }
 }
@@ -199,16 +199,16 @@ impl TickingClock {
     /// Sub-millisecond durations are truncated to zero (chrono's minimum resolution
     /// is microseconds). This method never panics.
     pub fn advance(&self, duration: std::time::Duration) {
-        let mut guard = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        let mut guard = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Ok(delta) = chrono::Duration::from_std(duration) {
-            *guard = *guard + delta;
+            *guard += delta;
         }
     }
 }
 
 impl ClockSource for TickingClock {
     fn now(&self) -> DateTime<Utc> {
-        *self.0.lock().unwrap_or_else(|p| p.into_inner())
+        *self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -228,7 +228,7 @@ pub fn clock_unix_secs(clock: &dyn ClockSource) -> u64 {
 pub fn clock_unix_duration(clock: &dyn ClockSource) -> std::time::Duration {
     let ts = clock.now().timestamp();
     if ts >= 0 {
-        std::time::Duration::from_secs(ts as u64)
+        std::time::Duration::from_secs(ts.cast_unsigned())
     } else {
         std::time::Duration::ZERO
     }
