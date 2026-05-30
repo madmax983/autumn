@@ -1331,6 +1331,43 @@ impl AppBuilder {
         })
     }
 
+    /// Register a feature-flag store with a group-membership resolver.
+    ///
+    /// The resolver is called during flag evaluation to check whether an actor
+    /// belongs to a named group listed in a flag's `group_allowlist`. Without
+    /// registering a resolver, group gates are silently ignored.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use autumn_web::feature_flags::{InMemoryFlagStore, GroupResolver};
+    /// use std::sync::Arc;
+    ///
+    /// let resolver: GroupResolver = Arc::new(|actor_id, group| {
+    ///     group == "staff" && actor_id.starts_with("staff:")
+    /// });
+    ///
+    /// autumn_web::app()
+    ///     .with_flag_store_and_resolver(InMemoryFlagStore::new(), resolver)
+    ///     .run()
+    ///     .await;
+    /// ```
+    #[must_use]
+    pub fn with_flag_store_and_resolver<S>(
+        self,
+        store: S,
+        resolver: crate::feature_flags::GroupResolver,
+    ) -> Self
+    where
+        S: crate::feature_flags::FlagStore,
+    {
+        let service = crate::feature_flags::FeatureFlagService::new(Arc::new(store) as Arc<_>)
+            .with_group_resolver(resolver);
+        self.state_initializer(move |state| {
+            state.insert_extension(service);
+        })
+    }
+
     /// Register a durable [`MailDeliveryQueue`](crate::mail::MailDeliveryQueue) for
     /// [`Mailer::deliver_later`](crate::mail::Mailer::deliver_later).
     ///

@@ -139,8 +139,7 @@ impl AdminModel for FeatureFlagAdminModel {
             .bind::<diesel::sql_types::Text, _>(&search_pattern)
             .get_result::<CountRow>(&mut conn)
             .await
-            .map(|r| r.count)
-            .unwrap_or(0);
+            .map_or(0, |r| r.count);
 
             let records: Vec<Value> = diesel::sql_query(
                 "SELECT id, key, description, enabled, rollout_pct, \
@@ -385,12 +384,35 @@ impl AdminModel for FeatureFlagAdminModel {
                 .await
                 .map_err(|e| AdminError::Database(e.to_string()))?;
 
+            // Resolve the key before deleting so we can record the deletion in
+            // feature_flag_changes — this lets spawn_poll_listener invalidate
+            // other replicas' caches rather than waiting for TTL expiry.
+            let key: Option<String> =
+                diesel::sql_query("SELECT key FROM autumn_feature_flags WHERE id = $1")
+                    .bind::<diesel::sql_types::BigInt, _>(id)
+                    .get_result::<KeyRow>(&mut conn)
+                    .await
+                    .ok()
+                    .map(|r: KeyRow| r.key);
+
             diesel::sql_query("DELETE FROM autumn_feature_flags WHERE id = $1")
                 .bind::<diesel::sql_types::BigInt, _>(id)
                 .execute(&mut conn)
                 .await
-                .map(|_| ())
-                .map_err(|e| AdminError::Database(e.to_string()))
+                .map_err(|e| AdminError::Database(e.to_string()))?;
+
+            if let Some(ref key) = key {
+                diesel::sql_query(
+                    "INSERT INTO feature_flag_changes (key, mutation, actor) \
+                     VALUES ($1, 'deleted', NULL)",
+                )
+                .bind::<diesel::sql_types::Text, _>(key)
+                .execute(&mut conn)
+                .await
+                .ok();
+            }
+
+            Ok(())
         })
     }
 
@@ -439,8 +461,7 @@ impl AdminModel for FeatureFlagAdminModel {
                     .bind::<diesel::sql_types::Text, _>(&key)
                     .get_result::<CountRow>(&mut conn)
                     .await
-                    .map(|r| r.count)
-                    .unwrap_or(0);
+                    .map_or(0, |r| r.count);
 
             let offset = (page.saturating_sub(1)) * per_page;
             let entries: Vec<crate::AdminHistoryEntry> = diesel::sql_query(
