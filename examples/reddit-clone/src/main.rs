@@ -41,12 +41,11 @@ const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
 
 #[autumn_web::main]
 async fn main() {
-    reddit_clone::init_config();
-
     let webhook_store = Arc::new(InMemoryOutboundWebhookStore::new());
     let webhook_plugin = OutboundWebhookPlugin::new(webhook_store);
 
     autumn_web::app()
+        .migrations(autumn_web::migrate::FRAMEWORK_MIGRATIONS)
         .migrations(MIGRATIONS)
         .routes(routes![
             routes::posts::front_page,

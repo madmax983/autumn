@@ -911,6 +911,251 @@ impl ConfigStore for InMemoryConfigStore {
     }
 }
 
+// ── Postgres ConfigStore ────────────────────────────────────────────────────
+
+/// Postgres-backed runtime config storage.
+///
+/// Uses the framework-owned `autumn_runtime_config_values` and
+/// `autumn_runtime_config_changes` tables managed by
+/// [`crate::migrate::FRAMEWORK_MIGRATIONS`]. This is the persistent store that
+/// shares state with the `autumn config` CLI.
+#[cfg(feature = "db")]
+pub mod pg {
+    use super::{ConfigChangeRecord, ConfigStore, ConfigStoreError, ConfigValue};
+    use diesel::prelude::*;
+
+    pub(crate) const KEY_LOCK_SQL: &str = "SELECT pg_advisory_xact_lock(1, hashtext($1))";
+
+    pub(crate) const SET_RAW_SQL: &str = "\
+        WITH \
+            prior AS ( \
+                SELECT raw_value \
+                FROM autumn_runtime_config_values \
+                WHERE key = $1 \
+            ), \
+            upsert AS ( \
+                INSERT INTO autumn_runtime_config_values (key, raw_value, updated_at) \
+                    VALUES ($1, $2, NOW()) \
+                    ON CONFLICT (key) DO UPDATE \
+                        SET raw_value = EXCLUDED.raw_value, \
+                            updated_at = EXCLUDED.updated_at \
+                    RETURNING raw_value \
+            ) \
+        INSERT INTO autumn_runtime_config_changes (key, old_value, new_value, actor) \
+            SELECT $1, (SELECT raw_value FROM prior), $2, $3 \
+            FROM upsert;";
+
+    pub(crate) const UNSET_RAW_SQL: &str = "\
+        WITH \
+            removed AS ( \
+                DELETE FROM autumn_runtime_config_values \
+                WHERE key = $1 \
+                RETURNING raw_value \
+            ) \
+        INSERT INTO autumn_runtime_config_changes (key, old_value, new_value, actor) \
+            SELECT $1, raw_value, NULL, $2 \
+            FROM removed;";
+
+    #[derive(diesel::QueryableByName)]
+    struct RawValueRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        raw_value: String,
+    }
+
+    #[derive(diesel::QueryableByName)]
+    struct OverrideRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        key: String,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        raw_value: String,
+    }
+
+    #[derive(diesel::QueryableByName)]
+    struct HistoryRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        key: String,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        old_value: Option<String>,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        new_value: Option<String>,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        actor: Option<String>,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        timestamp_secs: i64,
+    }
+
+    impl HistoryRow {
+        fn into_record(self) -> ConfigChangeRecord {
+            let timestamp_secs = match u64::try_from(self.timestamp_secs) {
+                Ok(timestamp_secs) => timestamp_secs,
+                Err(_) => 0,
+            };
+            ConfigChangeRecord {
+                key: self.key,
+                old_value: self.old_value.map(ConfigValue::Text),
+                new_value: self.new_value.map(ConfigValue::Text),
+                actor: self.actor,
+                timestamp_secs,
+            }
+        }
+    }
+
+    /// Persistent [`ConfigStore`] implementation backed by Postgres.
+    #[derive(Debug, Clone)]
+    pub struct PgConfigStore {
+        database_url: String,
+    }
+
+    impl PgConfigStore {
+        /// Create a store that connects to `database_url` for each operation.
+        #[must_use]
+        pub fn new(database_url: impl Into<String>) -> Self {
+            Self {
+                database_url: database_url.into(),
+            }
+        }
+
+        /// Create a store from Autumn's primary/write database configuration.
+        ///
+        /// Returns `None` when neither `database.primary_url` nor the legacy
+        /// `database.url` field is configured.
+        #[must_use]
+        pub fn from_database_config(config: &crate::config::DatabaseConfig) -> Option<Self> {
+            config.effective_primary_url().map(Self::new)
+        }
+
+        /// Return the configured Postgres connection URL.
+        #[must_use]
+        pub fn database_url(&self) -> &str {
+            &self.database_url
+        }
+
+        fn connect(&self) -> Result<diesel::PgConnection, ConfigStoreError> {
+            diesel::PgConnection::establish(&self.database_url).map_err(store_error)
+        }
+    }
+
+    fn lock_key(
+        conn: &mut diesel::PgConnection,
+        key: &str,
+    ) -> Result<usize, diesel::result::Error> {
+        diesel::sql_query(KEY_LOCK_SQL)
+            .bind::<diesel::sql_types::Text, _>(key)
+            .execute(conn)
+    }
+
+    impl ConfigStore for PgConfigStore {
+        fn get_raw(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
+            let mut conn = self.connect()?;
+            diesel::sql_query(
+                "SELECT raw_value \
+                 FROM autumn_runtime_config_values \
+                 WHERE key = $1",
+            )
+            .bind::<diesel::sql_types::Text, _>(key)
+            .get_result::<RawValueRow>(&mut conn)
+            .optional()
+            .map(|row| row.map(|row| row.raw_value))
+            .map_err(store_error)
+        }
+
+        fn set_raw(
+            &self,
+            key: &str,
+            _old_raw: Option<String>,
+            new_raw: String,
+            actor: Option<&str>,
+        ) -> Result<(), ConfigStoreError> {
+            let mut conn = self.connect()?;
+            conn.transaction::<(), diesel::result::Error, _>(|conn| {
+                // Separate statement, same transaction: READ COMMITTED takes a fresh
+                // snapshot for SET_RAW_SQL after any blocked lock wait completes.
+                lock_key(conn, key)?;
+                diesel::sql_query(SET_RAW_SQL)
+                    .bind::<diesel::sql_types::Text, _>(key)
+                    .bind::<diesel::sql_types::Text, _>(&new_raw)
+                    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(
+                        actor.map(str::to_owned),
+                    )
+                    .execute(conn)?;
+                Ok(())
+            })
+            .map_err(store_error)
+        }
+
+        fn unset_raw(
+            &self,
+            key: &str,
+            _old_raw: Option<String>,
+            actor: Option<&str>,
+        ) -> Result<(), ConfigStoreError> {
+            let mut conn = self.connect()?;
+            conn.transaction::<(), diesel::result::Error, _>(|conn| {
+                // Keep the lock as its own statement for the same snapshot reason
+                // as set_raw: the DELETE must observe the post-lock row state.
+                lock_key(conn, key)?;
+                diesel::sql_query(UNSET_RAW_SQL)
+                    .bind::<diesel::sql_types::Text, _>(key)
+                    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(
+                        actor.map(str::to_owned),
+                    )
+                    .execute(conn)?;
+                Ok(())
+            })
+            .map_err(store_error)
+        }
+
+        fn list_overrides(&self) -> Result<Vec<(String, String)>, ConfigStoreError> {
+            let mut conn = self.connect()?;
+            diesel::sql_query(
+                "SELECT key, raw_value \
+                 FROM autumn_runtime_config_values \
+                 ORDER BY key",
+            )
+            .load::<OverrideRow>(&mut conn)
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|row| (row.key, row.raw_value))
+                    .collect()
+            })
+            .map_err(store_error)
+        }
+
+        fn history(
+            &self,
+            key: &str,
+            limit: usize,
+        ) -> Result<Vec<ConfigChangeRecord>, ConfigStoreError> {
+            let limit = match i64::try_from(limit) {
+                Ok(limit) => limit,
+                Err(_) => i64::MAX,
+            };
+            let mut conn = self.connect()?;
+            diesel::sql_query(
+                "SELECT \
+                    key, \
+                    old_value, \
+                    new_value, \
+                    actor, \
+                    EXTRACT(EPOCH FROM changed_at)::bigint AS timestamp_secs \
+                 FROM autumn_runtime_config_changes \
+                 WHERE key = $1 \
+                 ORDER BY changed_at DESC \
+                 LIMIT $2",
+            )
+            .bind::<diesel::sql_types::Text, _>(key)
+            .bind::<diesel::sql_types::BigInt, _>(limit)
+            .load::<HistoryRow>(&mut conn)
+            .map(|rows| rows.into_iter().map(HistoryRow::into_record).collect())
+            .map_err(store_error)
+        }
+    }
+
+    fn store_error(error: impl std::fmt::Display) -> ConfigStoreError {
+        ConfigStoreError::Backend(error.to_string())
+    }
+}
+
 // ── Service errors ────────────────────────────────────────────────────────────
 
 /// Error from [`RuntimeConfigService`].
@@ -1148,6 +1393,35 @@ mod tests {
         let registry = Arc::new(make_registry());
         let store = Arc::new(InMemoryConfigStore::new());
         RuntimeConfigService::new(registry, store)
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn postgres_store_is_available_under_documented_module() {
+        fn assert_config_store<T: ConfigStore>() {}
+
+        assert_config_store::<pg::PgConfigStore>();
+        let store = pg::PgConfigStore::new("postgres://localhost/autumn");
+
+        assert_eq!(store.database_url(), "postgres://localhost/autumn");
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn postgres_store_sql_uses_runtime_config_tables_and_key_locks() {
+        assert!(pg::KEY_LOCK_SQL.contains("pg_advisory_xact_lock(1, hashtext($1))"));
+        assert!(pg::SET_RAW_SQL.contains("autumn_runtime_config_values"));
+        assert!(pg::SET_RAW_SQL.contains("autumn_runtime_config_changes"));
+        assert!(pg::UNSET_RAW_SQL.contains("autumn_runtime_config_values"));
+        assert!(pg::UNSET_RAW_SQL.contains("autumn_runtime_config_changes"));
+        assert!(
+            !pg::SET_RAW_SQL.contains("pg_advisory_xact_lock"),
+            "set must take the key lock as a prior statement so READ COMMITTED uses a post-lock snapshot"
+        );
+        assert!(
+            !pg::UNSET_RAW_SQL.contains("pg_advisory_xact_lock"),
+            "unset must take the key lock as a prior statement so READ COMMITTED uses a post-lock snapshot"
+        );
     }
 
     #[derive(Debug, Default)]
