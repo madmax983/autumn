@@ -531,9 +531,64 @@ pub trait AdminModel: Send + Sync + 'static {
     ) -> AdminFuture<'a, AdminHistoryPage> {
         Box::pin(async move {
             Err(AdminError::Other(
-                "this model does not have version history enabled".to_owned(),
+                "this model does not have version history enabled; \
+                 use #[repository(Model, versioned = true)] to opt in"
+                    .to_owned(),
             ))
         })
+    }
+}
+
+// ── VersionPage → AdminHistoryPage conversion ──────────────────────
+
+impl From<autumn_web::version_history::VersionEntry> for AdminHistoryEntry {
+    fn from(e: autumn_web::version_history::VersionEntry) -> Self {
+        Self {
+            id: e.id,
+            actor: e.actor,
+            op: e.op.to_string(),
+            request_id: e.request_id,
+            changes: e
+                .changes
+                .into_iter()
+                .map(|c| serde_json::to_value(&c).unwrap_or(serde_json::Value::Null))
+                .collect(),
+            recorded_at: e.recorded_at,
+        }
+    }
+}
+
+impl From<autumn_web::version_history::VersionPage> for AdminHistoryPage {
+    /// Convert a [`autumn_web::version_history::VersionPage`] returned by a
+    /// versioned repository's `version_history()` method into an
+    /// [`AdminHistoryPage`] for the admin panel.
+    ///
+    /// ```rust,ignore
+    /// fn get_history<'a>(
+    ///     &'a self, pool: &'a Pool<AsyncPgConnection>,
+    ///     record_id: i64, page: u64, per_page: u64,
+    /// ) -> AdminFuture<'a, AdminHistoryPage> {
+    ///     let pool = pool.clone();
+    ///     Box::pin(async move {
+    ///         let repo = PgPostRepository::from_pool(pool);
+    ///         let filter = autumn_web::VersionFilter { page, per_page, ..Default::default() };
+    ///         repo.version_history(record_id, filter).await
+    ///             .map(AdminHistoryPage::from)
+    ///             .map_err(|e| AdminError::Database(e.to_string()))
+    ///     })
+    /// }
+    /// ```
+    fn from(vp: autumn_web::version_history::VersionPage) -> Self {
+        Self {
+            entries: vp
+                .entries
+                .into_iter()
+                .map(AdminHistoryEntry::from)
+                .collect(),
+            total: vp.total,
+            page: vp.page,
+            per_page: vp.per_page,
+        }
     }
 }
 
