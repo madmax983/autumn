@@ -208,12 +208,7 @@ pub trait FlagStore: Send + Sync + 'static {
     /// # Errors
     ///
     /// Returns a [`FlagStoreError`] on backend failure.
-    fn add_group(
-        &self,
-        key: &str,
-        group: &str,
-        actor: Option<&str>,
-    ) -> Result<(), FlagStoreError>;
+    fn add_group(&self, key: &str, group: &str, actor: Option<&str>) -> Result<(), FlagStoreError>;
 
     /// Return the most recent `limit` change records for `key`.
     ///
@@ -248,12 +243,7 @@ impl FlagStore for Box<dyn FlagStore> {
     ) -> Result<(), FlagStoreError> {
         (**self).allow_actor(key, actor_id, actor)
     }
-    fn add_group(
-        &self,
-        key: &str,
-        group: &str,
-        actor: Option<&str>,
-    ) -> Result<(), FlagStoreError> {
+    fn add_group(&self, key: &str, group: &str, actor: Option<&str>) -> Result<(), FlagStoreError> {
         (**self).add_group(key, group, actor)
     }
     fn history(&self, key: &str, limit: usize) -> Result<Vec<FlagChangeRecord>, FlagStoreError> {
@@ -333,11 +323,7 @@ impl FlagStore for InMemoryFlagStore {
             f.enabled = true;
             f.rollout_pct = pct;
         });
-        self.record(FlagChangeRecord::now(
-            key,
-            format!("rollout={pct}"),
-            actor,
-        ));
+        self.record(FlagChangeRecord::now(key, format!("rollout={pct}"), actor));
         Ok(())
     }
 
@@ -367,12 +353,7 @@ impl FlagStore for InMemoryFlagStore {
         Ok(())
     }
 
-    fn add_group(
-        &self,
-        key: &str,
-        group: &str,
-        actor: Option<&str>,
-    ) -> Result<(), FlagStoreError> {
+    fn add_group(&self, key: &str, group: &str, actor: Option<&str>) -> Result<(), FlagStoreError> {
         self.upsert(key, |f| {
             if !f.enabled {
                 // Same targeted-enable semantics as allow_actor.
@@ -523,10 +504,7 @@ pub mod pg {
             Ok(())
         }
 
-        fn notify(
-            conn: &mut diesel::PgConnection,
-            key: &str,
-        ) -> Result<(), diesel::result::Error> {
+        fn notify(conn: &mut diesel::PgConnection, key: &str) -> Result<(), diesel::result::Error> {
             diesel::sql_query("SELECT pg_notify('autumn_flags', $1)")
                 .bind::<diesel::sql_types::Text, _>(key)
                 .execute(conn)?;
@@ -1008,7 +986,9 @@ impl FeatureFlagService {
         }
 
         // Percent rollout (1–99%).
-        if flag.rollout_pct > 0 && let Some(actor) = actor_id {
+        if flag.rollout_pct > 0
+            && let Some(actor) = actor_id
+        {
             let bucket = rollout_bucket(&flag.key, actor);
             return bucket < flag.rollout_pct;
         }
@@ -1128,8 +1108,7 @@ impl Flags {
     /// Return `true` if `flag_key` is enabled for the current actor.
     #[must_use]
     pub fn enabled(&self, flag_key: &str) -> bool {
-        self.service
-            .is_enabled(flag_key, self.actor_id.as_deref())
+        self.service.is_enabled(flag_key, self.actor_id.as_deref())
     }
 
     /// Return the underlying service for direct mutation from handlers.
@@ -1372,7 +1351,8 @@ mod tests {
     fn mutations_are_recorded_in_history() {
         let svc = make_svc();
         svc.enable("tracked_flag", Some("ops@example.com")).unwrap();
-        svc.disable("tracked_flag", Some("ops@example.com")).unwrap();
+        svc.disable("tracked_flag", Some("ops@example.com"))
+            .unwrap();
         let history = svc.history("tracked_flag", 10).unwrap();
         assert_eq!(history.len(), 2, "two mutations should be recorded");
         assert_eq!(history[0].mutation, "disabled");
@@ -1513,7 +1493,10 @@ mod tests {
         store.set_rollout("staged", 50, None).unwrap();
         store.allow_actor("staged", "user:42", None).unwrap();
         let flag = store.get("staged").unwrap().unwrap();
-        assert_eq!(flag.rollout_pct, 50, "rollout_pct must be preserved when flag was already enabled");
+        assert_eq!(
+            flag.rollout_pct, 50,
+            "rollout_pct must be preserved when flag was already enabled"
+        );
         assert!(flag.actor_allowlist.contains(&"user:42".to_owned()));
     }
 }

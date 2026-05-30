@@ -19,28 +19,67 @@ use axum::http::StatusCode;
 struct SharedStore(Arc<InMemoryFlagStore>);
 
 impl FlagStore for SharedStore {
-    fn get(&self, key: &str) -> Result<Option<autumn_web::feature_flags::FlagConfig>, autumn_web::feature_flags::FlagStoreError> {
+    fn get(
+        &self,
+        key: &str,
+    ) -> Result<
+        Option<autumn_web::feature_flags::FlagConfig>,
+        autumn_web::feature_flags::FlagStoreError,
+    > {
         self.0.get(key)
     }
-    fn list(&self) -> Result<Vec<autumn_web::feature_flags::FlagConfig>, autumn_web::feature_flags::FlagStoreError> {
+    fn list(
+        &self,
+    ) -> Result<Vec<autumn_web::feature_flags::FlagConfig>, autumn_web::feature_flags::FlagStoreError>
+    {
         self.0.list()
     }
-    fn enable(&self, key: &str, actor: Option<&str>) -> Result<(), autumn_web::feature_flags::FlagStoreError> {
+    fn enable(
+        &self,
+        key: &str,
+        actor: Option<&str>,
+    ) -> Result<(), autumn_web::feature_flags::FlagStoreError> {
         self.0.enable(key, actor)
     }
-    fn disable(&self, key: &str, actor: Option<&str>) -> Result<(), autumn_web::feature_flags::FlagStoreError> {
+    fn disable(
+        &self,
+        key: &str,
+        actor: Option<&str>,
+    ) -> Result<(), autumn_web::feature_flags::FlagStoreError> {
         self.0.disable(key, actor)
     }
-    fn set_rollout(&self, key: &str, pct: u8, actor: Option<&str>) -> Result<(), autumn_web::feature_flags::FlagStoreError> {
+    fn set_rollout(
+        &self,
+        key: &str,
+        pct: u8,
+        actor: Option<&str>,
+    ) -> Result<(), autumn_web::feature_flags::FlagStoreError> {
         self.0.set_rollout(key, pct, actor)
     }
-    fn allow_actor(&self, key: &str, actor_id: &str, actor: Option<&str>) -> Result<(), autumn_web::feature_flags::FlagStoreError> {
+    fn allow_actor(
+        &self,
+        key: &str,
+        actor_id: &str,
+        actor: Option<&str>,
+    ) -> Result<(), autumn_web::feature_flags::FlagStoreError> {
         self.0.allow_actor(key, actor_id, actor)
     }
-    fn add_group(&self, key: &str, group: &str, actor: Option<&str>) -> Result<(), autumn_web::feature_flags::FlagStoreError> {
+    fn add_group(
+        &self,
+        key: &str,
+        group: &str,
+        actor: Option<&str>,
+    ) -> Result<(), autumn_web::feature_flags::FlagStoreError> {
         self.0.add_group(key, group, actor)
     }
-    fn history(&self, key: &str, limit: usize) -> Result<Vec<autumn_web::feature_flags::FlagChangeRecord>, autumn_web::feature_flags::FlagStoreError> {
+    fn history(
+        &self,
+        key: &str,
+        limit: usize,
+    ) -> Result<
+        Vec<autumn_web::feature_flags::FlagChangeRecord>,
+        autumn_web::feature_flags::FlagStoreError,
+    > {
         self.0.history(key, limit)
     }
 }
@@ -71,8 +110,7 @@ async fn rollout_handler(
     let svc = state.extension::<FeatureFlagService>();
     let enabled = svc
         .as_deref()
-        .map(|s| s.is_enabled("rollout_flag", Some("user:1")))
-        .unwrap_or(false);
+        .is_some_and(|s| s.is_enabled("rollout_flag", Some("user:1")));
     if enabled {
         axum::http::Response::builder()
             .status(StatusCode::OK)
@@ -126,11 +164,7 @@ async fn toggling_flag_propagates_within_one_request() {
     store.enable("my_feature", None).unwrap();
 
     // Next request sees the flag as enabled
-    client
-        .get("/gate")
-        .send()
-        .await
-        .assert_ok();
+    client.get("/gate").send().await.assert_ok();
 }
 
 #[tokio::test]
@@ -190,9 +224,7 @@ async fn rollout_at_0_disables_for_all_actors() {
 
 #[tokio::test]
 async fn flags_extractor_returns_500_when_no_store_registered() {
-    let client = TestApp::new()
-        .routes(routes![gate_handler])
-        .build();
+    let client = TestApp::new().routes(routes![gate_handler]).build();
 
     client
         .get("/gate")

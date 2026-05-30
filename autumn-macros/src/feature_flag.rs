@@ -86,15 +86,19 @@ pub fn feature_flag_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let flag_key = &args.flag_key;
 
     let disabled_response = args.fallback.as_ref().map_or_else(
-        || quote! {
-            return ::autumn_web::reexports::axum::response::IntoResponse::into_response(
-                ::autumn_web::reexports::http::StatusCode::NOT_FOUND
-            );
+        || {
+            quote! {
+                return ::autumn_web::reexports::axum::response::IntoResponse::into_response(
+                    ::autumn_web::reexports::http::StatusCode::NOT_FOUND
+                );
+            }
         },
-        |fallback_fn| quote! {
-            return ::autumn_web::reexports::axum::response::IntoResponse::into_response(
-                #fallback_fn().await
-            );
+        |fallback_fn| {
+            quote! {
+                return ::autumn_web::reexports::axum::response::IntoResponse::into_response(
+                    #fallback_fn().await
+                );
+            }
         },
     );
 
@@ -163,7 +167,10 @@ mod tests {
         );
         let code = result.to_string();
         // Must contain the flag key lookup
-        assert!(code.contains("my_flag"), "flag key must appear in generated code: {code}");
+        assert!(
+            code.contains("my_flag"),
+            "flag key must appear in generated code: {code}"
+        );
         // Must inject the flags parameter
         assert!(
             code.contains("__autumn_flags"),

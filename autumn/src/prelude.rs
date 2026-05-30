@@ -182,11 +182,11 @@ pub use crate::http_client::Client;
 pub use crate::state::AppState;
 
 // ── Feature flags ─────────────────────────────────────────────────
+/// The main feature-flag service, typically stored as an `AppState` extension.
+pub use crate::feature_flags::FeatureFlagService;
 /// Request-scoped feature flag extractor — call `flags.enabled("my_flag")`
 /// in handlers to gate behaviour without a redeploy.
 pub use crate::feature_flags::Flags;
-/// The main feature-flag service, typically stored as an `AppState` extension.
-pub use crate::feature_flags::FeatureFlagService;
 /// In-memory flag store — use in tests and `dev` profile; swap for
 /// `autumn_web::feature_flags::pg::PgFlagStore` in production.
 pub use crate::feature_flags::InMemoryFlagStore;

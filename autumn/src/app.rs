@@ -1325,8 +1325,7 @@ impl AppBuilder {
     where
         S: crate::feature_flags::FlagStore,
     {
-        let service =
-            crate::feature_flags::FeatureFlagService::new(Arc::new(store) as Arc<_>);
+        let service = crate::feature_flags::FeatureFlagService::new(Arc::new(store) as Arc<_>);
         self.state_initializer(move |state| {
             state.insert_extension(service);
         })

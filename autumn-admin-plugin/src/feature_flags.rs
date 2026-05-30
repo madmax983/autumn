@@ -54,17 +54,34 @@ impl AdminModel for FeatureFlagAdminModel {
                 .label("Description")
                 .optional()
                 .searchable(),
-            AdminField::new("enabled", AdminFieldKind::Boolean)
-                .label("Globally Enabled"),
+            AdminField::new("enabled", AdminFieldKind::Boolean).label("Globally Enabled"),
             AdminField::new(
                 "rollout_pct",
                 AdminFieldKind::Select(vec![
-                    SelectOption { value: "0".into(), label: "Off (0%)".into() },
-                    SelectOption { value: "10".into(), label: "10%".into() },
-                    SelectOption { value: "25".into(), label: "25%".into() },
-                    SelectOption { value: "50".into(), label: "50%".into() },
-                    SelectOption { value: "75".into(), label: "75%".into() },
-                    SelectOption { value: "100".into(), label: "All (100%)".into() },
+                    SelectOption {
+                        value: "0".into(),
+                        label: "Off (0%)".into(),
+                    },
+                    SelectOption {
+                        value: "10".into(),
+                        label: "10%".into(),
+                    },
+                    SelectOption {
+                        value: "25".into(),
+                        label: "25%".into(),
+                    },
+                    SelectOption {
+                        value: "50".into(),
+                        label: "50%".into(),
+                    },
+                    SelectOption {
+                        value: "75".into(),
+                        label: "75%".into(),
+                    },
+                    SelectOption {
+                        value: "100".into(),
+                        label: "All (100%)".into(),
+                    },
                 ]),
             )
             .label("Rollout %")
@@ -105,14 +122,15 @@ impl AdminModel for FeatureFlagAdminModel {
                 .await
                 .map_err(|e| AdminError::Database(e.to_string()))?;
 
-            let per_page = if params.per_page == 0 { 25 } else { params.per_page };
+            let per_page = if params.per_page == 0 {
+                25
+            } else {
+                params.per_page
+            };
             let offset = (params.page.saturating_sub(1)) * per_page;
 
             // Parameterized search — `%` alone matches everything (no search case).
-            let search_pattern = format!(
-                "%{}%",
-                params.search.as_deref().unwrap_or("")
-            );
+            let search_pattern = format!("%{}%", params.search.as_deref().unwrap_or(""));
 
             let total: i64 = diesel::sql_query(
                 "SELECT COUNT(*) FROM autumn_feature_flags \
@@ -196,7 +214,10 @@ impl AdminModel for FeatureFlagAdminModel {
                 .get("key")
                 .and_then(Value::as_str)
                 .ok_or_else(|| AdminError::Validation("'key' is required".into()))?;
-            let enabled = data.get("enabled").and_then(Value::as_bool).unwrap_or(false);
+            let enabled = data
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             // Select widget sends strings ("25"), direct API sends numbers.
             let mut rollout_pct = data
                 .get("rollout_pct")
@@ -286,7 +307,10 @@ impl AdminModel for FeatureFlagAdminModel {
                 .get("key")
                 .and_then(Value::as_str)
                 .ok_or_else(|| AdminError::Validation("'key' is required".into()))?;
-            let enabled = data.get("enabled").and_then(Value::as_bool).unwrap_or(false);
+            let enabled = data
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             let mut rollout_pct = data
                 .get("rollout_pct")
                 .and_then(|v| {
@@ -392,15 +416,14 @@ impl AdminModel for FeatureFlagAdminModel {
                 .map_err(|e| AdminError::Database(e.to_string()))?;
 
             // Resolve the flag key by its stable integer id.
-            let key: Option<String> = diesel::sql_query(
-                "SELECT key FROM autumn_feature_flags WHERE id = $1",
-            )
-            .bind::<diesel::sql_types::BigInt, _>(record_id)
-            .get_result::<KeyRow>(&mut conn)
-            .await
-            .optional()
-            .unwrap_or(None)
-            .map(|r| r.key);
+            let key: Option<String> =
+                diesel::sql_query("SELECT key FROM autumn_feature_flags WHERE id = $1")
+                    .bind::<diesel::sql_types::BigInt, _>(record_id)
+                    .get_result::<KeyRow>(&mut conn)
+                    .await
+                    .optional()
+                    .unwrap_or(None)
+                    .map(|r| r.key);
 
             let Some(key) = key else {
                 return Ok(crate::AdminHistoryPage {
@@ -411,14 +434,13 @@ impl AdminModel for FeatureFlagAdminModel {
                 });
             };
 
-            let count: i64 = diesel::sql_query(
-                "SELECT COUNT(*) FROM feature_flag_changes WHERE key = $1",
-            )
-            .bind::<diesel::sql_types::Text, _>(&key)
-            .get_result::<CountRow>(&mut conn)
-            .await
-            .map(|r| r.count)
-            .unwrap_or(0);
+            let count: i64 =
+                diesel::sql_query("SELECT COUNT(*) FROM feature_flag_changes WHERE key = $1")
+                    .bind::<diesel::sql_types::Text, _>(&key)
+                    .get_result::<CountRow>(&mut conn)
+                    .await
+                    .map(|r| r.count)
+                    .unwrap_or(0);
 
             let offset = (page.saturating_sub(1)) * per_page;
             let entries: Vec<crate::AdminHistoryEntry> = diesel::sql_query(
@@ -524,44 +546,53 @@ mod tests {
 
     #[test]
     fn feature_flag_admin_model_slug_is_feature_flags() {
-        let model = FeatureFlagAdminModel::default();
+        let model = FeatureFlagAdminModel;
         assert_eq!(model.slug(), "feature-flags");
     }
 
     #[test]
     fn feature_flag_admin_model_has_correct_display_names() {
-        let model = FeatureFlagAdminModel::default();
+        let model = FeatureFlagAdminModel;
         assert_eq!(model.display_name(), "Feature Flag");
         assert_eq!(model.display_name_plural(), "Feature Flags");
     }
 
     #[test]
     fn feature_flag_admin_fields_include_required_columns() {
-        let model = FeatureFlagAdminModel::default();
+        let model = FeatureFlagAdminModel;
         let fields = model.fields();
         let names: Vec<&str> = fields.iter().map(|f| f.name).collect();
         assert!(names.contains(&"key"), "must have key field");
         assert!(names.contains(&"enabled"), "must have enabled field");
-        assert!(names.contains(&"rollout_pct"), "must have rollout_pct field");
-        assert!(names.contains(&"actor_allowlist"), "must have actor_allowlist field");
+        assert!(
+            names.contains(&"rollout_pct"),
+            "must have rollout_pct field"
+        );
+        assert!(
+            names.contains(&"actor_allowlist"),
+            "must have actor_allowlist field"
+        );
     }
 
     #[test]
     fn feature_flag_admin_model_has_history() {
-        let model = FeatureFlagAdminModel::default();
-        assert!(model.has_history(), "feature flag admin must expose history");
+        let model = FeatureFlagAdminModel;
+        assert!(
+            model.has_history(),
+            "feature flag admin must expose history"
+        );
     }
 
     #[test]
     fn record_display_uses_flag_key() {
-        let model = FeatureFlagAdminModel::default();
+        let model = FeatureFlagAdminModel;
         let record = serde_json::json!({"key": "beta_inbox", "enabled": false});
         assert_eq!(model.record_display(&record), "Flag: beta_inbox");
     }
 
     #[test]
     fn record_display_fallback_when_no_key() {
-        let model = FeatureFlagAdminModel::default();
+        let model = FeatureFlagAdminModel;
         let record = serde_json::json!({});
         assert_eq!(model.record_display(&record), "Feature Flag");
     }
