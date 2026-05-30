@@ -19,6 +19,10 @@ async fn eris_csrf_path_traversal_bypass() {
     let app = Router::new()
         .route("/submit", post(|| async { "created" }))
         .route("/api/items", post(|| async { "created" }))
+        // Fallback represents Autumn's error page fallback middleware.
+        // Without this explicit fallback on the raw Router in testing,
+        // Axum's default 404 handler bypasses outer layers.
+        .fallback(|| async { (StatusCode::NOT_FOUND, "Not Found") })
         .layer(CsrfLayer::from_config(&config));
 
     let malicious_req = Request::builder()
@@ -29,8 +33,8 @@ async fn eris_csrf_path_traversal_bypass() {
 
     let response = app.clone().oneshot(malicious_req).await.unwrap();
 
-    // Axum routes strictly based on exact URI match and does not resolve '..'.
-    // Therefore, the request to /api/../submit safely falls through to a 404
-    // instead of executing the /submit handler, averting the CSRF bypass entirely.
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    // With path normalization inside CsrfLayer, `/api/../submit` resolves to `/submit`,
+    // which DOES NOT start with the exempt path `/api/`. Therefore CSRF applies,
+    // and since no token is provided, it must return FORBIDDEN.
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
 }

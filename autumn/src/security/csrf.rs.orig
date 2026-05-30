@@ -335,12 +335,13 @@ where
 
         // Normalize path for accurate exemption checking (prevents path traversal bypasses like `/api/../protected`)
         let normalized_path = crate::paths::normalize_path_for_routing(path);
+        let path_to_check = if normalized_path.is_empty() { path } else { &normalized_path };
 
         let is_exempt = self
             .settings
             .exempt_paths
             .iter()
-            .any(|prefix| normalized_path.starts_with(prefix.as_str()));
+            .any(|prefix| path_to_check.starts_with(prefix.as_str()));
         let is_safe = is_exempt || self.settings.safe_methods.contains(req.method());
         let raw_cookie_token = extract_cookie_token(req.headers(), &self.settings.cookie_name);
 
