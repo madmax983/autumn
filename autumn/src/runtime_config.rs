@@ -989,10 +989,7 @@ pub mod pg {
 
     impl HistoryRow {
         fn into_record(self) -> ConfigChangeRecord {
-            let timestamp_secs = match u64::try_from(self.timestamp_secs) {
-                Ok(timestamp_secs) => timestamp_secs,
-                Err(_) => 0,
-            };
+            let timestamp_secs: u64 = u64::try_from(self.timestamp_secs).unwrap_or_default();
             ConfigChangeRecord {
                 key: self.key,
                 old_value: self.old_value.map(ConfigValue::Text),
@@ -1007,6 +1004,12 @@ pub mod pg {
     struct CachedRawValue {
         value: Option<String>,
         expires_at: Instant,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum CachedRawLookup {
+        Hit(Option<String>),
+        Miss,
     }
 
     /// Persistent [`ConfigStore`] implementation backed by Postgres.
@@ -1065,7 +1068,7 @@ pub mod pg {
 
         /// Return the raw-read cache lifetime.
         #[must_use]
-        pub fn cache_ttl(&self) -> Duration {
+        pub const fn cache_ttl(&self) -> Duration {
             self.cache_ttl
         }
 
@@ -1073,16 +1076,21 @@ pub mod pg {
             diesel::PgConnection::establish(&self.database_url).map_err(store_error)
         }
 
-        fn get_cached_raw(&self, key: &str) -> Option<Option<String>> {
+        fn cached_raw(&self, key: &str) -> CachedRawLookup {
             let now = Instant::now();
-            let cache = self.raw_cache.read().ok()?;
-            let cached = cache.get(key)?;
+            let Ok(cache) = self.raw_cache.read() else {
+                return CachedRawLookup::Miss;
+            };
 
-            if cached.expires_at <= now {
-                return None;
-            }
+            let lookup = match cache.get(key) {
+                Some(cached) if cached.expires_at > now => {
+                    CachedRawLookup::Hit(cached.value.clone())
+                }
+                _ => CachedRawLookup::Miss,
+            };
 
-            Some(cached.value.clone())
+            drop(cache);
+            lookup
         }
 
         fn cache_raw(&self, key: &str, value: Option<String>) {
@@ -1103,6 +1111,7 @@ pub mod pg {
             };
 
             cache.insert(key.to_owned(), CachedRawValue { value, expires_at });
+            drop(cache);
         }
 
         fn invalidate_cached_raw(&self, key: &str) {
@@ -1111,6 +1120,7 @@ pub mod pg {
             };
 
             cache.remove(key);
+            drop(cache);
         }
     }
 
@@ -1125,8 +1135,9 @@ pub mod pg {
 
     impl ConfigStore for PgConfigStore {
         fn get_raw(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
-            if let Some(value) = self.get_cached_raw(key) {
-                return Ok(value);
+            match self.cached_raw(key) {
+                CachedRawLookup::Hit(value) => return Ok(value),
+                CachedRawLookup::Miss => {}
             }
 
             let mut conn = self.connect()?;
@@ -1218,10 +1229,7 @@ pub mod pg {
             key: &str,
             limit: usize,
         ) -> Result<Vec<ConfigChangeRecord>, ConfigStoreError> {
-            let limit = match i64::try_from(limit) {
-                Ok(limit) => limit,
-                Err(_) => i64::MAX,
-            };
+            let limit = i64::try_from(limit).unwrap_or(i64::MAX);
             let mut conn = self.connect()?;
             diesel::sql_query(
                 "SELECT \
@@ -1266,8 +1274,8 @@ pub mod pg {
             );
 
             assert_eq!(
-                store.get_cached_raw("posts_per_page"),
-                Some(Some("25".to_owned()))
+                store.cached_raw("posts_per_page"),
+                CachedRawLookup::Hit(Some("25".to_owned()))
             );
         }
 
@@ -1281,10 +1289,12 @@ pub mod pg {
             store.cache_raw_until(
                 "posts_per_page",
                 Some("25".to_owned()),
-                Instant::now() - Duration::from_secs(1),
+                Instant::now()
+                    .checked_sub(Duration::from_secs(1))
+                    .unwrap_or_else(Instant::now),
             );
 
-            assert_eq!(store.get_cached_raw("posts_per_page"), None);
+            assert_eq!(store.cached_raw("posts_per_page"), CachedRawLookup::Miss);
         }
 
         #[test]
@@ -1301,7 +1311,7 @@ pub mod pg {
             );
             store.invalidate_cached_raw("posts_per_page");
 
-            assert_eq!(store.get_cached_raw("posts_per_page"), None);
+            assert_eq!(store.cached_raw("posts_per_page"), CachedRawLookup::Miss);
         }
     }
 }
@@ -1448,6 +1458,12 @@ impl RuntimeConfigService {
     ///
     /// Keys are sorted alphabetically. Keys with no stored override show the
     /// schema default as `current`.
+    ///
+    /// # Errors
+    ///
+    /// - [`ConfigError::Store`] when the backing store cannot list overrides.
+    /// - [`ConfigError::TypeMismatch`] when a stored raw override cannot be
+    ///   parsed as the key's declared type.
     pub fn list(&self) -> Result<Vec<ConfigEntry>, ConfigError> {
         let overrides: HashMap<String, String> = self.store.list_overrides()?.into_iter().collect();
 
