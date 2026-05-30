@@ -575,55 +575,60 @@ pub mod pg {
             poll_interval: std::time::Duration,
         ) -> std::thread::JoinHandle<()> {
             std::thread::spawn(move || {
-                // Seed last_id from the current high-water mark so the first
-                // poll doesn't replay the entire historical change log on
-                // startup.  Only changes that arrive AFTER the listener starts
-                // need to be processed — the in-process cache starts empty and
-                // will re-populate lazily on first access.
-                let mut last_id: i64 = store
-                    .connect()
-                    .ok()
-                    .and_then(|mut conn| {
-                        diesel::sql_query(
-                            "SELECT COALESCE(MAX(id), 0) AS id FROM feature_flag_changes",
-                        )
-                        .get_result::<MaxIdRow>(&mut conn)
-                        .ok()
-                        .map(|r| r.id)
-                    })
-                    .unwrap_or(0);
+                // Timestamp-based cursor with a small lookback overlap.
+                //
+                // A sequence-ID cursor (WHERE id > last_id) is unsafe because
+                // PostgreSQL sequences allocate IDs before the transaction
+                // commits: transaction T1 (id=10) can commit after T2 (id=11),
+                // so advancing last_id to 11 would permanently miss id=10.
+                //
+                // A timestamp cursor avoids that by including a 5-second
+                // lookback on every poll (OVERLAP_SECS).  Any transaction that
+                // takes longer than 5 seconds to commit will still be missed,
+                // but such long-running writes are far outside the norm.
+                // Invalidating the same key twice is always safe (idempotent).
+                const OVERLAP_SECS: i64 = 5;
+                let now_secs = || {
+                    i64::try_from(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs(),
+                    )
+                    .unwrap_or(i64::MAX)
+                };
+                // Start the cursor in the past so we don't replay the entire
+                // historical log: only changes that arrive after the listener
+                // starts need processing (the in-process cache starts empty and
+                // repopulates lazily on first access).
+                let mut last_polled_secs: i64 = now_secs() - OVERLAP_SECS;
 
                 loop {
                     std::thread::sleep(poll_interval);
+                    // Advance the horizon before the query so concurrent writes
+                    // during the query are captured in the next poll cycle.
+                    let new_horizon = now_secs() - OVERLAP_SECS;
                     if let Ok(mut conn) = store.connect() {
-                        let rows: Vec<ChangeIdRow> = diesel::sql_query(
-                            "SELECT id, key FROM feature_flag_changes \
-                             WHERE id > $1 ORDER BY id",
+                        let rows: Vec<ChangeKeyRow> = diesel::sql_query(
+                            "SELECT DISTINCT key FROM feature_flag_changes \
+                             WHERE changed_at > to_timestamp($1)",
                         )
-                        .bind::<diesel::sql_types::BigInt, _>(last_id)
-                        .load::<ChangeIdRow>(&mut conn)
+                        .bind::<diesel::sql_types::BigInt, _>(last_polled_secs)
+                        .load::<ChangeKeyRow>(&mut conn)
                         .unwrap_or_default();
 
                         for row in rows {
-                            last_id = last_id.max(row.id);
                             store.invalidate(&row.key);
                         }
                     }
+                    last_polled_secs = new_horizon;
                 }
             })
         }
     }
 
     #[derive(diesel::QueryableByName)]
-    struct MaxIdRow {
-        #[diesel(sql_type = diesel::sql_types::BigInt)]
-        id: i64,
-    }
-
-    #[derive(diesel::QueryableByName)]
-    struct ChangeIdRow {
-        #[diesel(sql_type = diesel::sql_types::BigInt)]
-        id: i64,
+    struct ChangeKeyRow {
         #[diesel(sql_type = diesel::sql_types::Text)]
         key: String,
     }

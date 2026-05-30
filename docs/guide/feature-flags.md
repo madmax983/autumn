@@ -97,13 +97,20 @@ async fn upgrade_prompt() -> impl IntoResponse {
 
 For a given `(flag, actor)` pair, rules are checked in this order:
 
-| Priority | Rule                   | Wins when…                                              |
-|----------|------------------------|---------------------------------------------------------|
-| 1        | **Global gate**        | `enabled = true`                                        |
-| 2        | **Actor allowlist**    | The actor's ID is in `actor_allowlist`                  |
-| 3        | **Group allowlist**    | The actor belongs to any group in `group_allowlist`     |
-| 4        | **Percent rollout**    | The actor's deterministic bucket < `rollout_pct`        |
-| 5        | **Default**            | Returns `false` (fail-closed)                           |
+| Priority | Rule                   | Result when…                                                                       |
+|----------|------------------------|------------------------------------------------------------------------------------|
+| 1        | **Kill switch**        | `enabled = false` → **always off** (overrides all other rules)                     |
+| 2        | **Global on**          | `enabled = true` AND `rollout_pct >= 100` → **always on** for every actor          |
+| 3        | **Actor allowlist**    | `enabled = true` AND the actor's ID is in `actor_allowlist` → on for that actor    |
+| 4        | **Group allowlist**    | `enabled = true` AND the actor belongs to a group in `group_allowlist` → on        |
+| 5        | **Percent rollout**    | `enabled = true` AND actor's deterministic bucket < `rollout_pct` → on             |
+| 6        | **Default**            | Returns `false` (fail-closed)                                                      |
+
+> **Note:** `enabled = true` alone does **not** enable a flag for all actors — it
+> only means the kill switch is off.  To enable for everyone set `rollout_pct = 100`
+> (e.g. `autumn flags enable <key>` which sets both `enabled = true` and
+> `rollout_pct = 100`).  Setting `enabled = false` is an instant kill switch that
+> overrides rollout percentages and all allowlists.
 
 ---
 

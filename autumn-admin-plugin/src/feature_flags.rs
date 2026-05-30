@@ -482,35 +482,38 @@ impl AdminModel for FeatureFlagAdminModel {
                 });
             };
 
-            // Also include history from predecessor keys (recorded as
-            // 'renamed_from=<old_key>' breadcrumbs on the current key).
-            let count: i64 = diesel::sql_query(
-                "SELECT COUNT(*) FROM feature_flag_changes \
-                     WHERE key = $1 \
-                        OR key IN ( \
-                            SELECT regexp_replace(mutation, '^renamed_from=', '') \
-                            FROM feature_flag_changes \
-                            WHERE key = $1 AND mutation LIKE 'renamed_from=%' \
-                        )",
-            )
+            // Follow the full rename ancestry, not just one level.  Each rename
+            // writes (new_key, 'renamed_from=old_key') into feature_flag_changes;
+            // the recursive CTE walks those breadcrumbs until no more predecessors
+            // are found, so an a→b→c chain shows all three keys' histories.
+            let ancestor_cte = "WITH RECURSIVE ancestors AS ( \
+                SELECT $1::text AS key \
+                UNION \
+                SELECT regexp_replace(ffc.mutation, '^renamed_from=', '') \
+                FROM feature_flag_changes ffc \
+                JOIN ancestors a ON ffc.key = a.key \
+                WHERE ffc.mutation LIKE 'renamed_from=%' \
+            )";
+
+            let count: i64 = diesel::sql_query(format!(
+                "{ancestor_cte} \
+                 SELECT COUNT(*) FROM feature_flag_changes \
+                 WHERE key IN (SELECT key FROM ancestors)",
+            ))
             .bind::<diesel::sql_types::Text, _>(&key)
             .get_result::<CountRow>(&mut conn)
             .await
             .map_or(0, |r| r.count);
 
             let offset = (page.saturating_sub(1)) * per_page;
-            let entries: Vec<crate::AdminHistoryEntry> = diesel::sql_query(
-                "SELECT id, mutation AS op, actor, changed_at \
+            let entries: Vec<crate::AdminHistoryEntry> = diesel::sql_query(format!(
+                "{ancestor_cte} \
+                 SELECT id, mutation AS op, actor, changed_at \
                  FROM feature_flag_changes \
-                 WHERE key = $1 \
-                    OR key IN ( \
-                        SELECT regexp_replace(mutation, '^renamed_from=', '') \
-                        FROM feature_flag_changes \
-                        WHERE key = $1 AND mutation LIKE 'renamed_from=%' \
-                    ) \
+                 WHERE key IN (SELECT key FROM ancestors) \
                  ORDER BY changed_at DESC \
                  LIMIT $2 OFFSET $3",
-            )
+            ))
             .bind::<diesel::sql_types::Text, _>(&key)
             .bind::<diesel::sql_types::BigInt, _>(i64::try_from(per_page).unwrap_or(i64::MAX))
             .bind::<diesel::sql_types::BigInt, _>(i64::try_from(offset).unwrap_or(0))
