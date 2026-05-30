@@ -26,7 +26,7 @@ use crate::channels::Channels;
 #[cfg(feature = "db")]
 use crate::db::DbState;
 use crate::middleware;
-#[cfg(feature = "ws")]
+#[cfg(feature = "presence")]
 use crate::presence::Presence;
 use crate::probe;
 #[cfg(feature = "ws")]
@@ -105,9 +105,9 @@ pub struct AppState {
 
     /// Distributed presence tracker layered on top of [`Channels`].
     ///
-    /// Available when the `ws` feature is enabled. Use
+    /// Available when the `presence` feature is enabled. Use
     /// [`presence()`](Self::presence) for convenient access.
-    #[cfg(feature = "ws")]
+    #[cfg(feature = "presence")]
     pub(crate) presence: Presence,
 
     /// Cancellation token signalled during graceful shutdown.
@@ -431,7 +431,7 @@ impl AppState {
     }
 
     /// Returns a reference to the distributed presence tracker.
-    #[cfg(feature = "ws")]
+    #[cfg(feature = "presence")]
     #[must_use]
     pub const fn presence(&self) -> &Presence {
         &self.presence
@@ -504,10 +504,10 @@ impl AppState {
             task_registry: actuator::TaskRegistry::new(),
             job_registry: actuator::JobRegistry::new(),
             config_props: actuator::ConfigProperties::default(),
+            #[cfg(feature = "presence")]
+            presence: Presence::new(channels.clone()),
             #[cfg(feature = "ws")]
-            channels: channels.clone(),
-            #[cfg(feature = "ws")]
-            presence: Presence::new(channels),
+            channels,
             #[cfg(feature = "ws")]
             shutdown: CancellationToken::new(),
             policy_registry: PolicyRegistry::default(),

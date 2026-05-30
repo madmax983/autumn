@@ -162,9 +162,9 @@ pub mod pagination;
 pub mod paths;
 pub mod prelude;
 pub use paths::PathExt;
-#[cfg(feature = "ws")]
+#[cfg(feature = "presence")]
 pub mod presence;
-#[cfg(feature = "ws")]
+#[cfg(feature = "presence")]
 pub use presence::{Presence, PresenceEntry, PresenceEvent, PresenceHandle};
 pub(crate) mod route;
 pub use route::{RepositoryApiMeta, Route, RouteIdempotency};

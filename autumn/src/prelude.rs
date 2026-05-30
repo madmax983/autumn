@@ -86,7 +86,7 @@ pub use crate::{
     LocalChannelsBackend,
 };
 /// Distributed presence tracking extractor and related types.
-#[cfg(feature = "ws")]
+#[cfg(feature = "presence")]
 pub use crate::{Presence, PresenceEntry, PresenceEvent, PresenceHandle};
 /// State extractor.
 pub use axum::extract::State;
@@ -215,7 +215,7 @@ mod tests {
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
-            #[cfg(feature = "ws")]
+            #[cfg(feature = "presence")]
             presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
@@ -240,7 +240,7 @@ mod tests {
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
-            #[cfg(feature = "ws")]
+            #[cfg(feature = "presence")]
             presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
