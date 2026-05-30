@@ -21,6 +21,7 @@ use autumn_web::{get, routes};
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use tower::ServiceExt;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -139,8 +140,6 @@ async fn principal_strategy_keys_on_principal_extension() {
             .insert(RateLimitPrincipal(principal.to_owned()));
         req
     };
-
-    use tower::ServiceExt;
 
     // Principal A uses 1 token.
     let r = app.clone().oneshot(make_req("user-42")).await.unwrap();

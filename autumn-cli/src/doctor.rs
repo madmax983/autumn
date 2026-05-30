@@ -1205,12 +1205,11 @@ fn parse_config_bool(value: &str) -> Option<bool> {
     }
 }
 
-/// Resolve the signing secret from the environment or `autumn.toml`.
+/// Resolve the rate-limit key strategy from config/env.
 ///
 /// Priority:
-/// 1. `AUTUMN_SECURITY__SIGNING_SECRET` env var
-/// 2. `[security] signing_secret` in `autumn.toml`
-/// Resolve the rate-limit key strategy from config/env.
+/// 1. `AUTUMN_SECURITY__RATE_LIMIT__KEY_STRATEGY` env var
+/// 2. `[security.rate_limit] key_strategy` in `autumn.toml`
 fn resolve_rate_limit_key_strategy() -> String {
     if let Ok(val) = std::env::var("AUTUMN_SECURITY__RATE_LIMIT__KEY_STRATEGY")
         && !val.is_empty()
@@ -1235,12 +1234,12 @@ fn resolve_rate_limit_key_strategy() -> String {
 /// and is not explicitly disabled).
 fn resolve_auth_extractor_mounted() -> bool {
     if let Ok(val) = std::env::var("AUTUMN_AUTH__ENABLED") {
-        return val.trim().to_ascii_lowercase() != "false";
+        return !val.trim().eq_ignore_ascii_case("false");
     }
     std::fs::read_to_string("autumn.toml")
         .ok()
         .and_then(|c| toml::from_str::<toml::Table>(&c).ok())
-        .map_or(false, |t| {
+        .is_some_and(|t| {
             // [auth] section present and not explicitly disabled.
             t.get("auth").is_some_and(|auth| {
                 auth.get("enabled")
@@ -1357,6 +1356,7 @@ fn tailwind_enabled() -> bool {
 /// 2. **Check phase** (parallel) — every applicable check is spawned on its own
 ///    thread so that slow operations (TCP connect, subprocess calls) overlap.
 ///    Results are joined back in display order.
+#[allow(clippy::too_many_lines)]
 pub fn run(opts: DoctorOptions) {
     use std::thread;
     type Task = Box<dyn FnOnce() -> CheckResult + Send>;

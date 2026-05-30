@@ -205,9 +205,21 @@ impl MemoryStore {
             Ok(remaining_tokens) => {
                 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                 let remaining = remaining_tokens.floor() as u32;
+                // When the bucket has fewer than one token left after consuming,
+                // the next request will be denied. Compute the earliest future
+                // time at which a new token will arrive so clients can back off.
+                let reset_at_unix = if remaining_tokens < 1.0 {
+                    let secs_to_next = ((1.0 - remaining_tokens) / refill_per_sec).ceil().max(1.0);
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    {
+                        now_unix + secs_to_next as u64
+                    }
+                } else {
+                    now_unix
+                };
                 Decision::Allowed {
                     remaining,
-                    reset_at_unix: now_unix,
+                    reset_at_unix,
                 }
             }
             Err(current_tokens) => {
@@ -386,6 +398,12 @@ struct TierHookFn(Arc<dyn Fn(&str) -> Option<String> + Send + Sync>);
 impl TierHookFn {
     fn call(&self, key: &str) -> Option<String> {
         (self.0)(key)
+    }
+}
+
+impl Clone for TierHookFn {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
     }
 }
 
@@ -661,11 +679,14 @@ impl Limiter {
     }
 }
 
-/// Strip the "scheme:" prefix from an extracted bucket key before passing
+/// Strip the known scheme prefix from an extracted bucket key before passing
 /// to the tier hook, so hooks receive the raw value (e.g. "user-42" rather
-/// than "principal:user-42").
+/// than "principal:user-42"). Only removes `"token:"` and `"principal:"`
+/// — bare IP keys (including IPv6 addresses containing colons) are passed through unchanged.
 fn strip_key_prefix(key: &str) -> &str {
-    key.find(':').map_or(key, |pos| &key[pos + 1..])
+    key.strip_prefix("token:")
+        .or_else(|| key.strip_prefix("principal:"))
+        .unwrap_or(key)
 }
 
 /// Extract the key string from the `Authorization: Bearer <token>` header.
@@ -874,8 +895,7 @@ impl RateLimitLayer {
     where
         F: Fn(&str) -> Option<String> + Send + Sync + 'static,
     {
-        let mut limiter =
-            Arc::try_unwrap(self.limiter).unwrap_or_else(|arc| (*arc).clone_without_hook());
+        let mut limiter = Arc::try_unwrap(self.limiter).unwrap_or_else(|arc| (*arc).deep_clone());
         limiter.tier_hook = Some(TierHookFn(Arc::new(hook)));
         Self {
             limiter: Arc::new(limiter),
@@ -901,8 +921,7 @@ impl RateLimitLayer {
         path_prefix: impl Into<String>,
         override_: RateLimitOverride,
     ) -> Self {
-        let mut limiter =
-            Arc::try_unwrap(self.limiter).unwrap_or_else(|arc| (*arc).clone_without_hook());
+        let mut limiter = Arc::try_unwrap(self.limiter).unwrap_or_else(|arc| (*arc).deep_clone());
         limiter.path_overrides.push((path_prefix.into(), override_));
         Self {
             limiter: Arc::new(limiter),
@@ -911,8 +930,8 @@ impl RateLimitLayer {
 }
 
 impl Limiter {
-    /// Clone all fields except the tier hook (used when we need to mutate).
-    fn clone_without_hook(&self) -> Self {
+    /// Deep-clone for builder mutation (used when `Arc::try_unwrap` fails).
+    fn deep_clone(&self) -> Self {
         Self {
             refill_per_sec: self.refill_per_sec,
             burst: self.burst,
@@ -922,7 +941,7 @@ impl Limiter {
             trusted_proxies: self.trusted_proxies.clone(),
             key_strategy: self.key_strategy,
             tiers: Arc::clone(&self.tiers),
-            tier_hook: None,
+            tier_hook: self.tier_hook.clone(),
             path_overrides: self.path_overrides.clone(),
             backend: self.backend.clone(),
         }
