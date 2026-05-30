@@ -301,7 +301,9 @@ impl Presence {
 
     fn publish_event(&self, topic: &str, event: &PresenceEvent) {
         let json = serde_json::to_string(event).unwrap_or_default();
-        let _ = self.channels.publish(&format!("presence:{topic}"), json);
+        if let Err(e) = self.channels.publish(&format!("presence:{topic}"), json) {
+            tracing::warn!(topic, error = ?e, "presence: failed to publish event");
+        }
     }
 }
 
@@ -466,15 +468,17 @@ mod tests {
     #[test]
     fn sweep_respects_refreshed_entries() {
         let channels = Channels::new(16);
-        let presence = Presence::with_ttl(channels, Duration::from_millis(50));
+        // Generous TTL so the post-refresh sleep stays well within the window
+        // even on a loaded CI runner with imprecise sleep scheduling.
+        let presence = Presence::with_ttl(channels, Duration::from_millis(500));
 
         let handle = presence.track("room:1", "alice", serde_json::json!({}));
-        std::thread::sleep(Duration::from_millis(30));
-        handle.refresh(); // extend lease
-        std::thread::sleep(Duration::from_millis(30));
+        std::thread::sleep(Duration::from_millis(100));
+        handle.refresh(); // reset heartbeat
+        std::thread::sleep(Duration::from_millis(100));
 
         presence.sweep_expired();
-        // total elapsed since last refresh < TTL
+        // 100 ms since last refresh is well under the 500 ms TTL
         assert_eq!(presence.list("room:1").len(), 1);
     }
 

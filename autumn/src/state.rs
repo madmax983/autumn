@@ -487,6 +487,8 @@ impl AppState {
     /// WebSocket channel registries.
     #[must_use]
     pub fn detached() -> Self {
+        #[cfg(feature = "ws")]
+        let channels = Channels::new(32);
         Self {
             extensions: Arc::new(std::sync::RwLock::new(HashMap::new())),
             #[cfg(feature = "db")]
@@ -503,9 +505,9 @@ impl AppState {
             job_registry: actuator::JobRegistry::new(),
             config_props: actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
-            channels: Channels::new(32),
+            channels: channels.clone(),
             #[cfg(feature = "ws")]
-            presence: Presence::new(Channels::new(32)),
+            presence: Presence::new(channels),
             #[cfg(feature = "ws")]
             shutdown: CancellationToken::new(),
             policy_registry: PolicyRegistry::default(),

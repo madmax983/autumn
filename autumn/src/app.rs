@@ -1892,7 +1892,7 @@ impl AppBuilder {
             let presence = state.presence().clone();
             let sweep_shutdown = server_shutdown.child_token();
             tokio::spawn(async move {
-                let interval = std::time::Duration::from_secs(30);
+                let interval = std::time::Duration::from_secs(15);
                 loop {
                     tokio::select! {
                         () = tokio::time::sleep(interval) => {
