@@ -336,10 +336,7 @@ impl MetricsCollector {
                     .inner
                     .shutdown_aborted_requests
                     .load(Ordering::Relaxed),
-                request_timeouts_total: self
-                    .inner
-                    .request_timeouts_total
-                    .load(Ordering::Relaxed),
+                request_timeouts_total: self.inner.request_timeouts_total.load(Ordering::Relaxed),
             },
             idempotency: IdempotencyMetricsSnapshot {
                 hits: self.inner.idempotency_hits.load(Ordering::Relaxed),

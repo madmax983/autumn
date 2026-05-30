@@ -1098,8 +1098,7 @@ where
 
     // Apply a global body-size cap covering JSON, form, raw bytes, and multipart.
     // The Multipart extractor further refines this per the UploadConfig extension.
-    let router =
-        router.layer(axum::extract::DefaultBodyLimit::max(max_request_size));
+    let router = router.layer(axum::extract::DefaultBodyLimit::max(max_request_size));
 
     // Insert UploadConfig into extensions so the Multipart extractor can read
     // per-file limits and the allowed MIME-type list.
@@ -1130,7 +1129,10 @@ fn apply_request_timeout_middleware(
         _ => return router,
     };
     let duration = std::time::Duration::from_millis(timeout_ms);
-    let is_dev = matches!(config.profile.as_deref(), Some("dev" | "development") | None);
+    let is_dev = matches!(
+        config.profile.as_deref(),
+        Some("dev" | "development") | None
+    );
     tracing::info!(timeout_ms, "Per-request timeout enabled");
     router.layer(axum::middleware::from_fn(move |req, next| {
         request_timeout_handler(req, next, duration, metrics.clone(), is_dev)
@@ -1168,10 +1170,7 @@ async fn request_timeout_handler(
             );
             (
                 http::StatusCode::REQUEST_TIMEOUT,
-                [(
-                    http::header::CONTENT_TYPE,
-                    "application/problem+json",
-                )],
+                [(http::header::CONTENT_TYPE, "application/problem+json")],
                 body,
             )
                 .into_response()
@@ -3573,13 +3572,12 @@ mod trusted_host_tests {
         let mut config = AutumnConfig::default();
         config.security.upload.max_request_size_bytes = 100; // 100-byte limit
 
-        async fn read_body(_body: axum::body::Bytes) -> &'static str {
-            "ok"
-        }
-
-        let base: axum::Router<AppState> =
-            axum::Router::new().route("/data", axum::routing::post(read_body));
-        let router = apply_upload_middleware(base, &config).with_state(crate::state::AppState::for_test());
+        let base: axum::Router<AppState> = axum::Router::new().route(
+            "/data",
+            axum::routing::post(|_: axum::body::Bytes| async { "ok" }),
+        );
+        let router =
+            apply_upload_middleware(base, &config).with_state(crate::state::AppState::for_test());
 
         // 200 bytes of JSON-shaped content exceeds the 100-byte cap.
         let big_body = "x".repeat(200);
@@ -3607,13 +3605,12 @@ mod trusted_host_tests {
         let mut config = AutumnConfig::default();
         config.security.upload.max_request_size_bytes = 1024;
 
-        async fn read_body(_body: axum::body::Bytes) -> &'static str {
-            "ok"
-        }
-
-        let base: axum::Router<AppState> =
-            axum::Router::new().route("/data", axum::routing::post(read_body));
-        let router = apply_upload_middleware(base, &config).with_state(crate::state::AppState::for_test());
+        let base: axum::Router<AppState> = axum::Router::new().route(
+            "/data",
+            axum::routing::post(|_: axum::body::Bytes| async { "ok" }),
+        );
+        let router =
+            apply_upload_middleware(base, &config).with_state(crate::state::AppState::for_test());
 
         let response = router
             .oneshot(
@@ -3648,10 +3645,9 @@ mod trusted_host_tests {
         );
 
         // Place timeout inner to RequestIdLayer (matches apply_middleware ordering).
-        let router =
-            apply_request_timeout_middleware(router, &config, state.metrics.clone())
-                .layer(RequestIdLayer)
-                .with_state(state);
+        let router = apply_request_timeout_middleware(router, &config, state.metrics.clone())
+            .layer(RequestIdLayer)
+            .with_state(state);
 
         let response = router
             .oneshot(Request::builder().uri("/slow").body(Body::empty()).unwrap())
@@ -3664,7 +3660,10 @@ mod trusted_host_tests {
             "a slow handler must trigger 408"
         );
         assert_eq!(
-            response.headers().get("content-type").and_then(|v| v.to_str().ok()),
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
             Some("application/problem+json"),
             "timeout response must use Problem Details content type"
         );
@@ -3684,10 +3683,9 @@ mod trusted_host_tests {
             }),
         );
 
-        let router =
-            apply_request_timeout_middleware(router, &config, state.metrics.clone())
-                .layer(RequestIdLayer)
-                .with_state(state.clone());
+        let router = apply_request_timeout_middleware(router, &config, state.metrics.clone())
+            .layer(RequestIdLayer)
+            .with_state(state.clone());
 
         router
             .oneshot(Request::builder().uri("/slow").body(Body::empty()).unwrap())
@@ -3715,10 +3713,9 @@ mod trusted_host_tests {
             }),
         );
 
-        let router =
-            apply_request_timeout_middleware(router, &config, state.metrics.clone())
-                .layer(RequestIdLayer)
-                .with_state(state);
+        let router = apply_request_timeout_middleware(router, &config, state.metrics.clone())
+            .layer(RequestIdLayer)
+            .with_state(state);
 
         let response = router
             .oneshot(Request::builder().uri("/slow").body(Body::empty()).unwrap())
@@ -3745,12 +3742,11 @@ mod trusted_host_tests {
         let config = AutumnConfig::default(); // request_timeout_ms = None
 
         let state = crate::state::AppState::for_test();
-        let router: axum::Router<AppState> = axum::Router::new()
-            .route("/fast", axum::routing::get(|| async { "pong" }));
+        let router: axum::Router<AppState> =
+            axum::Router::new().route("/fast", axum::routing::get(|| async { "pong" }));
 
-        let router =
-            apply_request_timeout_middleware(router, &config, state.metrics.clone())
-                .with_state(state);
+        let router = apply_request_timeout_middleware(router, &config, state.metrics.clone())
+            .with_state(state);
 
         let response = router
             .oneshot(Request::builder().uri("/fast").body(Body::empty()).unwrap())
@@ -3766,12 +3762,11 @@ mod trusted_host_tests {
         config.server.timeouts.request_timeout_ms = Some(0); // 0 = disabled
 
         let state = crate::state::AppState::for_test();
-        let router: axum::Router<AppState> = axum::Router::new()
-            .route("/fast", axum::routing::get(|| async { "pong" }));
+        let router: axum::Router<AppState> =
+            axum::Router::new().route("/fast", axum::routing::get(|| async { "pong" }));
 
-        let router =
-            apply_request_timeout_middleware(router, &config, state.metrics.clone())
-                .with_state(state);
+        let router = apply_request_timeout_middleware(router, &config, state.metrics.clone())
+            .with_state(state);
 
         let response = router
             .oneshot(Request::builder().uri("/fast").body(Body::empty()).unwrap())

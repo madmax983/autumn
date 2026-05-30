@@ -5620,7 +5620,10 @@ path = "/api-spec.json"
         struct FakeEnv(std::collections::HashMap<String, String>);
         impl Env for FakeEnv {
             fn var(&self, key: &str) -> Result<String, std::env::VarError> {
-                self.0.get(key).cloned().ok_or(std::env::VarError::NotPresent)
+                self.0
+                    .get(key)
+                    .cloned()
+                    .ok_or(std::env::VarError::NotPresent)
             }
         }
 
