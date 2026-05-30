@@ -182,6 +182,21 @@ pub fn check_rate_limit_key_strategy_impl(
     key_strategy: &str,
     auth_extractor_mounted: bool,
 ) -> CheckResult {
+    if !key_strategy.is_empty()
+        && key_strategy != "ip"
+        && key_strategy != "api_token"
+        && key_strategy != "authenticated_principal"
+    {
+        return CheckResult {
+            name: "rate_limit_key_strategy",
+            status: CheckStatus::Fail,
+            detail: Some(format!(
+                "rate_limit.key_strategy = {key_strategy:?} is not a valid strategy"
+            )),
+            hint: Some("Expected \"ip\", \"api_token\", or \"authenticated_principal\""),
+        };
+    }
+
     if key_strategy == "authenticated_principal" && !auth_extractor_mounted {
         return CheckResult {
             name: "rate_limit_key_strategy",
@@ -205,7 +220,11 @@ pub fn check_rate_limit_key_strategy_impl(
         status: CheckStatus::Pass,
         detail: Some(format!(
             "rate_limit.key_strategy = {:?} is compatible with the current auth configuration",
-            if key_strategy.is_empty() { "ip" } else { key_strategy }
+            if key_strategy.is_empty() {
+                "ip"
+            } else {
+                key_strategy
+            }
         )),
         hint: None,
     }
@@ -2309,10 +2328,7 @@ foo = "bar"
         assert_eq!(r.status, CheckStatus::Warn);
         assert!(r.hint.is_some());
         assert!(
-            r.detail
-                .as_deref()
-                .unwrap_or("")
-                .contains("auth extractor"),
+            r.detail.as_deref().unwrap_or("").contains("auth extractor"),
             "detail should mention auth extractor"
         );
     }
@@ -2334,6 +2350,18 @@ foo = "bar"
         // Unconfigured / empty strategy is treated as default (ip).
         let r = check_rate_limit_key_strategy_impl("", false);
         assert_eq!(r.status, CheckStatus::Pass);
+    }
+
+    #[test]
+    fn rate_limit_key_strategy_invalid_value_fails() {
+        let r = check_rate_limit_key_strategy_impl("authenticated_principals", false);
+        assert_eq!(r.status, CheckStatus::Fail);
+        assert!(
+            r.detail
+                .as_deref()
+                .unwrap_or("")
+                .contains("not a valid strategy")
+        );
     }
 
     // ── check_maintenance_mode ────────────────────────────────────────────────

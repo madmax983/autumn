@@ -146,15 +146,23 @@ struct Bucket {
 /// Per-key token bucket state stored in-process.
 #[derive(Debug)]
 struct MemoryStore {
-    buckets: Mutex<LruCache<String, Bucket>>,
+    buckets: Arc<Mutex<LruCache<String, Bucket>>>,
+}
+
+impl Clone for MemoryStore {
+    fn clone(&self) -> Self {
+        Self {
+            buckets: Arc::clone(&self.buckets),
+        }
+    }
 }
 
 impl MemoryStore {
     fn new() -> Self {
         Self {
-            buckets: Mutex::new(LruCache::new(
+            buckets: Arc::new(Mutex::new(LruCache::new(
                 NonZeroUsize::new(10_000).expect("10_000 is non-zero"),
-            )),
+            ))),
         }
     }
 
@@ -227,7 +235,19 @@ struct RedisStore {
     key_prefix: String,
     failure_mode: RateLimitBackendFailure,
     /// Set to `true` once on the first Redis error; reset when it recovers.
-    outage_logged: std::sync::atomic::AtomicBool,
+    outage_logged: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(feature = "redis")]
+impl Clone for RedisStore {
+    fn clone(&self) -> Self {
+        Self {
+            connection: self.connection.clone(),
+            key_prefix: self.key_prefix.clone(),
+            failure_mode: self.failure_mode,
+            outage_logged: Arc::clone(&self.outage_logged),
+        }
+    }
 }
 
 #[cfg(feature = "redis")]
@@ -242,7 +262,7 @@ impl std::fmt::Debug for RedisStore {
 
 #[cfg(feature = "redis")]
 impl RedisStore {
-    const fn new(
+    fn new(
         connection: redis::aio::ConnectionManager,
         key_prefix: String,
         failure_mode: RateLimitBackendFailure,
@@ -251,7 +271,7 @@ impl RedisStore {
             connection,
             key_prefix,
             failure_mode,
-            outage_logged: std::sync::atomic::AtomicBool::new(false),
+            outage_logged: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -351,7 +371,7 @@ impl RedisStore {
 
 // ── Backend enum ──────────────────────────────────────────────────────────────
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum BucketBackend {
     Memory(MemoryStore),
     #[cfg(feature = "redis")]
@@ -542,25 +562,24 @@ impl Limiter {
         BucketBackend::Memory(MemoryStore::new())
     }
 
-    /// Resolve effective burst/rps for this request, consulting path overrides.
+    /// Resolve explicit path-override params for this request.
     ///
-    /// Returns `(burst, rps, key_namespace)` where `key_namespace` is a
-    /// non-empty string when a path override matched (used to isolate buckets
-    /// from the global default pool).
-    fn effective_params_with_ns<B>(&self, req: &Request<B>) -> (f64, f64, &str) {
+    /// Returns `(opt_burst, opt_rps, key_namespace)` where the `Option` values
+    /// are `Some` only when the override explicitly sets that field. `key_namespace`
+    /// is non-empty when a path override matched (used to isolate buckets from the
+    /// global default pool).
+    fn effective_params_with_ns<B>(&self, req: &Request<B>) -> (Option<f64>, Option<f64>, &str) {
         let path = req.uri().path();
         for (prefix, override_) in &self.path_overrides {
             if path.starts_with(prefix.as_str()) {
-                let burst = override_
-                    .burst
-                    .map_or(self.burst, |b| f64::from(b.max(1)));
+                let burst = override_.burst.map(|b| f64::from(b.max(1)));
                 let rps = override_
                     .requests_per_second
-                    .map_or(self.refill_per_sec, |r| r.max(f64::MIN_POSITIVE));
+                    .map(|r| r.max(f64::MIN_POSITIVE));
                 return (burst, rps, prefix.as_str());
             }
         }
-        (self.burst, self.refill_per_sec, "")
+        (None, None, "")
     }
 
     /// Resolve the bucket key and effective tier params for a request.
@@ -568,7 +587,7 @@ impl Limiter {
     /// Returns `(bucket_key, burst, rps)` or `None` if rate limiting should
     /// be bypassed for this request (in-process caller with no identifiable peer).
     fn resolve_key_and_params<B>(&self, req: &Request<B>) -> Option<(String, f64, f64)> {
-        let (path_burst, path_rps, key_ns) = self.effective_params_with_ns(req);
+        let (opt_burst, opt_rps, key_ns) = self.effective_params_with_ns(req);
 
         let raw_key = self.extract_key(req)?;
 
@@ -581,31 +600,27 @@ impl Limiter {
             format!("{key_ns}\0{raw_key}")
         };
 
+        let mut burst = opt_burst.unwrap_or(self.burst);
+        let mut rps = opt_rps.unwrap_or(self.refill_per_sec);
+
         // Apply tier hook if configured. Pass the raw (un-prefixed) value so
         // hooks receive e.g. "user-42" rather than "principal:user-42".
+        // Path overrides always take precedence over tier limits when explicitly set.
         if let Some(hook) = &self.tier_hook {
             let value = strip_key_prefix(&raw_key);
             if let Some(tier_name) = hook.call(value) {
                 if let Some(tier) = self.tiers.get(&tier_name) {
-                    let tier_burst = f64::from(tier.burst.max(1));
-                    let tier_rps = tier.requests_per_second.max(f64::MIN_POSITIVE);
-                    // Path overrides take precedence over tier when explicitly set.
-                    let burst = if path_burst != self.burst {
-                        path_burst
-                    } else {
-                        tier_burst
-                    };
-                    let rps = if path_rps != self.refill_per_sec {
-                        path_rps
-                    } else {
-                        tier_rps
-                    };
-                    return Some((key, burst, rps));
+                    if opt_burst.is_none() {
+                        burst = f64::from(tier.burst.max(1));
+                    }
+                    if opt_rps.is_none() {
+                        rps = tier.requests_per_second.max(f64::MIN_POSITIVE);
+                    }
                 }
             }
         }
 
-        Some((key, path_burst, path_rps))
+        Some((key, burst, rps))
     }
 
     /// Extract the bucket key based on the configured strategy.
@@ -638,9 +653,7 @@ impl Limiter {
     #[allow(clippy::unused_async)]
     async fn decide(&self, key: &str, burst: f64, rps: f64) -> Option<Decision> {
         match &self.backend {
-            BucketBackend::Memory(store) => {
-                Some(store.decide(key, Instant::now(), burst, rps))
-            }
+            BucketBackend::Memory(store) => Some(store.decide(key, Instant::now(), burst, rps)),
             #[cfg(feature = "redis")]
             BucketBackend::Redis(store) => store.decide(key, burst, rps).await,
         }
@@ -860,8 +873,8 @@ impl RateLimitLayer {
     where
         F: Fn(&str) -> Option<String> + Send + Sync + 'static,
     {
-        let mut limiter = Arc::try_unwrap(self.limiter)
-            .unwrap_or_else(|arc| (*arc).clone_without_hook());
+        let mut limiter =
+            Arc::try_unwrap(self.limiter).unwrap_or_else(|arc| (*arc).clone_without_hook());
         limiter.tier_hook = Some(TierHookFn(Arc::new(hook)));
         Self {
             limiter: Arc::new(limiter),
@@ -882,9 +895,13 @@ impl RateLimitLayer {
     ///     });
     /// ```
     #[must_use]
-    pub fn with_path_override(self, path_prefix: impl Into<String>, override_: RateLimitOverride) -> Self {
-        let mut limiter = Arc::try_unwrap(self.limiter)
-            .unwrap_or_else(|arc| (*arc).clone_without_hook());
+    pub fn with_path_override(
+        self,
+        path_prefix: impl Into<String>,
+        override_: RateLimitOverride,
+    ) -> Self {
+        let mut limiter =
+            Arc::try_unwrap(self.limiter).unwrap_or_else(|arc| (*arc).clone_without_hook());
         limiter.path_overrides.push((path_prefix.into(), override_));
         Self {
             limiter: Arc::new(limiter),
@@ -906,7 +923,7 @@ impl Limiter {
             tiers: Arc::clone(&self.tiers),
             tier_hook: None,
             path_overrides: self.path_overrides.clone(),
-            backend: BucketBackend::Memory(MemoryStore::new()),
+            backend: self.backend.clone(),
         }
     }
 }
@@ -960,13 +977,14 @@ where
                 None => None,
             };
 
-            let burst_for_header = resolved
-                .as_ref()
-                .map_or(limiter.burst_header.clone(), |(_, burst, _)| {
-                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                    let b = *burst as u32;
-                    HeaderValue::from(b)
-                });
+            let burst_for_header =
+                resolved
+                    .as_ref()
+                    .map_or(limiter.burst_header.clone(), |(_, burst, _)| {
+                        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                        let b = *burst as u32;
+                        HeaderValue::from(b)
+                    });
 
             match decision {
                 Some(Decision::Denied {
@@ -1266,21 +1284,27 @@ mod tests {
 
         // Immediately after, bucket.tokens = 0.0. Deficit = 1.0. Secs = 1.0 / 0.1 = 10.0
         match store.decide("ip1", now, 1.0, 0.1) {
-            Decision::Denied { retry_after_secs, .. } => assert_eq!(retry_after_secs, 10),
+            Decision::Denied {
+                retry_after_secs, ..
+            } => assert_eq!(retry_after_secs, 10),
             Decision::Allowed { .. } => panic!("Expected Denied"),
         }
 
         // 5 seconds later, bucket.tokens = 0.5. Deficit = 0.5. Secs = 0.5 / 0.1 = 5.0
         let later = now + Duration::from_secs(5);
         match store.decide("ip1", later, 1.0, 0.1) {
-            Decision::Denied { retry_after_secs, .. } => assert_eq!(retry_after_secs, 5),
+            Decision::Denied {
+                retry_after_secs, ..
+            } => assert_eq!(retry_after_secs, 5),
             Decision::Allowed { .. } => panic!("Expected Denied"),
         }
 
         // 9.5 seconds later, bucket.tokens = 0.95. Deficit = 0.05. Secs = 0.05 / 0.1 = 0.5 -> ceil -> 1.0
         let even_later = now + Duration::from_millis(9500);
         match store.decide("ip1", even_later, 1.0, 0.1) {
-            Decision::Denied { retry_after_secs, .. } => assert_eq!(retry_after_secs, 1),
+            Decision::Denied {
+                retry_after_secs, ..
+            } => assert_eq!(retry_after_secs, 1),
             Decision::Allowed { .. } => panic!("Expected Denied"),
         }
     }
@@ -1695,7 +1719,10 @@ mod tests {
             .header("authorization", "Bearer my-secret-token")
             .body(())
             .unwrap();
-        assert_eq!(extract_bearer_token(&req).as_deref(), Some("my-secret-token"));
+        assert_eq!(
+            extract_bearer_token(&req).as_deref(),
+            Some("my-secret-token")
+        );
     }
 
     #[test]
@@ -1734,7 +1761,10 @@ mod tests {
 
     #[test]
     fn key_class_label_principal() {
-        assert_eq!(key_class_label("principal:user-42"), "authenticated principal");
+        assert_eq!(
+            key_class_label("principal:user-42"),
+            "authenticated principal"
+        );
     }
 
     #[test]
@@ -1931,8 +1961,8 @@ mod tests {
 
     #[tokio::test]
     async fn tier_hook_assigns_correct_burst_to_tier() {
-        use std::collections::HashMap;
         use super::super::config::RateLimitTierConfig;
+        use std::collections::HashMap;
 
         let mut tiers = HashMap::new();
         tiers.insert(

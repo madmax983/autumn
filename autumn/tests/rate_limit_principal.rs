@@ -12,7 +12,10 @@
 //! - Tier assignment hook
 
 use autumn_web::config::AutumnConfig;
-use autumn_web::security::{KeyStrategy, RateLimitConfig, RateLimitLayer, RateLimitOverride, RateLimitPrincipal, RateLimitTierConfig};
+use autumn_web::security::{
+    KeyStrategy, RateLimitConfig, RateLimitLayer, RateLimitOverride, RateLimitPrincipal,
+    RateLimitTierConfig,
+};
 use autumn_web::test::TestApp;
 use autumn_web::{get, routes};
 use axum::Router;
@@ -95,10 +98,7 @@ async fn api_token_strategy_falls_back_to_ip_when_no_bearer() {
     // the limiter falls back to IP-based keying.
     let mut config = api_token_config(0.1, 1);
     config.security.rate_limit.trust_forwarded_headers = true;
-    let client = TestApp::new()
-        .routes(routes![ping])
-        .config(config)
-        .build();
+    let client = TestApp::new().routes(routes![ping]).config(config).build();
 
     client
         .get("/ping")
@@ -180,10 +180,18 @@ async fn principal_strategy_falls_back_to_ip_for_unauthenticated() {
         req
     };
 
-    let r = app.clone().oneshot(make_req("10.0.0.1:1234")).await.unwrap();
+    let r = app
+        .clone()
+        .oneshot(make_req("10.0.0.1:1234"))
+        .await
+        .unwrap();
     assert_eq!(r.status(), StatusCode::OK);
 
-    let r = app.clone().oneshot(make_req("10.0.0.1:1234")).await.unwrap();
+    let r = app
+        .clone()
+        .oneshot(make_req("10.0.0.1:1234"))
+        .await
+        .unwrap();
     assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
 }
 
@@ -205,7 +213,9 @@ async fn x_ratelimit_reset_present_on_allowed_response() {
     let reset = response
         .header("x-ratelimit-reset")
         .expect("X-RateLimit-Reset must be present on allowed responses");
-    let reset_val: u64 = reset.parse().expect("X-RateLimit-Reset is a unix timestamp");
+    let reset_val: u64 = reset
+        .parse()
+        .expect("X-RateLimit-Reset is a unix timestamp");
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -239,7 +249,9 @@ async fn x_ratelimit_reset_present_on_429_response() {
     let reset = throttled
         .header("x-ratelimit-reset")
         .expect("X-RateLimit-Reset must be present on 429 responses");
-    let reset_val: u64 = reset.parse().expect("X-RateLimit-Reset is a unix timestamp");
+    let reset_val: u64 = reset
+        .parse()
+        .expect("X-RateLimit-Reset is a unix timestamp");
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -438,7 +450,11 @@ async fn tier_assignment_hook_selects_correct_limits() {
     req.extensions_mut()
         .insert(RateLimitPrincipal("free_user456".to_owned()));
     let r = app.clone().oneshot(req).await.unwrap();
-    assert_eq!(r.status(), StatusCode::OK, "first free user request should pass");
+    assert_eq!(
+        r.status(),
+        StatusCode::OK,
+        "first free user request should pass"
+    );
 
     let mut req = Request::builder()
         .method("GET")
@@ -526,10 +542,7 @@ async fn existing_ip_config_still_works() {
     config.security.rate_limit.trust_forwarded_headers = true;
     // No key_strategy set — uses default (Ip).
 
-    let client = TestApp::new()
-        .routes(routes![ping])
-        .config(config)
-        .build();
+    let client = TestApp::new().routes(routes![ping]).config(config).build();
 
     client
         .get("/ping")
