@@ -251,41 +251,51 @@ impl AdminModel for FeatureFlagAdminModel {
 
             let mutation = if enabled { "enabled" } else { "disabled" };
 
-            let sql = "INSERT INTO autumn_feature_flags \
-                       (key, description, enabled, rollout_pct, actor_allowlist, group_allowlist) \
-                       VALUES ($1, $2, $3, $4, $5, $6) \
-                       ON CONFLICT (key) DO UPDATE \
-                       SET description = EXCLUDED.description, \
-                           enabled = EXCLUDED.enabled, \
-                           rollout_pct = EXCLUDED.rollout_pct, \
-                           actor_allowlist = EXCLUDED.actor_allowlist, \
-                           group_allowlist = EXCLUDED.group_allowlist, \
-                           updated_at = NOW() \
-                       RETURNING id, key, description, enabled, rollout_pct, \
-                                 actor_allowlist, group_allowlist, updated_at";
-
-            let row = diesel::sql_query(sql)
-                .bind::<diesel::sql_types::Text, _>(key)
-                .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(
-                    description.map(str::to_owned),
-                )
-                .bind::<diesel::sql_types::Bool, _>(enabled)
-                .bind::<diesel::sql_types::SmallInt, _>(i16::try_from(rollout_pct).unwrap_or(0))
-                .bind::<diesel::sql_types::Text, _>(actor_allowlist)
-                .bind::<diesel::sql_types::Text, _>(group_allowlist)
-                .get_result::<FlagRow>(&mut conn)
-                .await
-                .map_err(|e| AdminError::Database(e.to_string()))?;
-
-            // Record mutation in change log so LISTEN/NOTIFY propagates and history tab works.
-            diesel::sql_query(
-                "INSERT INTO feature_flag_changes (key, mutation, actor) VALUES ($1, $2, NULL)",
+            // A CTE combines the INSERT and audit-log write into one atomic
+            // statement.  Using a plain INSERT (no ON CONFLICT) means a duplicate
+            // key rejects with a validation error rather than silently overwriting
+            // a live flag via the admin "new record" form.
+            let row = diesel::sql_query(
+                "WITH inserted AS ( \
+                     INSERT INTO autumn_feature_flags \
+                         (key, description, enabled, rollout_pct, \
+                          actor_allowlist, group_allowlist) \
+                     VALUES ($1, $2, $3, $4, $5, $6) \
+                     RETURNING id, key, description, enabled, rollout_pct, \
+                               actor_allowlist, group_allowlist, updated_at \
+                 ), \
+                 _audit AS ( \
+                     INSERT INTO feature_flag_changes (key, mutation, actor) \
+                     SELECT key, $7, NULL FROM inserted \
+                 ) \
+                 SELECT id, key, description, enabled, rollout_pct, \
+                        actor_allowlist, group_allowlist, updated_at \
+                 FROM inserted",
             )
             .bind::<diesel::sql_types::Text, _>(key)
+            .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(
+                description.map(str::to_owned),
+            )
+            .bind::<diesel::sql_types::Bool, _>(enabled)
+            .bind::<diesel::sql_types::SmallInt, _>(i16::try_from(rollout_pct).unwrap_or(0))
+            .bind::<diesel::sql_types::Text, _>(actor_allowlist)
+            .bind::<diesel::sql_types::Text, _>(group_allowlist)
             .bind::<diesel::sql_types::Text, _>(mutation)
-            .execute(&mut conn)
+            .get_result::<FlagRow>(&mut conn)
             .await
-            .ok(); // best-effort; don't fail the admin save if history write fails
+            .map_err(|e| {
+                if matches!(
+                    e,
+                    diesel::result::Error::DatabaseError(
+                        diesel::result::DatabaseErrorKind::UniqueViolation,
+                        _
+                    )
+                ) {
+                    AdminError::Validation(format!("a flag with key '{key}' already exists"))
+                } else {
+                    AdminError::Database(e.to_string())
+                }
+            })?;
 
             Ok(FlagRow::into_json(row))
         })
@@ -342,27 +352,35 @@ impl AdminModel for FeatureFlagAdminModel {
 
             let mutation = if enabled { "enabled" } else { "disabled" };
 
-            // Resolve the current key BEFORE updating so that, if the admin
-            // renames the flag, we can also invalidate the old key in
-            // feature_flag_changes.  Other replicas cache entries by key, so
-            // only invalidating the new key leaves the old stale entry alive.
-            let old_key: Option<String> =
-                diesel::sql_query("SELECT key FROM autumn_feature_flags WHERE id = $1")
-                    .bind::<diesel::sql_types::BigInt, _>(id)
-                    .get_result::<KeyRow>(&mut conn)
-                    .await
-                    .ok()
-                    .map(|r: KeyRow| r.key);
-
-            // Target by id so a renamed key updates the correct row, not a
-            // different one (or a new row via key-based upsert).
+            // A CTE combines the key lookup, UPDATE, and both audit-log writes
+            // into one atomic statement.  'old_row' reads the pre-update key so
+            // a rename emits a 'deleted' invalidation for the old name;
+            // '_audit_rename' is a no-op when the key is unchanged.
             let row = diesel::sql_query(
-                "UPDATE autumn_feature_flags \
-                 SET key = $2, description = $3, enabled = $4, rollout_pct = $5, \
-                     actor_allowlist = $6, group_allowlist = $7, updated_at = NOW() \
-                 WHERE id = $1 \
-                 RETURNING id, key, description, enabled, rollout_pct, \
-                           actor_allowlist, group_allowlist, updated_at",
+                "WITH old_row AS ( \
+                     SELECT key FROM autumn_feature_flags WHERE id = $1 \
+                 ), \
+                 updated AS ( \
+                     UPDATE autumn_feature_flags \
+                     SET key = $2, description = $3, enabled = $4, rollout_pct = $5, \
+                         actor_allowlist = $6, group_allowlist = $7, updated_at = NOW() \
+                     WHERE id = $1 \
+                     RETURNING id, key, description, enabled, rollout_pct, \
+                               actor_allowlist, group_allowlist, updated_at \
+                 ), \
+                 _audit_rename AS ( \
+                     INSERT INTO feature_flag_changes (key, mutation, actor) \
+                     SELECT old_row.key, 'deleted', NULL \
+                     FROM old_row \
+                     WHERE old_row.key != $2 \
+                 ), \
+                 _audit AS ( \
+                     INSERT INTO feature_flag_changes (key, mutation, actor) \
+                     SELECT key, $8, NULL FROM updated \
+                 ) \
+                 SELECT id, key, description, enabled, rollout_pct, \
+                        actor_allowlist, group_allowlist, updated_at \
+                 FROM updated",
             )
             .bind::<diesel::sql_types::BigInt, _>(id)
             .bind::<diesel::sql_types::Text, _>(key)
@@ -373,32 +391,10 @@ impl AdminModel for FeatureFlagAdminModel {
             .bind::<diesel::sql_types::SmallInt, _>(i16::try_from(rollout_pct).unwrap_or(0))
             .bind::<diesel::sql_types::Text, _>(actor_allowlist)
             .bind::<diesel::sql_types::Text, _>(group_allowlist)
+            .bind::<diesel::sql_types::Text, _>(mutation)
             .get_result::<FlagRow>(&mut conn)
             .await
             .map_err(|e| AdminError::Database(e.to_string()))?;
-
-            // If the key was renamed, write a 'deleted' entry for the old key
-            // so that replicas with a cached entry under the old name promptly
-            // invalidate it instead of waiting for TTL expiry.
-            if let Some(ref ok) = old_key.filter(|ok| ok != key) {
-                diesel::sql_query(
-                    "INSERT INTO feature_flag_changes (key, mutation, actor) \
-                     VALUES ($1, 'deleted', NULL)",
-                )
-                .bind::<diesel::sql_types::Text, _>(ok)
-                .execute(&mut conn)
-                .await
-                .ok();
-            }
-
-            diesel::sql_query(
-                "INSERT INTO feature_flag_changes (key, mutation, actor) VALUES ($1, $2, NULL)",
-            )
-            .bind::<diesel::sql_types::Text, _>(key)
-            .bind::<diesel::sql_types::Text, _>(mutation)
-            .execute(&mut conn)
-            .await
-            .ok();
 
             Ok(FlagRow::into_json(row))
         })
@@ -418,33 +414,23 @@ impl AdminModel for FeatureFlagAdminModel {
                 .await
                 .map_err(|e| AdminError::Database(e.to_string()))?;
 
-            // Resolve the key before deleting so we can record the deletion in
-            // feature_flag_changes — this lets spawn_poll_listener invalidate
-            // other replicas' caches rather than waiting for TTL expiry.
-            let key: Option<String> =
-                diesel::sql_query("SELECT key FROM autumn_feature_flags WHERE id = $1")
-                    .bind::<diesel::sql_types::BigInt, _>(id)
-                    .get_result::<KeyRow>(&mut conn)
-                    .await
-                    .ok()
-                    .map(|r: KeyRow| r.key);
-
-            diesel::sql_query("DELETE FROM autumn_feature_flags WHERE id = $1")
-                .bind::<diesel::sql_types::BigInt, _>(id)
-                .execute(&mut conn)
-                .await
-                .map_err(|e| AdminError::Database(e.to_string()))?;
-
-            if let Some(ref key) = key {
-                diesel::sql_query(
-                    "INSERT INTO feature_flag_changes (key, mutation, actor) \
-                     VALUES ($1, 'deleted', NULL)",
-                )
-                .bind::<diesel::sql_types::Text, _>(key)
-                .execute(&mut conn)
-                .await
-                .ok();
-            }
+            // A CTE combines the DELETE and audit-log write into one atomic
+            // statement so that cache invalidation always fires together with
+            // the row removal.
+            diesel::sql_query(
+                "WITH deleted AS ( \
+                     DELETE FROM autumn_feature_flags WHERE id = $1 RETURNING key \
+                 ), \
+                 _audit AS ( \
+                     INSERT INTO feature_flag_changes (key, mutation, actor) \
+                     SELECT key, 'deleted', NULL FROM deleted \
+                 ) \
+                 SELECT COUNT(*) AS count FROM deleted",
+            )
+            .bind::<diesel::sql_types::BigInt, _>(id)
+            .get_result::<CountRow>(&mut conn)
+            .await
+            .map_err(|e| AdminError::Database(e.to_string()))?;
 
             Ok(())
         })

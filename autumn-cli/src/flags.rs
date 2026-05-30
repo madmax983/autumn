@@ -59,28 +59,38 @@ const LIST_SQL: &str = "SELECT key, \
     FROM autumn_feature_flags ORDER BY key;";
 
 // enable() sets enabled=true + rollout_pct=100 (globally on for all actors).
-const ENABLE_SQL: &str = "INSERT INTO autumn_feature_flags (key, enabled, rollout_pct) \
+// Wrapped in an explicit transaction so the audit row is always written
+// together with the flag change; ON_ERROR_STOP exits psql on failure and the
+// un-committed transaction is rolled back when the connection closes.
+const ENABLE_SQL: &str = "BEGIN; \
+INSERT INTO autumn_feature_flags (key, enabled, rollout_pct) \
     VALUES (:'key', TRUE, 100) \
     ON CONFLICT (key) DO UPDATE SET enabled = TRUE, rollout_pct = 100, updated_at = NOW(); \
 INSERT INTO feature_flag_changes (key, mutation, actor) \
-    VALUES (:'key', 'enabled', :'actor');";
+    VALUES (:'key', 'enabled', :'actor'); \
+COMMIT;";
 
 // disable() is a kill-switch: sets enabled=false, preserves rollout config.
-const DISABLE_SQL: &str = "INSERT INTO autumn_feature_flags (key, enabled) \
+const DISABLE_SQL: &str = "BEGIN; \
+INSERT INTO autumn_feature_flags (key, enabled) \
     VALUES (:'key', FALSE) \
     ON CONFLICT (key) DO UPDATE SET enabled = FALSE, updated_at = NOW(); \
 INSERT INTO feature_flag_changes (key, mutation, actor) \
-    VALUES (:'key', 'disabled', :'actor');";
+    VALUES (:'key', 'disabled', :'actor'); \
+COMMIT;";
 
 // set_rollout() also clears the kill-switch (sets enabled=true).
-const SET_ROLLOUT_SQL: &str = "INSERT INTO autumn_feature_flags (key, enabled, rollout_pct) \
+const SET_ROLLOUT_SQL: &str = "BEGIN; \
+INSERT INTO autumn_feature_flags (key, enabled, rollout_pct) \
     VALUES (:'key', TRUE, :'pct'::smallint) \
     ON CONFLICT (key) DO UPDATE \
         SET enabled = TRUE, rollout_pct = :'pct'::smallint, updated_at = NOW(); \
 INSERT INTO feature_flag_changes (key, mutation, actor) \
-    VALUES (:'key', 'rollout=' || :'pct', :'actor');";
+    VALUES (:'key', 'rollout=' || :'pct', :'actor'); \
+COMMIT;";
 
-const ALLOW_SQL: &str = "INSERT INTO autumn_feature_flags (key, enabled, rollout_pct) \
+const ALLOW_SQL: &str = "BEGIN; \
+INSERT INTO autumn_feature_flags (key, enabled, rollout_pct) \
     VALUES (:'key', TRUE, 0) ON CONFLICT (key) DO UPDATE \
         SET enabled = TRUE, \
             rollout_pct = CASE WHEN NOT autumn_feature_flags.enabled THEN 0 \
@@ -96,7 +106,8 @@ UPDATE autumn_feature_flags \
     ), updated_at = NOW() \
     WHERE key = :'key'; \
 INSERT INTO feature_flag_changes (key, mutation, actor) \
-    VALUES (:'key', 'allowed_actor=' || :'actor_id', :'actor');";
+    VALUES (:'key', 'allowed_actor=' || :'actor_id', :'actor'); \
+COMMIT;";
 
 // ── Public runners ────────────────────────────────────────────────────────────
 
