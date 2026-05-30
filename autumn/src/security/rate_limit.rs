@@ -380,6 +380,7 @@ enum BucketBackend {
 
 // ── Limiter (shared state) ────────────────────────────────────────────────────
 
+#[allow(clippy::type_complexity)]
 struct TierHookFn(Arc<dyn Fn(&str) -> Option<String> + Send + Sync>);
 
 impl TierHookFn {
@@ -608,14 +609,14 @@ impl Limiter {
         // Path overrides always take precedence over tier limits when explicitly set.
         if let Some(hook) = &self.tier_hook {
             let value = strip_key_prefix(&raw_key);
-            if let Some(tier_name) = hook.call(value) {
-                if let Some(tier) = self.tiers.get(&tier_name) {
-                    if opt_burst.is_none() {
-                        burst = f64::from(tier.burst.max(1));
-                    }
-                    if opt_rps.is_none() {
-                        rps = tier.requests_per_second.max(f64::MIN_POSITIVE);
-                    }
+            if let Some(tier_name) = hook.call(value)
+                && let Some(tier) = self.tiers.get(&tier_name)
+            {
+                if opt_burst.is_none() {
+                    burst = f64::from(tier.burst.max(1));
+                }
+                if opt_rps.is_none() {
+                    rps = tier.requests_per_second.max(f64::MIN_POSITIVE);
                 }
             }
         }
@@ -977,14 +978,14 @@ where
                 None => None,
             };
 
-            let burst_for_header =
-                resolved
-                    .as_ref()
-                    .map_or(limiter.burst_header.clone(), |(_, burst, _)| {
-                        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                        let b = *burst as u32;
-                        HeaderValue::from(b)
-                    });
+            let burst_for_header = resolved.as_ref().map_or_else(
+                || limiter.burst_header.clone(),
+                |(_, burst, _)| {
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let b = *burst as u32;
+                    HeaderValue::from(b)
+                },
+            );
 
             match decision {
                 Some(Decision::Denied {
