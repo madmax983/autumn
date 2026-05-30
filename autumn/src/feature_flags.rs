@@ -212,6 +212,44 @@ pub trait FlagStore: Send + Sync + 'static {
     fn history(&self, key: &str, limit: usize) -> Result<Vec<FlagChangeRecord>, FlagStoreError>;
 }
 
+// Blanket delegation so `Box<dyn FlagStore>` can be passed to `with_flag_store`.
+impl FlagStore for Box<dyn FlagStore> {
+    fn get(&self, key: &str) -> Result<Option<FlagConfig>, FlagStoreError> {
+        (**self).get(key)
+    }
+    fn list(&self) -> Result<Vec<FlagConfig>, FlagStoreError> {
+        (**self).list()
+    }
+    fn enable(&self, key: &str, actor: Option<&str>) -> Result<(), FlagStoreError> {
+        (**self).enable(key, actor)
+    }
+    fn disable(&self, key: &str, actor: Option<&str>) -> Result<(), FlagStoreError> {
+        (**self).disable(key, actor)
+    }
+    fn set_rollout(&self, key: &str, pct: u8, actor: Option<&str>) -> Result<(), FlagStoreError> {
+        (**self).set_rollout(key, pct, actor)
+    }
+    fn allow_actor(
+        &self,
+        key: &str,
+        actor_id: &str,
+        actor: Option<&str>,
+    ) -> Result<(), FlagStoreError> {
+        (**self).allow_actor(key, actor_id, actor)
+    }
+    fn add_group(
+        &self,
+        key: &str,
+        group: &str,
+        actor: Option<&str>,
+    ) -> Result<(), FlagStoreError> {
+        (**self).add_group(key, group, actor)
+    }
+    fn history(&self, key: &str, limit: usize) -> Result<Vec<FlagChangeRecord>, FlagStoreError> {
+        (**self).history(key, limit)
+    }
+}
+
 // ── InMemoryFlagStore ────────────────────────────────────────────────────────
 
 /// A thread-safe in-memory [`FlagStore`] suitable for tests and development.

@@ -1,4 +1,5 @@
 pub mod config;
+pub mod feature_flags;
 pub mod hooks;
 pub mod jobs;
 pub mod live_bus;

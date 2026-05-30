@@ -2,10 +2,12 @@
 //!
 //! Demonstrates: CRUD with the Db extractor, `CsrfToken` in forms,
 //! #[secured] for write operations, htmx for voting and deletion,
-//! Maud templates with Tailwind CSS.
+//! Maud templates with Tailwind CSS, and feature-flag fragment gating
+//! via the `Flags` extractor.
 
 use autumn_web::extract::Path;
 use autumn_web::extract::State;
+use autumn_web::feature_flags::Flags;
 use autumn_web::prelude::*;
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
@@ -42,7 +44,12 @@ type PostSummary = (
 // ── Front page — hot posts across all subreddits ───────────────
 
 #[get("/")]
-pub async fn front_page(session: Session, csrf: CsrfToken, mut db: Db) -> AutumnResult<Markup> {
+pub async fn front_page(
+    session: Session,
+    csrf: CsrfToken,
+    mut db: Db,
+    flags: Flags,
+) -> AutumnResult<Markup> {
     let current_user = session.get("username").await;
 
     let hot_posts: Vec<PostSummary> = posts::table
@@ -69,6 +76,16 @@ pub async fn front_page(session: Session, csrf: CsrfToken, mut db: Db) -> Autumn
         current_user.as_deref(),
         Some(csrf.token()),
         html! {
+            // Fragment gating: banner visible only to users in the new_ui_preview rollout cohort.
+            @if flags.enabled("new_ui_preview") {
+                div class="mb-4 px-4 py-2 bg-indigo-50 border border-indigo-200 rounded-lg \
+                           text-sm text-indigo-700 flex items-center gap-2" {
+                    span class="font-semibold" { "New UI Preview" }
+                    "You're in the early-access cohort. "
+                    a href="#" class="underline hover:text-indigo-900" { "Send feedback" }
+                }
+            }
+
             // Sort tabs
             div class="flex items-center gap-4 mb-4 text-sm" {
                 span class="px-3 py-1.5 bg-orange-100 text-orange-700 rounded-full font-medium" {
@@ -391,6 +408,7 @@ pub async fn show(
     session: Session,
     csrf: CsrfToken,
     mut db: Db,
+    flags: Flags,
 ) -> AutumnResult<Markup> {
     let current_user = session.get("username").await;
     let current_user_id = session.get("user_id").await;
@@ -486,6 +504,19 @@ pub async fn show(
                                 }
                             }
                         }
+                    }
+                }
+            }
+
+            // Handler gating: awards widget shown only when post_awards flag is enabled.
+            // Toggle live: autumn flags enable post_awards
+            @if flags.enabled("post_awards") {
+                div class="bg-white rounded-lg shadow-sm border border-gray-200 p-4 mb-6" {
+                    p class="text-sm font-semibold text-gray-700 mb-2" { "Awards" }
+                    div class="flex gap-2 text-lg" {
+                        span title="Gold" { "\u{1F947}" }
+                        span title="Silver" { "\u{1F948}" }
+                        span title="Bronze" { "\u{1F949}" }
                     }
                 }
             }
