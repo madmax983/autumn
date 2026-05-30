@@ -661,7 +661,7 @@ impl KeyStrategy {
 /// Declare named tiers under `[security.rate_limit.tiers.<name>]` in `autumn.toml`.
 /// Each tier gets its own token bucket with independent `requests_per_second` and
 /// `burst` values. The app maps callers to a tier via a tier-assignment hook
-/// (see [`RateLimitLayer::with_tier_hook`]).
+/// (see [`crate::security::rate_limit::RateLimitLayer::with_tier_hook`]).
 ///
 /// # `autumn.toml` example
 ///
