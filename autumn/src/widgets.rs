@@ -466,6 +466,13 @@ pub fn autocomplete_input(id: &str, label: &str, config: &AutocompleteConfig<'_>
     let hx_on_click = format!(
         "let o=event.target.closest('[role=option]');if(o){{document.getElementById('{query_id}').value=o.textContent.trim();document.getElementById('{value_id}').value=o.getAttribute('data-value');this.innerHTML='';}}"
     );
+    // Same selection logic for keyboard users: Enter or Space activates the focused option.
+    let hx_on_keydown = format!(
+        "let o=event.target.closest('[role=option]');if(o&&(event.key==='Enter'||event.key===' ')){{event.preventDefault();document.getElementById('{query_id}').value=o.textContent.trim();document.getElementById('{value_id}').value=o.getAttribute('data-value');this.innerHTML='';}}"
+    );
+    // Clear the hidden value whenever the user edits the visible field so a stale
+    // selection is not submitted if they change their mind without picking again.
+    let on_input_clear = format!("document.getElementById('{value_id}').value=''");
 
     maud::html! {
         div id=(format!("{id}-wrapper")) {
@@ -480,6 +487,7 @@ pub fn autocomplete_input(id: &str, label: &str, config: &AutocompleteConfig<'_>
                 aria-autocomplete="list"
                 aria-controls=(options_id)
                 placeholder=[config.placeholder]
+                oninput=(on_input_clear)
                 hx-get=(config.action)
                 hx-trigger=(trigger)
                 hx-target=(target)
@@ -494,7 +502,8 @@ pub fn autocomplete_input(id: &str, label: &str, config: &AutocompleteConfig<'_>
                 role="listbox"
                 aria-label=(label)
                 aria-live="polite"
-                "hx-on:click"=(hx_on_click) {}
+                "hx-on:click"=(hx_on_click)
+                "hx-on:keydown"=(hx_on_keydown) {}
             noscript {
                 select name=(config.value_name) aria-label=(label) {
                     option value="" { "— select —" }
@@ -1093,6 +1102,21 @@ mod tests {
         let config = AutocompleteConfig::new("/ac", "value_field");
         let html = autocomplete_input("x", "Label", &config).into_string();
         assert!(html.contains("aria-live"), "{html}");
+    }
+
+    #[test]
+    fn autocomplete_listbox_has_keyboard_handler() {
+        let config = AutocompleteConfig::new("/ac", "value_field");
+        let html = autocomplete_input("x", "Label", &config).into_string();
+        assert!(html.contains("hx-on:keydown"), "{html}");
+        assert!(html.contains("Enter"), "{html}");
+    }
+
+    #[test]
+    fn autocomplete_visible_input_clears_hidden_on_change() {
+        let config = AutocompleteConfig::new("/ac", "value_field");
+        let html = autocomplete_input("x", "Label", &config).into_string();
+        assert!(html.contains("oninput"), "{html}");
     }
 
     // ── autocomplete_option ────────────────────────────────────────────

@@ -200,16 +200,10 @@ pub async fn new_form() -> AutumnResult<Markup> {
                           class="w-full border rounded p-2 mt-1";
                 }
                 // ── Tag autocomplete ──────────────────────────────────────
-                // Use the autocomplete widget to look up existing tags.
-                // The hidden <input name="tag"> carries the selected value.
-                // The noscript fallback renders a plain text input.
+                // The widget renders a hidden <input name="tag"> for the selected
+                // value and a <noscript><select name="tag"> for the no-JS path.
                 div {
                     (autumn_web::widgets::autocomplete_input("tag-picker", "Tag", &tag_ac))
-                    // Fallback for non-htmx submit: also accept direct text entry
-                    noscript {
-                        input type="text" id="tag" name="tag" value="general" required
-                              class="w-full border rounded p-2 mt-1";
-                    }
                 }
                 button type="submit"
                        class="bg-indigo-600 text-white px-6 py-2 rounded hover:bg-indigo-700" {
@@ -303,6 +297,14 @@ pub struct SearchQuery {
     pub q: String,
 }
 
+/// Escape LIKE/ILIKE wildcards so user input is treated as literal characters.
+/// PostgreSQL's default escape character is `\`, so `%` → `\%`, `_` → `\_`.
+fn escape_like(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
 /// Active search handler — returns a `<ul>` partial of matching bookmarks.
 ///
 /// Wired up by [`autumn_web::widgets::active_search_input`] on the index page.
@@ -316,7 +318,7 @@ pub async fn search(Query(params): Query<SearchQuery>, mut db: Db) -> AutumnResu
         ));
     }
 
-    let pattern = format!("%{q}%");
+    let pattern = format!("%{}%", escape_like(q));
     let results: Vec<Bookmark> = bookmarks::table
         .filter(
             bookmarks::title
@@ -358,7 +360,7 @@ pub async fn tags_autocomplete(
         ));
     }
 
-    let pattern = format!("%{q}%");
+    let pattern = format!("%{}%", escape_like(q));
     let tags: Vec<String> = bookmarks::table
         .select(bookmarks::tag)
         .filter(bookmarks::tag.ilike(pattern))
