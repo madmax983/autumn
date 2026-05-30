@@ -17,8 +17,8 @@
 //! # htmx inline field validation
 //!
 //! Use [`text_input_htmx`] to wire up per-field inline validation with htmx.
-//! The rendered input POSTs to a validation endpoint on `blur`, and htmx
-//! swaps the returned field wrapper in place with `outerHTML`.
+//! The rendered input POSTs to a validation endpoint when its value changes,
+//! and htmx swaps the returned field wrapper in place with `outerHTML`.
 //!
 //! A minimal inline-validation endpoint:
 //!
@@ -752,11 +752,11 @@ pub fn text_input<T: Serialize>(
 
 /// Render a labeled `<input type="text">` with htmx inline-validation attributes.
 ///
-/// Like [`text_input`] but adds `hx-post`, `hx-trigger="blur"`,
-/// `hx-target="#{field}-field"`, `hx-swap="outerHTML"`, and
+/// Like [`text_input`] but adds `hx-post`, `hx-trigger="change"`,
+/// `hx-target="closest [data-autumn-field-wrapper]"`, `hx-swap="outerHTML"`, and
 /// `hx-include="closest form"` to the input element so htmx
-/// POSTs the whole form to `validate_url` on blur and swaps the
-/// returned field wrapper in place — no JavaScript required.
+/// POSTs the whole form to `validate_url` after a changed value is committed
+/// and swaps the returned field wrapper in place — no JavaScript required.
 ///
 /// The inline-validation handler should extract [`ChangesetForm<T>`],
 /// validate, and return `text_input_htmx(...)` for just the single field.
@@ -786,10 +786,10 @@ pub fn text_input_htmx<T: Serialize>(
     let value = changeset.field_value(field).unwrap_or_default();
     let error_id = format!("{field}-error");
     let wrapper_id = format!("{field}-field");
-    let target = format!("#{field}-field");
+    let target = "closest [data-autumn-field-wrapper]";
 
     maud::html! {
-        div id=(wrapper_id) {
+        div id=(wrapper_id) data-autumn-field-wrapper=(field) {
             label for=(field) { (label) }
             input
                 type="text"
@@ -799,7 +799,7 @@ pub fn text_input_htmx<T: Serialize>(
                 aria-invalid=(if has_errors { "true" } else { "false" })
                 aria-describedby=(if has_errors { error_id.as_str() } else { "" })
                 hx-post=(validate_url)
-                hx-trigger="blur"
+                hx-trigger="change"
                 hx-target=(target)
                 hx-swap="outerHTML"
                 hx-include="closest form";
@@ -1729,6 +1729,10 @@ mod tests {
         });
         let html = text_input_htmx(&cs, "name", "Name", "/validate/name").into_string();
         assert!(html.contains(r#"id="name-field""#), "{html}");
+        assert!(
+            html.contains(r#"data-autumn-field-wrapper="name""#),
+            "{html}"
+        );
     }
 
     #[cfg(feature = "maud")]
@@ -1747,7 +1751,7 @@ mod tests {
 
     #[cfg(feature = "maud")]
     #[test]
-    fn text_input_htmx_renders_hx_trigger_blur() {
+    fn text_input_htmx_renders_hx_trigger_change() {
         #[derive(serde::Serialize)]
         struct F {
             name: String,
@@ -1756,7 +1760,7 @@ mod tests {
             name: String::new(),
         });
         let html = text_input_htmx(&cs, "name", "Name", "/validate/name").into_string();
-        assert!(html.contains(r#"hx-trigger="blur""#), "{html}");
+        assert!(html.contains(r#"hx-trigger="change""#), "{html}");
     }
 
     #[cfg(feature = "maud")]
@@ -1770,8 +1774,34 @@ mod tests {
             name: String::new(),
         });
         let html = text_input_htmx(&cs, "name", "Name", "/validate/name").into_string();
-        assert!(html.contains("hx-target=\"#name-field\""), "{html}");
+        assert!(
+            html.contains(r#"hx-target="closest [data-autumn-field-wrapper]""#),
+            "{html}"
+        );
         assert!(html.contains(r#"hx-swap="outerHTML""#), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn text_input_htmx_target_is_safe_for_nested_field_names() {
+        #[derive(serde::Serialize)]
+        struct F {
+            name: String,
+        }
+        let cs = Changeset::new(F {
+            name: String::new(),
+        });
+        let html =
+            text_input_htmx(&cs, "address.street", "Street", "/validate/street").into_string();
+        assert!(html.contains(r#"id="address.street-field""#), "{html}");
+        assert!(
+            html.contains(r#"hx-target="closest [data-autumn-field-wrapper]""#),
+            "{html}"
+        );
+        assert!(
+            !html.contains("hx-target=\"#address.street-field\""),
+            "{html}"
+        );
     }
 
     #[cfg(feature = "maud")]
@@ -2005,7 +2035,10 @@ mod tests {
             let body = body_text(resp).await;
             assert!(body.contains(r#"aria-invalid="true""#), "{body}");
             assert!(body.contains(r#"role="alert""#), "{body}");
-            assert!(body.contains("Name must be at least 3 characters"), "{body}");
+            assert!(
+                body.contains("Name must be at least 3 characters"),
+                "{body}"
+            );
             // Value preserved after failed validation
             assert!(body.contains(r#"value="ab""#), "{body}");
         }
@@ -2050,7 +2083,10 @@ mod tests {
                 "full-form invalid submit must return 422"
             );
             let body = body_text(resp).await;
-            assert!(body.contains("Name must be at least 3 characters"), "{body}");
+            assert!(
+                body.contains("Name must be at least 3 characters"),
+                "{body}"
+            );
         }
 
         #[cfg(feature = "maud")]

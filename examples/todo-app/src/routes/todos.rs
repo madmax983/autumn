@@ -42,8 +42,8 @@
 //! ## Inline field validation (htmx)
 //!
 //! A field rendered with [`text_input_htmx`] POSTs to a validation endpoint
-//! on blur.  The handler extracts [`ChangesetForm`], validates, and returns
-//! just that field's wrapper partial — htmx swaps it with `outerHTML`.
+//! when its value changes. The handler extracts [`ChangesetForm`], validates,
+//! and returns just that field's wrapper partial — htmx swaps it with `outerHTML`.
 //! When JavaScript is disabled, the normal `#[post("/todos")]` handler still
 //! validates the whole form and returns 422 with inline errors.
 
@@ -58,7 +58,7 @@ use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 use serde::{Deserialize, Serialize};
 
-use crate::models::{NewTodo, Todo};
+use crate::models::{NewTodo, Todo, title_not_blank};
 use crate::schema::todos;
 
 // ── Form types ────────────────────────────────────────────────────
@@ -74,15 +74,6 @@ pub struct TodoForm {
         custom(function = "title_not_blank")
     )]
     title: String,
-}
-
-fn title_not_blank(s: &str) -> Result<(), validator::ValidationError> {
-    if s.trim().is_empty() {
-        let mut e = validator::ValidationError::new("blank");
-        e.message = Some("Title must not be blank or whitespace-only".into());
-        return Err(e);
-    }
-    Ok(())
 }
 
 // ── Helpers ──────────────────────────────────────────────────────
@@ -182,29 +173,21 @@ fn title_field_partial(form: &ChangesetForm<TodoForm>) -> Markup {
     let errors = form.errors_for("title");
     let value = form.field_value("title").unwrap_or_default();
     html! {
-        div id="title-field" class="flex flex-col gap-1" {
-            div class="flex gap-2" {
-                input type="text" name="title"
-                      value=(value)
-                      placeholder="What needs to be done?"
-                      autocomplete="off"
-                      aria-invalid=(if errors.is_empty() { "false" } else { "true" })
-                      hx-post=(paths::validate_title())
-                      hx-trigger="blur"
-                      hx-target="#title-field"
-                      hx-swap="outerHTML"
-                      hx-include="closest form"
-                      class="flex-1 px-4 py-2.5 bg-white border border-stone-300 rounded-lg \
-                             text-sm placeholder-stone-400 \
-                             focus:outline-none focus:ring-2 focus:ring-amber-400/50 \
-                             focus:border-amber-400 transition-colors";
-                button type="submit"
-                       class="px-5 py-2.5 bg-amber-600 text-white text-sm font-medium rounded-lg \
-                              shadow-sm hover:bg-amber-700 active:bg-amber-800 \
-                              transition-colors" {
-                    "Add"
-                }
-            }
+        div id="title-field" data-autumn-field-wrapper="title" class="flex-1 flex flex-col gap-1" {
+            input type="text" name="title"
+                  value=(value)
+                  placeholder="What needs to be done?"
+                  autocomplete="off"
+                  aria-invalid=(if errors.is_empty() { "false" } else { "true" })
+                  hx-post=(paths::validate_title())
+                  hx-trigger="change"
+                  hx-target="closest [data-autumn-field-wrapper]"
+                  hx-swap="outerHTML"
+                  hx-include="closest form"
+                  class="w-full px-4 py-2.5 bg-white border border-stone-300 rounded-lg \
+                         text-sm placeholder-stone-400 \
+                         focus:outline-none focus:ring-2 focus:ring-amber-400/50 \
+                         focus:border-amber-400 transition-colors";
             @for msg in errors {
                 p class="text-red-600 text-xs px-1" role="alert" { (msg) }
             }
@@ -217,7 +200,17 @@ fn new_todo_form(pending: &ChangesetForm<TodoForm>) -> Markup {
     let form = pending.form_tag(
         &paths::create(),
         "post",
-        title_field_partial(pending),
+        html! {
+            div class="flex gap-2 items-start" {
+                (title_field_partial(pending))
+                button type="submit"
+                       class="shrink-0 px-5 py-2.5 bg-amber-600 text-white text-sm font-medium rounded-lg \
+                              shadow-sm hover:bg-amber-700 active:bg-amber-800 \
+                              transition-colors" {
+                    "Add"
+                }
+            }
+        },
     );
     html! { div class="flex flex-col gap-2 mb-8" { (form) } }
 }
@@ -426,7 +419,7 @@ pub async fn detail(
 
 /// Inline field validation for the todo title (htmx endpoint).
 ///
-/// Called by htmx on `blur` of the title input.  Extracts and validates the
+/// Called by htmx when the title input changes. Extracts and validates the
 /// submitted form, then returns just the `<div id="title-field">` partial so
 /// htmx can swap it with `outerHTML`.
 ///
@@ -511,7 +504,15 @@ pub async fn delete_todo(
     }
 }
 
-autumn_web::paths![index, list, detail, create, validate_title, toggle, delete_todo];
+autumn_web::paths![
+    index,
+    list,
+    detail,
+    create,
+    validate_title,
+    toggle,
+    delete_todo
+];
 
 #[cfg(test)]
 mod tests {
@@ -703,6 +704,10 @@ mod inline_validation_tests {
         });
         let html = title_field_partial(&form).into_string();
         assert!(html.contains(r#"id="title-field""#), "{html}");
+        assert!(
+            html.contains(r#"data-autumn-field-wrapper="title""#),
+            "{html}"
+        );
     }
 
     #[test]
@@ -740,10 +745,23 @@ mod inline_validation_tests {
             html.contains(&format!(r#"hx-post="{}""#, paths::validate_title())),
             "{html}"
         );
-        assert!(html.contains(r#"hx-trigger="blur""#), "{html}");
-        assert!(html.contains("hx-target=\"#title-field\""), "{html}");
+        assert!(html.contains(r#"hx-trigger="change""#), "{html}");
+        assert!(
+            html.contains(r#"hx-target="closest [data-autumn-field-wrapper]""#),
+            "{html}"
+        );
         assert!(html.contains(r#"hx-swap="outerHTML""#), "{html}");
         assert!(html.contains(r#"hx-include="closest form""#), "{html}");
+    }
+
+    #[test]
+    fn title_field_partial_does_not_include_submit_button() {
+        let form = ChangesetForm::without_csrf(TodoForm {
+            title: String::new(),
+        });
+        let html = title_field_partial(&form).into_string();
+        assert!(!html.contains(r#"type="submit""#), "{html}");
+        assert!(!html.contains("Add"), "{html}");
     }
 
     #[test]
@@ -756,7 +774,9 @@ mod inline_validation_tests {
             html.contains(r#"hx-post="/todos/validate/title""#),
             "{html}"
         );
-        assert!(html.contains(r#"hx-trigger="blur""#), "{html}");
+        assert!(html.contains(r#"hx-trigger="change""#), "{html}");
+        assert!(html.contains(r#"type="submit""#), "{html}");
+        assert!(html.contains("Add"), "{html}");
     }
 
     // ── No-JavaScript fallback ─────────────────────────────────
@@ -809,10 +829,7 @@ mod inline_validation_tests {
 
     #[test]
     fn new_todo_changeset_preserves_submitted_value() {
-        let cs = NewTodo {
-            title: "ab".into(),
-        }
-        .into_changeset();
+        let cs = NewTodo { title: "ab".into() }.into_changeset();
         assert_eq!(cs.field_value("title"), Some("ab".to_string()));
     }
 }

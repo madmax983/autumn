@@ -74,7 +74,8 @@ pub struct NewTodo {
     pub title: String,
 }
 
-fn title_not_blank(s: &str) -> Result<(), validator::ValidationError> {
+/// Validate that a title has at least one non-whitespace character.
+pub(crate) fn title_not_blank(s: &str) -> Result<(), validator::ValidationError> {
     if s.trim().is_empty() {
         let mut e = validator::ValidationError::new("blank");
         e.message = Some("Title must not be blank or whitespace-only".into());
