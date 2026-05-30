@@ -1351,7 +1351,7 @@ fn render_oauth_routes_file(
 ) -> String {
     let provider_list = providers
         .iter()
-        .map(|p| format!("\"{}\"", p))
+        .map(|p| format!("\"{p}\""))
         .collect::<Vec<_>>()
         .join(", ");
 
@@ -1583,9 +1583,9 @@ Re-authentication with the same `(provider, subject)` pair links to the existing
 account. A second local user trying to claim the same identity returns an error and
 never silently merges accounts.
 "#,
-        provider_list = provider_list,
-        provider_config_examples = provider_config_examples,
-        first_provider = providers.first().map(String::as_str).unwrap_or("github"),
+        provider_list,
+        provider_config_examples,
+        first_provider = providers.first().map_or("github", String::as_str),
     )
 }
 

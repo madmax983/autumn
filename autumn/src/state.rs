@@ -245,7 +245,7 @@ impl AppState {
         &self.config_props
     }
 
-    /// Returns the resolved [`AutumnConfig`] from the extension map.
+    /// Returns the resolved [`crate::config::AutumnConfig`] from the extension map.
     ///
     /// Falls back to a default config if no config has been installed
     /// (typically only in tests that don't wire the full startup pipeline).

@@ -1179,14 +1179,14 @@ fn resolve_oauth2_providers(table: Option<&toml::Table>) -> Vec<(String, String)
         .map(|providers| {
             providers
                 .iter()
-                .filter_map(|(name, val)| {
+                .map(|(name, val)| {
                     let secret = val
                         .as_table()
                         .and_then(|t| t.get("client_secret"))
                         .and_then(toml::Value::as_str)
                         .unwrap_or("")
                         .to_owned();
-                    Some((name.clone(), secret))
+                    (name.clone(), secret)
                 })
                 .collect()
         })

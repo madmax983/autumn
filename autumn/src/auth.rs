@@ -497,11 +497,11 @@ pub struct OAuth2ProviderConfig {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum OAuthLinkingPolicy {
-    /// An unknown OAuth2 identity automatically creates a new local account.
+    /// An unknown `OAuth2` identity automatically creates a new local account.
     /// This is the default for apps where social login is the primary sign-up path.
     #[default]
     CreateAccount,
-    /// An unknown OAuth2 identity returns a clear error unless the user already
+    /// An unknown `OAuth2` identity returns a clear error unless the user already
     /// has a local account (linked separately). Choose this when social login is
     /// supplemental and you want explicit control over account creation.
     RequireLocalSignupFirst,
@@ -518,7 +518,7 @@ pub enum OAuthLinkingPolicy {
 /// | Key | Protocol | Notes |
 /// |-----|----------|-------|
 /// | `google` | OIDC | Uses `discovery_url`; scopes: `openid profile email` |
-/// | `github` | OAuth2 | Userinfo endpoint; no OIDC discovery |
+/// | `github` | `OAuth2` | Userinfo endpoint; no OIDC discovery |
 /// | `microsoft` | OIDC | Uses `discovery_url` (common tenant); scopes: `openid profile email` |
 ///
 /// # Examples
@@ -531,6 +531,7 @@ pub enum OAuthLinkingPolicy {
 ///     preset.redirect_uri = "http://localhost:3000/auth/google/callback".into();
 /// }
 /// ```
+#[must_use]
 pub fn provider_preset(name: &str) -> Option<OAuth2ProviderConfig> {
     match name {
         "google" => Some(OAuth2ProviderConfig {
