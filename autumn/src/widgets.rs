@@ -8,8 +8,8 @@
 //!
 //! | Situation | Use |
 //! |-----------|-----|
-//! | Keyword search over a rendered list | [`active_search`] / [`active_search_input`] |
-//! | Select a single related record and store its ID | [`autocomplete_input`] |
+//! | Keyword search over a rendered list | `active_search` / `active_search_input` |
+//! | Select a single related record and store its ID | `autocomplete_input` |
 //! | Plain `GET` form is sufficient | `axum::extract::Query` |
 //! | You need unusual htmx wiring | Hand-write `hx-*` attributes |
 //!
@@ -56,7 +56,7 @@
 //!
 //! # No-JavaScript fallback
 //!
-//! [`active_search`] and [`autocomplete_input`] include a `<noscript>` block
+//! `active_search` and `autocomplete_input` include a `<noscript>` block
 //! with a plain HTML form or select that works without JavaScript. Your handler
 //! already returns an HTML fragment — the only addition for a full no-JS page
 //! is wrapping the response in your layout template.
@@ -115,7 +115,8 @@ impl<'a> ActiveSearchConfig<'a> {
     ///
     /// - `action` — URL of the search handler
     /// - `target` — CSS selector for the results container, e.g. `"#search-results"`
-    pub fn new(action: &'a str, target: &'a str) -> Self {
+    #[must_use] 
+    pub const fn new(action: &'a str, target: &'a str) -> Self {
         Self {
             action,
             method: SearchMethod::Get,
@@ -131,49 +132,49 @@ impl<'a> ActiveSearchConfig<'a> {
 
     /// Use `POST` instead of the default `GET` for the search request.
     #[must_use]
-    pub fn post(mut self) -> Self {
+    pub const fn post(mut self) -> Self {
         self.method = SearchMethod::Post;
         self
     }
 
     /// Set the debounce delay in milliseconds (default: `300`).
     #[must_use]
-    pub fn debounce(mut self, ms: u32) -> Self {
+    pub const fn debounce(mut self, ms: u32) -> Self {
         self.debounce_ms = ms;
         self
     }
 
     /// Set the minimum query length before a search is triggered (default: `1`).
     #[must_use]
-    pub fn min_length(mut self, n: u32) -> Self {
+    pub const fn min_length(mut self, n: u32) -> Self {
         self.min_length = n;
         self
     }
 
     /// Set a CSS selector for the htmx loading indicator element.
     #[must_use]
-    pub fn indicator(mut self, selector: &'a str) -> Self {
+    pub const fn indicator(mut self, selector: &'a str) -> Self {
         self.indicator = Some(selector);
         self
     }
 
     /// Trigger a search on initial page load (useful for pre-populated results).
     #[must_use]
-    pub fn initial_load(mut self) -> Self {
+    pub const fn initial_load(mut self) -> Self {
         self.initial_load = true;
         self
     }
 
     /// Set placeholder text for the search input.
     #[must_use]
-    pub fn placeholder(mut self, text: &'a str) -> Self {
+    pub const fn placeholder(mut self, text: &'a str) -> Self {
         self.placeholder = Some(text);
         self
     }
 
     /// Set a custom query parameter name (default: `"q"`).
     #[must_use]
-    pub fn param_name(mut self, name: &'a str) -> Self {
+    pub const fn param_name(mut self, name: &'a str) -> Self {
         self.param_name = name;
         self
     }
@@ -193,67 +194,75 @@ pub struct AutocompleteConfig<'a> {
     pub debounce_ms: u32,
     /// Minimum character count before triggering autocomplete (default: `1`).
     pub min_length: u32,
-    /// Query parameter name sent to the handler (default: `"q"`).
+    /// Query parameter name sent to the handler and used as the visible input's
+    /// `name` (default: `"q"`).
     pub query_param: &'a str,
-    /// `name` attribute for the visible text input showing the selected label.
-    pub display_name: &'a str,
     /// `name` attribute for the hidden input storing the selected record ID.
     pub value_name: &'a str,
     /// Optional placeholder text for the visible input.
     pub placeholder: Option<&'a str>,
+    /// Static `(value, label)` pairs for the `<noscript>` `<select>` fallback.
+    pub fallback_options: Option<&'a [(&'a str, &'a str)]>,
 }
 
 impl<'a> AutocompleteConfig<'a> {
     /// Create a new autocomplete configuration with sensible defaults.
     ///
     /// - `action` — URL of the autocomplete handler
-    /// - `display_name` — `name` attribute for the visible search/label input
     /// - `value_name` — `name` attribute for the hidden selected-ID input
-    pub fn new(action: &'a str, display_name: &'a str, value_name: &'a str) -> Self {
+    #[must_use]
+    pub const fn new(action: &'a str, value_name: &'a str) -> Self {
         Self {
             action,
             indicator: None,
             debounce_ms: 300,
             min_length: 1,
             query_param: "q",
-            display_name,
             value_name,
             placeholder: None,
+            fallback_options: None,
         }
     }
 
     /// Set the debounce delay in milliseconds (default: `300`).
     #[must_use]
-    pub fn debounce(mut self, ms: u32) -> Self {
+    pub const fn debounce(mut self, ms: u32) -> Self {
         self.debounce_ms = ms;
         self
     }
 
     /// Set the minimum query length before autocomplete triggers (default: `1`).
     #[must_use]
-    pub fn min_length(mut self, n: u32) -> Self {
+    pub const fn min_length(mut self, n: u32) -> Self {
         self.min_length = n;
         self
     }
 
     /// Set a CSS selector for the htmx loading indicator element.
     #[must_use]
-    pub fn indicator(mut self, selector: &'a str) -> Self {
+    pub const fn indicator(mut self, selector: &'a str) -> Self {
         self.indicator = Some(selector);
         self
     }
 
     /// Set a custom query parameter name (default: `"q"`).
     #[must_use]
-    pub fn query_param(mut self, name: &'a str) -> Self {
+    pub const fn query_param(mut self, name: &'a str) -> Self {
         self.query_param = name;
         self
     }
 
     /// Set placeholder text for the visible input.
     #[must_use]
-    pub fn placeholder(mut self, text: &'a str) -> Self {
+    pub const fn placeholder(mut self, text: &'a str) -> Self {
         self.placeholder = Some(text);
+        self
+    }
+
+    /// Set static `(value, label)` pairs for the no-JavaScript `<select>` fallback.
+    #[must_use]
+    pub const fn fallback_options(mut self, options: &'a [(&'a str, &'a str)]) -> Self {
+        self.fallback_options = Some(options);
         self
     }
 }
@@ -271,6 +280,12 @@ fn build_trigger(debounce_ms: u32, min_length: u32, initial_load: bool) -> Strin
     let mut trigger = format!(
         "input{filter} changed delay:{debounce_ms}ms, keyup[key=='Enter']{filter}"
     );
+    // When a minimum length is configured, also fire when the value drops below
+    // the threshold so stale results are cleared via the server's empty-state response.
+    if min_length > 0 {
+        use std::fmt::Write as _;
+        let _ = write!(trigger, ", input[this.value.length < {min_length}] changed");
+    }
     if initial_load {
         trigger.push_str(", load");
     }
@@ -319,7 +334,6 @@ pub fn active_search_input(id: &str, label: &str, config: &ActiveSearchConfig<'_
                 id=(id)
                 name=(config.param_name)
                 autocomplete="off"
-                aria-label=(label)
                 aria-controls=(aria_controls)
                 placeholder=[config.placeholder]
                 hx-get=[hx_get]
@@ -372,7 +386,9 @@ pub fn active_search_results(id: &str) -> maud::Markup {
 #[cfg(feature = "maud")]
 #[must_use]
 pub fn active_search(id: &str, label: &str, config: &ActiveSearchConfig<'_>) -> maud::Markup {
-    let results_id = format!("{id}-results");
+    // Derive the results container ID from the configured target selector so the
+    // rendered container always matches what the input's hx-target points at.
+    let results_id = selector_to_id(config.target).to_string();
     let noscript_method = match config.method {
         SearchMethod::Get => "get",
         SearchMethod::Post => "post",
@@ -446,6 +462,11 @@ pub fn autocomplete_input(id: &str, label: &str, config: &AutocompleteConfig<'_>
     let options_id = format!("{id}-options");
     let trigger = build_trigger(config.debounce_ms, config.min_length, false);
     let target = format!("#{options_id}");
+    // Populate the visible input and the hidden value field when a user clicks
+    // an autocomplete option. Uses event delegation on the listbox container.
+    let hx_on_click = format!(
+        "let o=event.target.closest('[role=option]');if(o){{document.getElementById('{query_id}').value=o.textContent.trim();document.getElementById('{value_id}').value=o.getAttribute('data-value');this.innerHTML='';}}"
+    );
 
     maud::html! {
         div id=(format!("{id}-wrapper")) {
@@ -453,13 +474,12 @@ pub fn autocomplete_input(id: &str, label: &str, config: &AutocompleteConfig<'_>
             input
                 type="search"
                 id=(query_id)
-                name=(config.display_name)
+                name=(config.query_param)
                 autocomplete="off"
                 role="combobox"
                 aria-expanded="false"
                 aria-autocomplete="list"
                 aria-controls=(options_id)
-                aria-label=(label)
                 placeholder=[config.placeholder]
                 hx-get=(config.action)
                 hx-trigger=(trigger)
@@ -474,10 +494,16 @@ pub fn autocomplete_input(id: &str, label: &str, config: &AutocompleteConfig<'_>
                 id=(options_id)
                 role="listbox"
                 aria-label=(label)
-                aria-live="polite" {}
+                aria-live="polite"
+                "hx-on:click"=(hx_on_click) {}
             noscript {
                 select name=(config.value_name) aria-label=(label) {
                     option value="" { "— select —" }
+                    @if let Some(opts) = config.fallback_options {
+                        @for (val, lbl) in opts {
+                            option value=(val) { (lbl) }
+                        }
+                    }
                 }
             }
         }
@@ -560,9 +586,21 @@ mod tests {
     }
 
     #[test]
+    fn trigger_min_length_adds_clear_below_threshold() {
+        let t = build_trigger(300, 2, false);
+        assert!(t.contains("[this.value.length < 2]"), "{t}");
+    }
+
+    #[test]
     fn trigger_min_length_zero_has_no_filter() {
         let t = build_trigger(300, 0, false);
         assert!(!t.contains("this.value.length"), "{t}");
+    }
+
+    #[test]
+    fn trigger_min_length_zero_has_no_clear_trigger() {
+        let t = build_trigger(300, 0, false);
+        assert!(!t.contains("this.value.length <"), "{t}");
     }
 
     #[test]
@@ -763,13 +801,6 @@ mod tests {
     }
 
     #[test]
-    fn input_has_aria_label() {
-        let config = ActiveSearchConfig::new("/search", "#results");
-        let html = active_search_input("q", "Find Posts", &config).into_string();
-        assert!(html.contains(r#"aria-label="Find Posts""#), "{html}");
-    }
-
-    #[test]
     fn input_has_aria_controls() {
         let config = ActiveSearchConfig::new("/search", "#my-results");
         let html = active_search_input("q", "Search", &config).into_string();
@@ -842,6 +873,14 @@ mod tests {
     }
 
     #[test]
+    fn widget_results_id_matches_target_selector() {
+        // Callers pass any target; the generated container must match.
+        let config = ActiveSearchConfig::new("/search", "#custom-results");
+        let html = active_search("search-widget", "Search", &config).into_string();
+        assert!(html.contains(r#"id="custom-results""#), "{html}");
+    }
+
+    #[test]
     fn widget_has_noscript_fallback() {
         let config = ActiveSearchConfig::new("/search", "#results");
         let html = active_search("s", "Search", &config).into_string();
@@ -868,15 +907,23 @@ mod tests {
 
     #[test]
     fn autocomplete_visible_search_input() {
-        let config = AutocompleteConfig::new("/ac", "label_field", "value_field");
+        let config = AutocompleteConfig::new("/ac", "value_field");
         let html = autocomplete_input("x", "Label", &config).into_string();
         assert!(html.contains(r#"type="search""#), "{html}");
-        assert!(html.contains(r#"name="label_field""#), "{html}");
+        // visible input uses query_param (default "q") so htmx sends ?q=...
+        assert!(html.contains(r#"name="q""#), "{html}");
+    }
+
+    #[test]
+    fn autocomplete_visible_input_uses_query_param() {
+        let config = AutocompleteConfig::new("/ac", "value_field").query_param("search");
+        let html = autocomplete_input("x", "Label", &config).into_string();
+        assert!(html.contains(r#"name="search""#), "{html}");
     }
 
     #[test]
     fn autocomplete_hidden_value_field() {
-        let config = AutocompleteConfig::new("/ac", "label_field", "value_field");
+        let config = AutocompleteConfig::new("/ac", "value_field");
         let html = autocomplete_input("x", "Label", &config).into_string();
         assert!(html.contains(r#"type="hidden""#), "{html}");
         assert!(html.contains(r#"name="value_field""#), "{html}");
@@ -884,7 +931,7 @@ mod tests {
 
     #[test]
     fn autocomplete_hidden_field_empty_initial_value() {
-        let config = AutocompleteConfig::new("/ac", "label_field", "value_field");
+        let config = AutocompleteConfig::new("/ac", "value_field");
         let html = autocomplete_input("x", "Label", &config).into_string();
         assert!(html.contains(r#"type="hidden""#), "{html}");
         assert!(html.contains(r#"value="""#), "{html}");
@@ -892,42 +939,49 @@ mod tests {
 
     #[test]
     fn autocomplete_listbox_container() {
-        let config = AutocompleteConfig::new("/ac", "label_field", "value_field");
+        let config = AutocompleteConfig::new("/ac", "value_field");
         let html = autocomplete_input("x", "Label", &config).into_string();
         assert!(html.contains(r#"role="listbox""#), "{html}");
     }
 
     #[test]
+    fn autocomplete_listbox_has_click_handler() {
+        let config = AutocompleteConfig::new("/ac", "value_field");
+        let html = autocomplete_input("x", "Label", &config).into_string();
+        assert!(html.contains("hx-on:click"), "{html}");
+    }
+
+    #[test]
     fn autocomplete_combobox_role() {
-        let config = AutocompleteConfig::new("/ac", "label_field", "value_field");
+        let config = AutocompleteConfig::new("/ac", "value_field");
         let html = autocomplete_input("x", "Label", &config).into_string();
         assert!(html.contains(r#"role="combobox""#), "{html}");
     }
 
     #[test]
     fn autocomplete_aria_expanded_false() {
-        let config = AutocompleteConfig::new("/ac", "label_field", "value_field");
+        let config = AutocompleteConfig::new("/ac", "value_field");
         let html = autocomplete_input("x", "Label", &config).into_string();
         assert!(html.contains(r#"aria-expanded="false""#), "{html}");
     }
 
     #[test]
     fn autocomplete_aria_autocomplete_list() {
-        let config = AutocompleteConfig::new("/ac", "label_field", "value_field");
+        let config = AutocompleteConfig::new("/ac", "value_field");
         let html = autocomplete_input("x", "Label", &config).into_string();
         assert!(html.contains(r#"aria-autocomplete="list""#), "{html}");
     }
 
     #[test]
     fn autocomplete_has_aria_controls() {
-        let config = AutocompleteConfig::new("/ac", "label_field", "value_field");
+        let config = AutocompleteConfig::new("/ac", "value_field");
         let html = autocomplete_input("x", "Label", &config).into_string();
         assert!(html.contains("aria-controls"), "{html}");
     }
 
     #[test]
     fn autocomplete_renders_label() {
-        let config = AutocompleteConfig::new("/ac", "label_field", "value_field");
+        let config = AutocompleteConfig::new("/ac", "value_field");
         let html = autocomplete_input("x", "My Label", &config).into_string();
         assert!(html.contains("My Label"), "{html}");
         assert!(html.contains("<label"), "{html}");
@@ -935,7 +989,7 @@ mod tests {
 
     #[test]
     fn autocomplete_label_for_matches_query_input_id() {
-        let config = AutocompleteConfig::new("/ac", "label_field", "value_field");
+        let config = AutocompleteConfig::new("/ac", "value_field");
         let html = autocomplete_input("tag", "Tag", &config).into_string();
         assert!(html.contains(r#"for="tag-query""#), "{html}");
         assert!(html.contains(r#"id="tag-query""#), "{html}");
@@ -943,7 +997,7 @@ mod tests {
 
     #[test]
     fn autocomplete_has_noscript_fallback() {
-        let config = AutocompleteConfig::new("/ac", "label_field", "value_field");
+        let config = AutocompleteConfig::new("/ac", "value_field");
         let html = autocomplete_input("x", "Label", &config).into_string();
         assert!(html.contains("<noscript>"), "{html}");
         assert!(html.contains("<select"), "{html}");
@@ -951,21 +1005,32 @@ mod tests {
 
     #[test]
     fn autocomplete_noscript_select_uses_value_name() {
-        let config = AutocompleteConfig::new("/ac", "label_field", "value_field");
+        let config = AutocompleteConfig::new("/ac", "value_field");
         let html = autocomplete_input("x", "Label", &config).into_string();
         assert!(html.contains(r#"name="value_field""#), "{html}");
     }
 
     #[test]
+    fn autocomplete_fallback_options_rendered_in_noscript() {
+        let opts: &[(&str, &str)] = &[("1", "Alpha"), ("2", "Beta")];
+        let config = AutocompleteConfig::new("/ac", "value_field").fallback_options(opts);
+        let html = autocomplete_input("x", "Label", &config).into_string();
+        assert!(html.contains("Alpha"), "{html}");
+        assert!(html.contains("Beta"), "{html}");
+        assert!(html.contains(r#"value="1""#), "{html}");
+        assert!(html.contains(r#"value="2""#), "{html}");
+    }
+
+    #[test]
     fn autocomplete_has_hx_get() {
-        let config = AutocompleteConfig::new("/ac", "label_field", "value_field");
+        let config = AutocompleteConfig::new("/ac", "value_field");
         let html = autocomplete_input("x", "Label", &config).into_string();
         assert!(html.contains(r#"hx-get="/ac""#), "{html}");
     }
 
     #[test]
     fn autocomplete_hx_trigger_has_debounce() {
-        let config = AutocompleteConfig::new("/ac", "label_field", "value_field");
+        let config = AutocompleteConfig::new("/ac", "value_field");
         let html = autocomplete_input("x", "Label", &config).into_string();
         assert!(html.contains("hx-trigger"), "{html}");
         assert!(html.contains("delay:300ms"), "{html}");
@@ -973,14 +1038,14 @@ mod tests {
 
     #[test]
     fn autocomplete_configurable_debounce() {
-        let config = AutocompleteConfig::new("/ac", "label_field", "value_field").debounce(600);
+        let config = AutocompleteConfig::new("/ac", "value_field").debounce(600);
         let html = autocomplete_input("x", "Label", &config).into_string();
         assert!(html.contains("delay:600ms"), "{html}");
     }
 
     #[test]
     fn autocomplete_configurable_min_length() {
-        let config = AutocompleteConfig::new("/ac", "label_field", "value_field").min_length(2);
+        let config = AutocompleteConfig::new("/ac", "value_field").min_length(2);
         let html = autocomplete_input("x", "Label", &config).into_string();
         // Maud HTML-encodes `>=` as `&gt;=`; the browser decodes it before htmx sees it
         assert!(html.contains("this.value.length") && html.contains("2"), "{html}");
@@ -988,21 +1053,21 @@ mod tests {
 
     #[test]
     fn autocomplete_indicator_when_configured() {
-        let config = AutocompleteConfig::new("/ac", "label_field", "value_field").indicator("#ld");
+        let config = AutocompleteConfig::new("/ac", "value_field").indicator("#ld");
         let html = autocomplete_input("x", "Label", &config).into_string();
         assert!(html.contains("hx-indicator=\"#ld\""), "{html}");
     }
 
     #[test]
     fn autocomplete_no_indicator_by_default() {
-        let config = AutocompleteConfig::new("/ac", "label_field", "value_field");
+        let config = AutocompleteConfig::new("/ac", "value_field");
         let html = autocomplete_input("x", "Label", &config).into_string();
         assert!(!html.contains("hx-indicator"), "{html}");
     }
 
     #[test]
     fn autocomplete_listbox_has_aria_live() {
-        let config = AutocompleteConfig::new("/ac", "label_field", "value_field");
+        let config = AutocompleteConfig::new("/ac", "value_field");
         let html = autocomplete_input("x", "Label", &config).into_string();
         assert!(html.contains("aria-live"), "{html}");
     }

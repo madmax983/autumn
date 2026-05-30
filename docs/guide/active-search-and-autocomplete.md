@@ -59,10 +59,9 @@ The search input receives:
   id="post-search"
   name="q"
   autocomplete="off"
-  aria-label="Search posts"
   aria-controls="post-results"
   hx-get="/posts/search"
-  hx-trigger="input[this.value.length >= 2] changed delay:400ms, keyup[key=='Enter'][this.value.length >= 2]"
+  hx-trigger="input[this.value.length >= 2] changed delay:400ms, keyup[key=='Enter'][this.value.length >= 2], input[this.value.length < 2] changed"
   hx-target="#post-results"
 >
 ```
@@ -156,7 +155,6 @@ use autumn_web::widgets::{AutocompleteConfig, autocomplete_input};
 
 let config = AutocompleteConfig::new(
     "/tags/autocomplete", // handler URL
-    "tag_label",          // name of the visible input (shows the selected label)
     "tag_id",             // name of the hidden input (stores the selected ID)
 )
 .placeholder("Search tags…");
@@ -175,14 +173,15 @@ Rendered HTML (abbreviated):
 ```html
 <div id="tag-picker-wrapper">
   <label for="tag-picker-query">Tag</label>
-  <input type="search" id="tag-picker-query" name="tag_label"
+  <input type="search" id="tag-picker-query" name="q"
          role="combobox" aria-expanded="false" aria-autocomplete="list"
          aria-controls="tag-picker-options"
          hx-get="/tags/autocomplete"
-         hx-trigger="input[…] changed delay:300ms, keyup[key=='Enter'][…]"
+         hx-trigger="input[…] changed delay:300ms, keyup[key=='Enter'][…], input[this.value.length < 1] changed"
          hx-target="#tag-picker-options">
   <input type="hidden" id="tag-picker-value" name="tag_id" value="">
-  <div id="tag-picker-options" role="listbox" aria-live="polite"></div>
+  <div id="tag-picker-options" role="listbox" aria-live="polite"
+       hx-on:click="let o=event.target.closest('[role=option]');if(o){…}"></div>
   <noscript>
     <select name="tag_id">…</select>
   </noscript>
@@ -227,8 +226,10 @@ async fn tags_autocomplete(
 <div role="option" tabindex="0" data-value="42">Tag Name</div>
 ```
 
-Use `data-value` in a small `hx-on:click` handler or a server round-trip to
-populate the hidden field and the visible label when the user selects an option.
+The listbox container has a built-in `hx-on:click` delegating handler that
+fires when the user clicks an option. It copies the option's `textContent` into
+the visible input and its `data-value` into the hidden field, then clears the
+listbox. No additional wiring is needed.
 
 ---
 
@@ -241,7 +242,8 @@ works without JavaScript:
   Your handler already returns a correct response; wrap it in your layout
   for the full-page no-JS case.
 - **Autocomplete** — a `<select name="...">` that submits the value directly.
-  Populate its options server-side for the fallback path.
+  Pass `.fallback_options(&[("val", "Label"), …])` to `AutocompleteConfig` to
+  populate its options server-side for the fallback path.
 
 For a seamless no-JS experience, detect whether the request is an htmx
 request using `HxRequest` and wrap the response in a full layout if not:
@@ -265,7 +267,6 @@ async fn search(hx: HxRequest, Query(params): Query<SearchQuery>, ...) -> Autumn
 All widgets include:
 
 - `<label>` associated with the input via `for`/`id`
-- `aria-label` on the input
 - `aria-controls` pointing at the results container
 - `role="status"` and `aria-live="polite"` on the results container (so screen
   readers announce updates without moving focus)

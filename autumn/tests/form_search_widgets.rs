@@ -147,13 +147,6 @@ mod active_search_tests {
     }
 
     #[test]
-    fn active_search_has_aria_label() {
-        let config = ActiveSearchConfig::new("/search", "#results");
-        let html = active_search_input("q", "Find Posts", &config).into_string();
-        assert!(html.contains(r#"aria-label="Find Posts""#), "{html}");
-    }
-
-    #[test]
     fn active_search_has_aria_controls_pointing_at_results() {
         let config = ActiveSearchConfig::new("/search", "#my-results");
         let html = active_search_input("q", "Search", &config).into_string();
@@ -269,15 +262,16 @@ mod active_search_tests {
 
     #[test]
     fn autocomplete_has_visible_search_input() {
-        let config = AutocompleteConfig::new("/autocomplete", "tag_label", "tag_id");
+        let config = AutocompleteConfig::new("/autocomplete", "tag_id");
         let html = autocomplete_input("tag", "Tag", &config).into_string();
         assert!(html.contains(r#"type="search""#), "{html}");
-        assert!(html.contains(r#"name="tag_label""#), "{html}");
+        // visible input uses query_param (default "q") so htmx sends ?q=...
+        assert!(html.contains(r#"name="q""#), "{html}");
     }
 
     #[test]
     fn autocomplete_has_hidden_value_field() {
-        let config = AutocompleteConfig::new("/autocomplete", "tag_label", "tag_id");
+        let config = AutocompleteConfig::new("/autocomplete", "tag_id");
         let html = autocomplete_input("tag", "Tag", &config).into_string();
         assert!(html.contains(r#"type="hidden""#), "{html}");
         assert!(html.contains(r#"name="tag_id""#), "{html}");
@@ -285,7 +279,7 @@ mod active_search_tests {
 
     #[test]
     fn autocomplete_hidden_field_initial_value_is_empty() {
-        let config = AutocompleteConfig::new("/autocomplete", "tag_label", "tag_id");
+        let config = AutocompleteConfig::new("/autocomplete", "tag_id");
         let html = autocomplete_input("tag", "Tag", &config).into_string();
         // Hidden field should be present with empty initial value
         assert!(html.contains(r#"type="hidden""#), "{html}");
@@ -295,42 +289,42 @@ mod active_search_tests {
 
     #[test]
     fn autocomplete_has_listbox_container() {
-        let config = AutocompleteConfig::new("/autocomplete", "tag_label", "tag_id");
+        let config = AutocompleteConfig::new("/autocomplete", "tag_id");
         let html = autocomplete_input("tag", "Tag", &config).into_string();
         assert!(html.contains(r#"role="listbox""#), "{html}");
     }
 
     #[test]
     fn autocomplete_visible_input_has_combobox_role() {
-        let config = AutocompleteConfig::new("/autocomplete", "tag_label", "tag_id");
+        let config = AutocompleteConfig::new("/autocomplete", "tag_id");
         let html = autocomplete_input("tag", "Tag", &config).into_string();
         assert!(html.contains(r#"role="combobox""#), "{html}");
     }
 
     #[test]
     fn autocomplete_aria_expanded_false_initially() {
-        let config = AutocompleteConfig::new("/autocomplete", "tag_label", "tag_id");
+        let config = AutocompleteConfig::new("/autocomplete", "tag_id");
         let html = autocomplete_input("tag", "Tag", &config).into_string();
         assert!(html.contains(r#"aria-expanded="false""#), "{html}");
     }
 
     #[test]
     fn autocomplete_aria_autocomplete_attribute() {
-        let config = AutocompleteConfig::new("/autocomplete", "tag_label", "tag_id");
+        let config = AutocompleteConfig::new("/autocomplete", "tag_id");
         let html = autocomplete_input("tag", "Tag", &config).into_string();
         assert!(html.contains(r#"aria-autocomplete="list""#), "{html}");
     }
 
     #[test]
     fn autocomplete_has_aria_controls() {
-        let config = AutocompleteConfig::new("/autocomplete", "tag_label", "tag_id");
+        let config = AutocompleteConfig::new("/autocomplete", "tag_id");
         let html = autocomplete_input("tag", "Tag", &config).into_string();
         assert!(html.contains("aria-controls"), "{html}");
     }
 
     #[test]
     fn autocomplete_renders_label() {
-        let config = AutocompleteConfig::new("/autocomplete", "tag_label", "tag_id");
+        let config = AutocompleteConfig::new("/autocomplete", "tag_id");
         let html = autocomplete_input("tag", "Tag Name", &config).into_string();
         assert!(html.contains("Tag Name"), "{html}");
         assert!(html.contains("<label"), "{html}");
@@ -338,7 +332,7 @@ mod active_search_tests {
 
     #[test]
     fn autocomplete_label_for_matches_visible_input_id() {
-        let config = AutocompleteConfig::new("/autocomplete", "tag_label", "tag_id");
+        let config = AutocompleteConfig::new("/autocomplete", "tag_id");
         let html = autocomplete_input("tag", "Tag", &config).into_string();
         assert!(html.contains(r#"for="tag-query""#), "{html}");
         assert!(html.contains(r#"id="tag-query""#), "{html}");
@@ -346,7 +340,7 @@ mod active_search_tests {
 
     #[test]
     fn autocomplete_has_noscript_fallback() {
-        let config = AutocompleteConfig::new("/autocomplete", "tag_label", "tag_id");
+        let config = AutocompleteConfig::new("/autocomplete", "tag_id");
         let html = autocomplete_input("tag", "Tag", &config).into_string();
         assert!(html.contains("<noscript>"), "{html}");
         assert!(html.contains("<select"), "{html}");
@@ -354,7 +348,7 @@ mod active_search_tests {
 
     #[test]
     fn autocomplete_noscript_select_has_value_name() {
-        let config = AutocompleteConfig::new("/autocomplete", "tag_label", "tag_id");
+        let config = AutocompleteConfig::new("/autocomplete", "tag_id");
         let html = autocomplete_input("tag", "Tag", &config).into_string();
         // The noscript select should use the value field name
         assert!(html.contains(r#"name="tag_id""#), "{html}");
@@ -362,14 +356,14 @@ mod active_search_tests {
 
     #[test]
     fn autocomplete_has_htmx_get_on_visible_input() {
-        let config = AutocompleteConfig::new("/autocomplete", "tag_label", "tag_id");
+        let config = AutocompleteConfig::new("/autocomplete", "tag_id");
         let html = autocomplete_input("tag", "Tag", &config).into_string();
         assert!(html.contains(r#"hx-get="/autocomplete""#), "{html}");
     }
 
     #[test]
     fn autocomplete_has_hx_trigger_with_debounce() {
-        let config = AutocompleteConfig::new("/autocomplete", "tag_label", "tag_id");
+        let config = AutocompleteConfig::new("/autocomplete", "tag_id");
         let html = autocomplete_input("tag", "Tag", &config).into_string();
         assert!(html.contains("hx-trigger"), "{html}");
         assert!(html.contains("delay:300ms"), "{html}");
@@ -377,14 +371,14 @@ mod active_search_tests {
 
     #[test]
     fn autocomplete_configurable_debounce() {
-        let config = AutocompleteConfig::new("/autocomplete", "tag_label", "tag_id").debounce(600);
+        let config = AutocompleteConfig::new("/autocomplete", "tag_id").debounce(600);
         let html = autocomplete_input("tag", "Tag", &config).into_string();
         assert!(html.contains("delay:600ms"), "{html}");
     }
 
     #[test]
     fn autocomplete_configurable_min_length() {
-        let config = AutocompleteConfig::new("/autocomplete", "tag_label", "tag_id").min_length(2);
+        let config = AutocompleteConfig::new("/autocomplete", "tag_id").min_length(2);
         let html = autocomplete_input("tag", "Tag", &config).into_string();
         // Maud HTML-encodes `>=` as `&gt;=`; the browser decodes it before htmx sees it
         assert!(html.contains("this.value.length") && html.contains("2"), "{html}");
@@ -393,21 +387,21 @@ mod active_search_tests {
     #[test]
     fn autocomplete_indicator_when_configured() {
         let config =
-            AutocompleteConfig::new("/autocomplete", "tag_label", "tag_id").indicator("#loader");
+            AutocompleteConfig::new("/autocomplete", "tag_id").indicator("#loader");
         let html = autocomplete_input("tag", "Tag", &config).into_string();
         assert!(html.contains("hx-indicator=\"#loader\""), "{html}");
     }
 
     #[test]
     fn autocomplete_no_indicator_by_default() {
-        let config = AutocompleteConfig::new("/autocomplete", "tag_label", "tag_id");
+        let config = AutocompleteConfig::new("/autocomplete", "tag_id");
         let html = autocomplete_input("tag", "Tag", &config).into_string();
         assert!(!html.contains("hx-indicator"), "{html}");
     }
 
     #[test]
     fn autocomplete_listbox_has_aria_live() {
-        let config = AutocompleteConfig::new("/autocomplete", "tag_label", "tag_id");
+        let config = AutocompleteConfig::new("/autocomplete", "tag_id");
         let html = autocomplete_input("tag", "Tag", &config).into_string();
         assert!(html.contains("aria-live"), "{html}");
     }

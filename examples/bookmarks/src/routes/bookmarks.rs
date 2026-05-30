@@ -179,7 +179,6 @@ pub async fn by_tag(Path(tag): Path<String>, repo: PgBookmarkRepository) -> Autu
 pub async fn new_form() -> AutumnResult<Markup> {
     let tag_ac = autumn_web::widgets::AutocompleteConfig::new(
         "/bookmarks/tags/autocomplete",
-        "tag_label",
         "tag",
     )
     .placeholder("Search existing tags…")
@@ -316,19 +315,19 @@ pub async fn search(
     mut db: Db,
 ) -> AutumnResult<Markup> {
     let q = params.q.trim();
-    if q.is_empty() {
+    if q.chars().count() < 2 {
         return Ok(autumn_web::widgets::active_search_empty_state(
             "Enter at least two characters to search.",
         ));
     }
 
-    let pattern = format!("%{}%", q.to_lowercase());
+    let pattern = format!("%{q}%");
     let results: Vec<Bookmark> = bookmarks::table
         .filter(
-            diesel::dsl::sql::<diesel::sql_types::Bool>(
-                "lower(title) LIKE $1 OR lower(url) LIKE $1 OR lower(tag) LIKE $1",
-            )
-            .bind::<diesel::sql_types::Text, _>(pattern),
+            bookmarks::title
+                .ilike(pattern.clone())
+                .or(bookmarks::url.ilike(pattern.clone()))
+                .or(bookmarks::tag.ilike(pattern)),
         )
         .select(Bookmark::as_select())
         .load(&mut *db)
@@ -364,13 +363,10 @@ pub async fn tags_autocomplete(
         ));
     }
 
-    let pattern = format!("%{}%", q.to_lowercase());
+    let pattern = format!("%{q}%");
     let tags: Vec<String> = bookmarks::table
         .select(bookmarks::tag)
-        .filter(
-            diesel::dsl::sql::<diesel::sql_types::Bool>("lower(tag) LIKE $1")
-                .bind::<diesel::sql_types::Text, _>(pattern),
-        )
+        .filter(bookmarks::tag.ilike(pattern))
         .distinct()
         .order(bookmarks::tag.asc())
         .load(&mut *db)
