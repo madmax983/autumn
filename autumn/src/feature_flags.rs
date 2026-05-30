@@ -1568,4 +1568,176 @@ mod tests {
         );
         assert!(flag.actor_allowlist.contains(&"user:42".to_owned()));
     }
+
+    // ── Arc<T: FlagStore> delegation ──────────────────────────────────────────
+
+    #[test]
+    fn arc_flag_store_delegates_get() {
+        let store = Arc::new(InMemoryFlagStore::new());
+        store.enable("arc_flag", None).unwrap();
+        let arc_store: Arc<dyn FlagStore> = store;
+        let flag = arc_store.get("arc_flag").unwrap().unwrap();
+        assert!(flag.enabled);
+    }
+
+    #[test]
+    fn arc_flag_store_delegates_list() {
+        let store = Arc::new(InMemoryFlagStore::new());
+        store.enable("f1", None).unwrap();
+        store.enable("f2", None).unwrap();
+        let arc_store: Arc<dyn FlagStore> = store;
+        let flags = arc_store.list().unwrap();
+        assert_eq!(flags.len(), 2);
+    }
+
+    #[test]
+    fn arc_flag_store_delegates_enable_and_disable() {
+        let store = Arc::new(InMemoryFlagStore::new());
+        let arc_store: Arc<dyn FlagStore> = store;
+        arc_store.enable("f", None).unwrap();
+        assert!(arc_store.get("f").unwrap().unwrap().enabled);
+        arc_store.disable("f", None).unwrap();
+        assert!(!arc_store.get("f").unwrap().unwrap().enabled);
+    }
+
+    #[test]
+    fn arc_flag_store_delegates_set_rollout() {
+        let store = Arc::new(InMemoryFlagStore::new());
+        let arc_store: Arc<dyn FlagStore> = store;
+        arc_store.set_rollout("f", 42, None).unwrap();
+        let flag = arc_store.get("f").unwrap().unwrap();
+        assert_eq!(flag.rollout_pct, 42);
+    }
+
+    #[test]
+    fn arc_flag_store_delegates_allow_actor() {
+        let store = Arc::new(InMemoryFlagStore::new());
+        let arc_store: Arc<dyn FlagStore> = store;
+        arc_store.allow_actor("f", "user:1", None).unwrap();
+        let flag = arc_store.get("f").unwrap().unwrap();
+        assert!(flag.actor_allowlist.contains(&"user:1".to_owned()));
+    }
+
+    #[test]
+    fn arc_flag_store_delegates_add_group() {
+        let store = Arc::new(InMemoryFlagStore::new());
+        let arc_store: Arc<dyn FlagStore> = store;
+        arc_store.add_group("f", "beta_testers", None).unwrap();
+        let flag = arc_store.get("f").unwrap().unwrap();
+        assert!(flag.group_allowlist.contains(&"beta_testers".to_owned()));
+    }
+
+    #[test]
+    fn arc_flag_store_delegates_history() {
+        let store = Arc::new(InMemoryFlagStore::new());
+        let arc_store: Arc<dyn FlagStore> = store;
+        arc_store.enable("f", Some("cli")).unwrap();
+        let history = arc_store.history("f", 10).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].mutation, "enabled");
+    }
+
+    // ── Box<dyn FlagStore> delegation ─────────────────────────────────────────
+
+    #[test]
+    fn box_flag_store_delegates_all_operations() {
+        let store = InMemoryFlagStore::new();
+        let boxed: Box<dyn FlagStore> = Box::new(store);
+        boxed.enable("f", None).unwrap();
+        assert!(boxed.get("f").unwrap().unwrap().enabled);
+        boxed.set_rollout("g", 25, Some("cli")).unwrap();
+        assert_eq!(boxed.get("g").unwrap().unwrap().rollout_pct, 25);
+        boxed.allow_actor("h", "user:1", None).unwrap();
+        boxed.add_group("h", "staff", None).unwrap();
+        let flags = boxed.list().unwrap();
+        // f, g, h are present
+        assert_eq!(flags.len(), 3);
+        let hist = boxed.history("f", 5).unwrap();
+        assert_eq!(hist[0].mutation, "enabled");
+        boxed.disable("f", None).unwrap();
+        assert!(!boxed.get("f").unwrap().unwrap().enabled);
+    }
+
+    // ── FlagStoreError display ────────────────────────────────────────────────
+
+    #[test]
+    fn flag_store_error_displays_message() {
+        let err = FlagStoreError::Backend("connection refused".to_owned());
+        assert_eq!(
+            err.to_string(),
+            "flag store backend error: connection refused"
+        );
+    }
+
+    // ── FlagConfig clone and equality ─────────────────────────────────────────
+
+    #[test]
+    fn flag_config_clone_is_equal_to_original() {
+        let mut f = FlagConfig::new("cloned");
+        f.enabled = true;
+        f.rollout_pct = 50;
+        f.actor_allowlist = vec!["user:1".to_owned()];
+        let g = f.clone();
+        assert_eq!(f, g);
+    }
+
+    // ── evaluate() edge cases ─────────────────────────────────────────────────
+
+    #[test]
+    fn rollout_with_no_actor_returns_false() {
+        // When actor_id is None and there are no allowlists, a percent rollout
+        // must not enable the flag (there's no actor to compute a bucket for).
+        let svc = make_svc();
+        svc.set_rollout("gradual", 99, None).unwrap();
+        assert!(
+            !svc.is_enabled("gradual", None),
+            "percent rollout must not fire for anonymous (None) actor"
+        );
+    }
+
+    #[test]
+    fn group_resolver_with_no_actor_does_not_panic() {
+        let svc = FeatureFlagService::new(Arc::new(InMemoryFlagStore::new()))
+            .with_group_resolver(Arc::new(|_: &str, _: &str| true));
+        svc.add_group("f", "everyone", None).unwrap();
+        // No actor — group check must be skipped, not panic.
+        assert!(!svc.is_enabled("f", None));
+    }
+
+    #[test]
+    fn add_group_mutation_format() {
+        let store = InMemoryFlagStore::new();
+        store.add_group("f", "beta_testers", Some("cli")).unwrap();
+        let hist = store.history("f", 1).unwrap();
+        assert_eq!(hist[0].mutation, "added_group=beta_testers");
+        assert_eq!(hist[0].actor.as_deref(), Some("cli"));
+    }
+
+    #[test]
+    fn service_list_returns_all_flags() {
+        let svc = make_svc();
+        svc.enable("a", None).unwrap();
+        svc.disable("b", None).unwrap();
+        svc.set_rollout("c", 10, None).unwrap();
+        let flags = svc.list().unwrap();
+        assert_eq!(flags.len(), 3);
+        assert_eq!(flags[0].key, "a");
+        assert_eq!(flags[1].key, "b");
+        assert_eq!(flags[2].key, "c");
+    }
+
+    #[test]
+    fn service_debug_does_not_panic() {
+        let svc = make_svc();
+        let _ = format!("{svc:?}");
+    }
+
+    #[test]
+    fn flags_enabled_delegates_to_service() {
+        // Test the Flags::enabled() method via FeatureFlagService directly.
+        let svc = make_svc();
+        svc.enable("active", None).unwrap();
+        assert!(svc.is_enabled("active", Some("any_user")));
+        assert!(!svc.is_enabled("missing", Some("any_user")));
+    }
 }
