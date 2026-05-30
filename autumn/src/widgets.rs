@@ -269,22 +269,11 @@ impl<'a> AutocompleteConfig<'a> {
 
 /// Build the `hx-trigger` value for active search / autocomplete inputs.
 ///
-/// The canonical pattern is:
-/// `input[filter] changed delay:{n}ms, keyup[key=='Enter'][filter][, load]`
-fn build_trigger(debounce_ms: u32, min_length: u32, initial_load: bool) -> String {
-    let filter = if min_length > 0 {
-        format!("[this.value.length >= {min_length}]")
-    } else {
-        String::new()
-    };
-    let mut trigger =
-        format!("input{filter} changed delay:{debounce_ms}ms, keyup[key=='Enter']{filter}");
-    // When a minimum length is configured, also fire when the value drops below
-    // the threshold so stale results are cleared via the server's empty-state response.
-    if min_length > 0 {
-        use std::fmt::Write as _;
-        let _ = write!(trigger, ", input[this.value.length < {min_length}] changed");
-    }
+/// The canonical form is `input changed delay:{n}ms[, load]`.
+/// No filter expressions are emitted; `min_length` is enforced server-side so
+/// the trigger works under Autumn's default `script-src 'self'` CSP (no `unsafe-eval`).
+fn build_trigger(debounce_ms: u32, initial_load: bool) -> String {
+    let mut trigger = format!("input changed delay:{debounce_ms}ms");
     if initial_load {
         trigger.push_str(", load");
     }
@@ -312,13 +301,13 @@ fn selector_to_id(selector: &str) -> &str {
 /// | Attribute | Value |
 /// |-----------|-------|
 /// | `hx-get` / `hx-post` | `config.action` |
-/// | `hx-trigger` | `input[filter] changed delay:{n}ms, keyup[key=='Enter'][filter][, load]` |
+/// | `hx-trigger` | `input changed delay:{n}ms[, load]` |
 /// | `hx-target` | `config.target` |
 /// | `hx-indicator` | `config.indicator` (only when set) |
 #[cfg(feature = "maud")]
 #[must_use]
 pub fn active_search_input(id: &str, label: &str, config: &ActiveSearchConfig<'_>) -> maud::Markup {
-    let trigger = build_trigger(config.debounce_ms, config.min_length, config.initial_load);
+    let trigger = build_trigger(config.debounce_ms, config.initial_load);
     let aria_controls = selector_to_id(config.target);
     let (hx_get, hx_post) = match config.method {
         SearchMethod::Get => (Some(config.action), None::<&str>),
@@ -446,7 +435,7 @@ pub fn active_search_empty_state(message: &str) -> maud::Markup {
 /// ```rust,ignore
 /// use autumn_web::widgets::{AutocompleteConfig, autocomplete_input};
 ///
-/// let config = AutocompleteConfig::new("/tags/autocomplete", "tag_label", "tag_id")
+/// let config = AutocompleteConfig::new("/tags/autocomplete", "tag_id")
 ///     .placeholder("Search tags…");
 ///
 /// html! {
@@ -459,20 +448,27 @@ pub fn autocomplete_input(id: &str, label: &str, config: &AutocompleteConfig<'_>
     let query_id = format!("{id}-query");
     let value_id = format!("{id}-value");
     let options_id = format!("{id}-options");
-    let trigger = build_trigger(config.debounce_ms, config.min_length, false);
+    let trigger = build_trigger(config.debounce_ms, false);
     let target = format!("#{options_id}");
+    let vn = config.value_name;
     // Populate the visible input and the hidden value field when a user clicks
     // an autocomplete option. Uses event delegation on the listbox container.
+    // v.name is set here so the hidden input gains a name only via JS — preventing
+    // the duplicate-field problem when JavaScript is disabled (the <noscript><select>
+    // already carries the name).
     let hx_on_click = format!(
-        "let o=event.target.closest('[role=option]');if(o){{document.getElementById('{query_id}').value=o.textContent.trim();document.getElementById('{value_id}').value=o.getAttribute('data-value');this.innerHTML='';}}"
+        "let o=event.target.closest('[role=option]');if(o){{let v=document.getElementById('{value_id}');v.name='{vn}';v.value=o.getAttribute('data-value');document.getElementById('{query_id}').value=o.textContent.trim();this.innerHTML='';}}"
     );
     // Same selection logic for keyboard users: Enter or Space activates the focused option.
     let hx_on_keydown = format!(
-        "let o=event.target.closest('[role=option]');if(o&&(event.key==='Enter'||event.key===' ')){{event.preventDefault();document.getElementById('{query_id}').value=o.textContent.trim();document.getElementById('{value_id}').value=o.getAttribute('data-value');this.innerHTML='';}}"
+        "let o=event.target.closest('[role=option]');if(o&&(event.key==='Enter'||event.key===' ')){{event.preventDefault();let v=document.getElementById('{value_id}');v.name='{vn}';v.value=o.getAttribute('data-value');document.getElementById('{query_id}').value=o.textContent.trim();this.innerHTML='';}}"
     );
-    // Clear the hidden value whenever the user edits the visible field so a stale
-    // selection is not submitted if they change their mind without picking again.
-    let on_input_clear = format!("document.getElementById('{value_id}').value=''");
+    // Keep the hidden field in sync with the typed text so users can submit a value
+    // they typed directly (without picking from the list). v.name is also set here so
+    // the hidden input has no name attribute in HTML and only participates in JS-mode
+    // form submission.
+    let on_input_handler =
+        format!("let v=document.getElementById('{value_id}');v.name='{vn}';v.value=this.value");
 
     maud::html! {
         div id=(format!("{id}-wrapper")) {
@@ -487,7 +483,7 @@ pub fn autocomplete_input(id: &str, label: &str, config: &AutocompleteConfig<'_>
                 aria-autocomplete="list"
                 aria-controls=(options_id)
                 placeholder=[config.placeholder]
-                oninput=(on_input_clear)
+                "hx-on:input"=(on_input_handler)
                 hx-get=(config.action)
                 hx-trigger=(trigger)
                 hx-target=(target)
@@ -495,7 +491,6 @@ pub fn autocomplete_input(id: &str, label: &str, config: &AutocompleteConfig<'_>
             input
                 type="hidden"
                 id=(value_id)
-                name=(config.value_name)
                 value="";
             div
                 id=(options_id)
@@ -574,58 +569,41 @@ mod tests {
     // ── build_trigger ──────────────────────────────────────────────────
 
     #[test]
-    fn trigger_has_debounce_and_enter() {
-        let t = build_trigger(300, 1, false);
+    fn trigger_has_debounce() {
+        let t = build_trigger(300, false);
         assert!(t.contains("delay:300ms"), "{t}");
-        assert!(t.contains("keyup[key=='Enter']"), "{t}");
     }
 
     #[test]
     fn trigger_has_changed_modifier() {
-        let t = build_trigger(300, 0, false);
+        let t = build_trigger(300, false);
         assert!(t.contains("changed"), "{t}");
     }
 
     #[test]
-    fn trigger_min_length_adds_filter() {
-        let t = build_trigger(300, 2, false);
-        // The trigger string itself uses `>=` (not HTML-encoded); encoding happens in the template
-        assert!(t.contains("[this.value.length >= 2]"), "{t}");
-    }
-
-    #[test]
-    fn trigger_min_length_adds_clear_below_threshold() {
-        let t = build_trigger(300, 2, false);
-        assert!(t.contains("[this.value.length < 2]"), "{t}");
-    }
-
-    #[test]
-    fn trigger_min_length_zero_has_no_filter() {
-        let t = build_trigger(300, 0, false);
+    fn trigger_has_no_filter_expressions() {
+        // No [condition] filters are emitted — min_length is server-side only.
+        // This ensures the trigger works under Autumn's default CSP (no unsafe-eval).
+        let t = build_trigger(300, false);
         assert!(!t.contains("this.value.length"), "{t}");
-    }
-
-    #[test]
-    fn trigger_min_length_zero_has_no_clear_trigger() {
-        let t = build_trigger(300, 0, false);
-        assert!(!t.contains("this.value.length <"), "{t}");
+        assert!(!t.contains('['), "{t}");
     }
 
     #[test]
     fn trigger_initial_load_appends_load() {
-        let t = build_trigger(300, 0, true);
+        let t = build_trigger(300, true);
         assert!(t.contains(", load"), "{t}");
     }
 
     #[test]
     fn trigger_no_initial_load_by_default() {
-        let t = build_trigger(300, 0, false);
+        let t = build_trigger(300, false);
         assert!(!t.contains("load"), "{t}");
     }
 
     #[test]
     fn trigger_custom_debounce() {
-        let t = build_trigger(750, 0, false);
+        let t = build_trigger(750, false);
         assert!(t.contains("delay:750ms"), "{t}");
     }
 
@@ -746,14 +724,6 @@ mod tests {
     }
 
     #[test]
-    fn input_trigger_has_enter_key() {
-        let config = ActiveSearchConfig::new("/search", "#results");
-        let html = active_search_input("q", "Search", &config).into_string();
-        assert!(html.contains("keyup"), "{html}");
-        assert!(html.contains("Enter"), "{html}");
-    }
-
-    #[test]
     fn input_configurable_debounce() {
         let config = ActiveSearchConfig::new("/search", "#results").debounce(500);
         let html = active_search_input("q", "Search", &config).into_string();
@@ -764,11 +734,9 @@ mod tests {
     fn input_configurable_min_length() {
         let config = ActiveSearchConfig::new("/search", "#results").min_length(3);
         let html = active_search_input("q", "Search", &config).into_string();
-        // Maud HTML-encodes `>=` as `&gt;=`; the browser decodes it before htmx sees it
-        assert!(
-            html.contains("this.value.length") && html.contains('3'),
-            "{html}"
-        );
+        // min_length is enforced server-side; no filter expression in the trigger
+        assert!(html.contains("hx-trigger"), "{html}");
+        assert!(!html.contains("this.value.length"), "{html}");
     }
 
     #[test]
@@ -955,7 +923,9 @@ mod tests {
         let config = AutocompleteConfig::new("/ac", "value_field");
         let html = autocomplete_input("x", "Label", &config).into_string();
         assert!(html.contains(r#"type="hidden""#), "{html}");
-        assert!(html.contains(r#"name="value_field""#), "{html}");
+        // The hidden input has no name in HTML; name is set by JS on first interaction
+        // so no-JS forms don't see a duplicate field alongside the noscript <select>.
+        assert!(html.contains(r#"id="x-value""#), "{html}");
     }
 
     #[test]
@@ -1076,11 +1046,9 @@ mod tests {
     fn autocomplete_configurable_min_length() {
         let config = AutocompleteConfig::new("/ac", "value_field").min_length(2);
         let html = autocomplete_input("x", "Label", &config).into_string();
-        // Maud HTML-encodes `>=` as `&gt;=`; the browser decodes it before htmx sees it
-        assert!(
-            html.contains("this.value.length") && html.contains('2'),
-            "{html}"
-        );
+        // min_length is enforced server-side; no filter expression in the trigger
+        assert!(html.contains("hx-trigger"), "{html}");
+        assert!(!html.contains("this.value.length"), "{html}");
     }
 
     #[test]
@@ -1113,10 +1081,10 @@ mod tests {
     }
 
     #[test]
-    fn autocomplete_visible_input_clears_hidden_on_change() {
+    fn autocomplete_visible_input_syncs_hidden_on_input() {
         let config = AutocompleteConfig::new("/ac", "value_field");
         let html = autocomplete_input("x", "Label", &config).into_string();
-        assert!(html.contains("oninput"), "{html}");
+        assert!(html.contains("hx-on:input"), "{html}");
     }
 
     // ── autocomplete_option ────────────────────────────────────────────

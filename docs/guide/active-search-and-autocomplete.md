@@ -61,7 +61,7 @@ The search input receives:
   autocomplete="off"
   aria-controls="post-results"
   hx-get="/posts/search"
-  hx-trigger="input[this.value.length >= 2] changed delay:400ms, keyup[key=='Enter'][this.value.length >= 2], input[this.value.length < 2] changed"
+  hx-trigger="input changed delay:400ms"
   hx-target="#post-results"
 >
 ```
@@ -123,7 +123,7 @@ See [Full-Text Search](./full-text-search.md) for repository configuration.
 | Builder method | Default | Effect |
 |----------------|---------|--------|
 | `.debounce(ms)` | `300` | Debounce delay before the request fires |
-| `.min_length(n)` | `1` | Minimum character count before triggering |
+| `.min_length(n)` | `1` | Minimum characters required (enforced server-side) |
 | `.indicator(selector)` | *(none)* | CSS selector for an `htmx-indicator` element |
 | `.initial_load()` | `false` | Fire the search immediately on page load |
 | `.placeholder(text)` | *(none)* | Placeholder text for the input |
@@ -177,9 +177,9 @@ Rendered HTML (abbreviated):
          role="combobox" aria-expanded="false" aria-autocomplete="list"
          aria-controls="tag-picker-options"
          hx-get="/tags/autocomplete"
-         hx-trigger="input[…] changed delay:300ms, keyup[key=='Enter'][…], input[this.value.length < 1] changed"
+         hx-trigger="input changed delay:300ms"
          hx-target="#tag-picker-options">
-  <input type="hidden" id="tag-picker-value" name="tag_id" value="">
+  <input type="hidden" id="tag-picker-value" value="">
   <div id="tag-picker-options" role="listbox" aria-live="polite"
        hx-on:click="let o=event.target.closest('[role=option]');if(o){…}"></div>
   <noscript>

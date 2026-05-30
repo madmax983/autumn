@@ -60,14 +60,6 @@ mod active_search_tests {
     }
 
     #[test]
-    fn active_search_trigger_includes_enter_key() {
-        let config = ActiveSearchConfig::new("/search", "#results");
-        let html = active_search_input("q", "Search", &config).into_string();
-        assert!(html.contains("keyup"), "{html}");
-        assert!(html.contains("Enter"), "{html}");
-    }
-
-    #[test]
     fn active_search_configurable_debounce() {
         let config = ActiveSearchConfig::new("/search", "#results").debounce(500);
         let html = active_search_input("q", "Search", &config).into_string();
@@ -79,11 +71,9 @@ mod active_search_tests {
     fn active_search_configurable_min_length() {
         let config = ActiveSearchConfig::new("/search", "#results").min_length(3);
         let html = active_search_input("q", "Search", &config).into_string();
-        // Maud HTML-encodes `>=` as `&gt;=`; the browser decodes it before htmx sees it
-        assert!(
-            html.contains("this.value.length") && html.contains('3'),
-            "{html}"
-        );
+        // min_length is enforced server-side; no filter expression in the trigger
+        assert!(html.contains("hx-trigger"), "{html}");
+        assert!(!html.contains("this.value.length"), "{html}");
     }
 
     #[test]
@@ -277,16 +267,16 @@ mod active_search_tests {
         let config = AutocompleteConfig::new("/autocomplete", "tag_id");
         let html = autocomplete_input("tag", "Tag", &config).into_string();
         assert!(html.contains(r#"type="hidden""#), "{html}");
-        assert!(html.contains(r#"name="tag_id""#), "{html}");
+        // The hidden input has no name in HTML; name is set by JS on first interaction
+        // to prevent duplicate-field submission when JavaScript is disabled.
+        assert!(html.contains(r#"id="tag-value""#), "{html}");
     }
 
     #[test]
     fn autocomplete_hidden_field_initial_value_is_empty() {
         let config = AutocompleteConfig::new("/autocomplete", "tag_id");
         let html = autocomplete_input("tag", "Tag", &config).into_string();
-        // Hidden field should be present with empty initial value
         assert!(html.contains(r#"type="hidden""#), "{html}");
-        assert!(html.contains(r#"name="tag_id""#), "{html}");
         assert!(html.contains(r#"value="""#), "{html}");
     }
 
@@ -383,11 +373,9 @@ mod active_search_tests {
     fn autocomplete_configurable_min_length() {
         let config = AutocompleteConfig::new("/autocomplete", "tag_id").min_length(2);
         let html = autocomplete_input("tag", "Tag", &config).into_string();
-        // Maud HTML-encodes `>=` as `&gt;=`; the browser decodes it before htmx sees it
-        assert!(
-            html.contains("this.value.length") && html.contains('2'),
-            "{html}"
-        );
+        // min_length is enforced server-side; no filter expression in the trigger
+        assert!(html.contains("hx-trigger"), "{html}");
+        assert!(!html.contains("this.value.length"), "{html}");
     }
 
     #[test]
