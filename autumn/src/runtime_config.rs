@@ -923,6 +923,9 @@ impl ConfigStore for InMemoryConfigStore {
 pub mod pg {
     use super::{ConfigChangeRecord, ConfigStore, ConfigStoreError, ConfigValue};
     use diesel::prelude::*;
+    use std::collections::HashMap;
+    use std::sync::RwLock;
+    use std::time::{Duration, Instant};
 
     pub(crate) const KEY_LOCK_SQL: &str = "SELECT pg_advisory_xact_lock(1, hashtext($1))";
 
@@ -1000,18 +1003,48 @@ pub mod pg {
         }
     }
 
-    /// Persistent [`ConfigStore`] implementation backed by Postgres.
     #[derive(Debug, Clone)]
+    struct CachedRawValue {
+        value: Option<String>,
+        expires_at: Instant,
+    }
+
+    /// Persistent [`ConfigStore`] implementation backed by Postgres.
+    #[derive(Debug)]
     pub struct PgConfigStore {
         database_url: String,
+        cache_ttl: Duration,
+        raw_cache: RwLock<HashMap<String, CachedRawValue>>,
+    }
+
+    impl Clone for PgConfigStore {
+        fn clone(&self) -> Self {
+            Self::with_cache_ttl(self.database_url.clone(), self.cache_ttl)
+        }
     }
 
     impl PgConfigStore {
-        /// Create a store that connects to `database_url` for each operation.
+        /// Default read-through cache lifetime for raw key lookups.
+        pub const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(1);
+
+        /// Create a store using a short read-through cache for hot config reads.
+        ///
+        /// Cache misses still use synchronous Diesel, but repeated request-path
+        /// reads of the same key avoid opening a fresh libpq connection per call.
         #[must_use]
         pub fn new(database_url: impl Into<String>) -> Self {
+            Self::with_cache_ttl(database_url, Self::DEFAULT_CACHE_TTL)
+        }
+
+        /// Create a store with an explicit raw-read cache TTL.
+        ///
+        /// Use `Duration::ZERO` to disable the cache.
+        #[must_use]
+        pub fn with_cache_ttl(database_url: impl Into<String>, cache_ttl: Duration) -> Self {
             Self {
                 database_url: database_url.into(),
+                cache_ttl,
+                raw_cache: RwLock::new(HashMap::new()),
             }
         }
 
@@ -1030,8 +1063,54 @@ pub mod pg {
             &self.database_url
         }
 
+        /// Return the raw-read cache lifetime.
+        #[must_use]
+        pub fn cache_ttl(&self) -> Duration {
+            self.cache_ttl
+        }
+
         fn connect(&self) -> Result<diesel::PgConnection, ConfigStoreError> {
             diesel::PgConnection::establish(&self.database_url).map_err(store_error)
+        }
+
+        fn get_cached_raw(&self, key: &str) -> Option<Option<String>> {
+            let now = Instant::now();
+            let cache = self.raw_cache.read().ok()?;
+            let cached = cache.get(key)?;
+
+            if cached.expires_at <= now {
+                return None;
+            }
+
+            Some(cached.value.clone())
+        }
+
+        fn cache_raw(&self, key: &str, value: Option<String>) {
+            if self.cache_ttl.is_zero() {
+                return;
+            }
+
+            let Some(expires_at) = Instant::now().checked_add(self.cache_ttl) else {
+                return;
+            };
+
+            self.cache_raw_until(key, value, expires_at);
+        }
+
+        fn cache_raw_until(&self, key: &str, value: Option<String>, expires_at: Instant) {
+            let Ok(mut cache) = self.raw_cache.write() else {
+                return;
+            };
+
+            cache.insert(key.to_owned(), CachedRawValue { value, expires_at });
+        }
+
+        fn invalidate_cached_raw(&self, key: &str) {
+            let Ok(mut cache) = self.raw_cache.write() else {
+                return;
+            };
+
+            cache.remove(key);
         }
     }
 
@@ -1046,8 +1125,12 @@ pub mod pg {
 
     impl ConfigStore for PgConfigStore {
         fn get_raw(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
+            if let Some(value) = self.get_cached_raw(key) {
+                return Ok(value);
+            }
+
             let mut conn = self.connect()?;
-            diesel::sql_query(
+            let value = diesel::sql_query(
                 "SELECT raw_value \
                  FROM autumn_runtime_config_values \
                  WHERE key = $1",
@@ -1056,7 +1139,10 @@ pub mod pg {
             .get_result::<RawValueRow>(&mut conn)
             .optional()
             .map(|row| row.map(|row| row.raw_value))
-            .map_err(store_error)
+            .map_err(store_error)?;
+
+            self.cache_raw(key, value.clone());
+            Ok(value)
         }
 
         fn set_raw(
@@ -1080,7 +1166,10 @@ pub mod pg {
                     .execute(conn)?;
                 Ok(())
             })
-            .map_err(store_error)
+            .map_err(store_error)?;
+
+            self.invalidate_cached_raw(key);
+            Ok(())
         }
 
         fn unset_raw(
@@ -1102,7 +1191,10 @@ pub mod pg {
                     .execute(conn)?;
                 Ok(())
             })
-            .map_err(store_error)
+            .map_err(store_error)?;
+
+            self.invalidate_cached_raw(key);
+            Ok(())
         }
 
         fn list_overrides(&self) -> Result<Vec<(String, String)>, ConfigStoreError> {
@@ -1153,6 +1245,64 @@ pub mod pg {
 
     fn store_error(error: impl std::fmt::Display) -> ConfigStoreError {
         ConfigStoreError::Backend(error.to_string())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::time::{Duration, Instant};
+
+        #[test]
+        fn raw_cache_returns_recent_value_without_connecting() {
+            let store = PgConfigStore::with_cache_ttl(
+                "postgres://localhost/autumn",
+                Duration::from_secs(60),
+            );
+
+            store.cache_raw_until(
+                "posts_per_page",
+                Some("25".to_owned()),
+                Instant::now() + Duration::from_secs(60),
+            );
+
+            assert_eq!(
+                store.get_cached_raw("posts_per_page"),
+                Some(Some("25".to_owned()))
+            );
+        }
+
+        #[test]
+        fn raw_cache_ignores_expired_values() {
+            let store = PgConfigStore::with_cache_ttl(
+                "postgres://localhost/autumn",
+                Duration::from_secs(60),
+            );
+
+            store.cache_raw_until(
+                "posts_per_page",
+                Some("25".to_owned()),
+                Instant::now() - Duration::from_secs(1),
+            );
+
+            assert_eq!(store.get_cached_raw("posts_per_page"), None);
+        }
+
+        #[test]
+        fn raw_cache_invalidation_removes_cached_value() {
+            let store = PgConfigStore::with_cache_ttl(
+                "postgres://localhost/autumn",
+                Duration::from_secs(60),
+            );
+
+            store.cache_raw_until(
+                "posts_per_page",
+                Some("25".to_owned()),
+                Instant::now() + Duration::from_secs(60),
+            );
+            store.invalidate_cached_raw("posts_per_page");
+
+            assert_eq!(store.get_cached_raw("posts_per_page"), None);
+        }
     }
 }
 
@@ -1395,6 +1545,27 @@ mod tests {
         RuntimeConfigService::new(registry, store)
     }
 
+    #[test]
+    fn runtime_config_guide_documents_fallible_config_store_trait() {
+        let guide = include_str!("../../docs/guide/runtime-config.md").replace("\r\n", "\n");
+
+        assert!(
+            guide.contains(
+                "fn get_raw(&self, key: &str) -> Result<Option<String>, ConfigStoreError>;"
+            )
+        );
+        assert!(guide.contains(
+            "fn list_overrides(&self) -> Result<Vec<(String, String)>, ConfigStoreError>;"
+        ));
+        assert!(guide.contains(
+            "fn history(\n        &self,\n        key: &str,\n        limit: usize,\n    ) -> Result<Vec<ConfigChangeRecord>, ConfigStoreError>;"
+        ));
+        assert!(
+            !guide.contains("fn get_raw(&self, key: &str) -> Option<String>;"),
+            "guide must not document the pre-fallible ConfigStore signature"
+        );
+    }
+
     #[cfg(feature = "db")]
     #[test]
     fn postgres_store_is_available_under_documented_module() {
@@ -1404,6 +1575,7 @@ mod tests {
         let store = pg::PgConfigStore::new("postgres://localhost/autumn");
 
         assert_eq!(store.database_url(), "postgres://localhost/autumn");
+        assert_eq!(store.cache_ttl(), pg::PgConfigStore::DEFAULT_CACHE_TTL);
     }
 
     #[cfg(feature = "db")]

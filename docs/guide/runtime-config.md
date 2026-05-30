@@ -158,11 +158,26 @@ Implement the `ConfigStore` trait to plug in any backend:
 
 ```rust
 pub trait ConfigStore: Send + Sync + 'static {
-    fn get_raw(&self, key: &str) -> Option<String>;
-    fn set_raw(&self, key: &str, old_raw: Option<String>, new_raw: String, actor: Option<&str>) -> Result<(), ConfigStoreError>;
-    fn unset_raw(&self, key: &str, old_raw: Option<String>, actor: Option<&str>) -> Result<(), ConfigStoreError>;
-    fn list_overrides(&self) -> Vec<(String, String)>;
-    fn history(&self, key: &str, limit: usize) -> Vec<ConfigChangeRecord>;
+    fn get_raw(&self, key: &str) -> Result<Option<String>, ConfigStoreError>;
+    fn set_raw(
+        &self,
+        key: &str,
+        old_raw: Option<String>,
+        new_raw: String,
+        actor: Option<&str>,
+    ) -> Result<(), ConfigStoreError>;
+    fn unset_raw(
+        &self,
+        key: &str,
+        old_raw: Option<String>,
+        actor: Option<&str>,
+    ) -> Result<(), ConfigStoreError>;
+    fn list_overrides(&self) -> Result<Vec<(String, String)>, ConfigStoreError>;
+    fn history(
+        &self,
+        key: &str,
+        limit: usize,
+    ) -> Result<Vec<ConfigChangeRecord>, ConfigStoreError>;
 }
 ```
 
