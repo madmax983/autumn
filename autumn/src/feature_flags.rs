@@ -286,6 +286,7 @@ impl InMemoryFlagStore {
             .entry(key.to_owned())
             .or_insert_with(|| FlagConfig::new(key));
         f(flag);
+        drop(flags);
     }
 
     fn record(&self, record: FlagChangeRecord) {
@@ -499,14 +500,7 @@ pub mod pg {
             }
         }
 
-        fn invalidate_all(&self) {
-            if let Ok(mut cache) = self.cache.write() {
-                cache.clear();
-            }
-        }
-
         fn upsert_flag(
-            &self,
             conn: &mut diesel::PgConnection,
             key: &str,
         ) -> Result<(), diesel::result::Error> {
@@ -520,7 +514,6 @@ pub mod pg {
         }
 
         fn notify(
-            &self,
             conn: &mut diesel::PgConnection,
             key: &str,
         ) -> Result<(), diesel::result::Error> {
@@ -612,7 +605,7 @@ pub mod pg {
         fn enable(&self, key: &str, actor: Option<&str>) -> Result<(), FlagStoreError> {
             let mut conn = self.connect()?;
             conn.transaction::<(), diesel::result::Error, _>(|conn| {
-                self.upsert_flag(conn, key)?;
+                Self::upsert_flag(conn, key)?;
                 diesel::sql_query(
                     "UPDATE autumn_feature_flags \
                      SET enabled = true, rollout_pct = 100, updated_at = NOW() \
@@ -629,7 +622,7 @@ pub mod pg {
                     actor.map(str::to_owned),
                 )
                 .execute(conn)?;
-                self.notify(conn, key)?;
+                Self::notify(conn, key)?;
                 Ok(())
             })
             .map_err(|e| FlagStoreError::Backend(e.to_string()))?;
@@ -640,7 +633,7 @@ pub mod pg {
         fn disable(&self, key: &str, actor: Option<&str>) -> Result<(), FlagStoreError> {
             let mut conn = self.connect()?;
             conn.transaction::<(), diesel::result::Error, _>(|conn| {
-                self.upsert_flag(conn, key)?;
+                Self::upsert_flag(conn, key)?;
                 diesel::sql_query(
                     "UPDATE autumn_feature_flags SET enabled = false, updated_at = NOW() \
                      WHERE key = $1",
@@ -656,7 +649,7 @@ pub mod pg {
                     actor.map(str::to_owned),
                 )
                 .execute(conn)?;
-                self.notify(conn, key)?;
+                Self::notify(conn, key)?;
                 Ok(())
             })
             .map_err(|e| FlagStoreError::Backend(e.to_string()))?;
@@ -673,7 +666,7 @@ pub mod pg {
             let pct = i16::from(pct.min(100));
             let mut conn = self.connect()?;
             conn.transaction::<(), diesel::result::Error, _>(|conn| {
-                self.upsert_flag(conn, key)?;
+                Self::upsert_flag(conn, key)?;
                 diesel::sql_query(
                     "UPDATE autumn_feature_flags \
                      SET enabled = true, rollout_pct = $2, updated_at = NOW() \
@@ -692,7 +685,7 @@ pub mod pg {
                     actor.map(str::to_owned),
                 )
                 .execute(conn)?;
-                self.notify(conn, key)?;
+                Self::notify(conn, key)?;
                 Ok(())
             })
             .map_err(|e| FlagStoreError::Backend(e.to_string()))?;
@@ -708,7 +701,7 @@ pub mod pg {
         ) -> Result<(), FlagStoreError> {
             let mut conn = self.connect()?;
             conn.transaction::<(), diesel::result::Error, _>(|conn| {
-                self.upsert_flag(conn, key)?;
+                Self::upsert_flag(conn, key)?;
                 diesel::sql_query(
                     "UPDATE autumn_feature_flags \
                      SET enabled = true, \
@@ -735,7 +728,7 @@ pub mod pg {
                     actor.map(str::to_owned),
                 )
                 .execute(conn)?;
-                self.notify(conn, key)?;
+                Self::notify(conn, key)?;
                 Ok(())
             })
             .map_err(|e| FlagStoreError::Backend(e.to_string()))?;
@@ -751,7 +744,7 @@ pub mod pg {
         ) -> Result<(), FlagStoreError> {
             let mut conn = self.connect()?;
             conn.transaction::<(), diesel::result::Error, _>(|conn| {
-                self.upsert_flag(conn, key)?;
+                Self::upsert_flag(conn, key)?;
                 diesel::sql_query(
                     "UPDATE autumn_feature_flags \
                      SET enabled = true, \
@@ -778,7 +771,7 @@ pub mod pg {
                     actor.map(str::to_owned),
                 )
                 .execute(conn)?;
-                self.notify(conn, key)?;
+                Self::notify(conn, key)?;
                 Ok(())
             })
             .map_err(|e| FlagStoreError::Backend(e.to_string()))?;
@@ -937,10 +930,10 @@ impl FeatureFlagService {
         }
 
         // Actor allowlist.
-        if let Some(actor) = actor_id {
-            if flag.actor_allowlist.iter().any(|a| a.as_str() == actor) {
-                return true;
-            }
+        if let Some(actor) = actor_id
+            && flag.actor_allowlist.iter().any(|a| a.as_str() == actor)
+        {
+            return true;
         }
 
         // Named groups.
@@ -953,11 +946,9 @@ impl FeatureFlagService {
         }
 
         // Percent rollout (1–99%).
-        if flag.rollout_pct > 0 {
-            if let Some(actor) = actor_id {
-                let bucket = rollout_bucket(&flag.key, actor);
-                return bucket < flag.rollout_pct;
-            }
+        if flag.rollout_pct > 0 && let Some(actor) = actor_id {
+            let bucket = rollout_bucket(&flag.key, actor);
+            return bucket < flag.rollout_pct;
         }
 
         false
@@ -1081,7 +1072,7 @@ impl Flags {
 
     /// Return the underlying service for direct mutation from handlers.
     #[must_use]
-    pub fn service(&self) -> &FeatureFlagService {
+    pub const fn service(&self) -> &FeatureFlagService {
         &self.service
     }
 }
