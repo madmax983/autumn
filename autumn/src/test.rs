@@ -661,7 +661,9 @@ impl TestApp {
                 ),
             ));
             #[cfg(feature = "presence")]
-            { state.presence = crate::presence::Presence::new(state.channels.clone()); }
+            {
+                state.presence = crate::presence::Presence::new(state.channels.clone());
+            }
         }
         #[cfg(feature = "oauth2")]
         if let Some(interceptor) = self.http_interceptor {
