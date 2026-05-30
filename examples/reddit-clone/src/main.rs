@@ -21,6 +21,9 @@
 //   HTML stack          -> Maud templates, htmx interactivity, Tailwind CSS
 //   Runtime config      -> ConfigRegistry + RuntimeConfigService; live-tunable posts_per_page
 //                          and registration_open without a restart (see src/config.rs)
+//   Feature flags       -> AppBuilder::with_flag_store, Flags extractor, fragment + handler gating,
+//                          25% rollout of new_ui_preview (see src/feature_flags.rs,
+//                          routes/posts.rs front_page). Toggle live: autumn flags enable post_awards
 //
 // Run with:   cargo run -p reddit-clone   (first dev boot applies reddit migrations and
 //                                          starts the job runtime + durable live-feed relay)
@@ -29,6 +32,7 @@
 // API test:   curl http://localhost:3000/api/posts
 //             curl http://localhost:3000/api/subreddits
 
+use autumn_web::config::AutumnConfig;
 use autumn_web::migrate::{EmbeddedMigrations, embed_migrations};
 use autumn_web::prelude::*;
 use autumn_web::webhook_outbound::{InMemoryOutboundWebhookStore, OutboundWebhookPlugin};
@@ -44,9 +48,16 @@ async fn main() {
     let webhook_store = Arc::new(InMemoryOutboundWebhookStore::new());
     let webhook_plugin = OutboundWebhookPlugin::new(webhook_store);
 
+    // Feature flags: InMemoryFlagStore in dev, PgFlagStore when a DB URL is present.
+    // Pre-configured: new_ui_preview at 25% rollout, post_awards off.
+    // Toggle live without restart: autumn flags enable post_awards
+    let app_config = AutumnConfig::load().unwrap_or_default();
+    let flag_store = reddit_clone::feature_flags::build_store(&app_config);
+
     autumn_web::app()
         .migrations(autumn_web::migrate::FRAMEWORK_MIGRATIONS)
         .migrations(MIGRATIONS)
+        .with_flag_store(flag_store)
         .routes(routes![
             routes::posts::front_page,
             routes::about::about,

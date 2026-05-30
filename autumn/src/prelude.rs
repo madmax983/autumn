@@ -31,9 +31,9 @@ pub use crate::paths::PathExt;
 pub use autumn_macros::ws;
 /// HTTP method route macros, main macro, and route collection.
 pub use autumn_macros::{
-    api_doc, authorize, cached, delete, get, job, jobs, main, oauth2_callback, one_off_tasks,
-    patch, paths, post, put, routes, scheduled, secured, service, static_get, static_routes, task,
-    tasks,
+    api_doc, authorize, cached, delete, feature_flag, get, job, jobs, main, oauth2_callback,
+    one_off_tasks, patch, paths, post, put, routes, scheduled, secured, service, static_get,
+    static_routes, task, tasks,
 };
 #[cfg(feature = "mail")]
 pub use autumn_macros::{mail_previews, mailer, mailer_preview};
@@ -198,6 +198,16 @@ pub use crate::state::AppState;
 /// Use in handlers instead of `chrono::Utc::now()` to make time-sensitive
 /// logic testable without sleeping. Override via `TestApp::with_clock`.
 pub use crate::time::Clock;
+
+// ── Feature flags ─────────────────────────────────────────────────
+/// The main feature-flag service, typically stored as an `AppState` extension.
+pub use crate::feature_flags::FeatureFlagService;
+/// Request-scoped feature flag extractor — call `flags.enabled("my_flag")`
+/// in handlers to gate behaviour without a redeploy.
+pub use crate::feature_flags::Flags;
+/// In-memory flag store — use in tests and `dev` profile; swap for
+/// `autumn_web::feature_flags::pg::PgFlagStore` in production.
+pub use crate::feature_flags::InMemoryFlagStore;
 
 // ── Internationalization ───────────────────────────────────────
 /// Request-scoped locale extractor (resolves from query, cookie,

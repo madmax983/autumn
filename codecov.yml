@@ -20,6 +20,7 @@ ignore:
   - "autumn-cli/src/dev.rs"     # CLI subprocess orchestration — untestable in unit tests
   - "autumn-cli/src/doctor.rs"  # Mix of pure-function unit tests and IO-bound orchestration; IO paths (process spawning, TCP, filesystem) excluded like build.rs/dev.rs
   - "autumn-cli/src/config.rs"  # psql subprocess orchestration (run_set/unset/list/history/check_psql) — untestable in unit tests; URL-resolution logic is covered in separate tests
+  - "autumn-cli/src/flags.rs"  # psql subprocess orchestration (enable/disable/set-rollout/allow) — same pattern as config.rs
   - "autumn-cli/src/templates/**"
   - "autumn-cache-redis/**"     # Requires a live Redis server (testcontainers); all tests are #[ignore] for cross-platform CI
   - "**/*_test.rs"

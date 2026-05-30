@@ -70,38 +70,50 @@ pub fn route_macro(
     let method_const = format_ident!("{}", http_method); // e.g., GET
     let routing_fn = format_ident!("{}", axum_fn); // e.g., get
 
-    let primitive_wrapper = if should_stringify_primitive_output(&input_fn.sig.output) {
-        let wrapper_name = format_ident!("__autumn_primitive_handler_{}", fn_name);
-        let mut wrapper_inputs = Vec::new();
-        let mut call_args = Vec::new();
+    // When #[feature_flag] is stacked, it will change the return type to
+    // `Response` after this macro runs.  Generating a primitive wrapper here
+    // (which calls `.to_string()` on the handler result) would then try to
+    // stringify a `Response` value and fail to compile.  Skip it so that
+    // #[feature_flag] can rewrite the signature without breaking the route.
+    let has_feature_flag_attr = input_fn.attrs.iter().any(|a| {
+        a.path()
+            .segments
+            .last()
+            .is_some_and(|s| s.ident == "feature_flag")
+    });
+    let primitive_wrapper =
+        if should_stringify_primitive_output(&input_fn.sig.output) && !has_feature_flag_attr {
+            let wrapper_name = format_ident!("__autumn_primitive_handler_{}", fn_name);
+            let mut wrapper_inputs = Vec::new();
+            let mut call_args = Vec::new();
 
-        for (idx, arg) in input_fn.sig.inputs.iter().enumerate() {
-            match arg {
-                FnArg::Typed(pat_type) => {
-                    let arg_name = format_ident!("__autumn_arg_{idx}");
-                    let ty = &pat_type.ty;
-                    wrapper_inputs.push(quote! { #arg_name: #ty });
-                    call_args.push(quote! { #arg_name });
-                }
-                FnArg::Receiver(receiver) => {
-                    return syn::Error::new_spanned(
-                        receiver,
-                        "Autumn route handlers cannot take a self receiver",
-                    )
-                    .to_compile_error();
+            for (idx, arg) in input_fn.sig.inputs.iter().enumerate() {
+                match arg {
+                    FnArg::Typed(pat_type) => {
+                        let arg_name = format_ident!("__autumn_arg_{idx}");
+                        let ty = &pat_type.ty;
+                        wrapper_inputs.push(quote! { #arg_name: #ty });
+                        call_args.push(quote! { #arg_name });
+                    }
+                    FnArg::Receiver(receiver) => {
+                        return syn::Error::new_spanned(
+                            receiver,
+                            "Autumn route handlers cannot take a self receiver",
+                        )
+                        .to_compile_error();
+                    }
                 }
             }
-        }
 
-        Some(quote! {
-            #[doc(hidden)]
-            async fn #wrapper_name(#(#wrapper_inputs),*) -> ::std::string::String {
-                #fn_name(#(#call_args),*).await.to_string()
-            }
-        })
-    } else {
-        None
-    };
+            Some(quote! {
+                #[doc(hidden)]
+                async fn #wrapper_name(#(#wrapper_inputs),*) -> ::std::string::String {
+                    #fn_name(#(#call_args),*).await.to_string()
+                }
+            })
+        } else {
+            None
+        };
 
     let handler_name = primitive_wrapper.as_ref().map_or_else(
         || fn_name.clone(),
