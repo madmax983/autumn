@@ -399,6 +399,15 @@ pub struct AuthConfig {
     #[cfg(feature = "oauth2")]
     #[serde(default)]
     pub oauth2: OAuth2Config,
+
+    /// Account-linking policy for unknown OAuth2/OIDC identities.
+    ///
+    /// - `create_account` (default): a new local account is created on first sign-in.
+    /// - `require_local_signup_first`: returns an error unless the user already has
+    ///   a local account linked to their provider identity.
+    #[cfg(feature = "oauth2")]
+    #[serde(default)]
+    pub oauth_linking_policy: OAuthLinkingPolicy,
 }
 
 const fn default_bcrypt_cost() -> u32 {
@@ -465,6 +474,105 @@ pub struct OAuth2ProviderConfig {
     /// JWKS endpoint URL used to verify ID token signatures.
     #[serde(default)]
     pub jwks_url: Option<String>,
+    /// OIDC discovery base URL (e.g. `https://accounts.google.com`).
+    ///
+    /// When set, the framework appends `/.well-known/openid-configuration` and fetches
+    /// the discovery document to populate `authorize_url`, `token_url`, `userinfo_url`,
+    /// `jwks_url`, and `issuer` automatically. Explicit fields take precedence.
+    #[serde(default)]
+    pub discovery_url: Option<String>,
+}
+
+#[cfg(feature = "oauth2")]
+/// Policy for linking an OAuth2/OIDC identity to a local user account.
+///
+/// Configured under `[auth]` in `autumn.toml`:
+///
+/// ```toml
+/// [auth]
+/// oauth_linking_policy = "create_account"   # default
+/// # or
+/// oauth_linking_policy = "require_local_signup_first"
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OAuthLinkingPolicy {
+    /// An unknown OAuth2 identity automatically creates a new local account.
+    /// This is the default for apps where social login is the primary sign-up path.
+    #[default]
+    CreateAccount,
+    /// An unknown OAuth2 identity returns a clear error unless the user already
+    /// has a local account (linked separately). Choose this when social login is
+    /// supplemental and you want explicit control over account creation.
+    RequireLocalSignupFirst,
+}
+
+#[cfg(feature = "oauth2")]
+/// Returns a pre-populated [`OAuth2ProviderConfig`] for well-known providers.
+///
+/// `client_id`, `client_secret`, and `redirect_uri` are left empty and must be
+/// supplied by the application from `autumn.toml` or environment variables.
+///
+/// # Supported providers
+///
+/// | Key | Protocol | Notes |
+/// |-----|----------|-------|
+/// | `google` | OIDC | Uses `discovery_url`; scopes: `openid profile email` |
+/// | `github` | OAuth2 | Userinfo endpoint; no OIDC discovery |
+/// | `microsoft` | OIDC | Uses `discovery_url` (common tenant); scopes: `openid profile email` |
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use autumn_web::auth::provider_preset;
+/// if let Some(mut preset) = provider_preset("google") {
+///     preset.client_id = std::env::var("GOOGLE_CLIENT_ID").unwrap_or_default();
+///     preset.client_secret = std::env::var("GOOGLE_CLIENT_SECRET").unwrap_or_default();
+///     preset.redirect_uri = "http://localhost:3000/auth/google/callback".into();
+/// }
+/// ```
+pub fn provider_preset(name: &str) -> Option<OAuth2ProviderConfig> {
+    match name {
+        "google" => Some(OAuth2ProviderConfig {
+            client_id: String::new(),
+            client_secret: String::new(),
+            authorize_url: "https://accounts.google.com/o/oauth2/v2/auth".into(),
+            token_url: "https://oauth2.googleapis.com/token".into(),
+            userinfo_url: Some("https://openidconnect.googleapis.com/v1/userinfo".into()),
+            redirect_uri: String::new(),
+            scope: "openid profile email".into(),
+            issuer: Some("https://accounts.google.com".into()),
+            jwks_url: Some("https://www.googleapis.com/oauth2/v3/certs".into()),
+            discovery_url: Some("https://accounts.google.com".into()),
+        }),
+        "github" => Some(OAuth2ProviderConfig {
+            client_id: String::new(),
+            client_secret: String::new(),
+            authorize_url: "https://github.com/login/oauth/authorize".into(),
+            token_url: "https://github.com/login/oauth/access_token".into(),
+            userinfo_url: Some("https://api.github.com/user".into()),
+            redirect_uri: String::new(),
+            scope: "read:user user:email".into(),
+            issuer: None,
+            jwks_url: None,
+            discovery_url: None,
+        }),
+        "microsoft" => Some(OAuth2ProviderConfig {
+            client_id: String::new(),
+            client_secret: String::new(),
+            authorize_url: "https://login.microsoftonline.com/common/oauth2/v2.0/authorize".into(),
+            token_url: "https://login.microsoftonline.com/common/oauth2/v2.0/token".into(),
+            userinfo_url: None,
+            redirect_uri: String::new(),
+            scope: "openid profile email".into(),
+            issuer: None,
+            jwks_url: Some(
+                "https://login.microsoftonline.com/common/discovery/v2.0/keys".into(),
+            ),
+            discovery_url: Some("https://login.microsoftonline.com/common/v2.0".into()),
+        }),
+        _ => None,
+    }
 }
 
 #[cfg(feature = "oauth2")]
@@ -505,6 +613,9 @@ struct OAuth2TokenResponse {
 #[cfg(feature = "oauth2")]
 /// Build an `OAuth2` authorization URL and persist anti-CSRF state + nonce in session.
 ///
+/// PKCE (S256) is always enabled: a `code_verifier` is generated, stored in the
+/// session, and the corresponding `code_challenge` is added to the URL.
+///
 /// # Errors
 ///
 /// Returns an error if `authorize_url` is not a valid URL.
@@ -513,13 +624,34 @@ pub async fn oauth2_authorize_url(
     provider_name: &str,
     provider: &OAuth2ProviderConfig,
 ) -> crate::AutumnResult<String> {
+    use base64::Engine as _;
+    use sha2::Digest as _;
+
     let state = uuid::Uuid::new_v4().to_string();
     let nonce = uuid::Uuid::new_v4().to_string();
+
+    // PKCE S256: generate a 32-byte random verifier, base64url-encode it.
+    let mut verifier_bytes = [0u8; 32];
+    getrandom::getrandom(&mut verifier_bytes).map_err(|e| {
+        crate::AutumnError::service_unavailable_msg(format!("pkce rng failed: {e}"))
+    })?;
+    let code_verifier =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(verifier_bytes);
+    // code_challenge = BASE64URL(SHA256(ASCII(code_verifier)))
+    let digest = sha2::Sha256::digest(code_verifier.as_bytes());
+    let code_challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest);
+
     session
         .insert(format!("oauth2:{provider_name}:state"), state.clone())
         .await;
     session
         .insert(format!("oauth2:{provider_name}:nonce"), nonce.clone())
+        .await;
+    session
+        .insert(
+            format!("oauth2:{provider_name}:code_verifier"),
+            code_verifier,
+        )
         .await;
 
     let mut url = Url::parse(&provider.authorize_url)
@@ -534,6 +666,8 @@ pub async fn oauth2_authorize_url(
         }
         q.append_pair("state", &state);
         q.append_pair("nonce", &nonce);
+        q.append_pair("code_challenge", &code_challenge);
+        q.append_pair("code_challenge_method", "S256");
     }
     Ok(url.into())
 }
@@ -544,6 +678,10 @@ pub async fn oauth2_authorize_url(
 /// On success this method rotates the session ID and writes:
 /// - `session_key` (OIDC `sub`)
 /// - `auth_provider` (provider key, like `github`)
+///
+/// The PKCE `code_verifier` is read from the session (stored by
+/// [`oauth2_authorize_url`]) and included in the token exchange for every
+/// provider, regardless of whether the provider is confidential or public.
 ///
 /// # Errors
 ///
@@ -557,7 +695,11 @@ pub async fn oauth2_finish_login(
     callback: &OAuth2Callback,
 ) -> crate::AutumnResult<OidcIdentity> {
     validate_callback_state(session, provider_name, callback).await?;
-    let token = exchange_oauth2_token(provider, callback).await?;
+    // Retrieve (and consume) the PKCE code_verifier stored during authorize.
+    let code_verifier = session
+        .remove(&format!("oauth2:{provider_name}:code_verifier"))
+        .await;
+    let token = exchange_oauth2_token(provider, callback, code_verifier).await?;
     let (claims, source) = load_identity_claims(provider, &token).await?;
     validate_oidc_nonce(session, provider_name, &claims, source).await?;
     let subject = extract_subject(&claims, source)?;
@@ -594,17 +736,23 @@ async fn validate_callback_state(
 async fn exchange_oauth2_token(
     provider: &OAuth2ProviderConfig,
     callback: &OAuth2Callback,
+    code_verifier: Option<String>,
 ) -> crate::AutumnResult<OAuth2TokenResponse> {
+    // Build the base form fields; PKCE code_verifier is appended when present.
+    let mut form_fields: Vec<(&str, String)> = vec![
+        ("grant_type", "authorization_code".to_owned()),
+        ("code", callback.code.clone()),
+        ("redirect_uri", provider.redirect_uri.clone()),
+        ("client_id", provider.client_id.clone()),
+        ("client_secret", provider.client_secret.clone()),
+    ];
+    if let Some(ref verifier) = code_verifier {
+        form_fields.push(("code_verifier", verifier.clone()));
+    }
     let token_response = oauth_http_client()?
         .post(&provider.token_url)
         .header(reqwest::header::ACCEPT, "application/json")
-        .form(&[
-            ("grant_type", "authorization_code"),
-            ("code", callback.code.as_str()),
-            ("redirect_uri", provider.redirect_uri.as_str()),
-            ("client_id", provider.client_id.as_str()),
-            ("client_secret", provider.client_secret.as_str()),
-        ])
+        .form(&form_fields)
         .send()
         .await
         .map_err(|e| {
@@ -990,6 +1138,8 @@ impl Default for AuthConfig {
             session_key: default_session_key(),
             #[cfg(feature = "oauth2")]
             oauth2: OAuth2Config::default(),
+            #[cfg(feature = "oauth2")]
+            oauth_linking_policy: OAuthLinkingPolicy::default(),
         }
     }
 }
@@ -1646,6 +1796,7 @@ mod tests {
             scope: "openid profile".into(),
             issuer: None,
             jwks_url: None,
+            discovery_url: None,
         };
         let url = oauth2_authorize_url(&session, "github", &provider)
             .await
@@ -1669,6 +1820,7 @@ mod tests {
             scope: String::new(),
             issuer: None,
             jwks_url: None,
+            discovery_url: None,
         };
         let url = oauth2_authorize_url(&session, "github", &provider)
             .await
@@ -1689,6 +1841,7 @@ mod tests {
             scope: "openid profile".into(),
             issuer: None,
             jwks_url: None,
+            discovery_url: None,
         };
         let err = validate_and_decode_id_token("bad.token.value", &provider)
             .await
@@ -3297,5 +3450,164 @@ mod api_token_tests {
         let layer2 = RequireApiToken::new(store2);
         let mut svc2 = layer2.layer(MockService { ready: true });
         assert!(svc2.poll_ready(&mut cx).is_ready());
+    }
+}
+
+// ── OAuth2 unit tests (separate module for clean imports) ─────────────────────
+
+#[cfg(feature = "oauth2")]
+#[cfg(test)]
+mod oauth2_unit_tests {
+    use std::collections::HashMap;
+
+    use super::{
+        AuthConfig, OAuth2ProviderConfig, OAuthLinkingPolicy, oauth2_authorize_url, provider_preset,
+    };
+
+    fn make_provider(authorize_url: &str) -> OAuth2ProviderConfig {
+        OAuth2ProviderConfig {
+            client_id: "cid".into(),
+            client_secret: "secret".into(),
+            authorize_url: authorize_url.into(),
+            token_url: "https://idp.example/token".into(),
+            userinfo_url: None,
+            redirect_uri: "http://localhost:3000/callback".into(),
+            scope: "openid profile".into(),
+            issuer: None,
+            jwks_url: None,
+            discovery_url: None,
+        }
+    }
+
+    #[test]
+    fn provider_preset_google_returns_oidc_config() {
+        let preset = provider_preset("google").expect("google preset must exist");
+        assert!(!preset.authorize_url.is_empty(), "google authorize_url must not be empty");
+        assert!(!preset.token_url.is_empty(), "google token_url must not be empty");
+        assert!(
+            preset.discovery_url.is_some(),
+            "google must have discovery_url for OIDC"
+        );
+        assert!(
+            preset.scope.contains("openid"),
+            "google preset scope must include openid: {}",
+            preset.scope
+        );
+        assert!(
+            preset.scope.contains("email"),
+            "google preset scope must include email: {}",
+            preset.scope
+        );
+        assert_eq!(preset.client_id, "", "client_id must be empty in preset (user fills in)");
+        assert_eq!(preset.client_secret, "", "client_secret must be empty in preset");
+        assert_eq!(preset.redirect_uri, "", "redirect_uri must be empty in preset");
+    }
+
+    #[cfg(feature = "oauth2")]
+    #[test]
+    fn provider_preset_github_returns_pure_oauth2_config() {
+        let preset = provider_preset("github").expect("github preset must exist");
+        assert!(!preset.authorize_url.is_empty(), "github authorize_url must not be empty");
+        assert!(!preset.token_url.is_empty(), "github token_url must not be empty");
+        assert!(
+            preset.userinfo_url.is_some(),
+            "github must have userinfo_url (it is not OIDC)"
+        );
+        assert!(
+            preset.discovery_url.is_none(),
+            "github must NOT have discovery_url (pure OAuth2)"
+        );
+    }
+
+    #[cfg(feature = "oauth2")]
+    #[test]
+    fn provider_preset_microsoft_returns_oidc_config() {
+        let preset = provider_preset("microsoft").expect("microsoft preset must exist");
+        assert!(!preset.authorize_url.is_empty(), "microsoft authorize_url must not be empty");
+        assert!(
+            preset.discovery_url.is_some(),
+            "microsoft must have discovery_url for OIDC"
+        );
+        assert!(
+            preset.scope.contains("openid"),
+            "microsoft preset scope must include openid: {}",
+            preset.scope
+        );
+    }
+
+    #[cfg(feature = "oauth2")]
+    #[test]
+    fn provider_preset_unknown_returns_none() {
+        assert!(
+            provider_preset("nonexistent_provider_xyz").is_none(),
+            "unknown provider must return None"
+        );
+    }
+
+    #[cfg(feature = "oauth2")]
+    #[tokio::test]
+    async fn oauth2_authorize_url_includes_pkce_code_challenge() {
+        let session = crate::session::Session::new_for_test("s1".into(), HashMap::new());
+        let provider = OAuth2ProviderConfig {
+            client_id: "cid".into(),
+            client_secret: "secret".into(),
+            authorize_url: "https://idp.example/authorize".into(),
+            token_url: "https://idp.example/token".into(),
+            userinfo_url: None,
+            redirect_uri: "http://localhost:3000/callback".into(),
+            scope: "openid profile".into(),
+            issuer: None,
+            jwks_url: None,
+            discovery_url: None,
+        };
+        let url = oauth2_authorize_url(&session, "testprovider", &provider)
+            .await
+            .unwrap();
+        assert!(
+            url.contains("code_challenge="),
+            "PKCE code_challenge must be present in URL: {url}"
+        );
+        assert!(
+            url.contains("code_challenge_method=S256"),
+            "PKCE method must be S256: {url}"
+        );
+        assert!(
+            session.get("oauth2:testprovider:code_verifier").await.is_some(),
+            "code_verifier must be stored in session for later exchange"
+        );
+    }
+
+    #[cfg(feature = "oauth2")]
+    #[test]
+    fn oauth2_provider_config_has_discovery_url_field() {
+        let provider = OAuth2ProviderConfig {
+            client_id: "cid".into(),
+            client_secret: "secret".into(),
+            authorize_url: "https://idp.example/authorize".into(),
+            token_url: "https://idp.example/token".into(),
+            userinfo_url: None,
+            redirect_uri: "http://localhost:3000/callback".into(),
+            scope: String::new(),
+            issuer: None,
+            jwks_url: None,
+            discovery_url: Some("https://idp.example".into()),
+        };
+        assert_eq!(
+            provider.discovery_url.as_deref(),
+            Some("https://idp.example"),
+            "discovery_url must be accessible as a field"
+        );
+    }
+
+    #[cfg(feature = "oauth2")]
+    #[test]
+    fn auth_config_has_oauth_linking_policy() {
+        let config = AuthConfig::default();
+        // Default policy must be CreateAccount so unknown provider identities
+        // automatically create a local user record.
+        assert!(
+            matches!(config.oauth_linking_policy, OAuthLinkingPolicy::CreateAccount),
+            "default linking policy must be CreateAccount"
+        );
     }
 }

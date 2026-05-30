@@ -473,6 +473,7 @@ async fn test_oauth_client(session: autumn_web::session::Session) -> &'static st
         scope: "user".to_string(),
         issuer: None,
         jwks_url: None,
+        discovery_url: None,
     };
 
     let callback = OAuth2Callback {

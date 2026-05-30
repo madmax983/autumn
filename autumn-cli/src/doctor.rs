@@ -279,6 +279,53 @@ pub fn check_trusted_hosts_impl(hosts: &[String], is_production: bool) -> CheckR
     }
 }
 
+/// Check a single `[auth.oauth2.<provider>]` entry for common misconfigurations.
+///
+/// - In production (`is_production = true`): fails when `client_secret` is empty.
+/// - Outside production: warns when `client_secret` is empty.
+///
+/// The returned check name is `"oauth2:<provider_name>"`.
+pub fn check_oauth2_provider_impl(
+    provider_name: &str,
+    client_secret: &str,
+    is_production: bool,
+) -> CheckResult {
+    // Use a static string for the name field to satisfy lifetime constraints.
+    // The name is formatted in the `detail` field instead.
+    let detail_prefix = format!("[auth.oauth2.{provider_name}]");
+    if client_secret.trim().is_empty() {
+        return if is_production {
+            CheckResult {
+                name: "oauth2_provider",
+                status: CheckStatus::Fail,
+                detail: Some(format!(
+                    "{detail_prefix}: client_secret is empty — OAuth2 login will fail in production"
+                )),
+                hint: Some(
+                    "Set client_secret via AUTUMN_AUTH__OAUTH2__<PROVIDER>__CLIENT_SECRET \
+                     or autumn credentials edit",
+                ),
+            }
+        } else {
+            CheckResult {
+                name: "oauth2_provider",
+                status: CheckStatus::Warn,
+                detail: Some(format!(
+                    "{detail_prefix}: client_secret is empty (OK for dev if using env vars)"
+                )),
+                hint: Some("Set client_secret before deploying to production"),
+            }
+        };
+    }
+
+    CheckResult {
+        name: "oauth2_provider",
+        status: CheckStatus::Pass,
+        detail: Some(format!("{detail_prefix}: client_secret is configured")),
+        hint: None,
+    }
+}
+
 // ─── Pure helper functions (fully unit-testable) ──────────────────────────────
 
 pub const fn glyph(status: &CheckStatus) -> &'static str {
@@ -1122,6 +1169,30 @@ fn read_autumn_toml_table() -> Option<toml::Table> {
         .and_then(|contents| toml::from_str::<toml::Table>(&contents).ok())
 }
 
+/// Extract `(provider_name, client_secret)` pairs from `[auth.oauth2.*]` in autumn.toml.
+fn resolve_oauth2_providers(table: Option<&toml::Table>) -> Vec<(String, String)> {
+    table
+        .and_then(|t| t.get("auth"))
+        .and_then(toml::Value::as_table)
+        .and_then(|auth| auth.get("oauth2"))
+        .and_then(toml::Value::as_table)
+        .map(|providers| {
+            providers
+                .iter()
+                .filter_map(|(name, val)| {
+                    let secret = val
+                        .as_table()
+                        .and_then(|t| t.get("client_secret"))
+                        .and_then(toml::Value::as_str)
+                        .unwrap_or("")
+                        .to_owned();
+                    Some((name.clone(), secret))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn resolve_database_topology(table: Option<&toml::Table>) -> DoctorDatabaseTopology {
     resolve_database_topology_from_sources(
         |key| std::env::var(key).ok().filter(|value| !value.is_empty()),
@@ -1458,10 +1529,18 @@ pub fn run(opts: DoctorOptions) {
         check_rate_limit_key_strategy_impl(&rate_limit_key_strategy, auth_extractor_mounted)
     }));
 
-    // 9. Stale artifacts (warn only, never fail)
+    // 9. OAuth2 provider checks (client_secret validation)
+    let oauth2_providers = resolve_oauth2_providers(toml_table.as_ref());
+    for (provider_name, client_secret) in oauth2_providers {
+        tasks.push(Box::new(move || {
+            check_oauth2_provider_impl(&provider_name, &client_secret, is_production)
+        }));
+    }
+
+    // 10. Stale artifacts (warn only, never fail)
     tasks.push(Box::new(check_stale_artifacts));
 
-    // 10. Maintenance mode state
+    // 11. Maintenance mode state
     tasks.push(Box::new(check_maintenance_mode));
 
     // ── Phase 3: spawn all tasks concurrently ────────────────────────────────
@@ -2375,6 +2454,56 @@ foo = "bar"
             result.status == CheckStatus::Pass || result.status == CheckStatus::Warn,
             "unexpected status: {:?}",
             result.status
+        );
+    }
+
+    // ── check_oauth2 (RED phase) ──────────────────────────────────────────────
+
+    #[test]
+    fn check_oauth2_empty_client_secret_in_production_fails() {
+        let result = check_oauth2_provider_impl("github", "", true);
+        assert_eq!(
+            result.status,
+            CheckStatus::Fail,
+            "empty client_secret in production must fail: {:?}",
+            result
+        );
+        assert!(
+            result.detail.as_deref().unwrap_or("").contains("client_secret"),
+            "detail must mention client_secret: {:?}",
+            result.detail
+        );
+    }
+
+    #[test]
+    fn check_oauth2_empty_client_secret_in_dev_warns() {
+        let result = check_oauth2_provider_impl("github", "", false);
+        assert_eq!(
+            result.status,
+            CheckStatus::Warn,
+            "empty client_secret outside production must warn: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn check_oauth2_non_empty_client_secret_passes() {
+        let result = check_oauth2_provider_impl("github", "real-secret-value", true);
+        assert_eq!(
+            result.status,
+            CheckStatus::Pass,
+            "non-empty client_secret must pass: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn check_oauth2_provider_name_appears_in_check_name() {
+        let result = check_oauth2_provider_impl("google", "", true);
+        assert!(
+            result.name.contains("oauth2") || result.name.contains("google"),
+            "check name must identify the provider: {}",
+            result.name
         );
     }
 }

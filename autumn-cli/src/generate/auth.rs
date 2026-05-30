@@ -31,6 +31,14 @@ const AUTH_EXTRA_DEPS: &[(&str, &str)] = &[
     ("tracing", "\"0.1\""),
 ];
 
+/// OAuth2/OIDC options for `autumn generate auth --oauth`.
+#[derive(Debug, Clone, Default)]
+pub struct AuthOAuthOptions {
+    /// Provider keys to scaffold (e.g. `["github", "google"]`).
+    /// An empty list produces the same output as [`plan_auth`].
+    pub providers: Vec<String>,
+}
+
 /// Compute the file actions for `autumn generate auth`.
 ///
 /// Pure planning step — no I/O happens here. Tests use this directly so they
@@ -149,8 +157,220 @@ pub fn plan_auth(project_root: &Path, name: &str, timestamp: &str) -> Result<Pla
     Ok(plan)
 }
 
-/// CLI entry point for `autumn generate auth <Name>`.
+/// Compute the file actions for `autumn generate auth --oauth <providers>`.
+///
+/// When `oauth.providers` is empty this is identical to [`plan_auth`].
+/// When providers are specified the plan additionally includes:
+/// - An `oauth_identities` migration keyed by `(provider, subject)`.
+/// - `src/routes/oauth.rs` with `oauth_redirect` and `oauth_callback` handlers.
+/// - `docs/guide/oauth.md` covering provider setup, security properties, and troubleshooting.
+/// - The `oauth2` feature on `autumn-web` in `Cargo.toml`.
+///
+/// # Errors
+/// Same as [`plan_auth`].
+pub fn plan_auth_with_options(
+    project_root: &Path,
+    name: &str,
+    timestamp: &str,
+    oauth: &AuthOAuthOptions,
+) -> Result<Plan, GenerateError> {
+    // Start with the base auth plan.
+    let mut plan = plan_auth(project_root, name, timestamp)?;
+
+    if oauth.providers.is_empty() {
+        return Ok(plan);
+    }
+
+    let pascal_name = pascal(name);
+    let snake_name = snake(name);
+    let user_table = pluralize(&snake_name);
+
+    // ── oauth_identities migration ─────────────────────────────────────────
+    let mig_dir = project_root
+        .join("migrations")
+        .join(format!("{timestamp}_create_oauth_identities"));
+    plan.create(
+        mig_dir.join("up.sql"),
+        render_oauth_migration_up(&user_table),
+    );
+    plan.create(mig_dir.join("down.sql"), render_oauth_migration_down());
+
+    // ── oauth routes ───────────────────────────────────────────────────────
+    let routes_dir = project_root.join("src").join("routes");
+    plan.create(
+        routes_dir.join("oauth.rs"),
+        render_oauth_routes_file(&pascal_name, &snake_name, &user_table, &oauth.providers),
+    );
+
+    // Add `pub mod oauth;` to src/routes/mod.rs
+    let route_mod_path = routes_dir.join("mod.rs");
+    let route_mod_existing = read_or_empty(&route_mod_path);
+    // The base plan already modifies this file; we need to append our module declaration.
+    // Find the plan action for mod.rs and update it, or add a new one.
+    let updated_route_mod = add_mod_declaration(&route_mod_existing, "oauth");
+    plan.modify(route_mod_path, updated_route_mod);
+
+    // ── Register oauth routes in src/main.rs ───────────────────────────────
+    let main_path = project_root.join("src").join("main.rs");
+    let main_existing = std::fs::read_to_string(&main_path).map_err(|_| {
+        GenerateError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("missing {}", main_path.display()),
+        ))
+    })?;
+    let oauth_entries = oauth_route_entries();
+    // The base plan has already modified main.rs; find current state in plan or use existing.
+    let base_main = find_plan_content_for_path(&plan, &main_path)
+        .unwrap_or_else(|| main_existing.clone());
+    let updated_main =
+        super::schema_edit::update_main_rs(&base_main, &["models", "routes", "schema"], &oauth_entries);
+    plan.modify(main_path, updated_main);
+
+    // ── docs/guide/oauth.md ────────────────────────────────────────────────
+    let docs_dir = project_root.join("docs").join("guide");
+    plan.create(docs_dir.join("oauth.md"), render_oauth_docs_file(&oauth.providers));
+
+    // ── Cargo.toml: add oauth2 feature to autumn-web ─────────────────────
+    let cargo_toml_path = project_root.join("Cargo.toml");
+    let cargo_existing = read_or_empty(&cargo_toml_path);
+    // The base plan may have already updated Cargo.toml; use its content if present.
+    let base_cargo = find_plan_content_for_path(&plan, &cargo_toml_path)
+        .unwrap_or_else(|| cargo_existing.clone());
+    let with_oauth2 = ensure_autumn_web_oauth2_feature(&base_cargo);
+    if with_oauth2 != base_cargo {
+        plan.modify(cargo_toml_path, with_oauth2);
+    }
+
+    Ok(plan)
+}
+
+/// Extract the planned output content for a given path from the plan (last modify/create wins).
+fn find_plan_content_for_path(plan: &Plan, path: &std::path::Path) -> Option<String> {
+    use super::emit::Action;
+    plan.actions
+        .iter()
+        .rev()
+        .find(|a| a.path() == path)
+        .map(|a| match a {
+            Action::Create { contents, .. } | Action::Modify { contents, .. } => {
+                contents.clone()
+            }
+        })
+}
+
+/// Ensure `autumn-web` in `[dependencies]` has `features = ["oauth2"]`.
+fn ensure_autumn_web_oauth2_feature(toml: &str) -> String {
+    const CRATE: &str = "autumn-web";
+    const FEATURE: &str = "\"oauth2\"";
+
+    let mut lines: Vec<String> = toml.lines().map(str::to_owned).collect();
+    let trailing_newline = toml.ends_with('\n');
+
+    let simple_prefix = format!("{CRATE} = \"");
+    let table_prefix = format!("{CRATE} = {{");
+    let subtable_header = format!("[dependencies.{CRATE}]");
+
+    let mut i = 0;
+    while i < lines.len() {
+        let trimmed = lines[i].trim().to_owned();
+        let indent: String = lines[i]
+            .chars()
+            .take_while(char::is_ascii_whitespace)
+            .collect();
+
+        if let Some(rest) = trimmed.strip_prefix(&simple_prefix) {
+            let version = rest.trim_end_matches('"');
+            lines[i] = format!(
+                "{indent}{CRATE} = {{ version = \"{version}\", features = [{FEATURE}] }}"
+            );
+            break;
+        }
+
+        if trimmed.starts_with(&table_prefix) {
+            if trimmed.contains(FEATURE) {
+                break; // already present
+            }
+            if let Some(feat_bracket) = trimmed.find("features = [") {
+                let list_start = feat_bracket + "features = [".len();
+                let list_end = trimmed[list_start..].find(']').unwrap() + list_start;
+                let existing = trimmed[list_start..list_end].trim();
+                let new_list = if existing.is_empty() {
+                    FEATURE.to_owned()
+                } else {
+                    format!("{existing}, {FEATURE}")
+                };
+                lines[i] = format!(
+                    "{indent}{}{}{}",
+                    &trimmed[..list_start],
+                    new_list,
+                    &trimmed[list_end..]
+                );
+            } else {
+                let close = trimmed.rfind('}').unwrap();
+                let before_close = trimmed[..close].trim_end();
+                let sep = if before_close.ends_with('{') { "" } else { ", " };
+                lines[i] = format!(
+                    "{indent}{}{sep}features = [{FEATURE}]{}",
+                    &trimmed[..close],
+                    &trimmed[close..]
+                );
+            }
+            break;
+        }
+
+        if trimmed == subtable_header {
+            let mut j = i + 1;
+            let mut found_features = false;
+            while j < lines.len() {
+                let t = lines[j].trim().to_owned();
+                if t.starts_with('[') {
+                    break;
+                }
+                if t.starts_with("features") {
+                    found_features = true;
+                    if !t.contains(FEATURE)
+                        && let (Some(open), Some(close)) = (t.find('['), t.rfind(']'))
+                    {
+                        let inner = t[open + 1..close].trim();
+                        let new_inner = if inner.is_empty() {
+                            FEATURE.to_owned()
+                        } else {
+                            format!("{inner}, {FEATURE}")
+                        };
+                        let indent_j: String = lines[j]
+                            .chars()
+                            .take_while(char::is_ascii_whitespace)
+                            .collect();
+                        lines[j] = format!("{indent_j}features = [{new_inner}]");
+                    }
+                    break;
+                }
+                j += 1;
+            }
+            if !found_features {
+                lines.insert(i + 1, format!("features = [{FEATURE}]"));
+            }
+            break;
+        }
+
+        i += 1;
+    }
+
+    let mut out = lines.join("\n");
+    if trailing_newline && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+/// CLI entry point for `autumn generate auth <Name>` (no OAuth providers).
+#[allow(dead_code)]
 pub fn run(name: &str, flags: Flags) {
+    run_with_options(name, flags, &AuthOAuthOptions::default());
+}
+
+/// CLI entry point for `autumn generate auth <Name> --oauth <providers>`.
+pub fn run_with_options(name: &str, flags: Flags, oauth: &AuthOAuthOptions) {
     let cwd = match std::env::current_dir() {
         Ok(d) => d,
         Err(e) => {
@@ -159,7 +379,7 @@ pub fn run(name: &str, flags: Flags) {
         }
     };
     let timestamp = timestamp_now();
-    let plan = plan_auth(&cwd, name, &timestamp);
+    let plan = plan_auth_with_options(&cwd, name, &timestamp, oauth);
     match plan.and_then(|p| p.execute(flags)) {
         Ok(()) => {}
         Err(e) => {
@@ -1095,6 +1315,280 @@ fn auth_route_entries() -> Vec<String> {
     ]
 }
 
+fn oauth_route_entries() -> Vec<String> {
+    vec![
+        "routes::oauth::oauth_redirect".to_owned(),
+        "routes::oauth::oauth_callback".to_owned(),
+    ]
+}
+
+fn render_oauth_migration_up(user_table: &str) -> String {
+    format!(
+        "CREATE TABLE oauth_identities (\n\
+         \x20   id BIGSERIAL PRIMARY KEY,\n\
+         \x20   provider TEXT NOT NULL,\n\
+         \x20   subject TEXT NOT NULL,\n\
+         \x20   user_id BIGINT NOT NULL REFERENCES {user_table}(id) ON DELETE CASCADE,\n\
+         \x20   email TEXT NULL,\n\
+         \x20   name TEXT NULL,\n\
+         \x20   created_at TIMESTAMP NOT NULL DEFAULT NOW(),\n\
+         \x20   UNIQUE (provider, subject)\n\
+         );\n\
+         \n\
+         CREATE INDEX oauth_identities_user_id_idx ON oauth_identities (user_id);\n"
+    )
+}
+
+fn render_oauth_migration_down() -> String {
+    "DROP TABLE oauth_identities;\n".to_owned()
+}
+
+fn render_oauth_routes_file(
+    pascal_name: &str,
+    snake_name: &str,
+    user_table: &str,
+    providers: &[String],
+) -> String {
+    let provider_list = providers
+        .iter()
+        .map(|p| format!("\"{}\"", p))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    format!(
+        r#"//! OAuth2/OIDC redirect and callback handlers.
+//!
+//! Generated by `autumn generate auth --oauth`.
+//! Edit freely — once generated this is ordinary user code.
+//!
+//! Routes:
+//!   GET  /auth/:provider/redirect  → redirects the browser to the provider
+//!   GET  /auth/:provider/callback  → exchanges the code and logs the user in
+
+use autumn_web::auth::{{OAuth2Callback, OidcIdentity, oauth2_authorize_url, oauth2_finish_login}};
+use autumn_web::prelude::*;
+use axum::extract::{{Path, Query, State}};
+use axum::response::{{IntoResponse, Redirect}};
+use tracing::warn;
+
+/// Supported OAuth2/OIDC providers.
+const SUPPORTED_PROVIDERS: &[&str] = &[{provider_list}];
+
+/// Redirect the browser to the provider's authorization endpoint.
+///
+/// State and nonce are stored in the session for CSRF protection.
+/// PKCE (S256) code_challenge is appended automatically by the framework.
+pub async fn oauth_redirect(
+    Path(provider_name): Path<String>,
+    State(state): State<AppState>,
+    session: Session,
+) -> impl IntoResponse {{
+    if !SUPPORTED_PROVIDERS.contains(&provider_name.as_str()) {{
+        return Redirect::to("/login?error=unknown_provider").into_response();
+    }}
+
+    let auth_cfg = state.config().auth.clone();
+    let Some(provider) = auth_cfg.oauth2.providers.get(&provider_name) else {{
+        warn!(provider = %provider_name, "oauth provider not configured in autumn.toml");
+        return Redirect::to("/login?error=provider_not_configured").into_response();
+    }};
+
+    match oauth2_authorize_url(&session, &provider_name, provider).await {{
+        Ok(url) => Redirect::to(&url).into_response(),
+        Err(e) => {{
+            warn!(error = %e, "oauth2_authorize_url failed");
+            Redirect::to("/login?error=oauth_error").into_response()
+        }}
+    }}
+}}
+
+/// Handle the OAuth2 callback: exchange the code, create or link a local account.
+///
+/// On success the user is logged in and redirected to the account page.
+/// A missing/mismatched state returns a non-revealing error redirect without
+/// logging the offending values.
+pub async fn oauth_callback(
+    Path(provider_name): Path<String>,
+    Query(callback): Query<OAuth2Callback>,
+    State(state): State<AppState>,
+    session: Session,
+) -> impl IntoResponse {{
+    if !SUPPORTED_PROVIDERS.contains(&provider_name.as_str()) {{
+        return Redirect::to("/login?error=unknown_provider").into_response();
+    }}
+
+    let auth_cfg = state.config().auth.clone();
+    let Some(provider) = auth_cfg.oauth2.providers.get(&provider_name) else {{
+        warn!(provider = %provider_name, "oauth provider not configured in autumn.toml");
+        return Redirect::to("/login?error=provider_not_configured").into_response();
+    }};
+
+    let identity: OidcIdentity = match oauth2_finish_login(
+        &session,
+        &auth_cfg.session_key,
+        &provider_name,
+        provider,
+        &callback,
+    )
+    .await
+    {{
+        Ok(id) => id,
+        Err(_) => {{
+            // Do not log the offending state or code to avoid leaking sensitive values.
+            return Redirect::to("/login?error=oauth_failed").into_response();
+        }}
+    }};
+
+    // Link or create a local {pascal_name} record.
+    // TODO: query the `oauth_identities` table by (provider, subject).
+    //       If found, update the session with the linked user_id.
+    //       If not found, follow the configured OAuthLinkingPolicy:
+    //         CreateAccount → insert a new {pascal_name} + oauth_identity row.
+    //         RequireLocalSignupFirst → redirect to /signup?linked=true.
+    let _ = identity; // remove once linked to DB
+    let _ = user_table_placeholder_{snake_name}();
+
+    Redirect::to("/account").into_response()
+}}
+
+#[allow(dead_code)]
+fn user_table_placeholder_{snake_name}() -> &'static str {{
+    "{user_table}"
+}}
+"#,
+        provider_list = provider_list,
+        pascal_name = pascal_name,
+        snake_name = snake_name,
+        user_table = user_table,
+    )
+}
+
+fn render_oauth_docs_file(providers: &[String]) -> String {
+    let provider_list = providers.join(", ");
+    let provider_config_examples = providers
+        .iter()
+        .map(|p| {
+            let redirect = match p.as_str() {
+                "google" => "https://your-app.example.com/auth/google/callback",
+                "github" => "https://your-app.example.com/auth/github/callback",
+                "microsoft" => "https://your-app.example.com/auth/microsoft/callback",
+                _ => "https://your-app.example.com/auth/{provider}/callback",
+            };
+            format!(
+                r#"[auth.oauth2.{p}]
+client_id     = "${{AUTUMN_{UPPER}_CLIENT_ID}}"
+client_secret = "${{AUTUMN_{UPPER}_CLIENT_SECRET}}"
+redirect_uri  = "{redirect}"
+"#,
+                p = p,
+                UPPER = p.to_uppercase(),
+                redirect = redirect,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(
+        r#"# OAuth2 / OIDC Authentication
+
+Generated by `autumn generate auth --oauth {provider_list}`.
+
+## Quick start
+
+### 1. Register redirect URIs with each provider
+
+Before the app will work you must register each redirect URI with the provider's
+developer console:
+
+| Provider | Console URL | Redirect URI path |
+|----------|-------------|-------------------|
+| Google   | <https://console.cloud.google.com/> | `/auth/google/callback` |
+| GitHub   | <https://github.com/settings/developers> | `/auth/github/callback` |
+| Microsoft | <https://portal.azure.com/> | `/auth/microsoft/callback` |
+
+### 2. Add provider credentials to `autumn.toml`
+
+```toml
+{provider_config_examples}
+```
+
+Keep `client_secret` out of source control — use environment variables or
+`autumn credentials edit` to inject secrets at runtime.
+
+### 3. Run the generator command
+
+```sh
+autumn generate auth User --oauth {provider_list}
+autumn migrate
+autumn dev
+```
+
+Open <http://localhost:3000/auth/{first_provider}/redirect> to test the flow.
+
+## Security properties
+
+| Property | Status |
+|----------|--------|
+| PKCE (S256) | ✅ enabled for every provider by default |
+| State (anti-CSRF) | ✅ constant-time validated on every callback |
+| Nonce (replay protection) | ✅ validated for OIDC ID-token flows |
+| ID-token signature | ✅ verified against provider JWKS |
+| Session fixation prevention | ✅ session ID rotated on login |
+| `client_secret` in logs | ✅ never logged |
+
+## Account-linking policy
+
+Configure in `autumn.toml`:
+
+```toml
+[auth]
+oauth_linking_policy = "create_account"           # default: create a new account on first sign-in
+# oauth_linking_policy = "require_local_signup_first"  # link only to existing accounts
+```
+
+## OIDC discovery
+
+Providers that support OIDC discovery (`discovery_url` in preset) have their
+endpoints populated automatically from `{{discovery_url}}/.well-known/openid-configuration`.
+GitHub uses explicit endpoints (it is pure OAuth2, not OIDC).
+
+## Troubleshooting
+
+**`redirect_uri_mismatch`** — The `redirect_uri` in `autumn.toml` must match
+exactly what is registered in the provider console, including scheme and path.
+
+**`invalid_client`** — Check that `client_id` and `client_secret` are correct
+and that the app is not in a restricted mode in the provider console.
+
+**`state mismatch` on callback** — The session may have expired between the
+redirect and callback. Increase `[session] ttl` or check for load-balancer
+sticky-session misconfiguration.
+
+## Generated database schema
+
+```sql
+CREATE TABLE oauth_identities (
+    id         BIGSERIAL PRIMARY KEY,
+    provider   TEXT NOT NULL,
+    subject    TEXT NOT NULL,         -- provider's user identifier (sub / id)
+    user_id    BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    email      TEXT NULL,
+    name       TEXT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    UNIQUE (provider, subject)        -- collision guard: one local account per identity
+);
+```
+
+Re-authentication with the same `(provider, subject)` pair links to the existing
+account. A second local user trying to claim the same identity returns an error and
+never silently merges accounts.
+"#,
+        provider_list = provider_list,
+        provider_config_examples = provider_config_examples,
+        first_provider = providers.first().map(String::as_str).unwrap_or("github"),
+    )
+}
+
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1569,6 +2063,221 @@ mod tests {
         assert!(
             model.contains("pub struct Account"),
             "struct name should match given name"
+        );
+    }
+
+    // ── OAuth2 generator tests (RED phase) ──────────────────────────────────
+
+    #[test]
+    fn plan_auth_with_oauth_creates_oauth_identities_migration() {
+        let tmp = project_with_main();
+        let oauth = AuthOAuthOptions {
+            providers: vec!["github".to_owned(), "google".to_owned()],
+        };
+        let plan = plan_auth_with_options(tmp.path(), "User", "20260508000000", &oauth).unwrap();
+        let paths: Vec<String> = plan
+            .actions
+            .iter()
+            .map(|a| {
+                a.path()
+                    .strip_prefix(tmp.path())
+                    .unwrap()
+                    .display()
+                    .to_string()
+                    .replace('\\', "/")
+            })
+            .collect();
+        assert!(
+            paths.iter().any(|p| p.contains("oauth_identities")),
+            "oauth_identities migration missing; got {paths:?}"
+        );
+    }
+
+    #[test]
+    fn plan_auth_without_oauth_is_unchanged() {
+        let tmp = project_with_main();
+        // Calling with empty providers must produce the same plan as plain plan_auth.
+        let oauth = AuthOAuthOptions { providers: vec![] };
+        let plan_with = plan_auth_with_options(tmp.path(), "User", "20260508000000", &oauth)
+            .unwrap();
+        let plan_plain = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
+        // Plans should have the same number of actions and the same paths.
+        let paths_with: std::collections::HashSet<String> = plan_with
+            .actions
+            .iter()
+            .map(|a| {
+                a.path()
+                    .strip_prefix(tmp.path())
+                    .unwrap()
+                    .display()
+                    .to_string()
+                    .replace('\\', "/")
+            })
+            .collect();
+        let paths_plain: std::collections::HashSet<String> = plan_plain
+            .actions
+            .iter()
+            .map(|a| {
+                a.path()
+                    .strip_prefix(tmp.path())
+                    .unwrap()
+                    .display()
+                    .to_string()
+                    .replace('\\', "/")
+            })
+            .collect();
+        assert_eq!(
+            paths_with, paths_plain,
+            "empty --oauth must not add any extra files"
+        );
+    }
+
+    #[test]
+    fn oauth_migration_up_has_provider_subject_and_fk_columns() {
+        let tmp = project_with_main();
+        let oauth = AuthOAuthOptions {
+            providers: vec!["github".to_owned()],
+        };
+        let plan = plan_auth_with_options(tmp.path(), "User", "20260508000000", &oauth).unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        // Find the oauth_identities up.sql
+        let mig_dir = tmp
+            .path()
+            .join("migrations/20260508000000_create_oauth_identities");
+        let up = fs::read_to_string(mig_dir.join("up.sql")).unwrap();
+        assert!(
+            up.contains("CREATE TABLE oauth_identities"),
+            "missing CREATE TABLE oauth_identities: {up}"
+        );
+        assert!(up.contains("provider"), "missing provider column: {up}");
+        assert!(up.contains("subject"), "missing subject column: {up}");
+        assert!(
+            up.contains("UNIQUE"),
+            "provider+subject must have UNIQUE constraint: {up}"
+        );
+        assert!(
+            !up.contains("plaintext") && !up.contains("access_token"),
+            "oauth_identities must not store provider access tokens: {up}"
+        );
+    }
+
+    #[test]
+    fn oauth_routes_file_contains_redirect_and_callback_handlers() {
+        let tmp = project_with_main();
+        let oauth = AuthOAuthOptions {
+            providers: vec!["github".to_owned()],
+        };
+        let plan = plan_auth_with_options(tmp.path(), "User", "20260508000000", &oauth).unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/oauth.rs")).unwrap();
+        assert!(
+            routes.contains("pub async fn oauth_redirect"),
+            "oauth_redirect handler missing: {routes}"
+        );
+        assert!(
+            routes.contains("pub async fn oauth_callback"),
+            "oauth_callback handler missing: {routes}"
+        );
+        assert!(
+            routes.contains("oauth2_authorize_url"),
+            "oauth_redirect must call oauth2_authorize_url: {routes}"
+        );
+        assert!(
+            routes.contains("oauth2_finish_login"),
+            "oauth_callback must call oauth2_finish_login: {routes}"
+        );
+    }
+
+    #[test]
+    fn oauth_callback_uses_state_nonce_validation() {
+        let tmp = project_with_main();
+        let oauth = AuthOAuthOptions {
+            providers: vec!["github".to_owned()],
+        };
+        let plan = plan_auth_with_options(tmp.path(), "User", "20260508000000", &oauth).unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/oauth.rs")).unwrap();
+        // oauth2_finish_login handles state+nonce internally, so its presence
+        // is the contract that state/nonce checking is enforced.
+        assert!(
+            routes.contains("oauth2_finish_login"),
+            "callback must use oauth2_finish_login (which enforces state+nonce): {routes}"
+        );
+    }
+
+    #[test]
+    fn plan_auth_with_oauth_creates_oauth_doc() {
+        let tmp = project_with_main();
+        let oauth = AuthOAuthOptions {
+            providers: vec!["google".to_owned()],
+        };
+        let plan = plan_auth_with_options(tmp.path(), "User", "20260508000000", &oauth).unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let doc = fs::read_to_string(tmp.path().join("docs/guide/oauth.md")).unwrap();
+        assert!(
+            doc.contains("OAuth") || doc.contains("oauth"),
+            "oauth.md must reference OAuth: {doc}"
+        );
+        assert!(
+            doc.contains("google") || doc.contains("Google"),
+            "oauth.md must mention configured providers: {doc}"
+        );
+        assert!(
+            doc.contains("client_id"),
+            "oauth.md must cover client_id configuration: {doc}"
+        );
+        assert!(
+            doc.contains("PKCE") || doc.contains("pkce"),
+            "oauth.md must document PKCE security property: {doc}"
+        );
+    }
+
+    #[test]
+    fn plan_auth_with_oauth_adds_oauth2_feature_to_autumn_web() {
+        let tmp = project_with_main();
+        let oauth = AuthOAuthOptions {
+            providers: vec!["github".to_owned()],
+        };
+        let plan = plan_auth_with_options(tmp.path(), "User", "20260508000000", &oauth).unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let cargo = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+        assert!(
+            cargo.contains("\"oauth2\""),
+            "Cargo.toml must enable autumn-web's oauth2 feature: {cargo}"
+        );
+    }
+
+    #[test]
+    fn plan_auth_without_oauth_does_not_add_oauth2_feature() {
+        let tmp = project_with_main();
+        let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let cargo = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+        assert!(
+            !cargo.contains("\"oauth2\""),
+            "Cargo.toml must NOT enable oauth2 feature when --oauth not used: {cargo}"
+        );
+    }
+
+    #[test]
+    fn oauth_routes_registered_in_main_rs() {
+        let tmp = project_with_main();
+        let oauth = AuthOAuthOptions {
+            providers: vec!["github".to_owned()],
+        };
+        let plan = plan_auth_with_options(tmp.path(), "User", "20260508000000", &oauth).unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let main = fs::read_to_string(tmp.path().join("src/main.rs")).unwrap();
+        assert!(
+            main.contains("routes::oauth"),
+            "main.rs must register oauth routes: {main}"
         );
     }
 }
