@@ -1762,6 +1762,7 @@ impl AppBuilder {
                     vec![interceptor],
                 ),
             ));
+            state.presence = crate::presence::Presence::new(state.channels.clone());
         }
         #[cfg(feature = "oauth2")]
         if let Some(interceptor) = http_interceptor {
@@ -2292,6 +2293,7 @@ impl AppBuilder {
                     vec![interceptor],
                 ),
             ));
+            state.presence = crate::presence::Presence::new(state.channels.clone());
         }
         #[cfg(feature = "oauth2")]
         if let Some(interceptor) = http_interceptor {
@@ -2636,6 +2638,7 @@ impl AppBuilder {
                     vec![interceptor],
                 ),
             ));
+            state.presence = crate::presence::Presence::new(state.channels.clone());
         }
         #[cfg(feature = "oauth2")]
         if let Some(interceptor) = http_interceptor {

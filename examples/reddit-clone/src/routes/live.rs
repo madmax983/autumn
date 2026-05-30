@@ -149,23 +149,36 @@ pub async fn subreddit_viewer_stream(
         .event("viewer-count")
         .data(initial_count.to_string());
 
+    // Refresh the presence lease on a cadence shorter than the 30 s sweep TTL
+    // so long-lived SSE connections are not evicted while the browser is still
+    // open.
+    let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(15));
+    heartbeat.tick().await; // consume the immediate first tick
+
     let stream = async_stream::stream! {
         yield Ok(initial);
 
         loop {
-            match rx.recv().await {
-                Ok(_) => {
-                    let count = presence.list(&topic).len();
-                    yield Ok(Event::default().event("viewer-count").data(count.to_string()));
+            tokio::select! {
+                msg = rx.recv() => {
+                    match msg {
+                        Ok(_) => {
+                            let count = presence.list(&topic).len();
+                            yield Ok(Event::default().event("viewer-count").data(count.to_string()));
+                        }
+                        // Recover from a lagged broadcast buffer by re-reading the
+                        // current count and continuing — avoids disconnecting viewers
+                        // under bursts of join/leave events.
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            let count = presence.list(&topic).len();
+                            yield Ok(Event::default().event("viewer-count").data(count.to_string()));
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
                 }
-                // Recover from a lagged broadcast buffer by re-reading the
-                // current count and continuing — avoids disconnecting viewers
-                // under bursts of join/leave events.
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                    let count = presence.list(&topic).len();
-                    yield Ok(Event::default().event("viewer-count").data(count.to_string()));
+                _ = heartbeat.tick() => {
+                    handle.refresh();
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
         }
 
