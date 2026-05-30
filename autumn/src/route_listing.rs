@@ -194,6 +194,24 @@ pub(crate) fn append_framework_routes(
         }
     }
 
+    // Dev request inspector routes.
+    if matches!(config.profile.as_deref(), Some("dev" | "development")) {
+        let inspector_path = &config.dev.inspector_path;
+        let inspector_detail_path = format!("{inspector_path}/requests/{{id}}");
+        for (path, handler) in [
+            (inspector_path.as_str(), "inspector_index"),
+            (inspector_detail_path.as_str(), "inspector_detail"),
+        ] {
+            infos.push(RouteInfo {
+                method: "GET".to_owned(),
+                path: path.to_owned(),
+                handler: handler.to_owned(),
+                source: RouteSource::Framework,
+                middleware: Vec::new(),
+            });
+        }
+    }
+
     // Static file serving is unconditionally mounted at /static.
     infos.push(RouteInfo {
         method: "GET".to_owned(),

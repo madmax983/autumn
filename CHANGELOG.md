@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **dev inspector:** Built-in request inspector with N+1 query detection (#701)
+  - In `dev` profile, `autumn-web` automatically mounts a request inspector UI at `/_autumn/inspect` (configurable via `[dev] inspector_path`). The route does not exist in `prod` or `test` profiles.
+  - The inspector records the last N requests (default `N = 100`, configurable via `[dev] inspector_capacity`) in a bounded in-memory ring buffer. Each record includes HTTP method, path, status code, wall time, response Content-Type and Content-Length.
+  - An N+1 detector flags any request that issued ≥ M structurally identical SQL statements (default `M = 5`, configurable via `[dev] inspector_n_plus_one_threshold`). The flag includes the offending SQL template and the repetition count.
+  - A `RequestInspector` Axum extractor is available to handlers in `dev` profile to append SQL query records (with SQL text, bound parameters, elapsed time, and `file:line` call site). Integration tests can use the extractor to assert "this request issued exactly K queries."
+  - The inspector UI (server-rendered HTML, no client-side framework) lists requests newest-first with method, path, status, duration, query count, and an N+1 warning badge. Clicking a request opens a detail view with a per-query timing table and a `curl` snippet to reproduce the request.
+  - The inspector excludes its own requests from the ring buffer to avoid feedback loops.
+  - New `[dev]` config section: `inspector_path`, `inspector_capacity`, `inspector_n_plus_one_threshold`.
+  - Existing apps require zero changes — the inspector is purely additive.
+  - See `docs/guide/dev-inspector.md` for the full guide.
+
 - **pagination:** Wire first-class pagination into `#[repository]` and scaffold (#681)
   - `#[repository]` now generates a `page(req: &PageRequest) -> AutumnResult<Page<Model>>` method on every repository struct, enabling offset pagination without hand-written SQL.  Results are ordered by `id DESC` for deterministic page boundaries.
   - `#[repository(Model, cursor_key = field)]` additionally generates `cursor_page(req: &CursorRequest) -> AutumnResult<CursorPage<Model>>` — keyset pagination sorted by `(field DESC, id DESC)`.  The cursor payload encodes both the sort-key value and `id` so the keyset filter is always correct: `WHERE (field < after_k) OR (field = after_k AND id < after_id)`.

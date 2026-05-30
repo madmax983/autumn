@@ -159,5 +159,9 @@ rustdoc-args = ["--cfg", "docsrs"]
 name = "version_history"
 harness = false
 
+[[bench]]
+name = "inspector"
+harness = false
+
 [lints]
 workspace = true

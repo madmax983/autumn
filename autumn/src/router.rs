@@ -346,6 +346,31 @@ fn build_router_pre_state(
             .layer(axum::middleware::from_fn(dev::inject_live_reload));
     }
 
+    // Dev request inspector: mount UI and apply recording middleware.
+    // Only active when profile = "dev"; returns 404 for all other profiles.
+    let is_dev_profile = matches!(config.profile.as_deref(), Some("dev" | "development"));
+    if is_dev_profile {
+        let buf = crate::inspector::InspectorBuffer::new(config.dev.inspector_capacity);
+        let inspector_path = config.dev.inspector_path.clone();
+        let threshold = config.dev.inspector_n_plus_one_threshold;
+
+        // Mount the inspector UI routes.
+        router = router.merge(crate::inspector::inspector_router(
+            buf.clone(),
+            &inspector_path,
+        ));
+        tracing::debug!(
+            path = %inspector_path,
+            "Mounted dev request inspector"
+        );
+
+        // Apply the recording middleware (outermost layer so it captures
+        // all routes). Self-excludes inspector's own path prefix.
+        let layer = crate::inspector::InspectorLayer::new(buf, threshold, inspector_path)
+            .with_session_cookie_name(config.session.cookie_name.clone());
+        router = router.layer(layer);
+    }
+
     #[cfg(feature = "oauth2")]
     let router = router.layer(axum::middleware::from_fn_with_state(
         state.clone(),

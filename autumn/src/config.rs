@@ -116,6 +116,9 @@
 //! | `AUTUMN_SECURITY__WEBHOOKS__REPLAY__REDIS__URL` | `security.webhooks.replay.redis.url` | `String` |
 //! | `AUTUMN_SECURITY__WEBHOOKS__REPLAY__REDIS__KEY_PREFIX` | `security.webhooks.replay.redis.key_prefix` | `String` |
 //! | `AUTUMN_SECURITY__WEBHOOKS__REPLAY__ALLOW_MEMORY_IN_PRODUCTION` | `security.webhooks.replay.allow_memory_in_production` | `bool` |
+//! | `AUTUMN_DEV__INSPECTOR_PATH` | `dev.inspector_path` | `String` |
+//! | `AUTUMN_DEV__INSPECTOR_CAPACITY` | `dev.inspector_capacity` | `usize` |
+//! | `AUTUMN_DEV__INSPECTOR_N_PLUS_ONE_THRESHOLD` | `dev.inspector_n_plus_one_threshold` | `usize` |
 
 use std::path::{Path, PathBuf};
 
@@ -733,6 +736,71 @@ pub struct AutumnConfig {
     #[cfg(feature = "http-client")]
     #[serde(default, rename = "http")]
     pub http: HttpConfig,
+
+    /// Developer-experience settings (`[dev]` section in `autumn.toml`).
+    ///
+    /// Controls the request inspector and other dev-only features.
+    /// These settings have no effect outside the `dev` profile.
+    #[serde(default)]
+    pub dev: DevConfig,
+}
+
+/// Developer-experience settings (`[dev]` section in `autumn.toml`).
+///
+/// All fields are ignored outside the `dev` profile.
+///
+/// # Example `autumn.toml`
+///
+/// ```toml
+/// [dev]
+/// inspector_path = "/_autumn/inspect"
+/// inspector_capacity = 200
+/// inspector_n_plus_one_threshold = 3
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct DevConfig {
+    /// Mount path for the request inspector UI.
+    ///
+    /// Default: `"/_autumn/inspect"`. Only active in the `dev` profile;
+    /// ignored everywhere else.
+    #[serde(default = "default_inspector_path")]
+    pub inspector_path: String,
+
+    /// Maximum number of requests retained in the in-memory ring buffer.
+    ///
+    /// Default: `100`. Set to `0` to disable recording without removing
+    /// the middleware.
+    #[serde(default = "default_inspector_capacity")]
+    pub inspector_capacity: usize,
+
+    /// Minimum number of structurally identical SQL statements in a single
+    /// request before an N+1 warning is emitted.
+    ///
+    /// Default: `5`. Set to `0` to disable N+1 detection.
+    #[serde(default = "default_inspector_n_plus_one_threshold")]
+    pub inspector_n_plus_one_threshold: usize,
+}
+
+impl Default for DevConfig {
+    fn default() -> Self {
+        Self {
+            inspector_path: default_inspector_path(),
+            inspector_capacity: default_inspector_capacity(),
+            inspector_n_plus_one_threshold: default_inspector_n_plus_one_threshold(),
+        }
+    }
+}
+
+fn default_inspector_path() -> String {
+    "/_autumn/inspect".to_owned()
+}
+
+const fn default_inspector_capacity() -> usize {
+    100
+}
+
+const fn default_inspector_n_plus_one_threshold() -> usize {
+    5
 }
 
 /// Top-level `[http]` configuration section.
@@ -1571,10 +1639,29 @@ impl AutumnConfig {
         self.apply_auth_env_overrides_with_env(env);
         self.apply_security_env_overrides_with_env(env);
         self.apply_idempotency_env_overrides_with_env(env);
+        self.apply_dev_env_overrides_with_env(env);
         #[cfg(feature = "storage")]
         self.apply_storage_env_overrides_with_env(env);
         #[cfg(feature = "mail")]
         self.apply_mail_env_overrides_with_env(env);
+    }
+
+    fn apply_dev_env_overrides_with_env(&mut self, env: &dyn Env) {
+        parse_env_string(
+            env,
+            "AUTUMN_DEV__INSPECTOR_PATH",
+            &mut self.dev.inspector_path,
+        );
+        parse_env(
+            env,
+            "AUTUMN_DEV__INSPECTOR_CAPACITY",
+            &mut self.dev.inspector_capacity,
+        );
+        parse_env(
+            env,
+            "AUTUMN_DEV__INSPECTOR_N_PLUS_ONE_THRESHOLD",
+            &mut self.dev.inspector_n_plus_one_threshold,
+        );
     }
 
     fn apply_idempotency_env_overrides_with_env(&mut self, env: &dyn Env) {
