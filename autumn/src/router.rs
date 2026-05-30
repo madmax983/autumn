@@ -366,7 +366,8 @@ fn build_router_pre_state(
 
         // Apply the recording middleware (outermost layer so it captures
         // all routes). Self-excludes inspector's own path prefix.
-        let layer = crate::inspector::InspectorLayer::new(buf, threshold, inspector_path);
+        let layer = crate::inspector::InspectorLayer::new(buf, threshold, inspector_path)
+            .with_session_cookie_name(config.session.cookie_name.clone());
         router = router.layer(layer);
     }
 

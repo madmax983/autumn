@@ -58,6 +58,9 @@ pub struct RequestRecord {
     pub method: String,
     /// Request path (e.g. `"/posts"`).
     pub path: String,
+    /// Matched route pattern (e.g. `"/posts/{id}"`), set by Axum's router.
+    /// `None` when the route was not matched (404) or MatchedPath was unavailable.
+    pub route: Option<String>,
     /// HTTP status code.
     pub status: u16,
     /// Total wall time for the request, in milliseconds.
@@ -66,6 +69,8 @@ pub struct RequestRecord {
     pub content_type: Option<String>,
     /// Value of the `Content-Length` response header, if present.
     pub content_length: Option<u64>,
+    /// Session identifier parsed from the session cookie, if present.
+    pub session_id: Option<String>,
     /// SQL queries issued during this request (via [`RequestInspector`]).
     pub queries: Vec<QueryRecord>,
     /// Set when an N+1 pattern was detected, otherwise `None`.
@@ -299,6 +304,8 @@ pub struct InspectorLayer {
     buffer: InspectorBuffer,
     n_plus_one_threshold: usize,
     inspector_path_prefix: String,
+    /// Name of the session cookie used to extract the session identifier.
+    session_cookie_name: String,
 }
 
 impl InspectorLayer {
@@ -312,7 +319,18 @@ impl InspectorLayer {
         n_plus_one_threshold: usize,
         inspector_path_prefix: String,
     ) -> Self {
-        Self { buffer, n_plus_one_threshold, inspector_path_prefix }
+        Self {
+            buffer,
+            n_plus_one_threshold,
+            inspector_path_prefix,
+            session_cookie_name: "autumn_session".to_owned(),
+        }
+    }
+
+    /// Override the session cookie name used for session-ID extraction.
+    pub fn with_session_cookie_name(mut self, name: impl Into<String>) -> Self {
+        self.session_cookie_name = name.into();
+        self
     }
 }
 
@@ -325,6 +343,7 @@ impl<S> tower::Layer<S> for InspectorLayer {
             buffer: self.buffer.clone(),
             n_plus_one_threshold: self.n_plus_one_threshold,
             inspector_path_prefix: self.inspector_path_prefix.clone(),
+            session_cookie_name: self.session_cookie_name.clone(),
         }
     }
 }
@@ -336,6 +355,7 @@ pub struct InspectorMiddleware<S> {
     buffer: InspectorBuffer,
     n_plus_one_threshold: usize,
     inspector_path_prefix: String,
+    session_cookie_name: String,
 }
 
 impl<S> tower::Service<axum::extract::Request> for InspectorMiddleware<S>
@@ -368,6 +388,16 @@ where
         let method = req.method().to_string();
         let buffer = self.buffer.clone();
         let threshold = self.n_plus_one_threshold;
+
+        // Extract route pattern — available because Axum's Router::layer applies
+        // after route dispatch, so MatchedPath is already set in extensions.
+        let route = req
+            .extensions()
+            .get::<axum::extract::MatchedPath>()
+            .map(|mp| mp.as_str().to_owned());
+
+        // Extract session ID from the cookie header before the request is consumed.
+        let session_id = extract_session_id(req.headers(), &self.session_cookie_name);
 
         // Inject per-request query list into extensions so handlers can call
         // RequestInspector::record_query(...).
@@ -404,10 +434,12 @@ where
                 id: 0, // assigned by InspectorBuffer::push
                 method,
                 path,
+                route,
                 status,
                 elapsed_ms,
                 content_type,
                 content_length,
+                session_id,
                 queries,
                 n_plus_one,
                 recorded_at,
@@ -417,6 +449,31 @@ where
             Ok(response)
         })
     }
+}
+
+/// Parse the session identifier from a `Cookie` header value.
+///
+/// The session cookie may be signed (`{id}.{hmac}`); we return only
+/// the `id` portion (everything before the first `.`).
+fn extract_session_id(
+    headers: &axum::http::HeaderMap,
+    cookie_name: &str,
+) -> Option<String> {
+    let cookie_header = headers.get(header::COOKIE)?.to_str().ok()?;
+    for pair in cookie_header.split(';') {
+        let pair = pair.trim();
+        if let Some((name, value)) = pair.split_once('=') {
+            if name.trim() == cookie_name {
+                let raw = value.trim();
+                // Strip HMAC signature: `{session_id}.{hmac_hex}` → `{session_id}`
+                let id = raw.split_once('.').map_or(raw, |(id, _)| id);
+                if !id.is_empty() {
+                    return Some(id.to_owned());
+                }
+            }
+        }
+    }
+    None
 }
 
 // ── HTTP handlers ─────────────────────────────────────────────────────────────
@@ -480,7 +537,7 @@ fn render_index(records: &[RequestRecord], inspector_path: &str) -> String {
     if records.is_empty() {
         body.push_str("<p class=\"empty\">No requests recorded yet. Make some requests then refresh.</p>");
     } else {
-        body.push_str("<table><thead><tr><th>Method</th><th>Path</th><th>Status</th><th>Duration</th><th>Queries</th><th>N+1?</th></tr></thead><tbody>");
+        body.push_str("<table><thead><tr><th>Method</th><th>Path</th><th>Route</th><th>Status</th><th>Duration</th><th>Queries</th><th>N+1?</th></tr></thead><tbody>");
         for rec in records {
             let n1 = if rec.n_plus_one.is_some() { "⚠ N+1" } else { "" };
             let status_class = if rec.status >= 500 {
@@ -490,6 +547,7 @@ fn render_index(records: &[RequestRecord], inspector_path: &str) -> String {
             } else {
                 ""
             };
+            let route_display = rec.route.as_deref().unwrap_or("—");
             body.push_str("<tr>");
             body.push_str("<td><code>");
             body.push_str(&escape_html(&rec.method));
@@ -499,7 +557,9 @@ fn render_index(records: &[RequestRecord], inspector_path: &str) -> String {
             body.push_str(&rec.id.to_string());
             body.push_str("\">");
             body.push_str(&escape_html(&rec.path));
-            body.push_str("</a></td><td class=\"");
+            body.push_str("</a></td><td class=\"muted\"><code>");
+            body.push_str(&escape_html(route_display));
+            body.push_str("</code></td><td class=\"");
             body.push_str(status_class);
             body.push_str("\">");
             body.push_str(&rec.status.to_string());
@@ -534,6 +594,18 @@ fn render_detail(rec: &RequestRecord) -> String {
     body.push_str(&rec.elapsed_ms.to_string());
     body.push_str("ms</dd><dt>Queries</dt><dd>");
     body.push_str(&rec.queries.len().to_string());
+    if let Some(route) = &rec.route {
+        body.push_str("</dd><dt>Route</dt><dd><code>");
+        body.push_str(&escape_html(route));
+        body.push_str("</code>");
+    }
+    if let Some(sid) = &rec.session_id {
+        body.push_str("</dd><dt>Session&nbsp;ID</dt><dd><code>");
+        // Show only first 8 chars to avoid exposing the full token in the UI
+        let truncated = if sid.len() > 8 { &sid[..8] } else { sid };
+        body.push_str(&escape_html(truncated));
+        body.push_str("…</code>");
+    }
     if let Some(ct) = &rec.content_type {
         body.push_str("</dd><dt>Content-Type</dt><dd>");
         body.push_str(&escape_html(ct));
@@ -659,10 +731,12 @@ mod tests {
             id: 0,
             method: method.to_owned(),
             path: path.to_owned(),
+            route: None,
             status,
             elapsed_ms: 10,
             content_type: None,
             content_length: None,
+            session_id: None,
             queries: vec![],
             n_plus_one: None,
             recorded_at: 0,
@@ -859,5 +933,62 @@ mod tests {
         let snap = buf.snapshot();
         assert_eq!(snap[0].query_count(), 1);
         assert_eq!(snap[0].queries[0].sql, "SELECT 1");
+    }
+
+    #[tokio::test]
+    async fn middleware_captures_matched_route_pattern() {
+        let buf = InspectorBuffer::new(10);
+        let layer = InspectorLayer::new(buf.clone(), 5, "/_autumn/inspect".to_owned());
+        let app = axum::Router::new()
+            .route("/items/{id}", axum::routing::get(|| async { "item" }))
+            .layer(layer);
+        let req = Request::builder()
+            .uri("/items/99")
+            .body(Body::empty())
+            .unwrap();
+        let _ = app.oneshot(req).await.unwrap();
+        let snap = buf.snapshot();
+        assert_eq!(snap[0].path, "/items/99");
+        assert_eq!(snap[0].route.as_deref(), Some("/items/{id}"));
+    }
+
+    #[test]
+    fn extract_session_id_finds_named_cookie() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            axum::http::HeaderValue::from_static("other=x; my_sess=abc123; foo=bar"),
+        );
+        let id = extract_session_id(&headers, "my_sess");
+        assert_eq!(id.as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn extract_session_id_strips_hmac_suffix() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            axum::http::HeaderValue::from_static("sess=sessionid.hmacdata"),
+        );
+        let id = extract_session_id(&headers, "sess");
+        assert_eq!(id.as_deref(), Some("sessionid"));
+    }
+
+    #[test]
+    fn extract_session_id_returns_none_when_absent() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            axum::http::HeaderValue::from_static("other=val"),
+        );
+        let id = extract_session_id(&headers, "my_sess");
+        assert!(id.is_none());
+    }
+
+    #[test]
+    fn extract_session_id_returns_none_with_no_cookie_header() {
+        let headers = axum::http::HeaderMap::new();
+        let id = extract_session_id(&headers, "sess");
+        assert!(id.is_none());
     }
 }

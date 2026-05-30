@@ -359,6 +359,101 @@ async fn inspector_detail_returns_404_for_unknown_id() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
+// ── Route pattern (MatchedPath) and session ID ────────────────────────────────
+
+#[tokio::test]
+async fn inspector_records_matched_route_pattern() {
+    let buf = InspectorBuffer::new(10);
+    let layer = InspectorLayer::new(buf.clone(), 5, "/_autumn/inspect".to_owned());
+
+    let app = axum::Router::new()
+        .route("/posts/{id}", axum::routing::get(|| async { "ok" }))
+        .layer(layer);
+
+    let req = Request::builder()
+        .uri("/posts/42")
+        .body(Body::empty())
+        .unwrap();
+    let _ = app.oneshot(req).await.unwrap();
+
+    let record = &buf.snapshot()[0];
+    assert_eq!(record.path, "/posts/42", "path should be the concrete URI");
+    assert_eq!(
+        record.route.as_deref(),
+        Some("/posts/{id}"),
+        "route should be the Axum route pattern"
+    );
+}
+
+#[tokio::test]
+async fn inspector_records_session_id_from_cookie() {
+    let buf = InspectorBuffer::new(10);
+    let layer = InspectorLayer::new(buf.clone(), 5, "/_autumn/inspect".to_owned())
+        .with_session_cookie_name("my_session");
+
+    let app = axum::Router::new()
+        .route("/page", axum::routing::get(|| async { "ok" }))
+        .layer(layer);
+
+    let req = Request::builder()
+        .uri("/page")
+        .header(axum::http::header::COOKIE, "my_session=abc123def456; other=x")
+        .body(Body::empty())
+        .unwrap();
+    let _ = app.oneshot(req).await.unwrap();
+
+    let record = &buf.snapshot()[0];
+    assert_eq!(
+        record.session_id.as_deref(),
+        Some("abc123def456"),
+        "session_id should be extracted from the named cookie"
+    );
+}
+
+#[tokio::test]
+async fn inspector_strips_hmac_from_signed_session_cookie() {
+    let buf = InspectorBuffer::new(10);
+    let layer = InspectorLayer::new(buf.clone(), 5, "/_autumn/inspect".to_owned())
+        .with_session_cookie_name("sess");
+
+    let app = axum::Router::new()
+        .route("/", axum::routing::get(|| async { "ok" }))
+        .layer(layer);
+
+    // Simulate a signed cookie: session_id.hmac_hex
+    let req = Request::builder()
+        .uri("/")
+        .header(axum::http::header::COOKIE, "sess=sessionid123.hmacdata")
+        .body(Body::empty())
+        .unwrap();
+    let _ = app.oneshot(req).await.unwrap();
+
+    let record = &buf.snapshot()[0];
+    assert_eq!(
+        record.session_id.as_deref(),
+        Some("sessionid123"),
+        "HMAC suffix should be stripped from the session ID"
+    );
+}
+
+#[tokio::test]
+async fn inspector_session_id_none_when_no_session_cookie() {
+    let buf = InspectorBuffer::new(10);
+    let layer = InspectorLayer::new(buf.clone(), 5, "/_autumn/inspect".to_owned());
+
+    let app = axum::Router::new()
+        .route("/", axum::routing::get(|| async { "ok" }))
+        .layer(layer);
+
+    let req = Request::builder().uri("/").body(Body::empty()).unwrap();
+    let _ = app.oneshot(req).await.unwrap();
+
+    assert!(
+        buf.snapshot()[0].session_id.is_none(),
+        "session_id should be None when no cookie is present"
+    );
+}
+
 // ── Config defaults ────────────────────────────────────────────────────────────
 
 #[test]
@@ -376,10 +471,12 @@ fn make_record(method: &str, path: &str, status: u16) -> RequestRecord {
         id: 0,
         method: method.to_owned(),
         path: path.to_owned(),
+        route: None,
         status,
         elapsed_ms: 10,
         content_type: None,
         content_length: None,
+        session_id: None,
         queries: vec![],
         n_plus_one: None,
         recorded_at: 0,
