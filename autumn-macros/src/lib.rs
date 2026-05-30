@@ -422,8 +422,8 @@ pub fn secured(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// `404 Not Found` by default. Provide a `fallback` function to return a
 /// custom response instead.
 ///
-/// The flag key is resolved against the [`FeatureFlagService`] stored in the
-/// [`AppState`] extensions. Unknown flags are treated as **disabled**
+/// The flag key is resolved against the `FeatureFlagService` stored in the
+/// `AppState` extensions. Unknown flags are treated as **disabled**
 /// (fail-closed).
 ///
 /// # Forms
@@ -443,8 +443,6 @@ pub fn secured(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// }
 /// ```
 ///
-/// [`FeatureFlagService`]: autumn_web::feature_flags::FeatureFlagService
-/// [`AppState`]: autumn_web::AppState
 #[proc_macro_attribute]
 pub fn feature_flag(attr: TokenStream, item: TokenStream) -> TokenStream {
     feature_flag::feature_flag_macro(attr.into(), item.into()).into()

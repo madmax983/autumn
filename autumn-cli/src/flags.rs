@@ -50,8 +50,7 @@ pub struct AllowOptions {
 
 // ── SQL helpers ──────────────────────────────────────────────────────────────
 
-const LIST_SQL: &str = "\\pset footer off \
-    SELECT key, \
+const LIST_SQL: &str = "SELECT key, \
            CASE WHEN enabled THEN 'YES' ELSE 'no' END AS enabled, \
            rollout_pct || '%' AS rollout, \
            actor_allowlist, \
@@ -59,26 +58,30 @@ const LIST_SQL: &str = "\\pset footer off \
            updated_at \
     FROM autumn_feature_flags ORDER BY key;";
 
-const ENABLE_SQL: &str = "INSERT INTO autumn_feature_flags (key, enabled) \
-    VALUES (:'key', TRUE) \
-    ON CONFLICT (key) DO UPDATE SET enabled = TRUE, updated_at = NOW(); \
+// enable() sets enabled=true + rollout_pct=100 (globally on for all actors).
+const ENABLE_SQL: &str = "INSERT INTO autumn_feature_flags (key, enabled, rollout_pct) \
+    VALUES (:'key', TRUE, 100) \
+    ON CONFLICT (key) DO UPDATE SET enabled = TRUE, rollout_pct = 100, updated_at = NOW(); \
 INSERT INTO feature_flag_changes (key, mutation, actor) \
     VALUES (:'key', 'enabled', :'actor');";
 
+// disable() is a kill-switch: sets enabled=false, preserves rollout config.
 const DISABLE_SQL: &str = "INSERT INTO autumn_feature_flags (key, enabled) \
     VALUES (:'key', FALSE) \
     ON CONFLICT (key) DO UPDATE SET enabled = FALSE, updated_at = NOW(); \
 INSERT INTO feature_flag_changes (key, mutation, actor) \
     VALUES (:'key', 'disabled', :'actor');";
 
-const SET_ROLLOUT_SQL: &str = "INSERT INTO autumn_feature_flags (key, rollout_pct) \
-    VALUES (:'key', :'pct'::smallint) \
-    ON CONFLICT (key) DO UPDATE SET rollout_pct = :'pct'::smallint, updated_at = NOW(); \
+// set_rollout() also clears the kill-switch (sets enabled=true).
+const SET_ROLLOUT_SQL: &str = "INSERT INTO autumn_feature_flags (key, enabled, rollout_pct) \
+    VALUES (:'key', TRUE, :'pct'::smallint) \
+    ON CONFLICT (key) DO UPDATE \
+        SET enabled = TRUE, rollout_pct = :'pct'::smallint, updated_at = NOW(); \
 INSERT INTO feature_flag_changes (key, mutation, actor) \
     VALUES (:'key', 'rollout=' || :'pct', :'actor');";
 
-const ALLOW_SQL: &str = "INSERT INTO autumn_feature_flags (key) \
-    VALUES (:'key') ON CONFLICT (key) DO NOTHING; \
+const ALLOW_SQL: &str = "INSERT INTO autumn_feature_flags (key, enabled) \
+    VALUES (:'key', TRUE) ON CONFLICT (key) DO UPDATE SET enabled = TRUE, updated_at = NOW(); \
 UPDATE autumn_feature_flags \
     SET actor_allowlist = ( \
         SELECT json_agg(DISTINCT elem)::text \
@@ -97,6 +100,9 @@ INSERT INTO feature_flag_changes (key, mutation, actor) \
 pub fn run_list(_opts: &ListOptions) {
     let db_url = resolve_database_url();
     let mut cmd = psql_command(&db_url);
+    // Use separate -c arguments: psql meta-commands and SQL cannot be mixed
+    // in a single --command string.
+    cmd.arg("--command").arg("\\pset footer off");
     cmd.arg("--command").arg(LIST_SQL);
     exec(cmd, "flags list");
 }
@@ -165,6 +171,7 @@ fn psql_command(db_url: &str) -> Command {
     let mut cmd = Command::new("psql");
     cmd.arg(db_url);
     cmd.arg("--no-psqlrc");
+    cmd.arg("--set=ON_ERROR_STOP=on");
     cmd
 }
 

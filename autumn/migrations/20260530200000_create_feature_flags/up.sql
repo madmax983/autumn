@@ -8,7 +8,8 @@
 -- running replicas can invalidate their in-process cache within seconds.
 
 CREATE TABLE IF NOT EXISTS autumn_feature_flags (
-    key              TEXT        NOT NULL PRIMARY KEY,
+    id               BIGSERIAL   PRIMARY KEY,
+    key              TEXT        NOT NULL UNIQUE,
     description      TEXT,
     enabled          BOOLEAN     NOT NULL DEFAULT FALSE,
     rollout_pct      SMALLINT    NOT NULL DEFAULT 0 CHECK (rollout_pct BETWEEN 0 AND 100),
@@ -23,8 +24,8 @@ COMMENT ON COLUMN autumn_feature_flags.actor_allowlist IS
 COMMENT ON COLUMN autumn_feature_flags.group_allowlist IS
     'JSON array of group name strings; membership resolved by the app group resolver';
 
--- Fast look-up by key (already primary key, index implicit).
-
+CREATE INDEX IF NOT EXISTS idx_autumn_feature_flags_key
+    ON autumn_feature_flags (key);
 CREATE TABLE IF NOT EXISTS feature_flag_changes (
     id          BIGSERIAL   PRIMARY KEY,
     key         TEXT        NOT NULL,

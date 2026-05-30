@@ -41,8 +41,7 @@ struct FeatureFlagArgs {
 impl syn::parse::Parse for FeatureFlagArgs {
     fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
         let flag_key: LitStr = input.parse()?;
-        let mut fallback = None;
-        if input.peek(Token![,]) {
+        let fallback = if input.peek(Token![,]) {
             let _: Token![,] = input.parse()?;
             let ident: syn::Ident = input.parse()?;
             if ident != "fallback" {
@@ -52,8 +51,10 @@ impl syn::parse::Parse for FeatureFlagArgs {
                 ));
             }
             let _: Token![=] = input.parse()?;
-            fallback = Some(input.parse()?);
-        }
+            Some(input.parse()?)
+        } else {
+            None
+        };
         Ok(Self {
             flag_key: flag_key.value(),
             fallback,
@@ -62,6 +63,8 @@ impl syn::parse::Parse for FeatureFlagArgs {
 }
 
 pub fn feature_flag_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
+    use crate::param_helpers::has_input_named;
+
     let args: FeatureFlagArgs = match syn::parse2(attr) {
         Ok(a) => a,
         Err(err) => return err.to_compile_error(),
@@ -82,31 +85,21 @@ pub fn feature_flag_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let flag_key = &args.flag_key;
 
-    let disabled_response = match &args.fallback {
-        Some(fallback_fn) => quote! {
-            return ::autumn_web::reexports::axum::response::IntoResponse::into_response(
-                #fallback_fn().await
-            );
-        },
-        None => quote! {
+    let disabled_response = args.fallback.as_ref().map_or_else(
+        || quote! {
             return ::autumn_web::reexports::axum::response::IntoResponse::into_response(
                 ::autumn_web::reexports::http::StatusCode::NOT_FOUND
             );
         },
-    };
+        |fallback_fn| quote! {
+            return ::autumn_web::reexports::axum::response::IntoResponse::into_response(
+                #fallback_fn().await
+            );
+        },
+    );
 
     let flag_check = quote! {
-        let __autumn_flag_enabled = {
-            let __flags_svc = __autumn_state.extension::<::autumn_web::feature_flags::FeatureFlagService>();
-            match __flags_svc {
-                Some(svc) => {
-                    let actor_id: Option<String> = None;
-                    svc.is_enabled(#flag_key, actor_id.as_deref())
-                }
-                None => false,
-            }
-        };
-        if !__autumn_flag_enabled {
+        if !__autumn_flags.enabled(#flag_key) {
             #disabled_response
         }
     };
@@ -128,13 +121,11 @@ pub fn feature_flag_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         },
     };
 
-    use crate::param_helpers::has_input_named;
-    if !has_input_named(&input_fn, "__autumn_state") {
-        let state_param: syn::FnArg = parse_quote! {
-            ::autumn_web::reexports::axum::extract::State(__autumn_state):
-                ::autumn_web::reexports::axum::extract::State<::autumn_web::AppState>
+    if !has_input_named(&input_fn, "__autumn_flags") {
+        let flags_param: syn::FnArg = parse_quote! {
+            __autumn_flags: ::autumn_web::feature_flags::Flags
         };
-        input_fn.sig.inputs.insert(0, state_param);
+        input_fn.sig.inputs.insert(0, flags_param);
     }
 
     input_fn
@@ -173,10 +164,10 @@ mod tests {
         let code = result.to_string();
         // Must contain the flag key lookup
         assert!(code.contains("my_flag"), "flag key must appear in generated code: {code}");
-        // Must inject the state parameter
+        // Must inject the flags parameter
         assert!(
-            code.contains("__autumn_state"),
-            "must inject state param: {code}"
+            code.contains("__autumn_flags"),
+            "must inject flags param: {code}"
         );
         // Must handle the disabled case
         assert!(

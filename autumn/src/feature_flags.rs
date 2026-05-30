@@ -29,12 +29,19 @@
 //!
 //! For a given `(flag, actor)` pair, rules are checked in this order:
 //!
-//! 1. **Global gate**: if `enabled = true`, return `true` immediately.
-//! 2. **Actor allowlist**: if the actor ID is in the explicit allowlist, return `true`.
-//! 3. **Group membership**: if the actor belongs to any allowed group, return `true`.
-//! 4. **Percent rollout**: if `rollout_pct > 0` and the deterministic hash bucket
+//! 1. **Kill switch**: if `enabled = false`, return `false` immediately.
+//!    Call `disable()` for an instant kill-switch that overrides rollout and allowlists.
+//! 2. **Global on**: if `rollout_pct >= 100`, return `true` for all actors.
+//!    Call `enable()` to globally enable a flag.
+//! 3. **Actor allowlist**: if the actor ID is in the explicit allowlist, return `true`.
+//! 4. **Group membership**: if the actor belongs to any allowed group, return `true`.
+//! 5. **Percent rollout**: if `rollout_pct > 0` and the deterministic hash bucket
 //!    of `(flag_name, actor_id)` falls below the threshold, return `true`.
-//! 5. Otherwise return `false`.
+//! 6. Otherwise return `false`.
+//!
+//! Calling `enable()` sets `rollout_pct = 100` (globally on for all actors).
+//! Calling `disable()` sets `enabled = false` — a hard kill-switch that overrides
+//! rollout and allowlists — while preserving the rollout/allowlist configuration.
 //!
 //! Percent-rollout buckets are computed with a FNV-1a hash over the UTF-8
 //! encoding of `"<flag_name>:<actor_id>"` and are therefore stable across
@@ -155,14 +162,19 @@ pub trait FlagStore: Send + Sync + 'static {
     /// Returns a [`FlagStoreError`] on backend failure.
     fn list(&self) -> Result<Vec<FlagConfig>, FlagStoreError>;
 
-    /// Set the global gate for `key` to `true`, creating the flag if absent.
+    /// Globally enable `key` for all actors (`enabled = true`, `rollout_pct = 100`).
+    ///
+    /// Creates the flag if absent. Clears any prior `disable()` kill-switch.
     ///
     /// # Errors
     ///
     /// Returns a [`FlagStoreError`] on backend failure.
     fn enable(&self, key: &str, actor: Option<&str>) -> Result<(), FlagStoreError>;
 
-    /// Set the global gate for `key` to `false`, creating the flag if absent.
+    /// Kill-switch `key` for all actors (`enabled = false`).
+    ///
+    /// Overrides rollout and allowlists while preserving their configuration.
+    /// Call `enable()` or `set_rollout()` to restore access.
     ///
     /// # Errors
     ///
@@ -171,9 +183,8 @@ pub trait FlagStore: Send + Sync + 'static {
 
     /// Set the percent-rollout gate for `key` to `pct` (0–100).
     ///
-    /// Setting `pct` to 100 is equivalent to calling [`FlagStore::enable`].
-    /// Setting `pct` to 0 disables the rollout gate (actors fall through to
-    /// the global gate).
+    /// Also clears any prior `disable()` kill-switch (`enabled = true`).
+    /// Use `disable()` for an instant kill-switch that overrides rollout.
     ///
     /// # Errors
     ///
@@ -299,7 +310,10 @@ impl FlagStore for InMemoryFlagStore {
     }
 
     fn enable(&self, key: &str, actor: Option<&str>) -> Result<(), FlagStoreError> {
-        self.upsert(key, |f| f.enabled = true);
+        self.upsert(key, |f| {
+            f.enabled = true;
+            f.rollout_pct = 100;
+        });
         self.record(FlagChangeRecord::now(key, "enabled", actor));
         Ok(())
     }
@@ -314,7 +328,10 @@ impl FlagStore for InMemoryFlagStore {
 
     fn set_rollout(&self, key: &str, pct: u8, actor: Option<&str>) -> Result<(), FlagStoreError> {
         let pct = pct.min(100);
-        self.upsert(key, |f| f.rollout_pct = pct);
+        self.upsert(key, |f| {
+            f.enabled = true;
+            f.rollout_pct = pct;
+        });
         self.record(FlagChangeRecord::now(
             key,
             format!("rollout={pct}"),
@@ -330,6 +347,7 @@ impl FlagStore for InMemoryFlagStore {
         actor: Option<&str>,
     ) -> Result<(), FlagStoreError> {
         self.upsert(key, |f| {
+            f.enabled = true;
             if !f.actor_allowlist.contains(&actor_id.to_owned()) {
                 f.actor_allowlist.push(actor_id.to_owned());
             }
@@ -349,6 +367,7 @@ impl FlagStore for InMemoryFlagStore {
         actor: Option<&str>,
     ) -> Result<(), FlagStoreError> {
         self.upsert(key, |f| {
+            f.enabled = true;
             if !f.group_allowlist.contains(&group.to_owned()) {
                 f.group_allowlist.push(group.to_owned());
             }
@@ -595,7 +614,8 @@ pub mod pg {
             conn.transaction::<(), diesel::result::Error, _>(|conn| {
                 self.upsert_flag(conn, key)?;
                 diesel::sql_query(
-                    "UPDATE autumn_feature_flags SET enabled = true, updated_at = NOW() \
+                    "UPDATE autumn_feature_flags \
+                     SET enabled = true, rollout_pct = 100, updated_at = NOW() \
                      WHERE key = $1",
                 )
                 .bind::<diesel::sql_types::Text, _>(key)
@@ -655,7 +675,8 @@ pub mod pg {
             conn.transaction::<(), diesel::result::Error, _>(|conn| {
                 self.upsert_flag(conn, key)?;
                 diesel::sql_query(
-                    "UPDATE autumn_feature_flags SET rollout_pct = $2, updated_at = NOW() \
+                    "UPDATE autumn_feature_flags \
+                     SET enabled = true, rollout_pct = $2, updated_at = NOW() \
                      WHERE key = $1",
                 )
                 .bind::<diesel::sql_types::Text, _>(key)
@@ -690,13 +711,14 @@ pub mod pg {
                 self.upsert_flag(conn, key)?;
                 diesel::sql_query(
                     "UPDATE autumn_feature_flags \
-                     SET actor_allowlist = (
-                         SELECT json_agg(DISTINCT elem) \
-                         FROM (
-                             SELECT jsonb_array_elements_text(actor_allowlist::jsonb) AS elem \
-                             UNION SELECT $2
-                         ) t \
-                     )::text, \
+                     SET enabled = true, \
+                         actor_allowlist = (
+                             SELECT json_agg(DISTINCT elem) \
+                             FROM (
+                                 SELECT jsonb_array_elements_text(actor_allowlist::jsonb) AS elem \
+                                 UNION SELECT $2
+                             ) t \
+                         )::text, \
                          updated_at = NOW() \
                      WHERE key = $1",
                 )
@@ -732,13 +754,14 @@ pub mod pg {
                 self.upsert_flag(conn, key)?;
                 diesel::sql_query(
                     "UPDATE autumn_feature_flags \
-                     SET group_allowlist = (
-                         SELECT json_agg(DISTINCT elem) \
-                         FROM (
-                             SELECT jsonb_array_elements_text(group_allowlist::jsonb) AS elem \
-                             UNION SELECT $2
-                         ) t \
-                     )::text, \
+                     SET enabled = true, \
+                         group_allowlist = (
+                             SELECT json_agg(DISTINCT elem) \
+                             FROM (
+                                 SELECT jsonb_array_elements_text(group_allowlist::jsonb) AS elem \
+                                 UNION SELECT $2
+                             ) t \
+                         )::text, \
                          updated_at = NOW() \
                      WHERE key = $1",
                 )
@@ -903,18 +926,19 @@ impl FeatureFlagService {
     }
 
     fn evaluate(&self, flag: &FlagConfig, actor_id: Option<&str>) -> bool {
-        // Global gate — fastest path.
-        if flag.enabled {
+        // Kill switch: enabled=false overrides all other gates.
+        if !flag.enabled {
+            return false;
+        }
+
+        // Globally on: rollout_pct=100 enables everyone without per-actor check.
+        if flag.rollout_pct >= 100 {
             return true;
         }
 
         // Actor allowlist.
         if let Some(actor) = actor_id {
-            if flag
-                .actor_allowlist
-                .iter()
-                .any(|a| a.as_str() == actor)
-            {
+            if flag.actor_allowlist.iter().any(|a| a.as_str() == actor) {
                 return true;
             }
         }
@@ -928,7 +952,7 @@ impl FeatureFlagService {
             }
         }
 
-        // Percent rollout.
+        // Percent rollout (1–99%).
         if flag.rollout_pct > 0 {
             if let Some(actor) = actor_id {
                 let bucket = rollout_bucket(&flag.key, actor);
@@ -1356,5 +1380,44 @@ mod tests {
         let store = InMemoryFlagStore::new();
         store.set_rollout("f", 200, None).unwrap();
         assert_eq!(store.get("f").unwrap().unwrap().rollout_pct, 100);
+    }
+
+    // AC-1 kill-switch: disable() must override rollout and allowlists ─────────
+
+    #[test]
+    fn disable_kills_flag_even_when_rollout_is_100_percent() {
+        let svc = make_svc();
+        svc.set_rollout("roll_flag", 100, None).unwrap();
+        svc.disable("roll_flag", None).unwrap();
+        for i in 0..20_u32 {
+            assert!(
+                !svc.is_enabled("roll_flag", Some(&format!("user:{i}"))),
+                "disable() must override rollout for actor user:{i}"
+            );
+        }
+        assert!(!svc.is_enabled("roll_flag", None));
+    }
+
+    #[test]
+    fn disable_kills_flag_even_when_actor_is_in_allowlist() {
+        let svc = make_svc();
+        svc.allow_actor("guarded", "user:42", None).unwrap();
+        svc.disable("guarded", None).unwrap();
+        assert!(
+            !svc.is_enabled("guarded", Some("user:42")),
+            "disable() must override actor allowlist"
+        );
+    }
+
+    #[test]
+    fn enable_after_disable_restores_rollout_config() {
+        let svc = make_svc();
+        svc.set_rollout("roll_flag", 50, None).unwrap();
+        svc.disable("roll_flag", None).unwrap();
+        // Re-enable globally — disable() preserves rollout_pct=50 in the store,
+        // but enable() resets it to 100 (globally on).
+        svc.enable("roll_flag", None).unwrap();
+        assert!(svc.is_enabled("roll_flag", None));
+        assert!(svc.is_enabled("roll_flag", Some("user:1")));
     }
 }

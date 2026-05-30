@@ -108,41 +108,39 @@ impl AdminModel for FeatureFlagAdminModel {
                 .map_err(|e| AdminError::Database(e.to_string()))?;
 
             let per_page = if params.per_page == 0 { 25 } else { params.per_page };
-
-            let search_filter = params.search.clone().unwrap_or_default();
-            let search_sql = if search_filter.is_empty() {
-                "TRUE".to_owned()
-            } else {
-                format!(
-                    "(key ILIKE '%{search}%' OR COALESCE(description,'') ILIKE '%{search}%')",
-                    search = search_filter.replace('\'', "''")
-                )
-            };
-
-            let count_sql = format!(
-                "SELECT COUNT(*) FROM autumn_feature_flags WHERE {search_sql}"
-            );
-            let total: i64 = diesel::sql_query(&count_sql)
-                .get_result::<CountRow>(&mut conn)
-                .await
-                .map(|r| r.count)
-                .unwrap_or(0);
-
             let offset = (params.page.saturating_sub(1)) * per_page;
-            let list_sql = format!(
-                "SELECT key, description, enabled, rollout_pct, \
+
+            // Parameterized search — `%` alone matches everything (no search case).
+            let search_pattern = format!(
+                "%{}%",
+                params.search.as_deref().unwrap_or("")
+            );
+
+            let total: i64 = diesel::sql_query(
+                "SELECT COUNT(*) FROM autumn_feature_flags \
+                 WHERE (key ILIKE $1 OR COALESCE(description,'') ILIKE $1)",
+            )
+            .bind::<diesel::sql_types::Text, _>(&search_pattern)
+            .get_result::<CountRow>(&mut conn)
+            .await
+            .map(|r| r.count)
+            .unwrap_or(0);
+
+            let records: Vec<Value> = diesel::sql_query(
+                "SELECT id, key, description, enabled, rollout_pct, \
                         actor_allowlist, group_allowlist, updated_at \
                  FROM autumn_feature_flags \
-                 WHERE {search_sql} \
+                 WHERE (key ILIKE $1 OR COALESCE(description,'') ILIKE $1) \
                  ORDER BY key \
-                 LIMIT {per_page} OFFSET {offset}"
-            );
-
-            let records: Vec<Value> = diesel::sql_query(&list_sql)
-                .load::<FlagRow>(&mut conn)
-                .await
-                .map(|rows| rows.into_iter().map(FlagRow::into_json).collect())
-                .map_err(|e| AdminError::Database(e.to_string()))?;
+                 LIMIT $2 OFFSET $3",
+            )
+            .bind::<diesel::sql_types::Text, _>(&search_pattern)
+            .bind::<diesel::sql_types::BigInt, _>(per_page as i64)
+            .bind::<diesel::sql_types::BigInt, _>(offset as i64)
+            .load::<FlagRow>(&mut conn)
+            .await
+            .map(|rows| rows.into_iter().map(FlagRow::into_json).collect())
+            .map_err(|e| AdminError::Database(e.to_string()))?;
 
             Ok(ListResult {
                 total: u64::try_from(total).unwrap_or(0),
@@ -168,24 +166,17 @@ impl AdminModel for FeatureFlagAdminModel {
                 .await
                 .map_err(|e| AdminError::Database(e.to_string()))?;
 
-            // The "ID" for flags is the key encoded as a number via hashtext.
-            // We use the key from a separate lookup table or use sequential IDs.
-            // For simplicity, we treat id as a row index (1-based) via OFFSET.
-            let sql = format!(
-                "SELECT key, description, enabled, rollout_pct, \
+            diesel::sql_query(
+                "SELECT id, key, description, enabled, rollout_pct, \
                         actor_allowlist, group_allowlist, updated_at \
-                 FROM autumn_feature_flags \
-                 ORDER BY key \
-                 LIMIT 1 OFFSET {offset}",
-                offset = id.saturating_sub(1)
-            );
-
-            diesel::sql_query(&sql)
-                .get_result::<FlagRow>(&mut conn)
-                .await
-                .optional()
-                .map(|r| r.map(|f| f.into_json()))
-                .map_err(|e| AdminError::Database(e.to_string()))
+                 FROM autumn_feature_flags WHERE id = $1",
+            )
+            .bind::<diesel::sql_types::BigInt, _>(id)
+            .get_result::<FlagRow>(&mut conn)
+            .await
+            .optional()
+            .map(|r| r.map(FlagRow::into_json))
+            .map_err(|e| AdminError::Database(e.to_string()))
         })
     }
 
@@ -209,35 +200,64 @@ impl AdminModel for FeatureFlagAdminModel {
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| AdminError::Validation("'key' is required".into()))?;
             let enabled = data.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+            // Select widget sends strings ("25"), direct API sends numbers.
             let rollout_pct = data
                 .get("rollout_pct")
-                .and_then(|v| v.as_i64())
+                .and_then(|v| {
+                    v.as_i64()
+                        .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
+                })
                 .unwrap_or(0)
                 .clamp(0, 100);
             let description = data.get("description").and_then(|v| v.as_str());
+            let actor_allowlist = data
+                .get("actor_allowlist")
+                .and_then(|v| v.as_str())
+                .unwrap_or("[]");
+            let group_allowlist = data
+                .get("group_allowlist")
+                .and_then(|v| v.as_str())
+                .unwrap_or("[]");
+
+            let mutation = if enabled { "enabled" } else { "disabled" };
 
             let sql = "INSERT INTO autumn_feature_flags \
-                       (key, description, enabled, rollout_pct) \
-                       VALUES ($1, $2, $3, $4) \
+                       (key, description, enabled, rollout_pct, actor_allowlist, group_allowlist) \
+                       VALUES ($1, $2, $3, $4, $5, $6) \
                        ON CONFLICT (key) DO UPDATE \
                        SET description = EXCLUDED.description, \
                            enabled = EXCLUDED.enabled, \
                            rollout_pct = EXCLUDED.rollout_pct, \
+                           actor_allowlist = EXCLUDED.actor_allowlist, \
+                           group_allowlist = EXCLUDED.group_allowlist, \
                            updated_at = NOW() \
-                       RETURNING key, description, enabled, rollout_pct, \
+                       RETURNING id, key, description, enabled, rollout_pct, \
                                  actor_allowlist, group_allowlist, updated_at";
 
-            diesel::sql_query(sql)
+            let row = diesel::sql_query(sql)
                 .bind::<diesel::sql_types::Text, _>(key)
                 .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(
                     description.map(str::to_owned),
                 )
                 .bind::<diesel::sql_types::Bool, _>(enabled)
                 .bind::<diesel::sql_types::SmallInt, _>(rollout_pct as i16)
+                .bind::<diesel::sql_types::Text, _>(actor_allowlist)
+                .bind::<diesel::sql_types::Text, _>(group_allowlist)
                 .get_result::<FlagRow>(&mut conn)
                 .await
-                .map(FlagRow::into_json)
-                .map_err(|e| AdminError::Database(e.to_string()))
+                .map_err(|e| AdminError::Database(e.to_string()))?;
+
+            // Record mutation in change log so LISTEN/NOTIFY propagates and history tab works.
+            diesel::sql_query(
+                "INSERT INTO feature_flag_changes (key, mutation, actor) VALUES ($1, $2, NULL)",
+            )
+            .bind::<diesel::sql_types::Text, _>(key)
+            .bind::<diesel::sql_types::Text, _>(mutation)
+            .execute(&mut conn)
+            .await
+            .ok(); // best-effort; don't fail the admin save if history write fails
+
+            Ok(FlagRow::into_json(row))
         })
     }
 
@@ -247,7 +267,6 @@ impl AdminModel for FeatureFlagAdminModel {
         _id: i64,
         data: Value,
     ) -> AdminFuture<'_, Value> {
-        // For feature flags we always update by key.
         self.create(pool, data)
     }
 
@@ -266,16 +285,8 @@ impl AdminModel for FeatureFlagAdminModel {
                 .await
                 .map_err(|e| AdminError::Database(e.to_string()))?;
 
-            let sql = format!(
-                "DELETE FROM autumn_feature_flags \
-                 WHERE key = ( \
-                     SELECT key FROM autumn_feature_flags \
-                     ORDER BY key LIMIT 1 OFFSET {offset} \
-                 )",
-                offset = id.saturating_sub(1)
-            );
-
-            diesel::sql_query(&sql)
+            diesel::sql_query("DELETE FROM autumn_feature_flags WHERE id = $1")
+                .bind::<diesel::sql_types::BigInt, _>(id)
                 .execute(&mut conn)
                 .await
                 .map(|_| ())
@@ -304,17 +315,16 @@ impl AdminModel for FeatureFlagAdminModel {
                 .await
                 .map_err(|e| AdminError::Database(e.to_string()))?;
 
-            // Resolve the flag key by row index (same as get).
-            let key_sql = format!(
-                "SELECT key FROM autumn_feature_flags ORDER BY key LIMIT 1 OFFSET {offset}",
-                offset = record_id.saturating_sub(1)
-            );
-            let key: Option<String> = diesel::sql_query(&key_sql)
-                .get_result::<KeyRow>(&mut conn)
-                .await
-                .optional()
-                .unwrap_or(None)
-                .map(|r| r.key);
+            // Resolve the flag key by its stable integer id.
+            let key: Option<String> = diesel::sql_query(
+                "SELECT key FROM autumn_feature_flags WHERE id = $1",
+            )
+            .bind::<diesel::sql_types::BigInt, _>(record_id)
+            .get_result::<KeyRow>(&mut conn)
+            .await
+            .optional()
+            .unwrap_or(None)
+            .map(|r| r.key);
 
             let Some(key) = key else {
                 return Ok(crate::AdminHistoryPage {
@@ -385,6 +395,8 @@ struct KeyRow {
 
 #[derive(diesel::QueryableByName)]
 struct FlagRow {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    id: i64,
     #[diesel(sql_type = diesel::sql_types::Text)]
     key: String,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
@@ -404,6 +416,7 @@ struct FlagRow {
 impl FlagRow {
     fn into_json(self) -> Value {
         serde_json::json!({
+            "id": self.id,
             "key": self.key,
             "description": self.description,
             "enabled": self.enabled,
