@@ -1,3 +1,36 @@
+//! Idempotency handling for mutating HTTP requests.
+//!
+//! This module provides the [`IdempotencyLayer`] middleware, which ensures that
+//! retried mutating requests (e.g., POST, PUT, PATCH, DELETE) are only executed
+//! once, and subsequent retries with the same `idempotency-key` header return the
+//! cached response.
+//!
+//! # Mechanics
+//!
+//! When a client includes an `idempotency-key` header:
+//! 1. The middleware acquires an in-flight lock for the key.
+//! 2. If a cached response exists, it is returned immediately (with `x-idempotent-replayed: true`).
+//! 3. If a concurrent request is processing the same key, a `409 Conflict` is returned.
+//! 4. If no cached response exists, the request proceeds down the middleware stack.
+//! 5. Successful responses (and specific client errors like `400 Bad Request`) are cached.
+//!
+//! # Examples
+//!
+//! The middleware is automatically installed by the Autumn framework, but you can
+//! configure it during app setup:
+//!
+//! ```rust,ignore
+//! use autumn_web::prelude::*;
+//! use std::time::Duration;
+//!
+//! #[autumn_web::main]
+//! async fn main() {
+//!     autumn_web::app()
+//!         .idempotency_ttl(Duration::from_secs(86400)) // 24 hours
+//!         .run()
+//!         .await;
+//! }
+//! ```
 use bytes::Bytes;
 use futures::StreamExt as FuturesStreamExt;
 
