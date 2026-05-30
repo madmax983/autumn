@@ -13,7 +13,7 @@
 //! on the `test-support` feature (which pulls in `testcontainers`).
 
 use autumn_web::security::{
-    RateLimitBackend, RateLimitBackendFailure, RateLimitConfig, RateLimitLayer,
+    KeyStrategy, RateLimitBackend, RateLimitBackendFailure, RateLimitConfig, RateLimitLayer,
     RateLimitRedisConfig,
 };
 use axum::Router;
@@ -71,6 +71,8 @@ async fn two_replicas_share_global_budget() {
             key_prefix: "test:rl".to_owned(),
         },
         on_backend_failure: RateLimitBackendFailure::FailOpen,
+        key_strategy: KeyStrategy::default(),
+        tiers: std::collections::HashMap::new(),
     };
     let app_a = app_from_config(&config);
     let app_b = app_from_config(&config);
@@ -118,6 +120,8 @@ async fn memory_replicas_have_independent_budgets() {
         backend: RateLimitBackend::Memory,
         redis: RateLimitRedisConfig::default(),
         on_backend_failure: RateLimitBackendFailure::FailOpen,
+        key_strategy: KeyStrategy::default(),
+        tiers: std::collections::HashMap::new(),
     };
     let app_a = app_from_config(&config);
     let app_b = app_from_config(&config);
@@ -162,6 +166,8 @@ async fn fail_open_allows_requests_when_redis_unavailable() {
             key_prefix: "test:rl".to_owned(),
         },
         on_backend_failure: RateLimitBackendFailure::FailOpen,
+        key_strategy: KeyStrategy::default(),
+        tiers: std::collections::HashMap::new(),
     };
     let app = app_from_config(&config);
 
@@ -194,6 +200,8 @@ async fn fail_closed_blocks_requests_when_redis_unavailable() {
             key_prefix: "test:rl".to_owned(),
         },
         on_backend_failure: RateLimitBackendFailure::FailClosed,
+        key_strategy: KeyStrategy::default(),
+        tiers: std::collections::HashMap::new(),
     };
     let app = app_from_config(&config);
 

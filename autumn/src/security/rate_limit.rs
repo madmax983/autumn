@@ -1,63 +1,52 @@
 //! Rate limiting middleware.
 //!
-//! Protects endpoints from abuse by applying a per-client-IP token bucket.
-//! Requests that exhaust their bucket receive `429 Too Many Requests` with
-//! a `Retry-After` header indicating when to retry.
+//! Protects endpoints from abuse by applying a per-client token bucket.
+//! The bucket key defaults to client IP and can be changed to
+//! authenticated principal or API bearer token via [`KeyStrategy`].
+//! Requests that exhaust their bucket receive `429 Too Many Requests`
+//! in Problem Details format (RFC 9457) with `Retry-After` and
+//! `X-RateLimit-*` headers.
 //!
-//! # How it works
+//! # Key strategies
 //!
-//! Each client IP gets its own token bucket holding up to `burst` tokens
-//! that refill at `requests_per_second`. Every incoming request costs one
-//! token. When the bucket is empty the middleware rejects the request
-//! without invoking the handler.
+//! | Strategy | Key source | Fallback |
+//! |----------|-----------|---------|
+//! | `ip` (default) | Connection peer / `X-Forwarded-For` | — |
+//! | `api_token` | `Authorization: Bearer <token>` | client IP |
+//! | `authenticated_principal` | [`RateLimitPrincipal`] extension | client IP |
 //!
-//! Client IP is extracted from the connection peer address
-//! ([`ConnectInfo<SocketAddr>`]) by default. When
-//! [`RateLimitConfig::trust_forwarded_headers`] is `true` — which should
-//! only be set behind a reverse proxy that strips and rewrites these
-//! headers — the limiter consults `X-Forwarded-For` and `X-Real-IP` first,
-//! falling back to the peer address. If
-//! [`RateLimitConfig::trusted_proxies`] is configured, trusted proxy
-//! addresses at the right side of the `X-Forwarded-For` chain are skipped,
-//! but only when the request peer address is present and trusted, so
-//! appended proxy chains still key on the nearest untrusted client without
-//! trusting spoofable headers from direct callers.
+//! # Tiered quotas
 //!
-//! Requests with no identifiable client (no trusted forwarding header
-//! AND no `ConnectInfo`) bypass rate limiting entirely. In-process
-//! callers such as the static site generator and test harnesses that
-//! invoke the router via [`tower::ServiceExt::oneshot`] fall into this
-//! bucket and must not be throttled.
+//! Register named tiers in `autumn.toml` and map principals to tiers via
+//! [`RateLimitLayer::with_tier_hook`]. Callers not assigned a tier use the
+//! top-level `requests_per_second` / `burst` defaults.
+//!
+//! # Per-path overrides
+//!
+//! Call [`RateLimitLayer::with_path_override`] to apply stricter or laxer
+//! limits on specific URL paths without disabling the global limiter.
 //!
 //! # Backends
 //!
-//! The bucket store is configurable via [`RateLimitConfig::backend`]:
-//!
-//! - `"memory"` (default): in-process LRU of token buckets. Zero-config for
-//!   development. Each replica enforces the limit independently, so a
-//!   3-replica deployment permits up to 3× the configured rate.
-//! - `"redis"`: shared bucket store coordinated across replicas via an atomic
-//!   Lua script. The configured rate is enforced globally regardless of replica
-//!   count. Reuses the same Redis connection as sessions, cache, and the
-//!   scheduler.
-//!
-//! When the Redis backend is unavailable, behavior is controlled by
-//! [`RateLimitConfig::on_backend_failure`]:
-//! - `"fail_open"` (default): allow the request through, matching the
-//!   existing single-replica posture.
-//! - `"fail_closed"`: return `429` until the backend recovers.
-//!
-//! A single `tracing::warn!` is emitted per outage, not per request.
+//! - `"memory"` (default): in-process LRU, zero-config for development.
+//! - `"redis"`: shared atomic bucket across replicas (requires `redis` feature).
 //!
 //! # Configuration
-//!
-//! See [`RateLimitConfig`] for available settings.
 //!
 //! ```toml
 //! [security.rate_limit]
 //! enabled = true
 //! requests_per_second = 10.0
 //! burst = 20
+//! key_strategy = "authenticated_principal"
+//!
+//! [security.rate_limit.tiers.free]
+//! requests_per_second = 1.0
+//! burst = 10
+//!
+//! [security.rate_limit.tiers.pro]
+//! requests_per_second = 10.0
+//! burst = 100
 //!
 //! # Multi-replica: share the budget across all pods
 //! backend = "redis"
@@ -79,21 +68,71 @@ use std::time::Instant;
 
 use axum::extract::ConnectInfo;
 use axum::http::{HeaderValue, Request, Response, StatusCode};
-use http::header::{HeaderName, RETRY_AFTER};
+use http::header::{CONTENT_TYPE, HeaderName, RETRY_AFTER};
 use tower::{Layer, Service};
 
 #[cfg(feature = "redis")]
 use super::config::RateLimitBackendFailure;
-use super::config::{RateLimitBackend, RateLimitConfig};
+use super::config::{KeyStrategy, RateLimitBackend, RateLimitConfig, RateLimitTierConfig};
 
 const X_RATELIMIT_LIMIT: HeaderName = HeaderName::from_static("x-ratelimit-limit");
 const X_RATELIMIT_REMAINING: HeaderName = HeaderName::from_static("x-ratelimit-remaining");
+const X_RATELIMIT_RESET: HeaderName = HeaderName::from_static("x-ratelimit-reset");
+
+// ── Public extension types ────────────────────────────────────────────────────
+
+/// Request extension inserted by auth middleware to identify the authenticated
+/// principal for rate-limit keying.
+///
+/// Auth middleware that wants to participate in principal-keyed rate limiting
+/// should insert this type into the request extensions before the rate limiter
+/// runs. The value is typically the user ID or session principal ID.
+///
+/// ```rust,ignore
+/// // In auth middleware:
+/// req.extensions_mut().insert(RateLimitPrincipal(user_id.to_string()));
+/// ```
+///
+/// When `key_strategy = "authenticated_principal"` and this extension is absent,
+/// the limiter falls back to IP-based keying so unauthenticated callers are
+/// never silently unbounded.
+#[derive(Clone, Debug)]
+pub struct RateLimitPrincipal(pub String);
+
+/// Per-path rate limit override.
+///
+/// Apply a stricter or laxer limit on a specific URL prefix without disabling
+/// the global rate limiter. Register via [`RateLimitLayer::with_path_override`].
+///
+/// `None` fields inherit from the global config.
+///
+/// ```rust,ignore
+/// let layer = RateLimitLayer::from_config(&config)
+///     .with_path_override("/api/free", RateLimitOverride { burst: Some(5), requests_per_second: Some(1.0) });
+/// ```
+#[derive(Clone, Debug)]
+pub struct RateLimitOverride {
+    /// Override `requests_per_second` for this path prefix. `None` uses the global value.
+    pub requests_per_second: Option<f64>,
+    /// Override `burst` for this path prefix. `None` uses the global value.
+    pub burst: Option<u32>,
+}
+
+// ── Decision ──────────────────────────────────────────────────────────────────
 
 /// Outcome of consuming one token from a bucket.
 #[derive(Debug, Clone, Copy)]
 enum Decision {
-    Allowed { remaining: u32 },
-    Denied { retry_after_secs: u64 },
+    Allowed {
+        remaining: u32,
+        /// Unix timestamp (seconds) of when the bucket will be available again.
+        reset_at_unix: u64,
+    },
+    Denied {
+        retry_after_secs: u64,
+        /// Unix timestamp (seconds) of when the next token will be available.
+        reset_at_unix: u64,
+    },
 }
 
 // ── In-memory bucket store ────────────────────────────────────────────────────
@@ -104,23 +143,36 @@ struct Bucket {
     last_refill: Instant,
 }
 
-/// Per-IP token bucket state stored in-process.
+/// Per-key token bucket state stored in-process.
 #[derive(Debug)]
 struct MemoryStore {
-    buckets: Mutex<LruCache<String, Bucket>>,
+    buckets: Arc<Mutex<LruCache<String, Bucket>>>,
+}
+
+impl Clone for MemoryStore {
+    fn clone(&self) -> Self {
+        Self {
+            buckets: Arc::clone(&self.buckets),
+        }
+    }
 }
 
 impl MemoryStore {
     fn new() -> Self {
         Self {
-            buckets: Mutex::new(LruCache::new(
+            buckets: Arc::new(Mutex::new(LruCache::new(
                 NonZeroUsize::new(10_000).expect("10_000 is non-zero"),
-            )),
+            ))),
         }
     }
 
     #[allow(clippy::significant_drop_tightening)]
     fn decide(&self, key: &str, now: Instant, burst: f64, refill_per_sec: f64) -> Decision {
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
         let tokens_after = {
             let mut buckets = match self.buckets.lock() {
                 Ok(guard) => guard,
@@ -153,14 +205,32 @@ impl MemoryStore {
             Ok(remaining_tokens) => {
                 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                 let remaining = remaining_tokens.floor() as u32;
-                Decision::Allowed { remaining }
+                // When the bucket has fewer than one token left after consuming,
+                // the next request will be denied. Compute the earliest future
+                // time at which a new token will arrive so clients can back off.
+                let reset_at_unix = if remaining_tokens < 1.0 {
+                    let secs_to_next = ((1.0 - remaining_tokens) / refill_per_sec).ceil().max(1.0);
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    {
+                        now_unix + secs_to_next as u64
+                    }
+                } else {
+                    now_unix
+                };
+                Decision::Allowed {
+                    remaining,
+                    reset_at_unix,
+                }
             }
             Err(current_tokens) => {
                 let deficit = 1.0 - current_tokens;
                 let secs = (deficit / refill_per_sec).ceil().max(1.0);
                 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                 let retry_after_secs = secs as u64;
-                Decision::Denied { retry_after_secs }
+                Decision::Denied {
+                    retry_after_secs,
+                    reset_at_unix: now_unix + retry_after_secs,
+                }
             }
         }
     }
@@ -177,7 +247,19 @@ struct RedisStore {
     key_prefix: String,
     failure_mode: RateLimitBackendFailure,
     /// Set to `true` once on the first Redis error; reset when it recovers.
-    outage_logged: std::sync::atomic::AtomicBool,
+    outage_logged: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(feature = "redis")]
+impl Clone for RedisStore {
+    fn clone(&self) -> Self {
+        Self {
+            connection: self.connection.clone(),
+            key_prefix: self.key_prefix.clone(),
+            failure_mode: self.failure_mode,
+            outage_logged: Arc::clone(&self.outage_logged),
+        }
+    }
 }
 
 #[cfg(feature = "redis")]
@@ -192,7 +274,7 @@ impl std::fmt::Debug for RedisStore {
 
 #[cfg(feature = "redis")]
 impl RedisStore {
-    const fn new(
+    fn new(
         connection: redis::aio::ConnectionManager,
         key_prefix: String,
         failure_mode: RateLimitBackendFailure,
@@ -201,12 +283,17 @@ impl RedisStore {
             connection,
             key_prefix,
             failure_mode,
-            outage_logged: std::sync::atomic::AtomicBool::new(false),
+            outage_logged: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
     async fn decide(&self, key: &str, burst: f64, refill_per_sec: f64) -> Option<Decision> {
         use std::time::{SystemTime, UNIX_EPOCH};
+
+        let now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
 
         let redis_key = format!("{}:{}", self.key_prefix, key);
         let now_ms = SystemTime::now()
@@ -235,11 +322,17 @@ impl RedisStore {
                 if allowed {
                     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                     let remaining = values[1] as u32;
-                    Some(Decision::Allowed { remaining })
+                    Some(Decision::Allowed {
+                        remaining,
+                        reset_at_unix: now_unix,
+                    })
                 } else {
                     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                     let retry_after_secs = values[2].max(1) as u64;
-                    Some(Decision::Denied { retry_after_secs })
+                    Some(Decision::Denied {
+                        retry_after_secs,
+                        reset_at_unix: now_unix + retry_after_secs,
+                    })
                 }
             }
             Err(err) => {
@@ -259,6 +352,7 @@ impl RedisStore {
                     RateLimitBackendFailure::FailOpen => None,
                     RateLimitBackendFailure::FailClosed => Some(Decision::Denied {
                         retry_after_secs: 1,
+                        reset_at_unix: now_unix + 1,
                     }),
                 }
             }
@@ -279,6 +373,7 @@ impl RedisStore {
                     RateLimitBackendFailure::FailOpen => None,
                     RateLimitBackendFailure::FailClosed => Some(Decision::Denied {
                         retry_after_secs: 1,
+                        reset_at_unix: now_unix + 1,
                     }),
                 }
             }
@@ -288,7 +383,7 @@ impl RedisStore {
 
 // ── Backend enum ──────────────────────────────────────────────────────────────
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum BucketBackend {
     Memory(MemoryStore),
     #[cfg(feature = "redis")]
@@ -296,6 +391,27 @@ enum BucketBackend {
 }
 
 // ── Limiter (shared state) ────────────────────────────────────────────────────
+
+#[allow(clippy::type_complexity)]
+struct TierHookFn(Arc<dyn Fn(&str) -> Option<String> + Send + Sync>);
+
+impl TierHookFn {
+    fn call(&self, key: &str) -> Option<String> {
+        (self.0)(key)
+    }
+}
+
+impl Clone for TierHookFn {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
+
+impl std::fmt::Debug for TierHookFn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TierHookFn")
+    }
+}
 
 /// Shared rate limiter state.
 #[derive(Debug)]
@@ -306,6 +422,10 @@ struct Limiter {
     trust_forwarded_headers: bool,
     trusted_proxies_configured: bool,
     trusted_proxies: Vec<TrustedProxy>,
+    key_strategy: KeyStrategy,
+    tiers: Arc<std::collections::HashMap<String, RateLimitTierConfig>>,
+    tier_hook: Option<TierHookFn>,
+    path_overrides: Vec<(String, RateLimitOverride)>,
     backend: BucketBackend,
 }
 
@@ -397,6 +517,10 @@ impl Limiter {
             trust_forwarded_headers: config.trust_forwarded_headers,
             trusted_proxies_configured,
             trusted_proxies,
+            key_strategy: config.key_strategy,
+            tiers: Arc::new(config.tiers.clone()),
+            tier_hook: None,
+            path_overrides: Vec::new(),
             backend,
         }
     }
@@ -457,39 +581,133 @@ impl Limiter {
         BucketBackend::Memory(MemoryStore::new())
     }
 
-    /// Consume one token for `key`. Returns `None` when throttling must be bypassed
-    /// (no client, or Redis fail-open).
-    #[allow(clippy::unused_async)] // async is needed for the Redis arm when that feature is active
-    async fn decide(&self, key: &str) -> Option<Decision> {
-        match &self.backend {
-            BucketBackend::Memory(store) => {
-                Some(store.decide(key, Instant::now(), self.burst, self.refill_per_sec))
+    /// Resolve explicit path-override params for this request.
+    ///
+    /// Returns `(opt_burst, opt_rps, key_namespace)` where the `Option` values
+    /// are `Some` only when the override explicitly sets that field. `key_namespace`
+    /// is non-empty when a path override matched (used to isolate buckets from the
+    /// global default pool).
+    fn effective_params_with_ns<B>(&self, req: &Request<B>) -> (Option<f64>, Option<f64>, &str) {
+        let path = req.uri().path();
+        for (prefix, override_) in &self.path_overrides {
+            if path.starts_with(prefix.as_str()) {
+                let burst = override_.burst.map(|b| f64::from(b.max(1)));
+                let rps = override_
+                    .requests_per_second
+                    .map(|r| r.max(f64::MIN_POSITIVE));
+                return (burst, rps, prefix.as_str());
             }
-            #[cfg(feature = "redis")]
-            BucketBackend::Redis(store) => store.decide(key, self.burst, self.refill_per_sec).await,
+        }
+        (None, None, "")
+    }
+
+    /// Resolve the bucket key and effective tier params for a request.
+    ///
+    /// Returns `(bucket_key, burst, rps)` or `None` if rate limiting should
+    /// be bypassed for this request (in-process caller with no identifiable peer).
+    fn resolve_key_and_params<B>(&self, req: &Request<B>) -> Option<(String, f64, f64)> {
+        let (opt_burst, opt_rps, key_ns) = self.effective_params_with_ns(req);
+
+        let raw_key = self.extract_key(req)?;
+
+        // Namespace the bucket key by the active path prefix so that different
+        // path overrides get independent token buckets (avoids burst-value
+        // collision when /strict and /normal share the same client IP).
+        let key = if key_ns.is_empty() {
+            raw_key.clone()
+        } else {
+            format!("{key_ns}\0{raw_key}")
+        };
+
+        let mut burst = opt_burst.unwrap_or(self.burst);
+        let mut rps = opt_rps.unwrap_or(self.refill_per_sec);
+
+        // Apply tier hook if configured. Pass the raw (un-prefixed) value so
+        // hooks receive e.g. "user-42" rather than "principal:user-42".
+        // Path overrides always take precedence over tier limits when explicitly set.
+        if let Some(hook) = &self.tier_hook {
+            let value = strip_key_prefix(&raw_key);
+            if let Some(tier_name) = hook.call(value)
+                && let Some(tier) = self.tiers.get(&tier_name)
+            {
+                if opt_burst.is_none() {
+                    burst = f64::from(tier.burst.max(1));
+                }
+                if opt_rps.is_none() {
+                    rps = tier.requests_per_second.max(f64::MIN_POSITIVE);
+                }
+            }
+        }
+
+        Some((key, burst, rps))
+    }
+
+    /// Extract the bucket key based on the configured strategy.
+    fn extract_key<B>(&self, req: &Request<B>) -> Option<String> {
+        match self.key_strategy {
+            KeyStrategy::Ip => self.client_ip(req),
+            KeyStrategy::ApiToken => {
+                let token = extract_bearer_token(req);
+                if token.is_some() {
+                    token.map(|t| format!("token:{t}"))
+                } else {
+                    self.client_ip(req)
+                }
+            }
+            KeyStrategy::AuthenticatedPrincipal => {
+                let principal = req
+                    .extensions()
+                    .get::<RateLimitPrincipal>()
+                    .map(|p| format!("principal:{}", p.0));
+                if principal.is_some() {
+                    principal
+                } else {
+                    self.client_ip(req)
+                }
+            }
         }
     }
+
+    /// Consume one token for `key`. Returns `None` when throttling must be bypassed.
+    #[allow(clippy::unused_async)]
+    async fn decide(&self, key: &str, burst: f64, rps: f64) -> Option<Decision> {
+        match &self.backend {
+            BucketBackend::Memory(store) => Some(store.decide(key, Instant::now(), burst, rps)),
+            #[cfg(feature = "redis")]
+            BucketBackend::Redis(store) => store.decide(key, burst, rps).await,
+        }
+    }
+}
+
+/// Strip the known scheme prefix from an extracted bucket key before passing
+/// to the tier hook, so hooks receive the raw value (e.g. "user-42" rather
+/// than "principal:user-42"). Only removes `"token:"` and `"principal:"`
+/// — bare IP keys (including IPv6 addresses containing colons) are passed through unchanged.
+fn strip_key_prefix(key: &str) -> &str {
+    key.strip_prefix("token:")
+        .or_else(|| key.strip_prefix("principal:"))
+        .unwrap_or(key)
+}
+
+/// Extract the key string from the `Authorization: Bearer <token>` header.
+fn extract_bearer_token<B>(req: &Request<B>) -> Option<String> {
+    req.headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| {
+            let mut parts = s.splitn(2, ' ');
+            let scheme = parts.next()?;
+            if !scheme.eq_ignore_ascii_case("bearer") {
+                return None;
+            }
+            parts.next().map(|t| t.trim().to_owned())
+        })
+        .filter(|t| !t.is_empty())
 }
 
 impl Limiter {
     /// Extract the originating client IP from a request, honoring this
     /// limiter's trusted-proxy policy.
-    ///
-    /// Returns `None` when no identifiable client is present, signalling
-    /// the middleware to bypass throttling. In-process callers such as
-    /// the static site generator and `Router::oneshot`-style test
-    /// harnesses fall into this path.
-    ///
-    /// When `trust_forwarded_headers` is `true`, `X-Forwarded-For` and
-    /// then `X-Real-IP` are consulted before [`ConnectInfo<SocketAddr>`].
-    /// If trusted proxies are configured, the `X-Forwarded-For` chain is
-    /// walked from right to left and configured proxy IPs/CIDRs are
-    /// skipped, but only when the request peer is present and trusted.
-    /// Without a trusted proxy list, the last non-empty XFF entry is used
-    /// for the existing single-proxy setup where proxies append the peer
-    /// address after any client-supplied header value. If that entry is
-    /// the immediate socket peer, the peer has appended its own address,
-    /// so the client entry immediately to its left is used instead.
     fn client_ip<B>(&self, req: &Request<B>) -> Option<String> {
         let peer_ip = Self::peer_ip(req);
 
@@ -582,11 +800,67 @@ impl Limiter {
     }
 }
 
+// ── Response building helpers ─────────────────────────────────────────────────
+
+/// Build the `application/problem+json` 429 body per RFC 9457.
+fn rate_limit_problem_json(key_class: &str) -> String {
+    use crate::error::problem_details_json_string;
+    use axum::http::StatusCode;
+
+    problem_details_json_string(
+        StatusCode::TOO_MANY_REQUESTS,
+        format!("Rate limit exceeded for {key_class}"),
+        None,
+        Some("https://autumn.dev/problems/rate-limited"),
+        None,
+        None,
+        true,
+    )
+}
+
+/// Classify the bucket key for user-facing error messages without leaking the value.
+fn key_class_label(key: &str) -> &'static str {
+    if key.starts_with("token:") {
+        "api token"
+    } else if key.starts_with("principal:") {
+        "authenticated principal"
+    } else {
+        "ip"
+    }
+}
+
 // ── Tower layer & service ─────────────────────────────────────────────────────
 
 /// Tower [`Layer`] that applies rate limiting.
 ///
 /// Applied automatically when `security.rate_limit.enabled = true`.
+///
+/// # Per-principal / API-token keying
+///
+/// Configure `key_strategy` in `autumn.toml` or set it programmatically:
+///
+/// ```rust,ignore
+/// let layer = RateLimitLayer::from_config(&config.security.rate_limit);
+/// ```
+///
+/// # Tiered quotas
+///
+/// Register a tier-assignment hook after creating the layer:
+///
+/// ```rust,ignore
+/// let layer = RateLimitLayer::from_config(&config.security.rate_limit)
+///     .with_tier_hook(|principal_id| match db.get_plan(principal_id) {
+///         "pro" => Some("pro".into()),
+///         _ => None,
+///     });
+/// ```
+///
+/// # Per-path overrides
+///
+/// ```rust,ignore
+/// let layer = RateLimitLayer::from_config(&config.security.rate_limit)
+///     .with_path_override("/api/free/", RateLimitOverride { burst: Some(5), requests_per_second: Some(1.0) });
+/// ```
 #[derive(Clone, Debug)]
 pub struct RateLimitLayer {
     limiter: Arc<Limiter>,
@@ -598,6 +872,78 @@ impl RateLimitLayer {
     pub fn from_config(config: &RateLimitConfig) -> Self {
         Self {
             limiter: Arc::new(Limiter::from_config(config)),
+        }
+    }
+
+    /// Register an app-supplied tier-assignment hook.
+    ///
+    /// The hook receives the extracted bucket key (principal ID or token, without
+    /// the scheme prefix) and returns a tier name that matches a key in
+    /// `[security.rate_limit.tiers]`. Returning `None` uses the top-level
+    /// `requests_per_second` / `burst` defaults.
+    ///
+    /// The hook is called synchronously on every request; keep it O(1).
+    ///
+    /// ```rust,ignore
+    /// let layer = RateLimitLayer::from_config(&config)
+    ///     .with_tier_hook(|key| {
+    ///         if key.starts_with("pro_") { Some("pro".into()) } else { None }
+    ///     });
+    /// ```
+    #[must_use]
+    pub fn with_tier_hook<F>(self, hook: F) -> Self
+    where
+        F: Fn(&str) -> Option<String> + Send + Sync + 'static,
+    {
+        let mut limiter = Arc::try_unwrap(self.limiter).unwrap_or_else(|arc| (*arc).deep_clone());
+        limiter.tier_hook = Some(TierHookFn(Arc::new(hook)));
+        Self {
+            limiter: Arc::new(limiter),
+        }
+    }
+
+    /// Register a per-path rate limit override.
+    ///
+    /// Requests whose URL path starts with `path_prefix` use the override's
+    /// `burst` / `requests_per_second` values instead of the global defaults.
+    /// The first matching prefix wins (registration order matters).
+    ///
+    /// ```rust,ignore
+    /// let layer = RateLimitLayer::from_config(&config)
+    ///     .with_path_override("/api/strict/", RateLimitOverride {
+    ///         burst: Some(1),
+    ///         requests_per_second: Some(0.1),
+    ///     });
+    /// ```
+    #[must_use]
+    pub fn with_path_override(
+        self,
+        path_prefix: impl Into<String>,
+        override_: RateLimitOverride,
+    ) -> Self {
+        let mut limiter = Arc::try_unwrap(self.limiter).unwrap_or_else(|arc| (*arc).deep_clone());
+        limiter.path_overrides.push((path_prefix.into(), override_));
+        Self {
+            limiter: Arc::new(limiter),
+        }
+    }
+}
+
+impl Limiter {
+    /// Deep-clone for builder mutation (used when `Arc::try_unwrap` fails).
+    fn deep_clone(&self) -> Self {
+        Self {
+            refill_per_sec: self.refill_per_sec,
+            burst: self.burst,
+            burst_header: self.burst_header.clone(),
+            trust_forwarded_headers: self.trust_forwarded_headers,
+            trusted_proxies_configured: self.trusted_proxies_configured,
+            trusted_proxies: self.trusted_proxies.clone(),
+            key_strategy: self.key_strategy,
+            tiers: Arc::clone(&self.tiers),
+            tier_hook: self.tier_hook.clone(),
+            path_overrides: self.path_overrides.clone(),
+            backend: self.backend.clone(),
         }
     }
 }
@@ -626,7 +972,7 @@ where
     S::Future: Send + 'static,
     S::Error: Send + 'static,
     ReqBody: Send + 'static,
-    ResBody: Default + Send + 'static,
+    ResBody: Default + From<String> + Send + 'static,
 {
     type Response = S::Response;
     type Error = S::Error;
@@ -637,8 +983,8 @@ where
     }
 
     fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
-        // Extract the client key synchronously (no I/O required).
-        let client_key = self.limiter.client_ip(&req);
+        // Resolve key and effective params synchronously (no I/O).
+        let resolved = self.limiter.resolve_key_and_params(&req);
 
         let limiter = Arc::clone(&self.limiter);
         let mut inner = self.inner.clone();
@@ -646,27 +992,52 @@ where
         std::mem::swap(&mut self.inner, &mut inner);
 
         Box::pin(async move {
-            // Resolve the rate-limit decision (may be async for the Redis backend).
-            let decision = match client_key {
-                Some(key) => limiter.decide(&key).await,
+            let decision = match resolved {
+                Some((ref key, burst, rps)) => limiter.decide(key, burst, rps).await,
                 None => None,
             };
 
+            let burst_for_header = resolved.as_ref().map_or_else(
+                || limiter.burst_header.clone(),
+                |(_, burst, _)| {
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let b = *burst as u32;
+                    HeaderValue::from(b)
+                },
+            );
+
             match decision {
-                Some(Decision::Denied { retry_after_secs }) => {
-                    let mut response = Response::new(ResBody::default());
+                Some(Decision::Denied {
+                    retry_after_secs,
+                    reset_at_unix,
+                }) => {
+                    let key_class = resolved
+                        .as_ref()
+                        .map_or("ip", |(k, _, _)| key_class_label(k));
+                    let body_json = rate_limit_problem_json(key_class);
+
+                    let mut response = Response::new(ResBody::from(body_json));
                     *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
                     let headers = response.headers_mut();
                     headers.insert(RETRY_AFTER, HeaderValue::from(retry_after_secs));
-                    headers.insert(X_RATELIMIT_LIMIT, limiter.burst_header.clone());
+                    headers.insert(X_RATELIMIT_LIMIT, burst_for_header);
                     headers.insert(X_RATELIMIT_REMAINING, HeaderValue::from_static("0"));
+                    headers.insert(X_RATELIMIT_RESET, HeaderValue::from(reset_at_unix));
+                    headers.insert(
+                        CONTENT_TYPE,
+                        HeaderValue::from_static("application/problem+json"),
+                    );
                     Ok(response)
                 }
-                Some(Decision::Allowed { remaining }) => {
+                Some(Decision::Allowed {
+                    remaining,
+                    reset_at_unix,
+                }) => {
                     let mut response = inner.call(req).await?;
                     let headers = response.headers_mut();
-                    headers.insert(X_RATELIMIT_LIMIT, limiter.burst_header.clone());
+                    headers.insert(X_RATELIMIT_LIMIT, burst_for_header);
                     headers.insert(X_RATELIMIT_REMAINING, HeaderValue::from(remaining));
+                    headers.insert(X_RATELIMIT_RESET, HeaderValue::from(reset_at_unix));
                     Ok(response)
                 }
                 None => inner.call(req).await,
@@ -801,6 +1172,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn request_429_has_problem_details_body() {
+        let app = app(&cfg(true, 1.0, 1));
+
+        let _ = app.clone().oneshot(req_with_ip("9.9.9.9")).await.unwrap();
+        let response = app.clone().oneshot(req_with_ip("9.9.9.9")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let ct = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            ct.contains("application/problem+json"),
+            "content-type should be application/problem+json, got {ct}"
+        );
+
+        let reset = response.headers().get("x-ratelimit-reset");
+        assert!(reset.is_some(), "x-ratelimit-reset must be present on 429");
+    }
+
+    #[tokio::test]
+    async fn request_ok_has_ratelimit_reset_header() {
+        let app = app(&cfg(true, 10.0, 5));
+        let response = app.clone().oneshot(req_with_ip("8.8.8.8")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response.headers().get("x-ratelimit-reset").is_some(),
+            "x-ratelimit-reset must be present on allowed responses"
+        );
+    }
+
+    #[tokio::test]
     async fn different_ips_are_independent() {
         let app = app(&cfg(true, 0.1, 1));
 
@@ -900,21 +1304,27 @@ mod tests {
 
         // Immediately after, bucket.tokens = 0.0. Deficit = 1.0. Secs = 1.0 / 0.1 = 10.0
         match store.decide("ip1", now, 1.0, 0.1) {
-            Decision::Denied { retry_after_secs } => assert_eq!(retry_after_secs, 10),
+            Decision::Denied {
+                retry_after_secs, ..
+            } => assert_eq!(retry_after_secs, 10),
             Decision::Allowed { .. } => panic!("Expected Denied"),
         }
 
         // 5 seconds later, bucket.tokens = 0.5. Deficit = 0.5. Secs = 0.5 / 0.1 = 5.0
         let later = now + Duration::from_secs(5);
         match store.decide("ip1", later, 1.0, 0.1) {
-            Decision::Denied { retry_after_secs } => assert_eq!(retry_after_secs, 5),
+            Decision::Denied {
+                retry_after_secs, ..
+            } => assert_eq!(retry_after_secs, 5),
             Decision::Allowed { .. } => panic!("Expected Denied"),
         }
 
         // 9.5 seconds later, bucket.tokens = 0.95. Deficit = 0.05. Secs = 0.05 / 0.1 = 0.5 -> ceil -> 1.0
         let even_later = now + Duration::from_millis(9500);
         match store.decide("ip1", even_later, 1.0, 0.1) {
-            Decision::Denied { retry_after_secs } => assert_eq!(retry_after_secs, 1),
+            Decision::Denied {
+                retry_after_secs, ..
+            } => assert_eq!(retry_after_secs, 1),
             Decision::Allowed { .. } => panic!("Expected Denied"),
         }
     }
@@ -1216,9 +1626,6 @@ mod tests {
 
     #[tokio::test]
     async fn requests_without_connect_info_bypass_rate_limit() {
-        // Static site generation and `Router::oneshot`-style callers
-        // don't set ConnectInfo. The limiter must pass them through so
-        // build-time rendering isn't throttled onto a shared bucket.
         let config = RateLimitConfig {
             enabled: true,
             requests_per_second: 0.001,
@@ -1324,13 +1731,117 @@ mod tests {
         assert_eq!(blocked.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 
+    // ── Key strategy unit tests ───────────────────────────────────────────────
+
+    #[test]
+    fn extract_bearer_token_parses_authorization_header() {
+        let req = Request::builder()
+            .header("authorization", "Bearer my-secret-token")
+            .body(())
+            .unwrap();
+        assert_eq!(
+            extract_bearer_token(&req).as_deref(),
+            Some("my-secret-token")
+        );
+    }
+
+    #[test]
+    fn extract_bearer_token_case_insensitive_scheme() {
+        let req = Request::builder()
+            .header("authorization", "BEARER token123")
+            .body(())
+            .unwrap();
+        assert_eq!(extract_bearer_token(&req).as_deref(), Some("token123"));
+    }
+
+    #[test]
+    fn extract_bearer_token_returns_none_for_non_bearer() {
+        let req = Request::builder()
+            .header("authorization", "Basic dXNlcjpwYXNz")
+            .body(())
+            .unwrap();
+        assert!(extract_bearer_token(&req).is_none());
+    }
+
+    #[test]
+    fn extract_bearer_token_returns_none_when_absent() {
+        let req = Request::builder().body(()).unwrap();
+        assert!(extract_bearer_token(&req).is_none());
+    }
+
+    #[test]
+    fn key_class_label_ip() {
+        assert_eq!(key_class_label("1.2.3.4"), "ip");
+    }
+
+    #[test]
+    fn key_class_label_token() {
+        assert_eq!(key_class_label("token:abc123"), "api token");
+    }
+
+    #[test]
+    fn key_class_label_principal() {
+        assert_eq!(
+            key_class_label("principal:user-42"),
+            "authenticated principal"
+        );
+    }
+
+    #[test]
+    fn key_strategy_extract_api_token_with_header() {
+        let config = RateLimitConfig {
+            key_strategy: KeyStrategy::ApiToken,
+            trust_forwarded_headers: true,
+            ..Default::default()
+        };
+        let limiter = Limiter::from_config(&config);
+        let req = Request::builder()
+            .header("authorization", "Bearer tok-abc")
+            .header("X-Forwarded-For", "1.2.3.4")
+            .body(())
+            .unwrap();
+        let key = limiter.extract_key(&req).unwrap();
+        assert_eq!(key, "token:tok-abc");
+    }
+
+    #[test]
+    fn key_strategy_principal_uses_extension() {
+        let config = RateLimitConfig {
+            key_strategy: KeyStrategy::AuthenticatedPrincipal,
+            trust_forwarded_headers: true,
+            ..Default::default()
+        };
+        let limiter = Limiter::from_config(&config);
+        let mut req: Request<()> = Request::builder().body(()).unwrap();
+        req.extensions_mut()
+            .insert(RateLimitPrincipal("user-99".to_owned()));
+        let key = limiter.extract_key(&req).unwrap();
+        assert_eq!(key, "principal:user-99");
+    }
+
+    #[test]
+    fn key_strategy_principal_falls_back_to_ip() {
+        let config = RateLimitConfig {
+            key_strategy: KeyStrategy::AuthenticatedPrincipal,
+            trust_forwarded_headers: true,
+            ..Default::default()
+        };
+        let limiter = Limiter::from_config(&config);
+        let req: Request<()> = Request::builder()
+            .header("X-Forwarded-For", "5.5.5.5")
+            .body(())
+            .unwrap();
+        // No RateLimitPrincipal extension → falls back to IP.
+        let key = limiter.extract_key(&req).unwrap();
+        assert_eq!(key, "5.5.5.5");
+    }
+
     // ── Redis backend build_backend fallback tests ────────────────────────────
 
     #[cfg(feature = "redis")]
     #[tokio::test]
     async fn redis_store_debug_format() {
         use super::super::config::RateLimitBackendFailure;
-        // Check that RedisStore implements Debug correctly, logging key_prefix and failure_mode
         let client = redis::Client::open("redis://127.0.0.1/").unwrap();
         let connection = redis::aio::ConnectionManager::new_lazy_with_config(
             client,
@@ -1368,9 +1879,8 @@ mod tests {
                 key_prefix: "test:rl".to_owned(),
             },
             on_backend_failure: RateLimitBackendFailure::FailOpen,
+            ..Default::default()
         };
-        // When no Redis URL is provided, build_backend must not panic and the
-        // limiter must still enforce in-memory rate limits.
         let limiter = Limiter::from_config(&config);
         assert!(matches!(limiter.backend, BucketBackend::Memory(_)));
     }
@@ -1393,6 +1903,7 @@ mod tests {
                 key_prefix: "test:rl".to_owned(),
             },
             on_backend_failure: RateLimitBackendFailure::FailClosed,
+            ..Default::default()
         };
         let limiter = Limiter::from_config(&config);
         assert!(matches!(limiter.backend, BucketBackend::Memory(_)));
@@ -1409,5 +1920,124 @@ mod tests {
 
         let untrusted_ip: IpAddr = "192.168.1.1".parse().unwrap();
         assert!(!limiter.is_trusted_proxy(untrusted_ip));
+    }
+
+    // ── Path override tests ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn path_override_applies_stricter_burst() {
+        let config = RateLimitConfig {
+            enabled: true,
+            requests_per_second: 0.1,
+            burst: 5, // global: 5
+            trust_forwarded_headers: true,
+            ..Default::default()
+        };
+
+        let layer = RateLimitLayer::from_config(&config).with_path_override(
+            "/strict",
+            RateLimitOverride {
+                burst: Some(1), // override: 1
+                requests_per_second: None,
+            },
+        );
+
+        let app = Router::new()
+            .route("/strict", get(|| async { "strict" }))
+            .route("/normal", get(|| async { "normal" }))
+            .layer(layer);
+
+        let strict_req = || {
+            Request::builder()
+                .method("GET")
+                .uri("/strict")
+                .header("X-Forwarded-For", "2.2.2.2")
+                .body(Body::empty())
+                .unwrap()
+        };
+        let normal_req = || {
+            Request::builder()
+                .method("GET")
+                .uri("/normal")
+                .header("X-Forwarded-For", "2.2.2.2")
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        // /strict: 1 allowed, then denied.
+        let r = app.clone().oneshot(strict_req()).await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let r = app.clone().oneshot(strict_req()).await.unwrap();
+        assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // /normal: still uses global burst=5, should pass.
+        for _ in 0..3 {
+            let r = app.clone().oneshot(normal_req()).await.unwrap();
+            assert_eq!(r.status(), StatusCode::OK);
+        }
+    }
+
+    // ── Tier hook tests ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn tier_hook_assigns_correct_burst_to_tier() {
+        use super::super::config::RateLimitTierConfig;
+        use std::collections::HashMap;
+
+        let mut tiers = HashMap::new();
+        tiers.insert(
+            "premium".to_owned(),
+            RateLimitTierConfig {
+                requests_per_second: 0.1,
+                burst: 10,
+            },
+        );
+
+        let config = RateLimitConfig {
+            enabled: true,
+            requests_per_second: 0.1,
+            burst: 1, // default
+            key_strategy: KeyStrategy::AuthenticatedPrincipal,
+            tiers,
+            ..Default::default()
+        };
+
+        let layer = RateLimitLayer::from_config(&config).with_tier_hook(|key| {
+            // key is the raw value after stripping the scheme prefix.
+            if key.starts_with("vip_") {
+                Some("premium".to_owned())
+            } else {
+                None
+            }
+        });
+
+        let app = Router::new()
+            .route("/", get(|| async { "ok" }))
+            .layer(layer);
+
+        let make_req = |principal: &str| {
+            let mut req = Request::builder()
+                .method("GET")
+                .uri("/")
+                .body(Body::empty())
+                .unwrap();
+            req.extensions_mut()
+                .insert(RateLimitPrincipal(principal.to_owned()));
+            req
+        };
+
+        // Premium user: burst=10.
+        for i in 0..10 {
+            let r = app.clone().oneshot(make_req("vip_user")).await.unwrap();
+            assert_eq!(r.status(), StatusCode::OK, "premium request {i} failed");
+        }
+        let r = app.clone().oneshot(make_req("vip_user")).await.unwrap();
+        assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // Regular user: burst=1.
+        let r = app.clone().oneshot(make_req("regular_user")).await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let r = app.clone().oneshot(make_req("regular_user")).await.unwrap();
+        assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 }

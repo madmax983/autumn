@@ -167,6 +167,69 @@ pub fn check_signing_secret_impl(secret: Option<&str>, is_production: bool) -> C
     }
 }
 
+/// Check that the rate-limit key strategy is consistent with mounted auth middleware.
+///
+/// When `key_strategy = "authenticated_principal"`, the rate limiter reads a
+/// `RateLimitPrincipal` extension that must be set by the auth layer. If no
+/// auth extractor is mounted, unauthenticated requests still fall back to IP
+/// keying, but authenticated routes will never use the principal bucket.
+///
+/// `auth_extractor_mounted` should be `true` when the project has auth configured
+/// (e.g. `[auth]` section present and enabled in `autumn.toml`).
+///
+/// In strict mode (`autumn doctor --strict`), a warning is surfaced as an error.
+pub fn check_rate_limit_key_strategy_impl(
+    key_strategy: &str,
+    auth_extractor_mounted: bool,
+) -> CheckResult {
+    if !key_strategy.is_empty()
+        && key_strategy != "ip"
+        && key_strategy != "api_token"
+        && key_strategy != "authenticated_principal"
+    {
+        return CheckResult {
+            name: "rate_limit_key_strategy",
+            status: CheckStatus::Fail,
+            detail: Some(format!(
+                "rate_limit.key_strategy = {key_strategy:?} is not a valid strategy"
+            )),
+            hint: Some("Expected \"ip\", \"api_token\", or \"authenticated_principal\""),
+        };
+    }
+
+    if key_strategy == "authenticated_principal" && !auth_extractor_mounted {
+        return CheckResult {
+            name: "rate_limit_key_strategy",
+            status: CheckStatus::Warn,
+            detail: Some(
+                "rate_limit.key_strategy = \"authenticated_principal\" is configured \
+                 but no auth extractor is mounted — unauthenticated requests will \
+                 always fall back to IP keying, so the per-principal budget \
+                 is never applied to authenticated callers"
+                    .into(),
+            ),
+            hint: Some(
+                "Mount an auth layer (e.g. `[auth]` in autumn.toml) or change \
+                 key_strategy to \"ip\" or \"api_token\"",
+            ),
+        };
+    }
+
+    CheckResult {
+        name: "rate_limit_key_strategy",
+        status: CheckStatus::Pass,
+        detail: Some(format!(
+            "rate_limit.key_strategy = {:?} is compatible with the current auth configuration",
+            if key_strategy.is_empty() {
+                "ip"
+            } else {
+                key_strategy
+            }
+        )),
+        hint: None,
+    }
+}
+
 pub fn check_trusted_hosts_impl(hosts: &[String], is_production: bool) -> CheckResult {
     let normalized: Vec<String> = hosts
         .iter()
@@ -1142,11 +1205,50 @@ fn parse_config_bool(value: &str) -> Option<bool> {
     }
 }
 
-/// Resolve the signing secret from the environment or `autumn.toml`.
+/// Resolve the rate-limit key strategy from config/env.
 ///
 /// Priority:
-/// 1. `AUTUMN_SECURITY__SIGNING_SECRET` env var
-/// 2. `[security] signing_secret` in `autumn.toml`
+/// 1. `AUTUMN_SECURITY__RATE_LIMIT__KEY_STRATEGY` env var
+/// 2. `[security.rate_limit] key_strategy` in `autumn.toml`
+fn resolve_rate_limit_key_strategy() -> String {
+    if let Ok(val) = std::env::var("AUTUMN_SECURITY__RATE_LIMIT__KEY_STRATEGY")
+        && !val.is_empty()
+    {
+        return val;
+    }
+    std::fs::read_to_string("autumn.toml")
+        .ok()
+        .and_then(|c| toml::from_str::<toml::Table>(&c).ok())
+        .and_then(|t| {
+            t.get("security")
+                .and_then(|s| s.get("rate_limit"))
+                .and_then(|rl| rl.get("key_strategy"))
+                .and_then(toml::Value::as_str)
+                .filter(|v| !v.is_empty())
+                .map(std::borrow::ToOwned::to_owned)
+        })
+        .unwrap_or_default()
+}
+
+/// Detect whether an auth extractor is mounted (i.e. `[auth]` section exists
+/// and is not explicitly disabled).
+fn resolve_auth_extractor_mounted() -> bool {
+    if let Ok(val) = std::env::var("AUTUMN_AUTH__ENABLED") {
+        return !val.trim().eq_ignore_ascii_case("false");
+    }
+    std::fs::read_to_string("autumn.toml")
+        .ok()
+        .and_then(|c| toml::from_str::<toml::Table>(&c).ok())
+        .is_some_and(|t| {
+            // [auth] section present and not explicitly disabled.
+            t.get("auth").is_some_and(|auth| {
+                auth.get("enabled")
+                    .and_then(toml::Value::as_bool)
+                    .unwrap_or(true) // enabled by default when section exists
+            })
+        })
+}
+
 fn resolve_optional_signing_secret() -> Option<String> {
     if let Ok(val) = std::env::var("AUTUMN_SECURITY__SIGNING_SECRET")
         && !val.is_empty()
@@ -1254,6 +1356,7 @@ fn tailwind_enabled() -> bool {
 /// 2. **Check phase** (parallel) — every applicable check is spawned on its own
 ///    thread so that slow operations (TCP connect, subprocess calls) overlap.
 ///    Results are joined back in display order.
+#[allow(clippy::too_many_lines)]
 pub fn run(opts: DoctorOptions) {
     use std::thread;
     type Task = Box<dyn FnOnce() -> CheckResult + Send>;
@@ -1279,6 +1382,8 @@ pub fn run(opts: DoctorOptions) {
     let signing_secret = resolve_optional_signing_secret();
     let trusted_hosts = resolve_trusted_hosts();
     let is_production = resolve_is_production();
+    let rate_limit_key_strategy = resolve_rate_limit_key_strategy();
+    let auth_extractor_mounted = resolve_auth_extractor_mounted();
 
     // ── Phase 2: build tasks in display order ────────────────────────────────
     let mut tasks: Vec<Task> = Vec::new();
@@ -1346,6 +1451,11 @@ pub fn run(opts: DoctorOptions) {
     }));
     tasks.push(Box::new(move || {
         check_trusted_hosts_impl(&trusted_hosts, is_production)
+    }));
+
+    // 8b. Rate-limit key-strategy misconfiguration
+    tasks.push(Box::new(move || {
+        check_rate_limit_key_strategy_impl(&rate_limit_key_strategy, auth_extractor_mounted)
     }));
 
     // 9. Stale artifacts (warn only, never fail)
@@ -2196,6 +2306,62 @@ foo = "bar"
         let json = to_json_output(&results, &summary);
         // Should parse as valid JSON
         assert!(serde_json::from_str::<serde_json::Value>(&json).is_ok());
+    }
+
+    // ── check_rate_limit_key_strategy ────────────────────────────────────────
+
+    #[test]
+    fn rate_limit_key_strategy_ip_always_passes() {
+        let r = check_rate_limit_key_strategy_impl("ip", false);
+        assert_eq!(r.status, CheckStatus::Pass);
+    }
+
+    #[test]
+    fn rate_limit_key_strategy_api_token_always_passes() {
+        let r = check_rate_limit_key_strategy_impl("api_token", false);
+        assert_eq!(r.status, CheckStatus::Pass);
+    }
+
+    #[test]
+    fn rate_limit_key_strategy_authenticated_principal_without_auth_warns_in_strict() {
+        let r = check_rate_limit_key_strategy_impl("authenticated_principal", false);
+        assert_eq!(r.status, CheckStatus::Warn);
+        assert!(r.hint.is_some());
+        assert!(
+            r.detail.as_deref().unwrap_or("").contains("auth extractor"),
+            "detail should mention auth extractor"
+        );
+    }
+
+    #[test]
+    fn rate_limit_key_strategy_authenticated_principal_with_auth_passes() {
+        let r = check_rate_limit_key_strategy_impl("authenticated_principal", true);
+        assert_eq!(r.status, CheckStatus::Pass);
+    }
+
+    #[test]
+    fn rate_limit_key_strategy_name_is_stable() {
+        let r = check_rate_limit_key_strategy_impl("authenticated_principal", false);
+        assert_eq!(r.name, "rate_limit_key_strategy");
+    }
+
+    #[test]
+    fn rate_limit_key_strategy_empty_strategy_passes() {
+        // Unconfigured / empty strategy is treated as default (ip).
+        let r = check_rate_limit_key_strategy_impl("", false);
+        assert_eq!(r.status, CheckStatus::Pass);
+    }
+
+    #[test]
+    fn rate_limit_key_strategy_invalid_value_fails() {
+        let r = check_rate_limit_key_strategy_impl("authenticated_principals", false);
+        assert_eq!(r.status, CheckStatus::Fail);
+        assert!(
+            r.detail
+                .as_deref()
+                .unwrap_or("")
+                .contains("not a valid strategy")
+        );
     }
 
     // ── check_maintenance_mode ────────────────────────────────────────────────
