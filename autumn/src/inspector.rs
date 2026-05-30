@@ -413,8 +413,12 @@ where
             .path_and_query()
             .map_or_else(|| req.uri().path().to_owned(), |pq| pq.as_str().to_owned());
 
-        // Self-exclusion: don't record the inspector's own requests.
-        if path.starts_with(&self.inspector_path_prefix) {
+        // Self-exclusion: don't record requests to the inspector's own subtree.
+        // Use exact match or subtree prefix ("/prefix/") to avoid false-excluding
+        // unrelated routes that share the same string prefix (e.g. "/_autumn/inspector").
+        let is_inspector = path == self.inspector_path_prefix
+            || path.starts_with(&format!("{}/", self.inspector_path_prefix));
+        if is_inspector {
             let fut = self.inner.call(req);
             return Box::pin(fut);
         }
@@ -461,8 +465,7 @@ where
             let n_plus_one = detect_n_plus_one(&queries, threshold);
             let recorded_at = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
+                .map_or(0, |d| d.as_secs());
 
             let record = RequestRecord {
                 id: 0, // assigned by InspectorBuffer::push
