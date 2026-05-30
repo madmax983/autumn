@@ -1083,7 +1083,7 @@ impl FeatureFlagService {
 
 /// Request extractor that resolves the current user's flag service handle.
 ///
-/// Extracts [`FeatureFlagService`] from the [`AppState`] extension slot. If no
+/// Extracts [`FeatureFlagService`] from the `AppState` extension slot. If no
 /// service is registered the extraction fails with `500 Internal Server Error`.
 ///
 /// ```rust,ignore
