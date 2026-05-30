@@ -997,6 +997,8 @@ pub mod pg {
             let cloned = store.clone();
             // Clone starts with an empty cache, so this is a Miss.
             assert_eq!(cloned.cached("cached"), CacheLookup::Miss);
+            // Original still holds its value — confirming the two caches are independent.
+            assert!(matches!(store.cached("cached"), CacheLookup::Hit(Some(_))));
         }
     }
 }
