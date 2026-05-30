@@ -26,6 +26,8 @@ use crate::channels::Channels;
 #[cfg(feature = "db")]
 use crate::db::DbState;
 use crate::middleware;
+#[cfg(feature = "presence")]
+use crate::presence::Presence;
 use crate::probe;
 #[cfg(feature = "ws")]
 use tokio_util::sync::CancellationToken;
@@ -100,6 +102,13 @@ pub struct AppState {
     /// [`channels()`](Self::channels) for convenient access.
     #[cfg(feature = "ws")]
     pub(crate) channels: Channels,
+
+    /// Distributed presence tracker layered on top of [`Channels`].
+    ///
+    /// Available when the `presence` feature is enabled. Use
+    /// [`presence()`](Self::presence) for convenient access.
+    #[cfg(feature = "presence")]
+    pub(crate) presence: Presence,
 
     /// Cancellation token signalled during graceful shutdown.
     ///
@@ -421,6 +430,13 @@ impl AppState {
         &self.channels
     }
 
+    /// Returns a reference to the distributed presence tracker.
+    #[cfg(feature = "presence")]
+    #[must_use]
+    pub const fn presence(&self) -> &Presence {
+        &self.presence
+    }
+
     /// Returns a high-level broadcast facade for raw and htmx HTML payloads.
     #[cfg(feature = "ws")]
     #[must_use]
@@ -471,6 +487,8 @@ impl AppState {
     /// WebSocket channel registries.
     #[must_use]
     pub fn detached() -> Self {
+        #[cfg(feature = "ws")]
+        let channels = Channels::new(32);
         Self {
             extensions: Arc::new(std::sync::RwLock::new(HashMap::new())),
             #[cfg(feature = "db")]
@@ -486,8 +504,10 @@ impl AppState {
             task_registry: actuator::TaskRegistry::new(),
             job_registry: actuator::JobRegistry::new(),
             config_props: actuator::ConfigProperties::default(),
+            #[cfg(feature = "presence")]
+            presence: Presence::new(channels.clone()),
             #[cfg(feature = "ws")]
-            channels: Channels::new(32),
+            channels,
             #[cfg(feature = "ws")]
             shutdown: CancellationToken::new(),
             policy_registry: PolicyRegistry::default(),

@@ -595,6 +595,8 @@ impl TestApp {
         crate::cache::clear_global_cache();
 
         let probes = crate::probe::ProbeState::ready_for_test();
+        #[cfg(feature = "ws")]
+        let test_channels = crate::channels::Channels::new(32);
         #[cfg_attr(not(feature = "ws"), allow(unused_mut))]
         let mut state = AppState {
             extensions: std::sync::Arc::new(std::sync::RwLock::new(
@@ -613,8 +615,11 @@ impl TestApp {
             task_registry: crate::actuator::TaskRegistry::new(),
             job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
+            #[cfg(feature = "presence")]
+            presence: crate::presence::Presence::new(test_channels.clone()),
             #[cfg(feature = "ws")]
-            channels: crate::channels::Channels::new(32),
+            channels: test_channels,
+
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
             policy_registry: crate::authorization::PolicyRegistry::default(),
@@ -655,6 +660,10 @@ impl TestApp {
                     vec![interceptor],
                 ),
             ));
+            #[cfg(feature = "presence")]
+            {
+                state.presence = crate::presence::Presence::new(state.channels.clone());
+            }
         }
         #[cfg(feature = "oauth2")]
         if let Some(interceptor) = self.http_interceptor {

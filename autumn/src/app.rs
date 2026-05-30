@@ -1762,6 +1762,10 @@ impl AppBuilder {
                     vec![interceptor],
                 ),
             ));
+            #[cfg(feature = "presence")]
+            {
+                state.presence = crate::presence::Presence::new(state.channels.clone());
+            }
         }
         #[cfg(feature = "oauth2")]
         if let Some(interceptor) = http_interceptor {
@@ -1884,6 +1888,23 @@ impl AppBuilder {
                 pool,
                 server_shutdown.child_token(),
             );
+        }
+
+        #[cfg(feature = "presence")]
+        {
+            let presence = state.presence().clone();
+            let sweep_shutdown = server_shutdown.child_token();
+            tokio::spawn(async move {
+                let interval = std::time::Duration::from_secs(15);
+                loop {
+                    tokio::select! {
+                        () = tokio::time::sleep(interval) => {
+                            presence.sweep_expired();
+                        }
+                        () = sweep_shutdown.cancelled() => break,
+                    }
+                }
+            });
         }
 
         tracing::info!(addr = %addr, "Listening");
@@ -2275,6 +2296,10 @@ impl AppBuilder {
                     vec![interceptor],
                 ),
             ));
+            #[cfg(feature = "presence")]
+            {
+                state.presence = crate::presence::Presence::new(state.channels.clone());
+            }
         }
         #[cfg(feature = "oauth2")]
         if let Some(interceptor) = http_interceptor {
@@ -2619,6 +2644,10 @@ impl AppBuilder {
                     vec![interceptor],
                 ),
             ));
+            #[cfg(feature = "presence")]
+            {
+                state.presence = crate::presence::Presence::new(state.channels.clone());
+            }
         }
         #[cfg(feature = "oauth2")]
         if let Some(interceptor) = http_interceptor {
@@ -4622,6 +4651,8 @@ fn build_state(
         task_registry: crate::actuator::TaskRegistry::new(),
         job_registry: crate::actuator::JobRegistry::new(),
         config_props: crate::actuator::ConfigProperties::from_config(config),
+        #[cfg(feature = "presence")]
+        presence: crate::presence::Presence::new(channels.clone()),
         #[cfg(feature = "ws")]
         channels,
         #[cfg(feature = "ws")]
@@ -4890,6 +4921,8 @@ mod tests {
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
+            #[cfg(feature = "presence")]
+            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
             policy_registry: crate::authorization::PolicyRegistry::default(),
@@ -5808,6 +5841,8 @@ mod tests {
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
+            #[cfg(feature = "presence")]
+            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
             policy_registry: crate::authorization::PolicyRegistry::default(),
@@ -5910,6 +5945,8 @@ mod tests {
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
+            #[cfg(feature = "presence")]
+            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
             policy_registry: crate::authorization::PolicyRegistry::default(),
@@ -5987,6 +6024,8 @@ mod tests {
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
+            #[cfg(feature = "presence")]
+            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
             policy_registry: crate::authorization::PolicyRegistry::default(),
@@ -6275,6 +6314,8 @@ mod tests {
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
+            #[cfg(feature = "presence")]
+            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
             policy_registry: crate::authorization::PolicyRegistry::default(),
@@ -6579,6 +6620,8 @@ mod tests {
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
+            #[cfg(feature = "presence")]
+            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
             policy_registry: crate::authorization::PolicyRegistry::default(),
@@ -6725,6 +6768,8 @@ mod tests {
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
+            #[cfg(feature = "presence")]
+            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
             policy_registry: crate::authorization::PolicyRegistry::default(),
@@ -6769,6 +6814,8 @@ mod tests {
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
+            #[cfg(feature = "presence")]
+            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
             policy_registry: crate::authorization::PolicyRegistry::default(),
@@ -7022,6 +7069,8 @@ mod tests {
             job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             channels: crate::channels::Channels::new(32),
+            #[cfg(feature = "presence")]
+            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
             shutdown: tokio_util::sync::CancellationToken::new(),
             policy_registry: crate::authorization::PolicyRegistry::default(),
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
@@ -7090,6 +7139,8 @@ mod tests {
             job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             channels: crate::channels::Channels::new(32),
+            #[cfg(feature = "presence")]
+            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
             shutdown: tokio_util::sync::CancellationToken::new(),
             policy_registry: crate::authorization::PolicyRegistry::default(),
             forbidden_response: crate::authorization::ForbiddenResponse::default(),

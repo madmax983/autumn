@@ -162,6 +162,10 @@ pub mod pagination;
 pub mod paths;
 pub mod prelude;
 pub use paths::PathExt;
+#[cfg(feature = "presence")]
+pub mod presence;
+#[cfg(feature = "presence")]
+pub use presence::{Presence, PresenceEntry, PresenceEvent, PresenceHandle};
 pub(crate) mod route;
 pub use route::{RepositoryApiMeta, Route, RouteIdempotency};
 /// First-class Markdown rendering with frontmatter parsing and SSG integration.
