@@ -1894,10 +1894,10 @@ impl AppBuilder {
                 let interval = std::time::Duration::from_secs(30);
                 loop {
                     tokio::select! {
-                        _ = tokio::time::sleep(interval) => {
+                        () = tokio::time::sleep(interval) => {
                             presence.sweep_expired();
                         }
-                        _ = sweep_shutdown.cancelled() => break,
+                        () = sweep_shutdown.cancelled() => break,
                     }
                 }
             });

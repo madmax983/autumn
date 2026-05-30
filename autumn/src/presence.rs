@@ -117,12 +117,12 @@ impl PresenceInner {
     }
 
     fn refresh(&mut self, topic: &str, key: &str, connection_id: u64) {
-        if let Some(by_key) = self.entries.get_mut(topic) {
-            if let Some(conns) = by_key.get_mut(key) {
-                for c in conns.iter_mut() {
-                    if c.connection_id == connection_id {
-                        c.last_heartbeat = Instant::now();
-                    }
+        if let Some(by_key) = self.entries.get_mut(topic)
+            && let Some(conns) = by_key.get_mut(key)
+        {
+            for c in conns.iter_mut() {
+                if c.connection_id == connection_id {
+                    c.last_heartbeat = Instant::now();
                 }
             }
         }
@@ -227,6 +227,10 @@ impl Presence {
     /// `presence:{topic}`. The returned [`PresenceHandle`] keeps the entry
     /// alive; when it is dropped a leave event is broadcast and the entry is
     /// removed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal presence store mutex is poisoned.
     pub fn track(
         &self,
         topic: impl Into<String>,
@@ -263,6 +267,10 @@ impl Presence {
     /// Connections with the same `key` are collapsed into one [`PresenceEntry`]
     /// with a list of `metas` — one per active connection (Phoenix
     /// `Presence.list/1` semantics).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal presence store mutex is poisoned.
     #[must_use]
     pub fn list(&self, topic: &str) -> Vec<PresenceEntry> {
         self.inner
@@ -277,6 +285,10 @@ impl Presence {
     /// This is called automatically by the background sweep task started during
     /// `AppBuilder::run`. You only need to call it manually in tests or custom
     /// task runners.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal presence store mutex is poisoned.
     pub fn sweep_expired(&self) {
         let removed = {
             let mut inner = self.inner.lock().expect("presence lock poisoned");
@@ -309,6 +321,10 @@ impl PresenceHandle {
     /// Refresh the heartbeat for this entry, extending its lease by the full TTL.
     ///
     /// Call from your WebSocket ping loop or SSE keep-alive to prevent eviction.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal presence store mutex is poisoned.
     pub fn refresh(&self) {
         let mut inner = self.inner.lock().expect("presence lock poisoned");
         inner.refresh(&self.topic, &self.key, self.connection_id);

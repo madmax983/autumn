@@ -433,7 +433,7 @@ impl AppState {
     /// Returns a reference to the distributed presence tracker.
     #[cfg(feature = "ws")]
     #[must_use]
-    pub fn presence(&self) -> &Presence {
+    pub const fn presence(&self) -> &Presence {
         &self.presence
     }
 
