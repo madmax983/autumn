@@ -42,7 +42,9 @@ jobs:
         run: cargo test --workspace
       - name: Run Docker-dependent tests
         if: runner.os == 'Linux'
-        run: cargo test -p autumn-web --test db_hooks_lifecycle -- --ignored
+        run: |
+          cargo test -p autumn-web --test db_hooks_lifecycle -- --ignored
+          cargo test -p autumn-web --all-features --test feature_flags_pg_integration -- --ignored
 
   coverage:
     name: Coverage
@@ -60,6 +62,8 @@ jobs:
           cargo llvm-cov --workspace --all-features --no-report
           cargo llvm-cov --no-report -p autumn-web --all-features \
             --test db_hooks_lifecycle -- --ignored
+          cargo llvm-cov --no-report -p autumn-web --all-features \
+            --test feature_flags_pg_integration -- --ignored
           cargo llvm-cov report --lcov --output-path lcov.info
       - name: Upload to Codecov
         uses: codecov/codecov-action@v6
