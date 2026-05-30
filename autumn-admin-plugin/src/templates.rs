@@ -2101,8 +2101,10 @@ mod tests {
             per_page: 100,
         };
 
-        let html = model_history_page(&r, "posts", "Post", "Posts", 42, &history, "/admin", "/ops")
-            .into_string();
+        let html = model_history_page(
+            &r, "posts", "Post", "Posts", 42, &history, "/admin", "/ops", false,
+        )
+        .into_string();
 
         assert!(
             html.contains("/admin/posts/42/history?page=1&amp;per_page=100"),

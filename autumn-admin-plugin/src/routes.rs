@@ -159,8 +159,6 @@ pub fn admin_router(
         // Version history pane (only reachable when model.has_history() is true)
         .route("/{slug}/{id}/history", routing::get(model_history))
         .route("/{slug}/{id}/edit", routing::get(model_edit_form))
-        // Version history pane (only reachable when model.has_history() is true)
-        .route("/{slug}/{id}/history", routing::get(model_history))
         // Bulk-action endpoint. Receives selected `ids[]` and an `action`
         // name from the list-view form; dispatches to
         // `AdminModel::execute_action`.

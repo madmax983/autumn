@@ -209,51 +209,6 @@ impl AdminHistoryPage {
 
 // ── The core trait ──────────────────────────────────────────────────
 
-// -- Version history ---------------------------------------------------------
-
-/// A single entry in the admin History pane for an opted-in model.
-#[derive(Debug, Clone)]
-pub struct AdminHistoryEntry {
-    /// Auto-incrementing primary key in the history table.
-    pub id: i64,
-    /// Actor identifier (`user_id` or `"system"`).
-    pub actor: String,
-    /// Operation: `"insert"`, `"update"`, or `"delete"`.
-    pub op: String,
-    /// Request / trace correlation ID.
-    pub request_id: Option<String>,
-    /// Column-level changes, serialized as JSON for template rendering.
-    pub changes: Vec<Value>,
-    /// When this entry was recorded.
-    pub recorded_at: DateTime<Utc>,
-}
-
-/// Paginated history result for the admin History pane.
-#[derive(Debug, Clone)]
-pub struct AdminHistoryPage {
-    pub entries: Vec<AdminHistoryEntry>,
-    pub total: u64,
-    pub page: u64,
-    pub per_page: u64,
-}
-
-impl AdminHistoryPage {
-    /// Total number of pages.
-    #[must_use]
-    pub const fn total_pages(&self) -> u64 {
-        if self.per_page == 0 {
-            return 0;
-        }
-        self.total.div_ceil(self.per_page)
-    }
-
-    /// Whether there is a next page.
-    #[must_use]
-    pub const fn has_next_page(&self) -> bool {
-        self.page < self.total_pages()
-    }
-}
-
 /// Type alias for the boxed future returned by async `AdminModel` methods.
 pub type AdminFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, AdminError>> + Send + 'a>>;
 
