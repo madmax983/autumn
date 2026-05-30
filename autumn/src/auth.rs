@@ -1047,13 +1047,7 @@ pub trait ApiTokenStore: Send + Sync + 'static {
 #[must_use]
 pub fn hash_api_token(raw: &str) -> String {
     use sha2::Digest as _;
-    sha2::Sha256::digest(raw.as_bytes())
-        .iter()
-        .fold(String::with_capacity(64), |mut s, b| {
-            use std::fmt::Write as _;
-            let _ = write!(s, "{b:02x}");
-            s
-        })
+    hex::encode(sha2::Sha256::digest(raw.as_bytes()))
 }
 
 /// Generate a 256-bit random raw API token as a lowercase hex string.

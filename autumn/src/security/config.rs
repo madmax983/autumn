@@ -242,11 +242,7 @@ pub fn hmac_sha256_hex(key: &[u8], message: &[u8]) -> String {
     let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
     mac.update(message);
     let bytes = mac.finalize().into_bytes();
-    bytes.iter().fold(String::with_capacity(64), |mut acc, b| {
-        use std::fmt::Write as _;
-        let _ = write!(acc, "{b:02x}");
-        acc
-    })
+    hex::encode(bytes)
 }
 
 /// Constant-time string comparison for HMAC verification.

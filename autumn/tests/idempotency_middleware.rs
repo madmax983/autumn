@@ -78,14 +78,7 @@ fn principal_digest() -> String {
     let mut hasher = sha2::Sha256::new();
     hasher.update(b"authorization:");
     hasher.update(b"\nsession:");
-    hasher
-        .finalize()
-        .iter()
-        .fold(String::with_capacity(64), |mut out, byte| {
-            use std::fmt::Write as _;
-            let _ = write!(out, "{byte:02x}");
-            out
-        })
+    hex::encode(hasher.finalize())
 }
 
 fn storage_key(method: &str, path: &str, idempotency_key: &str) -> String {
@@ -108,17 +101,7 @@ fn storage_key(method: &str, path: &str, idempotency_key: &str) -> String {
     push_component(&mut storage, "scope-header-count", b"0");
     push_component(&mut storage, "principal", principal.as_bytes());
     push_component(&mut storage, "idempotency-key", idempotency_key.as_bytes());
-    format!(
-        "v2:{}",
-        storage
-            .finalize()
-            .iter()
-            .fold(String::with_capacity(64), |mut out, byte| {
-                use std::fmt::Write as _;
-                let _ = write!(out, "{byte:02x}");
-                out
-            })
-    )
+    format!("v2:{}", hex::encode(storage.finalize()))
 }
 
 /// Axum middleware that injects a 5-byte `UploadConfig` limit into extensions.
