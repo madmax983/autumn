@@ -532,6 +532,45 @@ pub mod pg {
                 .execute(conn)?;
             Ok(())
         }
+
+        /// Spawn a background thread that polls `feature_flag_changes` and
+        /// invalidates this store's cache whenever a remote replica writes a flag.
+        ///
+        /// Without this, the cache can only be invalidated when the TTL expires.
+        /// Call this once at startup when using `PgFlagStore` in a multi-replica
+        /// deployment:
+        ///
+        /// ```rust,ignore
+        /// let store = Arc::new(PgFlagStore::new(db_url));
+        /// PgFlagStore::spawn_poll_listener(Arc::clone(&store), Duration::from_secs(1));
+        /// ```
+        ///
+        /// The thread runs indefinitely; the returned handle can be detached.
+        pub fn spawn_poll_listener(
+            store: std::sync::Arc<Self>,
+            poll_interval: std::time::Duration,
+        ) -> std::thread::JoinHandle<()> {
+            std::thread::spawn(move || {
+                let mut last_id: i64 = 0;
+                loop {
+                    std::thread::sleep(poll_interval);
+                    if let Ok(mut conn) = store.connect() {
+                        let rows: Vec<ChangeIdRow> = diesel::sql_query(
+                            "SELECT id, key FROM feature_flag_changes \
+                             WHERE id > $1 ORDER BY id",
+                        )
+                        .bind::<diesel::sql_types::BigInt, _>(last_id)
+                        .load::<ChangeIdRow>(&mut conn)
+                        .unwrap_or_default();
+
+                        for row in rows {
+                            last_id = last_id.max(row.id);
+                            store.invalidate(&row.key);
+                        }
+                    }
+                }
+            })
+        }
     }
 
     #[derive(diesel::QueryableByName)]
@@ -800,45 +839,6 @@ pub mod pg {
             .map_err(|e| FlagStoreError::Backend(e.to_string()))?;
             self.invalidate(key);
             Ok(())
-        }
-
-        /// Spawn a background thread that polls `feature_flag_changes` and
-        /// invalidates this store's cache whenever a remote replica writes a flag.
-        ///
-        /// Without this, the cache can only be invalidated when the TTL expires.
-        /// Call this once at startup when using `PgFlagStore` in a multi-replica
-        /// deployment:
-        ///
-        /// ```rust,ignore
-        /// let store = Arc::new(PgFlagStore::new(db_url));
-        /// PgFlagStore::spawn_poll_listener(Arc::clone(&store), Duration::from_secs(1));
-        /// ```
-        ///
-        /// The thread runs indefinitely; the returned handle can be detached.
-        pub fn spawn_poll_listener(
-            store: std::sync::Arc<Self>,
-            poll_interval: std::time::Duration,
-        ) -> std::thread::JoinHandle<()> {
-            std::thread::spawn(move || {
-                let mut last_id: i64 = 0;
-                loop {
-                    std::thread::sleep(poll_interval);
-                    if let Ok(mut conn) = store.connect() {
-                        let rows: Vec<ChangeIdRow> = diesel::sql_query(
-                            "SELECT id, key FROM feature_flag_changes \
-                             WHERE id > $1 ORDER BY id",
-                        )
-                        .bind::<diesel::sql_types::BigInt, _>(last_id)
-                        .load::<ChangeIdRow>(&mut conn)
-                        .unwrap_or_default();
-
-                        for row in rows {
-                            last_id = last_id.max(row.id);
-                            store.invalidate(&row.key);
-                        }
-                    }
-                }
-            })
         }
 
         fn history(
