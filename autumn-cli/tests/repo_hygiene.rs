@@ -569,6 +569,41 @@ fn version_history_migration_has_tenant_scope_column_and_index() {
 }
 
 #[test]
+fn runtime_config_migration_sorts_after_existing_framework_versions() {
+    let root = workspace_root();
+    let migrations_dir = root.join("autumn/migrations");
+    let mut runtime_config_version = None;
+    let mut version_history_version = None;
+
+    for entry in std::fs::read_dir(&migrations_dir)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", migrations_dir.display()))
+    {
+        let entry = entry.unwrap_or_else(|err| panic!("failed to read migration entry: {err}"));
+        let file_name = entry.file_name();
+        let file_name = file_name.to_string_lossy();
+        let Some((version, name)) = file_name.split_once('_') else {
+            continue;
+        };
+
+        match name {
+            "create_runtime_config" => runtime_config_version = Some(version.to_owned()),
+            "create_version_history" => version_history_version = Some(version.to_owned()),
+            _ => {}
+        }
+    }
+
+    let runtime_config_version =
+        runtime_config_version.expect("runtime config framework migration must exist");
+    let version_history_version =
+        version_history_version.expect("version history framework migration must exist");
+
+    assert!(
+        runtime_config_version > version_history_version,
+        "runtime config migration must sort after version history so new deployments roll back in release order"
+    );
+}
+
+#[test]
 fn benchmark_runtime_startup_applies_packaged_migrations() {
     let root = workspace_root();
 

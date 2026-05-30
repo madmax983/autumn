@@ -465,19 +465,10 @@ pub trait AdminModel: Send + Sync + 'static {
         Box::pin(async move { fut.await.map(|r| r.total) })
     }
 
-    // ── Version history ─────────────────────────────────────────────
-
     /// Whether this model has automatic record version history enabled.
     ///
-    /// When `true`, the admin panel renders a **History** tab on the
-    /// detail page. No route configuration is required from the app.
-    ///
-    /// Override and return `true` when using
-    /// `#[repository(Model, versioned = true)]`. The generated
-    /// `PgXxxRepository::version_history(record_id, filter)` method can be
-    /// called from [`get_history`](AdminModel::get_history) to bridge the
-    /// repository's history store into the admin panel, then converted into an
-    /// [`AdminHistoryPage`] with `AdminHistoryPage::from`.
+    /// When `true`, the admin panel renders a **History** affordance on the
+    /// detail page and serves `/{slug}/{id}/history`.
     fn has_history(&self) -> bool {
         false
     }
@@ -486,9 +477,6 @@ pub trait AdminModel: Send + Sync + 'static {
     ///
     /// The default implementation returns [`AdminError::Other`] so models
     /// that do not opt in get a clear error instead of a silent no-op.
-    /// Override this when `has_history` returns `true`, delegating to the
-    /// repository's generated `version_history` method and converting the
-    /// returned page into an [`AdminHistoryPage`] with `AdminHistoryPage::from`.
     fn get_history<'a>(
         &'a self,
         _pool: &'a diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,

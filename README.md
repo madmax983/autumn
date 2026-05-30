@@ -178,7 +178,7 @@ See [EXAMPLES.md](EXAMPLES.md) for the full catalog with personas, journeys, pre
 | [`examples/bookmarks`](examples/bookmarks) | Repository macro, generated CRUD API, profiles, scheduled tasks, and actuator endpoints |
 | [`examples/bookmarks-distributed`](examples/bookmarks-distributed) | Primary/replica Postgres, multi-replica web tier behind nginx, advisory-lock scheduling, and Docker Compose deployment |
 | [`examples/wiki`](examples/wiki) | Mutation hooks, revision history, generated REST API, and slug lifecycle management |
-| [`examples/reddit-clone`](examples/reddit-clone) | Full-featured Reddit clone: auth, sessions, CSRF, `#[secured]`, transactional email, `#[job]`, `#[ws]` channels, Redis fan-out, htmx voting, and profiles |
+| [`examples/reddit-clone`](examples/reddit-clone) | Full-featured Reddit clone: auth, sessions, CSRF, `#[secured]`, transactional email, `#[job]`, `#[ws]` channels, Redis fan-out, htmx voting, profiles, and live-tunable runtime config |
 | [`examples/custom_config_loader`](examples/custom_config_loader) | Replace the default TOML + env config loader with a custom `ConfigLoader` (JSON file, Vault, Secrets Manager, etc.) |
 | [`examples/ws-echo`](examples/ws-echo) | WebSocket echo server, SSE fan-out, htmx live list, and Redis-backed multi-replica pub/sub |
 | [`examples/signed-webhooks`](examples/signed-webhooks) | Signed webhook intake with provider-shaped HMAC verification, replay protection, and fixture tests |

@@ -19,6 +19,8 @@
 //   Profiles            -> autumn.toml + autumn-dev.toml dev overrides
 //   Actuator            -> /health, /actuator/health, /actuator/info, /actuator/tasks
 //   HTML stack          -> Maud templates, htmx interactivity, Tailwind CSS
+//   Runtime config      -> ConfigRegistry + RuntimeConfigService; live-tunable posts_per_page
+//                          and registration_open without a restart (see src/config.rs)
 //
 // Run with:   cargo run -p reddit-clone   (first dev boot applies reddit migrations and
 //                                          starts the job runtime + durable live-feed relay)
@@ -43,6 +45,7 @@ async fn main() {
     let webhook_plugin = OutboundWebhookPlugin::new(webhook_store);
 
     autumn_web::app()
+        .migrations(autumn_web::migrate::FRAMEWORK_MIGRATIONS)
         .migrations(MIGRATIONS)
         .routes(routes![
             routes::posts::front_page,

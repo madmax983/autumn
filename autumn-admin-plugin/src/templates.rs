@@ -8,6 +8,7 @@ use autumn_web::flash::FlashMessage;
 use autumn_web::job::{
     JobAdminPage, JobAdminRecord, JobAdminSnapshot, JobAdminStatus, JobScheduleSummary,
 };
+use autumn_web::runtime_config::{ConfigChangeRecord, ConfigEntry};
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 use serde_json::Value;
 
@@ -21,6 +22,7 @@ const HTMX_JS_PATH: &str = "/static/js/htmx.min.js";
 const HTMX_CSRF_JS_PATH: &str = "/static/js/autumn-htmx-csrf.js";
 const TOKENS_CSS: &str = include_str!("tokens.css");
 const JOBS_NAV_SLUG: &str = "__admin_jobs";
+const RUNTIME_CONFIG_NAV_SLUG: &str = "__admin_config";
 const FLASH_CSS: &str = "\
 .flash {
     padding: 0.75rem 1rem;
@@ -400,6 +402,7 @@ pub fn admin_layout(
     actuator_prefix: &str,
     csrf_token: &str,
     messages: &[FlashMessage],
+    show_config: bool,
     content: &Markup,
 ) -> Markup {
     html! {
@@ -455,6 +458,14 @@ pub fn admin_layout(
                                         "Jobs"
                                     }
                                 }
+                                @if show_config {
+                                    li {
+                                        a href={ (prefix) "/config" }
+                                          class=[(active_slug == Some(RUNTIME_CONFIG_NAV_SLUG)).then_some("active")] {
+                                            "Runtime Config"
+                                        }
+                                    }
+                                }
                                 li { a href={ (actuator_prefix) "/ui" } { "Actuator" } }
                             }
                         }
@@ -483,6 +494,7 @@ fn csrf_hidden_input(csrf_token: &str, csrf_form_field: &str) -> Markup {
 }
 
 /// Render the built-in jobs admin dashboard.
+#[allow(clippy::too_many_arguments)]
 pub fn jobs_page(
     registry: &AdminRegistry,
     snapshot: &JobAdminSnapshot,
@@ -491,6 +503,7 @@ pub fn jobs_page(
     csrf_form_field: &str,
     prefix: &str,
     actuator_prefix: &str,
+    show_config: bool,
 ) -> Markup {
     let content = html! {
         div class="breadcrumbs" {
@@ -557,6 +570,7 @@ pub fn jobs_page(
         actuator_prefix,
         csrf_token,
         messages,
+        show_config,
         &content,
     )
 }
@@ -801,6 +815,7 @@ pub fn dashboard_page(
     csrf_token: &str,
     prefix: &str,
     actuator_prefix: &str,
+    show_config: bool,
 ) -> Markup {
     let content = html! {
         h1 style="font-size: 1.5rem; font-weight: 700; margin-bottom: 1.5rem;" {
@@ -838,6 +853,7 @@ pub fn dashboard_page(
         actuator_prefix,
         csrf_token,
         messages,
+        show_config,
         &content,
     )
 }
@@ -865,6 +881,7 @@ pub fn model_list_page(
     csrf_form_field: &str,
     prefix: &str,
     actuator_prefix: &str,
+    show_config: bool,
 ) -> Markup {
     // Password fields are documented as write-only — never surface their
     // values (raw or hashed) in the index view. Hidden fields are
@@ -1040,6 +1057,7 @@ pub fn model_list_page(
         actuator_prefix,
         csrf_token,
         messages,
+        show_config,
         &content,
     )
 }
@@ -1065,6 +1083,7 @@ pub fn model_detail_page(
     prefix: &str,
     actuator_prefix: &str,
     has_history: bool,
+    show_config: bool,
 ) -> Markup {
     let content = html! {
         div class="breadcrumbs" {
@@ -1114,6 +1133,7 @@ pub fn model_detail_page(
         actuator_prefix,
         csrf_token,
         messages,
+        show_config,
         &content,
     )
 }
@@ -1137,6 +1157,7 @@ pub fn model_form_page(
     csrf_form_field: &str,
     prefix: &str,
     actuator_prefix: &str,
+    show_config: bool,
 ) -> Markup {
     let is_edit = id.is_some();
     let title = if is_edit {
@@ -1202,7 +1223,234 @@ pub fn model_form_page(
         actuator_prefix,
         csrf_token,
         messages,
+        show_config,
         &content,
+    )
+}
+
+// ── Runtime config page ─────────────────────────────────────────────
+
+/// Render the runtime config management page.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub fn config_page(
+    registry: &AdminRegistry,
+    entries: &[ConfigEntry],
+    messages: &[FlashMessage],
+    csrf_token: &str,
+    csrf_form_field: &str,
+    prefix: &str,
+    actuator_prefix: &str,
+) -> Markup {
+    let content = html! {
+        div class="breadcrumbs" {
+            a href=(prefix) { "Admin" }
+            span class="sep" { "›" }
+            span { "Runtime Config" }
+        }
+
+        h1 style="font-size: 1.5rem; font-weight: 700; margin-bottom: 0.5rem;" {
+            "Runtime Config"
+        }
+        p style="color: var(--text-muted); margin-bottom: 1.5rem; font-size: 0.875rem;" {
+            "Live-tunable operational knobs. Changes take effect immediately without a restart."
+        }
+
+        @if entries.is_empty() {
+            div class="card" {
+                p style="color: var(--text-muted); padding: 1rem;" {
+                    "No config keys have been registered. Declare keys with "
+                    code { "ConfigRegistry::define" }
+                    " and pass the service via "
+                    code { "AdminPlugin::with_runtime_config" }
+                    "."
+                }
+            }
+        } @else {
+            div class="card" {
+                table class="table" {
+                    thead {
+                        tr {
+                            th { "Key" }
+                            th { "Type" }
+                            th { "Current Value" }
+                            th { "Default" }
+                            th { "Status" }
+                            th { "Actions" }
+                        }
+                    }
+                    tbody {
+                        @for entry in entries {
+                            tr {
+                                td {
+                                    strong { (entry.name) }
+                                    @if let Some(desc) = &entry.description {
+                                        br;
+                                        span style="color: var(--text-muted); font-size: 0.8125rem;" {
+                                            (desc)
+                                        }
+                                    }
+                                }
+                                td { code style="font-size: 0.8125rem;" { (entry.value_type) } }
+                                td { code style="font-size: 0.8125rem;" { (entry.current.to_raw()) } }
+                                td {
+                                    code style="font-size: 0.8125rem; color: var(--text-muted);" {
+                                        (entry.default.to_raw())
+                                    }
+                                }
+                                td {
+                                    @if entry.is_overridden {
+                                        span style="color: var(--warning); font-size: 0.8125rem; font-weight: 500;" {
+                                            "overridden"
+                                        }
+                                    } @else {
+                                        span style="color: var(--text-muted); font-size: 0.8125rem;" {
+                                            "default"
+                                        }
+                                    }
+                                }
+                                td {
+                                    div style="display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: center;" {
+                                        form method="post"
+                                            action={ (prefix) "/config/" (entry.name) "/set" }
+                                            style="display: flex; gap: 0.25rem; align-items: center;" {
+                                            (csrf_hidden_input(csrf_token, csrf_form_field))
+                                            input type="text" name="value"
+                                                value=(entry.current.to_raw())
+                                                style="width: 11rem; font-size: 0.8125rem; padding: 0.25rem 0.5rem; border: 1px solid var(--border); border-radius: 0.25rem;" {}
+                                            button type="submit" class="btn btn-sm btn-primary" { "Save" }
+                                        }
+                                        @if entry.is_overridden {
+                                            form method="post"
+                                                action={ (prefix) "/config/" (entry.name) "/unset" } {
+                                                (csrf_hidden_input(csrf_token, csrf_form_field))
+                                                button type="submit" class="btn btn-sm" { "Reset" }
+                                            }
+                                        }
+                                        a href={ (prefix) "/config/" (entry.name) "/history" }
+                                            class="btn btn-sm" { "History" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    };
+    admin_layout(
+        registry,
+        Some(RUNTIME_CONFIG_NAV_SLUG),
+        "Runtime Config",
+        prefix,
+        actuator_prefix,
+        csrf_token,
+        messages,
+        true,
+        &content,
+    )
+}
+
+/// Render the change history page for a single config key.
+#[allow(clippy::too_many_arguments)]
+pub fn config_history_page(
+    registry: &AdminRegistry,
+    key: &str,
+    history: &[ConfigChangeRecord],
+    messages: &[FlashMessage],
+    csrf_token: &str,
+    prefix: &str,
+    actuator_prefix: &str,
+) -> Markup {
+    let title = format!("History: {key}");
+    let content = html! {
+        div class="breadcrumbs" {
+            a href=(prefix) { "Admin" }
+            span class="sep" { "›" }
+            a href={ (prefix) "/config" } { "Runtime Config" }
+            span class="sep" { "›" }
+            span { (key) }
+        }
+
+        h1 style="font-size: 1.5rem; font-weight: 700; margin-bottom: 1rem;" {
+            "History: " (key)
+        }
+
+        div class="card" {
+            @if history.is_empty() {
+                p style="color: var(--text-muted); padding: 1rem;" {
+                    "No changes recorded for this key yet."
+                }
+            } @else {
+                table class="table" {
+                    thead {
+                        tr {
+                            th { "Timestamp (UTC)" }
+                            th { "Actor" }
+                            th { "Old Value" }
+                            th { "New Value" }
+                        }
+                    }
+                    tbody {
+                        @for record in history {
+                            tr {
+                                td {
+                                    code style="font-size: 0.8125rem;" {
+                                        (format_timestamp(record.timestamp_secs))
+                                    }
+                                }
+                                td { (record.actor.as_deref().unwrap_or("—")) }
+                                td {
+                                    @match &record.old_value {
+                                        Some(v) => {
+                                            code style="font-size: 0.8125rem;" { (v.to_raw()) }
+                                        }
+                                        None => {
+                                            span style="color: var(--text-muted);" { "—" }
+                                        }
+                                    }
+                                }
+                                td {
+                                    @match &record.new_value {
+                                        Some(v) => {
+                                            code style="font-size: 0.8125rem;" { (v.to_raw()) }
+                                        }
+                                        None => {
+                                            span style="color: var(--text-muted); font-style: italic;" {
+                                                "reset to default"
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        a href={ (prefix) "/config" } class="btn" style="margin-top: 1rem;" {
+            "← Back to Runtime Config"
+        }
+    };
+    admin_layout(
+        registry,
+        Some(RUNTIME_CONFIG_NAV_SLUG),
+        &title,
+        prefix,
+        actuator_prefix,
+        csrf_token,
+        messages,
+        true,
+        &content,
+    )
+}
+
+fn format_timestamp(ts: u64) -> String {
+    use chrono::{DateTime, Utc};
+    let secs = i64::try_from(ts).unwrap_or(i64::MAX);
+    DateTime::from_timestamp(secs, 0).map_or_else(
+        || ts.to_string(),
+        |dt: DateTime<Utc>| dt.format("%Y-%m-%d %H:%M:%S").to_string(),
     )
 }
 
@@ -1559,7 +1807,7 @@ fn pagination_range(current: u64, total: u64) -> Vec<u64> {
     pages
 }
 
-// ── Version history pane ────────────────────────────────────────────
+// -- Version history pane ----------------------------------------------------
 
 /// Render the version history pane for an opted-in model record.
 ///
@@ -1575,6 +1823,7 @@ pub fn model_history_page(
     history: &AdminHistoryPage,
     prefix: &str,
     actuator_prefix: &str,
+    show_config: bool,
 ) -> Markup {
     let record_display = format!("{model_name} #{record_id_val}");
     let history_page_href = |page: u64| {
@@ -1583,7 +1832,7 @@ pub fn model_history_page(
             history.per_page
         )
     };
-    let empty_messages: &[autumn_web::flash::FlashMessage] = &[];
+    let empty_messages: &[FlashMessage] = &[];
     let content = html! {
         div class="breadcrumbs" {
             a href=(prefix) { "Admin" }
@@ -1639,10 +1888,10 @@ pub fn model_history_page(
                                             ul class="change-list" {
                                                 @for change in &entry.changes {
                                                     li {
-                                                        @if let Some(col) = change.get("column").and_then(|v| v.as_str()) {
+                                                        @if let Some(col) = change.get("column").and_then(Value::as_str) {
                                                             code { (col) }
                                                         }
-                                                        @if change.get("sensitive").and_then(serde_json::Value::as_bool).unwrap_or(false) {
+                                                        @if change.get("sensitive").and_then(Value::as_bool).unwrap_or(false) {
                                                             span class="badge-sensitive" { " [sensitive]" }
                                                         } @else {
                                                             " "
@@ -1676,7 +1925,6 @@ pub fn model_history_page(
                     }
                 }
 
-                // Pagination
                 @if history.total_pages() > 1 {
                     div class="pagination" {
                         @if history.page > 1 {
@@ -1701,6 +1949,7 @@ pub fn model_history_page(
         actuator_prefix,
         "",
         empty_messages,
+        show_config,
         &content,
     )
 }
@@ -1852,8 +2101,10 @@ mod tests {
             per_page: 100,
         };
 
-        let html = model_history_page(&r, "posts", "Post", "Posts", 42, &history, "/admin", "/ops")
-            .into_string();
+        let html = model_history_page(
+            &r, "posts", "Post", "Posts", 42, &history, "/admin", "/ops", false,
+        )
+        .into_string();
 
         assert!(
             html.contains("/admin/posts/42/history?page=1&amp;per_page=100"),
@@ -1868,7 +2119,7 @@ mod tests {
     #[test]
     fn dashboard_emits_csrf_meta_and_script() {
         let r = dummy_registry();
-        let html = dashboard_page(&r, &[], &[], "tok-123", "/admin", "/ops").into_string();
+        let html = dashboard_page(&r, &[], &[], "tok-123", "/admin", "/ops", false).into_string();
         assert!(
             html.contains(r#"<meta name="csrf-token" content="tok-123""#),
             "CSRF meta tag missing: {html}"
@@ -1882,7 +2133,7 @@ mod tests {
     #[test]
     fn dashboard_uses_configured_actuator_prefix() {
         let r = dummy_registry();
-        let html = dashboard_page(&r, &[], &[], "tok", "/admin", "/ops").into_string();
+        let html = dashboard_page(&r, &[], &[], "tok", "/admin", "/ops", false).into_string();
         assert!(
             html.contains(r#"href="/ops/ui""#),
             "sidebar link wrong: {html}"
@@ -1995,6 +2246,7 @@ mod tests {
             "authenticity_token",
             "/admin",
             "/actuator",
+            false,
         )
         .into_string();
         assert!(html.contains("Jobs"));
@@ -2042,6 +2294,7 @@ mod tests {
             "authenticity_token",
             "/admin",
             "/actuator",
+            false,
         )
         .into_string();
         assert!(
@@ -2070,6 +2323,7 @@ mod tests {
             "_csrf",
             "/admin",
             "/actuator",
+            false,
         )
         .into_string();
         assert!(
@@ -2102,6 +2356,7 @@ mod tests {
             "_csrf",
             "/admin",
             "/actuator",
+            false,
         )
         .into_string();
         assert!(
@@ -2132,6 +2387,7 @@ mod tests {
             "t",
             "/admin",
             "/actuator",
+            false,
             false,
         )
         .into_string();
@@ -2173,6 +2429,7 @@ mod tests {
             "/admin",
             "/actuator",
             false,
+            false,
         )
         .into_string();
         assert!(
@@ -2192,7 +2449,7 @@ mod tests {
         // Instead it must load the plugin-owned asset at a fingerprinted
         // `/{prefix}/static/admin.<hash>.js` URL.
         let r = dummy_registry();
-        let html = dashboard_page(&r, &[], &[], "t", "/admin", "/actuator").into_string();
+        let html = dashboard_page(&r, &[], &[], "t", "/admin", "/actuator", false).into_string();
         let expected = format!(r#"src="/admin{}""#, &**ADMIN_JS_PATH);
         assert!(
             html.contains(&expected),
@@ -2251,6 +2508,7 @@ mod tests {
             "_csrf",
             "/admin",
             "/actuator",
+            false,
         )
         .into_string();
         assert!(
@@ -2299,6 +2557,7 @@ mod tests {
             "_csrf",
             "/admin",
             "/actuator",
+            false,
         )
         .into_string();
         assert!(
@@ -2344,6 +2603,7 @@ mod tests {
             "_csrf",
             "/admin",
             "/actuator",
+            false,
         )
         .into_string();
         // Row with id renders working links and a checkbox.
@@ -2401,6 +2661,7 @@ mod tests {
             "_csrf",
             "/admin",
             "/actuator",
+            false,
         )
         .into_string();
         // Sort header link carries both filters.
@@ -2453,6 +2714,7 @@ mod tests {
             "_csrf",
             "/admin",
             "/actuator",
+            false,
         )
         .into_string();
         assert!(
@@ -2506,6 +2768,7 @@ mod tests {
             "_csrf",
             "/admin",
             "/actuator",
+            false,
         )
         .into_string();
         assert!(
@@ -2555,6 +2818,7 @@ mod tests {
             "admin_csrf",
             "/admin",
             "/actuator",
+            false,
         )
         .into_string();
         // Form posts to the bulk-action endpoint with the CSRF token.
@@ -2604,6 +2868,7 @@ mod tests {
             "_csrf",
             "/admin",
             "/actuator",
+            false,
         )
         .into_string();
         assert!(
@@ -2642,6 +2907,7 @@ mod tests {
             "_csrf",
             "/admin",
             "/actuator",
+            false,
         )
         .into_string();
         // Sortable field gets a sort link.
@@ -2695,5 +2961,215 @@ mod tests {
             "",
             "",
         );
+    }
+
+    // ── Runtime config page tests ────────────────────────────────────────────
+
+    #[test]
+    fn config_page_empty_shows_no_keys_registered_message() {
+        let r = dummy_registry();
+        let html = config_page(&r, &[], &[], "tok", "_csrf", "/admin", "/actuator").into_string();
+        assert!(
+            html.contains("No config keys have been registered"),
+            "empty state message missing: {html}"
+        );
+        assert!(
+            html.contains("Runtime Config"),
+            "page title missing: {html}"
+        );
+    }
+
+    #[test]
+    fn config_page_renders_key_name_type_and_value() {
+        use autumn_web::runtime_config::{ConfigEntry, ConfigValue, ConfigValueType};
+
+        let r = dummy_registry();
+        let entries = vec![ConfigEntry {
+            name: "max_upload_mb".to_owned(),
+            value_type: ConfigValueType::Int,
+            current: ConfigValue::Int(50),
+            default: ConfigValue::Int(50),
+            is_overridden: false,
+            description: Some("Max upload in MB".to_owned()),
+        }];
+        let html =
+            config_page(&r, &entries, &[], "tok", "_csrf", "/admin", "/actuator").into_string();
+        assert!(html.contains("max_upload_mb"), "key name missing: {html}");
+        assert!(
+            html.contains("Max upload in MB"),
+            "description missing: {html}"
+        );
+        assert!(
+            html.contains(r#"action="/admin/config/max_upload_mb/set""#),
+            "set form action missing: {html}"
+        );
+        assert!(
+            html.contains(r#"href="/admin/config/max_upload_mb/history""#),
+            "history link missing: {html}"
+        );
+    }
+
+    #[test]
+    fn config_page_overridden_key_shows_unset_form() {
+        use autumn_web::runtime_config::{ConfigEntry, ConfigValue, ConfigValueType};
+
+        let r = dummy_registry();
+        let entries = vec![ConfigEntry {
+            name: "rate_limit".to_owned(),
+            value_type: ConfigValueType::Int,
+            current: ConfigValue::Int(200),
+            default: ConfigValue::Int(100),
+            is_overridden: true,
+            description: None,
+        }];
+        let html =
+            config_page(&r, &entries, &[], "tok", "_csrf", "/admin", "/actuator").into_string();
+        assert!(
+            html.contains(r#"action="/admin/config/rate_limit/unset""#),
+            "unset form should appear for overridden key: {html}"
+        );
+    }
+
+    #[test]
+    fn config_page_shows_overridden_status() {
+        use autumn_web::runtime_config::{ConfigEntry, ConfigValue, ConfigValueType};
+
+        let r = dummy_registry();
+        let entries = vec![ConfigEntry {
+            name: "rate_limit".to_owned(),
+            value_type: ConfigValueType::Int,
+            current: ConfigValue::Int(200),
+            default: ConfigValue::Int(100),
+            is_overridden: true,
+            description: None,
+        }];
+        let html =
+            config_page(&r, &entries, &[], "tok", "_csrf", "/admin", "/actuator").into_string();
+        assert!(
+            html.to_lowercase().contains("overridden"),
+            "overridden status missing: {html}"
+        );
+    }
+
+    #[test]
+    fn config_page_shows_default_status_for_unoverridden_key() {
+        use autumn_web::runtime_config::{ConfigEntry, ConfigValue, ConfigValueType};
+
+        let r = dummy_registry();
+        let entries = vec![ConfigEntry {
+            name: "feature_flag".to_owned(),
+            value_type: ConfigValueType::Bool,
+            current: ConfigValue::Bool(false),
+            default: ConfigValue::Bool(false),
+            is_overridden: false,
+            description: None,
+        }];
+        let html =
+            config_page(&r, &entries, &[], "tok", "_csrf", "/admin", "/actuator").into_string();
+        assert!(
+            html.to_lowercase().contains("default"),
+            "default status missing: {html}"
+        );
+    }
+
+    #[test]
+    fn config_page_embeds_csrf_token_in_forms() {
+        use autumn_web::runtime_config::{ConfigEntry, ConfigValue, ConfigValueType};
+
+        let r = dummy_registry();
+        let entries = vec![ConfigEntry {
+            name: "timeout_secs".to_owned(),
+            value_type: ConfigValueType::Int,
+            current: ConfigValue::Int(30),
+            default: ConfigValue::Int(30),
+            is_overridden: false,
+            description: None,
+        }];
+        let html = config_page(
+            &r,
+            &entries,
+            &[],
+            "csrf-tok-789",
+            "authenticity_token",
+            "/admin",
+            "/actuator",
+        )
+        .into_string();
+        assert!(
+            html.contains(r#"name="authenticity_token" value="csrf-tok-789""#),
+            "CSRF token not embedded in config forms: {html}"
+        );
+    }
+
+    #[test]
+    fn config_history_page_shows_empty_state() {
+        let r = dummy_registry();
+        let html = config_history_page(&r, "rate_limit", &[], &[], "tok", "/admin", "/actuator")
+            .into_string();
+        assert!(
+            html.contains("No changes recorded"),
+            "empty history message missing: {html}"
+        );
+        assert!(html.contains("rate_limit"), "key name missing: {html}");
+    }
+
+    #[test]
+    fn config_history_page_renders_change_records() {
+        use autumn_web::runtime_config::{ConfigChangeRecord, ConfigValue};
+
+        let r = dummy_registry();
+        let history = vec![ConfigChangeRecord {
+            key: "rate_limit".to_owned(),
+            old_value: Some(ConfigValue::Int(100)),
+            new_value: Some(ConfigValue::Int(200)),
+            actor: Some("ops@example.com".to_owned()),
+            timestamp_secs: 1_700_000_000,
+        }];
+        let html = config_history_page(
+            &r,
+            "rate_limit",
+            &history,
+            &[],
+            "tok",
+            "/admin",
+            "/actuator",
+        )
+        .into_string();
+        assert!(html.contains("rate_limit"), "key name missing: {html}");
+        assert!(html.contains("ops@example.com"), "actor missing: {html}");
+        assert!(html.contains("100"), "old value missing: {html}");
+        assert!(html.contains("200"), "new value missing: {html}");
+    }
+
+    #[test]
+    fn config_history_page_handles_unset_record() {
+        use autumn_web::runtime_config::{ConfigChangeRecord, ConfigValue};
+
+        let r = dummy_registry();
+        let history = vec![ConfigChangeRecord {
+            key: "flag".to_owned(),
+            old_value: Some(ConfigValue::Bool(true)),
+            new_value: None,
+            actor: None,
+            timestamp_secs: 0,
+        }];
+        let html = config_history_page(&r, "flag", &history, &[], "tok", "/admin", "/actuator")
+            .into_string();
+        assert!(html.contains("flag"), "key name missing: {html}");
+        // The null actor should render as a dash placeholder.
+        assert!(html.contains("—"), "null actor placeholder missing: {html}");
+    }
+
+    #[test]
+    fn format_timestamp_formats_unix_epoch() {
+        let s = format_timestamp(0);
+        assert!(s.contains("1970"), "epoch should format as 1970: {s}");
+    }
+
+    #[test]
+    fn format_timestamp_formats_known_instant() {
+        // 2023-11-14 22:13:20 UTC
+        let s = format_timestamp(1_700_000_000);
+        assert!(s.contains("2023"), "expected 2023 in formatted output: {s}");
     }
 }

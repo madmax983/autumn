@@ -119,8 +119,8 @@ blocks publishing `autumn-web` or `autumn-cli`.
 | Field | Value |
 |-------|-------|
 | **Persona** | Developer building a production-shaped Autumn application with auth and real-time features |
-| **Journey** | Full-stack Reddit clone: registration, sessions, posts, voting, live feeds, background jobs, transactional email |
-| **Key capabilities** | `#[secured]`, CSRF, sessions, `#[job]`, `#[ws]` channels, Redis fan-out, `#[scheduled]`, `#[static_get]`, transactional email, htmx voting |
+| **Journey** | Full-stack Reddit clone: registration, sessions, posts, voting, live feeds, background jobs, transactional email, live-tunable runtime config |
+| **Key capabilities** | `#[secured]`, CSRF, sessions, `#[job]`, `#[ws]` channels, Redis fan-out, `#[scheduled]`, `#[static_get]`, transactional email, htmx voting, `RuntimeConfigService` |
 | **Prerequisites** | Rust 1.88.0+, PostgreSQL, Redis (optional for local run; required for multi-replica fan-out) |
 | **Run command** | `cargo run -p reddit-clone` |
 | **Success proof** | `curl http://localhost:3000/` returns the front-page HTML |
