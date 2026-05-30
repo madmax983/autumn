@@ -2,6 +2,50 @@
 //!
 //! These routes render Maud templates styled with Tailwind CSS and
 //! use htmx attributes for interactive toggle/delete behaviour.
+//!
+//! # Form validation patterns
+//!
+//! This module demonstrates two Autumn form validation patterns:
+//!
+//! ## Pattern A — Custom form struct (`TodoForm`)
+//!
+//! Use a dedicated form struct when form validation rules differ from the
+//! model, the form has extra fields (e.g. confirm password), or the form
+//! needs UI-specific derives (e.g. `Clone` for re-rendering).
+//!
+//! ```rust,ignore
+//! #[post("/todos")]
+//! async fn create(db: Db, form: ChangesetForm<TodoForm>) -> impl IntoResponse {
+//!     match form.into_valid() {
+//!         Ok(f) => { /* insert NewTodo { title: f.title } */ }
+//!         Err(form) => (StatusCode::UNPROCESSABLE_ENTITY, render_form(&form)).into_response(),
+//!     }
+//! }
+//! ```
+//!
+//! ## Pattern B — `NewModel` direct (`NewTodo`)
+//!
+//! When the model struct already has `#[derive(Validate)]` and the form shape
+//! matches the model shape exactly, use `ChangesetForm<NewTodo>` directly —
+//! no separate form struct needed.
+//!
+//! ```rust,ignore
+//! #[post("/todos/simple")]
+//! async fn create_simple(db: Db, form: ChangesetForm<NewTodo>) -> impl IntoResponse {
+//!     match form.into_valid() {
+//!         Ok(new_todo) => { /* insert new_todo directly */ }
+//!         Err(form) => (StatusCode::UNPROCESSABLE_ENTITY, render_form(&form)).into_response(),
+//!     }
+//! }
+//! ```
+//!
+//! ## Inline field validation (htmx)
+//!
+//! A field rendered with [`text_input_htmx`] POSTs to a validation endpoint
+//! on blur.  The handler extracts [`ChangesetForm`], validates, and returns
+//! just that field's wrapper partial — htmx swaps it with `outerHTML`.
+//! When JavaScript is disabled, the normal `#[post("/todos")]` handler still
+//! validates the whole form and returns 422 with inline errors.
 
 use autumn_web::etag::fresh_when;
 use autumn_web::extract::Path;
@@ -17,7 +61,20 @@ use serde::{Deserialize, Serialize};
 use crate::models::{NewTodo, Todo};
 use crate::schema::todos;
 
-// ── Form type ─────────────────────────────────────────────────────
+// ── Form types ────────────────────────────────────────────────────
+
+/// Custom form struct for the "create todo" flow.
+///
+/// Used when the form needs `Clone` for re-rendering or additional
+/// validation rules beyond those on [`NewTodo`] itself.
+#[derive(Deserialize, Serialize, Validate, Clone)]
+pub struct TodoForm {
+    #[validate(
+        length(min = 1, max = 255, message = "Title must be 1–255 characters"),
+        custom(function = "title_not_blank")
+    )]
+    title: String,
+}
 
 fn title_not_blank(s: &str) -> Result<(), validator::ValidationError> {
     if s.trim().is_empty() {
@@ -26,15 +83,6 @@ fn title_not_blank(s: &str) -> Result<(), validator::ValidationError> {
         return Err(e);
     }
     Ok(())
-}
-
-#[derive(Deserialize, Serialize, Validate, Clone)]
-pub struct TodoForm {
-    #[validate(
-        length(min = 1, max = 255, message = "Title must be 1–255 characters"),
-        custom(function = "title_not_blank")
-    )]
-    title: String,
 }
 
 // ── Helpers ──────────────────────────────────────────────────────
@@ -122,32 +170,55 @@ fn todo_item(todo: &Todo) -> Markup {
     }
 }
 
-/// Render the new-todo form, re-populating the title and showing errors on failure.
-fn new_todo_form(pending: &ChangesetForm<TodoForm>) -> Markup {
-    let errors = pending.errors_for("title");
-    let inner = html! {
-        div class="flex gap-2" {
-            input type="text" name="title"
-                  value=(pending.field_value("title").unwrap_or_default())
-                  placeholder="What needs to be done?"
-                  autocomplete="off"
-                  aria-invalid=(if errors.is_empty() { "false" } else { "true" })
-                  class="flex-1 px-4 py-2.5 bg-white border border-stone-300 rounded-lg \
-                         text-sm placeholder-stone-400 \
-                         focus:outline-none focus:ring-2 focus:ring-amber-400/50 \
-                         focus:border-amber-400 transition-colors";
-            button type="submit"
-                   class="px-5 py-2.5 bg-amber-600 text-white text-sm font-medium rounded-lg \
-                          shadow-sm hover:bg-amber-700 active:bg-amber-800 \
-                          transition-colors" {
-                "Add"
+/// Render the title input field wrapper with htmx inline-validation attributes.
+///
+/// Returns a `<div id="title-field">` partial so that:
+/// - The initial form render includes the field with htmx wired up.
+/// - The `POST /todos/validate/title` handler returns this same partial,
+///   which htmx swaps in place with `outerHTML`.
+/// - No-JavaScript fallback: when htmx is absent the full form POST to
+///   `POST /todos` re-renders this partial inside the full form response.
+fn title_field_partial(form: &ChangesetForm<TodoForm>) -> Markup {
+    let errors = form.errors_for("title");
+    let value = form.field_value("title").unwrap_or_default();
+    html! {
+        div id="title-field" class="flex flex-col gap-1" {
+            div class="flex gap-2" {
+                input type="text" name="title"
+                      value=(value)
+                      placeholder="What needs to be done?"
+                      autocomplete="off"
+                      aria-invalid=(if errors.is_empty() { "false" } else { "true" })
+                      hx-post=(paths::validate_title())
+                      hx-trigger="blur"
+                      hx-target="#title-field"
+                      hx-swap="outerHTML"
+                      hx-include="closest form"
+                      class="flex-1 px-4 py-2.5 bg-white border border-stone-300 rounded-lg \
+                             text-sm placeholder-stone-400 \
+                             focus:outline-none focus:ring-2 focus:ring-amber-400/50 \
+                             focus:border-amber-400 transition-colors";
+                button type="submit"
+                       class="px-5 py-2.5 bg-amber-600 text-white text-sm font-medium rounded-lg \
+                              shadow-sm hover:bg-amber-700 active:bg-amber-800 \
+                              transition-colors" {
+                    "Add"
+                }
+            }
+            @for msg in errors {
+                p class="text-red-600 text-xs px-1" role="alert" { (msg) }
             }
         }
-        @for msg in errors {
-            p class="text-red-600 text-xs px-1" { (msg) }
-        }
-    };
-    let form = pending.form_tag(&paths::create(), "post", inner);
+    }
+}
+
+/// Render the new-todo form, re-populating the title and showing errors on failure.
+fn new_todo_form(pending: &ChangesetForm<TodoForm>) -> Markup {
+    let form = pending.form_tag(
+        &paths::create(),
+        "post",
+        title_field_partial(pending),
+    );
     html! { div class="flex flex-col gap-2 mb-8" { (form) } }
 }
 
@@ -353,6 +424,19 @@ pub async fn detail(
     Ok(fw.or(detail_view(&todo, csrf.as_ref().map(CsrfToken::token))))
 }
 
+/// Inline field validation for the todo title (htmx endpoint).
+///
+/// Called by htmx on `blur` of the title input.  Extracts and validates the
+/// submitted form, then returns just the `<div id="title-field">` partial so
+/// htmx can swap it with `outerHTML`.
+///
+/// No-JavaScript fallback: when htmx is absent this endpoint is never called;
+/// the full `#[post("/todos")]` handler validates the whole form instead.
+#[post("/todos/validate/title")]
+pub async fn validate_title(form: ChangesetForm<TodoForm>) -> Markup {
+    title_field_partial(&form)
+}
+
 /// Create a new todo from a form submission.
 ///
 /// On validation failure the list page is re-rendered with inline errors (422).
@@ -427,7 +511,7 @@ pub async fn delete_todo(
     }
 }
 
-autumn_web::paths![index, list, detail, create, toggle, delete_todo];
+autumn_web::paths![index, list, detail, create, validate_title, toggle, delete_todo];
 
 #[cfg(test)]
 mod tests {
@@ -601,6 +685,135 @@ mod tests {
             html.is_empty(),
             "single page must render no pagination controls: {html}"
         );
+    }
+}
+
+/// Tests covering the htmx inline validation pattern (AC10, AC11).
+#[cfg(test)]
+mod inline_validation_tests {
+    use super::*;
+    use autumn_web::form::IntoChangeset;
+
+    // ── title_field_partial ──────────────────────────────────────
+
+    #[test]
+    fn title_field_partial_has_stable_wrapper_id() {
+        let form = ChangesetForm::without_csrf(TodoForm {
+            title: "Buy milk".into(),
+        });
+        let html = title_field_partial(&form).into_string();
+        assert!(html.contains(r#"id="title-field""#), "{html}");
+    }
+
+    #[test]
+    fn title_field_partial_valid_no_errors() {
+        let form = ChangesetForm::without_csrf(TodoForm {
+            title: "Buy milk".into(),
+        });
+        let html = title_field_partial(&form).into_string();
+        assert!(html.contains(r#"aria-invalid="false""#), "{html}");
+        assert!(!html.contains(r#"role="alert""#), "{html}");
+        assert!(html.contains(r#"value="Buy milk""#), "{html}");
+    }
+
+    #[test]
+    fn title_field_partial_invalid_shows_errors_and_preserves_value() {
+        let cs = TodoForm {
+            title: String::new(),
+        }
+        .into_changeset();
+        let form = ChangesetForm::from_changeset(cs);
+        let html = title_field_partial(&form).into_string();
+        assert!(html.contains(r#"aria-invalid="true""#), "{html}");
+        assert!(html.contains(r#"role="alert""#), "{html}");
+        assert!(html.contains("Title must be 1"), "{html}");
+        assert!(html.contains(r#"value="""#), "{html}");
+    }
+
+    #[test]
+    fn title_field_partial_has_htmx_validation_attributes() {
+        let form = ChangesetForm::without_csrf(TodoForm {
+            title: String::new(),
+        });
+        let html = title_field_partial(&form).into_string();
+        assert!(
+            html.contains(&format!(r#"hx-post="{}""#, paths::validate_title())),
+            "{html}"
+        );
+        assert!(html.contains(r#"hx-trigger="blur""#), "{html}");
+        assert!(html.contains("hx-target=\"#title-field\""), "{html}");
+        assert!(html.contains(r#"hx-swap="outerHTML""#), "{html}");
+        assert!(html.contains(r#"hx-include="closest form""#), "{html}");
+    }
+
+    #[test]
+    fn new_todo_form_includes_htmx_validation() {
+        let form = ChangesetForm::without_csrf(TodoForm {
+            title: String::new(),
+        });
+        let html = new_todo_form(&form).into_string();
+        assert!(
+            html.contains(r#"hx-post="/todos/validate/title""#),
+            "{html}"
+        );
+        assert!(html.contains(r#"hx-trigger="blur""#), "{html}");
+    }
+
+    // ── No-JavaScript fallback ─────────────────────────────────
+
+    #[test]
+    fn new_todo_form_has_standard_form_action_for_no_js_fallback() {
+        let form = ChangesetForm::without_csrf(TodoForm {
+            title: String::new(),
+        });
+        let html = new_todo_form(&form).into_string();
+        assert!(html.contains(r#"action="/todos""#), "{html}");
+        assert!(html.contains(r#"method="post""#), "{html}");
+    }
+
+    // ── AC7: NewModel validation reuse ─────────────────────────
+
+    #[test]
+    fn new_todo_with_validate_can_use_changeset_form_directly() {
+        let cs = NewTodo {
+            title: String::new(),
+        }
+        .into_changeset();
+        assert!(!cs.is_valid(), "empty title should be invalid");
+        assert!(!cs.errors_for("title").is_empty());
+    }
+
+    #[test]
+    fn new_todo_valid_title_produces_valid_changeset() {
+        let cs = NewTodo {
+            title: "Buy milk".into(),
+        }
+        .into_changeset();
+        assert!(cs.is_valid());
+        assert!(cs.errors_for("title").is_empty());
+    }
+
+    #[test]
+    fn new_todo_blank_title_fails_custom_validator() {
+        let cs = NewTodo {
+            title: "   ".into(),
+        }
+        .into_changeset();
+        assert!(!cs.is_valid());
+        let errs = cs.errors_for("title");
+        assert!(
+            errs.iter().any(|e| e.contains("blank")),
+            "expected blank error: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn new_todo_changeset_preserves_submitted_value() {
+        let cs = NewTodo {
+            title: "ab".into(),
+        }
+        .into_changeset();
+        assert_eq!(cs.field_value("title"), Some("ab".to_string()));
     }
 }
 
