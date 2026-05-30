@@ -3775,6 +3775,34 @@ mod trusted_host_tests {
 
         assert_eq!(response.status(), StatusCode::OK);
     }
+
+    // Exercises the warn!("Request timed out") branch when no RequestIdLayer
+    // is present (no request_id extension), keeping coverage of the else arm.
+    #[tokio::test(start_paused = true)]
+    async fn request_timeout_408_without_request_id_layer() {
+        let mut config = AutumnConfig::default();
+        config.server.timeouts.request_timeout_ms = Some(100);
+
+        let state = crate::state::AppState::for_test();
+        let router: axum::Router<AppState> = axum::Router::new().route(
+            "/slow",
+            axum::routing::get(|| async {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                "ok"
+            }),
+        );
+
+        // No RequestIdLayer — exercises the else branch in request_timeout_handler.
+        let router = apply_request_timeout_middleware(router, &config, state.metrics.clone())
+            .with_state(state);
+
+        let response = router
+            .oneshot(Request::builder().uri("/slow").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+    }
 }
 #[derive(Clone, Debug)]
 struct TrustedHostPolicy {

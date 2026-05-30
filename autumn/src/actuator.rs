@@ -2819,6 +2819,10 @@ mod tests {
         assert!(
             text.contains("autumn_http_route_requests_total{method=\"POST\",route=\"/test\"} 1")
         );
+
+        assert!(text.contains("# HELP autumn_request_timeouts_total"));
+        assert!(text.contains("# TYPE autumn_request_timeouts_total counter"));
+        assert!(text.contains("autumn_request_timeouts_total 0"));
     }
 
     #[tokio::test]

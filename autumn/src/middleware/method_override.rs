@@ -1411,4 +1411,30 @@ mod tests {
         assert_eq!(info.status, StatusCode::BAD_REQUEST);
         assert!(info.message.contains("PUT, PATCH, or DELETE"));
     }
+
+    #[tokio::test]
+    async fn with_max_scan_bytes_rejects_body_exceeding_custom_cap() {
+        let router = Router::new()
+            .route("/items", post(|| async { "ok" }))
+            .layer(axum::middleware::from_fn(method_override_rejection_filter));
+
+        // Set a very small cap (10 bytes) — the 20-byte body should be rejected.
+        let service =
+            tower::Layer::layer(&MethodOverrideLayer::new().with_max_scan_bytes(10), router);
+
+        let response = service
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/items")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .header("sec-fetch-site", "same-origin")
+                    .body(Body::from("_method=DELETE&x=123456789012"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
 }
