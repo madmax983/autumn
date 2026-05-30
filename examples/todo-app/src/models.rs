@@ -3,6 +3,7 @@ use autumn_web::pagination::{Page, PageRequest};
 use diesel::prelude::*;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use serde::{Deserialize, Serialize};
+use validator::Validate;
 
 use crate::schema::todos;
 
@@ -55,10 +56,32 @@ impl Todo {
 }
 
 /// Data needed to insert a new todo.
-#[derive(Insertable, Deserialize)]
+///
+/// Derives [`Validate`] so it can be used directly with
+/// [`ChangesetForm<NewTodo>`](autumn_web::form::ChangesetForm) when
+/// the form shape matches the model shape — no separate form struct needed.
+///
+/// When the form requires extra fields, different validation rules, or
+/// UI-specific concerns (e.g. a `confirm_password` field), define a
+/// dedicated form struct instead and convert it to `NewTodo` on success.
+#[derive(Insertable, Deserialize, Serialize, Validate)]
 #[diesel(table_name = todos)]
 pub struct NewTodo {
+    #[validate(
+        length(min = 1, max = 255, message = "Title must be 1–255 characters"),
+        custom(function = "title_not_blank")
+    )]
     pub title: String,
+}
+
+/// Validate that a title has at least one non-whitespace character.
+pub(crate) fn title_not_blank(s: &str) -> Result<(), validator::ValidationError> {
+    if s.trim().is_empty() {
+        let mut e = validator::ValidationError::new("blank");
+        e.message = Some("Title must not be blank or whitespace-only".into());
+        return Err(e);
+    }
+    Ok(())
 }
 
 impl NewTodo {

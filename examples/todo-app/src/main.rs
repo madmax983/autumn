@@ -89,6 +89,7 @@ async fn main() {
             routes::todos::list,
             routes::todos::detail,
             routes::todos::create,
+            routes::todos::validate_title,
             routes::todos::toggle,
             routes::todos::delete_todo,
             routes::api::issue_token,

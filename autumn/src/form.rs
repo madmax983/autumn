@@ -7,10 +7,64 @@
 //! in a single route handler — no manual flash-carrying, no conditional
 //! error-threading.
 //!
-//! [`ChangesetForm<T>`] is the axum extractor that decodes the request body
-//! (URL-encoded **or** multipart), runs validation, captures the CSRF token,
-//! and hands the handler a ready-to-use changeset — CSRF is emitted
+//! [`ChangesetForm<T>`] is the **default server-rendered HTML form validation
+//! path** for any `T: DeserializeOwned + Serialize + Validate`.  It is the
+//! axum extractor that decodes the request body (URL-encoded **or**
+//! multipart), runs [`validator::Validate`], captures the CSRF token, and
+//! hands the handler a ready-to-use changeset — CSRF is emitted
 //! automatically when you call [`ChangesetForm::form_tag`].
+//!
+//! # htmx inline field validation
+//!
+//! Use [`text_input_htmx`] to wire up per-field inline validation with htmx.
+//! The rendered input POSTs to a validation endpoint when its value changes,
+//! and htmx swaps the returned field wrapper in place with `outerHTML`.
+//!
+//! A minimal inline-validation endpoint:
+//!
+//! ```rust,ignore
+//! #[post("/users/validate/email")]
+//! async fn validate_email(form: ChangesetForm<UserForm>) -> Markup {
+//!     text_input_htmx(&form.changeset, "email", "Email", "/users/validate/email")
+//! }
+//! ```
+//!
+//! No-JavaScript fallback is automatic: when htmx is absent the browser
+//! falls through to the standard full-form `POST` handler, which returns
+//! 422 with inline errors via the same `text_input_htmx` partial.
+//!
+//! # Model vs custom form structs
+//!
+//! ## Pattern A — `NewModel` direct
+//!
+//! When the model struct already has `#[derive(Validate)]` and the form
+//! shape matches, use `ChangesetForm<NewModel>` directly:
+//!
+//! ```rust,ignore
+//! #[post("/todos")]
+//! async fn create(db: Db, form: ChangesetForm<NewTodo>) -> impl IntoResponse {
+//!     match form.into_valid() {
+//!         Ok(new_todo) => { /* insert new_todo directly */ }
+//!         Err(form) => (StatusCode::UNPROCESSABLE_ENTITY, render(&form)).into_response(),
+//!     }
+//! }
+//! ```
+//!
+//! ## Pattern B — Custom workflow struct
+//!
+//! Define a separate form struct when the form needs extra fields (e.g.
+//! `confirm_password`), different validation rules, or UI-specific derives.
+//! Convert to the model type on successful validation:
+//!
+//! ```rust,ignore
+//! #[post("/users")]
+//! async fn create_user(form: ChangesetForm<RegistrationForm>) -> impl IntoResponse {
+//!     match form.into_valid() {
+//!         Ok(f) => { let user = NewUser::from(f); /* persist */ }
+//!         Err(form) => (StatusCode::UNPROCESSABLE_ENTITY, render(&form)).into_response(),
+//!     }
+//! }
+//! ```
 //!
 //! # Framework comparison
 //!
@@ -367,6 +421,14 @@ impl<T: Serialize> ChangesetForm<T> {
         text_input(&self.changeset, field, label)
     }
 
+    /// Render a labeled `<input type="text">` with htmx inline-validation
+    /// attributes for `field`.
+    ///
+    /// Delegates to [`text_input_htmx`]; see that function for full docs.
+    pub fn text_input_htmx(&self, field: &str, label: &str, validate_url: &str) -> maud::Markup {
+        text_input_htmx(&self.changeset, field, label, validate_url)
+    }
+
     /// Render a `<button type="submit">` with `label`.
     pub fn submit_button(&self, label: &str) -> maud::Markup {
         submit_button(label)
@@ -648,9 +710,12 @@ pub fn method_input(method: &str) -> maud::Markup {
 /// Render a labeled `<input type="text">` tied to a changeset field.
 ///
 /// - Sets `name` and `id` to `field`
+/// - Wraps in a `<div id="{field}-field">` for stable htmx targeting
 /// - Populates `value` from the changeset's serialized data
 /// - Adds `aria-invalid="true"` + `aria-describedby` when errors exist
 /// - Emits a `<div role="alert">` with per-message `<p>` error elements
+///
+/// Use [`text_input_htmx`] to add htmx inline-validation attributes.
 #[cfg(feature = "maud")]
 #[must_use]
 pub fn text_input<T: Serialize>(
@@ -662,9 +727,10 @@ pub fn text_input<T: Serialize>(
     let has_errors = !errors.is_empty();
     let value = changeset.field_value(field).unwrap_or_default();
     let error_id = format!("{field}-error");
+    let wrapper_id = format!("{field}-field");
 
     maud::html! {
-        div {
+        div id=(wrapper_id) {
             label for=(field) { (label) }
             input
                 type="text"
@@ -673,6 +739,70 @@ pub fn text_input<T: Serialize>(
                 value=(value)
                 aria-invalid=(if has_errors { "true" } else { "false" })
                 aria-describedby=(if has_errors { error_id.as_str() } else { "" });
+            @if has_errors {
+                div id=(error_id) role="alert" {
+                    @for error in errors {
+                        p { (error) }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Render a labeled `<input type="text">` with htmx inline-validation attributes.
+///
+/// Like [`text_input`] but adds `hx-post`, `hx-trigger="change"`,
+/// `hx-target="closest [data-autumn-field-wrapper]"`, `hx-swap="outerHTML"`, and
+/// `hx-include="closest form"` to the input element so htmx
+/// POSTs the whole form to `validate_url` after a changed value is committed
+/// and swaps the returned field wrapper in place — no JavaScript required.
+///
+/// The inline-validation handler should extract [`ChangesetForm<T>`],
+/// validate, and return `text_input_htmx(...)` for just the single field.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// // Render:
+/// form.text_input_htmx("email", "Email", "/users/validate/email")
+///
+/// // Inline-validation handler:
+/// #[post("/users/validate/email")]
+/// async fn validate_email(form: ChangesetForm<UserForm>) -> Markup {
+///     text_input_htmx(&form.changeset, "email", "Email", "/users/validate/email")
+/// }
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn text_input_htmx<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+    validate_url: &str,
+) -> maud::Markup {
+    let errors = changeset.errors_for(field);
+    let has_errors = !errors.is_empty();
+    let value = changeset.field_value(field).unwrap_or_default();
+    let error_id = format!("{field}-error");
+    let wrapper_id = format!("{field}-field");
+    let target = "closest [data-autumn-field-wrapper]";
+
+    maud::html! {
+        div id=(wrapper_id) data-autumn-field-wrapper=(field) {
+            label for=(field) { (label) }
+            input
+                type="text"
+                id=(field)
+                name=(field)
+                value=(value)
+                aria-invalid=(if has_errors { "true" } else { "false" })
+                aria-describedby=(if has_errors { error_id.as_str() } else { "" })
+                hx-post=(validate_url)
+                hx-trigger="change"
+                hx-target=(target)
+                hx-swap="outerHTML"
+                hx-include="closest form";
             @if has_errors {
                 div id=(error_id) role="alert" {
                     @for error in errors {
@@ -699,6 +829,7 @@ pub fn submit_button(label: &str) -> maud::Markup {
 /// `value` attribute — browsers must not auto-fill passwords into the markup
 /// and screen readers must not announce the value.
 ///
+/// Wraps in `<div id="{field}-field">` for stable htmx targeting.
 /// ARIA annotations (`aria-invalid`, `aria-describedby`, error block) behave
 /// identically to [`text_input`].
 #[cfg(feature = "maud")]
@@ -711,9 +842,10 @@ pub fn password_input<T: Serialize>(
     let errors = changeset.errors_for(field);
     let has_errors = !errors.is_empty();
     let error_id = format!("{field}-error");
+    let wrapper_id = format!("{field}-field");
 
     maud::html! {
-        div {
+        div id=(wrapper_id) {
             label for=(field) { (label) }
             input
                 type="password"
@@ -735,7 +867,8 @@ pub fn password_input<T: Serialize>(
 /// Render a labeled `<textarea>` tied to a changeset field.
 ///
 /// The current field value is emitted as the textarea body (not a `value`
-/// attribute). ARIA annotations behave identically to [`text_input`].
+/// attribute). Wraps in `<div id="{field}-field">` for stable htmx targeting.
+/// ARIA annotations behave identically to [`text_input`].
 #[cfg(feature = "maud")]
 #[must_use]
 pub fn textarea_input<T: Serialize>(
@@ -747,9 +880,10 @@ pub fn textarea_input<T: Serialize>(
     let has_errors = !errors.is_empty();
     let value = changeset.field_value(field).unwrap_or_default();
     let error_id = format!("{field}-error");
+    let wrapper_id = format!("{field}-field");
 
     maud::html! {
-        div {
+        div id=(wrapper_id) {
             label for=(field) { (label) }
             textarea
                 id=(field)
@@ -773,6 +907,7 @@ pub fn textarea_input<T: Serialize>(
 /// Identical to [`text_input`] but adds `aria-required="true"` and the HTML
 /// `required` attribute, giving both AT users and browser-native validation
 /// the required-field signal without relying solely on color.
+/// Wraps in `<div id="{field}-field">` for stable htmx targeting.
 #[cfg(feature = "maud")]
 #[must_use]
 pub fn required_text_input<T: Serialize>(
@@ -784,9 +919,10 @@ pub fn required_text_input<T: Serialize>(
     let has_errors = !errors.is_empty();
     let value = changeset.field_value(field).unwrap_or_default();
     let error_id = format!("{field}-error");
+    let wrapper_id = format!("{field}-field");
 
     maud::html! {
-        div {
+        div id=(wrapper_id) {
             label for=(field) { (label) }
             input
                 type="text"
@@ -1521,6 +1657,214 @@ mod tests {
         assert!(html.contains("skip-link"), "{html}");
     }
 
+    // ── AC2: Stable wrapper IDs ────────────────────────────────────
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn text_input_wrapper_div_has_stable_id() {
+        #[derive(serde::Serialize)]
+        struct F {
+            name: String,
+        }
+        let cs = Changeset::new(F {
+            name: "Alice".into(),
+        });
+        let html = text_input(&cs, "name", "Name").into_string();
+        assert!(html.contains(r#"id="name-field""#), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn password_input_wrapper_div_has_stable_id() {
+        #[derive(serde::Serialize)]
+        struct F {
+            password: String,
+        }
+        let cs = Changeset::new(F {
+            password: String::new(),
+        });
+        let html = password_input(&cs, "password", "Password").into_string();
+        assert!(html.contains(r#"id="password-field""#), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn textarea_input_wrapper_div_has_stable_id() {
+        #[derive(serde::Serialize)]
+        struct F {
+            bio: String,
+        }
+        let cs = Changeset::new(F {
+            bio: "Hello".into(),
+        });
+        let html = textarea_input(&cs, "bio", "Bio").into_string();
+        assert!(html.contains(r#"id="bio-field""#), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn required_text_input_wrapper_div_has_stable_id() {
+        #[derive(serde::Serialize)]
+        struct F {
+            name: String,
+        }
+        let cs = Changeset::new(F {
+            name: "Alice".into(),
+        });
+        let html = required_text_input(&cs, "name", "Name").into_string();
+        assert!(html.contains(r#"id="name-field""#), "{html}");
+    }
+
+    // ── AC2 + AC3: text_input_htmx ────────────────────────────────
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn text_input_htmx_wrapper_has_stable_id() {
+        #[derive(serde::Serialize)]
+        struct F {
+            name: String,
+        }
+        let cs = Changeset::new(F {
+            name: "Alice".into(),
+        });
+        let html = text_input_htmx(&cs, "name", "Name", "/validate/name").into_string();
+        assert!(html.contains(r#"id="name-field""#), "{html}");
+        assert!(
+            html.contains(r#"data-autumn-field-wrapper="name""#),
+            "{html}"
+        );
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn text_input_htmx_renders_hx_post() {
+        #[derive(serde::Serialize)]
+        struct F {
+            name: String,
+        }
+        let cs = Changeset::new(F {
+            name: "Alice".into(),
+        });
+        let html = text_input_htmx(&cs, "name", "Name", "/validate/name").into_string();
+        assert!(html.contains(r#"hx-post="/validate/name""#), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn text_input_htmx_renders_hx_trigger_change() {
+        #[derive(serde::Serialize)]
+        struct F {
+            name: String,
+        }
+        let cs = Changeset::new(F {
+            name: String::new(),
+        });
+        let html = text_input_htmx(&cs, "name", "Name", "/validate/name").into_string();
+        assert!(html.contains(r#"hx-trigger="change""#), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn text_input_htmx_renders_hx_target_and_swap() {
+        #[derive(serde::Serialize)]
+        struct F {
+            name: String,
+        }
+        let cs = Changeset::new(F {
+            name: String::new(),
+        });
+        let html = text_input_htmx(&cs, "name", "Name", "/validate/name").into_string();
+        assert!(
+            html.contains(r#"hx-target="closest [data-autumn-field-wrapper]""#),
+            "{html}"
+        );
+        assert!(html.contains(r#"hx-swap="outerHTML""#), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn text_input_htmx_target_is_safe_for_nested_field_names() {
+        #[derive(serde::Serialize)]
+        struct F {
+            name: String,
+        }
+        let cs = Changeset::new(F {
+            name: String::new(),
+        });
+        let html =
+            text_input_htmx(&cs, "address.street", "Street", "/validate/street").into_string();
+        assert!(html.contains(r#"id="address.street-field""#), "{html}");
+        assert!(
+            html.contains(r#"hx-target="closest [data-autumn-field-wrapper]""#),
+            "{html}"
+        );
+        assert!(
+            !html.contains("hx-target=\"#address.street-field\""),
+            "{html}"
+        );
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn text_input_htmx_includes_all_form_fields() {
+        #[derive(serde::Serialize)]
+        struct F {
+            name: String,
+        }
+        let cs = Changeset::new(F {
+            name: String::new(),
+        });
+        let html = text_input_htmx(&cs, "name", "Name", "/validate/name").into_string();
+        assert!(html.contains(r#"hx-include="closest form""#), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn text_input_htmx_valid_state_no_error_markup() {
+        #[derive(serde::Serialize)]
+        struct F {
+            name: String,
+        }
+        let cs = Changeset::new(F {
+            name: "Alice".into(),
+        });
+        let html = text_input_htmx(&cs, "name", "Name", "/v").into_string();
+        assert!(!html.contains(r#"role="alert""#), "{html}");
+        assert!(html.contains(r#"aria-invalid="false""#), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn text_input_htmx_invalid_preserves_value_and_shows_errors() {
+        #[derive(serde::Serialize)]
+        struct F {
+            name: String,
+        }
+        let mut errors = HashMap::new();
+        errors.insert("name".to_string(), vec!["too short".to_string()]);
+        let cs = Changeset::from_errors(F { name: "ab".into() }, errors);
+        let html = text_input_htmx(&cs, "name", "Name", "/v").into_string();
+        assert!(html.contains(r#"value="ab""#), "{html}");
+        assert!(html.contains("too short"), "{html}");
+        assert!(html.contains(r#"aria-invalid="true""#), "{html}");
+        assert!(html.contains(r#"role="alert""#), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn text_input_htmx_invalid_has_describedby_link() {
+        #[derive(serde::Serialize)]
+        struct F {
+            email: String,
+        }
+        let mut errors = HashMap::new();
+        errors.insert("email".to_string(), vec!["invalid".to_string()]);
+        let cs = Changeset::from_errors(F { email: "x".into() }, errors);
+        let html = text_input_htmx(&cs, "email", "Email", "/v").into_string();
+        assert!(html.contains("email-error"), "{html}");
+        assert!(html.contains(r#"aria-describedby="email-error""#), "{html}");
+    }
+
     // ── ChangesetForm extractor (axum integration) ─────────────────
 
     mod extractor_tests {
@@ -1648,6 +1992,122 @@ mod tests {
                 .await
                 .unwrap();
             assert_body(resp, "valid=false").await;
+        }
+
+        // ── AC3: Inline field validation (htmx partial response) ──
+
+        #[derive(serde::Deserialize, validator::Validate, serde::Serialize)]
+        struct InlineTestForm {
+            #[validate(length(min = 3, message = "Name must be at least 3 characters"))]
+            name: String,
+        }
+
+        #[cfg(feature = "maud")]
+        #[tokio::test]
+        async fn inline_valid_field_returns_field_partial_without_errors() {
+            async fn handler(form: ChangesetForm<InlineTestForm>) -> maud::Markup {
+                text_input_htmx(&form.changeset, "name", "Name", "/validate/name")
+            }
+            let resp = Router::new()
+                .route("/validate/name", post(handler))
+                .oneshot(urlencoded_req("/validate/name", "name=Alice"))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), axum::http::StatusCode::OK);
+            let body = body_text(resp).await;
+            assert!(body.contains(r#"aria-invalid="false""#), "{body}");
+            assert!(!body.contains(r#"role="alert""#), "{body}");
+            assert!(body.contains(r#"value="Alice""#), "{body}");
+        }
+
+        #[cfg(feature = "maud")]
+        #[tokio::test]
+        async fn inline_invalid_field_returns_field_partial_with_errors() {
+            async fn handler(form: ChangesetForm<InlineTestForm>) -> maud::Markup {
+                text_input_htmx(&form.changeset, "name", "Name", "/validate/name")
+            }
+            let resp = Router::new()
+                .route("/validate/name", post(handler))
+                .oneshot(urlencoded_req("/validate/name", "name=ab"))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), axum::http::StatusCode::OK);
+            let body = body_text(resp).await;
+            assert!(body.contains(r#"aria-invalid="true""#), "{body}");
+            assert!(body.contains(r#"role="alert""#), "{body}");
+            assert!(
+                body.contains("Name must be at least 3 characters"),
+                "{body}"
+            );
+            // Value preserved after failed validation
+            assert!(body.contains(r#"value="ab""#), "{body}");
+        }
+
+        #[cfg(feature = "maud")]
+        #[tokio::test]
+        async fn inline_invalid_field_partial_is_htmx_swappable() {
+            async fn handler(form: ChangesetForm<InlineTestForm>) -> maud::Markup {
+                text_input_htmx(&form.changeset, "name", "Name", "/validate/name")
+            }
+            let resp = Router::new()
+                .route("/validate/name", post(handler))
+                .oneshot(urlencoded_req("/validate/name", "name=ab"))
+                .await
+                .unwrap();
+            let body = body_text(resp).await;
+            // Wrapper must have stable id for hx-swap="outerHTML" targeting
+            assert!(body.contains(r#"id="name-field""#), "{body}");
+        }
+
+        #[cfg(feature = "maud")]
+        #[tokio::test]
+        async fn full_form_submit_invalid_returns_422() {
+            async fn handler(form: ChangesetForm<InlineTestForm>) -> impl IntoResponse {
+                match form.into_valid() {
+                    Ok(_) => axum::http::StatusCode::OK.into_response(),
+                    Err(form) => (
+                        axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                        text_input_htmx(&form.changeset, "name", "Name", "/validate/name"),
+                    )
+                        .into_response(),
+                }
+            }
+            let resp = Router::new()
+                .route("/submit", post(handler))
+                .oneshot(urlencoded_req("/submit", "name=ab"))
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                "full-form invalid submit must return 422"
+            );
+            let body = body_text(resp).await;
+            assert!(
+                body.contains("Name must be at least 3 characters"),
+                "{body}"
+            );
+        }
+
+        #[cfg(feature = "maud")]
+        #[tokio::test]
+        async fn full_form_submit_valid_returns_200() {
+            async fn handler(form: ChangesetForm<InlineTestForm>) -> impl IntoResponse {
+                match form.into_valid() {
+                    Ok(_) => axum::http::StatusCode::OK.into_response(),
+                    Err(form) => (
+                        axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                        text_input_htmx(&form.changeset, "name", "Name", "/validate/name"),
+                    )
+                        .into_response(),
+                }
+            }
+            let resp = Router::new()
+                .route("/submit", post(handler))
+                .oneshot(urlencoded_req("/submit", "name=Alice"))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), axum::http::StatusCode::OK);
         }
 
         // ── Helpers ────────────────────────────────────────────────
