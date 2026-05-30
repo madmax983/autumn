@@ -227,14 +227,18 @@ impl AdminModel for FeatureFlagAdminModel {
                 .unwrap_or(0)
                 .clamp(0, 100);
             let description = data.get("description").and_then(Value::as_str);
-            let actor_allowlist = data
-                .get("actor_allowlist")
-                .and_then(Value::as_str)
-                .unwrap_or("[]");
-            let group_allowlist = data
-                .get("group_allowlist")
-                .and_then(Value::as_str)
-                .unwrap_or("[]");
+            let actor_allowlist = validate_string_array(
+                data.get("actor_allowlist")
+                    .and_then(Value::as_str)
+                    .unwrap_or("[]"),
+                "actor_allowlist",
+            )?;
+            let group_allowlist = validate_string_array(
+                data.get("group_allowlist")
+                    .and_then(Value::as_str)
+                    .unwrap_or("[]"),
+                "group_allowlist",
+            )?;
 
             // "Globally Enabled" with empty allowlists means globally on for all
             // actors — promote rollout_pct to 100 so the evaluator agrees.
@@ -319,14 +323,18 @@ impl AdminModel for FeatureFlagAdminModel {
                 .unwrap_or(0)
                 .clamp(0, 100);
             let description = data.get("description").and_then(Value::as_str);
-            let actor_allowlist = data
-                .get("actor_allowlist")
-                .and_then(Value::as_str)
-                .unwrap_or("[]");
-            let group_allowlist = data
-                .get("group_allowlist")
-                .and_then(Value::as_str)
-                .unwrap_or("[]");
+            let actor_allowlist = validate_string_array(
+                data.get("actor_allowlist")
+                    .and_then(Value::as_str)
+                    .unwrap_or("[]"),
+                "actor_allowlist",
+            )?;
+            let group_allowlist = validate_string_array(
+                data.get("group_allowlist")
+                    .and_then(Value::as_str)
+                    .unwrap_or("[]"),
+                "group_allowlist",
+            )?;
             let has_allowlist = actor_allowlist != "[]" || group_allowlist != "[]";
             if enabled && rollout_pct == 0 && !has_allowlist {
                 rollout_pct = 100;
@@ -495,6 +503,32 @@ impl AdminModel for FeatureFlagAdminModel {
                 per_page,
             })
         })
+    }
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Parse `raw` as a JSON array of strings and re-serialise to canonical form.
+///
+/// An empty string is treated as `[]`.  A trailing comma (`["a",]`), a
+/// non-array value, or mixed element types are all rejected with a validation
+/// error so bad data never reaches the database column that later casts to
+/// `::jsonb`.
+fn validate_string_array(raw: &str, field: &str) -> Result<String, AdminError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok("[]".to_owned());
+    }
+    match serde_json::from_str::<Vec<serde_json::Value>>(trimmed) {
+        Ok(arr) if arr.iter().all(serde_json::Value::is_string) => {
+            Ok(serde_json::to_string(&arr).unwrap_or_else(|_| "[]".to_owned()))
+        }
+        Ok(_) => Err(AdminError::Validation(format!(
+            "'{field}' must be a JSON array of strings (e.g. [\"user:42\"])"
+        ))),
+        Err(_) => Err(AdminError::Validation(format!(
+            "'{field}' must be valid JSON (e.g. [\"user:42\"]); check for trailing commas"
+        ))),
     }
 }
 
@@ -685,5 +719,42 @@ mod tests {
             rollout_pct, 0,
             "allowlist-only flag must not have rollout_pct promoted to 100"
         );
+    }
+
+    #[test]
+    fn validate_string_array_accepts_valid_array() {
+        let result = validate_string_array(r#"["user:1","user:2"]"#, "actor_allowlist");
+        assert!(result.is_ok(), "valid array must be accepted: {result:?}");
+    }
+
+    #[test]
+    fn validate_string_array_accepts_empty_string_as_empty_array() {
+        let result = validate_string_array("", "actor_allowlist");
+        assert_eq!(result.unwrap(), "[]");
+    }
+
+    #[test]
+    fn validate_string_array_rejects_trailing_comma() {
+        let result = validate_string_array(r#"["user:42",]"#, "actor_allowlist");
+        assert!(result.is_err(), "trailing comma must be rejected");
+    }
+
+    #[test]
+    fn validate_string_array_rejects_non_array() {
+        let result = validate_string_array("user:42", "actor_allowlist");
+        assert!(result.is_err(), "bare string must be rejected");
+    }
+
+    #[test]
+    fn validate_string_array_rejects_array_with_non_string_elements() {
+        let result = validate_string_array("[1, 2, 3]", "actor_allowlist");
+        assert!(result.is_err(), "integer elements must be rejected");
+    }
+
+    #[test]
+    fn validate_string_array_normalises_output() {
+        // Re-serialisation removes extra whitespace and produces canonical JSON.
+        let result = validate_string_array(r#"[ "user:1" ,  "user:2" ]"#, "actor_allowlist");
+        assert_eq!(result.unwrap(), r#"["user:1","user:2"]"#);
     }
 }

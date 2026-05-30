@@ -109,20 +109,14 @@ pub fn feature_flag_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     let original_body = &input_fn.block;
-    let original_response = match &input_fn.sig.output {
-        syn::ReturnType::Default => quote! {
-            let __autumn_inner: () = (async move #original_body).await;
-            ::autumn_web::reexports::axum::response::IntoResponse::into_response(__autumn_inner)
-        },
-        syn::ReturnType::Type(_, ty) if matches!(ty.as_ref(), syn::Type::ImplTrait(_)) => quote! {
-            ::autumn_web::reexports::axum::response::IntoResponse::into_response(
-                (async move #original_body).await
-            )
-        },
-        syn::ReturnType::Type(_, ty) => quote! {
-            let __autumn_inner: #ty = (async move #original_body).await;
-            ::autumn_web::reexports::axum::response::IntoResponse::into_response(__autumn_inner)
-        },
+    // Do NOT annotate the temporary with the original return type.  Rust
+    // rejects `impl Trait` in local-variable positions (e.g. when the handler
+    // returns `Result<impl IntoResponse, E>`), so we call `into_response`
+    // directly on the awaited block result for all return-type shapes.
+    let original_response = quote! {
+        ::autumn_web::reexports::axum::response::IntoResponse::into_response(
+            (async move #original_body).await
+        )
     };
 
     if !has_input_named(&input_fn, "__autumn_flags") {
@@ -218,6 +212,26 @@ mod tests {
         assert!(
             code.contains("compile_error"),
             "non-async fn must produce compile_error: {code}"
+        );
+    }
+
+    #[test]
+    fn feature_flag_impl_trait_return_does_not_emit_typed_binding() {
+        // Result<impl IntoResponse, E> must NOT produce `let x: Result<impl IntoResponse, E> = ...`
+        // because Rust rejects `impl Trait` in local-variable positions.
+        let result = feature_flag_macro(
+            quote! { "my_flag" },
+            quote! {
+                async fn my_handler() -> Result<impl IntoResponse, String> {
+                    Ok("hello")
+                }
+            },
+        );
+        let code = result.to_string();
+        // The generated code must NOT contain a typed binding with the return type
+        assert!(
+            !code.contains("let __autumn_inner :"),
+            "must not emit typed local binding: {code}"
         );
     }
 
