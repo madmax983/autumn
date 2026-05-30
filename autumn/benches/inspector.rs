@@ -104,14 +104,18 @@ fn main() {
 
     println!("{}", "─".repeat(60));
 
-    let overhead_ns = instrumented
-        .as_nanos()
-        .saturating_sub(baseline.as_nanos())
-        / u128::from(iterations);
+    let overhead_ns =
+        instrumented.as_nanos().saturating_sub(baseline.as_nanos()) / u128::from(iterations);
     let budget_ns: u128 = 1_000_000; // 1 ms
-    let status = if overhead_ns < budget_ns { "✓ PASS" } else { "✗ FAIL" };
+    let status = if overhead_ns < budget_ns {
+        "✓ PASS"
+    } else {
+        "✗ FAIL"
+    };
 
-    println!("Inspector overhead:         {overhead_ns:>8} ns/op  (budget < {budget_ns} ns)  {status}");
+    println!(
+        "Inspector overhead:         {overhead_ns:>8} ns/op  (budget < {budget_ns} ns)  {status}"
+    );
 
     // The benchmark itself doesn't assert — latency varies across CI machines.
     // Use the printed output for manual verification and flamegraph profiling.

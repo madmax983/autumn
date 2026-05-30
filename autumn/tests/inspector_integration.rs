@@ -2,7 +2,8 @@
 // These fail until the implementation lands.
 
 use autumn_web::inspector::{
-    InspectorBuffer, InspectorLayer, QueryRecord, RequestInspector, RequestRecord, detect_n_plus_one,
+    InspectorBuffer, InspectorLayer, QueryRecord, RequestInspector, RequestRecord,
+    detect_n_plus_one,
 };
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -112,7 +113,10 @@ fn n_plus_one_normalizes_whitespace() {
         make_query("SELECT * FROM users WHERE id = $1"),
     ];
     let warning = detect_n_plus_one(&queries, 5);
-    assert!(warning.is_some(), "whitespace-normalized queries should match");
+    assert!(
+        warning.is_some(),
+        "whitespace-normalized queries should match"
+    );
 }
 
 #[test]
@@ -187,16 +191,11 @@ async fn inspector_middleware_records_elapsed_and_status() {
     let app = axum::Router::new()
         .route(
             "/gone",
-            axum::routing::get(|| async {
-                (StatusCode::NOT_FOUND, "gone")
-            }),
+            axum::routing::get(|| async { (StatusCode::NOT_FOUND, "gone") }),
         )
         .layer(layer);
 
-    let req = Request::builder()
-        .uri("/gone")
-        .body(Body::empty())
-        .unwrap();
+    let req = Request::builder().uri("/gone").body(Body::empty()).unwrap();
     let _ = app.oneshot(req).await.unwrap();
 
     let record = &buf.snapshot()[0];
@@ -267,10 +266,7 @@ async fn request_inspector_triggers_n_plus_one_detection() {
         )
         .layer(layer);
 
-    let req = Request::builder()
-        .uri("/loop")
-        .body(Body::empty())
-        .unwrap();
+    let req = Request::builder().uri("/loop").body(Body::empty()).unwrap();
     let _ = app.oneshot(req).await.unwrap();
 
     let record = &buf.snapshot()[0];
@@ -288,27 +284,27 @@ async fn inspector_index_returns_html() {
     let buf = InspectorBuffer::new(10);
     buf.push(make_record("GET", "/posts", 200));
 
-    let router = autumn_web::inspector::inspector_router(
-        buf,
-        "/_autumn/inspect",
-    );
+    let router = autumn_web::inspector::inspector_router(buf, "/_autumn/inspect");
 
     let req = Request::builder()
         .uri("/_autumn/inspect")
         .body(Body::empty())
         .unwrap();
-    let resp = router
-        .oneshot(req)
-        .await
-        .expect("inspector index request");
+    let resp = router.oneshot(req).await.expect("inspector index request");
     assert_eq!(resp.status(), StatusCode::OK);
 
     let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
         .await
         .unwrap();
     let html = std::str::from_utf8(&body).unwrap();
-    assert!(html.contains("/_autumn/inspect"), "index page should reference inspector path");
-    assert!(html.contains("/posts"), "index should list the recorded request");
+    assert!(
+        html.contains("/_autumn/inspect"),
+        "index page should reference inspector path"
+    );
+    assert!(
+        html.contains("/posts"),
+        "index should list the recorded request"
+    );
 }
 
 #[tokio::test]
@@ -318,35 +314,29 @@ async fn inspector_detail_returns_html() {
     let snapshot = buf.snapshot();
     let id = snapshot[0].id;
 
-    let router = autumn_web::inspector::inspector_router(
-        buf,
-        "/_autumn/inspect",
-    );
+    let router = autumn_web::inspector::inspector_router(buf, "/_autumn/inspect");
 
     let req = Request::builder()
         .uri(format!("/_autumn/inspect/requests/{id}"))
         .body(Body::empty())
         .unwrap();
-    let resp = router
-        .oneshot(req)
-        .await
-        .expect("inspector detail request");
+    let resp = router.oneshot(req).await.expect("inspector detail request");
     assert_eq!(resp.status(), StatusCode::OK);
 
     let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
         .await
         .unwrap();
     let html = std::str::from_utf8(&body).unwrap();
-    assert!(html.contains("/detail-test"), "detail page should show the request path");
+    assert!(
+        html.contains("/detail-test"),
+        "detail page should show the request path"
+    );
 }
 
 #[tokio::test]
 async fn inspector_detail_returns_404_for_unknown_id() {
     let buf = InspectorBuffer::new(10);
-    let router = autumn_web::inspector::inspector_router(
-        buf,
-        "/_autumn/inspect",
-    );
+    let router = autumn_web::inspector::inspector_router(buf, "/_autumn/inspect");
 
     let req = Request::builder()
         .uri("/_autumn/inspect/requests/9999")
@@ -397,7 +387,10 @@ async fn inspector_records_session_id_from_cookie() {
 
     let req = Request::builder()
         .uri("/page")
-        .header(axum::http::header::COOKIE, "my_session=abc123def456; other=x")
+        .header(
+            axum::http::header::COOKIE,
+            "my_session=abc123def456; other=x",
+        )
         .body(Body::empty())
         .unwrap();
     let _ = app.oneshot(req).await.unwrap();

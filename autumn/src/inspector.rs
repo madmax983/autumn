@@ -81,15 +81,18 @@ pub struct RequestRecord {
 
 impl RequestRecord {
     /// Number of SQL queries issued during this request.
-    #[must_use] 
+    #[must_use]
     pub const fn query_count(&self) -> usize {
         self.queries.len()
     }
 
     /// A `curl` one-liner that reproduces the method + path of this request.
-    #[must_use] 
+    #[must_use]
     pub fn curl_snippet(&self) -> String {
-        format!("curl -X {} 'http://localhost:3000{}'", self.method, self.path)
+        format!(
+            "curl -X {} 'http://localhost:3000{}'",
+            self.method, self.path
+        )
     }
 }
 
@@ -115,7 +118,7 @@ impl InspectorBuffer {
     /// Create a new buffer with the given capacity.
     ///
     /// A capacity of `0` disables recording (all pushes are no-ops).
-    #[must_use] 
+    #[must_use]
     pub fn new(capacity: usize) -> Self {
         Self {
             inner: Arc::new(Mutex::new(InspectorInner {
@@ -200,16 +203,12 @@ impl InspectorBuffer {
 /// all whitespace and converting to lower-case. This catches formatting
 /// differences between call sites while still allowing different predicates
 /// to be treated as different queries.
-#[must_use] 
-pub fn detect_n_plus_one(
-    queries: &[QueryRecord],
-    threshold: usize,
-) -> Option<NPlusOneWarning> {
+#[must_use]
+pub fn detect_n_plus_one(queries: &[QueryRecord], threshold: usize) -> Option<NPlusOneWarning> {
     if threshold == 0 || queries.is_empty() {
         return None;
     }
-    let mut counts: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for q in queries {
         *counts.entry(normalize_sql(&q.sql)).or_insert(0) += 1;
     }
@@ -217,12 +216,18 @@ pub fn detect_n_plus_one(
         .into_iter()
         .filter(|(_, c)| *c >= threshold)
         .max_by_key(|(_, c)| *c)
-        .map(|(sql_template, count)| NPlusOneWarning { sql_template, count })
+        .map(|(sql_template, count)| NPlusOneWarning {
+            sql_template,
+            count,
+        })
 }
 
 /// Collapse whitespace and lower-case a SQL string for comparison.
 fn normalize_sql(sql: &str) -> String {
-    sql.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+    sql.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
 // ── Per-request query accumulator ─────────────────────────────────────────────
@@ -247,7 +252,10 @@ impl RequestQueryList {
     }
 
     pub fn push(&self, record: QueryRecord) {
-        self.0.lock().expect("query list lock poisoned").push(record);
+        self.0
+            .lock()
+            .expect("query list lock poisoned")
+            .push(record);
     }
 
     pub fn snapshot(&self) -> Vec<QueryRecord> {
@@ -292,7 +300,7 @@ impl RequestInspector {
     }
 
     /// Number of queries recorded so far in this request.
-    #[must_use] 
+    #[must_use]
     pub fn query_count(&self) -> usize {
         self.list.snapshot().len()
     }
@@ -301,10 +309,7 @@ impl RequestInspector {
 impl<S: Send + Sync> FromRequestParts<S> for RequestInspector {
     type Rejection = std::convert::Infallible;
 
-    async fn from_request_parts(
-        parts: &mut Parts,
-        _state: &S,
-    ) -> Result<Self, Self::Rejection> {
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
         let list = parts
             .extensions
             .get::<RequestQueryList>()
@@ -338,7 +343,7 @@ impl InspectorLayer {
     /// * `buffer` — shared ring buffer to write records into.
     /// * `n_plus_one_threshold` — minimum repetition count to trigger an N+1 warning.
     /// * `inspector_path_prefix` — path prefix of the inspector UI (excluded from recording).
-    #[must_use] 
+    #[must_use]
     pub fn new(
         buffer: InspectorBuffer,
         n_plus_one_threshold: usize,
@@ -484,22 +489,20 @@ where
 ///
 /// The session cookie may be signed (`{id}.{hmac}`); we return only
 /// the `id` portion (everything before the first `.`).
-fn extract_session_id(
-    headers: &axum::http::HeaderMap,
-    cookie_name: &str,
-) -> Option<String> {
+fn extract_session_id(headers: &axum::http::HeaderMap, cookie_name: &str) -> Option<String> {
     let cookie_header = headers.get(header::COOKIE)?.to_str().ok()?;
     for pair in cookie_header.split(';') {
         let pair = pair.trim();
         if let Some((name, value)) = pair.split_once('=')
-            && name.trim() == cookie_name {
-                let raw = value.trim();
-                // Strip HMAC signature: `{session_id}.{hmac_hex}` → `{session_id}`
-                let id = raw.split_once('.').map_or(raw, |(id, _)| id);
-                if !id.is_empty() {
-                    return Some(id.to_owned());
-                }
+            && name.trim() == cookie_name
+        {
+            let raw = value.trim();
+            // Strip HMAC signature: `{session_id}.{hmac_hex}` → `{session_id}`
+            let id = raw.split_once('.').map_or(raw, |(id, _)| id);
+            if !id.is_empty() {
+                return Some(id.to_owned());
             }
+        }
     }
     None
 }
@@ -511,10 +514,7 @@ fn extract_session_id(
 /// Mounts:
 /// * `GET {path}` — request list (newest-first)
 /// * `GET {path}/requests/{id}` — request detail
-pub fn inspector_router<S>(
-    buffer: InspectorBuffer,
-    path: &str,
-) -> axum::Router<S>
+pub fn inspector_router<S>(buffer: InspectorBuffer, path: &str) -> axum::Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
@@ -558,11 +558,17 @@ fn render_index(records: &[RequestRecord], inspector_path: &str) -> String {
     body.push_str("\">Refresh</a></p>");
 
     if records.is_empty() {
-        body.push_str("<p class=\"empty\">No requests recorded yet. Make some requests then refresh.</p>");
+        body.push_str(
+            "<p class=\"empty\">No requests recorded yet. Make some requests then refresh.</p>",
+        );
     } else {
         body.push_str("<table><thead><tr><th>Method</th><th>Path</th><th>Route</th><th>Status</th><th>Duration</th><th>Queries</th><th>N+1?</th></tr></thead><tbody>");
         for rec in records {
-            let n1 = if rec.n_plus_one.is_some() { "⚠ N+1" } else { "" };
+            let n1 = if rec.n_plus_one.is_some() {
+                "⚠ N+1"
+            } else {
+                ""
+            };
             let status_class = if rec.status >= 500 {
                 "error"
             } else if rec.status >= 400 {
@@ -644,7 +650,9 @@ fn render_detail(rec: &RequestRecord, inspector_path: &str) -> String {
 
     // N+1 warning banner
     if let Some(w) = &rec.n_plus_one {
-        body.push_str("<div class=\"n1-banner\"><strong>&#9888; N+1 detected:</strong> query issued ");
+        body.push_str(
+            "<div class=\"n1-banner\"><strong>&#9888; N+1 detected:</strong> query issued ",
+        );
         body.push_str(&w.count.to_string());
         body.push_str(" times — <code>");
         body.push_str(&escape_html(&w.sql_template));
@@ -895,7 +903,10 @@ mod tests {
 
     #[test]
     fn escape_html_escapes_special_chars() {
-        assert_eq!(escape_html("<script>&\"'"), "&lt;script&gt;&amp;&quot;&#39;");
+        assert_eq!(
+            escape_html("<script>&\"'"),
+            "&lt;script&gt;&amp;&quot;&#39;"
+        );
     }
 
     // Middleware tests
