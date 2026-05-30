@@ -5,6 +5,10 @@
 //! delegates to a custom fallback handler specified with
 //! `#[feature_flag("key", fallback = my_fallback_handler)]`.
 //!
+//! The flag check runs inside a dedicated `FromRequestParts` extractor so
+//! Axum can short-circuit **before** body extractors (`Json`, `Form`) are
+//! consumed and before other resources (DB connections, etc.) are acquired.
+//!
 //! ## Usage
 //!
 //! ```ignore
@@ -30,7 +34,7 @@
 //! ```
 
 use proc_macro2::TokenStream;
-use quote::quote;
+use quote::{format_ident, quote};
 use syn::{Expr, ItemFn, LitStr, Token, parse::ParseStream, parse_quote};
 
 struct FeatureFlagArgs {
@@ -63,8 +67,6 @@ impl syn::parse::Parse for FeatureFlagArgs {
 }
 
 pub fn feature_flag_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
-    use crate::param_helpers::has_input_named;
-
     let args: FeatureFlagArgs = match syn::parse2(attr) {
         Ok(a) => a,
         Err(err) => return err.to_compile_error(),
@@ -84,63 +86,87 @@ pub fn feature_flag_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 
     let flag_key = &args.flag_key;
+    let fn_name = &input_fn.sig.ident;
 
-    let disabled_response = args.fallback.as_ref().map_or_else(
+    // One gate struct per handler keeps names unique within the module.
+    let gate_ident = format_ident!("__AutumnFlagGate_{}", fn_name);
+
+    // The gate's rejection: either the default 404 or a custom fallback.
+    let disabled_rejection = args.fallback.as_ref().map_or_else(
         || {
             quote! {
-                return ::autumn_web::reexports::axum::response::IntoResponse::into_response(
-                    ::autumn_web::reexports::http::StatusCode::NOT_FOUND
-                );
+                ::std::result::Result::Err(
+                    ::autumn_web::reexports::axum::response::IntoResponse::into_response(
+                        ::autumn_web::reexports::http::StatusCode::NOT_FOUND,
+                    )
+                )
             }
         },
         |fallback_fn| {
             quote! {
-                return ::autumn_web::reexports::axum::response::IntoResponse::into_response(
-                    #fallback_fn().await
-                );
+                ::std::result::Result::Err(
+                    ::autumn_web::reexports::axum::response::IntoResponse::into_response(
+                        #fallback_fn().await,
+                    )
+                )
             }
         },
     );
 
-    let flag_check = quote! {
-        if !__autumn_flags.enabled(#flag_key) {
-            #disabled_response
+    // Generate the gate struct and its FromRequestParts impl.
+    //
+    // Axum extracts all FromRequestParts items (including this gate) before
+    // it extracts the body extractor (Json, Form, etc.).  If the flag is
+    // disabled, from_request_parts returns Err(Response) and Axum returns that
+    // response directly — the handler body and body extractors never run.
+    let gate_impl = quote! {
+        #[doc(hidden)]
+        #[allow(non_camel_case_types)]
+        struct #gate_ident;
+
+        #[automatically_derived]
+        impl ::autumn_web::reexports::axum::extract::FromRequestParts<::autumn_web::AppState>
+            for #gate_ident
+        {
+            type Rejection = ::autumn_web::reexports::axum::response::Response;
+
+            async fn from_request_parts(
+                parts: &mut ::autumn_web::reexports::http::request::Parts,
+                state: &::autumn_web::AppState,
+            ) -> ::std::result::Result<Self, Self::Rejection> {
+                let flags = <::autumn_web::feature_flags::Flags
+                    as ::autumn_web::reexports::axum::extract::FromRequestParts<
+                        ::autumn_web::AppState,
+                    >>::from_request_parts(parts, state)
+                    .await
+                    .map_err(|e| {
+                        ::autumn_web::reexports::axum::response::IntoResponse::into_response(e)
+                    })?;
+                if flags.enabled(#flag_key) {
+                    ::std::result::Result::Ok(#gate_ident)
+                } else {
+                    #disabled_rejection
+                }
+            }
         }
     };
 
-    let original_body = &input_fn.block;
-    // Do NOT annotate the temporary with the original return type.  Rust
-    // rejects `impl Trait` in local-variable positions (e.g. when the handler
-    // returns `Result<impl IntoResponse, E>`), so we call `into_response`
-    // directly on the awaited block result for all return-type shapes.
-    let original_response = quote! {
-        ::autumn_web::reexports::axum::response::IntoResponse::into_response(
-            (async move #original_body).await
-        )
-    };
-
-    if !has_input_named(&input_fn, "__autumn_flags") {
-        let flags_param: syn::FnArg = parse_quote! {
-            __autumn_flags: ::autumn_web::feature_flags::Flags
-        };
-        input_fn.sig.inputs.insert(0, flags_param);
-    }
+    // Inject the gate as the first handler parameter.  The value is unused
+    // in the handler body — its sole purpose is to trigger the extraction.
+    let gate_param: syn::FnArg = parse_quote! { _: #gate_ident };
+    input_fn.sig.inputs.insert(0, gate_param);
 
     input_fn
         .attrs
         .push(parse_quote!(#[allow(clippy::too_many_arguments)]));
-    input_fn.sig.output = parse_quote! {
-        -> ::autumn_web::reexports::axum::response::Response
-    };
 
-    input_fn.block = syn::parse_quote! {
-        {
-            #flag_check
-            #original_response
-        }
-    };
-
-    quote! { #input_fn }
+    // The return type and body are left unchanged — the gate extractor handles
+    // the disabled case before the handler is called, so no body injection or
+    // return-type change is needed.
+    quote! {
+        #gate_impl
+        #input_fn
+    }
 }
 
 #[cfg(test)]
@@ -165,15 +191,20 @@ mod tests {
             code.contains("my_flag"),
             "flag key must appear in generated code: {code}"
         );
-        // Must inject the flags parameter
+        // Must emit a gate type
         assert!(
-            code.contains("__autumn_flags"),
-            "must inject flags param: {code}"
+            code.contains("__AutumnFlagGate_my_handler"),
+            "must emit a gate struct: {code}"
         );
         // Must handle the disabled case
         assert!(
             code.contains("NOT_FOUND") || code.contains("404"),
             "must have 404 fallback: {code}"
+        );
+        // Must NOT emit typed local binding
+        assert!(
+            !code.contains("let __autumn_inner"),
+            "must not emit typed local binding: {code}"
         );
     }
 
@@ -217,8 +248,8 @@ mod tests {
 
     #[test]
     fn feature_flag_impl_trait_return_does_not_emit_typed_binding() {
-        // Result<impl IntoResponse, E> must NOT produce `let x: Result<impl IntoResponse, E> = ...`
-        // because Rust rejects `impl Trait` in local-variable positions.
+        // The gate approach never emits a typed local binding at all —
+        // the handler body is unchanged and the return type is preserved.
         let result = feature_flag_macro(
             quote! { "my_flag" },
             quote! {
@@ -228,9 +259,8 @@ mod tests {
             },
         );
         let code = result.to_string();
-        // The generated code must NOT contain a typed binding with the return type
         assert!(
-            !code.contains("let __autumn_inner :"),
+            !code.contains("let __autumn_inner"),
             "must not emit typed local binding: {code}"
         );
     }
@@ -249,6 +279,31 @@ mod tests {
         assert!(
             code.contains("compile_error"),
             "unknown arg must produce compile_error: {code}"
+        );
+    }
+
+    #[test]
+    fn feature_flag_gate_runs_before_body_extractors() {
+        // The gate extractor is injected as the first parameter (a
+        // FromRequestParts impl), so Axum evaluates it before consuming the
+        // request body (Json, Form, etc.).  Verify the generated code does NOT
+        // contain the old body-wrapping pattern.
+        let result = feature_flag_macro(
+            quote! { "my_flag" },
+            quote! {
+                async fn my_handler(body: String) -> String {
+                    body
+                }
+            },
+        );
+        let code = result.to_string();
+        assert!(
+            code.contains("FromRequestParts"),
+            "must generate a FromRequestParts impl: {code}"
+        );
+        assert!(
+            !code.contains("async move"),
+            "must not wrap body in async move block: {code}"
         );
     }
 }

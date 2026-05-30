@@ -1206,7 +1206,7 @@ impl axum::extract::FromRequestParts<crate::AppState> for Flags {
 
         // Resolve actor_id from session if available (best-effort, non-blocking).
         let actor_id = if let Some(session) = parts.extensions.get::<crate::session::Session>() {
-            session.get("current_user_id").await
+            session.get("user_id").await
         } else {
             None
         };

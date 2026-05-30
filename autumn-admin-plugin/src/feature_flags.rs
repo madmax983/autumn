@@ -374,6 +374,12 @@ impl AdminModel for FeatureFlagAdminModel {
                      FROM old_row \
                      WHERE old_row.key != $2 \
                  ), \
+                 _audit_rename_breadcrumb AS ( \
+                     INSERT INTO feature_flag_changes (key, mutation, actor) \
+                     SELECT $2, 'renamed_from=' || old_row.key, NULL \
+                     FROM old_row \
+                     WHERE old_row.key != $2 \
+                 ), \
                  _audit AS ( \
                      INSERT INTO feature_flag_changes (key, mutation, actor) \
                      SELECT key, $8, NULL FROM updated \
@@ -476,18 +482,32 @@ impl AdminModel for FeatureFlagAdminModel {
                 });
             };
 
-            let count: i64 =
-                diesel::sql_query("SELECT COUNT(*) FROM feature_flag_changes WHERE key = $1")
-                    .bind::<diesel::sql_types::Text, _>(&key)
-                    .get_result::<CountRow>(&mut conn)
-                    .await
-                    .map_or(0, |r| r.count);
+            // Also include history from predecessor keys (recorded as
+            // 'renamed_from=<old_key>' breadcrumbs on the current key).
+            let count: i64 = diesel::sql_query(
+                "SELECT COUNT(*) FROM feature_flag_changes \
+                     WHERE key = $1 \
+                        OR key IN ( \
+                            SELECT regexp_replace(mutation, '^renamed_from=', '') \
+                            FROM feature_flag_changes \
+                            WHERE key = $1 AND mutation LIKE 'renamed_from=%' \
+                        )",
+            )
+            .bind::<diesel::sql_types::Text, _>(&key)
+            .get_result::<CountRow>(&mut conn)
+            .await
+            .map_or(0, |r| r.count);
 
             let offset = (page.saturating_sub(1)) * per_page;
             let entries: Vec<crate::AdminHistoryEntry> = diesel::sql_query(
                 "SELECT id, mutation AS op, actor, changed_at \
                  FROM feature_flag_changes \
                  WHERE key = $1 \
+                    OR key IN ( \
+                        SELECT regexp_replace(mutation, '^renamed_from=', '') \
+                        FROM feature_flag_changes \
+                        WHERE key = $1 AND mutation LIKE 'renamed_from=%' \
+                    ) \
                  ORDER BY changed_at DESC \
                  LIMIT $2 OFFSET $3",
             )
