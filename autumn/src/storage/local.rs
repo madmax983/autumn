@@ -60,6 +60,7 @@ impl SigningKey {
     }
 
     /// Returns the raw key bytes.
+    #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
