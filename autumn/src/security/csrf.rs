@@ -182,6 +182,7 @@ struct CsrfSettings {
     safe_methods: Vec<http::Method>,
     exempt_paths: Vec<String>,
     signing_keys: Option<Arc<crate::security::config::ResolvedSigningKeys>>,
+    max_scan_bytes: usize,
 }
 
 /// Tower [`Layer`] that applies CSRF protection.
@@ -215,8 +216,18 @@ impl CsrfLayer {
                 safe_methods,
                 exempt_paths: config.exempt_paths.clone(),
                 signing_keys: None,
+                max_scan_bytes: 2 * 1024 * 1024,
             }),
         }
+    }
+
+    /// Limit the form-body bytes read when scanning for the CSRF token field.
+    /// The effective limit is `min(n, 2 MiB)`.
+    #[must_use]
+    pub(crate) fn with_max_scan_bytes(mut self, n: usize) -> Self {
+        let settings = Arc::make_mut(&mut self.settings);
+        settings.max_scan_bytes = n.min(2 * 1024 * 1024);
+        self
     }
 
     /// Attach signing keys so CSRF tokens are HMAC-signed.
@@ -498,7 +509,7 @@ async fn verify_csrf_token(
     let body = std::mem::replace(req.body_mut(), axum::body::Body::empty());
 
     // Limit body size to avoid DoS when extracting form field
-    let bytes = axum::body::to_bytes(body, 2 * 1024 * 1024)
+    let bytes = axum::body::to_bytes(body, settings.max_scan_bytes)
         .await
         .unwrap_or_else(|_| axum::body::Bytes::new());
 

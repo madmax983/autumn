@@ -237,6 +237,7 @@ pub async fn method_override_rejection_filter(
 #[derive(Clone, Debug)]
 pub struct MethodOverrideLayer {
     config: Arc<MethodOverrideConfig>,
+    max_scan_bytes: usize,
 }
 
 impl MethodOverrideLayer {
@@ -251,7 +252,16 @@ impl MethodOverrideLayer {
     pub fn from_config(config: MethodOverrideConfig) -> Self {
         Self {
             config: Arc::new(config),
+            max_scan_bytes: MAX_BODY_SCAN_BYTES,
         }
+    }
+
+    /// Limit the body bytes read when scanning for a `_method` field.
+    /// The effective limit is `min(n, MAX_BODY_SCAN_BYTES)`.
+    #[must_use]
+    pub(crate) fn with_max_scan_bytes(mut self, n: usize) -> Self {
+        self.max_scan_bytes = n.min(MAX_BODY_SCAN_BYTES);
+        self
     }
 }
 
@@ -268,6 +278,7 @@ impl<S> Layer<S> for MethodOverrideLayer {
         MethodOverrideService {
             inner,
             config: Arc::clone(&self.config),
+            max_scan_bytes: self.max_scan_bytes,
         }
     }
 }
@@ -277,6 +288,7 @@ impl<S> Layer<S> for MethodOverrideLayer {
 pub struct MethodOverrideService<S> {
     inner: S,
     config: Arc<MethodOverrideConfig>,
+    max_scan_bytes: usize,
 }
 
 /// Returns `Some(method)` when `value` is a recognised override target.
@@ -477,6 +489,7 @@ where
         }
 
         let config = Arc::clone(&self.config);
+        let max_scan_bytes = self.max_scan_bytes;
         let mut inner = self.inner.clone();
         std::mem::swap(&mut self.inner, &mut inner);
 
@@ -497,7 +510,7 @@ where
             // filter render `413` so the user is told plainly that
             // the form is too large to support the override.
             let body = std::mem::replace(req.body_mut(), axum::body::Body::empty());
-            let Ok(bytes) = axum::body::to_bytes(body, MAX_BODY_SCAN_BYTES).await else {
+            let Ok(bytes) = axum::body::to_bytes(body, max_scan_bytes).await else {
                 // Body exceeded the scan cap. The bytes are gone, so
                 // we can't forward a faithful request — and we don't
                 // want to silently turn an intended `DELETE` into a
@@ -1397,5 +1410,31 @@ mod tests {
             .expect("override rejection must carry AutumnErrorInfo");
         assert_eq!(info.status, StatusCode::BAD_REQUEST);
         assert!(info.message.contains("PUT, PATCH, or DELETE"));
+    }
+
+    #[tokio::test]
+    async fn with_max_scan_bytes_rejects_body_exceeding_custom_cap() {
+        let router = Router::new()
+            .route("/items", post(|| async { "ok" }))
+            .layer(axum::middleware::from_fn(method_override_rejection_filter));
+
+        // Set a very small cap (10 bytes) — the 20-byte body should be rejected.
+        let service =
+            tower::Layer::layer(&MethodOverrideLayer::new().with_max_scan_bytes(10), router);
+
+        let response = service
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/items")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .header("sec-fetch-site", "same-origin")
+                    .body(Body::from("_method=DELETE&x=123456789012"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 }

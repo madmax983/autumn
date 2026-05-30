@@ -1919,7 +1919,11 @@ impl AppBuilder {
         // a layered service ever runs. Wrapping the whole router as a
         // tower::Service is the documented way to run middleware before
         // route matching.
-        let service = tower::Layer::layer(&crate::middleware::MethodOverrideLayer::new(), router);
+        let service = tower::Layer::layer(
+            &crate::middleware::MethodOverrideLayer::new()
+                .with_max_scan_bytes(config.security.upload.max_request_size_bytes),
+            router,
+        );
         let make_service =
             axum::ServiceExt::<axum::extract::Request>::into_make_service_with_connect_info::<
                 std::net::SocketAddr,

@@ -41,6 +41,7 @@
 //! | `AUTUMN_SERVER__HOST` | `server.host` | `String` |
 //! | `AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS` | `server.shutdown_timeout_secs` | `u64` |
 //! | `AUTUMN_SERVER__PRESTOP_GRACE_SECS` | `server.prestop_grace_secs` | `u64` |
+//! | `AUTUMN_SERVER__TIMEOUTS__REQUEST_TIMEOUT_MS` | `server.timeouts.request_timeout_ms` | `u64` |
 //! | `AUTUMN_DATABASE__URL` | `database.url` | `String` |
 //! | `AUTUMN_DATABASE__PRIMARY_URL` | `database.primary_url` | `String` |
 //! | `AUTUMN_DATABASE__REPLICA_URL` | `database.replica_url` | `String` |
@@ -437,6 +438,9 @@ fn profile_defaults_as_toml(profile: &str) -> toml::Value {
             let mut server = toml::map::Map::new();
             server.insert("host".into(), "0.0.0.0".into());
             server.insert("shutdown_timeout_secs".into(), toml::Value::Integer(30));
+            let mut timeouts = toml::map::Map::new();
+            timeouts.insert("request_timeout_ms".into(), toml::Value::Integer(30_000));
+            server.insert("timeouts".into(), toml::Value::Table(timeouts));
             table.insert("server".into(), toml::Value::Table(server));
 
             let mut health = toml::map::Map::new();
@@ -1718,6 +1722,11 @@ impl AutumnConfig {
             "AUTUMN_SERVER__PRESTOP_GRACE_SECS",
             &mut self.server.prestop_grace_secs,
         );
+        parse_env_option(
+            env,
+            "AUTUMN_SERVER__TIMEOUTS__REQUEST_TIMEOUT_MS",
+            &mut self.server.timeouts.request_timeout_ms,
+        );
     }
 
     fn apply_database_env_overrides_with_env(&mut self, env: &dyn Env) {
@@ -2361,6 +2370,29 @@ impl AutumnConfig {
 /// assert_eq!(server.port, 3000);
 /// assert_eq!(server.host, "127.0.0.1");
 /// ```
+/// Per-request timeout configuration.
+///
+/// Controls how long the server waits for a complete request-response cycle
+/// before returning `408 Request Timeout`. A value of `None` or `0` disables
+/// the timeout (the default, so existing applications are unaffected).
+///
+/// # `autumn.toml` example
+///
+/// ```toml
+/// [server.timeouts]
+/// request_timeout_ms = 30000  # 30 seconds
+/// ```
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RequestTimeoutsConfig {
+    /// Maximum time in milliseconds allowed for a complete request-response
+    /// cycle. When exceeded the framework returns `408 Request Timeout` with
+    /// a Problem Details body. `None` (default) or `0` disables the timeout.
+    ///
+    /// Configured via `AUTUMN_SERVER__TIMEOUTS__REQUEST_TIMEOUT_MS`.
+    #[serde(default)]
+    pub request_timeout_ms: Option<u64>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerConfig {
     /// Port to listen on. Default: `3000`.
@@ -2393,6 +2425,14 @@ pub struct ServerConfig {
     /// propagation time. Set to `0` to disable the grace period.
     #[serde(default = "default_prestop_grace")]
     pub prestop_grace_secs: u64,
+
+    /// Per-request timeout configuration.
+    ///
+    /// Controls request-cycle timeouts for `DoS` protection. By default
+    /// all timeouts are disabled so existing applications are unaffected.
+    /// Set `request_timeout_ms` in `[server.timeouts]` to enable.
+    #[serde(default)]
+    pub timeouts: RequestTimeoutsConfig,
 }
 
 /// Behavior when a configured read replica is unavailable or stale.
@@ -3027,6 +3067,7 @@ impl Default for ServerConfig {
             host: default_host(),
             shutdown_timeout_secs: default_shutdown_timeout(),
             prestop_grace_secs: default_prestop_grace(),
+            timeouts: RequestTimeoutsConfig::default(),
         }
     }
 }
@@ -5529,5 +5570,95 @@ path = "/api-spec.json"
         let parsed_null: TestConfig = toml::from_str(toml_str_null).unwrap();
         assert_eq!(parsed_null.timeout, None);
         assert_eq!(parsed_null.threshold, std::time::Duration::from_millis(500));
+    }
+
+    // ── RequestTimeoutsConfig ──────────────────────────────────────────────
+
+    #[test]
+    fn request_timeouts_config_defaults_to_none() {
+        let config = RequestTimeoutsConfig::default();
+        assert!(config.request_timeout_ms.is_none());
+    }
+
+    #[test]
+    fn server_config_timeouts_defaults_to_disabled() {
+        let config = ServerConfig::default();
+        assert!(config.timeouts.request_timeout_ms.is_none());
+    }
+
+    #[test]
+    fn request_timeouts_config_can_be_set_via_toml() {
+        let toml_str = "request_timeout_ms = 5000";
+        let config: RequestTimeoutsConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.request_timeout_ms, Some(5000));
+    }
+
+    #[test]
+    fn server_config_timeouts_deserialize_nested() {
+        let toml_str = r#"
+            port = 3000
+            host = "127.0.0.1"
+            shutdown_timeout_secs = 30
+            prestop_grace_secs = 5
+
+            [timeouts]
+            request_timeout_ms = 15000
+        "#;
+        let config: ServerConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.timeouts.request_timeout_ms, Some(15_000));
+    }
+
+    #[test]
+    fn autumn_config_server_timeouts_roundtrip() {
+        let mut config = AutumnConfig::default();
+        config.server.timeouts.request_timeout_ms = Some(20_000);
+        assert_eq!(config.server.timeouts.request_timeout_ms, Some(20_000));
+    }
+
+    #[test]
+    fn server_timeouts_env_var_override() {
+        struct FakeEnv(std::collections::HashMap<String, String>);
+        impl Env for FakeEnv {
+            fn var(&self, key: &str) -> Result<String, std::env::VarError> {
+                self.0
+                    .get(key)
+                    .cloned()
+                    .ok_or(std::env::VarError::NotPresent)
+            }
+        }
+
+        let mut config = AutumnConfig::default();
+        let env = FakeEnv(
+            [(
+                "AUTUMN_SERVER__TIMEOUTS__REQUEST_TIMEOUT_MS".to_owned(),
+                "8000".to_owned(),
+            )]
+            .into(),
+        );
+        config.apply_server_env_overrides_with_env(&env);
+        assert_eq!(config.server.timeouts.request_timeout_ms, Some(8000));
+    }
+
+    #[test]
+    fn prod_profile_sets_request_timeout_30s() {
+        let defaults = profile_defaults_as_toml("prod");
+        let toml_str = toml::to_string(&defaults).unwrap();
+        let config: AutumnConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(
+            config.server.timeouts.request_timeout_ms,
+            Some(30_000),
+            "prod profile must enable the 30-second request timeout by default"
+        );
+    }
+
+    #[test]
+    fn dev_profile_leaves_request_timeout_disabled() {
+        let defaults = profile_defaults_as_toml("dev");
+        let toml_str = toml::to_string(&defaults).unwrap();
+        let config: AutumnConfig = toml::from_str(&toml_str).unwrap();
+        assert!(
+            config.server.timeouts.request_timeout_ms.is_none(),
+            "dev profile must not enable a request timeout by default"
+        );
     }
 }

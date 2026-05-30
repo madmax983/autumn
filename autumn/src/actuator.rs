@@ -1217,6 +1217,18 @@ pub(crate) async fn prometheus_endpoint<S: ProvideActuatorState + Send + Sync + 
         snapshot.http.shutdown_aborted_requests_total
     );
 
+    // autumn_request_timeouts_total
+    out.push_str(
+        "# HELP autumn_request_timeouts_total \
+         HTTP requests that exceeded the configured per-request timeout\n",
+    );
+    out.push_str("# TYPE autumn_request_timeouts_total counter\n");
+    let _ = writeln!(
+        out,
+        "autumn_request_timeouts_total {}",
+        snapshot.http.request_timeouts_total
+    );
+
     // by_route
     if !snapshot.http.by_route.is_empty() {
         out.push_str("# HELP autumn_http_route_requests_total HTTP requests by route and method\n");
@@ -2807,6 +2819,10 @@ mod tests {
         assert!(
             text.contains("autumn_http_route_requests_total{method=\"POST\",route=\"/test\"} 1")
         );
+
+        assert!(text.contains("# HELP autumn_request_timeouts_total"));
+        assert!(text.contains("# TYPE autumn_request_timeouts_total counter"));
+        assert!(text.contains("autumn_request_timeouts_total 0"));
     }
 
     #[tokio::test]
