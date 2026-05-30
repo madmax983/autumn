@@ -7,6 +7,7 @@ mod credentials;
 mod dev;
 mod dev_loop_bench;
 mod doctor;
+mod experiments;
 mod export;
 mod flags;
 mod generate;
@@ -217,6 +218,28 @@ enum Commands {
     #[command(subcommand, verbatim_doc_comment)]
     #[allow(clippy::doc_markdown)]
     Flags(FlagsCommands),
+
+    /// Manage A/B experiments at runtime.
+    ///
+    /// Experiments declare named variants with weights, assign actors to variants
+    /// deterministically, and emit structured exposure events to your analytics
+    /// pipeline.  Weight changes propagate to new actors immediately; existing
+    /// sticky assignments are preserved.
+    ///
+    /// The database URL is resolved from `autumn.toml`, profile overrides, or
+    /// the `AUTUMN_DATABASE__PRIMARY_URL` / `AUTUMN_DATABASE__URL` /
+    /// `DATABASE_URL` environment variables.
+    ///
+    /// # Examples
+    ///
+    ///   autumn experiments list
+    ///   autumn experiments status checkout_v2
+    ///   autumn experiments set-weights checkout_v2 control=50,treatment=50
+    ///   autumn experiments conclude checkout_v2 treatment
+    ///   autumn experiments override checkout_v2 qa@example.com treatment
+    #[command(subcommand, verbatim_doc_comment)]
+    #[allow(clippy::doc_markdown)]
+    Experiments(ExperimentsCommands),
 
     /// Run accessibility (WCAG 2.1 AA) checks against rendered HTML.
     ///
@@ -686,6 +709,83 @@ enum FlagsCommands {
     },
 }
 
+/// Subcommands for `autumn experiments`.
+#[derive(Subcommand)]
+enum ExperimentsCommands {
+    /// List all experiments and their current state.
+    List,
+    /// Show detailed status for a single experiment.
+    ///
+    /// # Example
+    ///
+    ///   autumn experiments status checkout_v2
+    #[command(verbatim_doc_comment)]
+    Status {
+        /// Experiment name.
+        name: String,
+    },
+    /// Update the variant weights for an experiment.
+    ///
+    /// Existing sticky assignments are NOT re-bucketed. New actors will be
+    /// bucketed against the updated weights immediately.
+    ///
+    /// Weights are specified as comma-separated `variant=weight` pairs. Weights
+    /// are relative and do not need to sum to 100.
+    ///
+    /// # Example
+    ///
+    ///   autumn experiments set-weights checkout_v2 control=50,treatment=50
+    ///   autumn experiments set-weights pricing_v3 control=33,low=33,high=34
+    #[command(name = "set-weights", verbatim_doc_comment)]
+    SetWeights {
+        /// Experiment name.
+        name: String,
+        /// Variant weights as `"variant=weight,..."` (e.g. `"control=50,treatment=50"`).
+        weights: String,
+        /// Actor identifier stored in the change log.
+        #[arg(long, value_name = "ACTOR")]
+        actor: Option<String>,
+    },
+    /// Conclude an experiment and pin a winning variant.
+    ///
+    /// After concluding, `assign()` returns the winner for all actors without
+    /// emitting new exposure events.
+    ///
+    /// # Example
+    ///
+    ///   autumn experiments conclude checkout_v2 treatment
+    #[command(verbatim_doc_comment)]
+    Conclude {
+        /// Experiment name.
+        name: String,
+        /// Winning variant name.
+        winner: String,
+        /// Actor identifier stored in the change log.
+        #[arg(long, value_name = "ACTOR")]
+        actor: Option<String>,
+    },
+    /// Pin a staff/QA actor to a specific variant, bypassing weight-based bucketing.
+    ///
+    /// The override is tagged with `is_override = true` in exposure events so
+    /// analytics pipelines can exclude overridden assignments from results.
+    ///
+    /// # Example
+    ///
+    ///   autumn experiments override checkout_v2 qa@example.com treatment
+    #[command(verbatim_doc_comment)]
+    Override {
+        /// Experiment name.
+        name: String,
+        /// Actor ID to pin (e.g. `user:42` or `qa@example.com`).
+        actor_id: String,
+        /// Variant to force for this actor.
+        variant: String,
+        /// Actor identifier stored in the change log.
+        #[arg(long, value_name = "ACTOR")]
+        actor: Option<String>,
+    },
+}
+
 /// Subcommands for `autumn release`.
 #[derive(Subcommand)]
 enum ReleaseCommands {
@@ -1084,6 +1184,47 @@ fn run_command(command: Commands) {
                 flags::run_allow(&flags::AllowOptions {
                     key,
                     actor_id,
+                    actor,
+                });
+            }
+        },
+        Commands::Experiments(cmd) => match cmd {
+            ExperimentsCommands::List => experiments::run_list(&experiments::ListOptions),
+            ExperimentsCommands::Status { name } => {
+                experiments::run_status(&experiments::StatusOptions { name });
+            }
+            ExperimentsCommands::SetWeights {
+                name,
+                weights,
+                actor,
+            } => {
+                experiments::run_set_weights(&experiments::SetWeightsOptions {
+                    name,
+                    weights,
+                    actor,
+                });
+            }
+            ExperimentsCommands::Conclude {
+                name,
+                winner,
+                actor,
+            } => {
+                experiments::run_conclude(&experiments::ConcludeOptions {
+                    name,
+                    winner,
+                    actor,
+                });
+            }
+            ExperimentsCommands::Override {
+                name,
+                actor_id,
+                variant,
+                actor,
+            } => {
+                experiments::run_override(&experiments::OverrideOptions {
+                    name,
+                    actor_id,
+                    variant,
                     actor,
                 });
             }

@@ -1389,6 +1389,73 @@ impl AppBuilder {
         })
     }
 
+    /// Register an experiment store, enabling the [`Experiments`] extractor.
+    ///
+    /// Wrap any [`ExperimentStore`] implementation. Use [`InMemoryExperimentStore`]
+    /// for development and tests; use the Postgres-backed store for production.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use autumn_web::experiments::InMemoryExperimentStore;
+    ///
+    /// autumn_web::app()
+    ///     .with_experiment_store(InMemoryExperimentStore::new())
+    ///     .run()
+    ///     .await;
+    /// ```
+    ///
+    /// [`Experiments`]: crate::experiments::Experiments
+    /// [`ExperimentStore`]: crate::experiments::ExperimentStore
+    /// [`InMemoryExperimentStore`]: crate::experiments::InMemoryExperimentStore
+    #[must_use]
+    pub fn with_experiment_store<S>(self, store: S) -> Self
+    where
+        S: crate::experiments::ExperimentStore,
+    {
+        let service = crate::experiments::ExperimentService::new(Arc::new(store) as Arc<_>);
+        self.state_initializer(move |state| {
+            state.insert_extension(service);
+        })
+    }
+
+    /// Register an experiment store with a custom [`ExposureSink`].
+    ///
+    /// Use when you want to forward exposure events to an analytics pipeline
+    /// rather than the default `tracing` log.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use autumn_web::experiments::{InMemoryExperimentStore, NoOpExposureSink};
+    /// use std::sync::Arc;
+    ///
+    /// autumn_web::app()
+    ///     .with_experiment_store_and_sink(
+    ///         InMemoryExperimentStore::new(),
+    ///         Arc::new(NoOpExposureSink),
+    ///     )
+    ///     .run()
+    ///     .await;
+    /// ```
+    ///
+    /// [`ExposureSink`]: crate::experiments::ExposureSink
+    #[must_use]
+    pub fn with_experiment_store_and_sink<S>(
+        self,
+        store: S,
+        sink: Arc<dyn crate::experiments::ExposureSink>,
+    ) -> Self
+    where
+        S: crate::experiments::ExperimentStore,
+    {
+        let service = crate::experiments::ExperimentService::new(Arc::new(store) as Arc<_>)
+            .with_exposure_sink(sink);
+        self.state_initializer(move |state| {
+            state.insert_extension(service);
+        })
+    }
+
     /// Register a durable [`MailDeliveryQueue`](crate::mail::MailDeliveryQueue) for
     /// [`Mailer::deliver_later`](crate::mail::Mailer::deliver_later).
     ///
