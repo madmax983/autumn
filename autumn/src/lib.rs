@@ -194,6 +194,11 @@ pub mod seed;
 pub mod task;
 pub mod telemetry;
 pub mod ui;
+/// Active search and autocomplete form primitives with htmx integration.
+///
+/// See [`widgets`] for the full API including [`widgets::active_search`],
+/// [`widgets::autocomplete_input`], and their configuration types.
+pub mod widgets;
 /// Changeset type carrying submitted values + per-field errors.
 pub use form::Changeset;
 /// Changeset form extractor — decodes body + validates, captures errors in [`form::Changeset`].
@@ -310,7 +315,7 @@ pub use validation::Validated;
 /// Useful for cache-busting or diagnostic logging. The corresponding
 /// minified JS is served automatically at `/static/js/htmx.min.js`.
 #[cfg(feature = "htmx")]
-pub use htmx::{HTMX_CSRF_JS_PATH, HTMX_JS_PATH, HTMX_VERSION};
+pub use htmx::{AUTUMN_WIDGETS_JS_PATH, HTMX_CSRF_JS_PATH, HTMX_JS_PATH, HTMX_VERSION};
 #[cfg(feature = "mail")]
 pub use mail::{
     Mail, MailConfig, MailDeliveryQueue, MailDeliveryQueueHandle, MailError, MailTransport, Mailer,

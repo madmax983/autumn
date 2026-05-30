@@ -22,6 +22,8 @@ async fn main() {
         .routes(routes![
             home,
             routes::bookmarks::index,
+            routes::bookmarks::search,
+            routes::bookmarks::tags_autocomplete,
             routes::bookmarks::show,
             routes::bookmarks::by_tag,
             routes::bookmarks::new_form,
