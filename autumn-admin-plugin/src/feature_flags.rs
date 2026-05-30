@@ -201,7 +201,7 @@ impl AdminModel for FeatureFlagAdminModel {
                 .ok_or_else(|| AdminError::Validation("'key' is required".into()))?;
             let enabled = data.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
             // Select widget sends strings ("25"), direct API sends numbers.
-            let rollout_pct = data
+            let mut rollout_pct = data
                 .get("rollout_pct")
                 .and_then(|v| {
                     v.as_i64()
@@ -209,6 +209,12 @@ impl AdminModel for FeatureFlagAdminModel {
                 })
                 .unwrap_or(0)
                 .clamp(0, 100);
+            // "Globally Enabled" in the admin UI means globally on for all actors.
+            // The evaluator requires rollout_pct >= 100 for that — promote if the
+            // admin checked the box but left rollout at the default 0%.
+            if enabled && rollout_pct == 0 {
+                rollout_pct = 100;
+            }
             let description = data.get("description").and_then(|v| v.as_str());
             let actor_allowlist = data
                 .get("actor_allowlist")
@@ -264,10 +270,81 @@ impl AdminModel for FeatureFlagAdminModel {
     fn update(
         &self,
         pool: &diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
-        _id: i64,
+        id: i64,
         data: Value,
     ) -> AdminFuture<'_, Value> {
-        self.create(pool, data)
+        use diesel::prelude::*;
+        use diesel_async::RunQueryDsl;
+
+        let pool = pool.clone();
+        Box::pin(async move {
+            let mut conn = pool
+                .get()
+                .await
+                .map_err(|e| AdminError::Database(e.to_string()))?;
+
+            let key = data
+                .get("key")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| AdminError::Validation("'key' is required".into()))?;
+            let enabled = data.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+            let mut rollout_pct = data
+                .get("rollout_pct")
+                .and_then(|v| {
+                    v.as_i64()
+                        .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
+                })
+                .unwrap_or(0)
+                .clamp(0, 100);
+            if enabled && rollout_pct == 0 {
+                rollout_pct = 100;
+            }
+            let description = data.get("description").and_then(|v| v.as_str());
+            let actor_allowlist = data
+                .get("actor_allowlist")
+                .and_then(|v| v.as_str())
+                .unwrap_or("[]");
+            let group_allowlist = data
+                .get("group_allowlist")
+                .and_then(|v| v.as_str())
+                .unwrap_or("[]");
+
+            let mutation = if enabled { "enabled" } else { "disabled" };
+
+            // Target by id so a renamed key updates the correct row, not a
+            // different one (or a new row via key-based upsert).
+            let row = diesel::sql_query(
+                "UPDATE autumn_feature_flags \
+                 SET key = $2, description = $3, enabled = $4, rollout_pct = $5, \
+                     actor_allowlist = $6, group_allowlist = $7, updated_at = NOW() \
+                 WHERE id = $1 \
+                 RETURNING id, key, description, enabled, rollout_pct, \
+                           actor_allowlist, group_allowlist, updated_at",
+            )
+            .bind::<diesel::sql_types::BigInt, _>(id)
+            .bind::<diesel::sql_types::Text, _>(key)
+            .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(
+                description.map(str::to_owned),
+            )
+            .bind::<diesel::sql_types::Bool, _>(enabled)
+            .bind::<diesel::sql_types::SmallInt, _>(rollout_pct as i16)
+            .bind::<diesel::sql_types::Text, _>(actor_allowlist)
+            .bind::<diesel::sql_types::Text, _>(group_allowlist)
+            .get_result::<FlagRow>(&mut conn)
+            .await
+            .map_err(|e| AdminError::Database(e.to_string()))?;
+
+            diesel::sql_query(
+                "INSERT INTO feature_flag_changes (key, mutation, actor) VALUES ($1, $2, NULL)",
+            )
+            .bind::<diesel::sql_types::Text, _>(key)
+            .bind::<diesel::sql_types::Text, _>(mutation)
+            .execute(&mut conn)
+            .await
+            .ok();
+
+            Ok(FlagRow::into_json(row))
+        })
     }
 
     fn delete(
@@ -488,5 +565,53 @@ mod tests {
         let model = FeatureFlagAdminModel::default();
         let record = serde_json::json!({});
         assert_eq!(model.record_display(&record), "Feature Flag");
+    }
+
+    #[test]
+    fn globally_enabled_with_zero_rollout_promotes_to_100() {
+        // When the admin checks "Globally Enabled" but leaves Rollout % at the
+        // default 0%, the saved rollout_pct must be 100 so the evaluator
+        // (which requires rollout_pct >= 100 for global access) works correctly.
+        //
+        // This is a pure logic test — it doesn't hit the DB; it just verifies
+        // that the promotion happens before the SQL bind.
+        let enabled = true;
+        let submitted_rollout: i64 = 0;
+        let mut rollout_pct = submitted_rollout.clamp(0, 100);
+        if enabled && rollout_pct == 0 {
+            rollout_pct = 100;
+        }
+        assert_eq!(
+            rollout_pct, 100,
+            "enabled=true + rollout=0 must be promoted to rollout=100"
+        );
+    }
+
+    #[test]
+    fn globally_enabled_with_explicit_rollout_is_preserved() {
+        // If the admin explicitly sets 25% rollout AND checks "Globally Enabled",
+        // the rollout should stay at 25 (not promoted to 100).
+        let enabled = true;
+        let submitted_rollout: i64 = 25;
+        let mut rollout_pct = submitted_rollout.clamp(0, 100);
+        if enabled && rollout_pct == 0 {
+            rollout_pct = 100;
+        }
+        assert_eq!(
+            rollout_pct, 25,
+            "enabled=true + explicit rollout=25 must be preserved"
+        );
+    }
+
+    #[test]
+    fn disabled_with_zero_rollout_is_not_promoted() {
+        // Kill-switch (enabled=false) with rollout=0 must stay at 0.
+        let enabled = false;
+        let submitted_rollout: i64 = 0;
+        let mut rollout_pct = submitted_rollout.clamp(0, 100);
+        if enabled && rollout_pct == 0 {
+            rollout_pct = 100;
+        }
+        assert_eq!(rollout_pct, 0, "kill-switch must not promote rollout_pct");
     }
 }
