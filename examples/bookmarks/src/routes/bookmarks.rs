@@ -2,6 +2,19 @@
 //!
 //! The generated scaffold provides the resource shape. The shipped example adds
 //! Tailwind styling, htmx affordances, tag filtering, and local-demo writes.
+//!
+//! # Active Search & Autocomplete (issue #768)
+//!
+//! Two widget-driven routes are included to demonstrate the primitives:
+//!
+//! - `GET /bookmarks/search?q=…` — returns a rendered partial of matching
+//!   bookmarks. The index page wires this up via [`autumn_web::widgets::active_search`].
+//! - `GET /bookmarks/tags/autocomplete?q=…` — returns matching tag option
+//!   partials. The new/edit forms wire this up via
+//!   [`autumn_web::widgets::autocomplete_input`].
+//!
+//! Both handlers are ordinary Autumn route handlers that return `Markup`.
+//! They own the Diesel query; the widgets own the htmx wiring.
 
 use autumn_web::extract::{Form, Path};
 use autumn_web::prelude::*;
@@ -79,6 +92,14 @@ fn bookmark_card(bookmark: &Bookmark) -> Markup {
 #[get("/bookmarks")]
 pub async fn index(repo: PgBookmarkRepository) -> AutumnResult<Markup> {
     let rows = repo.find_all().await?;
+    let search_config = autumn_web::widgets::ActiveSearchConfig::new(
+        "/bookmarks/search",
+        "#bookmark-search-results",
+    )
+    .placeholder("Search by title, URL, or tag…")
+    .debounce(400)
+    .min_length(2);
+
     Ok(layout(
         "All",
         html! {
@@ -89,12 +110,23 @@ pub async fn index(repo: PgBookmarkRepository) -> AutumnResult<Markup> {
                     "+ Add"
                 }
             }
-            ul class="space-y-3" {
-                @for row in &rows {
-                    (bookmark_card(row))
-                }
-                @if rows.is_empty() {
-                    li class="text-gray-400 text-center py-8" { "No bookmarks yet." }
+            // ── Active search widget ──────────────────────────────────────
+            div class="mb-6" {
+                (autumn_web::widgets::active_search_input(
+                    "bookmark-search",
+                    "Search bookmarks",
+                    &search_config,
+                ))
+            }
+            // ── Results (initial list; replaced by search partial) ────────
+            div id="bookmark-search-results" role="status" aria-live="polite" aria-atomic="true" {
+                ul class="space-y-3" {
+                    @for row in &rows {
+                        (bookmark_card(row))
+                    }
+                    @if rows.is_empty() {
+                        li class="text-gray-400 text-center py-8" { "No bookmarks yet." }
+                    }
                 }
             }
         },
@@ -145,6 +177,14 @@ pub async fn by_tag(Path(tag): Path<String>, repo: PgBookmarkRepository) -> Autu
 
 #[get("/bookmarks/new")]
 pub async fn new_form() -> AutumnResult<Markup> {
+    let tag_ac = autumn_web::widgets::AutocompleteConfig::new(
+        "/bookmarks/tags/autocomplete",
+        "tag_label",
+        "tag",
+    )
+    .placeholder("Search existing tags…")
+    .min_length(1);
+
     Ok(layout(
         "Add Bookmark",
         html! {
@@ -162,10 +202,17 @@ pub async fn new_form() -> AutumnResult<Markup> {
                           placeholder="My favorite site"
                           class="w-full border rounded p-2 mt-1";
                 }
+                // ── Tag autocomplete ──────────────────────────────────────
+                // Use the autocomplete widget to look up existing tags.
+                // The hidden <input name="tag"> carries the selected value.
+                // The noscript fallback renders a plain text input.
                 div {
-                    label for="tag" class="block text-sm font-medium" { "Tag" }
-                    input type="text" id="tag" name="tag" value="general" required
-                          class="w-full border rounded p-2 mt-1";
+                    (autumn_web::widgets::autocomplete_input("tag-picker", "Tag", &tag_ac))
+                    // Fallback for non-htmx submit: also accept direct text entry
+                    noscript {
+                        input type="text" id="tag" name="tag" value="general" required
+                              class="w-full border rounded p-2 mt-1";
+                    }
                 }
                 button type="submit"
                        class="bg-indigo-600 text-white px-6 py-2 rounded hover:bg-indigo-700" {
@@ -249,4 +296,93 @@ pub async fn update(
     }
 
     Ok(Redirect::to(&format!("/bookmarks/{}", *id)))
+}
+
+// ── Active search handler ─────────────────────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+pub struct SearchQuery {
+    #[serde(default)]
+    pub q: String,
+}
+
+/// Active search handler — returns a `<ul>` partial of matching bookmarks.
+///
+/// Wired up by [`autumn_web::widgets::active_search_input`] on the index page.
+/// Works equally well without JavaScript (direct GET form submission).
+#[get("/bookmarks/search")]
+pub async fn search(
+    Query(params): Query<SearchQuery>,
+    mut db: Db,
+) -> AutumnResult<Markup> {
+    let q = params.q.trim();
+    if q.is_empty() {
+        return Ok(autumn_web::widgets::active_search_empty_state(
+            "Enter at least two characters to search.",
+        ));
+    }
+
+    let pattern = format!("%{}%", q.to_lowercase());
+    let results: Vec<Bookmark> = bookmarks::table
+        .filter(
+            diesel::dsl::sql::<diesel::sql_types::Bool>(
+                "lower(title) LIKE $1 OR lower(url) LIKE $1 OR lower(tag) LIKE $1",
+            )
+            .bind::<diesel::sql_types::Text, _>(pattern),
+        )
+        .select(Bookmark::as_select())
+        .load(&mut *db)
+        .await?;
+
+    Ok(html! {
+        @if results.is_empty() {
+            (autumn_web::widgets::active_search_empty_state("No bookmarks match your search."))
+        } @else {
+            ul class="space-y-3" {
+                @for row in &results {
+                    (bookmark_card(row))
+                }
+            }
+        }
+    })
+}
+
+// ── Tag autocomplete handler ──────────────────────────────────────────────────
+
+/// Tag autocomplete handler — returns option partials for matching tags.
+///
+/// Wired up by [`autumn_web::widgets::autocomplete_input`] on the new/edit forms.
+#[get("/bookmarks/tags/autocomplete")]
+pub async fn tags_autocomplete(
+    Query(params): Query<SearchQuery>,
+    mut db: Db,
+) -> AutumnResult<Markup> {
+    let q = params.q.trim();
+    if q.is_empty() {
+        return Ok(autumn_web::widgets::autocomplete_empty_state(
+            "Type to search tags.",
+        ));
+    }
+
+    let pattern = format!("%{}%", q.to_lowercase());
+    let tags: Vec<String> = bookmarks::table
+        .select(bookmarks::tag)
+        .filter(
+            diesel::dsl::sql::<diesel::sql_types::Bool>("lower(tag) LIKE $1")
+                .bind::<diesel::sql_types::Text, _>(pattern),
+        )
+        .distinct()
+        .order(bookmarks::tag.asc())
+        .load(&mut *db)
+        .await?;
+
+    Ok(html! {
+        @if tags.is_empty() {
+            (autumn_web::widgets::autocomplete_empty_state("No matching tags found."))
+        } @else {
+            @for tag in &tags {
+                (autumn_web::widgets::autocomplete_option(tag, tag))
+            }
+        }
+    })
 }

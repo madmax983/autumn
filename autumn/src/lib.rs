@@ -192,6 +192,11 @@ pub mod seed;
 pub mod task;
 pub mod telemetry;
 pub mod ui;
+/// Active search and autocomplete form primitives with htmx integration.
+///
+/// See [`widgets`] for the full API including [`widgets::active_search`],
+/// [`widgets::autocomplete_input`], and their configuration types.
+pub mod widgets;
 /// Changeset type carrying submitted values + per-field errors.
 pub use form::Changeset;
 /// Changeset form extractor — decodes body + validates, captures errors in [`form::Changeset`].
