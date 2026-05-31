@@ -142,6 +142,7 @@ loom = "0.7.2"
 temp-env = { version = "0.3.6", features = ["async_closure"] }
 rustversion = "1"
 rusty-fork = "0.3.1"
+httpmock = "0.8.3"
 
 # docs.rs feature posture: include all features except those that require
 # system libraries unavailable in the docs.rs sandbox.
