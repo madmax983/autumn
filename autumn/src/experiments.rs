@@ -1348,6 +1348,7 @@ impl axum::extract::FromRequestParts<crate::AppState> for Experiments {
 
 // ── pg module ─────────────────────────────────────────────────────────────────
 
+#[cfg(feature = "db")]
 pub mod pg {
     use super::{
         Assignment, ChangeRecord, ExperimentConfig, ExperimentState, ExperimentStore,
