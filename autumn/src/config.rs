@@ -2042,12 +2042,11 @@ impl AutumnConfig {
                     "AUTUMN_AUTH__OAUTH2__{upper}__CLIENT_SECRET",
                     upper = name.to_uppercase()
                 );
-                if let Ok(secret) = env.var(&var_key) {
-                    if !secret.is_empty() {
-                        if let Some(p) = self.auth.oauth2.providers.get_mut(&name) {
-                            p.client_secret = secret;
-                        }
-                    }
+                if let Ok(secret) = env.var(&var_key)
+                    && !secret.is_empty()
+                    && let Some(p) = self.auth.oauth2.providers.get_mut(&name)
+                {
+                    p.client_secret = secret;
                 }
             }
         }
