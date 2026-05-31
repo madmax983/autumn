@@ -462,6 +462,9 @@ async fn test_oauth_client(session: autumn_web::session::Session) -> &'static st
     session
         .insert("oauth2:github:state", state_val.to_string())
         .await;
+    session
+        .insert("oauth2:github:code_verifier", "test-verifier".to_string())
+        .await;
 
     let provider = OAuth2ProviderConfig {
         client_id: "client-id".to_string(),
@@ -473,6 +476,7 @@ async fn test_oauth_client(session: autumn_web::session::Session) -> &'static st
         scope: "user".to_string(),
         issuer: None,
         jwks_url: None,
+        discovery_url: None,
     };
 
     let callback = OAuth2Callback {
@@ -480,7 +484,7 @@ async fn test_oauth_client(session: autumn_web::session::Session) -> &'static st
         state: state_val.to_string(),
     };
 
-    let _ = oauth2_finish_login(&session, "user_id", "github", &provider, &callback).await;
+    let _ = oauth2_finish_login(&session, "github", &provider, &callback).await;
 
     "ok"
 }
