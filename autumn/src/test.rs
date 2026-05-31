@@ -480,6 +480,24 @@ impl TestApp {
         self.jobs.extend(app_builder.jobs);
         self.exception_filters.extend(app_builder.exception_filters);
 
+        // Carry plugin-registered error reporters into the test app so
+        // reporting-enabled plugins exercise the same behavior under `TestApp`
+        // that they get from `AppBuilder::run`.
+        #[cfg(feature = "reporting")]
+        {
+            let reporters = std::mem::take(&mut app_builder.error_reporters);
+            if !reporters.is_empty() {
+                self.state_initializers.push(Box::new(move |state| {
+                    let mut existing = state
+                        .extension::<crate::reporting::RegisteredReporters>()
+                        .map(|registered| registered.0.clone())
+                        .unwrap_or_default();
+                    existing.extend(reporters.iter().cloned());
+                    state.insert_extension(crate::reporting::RegisteredReporters(existing));
+                }));
+            }
+        }
+
         for hook in app_builder.startup_hooks {
             self.state_initializers.push(Box::new(move |state| {
                 let state_owned = state.clone();

@@ -158,9 +158,8 @@ async fn panic_reported_once_with_context() {
 /// than toggling it mid-process.
 #[tokio::test]
 async fn panic_backtrace_tracks_rust_backtrace_env() {
-    let backtrace_enabled = std::env::var("RUST_BACKTRACE")
-        .map(|v| v != "0" && !v.is_empty())
-        .unwrap_or(false);
+    let backtrace_enabled =
+        std::env::var("RUST_BACKTRACE").is_ok_and(|v| v != "0" && !v.is_empty());
 
     let (tx, mut rx) = mpsc::unbounded_channel();
     let client = TestApp::new()

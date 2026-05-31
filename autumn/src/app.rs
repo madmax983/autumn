@@ -249,7 +249,7 @@ pub struct AppBuilder {
     /// 5xx [`ErrorEvent`](crate::reporting::ErrorEvent)s to each. Empty means
     /// the built-in [`LogReporter`](crate::reporting::LogReporter) is used.
     #[cfg(feature = "reporting")]
-    error_reporters: Vec<Arc<dyn crate::reporting::ErrorReporter>>,
+    pub(crate) error_reporters: Vec<Arc<dyn crate::reporting::ErrorReporter>>,
     /// `OpenAPI` generation configuration. When `Some`, the router mounts
     /// `/v3/api-docs` (serving `openapi.json`) and `/swagger-ui` (if the
     /// Swagger UI path is set). When `None`, no docs endpoints are mounted.

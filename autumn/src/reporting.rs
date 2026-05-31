@@ -402,15 +402,30 @@ where
             .extensions()
             .get::<RequestId>()
             .map(std::string::ToString::to_string);
+        let context = Some(RequestContext {
+            method,
+            route,
+            request_id,
+        });
 
-        ReportingFuture {
-            inner: self.inner.call(req),
-            context: Some(RequestContext {
-                method,
-                route,
-                request_id,
-            }),
-            chain: Arc::clone(&self.chain),
+        // Catch panics raised synchronously while the inner service constructs
+        // its future (e.g. a handler closure or user Tower layer that panics in
+        // `call` before returning a future), not just panics raised while
+        // polling. Mirrors `tower_http::catch_panic`.
+        let inner = &mut self.inner;
+        match std::panic::catch_unwind(AssertUnwindSafe(|| inner.call(req))) {
+            Ok(future) => ReportingFuture {
+                inner: Some(future),
+                pending_panic: None,
+                context,
+                chain: Arc::clone(&self.chain),
+            },
+            Err(panic) => ReportingFuture {
+                inner: None,
+                pending_panic: Some(panic),
+                context,
+                chain: Arc::clone(&self.chain),
+            },
         }
     }
 }
@@ -420,7 +435,10 @@ pin_project! {
     /// events for panics and 5xx responses.
     pub struct ReportingFuture<F> {
         #[pin]
-        inner: F,
+        inner: Option<F>,
+        // A panic captured from the inner service's `call`, surfaced on the
+        // first poll. `inner` is `None` exactly when this is `Some`.
+        pending_panic: Option<Box<dyn Any + Send>>,
         context: Option<RequestContext>,
         chain: Arc<ReporterChain>,
     }
@@ -434,7 +452,17 @@ where
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.project();
-        let inner = this.inner;
+
+        // A panic captured in `call` is surfaced as a sanitized 500 here.
+        if let Some(panic) = this.pending_panic.take() {
+            let context = this.context.take();
+            return Poll::Ready(Ok(handle_panic(&*panic, context, this.chain)));
+        }
+
+        let Some(inner) = this.inner.as_pin_mut() else {
+            // Already resolved a panic on a prior poll; nothing left to do.
+            return Poll::Pending;
+        };
 
         // Catch a panic raised while polling the handler future. Wrapping the
         // poll keeps a panicking handler from aborting the worker task.
@@ -554,6 +582,38 @@ mod tests {
     fn log_reporter_is_the_default_when_empty() {
         let layer = ReportingLayer::new(Vec::new(), true, 1.0);
         assert_eq!(layer.chain.reporters.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn panic_in_inner_call_is_caught_as_500() {
+        use axum::body::Body;
+        use std::convert::Infallible;
+        use tower::ServiceExt;
+
+        // An inner service that panics synchronously in `call`, before ever
+        // returning a future — the case poll-only catch_unwind would miss.
+        #[derive(Clone)]
+        struct PanicInCall;
+        impl Service<Request<Body>> for PanicInCall {
+            type Response = Response;
+            type Error = Infallible;
+            type Future = std::future::Ready<Result<Response, Infallible>>;
+
+            fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn call(&mut self, _req: Request<Body>) -> Self::Future {
+                panic!("boom in call");
+            }
+        }
+
+        let service = ReportingLayer::new(Vec::new(), true, 1.0).layer(PanicInCall);
+        let response = service
+            .oneshot(Request::new(Body::empty()))
+            .await
+            .expect("panic in call must be converted to a response, not propagated");
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[tokio::test]
