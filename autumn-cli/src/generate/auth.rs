@@ -200,6 +200,23 @@ pub fn plan_auth_with_options(
     );
     plan.create(mig_dir.join("down.sql"), render_oauth_migration_down());
 
+    // ── src/schema.rs entry for oauth_identities ───────────────────────────
+    let schema_path = project_root.join("src").join("schema.rs");
+    let schema_base = find_plan_content_for_path(&plan, &schema_path)
+        .unwrap_or_else(|| read_or_empty(&schema_path));
+    let oauth_fields: Vec<super::dsl::Field> = [
+        "provider:String",
+        "subject:String",
+        "user_id:i64",
+        "email:Option<String>",
+        "name:Option<String>",
+    ]
+    .iter()
+    .map(|t| super::dsl::parse_field(t).expect("oauth field tokens are always valid"))
+    .collect();
+    let updated_schema = append_schema_table(&schema_base, "oauth_identities", &oauth_fields);
+    plan.modify(schema_path, updated_schema);
+
     // ── oauth routes ───────────────────────────────────────────────────────
     let routes_dir = project_root.join("src").join("routes");
     plan.create(
@@ -2183,8 +2200,7 @@ mod tests {
             })
             .collect();
         assert_eq!(
-            paths_with,
-            paths_plain,
+            paths_with, paths_plain,
             "empty --oauth must not add any extra files"
         );
     }
@@ -2360,8 +2376,7 @@ mod tests {
             let a_ts = a.split('_').next().unwrap_or("");
             let o_ts = o.split('_').next().unwrap_or("");
             assert_ne!(
-                a_ts,
-                o_ts,
+                a_ts, o_ts,
                 "oauth_identities migration must have a different timestamp than the auth migration"
             );
         }
@@ -2410,11 +2425,47 @@ mod tests {
         // Executable session.insert calls are not prefixed with "//" or "#".
         let executable_insert = routes
             .lines()
-            .filter(|l| !l.trim_start().starts_with("//'))
+            .filter(|l| !l.trim_start().starts_with("//"))
             .any(|l| l.contains("session.insert(&auth_cfg.session_key"));
         assert!(
             !executable_insert,
             "generated callback must not execute session.insert before account linking: {routes}"
+        );
+    }
+
+    #[test]
+    fn plan_auth_with_oauth_adds_oauth_identities_to_schema_rs() {
+        let tmp = project_with_main();
+        let oauth = AuthOAuthOptions {
+            providers: vec!["github".to_owned()],
+        };
+        let plan = plan_auth_with_options(tmp.path(), "User", "20260508000000", &oauth).unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let schema = fs::read_to_string(tmp.path().join("src/schema.rs")).unwrap();
+        assert!(
+            schema.contains("oauth_identities (id)"),
+            "schema.rs must contain oauth_identities table block: {schema}"
+        );
+        assert!(
+            schema.contains("provider -> Text"),
+            "schema.rs must contain provider column: {schema}"
+        );
+        assert!(
+            schema.contains("subject -> Text"),
+            "schema.rs must contain subject column: {schema}"
+        );
+        assert!(
+            schema.contains("user_id -> Int8"),
+            "schema.rs must contain user_id column: {schema}"
+        );
+        assert!(
+            schema.contains("email -> Nullable<Text>"),
+            "schema.rs must contain nullable email: {schema}"
+        );
+        assert!(
+            schema.contains("name -> Nullable<Text>"),
+            "schema.rs must contain nullable name: {schema}"
         );
     }
 }
