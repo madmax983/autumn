@@ -589,6 +589,7 @@ pub fn verify_upload_with_now(
 
 /// Verify an upload token against the current key and each previous key in a
 /// rotation grace window.
+#[cfg(test)]
 pub(crate) fn verify_upload_with_rotation(
     current: &SigningKey,
     previous: &[SigningKey],
@@ -993,6 +994,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 /// against every key using constant-time comparison; the first match wins.
 /// This enables a rotation grace window: sign new URLs with `current` while
 /// URLs that were signed with an old key continue to serve until their expiry.
+#[cfg(test)]
 pub(crate) fn verify_with_rotation(
     current: &SigningKey,
     previous: &[SigningKey],
@@ -1003,7 +1005,19 @@ pub(crate) fn verify_with_rotation(
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    if expires_at < now {
+    verify_with_rotation_with_now(current, previous, blob_key, expires_at, signature, now)
+}
+
+/// Clock-injectable variant of [`verify_with_rotation`].
+pub(crate) fn verify_with_rotation_with_now(
+    current: &SigningKey,
+    previous: &[SigningKey],
+    blob_key: &str,
+    expires_at: u64,
+    signature: &str,
+    now_unix: u64,
+) -> Result<(), BlobStoreError> {
+    if expires_at < now_unix {
         return Err(BlobStoreError::Signature("signed url expired".into()));
     }
     let expected_current = sign(current.as_bytes(), blob_key, expires_at);
@@ -1051,15 +1065,19 @@ pub fn serve_router(store: &LocalBlobStore) -> axum::Router<crate::AppState> {
     let store_for_route = store.clone();
     let mount = format!("{}/{{*key}}", store.mount_path().trim_end_matches('/'));
 
-    let handler = move |Path(blob_key): Path<String>, Query(q): Query<SignedQuery>| {
+    let handler = move |axum::extract::State(state): axum::extract::State<crate::AppState>,
+                        Path(blob_key): Path<String>,
+                        Query(q): Query<SignedQuery>| {
         let store = store_for_route.clone();
         async move {
-            if let Err(err) = verify_with_rotation(
+            let now = crate::time::clock_unix_secs(state.clock());
+            if let Err(err) = verify_with_rotation_with_now(
                 &store.inner.signing_key,
                 &store.inner.previous_signing_keys,
                 &blob_key,
                 q.exp,
                 &q.sig,
+                now,
             ) {
                 return (StatusCode::FORBIDDEN, err.to_string()).into_response();
             }
@@ -1078,35 +1096,39 @@ pub fn serve_router(store: &LocalBlobStore) -> axum::Router<crate::AppState> {
     };
 
     let store_for_upload = store.clone();
-    let upload_handler = move |Path(blob_key): Path<String>,
-                               Query(q): Query<UploadQuery>,
-                               body: axum::body::Body| {
-        use futures::StreamExt as _;
-        let store = store_for_upload.clone();
-        async move {
-            if let Err(err) = verify_upload_with_rotation(
-                &store.inner.signing_key,
-                &store.inner.previous_signing_keys,
-                &blob_key,
-                &q.ct,
-                q.exp,
-                &q.sig,
-            ) {
-                return (StatusCode::FORBIDDEN, err.to_string()).into_response();
-            }
+    let upload_handler =
+        move |axum::extract::State(state): axum::extract::State<crate::AppState>,
+              Path(blob_key): Path<String>,
+              Query(q): Query<UploadQuery>,
+              body: axum::body::Body| {
+            use futures::StreamExt as _;
+            let store = store_for_upload.clone();
+            async move {
+                let now = crate::time::clock_unix_secs(state.clock());
+                if let Err(err) = verify_upload_rotation_with_now(
+                    &store.inner.signing_key,
+                    &store.inner.previous_signing_keys,
+                    &blob_key,
+                    &q.ct,
+                    q.exp,
+                    &q.sig,
+                    now,
+                ) {
+                    return (StatusCode::FORBIDDEN, err.to_string()).into_response();
+                }
 
-            let stream = body.into_data_stream();
-            let byte_stream = Box::pin(stream.map(|item| match item {
-                Ok(bytes) => Ok(bytes),
-                Err(e) => Err(crate::storage::BlobStoreError::Io(e.to_string())),
-            }));
+                let stream = body.into_data_stream();
+                let byte_stream = Box::pin(stream.map(|item| match item {
+                    Ok(bytes) => Ok(bytes),
+                    Err(e) => Err(crate::storage::BlobStoreError::Io(e.to_string())),
+                }));
 
-            match store.put_stream(&blob_key, &q.ct, byte_stream).await {
-                Ok(_blob) => StatusCode::OK.into_response(),
-                Err(err) => err.into_autumn_error().into_response(),
+                match store.put_stream(&blob_key, &q.ct, byte_stream).await {
+                    Ok(_blob) => StatusCode::OK.into_response(),
+                    Err(err) => err.into_autumn_error().into_response(),
+                }
             }
-        }
-    };
+        };
 
     axum::Router::new()
         .route(&mount, axum::routing::get(handler))
