@@ -2490,7 +2490,11 @@ foo = "bar"
             "empty client_secret in production must fail: {result:?}",
         );
         assert!(
-            result.detail.as_deref().unwrap_or("").contains("client_secret"),
+            result
+                .detail
+                .as_deref()
+                .unwrap_or("")
+                .contains("client_secret"),
             "detail must mention client_secret: {:?}",
             result.detail
         );

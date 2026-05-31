@@ -3001,9 +3001,8 @@ mod tests {
 
     #[test]
     fn parse_generate_auth_with_oauth_flag_single_provider() {
-        let cli =
-            Cli::try_parse_from(["autumn", "generate", "auth", "User", "--oauth", "github"])
-                .unwrap();
+        let cli = Cli::try_parse_from(["autumn", "generate", "auth", "User", "--oauth", "github"])
+            .unwrap();
         let Commands::Generate(GenerateCommands::Auth { name, oauth, .. }) = cli.command else {
             panic!("expected generate auth");
         };

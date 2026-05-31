@@ -225,15 +225,21 @@ pub fn plan_auth_with_options(
     })?;
     let oauth_entries = oauth_route_entries();
     // The base plan has already modified main.rs; find current state in plan or use existing.
-    let base_main = find_plan_content_for_path(&plan, &main_path)
-        .unwrap_or_else(|| main_existing.clone());
-    let updated_main =
-        super::schema_edit::update_main_rs(&base_main, &["models", "routes", "schema"], &oauth_entries);
+    let base_main =
+        find_plan_content_for_path(&plan, &main_path).unwrap_or_else(|| main_existing.clone());
+    let updated_main = super::schema_edit::update_main_rs(
+        &base_main,
+        &["models", "routes", "schema"],
+        &oauth_entries,
+    );
     plan.modify(main_path, updated_main);
 
     // ── docs/guide/oauth.md ────────────────────────────────────────────────
     let docs_dir = project_root.join("docs").join("guide");
-    plan.create(docs_dir.join("oauth.md"), render_oauth_docs_file(&oauth.providers));
+    plan.create(
+        docs_dir.join("oauth.md"),
+        render_oauth_docs_file(&oauth.providers),
+    );
 
     // ── Cargo.toml: add oauth2 feature to autumn-web ─────────────────────
     let cargo_toml_path = project_root.join("Cargo.toml");
@@ -257,9 +263,7 @@ fn find_plan_content_for_path(plan: &Plan, path: &std::path::Path) -> Option<Str
         .rev()
         .find(|a| a.path() == path)
         .map(|a| match a {
-            Action::Create { contents, .. } | Action::Modify { contents, .. } => {
-                contents.clone()
-            }
+            Action::Create { contents, .. } | Action::Modify { contents, .. } => contents.clone(),
         })
 }
 
@@ -285,9 +289,8 @@ fn ensure_autumn_web_oauth2_feature(toml: &str) -> String {
 
         if let Some(rest) = trimmed.strip_prefix(&simple_prefix) {
             let version = rest.trim_end_matches('"');
-            lines[i] = format!(
-                "{indent}{CRATE} = {{ version = \"{version}\", features = [{FEATURE}] }}"
-            );
+            lines[i] =
+                format!("{indent}{CRATE} = {{ version = \"{version}\", features = [{FEATURE}] }}");
             break;
         }
 
@@ -313,7 +316,11 @@ fn ensure_autumn_web_oauth2_feature(toml: &str) -> String {
             } else {
                 let close = trimmed.rfind('}').unwrap();
                 let before_close = trimmed[..close].trim_end();
-                let sep = if before_close.ends_with('{') { "" } else { ", " };
+                let sep = if before_close.ends_with('{') {
+                    ""
+                } else {
+                    ", "
+                };
                 lines[i] = format!(
                     "{indent}{}{sep}features = [{FEATURE}]{}",
                     &trimmed[..close],
@@ -2111,8 +2118,8 @@ mod tests {
         let tmp = project_with_main();
         // Calling with empty providers must produce the same plan as plain plan_auth.
         let oauth = AuthOAuthOptions { providers: vec![] };
-        let plan_with = plan_auth_with_options(tmp.path(), "User", "20260508000000", &oauth)
-            .unwrap();
+        let plan_with =
+            plan_auth_with_options(tmp.path(), "User", "20260508000000", &oauth).unwrap();
         let plan_plain = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
         // Plans should have the same number of actions and the same paths.
         let paths_with: std::collections::HashSet<String> = plan_with
@@ -2308,7 +2315,9 @@ mod tests {
             .filter_map(Result::ok)
             .map(|e| e.file_name().to_string_lossy().to_string())
             .collect();
-        let auth_mig = mig_entries.iter().find(|n| n.contains("create_users") || n.contains("create_accounts"));
+        let auth_mig = mig_entries
+            .iter()
+            .find(|n| n.contains("create_users") || n.contains("create_accounts"));
         let oauth_mig = mig_entries.iter().find(|n| n.contains("oauth_identities"));
         if let (Some(a), Some(o)) = (auth_mig, oauth_mig) {
             let a_ts = a.split('_').next().unwrap_or("");

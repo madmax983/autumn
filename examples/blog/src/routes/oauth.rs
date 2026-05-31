@@ -78,17 +78,12 @@ pub async fn oauth_callback(
         })?
         .clone();
 
-    let identity = oauth2_finish_login(
-        &session,
-        &provider_name,
-        &provider,
-        &callback,
-    )
-    .await
-    .map_err(|_| {
-        // Do not surface the underlying error to avoid leaking sensitive state values.
-        AutumnError::bad_request_msg("OAuth2 login failed — check provider configuration")
-    })?;
+    let identity = oauth2_finish_login(&session, &provider_name, &provider, &callback)
+        .await
+        .map_err(|_| {
+            // Do not surface the underlying error to avoid leaking sensitive state values.
+            AutumnError::bad_request_msg("OAuth2 login failed — check provider configuration")
+        })?;
 
     // TODO: look up or create user in `oauth_identities` + users tables, then set
     // the application session key before redirecting so the user is logged in.

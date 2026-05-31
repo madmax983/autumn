@@ -569,9 +569,7 @@ pub fn provider_preset(name: &str) -> Option<OAuth2ProviderConfig> {
             // The common-tenant issuer used for multi-tenant apps.  Single-tenant
             // apps must override this with their specific tenant ID URL.
             issuer: Some("https://login.microsoftonline.com/common/v2.0".into()),
-            jwks_url: Some(
-                "https://login.microsoftonline.com/common/discovery/v2.0/keys".into(),
-            ),
+            jwks_url: Some("https://login.microsoftonline.com/common/discovery/v2.0/keys".into()),
             discovery_url: Some("https://login.microsoftonline.com/common/v2.0".into()),
         }),
         _ => None,
@@ -638,8 +636,7 @@ pub async fn oauth2_authorize_url(
     getrandom::getrandom(&mut verifier_bytes).map_err(|e| {
         crate::AutumnError::service_unavailable_msg(format!("pkce rng failed: {e}"))
     })?;
-    let code_verifier =
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(verifier_bytes);
+    let code_verifier = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(verifier_bytes);
     // code_challenge = BASE64URL(SHA256(ASCII(code_verifier)))
     let digest = sha2::Sha256::digest(code_verifier.as_bytes());
     let code_challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest);
@@ -3486,8 +3483,14 @@ mod oauth2_unit_tests {
     #[test]
     fn provider_preset_google_returns_oidc_config() {
         let preset = provider_preset("google").expect("google preset must exist");
-        assert!(!preset.authorize_url.is_empty(), "google authorize_url must not be empty");
-        assert!(!preset.token_url.is_empty(), "google token_url must not be empty");
+        assert!(
+            !preset.authorize_url.is_empty(),
+            "google authorize_url must not be empty"
+        );
+        assert!(
+            !preset.token_url.is_empty(),
+            "google token_url must not be empty"
+        );
         assert!(
             preset.discovery_url.is_some(),
             "google must have discovery_url for OIDC"
@@ -3502,17 +3505,32 @@ mod oauth2_unit_tests {
             "google preset scope must include email: {}",
             preset.scope
         );
-        assert_eq!(preset.client_id, "", "client_id must be empty in preset (user fills in)");
-        assert_eq!(preset.client_secret, "", "client_secret must be empty in preset");
-        assert_eq!(preset.redirect_uri, "", "redirect_uri must be empty in preset");
+        assert_eq!(
+            preset.client_id, "",
+            "client_id must be empty in preset (user fills in)"
+        );
+        assert_eq!(
+            preset.client_secret, "",
+            "client_secret must be empty in preset"
+        );
+        assert_eq!(
+            preset.redirect_uri, "",
+            "redirect_uri must be empty in preset"
+        );
     }
 
     #[cfg(feature = "oauth2")]
     #[test]
     fn provider_preset_github_returns_pure_oauth2_config() {
         let preset = provider_preset("github").expect("github preset must exist");
-        assert!(!preset.authorize_url.is_empty(), "github authorize_url must not be empty");
-        assert!(!preset.token_url.is_empty(), "github token_url must not be empty");
+        assert!(
+            !preset.authorize_url.is_empty(),
+            "github authorize_url must not be empty"
+        );
+        assert!(
+            !preset.token_url.is_empty(),
+            "github token_url must not be empty"
+        );
         assert!(
             preset.userinfo_url.is_some(),
             "github must have userinfo_url (it is not OIDC)"
@@ -3527,7 +3545,10 @@ mod oauth2_unit_tests {
     #[test]
     fn provider_preset_microsoft_returns_oidc_config() {
         let preset = provider_preset("microsoft").expect("microsoft preset must exist");
-        assert!(!preset.authorize_url.is_empty(), "microsoft authorize_url must not be empty");
+        assert!(
+            !preset.authorize_url.is_empty(),
+            "microsoft authorize_url must not be empty"
+        );
         assert!(
             preset.discovery_url.is_some(),
             "microsoft must have discovery_url for OIDC"
@@ -3576,7 +3597,10 @@ mod oauth2_unit_tests {
             "PKCE method must be S256: {url}"
         );
         assert!(
-            session.get("oauth2:testprovider:code_verifier").await.is_some(),
+            session
+                .get("oauth2:testprovider:code_verifier")
+                .await
+                .is_some(),
             "code_verifier must be stored in session for later exchange"
         );
     }
@@ -3610,7 +3634,10 @@ mod oauth2_unit_tests {
         // Default policy must be CreateAccount so unknown provider identities
         // automatically create a local user record.
         assert!(
-            matches!(config.oauth_linking_policy, OAuthLinkingPolicy::CreateAccount),
+            matches!(
+                config.oauth_linking_policy,
+                OAuthLinkingPolicy::CreateAccount
+            ),
             "default linking policy must be CreateAccount"
         );
     }
