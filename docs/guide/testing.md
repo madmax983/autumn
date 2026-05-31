@@ -398,6 +398,154 @@ let comment = Comment::factory().post_id(post.id).body("Nice!").create(&pool).aw
 | Raw router | `TestApp::from_router(my_router)` |
 | Build model in-memory | `MyModel::factory().field(val).build()` |
 | Persist model to DB | `MyModel::factory().field(val).create(&pool).await` |
+| Pin time (no advance) | `.with_clock(FixedClock::at(dt))` |
+| Advance time in test | `.with_clock(TickingClock::starting_at(dt))` + `client.advance_clock(dur)` |
+
+---
+
+## Testing time-sensitive logic
+
+Autumn ships a first-class `Clock` extractor so that handlers read wall-clock
+time through a swappable interface rather than calling `chrono::Utc::now()`
+directly. In tests you pin or advance time with
+`TestApp::with_clock` and `TestClient::advance_clock` — no `sleep`, no Tokio
+timer games, no third-party crates.
+
+### The Clock extractor
+
+Declare `clock: Clock` as a handler argument to access the framework clock:
+
+```rust
+use autumn_web::prelude::*;
+use autumn_web::time::Clock;
+
+#[get("/token-age")]
+async fn token_age(clock: Clock) -> String {
+    format!("current time: {}", clock.now())
+}
+```
+
+If no custom clock is configured, `Clock` delegates to `chrono::Utc::now()`
+with zero overhead — existing handlers that don't take `Clock` keep working
+unchanged.
+
+### FixedClock — pin time to a known instant
+
+Use [`FixedClock`] when you need a stable reference time but don't need to
+advance it between requests:
+
+```rust
+use autumn_web::test::TestApp;
+use autumn_web::time::FixedClock;
+use chrono::{TimeZone, Utc};
+
+#[tokio::test]
+async fn token_is_fresh_at_issue_time() {
+    let issued_at = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+    let client = TestApp::new()
+        .routes(routes![token_age])
+        .with_clock(FixedClock::at(issued_at))
+        .build();
+
+    client.get("/token-age").send().await.assert_ok();
+}
+```
+
+### TickingClock — advance time between requests
+
+Use [`TickingClock`] when the test needs to step time forward. Pass it to
+`with_clock` and call `advance_clock` on the built client between requests:
+
+```rust
+use autumn_web::test::TestApp;
+use autumn_web::time::{Clock, TickingClock};
+use chrono::{TimeZone, Utc};
+use std::time::Duration;
+
+#[get("/token")]
+async fn check_token(clock: Clock) -> axum::http::StatusCode {
+    let issued = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+    if clock.now() < issued + chrono::Duration::days(30) {
+        axum::http::StatusCode::OK
+    } else {
+        axum::http::StatusCode::UNAUTHORIZED
+    }
+}
+
+#[tokio::test]
+async fn token_expires_after_30_days() {
+    let issued = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+    let client = TestApp::new()
+        .routes(routes![check_token])
+        .with_clock(TickingClock::starting_at(issued))
+        .build();
+
+    client.get("/token").send().await.assert_status(200); // valid at issue
+
+    client.advance_clock(Duration::from_secs(29 * 24 * 3600));
+    client.get("/token").send().await.assert_status(200); // still valid
+
+    client.advance_clock(Duration::from_secs(2 * 24 * 3600));
+    client.get("/token").send().await.assert_status(401); // expired!
+}
+```
+
+This test runs in **< 10 ms** — no `sleep`, no Tokio time games, no
+third-party mocking crates. Compare that to a sleep-based equivalent that
+would have to wait at least 30 real days (or use a very short hard-coded TTL
+that doesn't match production).
+
+### Sharing a TickingClock handle
+
+`TickingClock` is `Clone`. Cloning shares the same internal instant so you can
+keep a handle in the test and still wire the same clock into the app:
+
+```rust
+let clock = TickingClock::starting_at(Utc::now());
+let client = TestApp::new()
+    .with_clock(clock.clone())  // shares state with `clock`
+    .build();
+
+clock.advance(Duration::from_secs(3600)); // or: client.advance_clock(...)
+```
+
+Both `clock.advance(...)` and `client.advance_clock(...)` advance the same
+shared instant — use whichever is more ergonomic for your test.
+
+### Signed-URL and scheduler determinism
+
+The same `clock_unix_secs` helper that handlers use is also available for
+framework internals:
+
+```rust
+use autumn_web::time::{TickingClock, clock_unix_secs};
+use autumn_web::storage::local::{SigningKey, sign, verify_with_now};
+
+let clock = TickingClock::starting_at(Utc::now());
+let key = SigningKey::new(b"my-signing-key".to_vec());
+let blob_key = "uploads/file.png";
+
+let now = clock_unix_secs(&clock);
+let expires_at = now + 300; // 5 minutes
+let sig = sign(key.as_bytes(), blob_key, expires_at);
+
+// Advance past expiry without sleeping:
+clock.advance(Duration::from_secs(400));
+assert!(verify_with_now(key.as_bytes(), blob_key, expires_at, &sig, clock_unix_secs(&clock)).is_err());
+```
+
+### Comparison with other frameworks
+
+| Framework | Time testing |
+|-----------|--------------|
+| Spring Boot | `java.time.Clock` injectable bean; `Clock.fixed(instant, zone)` in tests |
+| Rails | `travel_to`, `freeze_time` from `ActiveSupport::Testing::TimeHelpers` |
+| Django | `freezegun` (third-party) |
+| Phoenix | Mox or callable indirection (third-party) |
+| **Autumn** | `Clock` extractor + `with_clock` + `advance_clock` — first-class, no third-party crates |
+
+[`FixedClock`]: https://docs.rs/autumn-web/latest/autumn_web/time/struct.FixedClock.html
+[`TickingClock`]: https://docs.rs/autumn-web/latest/autumn_web/time/struct.TickingClock.html
 
 ---
 

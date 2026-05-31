@@ -3111,8 +3111,11 @@ async fn execute_fixed_delay_task(
     coordinator: Arc<dyn crate::scheduler::SchedulerCoordinator>,
     lease_ttl: std::time::Duration,
 ) {
-    let tick_key =
-        crate::scheduler::fixed_delay_tick_key(&name, delay, crate::scheduler::now_unix_duration());
+    let tick_key = crate::scheduler::fixed_delay_tick_key(
+        &name,
+        delay,
+        crate::time::clock_unix_duration(state.clock()),
+    );
     let lease = match coordinator
         .try_acquire(&name, &tick_key, coordination)
         .await
@@ -4756,6 +4759,7 @@ fn build_state(
         forbidden_response: config.security.forbidden_response,
         auth_session_key: config.auth.session_key.clone(),
         shared_cache: None,
+        clock: std::sync::Arc::new(crate::time::SystemClock),
     };
     #[cfg(feature = "db")]
     if state.replica_pool.is_some() {
@@ -5024,6 +5028,7 @@ mod tests {
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
+            clock: std::sync::Arc::new(crate::time::SystemClock),
         };
         crate::router::build_router(routes, &config, state)
     }
@@ -5944,6 +5949,7 @@ mod tests {
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
+            clock: std::sync::Arc::new(crate::time::SystemClock),
         };
         let router =
             crate::router::build_router(vec![test_get_route("/dummy", "dummy")], &config, state);
@@ -6048,6 +6054,7 @@ mod tests {
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
+            clock: std::sync::Arc::new(crate::time::SystemClock),
         };
         let router = crate::router::build_router(post_routes, &config, state);
 
@@ -6127,6 +6134,7 @@ mod tests {
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
+            clock: std::sync::Arc::new(crate::time::SystemClock),
         };
         let router = crate::router::build_router(route_list, &config, state);
 
@@ -6417,6 +6425,7 @@ mod tests {
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
+            clock: std::sync::Arc::new(crate::time::SystemClock),
         };
         let router = crate::router::build_router_with_static(
             vec![test_get_route("/other", "other_page")],
@@ -6723,6 +6732,7 @@ mod tests {
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
+            clock: std::sync::Arc::new(crate::time::SystemClock),
         };
         crate::router::build_router(routes, config, state)
     }
@@ -6871,6 +6881,7 @@ mod tests {
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
+            clock: std::sync::Arc::new(crate::time::SystemClock),
         };
         let router = crate::router::build_router_with_static(
             vec![test_get_route("/test", "test")],
@@ -6917,6 +6928,7 @@ mod tests {
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
+            clock: std::sync::Arc::new(crate::time::SystemClock),
         };
         let router = crate::router::build_router_with_static(
             vec![test_get_route("/test", "test")],
@@ -7171,6 +7183,7 @@ mod tests {
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
+            clock: std::sync::Arc::new(crate::time::SystemClock),
         };
 
         let mut rx = state.channels().subscribe("sys:tasks");
@@ -7241,6 +7254,7 @@ mod tests {
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
+            clock: std::sync::Arc::new(crate::time::SystemClock),
         };
 
         let mut rx = state.channels().subscribe("sys:tasks");

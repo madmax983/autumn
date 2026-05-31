@@ -185,6 +185,7 @@ pub mod static_gen;
 #[cfg(feature = "storage")]
 pub mod storage;
 pub mod tenancy;
+pub mod time;
 
 pub mod feature_flags;
 pub mod form;

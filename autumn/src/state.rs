@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::cache::Cache;
+use crate::time::{ClockSource, SystemClock};
 
 /// Newtype wrapper used to store the global cache in the extension map so that
 /// `set_cache` (called from startup hooks) is visible to all `AppState` clones.
@@ -135,6 +136,10 @@ pub struct AppState {
     /// Shared application cache backend. `None` means no global cache has been
     /// registered; `#[cached]` will fall back to its per-function Moka store.
     pub(crate) shared_cache: Option<Arc<dyn Cache>>,
+
+    /// Injected wall-clock. Defaults to [`SystemClock`] (real time).
+    /// Tests override via [`crate::test::TestApp::with_clock`].
+    pub(crate) clock: Arc<dyn ClockSource>,
 }
 
 impl AppState {
@@ -310,6 +315,23 @@ impl AppState {
     #[must_use]
     pub fn with_cache(mut self, cache: Arc<dyn Cache>) -> Self {
         self.shared_cache = Some(cache);
+        self
+    }
+
+    /// Returns the active clock source wired into this state.
+    ///
+    /// Handlers should prefer the [`crate::time::Clock`] extractor; this
+    /// accessor exists for framework internals (middleware, storage) that
+    /// need the time without going through Axum's extractor machinery.
+    #[must_use]
+    pub fn clock(&self) -> &dyn ClockSource {
+        self.clock.as_ref()
+    }
+
+    /// Replace the clock (builder / test helper).
+    #[must_use]
+    pub fn with_clock(mut self, clock: Arc<dyn ClockSource>) -> Self {
+        self.clock = clock;
         self
     }
 
@@ -514,6 +536,7 @@ impl AppState {
             forbidden_response: ForbiddenResponse::default(),
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
+            clock: Arc::new(SystemClock),
         }
     }
 
