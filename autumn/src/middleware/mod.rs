@@ -19,7 +19,7 @@
 pub(crate) mod dev;
 pub(crate) mod error_page_filter;
 pub(crate) mod exception_filter;
-pub mod maintenance;
+pub(crate) mod maintenance;
 pub(crate) mod method_override;
 pub(crate) mod metrics;
 pub(crate) mod request_id;

@@ -106,7 +106,7 @@
 pub(crate) mod config;
 pub(crate) mod csrf;
 pub(crate) mod headers;
-pub mod rate_limit;
+pub(crate) mod rate_limit;
 
 // Re-export commonly used types at the module level.
 pub use config::{
