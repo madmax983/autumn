@@ -1515,28 +1515,77 @@ impl AutumnConfig {
 
         #[cfg(feature = "oauth2")]
         {
-            let provider_names: Vec<String> =
-                config.auth.oauth2.providers.keys().cloned().collect();
-            for name in provider_names {
-                if let Some(p) = config.auth.oauth2.providers.get_mut(&name) {
-                    let id_key = format!("oauth2_{name}_client_id");
-                    if p.client_id.is_empty()
-                        && let Some(id) = config.credentials.get::<String>(&id_key)
+            config.expand_oauth2_providers();
+        }
+
+        Ok(config)
+    }
+
+    /// Helper method to expand `OAuth2` preset configurations and resolve credentials-backed values.
+    #[cfg(feature = "oauth2")]
+    fn expand_oauth2_providers(&mut self) {
+        let provider_names: Vec<String> = self.auth.oauth2.providers.keys().cloned().collect();
+        for name in provider_names {
+            // 1. Expand from preset if available
+            if let (Some(preset), Some(p)) = (
+                crate::auth::provider_preset(&name),
+                self.auth.oauth2.providers.get_mut(&name),
+            ) {
+                if p.authorize_url.is_empty() {
+                    p.authorize_url = preset.authorize_url;
+                }
+                if p.token_url.is_empty() {
+                    p.token_url = preset.token_url;
+                }
+                if p.userinfo_url.is_none() {
+                    p.userinfo_url = preset.userinfo_url;
+                }
+                if p.scope.is_empty() || p.scope == "default" {
+                    p.scope = preset.scope;
+                }
+                if p.issuer.is_none() {
+                    p.issuer = preset.issuer;
+                }
+                if p.jwks_url.is_none() {
+                    p.jwks_url = preset.jwks_url;
+                }
+                if p.discovery_url.is_none() {
+                    p.discovery_url = preset.discovery_url;
+                }
+            }
+
+            // 2. Resolve credentials-backed secrets/IDs
+            if let Some(p) = self.auth.oauth2.providers.get_mut(&name) {
+                let normalized_name = name
+                    .chars()
+                    .map(|c| if c.is_alphanumeric() { c } else { '_' })
+                    .collect::<String>()
+                    .to_lowercase();
+
+                let id_key = format!("oauth2_{normalized_name}_client_id");
+                if p.client_id.is_empty() {
+                    if let Some(id) = self.credentials.get::<String>(&id_key) {
+                        p.client_id = id;
+                    } else if let Some(id) = self
+                        .credentials
+                        .get::<String>(&format!("oauth2_{name}_client_id"))
                     {
                         p.client_id = id;
                     }
-
-                    let secret_key = format!("oauth2_{name}_client_secret");
-                    if p.client_secret.is_empty()
-                        && let Some(secret) = config.credentials.get::<String>(&secret_key)
+                }
+                let secret_key = format!("oauth2_{normalized_name}_client_secret");
+                if p.client_secret.is_empty() {
+                    if let Some(secret) = self.credentials.get::<String>(&secret_key) {
+                        p.client_secret = secret;
+                    } else if let Some(secret) = self
+                        .credentials
+                        .get::<String>(&format!("oauth2_{name}_client_secret"))
                     {
                         p.client_secret = secret;
                     }
                 }
             }
         }
-
-        Ok(config)
     }
 
     /// Load configuration from a specific TOML file path.
@@ -2061,11 +2110,22 @@ impl AutumnConfig {
         {
             let provider_names: Vec<String> = self.auth.oauth2.providers.keys().cloned().collect();
             for name in provider_names {
-                let var_key = format!(
-                    "AUTUMN_AUTH__OAUTH2__{upper}__CLIENT_SECRET",
-                    upper = name.to_uppercase()
-                );
-                if let Ok(secret) = env.var(&var_key)
+                let upper = name
+                    .chars()
+                    .map(|c| if c.is_alphanumeric() { c } else { '_' })
+                    .collect::<String>()
+                    .to_uppercase();
+
+                let client_id_var = format!("AUTUMN_AUTH__OAUTH2__{upper}__CLIENT_ID");
+                if let Ok(id) = env.var(&client_id_var)
+                    && !id.is_empty()
+                    && let Some(p) = self.auth.oauth2.providers.get_mut(&name)
+                {
+                    p.client_id = id;
+                }
+
+                let client_secret_var = format!("AUTUMN_AUTH__OAUTH2__{upper}__CLIENT_SECRET");
+                if let Ok(secret) = env.var(&client_secret_var)
                     && !secret.is_empty()
                     && let Some(p) = self.auth.oauth2.providers.get_mut(&name)
                 {

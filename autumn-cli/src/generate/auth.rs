@@ -47,6 +47,7 @@ pub struct AuthOAuthOptions {
 /// # Errors
 /// Returns [`GenerateError::NotInProject`] when run outside an Autumn project
 /// root, or [`GenerateError::InvalidName`] for a bad resource name.
+#[allow(dead_code)]
 pub fn plan_auth(project_root: &Path, name: &str, timestamp: &str) -> Result<Plan, GenerateError> {
     plan_auth_with_providers(project_root, name, timestamp, &[])
 }
@@ -304,6 +305,7 @@ fn find_plan_content_for_path(plan: &Plan, path: &std::path::Path) -> Option<Str
 }
 
 /// Ensure `autumn-web` in `[dependencies]` has `features = ["oauth2"]`.
+#[allow(clippy::too_many_lines)]
 fn ensure_autumn_web_oauth2_feature(toml: &str) -> String {
     const CRATE: &str = "autumn-web";
     const FEATURE: &str = "\"oauth2\"";
@@ -314,6 +316,7 @@ fn ensure_autumn_web_oauth2_feature(toml: &str) -> String {
     let simple_prefix = format!("{CRATE} = \"");
     let table_prefix = format!("{CRATE} = {{");
     let subtable_header = format!("[dependencies.{CRATE}]");
+    let subtable_header_underscore = format!("[dependencies.{}]", CRATE.replace('-', "_"));
 
     let mut i = 0;
     while i < lines.len() {
@@ -336,19 +339,47 @@ fn ensure_autumn_web_oauth2_feature(toml: &str) -> String {
             }
             if let Some(feat_bracket) = trimmed.find("features = [") {
                 let list_start = feat_bracket + "features = [".len();
-                let list_end = trimmed[list_start..].find(']').unwrap() + list_start;
-                let existing = trimmed[list_start..list_end].trim();
-                let new_list = if existing.is_empty() {
-                    FEATURE.to_owned()
+                if let Some(close_bracket) = trimmed[list_start..].find(']') {
+                    let list_end = close_bracket + list_start;
+                    let existing = trimmed[list_start..list_end].trim();
+                    let new_list = if existing.is_empty() {
+                        FEATURE.to_owned()
+                    } else {
+                        format!("{existing}, {FEATURE}")
+                    };
+                    lines[i] = format!(
+                        "{indent}{}{}{}",
+                        &trimmed[..list_start],
+                        new_list,
+                        &trimmed[list_end..]
+                    );
                 } else {
-                    format!("{existing}, {FEATURE}")
-                };
-                lines[i] = format!(
-                    "{indent}{}{}{}",
-                    &trimmed[..list_start],
-                    new_list,
-                    &trimmed[list_end..]
-                );
+                    let mut j = i + 1;
+                    while j < lines.len() {
+                        let tj = lines[j].trim();
+                        if tj.starts_with('[') {
+                            break;
+                        }
+                        if let Some(close_idx) = tj.find(']') {
+                            let before_close = tj[..close_idx].trim();
+                            let sep = if before_close.is_empty() || before_close.ends_with(',') {
+                                ""
+                            } else {
+                                ", "
+                            };
+                            let indent_j: String = lines[j]
+                                .chars()
+                                .take_while(char::is_ascii_whitespace)
+                                .collect();
+                            lines[j] = format!(
+                                "{indent_j}{before_close}{sep}{FEATURE}{}",
+                                &tj[close_idx..]
+                            );
+                            break;
+                        }
+                        j += 1;
+                    }
+                }
             } else {
                 let close = trimmed.rfind('}').unwrap();
                 let before_close = trimmed[..close].trim_end();
@@ -366,7 +397,7 @@ fn ensure_autumn_web_oauth2_feature(toml: &str) -> String {
             break;
         }
 
-        if trimmed == subtable_header {
+        if trimmed == subtable_header || trimmed == subtable_header_underscore {
             let mut j = i + 1;
             let mut found_features = false;
             while j < lines.len() {
@@ -376,20 +407,50 @@ fn ensure_autumn_web_oauth2_feature(toml: &str) -> String {
                 }
                 if t.starts_with("features") {
                     found_features = true;
-                    if !t.contains(FEATURE)
-                        && let (Some(open), Some(close)) = (t.find('['), t.rfind(']'))
-                    {
-                        let inner = t[open + 1..close].trim();
-                        let new_inner = if inner.is_empty() {
-                            FEATURE.to_owned()
+                    if t.contains(FEATURE) {
+                        break;
+                    }
+                    if let Some(open) = t.find('[') {
+                        if let Some(close) = t.rfind(']') {
+                            let inner = t[open + 1..close].trim();
+                            let new_inner = if inner.is_empty() {
+                                FEATURE.to_owned()
+                            } else {
+                                format!("{inner}, {FEATURE}")
+                            };
+                            let indent_j: String = lines[j]
+                                .chars()
+                                .take_while(char::is_ascii_whitespace)
+                                .collect();
+                            lines[j] = format!("{indent_j}features = [{new_inner}]");
                         } else {
-                            format!("{inner}, {FEATURE}")
-                        };
-                        let indent_j: String = lines[j]
-                            .chars()
-                            .take_while(char::is_ascii_whitespace)
-                            .collect();
-                        lines[j] = format!("{indent_j}features = [{new_inner}]");
+                            let mut k = j + 1;
+                            while k < lines.len() {
+                                let tk = lines[k].trim();
+                                if tk.starts_with('[') {
+                                    break;
+                                }
+                                if let Some(close_idx) = tk.find(']') {
+                                    let before_close = tk[..close_idx].trim();
+                                    let sep =
+                                        if before_close.is_empty() || before_close.ends_with(',') {
+                                            ""
+                                        } else {
+                                            ", "
+                                        };
+                                    let indent_k: String = lines[k]
+                                        .chars()
+                                        .take_while(char::is_ascii_whitespace)
+                                        .collect();
+                                    lines[k] = format!(
+                                        "{indent_k}{before_close}{sep}{FEATURE}{}",
+                                        &tk[close_idx..]
+                                    );
+                                    break;
+                                }
+                                k += 1;
+                            }
+                        }
                     }
                     break;
                 }
@@ -588,6 +649,23 @@ token_url = "https://oauth2.googleapis.com/token"
 userinfo_url = "https://openidconnect.googleapis.com/v1/userinfo"
 redirect_uri = "http://localhost:3000/auth/google/callback"
 scope = "openid profile email"
+issuer = "https://accounts.google.com"
+jwks_url = "https://www.googleapis.com/oauth2/v3/certs"
+discovery_url = "https://accounts.google.com"
+"#
+            }
+            "microsoft" => {
+                r#"
+[auth.oauth2.microsoft]
+client_id = ""
+client_secret = ""
+authorize_url = "https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
+token_url = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
+redirect_uri = "http://localhost:3000/auth/microsoft/callback"
+scope = "openid profile email"
+issuer = "https://login.microsoftonline.com/common/v2.0"
+jwks_url = "https://login.microsoftonline.com/common/discovery/v2.0/keys"
+discovery_url = "https://login.microsoftonline.com/common/v2.0"
 "#
             }
             _ => &format!(
@@ -1495,7 +1573,7 @@ fn render_oauth_routes_file(
 
 use autumn_web::auth::{{OAuth2Callback, OidcIdentity, oauth2_authorize_url, oauth2_finish_login}};
 use autumn_web::prelude::*;
-use autumn_web::{{get, AppState, State}};
+use autumn_web::{{get, oauth2_callback, AppState, State}};
 use axum::extract::{{Path, Query}};
 use axum::response::{{IntoResponse, Redirect}};
 use tracing::warn;
@@ -1539,8 +1617,8 @@ pub async fn oauth_redirect(
 ///
 /// **Important:** `oauth2_finish_login` does NOT set the application session key.
 /// You must resolve (or create) the local {pascal_name} row and call
-/// `session.insert(&auth_cfg.session_key, local_user_id)` before redirecting.
-#[get("/auth/{{provider}}/callback")]
+/// `session.insert(&auth_cfg.session_key, local_user_id.to_string())` before redirecting.
+#[oauth2_callback("/auth/{{provider}}/callback")]
 pub async fn oauth_callback(
     Path(provider_name): Path<String>,
     Query(callback): Query<OAuth2Callback>,
@@ -1583,7 +1661,7 @@ pub async fn oauth_callback(
     //       &auth_cfg,          // carries oauth_linking_policy
     //   ).await?;
     //
-    //   session.insert(&auth_cfg.session_key, local_user_id).await;
+    //   session.insert(&auth_cfg.session_key, local_user_id.to_string()).await;
     //
     // Until the above is implemented the user will NOT be logged in after the OAuth
     // callback — that is intentional to avoid authenticating without a local account.
@@ -1601,6 +1679,7 @@ fn user_table_placeholder_{snake_name}() -> &'static str {{
     )
 }
 
+#[allow(clippy::too_many_lines)]
 fn render_oauth_docs_file(providers: &[String]) -> String {
     let provider_list = providers.join(", ");
     let provider_config_examples = providers
@@ -1608,23 +1687,23 @@ fn render_oauth_docs_file(providers: &[String]) -> String {
         .map(|p| match p.as_str() {
             "github" => concat!(
                 "[auth.oauth2.github]\n",
-                "client_id     = \"${AUTUMN_GITHUB_CLIENT_ID}\"\n",
-                "client_secret = \"${AUTUMN_GITHUB_CLIENT_SECRET}\"\n",
+                "client_id     = \"\"\n",
+                "client_secret = \"\"\n",
                 "authorize_url = \"https://github.com/login/oauth/authorize\"\n",
                 "token_url     = \"https://github.com/login/oauth/access_token\"\n",
                 "userinfo_url  = \"https://api.github.com/user\"\n",
-                "redirect_uri  = \"https://your-app.example.com/auth/oauth/github/callback\"\n",
+                "redirect_uri  = \"https://your-app.example.com/auth/github/callback\"\n",
                 "scope         = \"read:user user:email\"\n",
             )
             .to_owned(),
             "google" => concat!(
                 "[auth.oauth2.google]\n",
-                "client_id     = \"${AUTUMN_GOOGLE_CLIENT_ID}\"\n",
-                "client_secret = \"${AUTUMN_GOOGLE_CLIENT_SECRET}\"\n",
+                "client_id     = \"\"\n",
+                "client_secret = \"\"\n",
                 "authorize_url = \"https://accounts.google.com/o/oauth2/v2/auth\"\n",
                 "token_url     = \"https://oauth2.googleapis.com/token\"\n",
                 "userinfo_url  = \"https://openidconnect.googleapis.com/v1/userinfo\"\n",
-                "redirect_uri  = \"https://your-app.example.com/auth/oauth/google/callback\"\n",
+                "redirect_uri  = \"https://your-app.example.com/auth/google/callback\"\n",
                 "scope         = \"openid email profile\"\n",
                 "issuer        = \"https://accounts.google.com\"\n",
                 "jwks_url      = \"https://www.googleapis.com/oauth2/v3/certs\"\n",
@@ -1633,11 +1712,11 @@ fn render_oauth_docs_file(providers: &[String]) -> String {
             .to_owned(),
             "microsoft" => concat!(
                 "[auth.oauth2.microsoft]\n",
-                "client_id     = \"${AUTUMN_MICROSOFT_CLIENT_ID}\"\n",
-                "client_secret = \"${AUTUMN_MICROSOFT_CLIENT_SECRET}\"\n",
+                "client_id     = \"\"\n",
+                "client_secret = \"\"\n",
                 "authorize_url = \"https://login.microsoftonline.com/{YOUR_TENANT_ID}/oauth2/v2.0/authorize\"\n",
                 "token_url     = \"https://login.microsoftonline.com/{YOUR_TENANT_ID}/oauth2/v2.0/token\"\n",
-                "redirect_uri  = \"https://your-app.example.com/auth/oauth/microsoft/callback\"\n",
+                "redirect_uri  = \"https://your-app.example.com/auth/microsoft/callback\"\n",
                 "scope         = \"openid email profile\"\n",
                 "# Single-tenant: replace {YOUR_TENANT_ID} with your Directory (tenant) ID.\n",
                 "# Multi-tenant (common endpoint): ID-token issuer varies per user — see docs/guide/oauth.md.\n",
@@ -1646,14 +1725,13 @@ fn render_oauth_docs_file(providers: &[String]) -> String {
             )
             .to_owned(),
             p => {
-                let upper = p.to_uppercase();
                 format!(
                     r#"[auth.oauth2.{p}]
-client_id     = "${{AUTUMN_{upper}_CLIENT_ID}}"
-client_secret = "${{AUTUMN_{upper}_CLIENT_SECRET}}"
+client_id     = ""
+client_secret = ""
 authorize_url = "https://{p}.example.com/oauth2/authorize"
 token_url     = "https://{p}.example.com/oauth2/token"
-redirect_uri  = "https://your-app.example.com/auth/oauth/{p}/callback"
+redirect_uri  = "https://your-app.example.com/auth/{p}/callback"
 scope         = "openid profile email"
 "#
                 )

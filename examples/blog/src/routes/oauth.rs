@@ -13,7 +13,7 @@ use autumn_web::AppState;
 use autumn_web::auth::{OAuth2Callback, oauth2_authorize_url, oauth2_finish_login};
 use autumn_web::extract::{Path, Query};
 use autumn_web::session::Session;
-use autumn_web::{AutumnError, AutumnResult, Redirect, State, get};
+use autumn_web::{AutumnError, AutumnResult, Redirect, State, get, oauth2_callback};
 
 /// Supported providers — must match keys in `[auth.oauth2.*]` in autumn.toml.
 const SUPPORTED_PROVIDERS: &[&str] = &["github", "google"];
@@ -21,7 +21,7 @@ const SUPPORTED_PROVIDERS: &[&str] = &["github", "google"];
 /// Redirect the browser to the provider's authorization endpoint.
 ///
 /// PKCE (S256) code_challenge, state, and nonce are stored in the session.
-#[get("/auth/oauth/{provider}/redirect")]
+#[get("/auth/{provider}/redirect")]
 pub async fn oauth_redirect(
     Path(provider_name): Path<String>,
     State(state): State<AppState>,
@@ -53,7 +53,7 @@ pub async fn oauth_redirect(
 ///
 /// State is validated with constant-time comparison against the session value.
 /// On success the user is redirected to the home page.
-#[get("/auth/oauth/{provider}/callback")]
+#[oauth2_callback("/auth/{provider}/callback")]
 pub async fn oauth_callback(
     Path(provider_name): Path<String>,
     Query(callback): Query<OAuth2Callback>,

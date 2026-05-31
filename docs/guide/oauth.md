@@ -27,7 +27,7 @@ client_secret = "YOUR_CLIENT_SECRET"   # use env var in production
 authorize_url = "https://github.com/login/oauth/authorize"
 token_url     = "https://github.com/login/oauth/access_token"
 userinfo_url  = "https://api.github.com/user"
-redirect_uri  = "https://yourapp.com/auth/oauth/github/callback"
+redirect_uri  = "https://yourapp.com/auth/github/callback"
 scope         = "read:user user:email"
 
 [auth.oauth2.google]
@@ -36,7 +36,7 @@ client_secret = "YOUR_CLIENT_SECRET"
 authorize_url = "https://accounts.google.com/o/oauth2/v2/auth"
 token_url     = "https://oauth2.googleapis.com/token"
 userinfo_url  = "https://openidconnect.googleapis.com/v1/userinfo"
-redirect_uri  = "https://yourapp.com/auth/oauth/google/callback"
+redirect_uri  = "https://yourapp.com/auth/google/callback"
 scope         = "openid email profile"
 issuer        = "https://accounts.google.com"
 jwks_url      = "https://www.googleapis.com/oauth2/v3/certs"
@@ -49,7 +49,7 @@ client_id     = "YOUR_CLIENT_ID"
 client_secret = "YOUR_CLIENT_SECRET"
 authorize_url = "https://login.microsoftonline.com/{YOUR_TENANT_ID}/oauth2/v2.0/authorize"
 token_url     = "https://login.microsoftonline.com/{YOUR_TENANT_ID}/oauth2/v2.0/token"
-redirect_uri  = "https://yourapp.com/auth/oauth/microsoft/callback"
+redirect_uri  = "https://yourapp.com/auth/microsoft/callback"
 scope         = "openid email profile"
 issuer        = "https://login.microsoftonline.com/{YOUR_TENANT_ID}/v2.0"
 jwks_url      = "https://login.microsoftonline.com/{YOUR_TENANT_ID}/discovery/v2.0/keys"
@@ -66,15 +66,15 @@ jwks_url      = "https://login.microsoftonline.com/{YOUR_TENANT_ID}/discovery/v2
 Each provider requires you to allowlist your callback URL before login works.
 
 **GitHub** — Settings → Developer settings → OAuth Apps → New OAuth App  
-Callback URL: `https://yourapp.com/auth/oauth/github/callback`
+Callback URL: `https://yourapp.com/auth/github/callback`
 
 **Google** — Google Cloud Console → APIs & Services → Credentials → OAuth 2.0 Client  
-Authorized redirect URI: `https://yourapp.com/auth/oauth/google/callback`
+Authorized redirect URI: `https://yourapp.com/auth/google/callback`
 
 **Microsoft** — Azure portal → App registrations → Redirect URIs  
-Platform: Web, URI: `https://yourapp.com/auth/oauth/microsoft/callback`
+Platform: Web, URI: `https://yourapp.com/auth/microsoft/callback`
 
-For local development use `http://localhost:3000/auth/oauth/<provider>/callback`.
+For local development use `http://localhost:3000/auth/<provider>/callback`.
 
 ## Security properties
 

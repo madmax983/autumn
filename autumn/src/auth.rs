@@ -453,17 +453,22 @@ pub struct OAuth2Config {
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct OAuth2ProviderConfig {
     /// The client ID provided by the `OAuth2` identity provider.
+    #[serde(default)]
     pub client_id: String,
     /// The client secret provided by the `OAuth2` identity provider.
+    #[serde(default)]
     pub client_secret: String,
     /// The authorization endpoint URL where users are redirected to authenticate.
+    #[serde(default)]
     pub authorize_url: String,
     /// The token endpoint URL used to exchange an authorization code for tokens.
+    #[serde(default)]
     pub token_url: String,
     /// The optional userinfo endpoint URL used to fetch profile details.
     #[serde(default)]
     pub userinfo_url: Option<String>,
     /// The local redirect URI registered with the identity provider (e.g., `http://localhost/auth/callback`).
+    #[serde(default)]
     pub redirect_uri: String,
     /// The requested scope string (e.g., `openid profile email`).
     #[serde(default = "default_provider_scope")]
@@ -987,7 +992,32 @@ async fn validate_and_decode_id_token(
         .map_err(|e| crate::AutumnError::unauthorized_msg(format!("invalid jwk key: {e}")))?;
 
     let mut validation = jsonwebtoken::Validation::new(alg);
-    validation.set_issuer(&[issuer]);
+    let mut issuers = vec![issuer.to_owned()];
+    if let (true, Some(payload_b64)) = (
+        issuer.contains("login.microsoftonline.com"),
+        token.split('.').nth(1),
+    ) {
+        use base64::Engine as _;
+        let extract_microsoft_iss = || -> Option<String> {
+            let payload_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(payload_b64)
+                .ok()?;
+            let claims: serde_json::Value = serde_json::from_slice(&payload_bytes).ok()?;
+            let unverified_iss = claims.get("iss")?.as_str()?;
+            if unverified_iss.starts_with("https://login.microsoftonline.com/")
+                && unverified_iss.ends_with("/v2.0")
+            {
+                Some(unverified_iss.to_owned())
+            } else {
+                None
+            }
+        };
+        if let Some(unverified_iss) = extract_microsoft_iss() {
+            issuers.push(unverified_iss);
+        }
+    }
+    let issuer_refs: Vec<&str> = issuers.iter().map(String::as_str).collect();
+    validation.set_issuer(&issuer_refs);
     validation.set_audience(std::slice::from_ref(&provider.client_id));
     validation.required_spec_claims = ["exp", "iss", "aud", "sub"]
         .into_iter()
