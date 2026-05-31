@@ -703,7 +703,10 @@ pub async fn oauth2_finish_login(
     // Retrieve (and consume) the PKCE code_verifier stored during authorize.
     let code_verifier = session
         .remove(&format!("oauth2:{provider_name}:code_verifier"))
-        .await;
+        .await
+        .ok_or_else(|| {
+            crate::AutumnError::unauthorized_msg("oauth2 code_verifier missing from session")
+        })?;
     let token = exchange_oauth2_token(provider, callback, code_verifier).await?;
     let (claims, source) = load_identity_claims(provider, &token).await?;
     validate_oidc_nonce(session, provider_name, &claims, source).await?;
@@ -741,19 +744,17 @@ async fn validate_callback_state(
 async fn exchange_oauth2_token(
     provider: &OAuth2ProviderConfig,
     callback: &OAuth2Callback,
-    code_verifier: Option<String>,
+    code_verifier: String,
 ) -> crate::AutumnResult<OAuth2TokenResponse> {
-    // Build the base form fields; PKCE code_verifier is appended when present.
-    let mut form_fields: Vec<(&str, String)> = vec![
+    // Build the base form fields; PKCE code_verifier is appended.
+    let form_fields: Vec<(&str, String)> = vec![
         ("grant_type", "authorization_code".to_owned()),
         ("code", callback.code.clone()),
         ("redirect_uri", provider.redirect_uri.clone()),
         ("client_id", provider.client_id.clone()),
         ("client_secret", provider.client_secret.clone()),
+        ("code_verifier", code_verifier),
     ];
-    if let Some(ref verifier) = code_verifier {
-        form_fields.push(("code_verifier", verifier.clone()));
-    }
     let token_response = oauth_http_client()?
         .post(&provider.token_url)
         .header(reqwest::header::ACCEPT, "application/json")

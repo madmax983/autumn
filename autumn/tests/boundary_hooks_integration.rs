@@ -462,6 +462,9 @@ async fn test_oauth_client(session: autumn_web::session::Session) -> &'static st
     session
         .insert("oauth2:github:state", state_val.to_string())
         .await;
+    session
+        .insert("oauth2:github:code_verifier", "test-verifier".to_string())
+        .await;
 
     let provider = OAuth2ProviderConfig {
         client_id: "client-id".to_string(),

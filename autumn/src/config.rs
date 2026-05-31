@@ -1520,17 +1520,17 @@ impl AutumnConfig {
             for name in provider_names {
                 if let Some(p) = config.auth.oauth2.providers.get_mut(&name) {
                     let id_key = format!("oauth2_{name}_client_id");
-                    if p.client_id.is_empty() {
-                        if let Some(id) = config.credentials.get::<String>(&id_key) {
-                            p.client_id = id;
-                        }
+                    if p.client_id.is_empty()
+                        && let Some(id) = config.credentials.get::<String>(&id_key)
+                    {
+                        p.client_id = id;
                     }
 
                     let secret_key = format!("oauth2_{name}_client_secret");
-                    if p.client_secret.is_empty() {
-                        if let Some(secret) = config.credentials.get::<String>(&secret_key) {
-                            p.client_secret = secret;
-                        }
+                    if p.client_secret.is_empty()
+                        && let Some(secret) = config.credentials.get::<String>(&secret_key)
+                    {
+                        p.client_secret = secret;
                     }
                 }
             }

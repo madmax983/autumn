@@ -48,6 +48,15 @@ pub struct AuthOAuthOptions {
 /// Returns [`GenerateError::NotInProject`] when run outside an Autumn project
 /// root, or [`GenerateError::InvalidName`] for a bad resource name.
 pub fn plan_auth(project_root: &Path, name: &str, timestamp: &str) -> Result<Plan, GenerateError> {
+    plan_auth_with_providers(project_root, name, timestamp, &[])
+}
+
+pub fn plan_auth_with_providers(
+    project_root: &Path,
+    name: &str,
+    timestamp: &str,
+    providers: &[String],
+) -> Result<Plan, GenerateError> {
     ensure_project_root(project_root)?;
     super::model::validate_resource_name(name)?;
 
@@ -105,7 +114,7 @@ pub fn plan_auth(project_root: &Path, name: &str, timestamp: &str) -> Result<Pla
     let routes_dir = project_root.join("src").join("routes");
     plan.create(
         routes_dir.join("auth.rs"),
-        render_routes_file(&pascal_name, &snake_name, &table),
+        render_routes_file(&pascal_name, &snake_name, &table, providers),
     );
     let route_mod_path = routes_dir.join("mod.rs");
     plan.modify(
@@ -174,8 +183,8 @@ pub fn plan_auth_with_options(
     timestamp: &str,
     oauth: &AuthOAuthOptions,
 ) -> Result<Plan, GenerateError> {
-    // Start with the base auth plan.
-    let mut plan = plan_auth(project_root, name, timestamp)?;
+    // Start with the base auth plan with providers passed in.
+    let mut plan = plan_auth_with_providers(project_root, name, timestamp, &oauth.providers)?;
 
     if oauth.providers.is_empty() {
         return Ok(plan);
@@ -267,6 +276,16 @@ pub fn plan_auth_with_options(
     let with_oauth2 = ensure_autumn_web_oauth2_feature(&base_cargo);
     if with_oauth2 != base_cargo {
         plan.modify(cargo_toml_path, with_oauth2);
+    }
+
+    // ── autumn.toml OAuth provider stubs ───────────────────────────────────
+    let autumn_toml_path = project_root.join("autumn.toml");
+    if autumn_toml_path.exists() {
+        let toml_existing = read_or_empty(&autumn_toml_path);
+        let updated_toml = append_oauth_stubs_to_toml(&toml_existing, &oauth.providers);
+        if updated_toml != toml_existing {
+            plan.modify(autumn_toml_path, updated_toml);
+        }
     }
 
     Ok(plan)
@@ -539,6 +558,57 @@ fn ensure_autumn_web_mail_feature(toml: &str) -> String {
     out
 }
 
+fn append_oauth_stubs_to_toml(existing: &str, providers: &[String]) -> String {
+    let mut out = existing.trim_end().to_owned();
+    for name in providers {
+        let header = format!("[auth.oauth2.{name}]");
+        if out.contains(&header) {
+            continue;
+        }
+        let preset = match name.as_str() {
+            "github" => {
+                r#"
+[auth.oauth2.github]
+client_id = ""
+client_secret = ""
+authorize_url = "https://github.com/login/oauth/authorize"
+token_url = "https://github.com/login/oauth/access_token"
+userinfo_url = "https://api.github.com/user"
+redirect_uri = "http://localhost:3000/auth/github/callback"
+scope = "read:user user:email"
+"#
+            }
+            "google" => {
+                r#"
+[auth.oauth2.google]
+client_id = ""
+client_secret = ""
+authorize_url = "https://accounts.google.com/o/oauth2/v2/auth"
+token_url = "https://oauth2.googleapis.com/token"
+userinfo_url = "https://openidconnect.googleapis.com/v1/userinfo"
+redirect_uri = "http://localhost:3000/auth/google/callback"
+scope = "openid profile email"
+"#
+            }
+            _ => &format!(
+                r#"
+[auth.oauth2.{name}]
+client_id = ""
+client_secret = ""
+authorize_url = "https://example.com/oauth/authorize"
+token_url = "https://example.com/oauth/token"
+redirect_uri = "http://localhost:3000/auth/{name}/callback"
+scope = "openid profile email"
+"#
+            ),
+        };
+        out.push('\n');
+        out.push_str(preset.trim_start());
+    }
+    out.push('\n');
+    out
+}
+
 // ── Template rendering ────────────────────────────────────────────────────────
 
 fn render_migration_up(table: &str) -> String {
@@ -588,7 +658,35 @@ pub struct {pascal_name} {{
     clippy::too_many_lines,
     reason = "Single auth-routes template — splitting fragments makes the template harder to read."
 )]
-fn render_routes_file(pascal_name: &str, snake_name: &str, table: &str) -> String {
+fn render_routes_file(
+    pascal_name: &str,
+    snake_name: &str,
+    table: &str,
+    providers: &[String],
+) -> String {
+    use std::fmt::Write as _;
+
+    let oauth_buttons = if providers.is_empty() {
+        String::new()
+    } else {
+        let mut btn_html = String::new();
+        btn_html.push_str("hr;\n        h3 { \"Or sign in with:\" }\n        div style=\"display: flex; gap: 0.5rem;\" {\n");
+        for p in providers {
+            let label = match p.as_str() {
+                "github" => "GitHub",
+                "google" => "Google",
+                "microsoft" => "Microsoft",
+                _ => p,
+            };
+            let _ = writeln!(
+                btn_html,
+                "            a href=\"/auth/{p}/redirect\" {{ button type=\"button\" {{ \"Sign in with {label}\" }} }}"
+            );
+        }
+        btn_html.push_str("        }\n");
+        btn_html
+    };
+
     format!(
         r#"//! Generated by `autumn generate auth`.
 //!
@@ -733,6 +831,7 @@ pub async fn login_form(csrf: Option<CsrfToken>, csrf_field: Option<CsrfFormFiel
             }}
             button type="submit" {{ "Log In" }}
         }}
+        {oauth_buttons}
         p {{ a href="/signup" {{ "New here? Create an account" }} }}
         p {{ a href="/forgot-password" {{ "Forgot your password?" }} }}
     }}))
@@ -1914,7 +2013,7 @@ mod tests {
 
     #[test]
     fn routes_file_uses_configured_auth_session_key_for_policy_identity() {
-        let routes = render_routes_file("Account", "account", "accounts");
+        let routes = render_routes_file("Account", "account", "accounts", &[]);
         assert!(
             routes.contains("State(state): State<AppState>"),
             "auth routes must receive AppState: {routes}"
@@ -2466,6 +2565,57 @@ mod tests {
         assert!(
             schema.contains("name -> Nullable<Text>"),
             "schema.rs must contain nullable name: {schema}"
+        );
+    }
+
+    #[test]
+    fn plan_auth_with_oauth_appends_stubs_to_autumn_toml() {
+        let tmp = project_with_main();
+        let oauth = AuthOAuthOptions {
+            providers: vec!["github".to_owned(), "google".to_owned()],
+        };
+        // Setup mock autumn.toml
+        fs::write(tmp.path().join("autumn.toml"), "[server]\nport = 3000\n").unwrap();
+
+        let plan = plan_auth_with_options(tmp.path(), "User", "20260508000000", &oauth).unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let toml = fs::read_to_string(tmp.path().join("autumn.toml")).unwrap();
+        assert!(
+            toml.contains("[auth.oauth2.github]"),
+            "autumn.toml missing github preset"
+        );
+        assert!(
+            toml.contains("[auth.oauth2.google]"),
+            "autumn.toml missing google preset"
+        );
+        assert!(
+            toml.contains("scope = \"read:user user:email\""),
+            "autumn.toml missing github scope"
+        );
+    }
+
+    #[test]
+    fn oauth_routes_file_contains_login_buttons() {
+        let tmp = project_with_main();
+        let oauth = AuthOAuthOptions {
+            providers: vec!["github".to_owned(), "google".to_owned()],
+        };
+        let plan = plan_auth_with_options(tmp.path(), "User", "20260508000000", &oauth).unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+        assert!(
+            routes.contains("Or sign in with:"),
+            "login form routes file must render OAuth provider buttons"
+        );
+        assert!(
+            routes.contains("a href=\"/auth/github/redirect\""),
+            "login form routes file missing github redirect link"
+        );
+        assert!(
+            routes.contains("a href=\"/auth/google/redirect\""),
+            "login form routes file missing google redirect link"
         );
     }
 }
