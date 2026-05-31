@@ -183,6 +183,7 @@ See [EXAMPLES.md](EXAMPLES.md) for the full catalog with personas, journeys, pre
 | [`examples/ws-echo`](examples/ws-echo) | WebSocket echo server, SSE fan-out, htmx live list, and Redis-backed multi-replica pub/sub |
 | [`examples/signed-webhooks`](examples/signed-webhooks) | Signed webhook intake with provider-shaped HMAC verification, replay protection, and fixture tests |
 | [`examples/outbound-http`](examples/outbound-http) | Traced outbound HTTP client with automatic retries, `TestApp::http_mock` test harness, and Stripe-style charge endpoint |
+| [`examples/experiments`](examples/experiments) | A/B experiment system: deterministic 50/50 bucketing, sticky assignments, exposure telemetry, QA overrides, and lifecycle transitions |
 
 ## Documentation
 
