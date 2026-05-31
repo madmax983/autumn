@@ -1392,9 +1392,26 @@ impl AppBuilder {
     /// Register an experiment store, enabling the [`Experiments`] extractor.
     ///
     /// Wrap any [`ExperimentStore`] implementation. Use [`InMemoryExperimentStore`]
-    /// for development and tests; use the Postgres-backed store for production.
+    /// for development and tests; use
+    /// [`pg::PgExperimentStore`](crate::experiments::pg::PgExperimentStore)
+    /// for production against the `autumn_experiments` tables.
     ///
-    /// # Example
+    /// # Production example (Postgres-backed)
+    ///
+    /// ```rust,ignore
+    /// use std::sync::Arc;
+    /// use std::time::Duration;
+    /// use autumn_web::experiments::pg::PgExperimentStore;
+    ///
+    /// let store = Arc::new(PgExperimentStore::new(&config.database.primary_url));
+    /// PgExperimentStore::spawn_poll_listener(Arc::clone(&store), Duration::from_secs(5));
+    /// autumn_web::app()
+    ///     .with_experiment_store(Arc::clone(&store))
+    ///     .run()
+    ///     .await;
+    /// ```
+    ///
+    /// # Development / test example
     ///
     /// ```rust,ignore
     /// use autumn_web::experiments::InMemoryExperimentStore;
