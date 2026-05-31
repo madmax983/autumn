@@ -27,6 +27,21 @@
 //! Client (`4xx`) errors are intentionally *not* reported — this slice is
 //! panics + server errors only.
 //!
+//! ## Scope: which 5xx are observed
+//!
+//! The layer is installed inner to
+//! [`RequestIdLayer`](crate::middleware::RequestIdLayer) so every event carries
+//! the request id (and a panic, which unwinds the inner stack, still has it).
+//! A consequence of that placement is that 5xx responses produced by middleware
+//! *outer* to it — most notably a `503` from the session layer when a session
+//! store (e.g. Redis) is unavailable — are not observed here. That is a
+//! deliberate trade-off: such failures are infrastructure outages already
+//! surfaced by readiness/health probes, and moving reporting outside the
+//! session layer would also move it outside `RequestIdLayer`, dropping the
+//! request id from *every* event. Handler panics and handler/inner-middleware
+//! server errors — the failures an app owner is expected to act on — are
+//! reported with full context.
+//!
 //! # Example
 //!
 //! ```rust,no_run

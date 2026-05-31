@@ -136,6 +136,18 @@ This is the panic-aware promotion of the older
 *response*; `ErrorReporter` ships the *event*. They compose — keep your
 filters, add reporters.
 
+### Scope: which 5xx are observed
+
+Because the layer sits *inside* `RequestIdLayer` (so every event — panics
+included — carries the request id), 5xx responses produced by middleware
+*outside* it are not observed. In practice the only such case is a `503` from
+the **session layer** when a session store (e.g. Redis) is unavailable. That is
+a deliberate trade-off: a session-store outage is an infrastructure failure
+already surfaced by readiness/health probes, and moving reporting outside the
+session layer would also move it outside `RequestIdLayer`, dropping the request
+id from *every* event. Handler panics and handler/inner-middleware server errors
+— the failures you're expected to act on — are reported with full context.
+
 ---
 
 ## Shipping to a concrete backend
