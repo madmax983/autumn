@@ -993,8 +993,12 @@ async fn validate_and_decode_id_token(
 
     let mut validation = jsonwebtoken::Validation::new(alg);
     let mut issuers = vec![issuer.to_owned()];
-    if let (true, Some(payload_b64)) = (
+    let is_multi_tenant = issuer.contains("/common/")
+        || issuer.contains("/organizations/")
+        || issuer.contains("/consumers/");
+    if let (true, true, Some(payload_b64)) = (
         issuer.contains("login.microsoftonline.com"),
+        is_multi_tenant,
         token.split('.').nth(1),
     ) {
         use base64::Engine as _;

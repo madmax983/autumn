@@ -742,12 +742,10 @@ fn render_routes_file(
     table: &str,
     providers: &[String],
 ) -> String {
-    use std::fmt::Write as _;
-
     let oauth_buttons = if providers.is_empty() {
         String::new()
     } else {
-        let mut btn_html = String::new();
+        let mut btn_html = String::with_capacity(256);
         btn_html.push_str("hr;\n        h3 { \"Or sign in with:\" }\n        div style=\"display: flex; gap: 0.5rem;\" {\n");
         for p in providers {
             let label = match p.as_str() {
@@ -756,10 +754,11 @@ fn render_routes_file(
                 "microsoft" => "Microsoft",
                 _ => p,
             };
-            let _ = writeln!(
-                btn_html,
-                "            a href=\"/auth/{p}/redirect\" {{ button type=\"button\" {{ \"Sign in with {label}\" }} }}"
-            );
+            btn_html.push_str("            a href=\"/auth/");
+            btn_html.push_str(p);
+            btn_html.push_str("/redirect\" { button type=\"button\" { \"Sign in with ");
+            btn_html.push_str(label);
+            btn_html.push_str("\" } }\n");
         }
         btn_html.push_str("        }\n");
         btn_html

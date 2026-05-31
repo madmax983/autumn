@@ -284,7 +284,7 @@ pub fn check_trusted_hosts_impl(hosts: &[String], is_production: bool) -> CheckR
 /// - In production (`is_production = true`): fails when `client_secret` is empty.
 /// - Outside production: warns when `client_secret` is empty.
 ///
-/// The returned check name is `"oauth2:<provider_name>"`.
+/// The returned check name is `"oauth2_provider"`.
 pub fn check_oauth2_provider_impl(
     provider_name: &str,
     client_id: &str,
@@ -1250,9 +1250,14 @@ pub struct DoctorOAuth2Provider {
 }
 
 fn resolve_oauth2_providers() -> Vec<DoctorOAuth2Provider> {
-    let profile = std::env::var("AUTUMN_ENV")
+    let raw_profile = std::env::var("AUTUMN_ENV")
         .or_else(|_| std::env::var("AUTUMN_PROFILE"))
         .unwrap_or_else(|_| "dev".to_owned());
+    let profile = match raw_profile.trim().to_lowercase().as_str() {
+        "production" => "prod".to_owned(),
+        "development" => "dev".to_owned(),
+        other => other.to_owned(),
+    };
     let merged_toml = get_merged_toml_table(&profile);
     resolve_oauth2_providers_from_sources(
         |key| std::env::var(key).ok().filter(|v| !v.is_empty()),
