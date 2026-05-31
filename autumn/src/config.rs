@@ -2034,6 +2034,23 @@ impl AutumnConfig {
     fn apply_auth_env_overrides_with_env(&mut self, env: &dyn Env) {
         parse_env(env, "AUTUMN_AUTH__BCRYPT_COST", &mut self.auth.bcrypt_cost);
         parse_env_string(env, "AUTUMN_AUTH__SESSION_KEY", &mut self.auth.session_key);
+        #[cfg(feature = "oauth2")]
+        {
+            let provider_names: Vec<String> = self.auth.oauth2.providers.keys().cloned().collect();
+            for name in provider_names {
+                let var_key = format!(
+                    "AUTUMN_AUTH__OAUTH2__{upper}__CLIENT_SECRET",
+                    upper = name.to_uppercase()
+                );
+                if let Ok(secret) = env.var(&var_key) {
+                    if !secret.is_empty() {
+                        if let Some(p) = self.auth.oauth2.providers.get_mut(&name) {
+                            p.client_secret = secret;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Apply `AUTUMN_SECURITY__*` environment variable overrides.

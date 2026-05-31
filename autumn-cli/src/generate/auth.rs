@@ -1489,23 +1489,59 @@ fn render_oauth_docs_file(providers: &[String]) -> String {
     let provider_list = providers.join(", ");
     let provider_config_examples = providers
         .iter()
-        .map(|p| {
-            let redirect = match p.as_str() {
-                "google" => "https://your-app.example.com/auth/google/callback",
-                "github" => "https://your-app.example.com/auth/github/callback",
-                "microsoft" => "https://your-app.example.com/auth/microsoft/callback",
-                _ => "https://your-app.example.com/auth/{provider}/callback",
-            };
-            format!(
-                r#"[auth.oauth2.{p}]
-client_id     = "${{AUTUMN_{UPPER}_CLIENT_ID}}"
-client_secret = "${{AUTUMN_{UPPER}_CLIENT_SECRET}}"
-redirect_uri  = "{redirect}"
-"#,
-                p = p,
-                UPPER = p.to_uppercase(),
-                redirect = redirect,
-            )
+        .map(|p| match p.as_str() {
+            "github" => format!(
+                r#"[auth.oauth2.github]
+client_id     = "${{AUTUMN_GITHUB_CLIENT_ID}}"
+client_secret = "${{AUTUMN_GITHUB_CLIENT_SECRET}}"
+authorize_url = "https://github.com/login/oauth/authorize"
+token_url     = "https://github.com/login/oauth/access_token"
+userinfo_url  = "https://api.github.com/user"
+redirect_uri  = "https://your-app.example.com/auth/oauth/github/callback"
+scope         = "read:user user:email"
+"#
+            ),
+            "google" => format!(
+                r#"[auth.oauth2.google]
+client_id     = "${{AUTUMN_GOOGLE_CLIENT_ID}}"
+client_secret = "${{AUTUMN_GOOGLE_CLIENT_SECRET}}"
+authorize_url = "https://accounts.google.com/o/oauth2/v2/auth"
+token_url     = "https://oauth2.googleapis.com/token"
+userinfo_url  = "https://openidconnect.googleapis.com/v1/userinfo"
+redirect_uri  = "https://your-app.example.com/auth/oauth/google/callback"
+scope         = "openid email profile"
+issuer        = "https://accounts.google.com"
+jwks_url      = "https://www.googleapis.com/oauth2/v3/certs"
+discovery_url = "https://accounts.google.com"
+"#
+            ),
+            "microsoft" => format!(
+                r#"[auth.oauth2.microsoft]
+client_id     = "${{AUTUMN_MICROSOFT_CLIENT_ID}}"
+client_secret = "${{AUTUMN_MICROSOFT_CLIENT_SECRET}}"
+authorize_url = "https://login.microsoftonline.com/{{YOUR_TENANT_ID}}/oauth2/v2.0/authorize"
+token_url     = "https://login.microsoftonline.com/{{YOUR_TENANT_ID}}/oauth2/v2.0/token"
+redirect_uri  = "https://your-app.example.com/auth/oauth/microsoft/callback"
+scope         = "openid email profile"
+# Single-tenant: replace {{YOUR_TENANT_ID}} and set issuer to your tenant-specific URL.
+# Multi-tenant (common endpoint): ID-token issuer varies per user — see docs/guide/oauth.md.
+issuer        = "https://login.microsoftonline.com/{{YOUR_TENANT_ID}}/v2.0"
+jwks_url      = "https://login.microsoftonline.com/{{YOUR_TENANT_ID}}/discovery/v2.0/keys"
+"#
+            ),
+            p => {
+                let upper = p.to_uppercase();
+                format!(
+                    r#"[auth.oauth2.{p}]
+client_id     = "${{AUTUMN_{upper}_CLIENT_ID}}"
+client_secret = "${{AUTUMN_{upper}_CLIENT_SECRET}}"
+authorize_url = "https://{p}.example.com/oauth2/authorize"
+token_url     = "https://{p}.example.com/oauth2/token"
+redirect_uri  = "https://your-app.example.com/auth/oauth/{p}/callback"
+scope         = "openid profile email"
+"#
+                )
+            }
         })
         .collect::<Vec<_>>()
         .join("\n");

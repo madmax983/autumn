@@ -566,8 +566,13 @@ pub fn provider_preset(name: &str) -> Option<OAuth2ProviderConfig> {
             userinfo_url: None,
             redirect_uri: String::new(),
             scope: "openid profile email".into(),
-            // The common-tenant issuer used for multi-tenant apps.  Single-tenant
-            // apps must override this with their specific tenant ID URL.
+            // ⚠ The `common` endpoint is a routing alias — ID tokens it issues carry
+            // a tenant-specific `iss` claim (`https://login.microsoftonline.com/{tid}/v2.0`),
+            // which will NOT match this issuer and will fail validation.
+            //
+            // Single-tenant apps: replace every `common` segment with your tenant ID.
+            // Multi-tenant apps: use the `organizations` or `consumers` endpoint and
+            // override `issuer` with the concrete tenant ID after decoding the `tid` claim.
             issuer: Some("https://login.microsoftonline.com/common/v2.0".into()),
             jwks_url: Some("https://login.microsoftonline.com/common/discovery/v2.0/keys".into()),
             discovery_url: Some("https://login.microsoftonline.com/common/v2.0".into()),

@@ -24,27 +24,42 @@ Add the provider name to `autumn.toml` and fill in your credentials:
 [auth.oauth2.github]
 client_id     = "YOUR_CLIENT_ID"
 client_secret = "YOUR_CLIENT_SECRET"   # use env var in production
+authorize_url = "https://github.com/login/oauth/authorize"
+token_url     = "https://github.com/login/oauth/access_token"
+userinfo_url  = "https://api.github.com/user"
 redirect_uri  = "https://yourapp.com/auth/oauth/github/callback"
 scope         = "read:user user:email"
 
 [auth.oauth2.google]
 client_id     = "YOUR_CLIENT_ID"
 client_secret = "YOUR_CLIENT_SECRET"
+authorize_url = "https://accounts.google.com/o/oauth2/v2/auth"
+token_url     = "https://oauth2.googleapis.com/token"
+userinfo_url  = "https://openidconnect.googleapis.com/v1/userinfo"
 redirect_uri  = "https://yourapp.com/auth/oauth/google/callback"
 scope         = "openid email profile"
+issuer        = "https://accounts.google.com"
+jwks_url      = "https://www.googleapis.com/oauth2/v3/certs"
+discovery_url = "https://accounts.google.com"
 
+# Microsoft — single-tenant: replace {YOUR_TENANT_ID} with your Directory (tenant) ID.
+# Multi-tenant: see the note on issuer validation below.
 [auth.oauth2.microsoft]
 client_id     = "YOUR_CLIENT_ID"
 client_secret = "YOUR_CLIENT_SECRET"
+authorize_url = "https://login.microsoftonline.com/{YOUR_TENANT_ID}/oauth2/v2.0/authorize"
+token_url     = "https://login.microsoftonline.com/{YOUR_TENANT_ID}/oauth2/v2.0/token"
 redirect_uri  = "https://yourapp.com/auth/oauth/microsoft/callback"
 scope         = "openid email profile"
+issuer        = "https://login.microsoftonline.com/{YOUR_TENANT_ID}/v2.0"
+jwks_url      = "https://login.microsoftonline.com/{YOUR_TENANT_ID}/discovery/v2.0/keys"
 ```
 
-| Provider  | Protocol | Discovery URL            | Notes                        |
-|-----------|----------|--------------------------|------------------------------|
-| Google    | OIDC     | accounts.google.com      | ID token validated via JWKS  |
-| GitHub    | OAuth2   | n/a (explicit endpoints) | Uses `/user` and `/user/emails` userinfo |
-| Microsoft | OIDC     | login.microsoftonline.com/common/v2.0 | Supports personal + work accounts |
+| Provider  | Protocol | Notes                        |
+|-----------|----------|------------------------------|
+| Google    | OIDC     | ID token validated via JWKS; all required endpoints are stable |
+| GitHub    | OAuth2   | No ID token; uses `/user` userinfo endpoint |
+| Microsoft | OIDC     | **Single-tenant**: use your tenant-specific endpoints and issuer. **Multi-tenant** (`/common`): the ID-token `iss` claim is tenant-specific and will not match the common issuer — issuer validation must be relaxed or performed after decoding the `tid` claim |
 
 ## Registering redirect URIs
 
@@ -81,16 +96,26 @@ When using OIDC providers (Google, Microsoft) a random `nonce` is embedded in th
 
 ## Account linking
 
-By default (`create_account` policy) a new local user record is created automatically when an OAuth identity logs in for the first time.
+`oauth2_finish_login` validates the OAuth2 flow (PKCE, state, nonce, ID-token signature) and returns an `OAuthIdentity` containing the provider name and the provider's stable user identifier (`subject`).  
+**Account creation is not automatic** — you must implement it in the callback handler after receiving the identity:
 
-To require existing accounts first, set in `autumn.toml`:
+```rust
+let identity = oauth2_finish_login(&session, &provider_name, &provider, &callback).await?;
+
+// Look up or create the local user, then set the application session:
+let user_id = upsert_oauth_user(&mut db, &identity).await?;
+session.insert(&auth_cfg.session_key, user_id).await;
+```
+
+The `oauth_linking_policy` field in `autumn.toml` communicates intent to `autumn doctor`:
+
+- `create_account` (default) — doctor expects the callback creates a new account on first sign-in
+- `require_local_signup_first` — doctor expects the callback rejects unknown identities
 
 ```toml
 [auth]
 oauth_linking_policy = "require_local_signup_first"
 ```
-
-Under this policy, login with an unlinked provider identity returns an error directing the user to sign up locally first.
 
 ## Database schema
 
