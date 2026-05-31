@@ -2487,8 +2487,7 @@ foo = "bar"
         assert_eq!(
             result.status,
             CheckStatus::Fail,
-            "empty client_secret in production must fail: {:?}",
-            result
+            "empty client_secret in production must fail: {result:?}",
         );
         assert!(
             result.detail.as_deref().unwrap_or("").contains("client_secret"),
@@ -2503,8 +2502,7 @@ foo = "bar"
         assert_eq!(
             result.status,
             CheckStatus::Warn,
-            "empty client_secret outside production must warn: {:?}",
-            result
+            "empty client_secret outside production must warn: {result:?}",
         );
     }
 
@@ -2514,8 +2512,7 @@ foo = "bar"
         assert_eq!(
             result.status,
             CheckStatus::Pass,
-            "non-empty client_secret must pass: {:?}",
-            result
+            "non-empty client_secret must pass: {result:?}",
         );
     }
 

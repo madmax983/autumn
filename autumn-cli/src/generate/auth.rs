@@ -2305,7 +2305,7 @@ mod tests {
 
         let mig_entries: Vec<_> = fs::read_dir(tmp.path().join("migrations"))
             .unwrap()
-            .filter_map(|e| e.ok())
+            .filter_map(Result::ok)
             .map(|e| e.file_name().to_string_lossy().to_string())
             .collect();
         let auth_mig = mig_entries.iter().find(|n| n.contains("create_users") || n.contains("create_accounts"));

@@ -3467,6 +3467,7 @@ mod oauth2_unit_tests {
         AuthConfig, OAuth2ProviderConfig, OAuthLinkingPolicy, oauth2_authorize_url, provider_preset,
     };
 
+    #[allow(dead_code)]
     fn make_provider(authorize_url: &str) -> OAuth2ProviderConfig {
         OAuth2ProviderConfig {
             client_id: "cid".into(),
