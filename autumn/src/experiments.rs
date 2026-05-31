@@ -1163,6 +1163,9 @@ impl ExperimentService {
             .store
             .get(name)?
             .ok_or_else(|| ExperimentError::NotFound(name.to_owned()))?;
+        if config.state == ExperimentState::Archived {
+            return Err(ExperimentError::Archived(name.to_owned()));
+        }
         if !config.variants.iter().any(|v| v.name == winner) {
             return Err(ExperimentError::NoVariant(format!(
                 "'{winner}' is not a configured variant of experiment '{name}'"
@@ -1206,9 +1209,22 @@ impl ExperimentService {
         actor: Option<&str>,
     ) -> Result<(), ExperimentError> {
         validate_variants(&variants)?;
-        self.store
+        let config = self
+            .store
             .get(name)?
             .ok_or_else(|| ExperimentError::NotFound(name.to_owned()))?;
+        match config.state {
+            ExperimentState::Concluded => {
+                return Err(ExperimentError::NotRunning(
+                    name.to_owned(),
+                    ExperimentState::Concluded,
+                ));
+            }
+            ExperimentState::Archived => {
+                return Err(ExperimentError::Archived(name.to_owned()));
+            }
+            _ => {}
+        }
         self.store.set_variants(name, variants, actor)?;
         Ok(())
     }
