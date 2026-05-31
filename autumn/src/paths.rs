@@ -77,12 +77,12 @@ pub(crate) fn normalize_path(path: &str) -> String {
         res = if decoded.starts_with('/') {
             "/".to_string()
         } else {
-            "".to_string()
+            String::new()
         };
     }
 
     if has_trailing && !res.ends_with('/') {
-        format!("{}/", res)
+        format!("{res}/")
     } else {
         res
     }
