@@ -209,10 +209,7 @@ impl AdminModel for ExperimentAdminModel {
                 .and_then(Value::as_str)
                 .ok_or_else(|| AdminError::Validation("'name' is required".into()))?;
             let description = data.get("description").and_then(Value::as_str);
-            let state = data
-                .get("state")
-                .and_then(Value::as_str)
-                .unwrap_or("draft");
+            let state = data.get("state").and_then(Value::as_str).unwrap_or("draft");
             let variants = validate_variants_json(&extract_variants_str(&data))?;
             let exclusion_group = data.get("exclusion_group").and_then(Value::as_str);
 
@@ -250,9 +247,7 @@ impl AdminModel for ExperimentAdminModel {
                         _
                     )
                 ) {
-                    AdminError::Validation(format!(
-                        "an experiment named '{name}' already exists"
-                    ))
+                    AdminError::Validation(format!("an experiment named '{name}' already exists"))
                 } else {
                     AdminError::Database(e.to_string())
                 }
@@ -280,10 +275,7 @@ impl AdminModel for ExperimentAdminModel {
             // name is read-only after creation; we read it only to satisfy field validation
             // and for display — the SQL does not allow renaming an experiment.
             let description = data.get("description").and_then(Value::as_str);
-            let state = data
-                .get("state")
-                .and_then(Value::as_str)
-                .unwrap_or("draft");
+            let state = data.get("state").and_then(Value::as_str).unwrap_or("draft");
             let variants = validate_variants_json(&extract_variants_str(&data))?;
             let winner = data.get("winner").and_then(Value::as_str);
             let exclusion_group = data.get("exclusion_group").and_then(Value::as_str);
@@ -452,9 +444,7 @@ impl AdminModel for ExperimentAdminModel {
 fn extract_variants_str(data: &Value) -> String {
     match data.get("variants") {
         Some(Value::String(s)) => s.clone(),
-        Some(v) if !v.is_null() => {
-            serde_json::to_string(v).unwrap_or_else(|_| "[]".to_owned())
-        }
+        Some(v) if !v.is_null() => serde_json::to_string(v).unwrap_or_else(|_| "[]".to_owned()),
         _ => "[]".to_owned(),
     }
 }
@@ -473,10 +463,7 @@ fn validate_variants_json(raw: &str) -> Result<String, AdminError> {
                         "variants[{i}].name must be a string"
                     )));
                 }
-                if v.get("weight")
-                    .and_then(Value::as_u64)
-                    .is_none()
-                {
+                if v.get("weight").and_then(Value::as_u64).is_none() {
                     return Err(AdminError::Validation(format!(
                         "variants[{i}].weight must be a non-negative integer"
                     )));
@@ -659,9 +646,10 @@ mod tests {
 
     #[test]
     fn validate_variants_json_accepts_valid_array() {
-        let json =
-            validate_variants_json(r#"[{"name":"control","weight":50},{"name":"treatment","weight":50}]"#)
-                .unwrap();
+        let json = validate_variants_json(
+            r#"[{"name":"control","weight":50},{"name":"treatment","weight":50}]"#,
+        )
+        .unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v.as_array().unwrap().len(), 2);
     }

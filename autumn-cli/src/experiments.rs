@@ -118,11 +118,15 @@ pub fn run_set_weights(opts: &SetWeightsOptions) {
     });
     let mut cmd = psql_command(&db_url);
     cmd.arg("--variable").arg(format!("name={}", opts.name));
-    cmd.arg("--variable").arg(format!("variants={variants_json}"));
+    cmd.arg("--variable")
+        .arg(format!("variants={variants_json}"));
     cmd.arg("--variable").arg(format!("actor={actor}"));
     cmd.arg("--command").arg(SET_WEIGHTS_SQL);
     exec(cmd, "experiments set-weights");
-    println!("✓ Experiment '{}' weights updated to {}.", opts.name, opts.weights);
+    println!(
+        "✓ Experiment '{}' weights updated to {}.",
+        opts.name, opts.weights
+    );
 }
 
 /// Run `autumn experiments conclude <name> <winner>`.
@@ -147,8 +151,10 @@ pub fn run_override(opts: &OverrideOptions) {
     let actor = opts.actor.as_deref().unwrap_or("cli");
     let mut cmd = psql_command(&db_url);
     cmd.arg("--variable").arg(format!("name={}", opts.name));
-    cmd.arg("--variable").arg(format!("actor_id={}", opts.actor_id));
-    cmd.arg("--variable").arg(format!("variant={}", opts.variant));
+    cmd.arg("--variable")
+        .arg(format!("actor_id={}", opts.actor_id));
+    cmd.arg("--variable")
+        .arg(format!("variant={}", opts.variant));
     cmd.arg("--variable").arg(format!("actor={actor}"));
     cmd.arg("--command").arg(OVERRIDE_SQL);
     exec(cmd, "experiments override");
@@ -169,7 +175,9 @@ fn parse_weights_to_json(weights: &str) -> Result<String, String> {
         let mut it = pair.splitn(2, '=');
         let name = it.next().unwrap_or("").trim();
         if name.is_empty() {
-            return Err(format!("malformed weight spec {pair:?}: variant name is empty"));
+            return Err(format!(
+                "malformed weight spec {pair:?}: variant name is empty"
+            ));
         }
         let weight_str = it
             .next()
@@ -225,8 +233,14 @@ mod tests {
     #[test]
     fn sql_mutations_use_transactions() {
         for sql in [SET_WEIGHTS_SQL, CONCLUDE_SQL, OVERRIDE_SQL] {
-            assert!(sql.starts_with("BEGIN;"), "mutation SQL must use BEGIN: {sql}");
-            assert!(sql.contains("COMMIT;"), "mutation SQL must use COMMIT: {sql}");
+            assert!(
+                sql.starts_with("BEGIN;"),
+                "mutation SQL must use BEGIN: {sql}"
+            );
+            assert!(
+                sql.contains("COMMIT;"),
+                "mutation SQL must use COMMIT: {sql}"
+            );
         }
     }
 
@@ -274,12 +288,18 @@ mod tests {
     #[test]
     fn parse_weights_errors_on_missing_equals() {
         let err = parse_weights_to_json("control50").unwrap_err();
-        assert!(err.contains("malformed"), "expected malformed error, got: {err}");
+        assert!(
+            err.contains("malformed"),
+            "expected malformed error, got: {err}"
+        );
     }
 
     #[test]
     fn parse_weights_errors_on_non_integer_weight() {
         let err = parse_weights_to_json("control=abc").unwrap_err();
-        assert!(err.contains("integer"), "expected integer error, got: {err}");
+        assert!(
+            err.contains("integer"),
+            "expected integer error, got: {err}"
+        );
     }
 }

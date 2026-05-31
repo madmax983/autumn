@@ -711,7 +711,11 @@ impl ExperimentStore for InMemoryExperimentStore {
 
     fn record_assignment(&self, assignment: Assignment) -> Result<(), ExperimentStoreError> {
         let key = (assignment.experiment.clone(), assignment.actor.clone());
-        self.inner.write().unwrap().assignments.insert(key, assignment);
+        self.inner
+            .write()
+            .unwrap()
+            .assignments
+            .insert(key, assignment);
         Ok(())
     }
 
@@ -1124,7 +1128,8 @@ impl ExperimentService {
         self.store
             .get(name)?
             .ok_or_else(|| ExperimentError::NotFound(name.to_owned()))?;
-        self.store.set_state(name, ExperimentState::Archived, None)?;
+        self.store
+            .set_state(name, ExperimentState::Archived, None)?;
         Ok(())
     }
 
@@ -1469,10 +1474,16 @@ mod tests {
         // To regenerate: run `experiment_bucket(name, actor)` and record the output.
         let b1 = experiment_bucket("checkout_v2", "user:1");
         let b2 = experiment_bucket("checkout_v2", "user:1");
-        assert_eq!(b1, b2, "hash must be deterministic (same input → same output)");
+        assert_eq!(
+            b1, b2,
+            "hash must be deterministic (same input → same output)"
+        );
 
         // Fixture values established on first run — sentinel against algorithm drift.
-        assert_eq!(b1, 4_830, "checkout_v2:user:1 bucket changed — hash regression");
+        assert_eq!(
+            b1, 4_830,
+            "checkout_v2:user:1 bucket changed — hash regression"
+        );
         assert_eq!(
             experiment_bucket("checkout_v2", "user:2"),
             6_619,
@@ -1547,10 +1558,7 @@ mod tests {
         let svc = make_svc();
         svc.create(ExperimentConfig::new(
             "exp",
-            vec![
-                VariantConfig::new("a", 0),
-                VariantConfig::new("b", 0),
-            ],
+            vec![VariantConfig::new("a", 0), VariantConfig::new("b", 0)],
         ))
         .unwrap();
         svc.start("exp").unwrap();
@@ -1616,11 +1624,23 @@ mod tests {
         let (svc, records) = make_svc_with_sink();
         running(&svc, "exp");
         svc.assign("exp", "user:1").unwrap();
-        assert_eq!(records.lock().unwrap().len(), 1, "first assign → 1 exposure");
+        assert_eq!(
+            records.lock().unwrap().len(),
+            1,
+            "first assign → 1 exposure"
+        );
         svc.assign("exp", "user:1").unwrap();
-        assert_eq!(records.lock().unwrap().len(), 2, "second assign → 2 total exposures");
+        assert_eq!(
+            records.lock().unwrap().len(),
+            2,
+            "second assign → 2 total exposures"
+        );
         svc.assign("exp", "user:2").unwrap();
-        assert_eq!(records.lock().unwrap().len(), 3, "different actor → 3 total exposures");
+        assert_eq!(
+            records.lock().unwrap().len(),
+            3,
+            "different actor → 3 total exposures"
+        );
     }
 
     // ── AC: exposure record contains correct fields ───────────────────────────
@@ -1669,7 +1689,10 @@ mod tests {
         svc.start("exp").unwrap();
         svc.set_override("exp", "qa:alice", "treatment").unwrap();
         let v = svc.assign("exp", "qa:alice").unwrap();
-        assert_eq!(v, "treatment", "override must bypass weight-based bucketing");
+        assert_eq!(
+            v, "treatment",
+            "override must bypass weight-based bucketing"
+        );
     }
 
     // ── AC: override emits exposure tagged as override ────────────────────────
@@ -1902,7 +1925,9 @@ mod tests {
         let asgn = arc_store.get_assignment("my_exp", "user:1").unwrap();
         assert_eq!(asgn.unwrap().variant, "control");
 
-        arc_store.set_override("my_exp", "qa:1", "treatment").unwrap();
+        arc_store
+            .set_override("my_exp", "qa:1", "treatment")
+            .unwrap();
         assert_eq!(
             arc_store.get_override("my_exp", "qa:1").unwrap().unwrap(),
             "treatment"
@@ -1923,18 +1948,26 @@ mod tests {
 
     #[test]
     fn experiment_error_display() {
-        assert!(ExperimentError::NotFound("x".to_owned())
-            .to_string()
-            .contains("not found"));
-        assert!(ExperimentError::Archived("x".to_owned())
-            .to_string()
-            .contains("archived"));
-        assert!(ExperimentError::ExcludedByGroup("x".to_owned(), "g".to_owned())
-            .to_string()
-            .contains("mutual exclusion"));
-        assert!(ExperimentError::NoVariant("x".to_owned())
-            .to_string()
-            .contains("weights are zero"));
+        assert!(
+            ExperimentError::NotFound("x".to_owned())
+                .to_string()
+                .contains("not found")
+        );
+        assert!(
+            ExperimentError::Archived("x".to_owned())
+                .to_string()
+                .contains("archived")
+        );
+        assert!(
+            ExperimentError::ExcludedByGroup("x".to_owned(), "g".to_owned())
+                .to_string()
+                .contains("mutual exclusion")
+        );
+        assert!(
+            ExperimentError::NoVariant("x".to_owned())
+                .to_string()
+                .contains("weights are zero")
+        );
     }
 
     // ── AC: service debug ─────────────────────────────────────────────────────
