@@ -1513,6 +1513,29 @@ impl AutumnConfig {
         )
         .map_err(|e| ConfigError::Credentials(e.to_string()))?;
 
+        #[cfg(feature = "oauth2")]
+        {
+            let provider_names: Vec<String> =
+                config.auth.oauth2.providers.keys().cloned().collect();
+            for name in provider_names {
+                if let Some(p) = config.auth.oauth2.providers.get_mut(&name) {
+                    let id_key = format!("oauth2_{name}_client_id");
+                    if p.client_id.is_empty() {
+                        if let Some(id) = config.credentials.get::<String>(&id_key) {
+                            p.client_id = id;
+                        }
+                    }
+
+                    let secret_key = format!("oauth2_{name}_client_secret");
+                    if p.client_secret.is_empty() {
+                        if let Some(secret) = config.credentials.get::<String>(&secret_key) {
+                            p.client_secret = secret;
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(config)
     }
 
@@ -5521,6 +5544,42 @@ path = "/api-spec.json"
         let config = AutumnConfig::load_with_env(&env).unwrap();
         let val: Option<String> = config.credentials().get("stripe_key");
         assert_eq!(val.as_deref(), Some("sk_test_xyz"));
+    }
+
+    #[cfg(feature = "oauth2")]
+    #[test]
+    fn config_resolves_oauth_credentials_by_convention() {
+        use crate::credentials::{MasterKey, encrypt};
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let key = MasterKey::generate();
+        let ct = encrypt(
+            &key,
+            b"oauth2_github_client_id = \"git-id-123\"\noauth2_github_client_secret = \"git-secret-456\"\n",
+        );
+        std::fs::create_dir_all(tmp.path().join("config/credentials")).unwrap();
+        std::fs::write(tmp.path().join("config/credentials/dev.toml.enc"), &ct).unwrap();
+
+        // Write a base configuration with an empty/blank github provider defined
+        std::fs::create_dir_all(tmp.path().join("config")).unwrap();
+        let config_toml = r#"
+[auth.oauth2.github]
+client_id = ""
+client_secret = ""
+authorize_url = "https://github.com/login/oauth/authorize"
+token_url = "https://github.com/login/oauth/access_token"
+redirect_uri = "http://localhost:3000/auth/github/callback"
+"#;
+        std::fs::write(tmp.path().join("autumn.toml"), config_toml).unwrap();
+
+        let env = MockEnv::new()
+            .with("AUTUMN_MASTER_KEY", &key.to_hex())
+            .with("AUTUMN_MANIFEST_DIR", tmp.path().to_str().unwrap());
+        let config = AutumnConfig::load_with_env(&env).unwrap();
+        let github = config.auth.oauth2.providers.get("github").unwrap();
+        assert_eq!(github.client_id, "git-id-123");
+        assert_eq!(github.client_secret, "git-secret-456");
     }
 
     #[test]
