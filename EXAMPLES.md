@@ -187,6 +187,21 @@ blocks publishing `autumn-web` or `autumn-cli`.
 
 ---
 
+### `examples/experiments` - A/B Experiments
+
+<!-- catalog:example name=experiments tier=supported -->
+
+| Field | Value |
+|-------|-------|
+| **Persona** | Engineer adding feature experimentation to a production app |
+| **Journey** | Declare a 50/50 experiment, assign actors deterministically, emit exposure events, pin a QA override, and conclude with a winner |
+| **Key capabilities** | `ExperimentService`, `InMemoryExperimentStore`, `TracingExposureSink`, `Experiments` extractor, QA overrides, lifecycle transitions |
+| **Prerequisites** | Rust 1.88.0+ |
+| **Run command** | `cargo run -p experiments` |
+| **Success proof** | `cargo test -p experiments` passes; `curl http://localhost:3000/checkout/user:1` returns a variant; `qa:alice` always returns `treatment` |
+
+---
+
 ## Journey Map
 
 The table below maps each example to a distinct learning journey so evaluators
@@ -204,6 +219,7 @@ can pick the closest starting point without overlap.
 | Custom config loading | `custom_config_loader` | Replace the default config loader with a custom `ConfigLoader` |
 | WebSocket / SSE | `ws-echo` | Echo, fan-out channels, SSE, Redis multi-replica pub/sub |
 | Signed intake | `signed-webhooks` | Provider-shaped webhook HMAC verification and replay rejection |
+| A/B experiments | `experiments` | Deterministic bucketing, sticky assignments, exposure telemetry, QA overrides |
 
 ---
 

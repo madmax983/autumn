@@ -711,6 +711,7 @@ enum FlagsCommands {
 
 /// Subcommands for `autumn experiments`.
 #[derive(Subcommand)]
+#[allow(clippy::doc_markdown)]
 enum ExperimentsCommands {
     /// List all experiments and their current state.
     List,

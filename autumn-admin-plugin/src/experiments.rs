@@ -213,11 +213,7 @@ impl AdminModel for ExperimentAdminModel {
                 .get("state")
                 .and_then(Value::as_str)
                 .unwrap_or("draft");
-            let variants = validate_variants_json(
-                data.get("variants")
-                    .and_then(Value::as_str)
-                    .unwrap_or("[]"),
-            )?;
+            let variants = validate_variants_json(&extract_variants_str(&data))?;
             let exclusion_group = data.get("exclusion_group").and_then(Value::as_str);
 
             let row = diesel::sql_query(
@@ -281,30 +277,24 @@ impl AdminModel for ExperimentAdminModel {
                 .await
                 .map_err(|e| AdminError::Database(e.to_string()))?;
 
-            let name = data
-                .get("name")
-                .and_then(Value::as_str)
-                .ok_or_else(|| AdminError::Validation("'name' is required".into()))?;
+            // name is read-only after creation; we read it only to satisfy field validation
+            // and for display — the SQL does not allow renaming an experiment.
             let description = data.get("description").and_then(Value::as_str);
             let state = data
                 .get("state")
                 .and_then(Value::as_str)
                 .unwrap_or("draft");
-            let variants = validate_variants_json(
-                data.get("variants")
-                    .and_then(Value::as_str)
-                    .unwrap_or("[]"),
-            )?;
+            let variants = validate_variants_json(&extract_variants_str(&data))?;
             let winner = data.get("winner").and_then(Value::as_str);
             let exclusion_group = data.get("exclusion_group").and_then(Value::as_str);
 
             let row = diesel::sql_query(
                 "WITH updated AS ( \
                      UPDATE autumn_experiments \
-                     SET name = $2, description = $3, \
-                         state = $4::autumn_experiment_state, \
-                         variants = $5::jsonb, winner = $6, \
-                         exclusion_group = $7, updated_at = NOW() \
+                     SET description = $2, \
+                         state = $3::autumn_experiment_state, \
+                         variants = $4::jsonb, winner = $5, \
+                         exclusion_group = $6, updated_at = NOW() \
                      WHERE id = $1 \
                      RETURNING id, name, description, state::text AS state, \
                                variants::text AS variants, winner, updated_at \
@@ -317,7 +307,6 @@ impl AdminModel for ExperimentAdminModel {
                  FROM updated",
             )
             .bind::<diesel::sql_types::BigInt, _>(id)
-            .bind::<diesel::sql_types::Text, _>(name)
             .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(
                 description.map(str::to_owned),
             )
@@ -354,6 +343,14 @@ impl AdminModel for ExperimentAdminModel {
             diesel::sql_query(
                 "WITH deleted AS ( \
                      DELETE FROM autumn_experiments WHERE id = $1 RETURNING name \
+                 ), \
+                 _del_assignments AS ( \
+                     DELETE FROM autumn_experiment_assignments \
+                     WHERE experiment IN (SELECT name FROM deleted) \
+                 ), \
+                 _del_overrides AS ( \
+                     DELETE FROM autumn_experiment_overrides \
+                     WHERE experiment IN (SELECT name FROM deleted) \
                  ), \
                  _audit AS ( \
                      INSERT INTO autumn_experiment_changes (experiment, mutation, actor) \
@@ -450,6 +447,18 @@ impl AdminModel for ExperimentAdminModel {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+/// Extract `variants` from admin form data, handling both pre-parsed JSON arrays
+/// (normalized by the admin route) and raw JSON strings submitted by the form.
+fn extract_variants_str(data: &Value) -> String {
+    match data.get("variants") {
+        Some(Value::String(s)) => s.clone(),
+        Some(v) if !v.is_null() => {
+            serde_json::to_string(v).unwrap_or_else(|_| "[]".to_owned())
+        }
+        _ => "[]".to_owned(),
+    }
+}
+
 /// Validate `raw` as a JSON array of `{"name": string, "weight": integer}` objects.
 fn validate_variants_json(raw: &str) -> Result<String, AdminError> {
     let trimmed = raw.trim();
@@ -465,7 +474,7 @@ fn validate_variants_json(raw: &str) -> Result<String, AdminError> {
                     )));
                 }
                 if v.get("weight")
-                    .and_then(|w| w.as_u64())
+                    .and_then(Value::as_u64)
                     .is_none()
                 {
                     return Err(AdminError::Validation(format!(
@@ -495,7 +504,7 @@ struct NameRow {
     name: String,
 }
 
-/// Row returned from list queries (no exclusion_group for brevity in list view).
+/// Row returned from list queries (no `exclusion_group` for brevity in list view).
 #[derive(diesel::QueryableByName)]
 struct ExperimentRow {
     #[diesel(sql_type = diesel::sql_types::BigInt)]
@@ -528,7 +537,7 @@ impl ExperimentRow {
     }
 }
 
-/// Row returned from detail (get) queries — includes exclusion_group.
+/// Row returned from detail (get) queries — includes `exclusion_group`.
 #[derive(diesel::QueryableByName)]
 struct ExperimentDetailRow {
     #[diesel(sql_type = diesel::sql_types::BigInt)]
@@ -584,26 +593,26 @@ mod tests {
 
     #[test]
     fn experiment_admin_model_slug() {
-        let model = ExperimentAdminModel::default();
+        let model = ExperimentAdminModel;
         assert_eq!(model.slug(), "experiments");
     }
 
     #[test]
     fn experiment_admin_model_display_names() {
-        let model = ExperimentAdminModel::default();
+        let model = ExperimentAdminModel;
         assert_eq!(model.display_name(), "Experiment");
         assert_eq!(model.display_name_plural(), "Experiments");
     }
 
     #[test]
     fn experiment_admin_model_has_history() {
-        let model = ExperimentAdminModel::default();
+        let model = ExperimentAdminModel;
         assert!(model.has_history(), "experiment admin must expose history");
     }
 
     #[test]
     fn experiment_admin_model_has_expected_fields() {
-        let model = ExperimentAdminModel::default();
+        let model = ExperimentAdminModel;
         let fields = model.fields();
         let names: Vec<&str> = fields.iter().map(|f| f.name).collect();
         assert!(names.contains(&"name"), "must have 'name' field");
@@ -618,7 +627,7 @@ mod tests {
 
     #[test]
     fn experiment_admin_model_state_field_has_all_lifecycle_states() {
-        let model = ExperimentAdminModel::default();
+        let model = ExperimentAdminModel;
         let state_field = model
             .fields()
             .into_iter()
@@ -636,14 +645,14 @@ mod tests {
 
     #[test]
     fn record_display_uses_experiment_name() {
-        let model = ExperimentAdminModel::default();
+        let model = ExperimentAdminModel;
         let record = serde_json::json!({"name": "checkout_v2", "state": "running"});
         assert_eq!(model.record_display(&record), "Experiment: checkout_v2");
     }
 
     #[test]
     fn record_display_fallback_when_no_name() {
-        let model = ExperimentAdminModel::default();
+        let model = ExperimentAdminModel;
         let record = serde_json::json!({});
         assert_eq!(model.record_display(&record), "Experiment");
     }

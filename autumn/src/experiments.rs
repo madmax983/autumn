@@ -141,7 +141,7 @@ impl VariantConfig {
 // ── ExperimentConfig ─────────────────────────────────────────────────────────
 
 /// Full configuration of a single experiment.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExperimentConfig {
     /// Unique experiment name (e.g. `"checkout_v2"`).
     pub name: String,
@@ -626,21 +626,25 @@ impl ExperimentStore for InMemoryExperimentStore {
     }
 
     fn list(&self) -> Result<Vec<ExperimentConfig>, ExperimentStoreError> {
-        let inner = self.inner.read().unwrap();
-        let mut exps: Vec<ExperimentConfig> = inner.experiments.values().cloned().collect();
+        let mut exps: Vec<ExperimentConfig> = {
+            let inner = self.inner.read().unwrap();
+            inner.experiments.values().cloned().collect()
+        };
         exps.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(exps)
     }
 
     fn upsert(&self, config: ExperimentConfig) -> Result<(), ExperimentStoreError> {
         let name = config.name.clone();
-        let mut inner = self.inner.write().unwrap();
-        inner.experiments.insert(name.clone(), config);
-        inner
-            .changes
-            .entry(name.clone())
-            .or_default()
-            .push(ChangeRecord::now(&name, "created", None));
+        {
+            let mut inner = self.inner.write().unwrap();
+            inner.experiments.insert(name.clone(), config);
+            inner
+                .changes
+                .entry(name.clone())
+                .or_default()
+                .push(ChangeRecord::now(&name, "created", None));
+        }
         Ok(())
     }
 
@@ -650,27 +654,25 @@ impl ExperimentStore for InMemoryExperimentStore {
         state: ExperimentState,
         winner: Option<&str>,
     ) -> Result<(), ExperimentStoreError> {
-        let mut inner = self.inner.write().unwrap();
-        if let Some(exp) = inner.experiments.get_mut(name) {
-            exp.state = state;
-            if let Some(w) = winner {
-                exp.winner = Some(w.to_owned());
-            }
-            exp.updated_at_secs = now_secs();
-        }
-        inner
-            .changes
-            .entry(name.to_owned())
-            .or_default()
-            .push(ChangeRecord::now(
-                name,
+        {
+            let mut inner = self.inner.write().unwrap();
+            if let Some(exp) = inner.experiments.get_mut(name) {
+                exp.state = state;
                 if let Some(w) = winner {
-                    format!("concluded={w}")
-                } else {
-                    format!("state={state}")
-                },
-                None,
-            ));
+                    exp.winner = Some(w.to_owned());
+                }
+                exp.updated_at_secs = now_secs();
+            }
+            inner
+                .changes
+                .entry(name.to_owned())
+                .or_default()
+                .push(ChangeRecord::now(
+                    name,
+                    winner.map_or_else(|| format!("state={state}"), |w| format!("concluded={w}")),
+                    None,
+                ));
+        }
         Ok(())
     }
 
@@ -680,16 +682,18 @@ impl ExperimentStore for InMemoryExperimentStore {
         variants: Vec<VariantConfig>,
         actor: Option<&str>,
     ) -> Result<(), ExperimentStoreError> {
-        let mut inner = self.inner.write().unwrap();
-        if let Some(exp) = inner.experiments.get_mut(name) {
-            exp.variants = variants;
-            exp.updated_at_secs = now_secs();
+        {
+            let mut inner = self.inner.write().unwrap();
+            if let Some(exp) = inner.experiments.get_mut(name) {
+                exp.variants = variants;
+                exp.updated_at_secs = now_secs();
+            }
+            inner
+                .changes
+                .entry(name.to_owned())
+                .or_default()
+                .push(ChangeRecord::now(name, "set_weights", actor));
         }
-        inner
-            .changes
-            .entry(name.to_owned())
-            .or_default()
-            .push(ChangeRecord::now(name, "set_weights", actor));
         Ok(())
     }
 
@@ -767,18 +771,20 @@ impl ExperimentStore for InMemoryExperimentStore {
         experiment: &str,
         limit: usize,
     ) -> Result<Vec<ChangeRecord>, ExperimentStoreError> {
-        let inner = self.inner.read().unwrap();
-        let records = inner
-            .changes
-            .get(experiment)
-            .map(|v| {
-                if limit == 0 {
-                    v.clone()
-                } else {
-                    v.iter().rev().take(limit).cloned().collect()
-                }
-            })
-            .unwrap_or_default();
+        let records = {
+            let inner = self.inner.read().unwrap();
+            inner
+                .changes
+                .get(experiment)
+                .map(|v| {
+                    if limit == 0 {
+                        v.clone()
+                    } else {
+                        v.iter().rev().take(limit).cloned().collect()
+                    }
+                })
+                .unwrap_or_default()
+        };
         Ok(records)
     }
 }
@@ -988,7 +994,9 @@ impl ExperimentService {
             }
             ExperimentState::Concluded => {
                 // Return winner for all actors; no exposure emitted (experiment is done).
-                let winner = config.winner.clone().unwrap_or_else(|| "control".to_owned());
+                let winner = config
+                    .winner
+                    .ok_or_else(|| ExperimentError::NoVariant(experiment.to_owned()))?;
                 return Ok(winner);
             }
             ExperimentState::Draft => {
@@ -1021,16 +1029,15 @@ impl ExperimentService {
         }
 
         // Mutual exclusion group check.
-        if let Some(group) = &config.exclusion_group {
-            if self
+        if let Some(group) = &config.exclusion_group
+            && self
                 .store
                 .has_assignment_in_group(actor, group, experiment)?
-            {
-                return Err(ExperimentError::ExcludedByGroup(
-                    experiment.to_owned(),
-                    group.clone(),
-                ));
-            }
+        {
+            return Err(ExperimentError::ExcludedByGroup(
+                experiment.to_owned(),
+                group.clone(),
+            ));
         }
 
         // Bucket the actor and pick a variant.
@@ -1393,7 +1400,7 @@ mod tests {
         let (svc, records) = make_svc_with_sink();
         let store = Arc::new(InMemoryExperimentStore::new());
         let (sink2, records2) = RecordingExposureSink::new();
-        let svc2 = ExperimentService::new(store.clone() as Arc<dyn ExperimentStore>)
+        let svc2 = ExperimentService::new(store as Arc<dyn ExperimentStore>)
             .with_exposure_sink(Arc::new(sink2));
         svc2.create(fifty_fifty("exp")).unwrap();
         svc2.start("exp").unwrap();
@@ -1625,14 +1632,24 @@ mod tests {
         let variant = svc
             .assign_with_request_id("checkout_v2", "user:42", Some("req-abc"))
             .unwrap();
-        let rec = records.lock().unwrap();
-        assert_eq!(rec.len(), 1);
-        let exp = &rec[0];
-        assert_eq!(exp.experiment, "checkout_v2");
-        assert_eq!(exp.variant, variant);
-        assert_eq!(exp.actor, "user:42");
-        assert_eq!(exp.request_id.as_deref(), Some("req-abc"));
-        assert!(!exp.is_override);
+        let (len, exp_name, exp_variant, exp_actor, exp_req_id, exp_is_override) = {
+            let rec = records.lock().unwrap();
+            let r = &rec[0];
+            (
+                rec.len(),
+                r.experiment.clone(),
+                r.variant.clone(),
+                r.actor.clone(),
+                r.request_id.clone(),
+                r.is_override,
+            )
+        };
+        assert_eq!(len, 1);
+        assert_eq!(exp_name, "checkout_v2");
+        assert_eq!(exp_variant, variant);
+        assert_eq!(exp_actor, "user:42");
+        assert_eq!(exp_req_id.as_deref(), Some("req-abc"));
+        assert!(!exp_is_override);
     }
 
     // ── AC: override bypasses weight-based bucketing ──────────────────────────
@@ -1663,13 +1680,16 @@ mod tests {
         running(&svc, "exp");
         svc.set_override("exp", "qa:alice", "treatment").unwrap();
         svc.assign("exp", "qa:alice").unwrap();
-        let rec = records.lock().unwrap();
-        assert_eq!(rec.len(), 1);
+        let (len, is_override, exp_variant) = {
+            let rec = records.lock().unwrap();
+            (rec.len(), rec[0].is_override, rec[0].variant.clone())
+        };
+        assert_eq!(len, 1);
         assert!(
-            rec[0].is_override,
+            is_override,
             "exposure from override must be tagged is_override = true"
         );
-        assert_eq!(rec[0].variant, "treatment");
+        assert_eq!(exp_variant, "treatment");
     }
 
     // ── AC: mutual exclusion — second experiment in group is excluded ─────────

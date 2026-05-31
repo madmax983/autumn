@@ -63,6 +63,7 @@ const STATUS_SQL: &str = "SELECT name, description, state, variants, winner, \
     FROM autumn_experiments WHERE name = :'name';";
 
 const SET_WEIGHTS_SQL: &str = "BEGIN; \
+SELECT 1/(SELECT COUNT(*)::int FROM autumn_experiments WHERE name = :'name') AS exists_check; \
 UPDATE autumn_experiments SET variants = :'variants'::jsonb, updated_at = NOW() \
     WHERE name = :'name'; \
 INSERT INTO autumn_experiment_changes (experiment, mutation, actor) \
@@ -70,6 +71,7 @@ INSERT INTO autumn_experiment_changes (experiment, mutation, actor) \
 COMMIT;";
 
 const CONCLUDE_SQL: &str = "BEGIN; \
+SELECT 1/(SELECT COUNT(*)::int FROM autumn_experiments WHERE name = :'name') AS exists_check; \
 UPDATE autumn_experiments SET state = 'concluded', winner = :'winner', updated_at = NOW() \
     WHERE name = :'name'; \
 INSERT INTO autumn_experiment_changes (experiment, mutation, actor) \
@@ -110,7 +112,10 @@ pub fn run_set_weights(opts: &SetWeightsOptions) {
     let db_url = resolve_database_url();
     let actor = opts.actor.as_deref().unwrap_or("cli");
     // Parse "control=50,treatment=50" into JSON array of variant objects.
-    let variants_json = parse_weights_to_json(&opts.weights);
+    let variants_json = parse_weights_to_json(&opts.weights).unwrap_or_else(|e| {
+        eprintln!("autumn experiments set-weights: {e}");
+        std::process::exit(1);
+    });
     let mut cmd = psql_command(&db_url);
     cmd.arg("--variable").arg(format!("name={}", opts.name));
     cmd.arg("--variable").arg(format!("variants={variants_json}"));
@@ -156,17 +161,25 @@ pub fn run_override(opts: &OverrideOptions) {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Convert `"control=50,treatment=50"` to `[{"name":"control","weight":50},...]`.
-fn parse_weights_to_json(weights: &str) -> String {
-    let parts: Vec<serde_json::Value> = weights
-        .split(',')
-        .filter_map(|pair| {
-            let mut it = pair.trim().splitn(2, '=');
-            let name = it.next()?.trim();
-            let weight: u32 = it.next()?.trim().parse().ok()?;
-            Some(serde_json::json!({"name": name, "weight": weight}))
-        })
-        .collect();
-    serde_json::to_string(&parts).unwrap_or_else(|_| "[]".to_owned())
+/// Returns an error message if any pair is malformed.
+fn parse_weights_to_json(weights: &str) -> Result<String, String> {
+    let mut parts: Vec<serde_json::Value> = Vec::new();
+    for raw in weights.split(',') {
+        let pair = raw.trim();
+        let mut it = pair.splitn(2, '=');
+        let name = it.next().unwrap_or("").trim();
+        if name.is_empty() {
+            return Err(format!("malformed weight spec {pair:?}: variant name is empty"));
+        }
+        let weight_str = it
+            .next()
+            .ok_or_else(|| format!("malformed weight spec {pair:?}: missing '=<weight>'"))?;
+        let weight: u32 = weight_str.trim().parse().map_err(|_| {
+            format!("malformed weight spec {pair:?}: weight must be a non-negative integer")
+        })?;
+        parts.push(serde_json::json!({"name": name, "weight": weight}));
+    }
+    Ok(serde_json::to_string(&parts).unwrap_or_else(|_| "[]".to_owned()))
 }
 
 fn resolve_database_url() -> String {
@@ -233,7 +246,7 @@ mod tests {
 
     #[test]
     fn parse_weights_to_json_produces_valid_json() {
-        let json = parse_weights_to_json("control=50,treatment=50");
+        let json = parse_weights_to_json("control=50,treatment=50").unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).expect("invalid JSON");
         let arr = v.as_array().unwrap();
         assert_eq!(arr.len(), 2);
@@ -245,16 +258,28 @@ mod tests {
 
     #[test]
     fn parse_weights_handles_three_variants() {
-        let json = parse_weights_to_json("control=33,treatment_a=33,treatment_b=34");
+        let json = parse_weights_to_json("control=33,treatment_a=33,treatment_b=34").unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).expect("invalid JSON");
         assert_eq!(v.as_array().unwrap().len(), 3);
     }
 
     #[test]
     fn parse_weights_handles_whitespace() {
-        let json = parse_weights_to_json(" control = 50 , treatment = 50 ");
+        let json = parse_weights_to_json(" control = 50 , treatment = 50 ").unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         let arr = v.as_array().unwrap();
         assert_eq!(arr[0]["name"], "control");
+    }
+
+    #[test]
+    fn parse_weights_errors_on_missing_equals() {
+        let err = parse_weights_to_json("control50").unwrap_err();
+        assert!(err.contains("malformed"), "expected malformed error, got: {err}");
+    }
+
+    #[test]
+    fn parse_weights_errors_on_non_integer_weight() {
+        let err = parse_weights_to_json("control=abc").unwrap_err();
+        assert!(err.contains("integer"), "expected integer error, got: {err}");
     }
 }
