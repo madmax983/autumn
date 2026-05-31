@@ -37,6 +37,9 @@ async fn main() {
             routes::posts::edit_form,
             routes::posts::update,
             routes::posts::delete_post,
+            // OAuth2 sign-in (enabled via oauth2 feature in Cargo.toml)
+            routes::oauth::oauth_redirect,
+            routes::oauth::oauth_callback,
             // JSON API
             routes::api::list_json,
             routes::api::create_json,

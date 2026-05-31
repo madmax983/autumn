@@ -18,3 +18,28 @@ hosts = ["localhost", "127.0.0.1", "::1"]
 [i18n]
 default_locale = "en"
 supported_locales = ["en", "es"]
+
+# ── OAuth2 / OIDC providers ──────────────────────────────────────────────────
+# Set client_secret via environment variable in production:
+#   AUTUMN_AUTH__OAUTH2__GITHUB__CLIENT_SECRET=ghp_...
+#
+[auth.oauth2.github]
+client_id     = ""
+client_secret = ""
+authorize_url = "https://github.com/login/oauth/authorize"
+token_url     = "https://github.com/login/oauth/access_token"
+userinfo_url  = "https://api.github.com/user"
+redirect_uri  = "http://localhost:3000/auth/oauth/github/callback"
+scope         = "read:user user:email"
+
+[auth.oauth2.google]
+client_id     = ""
+client_secret = ""
+authorize_url = "https://accounts.google.com/o/oauth2/v2/auth"
+token_url     = "https://oauth2.googleapis.com/token"
+userinfo_url  = "https://openidconnect.googleapis.com/v1/userinfo"
+redirect_uri  = "http://localhost:3000/auth/oauth/google/callback"
+scope         = "openid email profile"
+discovery_url = "https://accounts.google.com"
+issuer        = "https://accounts.google.com"
+jwks_url      = "https://www.googleapis.com/oauth2/v3/certs"

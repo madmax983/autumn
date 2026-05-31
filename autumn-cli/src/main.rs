@@ -893,13 +893,24 @@ enum GenerateCommands {
     /// hashing, and mail primitives. Only password digests and reset-token
     /// digests are stored — raw secrets are never persisted or logged.
     ///
-    /// Example:
+    /// Pass `--oauth` to additionally scaffold OAuth2/OIDC social-login handlers
+    /// for the listed providers (google, github, microsoft are built-in presets;
+    /// custom providers are configurable via `autumn.toml`).
+    ///
+    /// Examples:
     ///
     ///   autumn generate auth User
+    ///   autumn generate auth User --oauth github,google
     #[command(verbatim_doc_comment)]
     Auth {
         /// Model name (`PascalCase` or `snake_case`, e.g. `User`).
         name: String,
+        /// Comma-separated OAuth2/OIDC providers to scaffold
+        /// (e.g. `github,google` or `github,google,microsoft`).
+        /// Adds redirect + callback handlers, an `oauth_identities` migration,
+        /// the `oauth2` feature on `autumn-web`, and `docs/guide/oauth.md`.
+        #[arg(long, value_delimiter = ',', value_name = "PROVIDER")]
+        oauth: Vec<String>,
         /// Print the file plan and exit without writing anything.
         #[arg(long)]
         dry_run: bool,
@@ -1397,10 +1408,16 @@ fn run_generate_command(cmd: GenerateCommands) {
         } => generate::mailer::run(&name, generate::Flags { dry_run, force }),
         GenerateCommands::Auth {
             name,
+            oauth,
             dry_run,
             force,
         } => {
-            generate::auth::run(&name, generate::Flags { dry_run, force });
+            let oauth_options = generate::auth::AuthOAuthOptions { providers: oauth };
+            generate::auth::run_with_options(
+                &name,
+                generate::Flags { dry_run, force },
+                &oauth_options,
+            );
         }
         GenerateCommands::Admin {
             name,
@@ -1911,6 +1928,7 @@ mod tests {
             name,
             dry_run,
             force,
+            ..
         }) = cli.command
         else {
             panic!("expected generate auth");
@@ -3242,5 +3260,47 @@ mod tests {
     #[test]
     fn parse_config_without_subcommand_is_error() {
         assert!(Cli::try_parse_from(["autumn", "config"]).is_err());
+    }
+
+    // ── autumn generate auth --oauth tests (RED phase) ─────────────────────
+
+    #[test]
+    fn parse_generate_auth_with_oauth_flag_single_provider() {
+        let cli = Cli::try_parse_from(["autumn", "generate", "auth", "User", "--oauth", "github"])
+            .unwrap();
+        let Commands::Generate(GenerateCommands::Auth { name, oauth, .. }) = cli.command else {
+            panic!("expected generate auth");
+        };
+        assert_eq!(name, "User");
+        assert_eq!(oauth, vec!["github"]);
+    }
+
+    #[test]
+    fn parse_generate_auth_with_oauth_multiple_providers() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "generate",
+            "auth",
+            "User",
+            "--oauth",
+            "github,google",
+        ])
+        .unwrap();
+        let Commands::Generate(GenerateCommands::Auth { oauth, .. }) = cli.command else {
+            panic!("expected generate auth");
+        };
+        assert_eq!(oauth, vec!["github", "google"]);
+    }
+
+    #[test]
+    fn parse_generate_auth_without_oauth_defaults_empty() {
+        let cli = Cli::try_parse_from(["autumn", "generate", "auth", "User"]).unwrap();
+        let Commands::Generate(GenerateCommands::Auth { oauth, .. }) = cli.command else {
+            panic!("expected generate auth");
+        };
+        assert!(
+            oauth.is_empty(),
+            "oauth must default to empty when flag not given"
+        );
     }
 }
