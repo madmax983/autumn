@@ -123,14 +123,30 @@ const fn heading_level_to_u8(level: HeadingLevel) -> u8 {
 /// assert_eq!(heading_id("Getting Started"), "getting-started");
 /// assert_eq!(heading_id("Über uns"), "über-uns");
 /// ```
+///
+/// **Performance Note:**
+/// This implementation uses a single-pass character loop writing directly into
+/// a pre-allocated `String`. This eliminates intermediate heap allocations that
+/// would otherwise occur when splitting strings and collecting into vectors.
 #[must_use]
 pub fn heading_id(text: &str) -> String {
-    let words: Vec<String> = text
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|s| !s.is_empty())
-        .map(str::to_lowercase)
-        .collect();
-    words.join("-")
+    let mut out = String::with_capacity(text.len());
+    let mut in_word = false;
+    for c in text.chars() {
+        if c.is_alphanumeric() {
+            for lower in c.to_lowercase() {
+                out.push(lower);
+            }
+            in_word = true;
+        } else if in_word {
+            out.push('-');
+            in_word = false;
+        }
+    }
+    if out.ends_with('-') {
+        out.pop();
+    }
+    out
 }
 
 #[cfg(test)]
