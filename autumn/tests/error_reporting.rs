@@ -264,6 +264,7 @@ async fn panicking_reporter_does_not_break_response() {
 // ── AC #7: [reporting] enabled = false suppresses delivery ───────────────────
 
 #[tokio::test]
+#[allow(clippy::field_reassign_with_default)]
 async fn disabled_reporting_suppresses_delivery_but_still_catches_panics() {
     let mut config = AutumnConfig::default();
     config.profile = Some("test".into());

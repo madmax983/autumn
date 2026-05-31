@@ -26,7 +26,11 @@ struct ConsoleReporter;
 impl ErrorReporter for ConsoleReporter {
     fn report<'a>(&'a self, event: &'a ErrorEvent) -> ReportFuture<'a> {
         Box::pin(async move {
-            let kind = if event.panic.is_some() { "panic" } else { "error" };
+            let kind = if event.panic.is_some() {
+                "panic"
+            } else {
+                "error"
+            };
             println!(
                 "[report] {kind} {} {} {} (request_id={})",
                 event.status,

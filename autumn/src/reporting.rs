@@ -220,6 +220,38 @@ impl ReporterChain {
     }
 }
 
+thread_local! {
+    /// Per-thread Xorshift64 state, seeded once from the OS entropy source.
+    /// Sampling does not need cryptographic randomness, so a userspace PRNG
+    /// keeps the hot path (every panic / 5xx) free of `getrandom` syscalls.
+    static RNG_STATE: std::cell::Cell<u64> = std::cell::Cell::new(seed_rng());
+}
+
+/// Seed the per-thread PRNG from the OS entropy source, falling back to a
+/// non-zero constant if that ever fails (Xorshift must never start at zero).
+fn seed_rng() -> u64 {
+    let mut buf = [0u8; 8];
+    if getrandom::getrandom(&mut buf).is_ok() {
+        let seed = u64::from_ne_bytes(buf);
+        if seed != 0 {
+            return seed;
+        }
+    }
+    0x5555_5555_5555_5555
+}
+
+/// Draw a fast, non-cryptographic `u64` from the per-thread Xorshift64 PRNG.
+fn next_u64() -> u64 {
+    RNG_STATE.with(|cell| {
+        let mut x = cell.get();
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        cell.set(x);
+        x
+    })
+}
+
 /// Draw a sampling decision for the given rate in `[0.0, 1.0]`.
 ///
 /// The cast precision loss is irrelevant here: sampling tolerates a fuzzy
@@ -232,13 +264,8 @@ fn sampled(rate: f64) -> bool {
     if rate <= 0.0 {
         return false;
     }
-    let mut buf = [0u8; 8];
-    // On the (vanishingly unlikely) RNG failure, fail open and report.
-    if getrandom::getrandom(&mut buf).is_err() {
-        return true;
-    }
     // Mask to 53 bits so the value converts to f64 without rounding.
-    let draw = u64::from_le_bytes(buf) >> 11;
+    let draw = next_u64() >> 11;
     let value = draw as f64 / (1u64 << 53) as f64;
     value < rate
 }
@@ -266,8 +293,8 @@ fn ensure_panic_hook() {
             // `Backtrace::capture()` only captures when `RUST_BACKTRACE` is set,
             // so this is free when backtraces are disabled.
             let backtrace = Backtrace::capture();
-            let backtrace = (backtrace.status() == BacktraceStatus::Captured)
-                .then(|| backtrace.to_string());
+            let backtrace =
+                (backtrace.status() == BacktraceStatus::Captured).then(|| backtrace.to_string());
             LAST_PANIC.with(|cell| {
                 *cell.borrow_mut() = Some(CapturedPanic { backtrace });
             });
@@ -446,12 +473,7 @@ fn report_response(response: &Response, context: RequestContext, chain: &Arc<Rep
                 None,
             )
         },
-        |info| {
-            (
-                info.message.clone(),
-                info.problem_type.map(str::to_owned),
-            )
-        },
+        |info| (info.message.clone(), info.problem_type.map(str::to_owned)),
     );
 
     chain.dispatch(ErrorEvent {
