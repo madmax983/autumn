@@ -1704,10 +1704,26 @@ impl AutumnConfig {
         self.apply_security_env_overrides_with_env(env);
         self.apply_idempotency_env_overrides_with_env(env);
         self.apply_dev_env_overrides_with_env(env);
+        #[cfg(feature = "reporting")]
+        self.apply_reporting_env_overrides_with_env(env);
         #[cfg(feature = "storage")]
         self.apply_storage_env_overrides_with_env(env);
         #[cfg(feature = "mail")]
         self.apply_mail_env_overrides_with_env(env);
+    }
+
+    #[cfg(feature = "reporting")]
+    fn apply_reporting_env_overrides_with_env(&mut self, env: &dyn Env) {
+        parse_env_bool(
+            env,
+            "AUTUMN_REPORTING__ENABLED",
+            &mut self.reporting.enabled,
+        );
+        parse_env(
+            env,
+            "AUTUMN_REPORTING__SAMPLE_RATE",
+            &mut self.reporting.sample_rate,
+        );
     }
 
     fn apply_dev_env_overrides_with_env(&mut self, env: &dyn Env) {
@@ -3971,6 +3987,20 @@ path = "/healthz"
         let mut config = AutumnConfig::default();
         config.apply_env_overrides_with_env(&env);
         assert_eq!(config.database.pool_size, 25);
+    }
+
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn env_override_reporting() {
+        let env = MockEnv::new()
+            .with("AUTUMN_REPORTING__ENABLED", "false")
+            .with("AUTUMN_REPORTING__SAMPLE_RATE", "0.1");
+        let mut config = AutumnConfig::default();
+        assert!(config.reporting.enabled);
+        assert!((config.reporting.sample_rate - 1.0).abs() < f64::EPSILON);
+        config.apply_env_overrides_with_env(&env);
+        assert!(!config.reporting.enabled);
+        assert!((config.reporting.sample_rate - 0.1).abs() < f64::EPSILON);
     }
 
     #[test]
