@@ -79,6 +79,7 @@ INSERT INTO autumn_experiment_changes (experiment, mutation, actor) \
 COMMIT;";
 
 const OVERRIDE_SQL: &str = "BEGIN; \
+SELECT 1/(SELECT COUNT(*)::int FROM autumn_experiments WHERE name = :'name') AS exists_check; \
 INSERT INTO autumn_experiment_overrides (experiment, actor, variant) \
     VALUES (:'name', :'actor_id', :'variant') \
     ON CONFLICT (experiment, actor) DO UPDATE SET variant = :'variant'; \
@@ -256,6 +257,16 @@ mod tests {
             OVERRIDE_SQL.contains("ON CONFLICT"),
             "override SQL must use INSERT ... ON CONFLICT"
         );
+    }
+
+    #[test]
+    fn mutation_sql_have_existence_checks() {
+        for sql in [SET_WEIGHTS_SQL, CONCLUDE_SQL, OVERRIDE_SQL] {
+            assert!(
+                sql.contains("EXISTS") || sql.contains("COUNT(*)"),
+                "mutation SQL must have an existence check: {sql}"
+            );
+        }
     }
 
     #[test]

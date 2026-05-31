@@ -889,6 +889,26 @@ pub enum ExperimentError {
     Store(#[from] ExperimentStoreError),
 }
 
+// ── Validation helpers ────────────────────────────────────────────────────────
+
+fn validate_variants(variants: &[VariantConfig]) -> Result<(), ExperimentError> {
+    let mut seen = std::collections::HashSet::new();
+    for v in variants {
+        if v.name.trim().is_empty() {
+            return Err(ExperimentError::NoVariant(
+                "variant name must not be empty".into(),
+            ));
+        }
+        if !seen.insert(v.name.as_str()) {
+            return Err(ExperimentError::NoVariant(format!(
+                "duplicate variant name: '{}'",
+                v.name
+            )));
+        }
+    }
+    Ok(())
+}
+
 // ── ExperimentService ─────────────────────────────────────────────────────────
 
 /// The main experiment service.
@@ -1082,6 +1102,7 @@ impl ExperimentService {
     ///
     /// Returns [`ExperimentError::Store`] on backend failure.
     pub fn create(&self, config: ExperimentConfig) -> Result<(), ExperimentError> {
+        validate_variants(&config.variants)?;
         self.store.upsert(config)?;
         Ok(())
     }
@@ -1108,9 +1129,15 @@ impl ExperimentService {
     ///
     /// Returns [`ExperimentError::NotFound`] if the experiment is unknown.
     pub fn conclude(&self, name: &str, winner: &str) -> Result<(), ExperimentError> {
-        self.store
+        let config = self
+            .store
             .get(name)?
             .ok_or_else(|| ExperimentError::NotFound(name.to_owned()))?;
+        if !config.variants.iter().any(|v| v.name == winner) {
+            return Err(ExperimentError::NoVariant(format!(
+                "'{winner}' is not a configured variant of experiment '{name}'"
+            )));
+        }
         self.store
             .set_state(name, ExperimentState::Concluded, Some(winner))?;
         Ok(())
@@ -1148,6 +1175,7 @@ impl ExperimentService {
         variants: Vec<VariantConfig>,
         actor: Option<&str>,
     ) -> Result<(), ExperimentError> {
+        validate_variants(&variants)?;
         self.store
             .get(name)?
             .ok_or_else(|| ExperimentError::NotFound(name.to_owned()))?;
@@ -1169,9 +1197,15 @@ impl ExperimentService {
         actor: &str,
         variant: &str,
     ) -> Result<(), ExperimentError> {
-        self.store
+        let config = self
+            .store
             .get(experiment)?
             .ok_or_else(|| ExperimentError::NotFound(experiment.to_owned()))?;
+        if !config.variants.iter().any(|v| v.name == variant) {
+            return Err(ExperimentError::NoVariant(format!(
+                "'{variant}' is not a configured variant of experiment '{experiment}'"
+            )));
+        }
         self.store.set_override(experiment, actor, variant)?;
         Ok(())
     }
@@ -1247,7 +1281,10 @@ pub struct Experiments {
 impl Experiments {
     /// Assign a variant for the current session actor.
     ///
-    /// Propagates the session `user_id` and `x-request-id` header automatically.
+    /// Propagates the session actor ID and `x-request-id` header automatically.
+    /// For logged-out sessions, falls back to the session ID so each visitor
+    /// gets a stable, per-session bucket rather than collapsing all anonymous
+    /// traffic into a single `"anonymous"` actor.
     ///
     /// # Errors
     ///
@@ -1283,7 +1320,14 @@ impl axum::extract::FromRequestParts<crate::AppState> for Experiments {
             })?;
 
         let actor_id = if let Some(session) = parts.extensions.get::<crate::session::Session>() {
-            session.get("user_id").await
+            // Use the configured auth session key (e.g. "user_id"); fall back to
+            // the session ID so each anonymous visitor gets a stable, per-session
+            // bucket rather than all collapsing into a single "anonymous" actor.
+            let session_key = state.auth_session_key();
+            match session.get(session_key).await {
+                Some(uid) => Some(uid),
+                None => Some(session.id().await),
+            }
         } else {
             None
         };
@@ -1299,6 +1343,517 @@ impl axum::extract::FromRequestParts<crate::AppState> for Experiments {
             actor_id,
             request_id,
         })
+    }
+}
+
+// ── pg module ─────────────────────────────────────────────────────────────────
+
+pub mod pg {
+    use super::{
+        Assignment, ChangeRecord, ExperimentConfig, ExperimentState, ExperimentStore,
+        ExperimentStoreError, VariantConfig,
+    };
+    use diesel::prelude::*;
+    use std::collections::HashMap;
+    use std::sync::RwLock;
+    use std::time::{Duration, Instant};
+
+    // ── Cache types ───────────────────────────────────────────────────────────
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum CacheLookup {
+        Hit(Option<ExperimentConfig>),
+        Miss,
+    }
+
+    #[derive(Debug, Clone)]
+    struct CachedEntry {
+        value: Option<ExperimentConfig>,
+        expires_at: Instant,
+    }
+
+    // ── Row structs ───────────────────────────────────────────────────────────
+
+    #[derive(diesel::QueryableByName)]
+    struct ExperimentRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        name: String,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        description: Option<String>,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        state: String,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        variants: String,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        winner: Option<String>,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        exclusion_group: Option<String>,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        updated_at_secs: i64,
+    }
+
+    impl ExperimentRow {
+        fn into_config(self) -> ExperimentConfig {
+            let variants: Vec<VariantConfig> =
+                serde_json::from_str(&self.variants).unwrap_or_default();
+            let state = match self.state.as_str() {
+                "running" => ExperimentState::Running,
+                "concluded" => ExperimentState::Concluded,
+                "archived" => ExperimentState::Archived,
+                _ => ExperimentState::Draft,
+            };
+            ExperimentConfig {
+                name: self.name,
+                description: self.description,
+                state,
+                variants,
+                winner: self.winner,
+                exclusion_group: self.exclusion_group,
+                updated_at_secs: u64::try_from(self.updated_at_secs).unwrap_or(0),
+            }
+        }
+    }
+
+    #[derive(diesel::QueryableByName)]
+    struct AssignmentRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        experiment: String,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        actor: String,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        variant: String,
+        #[diesel(sql_type = diesel::sql_types::Bool)]
+        is_override: bool,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        assigned_at_secs: i64,
+    }
+
+    #[derive(diesel::QueryableByName)]
+    struct BoolRow {
+        #[diesel(sql_type = diesel::sql_types::Bool)]
+        result: bool,
+    }
+
+    #[derive(diesel::QueryableByName)]
+    struct VariantNameRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        variant: String,
+    }
+
+    #[derive(diesel::QueryableByName)]
+    struct ChangeRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        experiment: String,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        mutation: String,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        actor: Option<String>,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        timestamp_secs: i64,
+    }
+
+    #[derive(diesel::QueryableByName)]
+    struct ChangeExperimentRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        experiment: String,
+    }
+
+    // ── PgExperimentStore ─────────────────────────────────────────────────────
+
+    /// Postgres-backed [`ExperimentStore`] with a short-lived read-through cache.
+    ///
+    /// Writes trigger `pg_notify('autumn_experiments', name)` so replicas can
+    /// invalidate their caches quickly via a background poll listener.
+    #[derive(Debug)]
+    pub struct PgExperimentStore {
+        database_url: String,
+        cache_ttl: Duration,
+        cache: RwLock<HashMap<String, CachedEntry>>,
+    }
+
+    impl Clone for PgExperimentStore {
+        fn clone(&self) -> Self {
+            Self::with_cache_ttl(self.database_url.clone(), self.cache_ttl)
+        }
+    }
+
+    impl PgExperimentStore {
+        /// Default read-through cache lifetime.
+        pub const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(1);
+
+        /// Create a store using the default 1 s read-through cache.
+        #[must_use]
+        pub fn new(database_url: impl Into<String>) -> Self {
+            Self::with_cache_ttl(database_url, Self::DEFAULT_CACHE_TTL)
+        }
+
+        /// Create a store with an explicit cache TTL. Use `Duration::ZERO` to
+        /// disable caching.
+        #[must_use]
+        pub fn with_cache_ttl(database_url: impl Into<String>, cache_ttl: Duration) -> Self {
+            Self {
+                database_url: database_url.into(),
+                cache_ttl,
+                cache: RwLock::new(HashMap::new()),
+            }
+        }
+
+        /// Create a store from Autumn's primary database configuration.
+        #[must_use]
+        pub fn from_database_config(config: &crate::config::DatabaseConfig) -> Option<Self> {
+            config.effective_primary_url().map(Self::new)
+        }
+
+        fn connect(&self) -> Result<diesel::PgConnection, ExperimentStoreError> {
+            diesel::PgConnection::establish(&self.database_url)
+                .map_err(|e| ExperimentStoreError::Backend(e.to_string()))
+        }
+
+        fn cached(&self, name: &str) -> CacheLookup {
+            let now = Instant::now();
+            let Ok(cache) = self.cache.read() else {
+                return CacheLookup::Miss;
+            };
+            match cache.get(name) {
+                Some(c) if c.expires_at > now => CacheLookup::Hit(c.value.clone()),
+                _ => CacheLookup::Miss,
+            }
+        }
+
+        fn store_cache(&self, name: &str, value: Option<ExperimentConfig>) {
+            if self.cache_ttl.is_zero() {
+                return;
+            }
+            let Some(expires_at) = Instant::now().checked_add(self.cache_ttl) else {
+                return;
+            };
+            if let Ok(mut cache) = self.cache.write() {
+                cache.insert(name.to_owned(), CachedEntry { value, expires_at });
+            }
+        }
+
+        fn invalidate(&self, name: &str) {
+            if let Ok(mut cache) = self.cache.write() {
+                cache.remove(name);
+            }
+        }
+
+        /// Spawn a background thread that polls `autumn_experiment_changes` and
+        /// invalidates this store's cache for changed experiments.
+        ///
+        /// The thread runs indefinitely; the returned handle can be detached.
+        pub fn spawn_poll_listener(
+            store: std::sync::Arc<Self>,
+            poll_interval: Duration,
+        ) -> std::thread::JoinHandle<()> {
+            std::thread::spawn(move || {
+                const OVERLAP_SECS: i64 = 5;
+                let now_secs = || {
+                    i64::try_from(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs(),
+                    )
+                    .unwrap_or(i64::MAX)
+                };
+                let mut last_polled_secs: i64 = now_secs() - OVERLAP_SECS;
+
+                loop {
+                    std::thread::sleep(poll_interval);
+                    let new_horizon = now_secs() - OVERLAP_SECS;
+                    if let Ok(mut conn) = store.connect() {
+                        let rows: Vec<ChangeExperimentRow> = diesel::sql_query(
+                            "SELECT DISTINCT experiment FROM autumn_experiment_changes \
+                             WHERE changed_at > to_timestamp($1)",
+                        )
+                        .bind::<diesel::sql_types::BigInt, _>(last_polled_secs)
+                        .load::<ChangeExperimentRow>(&mut conn)
+                        .unwrap_or_default();
+
+                        for row in rows {
+                            store.invalidate(&row.experiment);
+                        }
+                    }
+                    last_polled_secs = new_horizon;
+                }
+            })
+        }
+    }
+
+    // ── ExperimentStore impl ──────────────────────────────────────────────────
+
+    impl ExperimentStore for PgExperimentStore {
+        fn get(&self, name: &str) -> Result<Option<ExperimentConfig>, ExperimentStoreError> {
+            if let CacheLookup::Hit(v) = self.cached(name) {
+                return Ok(v);
+            }
+            let mut conn = self.connect()?;
+            let result = diesel::sql_query(
+                "SELECT name, description, state::text, variants::text, winner, \
+                        exclusion_group, \
+                        EXTRACT(EPOCH FROM updated_at)::bigint AS updated_at_secs \
+                 FROM autumn_experiments WHERE name = $1",
+            )
+            .bind::<diesel::sql_types::Text, _>(name)
+            .get_result::<ExperimentRow>(&mut conn)
+            .optional()
+            .map(|r| r.map(ExperimentRow::into_config))
+            .map_err(|e| ExperimentStoreError::Backend(e.to_string()))?;
+
+            self.store_cache(name, result.clone());
+            Ok(result)
+        }
+
+        fn list(&self) -> Result<Vec<ExperimentConfig>, ExperimentStoreError> {
+            let mut conn = self.connect()?;
+            diesel::sql_query(
+                "SELECT name, description, state::text, variants::text, winner, \
+                        exclusion_group, \
+                        EXTRACT(EPOCH FROM updated_at)::bigint AS updated_at_secs \
+                 FROM autumn_experiments ORDER BY name",
+            )
+            .load::<ExperimentRow>(&mut conn)
+            .map(|rows| rows.into_iter().map(ExperimentRow::into_config).collect())
+            .map_err(|e| ExperimentStoreError::Backend(e.to_string()))
+        }
+
+        fn upsert(&self, config: ExperimentConfig) -> Result<(), ExperimentStoreError> {
+            let variants_json =
+                serde_json::to_string(&config.variants).unwrap_or_else(|_| "[]".to_owned());
+            let state_str = config.state.to_string();
+            let mut conn = self.connect()?;
+            diesel::sql_query(
+                "WITH upserted AS ( \
+                     INSERT INTO autumn_experiments \
+                         (name, description, state, variants, winner, exclusion_group) \
+                     VALUES ($1, $2, $3::autumn_experiment_state, $4::jsonb, $5, $6) \
+                     ON CONFLICT (name) DO UPDATE \
+                         SET description = EXCLUDED.description, \
+                             state = EXCLUDED.state, \
+                             variants = EXCLUDED.variants, \
+                             winner = EXCLUDED.winner, \
+                             exclusion_group = EXCLUDED.exclusion_group, \
+                             updated_at = NOW() \
+                     RETURNING name \
+                 ) \
+                 INSERT INTO autumn_experiment_changes (experiment, mutation, actor) \
+                 SELECT name, 'created', NULL FROM upserted",
+            )
+            .bind::<diesel::sql_types::Text, _>(&config.name)
+            .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(config.description)
+            .bind::<diesel::sql_types::Text, _>(&state_str)
+            .bind::<diesel::sql_types::Text, _>(&variants_json)
+            .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(config.winner)
+            .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(config.exclusion_group)
+            .execute(&mut conn)
+            .map_err(|e| ExperimentStoreError::Backend(e.to_string()))?;
+            self.invalidate(&config.name);
+            Ok(())
+        }
+
+        fn set_state(
+            &self,
+            name: &str,
+            state: ExperimentState,
+            winner: Option<&str>,
+        ) -> Result<(), ExperimentStoreError> {
+            let state_str = state.to_string();
+            let mutation =
+                winner.map_or_else(|| format!("state={state}"), |w| format!("concluded={w}"));
+            let mut conn = self.connect()?;
+            diesel::sql_query(
+                "WITH updated AS ( \
+                     UPDATE autumn_experiments \
+                     SET state = $2::autumn_experiment_state, \
+                         winner = COALESCE($3, winner), \
+                         updated_at = NOW() \
+                     WHERE name = $1 \
+                     RETURNING name \
+                 ) \
+                 INSERT INTO autumn_experiment_changes (experiment, mutation, actor) \
+                 SELECT name, $4, NULL FROM updated",
+            )
+            .bind::<diesel::sql_types::Text, _>(name)
+            .bind::<diesel::sql_types::Text, _>(&state_str)
+            .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(
+                winner.map(str::to_owned),
+            )
+            .bind::<diesel::sql_types::Text, _>(&mutation)
+            .execute(&mut conn)
+            .map_err(|e| ExperimentStoreError::Backend(e.to_string()))?;
+            self.invalidate(name);
+            Ok(())
+        }
+
+        fn set_variants(
+            &self,
+            name: &str,
+            variants: Vec<VariantConfig>,
+            actor: Option<&str>,
+        ) -> Result<(), ExperimentStoreError> {
+            let variants_json =
+                serde_json::to_string(&variants).unwrap_or_else(|_| "[]".to_owned());
+            let mut conn = self.connect()?;
+            diesel::sql_query(
+                "WITH updated AS ( \
+                     UPDATE autumn_experiments \
+                     SET variants = $2::jsonb, updated_at = NOW() \
+                     WHERE name = $1 \
+                     RETURNING name \
+                 ) \
+                 INSERT INTO autumn_experiment_changes (experiment, mutation, actor) \
+                 SELECT name, 'set_weights', $3 FROM updated",
+            )
+            .bind::<diesel::sql_types::Text, _>(name)
+            .bind::<diesel::sql_types::Text, _>(&variants_json)
+            .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(
+                actor.map(str::to_owned),
+            )
+            .execute(&mut conn)
+            .map_err(|e| ExperimentStoreError::Backend(e.to_string()))?;
+            self.invalidate(name);
+            Ok(())
+        }
+
+        fn get_assignment(
+            &self,
+            experiment: &str,
+            actor: &str,
+        ) -> Result<Option<Assignment>, ExperimentStoreError> {
+            let mut conn = self.connect()?;
+            diesel::sql_query(
+                "SELECT experiment, actor, variant, is_override, \
+                        EXTRACT(EPOCH FROM assigned_at)::bigint AS assigned_at_secs \
+                 FROM autumn_experiment_assignments \
+                 WHERE experiment = $1 AND actor = $2",
+            )
+            .bind::<diesel::sql_types::Text, _>(experiment)
+            .bind::<diesel::sql_types::Text, _>(actor)
+            .get_result::<AssignmentRow>(&mut conn)
+            .optional()
+            .map(|r| {
+                r.map(|row| Assignment {
+                    experiment: row.experiment,
+                    actor: row.actor,
+                    variant: row.variant,
+                    is_override: row.is_override,
+                    assigned_at_secs: u64::try_from(row.assigned_at_secs).unwrap_or(0),
+                })
+            })
+            .map_err(|e| ExperimentStoreError::Backend(e.to_string()))
+        }
+
+        fn record_assignment(&self, assignment: Assignment) -> Result<(), ExperimentStoreError> {
+            let mut conn = self.connect()?;
+            diesel::sql_query(
+                "INSERT INTO autumn_experiment_assignments \
+                     (experiment, actor, variant, is_override) \
+                 VALUES ($1, $2, $3, $4) \
+                 ON CONFLICT (experiment, actor) DO NOTHING",
+            )
+            .bind::<diesel::sql_types::Text, _>(&assignment.experiment)
+            .bind::<diesel::sql_types::Text, _>(&assignment.actor)
+            .bind::<diesel::sql_types::Text, _>(&assignment.variant)
+            .bind::<diesel::sql_types::Bool, _>(assignment.is_override)
+            .execute(&mut conn)
+            .map_err(|e| ExperimentStoreError::Backend(e.to_string()))?;
+            Ok(())
+        }
+
+        fn get_override(
+            &self,
+            experiment: &str,
+            actor: &str,
+        ) -> Result<Option<String>, ExperimentStoreError> {
+            let mut conn = self.connect()?;
+            diesel::sql_query(
+                "SELECT variant FROM autumn_experiment_overrides \
+                 WHERE experiment = $1 AND actor = $2",
+            )
+            .bind::<diesel::sql_types::Text, _>(experiment)
+            .bind::<diesel::sql_types::Text, _>(actor)
+            .get_result::<VariantNameRow>(&mut conn)
+            .optional()
+            .map(|r| r.map(|row| row.variant))
+            .map_err(|e| ExperimentStoreError::Backend(e.to_string()))
+        }
+
+        fn set_override(
+            &self,
+            experiment: &str,
+            actor: &str,
+            variant: &str,
+        ) -> Result<(), ExperimentStoreError> {
+            let mut conn = self.connect()?;
+            diesel::sql_query(
+                "INSERT INTO autumn_experiment_overrides (experiment, actor, variant) \
+                 VALUES ($1, $2, $3) \
+                 ON CONFLICT (experiment, actor) DO UPDATE SET variant = EXCLUDED.variant",
+            )
+            .bind::<diesel::sql_types::Text, _>(experiment)
+            .bind::<diesel::sql_types::Text, _>(actor)
+            .bind::<diesel::sql_types::Text, _>(variant)
+            .execute(&mut conn)
+            .map_err(|e| ExperimentStoreError::Backend(e.to_string()))?;
+            Ok(())
+        }
+
+        fn has_assignment_in_group(
+            &self,
+            actor: &str,
+            group: &str,
+            exclude_experiment: &str,
+        ) -> Result<bool, ExperimentStoreError> {
+            let mut conn = self.connect()?;
+            diesel::sql_query(
+                "SELECT EXISTS ( \
+                     SELECT 1 \
+                     FROM autumn_experiment_assignments a \
+                     JOIN autumn_experiments e ON e.name = a.experiment \
+                     WHERE a.actor = $1 \
+                       AND e.exclusion_group = $2 \
+                       AND a.experiment <> $3 \
+                 ) AS result",
+            )
+            .bind::<diesel::sql_types::Text, _>(actor)
+            .bind::<diesel::sql_types::Text, _>(group)
+            .bind::<diesel::sql_types::Text, _>(exclude_experiment)
+            .get_result::<BoolRow>(&mut conn)
+            .map(|r| r.result)
+            .map_err(|e| ExperimentStoreError::Backend(e.to_string()))
+        }
+
+        fn history(
+            &self,
+            experiment: &str,
+            limit: usize,
+        ) -> Result<Vec<ChangeRecord>, ExperimentStoreError> {
+            let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+            let mut conn = self.connect()?;
+            diesel::sql_query(
+                "SELECT experiment, mutation, actor, \
+                        EXTRACT(EPOCH FROM changed_at)::bigint AS timestamp_secs \
+                 FROM autumn_experiment_changes \
+                 WHERE experiment = $1 \
+                 ORDER BY changed_at DESC \
+                 LIMIT NULLIF($2::bigint, 0)",
+            )
+            .bind::<diesel::sql_types::Text, _>(experiment)
+            .bind::<diesel::sql_types::BigInt, _>(limit)
+            .load::<ChangeRow>(&mut conn)
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|r| ChangeRecord {
+                        experiment: r.experiment,
+                        mutation: r.mutation,
+                        actor: r.actor,
+                        timestamp_secs: u64::try_from(r.timestamp_secs).unwrap_or(0),
+                    })
+                    .collect()
+            })
+            .map_err(|e| ExperimentStoreError::Backend(e.to_string()))
+        }
     }
 }
 
