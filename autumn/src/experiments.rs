@@ -1109,13 +1109,20 @@ impl ExperimentService {
 
     /// Transition a `Draft` or `Concluded` experiment to `Running`.
     ///
+    /// `Archived` experiments are terminal and cannot be restarted.
+    ///
     /// # Errors
     ///
     /// Returns [`ExperimentError::NotFound`] if the experiment is unknown.
+    /// Returns [`ExperimentError::Archived`] if the experiment is archived.
     pub fn start(&self, name: &str) -> Result<(), ExperimentError> {
-        self.store
+        let config = self
+            .store
             .get(name)?
             .ok_or_else(|| ExperimentError::NotFound(name.to_owned()))?;
+        if config.state == ExperimentState::Archived {
+            return Err(ExperimentError::Archived(name.to_owned()));
+        }
         self.store.set_state(name, ExperimentState::Running, None)?;
         Ok(())
     }
@@ -1788,9 +1795,14 @@ pub mod pg {
         ) -> Result<(), ExperimentStoreError> {
             let mut conn = self.connect()?;
             diesel::sql_query(
-                "INSERT INTO autumn_experiment_overrides (experiment, actor, variant) \
-                 VALUES ($1, $2, $3) \
-                 ON CONFLICT (experiment, actor) DO UPDATE SET variant = EXCLUDED.variant",
+                "WITH upserted AS ( \
+                     INSERT INTO autumn_experiment_overrides (experiment, actor, variant) \
+                     VALUES ($1, $2, $3) \
+                     ON CONFLICT (experiment, actor) DO UPDATE SET variant = EXCLUDED.variant \
+                     RETURNING experiment, actor, variant \
+                 ) \
+                 INSERT INTO autumn_experiment_changes (experiment, mutation, actor) \
+                 SELECT experiment, 'override=' || actor || ':' || variant, NULL FROM upserted",
             )
             .bind::<diesel::sql_types::Text, _>(experiment)
             .bind::<diesel::sql_types::Text, _>(actor)

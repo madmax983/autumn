@@ -278,6 +278,25 @@ impl AdminModel for ExperimentAdminModel {
             let state = data.get("state").and_then(Value::as_str).unwrap_or("draft");
             let variants = validate_variants_json(&extract_variants_str(&data))?;
             let winner = data.get("winner").and_then(Value::as_str);
+
+            // Concluding requires a non-empty winner that is a configured variant.
+            if state == "concluded" {
+                let w = winner.filter(|s| !s.trim().is_empty()).ok_or_else(|| {
+                    AdminError::Validation(
+                        "a concluded experiment requires a non-empty winner".into(),
+                    )
+                })?;
+                let arr: Vec<serde_json::Value> =
+                    serde_json::from_str(&variants).unwrap_or_default();
+                if !arr
+                    .iter()
+                    .any(|v| v.get("name").and_then(Value::as_str) == Some(w))
+                {
+                    return Err(AdminError::Validation(format!(
+                        "winner '{w}' is not a configured variant"
+                    )));
+                }
+            }
             let exclusion_group = data.get("exclusion_group").and_then(Value::as_str);
 
             let row = diesel::sql_query(
@@ -471,10 +490,19 @@ fn validate_variants_json(raw: &str) -> Result<String, AdminError> {
                     }
                     _ => {}
                 }
-                if v.get("weight").and_then(Value::as_u64).is_none() {
-                    return Err(AdminError::Validation(format!(
-                        "variants[{i}].weight must be a non-negative integer"
-                    )));
+                match v.get("weight").and_then(Value::as_u64) {
+                    None => {
+                        return Err(AdminError::Validation(format!(
+                            "variants[{i}].weight must be a non-negative integer"
+                        )));
+                    }
+                    Some(w) if w > u64::from(u32::MAX) => {
+                        return Err(AdminError::Validation(format!(
+                            "variants[{i}].weight must not exceed {} (u32::MAX)",
+                            u32::MAX
+                        )));
+                    }
+                    _ => {}
                 }
             }
             Ok(serde_json::to_string(&arr).unwrap_or_else(|_| "[]".to_owned()))
