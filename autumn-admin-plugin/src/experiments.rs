@@ -458,10 +458,18 @@ fn validate_variants_json(raw: &str) -> Result<String, AdminError> {
     match serde_json::from_str::<Vec<serde_json::Value>>(trimmed) {
         Ok(arr) => {
             for (i, v) in arr.iter().enumerate() {
-                if v.get("name").and_then(|n| n.as_str()).is_none() {
-                    return Err(AdminError::Validation(format!(
-                        "variants[{i}].name must be a string"
-                    )));
+                match v.get("name").and_then(|n| n.as_str()) {
+                    None => {
+                        return Err(AdminError::Validation(format!(
+                            "variants[{i}].name must be a string"
+                        )));
+                    }
+                    Some(n) if n.trim().is_empty() => {
+                        return Err(AdminError::Validation(format!(
+                            "variants[{i}].name must not be empty"
+                        )));
+                    }
+                    _ => {}
                 }
                 if v.get("weight").and_then(Value::as_u64).is_none() {
                     return Err(AdminError::Validation(format!(
@@ -675,5 +683,23 @@ mod tests {
     fn validate_variants_json_rejects_invalid_json() {
         let err = validate_variants_json("{not json}").unwrap_err();
         assert!(err.to_string().contains("JSON"));
+    }
+
+    #[test]
+    fn validate_variants_json_rejects_empty_name() {
+        let err = validate_variants_json(r#"[{"name":"","weight":100}]"#).unwrap_err();
+        assert!(
+            err.to_string().contains("empty"),
+            "expected empty-name error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_variants_json_rejects_whitespace_only_name() {
+        let err = validate_variants_json(r#"[{"name":"   ","weight":100}]"#).unwrap_err();
+        assert!(
+            err.to_string().contains("empty"),
+            "expected empty-name error, got: {err}"
+        );
     }
 }
