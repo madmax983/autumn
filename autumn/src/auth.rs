@@ -829,10 +829,48 @@ async fn validate_and_decode_id_token(
         .iter()
         .find(|k| k.common.key_id.as_deref() == Some(kid))
         .ok_or_else(|| crate::AutumnError::unauthorized_msg("no jwk matched id_token kid"))?;
+
+    // Determine the algorithm to use from the JWK if possible.
+    let expected_alg = match jwk.common.key_algorithm {
+        Some(jwk_alg) => {
+            // Convert jsonwebtoken::jwk::AlgorithmParameters/KeyAlgorithm to jsonwebtoken::Algorithm
+            match jwk_alg {
+                jsonwebtoken::jwk::KeyAlgorithm::RS256 => jsonwebtoken::Algorithm::RS256,
+                jsonwebtoken::jwk::KeyAlgorithm::RS384 => jsonwebtoken::Algorithm::RS384,
+                jsonwebtoken::jwk::KeyAlgorithm::RS512 => jsonwebtoken::Algorithm::RS512,
+                jsonwebtoken::jwk::KeyAlgorithm::ES256 => jsonwebtoken::Algorithm::ES256,
+                jsonwebtoken::jwk::KeyAlgorithm::ES384 => jsonwebtoken::Algorithm::ES384,
+                jsonwebtoken::jwk::KeyAlgorithm::PS256 => jsonwebtoken::Algorithm::PS256,
+                jsonwebtoken::jwk::KeyAlgorithm::PS384 => jsonwebtoken::Algorithm::PS384,
+                jsonwebtoken::jwk::KeyAlgorithm::PS512 => jsonwebtoken::Algorithm::PS512,
+                jsonwebtoken::jwk::KeyAlgorithm::EdDSA => jsonwebtoken::Algorithm::EdDSA,
+                _ => {
+                    return Err(crate::AutumnError::unauthorized_msg(
+                        "unsupported jwk algorithm",
+                    ));
+                }
+            }
+        }
+        None => {
+            // Fallback: If JWK doesn't specify an algorithm, use the one from the token header,
+            // BUT explicitly reject symmetric algorithms to prevent algorithm confusion attacks.
+            match alg {
+                jsonwebtoken::Algorithm::HS256
+                | jsonwebtoken::Algorithm::HS384
+                | jsonwebtoken::Algorithm::HS512 => {
+                    return Err(crate::AutumnError::unauthorized_msg(
+                        "symmetric algorithm not allowed for JWKS validation",
+                    ));
+                }
+                _ => alg,
+            }
+        }
+    };
+
     let decoding_key = jsonwebtoken::DecodingKey::from_jwk(jwk)
         .map_err(|e| crate::AutumnError::unauthorized_msg(format!("invalid jwk key: {e}")))?;
 
-    let mut validation = jsonwebtoken::Validation::new(alg);
+    let mut validation = jsonwebtoken::Validation::new(expected_alg);
     validation.set_issuer(&[issuer]);
     validation.set_audience(std::slice::from_ref(&provider.client_id));
     validation.required_spec_claims = ["exp", "iss", "aud", "sub"]
@@ -1694,6 +1732,93 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.to_string(), "provider.issuer required for oidc");
+    }
+
+    #[cfg(feature = "oauth2")]
+    #[tokio::test]
+    async fn validate_id_token_rejects_symmetric_algorithm_confusion() {
+        use httpmock::MockServer;
+        use jsonwebtoken::jwk::{CommonParameters, Jwk, JwkSet, RSAKeyParameters, RSAKeyType};
+        use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+
+        // Start a mock server for JWKS
+        let server = MockServer::start_async().await;
+
+        let provider = OAuth2ProviderConfig {
+            client_id: "test_client".into(),
+            client_secret: "secret".into(),
+            authorize_url: "https://idp.example/authorize".into(),
+            token_url: "https://idp.example/token".into(),
+            userinfo_url: None,
+            redirect_uri: "http://localhost:3000/callback".into(),
+            scope: "openid".into(),
+            issuer: Some("https://idp.example".into()),
+            jwks_url: Some(server.url("/jwks")),
+        };
+
+        // Create a dummy RSA public key JWK
+        let jwk = Jwk {
+            common: CommonParameters {
+                public_key_use: None,
+                key_operations: None,
+                key_algorithm: None,
+                key_id: Some("test-kid".into()),
+                x509_url: None,
+                x509_chain: None,
+                x509_sha1_fingerprint: None,
+                x509_sha256_fingerprint: None,
+            },
+            algorithm: jsonwebtoken::jwk::AlgorithmParameters::RSA(RSAKeyParameters {
+                key_type: RSAKeyType::RSA,
+                n: "0vx7agoebGcQSuuPiLJXZptN9nndrQmbXEps2aiAFbWhM78LhWx4cbbfAAtVT86zwu1RK7aPFFxuhDR1L6tSoc_BJECPebWKRXjBZCiFV4n3oknjhMstn64tZ_2W-5JsGY4Hc5n9yBXArwl93lqt7_RN5w6Cf0h4QyQ5v-65YGjQR0_FDW2QvzqY368QQMicAtaSqzs8KJZgnYb9c7d0zgdAZHzu6qMQvRL5hajrn1n91CbOpbISD08qNLyrdkt-bFTWhAI4vMQFh6WeZu0fM4lFd2NcRwr3XPksINHaQ-G_xBniIqbw0Ls1jF44-csFCur-kEgU8awapJzKnqDKgw".into(),
+                e: "AQAB".into(),
+            }),
+        };
+        let jwks = JwkSet { keys: vec![jwk] };
+
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::GET).path("/jwks");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body_obj(&jwks);
+            })
+            .await;
+
+        // Attacker creates a token using HS256, but signs it with the PUBLIC KEY 'n' modulus!
+        // (Or any other string they expect the server to use as the HS256 secret)
+        // jsonwebtoken library will use the DecodingKey derived from JWK as the HMAC secret
+        // if the header specifies HS256 and the library trusts it.
+        // The DecodingKey from the RSA JWK will be the DER representation of the public key or similar.
+        // We simulate the token generation here. We don't even need a perfectly valid MAC
+        // to test if it gets rejected BEFORE MAC verification (i.e. algorithm mismatch).
+        let mut header = Header::new(Algorithm::HS256);
+        header.kid = Some("test-kid".into());
+
+        let claims = serde_json::json!({
+            "sub": "attacker_controlled",
+            "iss": "https://idp.example",
+            "aud": "test_client",
+            "exp": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + 3600,
+            "nbf": 0,
+        });
+
+        // Sign with a dummy secret (doesn't matter if MAC fails, we want it to fail on ALGORITHM)
+        let token = encode(&header, &claims, &EncodingKey::from_secret(b"dummy")).unwrap();
+
+        let result = validate_and_decode_id_token(&token, &provider).await;
+
+        let err = result.unwrap_err();
+        let err_msg = err.to_string();
+
+        // It must NOT fail with "invalid signature" (which implies it tried to verify HS256).
+        // It should fail with an algorithm validation error.
+        assert!(
+            err_msg.contains("Algorithm not allowed")
+                || err_msg.contains("invalid algorithm")
+                || err_msg.contains("symmetric algorithm"),
+            "Expected algorithm rejection, got: {err_msg}"
+        );
     }
 
     #[cfg(feature = "oauth2")]
