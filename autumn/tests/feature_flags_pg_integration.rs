@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use autumn_web::feature_flags::FlagStore;
 use autumn_web::feature_flags::pg::PgFlagStore;
+use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
@@ -35,9 +36,7 @@ async fn setup_pg_store() -> (PgFlagStore, testcontainers::ContainerAsync<Postgr
 
     // Run the migration on a synchronous connection (PgFlagStore uses sync diesel).
     let mut conn = PgConnection::establish(&url).expect("db connection");
-    diesel::sql_query(MIGRATION_SQL)
-        .execute(&mut conn)
-        .expect("migration");
+    conn.batch_execute(MIGRATION_SQL).expect("migration");
 
     // Use TTL=0 so every test reads from the DB, not the cache.
     let store = PgFlagStore::with_cache_ttl(&url, Duration::ZERO);
@@ -168,9 +167,7 @@ async fn pg_store_cache_hit_avoids_second_db_call() {
     let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
 
     let mut conn = PgConnection::establish(&url).expect("conn");
-    diesel::sql_query(MIGRATION_SQL)
-        .execute(&mut conn)
-        .expect("migration");
+    conn.batch_execute(MIGRATION_SQL).expect("migration");
 
     // Use a 60-second TTL so reads populate the cache.
     let store = PgFlagStore::with_cache_ttl(&url, Duration::from_secs(60));
