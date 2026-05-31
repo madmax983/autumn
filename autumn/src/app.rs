@@ -7920,27 +7920,28 @@ mod tests {
     }
 }
 
-
 #[allow(clippy::too_many_arguments)]
 fn setup_state_and_extensions(
     config: &crate::config::AutumnConfig,
-    #[cfg(feature = "db")]
-    pool: Option<&crate::db::DatabaseTopology>,
-    #[cfg(feature = "ws")]
-    channels_backend: Option<std::sync::Arc<dyn crate::channels::ChannelsBackend>>,
-    #[cfg(feature = "mail")]
-    mail_interceptor: Option<std::sync::Arc<dyn crate::interceptor::MailInterceptor>>,
+    #[cfg(feature = "db")] pool: Option<&crate::db::DatabaseTopology>,
+    #[cfg(feature = "ws")] channels_backend: Option<
+        std::sync::Arc<dyn crate::channels::ChannelsBackend>,
+    >,
+    #[cfg(feature = "mail")] mail_interceptor: Option<
+        std::sync::Arc<dyn crate::interceptor::MailInterceptor>,
+    >,
     job_interceptor: Option<std::sync::Arc<dyn crate::interceptor::JobInterceptor>>,
-    #[cfg(feature = "db")]
-    db_interceptor: Option<std::sync::Arc<dyn crate::interceptor::DbConnectionInterceptor>>,
-    #[cfg(feature = "ws")]
-    channels_interceptor: Option<std::sync::Arc<dyn crate::interceptor::ChannelsInterceptor>>,
-    #[cfg(feature = "oauth2")]
-    http_interceptor: Option<std::sync::Arc<dyn crate::interceptor::HttpInterceptor>>,
-    #[cfg(feature = "db")]
-    replica_migration_check: Option<(String, String)>,
-    #[cfg(feature = "db")]
-    replica_readiness: Option<crate::migrate::ReplicaMigrationReadiness>,
+    #[cfg(feature = "db")] db_interceptor: Option<
+        std::sync::Arc<dyn crate::interceptor::DbConnectionInterceptor>,
+    >,
+    #[cfg(feature = "ws")] channels_interceptor: Option<
+        std::sync::Arc<dyn crate::interceptor::ChannelsInterceptor>,
+    >,
+    #[cfg(feature = "oauth2")] http_interceptor: Option<
+        std::sync::Arc<dyn crate::interceptor::HttpInterceptor>,
+    >,
+    #[cfg(feature = "db")] replica_migration_check: Option<(String, String)>,
+    #[cfg(feature = "db")] replica_readiness: Option<crate::migrate::ReplicaMigrationReadiness>,
     cache_backend: Option<std::sync::Arc<dyn crate::cache::Cache>>,
 ) -> AppState {
     let mut state = build_state(
