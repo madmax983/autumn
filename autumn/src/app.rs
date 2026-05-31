@@ -3111,8 +3111,11 @@ async fn execute_fixed_delay_task(
     coordinator: Arc<dyn crate::scheduler::SchedulerCoordinator>,
     lease_ttl: std::time::Duration,
 ) {
-    let tick_key =
-        crate::scheduler::fixed_delay_tick_key(&name, delay, crate::scheduler::now_unix_duration());
+    let tick_key = crate::scheduler::fixed_delay_tick_key(
+        &name,
+        delay,
+        crate::time::clock_unix_duration(state.clock()),
+    );
     let lease = match coordinator
         .try_acquire(&name, &tick_key, coordination)
         .await

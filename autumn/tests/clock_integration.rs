@@ -124,8 +124,8 @@ async fn app_without_custom_clock_uses_real_wall_clock() {
     assert!(diff < 5, "system clock diff should be < 5s, got {diff}s");
 }
 
-/// AC-4: `advance_clock` is a no-op when the app uses a FixedClock
-/// (FixedClock cannot be advanced — that's by design).
+/// AC-4: `advance_clock` is a no-op when the app uses a `FixedClock`
+/// (`FixedClock` cannot be advanced — that's by design).
 #[tokio::test]
 async fn advance_clock_with_fixed_clock_is_noop() {
     let pinned = Utc.with_ymd_and_hms(2025, 3, 1, 0, 0, 0).unwrap();
@@ -173,7 +173,10 @@ async fn scheduler_tick_key_is_deterministic_with_clock() {
         Duration::from_secs(60),
         Duration::from_secs(secs + 59),
     );
-    assert_eq!(tick_key, tick_key_before_flip, "within interval → same bucket");
+    assert_eq!(
+        tick_key, tick_key_before_flip,
+        "within interval → same bucket"
+    );
 
     // Advancing by exactly one interval flips to the next bucket.
     let tick_key_after_flip = autumn_web::scheduler::fixed_delay_tick_key(
@@ -181,7 +184,10 @@ async fn scheduler_tick_key_is_deterministic_with_clock() {
         Duration::from_secs(60),
         Duration::from_secs(secs + 60),
     );
-    assert_ne!(tick_key, tick_key_after_flip, "one interval later → new bucket");
+    assert_ne!(
+        tick_key, tick_key_after_flip,
+        "one interval later → new bucket"
+    );
 }
 
 /// AC-5 (signed URL): `verify_with_now` uses the injected clock's unix time.

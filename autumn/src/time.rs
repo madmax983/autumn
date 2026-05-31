@@ -199,7 +199,10 @@ impl TickingClock {
     /// Sub-millisecond durations are truncated to zero (chrono's minimum resolution
     /// is microseconds). This method never panics.
     pub fn advance(&self, duration: std::time::Duration) {
-        let mut guard = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Ok(delta) = chrono::Duration::from_std(duration) {
             *guard += delta;
         }
@@ -208,7 +211,10 @@ impl TickingClock {
 
 impl ClockSource for TickingClock {
     fn now(&self) -> DateTime<Utc> {
-        *self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -226,9 +232,10 @@ pub fn clock_unix_secs(clock: &dyn ClockSource) -> u64 {
 /// Compute the elapsed duration since the Unix epoch from the given clock.
 #[must_use]
 pub fn clock_unix_duration(clock: &dyn ClockSource) -> std::time::Duration {
-    let ts = clock.now().timestamp();
+    let now = clock.now();
+    let ts = now.timestamp();
     if ts >= 0 {
-        std::time::Duration::from_secs(ts.cast_unsigned())
+        std::time::Duration::new(ts.cast_unsigned(), now.timestamp_subsec_nanos())
     } else {
         std::time::Duration::ZERO
     }
@@ -246,7 +253,10 @@ mod tests {
         let clock = SystemClock;
         let a = clock.now();
         let b = Utc::now();
-        assert!((b - a).num_seconds().abs() < 1, "SystemClock should be within 1s of Utc::now()");
+        assert!(
+            (b - a).num_seconds().abs() < 1,
+            "SystemClock should be within 1s of Utc::now()"
+        );
     }
 
     #[test]
@@ -287,7 +297,7 @@ mod tests {
         let pinned = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
         let clock = FixedClock::at(pinned);
         let secs = clock_unix_secs(&clock);
-        assert_eq!(secs, pinned.timestamp() as u64);
+        assert_eq!(secs, pinned.timestamp().cast_unsigned());
     }
 
     #[test]
