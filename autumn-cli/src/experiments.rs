@@ -63,7 +63,8 @@ const STATUS_SQL: &str = "SELECT name, description, state, variants, winner, \
     FROM autumn_experiments WHERE name = :'name';";
 
 const SET_WEIGHTS_SQL: &str = "BEGIN; \
-SELECT 1/(SELECT COUNT(*)::int FROM autumn_experiments WHERE name = :'name') AS exists_check; \
+SELECT 1/(SELECT COUNT(*)::int FROM autumn_experiments \
+    WHERE name = :'name' AND state NOT IN ('concluded', 'archived')) AS exists_check; \
 UPDATE autumn_experiments SET variants = :'variants'::jsonb, updated_at = NOW() \
     WHERE name = :'name'; \
 INSERT INTO autumn_experiment_changes (experiment, mutation, actor) \
@@ -74,7 +75,7 @@ const CONCLUDE_SQL: &str = "BEGIN; \
 SELECT 1/( \
     SELECT COUNT(*)::int FROM autumn_experiments, \
     jsonb_array_elements(variants::jsonb) v \
-    WHERE name = :'name' AND v->>'name' = :'winner' \
+    WHERE name = :'name' AND state != 'archived' AND v->>'name' = :'winner' \
 ) AS winner_check; \
 UPDATE autumn_experiments SET state = 'concluded', winner = :'winner', updated_at = NOW() \
     WHERE name = :'name'; \
@@ -294,6 +295,22 @@ mod tests {
         assert!(
             OVERRIDE_SQL.contains("jsonb_array_elements"),
             "override SQL must check variant against variants: {OVERRIDE_SQL}"
+        );
+    }
+
+    #[test]
+    fn set_weights_sql_guards_non_editable_states() {
+        assert!(
+            SET_WEIGHTS_SQL.contains("concluded") && SET_WEIGHTS_SQL.contains("archived"),
+            "set_weights SQL must reject concluded and archived experiments: {SET_WEIGHTS_SQL}"
+        );
+    }
+
+    #[test]
+    fn conclude_sql_guards_against_archived() {
+        assert!(
+            CONCLUDE_SQL.contains("archived"),
+            "conclude SQL must reject archived experiments: {CONCLUDE_SQL}"
         );
     }
 

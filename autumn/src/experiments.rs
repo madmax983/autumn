@@ -1039,11 +1039,14 @@ impl ExperimentService {
         }
 
         // Check for staff/QA override (takes precedence over sticky).
+        // Skip stale overrides whose variant was removed from the experiment config.
         if let Some(override_variant) = self.store.get_override(experiment, actor)? {
-            let sticky = Assignment::new(experiment, actor, &override_variant, true);
-            self.store.record_assignment(sticky)?;
-            self.emit_exposure(experiment, &override_variant, actor, request_id, true);
-            return Ok(override_variant);
+            if config.variants.iter().any(|v| v.name == override_variant) {
+                let sticky = Assignment::new(experiment, actor, &override_variant, true);
+                self.store.record_assignment(sticky)?;
+                self.emit_exposure(experiment, &override_variant, actor, request_id, true);
+                return Ok(override_variant);
+            }
         }
 
         // Return existing sticky assignment (emit exposure each call).
