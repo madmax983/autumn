@@ -467,8 +467,13 @@ pub trait ExperimentStore: Send + Sync + 'static {
     ///
     /// # Errors
     ///
+    /// Returns the variant that was persisted (the existing row's variant on
+    /// conflict, or the newly-inserted variant on first write). Callers must
+    /// use this return value so that concurrent first-writers agree on the
+    /// same sticky bucket.
+    ///
     /// Returns [`ExperimentStoreError`] on backend failure.
-    fn record_assignment(&self, assignment: Assignment) -> Result<(), ExperimentStoreError>;
+    fn record_assignment(&self, assignment: Assignment) -> Result<String, ExperimentStoreError>;
 
     /// Return the override variant name for `(experiment, actor)`, or `None`.
     ///
@@ -555,7 +560,7 @@ impl<T: ExperimentStore> ExperimentStore for Arc<T> {
     ) -> Result<Option<Assignment>, ExperimentStoreError> {
         (**self).get_assignment(experiment, actor)
     }
-    fn record_assignment(&self, assignment: Assignment) -> Result<(), ExperimentStoreError> {
+    fn record_assignment(&self, assignment: Assignment) -> Result<String, ExperimentStoreError> {
         (**self).record_assignment(assignment)
     }
     fn get_override(
@@ -709,14 +714,15 @@ impl ExperimentStore for InMemoryExperimentStore {
             .cloned())
     }
 
-    fn record_assignment(&self, assignment: Assignment) -> Result<(), ExperimentStoreError> {
+    fn record_assignment(&self, assignment: Assignment) -> Result<String, ExperimentStoreError> {
+        let variant = assignment.variant.clone();
         let key = (assignment.experiment.clone(), assignment.actor.clone());
         self.inner
             .write()
             .unwrap()
             .assignments
             .insert(key, assignment);
-        Ok(())
+        Ok(variant)
     }
 
     fn get_override(
@@ -1070,12 +1076,13 @@ impl ExperimentService {
             .ok_or_else(|| ExperimentError::NoVariant(experiment.to_owned()))?
             .to_owned();
 
-        // Store sticky assignment and emit exposure.
+        // Store sticky assignment. Use the persisted variant (the winner of any
+        // concurrent first-write race), not the locally-computed one.
         let assignment = Assignment::new(experiment, actor, &variant_name, false);
-        self.store.record_assignment(assignment)?;
-        self.emit_exposure(experiment, &variant_name, actor, request_id, false);
+        let persisted_variant = self.store.record_assignment(assignment)?;
+        self.emit_exposure(experiment, &persisted_variant, actor, request_id, false);
 
-        Ok(variant_name)
+        Ok(persisted_variant)
     }
 
     fn emit_exposure(
@@ -1103,6 +1110,22 @@ impl ExperimentService {
     /// Returns [`ExperimentError::Store`] on backend failure.
     pub fn create(&self, config: ExperimentConfig) -> Result<(), ExperimentError> {
         validate_variants(&config.variants)?;
+        if config.state == ExperimentState::Concluded {
+            let winner = config
+                .winner
+                .as_deref()
+                .filter(|w| !w.trim().is_empty())
+                .ok_or_else(|| {
+                    ExperimentError::NoVariant(
+                        "concluded experiment requires a non-empty winner".into(),
+                    )
+                })?;
+            if !config.variants.iter().any(|v| v.name == winner) {
+                return Err(ExperimentError::NoVariant(format!(
+                    "'{winner}' is not a configured variant"
+                )));
+            }
+        }
         self.store.upsert(config)?;
         Ok(())
     }
@@ -1333,7 +1356,20 @@ impl axum::extract::FromRequestParts<crate::AppState> for Experiments {
             let session_key = state.auth_session_key();
             match session.get(session_key).await {
                 Some(uid) => Some(uid),
-                None => Some(session.id().await),
+                None => {
+                    // Use or create a stable per-session anonymous actor. We must
+                    // insert into the session (marking it dirty) so the framework
+                    // sets a cookie and the ID persists across requests; a bare
+                    // session.id() call does not mark the session dirty.
+                    const ANON_KEY: &str = "_autumn_anon_actor";
+                    if let Some(existing) = session.get(ANON_KEY).await {
+                        Some(existing)
+                    } else {
+                        let id = session.id().await;
+                        session.insert(ANON_KEY, &id).await;
+                        Some(id)
+                    }
+                }
             }
         } else {
             None
@@ -1746,21 +1782,30 @@ pub mod pg {
             .map_err(|e| ExperimentStoreError::Backend(e.to_string()))
         }
 
-        fn record_assignment(&self, assignment: Assignment) -> Result<(), ExperimentStoreError> {
+        fn record_assignment(
+            &self,
+            assignment: Assignment,
+        ) -> Result<String, ExperimentStoreError> {
             let mut conn = self.connect()?;
+            // The no-op DO UPDATE (setting each column to its existing value) forces
+            // Postgres to return a row even on conflict, giving us the first-writer's
+            // variant so concurrent replicas agree on the same sticky bucket.
             diesel::sql_query(
                 "INSERT INTO autumn_experiment_assignments \
                      (experiment, actor, variant, is_override) \
                  VALUES ($1, $2, $3, $4) \
-                 ON CONFLICT (experiment, actor) DO NOTHING",
+                 ON CONFLICT (experiment, actor) DO UPDATE \
+                     SET variant = autumn_experiment_assignments.variant, \
+                         is_override = autumn_experiment_assignments.is_override \
+                 RETURNING variant",
             )
             .bind::<diesel::sql_types::Text, _>(&assignment.experiment)
             .bind::<diesel::sql_types::Text, _>(&assignment.actor)
             .bind::<diesel::sql_types::Text, _>(&assignment.variant)
             .bind::<diesel::sql_types::Bool, _>(assignment.is_override)
-            .execute(&mut conn)
-            .map_err(|e| ExperimentStoreError::Backend(e.to_string()))?;
-            Ok(())
+            .get_result::<VariantNameRow>(&mut conn)
+            .map(|r| r.variant)
+            .map_err(|e| ExperimentStoreError::Backend(e.to_string()))
         }
 
         fn get_override(

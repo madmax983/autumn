@@ -179,6 +179,7 @@ pub fn run_override(opts: &OverrideOptions) {
 /// Returns an error message if any pair is malformed.
 fn parse_weights_to_json(weights: &str) -> Result<String, String> {
     let mut parts: Vec<serde_json::Value> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     for raw in weights.split(',') {
         let pair = raw.trim();
         let mut it = pair.splitn(2, '=');
@@ -187,6 +188,9 @@ fn parse_weights_to_json(weights: &str) -> Result<String, String> {
             return Err(format!(
                 "malformed weight spec {pair:?}: variant name is empty"
             ));
+        }
+        if !seen.insert(name) {
+            return Err(format!("duplicate variant name {name:?} in weight spec"));
         }
         let weight_str = it
             .next()

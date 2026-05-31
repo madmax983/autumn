@@ -289,6 +289,7 @@ impl AdminModel for ExperimentAdminModel {
         id: i64,
         data: Value,
     ) -> AdminFuture<'_, Value> {
+        use diesel::prelude::*;
         use diesel_async::RunQueryDsl;
 
         let pool = pool.clone();
@@ -297,6 +298,23 @@ impl AdminModel for ExperimentAdminModel {
                 .get()
                 .await
                 .map_err(|e| AdminError::Database(e.to_string()))?;
+
+            // Archived is a terminal state — reject any edit that tries to leave it.
+            let current_state: Option<String> = diesel::sql_query(
+                "SELECT state::text AS state FROM autumn_experiments WHERE id = $1",
+            )
+            .bind::<diesel::sql_types::BigInt, _>(id)
+            .get_result::<StateRow>(&mut conn)
+            .await
+            .optional()
+            .map_err(|e| AdminError::Database(e.to_string()))?
+            .map(|r| r.state);
+
+            if current_state.as_deref() == Some("archived") {
+                return Err(AdminError::Validation(
+                    "archived experiments cannot be edited".into(),
+                ));
+            }
 
             // name is read-only after creation; we read it only to satisfy field validation
             // and for display — the SQL does not allow renaming an experiment.
@@ -505,8 +523,9 @@ fn validate_variants_json(raw: &str) -> Result<String, AdminError> {
     }
     match serde_json::from_str::<Vec<serde_json::Value>>(trimmed) {
         Ok(arr) => {
+            let mut seen_names = std::collections::HashSet::new();
             for (i, v) in arr.iter().enumerate() {
-                match v.get("name").and_then(|n| n.as_str()) {
+                let name_str = match v.get("name").and_then(|n| n.as_str()) {
                     None => {
                         return Err(AdminError::Validation(format!(
                             "variants[{i}].name must be a string"
@@ -517,7 +536,12 @@ fn validate_variants_json(raw: &str) -> Result<String, AdminError> {
                             "variants[{i}].name must not be empty"
                         )));
                     }
-                    _ => {}
+                    Some(n) => n,
+                };
+                if !seen_names.insert(name_str) {
+                    return Err(AdminError::Validation(format!(
+                        "duplicate variant name '{name_str}' at variants[{i}]"
+                    )));
                 }
                 match v.get("weight").and_then(Value::as_u64) {
                     None => {
@@ -554,6 +578,12 @@ struct CountRow {
 struct NameRow {
     #[diesel(sql_type = diesel::sql_types::Text)]
     name: String,
+}
+
+#[derive(diesel::QueryableByName)]
+struct StateRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    state: String,
 }
 
 /// Row returned from list queries (no `exclusion_group` for brevity in list view).
