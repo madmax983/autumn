@@ -177,7 +177,6 @@ pub mod markdown;
 pub mod scheduler;
 pub mod security;
 pub mod session;
-pub mod time;
 #[cfg(feature = "redis")]
 pub(crate) mod session_redis;
 pub mod sse;
@@ -186,6 +185,7 @@ pub mod static_gen;
 #[cfg(feature = "storage")]
 pub mod storage;
 pub mod tenancy;
+pub mod time;
 
 pub mod feature_flags;
 pub mod form;

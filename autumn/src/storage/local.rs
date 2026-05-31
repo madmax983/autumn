@@ -550,7 +550,14 @@ pub fn verify_upload(
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    verify_upload_with_now(signing_key, blob_key, content_type, expires_at, signature, now)
+    verify_upload_with_now(
+        signing_key,
+        blob_key,
+        content_type,
+        expires_at,
+        signature,
+        now,
+    )
 }
 
 /// Clock-injectable variant of [`verify_upload`].
@@ -593,7 +600,15 @@ pub(crate) fn verify_upload_with_rotation(
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    verify_upload_rotation_with_now(current, previous, blob_key, content_type, expires_at, signature, now)
+    verify_upload_rotation_with_now(
+        current,
+        previous,
+        blob_key,
+        content_type,
+        expires_at,
+        signature,
+        now,
+    )
 }
 
 /// Clock-injectable variant of [`verify_upload_with_rotation`].

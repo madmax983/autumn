@@ -690,9 +690,9 @@ impl TestApp {
                 .unwrap_or(self.config.security.forbidden_response),
             auth_session_key: self.config.auth.session_key.clone(),
             shared_cache: None,
-            clock: self.clock.unwrap_or_else(|| {
-                std::sync::Arc::new(crate::time::SystemClock)
-            }),
+            clock: self
+                .clock
+                .unwrap_or_else(|| std::sync::Arc::new(crate::time::SystemClock)),
         };
 
         for register in self.policy_registrations {
