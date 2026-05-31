@@ -1636,13 +1636,7 @@ pub mod pg {
                      INSERT INTO autumn_experiments \
                          (name, description, state, variants, winner, exclusion_group) \
                      VALUES ($1, $2, $3::autumn_experiment_state, $4::jsonb, $5, $6) \
-                     ON CONFLICT (name) DO UPDATE \
-                         SET description = EXCLUDED.description, \
-                             state = EXCLUDED.state, \
-                             variants = EXCLUDED.variants, \
-                             winner = EXCLUDED.winner, \
-                             exclusion_group = EXCLUDED.exclusion_group, \
-                             updated_at = NOW() \
+                     ON CONFLICT (name) DO NOTHING \
                      RETURNING name \
                  ) \
                  INSERT INTO autumn_experiment_changes (experiment, mutation, actor) \

@@ -71,7 +71,11 @@ INSERT INTO autumn_experiment_changes (experiment, mutation, actor) \
 COMMIT;";
 
 const CONCLUDE_SQL: &str = "BEGIN; \
-SELECT 1/(SELECT COUNT(*)::int FROM autumn_experiments WHERE name = :'name') AS exists_check; \
+SELECT 1/( \
+    SELECT COUNT(*)::int FROM autumn_experiments, \
+    jsonb_array_elements(variants::jsonb) v \
+    WHERE name = :'name' AND v->>'name' = :'winner' \
+) AS winner_check; \
 UPDATE autumn_experiments SET state = 'concluded', winner = :'winner', updated_at = NOW() \
     WHERE name = :'name'; \
 INSERT INTO autumn_experiment_changes (experiment, mutation, actor) \
@@ -79,7 +83,11 @@ INSERT INTO autumn_experiment_changes (experiment, mutation, actor) \
 COMMIT;";
 
 const OVERRIDE_SQL: &str = "BEGIN; \
-SELECT 1/(SELECT COUNT(*)::int FROM autumn_experiments WHERE name = :'name') AS exists_check; \
+SELECT 1/( \
+    SELECT COUNT(*)::int FROM autumn_experiments, \
+    jsonb_array_elements(variants::jsonb) v \
+    WHERE name = :'name' AND v->>'name' = :'variant' \
+) AS variant_check; \
 INSERT INTO autumn_experiment_overrides (experiment, actor, variant) \
     VALUES (:'name', :'actor_id', :'variant') \
     ON CONFLICT (experiment, actor) DO UPDATE SET variant = :'variant'; \
@@ -267,6 +275,22 @@ mod tests {
                 "mutation SQL must have an existence check: {sql}"
             );
         }
+    }
+
+    #[test]
+    fn conclude_sql_validates_winner_in_variants() {
+        assert!(
+            CONCLUDE_SQL.contains("jsonb_array_elements"),
+            "conclude SQL must check winner against variants: {CONCLUDE_SQL}"
+        );
+    }
+
+    #[test]
+    fn override_sql_validates_variant_in_variants() {
+        assert!(
+            OVERRIDE_SQL.contains("jsonb_array_elements"),
+            "override SQL must check variant against variants: {OVERRIDE_SQL}"
+        );
     }
 
     #[test]

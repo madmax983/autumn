@@ -211,13 +211,36 @@ impl AdminModel for ExperimentAdminModel {
             let description = data.get("description").and_then(Value::as_str);
             let state = data.get("state").and_then(Value::as_str).unwrap_or("draft");
             let variants = validate_variants_json(&extract_variants_str(&data))?;
-            let exclusion_group = data.get("exclusion_group").and_then(Value::as_str);
+            let winner = data.get("winner").and_then(Value::as_str);
+            let exclusion_group = data
+                .get("exclusion_group")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty());
+
+            // Concluding requires a non-empty winner that is a configured variant.
+            if state == "concluded" {
+                let w = winner.filter(|s| !s.trim().is_empty()).ok_or_else(|| {
+                    AdminError::Validation(
+                        "a concluded experiment requires a non-empty winner".into(),
+                    )
+                })?;
+                let arr: Vec<serde_json::Value> =
+                    serde_json::from_str(&variants).unwrap_or_default();
+                if !arr
+                    .iter()
+                    .any(|v| v.get("name").and_then(Value::as_str) == Some(w))
+                {
+                    return Err(AdminError::Validation(format!(
+                        "winner '{w}' is not a configured variant"
+                    )));
+                }
+            }
 
             let row = diesel::sql_query(
                 "WITH inserted AS ( \
                      INSERT INTO autumn_experiments \
-                         (name, description, state, variants, exclusion_group) \
-                     VALUES ($1, $2, $3::autumn_experiment_state, $4::jsonb, $5) \
+                         (name, description, state, variants, winner, exclusion_group) \
+                     VALUES ($1, $2, $3::autumn_experiment_state, $4::jsonb, $5, $6) \
                      RETURNING id, name, description, state::text AS state, \
                                variants::text AS variants, winner, updated_at \
                  ), \
@@ -234,6 +257,9 @@ impl AdminModel for ExperimentAdminModel {
             )
             .bind::<diesel::sql_types::Text, _>(state)
             .bind::<diesel::sql_types::Text, _>(variants)
+            .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(
+                winner.map(str::to_owned),
+            )
             .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(
                 exclusion_group.map(str::to_owned),
             )
@@ -297,7 +323,10 @@ impl AdminModel for ExperimentAdminModel {
                     )));
                 }
             }
-            let exclusion_group = data.get("exclusion_group").and_then(Value::as_str);
+            let exclusion_group = data
+                .get("exclusion_group")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty());
 
             let row = diesel::sql_query(
                 "WITH updated AS ( \
