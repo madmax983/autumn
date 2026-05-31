@@ -186,9 +186,14 @@ pub fn plan_auth_with_options(
     let user_table = pluralize(&snake_name);
 
     // ── oauth_identities migration ─────────────────────────────────────────
+    // Increment the timestamp by one second so Diesel never sees two migrations
+    // with the same version number.
+    let oauth_ts_str: String = timestamp
+        .parse::<i64>()
+        .map_or_else(|_| format!("{timestamp}1"), |t| (t + 1).to_string());
     let mig_dir = project_root
         .join("migrations")
-        .join(format!("{timestamp}_create_oauth_identities"));
+        .join(format!("{oauth_ts_str}_create_oauth_identities"));
     plan.create(
         mig_dir.join("up.sql"),
         render_oauth_migration_up(&user_table),
@@ -202,12 +207,12 @@ pub fn plan_auth_with_options(
         render_oauth_routes_file(&pascal_name, &snake_name, &user_table, &oauth.providers),
     );
 
-    // Add `pub mod oauth;` to src/routes/mod.rs
+    // Add `pub mod oauth;` to src/routes/mod.rs — use the base plan's already-modified
+    // content so the base `pub mod auth;` declaration is not overwritten.
     let route_mod_path = routes_dir.join("mod.rs");
-    let route_mod_existing = read_or_empty(&route_mod_path);
-    // The base plan already modifies this file; we need to append our module declaration.
-    // Find the plan action for mod.rs and update it, or add a new one.
-    let updated_route_mod = add_mod_declaration(&route_mod_existing, "oauth");
+    let route_mod_base = find_plan_content_for_path(&plan, &route_mod_path)
+        .unwrap_or_else(|| read_or_empty(&route_mod_path));
+    let updated_route_mod = add_mod_declaration(&route_mod_base, "oauth");
     plan.modify(route_mod_path, updated_route_mod);
 
     // ── Register oauth routes in src/main.rs ───────────────────────────────
@@ -1367,7 +1372,8 @@ fn render_oauth_routes_file(
 
 use autumn_web::auth::{{OAuth2Callback, OidcIdentity, oauth2_authorize_url, oauth2_finish_login}};
 use autumn_web::prelude::*;
-use axum::extract::{{Path, Query, State}};
+use autumn_web::{{get, AppState, State}};
+use axum::extract::{{Path, Query}};
 use axum::response::{{IntoResponse, Redirect}};
 use tracing::warn;
 
@@ -1378,6 +1384,7 @@ const SUPPORTED_PROVIDERS: &[&str] = &[{provider_list}];
 ///
 /// State and nonce are stored in the session for CSRF protection.
 /// PKCE (S256) code_challenge is appended automatically by the framework.
+#[get("/auth/{{provider}}/redirect")]
 pub async fn oauth_redirect(
     Path(provider_name): Path<String>,
     State(state): State<AppState>,
@@ -1387,7 +1394,7 @@ pub async fn oauth_redirect(
         return Redirect::to("/login?error=unknown_provider").into_response();
     }}
 
-    let auth_cfg = state.config().auth.clone();
+    let auth_cfg = state.config().auth;
     let Some(provider) = auth_cfg.oauth2.providers.get(&provider_name) else {{
         warn!(provider = %provider_name, "oauth provider not configured in autumn.toml");
         return Redirect::to("/login?error=provider_not_configured").into_response();
@@ -1404,9 +1411,13 @@ pub async fn oauth_redirect(
 
 /// Handle the OAuth2 callback: exchange the code, create or link a local account.
 ///
-/// On success the user is logged in and redirected to the account page.
-/// A missing/mismatched state returns a non-revealing error redirect without
-/// logging the offending values.
+/// On success the user is redirected to `/account`. A missing or mismatched state
+/// returns a non-revealing error redirect without logging the offending values.
+///
+/// **Important:** `oauth2_finish_login` does NOT set the application session key.
+/// You must resolve (or create) the local {pascal_name} row and call
+/// `session.insert(&auth_cfg.session_key, local_user_id)` before redirecting.
+#[get("/auth/{{provider}}/callback")]
 pub async fn oauth_callback(
     Path(provider_name): Path<String>,
     Query(callback): Query<OAuth2Callback>,
@@ -1417,7 +1428,7 @@ pub async fn oauth_callback(
         return Redirect::to("/login?error=unknown_provider").into_response();
     }}
 
-    let auth_cfg = state.config().auth.clone();
+    let auth_cfg = state.config().auth;
     let Some(provider) = auth_cfg.oauth2.providers.get(&provider_name) else {{
         warn!(provider = %provider_name, "oauth provider not configured in autumn.toml");
         return Redirect::to("/login?error=provider_not_configured").into_response();
@@ -1425,7 +1436,6 @@ pub async fn oauth_callback(
 
     let identity: OidcIdentity = match oauth2_finish_login(
         &session,
-        &auth_cfg.session_key,
         &provider_name,
         provider,
         &callback,
@@ -1439,13 +1449,22 @@ pub async fn oauth_callback(
         }}
     }};
 
-    // Link or create a local {pascal_name} record.
-    // TODO: query the `oauth_identities` table by (provider, subject).
-    //       If found, update the session with the linked user_id.
-    //       If not found, follow the configured OAuthLinkingPolicy:
-    //         CreateAccount → insert a new {pascal_name} + oauth_identity row.
-    //         RequireLocalSignupFirst → redirect to /signup?linked=true.
-    let _ = identity; // remove once linked to DB
+    // TODO: resolve or create a local {pascal_name} record, then set the session.
+    //
+    // Example (fill in your actual DB query):
+    //
+    //   let local_user_id: i64 = link_or_create_{snake_name}(
+    //       &mut db,
+    //       &identity,          // OidcIdentity {{ subject, email, name, … }}
+    //       &provider_name,     // e.g. "github"
+    //       &auth_cfg,          // carries oauth_linking_policy
+    //   ).await?;
+    //
+    //   session.insert(&auth_cfg.session_key, local_user_id).await;
+    //
+    // Until the above is implemented the user will NOT be logged in after the OAuth
+    // callback — that is intentional to avoid authenticating without a local account.
+    let _ = identity;
     let _ = user_table_placeholder_{snake_name}();
 
     Redirect::to("/account").into_response()
@@ -1456,10 +1475,6 @@ fn user_table_placeholder_{snake_name}() -> &'static str {{
     "{user_table}"
 }}
 "#,
-        provider_list = provider_list,
-        pascal_name = pascal_name,
-        snake_name = snake_name,
-        user_table = user_table,
     )
 }
 
@@ -1583,8 +1598,6 @@ Re-authentication with the same `(provider, subject)` pair links to the existing
 account. A second local user trying to claim the same identity returns an error and
 never silently merges accounts.
 "#,
-        provider_list,
-        provider_config_examples,
         first_provider = providers.first().map_or("github", String::as_str),
     )
 }
@@ -2141,10 +2154,10 @@ mod tests {
         let plan = plan_auth_with_options(tmp.path(), "User", "20260508000000", &oauth).unwrap();
         plan.execute(Flags::default()).unwrap();
 
-        // Find the oauth_identities up.sql
+        // Find the oauth_identities up.sql — timestamp is base+1 to avoid Diesel conflicts.
         let mig_dir = tmp
             .path()
-            .join("migrations/20260508000000_create_oauth_identities");
+            .join("migrations/20260508000001_create_oauth_identities");
         let up = fs::read_to_string(mig_dir.join("up.sql")).unwrap();
         assert!(
             up.contains("CREATE TABLE oauth_identities"),
@@ -2278,6 +2291,83 @@ mod tests {
         assert!(
             main.contains("routes::oauth"),
             "main.rs must register oauth routes: {main}"
+        );
+    }
+
+    #[test]
+    fn oauth_migration_has_distinct_timestamp_from_base_auth_migration() {
+        let tmp = project_with_main();
+        let oauth = AuthOAuthOptions {
+            providers: vec!["github".to_owned()],
+        };
+        let plan = plan_auth_with_options(tmp.path(), "User", "20260508000000", &oauth).unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let mig_entries: Vec<_> = fs::read_dir(tmp.path().join("migrations"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        let auth_mig = mig_entries.iter().find(|n| n.contains("create_users") || n.contains("create_accounts"));
+        let oauth_mig = mig_entries.iter().find(|n| n.contains("oauth_identities"));
+        if let (Some(a), Some(o)) = (auth_mig, oauth_mig) {
+            let a_ts = a.split('_').next().unwrap_or("");
+            let o_ts = o.split('_').next().unwrap_or("");
+            assert_ne!(
+                a_ts, o_ts,
+                "oauth_identities migration must have a different timestamp than the auth migration"
+            );
+        }
+    }
+
+    #[test]
+    fn oauth_mod_rs_preserves_base_auth_module_declaration() {
+        let tmp = project_with_main();
+        let oauth = AuthOAuthOptions {
+            providers: vec!["github".to_owned()],
+        };
+        let plan = plan_auth_with_options(tmp.path(), "User", "20260508000000", &oauth).unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let mod_rs = fs::read_to_string(tmp.path().join("src/routes/mod.rs")).unwrap();
+        assert!(
+            mod_rs.contains("pub mod auth;"),
+            "routes/mod.rs must keep pub mod auth: {mod_rs}"
+        );
+        assert!(
+            mod_rs.contains("pub mod oauth;"),
+            "routes/mod.rs must add pub mod oauth: {mod_rs}"
+        );
+    }
+
+    #[test]
+    fn oauth_handlers_have_route_macros() {
+        let tmp = project_with_main();
+        let oauth = AuthOAuthOptions {
+            providers: vec!["github".to_owned()],
+        };
+        let plan = plan_auth_with_options(tmp.path(), "User", "20260508000000", &oauth).unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/oauth.rs")).unwrap();
+        assert!(
+            routes.contains("#[get("),
+            "oauth handlers must have #[get(...)] route macros for routes! registration: {routes}"
+        );
+    }
+
+    #[test]
+    fn oauth_callback_does_not_set_session_key_before_account_link() {
+        let routes = render_oauth_routes_file("User", "user", "users", &["github".to_owned()]);
+        // The TODO comment may mention the call; verify the EXECUTABLE line is absent.
+        // Executable session.insert calls are not prefixed with "//" or "#".
+        let executable_insert = routes
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .any(|l| l.contains("session.insert(&auth_cfg.session_key"));
+        assert!(
+            !executable_insert,
+            "generated callback must not execute session.insert before account linking: {routes}"
         );
     }
 }

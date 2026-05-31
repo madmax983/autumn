@@ -26,11 +26,17 @@ supported_locales = ["en", "es"]
 [auth.oauth2.github]
 client_id     = ""
 client_secret = ""
+authorize_url = "https://github.com/login/oauth/authorize"
+token_url     = "https://github.com/login/oauth/access_token"
+userinfo_url  = "https://api.github.com/user"
 redirect_uri  = "http://localhost:3000/auth/oauth/github/callback"
 scope         = "read:user user:email"
 
 [auth.oauth2.google]
 client_id     = ""
 client_secret = ""
+authorize_url = "https://accounts.google.com/o/oauth2/v2/auth"
+token_url     = "https://oauth2.googleapis.com/token"
 redirect_uri  = "http://localhost:3000/auth/oauth/google/callback"
 scope         = "openid email profile"
+discovery_url = "https://accounts.google.com"

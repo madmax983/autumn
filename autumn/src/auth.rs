@@ -566,7 +566,9 @@ pub fn provider_preset(name: &str) -> Option<OAuth2ProviderConfig> {
             userinfo_url: None,
             redirect_uri: String::new(),
             scope: "openid profile email".into(),
-            issuer: None,
+            // The common-tenant issuer used for multi-tenant apps.  Single-tenant
+            // apps must override this with their specific tenant ID URL.
+            issuer: Some("https://login.microsoftonline.com/common/v2.0".into()),
             jwks_url: Some(
                 "https://login.microsoftonline.com/common/discovery/v2.0/keys".into(),
             ),
@@ -676,9 +678,10 @@ pub async fn oauth2_authorize_url(
 #[cfg(feature = "oauth2")]
 /// Exchange callback code for tokens, validate state/nonce, and return OIDC identity.
 ///
-/// On success this method rotates the session ID and writes:
-/// - `session_key` (OIDC `sub`)
-/// - `auth_provider` (provider key, like `github`)
+/// On success this method rotates the session ID (preventing session fixation) and
+/// writes `auth_provider` to the session. It does **not** set the application
+/// session key — callers are responsible for resolving or creating a local user
+/// account and then calling `session.insert(session_key, local_user_id)`.
 ///
 /// The PKCE `code_verifier` is read from the session (stored by
 /// [`oauth2_authorize_url`]) and included in the token exchange for every
@@ -690,7 +693,6 @@ pub async fn oauth2_authorize_url(
 /// fails, ID token/userinfo payloads are invalid, or identity extraction fails.
 pub async fn oauth2_finish_login(
     session: &crate::session::Session,
-    session_key: &str,
     provider_name: &str,
     provider: &OAuth2ProviderConfig,
     callback: &OAuth2Callback,
@@ -704,7 +706,7 @@ pub async fn oauth2_finish_login(
     let (claims, source) = load_identity_claims(provider, &token).await?;
     validate_oidc_nonce(session, provider_name, &claims, source).await?;
     let subject = extract_subject(&claims, source)?;
-    finalize_oauth2_session(session, session_key, provider_name, subject, claims).await
+    finalize_oauth2_session(session, provider_name, subject, claims).await
 }
 
 #[cfg(feature = "oauth2")]
@@ -844,12 +846,12 @@ async fn validate_oidc_nonce(
 #[cfg(feature = "oauth2")]
 async fn finalize_oauth2_session(
     session: &crate::session::Session,
-    session_key: &str,
     provider_name: &str,
     subject: String,
     claims: serde_json::Value,
 ) -> crate::AutumnResult<OidcIdentity> {
-    session.insert(session_key, subject.clone()).await;
+    // Write provider metadata only — callers set the application session key
+    // after resolving or creating the local user record.
     session.insert("auth_provider", provider_name).await;
     session.rotate_id().await;
     Ok(OidcIdentity {

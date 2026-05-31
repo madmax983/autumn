@@ -80,7 +80,6 @@ pub async fn oauth_callback(
 
     let identity = oauth2_finish_login(
         &session,
-        &auth_cfg.session_key,
         &provider_name,
         &provider,
         &callback,
@@ -91,8 +90,11 @@ pub async fn oauth_callback(
         AutumnError::bad_request_msg("OAuth2 login failed — check provider configuration")
     })?;
 
-    // TODO: look up or create user in `oauth_identities` + users tables,
-    // set the authenticated user in the session, then redirect to the account page.
+    // TODO: look up or create user in `oauth_identities` + users tables, then set
+    // the application session key before redirecting so the user is logged in.
+    // Example:
+    //   let local_user_id = link_or_create_user(&mut db, &identity, &provider_name).await?;
+    //   session.insert(&auth_cfg.session_key, local_user_id).await;
     // See docs/guide/oauth.md for the full account-linking implementation guide.
     let _ = identity;
 

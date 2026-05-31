@@ -481,7 +481,7 @@ async fn test_oauth_client(session: autumn_web::session::Session) -> &'static st
         state: state_val.to_string(),
     };
 
-    let _ = oauth2_finish_login(&session, "user_id", "github", &provider, &callback).await;
+    let _ = oauth2_finish_login(&session, "github", &provider, &callback).await;
 
     "ok"
 }

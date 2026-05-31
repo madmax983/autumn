@@ -1169,8 +1169,25 @@ fn read_autumn_toml_table() -> Option<toml::Table> {
         .and_then(|contents| toml::from_str::<toml::Table>(&contents).ok())
 }
 
-/// Extract `(provider_name, client_secret)` pairs from `[auth.oauth2.*]` in autumn.toml.
+/// Extract `(provider_name, effective_client_secret)` pairs from `[auth.oauth2.*]`.
+///
+/// The effective secret is the env var `AUTUMN_AUTH__OAUTH2__<UPPER_PROVIDER>__CLIENT_SECRET`
+/// when set and non-empty, falling back to the `client_secret` field in the TOML.
+/// This matches the env-override convention documented in `autumn doctor --strict`.
 fn resolve_oauth2_providers(table: Option<&toml::Table>) -> Vec<(String, String)> {
+    resolve_oauth2_providers_from_sources(
+        |key| std::env::var(key).ok().filter(|v| !v.is_empty()),
+        table,
+    )
+}
+
+fn resolve_oauth2_providers_from_sources<F>(
+    env_var: F,
+    table: Option<&toml::Table>,
+) -> Vec<(String, String)>
+where
+    F: Fn(&str) -> Option<String>,
+{
     table
         .and_then(|t| t.get("auth"))
         .and_then(toml::Value::as_table)
@@ -1180,13 +1197,18 @@ fn resolve_oauth2_providers(table: Option<&toml::Table>) -> Vec<(String, String)
             providers
                 .iter()
                 .map(|(name, val)| {
-                    let secret = val
+                    let toml_secret = val
                         .as_table()
                         .and_then(|t| t.get("client_secret"))
                         .and_then(toml::Value::as_str)
                         .unwrap_or("")
                         .to_owned();
-                    (name.clone(), secret)
+                    let env_key = format!(
+                        "AUTUMN_AUTH__OAUTH2__{}__CLIENT_SECRET",
+                        name.to_uppercase()
+                    );
+                    let effective_secret = env_var(&env_key).unwrap_or(toml_secret);
+                    (name.clone(), effective_secret)
                 })
                 .collect()
         })
@@ -2504,6 +2526,38 @@ foo = "bar"
             result.name.contains("oauth2") || result.name.contains("google"),
             "check name must identify the provider: {}",
             result.name
+        );
+    }
+
+    #[test]
+    fn resolve_oauth2_providers_prefers_env_var_over_empty_toml_secret() {
+        let toml: toml::Table = toml::from_str(
+            r#"
+[auth.oauth2.github]
+client_id = "cid"
+client_secret = ""
+authorize_url = "https://github.com/login/oauth/authorize"
+token_url = "https://github.com/login/oauth/access_token"
+redirect_uri = "http://localhost/callback"
+"#,
+        )
+        .unwrap();
+
+        let providers = resolve_oauth2_providers_from_sources(
+            |key| {
+                if key == "AUTUMN_AUTH__OAUTH2__GITHUB__CLIENT_SECRET" {
+                    Some("ghp_test_secret".to_owned())
+                } else {
+                    None
+                }
+            },
+            Some(&toml),
+        );
+
+        let (_, secret) = providers.into_iter().find(|(n, _)| n == "github").unwrap();
+        assert_eq!(
+            secret, "ghp_test_secret",
+            "env var must override empty TOML client_secret"
         );
     }
 }
