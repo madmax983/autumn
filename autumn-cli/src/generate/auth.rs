@@ -1490,45 +1490,45 @@ fn render_oauth_docs_file(providers: &[String]) -> String {
     let provider_config_examples = providers
         .iter()
         .map(|p| match p.as_str() {
-            "github" => format!(
-                r#"[auth.oauth2.github]
-client_id     = "${{AUTUMN_GITHUB_CLIENT_ID}}"
-client_secret = "${{AUTUMN_GITHUB_CLIENT_SECRET}}"
-authorize_url = "https://github.com/login/oauth/authorize"
-token_url     = "https://github.com/login/oauth/access_token"
-userinfo_url  = "https://api.github.com/user"
-redirect_uri  = "https://your-app.example.com/auth/oauth/github/callback"
-scope         = "read:user user:email"
-"#
-            ),
-            "google" => format!(
-                r#"[auth.oauth2.google]
-client_id     = "${{AUTUMN_GOOGLE_CLIENT_ID}}"
-client_secret = "${{AUTUMN_GOOGLE_CLIENT_SECRET}}"
-authorize_url = "https://accounts.google.com/o/oauth2/v2/auth"
-token_url     = "https://oauth2.googleapis.com/token"
-userinfo_url  = "https://openidconnect.googleapis.com/v1/userinfo"
-redirect_uri  = "https://your-app.example.com/auth/oauth/google/callback"
-scope         = "openid email profile"
-issuer        = "https://accounts.google.com"
-jwks_url      = "https://www.googleapis.com/oauth2/v3/certs"
-discovery_url = "https://accounts.google.com"
-"#
-            ),
-            "microsoft" => format!(
-                r#"[auth.oauth2.microsoft]
-client_id     = "${{AUTUMN_MICROSOFT_CLIENT_ID}}"
-client_secret = "${{AUTUMN_MICROSOFT_CLIENT_SECRET}}"
-authorize_url = "https://login.microsoftonline.com/{{YOUR_TENANT_ID}}/oauth2/v2.0/authorize"
-token_url     = "https://login.microsoftonline.com/{{YOUR_TENANT_ID}}/oauth2/v2.0/token"
-redirect_uri  = "https://your-app.example.com/auth/oauth/microsoft/callback"
-scope         = "openid email profile"
-# Single-tenant: replace {{YOUR_TENANT_ID}} and set issuer to your tenant-specific URL.
-# Multi-tenant (common endpoint): ID-token issuer varies per user — see docs/guide/oauth.md.
-issuer        = "https://login.microsoftonline.com/{{YOUR_TENANT_ID}}/v2.0"
-jwks_url      = "https://login.microsoftonline.com/{{YOUR_TENANT_ID}}/discovery/v2.0/keys"
-"#
-            ),
+            "github" => concat!(
+                "[auth.oauth2.github]\n",
+                "client_id     = \"${AUTUMN_GITHUB_CLIENT_ID}\"\n",
+                "client_secret = \"${AUTUMN_GITHUB_CLIENT_SECRET}\"\n",
+                "authorize_url = \"https://github.com/login/oauth/authorize\"\n",
+                "token_url     = \"https://github.com/login/oauth/access_token\"\n",
+                "userinfo_url  = \"https://api.github.com/user\"\n",
+                "redirect_uri  = \"https://your-app.example.com/auth/oauth/github/callback\"\n",
+                "scope         = \"read:user user:email\"\n",
+            )
+            .to_owned(),
+            "google" => concat!(
+                "[auth.oauth2.google]\n",
+                "client_id     = \"${AUTUMN_GOOGLE_CLIENT_ID}\"\n",
+                "client_secret = \"${AUTUMN_GOOGLE_CLIENT_SECRET}\"\n",
+                "authorize_url = \"https://accounts.google.com/o/oauth2/v2/auth\"\n",
+                "token_url     = \"https://oauth2.googleapis.com/token\"\n",
+                "userinfo_url  = \"https://openidconnect.googleapis.com/v1/userinfo\"\n",
+                "redirect_uri  = \"https://your-app.example.com/auth/oauth/google/callback\"\n",
+                "scope         = \"openid email profile\"\n",
+                "issuer        = \"https://accounts.google.com\"\n",
+                "jwks_url      = \"https://www.googleapis.com/oauth2/v3/certs\"\n",
+                "discovery_url = \"https://accounts.google.com\"\n",
+            )
+            .to_owned(),
+            "microsoft" => concat!(
+                "[auth.oauth2.microsoft]\n",
+                "client_id     = \"${AUTUMN_MICROSOFT_CLIENT_ID}\"\n",
+                "client_secret = \"${AUTUMN_MICROSOFT_CLIENT_SECRET}\"\n",
+                "authorize_url = \"https://login.microsoftonline.com/{YOUR_TENANT_ID}/oauth2/v2.0/authorize\"\n",
+                "token_url     = \"https://login.microsoftonline.com/{YOUR_TENANT_ID}/oauth2/v2.0/token\"\n",
+                "redirect_uri  = \"https://your-app.example.com/auth/oauth/microsoft/callback\"\n",
+                "scope         = \"openid email profile\"\n",
+                "# Single-tenant: replace {YOUR_TENANT_ID} with your Directory (tenant) ID.\n",
+                "# Multi-tenant (common endpoint): ID-token issuer varies per user — see docs/guide/oauth.md.\n",
+                "issuer        = \"https://login.microsoftonline.com/{YOUR_TENANT_ID}/v2.0\"\n",
+                "jwks_url      = \"https://login.microsoftonline.com/{YOUR_TENANT_ID}/discovery/v2.0/keys\"\n",
+            )
+            .to_owned(),
             p => {
                 let upper = p.to_uppercase();
                 format!(
@@ -1586,7 +1586,7 @@ Open <http://localhost:3000/auth/{first_provider}/redirect> to test the flow.
 ## Security properties
 
 | Property | Status |
-|----------|--------|
+|----------|---------|
 | PKCE (S256) | ✅ enabled for every provider by default |
 | State (anti-CSRF) | ✅ constant-time validated on every callback |
 | Nonce (replay protection) | ✅ validated for OIDC ID-token flows |
@@ -2183,7 +2183,8 @@ mod tests {
             })
             .collect();
         assert_eq!(
-            paths_with, paths_plain,
+            paths_with,
+            paths_plain,
             "empty --oauth must not add any extra files"
         );
     }
@@ -2359,7 +2360,8 @@ mod tests {
             let a_ts = a.split('_').next().unwrap_or("");
             let o_ts = o.split('_').next().unwrap_or("");
             assert_ne!(
-                a_ts, o_ts,
+                a_ts,
+                o_ts,
                 "oauth_identities migration must have a different timestamp than the auth migration"
             );
         }
@@ -2408,7 +2410,7 @@ mod tests {
         // Executable session.insert calls are not prefixed with "//" or "#".
         let executable_insert = routes
             .lines()
-            .filter(|l| !l.trim_start().starts_with("//"))
+            .filter(|l| !l.trim_start().starts_with("//'))
             .any(|l| l.contains("session.insert(&auth_cfg.session_key"));
         assert!(
             !executable_insert,
