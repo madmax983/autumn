@@ -662,4 +662,89 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert_eq!(*count.lock().unwrap(), 0);
     }
+
+    fn server_error_event() -> ErrorEvent {
+        ErrorEvent {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: "boom".into(),
+            problem_type: Some("https://autumn.dev/problems/x".into()),
+            request_id: Some("req-1".into()),
+            route: Some("/x".into()),
+            method: Some("GET".into()),
+            panic: None,
+        }
+    }
+
+    fn panic_event() -> ErrorEvent {
+        ErrorEvent {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: "kaboom".into(),
+            problem_type: None,
+            request_id: None,
+            route: None,
+            method: None,
+            panic: Some(PanicInfo {
+                payload: "kaboom".into(),
+                backtrace: Some("<backtrace>".into()),
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn log_reporter_reports_both_event_kinds() {
+        // Exercises both branches of the default reporter, including the
+        // `unwrap_or` fallbacks for absent context.
+        let reporter = LogReporter;
+        reporter.report(&server_error_event()).await;
+        reporter.report(&panic_event()).await;
+    }
+
+    #[test]
+    fn sampled_fractional_uses_prng_and_varies() {
+        // Drives the thread-local Xorshift PRNG path (seed + draws + f64 math)
+        // that the rate-1.0 short-circuit never reaches.
+        let mut trues = 0;
+        for _ in 0..10_000 {
+            if sampled(0.5) {
+                trues += 1;
+            }
+        }
+        assert!(
+            trues > 0 && trues < 10_000,
+            "fractional sampling should produce a mix of decisions, got {trues}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reporter_panicking_while_constructing_future_is_swallowed() {
+        // A reporter whose `report` method panics *before* returning a future
+        // exercises the `Err` arm of `report_all` (distinct from a future that
+        // panics when polled).
+        struct PanicOnConstruct;
+        impl ErrorReporter for PanicOnConstruct {
+            fn report<'a>(&'a self, _event: &'a ErrorEvent) -> ReportFuture<'a> {
+                panic!("panic before returning the future");
+            }
+        }
+
+        let chain = ReporterChain {
+            reporters: vec![Arc::new(PanicOnConstruct)],
+            enabled: true,
+            sample_rate: 1.0,
+        };
+        // Must complete without unwinding.
+        chain.report_all(&server_error_event()).await;
+    }
+
+    #[test]
+    fn dispatch_without_a_runtime_is_a_noop() {
+        // A plain `#[test]` has no current tokio runtime, so dispatch should
+        // take the best-effort early return rather than panic on spawn.
+        let chain = Arc::new(ReporterChain {
+            reporters: vec![Arc::new(LogReporter)],
+            enabled: true,
+            sample_rate: 1.0,
+        });
+        chain.dispatch(server_error_event());
+    }
 }

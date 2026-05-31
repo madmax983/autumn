@@ -74,6 +74,13 @@ async fn ok() -> &'static str {
     "ok"
 }
 
+#[get("/raw500")]
+async fn raw500() -> axum::http::StatusCode {
+    // A raw 5xx that does NOT go through `AutumnError`, so the response carries
+    // no `AutumnErrorInfo` — exercises the reporting fallback path.
+    axum::http::StatusCode::INTERNAL_SERVER_ERROR
+}
+
 async fn recv_one(rx: &mut mpsc::UnboundedReceiver<ErrorEvent>) -> ErrorEvent {
     tokio::time::timeout(Duration::from_secs(2), rx.recv())
         .await
@@ -201,6 +208,27 @@ async fn server_error_reported_once() {
     assert_eq!(event.method.as_deref(), Some("GET"));
     assert_eq!(event.route.as_deref(), Some("/fail"));
     assert!(event.panic.is_none(), "a plain 5xx is not a panic");
+}
+
+#[tokio::test]
+async fn raw_5xx_without_autumn_error_is_reported() {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let client = TestApp::new()
+        .routes(routes![raw500])
+        .with_error_reporter(ChannelReporter { tx })
+        .build();
+
+    client.get("/raw500").send().await.assert_status(500);
+
+    let event = recv_one(&mut rx).await;
+    assert_eq!(event.status.as_u16(), 500);
+    assert!(
+        event.panic.is_none(),
+        "a raw status-code 5xx is not a panic"
+    );
+    // No AutumnErrorInfo on the response, so the message falls back to the
+    // status' canonical reason rather than an error string.
+    assert_eq!(event.message, "Internal Server Error");
 }
 
 #[tokio::test]
