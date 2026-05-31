@@ -1826,52 +1826,27 @@ impl AppBuilder {
         validate_repository_api_policies(&all_routes, &scoped_groups, &config);
 
         // 6. Build the router (with optional static-file layer)
-        let mut state = build_state(
+        let state = setup_state_and_extensions(
             &config,
             #[cfg(feature = "db")]
             pool.as_ref(),
             #[cfg(feature = "ws")]
             channels_backend,
+            #[cfg(feature = "mail")]
+            mail_interceptor,
+            job_interceptor,
+            #[cfg(feature = "db")]
+            db_interceptor,
+            #[cfg(feature = "ws")]
+            channels_interceptor,
+            #[cfg(feature = "oauth2")]
+            http_interceptor,
+            #[cfg(feature = "db")]
+            replica_migration_check,
+            #[cfg(feature = "db")]
+            replica_readiness,
+            cache_backend,
         );
-        #[cfg(feature = "mail")]
-        if let Some(interceptor) = mail_interceptor {
-            state.insert_extension(interceptor);
-        }
-        if let Some(interceptor) = job_interceptor {
-            state.insert_extension(interceptor);
-        }
-        #[cfg(feature = "db")]
-        if let Some(interceptor) = db_interceptor {
-            state.insert_extension(interceptor);
-        }
-        #[cfg(feature = "ws")]
-        if let Some(interceptor) = channels_interceptor {
-            state.insert_extension(interceptor.clone());
-            state.channels = crate::channels::Channels::with_shared_backend(std::sync::Arc::new(
-                crate::channels::InterceptedChannelsBackend::new(
-                    state.channels.backend().clone(),
-                    vec![interceptor],
-                ),
-            ));
-            #[cfg(feature = "presence")]
-            {
-                state.presence = crate::presence::Presence::new(state.channels.clone());
-            }
-        }
-        #[cfg(feature = "oauth2")]
-        if let Some(interceptor) = http_interceptor {
-            state.insert_extension(interceptor);
-        }
-        #[cfg(feature = "db")]
-        configure_replica_migration_check(&state, replica_migration_check);
-        #[cfg(feature = "db")]
-        apply_replica_migration_readiness(&state, replica_readiness);
-        if let Some(cache) = cache_backend {
-            crate::cache::set_global_cache(cache.clone());
-            state.shared_cache = Some(cache);
-        } else {
-            crate::cache::clear_global_cache();
-        }
         // Apply deferred policy / scope registrations onto the live
         // app state. Done before the router is built so any panic
         // from double-registration surfaces during startup, not
@@ -2364,52 +2339,27 @@ impl AppBuilder {
         #[cfg(feature = "db")]
         let replica_migration_check = database.replica_migration_check;
 
-        let mut state = build_state(
+        let mut state = setup_state_and_extensions(
             &config,
             #[cfg(feature = "db")]
             pool.as_ref(),
             #[cfg(feature = "ws")]
             channels_backend,
+            #[cfg(feature = "mail")]
+            mail_interceptor,
+            job_interceptor,
+            #[cfg(feature = "db")]
+            db_interceptor,
+            #[cfg(feature = "ws")]
+            channels_interceptor,
+            #[cfg(feature = "oauth2")]
+            http_interceptor,
+            #[cfg(feature = "db")]
+            replica_migration_check,
+            #[cfg(feature = "db")]
+            replica_readiness,
+            cache_backend,
         );
-        #[cfg(feature = "mail")]
-        if let Some(interceptor) = mail_interceptor {
-            state.insert_extension(interceptor);
-        }
-        if let Some(interceptor) = job_interceptor {
-            state.insert_extension(interceptor);
-        }
-        #[cfg(feature = "db")]
-        if let Some(interceptor) = db_interceptor {
-            state.insert_extension(interceptor);
-        }
-        #[cfg(feature = "ws")]
-        if let Some(interceptor) = channels_interceptor {
-            state.insert_extension(interceptor.clone());
-            state.channels = crate::channels::Channels::with_shared_backend(std::sync::Arc::new(
-                crate::channels::InterceptedChannelsBackend::new(
-                    state.channels.backend().clone(),
-                    vec![interceptor],
-                ),
-            ));
-            #[cfg(feature = "presence")]
-            {
-                state.presence = crate::presence::Presence::new(state.channels.clone());
-            }
-        }
-        #[cfg(feature = "oauth2")]
-        if let Some(interceptor) = http_interceptor {
-            state.insert_extension(interceptor);
-        }
-        #[cfg(feature = "db")]
-        configure_replica_migration_check(&state, replica_migration_check);
-        #[cfg(feature = "db")]
-        apply_replica_migration_readiness(&state, replica_readiness);
-        if let Some(cache) = cache_backend {
-            crate::cache::set_global_cache(cache.clone());
-            state.shared_cache = Some(cache);
-        } else {
-            crate::cache::clear_global_cache();
-        }
         // Static-site builds are short-lived and don't run the request loop,
         // so deliver_later is never invoked. install_mailer_with_factory skips
         // the queue factory when enforce_durable_guard is false (the factory
@@ -2712,52 +2662,27 @@ impl AppBuilder {
         #[cfg(feature = "db")]
         let replica_migration_check = database.replica_migration_check;
 
-        let mut state = build_state(
+        let state = setup_state_and_extensions(
             &config,
             #[cfg(feature = "db")]
             pool.as_ref(),
             #[cfg(feature = "ws")]
             channels_backend,
+            #[cfg(feature = "mail")]
+            mail_interceptor,
+            job_interceptor,
+            #[cfg(feature = "db")]
+            db_interceptor,
+            #[cfg(feature = "ws")]
+            channels_interceptor,
+            #[cfg(feature = "oauth2")]
+            http_interceptor,
+            #[cfg(feature = "db")]
+            replica_migration_check,
+            #[cfg(feature = "db")]
+            replica_readiness,
+            cache_backend,
         );
-        #[cfg(feature = "mail")]
-        if let Some(interceptor) = mail_interceptor {
-            state.insert_extension(interceptor);
-        }
-        if let Some(interceptor) = job_interceptor {
-            state.insert_extension(interceptor);
-        }
-        #[cfg(feature = "db")]
-        if let Some(interceptor) = db_interceptor {
-            state.insert_extension(interceptor);
-        }
-        #[cfg(feature = "ws")]
-        if let Some(interceptor) = channels_interceptor {
-            state.insert_extension(interceptor.clone());
-            state.channels = crate::channels::Channels::with_shared_backend(std::sync::Arc::new(
-                crate::channels::InterceptedChannelsBackend::new(
-                    state.channels.backend().clone(),
-                    vec![interceptor],
-                ),
-            ));
-            #[cfg(feature = "presence")]
-            {
-                state.presence = crate::presence::Presence::new(state.channels.clone());
-            }
-        }
-        #[cfg(feature = "oauth2")]
-        if let Some(interceptor) = http_interceptor {
-            state.insert_extension(interceptor);
-        }
-        #[cfg(feature = "db")]
-        configure_replica_migration_check(&state, replica_migration_check);
-        #[cfg(feature = "db")]
-        apply_replica_migration_readiness(&state, replica_readiness);
-        if let Some(cache) = cache_backend {
-            crate::cache::set_global_cache(cache.clone());
-            state.shared_cache = Some(cache);
-        } else {
-            crate::cache::clear_global_cache();
-        }
 
         for register in policy_registrations {
             register(state.policy_registry());
@@ -7993,4 +7918,76 @@ mod tests {
             "fast hook must still run even after slow hook overruns its per-hook budget"
         );
     }
+}
+
+
+#[allow(clippy::too_many_arguments)]
+fn setup_state_and_extensions(
+    config: &crate::config::AutumnConfig,
+    #[cfg(feature = "db")]
+    pool: Option<&crate::db::DatabaseTopology>,
+    #[cfg(feature = "ws")]
+    channels_backend: Option<std::sync::Arc<dyn crate::channels::ChannelsBackend>>,
+    #[cfg(feature = "mail")]
+    mail_interceptor: Option<std::sync::Arc<dyn crate::interceptor::MailInterceptor>>,
+    job_interceptor: Option<std::sync::Arc<dyn crate::interceptor::JobInterceptor>>,
+    #[cfg(feature = "db")]
+    db_interceptor: Option<std::sync::Arc<dyn crate::interceptor::DbConnectionInterceptor>>,
+    #[cfg(feature = "ws")]
+    channels_interceptor: Option<std::sync::Arc<dyn crate::interceptor::ChannelsInterceptor>>,
+    #[cfg(feature = "oauth2")]
+    http_interceptor: Option<std::sync::Arc<dyn crate::interceptor::HttpInterceptor>>,
+    #[cfg(feature = "db")]
+    replica_migration_check: Option<(String, String)>,
+    #[cfg(feature = "db")]
+    replica_readiness: Option<crate::migrate::ReplicaMigrationReadiness>,
+    cache_backend: Option<std::sync::Arc<dyn crate::cache::Cache>>,
+) -> AppState {
+    let mut state = build_state(
+        config,
+        #[cfg(feature = "db")]
+        pool,
+        #[cfg(feature = "ws")]
+        channels_backend,
+    );
+    #[cfg(feature = "mail")]
+    if let Some(interceptor) = mail_interceptor {
+        state.insert_extension(interceptor);
+    }
+    if let Some(interceptor) = job_interceptor {
+        state.insert_extension(interceptor);
+    }
+    #[cfg(feature = "db")]
+    if let Some(interceptor) = db_interceptor {
+        state.insert_extension(interceptor);
+    }
+    #[cfg(feature = "ws")]
+    if let Some(interceptor) = channels_interceptor {
+        state.insert_extension(interceptor.clone());
+        state.channels = crate::channels::Channels::with_shared_backend(std::sync::Arc::new(
+            crate::channels::InterceptedChannelsBackend::new(
+                state.channels.backend().clone(),
+                vec![interceptor],
+            ),
+        ));
+        #[cfg(feature = "presence")]
+        {
+            state.presence = crate::presence::Presence::new(state.channels.clone());
+        }
+    }
+    #[cfg(feature = "oauth2")]
+    if let Some(interceptor) = http_interceptor {
+        state.insert_extension(interceptor);
+    }
+    #[cfg(feature = "db")]
+    configure_replica_migration_check(&state, replica_migration_check);
+    #[cfg(feature = "db")]
+    apply_replica_migration_readiness(&state, replica_readiness);
+    if let Some(cache) = cache_backend {
+        crate::cache::set_global_cache(cache.clone());
+        state.shared_cache = Some(cache);
+    } else {
+        crate::cache::clear_global_cache();
+    }
+    state
 }
