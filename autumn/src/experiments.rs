@@ -1354,21 +1354,20 @@ impl axum::extract::FromRequestParts<crate::AppState> for Experiments {
             // the session ID so each anonymous visitor gets a stable, per-session
             // bucket rather than all collapsing into a single "anonymous" actor.
             let session_key = state.auth_session_key();
-            match session.get(session_key).await {
-                Some(uid) => Some(uid),
-                None => {
-                    // Use or create a stable per-session anonymous actor. We must
-                    // insert into the session (marking it dirty) so the framework
-                    // sets a cookie and the ID persists across requests; a bare
-                    // session.id() call does not mark the session dirty.
-                    const ANON_KEY: &str = "_autumn_anon_actor";
-                    if let Some(existing) = session.get(ANON_KEY).await {
-                        Some(existing)
-                    } else {
-                        let id = session.id().await;
-                        session.insert(ANON_KEY, &id).await;
-                        Some(id)
-                    }
+            if let Some(uid) = session.get(session_key).await {
+                Some(uid)
+            } else {
+                // Use or create a stable per-session anonymous actor. We must
+                // insert into the session (marking it dirty) so the framework
+                // sets a cookie and the ID persists across requests; a bare
+                // session.id() call does not mark the session dirty.
+                const ANON_KEY: &str = "_autumn_anon_actor";
+                if let Some(existing) = session.get(ANON_KEY).await {
+                    Some(existing)
+                } else {
+                    let id = session.id().await;
+                    session.insert(ANON_KEY, &id).await;
+                    Some(id)
                 }
             }
         } else {
