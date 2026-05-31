@@ -228,6 +228,16 @@ Migration note: pre-1.0 clients that parsed
 
 ---
 
+## Shipping errors somewhere (Sentry, Slack, …)
+
+The Problem Details response tells the *client* what happened — but where do
+*you* find out? Autumn catches handler panics at the HTTP layer (so a panic
+becomes a clean 500 instead of aborting the worker) and routes panics + 5xx
+errors to a pluggable reporter you configure once. See the
+[Error reporting guide](../error-reporting.md).
+
+---
+
 ### Checkpoint
 
 Expected project state with proper error handling throughout.

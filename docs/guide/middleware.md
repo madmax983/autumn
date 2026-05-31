@@ -180,6 +180,10 @@ header for downstream services.
 
 - [`AppBuilder::layer`] — method reference and trait bounds.
 - [`AppBuilder::scoped`] — the group-scoped variant.
+- [Error reporting guide](./error-reporting.md) — catch handler panics and ship
+  panics + 5xx errors to a pluggable reporter (Sentry/Slack/custom). The
+  panic-aware promotion of the `ExceptionFilter` concept shown in the ordering
+  diagram above.
 - [Extensibility guide](./extensibility.md) — picks the right tier for your
   extension point.
 

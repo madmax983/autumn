@@ -4,6 +4,15 @@
 //! and passes them through a chain of user-registered filters before the
 //! response is sent to the client.
 //!
+//! # Reporting vs. filtering
+//!
+//! An [`ExceptionFilter`] transforms the *response*. To catch handler panics
+//! and ship panic + 5xx *events* to an external sink (Sentry, Slack, a custom
+//! reporter), use the panic-aware [`reporting`](crate::reporting) module and
+//! [`AppBuilder::with_error_reporter`](crate::app::AppBuilder::with_error_reporter).
+//! The two compose: filters shape what the client sees, reporters decide where
+//! failures go.
+//!
 //! # How it works
 //!
 //! When `AutumnError::into_response()` runs, it stashes an

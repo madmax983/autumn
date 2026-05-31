@@ -182,6 +182,22 @@ impl AppState {
             .and_then(|value| Arc::downcast::<T>(value).ok())
     }
 
+    /// Returns the registered error reporters, if any were installed via
+    /// [`AppBuilder::with_error_reporter`](crate::app::AppBuilder::with_error_reporter).
+    ///
+    /// Returns an empty `Vec` when none are registered; the
+    /// [`ReportingLayer`](crate::reporting::ReportingLayer) then falls back to
+    /// the built-in [`LogReporter`](crate::reporting::LogReporter).
+    #[cfg(feature = "reporting")]
+    #[must_use]
+    pub(crate) fn error_reporters(
+        &self,
+    ) -> Vec<std::sync::Arc<dyn crate::reporting::ErrorReporter>> {
+        self.extension::<crate::reporting::RegisteredReporters>()
+            .map(|reporters| reporters.0.clone())
+            .unwrap_or_default()
+    }
+
     /// Returns the database connection pool.
     #[cfg(feature = "db")]
     #[must_use]

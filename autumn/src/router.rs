@@ -1338,6 +1338,20 @@ fn apply_middleware(
     //   BodyLimit/UploadConfig → MethodOverride → RateLimit → CSRF → CORS → handler
     router = apply_request_timeout_middleware(router, config, state.metrics.clone());
 
+    // Error-reporting + panic-catch layer. Placed inner to `RequestIdLayer`
+    // (so the request id is available when a handler panics) and outer to the
+    // timeout, user layers, and handler (so their panics are caught and turned
+    // into a clean 500 instead of aborting the worker task). The resulting 500
+    // still flows out through the exception-filter chain for HTML negotiation.
+    #[cfg(feature = "reporting")]
+    {
+        router = router.layer(crate::reporting::ReportingLayer::new(
+            state.error_reporters(),
+            config.reporting.enabled,
+            config.reporting.sample_rate,
+        ));
+    }
+
     let router = router.layer(RequestIdLayer).layer(security_headers);
 
     let router = crate::session::apply_session_layer(
