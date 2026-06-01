@@ -1346,6 +1346,7 @@ pub async fn reset_password(
         }})?;
 
     let new_digest = hash_password(&form.password).await?;
+{totp_reset_branch}
     diesel::update({table}::table.find({snake_name}.id))
         .set((
             {table}::password_digest.eq(&new_digest),
@@ -1354,7 +1355,7 @@ pub async fn reset_password(
         ))
         .execute(&mut *db)
         .await?;
-{totp_reset_branch}
+
     // Rotate session to invalidate any previous authenticated state.
     session.rotate_id().await;
     session.insert("{snake_name}_id", {snake_name}.id.to_string()).await;
@@ -2081,20 +2082,23 @@ fn totp_login_branch_src(snake_name: &str) -> String {
     TPL.replace("__SNAKE__", snake_name)
 }
 
-/// The interstitial branch injected into `reset_password` after the password is
-/// updated, so a 2FA-enabled account cannot be fully logged in via an emailed
-/// reset link without also passing the second factor.
+/// The interstitial branch injected into `reset_password` *before* the password
+/// is written. A correct reset token proves control of the email, not possession
+/// of the second factor — so for a 2FA-enabled account we DEFER the password
+/// change: stash the new digest in the session and require `/login/verify` to
+/// pass before committing it. Someone with only the emailed link therefore can't
+/// change the password (lockout/DoS) without the second factor.
 fn totp_reset_branch_src(snake_name: &str) -> String {
     const TPL: &str = r#"
     // ── 2FA interstitial ────────────────────────────────────────────────────
-    // A correct reset token proves control of the email, not possession of the
-    // second factor. If TOTP is enabled, require /login/verify before granting
-    // the secured session key (mirrors the password-login flow).
     if __SNAKE__.totp_enabled {
+        // Do NOT write the new password yet. Park it in the session and finish
+        // the reset in `login_verify` only after the second factor is proven.
         session.rotate_id().await;
         session
             .insert("totp_pending_id", __SNAKE__.id.to_string())
             .await;
+        session.insert("totp_pending_reset_digest", &new_digest).await;
         return Ok(redirect_to("/login/verify"));
     }
 "#;
@@ -2127,6 +2131,11 @@ const TOTP_STEP: u64 = 30;
 #[derive(Deserialize)]
 pub struct TotpCodeForm {
     pub code: String,
+}
+
+#[derive(Deserialize)]
+pub struct TotpEnableForm {
+    pub password: String,
 }
 
 #[derive(Deserialize)]
@@ -2300,6 +2309,10 @@ pub async fn two_factor_status(
             p { "Two-factor authentication is " strong { "disabled" } "." }
             form action="/account/2fa/enable" method="post" {
                 @if let Some(ref csrf) = csrf { input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }
+                p {
+                    label { "Confirm your password to begin enrollment:" }
+                    input type="password" name="password" autocomplete="current-password" required;
+                }
                 button type="submit" { "Enable two-factor" }
             }
         }
@@ -2319,6 +2332,7 @@ pub async fn two_factor_enable(
     mut db: Db,
     csrf: Option<CsrfToken>,
     csrf_field: Option<CsrfFormField>,
+    Form(form): Form<TotpEnableForm>,
 ) -> AutumnResult<Markup> {
     let __SNAKE___id: i64 = session
         .get("__SNAKE___id")
@@ -2331,6 +2345,18 @@ pub async fn two_factor_enable(
         .first(&mut *db)
         .await
         .map_err(|_| AutumnError::not_found_msg("Account not found."))?;
+
+    // Step-up re-auth: a logged-in but unattended/hijacked session must not be
+    // able to enroll an attacker's authenticator. Require the account password
+    // before starting enrollment (matches GitHub/Google behaviour).
+    if !verify_password(&form.password, &__SNAKE__.password_digest)
+        .await
+        .unwrap_or(false)
+    {
+        return Err(AutumnError::unprocessable_msg(
+            "Password confirmation failed.",
+        ));
+    }
 
     // Re-enrollment guard: if 2FA is already active, a hijacked (already-past-2FA)
     // session must not be able to swap in a new authenticator without re-proving
@@ -2432,7 +2458,7 @@ pub async fn two_factor_confirm(
         plaintext_codes.push(code);
     }
 
-    (*db)
+    let txn_result = (*db)
         .transaction::<_, diesel::result::Error, _>(|conn| {
         Box::pin(async move {
             diesel::update(__TABLE__::table.find(user_id))
@@ -2455,17 +2481,40 @@ pub async fn two_factor_confirm(
                     .execute(conn)
                     .await?;
             }
-            // Flip the flag last: the account is only "2FA-enabled" once the new
-            // secret and its recovery codes are durably stored.
-            diesel::update(__TABLE__::table.find(user_id))
-                .set(__TABLE__::totp_enabled.eq(true))
-                .execute(conn)
-                .await?;
+            // Flip the flag last, conditional on it still being false. This is
+            // both the durability gate (the account is only "2FA-enabled" once
+            // the new secret + recovery codes are stored) and the race gate: if
+            // a concurrent confirm already enabled 2FA, this matches zero rows
+            // and we roll back, discarding this request's recovery codes so the
+            // stored set always matches the plaintext the winner displayed.
+            let claimed = diesel::update(
+                __TABLE__::table
+                    .find(user_id)
+                    .filter(__TABLE__::totp_enabled.eq(false)),
+            )
+            .set(__TABLE__::totp_enabled.eq(true))
+            .execute(conn)
+            .await?;
+            if claimed != 1 {
+                return Err(diesel::result::Error::RollbackTransaction);
+            }
             Ok(())
         })
         })
-        .await
-        .map_err(|_| AutumnError::internal_server_error_msg("Failed to enable two-factor."))?;
+        .await;
+    match txn_result {
+        Ok(()) => {}
+        Err(diesel::result::Error::RollbackTransaction) => {
+            return Err(AutumnError::unprocessable_msg(
+                "Two-factor was just enabled by another request. Reload /account/2fa.",
+            ));
+        }
+        Err(_) => {
+            return Err(AutumnError::internal_server_error_msg(
+                "Failed to enable two-factor.",
+            ));
+        }
+    }
 
     session.remove("totp_pending_secret").await;
 
@@ -2503,12 +2552,27 @@ pub async fn two_factor_disable(
         .map_err(|_| AutumnError::not_found_msg("Account not found."))?;
 
     // Re-authenticate: accept a current TOTP code or the account password.
+    // A TOTP code used here is consumed with the same atomic replay guard as
+    // `/login/verify`, so a code already spent on login cannot be replayed to
+    // disable the factor.
     let mut ok = false;
     if let Some(code) = form.code.as_deref().filter(|c| !c.trim().is_empty()) {
         if let Some(stored) = __SNAKE__.totp_secret_encrypted.as_deref() {
             let secret = decrypt_secret(stored)?;
             let totp = build_totp(secret, &__SNAKE__.email)?;
-            ok = verify_totp_code(&totp, code).is_some();
+            if let Some(step) = verify_totp_code(&totp, code) {
+                let affected = diesel::update(
+                    __TABLE__::table.find(__SNAKE__.id).filter(
+                        __TABLE__::totp_last_used_step
+                            .is_null()
+                            .or(__TABLE__::totp_last_used_step.lt(step)),
+                    ),
+                )
+                .set(__TABLE__::totp_last_used_step.eq(Some(step)))
+                .execute(&mut *db)
+                .await?;
+                ok = affected == 1;
+            }
         }
     }
     if !ok {
@@ -2649,6 +2713,22 @@ pub async fn login_verify(
         return Err(AutumnError::unprocessable_msg("Invalid code."));
     }
 
+    // If this verification is finishing a password reset (the reset handler
+    // parked the new digest for a 2FA-enabled account), commit it now — only
+    // after the second factor has been proven. Reset tokens are single-use, so
+    // clear them here as well.
+    if let Some(new_digest) = session.get("totp_pending_reset_digest").await {
+        diesel::update(__TABLE__::table.find(__SNAKE__.id))
+            .set((
+                __TABLE__::password_digest.eq(&new_digest),
+                __TABLE__::reset_token_digest.eq(None::<String>),
+                __TABLE__::reset_token_expires_at.eq(None::<chrono::NaiveDateTime>),
+            ))
+            .execute(&mut *db)
+            .await?;
+        session.remove("totp_pending_reset_digest").await;
+    }
+
     // Promote the pending session to a fully authenticated one.
     session.rotate_id().await;
     session.remove("totp_pending_id").await;
@@ -2706,8 +2786,16 @@ the key invalidates existing enrollments.
 
 - Secrets encrypted at rest (never stored plaintext).
 - Verification accepts a ±1 time-step window; a consumed step cannot be replayed
-  (`totp_last_used_step`).
+  (`totp_last_used_step`), including on the disable path.
 - Recovery codes are single-use, bcrypt-hashed, and stamped `used_at` on use.
+- Enrolling requires step-up re-authentication (the account password), so a
+  stolen/unattended session cannot quietly add an attacker's authenticator.
+- Re-enrollment while 2FA is active is rejected — disable first (which itself
+  requires a current code or password).
+- Login, OAuth callback (guidance), and password reset all route 2FA-enabled
+  accounts through `/login/verify`. A password reset for a 2FA account is
+  **deferred**: the new password is parked and only committed after the second
+  factor is proven, so a reset link alone cannot change the password.
 - Disabling 2FA requires re-authentication (current code or password) and clears
   the secret plus all recovery codes.
 
@@ -3784,6 +3872,110 @@ mod tests {
         assert!(
             body.contains("totp_pending_id") && body.contains("/login/verify"),
             "reset_password must route 2FA-enabled users through /login/verify: {body}"
+        );
+    }
+
+    #[test]
+    fn totp_reset_password_defers_password_commit_until_verify() {
+        // P2 (#1057): for a 2FA-enabled account the password must NOT be written
+        // until /login/verify passes; the reset handler parks the digest and the
+        // verify handler commits it.
+        let tmp = project_with_main();
+        totp_plan(tmp.path()).execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+        let reset_pos = routes
+            .find("pub async fn reset_password(")
+            .expect("reset_password fn");
+        let reset_body = &routes[reset_pos..reset_pos + 1600.min(routes.len() - reset_pos)];
+        // The deferral branch (which returns to /login/verify) must come BEFORE
+        // the password_digest UPDATE in the handler body.
+        let park_at = reset_body
+            .find("totp_pending_reset_digest")
+            .expect("reset must park the pending digest");
+        let write_at = reset_body
+            .find("password_digest.eq(&new_digest)")
+            .expect("reset still writes the digest for non-2FA users");
+        assert!(
+            park_at < write_at,
+            "reset must park (and return) before committing the password for 2FA users"
+        );
+        // login_verify must commit a parked reset once the factor is proven.
+        let verify_pos = routes
+            .find("pub async fn login_verify(")
+            .expect("login_verify fn");
+        let verify_body = &routes[verify_pos..];
+        assert!(
+            verify_body.contains("totp_pending_reset_digest")
+                && verify_body.contains("password_digest.eq(&new_digest)"),
+            "login_verify must commit a parked password reset after 2FA: {verify_body}"
+        );
+    }
+
+    #[test]
+    fn totp_enroll_requires_password_reauth() {
+        // P2 (#1057): first enrollment must require step-up password re-auth.
+        let tmp = project_with_main();
+        totp_plan(tmp.path()).execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+        assert!(
+            routes.contains("struct TotpEnableForm"),
+            "enable must take a password form: {routes}"
+        );
+        let enable_pos = routes
+            .find("pub async fn two_factor_enable(")
+            .expect("enable fn");
+        let confirm_pos = routes
+            .find("pub async fn two_factor_confirm(")
+            .expect("confirm fn");
+        let enable_body = &routes[enable_pos..confirm_pos];
+        assert!(
+            enable_body.contains("verify_password(&form.password"),
+            "two_factor_enable must verify the account password before enrolling: {enable_body}"
+        );
+        // The status-page enable form must collect the password.
+        assert!(
+            routes.contains("Confirm your password to begin enrollment"),
+            "enable form must prompt for the password: {routes}"
+        );
+    }
+
+    #[test]
+    fn totp_disable_applies_replay_guard_on_code() {
+        // P2 (#1057): a TOTP code used to disable must advance/respect
+        // totp_last_used_step so a code already spent on login can't be replayed.
+        let tmp = project_with_main();
+        totp_plan(tmp.path()).execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+        let disable_pos = routes
+            .find("pub async fn two_factor_disable(")
+            .expect("disable fn");
+        let after = &routes[disable_pos..];
+        let body_end = after.find("\n/// ").unwrap_or(after.len());
+        let body = &after[..body_end];
+        assert!(
+            body.contains("totp_last_used_step") && body.contains("affected == 1"),
+            "disable must consume the TOTP step with the same atomic guard: {body}"
+        );
+    }
+
+    #[test]
+    fn totp_confirm_guards_against_double_submit() {
+        // P2 (#1057): the final enable flip is conditional on totp_enabled=false
+        // with a rollback, so concurrent confirms don't desync recovery codes.
+        let tmp = project_with_main();
+        totp_plan(tmp.path()).execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+        let confirm_pos = routes
+            .find("pub async fn two_factor_confirm(")
+            .expect("confirm fn");
+        let after = &routes[confirm_pos..];
+        let disable_pos = after
+            .find("pub async fn two_factor_disable(")
+            .unwrap_or(after.len());
+        let body = &after[..disable_pos];
+        assert!(
+            body.contains("totp_enabled.eq(false)") && body.contains("RollbackTransaction"),
+            "confirm must claim the enable transition conditionally and roll back on loss: {body}"
         );
     }
 
