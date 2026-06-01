@@ -42,9 +42,14 @@ fn percentiles(mut samples: Vec<u128>) -> (u128, u128) {
 
 #[allow(clippy::cast_precision_loss, clippy::branches_sharing_code)]
 fn main() {
-    // Generate the key-derivation salt at runtime rather than hard-coding it.
-    let mut salt = [0u8; 16];
-    getrandom::getrandom(&mut salt).expect("OS RNG");
+    // Derive the key-derivation salt from the wall clock at startup (a runtime
+    // value, not a hard-coded constant). A microbenchmark only needs the salt to
+    // be stable for the duration of the run.
+    let salt = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before UNIX_EPOCH")
+        .as_nanos()
+        .to_le_bytes();
     let ring = KeyRing::from_master_hex(KEY, &[], None, &salt).unwrap();
 
     // Build 10k rows: even ids plaintext, odd ids encrypted (mixed workload).
