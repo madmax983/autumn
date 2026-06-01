@@ -1757,6 +1757,7 @@ fn render_oauth_migration_down() -> String {
     "DROP TABLE oauth_identities;\n".to_owned()
 }
 
+#[allow(clippy::too_many_lines)]
 fn render_oauth_routes_file(
     pascal_name: &str,
     snake_name: &str,
@@ -1781,6 +1782,12 @@ fn render_oauth_routes_file(
          \x20   // the second-factor form, mirroring the password-login flow:\n\
          \x20   //\n\
          \x20   //   if local_user.totp_enabled {\n\
+         \x20   //       // Refuse if [auth].session_key collides with a reserved pending\n\
+         \x20   //       // key — otherwise parking `totp_pending_id` would write the very\n\
+         \x20   //       // key `#[secured]` trusts, authenticating before /login/verify:\n\
+         \x20   //       if crate::routes::auth::is_reserved_totp_pending_key(&auth_cfg.session_key) {\n\
+         \x20   //           return Redirect::to(\"/login?error=totp_key_collision\").into_response();\n\
+         \x20   //       }\n\
          \x20   //       session.rotate_id().await;\n\
          \x20   //       session.remove(\"totp_pending_reset_digest\").await;\n\
          \x20   //       session.remove(\"totp_pending_reset_token\").await;\n\
@@ -2218,7 +2225,10 @@ const RESERVED_TOTP_PENDING_KEYS: &[&str] = &[
 /// Whether `key` (typically the configured `[auth].session_key`) collides with a
 /// reserved `totp_pending_*` key. Used to refuse a config that would let a
 /// pending second-factor session write the trusted `#[secured]` auth key.
-fn is_reserved_totp_pending_key(key: &str) -> bool {
+///
+/// `pub(crate)` so the OAuth callback handler (a separate module) can apply the
+/// same guard before parking a pending 2FA session.
+pub(crate) fn is_reserved_totp_pending_key(key: &str) -> bool {
     RESERVED_TOTP_PENDING_KEYS.contains(&key)
 }
 
@@ -2299,6 +2309,11 @@ fn decrypt_secret(stored: &str) -> AutumnResult<Vec<u8>> {
 ///
 /// `get_url()` yields the standard `otpauth://` provisioning URI used for the QR.
 fn build_totp(secret: Vec<u8>, account: &str) -> AutumnResult<TOTP> {
+    // `totp-rs` rejects issuer/account labels containing a colon. The account
+    // label is only a display hint in the `otpauth://` URI (it doesn't affect
+    // code generation/verification), so strip colons defensively — otherwise an
+    // address like `a:b@example.com` would 500 on enrollment.
+    let account = account.replace(':', "_");
     TOTP::new(
         Algorithm::SHA1,
         6,
@@ -2306,7 +2321,7 @@ fn build_totp(secret: Vec<u8>, account: &str) -> AutumnResult<TOTP> {
         TOTP_STEP,
         secret,
         Some("__PASCAL__".to_owned()),
-        account.to_owned(),
+        account,
     )
     .map_err(|_| AutumnError::internal_server_error_msg("invalid TOTP secret"))
 }
@@ -2652,9 +2667,13 @@ pub async fn two_factor_disable(
     let mut ok = false;
     if let Some(code) = form.code.as_deref().filter(|c| !c.trim().is_empty()) {
         if let Some(stored) = __SNAKE__.totp_secret_encrypted.as_deref() {
-            let secret = decrypt_secret(stored)?;
-            let totp = build_totp(secret, &__SNAKE__.email)?;
-            if let Some(step) = verify_totp_code(&totp, code) {
+            // A decrypt/build failure (e.g. rotated TOTP_ENC_KEY) must not abort:
+            // the password fallback below is the escape from that lockout.
+            if let Some(step) = decrypt_secret(stored)
+                .ok()
+                .and_then(|secret| build_totp(secret, &__SNAKE__.email).ok())
+                .and_then(|totp| verify_totp_code(&totp, code))
+            {
                 let affected = diesel::update(
                     __TABLE__::table.find(__SNAKE__.id).filter(
                         __TABLE__::totp_last_used_step
@@ -2753,10 +2772,17 @@ pub async fn login_verify(
     //    still below this one, and we require exactly one row to be changed. Two
     //    concurrent requests with the same code therefore cannot both win — the
     //    second sees `affected == 0`.
+    //
+    //    A decrypt/build failure here (e.g. TOTP_ENC_KEY rotated/missing, or a
+    //    corrupt blob) is treated like a non-matching code rather than aborting,
+    //    so the user can still fall back to a recovery code below — recovery
+    //    codes are stored independently and are the only escape from that lockout.
     if let Some(stored) = __SNAKE__.totp_secret_encrypted.as_deref() {
-        let secret = decrypt_secret(stored)?;
-        let totp = build_totp(secret, &__SNAKE__.email)?;
-        if let Some(step) = verify_totp_code(&totp, &submitted) {
+        if let Some(step) = decrypt_secret(stored)
+            .ok()
+            .and_then(|secret| build_totp(secret, &__SNAKE__.email).ok())
+            .and_then(|totp| verify_totp_code(&totp, &submitted))
+        {
             let affected = diesel::update(
                 __TABLE__::table.find(__SNAKE__.id).filter(
                     __TABLE__::totp_last_used_step
@@ -4044,6 +4070,88 @@ mod tests {
         assert!(
             login_body.contains("is_reserved_totp_pending_key(state.auth_session_key())"),
             "login interstitial must reject a colliding auth session key: {login_body}"
+        );
+    }
+
+    #[test]
+    fn totp_login_verify_falls_back_to_recovery_on_broken_secret() {
+        // P2 (#1057 round 8): a decrypt/build failure (e.g. rotated TOTP_ENC_KEY)
+        // must not abort login_verify before the recovery-code branch — recovery
+        // codes are the only escape from that lockout.
+        let tmp = project_with_main();
+        totp_plan(tmp.path()).execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+        let verify_pos = routes
+            .find("pub async fn login_verify(")
+            .expect("login_verify fn");
+        // Up to the recovery-code branch, the TOTP attempt must not use `?` on
+        // decrypt_secret/build_totp (which would abort the whole handler).
+        let verify_to_recovery = &routes[verify_pos..];
+        let recovery_at = verify_to_recovery
+            .find("try an unused recovery code")
+            .expect("recovery-code comment");
+        let totp_branch = &verify_to_recovery[..recovery_at];
+        assert!(
+            !totp_branch.contains("decrypt_secret(stored)?"),
+            "login_verify TOTP branch must not abort on decrypt failure: {totp_branch}"
+        );
+        assert!(
+            totp_branch.contains("decrypt_secret(stored)") && totp_branch.contains(".ok()"),
+            "login_verify must treat a broken secret as a miss and fall through: {totp_branch}"
+        );
+    }
+
+    #[test]
+    fn totp_disable_falls_back_to_password_on_broken_secret() {
+        // P2 (#1057 round 8): the disable code path must likewise not abort on a
+        // decrypt failure, so the password fallback can still re-authenticate.
+        let tmp = project_with_main();
+        totp_plan(tmp.path()).execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+        let disable_pos = routes
+            .find("pub async fn two_factor_disable(")
+            .expect("two_factor_disable fn");
+        let next = routes[disable_pos + 1..]
+            .find("pub async fn ")
+            .map_or(routes.len(), |p| disable_pos + 1 + p);
+        let disable_body = &routes[disable_pos..next];
+        assert!(
+            !disable_body.contains("decrypt_secret(stored)?"),
+            "disable must not abort on decrypt failure before the password fallback: {disable_body}"
+        );
+    }
+
+    #[test]
+    fn totp_build_totp_sanitizes_colon_in_account_label() {
+        // P2 (#1057 round 8): totp-rs rejects account labels containing ':', so an
+        // email like a:b@example.com would 500. build_totp must strip colons.
+        let tmp = project_with_main();
+        totp_plan(tmp.path()).execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+        let build_pos = routes.find("fn build_totp(").expect("build_totp fn");
+        let build_body = &routes[build_pos..build_pos + 600.min(routes.len() - build_pos)];
+        assert!(
+            build_body.contains("account.replace(':'"),
+            "build_totp must sanitize colons in the account label: {build_body}"
+        );
+    }
+
+    #[test]
+    fn totp_oauth_pending_note_guards_session_key_collision() {
+        // P2 (#1057 round 8): the OAuth pending-2FA guidance must mirror the
+        // password/reset reserved-key rejection before parking totp_pending_id.
+        let tmp = project_with_main();
+        let oauth_opts = AuthOAuthOptions {
+            providers: vec!["github".to_owned()],
+        };
+        plan_auth_full(tmp.path(), "User", "20260508000000", &oauth_opts, true)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+        let oauth = fs::read_to_string(tmp.path().join("src/routes/oauth.rs")).unwrap();
+        assert!(
+            oauth.contains("is_reserved_totp_pending_key(&auth_cfg.session_key)"),
+            "OAuth pending-2FA guidance must guard against an auth-key collision: {oauth}"
         );
     }
 
