@@ -851,12 +851,29 @@ impl Db {
         // connection, but await them sequentially inside that task so callback
         // dependencies observe registration order.
         // Errors are counted and logged; they do NOT affect the committed tx.
+        // In transactional tests (outer transaction is rolled back), we suppress
+        // spawning these callbacks to prevent observing uncommitted side effects.
         if result.is_ok() {
             let callbacks: Vec<CommitCallback> = {
                 let mut reg = registry.lock().expect("registry lock");
                 std::mem::take(&mut *reg)
             };
-            let _ = spawn_committed_after_commit_callbacks(callbacks);
+
+            use diesel_async::RunQueryDsl;
+            let is_test_tx = diesel::select(diesel::dsl::sql::<
+                diesel::sql_types::Nullable<diesel::sql_types::Text>,
+            >(
+                "current_setting('autumn.test_transaction_started', true)",
+            ))
+            .get_result::<Option<String>>(&mut *self.conn)
+            .await
+            .ok()
+            .flatten()
+            .as_deref() == Some("true");
+
+            if !is_test_tx {
+                let _ = spawn_committed_after_commit_callbacks(callbacks);
+            }
         }
 
         result

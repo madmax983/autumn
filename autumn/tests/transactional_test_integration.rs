@@ -57,6 +57,36 @@ mod transactional_tests {
         Ok((axum::http::StatusCode::CREATED, Json(item)))
     }
 
+    static AFTER_COMMIT_RUN_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    #[post("/items-with-callback")]
+    async fn create_item_with_callback(
+        mut db: Db,
+        Json(new_item): Json<NewItem>,
+    ) -> AutumnResult<(axum::http::StatusCode, Json<Item>)> {
+        use scoped_futures::ScopedFutureExt;
+        db.tx(|conn| {
+            async move {
+                let item = diesel::insert_into(transactional_items::table)
+                    .values(&new_item)
+                    .returning(Item::as_returning())
+                    .get_result(conn)
+                    .await?;
+                
+                autumn_web::db::register_after_commit(|| async move {
+                    AFTER_COMMIT_RUN_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                })
+                .await;
+                
+                Ok::<_, diesel::result::Error>(item)
+            }
+            .scope_boxed()
+        })
+        .await
+        .map(|item| (axum::http::StatusCode::CREATED, Json(item)))
+    }
+
     // ── Setup ──────────────────────────────────────────────────
 
     static SETUP_CELL: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
@@ -137,5 +167,35 @@ mod transactional_tests {
                 .assert_ok()
                 .assert_body_eq("[]");
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn test_after_commit_suppression() {
+        let db = TestDb::shared().await;
+        setup_table(db).await;
+
+        // Reset the counter
+        AFTER_COMMIT_RUN_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
+
+        let client = TestApp::new()
+            .routes(routes![create_item_with_callback])
+            .with_transactional_db(db.url())
+            .build();
+
+        // Trigger the handler which registers an after-commit callback
+        client
+            .post("/items-with-callback")
+            .json(&serde_json::json!({"name": "Item with Callback"}))
+            .send()
+            .await
+            .assert_status(201);
+
+        // Verify that the callback was NOT run (suppressed due to transactional test mode)
+        assert_eq!(
+            std::sync::atomic::AtomicUsize::load(&AFTER_COMMIT_RUN_COUNT, std::sync::atomic::Ordering::SeqCst),
+            0,
+            "after_commit callback should be suppressed in transactional test mode"
+        );
     }
 }

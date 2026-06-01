@@ -1405,34 +1405,41 @@ impl crate::interceptor::DbConnectionInterceptor for TransactionalDbInterceptor 
             let mut conn = next.await?;
 
             // Check if transaction has already been started on this connection
-            let is_started: Option<String> = diesel::select(diesel::dsl::sql::<
+            let guc_result = diesel::select(diesel::dsl::sql::<
                 diesel::sql_types::Nullable<diesel::sql_types::Text>,
             >(
                 "current_setting('autumn.test_transaction_started', true)",
             ))
-            .get_result(&mut *conn)
-            .await
-            .ok()
-            .flatten();
+            .get_result::<Option<String>>(&mut *conn)
+            .await;
 
-            if is_started.as_deref() != Some("true") {
-                use diesel_async::AsyncConnection;
-                use diesel_async::RunQueryDsl;
+            match guc_result {
+                Ok(Some(ref s)) if s == "true" => {
+                    // Already started and healthy
+                }
+                Ok(_) => {
+                    use diesel_async::AsyncConnection;
+                    use diesel_async::RunQueryDsl;
 
-                conn.begin_test_transaction().await.map_err(|e| {
-                    crate::AutumnError::internal_server_error_msg(format!(
-                        "failed to start test transaction: {e}"
-                    ))
-                })?;
-
-                diesel::sql_query("SET autumn.test_transaction_started = 'true'")
-                    .execute(&mut *conn)
-                    .await
-                    .map_err(|e| {
+                    conn.begin_test_transaction().await.map_err(|e| {
                         crate::AutumnError::internal_server_error_msg(format!(
-                            "failed to set transaction session GUC: {e}"
+                            "failed to start test transaction: {e}"
                         ))
                     })?;
+
+                    diesel::sql_query("SET autumn.test_transaction_started = 'true'")
+                        .execute(&mut *conn)
+                        .await
+                        .map_err(|e| {
+                            crate::AutumnError::internal_server_error_msg(format!(
+                                "failed to set transaction session GUC: {e}"
+                            ))
+                        })?;
+                }
+                Err(_) => {
+                    // The GUC query failed. This happens when the connection is in a failed/aborted transaction block.
+                    // Since the transaction is already active (but aborted), do not retry begin_test_transaction!
+                }
             }
             Ok(conn)
         })
