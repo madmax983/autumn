@@ -33,16 +33,26 @@ pub trait VaultEntryRepository {}
 
 #[test]
 fn encrypted_columns_registered_and_versioned() {
+    use autumn_web::version_history::VersionedRecord;
+
     // The model registers its encrypted columns for composition.
-    assert_eq!(VaultEntry::__AUTUMN_ENCRYPTED_COLUMNS, &["secret", "lookup_key"]);
+    assert_eq!(
+        VaultEntry::__AUTUMN_ENCRYPTED_COLUMNS,
+        &["secret", "lookup_key"]
+    );
 
     // Version history treats encrypted columns as sensitive automatically, so the
     // plaintext that the in-memory model would serialize never reaches the
     // version table — it is recorded as a "changed (encrypted)" marker instead.
-    use autumn_web::version_history::VersionedRecord;
     let cols = VaultEntry::version_sensitive_columns();
-    assert!(cols.contains(&"secret"), "encrypted column auto-sensitive: {cols:?}");
-    assert!(cols.contains(&"lookup_key"), "encrypted column auto-sensitive: {cols:?}");
+    assert!(
+        cols.contains(&"secret"),
+        "encrypted column auto-sensitive: {cols:?}"
+    );
+    assert!(
+        cols.contains(&"lookup_key"),
+        "encrypted column auto-sensitive: {cols:?}"
+    );
 }
 
 #[test]
@@ -57,5 +67,8 @@ fn missing_keys_fail_fast_naming_the_credential_path() {
         err.contains("active_record_encryption.primary_key"),
         "diagnostic must name the missing credential path: {err}"
     );
-    assert!(err.contains("vault_entries"), "diagnostic must name the column: {err}");
+    assert!(
+        err.contains("vault_entries"),
+        "diagnostic must name the column: {err}"
+    );
 }

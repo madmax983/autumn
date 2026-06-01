@@ -103,6 +103,16 @@ pub enum EncryptionError {
     )]
     NoDeterministicKey,
 
+    /// No `key_derivation_salt` was configured.
+    ///
+    /// The salt is not secret, but it must be set explicitly (rather than a
+    /// shared built-in default) so key derivation is unique per deployment.
+    #[error(
+        "attribute encryption requires `{ns}.key_derivation_salt`; add it via `autumn credentials edit` (e.g. `openssl rand -hex 16`)",
+        ns = CREDENTIALS_NAMESPACE
+    )]
+    MissingSalt,
+
     /// The stored envelope is malformed (bad magic, truncated, bad base64).
     #[error("malformed encryption envelope: {0}")]
     MalformedEnvelope(&'static str),
@@ -275,9 +285,15 @@ impl KeyRing {
     ///
     /// Returns [`EncryptionError::NoDeterministicKey`] if deterministic mode is
     /// requested without a configured deterministic key.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the operating system's random number generator is unavailable
+    /// (randomized mode only).
     pub fn encrypt(&self, mode: Mode, plaintext: &[u8]) -> Result<String, EncryptionError> {
         use aes_gcm::aead::{Aead, KeyInit};
         use aes_gcm::{Aes256Gcm, Nonce};
+        use base64::Engine as _;
 
         let (mode_byte, data_key, nonce_bytes) = match mode {
             Mode::Randomized => {
@@ -313,7 +329,6 @@ impl KeyRing {
         out.extend_from_slice(&nonce_bytes);
         out.extend_from_slice(&ciphertext);
 
-        use base64::Engine as _;
         Ok(base64::engine::general_purpose::STANDARD.encode(out))
     }
 
@@ -326,6 +341,11 @@ impl KeyRing {
     ///
     /// See [`EncryptionError`] variants for malformed input, unknown key id, and
     /// authentication failure.
+    ///
+    /// # Panics
+    ///
+    /// Does not panic for any envelope input; the internal cipher construction
+    /// is infallible because data keys are always 32 bytes.
     pub fn decrypt(&self, envelope: &str) -> Result<Vec<u8>, EncryptionError> {
         use aes_gcm::aead::{Aead, KeyInit};
         use aes_gcm::{Aes256Gcm, Nonce};
@@ -446,7 +466,8 @@ pub struct EncryptionCredentials {
     /// Optional deterministic key (64-hex); required for deterministic columns.
     #[serde(default)]
     pub deterministic_key: Option<String>,
-    /// Salt mixed into key derivation.
+    /// Salt mixed into key derivation. Required (no shared built-in default) so
+    /// derivation is unique per deployment; not secret.
     #[serde(default)]
     pub key_derivation_salt: Option<String>,
     /// Retired keys kept for reads during rotation (64-hex each).
@@ -459,12 +480,14 @@ impl EncryptionCredentials {
     ///
     /// # Errors
     ///
-    /// Propagates [`EncryptionError::InvalidKeyFormat`] for malformed keys.
+    /// Propagates [`EncryptionError::InvalidKeyFormat`] for malformed keys, and
+    /// returns [`EncryptionError::MissingSalt`] if `key_derivation_salt` is not
+    /// configured (no shared built-in default — the salt must be deployment-unique).
     pub fn to_key_ring(&self) -> Result<KeyRing, EncryptionError> {
         let salt = self
             .key_derivation_salt
             .as_deref()
-            .unwrap_or("autumn-default-salt");
+            .ok_or(EncryptionError::MissingSalt)?;
         KeyRing::from_master_hex(
             &self.primary_key,
             &self.retired_keys,
@@ -571,11 +594,12 @@ pub fn merge_encrypted_columns_for_table(table: &str, columns: &mut Vec<&'static
     }
 }
 
-/// Boot validation: if any encrypted columns are registered, the key material
-/// must resolve. Mirrors the fast-fail diagnostic shape of the credentials and
-/// signing-secret checks (#597), naming the missing credential path.
+/// Boot validation for attribute encryption.
 ///
-/// On success, installs the global key ring.
+/// If any encrypted columns are registered, the key material must resolve.
+/// Mirrors the fast-fail diagnostic shape of the credentials and signing-secret
+/// checks (#597), naming the missing credential path. On success, installs the
+/// global key ring.
 ///
 /// # Errors
 ///
@@ -631,10 +655,30 @@ mod tests {
     const KEY_A: &str = "1111111111111111111111111111111111111111111111111111111111111111";
     const KEY_B: &str = "2222222222222222222222222222222222222222222222222222222222222222";
     const DET: &str = "3333333333333333333333333333333333333333333333333333333333333333";
-    const SALT: &[u8] = b"unit-test-salt";
+
+    // Salts are generated at runtime (not hard-coded) so the test fixtures don't
+    // ship a constant cryptographic value; a process-stable salt is shared so
+    // cross-ring determinism/rotation assertions hold.
+    fn salt() -> &'static [u8] {
+        static S: OnceLock<[u8; 16]> = OnceLock::new();
+        S.get_or_init(|| {
+            let mut b = [0u8; 16];
+            getrandom::getrandom(&mut b).expect("OS RNG");
+            b
+        })
+    }
+
+    fn salt2() -> &'static [u8] {
+        static S: OnceLock<[u8; 16]> = OnceLock::new();
+        S.get_or_init(|| {
+            let mut b = [1u8; 16];
+            getrandom::getrandom(&mut b).expect("OS RNG");
+            b
+        })
+    }
 
     fn ring() -> KeyRing {
-        KeyRing::from_master_hex(KEY_A, &[], Some(DET), SALT).unwrap()
+        KeyRing::from_master_hex(KEY_A, &[], Some(DET), salt()).unwrap()
     }
 
     #[test]
@@ -659,7 +703,10 @@ mod tests {
         let r2 = ring();
         let a = r1.encrypt(Mode::Deterministic, b"a@b.com").unwrap();
         let b = r2.encrypt(Mode::Deterministic, b"a@b.com").unwrap();
-        assert_eq!(a, b, "deterministic ciphertext must be stable for equality lookups");
+        assert_eq!(
+            a, b,
+            "deterministic ciphertext must be stable for equality lookups"
+        );
         let c = r1.encrypt(Mode::Deterministic, b"other@b.com").unwrap();
         assert_ne!(a, c);
         assert_eq!(r1.decrypt(&a).unwrap(), b"a@b.com");
@@ -667,7 +714,7 @@ mod tests {
 
     #[test]
     fn deterministic_without_key_errors() {
-        let r = KeyRing::from_master_hex(KEY_A, &[], None, SALT).unwrap();
+        let r = KeyRing::from_master_hex(KEY_A, &[], None, salt()).unwrap();
         assert!(matches!(
             r.encrypt(Mode::Deterministic, b"x"),
             Err(EncryptionError::NoDeterministicKey)
@@ -679,7 +726,9 @@ mod tests {
         use base64::Engine as _;
         let r = ring();
         let env = r.encrypt(Mode::Randomized, b"data").unwrap();
-        let raw = base64::engine::general_purpose::STANDARD.decode(&env).unwrap();
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(&env)
+            .unwrap();
         assert_eq!(raw[0], MAGIC);
         assert_eq!(raw[1], VERSION);
         assert_eq!(raw[2], ALG_AES_256_GCM);
@@ -691,20 +740,19 @@ mod tests {
 
     #[test]
     fn key_id_is_stable_across_rebuilds() {
-        let r1 = KeyRing::from_master_hex(KEY_A, &[], None, SALT).unwrap();
-        let r2 = KeyRing::from_master_hex(KEY_A, &[], None, SALT).unwrap();
+        let r1 = KeyRing::from_master_hex(KEY_A, &[], None, salt()).unwrap();
+        let r2 = KeyRing::from_master_hex(KEY_A, &[], None, salt()).unwrap();
         assert_eq!(r1.primary_key_id(), r2.primary_key_id());
     }
 
     #[test]
     fn rotation_reads_old_writes_with_retired_key() {
         // Write under A as primary.
-        let old = KeyRing::from_master_hex(KEY_A, &[], None, SALT).unwrap();
+        let old = KeyRing::from_master_hex(KEY_A, &[], None, salt()).unwrap();
         let written = old.encrypt(Mode::Randomized, b"legacy-row").unwrap();
 
         // Rotate: B is now primary, A retired.
-        let rotated =
-            KeyRing::from_master_hex(KEY_B, &[KEY_A.to_string()], None, SALT).unwrap();
+        let rotated = KeyRing::from_master_hex(KEY_B, &[KEY_A.to_string()], None, salt()).unwrap();
         // Old row still decrypts (no rewrite needed).
         assert_eq!(rotated.decrypt(&written).unwrap(), b"legacy-row");
         // New writes use the new primary key id.
@@ -715,10 +763,10 @@ mod tests {
 
     #[test]
     fn fully_retired_key_id_is_named_in_error() {
-        let old = KeyRing::from_master_hex(KEY_A, &[], None, SALT).unwrap();
+        let old = KeyRing::from_master_hex(KEY_A, &[], None, salt()).unwrap();
         let written = old.encrypt(Mode::Randomized, b"x").unwrap();
         // New ring without A at all.
-        let other = KeyRing::from_master_hex(KEY_B, &[], None, SALT).unwrap();
+        let other = KeyRing::from_master_hex(KEY_B, &[], None, salt()).unwrap();
         assert!(matches!(
             other.decrypt(&written),
             Err(EncryptionError::UnknownKeyId(_))
@@ -727,8 +775,8 @@ mod tests {
 
     #[test]
     fn wrong_salt_fails_decryption() {
-        let a = KeyRing::from_master_hex(KEY_A, &[], None, b"salt-1").unwrap();
-        let b = KeyRing::from_master_hex(KEY_A, &[], None, b"salt-2").unwrap();
+        let a = KeyRing::from_master_hex(KEY_A, &[], None, salt()).unwrap();
+        let b = KeyRing::from_master_hex(KEY_A, &[], None, salt2()).unwrap();
         let env = a.encrypt(Mode::Randomized, b"x").unwrap();
         // Different salt derives a different data key -> different id -> unknown.
         assert!(b.decrypt(&env).is_err());
@@ -737,7 +785,7 @@ mod tests {
     #[test]
     fn invalid_key_hex_is_rejected() {
         assert!(matches!(
-            KeyRing::from_master_hex("tooshort", &[], None, SALT),
+            KeyRing::from_master_hex("tooshort", &[], None, salt()),
             Err(EncryptionError::InvalidKeyFormat { .. })
         ));
     }
@@ -747,7 +795,7 @@ mod tests {
         let creds = EncryptionCredentials {
             primary_key: KEY_A.to_string(),
             deterministic_key: Some(DET.to_string()),
-            key_derivation_salt: Some("s".to_string()),
+            key_derivation_salt: Some(hex::encode(salt())),
             retired_keys: vec![],
         };
         let ring = creds.to_key_ring().unwrap();

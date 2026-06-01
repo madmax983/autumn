@@ -151,9 +151,7 @@ fn redacting_debug_impl(
 fn encrypted_wrapper_path(mode: EncryptedMode) -> Option<TokenStream> {
     match mode {
         EncryptedMode::None => None,
-        EncryptedMode::Randomized => {
-            Some(quote! { ::autumn_web::encryption::RandomizedText })
-        }
+        EncryptedMode::Randomized => Some(quote! { ::autumn_web::encryption::RandomizedText }),
         EncryptedMode::Deterministic => {
             Some(quote! { ::autumn_web::encryption::DeterministicText })
         }
@@ -718,8 +716,10 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         if encrypted_columns.is_empty() {
             (quote! { Debug, }, quote! {}, quote! { Debug, }, quote! {})
         } else {
-            let all_idents: Vec<&syn::Ident> =
-                all_fields.iter().map(|f| f.ident.as_ref().unwrap()).collect();
+            let all_idents: Vec<&syn::Ident> = all_fields
+                .iter()
+                .map(|f| f.ident.as_ref().unwrap())
+                .collect();
             let new_idents: Vec<&syn::Ident> = fields_for_new
                 .iter()
                 .map(|f| f.ident.as_ref().unwrap())
@@ -763,8 +763,9 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             // Encrypted columns route through an AEAD wrapper transparently:
             // `serialize_as` encrypts on write, `deserialize_as` decrypts on read.
             // The public field stays a plain `String` (plaintext in Rust code).
-            let enc = encrypted_wrapper_path(parse_field_encrypted(f).unwrap_or(EncryptedMode::None))
-                .map(|w| quote! { #[diesel(serialize_as = #w, deserialize_as = #w)] });
+            let enc =
+                encrypted_wrapper_path(parse_field_encrypted(f).unwrap_or(EncryptedMode::None))
+                    .map(|w| quote! { #[diesel(serialize_as = #w, deserialize_as = #w)] });
             quote! { #(#attrs)* #enc pub #ident: #ty }
         })
         .collect();
@@ -776,8 +777,9 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             let ident = &f.ident;
             let ty = &f.ty;
             let val_attrs = validate_attrs(f);
-            let enc = encrypted_wrapper_path(parse_field_encrypted(f).unwrap_or(EncryptedMode::None))
-                .map(|w| quote! { #[diesel(serialize_as = #w)] });
+            let enc =
+                encrypted_wrapper_path(parse_field_encrypted(f).unwrap_or(EncryptedMode::None))
+                    .map(|w| quote! { #[diesel(serialize_as = #w)] });
             quote! { #(#val_attrs)* #enc pub #ident: #ty }
         })
         .collect();
@@ -1104,8 +1106,9 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             // For encrypted columns the inner value is routed through the AEAD
             // wrapper via `serialize_as` (Diesel maps the `Option` skip itself),
             // so updates write ciphertext while the API stays plaintext.
-            let enc = encrypted_wrapper_path(parse_field_encrypted(f).unwrap_or(EncryptedMode::None))
-                .map(|w| quote! { #[diesel(serialize_as = #w)] });
+            let enc =
+                encrypted_wrapper_path(parse_field_encrypted(f).unwrap_or(EncryptedMode::None))
+                    .map(|w| quote! { #[diesel(serialize_as = #w)] });
             quote! { #enc pub #ident: Option<#ty> }
         })
         .collect();

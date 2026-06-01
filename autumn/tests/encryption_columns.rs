@@ -1,4 +1,4 @@
-//! End-to-end attribute-encryption integration tests over a real SQLite database.
+//! End-to-end attribute-encryption integration tests over a real `SQLite` database.
 //!
 //! Proves the headline acceptance criteria:
 //! * a `#[model]` field marked `#[encrypted]` persists as opaque ciphertext on
@@ -39,8 +39,18 @@ pub struct Secret {
 const KEY: &str = "1111111111111111111111111111111111111111111111111111111111111111";
 const DET: &str = "3333333333333333333333333333333333333333333333333333333333333333";
 
+// Process-stable, runtime-generated salt (not a hard-coded crypto value).
+fn itest_salt() -> &'static [u8] {
+    static S: std::sync::OnceLock<[u8; 16]> = std::sync::OnceLock::new();
+    S.get_or_init(|| {
+        let mut b = [0u8; 16];
+        getrandom::getrandom(&mut b).expect("OS RNG");
+        b
+    })
+}
+
 fn install_ring() {
-    let ring = KeyRing::from_master_hex(KEY, &[], Some(DET), b"itest-salt").unwrap();
+    let ring = KeyRing::from_master_hex(KEY, &[], Some(DET), itest_salt()).unwrap();
     encryption::install_key_ring(ring);
 }
 
@@ -77,7 +87,10 @@ fn encrypted_columns_are_ciphertext_on_disk_but_plaintext_in_rust() {
         .select((secrets::email, secrets::api_token, secrets::note))
         .first(&mut c)
         .unwrap();
-    assert_ne!(raw_email, "alice@example.com", "email must be ciphertext at rest");
+    assert_ne!(
+        raw_email, "alice@example.com",
+        "email must be ciphertext at rest"
+    );
     assert!(!raw_email.contains("alice"), "no plaintext leakage on disk");
     assert_ne!(raw_token, "sk_live_super_secret");
     assert!(!raw_token.contains("secret"));
@@ -91,7 +104,10 @@ fn encrypted_columns_are_ciphertext_on_disk_but_plaintext_in_rust() {
     );
 
     // Reading through the model yields plaintext with no call-site changes.
-    let got: Secret = secrets::table.select(Secret::as_select()).first(&mut c).unwrap();
+    let got: Secret = secrets::table
+        .select(Secret::as_select())
+        .first(&mut c)
+        .unwrap();
     assert_eq!(got.email, "alice@example.com");
     assert_eq!(got.api_token, "sk_live_super_secret");
     assert_eq!(got.note, "plain note");
@@ -145,7 +161,10 @@ fn updates_re_encrypt_transparently() {
         .execute(&mut c)
         .unwrap();
 
-    let got: Secret = secrets::table.select(Secret::as_select()).first(&mut c).unwrap();
+    let got: Secret = secrets::table
+        .select(Secret::as_select())
+        .first(&mut c)
+        .unwrap();
     assert_eq!(got.api_token, "rotated");
 }
 
@@ -153,7 +172,10 @@ fn updates_re_encrypt_transparently() {
 fn wrapper_debug_redacts_plaintext_by_default() {
     let w = autumn_web::encryption::RandomizedText::from("topsecret".to_string());
     let dbg = format!("{w:?}");
-    assert!(!dbg.contains("topsecret"), "wrapper Debug must redact: {dbg}");
+    assert!(
+        !dbg.contains("topsecret"),
+        "wrapper Debug must redact: {dbg}"
+    );
     assert!(dbg.contains("<encrypted>"));
 }
 
@@ -168,10 +190,22 @@ fn model_debug_redacts_encrypted_columns() {
         note: "fine to show".into(),
     };
     let dbg = format!("{s:?}");
-    assert!(!dbg.contains("leak@example.com"), "email must be redacted: {dbg}");
-    assert!(!dbg.contains("sk_live_dont_log_me"), "token must be redacted: {dbg}");
-    assert!(dbg.contains("<encrypted>"), "redaction marker present: {dbg}");
-    assert!(dbg.contains("fine to show"), "non-encrypted field still shown: {dbg}");
+    assert!(
+        !dbg.contains("leak@example.com"),
+        "email must be redacted: {dbg}"
+    );
+    assert!(
+        !dbg.contains("sk_live_dont_log_me"),
+        "token must be redacted: {dbg}"
+    );
+    assert!(
+        dbg.contains("<encrypted>"),
+        "redaction marker present: {dbg}"
+    );
+    assert!(
+        dbg.contains("fine to show"),
+        "non-encrypted field still shown: {dbg}"
+    );
     // NewSecret (insert DTO) redacts too.
     let n = NewSecret {
         email: "leak@example.com".into(),
@@ -179,7 +213,10 @@ fn model_debug_redacts_encrypted_columns() {
         note: "ok".into(),
     };
     let ndbg = format!("{n:?}");
-    assert!(!ndbg.contains("sk_live_dont_log_me"), "NewX token must redact: {ndbg}");
+    assert!(
+        !ndbg.contains("sk_live_dont_log_me"),
+        "NewX token must redact: {ndbg}"
+    );
 }
 
 #[test]

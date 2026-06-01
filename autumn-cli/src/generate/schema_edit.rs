@@ -263,7 +263,7 @@ pub fn add_columns_down_sql(table: &str, fields: &[Field]) -> String {
 /// the procedure and serves as the migration record.
 #[must_use]
 pub fn encrypt_columns_up_sql(table: &str, columns: &[String]) -> String {
-    let mut out = String::new();
+    let mut out = String::with_capacity(1024);
     let _ = writeln!(
         out,
         "-- autumn-safety: backfill \
@@ -312,7 +312,7 @@ pub fn encrypt_columns_up_sql(table: &str, columns: &[String]) -> String {
 /// ciphertext, given the keys.
 #[must_use]
 pub fn encrypt_columns_down_sql(table: &str, columns: &[String]) -> String {
-    let mut out = String::new();
+    let mut out = String::with_capacity(512);
     let _ = writeln!(
         out,
         "-- Rollback: restore plaintext from ciphertext on `{table}` (#805)."

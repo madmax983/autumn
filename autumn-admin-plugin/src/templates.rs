@@ -1984,8 +1984,14 @@ mod tests {
         let field = AdminField::new("ssn", AdminFieldKind::Text);
         let cell = render_cell_value(&record, &field).into_string();
         let detail = render_detail_value(&record, &field).into_string();
-        assert!(!cell.contains("123-45-6789"), "list cell must redact: {cell}");
-        assert!(!detail.contains("123-45-6789"), "detail must redact: {detail}");
+        assert!(
+            !cell.contains("123-45-6789"),
+            "list cell must redact: {cell}"
+        );
+        assert!(
+            !detail.contains("123-45-6789"),
+            "detail must redact: {detail}"
+        );
         assert!(cell.contains("••••••••"));
         assert!(detail.contains("••••••••"));
     }

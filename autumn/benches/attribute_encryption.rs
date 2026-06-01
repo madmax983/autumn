@@ -35,11 +35,17 @@ fn percentiles(mut samples: Vec<u128>) -> (u128, u128) {
     samples.sort_unstable();
     let p50 = samples[samples.len() / 2];
     let p99 = samples[(samples.len() * 99) / 100];
+    // Invariant: percentiles are monotonic on sorted samples.
+    assert!(p50 <= p99, "p50 ({p50}) must be <= p99 ({p99})");
     (p50, p99)
 }
 
+#[allow(clippy::cast_precision_loss, clippy::branches_sharing_code)]
 fn main() {
-    let ring = KeyRing::from_master_hex(KEY, &[], None, b"bench-salt").unwrap();
+    // Generate the key-derivation salt at runtime rather than hard-coding it.
+    let mut salt = [0u8; 16];
+    getrandom::getrandom(&mut salt).expect("OS RNG");
+    let ring = KeyRing::from_master_hex(KEY, &[], None, &salt).unwrap();
 
     // Build 10k rows: even ids plaintext, odd ids encrypted (mixed workload).
     let plaintexts: Vec<String> = (0..ROWS).map(|i| format!("row-value-{i:08}")).collect();
@@ -105,9 +111,7 @@ fn main() {
     // ~250µs, a per-column AEAD cost of `e50` ns is well under 10%.
     let db_read_baseline_ns: u128 = 250_000;
     let pct = (e50.saturating_sub(b50) as f64 / db_read_baseline_ns as f64) * 100.0;
-    println!(
-        "  vs {db_read_baseline_ns} ns DB-read baseline: +{pct:.3}% (budget: <10%)"
-    );
+    println!("  vs {db_read_baseline_ns} ns DB-read baseline: +{pct:.3}% (budget: <10%)");
     assert!(
         pct < 10.0,
         "AEAD per-read overhead {pct:.3}% exceeds the 10% budget against a {db_read_baseline_ns}ns DB read"
