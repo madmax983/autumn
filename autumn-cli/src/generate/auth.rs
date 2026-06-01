@@ -310,7 +310,13 @@ fn plan_auth_options_impl(
     let routes_dir = project_root.join("src").join("routes");
     plan.create(
         routes_dir.join("oauth.rs"),
-        render_oauth_routes_file(&pascal_name, &snake_name, &user_table, &oauth.providers),
+        render_oauth_routes_file(
+            &pascal_name,
+            &snake_name,
+            &user_table,
+            &oauth.providers,
+            totp,
+        ),
     );
 
     // Add `pub mod oauth;` to src/routes/mod.rs — use the base plan's already-modified
@@ -921,14 +927,15 @@ fn render_routes_file(
         btn_html
     };
 
-    let (totp_imports, totp_login_branch, totp_section) = if totp {
+    let (totp_imports, totp_login_branch, totp_reset_branch, totp_section) = if totp {
         (
             totp_imports_src().to_owned(),
             totp_login_branch_src(snake_name),
+            totp_reset_branch_src(snake_name),
             totp_routes_section_src(pascal_name, snake_name, table),
         )
     } else {
-        (String::new(), String::new(), String::new())
+        (String::new(), String::new(), String::new(), String::new())
     };
 
     format!(
@@ -1347,7 +1354,7 @@ pub async fn reset_password(
         ))
         .execute(&mut *db)
         .await?;
-
+{totp_reset_branch}
     // Rotate session to invalidate any previous authenticated state.
     session.rotate_id().await;
     session.insert("{snake_name}_id", {snake_name}.id.to_string()).await;
@@ -1733,12 +1740,34 @@ fn render_oauth_routes_file(
     snake_name: &str,
     user_table: &str,
     providers: &[String],
+    totp: bool,
 ) -> String {
     let provider_list = providers
         .iter()
         .map(|p| format!("\"{p}\""))
         .collect::<Vec<_>>()
         .join(", ");
+
+    // When TOTP is also generated, the callback guidance must NOT set the secured
+    // session key directly for a 2FA-enabled account — it has to route through
+    // `/login/verify` exactly like password login, or OAuth would bypass 2FA.
+    let totp_callback_note = if totp {
+        "    //\n\
+         \x20   // ⚠️ TWO-FACTOR: this app was generated with `--totp`. If the resolved\n\
+         \x20   // local account has `totp_enabled == true`, do NOT set the secured\n\
+         \x20   // session key here. Instead mark the session pending and redirect to\n\
+         \x20   // the second-factor form, mirroring the password-login flow:\n\
+         \x20   //\n\
+         \x20   //   if local_user.totp_enabled {\n\
+         \x20   //       session.rotate_id().await;\n\
+         \x20   //       session.insert(\"totp_pending_id\", local_user.id.to_string()).await;\n\
+         \x20   //       return Redirect::to(\"/login/verify\").into_response();\n\
+         \x20   //   }\n\
+         \x20   //   // otherwise, fully authenticate:\n\
+         \x20   //   session.insert(&auth_cfg.session_key, local_user.id.to_string()).await;\n"
+    } else {
+        ""
+    };
 
     format!(
         r#"//! OAuth2/OIDC redirect and callback handlers.
@@ -1844,7 +1873,7 @@ pub async fn oauth_callback(
     //
     // Until the above is implemented the user will NOT be logged in after the OAuth
     // callback — that is intentional to avoid authenticating without a local account.
-    let _ = identity;
+{totp_callback_note}    let _ = identity;
     let _ = user_table_placeholder_{snake_name}();
 
     Redirect::to("/account").into_response()
@@ -2029,6 +2058,7 @@ const fn totp_imports_src() -> &'static str {
      use aes_gcm::{Aes256Gcm, Key, Nonce};\n\
      use base64::Engine as _;\n\
      use base64::engine::general_purpose::STANDARD as B64;\n\
+     use diesel_async::AsyncConnection as _;\n\
      use totp_rs::{Algorithm, Secret, TOTP};\n\
      use crate::models::recovery_code::{NewRecoveryCode, RecoveryCode};\n\
      use crate::schema::recovery_codes;\n"
@@ -2040,6 +2070,26 @@ fn totp_login_branch_src(snake_name: &str) -> String {
     // ── 2FA interstitial ────────────────────────────────────────────────────
     // If the account has TOTP enabled, do NOT set the `#[secured]` auth key yet.
     // Mark the session `totp_pending` and redirect to the second-factor form.
+    if __SNAKE__.totp_enabled {
+        session.rotate_id().await;
+        session
+            .insert("totp_pending_id", __SNAKE__.id.to_string())
+            .await;
+        return Ok(redirect_to("/login/verify"));
+    }
+"#;
+    TPL.replace("__SNAKE__", snake_name)
+}
+
+/// The interstitial branch injected into `reset_password` after the password is
+/// updated, so a 2FA-enabled account cannot be fully logged in via an emailed
+/// reset link without also passing the second factor.
+fn totp_reset_branch_src(snake_name: &str) -> String {
+    const TPL: &str = r#"
+    // ── 2FA interstitial ────────────────────────────────────────────────────
+    // A correct reset token proves control of the email, not possession of the
+    // second factor. If TOTP is enabled, require /login/verify before granting
+    // the secured session key (mirrors the password-login flow).
     if __SNAKE__.totp_enabled {
         session.rotate_id().await;
         session
@@ -2259,8 +2309,9 @@ pub async fn two_factor_status(
 /// `POST /account/2fa/enable` — generate a secret, render the QR + manual key,
 /// and ask the user to confirm with a valid code before enabling. Requires auth.
 ///
-/// The secret is encrypted and stored immediately, but `totp_enabled` stays
-/// `false` until `two_factor_confirm` succeeds.
+/// The pending secret is held in the session (encrypted) and is NOT written to
+/// the account until `two_factor_confirm` succeeds. This means starting (and
+/// abandoning) re-enrollment never disturbs an already-active second factor.
 #[secured]
 #[post("/account/2fa/enable")]
 pub async fn two_factor_enable(
@@ -2293,15 +2344,10 @@ pub async fn two_factor_enable(
         .get_qr_base64()
         .map_err(|_| AutumnError::internal_server_error_msg("failed to render QR code"))?;
 
+    // Stash the pending secret in the session only — the live account row is
+    // untouched until the user proves possession in `two_factor_confirm`.
     let encrypted = encrypt_secret(&secret_bytes)?;
-    diesel::update(__TABLE__::table.find(__SNAKE__.id))
-        .set((
-            __TABLE__::totp_secret_encrypted.eq(Some(encrypted)),
-            __TABLE__::totp_enabled.eq(false),
-            __TABLE__::totp_last_used_step.eq(None::<i64>),
-        ))
-        .execute(&mut *db)
-        .await?;
+    session.insert("totp_pending_secret", &encrypted).await;
 
     Ok(layout("Enable Two-Factor", html! {
         h1 { "Scan this QR code" }
@@ -2340,42 +2386,68 @@ pub async fn two_factor_confirm(
         .await
         .map_err(|_| AutumnError::not_found_msg("Account not found."))?;
 
-    let stored = __SNAKE__
-        .totp_secret_encrypted
-        .as_deref()
+    // The pending secret lives in the session (set by `two_factor_enable`), so
+    // an unconfirmed enrollment never touched the live account row.
+    let pending = session
+        .get("totp_pending_secret")
+        .await
         .ok_or_else(|| AutumnError::unprocessable_msg("Start enrollment first."))?;
-    let secret = decrypt_secret(stored)?;
+    let secret = decrypt_secret(&pending)?;
     let totp = build_totp(secret, &__SNAKE__.email)?;
     let Some(step) = verify_totp_code(&totp, &form.code) else {
         return Err(AutumnError::unprocessable_msg("Invalid code. Try again."));
     };
 
-    diesel::update(__TABLE__::table.find(__SNAKE__.id))
-        .set((
-            __TABLE__::totp_enabled.eq(true),
-            __TABLE__::totp_last_used_step.eq(Some(step)),
-        ))
-        .execute(&mut *db)
-        .await?;
-
-    // Replace any prior recovery codes with a fresh single-use set.
-    diesel::delete(recovery_codes::table.filter(recovery_codes::user_id.eq(__SNAKE__.id)))
-        .execute(&mut *db)
-        .await?;
+    // Persist the new secret and a fresh single-use recovery-code set BEFORE
+    // flipping `totp_enabled`, so a failure mid-way leaves the account in its
+    // prior state rather than locked behind a secret whose codes were never
+    // shown. Run it all in one transaction for atomicity.
+    let pending_secret = pending.clone();
+    let user_id = __SNAKE__.id;
     let mut plaintext_codes: Vec<String> = Vec::with_capacity(RECOVERY_CODE_COUNT);
+    let mut hashed_codes: Vec<String> = Vec::with_capacity(RECOVERY_CODE_COUNT);
     for _ in 0..RECOVERY_CODE_COUNT {
         let code = generate_recovery_code();
-        let digest = hash_password(&code).await?;
-        diesel::insert_into(recovery_codes::table)
-            .values(NewRecoveryCode {
-                user_id: __SNAKE__.id,
-                code_digest: digest,
-                used_at: None,
-            })
-            .execute(&mut *db)
-            .await?;
+        hashed_codes.push(hash_password(&code).await?);
         plaintext_codes.push(code);
     }
+
+    (*db)
+        .transaction::<_, diesel::result::Error, _>(|conn| {
+        Box::pin(async move {
+            diesel::update(__TABLE__::table.find(user_id))
+                .set((
+                    __TABLE__::totp_secret_encrypted.eq(Some(pending_secret)),
+                    __TABLE__::totp_last_used_step.eq(Some(step)),
+                ))
+                .execute(conn)
+                .await?;
+            diesel::delete(recovery_codes::table.filter(recovery_codes::user_id.eq(user_id)))
+                .execute(conn)
+                .await?;
+            for digest in hashed_codes {
+                diesel::insert_into(recovery_codes::table)
+                    .values(NewRecoveryCode {
+                        user_id,
+                        code_digest: digest,
+                        used_at: None,
+                    })
+                    .execute(conn)
+                    .await?;
+            }
+            // Flip the flag last: the account is only "2FA-enabled" once the new
+            // secret and its recovery codes are durably stored.
+            diesel::update(__TABLE__::table.find(user_id))
+                .set(__TABLE__::totp_enabled.eq(true))
+                .execute(conn)
+                .await?;
+            Ok(())
+        })
+        })
+        .await
+        .map_err(|_| AutumnError::internal_server_error_msg("Failed to enable two-factor."))?;
+
+    session.remove("totp_pending_secret").await;
 
     Ok(layout("Save Your Recovery Codes", html! {
         h1 { "Two-factor authentication enabled" }
@@ -2499,22 +2571,34 @@ pub async fn login_verify(
     let mut verified = false;
 
     // 1) Try TOTP within the ±1 window, rejecting an already-used step (replay).
+    //    Consumption is atomic: the UPDATE only matches rows whose stored step is
+    //    still below this one, and we require exactly one row to be changed. Two
+    //    concurrent requests with the same code therefore cannot both win — the
+    //    second sees `affected == 0`.
     if let Some(stored) = __SNAKE__.totp_secret_encrypted.as_deref() {
         let secret = decrypt_secret(stored)?;
         let totp = build_totp(secret, &__SNAKE__.email)?;
         if let Some(step) = verify_totp_code(&totp, &submitted) {
-            let fresh = __SNAKE__.totp_last_used_step.map_or(true, |last| step > last);
-            if fresh {
-                diesel::update(__TABLE__::table.find(__SNAKE__.id))
-                    .set(__TABLE__::totp_last_used_step.eq(Some(step)))
-                    .execute(&mut *db)
-                    .await?;
+            let affected = diesel::update(
+                __TABLE__::table.find(__SNAKE__.id).filter(
+                    __TABLE__::totp_last_used_step
+                        .is_null()
+                        .or(__TABLE__::totp_last_used_step.lt(step)),
+                ),
+            )
+            .set(__TABLE__::totp_last_used_step.eq(Some(step)))
+            .execute(&mut *db)
+            .await?;
+            if affected == 1 {
                 verified = true;
             }
         }
     }
 
-    // 2) Otherwise, try an unused recovery code (single-use).
+    // 2) Otherwise, try an unused recovery code (single-use). Marking it used is
+    //    a conditional UPDATE guarded by `used_at IS NULL`; the code is only
+    //    accepted when this request is the one that flips it, so a code can never
+    //    be redeemed twice even under concurrent submissions.
     if !verified {
         let unused: Vec<RecoveryCode> = recovery_codes::table
             .filter(recovery_codes::user_id.eq(__SNAKE__.id))
@@ -2525,12 +2609,18 @@ pub async fn login_verify(
             .unwrap_or_default();
         for rc in &unused {
             if verify_password(&submitted, &rc.code_digest).await.unwrap_or(false) {
-                diesel::update(recovery_codes::table.find(rc.id))
-                    .set(recovery_codes::used_at.eq(Some(chrono::Utc::now().naive_utc())))
-                    .execute(&mut *db)
-                    .await?;
-                verified = true;
-                break;
+                let affected = diesel::update(
+                    recovery_codes::table
+                        .find(rc.id)
+                        .filter(recovery_codes::used_at.is_null()),
+                )
+                .set(recovery_codes::used_at.eq(Some(chrono::Utc::now().naive_utc())))
+                .execute(&mut *db)
+                .await?;
+                if affected == 1 {
+                    verified = true;
+                    break;
+                }
             }
         }
     }
@@ -3432,7 +3522,8 @@ mod tests {
 
     #[test]
     fn oauth_callback_does_not_set_session_key_before_account_link() {
-        let routes = render_oauth_routes_file("User", "user", "users", &["github".to_owned()]);
+        let routes =
+            render_oauth_routes_file("User", "user", "users", &["github".to_owned()], false);
         // The TODO comment may mention the call; verify the EXECUTABLE line is absent.
         // Executable session.insert calls are not prefixed with "//" or "#".
         let executable_insert = routes
@@ -3529,6 +3620,405 @@ mod tests {
         assert!(
             routes.contains("a href=\"/auth/google/redirect\""),
             "login form routes file missing google redirect link"
+        );
+    }
+
+    // ── TOTP two-factor generator tests (S-061 / #799) ──────────────────────
+
+    fn totp_plan(tmp: &std::path::Path) -> Plan {
+        let oauth = AuthOAuthOptions::default();
+        plan_auth_full(tmp, "User", "20260508000000", &oauth, true).unwrap()
+    }
+
+    #[test]
+    fn totp_migration_adds_totp_columns_and_recovery_table() {
+        let tmp = project_with_main();
+        totp_plan(tmp.path()).execute(Flags::default()).unwrap();
+        let up = fs::read_to_string(
+            tmp.path()
+                .join("migrations/20260508000000_create_users/up.sql"),
+        )
+        .unwrap();
+        assert!(
+            up.contains("totp_secret_encrypted"),
+            "missing totp_secret_encrypted: {up}"
+        );
+        assert!(up.contains("totp_enabled"), "missing totp_enabled: {up}");
+        assert!(
+            up.contains("CREATE TABLE recovery_codes"),
+            "missing recovery_codes table: {up}"
+        );
+        assert!(up.contains("code_digest"), "missing code_digest: {up}");
+        assert!(up.contains("used_at"), "missing used_at: {up}");
+        assert!(
+            !up.contains("totp_secret TEXT") && !up.contains("recovery_code TEXT"),
+            "raw secret / raw recovery code must never be stored: {up}"
+        );
+        let down = fs::read_to_string(
+            tmp.path()
+                .join("migrations/20260508000000_create_users/down.sql"),
+        )
+        .unwrap();
+        assert!(
+            down.contains("DROP TABLE recovery_codes"),
+            "down.sql must drop recovery_codes: {down}"
+        );
+    }
+
+    #[test]
+    fn totp_model_has_totp_fields_and_recovery_model() {
+        let tmp = project_with_main();
+        totp_plan(tmp.path()).execute(Flags::default()).unwrap();
+        let model = fs::read_to_string(tmp.path().join("src/models/user.rs")).unwrap();
+        assert!(
+            model.contains("pub totp_secret_encrypted: Option<String>"),
+            "{model}"
+        );
+        assert!(model.contains("pub totp_enabled: bool"), "{model}");
+        let rc = fs::read_to_string(tmp.path().join("src/models/recovery_code.rs")).unwrap();
+        assert!(rc.contains("pub struct RecoveryCode"), "{rc}");
+        assert!(rc.contains("pub code_digest: String"), "{rc}");
+        assert!(rc.contains("pub used_at: Option<"), "{rc}");
+        let mod_rs = fs::read_to_string(tmp.path().join("src/models/mod.rs")).unwrap();
+        assert!(mod_rs.contains("pub mod recovery_code;"), "{mod_rs}");
+    }
+
+    #[test]
+    fn totp_schema_has_totp_and_recovery_columns() {
+        let tmp = project_with_main();
+        totp_plan(tmp.path()).execute(Flags::default()).unwrap();
+        let schema = fs::read_to_string(tmp.path().join("src/schema.rs")).unwrap();
+        assert!(
+            schema.contains("totp_secret_encrypted -> Nullable<Text>"),
+            "{schema}"
+        );
+        assert!(schema.contains("totp_enabled -> Bool"), "{schema}");
+        assert!(schema.contains("recovery_codes (id)"), "{schema}");
+        assert!(schema.contains("code_digest -> Text"), "{schema}");
+        assert!(
+            schema.contains("used_at -> Nullable<Timestamp>"),
+            "{schema}"
+        );
+    }
+
+    #[test]
+    fn totp_routes_have_2fa_handlers_and_paths() {
+        let tmp = project_with_main();
+        totp_plan(tmp.path()).execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+        for needle in [
+            "pub async fn two_factor_status",
+            "pub async fn two_factor_enable",
+            "pub async fn two_factor_confirm",
+            "pub async fn two_factor_disable",
+            "pub async fn login_verify_form",
+            "pub async fn login_verify",
+        ] {
+            assert!(
+                routes.contains(needle),
+                "routes missing 2fa handler: {needle}"
+            );
+        }
+        for path in [
+            "\"/account/2fa\"",
+            "\"/account/2fa/enable\"",
+            "\"/account/2fa/disable\"",
+            "\"/login/verify\"",
+        ] {
+            assert!(routes.contains(path), "routes missing 2fa path: {path}");
+        }
+    }
+
+    #[test]
+    fn totp_login_marks_pending_and_redirects_to_verify() {
+        let tmp = project_with_main();
+        totp_plan(tmp.path()).execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+        assert!(
+            routes.contains("totp_pending_id"),
+            "login must set totp_pending marker: {routes}"
+        );
+        assert!(
+            routes.contains("totp_enabled"),
+            "login must branch on totp_enabled: {routes}"
+        );
+        assert!(
+            routes.contains("/login/verify"),
+            "login must redirect to /login/verify: {routes}"
+        );
+    }
+
+    #[test]
+    fn totp_reset_password_routes_2fa_users_through_verify() {
+        // P1 (#1057): a reset link must not bypass the second factor.
+        let tmp = project_with_main();
+        totp_plan(tmp.path()).execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+        // The 2FA interstitial branch must appear inside reset_password too.
+        let reset_pos = routes
+            .find("pub async fn reset_password(")
+            .expect("reset_password fn");
+        let after = &routes[reset_pos..];
+        let body_end = after.find("\n}").unwrap_or(after.len());
+        let body = &after[..body_end];
+        assert!(
+            body.contains("totp_pending_id") && body.contains("/login/verify"),
+            "reset_password must route 2FA-enabled users through /login/verify: {body}"
+        );
+    }
+
+    #[test]
+    fn totp_enable_does_not_disable_live_secret() {
+        // P1 (#1057): starting re-enrollment must not flip totp_enabled=false on
+        // the live account. The pending secret lives in the session instead.
+        let tmp = project_with_main();
+        totp_plan(tmp.path()).execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+        let enable_pos = routes
+            .find("pub async fn two_factor_enable(")
+            .expect("enable fn");
+        let confirm_pos = routes
+            .find("pub async fn two_factor_confirm(")
+            .expect("confirm fn");
+        let enable_body = &routes[enable_pos..confirm_pos];
+        assert!(
+            enable_body.contains("session.insert(\"totp_pending_secret\""),
+            "enable must stash the pending secret in the session: {enable_body}"
+        );
+        assert!(
+            !enable_body.contains("totp_enabled.eq("),
+            "enable must NOT write totp_enabled on the live row: {enable_body}"
+        );
+        assert!(
+            !enable_body.contains("totp_secret_encrypted.eq("),
+            "enable must NOT overwrite the live secret before confirmation: {enable_body}"
+        );
+    }
+
+    #[test]
+    fn totp_confirm_persists_codes_before_enabling_in_transaction() {
+        // P2 (#1057): enable + recovery-code replacement must be atomic and the
+        // flag flipped only after codes are persisted.
+        let tmp = project_with_main();
+        totp_plan(tmp.path()).execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+        let confirm_pos = routes
+            .find("pub async fn two_factor_confirm(")
+            .expect("confirm fn");
+        let after = &routes[confirm_pos..];
+        let disable_pos = after
+            .find("pub async fn two_factor_disable(")
+            .unwrap_or(after.len());
+        let body = &after[..disable_pos];
+        assert!(
+            body.contains(".transaction"),
+            "confirm must use a transaction: {body}"
+        );
+        assert!(
+            body.contains("RECOVERY_CODE_COUNT"),
+            "confirm must generate N codes: {body}"
+        );
+        assert!(
+            body.contains("hash_password"),
+            "recovery codes must be bcrypt-hashed: {body}"
+        );
+        // totp_enabled flip must come AFTER the recovery-code inserts.
+        let enabled_at = body.find("totp_enabled.eq(true)").expect("enable flag set");
+        let insert_at = body
+            .find("insert_into(recovery_codes::table")
+            .expect("code insert");
+        assert!(
+            enabled_at > insert_at,
+            "totp_enabled must be set after codes are persisted"
+        );
+        // The pending secret must be read from the session, not the live row.
+        assert!(
+            body.contains("totp_pending_secret"),
+            "confirm must consume session pending secret: {body}"
+        );
+    }
+
+    #[test]
+    fn totp_verification_window_and_atomic_replay_guard() {
+        let tmp = project_with_main();
+        totp_plan(tmp.path()).execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+        // ±1 step skew window helper.
+        assert!(
+            routes.contains("[-1i64, 0, 1]"),
+            "verification must use a ±1 step window: {routes}"
+        );
+        // Atomic, conditional consumption: rows-affected guard on the step update.
+        assert!(routes.contains("totp_last_used_step"), "{routes}");
+        assert!(
+            routes.contains("affected == 1"),
+            "step + recovery consumption must require exactly one affected row: {routes}"
+        );
+        assert!(
+            routes.contains("recovery_codes::used_at.is_null()"),
+            "recovery consumption must be guarded by used_at IS NULL: {routes}"
+        );
+    }
+
+    #[test]
+    fn totp_recovery_code_marked_used_and_count_surfaced() {
+        let tmp = project_with_main();
+        totp_plan(tmp.path()).execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+        assert!(
+            routes.contains("used_at"),
+            "consumed recovery code must be stamped used: {routes}"
+        );
+        assert!(
+            routes.contains("remaining"),
+            "remaining count must be surfaced: {routes}"
+        );
+    }
+
+    #[test]
+    fn totp_disable_requires_reauth_and_clears_secret() {
+        let tmp = project_with_main();
+        totp_plan(tmp.path()).execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+        assert!(
+            routes.contains("verify_password") && routes.contains("two_factor_disable"),
+            "disable must require re-auth: {routes}"
+        );
+        assert!(
+            routes.contains("totp_secret_encrypted.eq(None"),
+            "disable must clear the stored secret: {routes}"
+        );
+        assert!(
+            routes.contains("delete(recovery_codes::table"),
+            "disable must delete recovery codes: {routes}"
+        );
+    }
+
+    #[test]
+    fn totp_secret_encrypted_at_rest() {
+        let tmp = project_with_main();
+        totp_plan(tmp.path()).execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+        assert!(
+            routes.contains("Aes256Gcm"),
+            "totp secret must be AES-GCM encrypted: {routes}"
+        );
+        assert!(
+            routes.contains("fn encrypt_secret") && routes.contains("fn decrypt_secret"),
+            "generated code must provide encrypt/decrypt helpers: {routes}"
+        );
+        assert!(
+            routes.contains("otpauth://") || routes.contains("get_url"),
+            "must expose otpauth URI: {routes}"
+        );
+    }
+
+    #[test]
+    fn totp_generates_2fa_integration_tests() {
+        let tmp = project_with_main();
+        totp_plan(tmp.path()).execute(Flags::default()).unwrap();
+        let tests = fs::read_to_string(tmp.path().join("tests/auth_2fa.rs")).unwrap();
+        for flow in [
+            "two_factor_enroll_and_confirm",
+            "login_with_totp_code",
+            "login_with_recovery_code",
+            "recovery_code_reuse_rejected",
+            "two_factor_disable",
+        ] {
+            assert!(
+                tests.contains(flow),
+                "tests/auth_2fa.rs missing flow: {flow}"
+            );
+        }
+    }
+
+    #[test]
+    fn totp_registers_routes_in_main_rs_and_adds_deps() {
+        let tmp = project_with_main();
+        totp_plan(tmp.path()).execute(Flags::default()).unwrap();
+        let main = fs::read_to_string(tmp.path().join("src/main.rs")).unwrap();
+        for entry in [
+            "routes::auth::two_factor_enable",
+            "routes::auth::two_factor_confirm",
+            "routes::auth::two_factor_disable",
+            "routes::auth::login_verify",
+        ] {
+            assert!(main.contains(entry), "main.rs missing 2fa route: {entry}");
+        }
+        let cargo = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+        assert!(
+            cargo.contains("totp-rs"),
+            "Cargo.toml missing totp-rs: {cargo}"
+        );
+        assert!(
+            cargo.contains("aes-gcm"),
+            "Cargo.toml missing aes-gcm: {cargo}"
+        );
+    }
+
+    #[test]
+    fn without_totp_no_totp_artifacts() {
+        let tmp = project_with_main();
+        plan_auth(tmp.path(), "User", "20260508000000")
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+        let model = fs::read_to_string(tmp.path().join("src/models/user.rs")).unwrap();
+        assert!(
+            !model.contains("totp_enabled"),
+            "default model must not contain totp fields: {model}"
+        );
+        assert!(!tmp.path().join("src/models/recovery_code.rs").exists());
+        assert!(!tmp.path().join("tests/auth_2fa.rs").exists());
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+        assert!(
+            !routes.contains("two_factor_enable"),
+            "default routes must not have 2fa handlers"
+        );
+    }
+
+    #[test]
+    fn totp_combines_with_oauth_and_gates_callback() {
+        // P2 (#1057): OAuth callback guidance must be TOTP-aware.
+        let tmp = project_with_main();
+        let oauth = AuthOAuthOptions {
+            providers: vec!["github".to_owned()],
+        };
+        plan_auth_full(tmp.path(), "User", "20260508000000", &oauth, true)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+        assert!(tmp.path().join("src/routes/oauth.rs").exists());
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+        assert!(
+            routes.contains("two_factor_enable"),
+            "totp+oauth must keep 2fa handlers"
+        );
+        assert!(
+            routes.contains("Or sign in with:"),
+            "totp+oauth must keep oauth buttons"
+        );
+        let oauth_routes = fs::read_to_string(tmp.path().join("src/routes/oauth.rs")).unwrap();
+        assert!(
+            oauth_routes.contains("totp_pending_id") && oauth_routes.contains("/login/verify"),
+            "oauth callback guidance must route 2FA users through /login/verify: {oauth_routes}"
+        );
+    }
+
+    #[test]
+    fn oauth_without_totp_has_no_2fa_callback_note() {
+        let tmp = project_with_main();
+        let oauth = AuthOAuthOptions {
+            providers: vec!["github".to_owned()],
+        };
+        plan_auth_full(tmp.path(), "User", "20260508000000", &oauth, false)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+        let oauth_routes = fs::read_to_string(tmp.path().join("src/routes/oauth.rs")).unwrap();
+        assert!(
+            !oauth_routes.contains("TWO-FACTOR"),
+            "oauth-only scaffold must not mention the 2FA callback note: {oauth_routes}"
         );
     }
 }
