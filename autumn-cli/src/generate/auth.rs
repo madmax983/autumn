@@ -1064,7 +1064,7 @@ pub async fn signup(
     let {snake_name} = result.map_err(|_| account_err())?;
 
     session.rotate_id().await;
-    session.insert("{snake_name}_id", {snake_name}.id.to_string()).await;
+{totp_clear_pending}    session.insert("{snake_name}_id", {snake_name}.id.to_string()).await;
     session.insert("{snake_name}_email", &{snake_name}.email).await;
     // Use the same session key checked by `#[secured]` / `#[authorize]`.
     session.insert(state.auth_session_key(), {snake_name}.id.to_string()).await;
@@ -2086,12 +2086,24 @@ fn totp_login_branch_src(snake_name: &str) -> String {
     // If the account has TOTP enabled, do NOT set the `#[secured]` auth key yet.
     // Mark the session `totp_pending` and redirect to the second-factor form.
     if __SNAKE__.totp_enabled {
+        // A pending (pre-2FA) session must never write the `#[secured]` auth key.
+        // If the app configured `[auth].session_key` to collide with one of the
+        // reserved `totp_pending_*` keys, parking the pending marker would set the
+        // trusted auth key and let a half-authenticated session pass `#[secured]`.
+        // Refuse rather than risk a 2FA bypass.
+        if is_reserved_totp_pending_key(state.auth_session_key()) {
+            return Err(AutumnError::internal_server_error_msg(
+                "[auth].session_key collides with a reserved TOTP pending key (totp_pending_*). \
+                 Choose a different [auth].session_key.",
+            ));
+        }
         session.rotate_id().await;
-        // Drop any abandoned pending state from a previous flow first, so a
-        // stale parked reset (or a different account's pending login) can never
-        // be resumed under this login.
+        // Drop any abandoned pending state from a previous flow first, so a stale
+        // parked reset, enrollment secret, or a different account's pending login
+        // can never be resumed under this login.
         session.remove("totp_pending_reset_digest").await;
         session.remove("totp_pending_reset_token").await;
+        session.remove("totp_pending_secret").await;
         session
             .insert("totp_pending_id", __SNAKE__.id.to_string())
             .await;
@@ -2101,16 +2113,19 @@ fn totp_login_branch_src(snake_name: &str) -> String {
     TPL.replace("__SNAKE__", snake_name)
 }
 
-/// Lines injected into every *direct* full-authentication path (password login
-/// and password reset for non-2FA accounts) right after `session.rotate_id()`.
-/// They clear any leftover pending-2FA / parked-reset markers so an abandoned
-/// `/login/verify` for another account can't be resumed against this session.
+/// Lines injected into every *direct* full-authentication path (password login,
+/// password reset, and signup for non-2FA accounts) right after
+/// `session.rotate_id()`. They clear any leftover pending-2FA / parked-reset
+/// markers — and any half-finished enrollment secret — so an abandoned
+/// `/login/verify` or `/account/2fa/enable` for another account can't be
+/// resumed against this freshly established session.
 const fn totp_clear_pending_src() -> &'static str {
-    "    // Clear any abandoned pending-2FA / deferred-reset state so it cannot be\n\
-     \x20   // resumed under this freshly authenticated session.\n\
+    "    // Clear any abandoned pending-2FA / deferred-reset / enrollment state so it\n\
+     \x20   // cannot be resumed under this freshly authenticated session.\n\
      \x20   session.remove(\"totp_pending_id\").await;\n\
      \x20   session.remove(\"totp_pending_reset_digest\").await;\n\
-     \x20   session.remove(\"totp_pending_reset_token\").await;\n"
+     \x20   session.remove(\"totp_pending_reset_token\").await;\n\
+     \x20   session.remove(\"totp_pending_secret\").await;\n"
 }
 
 /// The interstitial branch injected into `reset_password` *before* the password
@@ -2123,9 +2138,19 @@ fn totp_reset_branch_src(snake_name: &str) -> String {
     const TPL: &str = r#"
     // ── 2FA interstitial ────────────────────────────────────────────────────
     if __SNAKE__.totp_enabled {
+        // A pending (pre-2FA) session must never write the `#[secured]` auth key
+        // (see the login interstitial). Refuse a colliding `[auth].session_key`.
+        if is_reserved_totp_pending_key(state.auth_session_key()) {
+            return Err(AutumnError::internal_server_error_msg(
+                "[auth].session_key collides with a reserved TOTP pending key (totp_pending_*). \
+                 Choose a different [auth].session_key.",
+            ));
+        }
         // Do NOT write the new password yet. Park it in the session and finish
         // the reset in `login_verify` only after the second factor is proven.
         session.rotate_id().await;
+        // Drop any half-finished enrollment secret from a prior abandoned flow.
+        session.remove("totp_pending_secret").await;
         session
             .insert("totp_pending_id", __SNAKE__.id.to_string())
             .await;
@@ -2159,6 +2184,23 @@ const RECOVERY_CODE_COUNT: usize = 10;
 
 /// TOTP time step in seconds (RFC 6238 default).
 const TOTP_STEP: u64 = 30;
+
+/// Session keys reserved by the two-factor flow for transient pre-auth state.
+/// `[auth].session_key` must not collide with any of these, or a pending
+/// (pre-2FA) session could be mistaken for a fully authenticated one.
+const RESERVED_TOTP_PENDING_KEYS: &[&str] = &[
+    "totp_pending_id",
+    "totp_pending_reset_digest",
+    "totp_pending_reset_token",
+    "totp_pending_secret",
+];
+
+/// Whether `key` (typically the configured `[auth].session_key`) collides with a
+/// reserved `totp_pending_*` key. Used to refuse a config that would let a
+/// pending second-factor session write the trusted `#[secured]` auth key.
+fn is_reserved_totp_pending_key(key: &str) -> bool {
+    RESERVED_TOTP_PENDING_KEYS.contains(&key)
+}
 
 #[derive(Deserialize)]
 pub struct TotpCodeForm {
@@ -3917,6 +3959,63 @@ mod tests {
         assert!(
             login_body.contains("session.remove(\"totp_pending_reset_digest\")"),
             "login interstitial must clear an abandoned deferred-reset marker: {login_body}"
+        );
+    }
+
+    #[test]
+    fn totp_signup_clears_pending_state() {
+        // P2 (#1057 round 6): signing up establishes a fresh authenticated
+        // session, so it must clear any abandoned pending-2FA / reset / enrollment
+        // markers — otherwise a later /login/verify could switch accounts.
+        let tmp = project_with_main();
+        totp_plan(tmp.path()).execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+        let signup_pos = routes.find("pub async fn signup(").expect("signup fn");
+        let next_pos = routes[signup_pos + 1..]
+            .find("pub async fn ")
+            .map_or(routes.len(), |p| signup_pos + 1 + p);
+        let signup_body = &routes[signup_pos..next_pos];
+        assert!(
+            signup_body.contains("session.remove(\"totp_pending_id\")")
+                && signup_body.contains("session.remove(\"totp_pending_secret\")"),
+            "signup must clear pending 2FA / enrollment markers: {signup_body}"
+        );
+    }
+
+    #[test]
+    fn totp_clear_pending_includes_enrollment_secret() {
+        // P2 (#1057 round 6): a stale totp_pending_secret must not survive a fresh
+        // full login, or two_factor_confirm could accept it for a different account.
+        let tmp = project_with_main();
+        totp_plan(tmp.path()).execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+        let login_pos = routes.find("pub async fn login(").expect("login fn");
+        let logout_pos = routes.find("pub async fn logout(").unwrap_or(routes.len());
+        let login_body = &routes[login_pos..logout_pos];
+        assert!(
+            login_body.contains("session.remove(\"totp_pending_secret\")"),
+            "login must clear a stale enrollment secret: {login_body}"
+        );
+    }
+
+    #[test]
+    fn totp_interstitial_rejects_session_key_collision() {
+        // P2 (#1057 round 6): if [auth].session_key collides with a reserved
+        // totp_pending_* key, parking the pending marker would set the trusted
+        // auth key. The interstitials must refuse such a configuration.
+        let tmp = project_with_main();
+        totp_plan(tmp.path()).execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+        assert!(
+            routes.contains("fn is_reserved_totp_pending_key"),
+            "must define the reserved-pending-key guard helper: {routes}"
+        );
+        let login_pos = routes.find("pub async fn login(").expect("login fn");
+        let logout_pos = routes.find("pub async fn logout(").unwrap_or(routes.len());
+        let login_body = &routes[login_pos..logout_pos];
+        assert!(
+            login_body.contains("is_reserved_totp_pending_key(state.auth_session_key())"),
+            "login interstitial must reject a colliding auth session key: {login_body}"
         );
     }
 
