@@ -2076,6 +2076,10 @@ fn totp_login_branch_src(snake_name: &str) -> String {
         session
             .insert("totp_pending_id", __SNAKE__.id.to_string())
             .await;
+        // Clear any abandoned deferred-reset marker so an ordinary password
+        // login can never accidentally commit a stale password change after the
+        // second factor (it is only set by the reset flow, just below).
+        session.remove("totp_pending_reset_digest").await;
         return Ok(redirect_to("/login/verify"));
     }
 "#;
@@ -3853,6 +3857,22 @@ mod tests {
         assert!(
             routes.contains("/login/verify"),
             "login must redirect to /login/verify: {routes}"
+        );
+    }
+
+    #[test]
+    fn totp_login_clears_abandoned_reset_marker() {
+        // P2 (#1057): an ordinary password login must clear any stale
+        // totp_pending_reset_digest so it can't commit a stale password change.
+        let tmp = project_with_main();
+        totp_plan(tmp.path()).execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+        let login_pos = routes.find("pub async fn login(").expect("login fn");
+        let logout_pos = routes.find("pub async fn logout(").unwrap_or(routes.len());
+        let login_body = &routes[login_pos..logout_pos];
+        assert!(
+            login_body.contains("session.remove(\"totp_pending_reset_digest\")"),
+            "login interstitial must clear an abandoned deferred-reset marker: {login_body}"
         );
     }
 
