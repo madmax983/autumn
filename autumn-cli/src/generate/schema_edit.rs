@@ -67,6 +67,15 @@ fn has_table(existing: &str, table: &str) -> bool {
     existing.lines().any(|l| l.trim().starts_with(&needle))
 }
 
+/// Public predicate: whether `schema` already declares a `<table>` block.
+///
+/// Generators use this to detect a collision before emitting a migration that
+/// would otherwise `CREATE TABLE` a name the project already owns.
+#[must_use]
+pub fn schema_has_table(schema: &str, table: &str) -> bool {
+    has_table(schema, table)
+}
+
 /// Build the full SQL for `up.sql` of a `CREATE TABLE` migration with
 /// optional defaults and non-unique indexes.
 #[must_use]

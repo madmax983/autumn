@@ -17,7 +17,9 @@ use std::path::Path;
 use super::emit::Plan;
 use super::model::ensure_cargo_dependencies;
 use super::naming::{pascal, pluralize, snake};
-use super::schema_edit::{add_mod_declaration, append_schema_table, update_main_rs};
+use super::schema_edit::{
+    add_mod_declaration, append_schema_table, schema_has_table, update_main_rs,
+};
 use super::{Flags, GenerateError, ensure_project_root, timestamp_now};
 
 /// Extra Cargo dependencies the auth generator needs on top of the model deps.
@@ -47,6 +49,93 @@ const TOTP_EXTRA_DEPS: &[(&str, &str)] = &[
     ("aes-gcm", "\"0.10\""),
     ("base64", "\"0.22\""),
 ];
+
+/// `totp-rs` cargo features the generated `--totp` routes rely on
+/// (`Secret::generate_secret`, `TOTP::new` with `otpauth`, `get_qr_base64`).
+const TOTP_RS_FEATURES: &[&str] = &["qr", "gen_secret", "otpauth"];
+
+/// Ensure an existing `totp-rs` dependency carries the features the generated
+/// routes need.
+///
+/// `ensure_cargo_dependencies` skips a crate that is already declared, so an app
+/// that already lists `totp-rs` (perhaps without `qr`/`gen_secret`/`otpauth`)
+/// would scaffold but fail to compile. This merges the missing features into the
+/// existing inline declaration, mirroring the `autumn-web` feature helpers.
+fn ensure_totp_rs_features(toml: &str) -> String {
+    const CRATE: &str = "totp-rs";
+    let trailing_newline = toml.ends_with('\n');
+    let mut lines: Vec<String> = toml.lines().map(str::to_owned).collect();
+    let simple_prefix = format!("{CRATE} = \"");
+    let table_prefix = format!("{CRATE} = {{");
+    let feats_csv = TOTP_RS_FEATURES
+        .iter()
+        .map(|f| format!("\"{f}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let mut i = 0;
+    while i < lines.len() {
+        let trimmed = lines[i].trim().to_owned();
+        let indent: String = lines[i]
+            .chars()
+            .take_while(char::is_ascii_whitespace)
+            .collect();
+
+        // `totp-rs = "5"` → promote to a table carrying the required features.
+        if let Some(rest) = trimmed.strip_prefix(&simple_prefix) {
+            let version = rest.trim_end_matches('"');
+            lines[i] = format!(
+                "{indent}{CRATE} = {{ version = \"{version}\", features = [{feats_csv}] }}"
+            );
+            break;
+        }
+
+        // `totp-rs = { ... }` inline table → merge any missing features.
+        if trimmed.starts_with(&table_prefix) {
+            if let Some(feat_bracket) = trimmed.find("features = [") {
+                let list_start = feat_bracket + "features = [".len();
+                if let Some(close_off) = trimmed[list_start..].find(']') {
+                    let list_end = close_off + list_start;
+                    let existing_list = &trimmed[list_start..list_end];
+                    let additions: Vec<String> = TOTP_RS_FEATURES
+                        .iter()
+                        .filter(|f| !existing_list.contains(&format!("\"{f}\"")))
+                        .map(|f| format!("\"{f}\""))
+                        .collect();
+                    if additions.is_empty() {
+                        return toml.to_owned();
+                    }
+                    let sep =
+                        if existing_list.trim().is_empty() || existing_list.trim().ends_with(',') {
+                            ""
+                        } else {
+                            ", "
+                        };
+                    lines[i] = format!(
+                        "{indent}{}{sep}{}{}",
+                        &trimmed[..list_end],
+                        additions.join(", "),
+                        &trimmed[list_end..]
+                    );
+                    break;
+                }
+            } else if let Some(close_brace) = trimmed.rfind('}') {
+                // No `features` key — insert one before the closing brace.
+                let before = trimmed[..close_brace].trim_end();
+                let sep = if before.ends_with('{') { " " } else { ", " };
+                lines[i] = format!("{indent}{before}{sep}features = [{feats_csv}] }}");
+                break;
+            }
+        }
+        i += 1;
+    }
+
+    let mut out = lines.join("\n");
+    if trailing_newline {
+        out.push('\n');
+    }
+    out
+}
 
 /// OAuth2/OIDC options for `autumn generate auth --oauth`.
 #[derive(Debug, Clone, Default)]
@@ -150,6 +239,19 @@ pub fn plan_auth_with_providers(
 
     let schema_path = project_root.join("src").join("schema.rs");
     let schema_existing = read_or_empty(&schema_path);
+    // Under `--totp` we unconditionally create a helper `recovery_codes` table.
+    // If the project already declares one (in `src/schema.rs`), the migration
+    // would emit a second `CREATE TABLE recovery_codes` and `diesel migration
+    // run` would fail with "relation already exists" (or clobber an unrelated
+    // table). Reject up front rather than generate an unusable app.
+    if totp && schema_has_table(&schema_existing, "recovery_codes") {
+        return Err(GenerateError::InvalidName(
+            name.to_owned(),
+            "this project already defines a `recovery_codes` table, which `--totp` \
+             needs for its helper model; rename or remove the existing table first."
+                .to_owned(),
+        ));
+    }
     let mut schema_new = append_schema_table(&schema_existing, &table, &auth_fields);
     if totp {
         let recovery_fields: Vec<super::dsl::Field> = [
@@ -219,6 +321,13 @@ pub fn plan_auth_with_providers(
         .collect();
     // Apply dep additions then enable the mail feature in a single write.
     let with_deps = ensure_cargo_dependencies(&cargo_existing, &all_deps);
+    // `ensure_cargo_dependencies` no-ops on an already-declared `totp-rs`, so
+    // merge the required features into any pre-existing declaration.
+    let with_deps = if totp {
+        ensure_totp_rs_features(&with_deps)
+    } else {
+        with_deps
+    };
     let final_cargo = ensure_autumn_web_mail_feature(&with_deps);
     if final_cargo != cargo_existing {
         plan.modify(cargo_toml_path, final_cargo);
@@ -1800,11 +1909,15 @@ fn render_oauth_routes_file(
          \x20   //       session.insert(\"totp_pending_id\", local_user.id.to_string()).await;\n\
          \x20   //       return Redirect::to(\"/login/verify\").into_response();\n\
          \x20   //   }\n\
-         \x20   //   // otherwise, fully authenticate. First clear any abandoned pending-2FA\n\
-         \x20   //   // / deferred-reset / enrollment state, then set BOTH the model-specific\n\
-         \x20   //   // identity keys the generated handlers read (`__SNAKE___id` / `_email`)\n\
-         \x20   //   // and the configured auth key — clearing stale model keys first so a\n\
-         \x20   //   // prior login in this browser can't leave a mismatched identity:\n\
+         \x20   //   // otherwise, fully authenticate. Rotate the session id first — like\n\
+         \x20   //   // the password-login/reset paths — so a pre-login (possibly fixated)\n\
+         \x20   //   // session id is never promoted unchanged:\n\
+         \x20   //   session.rotate_id().await;\n\
+         \x20   //   // Then clear any abandoned pending-2FA / deferred-reset / enrollment\n\
+         \x20   //   // state, and set BOTH the model-specific identity keys the generated\n\
+         \x20   //   // handlers read (`__SNAKE___id` / `_email`) and the configured auth key\n\
+         \x20   //   // — clearing stale model keys first so a prior login in this browser\n\
+         \x20   //   // can't leave a mismatched identity:\n\
          \x20   //   session.remove(\"totp_pending_id\").await;\n\
          \x20   //   session.remove(\"totp_pending_reset_digest\").await;\n\
          \x20   //   session.remove(\"totp_pending_reset_token\").await;\n\
@@ -2460,11 +2573,23 @@ pub async fn two_factor_status(
 #[post("/account/2fa/enable")]
 pub async fn two_factor_enable(
     session: Session,
+    State(state): State<AppState>,
     mut db: Db,
     csrf: Option<CsrfToken>,
     csrf_field: Option<CsrfFormField>,
     Form(form): Form<TotpEnableForm>,
 ) -> AutumnResult<Markup> {
+    // Enrollment stashes `totp_pending_secret` in the session. If the app
+    // configured `[auth].session_key` to a reserved `totp_pending_*` name, that
+    // write would clobber the live auth key and the account would later be
+    // locked out by the reserved-key guard in the login interstitial. Refuse the
+    // misconfiguration up front (the login/reset handoffs reject it too).
+    if is_reserved_totp_pending_key(state.auth_session_key()) {
+        return Err(AutumnError::internal_server_error_msg(
+            "[auth].session_key collides with a reserved TOTP pending key (totp_pending_*). \
+             Choose a different [auth].session_key.",
+        ));
+    }
     let __SNAKE___id: i64 = session
         .get("__SNAKE___id")
         .await
@@ -4233,6 +4358,118 @@ mod tests {
             plan_auth_with_providers(tmp.path(), "RecoveryCode", "20260508000000", &[], false)
                 .is_ok(),
             "recovery_code name must be allowed without --totp"
+        );
+    }
+
+    #[test]
+    fn totp_rejects_existing_recovery_codes_table() {
+        // P2 (#1057 round 11): if the project already declares a `recovery_codes`
+        // table, the unconditional --totp migration would CREATE it again and
+        // `diesel migration run` would fail. Reject up front.
+        let tmp = project_with_main();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(
+            tmp.path().join("src/schema.rs"),
+            "diesel::table! {\n    recovery_codes (id) {\n        id -> Int8,\n    }\n}\n",
+        )
+        .unwrap();
+        let err = plan_auth_with_providers(tmp.path(), "User", "20260508000000", &[], true)
+            .expect_err("existing recovery_codes table must be rejected under --totp");
+        assert!(
+            matches!(err, GenerateError::InvalidName(_, _)),
+            "expected InvalidName, got {err:?}"
+        );
+        // Without --totp there's no recovery_codes helper, so it's fine.
+        assert!(
+            plan_auth_with_providers(tmp.path(), "User", "20260508000000", &[], false).is_ok(),
+            "existing recovery_codes table is irrelevant without --totp"
+        );
+    }
+
+    #[test]
+    fn totp_enable_rejects_reserved_session_key() {
+        // P2 (#1057 round 11): two_factor_enable stashes totp_pending_secret, so it
+        // must also reject a [auth].session_key that collides with a reserved key.
+        let tmp = project_with_main();
+        totp_plan(tmp.path()).execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+        let enable_pos = routes
+            .find("pub async fn two_factor_enable(")
+            .expect("enable fn");
+        let confirm_pos = routes
+            .find("pub async fn two_factor_confirm(")
+            .unwrap_or(routes.len());
+        let enable_body = &routes[enable_pos..confirm_pos];
+        assert!(
+            enable_body.contains("is_reserved_totp_pending_key(state.auth_session_key())"),
+            "two_factor_enable must reject a reserved auth session key: {enable_body}"
+        );
+    }
+
+    #[test]
+    fn totp_oauth_full_login_note_rotates_session() {
+        // P2 (#1057 round 11): the non-2FA OAuth full-login guidance must rotate the
+        // session id before promoting, mirroring password login (anti-fixation).
+        let tmp = project_with_main();
+        let oauth_opts = AuthOAuthOptions {
+            providers: vec!["github".to_owned()],
+        };
+        plan_auth_full(tmp.path(), "User", "20260508000000", &oauth_opts, true)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+        let oauth = fs::read_to_string(tmp.path().join("src/routes/oauth.rs")).unwrap();
+        let note_pos = oauth
+            .find("otherwise, fully authenticate")
+            .expect("full-login guidance");
+        let after = &oauth[note_pos..];
+        assert!(
+            after.contains("session.rotate_id()"),
+            "OAuth full-login guidance must rotate the session: {after}"
+        );
+    }
+
+    #[test]
+    fn ensure_totp_rs_features_promotes_simple_version() {
+        let toml = "[dependencies]\ntotp-rs = \"5\"\n";
+        let out = ensure_totp_rs_features(toml);
+        assert!(
+            out.contains("\"qr\"") && out.contains("\"gen_secret\"") && out.contains("\"otpauth\""),
+            "simple version must be promoted with required features: {out}"
+        );
+    }
+
+    #[test]
+    fn ensure_totp_rs_features_merges_into_partial_features() {
+        let toml = "[dependencies]\ntotp-rs = { version = \"5\", features = [\"qr\"] }\n";
+        let out = ensure_totp_rs_features(toml);
+        assert!(
+            out.contains("\"qr\"") && out.contains("\"gen_secret\"") && out.contains("\"otpauth\""),
+            "missing features must be merged in: {out}"
+        );
+        // The pre-existing feature must not be duplicated.
+        assert_eq!(out.matches("\"qr\"").count(), 1, "qr duplicated: {out}");
+    }
+
+    #[test]
+    fn ensure_totp_rs_features_adds_features_key_when_absent() {
+        let toml = "[dependencies]\ntotp-rs = { version = \"5\" }\n";
+        let out = ensure_totp_rs_features(toml);
+        assert!(
+            out.contains("features = [")
+                && out.contains("\"gen_secret\"")
+                && out.contains("\"otpauth\""),
+            "a features key must be added: {out}"
+        );
+    }
+
+    #[test]
+    fn ensure_totp_rs_features_is_idempotent_when_complete() {
+        let toml = "[dependencies]\ntotp-rs = { version = \"5\", features = [\"qr\", \"gen_secret\", \"otpauth\"] }\n";
+        assert_eq!(
+            ensure_totp_rs_features(toml),
+            toml,
+            "already-complete features must be left untouched"
         );
     }
 
