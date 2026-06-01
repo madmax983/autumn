@@ -117,9 +117,20 @@ fn ensure_totp_rs_features(toml: &str) -> String {
 
         // `totp-rs = "5"` → promote to a table carrying the required features.
         if let Some(rest) = trimmed.strip_prefix(&simple_prefix) {
-            let version = rest.trim_end_matches('"');
+            // `rest` is everything after `totp-rs = "`. Take up to the closing
+            // quote so a trailing inline comment (`"5" # note`) isn't folded into
+            // the version string (which would make Cargo.toml invalid).
+            let (version, trailing) = rest.find('"').map_or_else(
+                || (rest.trim_end_matches('"'), ""),
+                |close| (&rest[..close], rest[close + 1..].trim()),
+            );
+            let trailing = if trailing.is_empty() {
+                String::new()
+            } else {
+                format!(" {trailing}")
+            };
             lines[i] = format!(
-                "{indent}{CRATE} = {{ version = \"{version}\", features = [{feats_csv}] }}"
+                "{indent}{CRATE} = {{ version = \"{version}\", features = [{feats_csv}] }}{trailing}"
             );
             break;
         }
@@ -163,10 +174,64 @@ fn ensure_totp_rs_features(toml: &str) -> String {
                     .chars()
                     .take_while(char::is_ascii_whitespace)
                     .collect();
-                match merge_into_list(&tj, "[") {
-                    Some(Some(new_line)) => lines[fl] = format!("{indent_j}{new_line}"),
-                    Some(None) => return toml.to_owned(),
-                    None => {}
+                if tj.contains(']') {
+                    // Single-line `features = [...]`.
+                    match merge_into_list(&tj, "[") {
+                        Some(Some(new_line)) => lines[fl] = format!("{indent_j}{new_line}"),
+                        Some(None) => return toml.to_owned(),
+                        None => {}
+                    }
+                } else {
+                    // Multiline `features = [` … `]` array: find the closing `]`,
+                    // collect the existing entries, and rebuild the list (collapsed
+                    // to one line) with the missing features appended.
+                    let mut close_line = None;
+                    let mut k = fl;
+                    while k < lines.len() {
+                        let tk = lines[k].trim();
+                        if k > fl && tk.starts_with('[') {
+                            break; // next table header — array never closed
+                        }
+                        if lines[k].contains(']') {
+                            close_line = Some(k);
+                            break;
+                        }
+                        k += 1;
+                    }
+                    if let Some(cl) = close_line {
+                        let fl_bracket = lines[fl].find('[').unwrap_or(lines[fl].len());
+                        let mut list_text = lines[fl][fl_bracket + 1..].to_owned();
+                        for line in &lines[fl + 1..cl] {
+                            list_text.push(' ');
+                            list_text.push_str(line.trim());
+                        }
+                        let cl_close = lines[cl].find(']').unwrap_or(lines[cl].len());
+                        list_text.push(' ');
+                        list_text.push_str(&lines[cl][..cl_close]);
+                        let trailing =
+                            lines[cl][cl_close.saturating_add(1).min(lines[cl].len())..].to_owned();
+
+                        let mut entries: Vec<String> = list_text
+                            .split(',')
+                            .map(str::trim)
+                            .filter(|t| !t.is_empty())
+                            .map(str::to_owned)
+                            .collect();
+                        let mut changed = false;
+                        for f in TOTP_RS_FEATURES {
+                            let q = format!("\"{f}\"");
+                            if !entries.iter().any(|e| e == &q) {
+                                entries.push(q);
+                                changed = true;
+                            }
+                        }
+                        if !changed {
+                            return toml.to_owned();
+                        }
+                        let rebuilt =
+                            format!("{indent_j}features = [{}]{trailing}", entries.join(", "));
+                        lines.splice(fl..=cl, std::iter::once(rebuilt));
+                    }
                 }
             } else {
                 // No `features` key in the subtable — add one right after the header.
@@ -4556,6 +4621,40 @@ mod tests {
                 && out.contains("\"otpauth\""),
             "a features key must be added to the subtable: {out}"
         );
+    }
+
+    #[test]
+    fn ensure_totp_rs_features_strips_inline_comment_on_simple_version() {
+        // P2 (#1057 round 13): a trailing inline comment must not be folded into
+        // the version string (which would make Cargo.toml invalid).
+        let toml = "[dependencies]\ntotp-rs = \"5\" # used by metrics\n";
+        let out = ensure_totp_rs_features(toml);
+        assert!(
+            out.contains("version = \"5\"") && out.contains("features = ["),
+            "version must be parsed cleanly: {out}"
+        );
+        assert!(
+            !out.contains("\"5\" # used by metrics\""),
+            "the comment must not leak into the version string: {out}"
+        );
+        // The comment is preserved after the rewritten table.
+        assert!(
+            out.contains("# used by metrics"),
+            "the trailing comment should be preserved: {out}"
+        );
+    }
+
+    #[test]
+    fn ensure_totp_rs_features_merges_multiline_subtable_array() {
+        // P2 (#1057 round 13): a multiline `features = [` array in the subtable
+        // form must still gain the missing features.
+        let toml = "[dependencies.totp-rs]\nversion = \"5\"\nfeatures = [\n    \"qr\",\n]\n";
+        let out = ensure_totp_rs_features(toml);
+        assert!(
+            out.contains("\"qr\"") && out.contains("\"gen_secret\"") && out.contains("\"otpauth\""),
+            "multiline subtable features must be merged: {out}"
+        );
+        assert_eq!(out.matches("\"qr\"").count(), 1, "qr duplicated: {out}");
     }
 
     #[test]
