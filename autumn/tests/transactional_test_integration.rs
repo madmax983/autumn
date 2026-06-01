@@ -79,65 +79,63 @@ mod transactional_tests {
 
     #[tokio::test]
     #[ignore = "requires Docker (testcontainers)"]
-    async fn test_1_insert_without_cleanup() {
+    async fn test_transactional_isolation() {
         let db = TestDb::shared().await;
         setup_table(db).await;
 
-        let client = TestApp::new()
-            .routes(routes![list_items, create_item])
-            .with_transactional_db(db.url())
-            .build();
+        // --- Phase 1: Insert item inside a transactional client ---
+        {
+            let client = TestApp::new()
+                .routes(routes![list_items, create_item])
+                .with_transactional_db(db.url())
+                .build();
 
-        // 1. Initially empty
-        client
-            .get("/items")
-            .send()
-            .await
-            .assert_ok()
-            .assert_body_eq("[]");
+            // 1. Initially empty
+            client
+                .get("/items")
+                .send()
+                .await
+                .assert_ok()
+                .assert_body_eq("[]");
 
-        // 2. Insert item
-        client
-            .post("/items")
-            .json(&serde_json::json!({"name": "Persisted Item"}))
-            .send()
-            .await
-            .assert_status(201);
+            // 2. Insert item
+            client
+                .post("/items")
+                .json(&serde_json::json!({"name": "Persisted Item"}))
+                .send()
+                .await
+                .assert_status(201);
 
-        // 3. Verify it is visible inside the same test session
-        client
-            .get("/items")
-            .send()
-            .await
-            .assert_ok()
-            .assert_json::<Vec<serde_json::Value>, _>(|items| {
-                assert_eq!(items.len(), 1);
-                assert_eq!(items[0]["name"], "Persisted Item");
-            });
+            // 3. Verify it is visible inside the same test session
+            client
+                .get("/items")
+                .send()
+                .await
+                .assert_ok()
+                .assert_json::<Vec<serde_json::Value>, _>(|items| {
+                    assert_eq!(items.len(), 1);
+                    assert_eq!(items[0]["name"], "Persisted Item");
+                });
 
-        // We finish the test WITHOUT running any TRUNCATE or DELETE.
-        // Under transactional isolation, this transaction should be rolled back!
-    }
+            // client goes out of scope here and is dropped.
+            // Under transactional isolation, the connection pool is dropped, closing the PostgreSQL connection and rolling back the transaction.
+        }
 
-    #[tokio::test]
-    #[ignore = "requires Docker (testcontainers)"]
-    async fn test_2_verify_isolation() {
-        let db = TestDb::shared().await;
-        setup_table(db).await;
+        // --- Phase 2: Verify isolation in a fresh transactional client ---
+        {
+            let client = TestApp::new()
+                .routes(routes![list_items])
+                .with_transactional_db(db.url())
+                .build();
 
-        let client = TestApp::new()
-            .routes(routes![list_items])
-            .with_transactional_db(db.url())
-            .build();
-
-        // Verify that the table is completely empty!
-        // This proves that test_1's uncommitted transaction was rolled back
-        // and did not leak any state to this test.
-        client
-            .get("/items")
-            .send()
-            .await
-            .assert_ok()
-            .assert_body_eq("[]");
+            // Verify that the table is completely empty!
+            // This proves that the first test client's uncommitted transaction was rolled back and did not leak any state.
+            client
+                .get("/items")
+                .send()
+                .await
+                .assert_ok()
+                .assert_body_eq("[]");
+        }
     }
 }
