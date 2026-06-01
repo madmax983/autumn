@@ -2332,6 +2332,17 @@ pub async fn two_factor_enable(
         .await
         .map_err(|_| AutumnError::not_found_msg("Account not found."))?;
 
+    // Re-enrollment guard: if 2FA is already active, a hijacked (already-past-2FA)
+    // session must not be able to swap in a new authenticator without re-proving
+    // the current factor. Disabling first goes through `/account/2fa/disable`,
+    // which requires a current code or the password.
+    if __SNAKE__.totp_enabled {
+        return Err(AutumnError::unprocessable_msg(
+            "Two-factor is already enabled. Disable it first (which requires your \
+             current code or password) before enrolling a new authenticator.",
+        ));
+    }
+
     let secret = Secret::generate_secret();
     let secret_bytes = secret
         .to_bytes()
@@ -2385,6 +2396,15 @@ pub async fn two_factor_confirm(
         .first(&mut *db)
         .await
         .map_err(|_| AutumnError::not_found_msg("Account not found."))?;
+
+    // Re-enrollment guard (defense in depth — `two_factor_enable` blocks this too):
+    // never replace an active factor without first disabling (which re-authenticates).
+    if __SNAKE__.totp_enabled {
+        return Err(AutumnError::unprocessable_msg(
+            "Two-factor is already enabled. Disable it first before confirming a \
+             new authenticator.",
+        ));
+    }
 
     // The pending secret lives in the session (set by `two_factor_enable`), so
     // an unconfirmed enrollment never touched the live account row.
@@ -3792,6 +3812,36 @@ mod tests {
         assert!(
             !enable_body.contains("totp_secret_encrypted.eq("),
             "enable must NOT overwrite the live secret before confirmation: {enable_body}"
+        );
+    }
+
+    #[test]
+    fn totp_enable_rejects_reenrollment_while_active() {
+        // P2 (#1057): a hijacked session must not swap the authenticator without
+        // first disabling (which re-authenticates). Both enable and confirm guard
+        // on the live `totp_enabled` flag.
+        let tmp = project_with_main();
+        totp_plan(tmp.path()).execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+        let enable_pos = routes
+            .find("pub async fn two_factor_enable(")
+            .expect("enable fn");
+        let confirm_pos = routes
+            .find("pub async fn two_factor_confirm(")
+            .expect("confirm fn");
+        let disable_pos = routes
+            .find("pub async fn two_factor_disable(")
+            .expect("disable fn");
+        let enable_body = &routes[enable_pos..confirm_pos];
+        let confirm_body = &routes[confirm_pos..disable_pos];
+        assert!(
+            enable_body.contains("if __SNAKE__.totp_enabled")
+                || enable_body.contains("if user.totp_enabled"),
+            "two_factor_enable must reject re-enrollment while 2FA is active: {enable_body}"
+        );
+        assert!(
+            confirm_body.contains("if user.totp_enabled") || confirm_body.contains("totp_enabled"),
+            "two_factor_confirm must reject re-enrollment while 2FA is active: {confirm_body}"
         );
     }
 
