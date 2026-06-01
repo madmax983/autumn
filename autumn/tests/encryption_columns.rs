@@ -220,6 +220,33 @@ fn model_debug_redacts_encrypted_columns() {
 }
 
 #[test]
+fn commit_hook_payload_encrypts_encrypted_columns_recoverably() {
+    install_ring();
+    // Mirrors what the generated commit-hook codec does to a model snapshot
+    // before persisting it to the durable autumn_repository_commit_hooks table.
+    let mut v = serde_json::json!({
+        "email": "a@b.com",
+        "api_token": "sk_live_secret",
+        "note": "plain",
+    });
+    encryption::encrypt_persisted_columns_in_value("secrets", &mut v);
+
+    // Encrypted columns are now ciphertext (never plaintext); plain columns stay.
+    assert_ne!(v["email"], "a@b.com");
+    assert_ne!(v["api_token"], "sk_live_secret");
+    assert_eq!(v["note"], "plain");
+    // ...and they remain recoverable with the keys.
+    assert_eq!(
+        encryption::decrypt_text(v["api_token"].as_str().unwrap()).unwrap(),
+        "sk_live_secret"
+    );
+    assert_eq!(
+        encryption::decrypt_text(v["email"].as_str().unwrap()).unwrap(),
+        "a@b.com"
+    );
+}
+
+#[test]
 fn encrypted_columns_are_registered_for_composition() {
     // The macro registers encrypted columns for log-scrub / version-history /
     // admin composition.

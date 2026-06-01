@@ -1631,19 +1631,20 @@ fn render_detail_value(record: &Value, field: &AdminField) -> Markup {
 
 /// Render a form widget for a field.
 fn render_form_widget(field: &AdminField, record: Option<&Value>) -> Markup {
-    // Never pre-fill an encrypted column's plaintext into an edit/new form,
-    // even when it is `admin_visible` (viewing decrypted is a read-only opt-in;
-    // editing a secret must be explicit). Leaving it blank keeps the value
-    // unchanged on save unless the admin types a new one (#805).
-    let encrypted = autumn_web::encryption::is_encrypted_column_name(field.name);
-    let current_value = if encrypted {
-        Value::Null
-    } else {
-        record
-            .and_then(|r| r.get(field.name))
-            .cloned()
-            .unwrap_or(Value::Null)
-    };
+    // Encrypted columns (#805) are not editable in the admin by default: render a
+    // disabled, redacted control with no `name`, so the plaintext is never placed
+    // into the form HTML and a save never submits (and thus never overwrites) the
+    // stored ciphertext. Set encrypted values out-of-band (e.g. via the API).
+    if autumn_web::encryption::is_encrypted_column_name(field.name) {
+        return html! {
+            input type="text" class="form-input" value="••••••••" disabled
+                title="Encrypted at rest — managed outside the admin";
+        };
+    }
+    let current_value = record
+        .and_then(|r| r.get(field.name))
+        .cloned()
+        .unwrap_or(Value::Null);
     let str_val = match &current_value {
         Value::String(s) => s.clone(),
         Value::Null => String::new(),

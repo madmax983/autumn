@@ -228,7 +228,55 @@ fn validate_encrypted_field(field: &syn::Field) -> syn::Result<()> {
              store an unencrypted value. Set the encrypted value explicitly on insert.",
         ));
     }
+    // The encrypted column is registered under its Rust field name, which the
+    // log-scrub / version-history / admin compositions match against the
+    // serde-serialized key. A `#[serde(rename)]` would desync those, leaking the
+    // renamed plaintext (e.g. into version history). Reject it in v1.
+    if field_has_serde_rename(field) {
+        return Err(syn::Error::new_spanned(
+            field,
+            "`#[encrypted]` fields cannot use `#[serde(rename = ...)]` in v1: the \
+             column is registered under its Rust name, which must match the \
+             serialized key used by version history / log scrubbing / admin redaction.",
+        ));
+    }
     Ok(())
+}
+
+/// Whether any attribute is a struct-level `#[serde(rename_all = "...")]`.
+fn attrs_have_serde_rename_all(attrs: &[syn::Attribute]) -> bool {
+    let mut found = false;
+    for attr in attrs.iter().filter(|a| a.path().is_ident("serde")) {
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("rename_all") {
+                found = true;
+            }
+            if let Ok(value) = meta.value() {
+                let _: syn::Result<syn::Lit> = value.parse();
+            }
+            Ok(())
+        });
+    }
+    found
+}
+
+/// Whether a field carries a `#[serde(rename = "...")]` (which would desync the
+/// encrypted-column registry from the serialized key).
+fn field_has_serde_rename(field: &syn::Field) -> bool {
+    let mut renamed = false;
+    for attr in field.attrs.iter().filter(|a| a.path().is_ident("serde")) {
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("rename") {
+                renamed = true;
+            }
+            // Consume any `= value` so sibling metas keep parsing.
+            if let Ok(value) = meta.value() {
+                let _: syn::Result<syn::Lit> = value.parse();
+            }
+            Ok(())
+        });
+    }
+    renamed
 }
 
 /// Parse the struct-level language dictionary configuration from `#[searchable(language = "...")]`
@@ -755,6 +803,18 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             Err(err) => return err.to_compile_error(),
         }
     }
+    // A struct-level `#[serde(rename_all = ...)]` also desyncs encrypted-column
+    // registration (Rust name) from the serialized key — reject it when any field
+    // is encrypted (see `field_has_serde_rename` for the per-field case).
+    if !encrypted_columns.is_empty() && attrs_have_serde_rename_all(outer_attrs) {
+        return syn::Error::new_spanned(
+            name,
+            "`#[serde(rename_all = ...)]` cannot be combined with `#[encrypted]` fields in v1: \
+             encrypted columns are registered under their Rust names, which must match the \
+             serialized keys used by version history / log scrubbing / admin redaction.",
+        )
+        .to_compile_error();
+    }
     let encrypted_column_names: Vec<&str> =
         encrypted_columns.iter().map(|(c, ..)| c.as_str()).collect();
     // Diesel's `AsChangeset`/`Insertable` derives expand `column.eq(value)` in
@@ -767,6 +827,18 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {
             #[allow(unused_imports)]
             use ::autumn_web::reexports::diesel::ExpressionMethods as _;
+        }
+    };
+    // Encrypt encrypted columns in the durable commit-hook payload so secrets are
+    // never persisted in plaintext to `autumn_repository_commit_hooks` (#805).
+    let commit_hook_encrypt_stmt = if encrypted_columns.is_empty() {
+        quote! {}
+    } else {
+        quote! {
+            ::autumn_web::encryption::encrypt_persisted_columns_in_value(
+                #table_name,
+                &mut __autumn_value,
+            );
         }
     };
     // For models with encrypted columns, replace the derived `Debug` on every
@@ -2032,7 +2104,13 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             {
                 let mut __autumn_object = ::autumn_web::reexports::serde_json::Map::new();
                 #(#commit_hook_serialize_fields)*
-                Ok(::autumn_web::reexports::serde_json::Value::Object(__autumn_object))
+                let mut __autumn_value =
+                    ::autumn_web::reexports::serde_json::Value::Object(__autumn_object);
+                // Encrypted columns must not be persisted in plaintext into the
+                // durable `autumn_repository_commit_hooks` table (#805). Rewrite
+                // them as recoverable ciphertext in their declared mode.
+                #commit_hook_encrypt_stmt
+                Ok(__autumn_value)
             }
 
             #[doc(hidden)]

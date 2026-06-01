@@ -68,8 +68,9 @@ retired_keys = []
 ```
 
 If a model declares an encrypted column but `primary_key` is missing, the app
-**fails fast at boot** with a diagnostic that names the exact missing credential
-path (the same shape as #597):
+**fails fast at boot in production** (and logs a warning in dev so local examples
+still start) with a diagnostic that names the exact missing credential path (the
+same shape as #597):
 
 ```text
 Attribute encryption misconfiguration: Encrypted column `accounts.api_token`

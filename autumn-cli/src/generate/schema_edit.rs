@@ -318,8 +318,17 @@ pub fn encrypt_columns_up_sql(table: &str, columns: &[String]) -> String {
     );
     let _ = writeln!(
         out,
-        "--    autumn_web::encryption::encrypt_text(Mode::Randomized, &plaintext):"
+        "--    autumn_web::encryption::encrypt_text(<mode>, &plaintext), where <mode> is"
     );
+    let _ = writeln!(
+        out,
+        "--    Mode::Deterministic for columns you will deploy as"
+    );
+    let _ = writeln!(
+        out,
+        "--    `#[encrypted(deterministic)]` (so existing rows are found by equality"
+    );
+    let _ = writeln!(out, "--    lookups) and Mode::Randomized otherwise:");
     for col in columns {
         let _ = writeln!(
             out,

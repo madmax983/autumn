@@ -664,6 +664,42 @@ pub fn encrypt_versioned_columns_in_value(table: &str, value: &mut serde_json::V
     }
 }
 
+/// Rewrite a model's JSON snapshot so encrypted columns carry ciphertext.
+///
+/// Every encrypted column is encrypted in its declared mode (deterministic
+/// columns deterministically, otherwise randomized).
+///
+/// Used for durable commit-hook payloads (`autumn_repository_commit_hooks`),
+/// which would otherwise persist decrypted secrets in a separate table. The
+/// values stay recoverable via [`decrypt_text`]. If encryption fails (e.g. a
+/// deterministic column without a deterministic key), the value is replaced with
+/// a `"<encrypted>"` marker so plaintext can never leak.
+pub fn encrypt_persisted_columns_in_value(table: &str, value: &mut serde_json::Value) {
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
+    for d in registered_encrypted_columns() {
+        if d.table != table {
+            continue;
+        }
+        if let Some(field) = obj.get_mut(d.column) {
+            if field.is_null() {
+                continue;
+            }
+            let mode = if d.deterministic {
+                Mode::Deterministic
+            } else {
+                Mode::Randomized
+            };
+            let marker = || serde_json::Value::String("<encrypted>".to_owned());
+            let replacement = field.as_str().map_or_else(marker, |plaintext| {
+                encrypt_text(mode, plaintext).map_or_else(|_| marker(), serde_json::Value::String)
+            });
+            *field = replacement;
+        }
+    }
+}
+
 /// Boot validation for attribute encryption.
 ///
 /// If any encrypted columns are registered, the key material must resolve.
