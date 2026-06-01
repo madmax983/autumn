@@ -67,8 +67,83 @@ fn user_attrs(field: &Field) -> Vec<&syn::Attribute> {
                 && !a.path().is_ident("factory_assoc")
                 && !a.path().is_ident("lock_version")
                 && !a.path().is_ident("searchable")
+                && !a.path().is_ident("encrypted")
         })
         .collect()
+}
+
+/// Encryption mode requested by an `#[encrypted]` field attribute.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EncryptedMode {
+    /// Not an encrypted field.
+    None,
+    /// `#[encrypted]` — randomized AEAD (default; no equality lookups).
+    Randomized,
+    /// `#[encrypted(deterministic)]` — stable ciphertext; supports equality
+    /// lookups, at the cost of leaking plaintext equality through ciphertext.
+    Deterministic,
+}
+
+/// Parse an `#[encrypted]` / `#[encrypted(deterministic)]` field attribute.
+fn parse_field_encrypted(field: &syn::Field) -> syn::Result<EncryptedMode> {
+    for attr in &field.attrs {
+        if !attr.path().is_ident("encrypted") {
+            continue;
+        }
+        // `#[encrypted]` (bare path) -> randomized.
+        if matches!(attr.meta, syn::Meta::Path(_)) {
+            return Ok(EncryptedMode::Randomized);
+        }
+        let mut mode = EncryptedMode::Randomized;
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("deterministic") {
+                mode = EncryptedMode::Deterministic;
+                Ok(())
+            } else if meta.path.is_ident("randomized") {
+                mode = EncryptedMode::Randomized;
+                Ok(())
+            } else {
+                Err(meta.error(
+                    "unsupported `#[encrypted]` option; expected `deterministic` or `randomized`",
+                ))
+            }
+        })?;
+        return Ok(mode);
+    }
+    Ok(EncryptedMode::None)
+}
+
+/// The `serialize_as`/`deserialize_as` wrapper path for an encrypted mode.
+fn encrypted_wrapper_path(mode: EncryptedMode) -> Option<TokenStream> {
+    match mode {
+        EncryptedMode::None => None,
+        EncryptedMode::Randomized => {
+            Some(quote! { ::autumn_web::encryption::RandomizedText })
+        }
+        EncryptedMode::Deterministic => {
+            Some(quote! { ::autumn_web::encryption::DeterministicText })
+        }
+    }
+}
+
+/// Validate that `#[encrypted]` is only applied to a plain `String` field.
+///
+/// v1 supports non-null `String` columns (the realistic targets: tokens, SSNs,
+/// emails). `Option<String>` and other types are rejected with a clear message.
+fn validate_encrypted_field(field: &syn::Field) -> syn::Result<()> {
+    if parse_field_encrypted(field)? == EncryptedMode::None {
+        return Ok(());
+    }
+    let is_string = matches!(&field.ty, syn::Type::Path(p) if p.path.segments.last().is_some_and(|s| s.ident == "String"));
+    if is_string {
+        Ok(())
+    } else {
+        Err(syn::Error::new_spanned(
+            &field.ty,
+            "`#[encrypted]` is only supported on non-null `String` fields in v1 \
+             (encrypt before storing structured/optional data)",
+        ))
+    }
 }
 
 /// Parse the struct-level language dictionary configuration from `#[searchable(language = "...")]`
@@ -573,6 +648,51 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         return err;
     }
 
+    // Collect `#[encrypted]` columns (validated to be non-null `String`).
+    let mut encrypted_columns: Vec<(String, bool)> = Vec::new();
+    for f in &all_fields {
+        if let Err(err) = validate_encrypted_field(f) {
+            return err.to_compile_error();
+        }
+        match parse_field_encrypted(f) {
+            Ok(EncryptedMode::None) => {}
+            Ok(mode) => {
+                let col = f.ident.as_ref().unwrap().to_string();
+                encrypted_columns.push((col, mode == EncryptedMode::Deterministic));
+            }
+            Err(err) => return err.to_compile_error(),
+        }
+    }
+    let encrypted_column_names: Vec<&str> =
+        encrypted_columns.iter().map(|(c, _)| c.as_str()).collect();
+    // Diesel's `AsChangeset`/`Insertable` derives expand `column.eq(value)` in
+    // the model's module scope when `serialize_as` is present, which needs
+    // `ExpressionMethods` in scope. Bring it in anonymously (only for models with
+    // encrypted columns) so app authors don't have to add the import themselves.
+    let encrypted_use = if encrypted_columns.is_empty() {
+        quote! {}
+    } else {
+        quote! {
+            #[allow(unused_imports)]
+            use ::autumn_web::reexports::diesel::ExpressionMethods as _;
+        }
+    };
+    let encrypted_inventory: Vec<TokenStream> = encrypted_columns
+        .iter()
+        .map(|(col, deterministic)| {
+            quote! {
+                ::autumn_web::reexports::inventory::submit! {
+                    ::autumn_web::encryption::EncryptedColumnDescriptor {
+                        model: stringify!(#name),
+                        table: #table_name,
+                        column: #col,
+                        deterministic: #deterministic,
+                    }
+                }
+            }
+        })
+        .collect();
+
     // Fields for UpdateX: Patch fields (from fields_for_new) plus the
     // lock_version field (plain required type, not Patch<T>).
 
@@ -586,7 +706,12 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             let ident = &f.ident;
             let ty = &f.ty;
             let attrs = user_attrs(f);
-            quote! { #(#attrs)* pub #ident: #ty }
+            // Encrypted columns route through an AEAD wrapper transparently:
+            // `serialize_as` encrypts on write, `deserialize_as` decrypts on read.
+            // The public field stays a plain `String` (plaintext in Rust code).
+            let enc = encrypted_wrapper_path(parse_field_encrypted(f).unwrap_or(EncryptedMode::None))
+                .map(|w| quote! { #[diesel(serialize_as = #w, deserialize_as = #w)] });
+            quote! { #(#attrs)* #enc pub #ident: #ty }
         })
         .collect();
 
@@ -597,7 +722,9 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             let ident = &f.ident;
             let ty = &f.ty;
             let val_attrs = validate_attrs(f);
-            quote! { #(#val_attrs)* pub #ident: #ty }
+            let enc = encrypted_wrapper_path(parse_field_encrypted(f).unwrap_or(EncryptedMode::None))
+                .map(|w| quote! { #[diesel(serialize_as = #w)] });
+            quote! { #(#val_attrs)* #enc pub #ident: #ty }
         })
         .collect();
 
@@ -919,7 +1046,13 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             // treats Option<T> as "skip if None, set if Some". For nullable
             // columns (Option<Inner>), this becomes Option<Option<Inner>> which
             // also handles "set to NULL" via Some(None).
-            quote! { pub #ident: Option<#ty> }
+            //
+            // For encrypted columns the inner value is routed through the AEAD
+            // wrapper via `serialize_as` (Diesel maps the `Option` skip itself),
+            // so updates write ciphertext while the API stays plaintext.
+            let enc = encrypted_wrapper_path(parse_field_encrypted(f).unwrap_or(EncryptedMode::None))
+                .map(|w| quote! { #[diesel(serialize_as = #w)] });
+            quote! { #enc pub #ident: Option<#ty> }
         })
         .collect();
     // The lock_version column must be in the changeset so the UPDATE can
@@ -1138,7 +1271,10 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             .await
             .expect("factory: failed to acquire db connection");
         ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
-            .values(&new_record)
+            // Owned (not `&new_record`): encrypted columns route through diesel
+            // `serialize_as`, which consumes the value, so `Insertable` is only
+            // implemented for the owned record. Owned also works for plain models.
+            .values(new_record)
             .returning(#name::as_returning())
             .get_result(&mut *conn)
             .await
@@ -1455,6 +1591,8 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     quote! {
+        #encrypted_use
+
         #[derive(Debug, Clone, ::diesel::Queryable, ::diesel::Selectable, ::diesel::AsChangeset, ::diesel::Insertable)]
         #[derive(::serde::Serialize, ::serde::Deserialize)]
         #[diesel(table_name = #table_ident)]
@@ -1487,6 +1625,19 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         pub struct #changeset_name {
             #(#changeset_fields,)*
         }
+
+        impl #name {
+            /// Column names on this model that are at-rest encrypted.
+            ///
+            /// Emitted for every model (empty when none are encrypted) so that
+            /// version history, log scrubbing, and the admin plugin can redact
+            /// encrypted columns by default. See `autumn_web::encryption`.
+            #[doc(hidden)]
+            pub const __AUTUMN_ENCRYPTED_COLUMNS: &'static [&'static str] =
+                &[#(#encrypted_column_names),*];
+        }
+
+        #(#encrypted_inventory)*
 
         impl #update_name {
             #[doc(hidden)]
@@ -1525,7 +1676,10 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
 
                 let stmt = ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
-                    .values(chunk)
+                    // Owned `Vec` (not `&[Self]`): encrypted columns use diesel
+                    // `serialize_as`, which only implements `Insertable` for owned
+                    // values. `to_vec()` also works for plain models.
+                    .values(chunk.to_vec())
                     .on_conflict(#table_ident::id)
                     .do_update()
                     .set(Self::__autumn_upsert_set());

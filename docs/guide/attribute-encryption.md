@@ -1,0 +1,238 @@
+# Attribute Encryption (at-rest column encryption)
+
+Autumn can encrypt individual `#[model]` columns at rest. A field marked
+`#[encrypted]` is stored as opaque ciphertext in the database but behaves like a
+normal `String` in your Rust code: `repo.find(id)` returns plaintext, and
+`repo.update(..)` / inserts accept plaintext. No per-call-site changes, no
+hand-rolled AEAD wrappers.
+
+This is the right tool for **sensitive data columns**: OAuth refresh tokens,
+government IDs, MFA seeds, PHI fields, payment metadata, end-user content keys.
+
+```rust
+#[autumn_web::model]
+pub struct Account {
+    #[id]
+    pub id: i64,
+    pub username: String,
+
+    // Randomized AEAD: a fresh nonce per write. The default. No equality lookups.
+    #[encrypted]
+    pub api_token: String,
+
+    // Deterministic AEAD: stable ciphertext, so `WHERE email = ?` works — at the
+    // cost of leaking *equality* of plaintext through equality of ciphertext.
+    // Requires the explicit `deterministic` opt-in.
+    #[encrypted(deterministic)]
+    pub email: String,
+}
+```
+
+## When to use this vs. the credentials store vs. log scrubbing
+
+| Concern | Use |
+| --- | --- |
+| Secrets needed to **boot** the app (DB URL, API keys, signing secret) | [Credentials store](./credentials.md) (#682) |
+| Keeping PII out of **logs and traces** | [Log scrubbing](./logging-pii.md) (#697) |
+| Sensitive **data columns** stored per-row in your tables | **Attribute encryption (this page)** |
+
+Attribute encryption *composes with* the other two: encryption key material lives
+in the credentials store, and encrypted columns are automatically scrubbed from
+logs.
+
+## Configuring keys
+
+Key material lives in the encrypted [credentials store](./credentials.md) under
+the `active_record_encryption` namespace (the name mirrors Rails so the mental
+model transfers). Run:
+
+```bash
+autumn credentials edit
+```
+
+and add:
+
+```toml
+[active_record_encryption]
+# Current key — used for all new writes. 64 hex chars.
+primary_key = "‹openssl rand -hex 32›"
+
+# Required only if any column uses #[encrypted(deterministic)].
+deterministic_key = "‹openssl rand -hex 32›"
+
+# Mixed into key derivation. Pick once and keep it stable.
+key_derivation_salt = "‹openssl rand -hex 16›"
+
+# Optional: keys retired by rotation, kept so old rows stay readable.
+retired_keys = []
+```
+
+If a model declares an encrypted column but `primary_key` is missing, the app
+**fails fast at boot** with a diagnostic that names the exact missing credential
+path (the same shape as #597):
+
+```text
+Attribute encryption misconfiguration: Encrypted column `accounts.api_token`
+requires a master key, but `active_record_encryption.primary_key` is not
+configured.
+  hint: run `autumn credentials edit` and add:
+    [active_record_encryption]
+    primary_key = "<64 hex chars from `openssl rand -hex 32`>"
+```
+
+## Randomized vs. deterministic — the tradeoff
+
+* **Randomized** (`#[encrypted]`, the default): every write gets a fresh random
+  nonce, so encrypting the same plaintext twice produces different ciphertext.
+  This is the safe choice. You **cannot** run `WHERE col = ?` equality queries on
+  a randomized column, because the value you search for won't match the stored
+  ciphertext.
+
+* **Deterministic** (`#[encrypted(deterministic)]`): the nonce is derived from
+  the plaintext, so equal plaintexts produce equal ciphertext and equality
+  lookups work. The cost: an observer of the database can tell which rows share
+  the same value, even without the key. **Only opt in when you need lookups, and
+  never on low-entropy columns** (e.g. a boolean-ish flag), where equality
+  leakage is most damaging.
+
+Randomized is default and deterministic is an explicit opt-in *by design*: the
+cost of accidentally shipping deterministic encryption on a sensitive low-entropy
+column is high; the cost of typing one extra word when you actually need lookup
+is low.
+
+### Equality lookups on deterministic columns
+
+Encrypt the search value to its stable ciphertext and filter on it:
+
+```rust
+use autumn_web::encryption::deterministic_ciphertext;
+
+let needle = deterministic_ciphertext("alice@example.com")?;
+let account: Account = accounts::table
+    .filter(accounts::email.eq(needle))
+    .select(Account::as_select())
+    .first(&mut conn)
+    .await?;
+```
+
+## On-disk format
+
+Each encrypted value is a base64 string wrapping a self-describing binary
+envelope:
+
+```text
+byte  0      magic   = 0xA7
+byte  1      version = 0x01
+byte  2      alg     = 0x01   (AES-256-GCM)
+byte  3      mode    = 0x00 randomized | 0x01 deterministic
+bytes 4..8   key_id  : u32 big-endian
+bytes 8..20  nonce   : 12 bytes
+bytes 20..   ciphertext + 16-byte AES-GCM tag
+```
+
+The single AEAD primitive is **AES-256-GCM** (via the vetted `aes-gcm` crate).
+There is no app-author algorithm choice in v1.
+
+Because the envelope embeds the `key_id`, an external decryption tool — given the
+master key material and the documented key derivation — can decode any column
+value. Key derivation:
+
+```text
+data_key = HMAC-SHA256(master_bytes, b"autumn:data:v1:" || salt)   # randomized
+det_key  = HMAC-SHA256(master_bytes, b"autumn:det:v1:"  || salt)   # deterministic
+key_id   = u32::from_be_bytes( SHA256(b"autumn:id:v1:" || data_key)[0..4] )
+```
+
+## Key rotation
+
+Rotation never rewrites existing rows. To rotate:
+
+1. Generate a new key: `openssl rand -hex 32`.
+2. `autumn credentials edit`: move the **old** `primary_key` into `retired_keys`
+   and set the new key as `primary_key`:
+
+   ```toml
+   [active_record_encryption]
+   primary_key  = "‹new key›"
+   retired_keys = ["‹previous primary_key›"]
+   ```
+
+3. Deploy. New writes use the new key; existing rows still decrypt because the
+   envelope's `key_id` selects the retired key transparently.
+
+Old rows are re-encrypted lazily — whenever a row is next updated it is written
+with the current key. You may also run a one-off task that loads and re-saves
+rows to migrate eagerly. A retired key can be dropped from `retired_keys` only
+once no row references its `key_id` anymore.
+
+## Backfilling an existing plaintext column
+
+Converting an existing plaintext column to encrypted is an **offline backfill**.
+Generate the migration scaffold:
+
+```bash
+autumn generate migration EncryptApiTokenOnAccounts api_token
+```
+
+This emits a migration whose `up.sql` documents the expand/encrypt/contract steps
+and whose `down.sql` documents the reverse (restoring plaintext from ciphertext
+given the keys). Because the actual encrypt/decrypt needs the app's key ring, the
+heavy lifting runs as a one-off task rather than raw SQL:
+
+```bash
+# 1. add the #[encrypted] attribute to the field and deploy with reads tolerant
+#    of both shapes, OR run the backfill before flipping reads (recommended):
+autumn task run backfill_encrypt_accounts_api_token
+```
+
+The generated task template loads each row's plaintext, calls
+`autumn_web::encryption::encrypt_text(Mode::Randomized, &plaintext)`, and writes
+the envelope back. The **rollback** task does the inverse with
+`decrypt_text(&envelope)`.
+
+> Always take a backup before a backfill, and keep the keys: a row encrypted with
+> a key you have lost is unrecoverable by design.
+
+## Composition with other subsystems
+
+* **Logs & traces (#697):** encrypted column names are automatically added to the
+  log parameter scrubber. Their values never appear in trace/error parameter
+  output. The wrapper types also redact in `Debug`.
+
+* **Record version history (#700):** encrypted columns are automatically treated
+  as *sensitive* in the version diff. The history stores a `changed (encrypted)`
+  marker — never the plaintext (which the in-memory model would otherwise
+  serialize). Plaintext never enters the version-history table.
+
+* **Admin plugin:** encrypted columns render **redacted** (`••••••••`) in admin
+  list and detail views by default. Showing decrypted plaintext to an authorized
+  admin is an explicit per-field opt-in, gated through the admin policy machinery
+  (#496) — this feature does not invent its own authorization.
+
+## Development escape hatch
+
+By default the encryption wrapper types render `<encrypted>` in `Debug`. For
+local debugging only you may opt back into plaintext:
+
+```rust
+// DEV ONLY — never enable in production.
+autumn_web::encryption::set_debug_plaintext(true);
+```
+
+## Performance
+
+Encryption adds an AES-256-GCM operation per encrypted value per read/write.
+AES-256-GCM is hardware-accelerated on modern CPUs (AES-NI). The framework's
+benchmark suite includes a mixed encrypted/plaintext read benchmark
+(`benchmarks/encryption`) and enforces a budget of **≤10% p99 read regression**
+on 10k rows. In practice the dominant cost of a request is the database round
+trip and serialization, not the AEAD.
+
+## Limitations (v1)
+
+* Encrypted columns are non-null `String` fields. Encrypt structured data by
+  serializing it to a string first.
+* The primary key is app-global (no per-tenant key partitioning yet).
+* No KMS integration, no per-row data keys, no searchable encryption beyond
+  deterministic equality, no format-preserving encryption. See the issue's
+  "Out of Scope" for the roadmap.

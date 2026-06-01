@@ -535,6 +535,30 @@ pub fn is_encrypted_column(table: &str, column: &str) -> bool {
         .any(|d| d.table == table && d.column == column)
 }
 
+/// Encrypted column names for a single table.
+#[must_use]
+pub fn encrypted_columns_for_table(table: &str) -> Vec<&'static str> {
+    registered_encrypted_columns()
+        .iter()
+        .filter(|d| d.table == table)
+        .map(|d| d.column)
+        .collect()
+}
+
+/// Append this table's encrypted columns to `columns`, de-duplicating.
+///
+/// Used by generated `VersionedRecord::version_sensitive_columns` so encrypted
+/// columns are always treated as sensitive in record version history (#700):
+/// the diff stores a "changed (encrypted)" marker and never the plaintext that
+/// the in-memory model would otherwise serialize.
+pub fn merge_encrypted_columns_for_table(table: &str, columns: &mut Vec<&'static str>) {
+    for col in encrypted_columns_for_table(table) {
+        if !columns.contains(&col) {
+            columns.push(col);
+        }
+    }
+}
+
 /// Boot validation: if any encrypted columns are registered, the key material
 /// must resolve. Mirrors the fast-fail diagnostic shape of the credentials and
 /// signing-secret checks (#597), naming the missing credential path.

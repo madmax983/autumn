@@ -947,7 +947,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                         .await
                                 } else {
                                     ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
-                                        .values(&input)
+                                        .values(input)
                                         .get_result::<#model_name>(conn)
                                         .await
                                 }
@@ -1076,7 +1076,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                         .await
                                 } else {
                                     ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
-                                        .values(&input)
+                                        .values(input)
                                         .get_result::<#model_name>(conn)
                                         .await
                                 }
@@ -1123,7 +1123,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 self.hooks.before_create(&mut ctx, &mut input).await?;
 
                                 let record = ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
-                                    .values(&input)
+                                    .values(input)
                                     .get_result::<#model_name>(conn)
                                     .await
                                     .map_err(::autumn_web::AutumnError::from)?;
@@ -1247,7 +1247,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 self.hooks.before_create(&mut ctx, &mut input).await?;
 
                                 let record = ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
-                                    .values(&input)
+                                    .values(input)
                                     .get_result::<#model_name>(conn)
                                     .await
                                     .map_err(::autumn_web::AutumnError::from)?;
@@ -1282,7 +1282,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 self.hooks.before_create(&mut ctx, &mut input).await?;
 
                                 let record = ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
-                                    .values(&input)
+                                    .values(input)
                                     .get_result::<#model_name>(conn)
                                     .await
                                     .map_err(::autumn_web::AutumnError::from)?;
@@ -1392,12 +1392,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     let update_target = #table_ident::table.find(id);
                                     let updated = if let ::core::option::Option::Some(ref t) = tenant_id {
                                         ::autumn_web::reexports::diesel::update(update_target.filter(#table_ident::tenant_id.eq(t)))
-                                            .set(&proposed)
+                                            .set(proposed.clone())
                                             .get_result::<#model_name>(conn)
                                             .await
                                     } else {
                                         ::autumn_web::reexports::diesel::update(update_target)
-                                            .set(&proposed)
+                                            .set(proposed.clone())
                                             .get_result::<#model_name>(conn)
                                             .await
                                     }
@@ -1430,12 +1430,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     let update_target = #table_ident::table.find(id);
                                     let updated = if let ::core::option::Option::Some(ref t) = tenant_id {
                                         ::autumn_web::reexports::diesel::update(update_target.filter(#table_ident::tenant_id.eq(t)))
-                                            .set(&proposed)
+                                            .set(proposed.clone())
                                             .get_result::<#model_name>(conn)
                                             .await
                                     } else {
                                         ::autumn_web::reexports::diesel::update(update_target)
-                                            .set(&proposed)
+                                            .set(proposed.clone())
                                             .get_result::<#model_name>(conn)
                                             .await
                                     }
@@ -1602,12 +1602,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     let update_target = #table_ident::table.find(id);
                                     let updated = if let ::core::option::Option::Some(ref t) = tenant_id {
                                         ::autumn_web::reexports::diesel::update(update_target.filter(#table_ident::tenant_id.eq(t)))
-                                            .set(&proposed)
+                                            .set(proposed.clone())
                                             .get_result::<#model_name>(conn)
                                             .await
                                     } else {
                                         ::autumn_web::reexports::diesel::update(update_target)
-                                            .set(&proposed)
+                                            .set(proposed.clone())
                                             .get_result::<#model_name>(conn)
                                             .await
                                     }
@@ -1640,12 +1640,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     let update_target = #table_ident::table.find(id);
                                     let updated = if let ::core::option::Option::Some(ref t) = tenant_id {
                                         ::autumn_web::reexports::diesel::update(update_target.filter(#table_ident::tenant_id.eq(t)))
-                                            .set(&proposed)
+                                            .set(proposed.clone())
                                             .get_result::<#model_name>(conn)
                                             .await
                                     } else {
                                         ::autumn_web::reexports::diesel::update(update_target)
-                                            .set(&proposed)
+                                            .set(proposed.clone())
                                             .get_result::<#model_name>(conn)
                                             .await
                                     }
@@ -1728,7 +1728,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                                     let proposed = draft.into_after();
                                     let updated = ::autumn_web::reexports::diesel::update(#table_ident::table.find(id))
-                                        .set(&proposed)
+                                        .set(proposed.clone())
                                         .get_result::<#model_name>(conn)
                                         .await
                                         .map_err(::autumn_web::AutumnError::from)?;
@@ -1752,7 +1752,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                                     let proposed = draft.into_after();
                                     let updated = ::autumn_web::reexports::diesel::update(#table_ident::table.find(id))
-                                        .set(&proposed)
+                                        .set(proposed.clone())
                                         .get_result::<#model_name>(conn)
                                         .await
                                         .map_err(::autumn_web::AutumnError::from)?;
@@ -1910,7 +1910,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                                     let proposed = draft.into_after();
                                     let updated = ::autumn_web::reexports::diesel::update(#table_ident::table.find(id))
-                                        .set(&proposed)
+                                        .set(proposed.clone())
                                         .get_result::<#model_name>(conn)
                                         .await
                                         .map_err(::autumn_web::AutumnError::from)?;
@@ -1932,7 +1932,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                                     let proposed = draft.into_after();
                                     let updated = ::autumn_web::reexports::diesel::update(#table_ident::table.find(id))
-                                        .set(&proposed)
+                                        .set(proposed.clone())
                                         .get_result::<#model_name>(conn)
                                         .await
                                         .map_err(::autumn_web::AutumnError::from)?;
@@ -1998,7 +1998,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                                     let proposed = draft.into_after();
                                     ::autumn_web::reexports::diesel::update(#table_ident::table.find(id))
-                                        .set(&proposed)
+                                        .set(proposed.clone())
                                         .get_result::<#model_name>(conn)
                                         .await
                                         .map_err(::autumn_web::AutumnError::from)?
@@ -2018,7 +2018,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                                     let proposed = draft.into_after();
                                     ::autumn_web::reexports::diesel::update(#table_ident::table.find(id))
-                                        .set(&proposed)
+                                        .set(proposed.clone())
                                         .get_result::<#model_name>(conn)
                                         .await
                                         .map_err(::autumn_web::AutumnError::from)?
@@ -2372,12 +2372,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         if let ::core::option::Option::Some(t) = tenant_id {
                             let values: Vec<_> = chunk.iter().cloned().map(|item| ::autumn_web::tenancy::TenantInsertable::tenant_values(item, t)).collect();
                             ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
-                                .values(&values)
+                                .values(values)
                                 .get_results::<#model_name>(conn)
                                 .await
                         } else {
                             ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
-                                .values(chunk)
+                                .values(chunk.to_vec())
                                 .get_results::<#model_name>(conn)
                                 .await
                         }
@@ -2387,7 +2387,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 quote! {
                     {
                         ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
-                            .values(chunk)
+                            .values(chunk.to_vec())
                             .get_results::<#model_name>(conn)
                             .await
                     }
@@ -2698,13 +2698,13 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         if let ::core::option::Option::Some(t) = tenant_id {
                             let values: Vec<_> = chunk.iter().map(|item| ::autumn_web::tenancy::TenantInsertable::tenant_values(item.0.clone(), t)).collect();
                             ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
-                                .values(&values)
+                                .values(values)
                                 .get_results::<#model_name>(conn)
                                 .await
                         } else {
                             let values: Vec<_> = chunk.iter().map(|item| item.0.clone()).collect();
                             ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
-                                .values(&values)
+                                .values(values)
                                 .get_results::<#model_name>(conn)
                                 .await
                         }
@@ -2715,7 +2715,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     {
                         let values: Vec<_> = chunk.iter().map(|item| item.0.clone()).collect();
                         ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
-                            .values(&values)
+                            .values(values)
                             .get_results::<#model_name>(conn)
                             .await
                     }
@@ -2727,12 +2727,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     if let ::core::option::Option::Some(t) = tenant_id {
                         let values = ::autumn_web::tenancy::TenantInsertable::tenant_values(item.0.clone(), t);
                         ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
-                            .values(&values)
+                            .values(values)
                             .get_result::<#model_name>(conn)
                             .await
                     } else {
                         ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
-                            .values(&item.0)
+                            .values(item.0.clone())
                             .get_result::<#model_name>(conn)
                             .await
                     }
@@ -2740,7 +2740,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             } else {
                 quote! {
                     ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
-                        .values(&item.0)
+                        .values(item.0.clone())
                         .get_result::<#model_name>(conn)
                         .await
                 }
@@ -3813,7 +3813,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             .await
                     } else {
                         ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
-                            .values(new)
+                            .values(new.clone())
                             .get_result::<#model_name>(conn)
                             .await
                     }
@@ -3842,7 +3842,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         .await
                 } else {
                     ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
-                        .values(new)
+                        .values(new.clone())
                         .get_result::<#model_name>(&mut conn)
                         .await
                 }
@@ -3866,7 +3866,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let mut conn = self.__autumn_acquire_conn().await?;
                 conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| async move {
                     let record = ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
-                        .values(new)
+                        .values(new.clone())
                         .get_result::<#model_name>(conn)
                         .await
                         .map_err(::autumn_web::AutumnError::from)?;
@@ -3881,7 +3881,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
                 let mut conn = self.__autumn_acquire_conn().await?;
                 ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
-                    .values(new)
+                    .values(new.clone())
                     .get_result::<#model_name>(&mut conn)
                     .await
                     .map_err(::autumn_web::AutumnError::from)
@@ -3959,12 +3959,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         let update_target = #table_ident::table.find(id);
                         let record = if let ::core::option::Option::Some(ref t) = tenant_id {
                             ::autumn_web::reexports::diesel::update(update_target.filter(#table_ident::tenant_id.eq(t)))
-                                .set(&diesel_changeset)
+                                .set(diesel_changeset.clone())
                                 .get_result::<#model_name>(conn)
                                 .await
                         } else {
                             ::autumn_web::reexports::diesel::update(update_target)
-                                .set(&diesel_changeset)
+                                .set(diesel_changeset.clone())
                                 .get_result::<#model_name>(conn)
                                 .await
                         }
@@ -4035,12 +4035,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             let update_target = #table_ident::table.find(id);
                             if let ::core::option::Option::Some(ref t) = tenant_id {
                                 ::autumn_web::reexports::diesel::update(update_target.filter(#table_ident::tenant_id.eq(t)))
-                                    .set(&diesel_changeset)
+                                    .set(diesel_changeset.clone())
                                     .get_result::<#model_name>(conn)
                                     .await
                             } else {
                                 ::autumn_web::reexports::diesel::update(update_target)
-                                    .set(&diesel_changeset)
+                                    .set(diesel_changeset.clone())
                                     .get_result::<#model_name>(conn)
                                     .await
                             }
@@ -4058,12 +4058,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     let update_target = #table_ident::table.find(id);
                     if let ::core::option::Option::Some(ref t) = tenant_id {
                         ::autumn_web::reexports::diesel::update(update_target.filter(#table_ident::tenant_id.eq(t)))
-                            .set(&diesel_changeset)
+                            .set(diesel_changeset.clone())
                             .get_result::<#model_name>(&mut conn)
                             .await
                     } else {
                         ::autumn_web::reexports::diesel::update(update_target)
-                            .set(&diesel_changeset)
+                            .set(diesel_changeset.clone())
                             .get_result::<#model_name>(&mut conn)
                             .await
                     }
@@ -4125,7 +4125,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         let diesel_changeset = changes.__to_changeset();
                         let update_target = #table_ident::table.find(id);
                         let record = ::autumn_web::reexports::diesel::update(update_target)
-                            .set(&diesel_changeset)
+                            .set(diesel_changeset.clone())
                             .get_result::<#model_name>(conn)
                             .await
                             .map_err(::autumn_web::AutumnError::from)?;
@@ -4176,7 +4176,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             let diesel_changeset = changes.__to_changeset();
                             let update_target = #table_ident::table.find(id);
                             ::autumn_web::reexports::diesel::update(update_target)
-                                .set(&diesel_changeset)
+                                .set(diesel_changeset.clone())
                                 .get_result::<#model_name>(conn)
                                 .await
                                 .map_err(::autumn_web::AutumnError::from)
@@ -4188,7 +4188,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     let diesel_changeset = changes.__to_changeset();
                     let update_target = #table_ident::table.find(id);
                     ::autumn_web::reexports::diesel::update(update_target)
-                        .set(&diesel_changeset)
+                        .set(diesel_changeset.clone())
                         .get_result::<#model_name>(&mut conn)
                         .await
                         .map_err(::autumn_web::AutumnError::from)
@@ -4525,12 +4525,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             let chunk_inserted = if let ::core::option::Option::Some(t) = tenant_id {
                                 let values: Vec<_> = chunk.iter().cloned().map(|item| ::autumn_web::tenancy::TenantInsertable::tenant_values(item, t)).collect();
                                 ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
-                                    .values(&values)
+                                    .values(values)
                                     .get_results::<#model_name>(conn)
                                     .await
                             } else {
                                 ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
-                                    .values(chunk)
+                                    .values(chunk.to_vec())
                                     .get_results::<#model_name>(conn)
                                     .await
                             }
@@ -4576,12 +4576,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             let chunk_inserted = if let ::core::option::Option::Some(t) = tenant_id {
                                 let values: Vec<_> = chunk.iter().cloned().map(|item| ::autumn_web::tenancy::TenantInsertable::tenant_values(item, t)).collect();
                                 ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
-                                    .values(&values)
+                                    .values(values)
                                     .get_results::<#model_name>(conn)
                                     .await
                             } else {
                                 ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
-                                    .values(chunk)
+                                    .values(chunk.to_vec())
                                     .get_results::<#model_name>(conn)
                                     .await
                             }
@@ -4623,7 +4623,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         let chunk_size = if cols == 0 { 1000 } else { (65535usize / cols).min(1000).max(1) };
                         for chunk in new.chunks(chunk_size) {
                             let chunk_inserted = ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
-                                .values(chunk)
+                                .values(chunk.to_vec())
                                 .get_results::<#model_name>(conn)
                                 .await
                                 .map_err(::autumn_web::AutumnError::from)?;
@@ -4658,7 +4658,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         let chunk_size = if cols == 0 { 1000 } else { (65535usize / cols).min(1000).max(1) };
                         for chunk in new.chunks(chunk_size) {
                             let chunk_inserted = ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
-                                .values(chunk)
+                                .values(chunk.to_vec())
                                 .get_results::<#model_name>(conn)
                                 .await
                                 .map_err(::autumn_web::AutumnError::from)?;
@@ -4722,12 +4722,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     if let ::core::option::Option::Some(t) = tenant_id {
                         let values: Vec<_> = chunk.iter().cloned().map(|item| ::autumn_web::tenancy::TenantInsertable::tenant_values(item, t)).collect();
                         ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
-                            .values(&values)
+                            .values(values)
                             .get_results::<#model_name>(conn)
                             .await
                     } else {
                         ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
-                            .values(chunk)
+                            .values(chunk.to_vec())
                             .get_results::<#model_name>(conn)
                             .await
                     }
@@ -4735,7 +4735,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             } else {
                 quote! {
                     ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
-                        .values(chunk)
+                        .values(chunk.to_vec())
                         .get_results::<#model_name>(conn)
                         .await
                 }
@@ -4746,12 +4746,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     if let ::core::option::Option::Some(t) = tenant_id {
                         let values = ::autumn_web::tenancy::TenantInsertable::tenant_values(item.clone(), t);
                         ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
-                            .values(&values)
+                            .values(values)
                             .get_result::<#model_name>(conn)
                             .await
                     } else {
                         ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
-                            .values(item)
+                            .values(item.clone())
                             .get_result::<#model_name>(conn)
                             .await
                     }
@@ -4759,7 +4759,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             } else {
                 quote! {
                     ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
-                        .values(item)
+                        .values(item.clone())
                         .get_result::<#model_name>(conn)
                         .await
                 }
@@ -4955,12 +4955,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 quote! {
                     if let ::core::option::Option::Some(t) = tenant_id {
                         ::autumn_web::reexports::diesel::update(#table_ident::table.filter(#table_ident::id.eq_any(chunk)).filter(#table_ident::tenant_id.eq(t)))
-                            .set(&diesel_changeset)
+                            .set(diesel_changeset.clone())
                             .get_results::<#model_name>(conn)
                             .await
                     } else {
                         ::autumn_web::reexports::diesel::update(#table_ident::table.filter(#table_ident::id.eq_any(chunk)))
-                            .set(&diesel_changeset)
+                            .set(diesel_changeset.clone())
                             .get_results::<#model_name>(conn)
                             .await
                     }
@@ -4968,7 +4968,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             } else {
                 quote! {
                     ::autumn_web::reexports::diesel::update(#table_ident::table.filter(#table_ident::id.eq_any(chunk)))
-                        .set(&diesel_changeset)
+                        .set(diesel_changeset.clone())
                         .get_results::<#model_name>(conn)
                         .await
                 }
@@ -7380,7 +7380,21 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         .unwrap_or(::autumn_web::reexports::serde_json::Value::Object(Default::default()))
                 }
                 fn version_sensitive_columns() -> &'static [&'static str] {
-                    #sensitive_ts
+                    // Merge declared sensitive columns with at-rest encrypted
+                    // columns (#805) so version history never records plaintext.
+                    static __VH_SENSITIVE: ::std::sync::OnceLock<::std::vec::Vec<&'static str>> =
+                        ::std::sync::OnceLock::new();
+                    __VH_SENSITIVE
+                        .get_or_init(|| {
+                            let declared: &[&'static str] = #sensitive_ts;
+                            let mut cols: ::std::vec::Vec<&'static str> = declared.to_vec();
+                            ::autumn_web::encryption::merge_encrypted_columns_for_table(
+                                #table_name,
+                                &mut cols,
+                            );
+                            cols
+                        })
+                        .as_slice()
                 }
                 #tenant_id_method
             }

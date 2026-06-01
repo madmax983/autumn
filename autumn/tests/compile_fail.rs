@@ -73,6 +73,14 @@ fn compile_pass_tests() {
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/model_factory.rs");
 
+    // Encrypted column field attribute (requires db feature)
+    #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/model_encrypted.rs");
+
+    // Full versioned repository over an encrypted model (requires db feature)
+    #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/repository_encrypted.rs");
+
     // Model factory composition (#[factory_assoc]) — requires db feature
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/model_factory_composition.rs");

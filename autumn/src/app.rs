@@ -1892,6 +1892,7 @@ impl AppBuilder {
         // 4d. Validate signing secret — production must have a stable, private,
         // entropy-meeting secret before the server binds. Dev/test are exempt.
         fail_fast_on_invalid_signing_secret(&config);
+        fail_fast_on_missing_encryption_keys(&config);
         fail_fast_on_invalid_trusted_hosts(&config);
 
         // 4e. Signed webhook configs must resolve to usable key material
@@ -2471,6 +2472,7 @@ impl AppBuilder {
         // builds don't run migrations against a doomed boot either.
         fail_fast_on_invalid_session_config(&config, session_store.is_some());
         fail_fast_on_invalid_signing_secret(&config);
+        fail_fast_on_missing_encryption_keys(&config);
         fail_fast_on_invalid_trusted_hosts(&config);
 
         // Preflight the configured BlobStore the same way `run()` does.
@@ -2830,6 +2832,7 @@ impl AppBuilder {
 
         fail_fast_on_invalid_session_config(&config, session_store.is_some());
         fail_fast_on_invalid_signing_secret(&config);
+        fail_fast_on_missing_encryption_keys(&config);
         fail_fast_on_invalid_trusted_hosts(&config);
 
         #[cfg(feature = "storage")]
@@ -3687,6 +3690,17 @@ fn fail_fast_on_invalid_session_config(config: &AutumnConfig, has_custom_session
 /// In production, a missing, too-short, or demo-valued signing secret is a
 /// hard failure — the server must not bind. In dev/test the check is skipped
 /// so zero-config local development continues to work.
+/// Fail fast (mirroring #597) when at-rest column encryption is in use but the
+/// key material under `active_record_encryption` is missing or malformed. On
+/// success this installs the process-global key ring. Apps that do not opt into
+/// encrypted columns are unaffected (no registered columns -> no-op).
+fn fail_fast_on_missing_encryption_keys(config: &AutumnConfig) {
+    if let Err(diagnostic) = crate::encryption::init_attribute_encryption(config.credentials()) {
+        eprintln!("Attribute encryption misconfiguration: {diagnostic}");
+        std::process::exit(1);
+    }
+}
+
 fn fail_fast_on_invalid_signing_secret(config: &AutumnConfig) {
     use crate::security::config::validate_signing_secret;
 
