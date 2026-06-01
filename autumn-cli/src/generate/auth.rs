@@ -1789,6 +1789,9 @@ fn render_oauth_routes_file(
          \x20   //           return Redirect::to(\"/login?error=totp_key_collision\").into_response();\n\
          \x20   //       }\n\
          \x20   //       session.rotate_id().await;\n\
+         \x20   //       // rotate_id() keeps session data, so drop any live auth from a\n\
+         \x20   //       // prior login in this browser before parking the pending handoff:\n\
+         \x20   //       session.remove(&auth_cfg.session_key).await;\n\
          \x20   //       session.remove(\"totp_pending_reset_digest\").await;\n\
          \x20   //       session.remove(\"totp_pending_reset_token\").await;\n\
          \x20   //       session.remove(\"totp_pending_secret\").await;\n\
@@ -2125,7 +2128,14 @@ fn totp_login_branch_src(snake_name: &str) -> String {
             ));
         }
         session.rotate_id().await;
-        // Drop any abandoned pending state from a previous flow first, so a stale
+        // `rotate_id()` keeps existing session data, so if this browser was
+        // already authenticated as another account, drop those *live* auth keys
+        // before parking the pending handoff — otherwise `#[secured]` routes
+        // would still treat the pre-2FA session as the previous account.
+        session.remove("__SNAKE___id").await;
+        session.remove("__SNAKE___email").await;
+        session.remove(state.auth_session_key()).await;
+        // Drop any abandoned pending state from a previous flow too, so a stale
         // parked reset, enrollment secret, or a different account's pending login
         // can never be resumed under this login.
         session.remove("totp_pending_reset_digest").await;
@@ -2176,7 +2186,12 @@ fn totp_reset_branch_src(snake_name: &str) -> String {
         // Do NOT write the new password yet. Park it in the session and finish
         // the reset in `login_verify` only after the second factor is proven.
         session.rotate_id().await;
-        // Drop any half-finished enrollment secret from a prior abandoned flow.
+        // `rotate_id()` keeps existing session data, so drop any live auth keys
+        // from a prior login in this browser before parking the pending handoff
+        // (see the login interstitial), and any half-finished enrollment secret.
+        session.remove("__SNAKE___id").await;
+        session.remove("__SNAKE___email").await;
+        session.remove(state.auth_session_key()).await;
         session.remove("totp_pending_secret").await;
         session
             .insert("totp_pending_id", __SNAKE__.id.to_string())
@@ -4074,6 +4089,41 @@ mod tests {
     }
 
     #[test]
+    fn totp_pending_handoff_clears_live_auth_keys() {
+        // P2 (#1057 round 9): rotate_id() preserves session data, so a pending-2FA
+        // handoff started while already authenticated as another account must drop
+        // the live auth keys, or #[secured] would still trust the old account.
+        let tmp = project_with_main();
+        totp_plan(tmp.path()).execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+        // Login interstitial: before parking totp_pending_id it must remove the
+        // configured auth session key.
+        let login_pos = routes.find("pub async fn login(").expect("login fn");
+        let logout_pos = routes.find("pub async fn logout(").unwrap_or(routes.len());
+        let login_body = &routes[login_pos..logout_pos];
+        let park_at = login_body
+            .find("insert(\"totp_pending_id\"")
+            .expect("login parks totp_pending_id");
+        let before_park = &login_body[..park_at];
+        assert!(
+            before_park.contains("session.remove(state.auth_session_key())"),
+            "login interstitial must clear the live auth key before parking 2FA: {login_body}"
+        );
+        // Reset interstitial must do the same.
+        let reset_pos = routes
+            .find("pub async fn reset_password(")
+            .expect("reset_password fn");
+        let reset_body = &routes[reset_pos..reset_pos + 2500.min(routes.len() - reset_pos)];
+        let reset_park = reset_body
+            .find("insert(\"totp_pending_id\"")
+            .expect("reset parks totp_pending_id");
+        assert!(
+            reset_body[..reset_park].contains("session.remove(state.auth_session_key())"),
+            "reset interstitial must clear the live auth key before parking 2FA: {reset_body}"
+        );
+    }
+
+    #[test]
     fn totp_login_verify_falls_back_to_recovery_on_broken_secret() {
         // P2 (#1057 round 8): a decrypt/build failure (e.g. rotated TOTP_ENC_KEY)
         // must not abort login_verify before the recovery-code branch — recovery
@@ -4257,7 +4307,7 @@ mod tests {
         let reset_pos = routes
             .find("pub async fn reset_password(")
             .expect("reset_password fn");
-        let reset_body = &routes[reset_pos..reset_pos + 2500.min(routes.len() - reset_pos)];
+        let reset_body = &routes[reset_pos..reset_pos + 3200.min(routes.len() - reset_pos)];
         // The deferral branch (which returns to /login/verify) must come BEFORE
         // the password_digest UPDATE in the handler body.
         let park_at = reset_body
@@ -4293,7 +4343,7 @@ mod tests {
         let reset_pos = routes
             .find("pub async fn reset_password(")
             .expect("reset_password fn");
-        let reset_body = &routes[reset_pos..reset_pos + 2500.min(routes.len() - reset_pos)];
+        let reset_body = &routes[reset_pos..reset_pos + 3200.min(routes.len() - reset_pos)];
         assert!(
             reset_body.contains("totp_pending_reset_token"),
             "reset_password 2FA branch must park the token digest: {reset_body}"
