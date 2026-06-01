@@ -1573,7 +1573,79 @@ impl AutumnConfig {
         )
         .map_err(|e| ConfigError::Credentials(e.to_string()))?;
 
+        #[cfg(feature = "oauth2")]
+        {
+            config.expand_oauth2_providers();
+        }
+
         Ok(config)
+    }
+
+    /// Helper method to expand `OAuth2` preset configurations and resolve credentials-backed values.
+    #[cfg(feature = "oauth2")]
+    fn expand_oauth2_providers(&mut self) {
+        let provider_names: Vec<String> = self.auth.oauth2.providers.keys().cloned().collect();
+        for name in provider_names {
+            // 1. Expand from preset if available
+            if let (Some(preset), Some(p)) = (
+                crate::auth::provider_preset(&name),
+                self.auth.oauth2.providers.get_mut(&name),
+            ) {
+                if p.authorize_url.is_empty() {
+                    p.authorize_url = preset.authorize_url;
+                }
+                if p.token_url.is_empty() {
+                    p.token_url = preset.token_url;
+                }
+                if p.userinfo_url.is_none() {
+                    p.userinfo_url = preset.userinfo_url;
+                }
+                if p.scope.is_empty() || p.scope == "default" {
+                    p.scope = preset.scope;
+                }
+                if p.issuer.is_none() {
+                    p.issuer = preset.issuer;
+                }
+                if p.jwks_url.is_none() {
+                    p.jwks_url = preset.jwks_url;
+                }
+                if p.discovery_url.is_none() {
+                    p.discovery_url = preset.discovery_url;
+                }
+            }
+
+            // 2. Resolve credentials-backed secrets/IDs
+            if let Some(p) = self.auth.oauth2.providers.get_mut(&name) {
+                let normalized_name = name
+                    .chars()
+                    .map(|c| if c.is_alphanumeric() { c } else { '_' })
+                    .collect::<String>()
+                    .to_lowercase();
+
+                let id_key = format!("oauth2_{normalized_name}_client_id");
+                if p.client_id.is_empty() {
+                    if let Some(id) = self.credentials.get::<String>(&id_key) {
+                        p.client_id = id;
+                    } else if let Some(id) = self
+                        .credentials
+                        .get::<String>(&format!("oauth2_{name}_client_id"))
+                    {
+                        p.client_id = id;
+                    }
+                }
+                let secret_key = format!("oauth2_{normalized_name}_client_secret");
+                if p.client_secret.is_empty() {
+                    if let Some(secret) = self.credentials.get::<String>(&secret_key) {
+                        p.client_secret = secret;
+                    } else if let Some(secret) = self
+                        .credentials
+                        .get::<String>(&format!("oauth2_{name}_client_secret"))
+                    {
+                        p.client_secret = secret;
+                    }
+                }
+            }
+        }
     }
 
     /// Load configuration from a specific TOML file path.
@@ -2110,6 +2182,33 @@ impl AutumnConfig {
     fn apply_auth_env_overrides_with_env(&mut self, env: &dyn Env) {
         parse_env(env, "AUTUMN_AUTH__BCRYPT_COST", &mut self.auth.bcrypt_cost);
         parse_env_string(env, "AUTUMN_AUTH__SESSION_KEY", &mut self.auth.session_key);
+        #[cfg(feature = "oauth2")]
+        {
+            let provider_names: Vec<String> = self.auth.oauth2.providers.keys().cloned().collect();
+            for name in provider_names {
+                let upper = name
+                    .chars()
+                    .map(|c| if c.is_alphanumeric() { c } else { '_' })
+                    .collect::<String>()
+                    .to_uppercase();
+
+                let client_id_var = format!("AUTUMN_AUTH__OAUTH2__{upper}__CLIENT_ID");
+                if let Ok(id) = env.var(&client_id_var)
+                    && !id.is_empty()
+                    && let Some(p) = self.auth.oauth2.providers.get_mut(&name)
+                {
+                    p.client_id = id;
+                }
+
+                let client_secret_var = format!("AUTUMN_AUTH__OAUTH2__{upper}__CLIENT_SECRET");
+                if let Ok(secret) = env.var(&client_secret_var)
+                    && !secret.is_empty()
+                    && let Some(p) = self.auth.oauth2.providers.get_mut(&name)
+                {
+                    p.client_secret = secret;
+                }
+            }
+        }
     }
 
     /// Apply `AUTUMN_SECURITY__*` environment variable overrides.
@@ -5595,6 +5694,42 @@ path = "/api-spec.json"
         let config = AutumnConfig::load_with_env(&env).unwrap();
         let val: Option<String> = config.credentials().get("stripe_key");
         assert_eq!(val.as_deref(), Some("sk_test_xyz"));
+    }
+
+    #[cfg(feature = "oauth2")]
+    #[test]
+    fn config_resolves_oauth_credentials_by_convention() {
+        use crate::credentials::{MasterKey, encrypt};
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let key = MasterKey::generate();
+        let ct = encrypt(
+            &key,
+            b"oauth2_github_client_id = \"git-id-123\"\noauth2_github_client_secret = \"git-secret-456\"\n",
+        );
+        std::fs::create_dir_all(tmp.path().join("config/credentials")).unwrap();
+        std::fs::write(tmp.path().join("config/credentials/dev.toml.enc"), &ct).unwrap();
+
+        // Write a base configuration with an empty/blank github provider defined
+        std::fs::create_dir_all(tmp.path().join("config")).unwrap();
+        let config_toml = r#"
+[auth.oauth2.github]
+client_id = ""
+client_secret = ""
+authorize_url = "https://github.com/login/oauth/authorize"
+token_url = "https://github.com/login/oauth/access_token"
+redirect_uri = "http://localhost:3000/auth/github/callback"
+"#;
+        std::fs::write(tmp.path().join("autumn.toml"), config_toml).unwrap();
+
+        let env = MockEnv::new()
+            .with("AUTUMN_MASTER_KEY", &key.to_hex())
+            .with("AUTUMN_MANIFEST_DIR", tmp.path().to_str().unwrap());
+        let config = AutumnConfig::load_with_env(&env).unwrap();
+        let github = config.auth.oauth2.providers.get("github").unwrap();
+        assert_eq!(github.client_id, "git-id-123");
+        assert_eq!(github.client_secret, "git-secret-456");
     }
 
     #[test]

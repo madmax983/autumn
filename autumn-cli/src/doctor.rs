@@ -279,6 +279,82 @@ pub fn check_trusted_hosts_impl(hosts: &[String], is_production: bool) -> CheckR
     }
 }
 
+/// Check a single `[auth.oauth2.<provider>]` entry for common misconfigurations.
+///
+/// - In production (`is_production = true`): fails when `client_secret` is empty.
+/// - Outside production: warns when `client_secret` is empty.
+///
+/// The returned check name is `"oauth2_provider"`.
+pub fn check_oauth2_provider_impl(
+    provider_name: &str,
+    client_id: &str,
+    client_secret: &str,
+    is_production: bool,
+) -> CheckResult {
+    // Use a static string for the name field to satisfy lifetime constraints.
+    // The name is formatted in the `detail` field instead.
+    let detail_prefix = format!("[auth.oauth2.{provider_name}]");
+
+    // Check client_id first
+    if client_id.trim().is_empty() {
+        return if is_production {
+            CheckResult {
+                name: "oauth2_provider",
+                status: CheckStatus::Fail,
+                detail: Some(format!(
+                    "{detail_prefix}: client_id is empty — OAuth2 login will fail in production"
+                )),
+                hint: Some(
+                    "Set client_id via AUTUMN_AUTH__OAUTH2__<PROVIDER>__CLIENT_ID \
+                     or in autumn.toml",
+                ),
+            }
+        } else {
+            CheckResult {
+                name: "oauth2_provider",
+                status: CheckStatus::Warn,
+                detail: Some(format!(
+                    "{detail_prefix}: client_id is empty (OK for dev if using env vars)"
+                )),
+                hint: Some("Set client_id before deploying to production"),
+            }
+        };
+    }
+
+    // Check client_secret next
+    if client_secret.trim().is_empty() {
+        return if is_production {
+            CheckResult {
+                name: "oauth2_provider",
+                status: CheckStatus::Fail,
+                detail: Some(format!(
+                    "{detail_prefix}: client_secret is empty — OAuth2 login will fail in production"
+                )),
+                hint: Some(
+                    "Set client_secret via AUTUMN_AUTH__OAUTH2__<PROVIDER>__CLIENT_SECRET \
+                     or autumn credentials edit",
+                ),
+            }
+        } else {
+            CheckResult {
+                name: "oauth2_provider",
+                status: CheckStatus::Warn,
+                detail: Some(format!(
+                    "{detail_prefix}: client_secret is empty (OK for dev if using env vars)"
+                )),
+                hint: Some("Set client_secret before deploying to production"),
+            }
+        };
+    }
+
+    CheckResult {
+        name: "oauth2_provider",
+        status: CheckStatus::Pass,
+        detail: Some(format!("{detail_prefix}: provider is correctly configured")),
+        hint: None,
+    }
+}
+
 // ─── Pure helper functions (fully unit-testable) ──────────────────────────────
 
 pub const fn glyph(status: &CheckStatus) -> &'static str {
@@ -1122,6 +1198,161 @@ fn read_autumn_toml_table() -> Option<toml::Table> {
         .and_then(|contents| toml::from_str::<toml::Table>(&contents).ok())
 }
 
+fn deep_merge(target: &mut toml::Table, source: &toml::Table) {
+    for (k, v) in source {
+        if let (Some(source_tbl), Some(target_tbl)) = (
+            v.as_table(),
+            target.get_mut(k).and_then(|t| t.as_table_mut()),
+        ) {
+            deep_merge(target_tbl, source_tbl);
+            continue;
+        }
+        target.insert(k.clone(), v.clone());
+    }
+}
+
+fn get_merged_toml_table(profile: &str) -> toml::Table {
+    let mut merged = toml::Table::new();
+
+    // 1. Base autumn.toml
+    if let Some(table) = std::fs::read_to_string("autumn.toml")
+        .ok()
+        .and_then(|contents| toml::from_str::<toml::Table>(&contents).ok())
+    {
+        deep_merge(&mut merged, &table);
+
+        // 2. Base autumn.toml [profile.{profile}]
+        if let Some(prof) = table
+            .get("profile")
+            .and_then(toml::Value::as_table)
+            .and_then(|p| p.get(profile))
+            .and_then(toml::Value::as_table)
+        {
+            deep_merge(&mut merged, prof);
+        }
+    }
+
+    // 3. autumn-{profile}.toml
+    if let Some(table) = std::fs::read_to_string(format!("autumn-{profile}.toml"))
+        .ok()
+        .and_then(|contents| toml::from_str::<toml::Table>(&contents).ok())
+    {
+        deep_merge(&mut merged, &table);
+    }
+
+    merged
+}
+
+pub struct DoctorOAuth2Provider {
+    pub name: String,
+    pub client_id: String,
+    pub client_secret: String,
+}
+
+fn resolve_oauth2_providers() -> Vec<DoctorOAuth2Provider> {
+    let raw_profile = std::env::var("AUTUMN_ENV")
+        .or_else(|_| std::env::var("AUTUMN_PROFILE"))
+        .unwrap_or_else(|_| "dev".to_owned());
+    let profile = match raw_profile.trim().to_lowercase().as_str() {
+        "production" => "prod".to_owned(),
+        "development" => "dev".to_owned(),
+        other => other.to_owned(),
+    };
+    let merged_toml = get_merged_toml_table(&profile);
+    resolve_oauth2_providers_from_sources(
+        |key| std::env::var(key).ok().filter(|v| !v.is_empty()),
+        Some(&merged_toml),
+        &profile,
+    )
+}
+
+fn resolve_oauth2_providers_from_sources<F>(
+    env_var: F,
+    table: Option<&toml::Table>,
+    profile: &str,
+) -> Vec<DoctorOAuth2Provider>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    // Load credentials if available
+    let credentials =
+        autumn_web::credentials::load_credentials(profile, std::path::Path::new(".")).ok();
+
+    table
+        .and_then(|t| t.get("auth"))
+        .and_then(toml::Value::as_table)
+        .and_then(|auth| auth.get("oauth2"))
+        .and_then(toml::Value::as_table)
+        .map(|providers| {
+            providers
+                .iter()
+                .map(|(name, val)| {
+                    let mut client_id = val
+                        .as_table()
+                        .and_then(|t| t.get("client_id"))
+                        .and_then(toml::Value::as_str)
+                        .unwrap_or("")
+                        .to_owned();
+                    let mut client_secret = val
+                        .as_table()
+                        .and_then(|t| t.get("client_secret"))
+                        .and_then(toml::Value::as_str)
+                        .unwrap_or("")
+                        .to_owned();
+
+                    let normalized_name = name
+                        .chars()
+                        .map(|c| if c.is_alphanumeric() { c } else { '_' })
+                        .collect::<String>()
+                        .to_lowercase();
+                    let upper = normalized_name.to_uppercase();
+
+                    // Get values from env vars
+                    let env_id_key = format!("AUTUMN_AUTH__OAUTH2__{upper}__CLIENT_ID");
+                    if let Some(id) = env_var(&env_id_key) {
+                        client_id = id;
+                    }
+                    let env_secret_key = format!("AUTUMN_AUTH__OAUTH2__{upper}__CLIENT_SECRET");
+                    if let Some(sec) = env_var(&env_secret_key) {
+                        client_secret = sec;
+                    }
+
+                    // Get values from credentials
+                    if let Some(ref creds) = credentials {
+                        let id_key = format!("oauth2_{normalized_name}_client_id");
+                        if client_id.is_empty() {
+                            if let Some(id) = creds.get::<String>(&id_key) {
+                                client_id = id;
+                            } else if let Some(id) =
+                                creds.get::<String>(&format!("oauth2_{name}_client_id"))
+                            {
+                                client_id = id;
+                            }
+                        }
+
+                        let secret_key = format!("oauth2_{normalized_name}_client_secret");
+                        if client_secret.is_empty() {
+                            if let Some(sec) = creds.get::<String>(&secret_key) {
+                                client_secret = sec;
+                            } else if let Some(sec) =
+                                creds.get::<String>(&format!("oauth2_{name}_client_secret"))
+                            {
+                                client_secret = sec;
+                            }
+                        }
+                    }
+
+                    DoctorOAuth2Provider {
+                        name: name.clone(),
+                        client_id,
+                        client_secret,
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn resolve_database_topology(table: Option<&toml::Table>) -> DoctorDatabaseTopology {
     resolve_database_topology_from_sources(
         |key| std::env::var(key).ok().filter(|value| !value.is_empty()),
@@ -1458,10 +1689,18 @@ pub fn run(opts: DoctorOptions) {
         check_rate_limit_key_strategy_impl(&rate_limit_key_strategy, auth_extractor_mounted)
     }));
 
-    // 9. Stale artifacts (warn only, never fail)
+    // 9. OAuth2 provider checks (client_id and client_secret validation)
+    let oauth2_providers = resolve_oauth2_providers();
+    for p in oauth2_providers {
+        tasks.push(Box::new(move || {
+            check_oauth2_provider_impl(&p.name, &p.client_id, &p.client_secret, is_production)
+        }));
+    }
+
+    // 10. Stale artifacts (warn only, never fail)
     tasks.push(Box::new(check_stale_artifacts));
 
-    // 10. Maintenance mode state
+    // 11. Maintenance mode state
     tasks.push(Box::new(check_maintenance_mode));
 
     // ── Phase 3: spawn all tasks concurrently ────────────────────────────────
@@ -2375,6 +2614,105 @@ foo = "bar"
             result.status == CheckStatus::Pass || result.status == CheckStatus::Warn,
             "unexpected status: {:?}",
             result.status
+        );
+    }
+
+    // ── check_oauth2 (RED phase) ──────────────────────────────────────────────
+
+    #[test]
+    fn check_oauth2_empty_client_id_in_production_fails() {
+        let result = check_oauth2_provider_impl("github", "", "real-secret-value", true);
+        assert_eq!(
+            result.status,
+            CheckStatus::Fail,
+            "empty client_id in production must fail: {result:?}",
+        );
+        assert!(
+            result.detail.as_deref().unwrap_or("").contains("client_id"),
+            "detail must mention client_id: {:?}",
+            result.detail
+        );
+    }
+
+    #[test]
+    fn check_oauth2_empty_client_secret_in_production_fails() {
+        let result = check_oauth2_provider_impl("github", "cid", "", true);
+        assert_eq!(
+            result.status,
+            CheckStatus::Fail,
+            "empty client_secret in production must fail: {result:?}",
+        );
+        assert!(
+            result
+                .detail
+                .as_deref()
+                .unwrap_or("")
+                .contains("client_secret"),
+            "detail must mention client_secret: {:?}",
+            result.detail
+        );
+    }
+
+    #[test]
+    fn check_oauth2_empty_client_secret_in_dev_warns() {
+        let result = check_oauth2_provider_impl("github", "cid", "", false);
+        assert_eq!(
+            result.status,
+            CheckStatus::Warn,
+            "empty client_secret outside production must warn: {result:?}",
+        );
+    }
+
+    #[test]
+    fn check_oauth2_non_empty_client_secret_passes() {
+        let result = check_oauth2_provider_impl("github", "cid", "real-secret-value", true);
+        assert_eq!(
+            result.status,
+            CheckStatus::Pass,
+            "non-empty client_secret must pass: {result:?}",
+        );
+    }
+
+    #[test]
+    fn check_oauth2_provider_name_appears_in_check_name() {
+        let result = check_oauth2_provider_impl("google", "cid", "", true);
+        assert!(
+            result.name.contains("oauth2") || result.name.contains("google"),
+            "check name must identify the provider: {}",
+            result.name
+        );
+    }
+
+    #[test]
+    fn resolve_oauth2_providers_prefers_env_var_over_empty_toml_secret() {
+        let toml: toml::Table = toml::from_str(
+            r#"
+[auth.oauth2.github]
+client_id = "cid"
+client_secret = ""
+authorize_url = "https://github.com/login/oauth/authorize"
+token_url = "https://github.com/login/oauth/access_token"
+redirect_uri = "http://localhost/callback"
+"#,
+        )
+        .unwrap();
+
+        let providers = resolve_oauth2_providers_from_sources(
+            |key| {
+                if key == "AUTUMN_AUTH__OAUTH2__GITHUB__CLIENT_SECRET" {
+                    Some("ghp_test_secret".to_owned())
+                } else {
+                    None
+                }
+            },
+            Some(&toml),
+            "dev",
+        );
+
+        let p = providers.into_iter().find(|p| p.name == "github").unwrap();
+        assert_eq!(
+            p.client_secret, "ghp_test_secret",
+            "env var must override empty TOML client_secret"
         );
     }
 }

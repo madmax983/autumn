@@ -266,6 +266,16 @@ impl AppState {
         &self.config_props
     }
 
+    /// Returns the resolved [`crate::config::AutumnConfig`] from the extension map.
+    ///
+    /// Falls back to a default config if no config has been installed
+    /// (typically only in tests that don't wire the full startup pipeline).
+    #[must_use]
+    pub fn config(&self) -> crate::config::AutumnConfig {
+        self.extension::<crate::config::AutumnConfig>()
+            .map_or_else(crate::config::AutumnConfig::default, |arc| (*arc).clone())
+    }
+
     /// Returns the shared probe lifecycle state.
     #[must_use]
     pub const fn probes(&self) -> &probe::ProbeState {
