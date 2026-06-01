@@ -1,0 +1,8 @@
+[advisories]
+ignore = [
+    "RUSTSEC-2023-0071", # rsa, no fixed upgrade is available
+    "RUSTSEC-2026-0098", # rustls-webpki, waiting on upstream fix compatible with hyper-rustls version
+    "RUSTSEC-2026-0099", # rustls-webpki, waiting on upstream fix compatible with hyper-rustls version
+    "RUSTSEC-2026-0104", # rustls-webpki, waiting on upstream fix compatible with hyper-rustls version
+    "RUSTSEC-2026-0138", # diesel-async, cannot upgrade due to trait boundary issues in Autumn codebase
+]
