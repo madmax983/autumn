@@ -60,18 +60,52 @@ const TOTP_RS_FEATURES: &[&str] = &["qr", "gen_secret", "otpauth"];
 /// `ensure_cargo_dependencies` skips a crate that is already declared, so an app
 /// that already lists `totp-rs` (perhaps without `qr`/`gen_secret`/`otpauth`)
 /// would scaffold but fail to compile. This merges the missing features into the
-/// existing inline declaration, mirroring the `autumn-web` feature helpers.
+/// existing declaration — shorthand, inline-table, or `[dependencies.totp-rs]`
+/// subtable form — mirroring the `autumn-web` feature helpers.
+#[allow(clippy::too_many_lines)]
 fn ensure_totp_rs_features(toml: &str) -> String {
     const CRATE: &str = "totp-rs";
     let trailing_newline = toml.ends_with('\n');
     let mut lines: Vec<String> = toml.lines().map(str::to_owned).collect();
     let simple_prefix = format!("{CRATE} = \"");
     let table_prefix = format!("{CRATE} = {{");
+    let subtable_header = format!("[dependencies.{CRATE}]");
+    let subtable_header_underscore = format!("[dependencies.{}]", CRATE.replace('-', "_"));
     let feats_csv = TOTP_RS_FEATURES
         .iter()
         .map(|f| format!("\"{f}\""))
         .collect::<Vec<_>>()
         .join(", ");
+
+    // Merge `TOTP_RS_FEATURES` into the `[ ... ]` list embedded in `line`,
+    // returning the rewritten line, or `None` if nothing changed (already
+    // complete) / no list found.
+    let merge_into_list = |line: &str, bracket_search: &str| -> Option<Option<String>> {
+        let feat_bracket = line.find(bracket_search)?;
+        let list_start = feat_bracket + bracket_search.len();
+        let close_off = line[list_start..].find(']')?;
+        let list_end = close_off + list_start;
+        let existing_list = &line[list_start..list_end];
+        let additions: Vec<String> = TOTP_RS_FEATURES
+            .iter()
+            .filter(|f| !existing_list.contains(&format!("\"{f}\"")))
+            .map(|f| format!("\"{f}\""))
+            .collect();
+        if additions.is_empty() {
+            return Some(None); // list present and already complete
+        }
+        let sep = if existing_list.trim().is_empty() || existing_list.trim().ends_with(',') {
+            ""
+        } else {
+            ", "
+        };
+        Some(Some(format!(
+            "{}{sep}{}{}",
+            &line[..list_end],
+            additions.join(", "),
+            &line[list_end..]
+        )))
+    };
 
     let mut i = 0;
     while i < lines.len() {
@@ -92,33 +126,12 @@ fn ensure_totp_rs_features(toml: &str) -> String {
 
         // `totp-rs = { ... }` inline table → merge any missing features.
         if trimmed.starts_with(&table_prefix) {
-            if let Some(feat_bracket) = trimmed.find("features = [") {
-                let list_start = feat_bracket + "features = [".len();
-                if let Some(close_off) = trimmed[list_start..].find(']') {
-                    let list_end = close_off + list_start;
-                    let existing_list = &trimmed[list_start..list_end];
-                    let additions: Vec<String> = TOTP_RS_FEATURES
-                        .iter()
-                        .filter(|f| !existing_list.contains(&format!("\"{f}\"")))
-                        .map(|f| format!("\"{f}\""))
-                        .collect();
-                    if additions.is_empty() {
-                        return toml.to_owned();
-                    }
-                    let sep =
-                        if existing_list.trim().is_empty() || existing_list.trim().ends_with(',') {
-                            ""
-                        } else {
-                            ", "
-                        };
-                    lines[i] = format!(
-                        "{indent}{}{sep}{}{}",
-                        &trimmed[..list_end],
-                        additions.join(", "),
-                        &trimmed[list_end..]
-                    );
-                    break;
+            if let Some(result) = merge_into_list(&trimmed, "features = [") {
+                match result {
+                    Some(new_line) => lines[i] = format!("{indent}{new_line}"),
+                    None => return toml.to_owned(),
                 }
+                break;
             } else if let Some(close_brace) = trimmed.rfind('}') {
                 // No `features` key — insert one before the closing brace.
                 let before = trimmed[..close_brace].trim_end();
@@ -126,6 +139,40 @@ fn ensure_totp_rs_features(toml: &str) -> String {
                 lines[i] = format!("{indent}{before}{sep}features = [{feats_csv}] }}");
                 break;
             }
+        }
+
+        // `[dependencies.totp-rs]` subtable form → merge into (or add) a
+        // `features = [...]` key within the subtable body.
+        if trimmed == subtable_header || trimmed == subtable_header_underscore {
+            let mut feature_line: Option<usize> = None;
+            let mut j = i + 1;
+            while j < lines.len() {
+                let tj = lines[j].trim();
+                if tj.starts_with('[') {
+                    break;
+                }
+                if tj.starts_with("features") && tj.contains('[') {
+                    feature_line = Some(j);
+                    break;
+                }
+                j += 1;
+            }
+            if let Some(fl) = feature_line {
+                let tj = lines[fl].trim().to_owned();
+                let indent_j: String = lines[fl]
+                    .chars()
+                    .take_while(char::is_ascii_whitespace)
+                    .collect();
+                match merge_into_list(&tj, "[") {
+                    Some(Some(new_line)) => lines[fl] = format!("{indent_j}{new_line}"),
+                    Some(None) => return toml.to_owned(),
+                    None => {}
+                }
+            } else {
+                // No `features` key in the subtable — add one right after the header.
+                lines.insert(i + 1, format!("features = [{feats_csv}]"));
+            }
+            break;
         }
         i += 1;
     }
@@ -2848,17 +2895,29 @@ pub async fn two_factor_disable(
         ));
     }
 
-    diesel::update(__TABLE__::table.find(__SNAKE__.id))
-        .set((
-            __TABLE__::totp_enabled.eq(false),
-            __TABLE__::totp_secret_encrypted.eq(None::<String>),
-            __TABLE__::totp_last_used_step.eq(None::<i64>),
-        ))
-        .execute(&mut *db)
-        .await?;
-    diesel::delete(recovery_codes::table.filter(recovery_codes::user_id.eq(__SNAKE__.id)))
-        .execute(&mut *db)
-        .await?;
+    // Disable the factor and delete the recovery codes in one transaction so a
+    // mid-operation failure can't leave the account with 2FA turned off but
+    // stale recovery codes still present (or vice versa).
+    let user_id = __SNAKE__.id;
+    (*db)
+        .transaction::<_, diesel::result::Error, _>(|conn| {
+            Box::pin(async move {
+                diesel::update(__TABLE__::table.find(user_id))
+                    .set((
+                        __TABLE__::totp_enabled.eq(false),
+                        __TABLE__::totp_secret_encrypted.eq(None::<String>),
+                        __TABLE__::totp_last_used_step.eq(None::<i64>),
+                    ))
+                    .execute(conn)
+                    .await?;
+                diesel::delete(recovery_codes::table.filter(recovery_codes::user_id.eq(user_id)))
+                    .execute(conn)
+                    .await?;
+                Ok(())
+            })
+        })
+        .await
+        .map_err(|_| AutumnError::internal_server_error_msg("Failed to disable two-factor."))?;
 
     Ok(redirect_to("/account/2fa"))
 }
@@ -4470,6 +4529,58 @@ mod tests {
             ensure_totp_rs_features(toml),
             toml,
             "already-complete features must be left untouched"
+        );
+    }
+
+    #[test]
+    fn ensure_totp_rs_features_merges_subtable_with_partial_features() {
+        // P2 (#1057 round 12): the `[dependencies.totp-rs]` subtable form must also
+        // gain the missing features.
+        let toml = "[dependencies.totp-rs]\nversion = \"5\"\nfeatures = [\"qr\"]\n";
+        let out = ensure_totp_rs_features(toml);
+        assert!(
+            out.contains("\"qr\"") && out.contains("\"gen_secret\"") && out.contains("\"otpauth\""),
+            "subtable features must be merged: {out}"
+        );
+        assert_eq!(out.matches("\"qr\"").count(), 1, "qr duplicated: {out}");
+    }
+
+    #[test]
+    fn ensure_totp_rs_features_adds_subtable_features_key_when_absent() {
+        let toml = "[dependencies.totp-rs]\nversion = \"5\"\n";
+        let out = ensure_totp_rs_features(toml);
+        assert!(
+            out.contains("features = [")
+                && out.contains("\"qr\"")
+                && out.contains("\"gen_secret\"")
+                && out.contains("\"otpauth\""),
+            "a features key must be added to the subtable: {out}"
+        );
+    }
+
+    #[test]
+    fn totp_disable_wraps_cleanup_in_transaction() {
+        // P2 (#1057 round 12): disabling 2FA must be atomic — the flag/secret clear
+        // and recovery-code delete run in one transaction.
+        let tmp = project_with_main();
+        totp_plan(tmp.path()).execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+        let disable_pos = routes
+            .find("pub async fn two_factor_disable(")
+            .expect("disable fn");
+        let next = routes[disable_pos + 1..]
+            .find("pub async fn ")
+            .map_or(routes.len(), |p| disable_pos + 1 + p);
+        let body = &routes[disable_pos..next];
+        assert!(
+            body.contains(".transaction::<_, diesel::result::Error, _>"),
+            "two_factor_disable must run cleanup in a transaction: {body}"
+        );
+        // Both the flag clear and the recovery-code delete must be inside it.
+        assert!(
+            body.contains("totp_enabled.eq(false)")
+                && body.contains("delete(recovery_codes::table"),
+            "transaction must cover both the disable update and recovery-code delete: {body}"
         );
     }
 
