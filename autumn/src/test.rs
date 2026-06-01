@@ -130,6 +130,8 @@ use crate::state::AppState;
 #[cfg(feature = "db")]
 use diesel_async::AsyncPgConnection;
 #[cfg(feature = "db")]
+use diesel_async::RunQueryDsl;
+#[cfg(feature = "db")]
 use diesel_async::pooled_connection::deadpool::Pool;
 
 // ── TestApp ────────────────────────────────────────────────────
@@ -735,17 +737,45 @@ impl TestApp {
                 .build()
                 .expect("failed to build transactional pool of size 1");
 
-            let interceptor = std::sync::Arc::new(TransactionalDbInterceptor {
-                started: std::sync::atomic::AtomicBool::new(false),
+            let trans_interceptor = std::sync::Arc::new(TransactionalDbInterceptor);
+            let interceptor = if let Some(user_interceptor) = self.db_interceptor {
+                std::sync::Arc::new(ComposedDbInterceptor {
+                    first: user_interceptor,
+                    second: trans_interceptor,
+                })
+                    as std::sync::Arc<dyn crate::interceptor::DbConnectionInterceptor>
+            } else {
+                trans_interceptor as std::sync::Arc<dyn crate::interceptor::DbConnectionInterceptor>
+            };
+
+            // Eagerly acquire connection in the background to start test transaction before any request/seed runs
+            let pool_cloned = pool.clone();
+            tokio::spawn(async move {
+                if let Ok(mut conn) = pool_cloned.get().await {
+                    let is_started: Option<String> = diesel::select(diesel::dsl::sql::<
+                        diesel::sql_types::Nullable<diesel::sql_types::Text>,
+                    >(
+                        "current_setting('autumn.test_transaction_started', true)",
+                    ))
+                    .get_result(&mut *conn)
+                    .await
+                    .ok()
+                    .flatten();
+
+                    if is_started.as_deref() != Some("true") {
+                        use diesel_async::AsyncConnection;
+                        use diesel_async::RunQueryDsl;
+                        if conn.begin_test_transaction().await.is_ok() {
+                            let _ =
+                                diesel::sql_query("SET autumn.test_transaction_started = 'true'")
+                                    .execute(&mut *conn)
+                                    .await;
+                        }
+                    }
+                }
             });
 
-            (
-                Some(pool),
-                None,
-                Some(
-                    interceptor as std::sync::Arc<dyn crate::interceptor::DbConnectionInterceptor>,
-                ),
-            )
+            (Some(pool), None, Some(interceptor))
         } else {
             (self.pool, self.replica_pool, self.db_interceptor)
         };
@@ -1344,9 +1374,7 @@ impl TestResponse {
 }
 
 #[cfg(feature = "db")]
-struct TransactionalDbInterceptor {
-    started: std::sync::atomic::AtomicBool,
-}
+struct TransactionalDbInterceptor;
 
 #[cfg(feature = "db")]
 impl crate::interceptor::DbConnectionInterceptor for TransactionalDbInterceptor {
@@ -1371,18 +1399,71 @@ impl crate::interceptor::DbConnectionInterceptor for TransactionalDbInterceptor 
     > {
         Box::pin(async move {
             let mut conn = next.await?;
-            if !self.started.load(std::sync::atomic::Ordering::SeqCst) {
+
+            // Check if transaction has already been started on this connection
+            let is_started: Option<String> = diesel::select(diesel::dsl::sql::<
+                diesel::sql_types::Nullable<diesel::sql_types::Text>,
+            >(
+                "current_setting('autumn.test_transaction_started', true)",
+            ))
+            .get_result(&mut *conn)
+            .await
+            .ok()
+            .flatten();
+
+            if is_started.as_deref() != Some("true") {
                 use diesel_async::AsyncConnection;
+                use diesel_async::RunQueryDsl;
+
                 conn.begin_test_transaction().await.map_err(|e| {
                     crate::AutumnError::internal_server_error_msg(format!(
                         "failed to start test transaction: {e}"
                     ))
                 })?;
-                self.started
-                    .store(true, std::sync::atomic::Ordering::SeqCst);
+
+                diesel::sql_query("SET autumn.test_transaction_started = 'true'")
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(|e| {
+                        crate::AutumnError::internal_server_error_msg(format!(
+                            "failed to set transaction session GUC: {e}"
+                        ))
+                    })?;
             }
             Ok(conn)
         })
+    }
+}
+
+#[cfg(feature = "db")]
+struct ComposedDbInterceptor {
+    first: std::sync::Arc<dyn crate::interceptor::DbConnectionInterceptor>,
+    second: std::sync::Arc<dyn crate::interceptor::DbConnectionInterceptor>,
+}
+
+#[cfg(feature = "db")]
+impl crate::interceptor::DbConnectionInterceptor for ComposedDbInterceptor {
+    fn intercept_checkout<'a>(
+        &'a self,
+        ctx: crate::interceptor::DbCheckoutContext,
+        next: std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<crate::db::PooledConnection, crate::AutumnError>,
+                    > + Send
+                    + 'a,
+            >,
+        >,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<crate::db::PooledConnection, crate::AutumnError>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        let next_wrapped = self.second.intercept_checkout(ctx.clone(), next);
+        self.first.intercept_checkout(ctx, next_wrapped)
     }
 }
 
