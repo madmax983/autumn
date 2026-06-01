@@ -729,11 +729,36 @@ impl TestApp {
                 .or_else(|| self.config.database.effective_primary_url())
                 .expect("Transactional isolation enabled but database URL is not configured. Use `with_transactional_db(url)` or configure database.primary_url/database.url");
 
+            let connect_timeout_secs = self.config.database.connect_timeout_secs;
+            let timeout = std::time::Duration::from_secs(connect_timeout_secs);
+
             let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
                 diesel_async::AsyncPgConnection,
             >::new(url);
             let pool = Pool::builder(manager)
                 .max_size(1)
+                .wait_timeout(Some(timeout))
+                .create_timeout(Some(timeout))
+                .runtime(deadpool::Runtime::Tokio1)
+                .post_create(deadpool::managed::Hook::async_fn(|conn: &mut diesel_async::AsyncPgConnection, _metrics| {
+                    Box::pin(async move {
+                        use diesel_async::AsyncConnection;
+                        use diesel_async::RunQueryDsl;
+
+                        conn.begin_test_transaction().await.map_err(|e| {
+                            deadpool::managed::HookError::Backend(diesel_async::pooled_connection::PoolError::QueryError(e))
+                        })?;
+
+                        diesel::sql_query("SET autumn.test_transaction_started = 'true'")
+                            .execute(conn)
+                            .await
+                            .map_err(|e| {
+                                deadpool::managed::HookError::Backend(diesel_async::pooled_connection::PoolError::QueryError(e))
+                            })?;
+
+                        Ok(())
+                    })
+                }))
                 .build()
                 .expect("failed to build transactional pool of size 1");
 
@@ -747,33 +772,6 @@ impl TestApp {
             } else {
                 trans_interceptor as std::sync::Arc<dyn crate::interceptor::DbConnectionInterceptor>
             };
-
-            // Eagerly acquire connection in the background to start test transaction before any request/seed runs
-            let pool_cloned = pool.clone();
-            tokio::spawn(async move {
-                if let Ok(mut conn) = pool_cloned.get().await {
-                    let is_started: Option<String> = diesel::select(diesel::dsl::sql::<
-                        diesel::sql_types::Nullable<diesel::sql_types::Text>,
-                    >(
-                        "current_setting('autumn.test_transaction_started', true)",
-                    ))
-                    .get_result(&mut *conn)
-                    .await
-                    .ok()
-                    .flatten();
-
-                    if is_started.as_deref() != Some("true") {
-                        use diesel_async::AsyncConnection;
-                        use diesel_async::RunQueryDsl;
-                        if conn.begin_test_transaction().await.is_ok() {
-                            let _ =
-                                diesel::sql_query("SET autumn.test_transaction_started = 'true'")
-                                    .execute(&mut *conn)
-                                    .await;
-                        }
-                    }
-                }
-            });
 
             (Some(pool), None, Some(interceptor))
         } else {
