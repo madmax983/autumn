@@ -113,6 +113,40 @@ fn parse_field_encrypted(field: &syn::Field) -> syn::Result<EncryptedMode> {
     Ok(EncryptedMode::None)
 }
 
+/// Build a manual `Debug` impl that redacts encrypted fields, so plaintext
+/// (held in memory as a `String` for ergonomics) never appears in `Debug`
+/// output, panic backtraces, or framework error messages. The development-only
+/// escape hatch (`encryption::set_debug_plaintext`) opts back into plaintext.
+fn redacting_debug_impl(
+    struct_name: &syn::Ident,
+    field_idents: &[&syn::Ident],
+    encrypted_names: &[&str],
+) -> TokenStream {
+    let stmts = field_idents.iter().map(|ident| {
+        let nm = ident.to_string();
+        if encrypted_names.contains(&nm.as_str()) {
+            quote! {
+                if ::autumn_web::encryption::debug_plaintext_enabled() {
+                    s.field(#nm, &self.#ident);
+                } else {
+                    s.field(#nm, &::core::format_args!("<encrypted>"));
+                }
+            }
+        } else {
+            quote! { s.field(#nm, &self.#ident); }
+        }
+    });
+    quote! {
+        impl ::core::fmt::Debug for #struct_name {
+            fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+                let mut s = f.debug_struct(stringify!(#struct_name));
+                #(#stmts)*
+                s.finish()
+            }
+        }
+    }
+}
+
 /// The `serialize_as`/`deserialize_as` wrapper path for an encrypted mode.
 fn encrypted_wrapper_path(mode: EncryptedMode) -> Option<TokenStream> {
     match mode {
@@ -677,6 +711,26 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             use ::autumn_web::reexports::diesel::ExpressionMethods as _;
         }
     };
+    // For models with encrypted columns, replace the derived `Debug` on the
+    // plaintext-holding structs with a redacting manual impl so values never
+    // leak through `Debug`/panic output (#805 AC, composes with #697).
+    let (name_debug_derive, name_debug_impl, new_debug_derive, new_debug_impl) =
+        if encrypted_columns.is_empty() {
+            (quote! { Debug, }, quote! {}, quote! { Debug, }, quote! {})
+        } else {
+            let all_idents: Vec<&syn::Ident> =
+                all_fields.iter().map(|f| f.ident.as_ref().unwrap()).collect();
+            let new_idents: Vec<&syn::Ident> = fields_for_new
+                .iter()
+                .map(|f| f.ident.as_ref().unwrap())
+                .collect();
+            (
+                quote! {},
+                redacting_debug_impl(name, &all_idents, &encrypted_column_names),
+                quote! {},
+                redacting_debug_impl(&new_name, &new_idents, &encrypted_column_names),
+            )
+        };
     let encrypted_inventory: Vec<TokenStream> = encrypted_columns
         .iter()
         .map(|(col, deterministic)| {
@@ -1593,21 +1647,23 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     quote! {
         #encrypted_use
 
-        #[derive(Debug, Clone, ::diesel::Queryable, ::diesel::Selectable, ::diesel::AsChangeset, ::diesel::Insertable)]
+        #[derive(#name_debug_derive Clone, ::diesel::Queryable, ::diesel::Selectable, ::diesel::AsChangeset, ::diesel::Insertable)]
         #[derive(::serde::Serialize, ::serde::Deserialize)]
         #[diesel(table_name = #table_ident)]
         #(#filtered_outer_attrs)*
         #vis struct #name {
             #(#query_fields,)*
         }
+        #name_debug_impl
 
-        #[derive(Debug, Clone, ::diesel::Insertable)]
+        #[derive(#new_debug_derive Clone, ::diesel::Insertable)]
         #[derive(::serde::Serialize, ::serde::Deserialize)]
         #validate_derive
         #[diesel(table_name = #table_ident)]
         #vis struct #new_name {
             #(#new_fields,)*
         }
+        #new_debug_impl
 
         #[derive(Debug, Clone, Default)]
         #[derive(::serde::Serialize, ::serde::Deserialize)]

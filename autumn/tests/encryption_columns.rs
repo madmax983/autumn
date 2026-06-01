@@ -158,6 +158,31 @@ fn wrapper_debug_redacts_plaintext_by_default() {
 }
 
 #[test]
+fn model_debug_redacts_encrypted_columns() {
+    // The model holds plaintext in memory (for ergonomics) but its Debug impl
+    // must never print encrypted-column values.
+    let s = Secret {
+        id: 7,
+        email: "leak@example.com".into(),
+        api_token: "sk_live_dont_log_me".into(),
+        note: "fine to show".into(),
+    };
+    let dbg = format!("{s:?}");
+    assert!(!dbg.contains("leak@example.com"), "email must be redacted: {dbg}");
+    assert!(!dbg.contains("sk_live_dont_log_me"), "token must be redacted: {dbg}");
+    assert!(dbg.contains("<encrypted>"), "redaction marker present: {dbg}");
+    assert!(dbg.contains("fine to show"), "non-encrypted field still shown: {dbg}");
+    // NewSecret (insert DTO) redacts too.
+    let n = NewSecret {
+        email: "leak@example.com".into(),
+        api_token: "sk_live_dont_log_me".into(),
+        note: "ok".into(),
+    };
+    let ndbg = format!("{n:?}");
+    assert!(!ndbg.contains("sk_live_dont_log_me"), "NewX token must redact: {ndbg}");
+}
+
+#[test]
 fn encrypted_columns_are_registered_for_composition() {
     // The macro registers encrypted columns for log-scrub / version-history /
     // admin composition.
