@@ -168,27 +168,25 @@ once no row references its `key_id` anymore.
 ## Backfilling an existing plaintext column
 
 Converting an existing plaintext column to encrypted is an **offline backfill**.
-Generate the migration scaffold:
+Generate the documented migration scaffold (the name shape is
+`Encrypt<Column>On<Table>`):
 
 ```bash
-autumn generate migration EncryptApiTokenOnAccounts api_token
+autumn generate migration EncryptApiTokenOnAccounts
 ```
 
-This emits a migration whose `up.sql` documents the expand/encrypt/contract steps
-and whose `down.sql` documents the reverse (restoring plaintext from ciphertext
-given the keys). Because the actual encrypt/decrypt needs the app's key ring, the
-heavy lifting runs as a one-off task rather than raw SQL:
+This emits a migration whose `up.sql` documents the key configuration and the
+encrypt backfill, and whose `down.sql` documents the reverse (restoring plaintext
+from ciphertext given the keys). The column stays `TEXT` — the envelope is base64
+text, so no type change is needed.
 
-```bash
-# 1. add the #[encrypted] attribute to the field and deploy with reads tolerant
-#    of both shapes, OR run the backfill before flipping reads (recommended):
-autumn task run backfill_encrypt_accounts_api_token
-```
-
-The generated task template loads each row's plaintext, calls
+Because the actual encrypt/decrypt needs the app's key ring, the row rewrite runs
+as a one-off task (which you write against your model), not raw SQL. The task
+loads each row's plaintext, calls
 `autumn_web::encryption::encrypt_text(Mode::Randomized, &plaintext)`, and writes
 the envelope back. The **rollback** task does the inverse with
-`decrypt_text(&envelope)`.
+`decrypt_text(&envelope)`. Run the backfill *before* deploying readers that mark
+the field `#[encrypted]`.
 
 > Always take a backup before a backfill, and keep the keys: a row encrypted with
 > a key you have lost is unrecoverable by design.
@@ -223,10 +221,19 @@ autumn_web::encryption::set_debug_plaintext(true);
 
 Encryption adds an AES-256-GCM operation per encrypted value per read/write.
 AES-256-GCM is hardware-accelerated on modern CPUs (AES-NI). The framework's
-benchmark suite includes a mixed encrypted/plaintext read benchmark
-(`benchmarks/encryption`) and enforces a budget of **≤10% p99 read regression**
-on 10k rows. In practice the dominant cost of a request is the database round
-trip and serialization, not the AEAD.
+benchmark suite includes a mixed encrypted/plaintext read benchmark — run it
+with:
+
+```bash
+cargo bench -p autumn-web --bench attribute_encryption
+```
+
+It reports p50/p99 per-row read latency for plaintext, mixed (50% encrypted),
+and all-encrypted workloads over 10k rows, and enforces a budget of **≤10% p99
+read regression** measured against a representative database-read baseline. In
+practice the dominant cost of a request is the database round trip and
+serialization (hundreds of microseconds), not the per-column AEAD (~a
+microsecond), so the budget is met comfortably.
 
 ## Limitations (v1)
 
