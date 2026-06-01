@@ -12,7 +12,7 @@ keywords = ["web", "composable", "axum", "htmx", "fullstack"]
 categories = ["web-programming", "web-programming::http-server"]
 
 [features]
-default = ["maud", "htmx", "tailwind", "db", "cache-moka", "http-client"]
+default = ["maud", "htmx", "tailwind", "db", "cache-moka", "http-client", "reporting"]
 ws = ["dep:tokio-stream"]
 presence = ["ws"]
 flash = []
@@ -54,6 +54,11 @@ i18n = []
 # When combined with `db`, opts diesel into `serde_json` so the `Blob`
 # value type can round-trip through a Postgres `JSONB` column.
 storage = ["diesel?/serde_json"]
+# Pluggable error reporting: catch handler panics at the HTTP layer and route
+# panics + 5xx responses to configured `ErrorReporter`s. Ships a `tracing`-based
+# `LogReporter` as the default. On by default; disable to drop the panic-catch
+# layer and the reporting machinery.
+reporting = []
 mail = ["dep:lettre", "maud"]
 # Enables `autumn_web::seed::SeedContext` for use in `src/bin/seed.rs`.
 # Depends on `db`; off by default so apps that don't seed pay zero compile cost.
@@ -152,6 +157,7 @@ features = [
   "maud", "htmx", "tailwind", "db", "cache-moka",
   "ws", "flash", "multipart", "http-client", "oauth2", "openapi",
   "redis", "i18n", "storage", "mail", "seed", "system-info", "markdown",
+  "reporting",
 ]
 rustdoc-args = ["--cfg", "docsrs"]
 

@@ -96,6 +96,8 @@ pub fn app() -> AppBuilder {
         #[cfg(feature = "storage")]
         blob_store: None,
         cache_backend: None,
+        #[cfg(feature = "reporting")]
+        error_reporters: Vec::new(),
         #[cfg(feature = "openapi")]
         openapi: None,
         audit_logger: None,
@@ -241,6 +243,13 @@ pub struct AppBuilder {
     /// When `Some`, installed onto `AppState` as `shared_cache` before startup
     /// hooks run.
     cache_backend: Option<Arc<dyn crate::cache::Cache>>,
+    /// Error reporters registered via [`AppBuilder::with_error_reporter`].
+    /// Installed onto `AppState` so the
+    /// [`ReportingLayer`](crate::reporting::ReportingLayer) delivers panic and
+    /// 5xx [`ErrorEvent`](crate::reporting::ErrorEvent)s to each. Empty means
+    /// the built-in [`LogReporter`](crate::reporting::LogReporter) is used.
+    #[cfg(feature = "reporting")]
+    pub(crate) error_reporters: Vec<Arc<dyn crate::reporting::ErrorReporter>>,
     /// `OpenAPI` generation configuration. When `Some`, the router mounts
     /// `/v3/api-docs` (serving `openapi.json`) and `/swagger-ui` (if the
     /// Swagger UI path is set). When `None`, no docs endpoints are mounted.
@@ -1298,6 +1307,48 @@ impl AppBuilder {
         self
     }
 
+    /// Register an [`ErrorReporter`](crate::reporting::ErrorReporter) for
+    /// unhandled panics and 5xx responses.
+    ///
+    /// Reporters receive a structured
+    /// [`ErrorEvent`](crate::reporting::ErrorEvent) for every caught handler
+    /// panic and every server-error response, carrying request context (route,
+    /// method, request id, status) and — for panics — the panic payload and a
+    /// backtrace (when `RUST_BACKTRACE` is set). Call this multiple times to
+    /// chain reporters; each receives every event. When none are registered,
+    /// the built-in [`LogReporter`](crate::reporting::LogReporter) is used.
+    ///
+    /// Mirrors [`with_blob_store`](Self::with_blob_store) /
+    /// [`with_cache_backend`](Self::with_cache_backend).
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use autumn_web::reporting::{ErrorEvent, ErrorReporter, ReportFuture};
+    ///
+    /// struct MyReporter;
+    /// impl ErrorReporter for MyReporter {
+    ///     fn report<'a>(&'a self, event: &'a ErrorEvent) -> ReportFuture<'a> {
+    ///         Box::pin(async move { eprintln!("error: {} {}", event.status, event.message); })
+    ///     }
+    /// }
+    ///
+    /// # #[autumn_web::main]
+    /// # async fn main() {
+    /// autumn_web::app()
+    ///     .with_error_reporter(MyReporter)
+    /// #   .routes(vec![])
+    /// #   ;
+    /// # }
+    /// ```
+    #[cfg(feature = "reporting")]
+    #[must_use]
+    pub fn with_error_reporter<R: crate::reporting::ErrorReporter>(mut self, reporter: R) -> Self {
+        self.error_reporters
+            .push(Arc::new(reporter) as Arc<dyn crate::reporting::ErrorReporter>);
+        self
+    }
+
     /// Register a [`FlagStore`](crate::feature_flags::FlagStore) backend for
     /// feature-flag evaluation.
     ///
@@ -1761,6 +1812,8 @@ impl AppBuilder {
             #[cfg(feature = "storage")]
             blob_store,
             cache_backend,
+            #[cfg(feature = "reporting")]
+            error_reporters,
             #[cfg(feature = "openapi")]
             openapi,
             audit_logger,
@@ -1955,6 +2008,13 @@ impl AppBuilder {
             state.shared_cache = Some(cache);
         } else {
             crate::cache::clear_global_cache();
+        }
+        // Install registered error reporters so the reporting layer (wired in
+        // `apply_middleware`) can deliver panic + 5xx events. Empty is fine —
+        // the layer falls back to the built-in `LogReporter`.
+        #[cfg(feature = "reporting")]
+        if !error_reporters.is_empty() {
+            state.insert_extension(crate::reporting::RegisteredReporters(error_reporters));
         }
         // Apply deferred policy / scope registrations onto the live
         // app state. Done before the router is built so any panic
@@ -2324,6 +2384,8 @@ impl AppBuilder {
             #[cfg(feature = "storage")]
             blob_store,
             cache_backend,
+            #[cfg(feature = "reporting")]
+            error_reporters,
             #[cfg(feature = "openapi")]
             openapi,
             audit_logger: _,
@@ -2493,6 +2555,10 @@ impl AppBuilder {
             state.shared_cache = Some(cache);
         } else {
             crate::cache::clear_global_cache();
+        }
+        #[cfg(feature = "reporting")]
+        if !error_reporters.is_empty() {
+            state.insert_extension(crate::reporting::RegisteredReporters(error_reporters));
         }
         // Static-site builds are short-lived and don't run the request loop,
         // so deliver_later is never invoked. install_mailer_with_factory skips

@@ -202,6 +202,21 @@ blocks publishing `autumn-web` or `autumn-cli`.
 
 ---
 
+### `examples/error-reporting` - Pluggable Error Reporting
+
+<!-- catalog:example name=error-reporting tier=supported -->
+
+| Field | Value |
+|-------|-------|
+| **Persona** | Operator who needs unhandled panics and 5xx errors routed to a sink (Sentry/Slack/custom) |
+| **Journey** | Implement a custom `ErrorReporter`, wire it with one builder call, watch panics and server errors deliver structured events while clients still get a clean 500 |
+| **Key capabilities** | `ErrorReporter`, `ErrorEvent`, `.with_error_reporter(..)`, HTTP-layer panic capture, `[reporting]` sampling/enable config |
+| **Prerequisites** | Rust 1.88.0+ |
+| **Run command** | `cargo run -p error-reporting` |
+| **Success proof** | `curl -i localhost:3000/boom` returns a clean 500 and the server logs one `[report]` line; `/ok` returns 200 with no report |
+
+---
+
 ## Journey Map
 
 The table below maps each example to a distinct learning journey so evaluators

@@ -747,6 +747,66 @@ pub struct AutumnConfig {
     /// These settings have no effect outside the `dev` profile.
     #[serde(default)]
     pub dev: DevConfig,
+
+    /// Error-reporting settings (`[reporting]` section in `autumn.toml`).
+    ///
+    /// Controls delivery of panic + 5xx [`ErrorEvent`](crate::reporting::ErrorEvent)s
+    /// to registered reporters. Honored only when the `reporting` cargo
+    /// feature is enabled.
+    #[cfg(feature = "reporting")]
+    #[serde(default)]
+    pub reporting: ReportingConfig,
+}
+
+/// Error-reporting settings (`[reporting]` section in `autumn.toml`).
+///
+/// # Example `autumn.toml`
+///
+/// ```toml
+/// [reporting]
+/// enabled = true      # deliver events to reporters (default: true)
+/// sample_rate = 0.25  # report ~25% of events (default: 1.0 = all)
+/// ```
+///
+/// Note: `enabled = false` only suppresses *delivery* to reporters. Handler
+/// panics are still caught and converted to a clean 500 response regardless of
+/// this setting.
+#[cfg(feature = "reporting")]
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReportingConfig {
+    /// Whether error events are delivered to registered reporters.
+    ///
+    /// Defaults to `true`. When `false`, panics are still caught and turned
+    /// into clean 500 responses, but no [`ErrorEvent`](crate::reporting::ErrorEvent)
+    /// is dispatched.
+    #[serde(default = "default_reporting_enabled")]
+    pub enabled: bool,
+    /// Fraction of events to deliver, in `[0.0, 1.0]`.
+    ///
+    /// `1.0` (the default) reports every event; `0.0` reports none. Values
+    /// outside the range are clamped at the extremes.
+    #[serde(default = "default_reporting_sample_rate")]
+    pub sample_rate: f64,
+}
+
+#[cfg(feature = "reporting")]
+impl Default for ReportingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_reporting_enabled(),
+            sample_rate: default_reporting_sample_rate(),
+        }
+    }
+}
+
+#[cfg(feature = "reporting")]
+const fn default_reporting_enabled() -> bool {
+    true
+}
+
+#[cfg(feature = "reporting")]
+const fn default_reporting_sample_rate() -> f64 {
+    1.0
 }
 
 /// Developer-experience settings (`[dev]` section in `autumn.toml`).
@@ -1644,10 +1704,26 @@ impl AutumnConfig {
         self.apply_security_env_overrides_with_env(env);
         self.apply_idempotency_env_overrides_with_env(env);
         self.apply_dev_env_overrides_with_env(env);
+        #[cfg(feature = "reporting")]
+        self.apply_reporting_env_overrides_with_env(env);
         #[cfg(feature = "storage")]
         self.apply_storage_env_overrides_with_env(env);
         #[cfg(feature = "mail")]
         self.apply_mail_env_overrides_with_env(env);
+    }
+
+    #[cfg(feature = "reporting")]
+    fn apply_reporting_env_overrides_with_env(&mut self, env: &dyn Env) {
+        parse_env_bool(
+            env,
+            "AUTUMN_REPORTING__ENABLED",
+            &mut self.reporting.enabled,
+        );
+        parse_env(
+            env,
+            "AUTUMN_REPORTING__SAMPLE_RATE",
+            &mut self.reporting.sample_rate,
+        );
     }
 
     fn apply_dev_env_overrides_with_env(&mut self, env: &dyn Env) {
@@ -3911,6 +3987,20 @@ path = "/healthz"
         let mut config = AutumnConfig::default();
         config.apply_env_overrides_with_env(&env);
         assert_eq!(config.database.pool_size, 25);
+    }
+
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn env_override_reporting() {
+        let env = MockEnv::new()
+            .with("AUTUMN_REPORTING__ENABLED", "false")
+            .with("AUTUMN_REPORTING__SAMPLE_RATE", "0.1");
+        let mut config = AutumnConfig::default();
+        assert!(config.reporting.enabled);
+        assert!((config.reporting.sample_rate - 1.0).abs() < f64::EPSILON);
+        config.apply_env_overrides_with_env(&env);
+        assert!(!config.reporting.enabled);
+        assert!((config.reporting.sample_rate - 0.1).abs() < f64::EPSILON);
     }
 
     #[test]

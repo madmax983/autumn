@@ -365,6 +365,27 @@ impl TestApp {
         self
     }
 
+    /// Register an [`ErrorReporter`](crate::reporting::ErrorReporter) for this
+    /// test app.
+    ///
+    /// Mirrors [`crate::app::AppBuilder::with_error_reporter`]. Call multiple
+    /// times to chain reporters; each receives every panic + 5xx event.
+    #[cfg(feature = "reporting")]
+    #[must_use]
+    pub fn with_error_reporter<R: crate::reporting::ErrorReporter>(mut self, reporter: R) -> Self {
+        let reporter =
+            std::sync::Arc::new(reporter) as std::sync::Arc<dyn crate::reporting::ErrorReporter>;
+        self.state_initializers.push(Box::new(move |state| {
+            let mut reporters = state
+                .extension::<crate::reporting::RegisteredReporters>()
+                .map(|registered| registered.0.clone())
+                .unwrap_or_default();
+            reporters.push(reporter.clone());
+            state.insert_extension(crate::reporting::RegisteredReporters(reporters));
+        }));
+        self
+    }
+
     /// Enable HTTP idempotency-key middleware for this test app.
     ///
     /// Mirrors [`crate::app::AppBuilder::idempotent`]: sets the
@@ -458,6 +479,24 @@ impl TestApp {
         self.custom_layers.extend(app_builder.custom_layers);
         self.jobs.extend(app_builder.jobs);
         self.exception_filters.extend(app_builder.exception_filters);
+
+        // Carry plugin-registered error reporters into the test app so
+        // reporting-enabled plugins exercise the same behavior under `TestApp`
+        // that they get from `AppBuilder::run`.
+        #[cfg(feature = "reporting")]
+        {
+            let reporters = std::mem::take(&mut app_builder.error_reporters);
+            if !reporters.is_empty() {
+                self.state_initializers.push(Box::new(move |state| {
+                    let mut existing = state
+                        .extension::<crate::reporting::RegisteredReporters>()
+                        .map(|registered| registered.0.clone())
+                        .unwrap_or_default();
+                    existing.extend(reporters.iter().cloned());
+                    state.insert_extension(crate::reporting::RegisteredReporters(existing));
+                }));
+            }
+        }
 
         for hook in app_builder.startup_hooks {
             self.state_initializers.push(Box::new(move |state| {

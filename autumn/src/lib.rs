@@ -174,6 +174,12 @@ pub use route::{RepositoryApiMeta, Route, RouteIdempotency};
 /// Enable with the Cargo feature `markdown`.
 #[cfg(feature = "markdown")]
 pub mod markdown;
+/// Pluggable error reporting: catch handler panics and route panics + 5xx
+/// responses to configured [`ErrorReporter`](reporting::ErrorReporter)s.
+///
+/// Enabled by the `reporting` Cargo feature (on by default).
+#[cfg(feature = "reporting")]
+pub mod reporting;
 pub mod scheduler;
 pub mod security;
 pub mod session;
