@@ -31,6 +31,23 @@ const AUTH_EXTRA_DEPS: &[(&str, &str)] = &[
     ("tracing", "\"0.1\""),
 ];
 
+/// Extra Cargo dependencies pulled in only by `--totp`.
+///
+/// - `totp-rs` (with the `qr` feature) provides RFC 6238 TOTP plus QR rendering.
+/// - `aes-gcm` encrypts the TOTP secret at rest.
+/// - `base64` encodes the encrypted secret / decodes the encryption key.
+///
+/// Recovery codes are hashed with bcrypt via the existing `autumn_web::auth`
+/// hashing path, so no extra hashing dependency is required.
+const TOTP_EXTRA_DEPS: &[(&str, &str)] = &[
+    (
+        "totp-rs",
+        "{ version = \"5\", features = [\"qr\", \"gen_secret\", \"otpauth\"] }",
+    ),
+    ("aes-gcm", "\"0.10\""),
+    ("base64", "\"0.22\""),
+];
+
 /// OAuth2/OIDC options for `autumn generate auth --oauth`.
 #[derive(Debug, Clone, Default)]
 pub struct AuthOAuthOptions {
@@ -49,14 +66,16 @@ pub struct AuthOAuthOptions {
 /// root, or [`GenerateError::InvalidName`] for a bad resource name.
 #[allow(dead_code)]
 pub fn plan_auth(project_root: &Path, name: &str, timestamp: &str) -> Result<Plan, GenerateError> {
-    plan_auth_with_providers(project_root, name, timestamp, &[])
+    plan_auth_with_providers(project_root, name, timestamp, &[], false)
 }
 
+#[allow(clippy::too_many_lines)]
 pub fn plan_auth_with_providers(
     project_root: &Path,
     name: &str,
     timestamp: &str,
     providers: &[String],
+    totp: bool,
 ) -> Result<Plan, GenerateError> {
     ensure_project_root(project_root)?;
     super::model::validate_resource_name(name)?;
@@ -71,20 +90,29 @@ pub fn plan_auth_with_providers(
     let mig_dir = project_root
         .join("migrations")
         .join(format!("{timestamp}_create_{table}"));
-    plan.create(mig_dir.join("up.sql"), render_migration_up(&table));
-    plan.create(mig_dir.join("down.sql"), render_migration_down(&table));
+    plan.create(mig_dir.join("up.sql"), render_migration_up(&table, totp));
+    plan.create(
+        mig_dir.join("down.sql"),
+        render_migration_down(&table, totp),
+    );
 
     // ── Model ──────────────────────────────────────────────────────────────
     let models_dir = project_root.join("src").join("models");
     plan.create(
         models_dir.join(format!("{snake_name}.rs")),
-        render_model_file(&pascal_name, &snake_name, &table),
+        render_model_file(&pascal_name, &snake_name, &table, totp),
     );
     let model_mod_path = models_dir.join("mod.rs");
-    plan.modify(
-        model_mod_path.clone(),
-        add_mod_declaration(&read_or_empty(&model_mod_path), &snake_name),
-    );
+    let mut model_mod = add_mod_declaration(&read_or_empty(&model_mod_path), &snake_name);
+    if totp {
+        // Recovery codes live in their own model + table.
+        plan.create(
+            models_dir.join("recovery_code.rs"),
+            render_recovery_code_model_file(&pascal_name, &table),
+        );
+        model_mod = add_mod_declaration(&model_mod, "recovery_code");
+    }
+    plan.modify(model_mod_path, model_mod);
 
     // ── src/schema.rs entry ────────────────────────────────────────────────
     // The generated model references `crate::schema::<table>`, so we must
@@ -94,28 +122,40 @@ pub fn plan_auth_with_providers(
     //   password_digest  String   → Text      NOT NULL
     //   reset_token_digest         Option<String>         → Nullable<Text>
     //   reset_token_expires_at     Option<NaiveDateTime>  → Nullable<Timestamp>
-    let auth_fields: Vec<super::dsl::Field> = [
-        "email:String",
-        "password_digest:String",
-        "reset_token_digest:Option<String>",
-        "reset_token_expires_at:Option<NaiveDateTime>",
-    ]
-    .iter()
-    .map(|t| super::dsl::parse_field(t).expect("auth field tokens are always valid"))
-    .collect();
+    let mut user_field_tokens: Vec<&str> = vec!["email:String", "password_digest:String"];
+    if totp {
+        user_field_tokens.push("totp_secret_encrypted:Option<String>");
+        user_field_tokens.push("totp_enabled:bool");
+        user_field_tokens.push("totp_last_used_step:Option<i64>");
+    }
+    user_field_tokens.push("reset_token_digest:Option<String>");
+    user_field_tokens.push("reset_token_expires_at:Option<NaiveDateTime>");
+    let auth_fields: Vec<super::dsl::Field> = user_field_tokens
+        .iter()
+        .map(|t| super::dsl::parse_field(t).expect("auth field tokens are always valid"))
+        .collect();
 
     let schema_path = project_root.join("src").join("schema.rs");
     let schema_existing = read_or_empty(&schema_path);
-    plan.modify(
-        schema_path,
-        append_schema_table(&schema_existing, &table, &auth_fields),
-    );
+    let mut schema_new = append_schema_table(&schema_existing, &table, &auth_fields);
+    if totp {
+        let recovery_fields: Vec<super::dsl::Field> = [
+            "user_id:i64",
+            "code_digest:String",
+            "used_at:Option<NaiveDateTime>",
+        ]
+        .iter()
+        .map(|t| super::dsl::parse_field(t).expect("recovery field tokens are always valid"))
+        .collect();
+        schema_new = append_schema_table(&schema_new, "recovery_codes", &recovery_fields);
+    }
+    plan.modify(schema_path, schema_new);
 
     // ── Auth routes ────────────────────────────────────────────────────────
     let routes_dir = project_root.join("src").join("routes");
     plan.create(
         routes_dir.join("auth.rs"),
-        render_routes_file(&pascal_name, &snake_name, &table, providers),
+        render_routes_file(&pascal_name, &snake_name, &table, providers, totp),
     );
     let route_mod_path = routes_dir.join("mod.rs");
     plan.modify(
@@ -129,12 +169,18 @@ pub fn plan_auth_with_providers(
         tests_dir.join("auth.rs"),
         render_tests_file(&pascal_name, &snake_name),
     );
+    if totp {
+        plan.create(
+            tests_dir.join("auth_2fa.rs"),
+            render_2fa_tests_file(&pascal_name, &snake_name),
+        );
+    }
 
     // ── Documentation ─────────────────────────────────────────────────────
     let docs_dir = project_root.join("docs").join("guide");
     plan.create(
         docs_dir.join("authentication.md"),
-        render_docs_file(&pascal_name),
+        render_docs_file(&pascal_name, totp),
     );
 
     // ── src/main.rs — module declarations + route registration ────────────
@@ -145,7 +191,7 @@ pub fn plan_auth_with_providers(
             format!("missing {}", main_path.display()),
         ))
     })?;
-    let entries = auth_route_entries();
+    let entries = auth_route_entries(totp);
     let updated = update_main_rs(&main_existing, &["models", "routes", "schema"], &entries);
     plan.modify(main_path, updated);
 
@@ -156,6 +202,7 @@ pub fn plan_auth_with_providers(
         .iter()
         .copied()
         .chain(AUTH_EXTRA_DEPS.iter().copied())
+        .chain(if totp { TOTP_EXTRA_DEPS } else { &[] }.iter().copied())
         .collect();
     // Apply dep additions then enable the mail feature in a single write.
     let with_deps = ensure_cargo_dependencies(&cargo_existing, &all_deps);
@@ -178,14 +225,46 @@ pub fn plan_auth_with_providers(
 ///
 /// # Errors
 /// Same as [`plan_auth`].
+///
+/// Retained as stable public API; internal call sites use [`plan_auth_full`].
+#[allow(dead_code)]
 pub fn plan_auth_with_options(
     project_root: &Path,
     name: &str,
     timestamp: &str,
     oauth: &AuthOAuthOptions,
 ) -> Result<Plan, GenerateError> {
-    // Start with the base auth plan with providers passed in.
-    let mut plan = plan_auth_with_providers(project_root, name, timestamp, &oauth.providers)?;
+    plan_auth_options_impl(project_root, name, timestamp, oauth, false)
+}
+
+/// Compute the file actions for `autumn generate auth [--oauth …] [--totp]`.
+///
+/// Layers optional TOTP two-factor authentication on top of the base (and
+/// optional OAuth) auth scaffold.
+///
+/// # Errors
+/// Same as [`plan_auth`].
+pub fn plan_auth_full(
+    project_root: &Path,
+    name: &str,
+    timestamp: &str,
+    oauth: &AuthOAuthOptions,
+    totp: bool,
+) -> Result<Plan, GenerateError> {
+    plan_auth_options_impl(project_root, name, timestamp, oauth, totp)
+}
+
+/// Shared implementation: base (optionally TOTP-aware) scaffold plus, when
+/// providers are supplied, the OAuth artifacts.
+fn plan_auth_options_impl(
+    project_root: &Path,
+    name: &str,
+    timestamp: &str,
+    oauth: &AuthOAuthOptions,
+    totp: bool,
+) -> Result<Plan, GenerateError> {
+    // Start with the base auth plan with providers (and optional TOTP) applied.
+    let mut plan = plan_auth_with_providers(project_root, name, timestamp, &oauth.providers, totp)?;
 
     if oauth.providers.is_empty() {
         return Ok(plan);
@@ -475,11 +554,11 @@ fn ensure_autumn_web_oauth2_feature(toml: &str) -> String {
 /// CLI entry point for `autumn generate auth <Name>` (no OAuth providers).
 #[allow(dead_code)]
 pub fn run(name: &str, flags: Flags) {
-    run_with_options(name, flags, &AuthOAuthOptions::default());
+    run_with_options(name, flags, &AuthOAuthOptions::default(), false);
 }
 
-/// CLI entry point for `autumn generate auth <Name> --oauth <providers>`.
-pub fn run_with_options(name: &str, flags: Flags, oauth: &AuthOAuthOptions) {
+/// CLI entry point for `autumn generate auth <Name> --oauth <providers> [--totp]`.
+pub fn run_with_options(name: &str, flags: Flags, oauth: &AuthOAuthOptions, totp: bool) {
     let cwd = match std::env::current_dir() {
         Ok(d) => d,
         Err(e) => {
@@ -488,7 +567,7 @@ pub fn run_with_options(name: &str, flags: Flags, oauth: &AuthOAuthOptions) {
         }
     };
     let timestamp = timestamp_now();
-    let plan = plan_auth_with_options(&cwd, name, &timestamp, oauth);
+    let plan = plan_auth_full(&cwd, name, &timestamp, oauth, totp);
     match plan.and_then(|p| p.execute(flags)) {
         Ok(()) => {}
         Err(e) => {
@@ -689,32 +768,80 @@ scope = "openid profile email"
 
 // ── Template rendering ────────────────────────────────────────────────────────
 
-fn render_migration_up(table: &str) -> String {
-    format!(
+fn render_migration_up(table: &str, totp: bool) -> String {
+    // TOTP columns are inserted after password_digest so the column order
+    // matches the generated model struct and `schema.rs` block.
+    let totp_columns = if totp {
+        "\x20   totp_secret_encrypted TEXT NULL,\n\
+         \x20   totp_enabled BOOLEAN NOT NULL DEFAULT FALSE,\n\
+         \x20   totp_last_used_step BIGINT NULL,\n"
+    } else {
+        ""
+    };
+    let mut out = format!(
         "CREATE TABLE {table} (\n\
          \x20   id BIGSERIAL PRIMARY KEY,\n\
          \x20   email TEXT NOT NULL UNIQUE,\n\
          \x20   password_digest TEXT NOT NULL,\n\
+         {totp_columns}\
          \x20   reset_token_digest TEXT NULL,\n\
          \x20   reset_token_expires_at TIMESTAMP NULL,\n\
          \x20   created_at TIMESTAMP NOT NULL DEFAULT NOW()\n\
          );\n"
-    )
+    );
+    if totp {
+        out.push_str(
+            "\n\
+             CREATE TABLE recovery_codes (\n\
+             \x20   id BIGSERIAL PRIMARY KEY,\n\
+             \x20   user_id BIGINT NOT NULL REFERENCES ",
+        );
+        out.push_str(table);
+        out.push_str(
+            "(id) ON DELETE CASCADE,\n\
+             \x20   code_digest TEXT NOT NULL,\n\
+             \x20   used_at TIMESTAMP NULL,\n\
+             \x20   created_at TIMESTAMP NOT NULL DEFAULT NOW()\n\
+             );\n\
+             \n\
+             CREATE INDEX recovery_codes_user_id_idx ON recovery_codes (user_id);\n",
+        );
+    }
+    out
 }
 
-fn render_migration_down(table: &str) -> String {
-    format!("DROP TABLE {table};\n")
+fn render_migration_down(table: &str, totp: bool) -> String {
+    // Drop the dependent table first so the FK constraint is satisfied.
+    if totp {
+        format!("DROP TABLE recovery_codes;\nDROP TABLE {table};\n")
+    } else {
+        format!("DROP TABLE {table};\n")
+    }
 }
 
-fn render_model_file(pascal_name: &str, _snake_name: &str, table: &str) -> String {
+fn render_model_file(pascal_name: &str, _snake_name: &str, table: &str, totp: bool) -> String {
+    // TOTP columns mirror the migration/schema order (after password_digest).
+    // TOTP columns mirror the migration/schema order (after password_digest).
+    // `totp_secret_encrypted` holds the AES-GCM-encrypted secret (never plaintext),
+    // and `totp_last_used_step` is the replay guard. All three are `#[default]`
+    // so they are excluded from `NewUser` and fall back to their DB defaults
+    // (disabled / NULL) on signup.
+    let totp_fields = if totp {
+        "    #[default]\n\
+         \x20   pub totp_secret_encrypted: Option<String>,\n\
+         \x20   #[default]\n\
+         \x20   pub totp_enabled: bool,\n\
+         \x20   #[default]\n\
+         \x20   pub totp_last_used_step: Option<i64>,\n"
+    } else {
+        ""
+    };
     format!(
         r"//! Generated by `autumn generate auth`.
 //!
 //! Edit freely — once generated, this is ordinary user code.
-//! Security note: never store raw passwords or reset tokens here, only digests.
-
-use chrono::NaiveDateTime;
-use diesel::prelude::*;
+//! Security note: never store raw passwords, reset tokens, or TOTP secrets
+//! here in the clear — only digests and encrypted blobs.
 
 use crate::schema::{table};
 
@@ -723,10 +850,39 @@ pub struct {pascal_name} {{
     pub id: i64,
     pub email: String,
     pub password_digest: String,
-    pub reset_token_digest: Option<String>,
-    pub reset_token_expires_at: Option<NaiveDateTime>,
+{totp_fields}    pub reset_token_digest: Option<String>,
+    pub reset_token_expires_at: Option<chrono::NaiveDateTime>,
     #[default]
-    pub created_at: NaiveDateTime,
+    pub created_at: chrono::NaiveDateTime,
+}}
+"
+    )
+}
+
+/// Render `src/models/recovery_code.rs` (only emitted with `--totp`).
+///
+/// Recovery codes are single-use: only the bcrypt `code_digest` is stored, and
+/// `used_at` is stamped when a code is consumed so it can never be replayed.
+fn render_recovery_code_model_file(user_pascal: &str, user_table: &str) -> String {
+    format!(
+        r"//! Generated by `autumn generate auth --totp`.
+//!
+//! Single-use TOTP recovery codes for {user_pascal}. Edit freely.
+//! Security note: only the bcrypt digest of each code is stored — never the
+//! raw code. `used_at` marks a code as consumed so it cannot be reused.
+
+use crate::schema::recovery_codes;
+
+#[autumn_web::model]
+pub struct RecoveryCode {{
+    pub id: i64,
+    // References {user_table}(id).
+    pub user_id: i64,
+    pub code_digest: String,
+    // Kept in `NewRecoveryCode` so inserts set it explicitly to `None`.
+    pub used_at: Option<chrono::NaiveDateTime>,
+    #[default]
+    pub created_at: chrono::NaiveDateTime,
 }}
 "
     )
@@ -741,6 +897,7 @@ fn render_routes_file(
     snake_name: &str,
     table: &str,
     providers: &[String],
+    totp: bool,
 ) -> String {
     let oauth_buttons = if providers.is_empty() {
         String::new()
@@ -762,6 +919,16 @@ fn render_routes_file(
         }
         btn_html.push_str("        }\n");
         btn_html
+    };
+
+    let (totp_imports, totp_login_branch, totp_section) = if totp {
+        (
+            totp_imports_src().to_owned(),
+            totp_login_branch_src(snake_name),
+            totp_routes_section_src(pascal_name, snake_name, table),
+        )
+    } else {
+        (String::new(), String::new(), String::new())
     };
 
     format!(
@@ -787,6 +954,7 @@ use serde::Deserialize;
 
 use crate::models::{snake_name}::{{New{pascal_name}, {pascal_name}}};
 use crate::schema::{table};
+{totp_imports}
 
 // ── Layout helpers ────────────────────────────────────────────────────────────
 
@@ -954,7 +1122,7 @@ pub async fn login(
         return Err(auth_err());
     }}
     let {snake_name} = found_{snake_name}.ok_or_else(auth_err)?;
-
+{totp_login_branch}
     session.rotate_id().await;
     session.insert("{snake_name}_id", {snake_name}.id.to_string()).await;
     session.insert("{snake_name}_email", &{snake_name}.email).await;
@@ -1251,7 +1419,7 @@ async fn send_reset_email(mailer: &Mailer, to: &str, token: &str) -> AutumnResul
         ))
     }})
 }}
-"#
+{totp_section}"#
     )
 }
 
@@ -1396,7 +1564,8 @@ fn auth_account_rejects_anonymous() {{
     )
 }
 
-fn render_docs_file(pascal_name: &str) -> String {
+fn render_docs_file(pascal_name: &str, totp: bool) -> String {
+    let totp_docs = if totp { TOTP_DOCS_SECTION } else { "" };
     format!(
         r#"# Authentication Guide
 
@@ -1479,7 +1648,7 @@ rather than silently showing "Check Your Email" when no mail will be sent.
 - **{pascal_name} fields**: Add display-name, avatar, or role fields to the
   `{pascal_name}` model and a new migration.
 
-## When to Choose This Flow vs. Alternatives
+{totp_docs}## When to Choose This Flow vs. Alternatives
 
 | Scenario | Recommendation |
 |----------|---------------|
@@ -1505,8 +1674,8 @@ Then open <http://localhost:3000/signup> to create your first account.
     )
 }
 
-fn auth_route_entries() -> Vec<String> {
-    vec![
+fn auth_route_entries(totp: bool) -> Vec<String> {
+    let mut entries = vec![
         "routes::auth::signup_form".to_owned(),
         "routes::auth::signup".to_owned(),
         "routes::auth::login_form".to_owned(),
@@ -1517,7 +1686,18 @@ fn auth_route_entries() -> Vec<String> {
         "routes::auth::forgot_password".to_owned(),
         "routes::auth::reset_password_form".to_owned(),
         "routes::auth::reset_password".to_owned(),
-    ]
+    ];
+    if totp {
+        entries.extend([
+            "routes::auth::login_verify_form".to_owned(),
+            "routes::auth::login_verify".to_owned(),
+            "routes::auth::two_factor_status".to_owned(),
+            "routes::auth::two_factor_enable".to_owned(),
+            "routes::auth::two_factor_confirm".to_owned(),
+            "routes::auth::two_factor_disable".to_owned(),
+        ]);
+    }
+    entries
 }
 
 fn oauth_route_entries() -> Vec<String> {
@@ -1838,6 +2018,662 @@ never silently merges accounts.
     )
 }
 
+// ── TOTP (two-factor) template fragments ────────────────────────────────────────
+//
+// These helpers return generated *application* source as plain Strings, so the
+// braces inside are literal (never processed by this generator's `format!`).
+
+/// Extra `use` lines added to the generated `src/routes/auth.rs` under `--totp`.
+const fn totp_imports_src() -> &'static str {
+    "use aes_gcm::aead::{Aead, KeyInit};\n\
+     use aes_gcm::{Aes256Gcm, Key, Nonce};\n\
+     use base64::Engine as _;\n\
+     use base64::engine::general_purpose::STANDARD as B64;\n\
+     use totp_rs::{Algorithm, Secret, TOTP};\n\
+     use crate::models::recovery_code::{NewRecoveryCode, RecoveryCode};\n\
+     use crate::schema::recovery_codes;\n"
+}
+
+/// The interstitial branch injected into `login` after password verification.
+fn totp_login_branch_src(snake_name: &str) -> String {
+    const TPL: &str = r#"
+    // ── 2FA interstitial ────────────────────────────────────────────────────
+    // If the account has TOTP enabled, do NOT set the `#[secured]` auth key yet.
+    // Mark the session `totp_pending` and redirect to the second-factor form.
+    if __SNAKE__.totp_enabled {
+        session.rotate_id().await;
+        session
+            .insert("totp_pending_id", __SNAKE__.id.to_string())
+            .await;
+        return Ok(redirect_to("/login/verify"));
+    }
+"#;
+    TPL.replace("__SNAKE__", snake_name)
+}
+
+/// The full TOTP routes section appended to `src/routes/auth.rs`.
+#[allow(clippy::too_many_lines)]
+fn totp_routes_section_src(pascal_name: &str, snake_name: &str, table: &str) -> String {
+    const TPL: &str = r#"
+// ── Two-factor authentication (TOTP) ────────────────────────────────────────────
+//
+// Generated by `autumn generate auth --totp`. Edit freely.
+//
+// Security properties:
+// - TOTP secrets are encrypted at rest with AES-256-GCM (never stored plaintext).
+// - Verification accepts a ±1 time-step window and refuses to replay a step that
+//   was already consumed (`totp_last_used_step`).
+// - Recovery codes are single-use; only their bcrypt digest is stored and each is
+//   marked `used_at` when consumed.
+// - NOTE: rate-limiting / lockout on repeated failed second-factor attempts is a
+//   follow-up (see docs) — add it before exposing this to untrusted traffic.
+
+/// Number of single-use recovery codes generated on enrollment.
+const RECOVERY_CODE_COUNT: usize = 10;
+
+/// TOTP time step in seconds (RFC 6238 default).
+const TOTP_STEP: u64 = 30;
+
+#[derive(Deserialize)]
+pub struct TotpCodeForm {
+    pub code: String,
+}
+
+#[derive(Deserialize)]
+pub struct TotpDisableForm {
+    pub password: Option<String>,
+    pub code: Option<String>,
+}
+
+/// Load the 32-byte AES-256-GCM key used to encrypt TOTP secrets at rest.
+///
+/// Read from the `TOTP_ENC_KEY` env var (base64 of 32 bytes). Manage it like any
+/// other secret (e.g. `autumn credentials`); never commit it.
+fn totp_enc_key() -> AutumnResult<[u8; 32]> {
+    let raw = std::env::var("TOTP_ENC_KEY").map_err(|_| {
+        AutumnError::internal_server_error_msg(
+            "TOTP_ENC_KEY is not set. Generate 32 random bytes, base64-encode them, \
+             and set TOTP_ENC_KEY before enabling two-factor auth.",
+        )
+    })?;
+    let bytes = B64
+        .decode(raw.trim())
+        .map_err(|_| AutumnError::internal_server_error_msg("TOTP_ENC_KEY must be valid base64."))?;
+    let arr: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+        AutumnError::internal_server_error_msg("TOTP_ENC_KEY must decode to exactly 32 bytes.")
+    })?;
+    Ok(arr)
+}
+
+/// Encrypt a TOTP secret for storage. Output is base64(nonce ‖ ciphertext).
+fn encrypt_secret(plaintext: &[u8]) -> AutumnResult<String> {
+    use rand::TryRngCore;
+    let key = totp_enc_key()?;
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
+    let mut nonce_bytes = [0u8; 12];
+    rand::rngs::OsRng
+        .try_fill_bytes(&mut nonce_bytes)
+        .map_err(|_| AutumnError::internal_server_error_msg("RNG failure generating nonce"))?;
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    let ct = cipher
+        .encrypt(nonce, plaintext)
+        .map_err(|_| AutumnError::internal_server_error_msg("failed to encrypt TOTP secret"))?;
+    let mut combined = nonce_bytes.to_vec();
+    combined.extend_from_slice(&ct);
+    Ok(B64.encode(combined))
+}
+
+/// Decrypt a stored TOTP secret produced by [`encrypt_secret`].
+fn decrypt_secret(stored: &str) -> AutumnResult<Vec<u8>> {
+    let key = totp_enc_key()?;
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
+    let raw = B64
+        .decode(stored.trim())
+        .map_err(|_| AutumnError::internal_server_error_msg("stored TOTP secret is not valid base64"))?;
+    if raw.len() < 12 {
+        return Err(AutumnError::internal_server_error_msg(
+            "stored TOTP secret is malformed",
+        ));
+    }
+    let (nonce_bytes, ct) = raw.split_at(12);
+    let nonce = Nonce::from_slice(nonce_bytes);
+    cipher
+        .decrypt(nonce, ct)
+        .map_err(|_| AutumnError::internal_server_error_msg("failed to decrypt TOTP secret"))
+}
+
+/// Build a `TOTP` (SHA1, 6 digits, ±1 step skew) from raw secret bytes.
+///
+/// `get_url()` yields the standard `otpauth://` provisioning URI used for the QR.
+fn build_totp(secret: Vec<u8>, account: &str) -> AutumnResult<TOTP> {
+    TOTP::new(
+        Algorithm::SHA1,
+        6,
+        1,
+        TOTP_STEP,
+        secret,
+        Some("__PASCAL__".to_owned()),
+        account.to_owned(),
+    )
+    .map_err(|_| AutumnError::internal_server_error_msg("invalid TOTP secret"))
+}
+
+/// Current RFC 6238 time step.
+fn current_step() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    (secs / TOTP_STEP) as i64
+}
+
+/// Verify a TOTP code within a ±1 step window, returning the matched step.
+///
+/// The caller compares the returned step against `totp_last_used_step` to reject
+/// replay of an already-consumed step.
+fn verify_totp_code(totp: &TOTP, code: &str) -> Option<i64> {
+    let step = current_step();
+    let candidate = code.trim();
+    for delta in [-1i64, 0, 1] {
+        let s = step + delta;
+        if s < 0 {
+            continue;
+        }
+        let expected = totp.generate(s as u64 * TOTP_STEP);
+        if expected == candidate {
+            return Some(s);
+        }
+    }
+    None
+}
+
+/// Generate one human-friendly single-use recovery code (10 hex chars, grouped).
+fn generate_recovery_code() -> String {
+    use rand::TryRngCore;
+    let mut bytes = [0u8; 5];
+    rand::rngs::OsRng
+        .try_fill_bytes(&mut bytes)
+        .expect("OS RNG failed");
+    let hexs = hex::encode(bytes);
+    format!("{}-{}", &hexs[..5], &hexs[5..])
+}
+
+/// `GET /account/2fa` — show current two-factor state. Requires authentication.
+#[secured]
+#[get("/account/2fa")]
+pub async fn two_factor_status(
+    session: Session,
+    mut db: Db,
+    csrf: Option<CsrfToken>,
+    csrf_field: Option<CsrfFormField>,
+) -> AutumnResult<Markup> {
+    let __SNAKE___id: i64 = session
+        .get("__SNAKE___id")
+        .await
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| AutumnError::unauthorized_msg("Not authenticated."))?;
+    let __SNAKE__: __PASCAL__ = __TABLE__::table
+        .find(__SNAKE___id)
+        .select(__PASCAL__::as_select())
+        .first(&mut *db)
+        .await
+        .map_err(|_| AutumnError::not_found_msg("Account not found."))?;
+
+    let remaining: i64 = if __SNAKE__.totp_enabled {
+        recovery_codes::table
+            .filter(recovery_codes::user_id.eq(__SNAKE__.id))
+            .filter(recovery_codes::used_at.is_null())
+            .count()
+            .get_result(&mut *db)
+            .await
+            .unwrap_or(0)
+    } else {
+        0
+    };
+
+    Ok(layout("Two-Factor Authentication", html! {
+        h1 { "Two-Factor Authentication" }
+        @if __SNAKE__.totp_enabled {
+            p { "Two-factor authentication is " strong { "enabled" } "." }
+            p { "You have " (remaining) " recovery codes remaining." }
+            form action="/account/2fa/disable" method="post" {
+                @if let Some(ref csrf) = csrf { input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }
+                p {
+                    label { "Confirm with your password or a current 6-digit code:" }
+                    input type="password" name="password" autocomplete="current-password";
+                    input type="text" name="code" inputmode="numeric" autocomplete="one-time-code";
+                }
+                button type="submit" { "Disable two-factor" }
+            }
+        } @else {
+            p { "Two-factor authentication is " strong { "disabled" } "." }
+            form action="/account/2fa/enable" method="post" {
+                @if let Some(ref csrf) = csrf { input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }
+                button type="submit" { "Enable two-factor" }
+            }
+        }
+    }))
+}
+
+/// `POST /account/2fa/enable` — generate a secret, render the QR + manual key,
+/// and ask the user to confirm with a valid code before enabling. Requires auth.
+///
+/// The secret is encrypted and stored immediately, but `totp_enabled` stays
+/// `false` until `two_factor_confirm` succeeds.
+#[secured]
+#[post("/account/2fa/enable")]
+pub async fn two_factor_enable(
+    session: Session,
+    mut db: Db,
+    csrf: Option<CsrfToken>,
+    csrf_field: Option<CsrfFormField>,
+) -> AutumnResult<Markup> {
+    let __SNAKE___id: i64 = session
+        .get("__SNAKE___id")
+        .await
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| AutumnError::unauthorized_msg("Not authenticated."))?;
+    let __SNAKE__: __PASCAL__ = __TABLE__::table
+        .find(__SNAKE___id)
+        .select(__PASCAL__::as_select())
+        .first(&mut *db)
+        .await
+        .map_err(|_| AutumnError::not_found_msg("Account not found."))?;
+
+    let secret = Secret::generate_secret();
+    let secret_bytes = secret
+        .to_bytes()
+        .map_err(|_| AutumnError::internal_server_error_msg("failed to generate TOTP secret"))?;
+    let manual_key = secret.to_encoded().to_string();
+    let totp = build_totp(secret_bytes.clone(), &__SNAKE__.email)?;
+    // The provisioning URI (otpauth://…) drives the QR and manual entry.
+    let provisioning_uri = totp.get_url();
+    let qr = totp
+        .get_qr_base64()
+        .map_err(|_| AutumnError::internal_server_error_msg("failed to render QR code"))?;
+
+    let encrypted = encrypt_secret(&secret_bytes)?;
+    diesel::update(__TABLE__::table.find(__SNAKE__.id))
+        .set((
+            __TABLE__::totp_secret_encrypted.eq(Some(encrypted)),
+            __TABLE__::totp_enabled.eq(false),
+            __TABLE__::totp_last_used_step.eq(None::<i64>),
+        ))
+        .execute(&mut *db)
+        .await?;
+
+    Ok(layout("Enable Two-Factor", html! {
+        h1 { "Scan this QR code" }
+        p { "Scan with Google Authenticator, 1Password, or any RFC 6238 app." }
+        img src=(format!("data:image/png;base64,{}", qr)) alt="TOTP QR code";
+        p { "Or enter this key manually: " code { (manual_key) } }
+        p { small { "Provisioning URI: " code { (provisioning_uri) } } }
+        h2 { "Confirm" }
+        p { "Enter the 6-digit code shown in your app to finish enabling 2FA." }
+        form action="/account/2fa/confirm" method="post" {
+            @if let Some(ref csrf) = csrf { input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }
+            input type="text" name="code" inputmode="numeric" autocomplete="one-time-code" required;
+            button type="submit" { "Confirm and enable" }
+        }
+    }))
+}
+
+/// `POST /account/2fa/confirm` — verify a code against the pending secret, flip
+/// `totp_enabled`, and generate single-use recovery codes (shown once). Requires auth.
+#[secured]
+#[post("/account/2fa/confirm")]
+pub async fn two_factor_confirm(
+    session: Session,
+    mut db: Db,
+    Form(form): Form<TotpCodeForm>,
+) -> AutumnResult<Markup> {
+    let __SNAKE___id: i64 = session
+        .get("__SNAKE___id")
+        .await
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| AutumnError::unauthorized_msg("Not authenticated."))?;
+    let __SNAKE__: __PASCAL__ = __TABLE__::table
+        .find(__SNAKE___id)
+        .select(__PASCAL__::as_select())
+        .first(&mut *db)
+        .await
+        .map_err(|_| AutumnError::not_found_msg("Account not found."))?;
+
+    let stored = __SNAKE__
+        .totp_secret_encrypted
+        .as_deref()
+        .ok_or_else(|| AutumnError::unprocessable_msg("Start enrollment first."))?;
+    let secret = decrypt_secret(stored)?;
+    let totp = build_totp(secret, &__SNAKE__.email)?;
+    let Some(step) = verify_totp_code(&totp, &form.code) else {
+        return Err(AutumnError::unprocessable_msg("Invalid code. Try again."));
+    };
+
+    diesel::update(__TABLE__::table.find(__SNAKE__.id))
+        .set((
+            __TABLE__::totp_enabled.eq(true),
+            __TABLE__::totp_last_used_step.eq(Some(step)),
+        ))
+        .execute(&mut *db)
+        .await?;
+
+    // Replace any prior recovery codes with a fresh single-use set.
+    diesel::delete(recovery_codes::table.filter(recovery_codes::user_id.eq(__SNAKE__.id)))
+        .execute(&mut *db)
+        .await?;
+    let mut plaintext_codes: Vec<String> = Vec::with_capacity(RECOVERY_CODE_COUNT);
+    for _ in 0..RECOVERY_CODE_COUNT {
+        let code = generate_recovery_code();
+        let digest = hash_password(&code).await?;
+        diesel::insert_into(recovery_codes::table)
+            .values(NewRecoveryCode {
+                user_id: __SNAKE__.id,
+                code_digest: digest,
+                used_at: None,
+            })
+            .execute(&mut *db)
+            .await?;
+        plaintext_codes.push(code);
+    }
+
+    Ok(layout("Save Your Recovery Codes", html! {
+        h1 { "Two-factor authentication enabled" }
+        p { strong { "Save these recovery codes now." } " Each can be used once if you lose your device. They will not be shown again." }
+        ul {
+            @for code in &plaintext_codes {
+                li { code { (code) } }
+            }
+        }
+        p { a href="/account/2fa" { "Done" } }
+    }))
+}
+
+/// `POST /account/2fa/disable` — require re-auth (current code OR password), then
+/// clear the secret and all recovery codes. Requires authentication.
+#[secured]
+#[post("/account/2fa/disable")]
+pub async fn two_factor_disable(
+    session: Session,
+    mut db: Db,
+    Form(form): Form<TotpDisableForm>,
+) -> AutumnResult<Response> {
+    let __SNAKE___id: i64 = session
+        .get("__SNAKE___id")
+        .await
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| AutumnError::unauthorized_msg("Not authenticated."))?;
+    let __SNAKE__: __PASCAL__ = __TABLE__::table
+        .find(__SNAKE___id)
+        .select(__PASCAL__::as_select())
+        .first(&mut *db)
+        .await
+        .map_err(|_| AutumnError::not_found_msg("Account not found."))?;
+
+    // Re-authenticate: accept a current TOTP code or the account password.
+    let mut ok = false;
+    if let Some(code) = form.code.as_deref().filter(|c| !c.trim().is_empty()) {
+        if let Some(stored) = __SNAKE__.totp_secret_encrypted.as_deref() {
+            let secret = decrypt_secret(stored)?;
+            let totp = build_totp(secret, &__SNAKE__.email)?;
+            ok = verify_totp_code(&totp, code).is_some();
+        }
+    }
+    if !ok {
+        if let Some(password) = form.password.as_deref().filter(|p| !p.is_empty()) {
+            ok = verify_password(password, &__SNAKE__.password_digest)
+                .await
+                .unwrap_or(false);
+        }
+    }
+    if !ok {
+        return Err(AutumnError::unprocessable_msg(
+            "Re-authentication failed. Provide a valid code or your password.",
+        ));
+    }
+
+    diesel::update(__TABLE__::table.find(__SNAKE__.id))
+        .set((
+            __TABLE__::totp_enabled.eq(false),
+            __TABLE__::totp_secret_encrypted.eq(None::<String>),
+            __TABLE__::totp_last_used_step.eq(None::<i64>),
+        ))
+        .execute(&mut *db)
+        .await?;
+    diesel::delete(recovery_codes::table.filter(recovery_codes::user_id.eq(__SNAKE__.id)))
+        .execute(&mut *db)
+        .await?;
+
+    Ok(redirect_to("/account/2fa"))
+}
+
+/// `GET /login/verify` — second-factor prompt shown after a correct password
+/// when the account has 2FA enabled (the session is `totp_pending`).
+#[get("/login/verify")]
+pub async fn login_verify_form(
+    session: Session,
+    csrf: Option<CsrfToken>,
+    csrf_field: Option<CsrfFormField>,
+) -> AutumnResult<Response> {
+    if session.get("totp_pending_id").await.is_none() {
+        return Ok(redirect_to("/login"));
+    }
+    Ok(layout("Two-Factor Verification", html! {
+        h1 { "Two-Factor Verification" }
+        form action="/login/verify" method="post" {
+            @if let Some(ref csrf) = csrf { input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }
+            div {
+                label { "Authentication code or recovery code" }
+                input type="text" name="code" inputmode="numeric" autocomplete="one-time-code" required;
+            }
+            button type="submit" { "Verify" }
+        }
+    })
+    .into_response())
+}
+
+/// `POST /login/verify` — accept a TOTP code OR a single-use recovery code.
+///
+/// Only on success is the `#[secured]` auth key set. A consumed recovery code is
+/// marked `used_at`; a used TOTP step cannot be replayed.
+#[post("/login/verify")]
+pub async fn login_verify(
+    mut db: Db,
+    State(state): State<AppState>,
+    session: Session,
+    Form(form): Form<TotpCodeForm>,
+) -> AutumnResult<Response> {
+    let pending_id: i64 = session
+        .get("totp_pending_id")
+        .await
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| AutumnError::unauthorized_msg("No pending login."))?;
+    let __SNAKE__: __PASCAL__ = __TABLE__::table
+        .find(pending_id)
+        .select(__PASCAL__::as_select())
+        .first(&mut *db)
+        .await
+        .map_err(|_| AutumnError::unauthorized_msg("No pending login."))?;
+
+    let submitted = form.code.trim().to_owned();
+    let mut verified = false;
+
+    // 1) Try TOTP within the ±1 window, rejecting an already-used step (replay).
+    if let Some(stored) = __SNAKE__.totp_secret_encrypted.as_deref() {
+        let secret = decrypt_secret(stored)?;
+        let totp = build_totp(secret, &__SNAKE__.email)?;
+        if let Some(step) = verify_totp_code(&totp, &submitted) {
+            let fresh = __SNAKE__.totp_last_used_step.map_or(true, |last| step > last);
+            if fresh {
+                diesel::update(__TABLE__::table.find(__SNAKE__.id))
+                    .set(__TABLE__::totp_last_used_step.eq(Some(step)))
+                    .execute(&mut *db)
+                    .await?;
+                verified = true;
+            }
+        }
+    }
+
+    // 2) Otherwise, try an unused recovery code (single-use).
+    if !verified {
+        let unused: Vec<RecoveryCode> = recovery_codes::table
+            .filter(recovery_codes::user_id.eq(__SNAKE__.id))
+            .filter(recovery_codes::used_at.is_null())
+            .select(RecoveryCode::as_select())
+            .load(&mut *db)
+            .await
+            .unwrap_or_default();
+        for rc in &unused {
+            if verify_password(&submitted, &rc.code_digest).await.unwrap_or(false) {
+                diesel::update(recovery_codes::table.find(rc.id))
+                    .set(recovery_codes::used_at.eq(Some(chrono::Utc::now().naive_utc())))
+                    .execute(&mut *db)
+                    .await?;
+                verified = true;
+                break;
+            }
+        }
+    }
+
+    if !verified {
+        return Err(AutumnError::unprocessable_msg("Invalid code."));
+    }
+
+    // Promote the pending session to a fully authenticated one.
+    session.rotate_id().await;
+    session.remove("totp_pending_id").await;
+    session.insert("__SNAKE___id", __SNAKE__.id.to_string()).await;
+    session.insert("__SNAKE___email", &__SNAKE__.email).await;
+    session.insert(state.auth_session_key(), __SNAKE__.id.to_string()).await;
+
+    let remaining: i64 = recovery_codes::table
+        .filter(recovery_codes::user_id.eq(__SNAKE__.id))
+        .filter(recovery_codes::used_at.is_null())
+        .count()
+        .get_result(&mut *db)
+        .await
+        .unwrap_or(0);
+    // Surface remaining recovery-code count via a flash-style query param.
+    Ok(redirect_to(&format!("/account?recovery_remaining={}", remaining)))
+}
+"#;
+    TPL.replace("__PASCAL__", pascal_name)
+        .replace("__SNAKE__", snake_name)
+        .replace("__TABLE__", table)
+}
+
+/// Markdown appended to `docs/guide/authentication.md` under `--totp`.
+const TOTP_DOCS_SECTION: &str = r#"## Two-Factor Authentication (TOTP)
+
+Generated with `--totp`. Users can enroll an authenticator app (Google
+Authenticator, 1Password, …) and fall back to single-use recovery codes.
+
+### Generated routes
+
+| Method | Path | Handler | Auth |
+|--------|------|---------|------|
+| GET | `/account/2fa` | `two_factor_status` | **Required** |
+| POST | `/account/2fa/enable` | `two_factor_enable` | **Required** |
+| POST | `/account/2fa/confirm` | `two_factor_confirm` | **Required** |
+| POST | `/account/2fa/disable` | `two_factor_disable` | **Required** |
+| GET | `/login/verify` | `login_verify_form` | Pending login |
+| POST | `/login/verify` | `login_verify` | Pending login |
+
+### Encryption key
+
+TOTP secrets are encrypted at rest with AES-256-GCM. Set `TOTP_ENC_KEY` to a
+base64-encoded 32-byte key before enabling 2FA:
+
+```sh
+# 32 random bytes, base64-encoded
+export TOTP_ENC_KEY="$(head -c 32 /dev/urandom | base64)"
+```
+
+Manage it like any other secret (`autumn credentials`); never commit it. Rotating
+the key invalidates existing enrollments.
+
+### Security properties
+
+- Secrets encrypted at rest (never stored plaintext).
+- Verification accepts a ±1 time-step window; a consumed step cannot be replayed
+  (`totp_last_used_step`).
+- Recovery codes are single-use, bcrypt-hashed, and stamped `used_at` on use.
+- Disabling 2FA requires re-authentication (current code or password) and clears
+  the secret plus all recovery codes.
+
+### Out of scope (follow-ups)
+
+- **Rate-limiting / lockout** on repeated failed second-factor attempts is not
+  included — add it before exposing 2FA to untrusted traffic.
+- WebAuthn / passkeys and SMS/email OTP are separate tracks.
+
+"#;
+
+/// Render `tests/auth_2fa.rs` — the generated 2FA integration suite.
+fn render_2fa_tests_file(pascal_name: &str, snake_name: &str) -> String {
+    const TPL: &str = r#"//! Generated 2FA integration tests for __PASCAL__ (`autumn generate auth --totp`).
+//!
+//! Like `tests/auth.rs`, these run against a live server started with
+//! `AUTUMN_TEST_BASE_URL` and skip when it is unset, so they compile and pass
+//! out of the box. Flesh out the bodies once your test harness boots the app
+//! with a database and a `TOTP_ENC_KEY`.
+//!
+//! Covered flows: enroll → confirm → login-with-code → login-with-recovery-code
+//! → recovery-code-reuse-rejected → disable.
+
+fn base_url() -> Option<String> {
+    std::env::var("AUTUMN_TEST_BASE_URL").ok()
+}
+
+#[test]
+fn two_factor_enroll_and_confirm() {
+    let Some(_base) = base_url() else {
+        eprintln!("skipping: AUTUMN_TEST_BASE_URL not set");
+        return;
+    };
+    // POST /account/2fa/enable then /account/2fa/confirm with a generated code.
+}
+
+#[test]
+fn login_with_totp_code() {
+    let Some(_base) = base_url() else {
+        eprintln!("skipping: AUTUMN_TEST_BASE_URL not set");
+        return;
+    };
+    // Password login redirects to /login/verify; a valid code completes login.
+}
+
+#[test]
+fn login_with_recovery_code() {
+    let Some(_base) = base_url() else {
+        eprintln!("skipping: AUTUMN_TEST_BASE_URL not set");
+        return;
+    };
+    // A single-use recovery code is accepted at /login/verify.
+}
+
+#[test]
+fn recovery_code_reuse_rejected() {
+    let Some(_base) = base_url() else {
+        eprintln!("skipping: AUTUMN_TEST_BASE_URL not set");
+        return;
+    };
+    // Re-submitting a consumed recovery code is rejected.
+}
+
+#[test]
+fn two_factor_disable() {
+    let Some(_base) = base_url() else {
+        eprintln!("skipping: AUTUMN_TEST_BASE_URL not set");
+        return;
+    };
+    // POST /account/2fa/disable with re-auth clears the secret + recovery codes.
+}
+"#;
+    TPL.replace("__PASCAL__", pascal_name)
+        .replace("__SNAKE__", snake_name)
+}
+
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -2090,7 +2926,7 @@ mod tests {
 
     #[test]
     fn routes_file_uses_configured_auth_session_key_for_policy_identity() {
-        let routes = render_routes_file("Account", "account", "accounts", &[]);
+        let routes = render_routes_file("Account", "account", "accounts", &[], false);
         assert!(
             routes.contains("State(state): State<AppState>"),
             "auth routes must receive AppState: {routes}"

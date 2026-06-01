@@ -951,6 +951,153 @@ fn generate_auth_help_documents_command() {
         "help should mention --dry-run"
     );
     assert!(stdout.contains("--force"), "help should mention --force");
+    assert!(stdout.contains("--totp"), "help should mention --totp");
+}
+
+// ── autumn generate auth --totp (issue #799) ──────────────────────────────────
+
+#[allow(clippy::too_many_lines)]
+#[test]
+fn generate_auth_totp_creates_expected_files() {
+    let (_tmp, project) = fresh_project("auth-totp-app");
+    run_autumn(&project, &["generate", "auth", "User", "--totp"]);
+
+    // Migration: TOTP columns on users + recovery_codes table.
+    let migrations: Vec<_> = fs::read_dir(project.join("migrations"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().ends_with("_create_users"))
+        .collect();
+    assert_eq!(migrations.len(), 1, "expected one create_users migration");
+    let up = fs::read_to_string(migrations[0].path().join("up.sql")).unwrap();
+    assert!(
+        up.contains("totp_secret_encrypted"),
+        "up.sql missing totp_secret_encrypted"
+    );
+    assert!(up.contains("totp_enabled"), "up.sql missing totp_enabled");
+    assert!(
+        up.contains("CREATE TABLE recovery_codes"),
+        "up.sql missing recovery_codes table"
+    );
+    assert!(up.contains("code_digest"), "up.sql missing code_digest");
+    assert!(up.contains("used_at"), "up.sql missing used_at");
+    let down = fs::read_to_string(migrations[0].path().join("down.sql")).unwrap();
+    assert!(
+        down.contains("DROP TABLE recovery_codes"),
+        "down.sql must drop recovery_codes"
+    );
+
+    // Model gains TOTP fields; recovery_code model exists.
+    let model = fs::read_to_string(project.join("src/models/user.rs")).unwrap();
+    assert!(model.contains("pub totp_secret_encrypted: Option<String>"));
+    assert!(model.contains("pub totp_enabled: bool"));
+    assert!(
+        project.join("src/models/recovery_code.rs").exists(),
+        "recovery_code model missing"
+    );
+    let mod_rs = fs::read_to_string(project.join("src/models/mod.rs")).unwrap();
+    assert!(
+        mod_rs.contains("pub mod recovery_code;"),
+        "models/mod.rs missing recovery_code"
+    );
+
+    // schema.rs: totp columns + recovery_codes table.
+    let schema = fs::read_to_string(project.join("src/schema.rs")).unwrap();
+    assert!(schema.contains("totp_secret_encrypted -> Nullable<Text>"));
+    assert!(schema.contains("totp_enabled -> Bool"));
+    assert!(schema.contains("recovery_codes (id)"));
+
+    // Routes: 2FA handlers + paths.
+    let routes = fs::read_to_string(project.join("src/routes/auth.rs")).unwrap();
+    for needle in [
+        "pub async fn two_factor_status",
+        "pub async fn two_factor_enable",
+        "pub async fn two_factor_confirm",
+        "pub async fn two_factor_disable",
+        "pub async fn login_verify",
+        "otpauth://",
+        "Aes256Gcm",
+        "totp_pending",
+    ] {
+        assert!(routes.contains(needle), "routes/auth.rs missing: {needle}");
+    }
+
+    // Generated 2FA integration tests cover the full round trip.
+    let tests = fs::read_to_string(project.join("tests/auth_2fa.rs")).unwrap();
+    for flow in [
+        "two_factor_enroll_and_confirm",
+        "login_with_totp_code",
+        "login_with_recovery_code",
+        "recovery_code_reuse_rejected",
+        "two_factor_disable",
+    ] {
+        assert!(tests.contains(flow), "tests/auth_2fa.rs missing: {flow}");
+    }
+
+    // Cargo deps + docs.
+    let cargo = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+    assert!(cargo.contains("totp-rs ="), "Cargo.toml missing totp-rs");
+    assert!(cargo.contains("aes-gcm ="), "Cargo.toml missing aes-gcm");
+    let docs = fs::read_to_string(project.join("docs/guide/authentication.md")).unwrap();
+    assert!(
+        docs.contains("Two-Factor Authentication"),
+        "docs missing 2FA section"
+    );
+
+    // main.rs registers the new routes.
+    let main = fs::read_to_string(project.join("src/main.rs")).unwrap();
+    for entry in [
+        "routes::auth::two_factor_enable",
+        "routes::auth::login_verify",
+    ] {
+        assert!(main.contains(entry), "main.rs missing route: {entry}");
+    }
+}
+
+#[test]
+fn generate_auth_without_totp_has_no_totp_artifacts() {
+    let (_tmp, project) = fresh_project("auth-no-totp-app");
+    run_autumn(&project, &["generate", "auth", "User"]);
+    let model = fs::read_to_string(project.join("src/models/user.rs")).unwrap();
+    assert!(
+        !model.contains("totp_enabled"),
+        "default auth must not include totp fields"
+    );
+    assert!(!project.join("src/models/recovery_code.rs").exists());
+    assert!(!project.join("tests/auth_2fa.rs").exists());
+}
+
+/// Slow: scaffold `generate auth --totp` and `cargo check --tests` the result
+/// against the local `autumn-web` crate, proving the generated 2FA app and its
+/// test suite type-check with zero edits (issue #799 success metric).
+#[test]
+#[ignore = "slow: cargo-checks a fresh project — run with `cargo test -p autumn-cli -- --ignored`"]
+fn generated_auth_totp_cargo_checks() {
+    let (_tmp, project) = fresh_project("auth-totp-build");
+    patch_generated_cargo_toml(&project);
+    let _ = fs::remove_file(project.join("build.rs"));
+
+    run_autumn(&project, &["generate", "auth", "User", "--totp"]);
+
+    let cargo_after = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+    for dep in ["totp-rs", "aes-gcm", "base64", "diesel", "maud", "chrono"] {
+        assert!(
+            cargo_after.contains(&format!("{dep} =")),
+            "Cargo.toml missing '{dep}' after `generate auth --totp`"
+        );
+    }
+
+    let check = Command::new("cargo")
+        .args(["check", "--tests", "--offline"])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "cargo check on generated --totp auth failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr),
+    );
 }
 
 // ── TOML config (issue #669) ──────────────────────────────────────────────────
