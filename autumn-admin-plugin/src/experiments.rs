@@ -687,6 +687,59 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_variants_str() {
+        let val_string = serde_json::json!({"variants": "[{\"name\":\"control\",\"weight\":1}]"});
+        assert_eq!(
+            extract_variants_str(&val_string),
+            "[{\"name\":\"control\",\"weight\":1}]"
+        );
+
+        let val_array = serde_json::json!({"variants": [{"name": "control", "weight": 1}]});
+        assert_eq!(
+            extract_variants_str(&val_array),
+            "[{\"name\":\"control\",\"weight\":1}]"
+        );
+
+        let val_null = serde_json::json!({"variants": null});
+        assert_eq!(extract_variants_str(&val_null), "[]");
+
+        let val_missing = serde_json::json!({});
+        assert_eq!(extract_variants_str(&val_missing), "[]");
+    }
+
+    #[test]
+    fn test_validate_variants_json_weight_boundary() {
+        let max_u32 = u32::MAX;
+        let ok_json = format!("[{{\"name\":\"control\",\"weight\":{max_u32}}}]");
+        assert!(validate_variants_json(&ok_json).is_ok());
+
+        let over_u32 = u64::from(u32::MAX) + 1;
+        let err_json = format!("[{{\"name\":\"control\",\"weight\":{over_u32}}}]");
+        assert!(validate_variants_json(&err_json).is_err());
+    }
+
+    #[test]
+    fn test_validate_variants_json_empty_name() {
+        let json = "[{\"name\":\"\",\"weight\":1}]";
+        assert!(validate_variants_json(json).is_err());
+
+        let json_spaces = "[{\"name\":\"  \",\"weight\":1}]";
+        assert!(validate_variants_json(json_spaces).is_err());
+    }
+
+    #[test]
+    fn test_validate_variants_json_duplicate_names() {
+        let json = "[{\"name\":\"a\",\"weight\":1},{\"name\":\"a\",\"weight\":2}]";
+        assert!(validate_variants_json(json).is_err());
+    }
+
+    #[test]
+    fn test_validate_variants_json_missing_weight() {
+        let json = "[{\"name\":\"a\"}]";
+        assert!(validate_variants_json(json).is_err());
+    }
+
+    #[test]
     fn experiment_admin_model_has_history() {
         let model = ExperimentAdminModel;
         assert!(model.has_history(), "experiment admin must expose history");
