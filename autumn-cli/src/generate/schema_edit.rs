@@ -117,6 +117,10 @@ pub enum MigrationShape {
     RemoveColumns { table: String },
     /// `AddSearchTo<Table>` or `AddSearchableTo<Table>` or `AddSearchVectorTo<Table>`
     AddSearch { table: String },
+    /// `Encrypt<Columns>On<Table>` — convert existing plaintext column(s) to
+    /// at-rest encrypted (#805). Emits a documented offline-backfill migration
+    /// and a rollback that restores plaintext from ciphertext given the keys.
+    EncryptColumns { table: String, columns: Vec<String> },
     /// Anything else — emit empty `up.sql` / `down.sql` files.
     Empty,
 }
@@ -144,6 +148,19 @@ pub fn detect_migration_shape(pascal_name: &str) -> MigrationShape {
     {
         return MigrationShape::AddSearch {
             table: normalize_table_name(rest),
+        };
+    }
+
+    if let Some(rest) = pascal_name.strip_prefix("Encrypt")
+        && rest.chars().next().is_some_and(char::is_uppercase)
+        && let Some((cols, table)) = split_on_keyword(rest, "On")
+    {
+        // `cols` is a PascalCase column name (the common case: one column per
+        // encryption migration, e.g. `EncryptApiTokenOnAccounts`). Authors can
+        // edit the emitted file to backfill additional columns.
+        return MigrationShape::EncryptColumns {
+            table: normalize_table_name(&table),
+            columns: vec![super::naming::pascal_to_snake(&cols)],
         };
     }
 
@@ -234,6 +251,87 @@ pub fn add_columns_down_sql(table: &str, fields: &[Field]) -> String {
     for f in fields.iter().rev() {
         let _ = writeln!(out, "ALTER TABLE {table} DROP COLUMN {};", f.name);
     }
+    out
+}
+
+/// `up.sql` for converting plaintext column(s) to at-rest encrypted (#805).
+///
+/// Encrypted values are stored as a base64 AES-256-GCM envelope, so the column
+/// stays `TEXT`/`VARCHAR` — no type change is required. The actual encryption
+/// of existing rows is an **offline backfill** that needs the application's key
+/// ring, so it runs as a one-off task rather than raw SQL. This file documents
+/// the procedure and serves as the migration record.
+#[must_use]
+pub fn encrypt_columns_up_sql(table: &str, columns: &[String]) -> String {
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "-- autumn-safety: backfill \
+         -- run the offline encryption backfill BEFORE deploying readers that \
+         expect ciphertext"
+    );
+    let _ = writeln!(out, "--");
+    let _ = writeln!(
+        out,
+        "-- Convert plaintext column(s) on `{table}` to at-rest encryption (#805)."
+    );
+    let _ = writeln!(
+        out,
+        "-- The envelope is base64 text, so no column type change is needed."
+    );
+    let _ = writeln!(out, "--");
+    let _ = writeln!(out, "-- 1. Configure keys (once):");
+    let _ = writeln!(out, "--      autumn credentials edit");
+    let _ = writeln!(out, "--      [active_record_encryption]");
+    let _ = writeln!(out, "--      primary_key = \"<openssl rand -hex 32>\"");
+    let _ = writeln!(out, "--");
+    let _ = writeln!(
+        out,
+        "-- 2. Mark the field(s) `#[encrypted]` on the model and run the backfill"
+    );
+    let _ = writeln!(
+        out,
+        "--    task, which loads each row's plaintext and rewrites it as ciphertext"
+    );
+    let _ = writeln!(
+        out,
+        "--    via autumn_web::encryption::encrypt_text(Mode::Randomized, &plaintext):"
+    );
+    for col in columns {
+        let _ = writeln!(out, "--      UPDATE {table} SET {col} = <encrypt({col})>;");
+    }
+    let _ = writeln!(out, "--");
+    let _ = writeln!(
+        out,
+        "-- Take a backup first: a row encrypted with a lost key is unrecoverable."
+    );
+    out
+}
+
+/// `down.sql` companion to [`encrypt_columns_up_sql`]: restore plaintext from
+/// ciphertext, given the keys.
+#[must_use]
+pub fn encrypt_columns_down_sql(table: &str, columns: &[String]) -> String {
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "-- Rollback: restore plaintext from ciphertext on `{table}` (#805)."
+    );
+    let _ = writeln!(
+        out,
+        "-- Run a one-off task that decrypts each row with the configured keys via"
+    );
+    let _ = writeln!(
+        out,
+        "-- autumn_web::encryption::decrypt_text(&envelope) and writes plaintext back:"
+    );
+    for col in columns {
+        let _ = writeln!(out, "--      UPDATE {table} SET {col} = <decrypt({col})>;");
+    }
+    let _ = writeln!(
+        out,
+        "-- Then remove the `#[encrypted]` attribute from the model field."
+    );
     out
 }
 
@@ -1731,6 +1829,33 @@ mod tests {
             MigrationShape::AddColumns { table } => assert_eq!(table, "posts"),
             other => panic!("expected AddColumns, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn detect_encrypt_migration() {
+        match detect_migration_shape("EncryptApiTokenOnAccounts") {
+            MigrationShape::EncryptColumns { table, columns } => {
+                assert_eq!(table, "accounts");
+                assert_eq!(columns, vec!["api_token".to_string()]);
+            }
+            other => panic!("expected EncryptColumns, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn encrypt_migration_documents_backfill_and_rollback() {
+        let cols = vec!["api_token".to_string()];
+        let up = encrypt_columns_up_sql("accounts", &cols);
+        let down = encrypt_columns_down_sql("accounts", &cols);
+        // up.sql documents the offline backfill + key configuration.
+        assert!(up.contains("active_record_encryption"));
+        assert!(up.contains("encrypt_text"));
+        assert!(up.contains("autumn-safety: backfill"));
+        assert!(up.contains("api_token"));
+        // down.sql documents restoring plaintext from ciphertext given the keys.
+        assert!(down.contains("decrypt_text"));
+        assert!(down.contains("Rollback"));
+        assert!(down.contains("api_token"));
     }
 
     #[test]

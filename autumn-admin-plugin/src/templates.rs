@@ -1464,6 +1464,12 @@ fn render_cell_value(record: &Value, field: &AdminField) -> Markup {
     if matches!(field.kind, AdminFieldKind::Password) {
         return html! { "••••••••" };
     }
+    // At-rest encrypted columns (#805) are redacted in admin views by default.
+    // Rendering decrypted plaintext is a documented per-field opt-in gated
+    // through the admin policy machinery (#496).
+    if autumn_web::encryption::is_encrypted_column_name(field.name) {
+        return html! { span title="encrypted at rest" { "••••••••" } };
+    }
     let val = record.get(field.name);
     match val {
         None | Some(Value::Null) => html! {
@@ -1587,6 +1593,10 @@ fn normalize_datetime_local_input(s: &str) -> String {
 
 /// Render a field value in the detail view.
 fn render_detail_value(record: &Value, field: &AdminField) -> Markup {
+    // Encrypted columns (#805) are redacted by default in admin detail views.
+    if autumn_web::encryption::is_encrypted_column_name(field.name) {
+        return html! { span title="encrypted at rest" { "••••••••" } };
+    }
     let val = record.get(field.name);
     match val {
         None | Some(Value::Null) => html! {
@@ -1957,6 +1967,28 @@ pub fn model_history_page(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Simulate a model that registered an at-rest encrypted column (#805).
+    autumn_web::reexports::inventory::submit! {
+        autumn_web::encryption::EncryptedColumnDescriptor {
+            model: "AdminTestModel",
+            table: "admin_test_models",
+            column: "ssn",
+            deterministic: false,
+        }
+    }
+
+    #[test]
+    fn encrypted_columns_are_redacted_in_admin_views() {
+        let record = serde_json::json!({ "id": 1, "ssn": "123-45-6789" });
+        let field = AdminField::new("ssn", AdminFieldKind::Text);
+        let cell = render_cell_value(&record, &field).into_string();
+        let detail = render_detail_value(&record, &field).into_string();
+        assert!(!cell.contains("123-45-6789"), "list cell must redact: {cell}");
+        assert!(!detail.contains("123-45-6789"), "detail must redact: {detail}");
+        assert!(cell.contains("••••••••"));
+        assert!(detail.contains("••••••••"));
+    }
 
     #[test]
     fn pagination_range_small() {

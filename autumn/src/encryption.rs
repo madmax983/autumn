@@ -535,6 +535,18 @@ pub fn is_encrypted_column(table: &str, column: &str) -> bool {
         .any(|d| d.table == table && d.column == column)
 }
 
+/// Whether any registered encrypted column has this name (table-agnostic).
+///
+/// Used by surfaces that lack table context — e.g. the admin plugin's cell
+/// renderer — to redact encrypted columns by default. Errs toward privacy: a
+/// same-named column on another table is also redacted.
+#[must_use]
+pub fn is_encrypted_column_name(column: &str) -> bool {
+    registered_encrypted_columns()
+        .iter()
+        .any(|d| d.column == column)
+}
+
 /// Encrypted column names for a single table.
 #[must_use]
 pub fn encrypted_columns_for_table(table: &str) -> Vec<&'static str> {
