@@ -1792,22 +1792,29 @@ fn render_oauth_routes_file(
          \x20   //       // rotate_id() keeps session data, so drop any live auth from a\n\
          \x20   //       // prior login in this browser before parking the pending handoff:\n\
          \x20   //       session.remove(&auth_cfg.session_key).await;\n\
+         \x20   //       session.remove(\"__SNAKE___id\").await;\n\
+         \x20   //       session.remove(\"__SNAKE___email\").await;\n\
          \x20   //       session.remove(\"totp_pending_reset_digest\").await;\n\
          \x20   //       session.remove(\"totp_pending_reset_token\").await;\n\
          \x20   //       session.remove(\"totp_pending_secret\").await;\n\
          \x20   //       session.insert(\"totp_pending_id\", local_user.id.to_string()).await;\n\
          \x20   //       return Redirect::to(\"/login/verify\").into_response();\n\
          \x20   //   }\n\
-         \x20   //   // otherwise, fully authenticate — but first clear any abandoned\n\
-         \x20   //   // pending-2FA / deferred-reset / enrollment state so a stale\n\
-         \x20   //   // marker from another account can't be resumed under this session:\n\
+         \x20   //   // otherwise, fully authenticate. First clear any abandoned pending-2FA\n\
+         \x20   //   // / deferred-reset / enrollment state, then set BOTH the model-specific\n\
+         \x20   //   // identity keys the generated handlers read (`__SNAKE___id` / `_email`)\n\
+         \x20   //   // and the configured auth key — clearing stale model keys first so a\n\
+         \x20   //   // prior login in this browser can't leave a mismatched identity:\n\
          \x20   //   session.remove(\"totp_pending_id\").await;\n\
          \x20   //   session.remove(\"totp_pending_reset_digest\").await;\n\
          \x20   //   session.remove(\"totp_pending_reset_token\").await;\n\
          \x20   //   session.remove(\"totp_pending_secret\").await;\n\
+         \x20   //   session.insert(\"__SNAKE___id\", local_user.id.to_string()).await;\n\
+         \x20   //   session.insert(\"__SNAKE___email\", &local_user.email).await;\n\
          \x20   //   session.insert(&auth_cfg.session_key, local_user.id.to_string()).await;\n"
+            .replace("__SNAKE__", snake_name)
     } else {
-        ""
+        String::new()
     };
 
     format!(
@@ -4274,6 +4281,14 @@ mod tests {
         assert!(
             after.contains("totp_pending_secret") && after.contains("totp_pending_id"),
             "OAuth full-login guidance must clear pending 2FA/enrollment state: {after}"
+        );
+        // P2 (#1057 round 10): the full-login guidance must also set the
+        // model-specific identity keys the generated handlers read, not only the
+        // configured auth key.
+        assert!(
+            after.contains("session.insert(\"user_id\", local_user.id.to_string())")
+                && after.contains("session.insert(\"user_email\", &local_user.email)"),
+            "OAuth full-login guidance must set the model identity keys: {after}"
         );
     }
 
