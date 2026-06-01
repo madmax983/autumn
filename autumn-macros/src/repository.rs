@@ -7374,8 +7374,16 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     self.id
                 }
                 fn version_column_values(&self) -> ::autumn_web::reexports::serde_json::Value {
-                    ::autumn_web::reexports::serde_json::to_value(self)
-                        .unwrap_or(::autumn_web::reexports::serde_json::Value::Object(Default::default()))
+                    let mut __vh_value = ::autumn_web::reexports::serde_json::to_value(self)
+                        .unwrap_or(::autumn_web::reexports::serde_json::Value::Object(Default::default()));
+                    // Columns opted into `versioned_ciphertext` (#805) store
+                    // ciphertext here; columns left as the default are excluded
+                    // from this snapshot via `version_sensitive_columns()`.
+                    ::autumn_web::encryption::encrypt_versioned_columns_in_value(
+                        #table_name,
+                        &mut __vh_value,
+                    );
+                    __vh_value
                 }
                 fn version_sensitive_columns() -> &'static [&'static str] {
                     // Merge declared sensitive columns with at-rest encrypted

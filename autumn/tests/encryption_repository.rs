@@ -22,9 +22,11 @@ pub struct VaultEntry {
     #[id]
     pub id: i64,
     pub label: String,
-    #[encrypted]
+    // Randomized + version history stores ciphertext (opt-in) instead of a marker.
+    #[encrypted(versioned_ciphertext)]
     pub secret: String,
-    #[encrypted(deterministic)]
+    // Deterministic + decrypted in admin read views (opt-in).
+    #[encrypted(deterministic, admin_visible)]
     pub lookup_key: String,
 }
 
@@ -33,6 +35,7 @@ pub trait VaultEntryRepository {}
 
 #[test]
 fn encrypted_columns_registered_and_versioned() {
+    use autumn_web::encryption;
     use autumn_web::version_history::VersionedRecord;
 
     // The model registers its encrypted columns for composition.
@@ -41,18 +44,29 @@ fn encrypted_columns_registered_and_versioned() {
         &["secret", "lookup_key"]
     );
 
-    // Version history treats encrypted columns as sensitive automatically, so the
-    // plaintext that the in-memory model would serialize never reaches the
-    // version table — it is recorded as a "changed (encrypted)" marker instead.
+    // `lookup_key` (default version-history behaviour) is treated as sensitive,
+    // so its plaintext never reaches the version table.
     let cols = VaultEntry::version_sensitive_columns();
     assert!(
-        cols.contains(&"secret"),
-        "encrypted column auto-sensitive: {cols:?}"
-    );
-    assert!(
         cols.contains(&"lookup_key"),
-        "encrypted column auto-sensitive: {cols:?}"
+        "default encrypted column auto-sensitive: {cols:?}"
     );
+    // `secret` opted into `versioned_ciphertext`, so it is EXCLUDED from the
+    // sensitive list (its before/after are stored as ciphertext instead).
+    assert!(
+        !cols.contains(&"secret"),
+        "versioned_ciphertext column is not a sensitive marker: {cols:?}"
+    );
+
+    // Opt-in flags round-trip through the registry.
+    let secret = encryption::registered_encrypted_columns()
+        .into_iter()
+        .find(|d| d.table == "vault_entries" && d.column == "secret")
+        .expect("secret registered");
+    assert!(secret.versioned_ciphertext);
+    // admin_visible: lookup_key is shown, secret is redacted.
+    assert!(!encryption::admin_redacts_column_name("lookup_key"));
+    assert!(encryption::admin_redacts_column_name("secret"));
 }
 
 #[test]

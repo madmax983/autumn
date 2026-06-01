@@ -84,33 +84,75 @@ enum EncryptedMode {
     Deterministic,
 }
 
-/// Parse an `#[encrypted]` / `#[encrypted(deterministic)]` field attribute.
-fn parse_field_encrypted(field: &syn::Field) -> syn::Result<EncryptedMode> {
+/// Parsed `#[encrypted(...)]` field specification.
+#[derive(Clone, Copy)]
+struct EncryptedSpec {
+    mode: EncryptedMode,
+    /// `admin_visible` — render decrypted plaintext in admin views (the admin
+    /// surface itself is authorization-gated; #496). Default: redacted.
+    admin_visible: bool,
+    /// `versioned_ciphertext` — store encrypted before/after ciphertext in record
+    /// version history instead of the default "changed (encrypted)" marker.
+    versioned_ciphertext: bool,
+}
+
+impl EncryptedSpec {
+    const NONE: Self = Self {
+        mode: EncryptedMode::None,
+        admin_visible: false,
+        versioned_ciphertext: false,
+    };
+    fn is_encrypted(self) -> bool {
+        self.mode != EncryptedMode::None
+    }
+}
+
+/// Parse an `#[encrypted]` / `#[encrypted(deterministic, admin_visible, ...)]`
+/// field attribute.
+fn parse_field_encrypted(field: &syn::Field) -> syn::Result<EncryptedSpec> {
     for attr in &field.attrs {
         if !attr.path().is_ident("encrypted") {
             continue;
         }
-        // `#[encrypted]` (bare path) -> randomized.
+        // `#[encrypted]` (bare path) -> randomized, no opt-ins.
         if matches!(attr.meta, syn::Meta::Path(_)) {
-            return Ok(EncryptedMode::Randomized);
+            return Ok(EncryptedSpec {
+                mode: EncryptedMode::Randomized,
+                ..EncryptedSpec::NONE
+            });
         }
-        let mut mode = EncryptedMode::Randomized;
+        let mut spec = EncryptedSpec {
+            mode: EncryptedMode::Randomized,
+            ..EncryptedSpec::NONE
+        };
         attr.parse_nested_meta(|meta| {
             if meta.path.is_ident("deterministic") {
-                mode = EncryptedMode::Deterministic;
+                spec.mode = EncryptedMode::Deterministic;
                 Ok(())
             } else if meta.path.is_ident("randomized") {
-                mode = EncryptedMode::Randomized;
+                spec.mode = EncryptedMode::Randomized;
+                Ok(())
+            } else if meta.path.is_ident("admin_visible") {
+                spec.admin_visible = true;
+                Ok(())
+            } else if meta.path.is_ident("versioned_ciphertext") {
+                spec.versioned_ciphertext = true;
                 Ok(())
             } else {
                 Err(meta.error(
-                    "unsupported `#[encrypted]` option; expected `deterministic` or `randomized`",
+                    "unsupported `#[encrypted]` option; expected one of \
+                     `deterministic`, `randomized`, `admin_visible`, `versioned_ciphertext`",
                 ))
             }
         })?;
-        return Ok(mode);
+        return Ok(spec);
     }
-    Ok(EncryptedMode::None)
+    Ok(EncryptedSpec::NONE)
+}
+
+/// Convenience: just the mode (used by the diesel-wrapper routing).
+fn parse_field_encrypted_mode(field: &syn::Field) -> syn::Result<EncryptedMode> {
+    Ok(parse_field_encrypted(field)?.mode)
 }
 
 /// Build a manual `Debug` impl that redacts encrypted fields, so plaintext
@@ -163,7 +205,7 @@ fn encrypted_wrapper_path(mode: EncryptedMode) -> Option<TokenStream> {
 /// v1 supports non-null `String` columns (the realistic targets: tokens, SSNs,
 /// emails). `Option<String>` and other types are rejected with a clear message.
 fn validate_encrypted_field(field: &syn::Field) -> syn::Result<()> {
-    if parse_field_encrypted(field)? == EncryptedMode::None {
+    if !parse_field_encrypted(field)?.is_encrypted() {
         return Ok(());
     }
     let is_string = matches!(&field.ty, syn::Type::Path(p) if p.path.segments.last().is_some_and(|s| s.ident == "String"));
@@ -578,6 +620,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let new_name = format_ident!("New{name}");
     let update_name = format_ident!("Update{name}");
+    let changeset_name = format_ident!("__{}Changeset", name);
 
     // Classify fields
     let all_fields: Vec<&Field> = fields.named.iter().collect();
@@ -681,22 +724,28 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 
     // Collect `#[encrypted]` columns (validated to be non-null `String`).
-    let mut encrypted_columns: Vec<(String, bool)> = Vec::new();
+    // Each entry: (column, deterministic, admin_visible, versioned_ciphertext).
+    let mut encrypted_columns: Vec<(String, bool, bool, bool)> = Vec::new();
     for f in &all_fields {
         if let Err(err) = validate_encrypted_field(f) {
             return err.to_compile_error();
         }
         match parse_field_encrypted(f) {
-            Ok(EncryptedMode::None) => {}
-            Ok(mode) => {
+            Ok(spec) if spec.is_encrypted() => {
                 let col = f.ident.as_ref().unwrap().to_string();
-                encrypted_columns.push((col, mode == EncryptedMode::Deterministic));
+                encrypted_columns.push((
+                    col,
+                    spec.mode == EncryptedMode::Deterministic,
+                    spec.admin_visible,
+                    spec.versioned_ciphertext,
+                ));
             }
+            Ok(_) => {}
             Err(err) => return err.to_compile_error(),
         }
     }
     let encrypted_column_names: Vec<&str> =
-        encrypted_columns.iter().map(|(c, _)| c.as_str()).collect();
+        encrypted_columns.iter().map(|(c, ..)| c.as_str()).collect();
     // Diesel's `AsChangeset`/`Insertable` derives expand `column.eq(value)` in
     // the model's module scope when `serialize_as` is present, which needs
     // `ExpressionMethods` in scope. Bring it in anonymously (only for models with
@@ -709,42 +758,75 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             use ::autumn_web::reexports::diesel::ExpressionMethods as _;
         }
     };
-    // For models with encrypted columns, replace the derived `Debug` on the
-    // plaintext-holding structs with a redacting manual impl so values never
-    // leak through `Debug`/panic output (#805 AC, composes with #697).
-    let (name_debug_derive, name_debug_impl, new_debug_derive, new_debug_impl) =
-        if encrypted_columns.is_empty() {
-            (quote! { Debug, }, quote! {}, quote! { Debug, }, quote! {})
-        } else {
-            let all_idents: Vec<&syn::Ident> = all_fields
-                .iter()
-                .map(|f| f.ident.as_ref().unwrap())
-                .collect();
-            let new_idents: Vec<&syn::Ident> = fields_for_new
-                .iter()
-                .map(|f| f.ident.as_ref().unwrap())
-                .collect();
-            (
-                quote! {},
-                redacting_debug_impl(name, &all_idents, &encrypted_column_names),
-                quote! {},
-                redacting_debug_impl(&new_name, &new_idents, &encrypted_column_names),
-            )
-        };
+    // For models with encrypted columns, replace the derived `Debug` on every
+    // plaintext-holding struct (query, New*, Update*, Changeset) with a redacting
+    // manual impl so values never leak through `Debug`/panic output — including
+    // update payloads whose `Patch<String>` would otherwise print `Set("secret")`
+    // (#805 AC, composes with #697).
+    let lock_version_ident: Option<&syn::Ident> = lock_version_field.and_then(|f| f.ident.as_ref());
+    let mutable_idents: Vec<&syn::Ident> = fields_for_new
+        .iter()
+        .map(|f| f.ident.as_ref().unwrap())
+        .chain(lock_version_ident)
+        .collect();
+    let (
+        name_debug_derive,
+        name_debug_impl,
+        new_debug_derive,
+        new_debug_impl,
+        update_debug_derive,
+        update_debug_impl,
+        changeset_debug_derive,
+        changeset_debug_impl,
+    ) = if encrypted_columns.is_empty() {
+        (
+            quote! { Debug, },
+            quote! {},
+            quote! { Debug, },
+            quote! {},
+            quote! { Debug, },
+            quote! {},
+            quote! { Debug, },
+            quote! {},
+        )
+    } else {
+        let all_idents: Vec<&syn::Ident> = all_fields
+            .iter()
+            .map(|f| f.ident.as_ref().unwrap())
+            .collect();
+        let new_idents: Vec<&syn::Ident> = fields_for_new
+            .iter()
+            .map(|f| f.ident.as_ref().unwrap())
+            .collect();
+        (
+            quote! {},
+            redacting_debug_impl(name, &all_idents, &encrypted_column_names),
+            quote! {},
+            redacting_debug_impl(&new_name, &new_idents, &encrypted_column_names),
+            quote! {},
+            redacting_debug_impl(&update_name, &mutable_idents, &encrypted_column_names),
+            quote! {},
+            redacting_debug_impl(&changeset_name, &mutable_idents, &encrypted_column_names),
+        )
+    };
     let encrypted_inventory: Vec<TokenStream> = encrypted_columns
         .iter()
-        .map(|(col, deterministic)| {
-            quote! {
-                ::autumn_web::reexports::inventory::submit! {
-                    ::autumn_web::encryption::EncryptedColumnDescriptor {
-                        model: stringify!(#name),
-                        table: #table_name,
-                        column: #col,
-                        deterministic: #deterministic,
+        .map(
+            |(col, deterministic, admin_visible, versioned_ciphertext)| {
+                quote! {
+                    ::autumn_web::reexports::inventory::submit! {
+                        ::autumn_web::encryption::EncryptedColumnDescriptor {
+                            model: stringify!(#name),
+                            table: #table_name,
+                            column: #col,
+                            deterministic: #deterministic,
+                            admin_visible: #admin_visible,
+                            versioned_ciphertext: #versioned_ciphertext,
+                        }
                     }
                 }
-            }
-        })
+            },
+        )
         .collect();
 
     // Fields for UpdateX: Patch fields (from fields_for_new) plus the
@@ -763,9 +845,10 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             // Encrypted columns route through an AEAD wrapper transparently:
             // `serialize_as` encrypts on write, `deserialize_as` decrypts on read.
             // The public field stays a plain `String` (plaintext in Rust code).
-            let enc =
-                encrypted_wrapper_path(parse_field_encrypted(f).unwrap_or(EncryptedMode::None))
-                    .map(|w| quote! { #[diesel(serialize_as = #w, deserialize_as = #w)] });
+            let enc = encrypted_wrapper_path(
+                parse_field_encrypted_mode(f).unwrap_or(EncryptedMode::None),
+            )
+            .map(|w| quote! { #[diesel(serialize_as = #w, deserialize_as = #w)] });
             quote! { #(#attrs)* #enc pub #ident: #ty }
         })
         .collect();
@@ -777,9 +860,10 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             let ident = &f.ident;
             let ty = &f.ty;
             let val_attrs = validate_attrs(f);
-            let enc =
-                encrypted_wrapper_path(parse_field_encrypted(f).unwrap_or(EncryptedMode::None))
-                    .map(|w| quote! { #[diesel(serialize_as = #w)] });
+            let enc = encrypted_wrapper_path(
+                parse_field_encrypted_mode(f).unwrap_or(EncryptedMode::None),
+            )
+            .map(|w| quote! { #[diesel(serialize_as = #w)] });
             quote! { #(#val_attrs)* #enc pub #ident: #ty }
         })
         .collect();
@@ -899,7 +983,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let new_column_count = fields_for_new.len();
 
     // Build Diesel-compatible changeset bridge (private struct with Option<T> fields)
-    let changeset_name = format_ident!("__{}Changeset", name);
+    // (`changeset_name` is bound earlier so the redacting Debug impl can use it.)
 
     let tenant_id_field = all_fields
         .iter()
@@ -1106,9 +1190,10 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             // For encrypted columns the inner value is routed through the AEAD
             // wrapper via `serialize_as` (Diesel maps the `Option` skip itself),
             // so updates write ciphertext while the API stays plaintext.
-            let enc =
-                encrypted_wrapper_path(parse_field_encrypted(f).unwrap_or(EncryptedMode::None))
-                    .map(|w| quote! { #[diesel(serialize_as = #w)] });
+            let enc = encrypted_wrapper_path(
+                parse_field_encrypted_mode(f).unwrap_or(EncryptedMode::None),
+            )
+            .map(|w| quote! { #[diesel(serialize_as = #w)] });
             quote! { #enc pub #ident: Option<#ty> }
         })
         .collect();
@@ -1668,22 +1753,24 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
         #new_debug_impl
 
-        #[derive(Debug, Clone, Default)]
+        #[derive(#update_debug_derive Clone, Default)]
         #[derive(::serde::Serialize, ::serde::Deserialize)]
         #vis struct #update_name {
             #(#update_fields,)*
         }
+        #update_debug_impl
 
         /// Diesel-compatible changeset derived from `Patch<T>` fields.
         ///
         /// This type bridges the `Patch`-based `UpdateX` and Diesel's
         /// `AsChangeset` trait. Use `UpdateX::__to_changeset()` to convert.
         #[doc(hidden)]
-        #[derive(Debug, Clone, ::diesel::AsChangeset)]
+        #[derive(#changeset_debug_derive Clone, ::diesel::AsChangeset)]
         #[diesel(table_name = #table_ident)]
         pub struct #changeset_name {
             #(#changeset_fields,)*
         }
+        #changeset_debug_impl
 
         impl #name {
             /// Column names on this model that are at-rest encrypted.

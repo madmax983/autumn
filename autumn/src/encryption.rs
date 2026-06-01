@@ -525,6 +525,12 @@ pub struct EncryptedColumnDescriptor {
     pub column: &'static str,
     /// Whether the column uses deterministic mode.
     pub deterministic: bool,
+    /// `admin_visible` opt-in: render decrypted plaintext in admin views (the
+    /// admin surface itself is authorization-gated; #496). Default: redacted.
+    pub admin_visible: bool,
+    /// `versioned_ciphertext` opt-in: store encrypted before/after ciphertext in
+    /// record version history instead of the default "changed (encrypted)" marker.
+    pub versioned_ciphertext: bool,
 }
 
 inventory::collect!(EncryptedColumnDescriptor);
@@ -570,6 +576,23 @@ pub fn is_encrypted_column_name(column: &str) -> bool {
         .any(|d| d.column == column)
 }
 
+/// Whether an encrypted column named `column` should be redacted in admin views.
+///
+/// Returns `false` only when the column is encrypted and *every* registration of
+/// that name opted into `admin_visible` (conservative: any non-visible
+/// registration of the same name forces redaction).
+#[must_use]
+pub fn admin_redacts_column_name(column: &str) -> bool {
+    for d in registered_encrypted_columns() {
+        if d.column == column && !d.admin_visible {
+            return true;
+        }
+    }
+    // Either not an encrypted column, or every registration opted into
+    // admin_visible — in both cases this helper does not force redaction.
+    false
+}
+
 /// Encrypted column names for a single table.
 #[must_use]
 pub fn encrypted_columns_for_table(table: &str) -> Vec<&'static str> {
@@ -583,13 +606,49 @@ pub fn encrypted_columns_for_table(table: &str) -> Vec<&'static str> {
 /// Append this table's encrypted columns to `columns`, de-duplicating.
 ///
 /// Used by generated `VersionedRecord::version_sensitive_columns` so encrypted
-/// columns are always treated as sensitive in record version history (#700):
-/// the diff stores a "changed (encrypted)" marker and never the plaintext that
-/// the in-memory model would otherwise serialize.
+/// columns are treated as sensitive in record version history (#700): the diff
+/// stores a "changed (encrypted)" marker and never the plaintext that the
+/// in-memory model would otherwise serialize.
+///
+/// Columns that opted into `versioned_ciphertext` are **excluded** here — their
+/// before/after values are stored as ciphertext instead (see
+/// [`encrypt_versioned_columns_in_value`]).
 pub fn merge_encrypted_columns_for_table(table: &str, columns: &mut Vec<&'static str>) {
-    for col in encrypted_columns_for_table(table) {
-        if !columns.contains(&col) {
-            columns.push(col);
+    for d in registered_encrypted_columns() {
+        if d.table == table && !d.versioned_ciphertext && !columns.contains(&d.column) {
+            columns.push(d.column);
+        }
+    }
+}
+
+/// Rewrite a model's JSON column-values snapshot (as produced for record version
+/// history) so that columns opted into `versioned_ciphertext` carry ciphertext
+/// rather than plaintext.
+///
+/// The values are encrypted **deterministically** so that an unchanged plaintext
+/// produces identical ciphertext across snapshots — keeping the version diff
+/// accurate. If a deterministic key is not configured (or encryption otherwise
+/// fails), the value is replaced with a `"<encrypted>"` marker so plaintext can
+/// never leak into the version-history table.
+pub fn encrypt_versioned_columns_in_value(table: &str, value: &mut serde_json::Value) {
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
+    for d in registered_encrypted_columns() {
+        if d.table != table || !d.versioned_ciphertext {
+            continue;
+        }
+        if let Some(field) = obj.get_mut(d.column) {
+            // Non-null, non-string values keep their structure (never plaintext).
+            if field.is_null() {
+                continue;
+            }
+            let marker = || serde_json::Value::String("<encrypted>".to_owned());
+            let replacement = field.as_str().map_or_else(marker, |plaintext| {
+                encrypt_text(Mode::Deterministic, plaintext)
+                    .map_or_else(|_| marker(), serde_json::Value::String)
+            });
+            *field = replacement;
         }
     }
 }
@@ -651,6 +710,29 @@ pub use diesel_types::{DeterministicText, RandomizedText};
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A registered `versioned_ciphertext` + `admin_visible` column, used by the
+    // composition tests below.
+    inventory::submit! {
+        EncryptedColumnDescriptor {
+            model: "VcModel",
+            table: "vc_table",
+            column: "vc_col",
+            deterministic: false,
+            admin_visible: false,
+            versioned_ciphertext: true,
+        }
+    }
+    inventory::submit! {
+        EncryptedColumnDescriptor {
+            model: "VcModel",
+            table: "vc_table",
+            column: "visible_col",
+            deterministic: false,
+            admin_visible: true,
+            versioned_ciphertext: false,
+        }
+    }
 
     const KEY_A: &str = "1111111111111111111111111111111111111111111111111111111111111111";
     const KEY_B: &str = "2222222222222222222222222222222222222222222222222222222222222222";
@@ -801,5 +883,73 @@ mod tests {
         let ring = creds.to_key_ring().unwrap();
         let env = ring.encrypt(Mode::Randomized, b"z").unwrap();
         assert_eq!(ring.decrypt(&env).unwrap(), b"z");
+    }
+
+    #[test]
+    fn missing_salt_is_rejected() {
+        let creds = EncryptionCredentials {
+            primary_key: KEY_A.to_string(),
+            deterministic_key: None,
+            key_derivation_salt: None,
+            retired_keys: vec![],
+        };
+        assert!(matches!(
+            creds.to_key_ring(),
+            Err(EncryptionError::MissingSalt)
+        ));
+    }
+
+    #[test]
+    fn versioned_ciphertext_column_excluded_from_sensitive_marker() {
+        // `versioned_ciphertext` columns store ciphertext, so they must NOT be in
+        // the sensitive list (which would suppress their values entirely).
+        let mut cols: Vec<&'static str> = Vec::new();
+        merge_encrypted_columns_for_table("vc_table", &mut cols);
+        assert!(
+            !cols.contains(&"vc_col"),
+            "versioned_ciphertext excluded: {cols:?}"
+        );
+    }
+
+    #[test]
+    fn versioned_ciphertext_payload_is_deterministic_ciphertext_not_plaintext() {
+        install_key_ring(KeyRing::from_master_hex(KEY_A, &[], Some(DET), salt()).unwrap());
+
+        let mut v = serde_json::json!({ "id": 1, "vc_col": "topsecret", "plain": "ok" });
+        encrypt_versioned_columns_in_value("vc_table", &mut v);
+
+        let stored = v["vc_col"].as_str().unwrap();
+        assert_ne!(stored, "topsecret", "version payload must be ciphertext");
+        assert!(!stored.contains("topsecret"), "no plaintext leak: {stored}");
+        assert_eq!(v["plain"], "ok", "non-encrypted column untouched");
+
+        // Deterministic: equal plaintext -> equal ciphertext, so the diff stays
+        // accurate (an unchanged value is not reported as changed).
+        let mut v2 = serde_json::json!({ "vc_col": "topsecret" });
+        encrypt_versioned_columns_in_value("vc_table", &mut v2);
+        assert_eq!(v2["vc_col"], v["vc_col"]);
+
+        // And it is genuinely decryptable back to the plaintext.
+        let ring = key_ring().unwrap();
+        assert_eq!(
+            String::from_utf8(ring.decrypt(stored).unwrap()).unwrap(),
+            "topsecret"
+        );
+    }
+
+    #[test]
+    fn admin_visibility_helper_respects_opt_in() {
+        assert!(
+            admin_redacts_column_name("vc_col"),
+            "default column is redacted"
+        );
+        assert!(
+            !admin_redacts_column_name("visible_col"),
+            "admin_visible column is not redacted"
+        );
+        assert!(
+            !admin_redacts_column_name("not_encrypted_at_all"),
+            "non-encrypted column is not forced-redacted by this helper"
+        );
     }
 }

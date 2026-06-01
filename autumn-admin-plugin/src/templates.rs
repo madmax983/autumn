@@ -1467,7 +1467,7 @@ fn render_cell_value(record: &Value, field: &AdminField) -> Markup {
     // At-rest encrypted columns (#805) are redacted in admin views by default.
     // Rendering decrypted plaintext is a documented per-field opt-in gated
     // through the admin policy machinery (#496).
-    if autumn_web::encryption::is_encrypted_column_name(field.name) {
+    if autumn_web::encryption::admin_redacts_column_name(field.name) {
         return html! { span title="encrypted at rest" { "••••••••" } };
     }
     let val = record.get(field.name);
@@ -1594,7 +1594,7 @@ fn normalize_datetime_local_input(s: &str) -> String {
 /// Render a field value in the detail view.
 fn render_detail_value(record: &Value, field: &AdminField) -> Markup {
     // Encrypted columns (#805) are redacted by default in admin detail views.
-    if autumn_web::encryption::is_encrypted_column_name(field.name) {
+    if autumn_web::encryption::admin_redacts_column_name(field.name) {
         return html! { span title="encrypted at rest" { "••••••••" } };
     }
     let val = record.get(field.name);
@@ -1631,10 +1631,19 @@ fn render_detail_value(record: &Value, field: &AdminField) -> Markup {
 
 /// Render a form widget for a field.
 fn render_form_widget(field: &AdminField, record: Option<&Value>) -> Markup {
-    let current_value = record
-        .and_then(|r| r.get(field.name))
-        .cloned()
-        .unwrap_or(Value::Null);
+    // Never pre-fill an encrypted column's plaintext into an edit/new form,
+    // even when it is `admin_visible` (viewing decrypted is a read-only opt-in;
+    // editing a secret must be explicit). Leaving it blank keeps the value
+    // unchanged on save unless the admin types a new one (#805).
+    let encrypted = autumn_web::encryption::is_encrypted_column_name(field.name);
+    let current_value = if encrypted {
+        Value::Null
+    } else {
+        record
+            .and_then(|r| r.get(field.name))
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
     let str_val = match &current_value {
         Value::String(s) => s.clone(),
         Value::Null => String::new(),
@@ -1968,13 +1977,26 @@ pub fn model_history_page(
 mod tests {
     use super::*;
 
-    // Simulate a model that registered an at-rest encrypted column (#805).
+    // Simulate a model that registered an at-rest encrypted column (#805):
+    // `ssn` is redacted by default; `audit_note` opts into `admin_visible`.
     autumn_web::reexports::inventory::submit! {
         autumn_web::encryption::EncryptedColumnDescriptor {
             model: "AdminTestModel",
             table: "admin_test_models",
             column: "ssn",
             deterministic: false,
+            admin_visible: false,
+            versioned_ciphertext: false,
+        }
+    }
+    autumn_web::reexports::inventory::submit! {
+        autumn_web::encryption::EncryptedColumnDescriptor {
+            model: "AdminTestModel",
+            table: "admin_test_models",
+            column: "audit_note",
+            deterministic: false,
+            admin_visible: true,
+            versioned_ciphertext: false,
         }
     }
 
@@ -1994,6 +2016,36 @@ mod tests {
         );
         assert!(cell.contains("••••••••"));
         assert!(detail.contains("••••••••"));
+    }
+
+    #[test]
+    fn admin_visible_encrypted_column_renders_plaintext_in_views() {
+        // The decrypted record (admin loads it through the model) is shown for
+        // an `admin_visible` column in list/detail views.
+        let record = serde_json::json!({ "id": 1, "audit_note": "visible-note" });
+        let field = AdminField::new("audit_note", AdminFieldKind::Text);
+        let cell = render_cell_value(&record, &field).into_string();
+        let detail = render_detail_value(&record, &field).into_string();
+        assert!(cell.contains("visible-note"), "admin_visible cell: {cell}");
+        assert!(
+            detail.contains("visible-note"),
+            "admin_visible detail: {detail}"
+        );
+    }
+
+    #[test]
+    fn edit_form_never_prefills_encrypted_plaintext() {
+        // Even an admin_visible column must not pre-fill its secret into the
+        // editable form control.
+        let record = serde_json::json!({ "ssn": "123-45-6789", "audit_note": "visible-note" });
+        for col in ["ssn", "audit_note"] {
+            let field = AdminField::new(col, AdminFieldKind::Text);
+            let form = render_form_widget(&field, Some(&record)).into_string();
+            assert!(
+                !form.contains("123-45-6789") && !form.contains("visible-note"),
+                "edit form must not pre-fill encrypted plaintext for {col}: {form}"
+            );
+        }
     }
 
     #[test]

@@ -287,19 +287,40 @@ pub fn encrypt_columns_up_sql(table: &str, columns: &[String]) -> String {
     let _ = writeln!(out, "--");
     let _ = writeln!(
         out,
-        "-- 2. Mark the field(s) `#[encrypted]` on the model and run the backfill"
+        "-- 2. Backfill BEFORE adding `#[encrypted]` to the model field. Once the"
     );
     let _ = writeln!(
         out,
-        "--    task, which loads each row's plaintext and rewrites it as ciphertext"
+        "--    attribute is present the column's reader decrypts on load, so any"
     );
     let _ = writeln!(
         out,
-        "--    via autumn_web::encryption::encrypt_text(Mode::Randomized, &plaintext):"
+        "--    still-plaintext row would fail with a malformed-envelope error."
+    );
+    let _ = writeln!(
+        out,
+        "--    Run a one-off task over a TEMPORARY plaintext model (no `#[encrypted]`)"
+    );
+    let _ = writeln!(
+        out,
+        "--    that reads each row's plaintext and writes the envelope produced by"
+    );
+    let _ = writeln!(
+        out,
+        "--    autumn_web::encryption::encrypt_text(Mode::Randomized, &plaintext):"
     );
     for col in columns {
-        let _ = writeln!(out, "--      UPDATE {table} SET {col} = <encrypt({col})>;");
+        let _ = writeln!(
+            out,
+            "--      UPDATE {table} SET {col} = <encrypt_text({col})>;"
+        );
     }
+    let _ = writeln!(out, "--");
+    let _ = writeln!(
+        out,
+        "-- 3. Only after every row is ciphertext, add `#[encrypted]` to the field"
+    );
+    let _ = writeln!(out, "--    and deploy the encrypted reader.");
     let _ = writeln!(out, "--");
     let _ = writeln!(
         out,

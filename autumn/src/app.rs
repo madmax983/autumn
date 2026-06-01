@@ -3685,22 +3685,35 @@ fn fail_fast_on_invalid_session_config(config: &AutumnConfig, has_custom_session
     }
 }
 
+/// Resolve at-rest column-encryption keys at boot (#805).
+///
+/// On success this installs the process-global key ring. When encrypted columns
+/// are registered but the key material under `active_record_encryption` is
+/// missing or malformed, the behaviour mirrors the signing-secret check (#597):
+/// a **hard failure in production** (the server must not bind with unusable
+/// encryption), but only a **warning in dev/test** so zero-config local
+/// development and the example apps continue to run. Apps that do not opt into
+/// encrypted columns are unaffected (no registered columns -> no-op).
+fn fail_fast_on_missing_encryption_keys(config: &AutumnConfig) {
+    if let Err(diagnostic) = crate::encryption::init_attribute_encryption(config.credentials()) {
+        let is_production = matches!(config.profile.as_deref(), Some("prod" | "production"));
+        if is_production {
+            eprintln!("Attribute encryption misconfiguration: {diagnostic}");
+            std::process::exit(1);
+        }
+        eprintln!(
+            "warning: attribute encryption is not fully configured (dev): {diagnostic}\n  \
+             note: encrypted-column reads/writes will fail until keys are set; \
+             this is a hard error in production."
+        );
+    }
+}
+
 /// Fail immediately if the signing secret is misconfigured for the active profile.
 ///
 /// In production, a missing, too-short, or demo-valued signing secret is a
 /// hard failure — the server must not bind. In dev/test the check is skipped
 /// so zero-config local development continues to work.
-/// Fail fast (mirroring #597) when at-rest column encryption is in use but the
-/// key material under `active_record_encryption` is missing or malformed. On
-/// success this installs the process-global key ring. Apps that do not opt into
-/// encrypted columns are unaffected (no registered columns -> no-op).
-fn fail_fast_on_missing_encryption_keys(config: &AutumnConfig) {
-    if let Err(diagnostic) = crate::encryption::init_attribute_encryption(config.credentials()) {
-        eprintln!("Attribute encryption misconfiguration: {diagnostic}");
-        std::process::exit(1);
-    }
-}
-
 fn fail_fast_on_invalid_signing_secret(config: &AutumnConfig) {
     use crate::security::config::validate_signing_secret;
 

@@ -180,13 +180,15 @@ encrypt backfill, and whose `down.sql` documents the reverse (restoring plaintex
 from ciphertext given the keys). The column stays `TEXT` — the envelope is base64
 text, so no type change is needed.
 
-Because the actual encrypt/decrypt needs the app's key ring, the row rewrite runs
-as a one-off task (which you write against your model), not raw SQL. The task
-loads each row's plaintext, calls
-`autumn_web::encryption::encrypt_text(Mode::Randomized, &plaintext)`, and writes
-the envelope back. The **rollback** task does the inverse with
-`decrypt_text(&envelope)`. Run the backfill *before* deploying readers that mark
-the field `#[encrypted]`.
+Order matters. **Backfill before adding `#[encrypted]` to the model field.**
+Once the attribute is present the column's reader decrypts on load, so any
+still-plaintext row would fail with a malformed-envelope error. Run a one-off
+task over a *temporary* plaintext model (one without `#[encrypted]`) that reads
+each row's plaintext and writes the envelope produced by
+`autumn_web::encryption::encrypt_text(Mode::Randomized, &plaintext)`. Only after
+every row is ciphertext do you add `#[encrypted]` and deploy the encrypted
+reader. The **rollback** task does the inverse with `decrypt_text(&envelope)`
+(again via a temporary plaintext model), then you remove the attribute.
 
 > Always take a backup before a backfill, and keep the keys: a row encrypted with
 > a key you have lost is unrecoverable by design.
@@ -198,14 +200,32 @@ the field `#[encrypted]`.
   output. The wrapper types also redact in `Debug`.
 
 * **Record version history (#700):** encrypted columns are automatically treated
-  as *sensitive* in the version diff. The history stores a `changed (encrypted)`
-  marker — never the plaintext (which the in-memory model would otherwise
-  serialize). Plaintext never enters the version-history table.
+  as *sensitive* in the version diff. By default the history stores a
+  `changed (encrypted)` marker — never the plaintext (which the in-memory model
+  would otherwise serialize). Plaintext never enters the version-history table.
+
+  Per-field opt-in: `#[encrypted(versioned_ciphertext)]` stores the before/after
+  **ciphertext** instead of the marker (deterministically encrypted so the diff
+  stays accurate, and re-encryptable on key rotation). This requires a
+  `deterministic_key`; if encryption fails the value falls back to the
+  `<encrypted>` marker so plaintext still never leaks.
 
 * **Admin plugin:** encrypted columns render **redacted** (`••••••••`) in admin
-  list and detail views by default. Showing decrypted plaintext to an authorized
-  admin is an explicit per-field opt-in, gated through the admin policy machinery
-  (#496) — this feature does not invent its own authorization.
+  list and detail views by default, and edit forms never pre-fill their plaintext.
+  Showing decrypted plaintext is an explicit per-field opt-in,
+  `#[encrypted(admin_visible)]`, surfaced only in the admin's read views; the
+  admin surface itself is authorization-gated (`AdminPlugin::require_role`,
+  composing with #496) — this feature does not invent its own authorization.
+
+### Per-field options summary
+
+```rust
+#[encrypted]                          // randomized; redacted everywhere (default)
+#[encrypted(deterministic)]           // stable ciphertext; supports equality lookups
+#[encrypted(admin_visible)]           // show decrypted plaintext in admin read views
+#[encrypted(versioned_ciphertext)]    // store ciphertext (not a marker) in version history
+// options combine, e.g. #[encrypted(deterministic, admin_visible)]
+```
 
 ## Development escape hatch
 
