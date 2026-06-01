@@ -209,15 +209,26 @@ fn validate_encrypted_field(field: &syn::Field) -> syn::Result<()> {
         return Ok(());
     }
     let is_string = matches!(&field.ty, syn::Type::Path(p) if p.path.segments.last().is_some_and(|s| s.ident == "String"));
-    if is_string {
-        Ok(())
-    } else {
-        Err(syn::Error::new_spanned(
+    if !is_string {
+        return Err(syn::Error::new_spanned(
             &field.ty,
             "`#[encrypted]` is only supported on non-null `String` fields in v1 \
              (encrypt before storing structured/optional data)",
-        ))
+        ));
     }
+    // `#[encrypted]` columns must flow through the `serialize_as` wrapper on
+    // insert. Fields excluded from the insert (`#[id]`, `#[default]`,
+    // `#[lock_version]`) would instead get a raw database value, which the
+    // decrypting reader then rejects as a malformed envelope. Reject the combo.
+    if has_attr(field, "default") || has_attr(field, "lock_version") || has_attr(field, "id") {
+        return Err(syn::Error::new_spanned(
+            field,
+            "`#[encrypted]` cannot be combined with `#[default]`, `#[lock_version]`, \
+             or `#[id]`: those fields bypass the insert path, so the column would \
+             store an unencrypted value. Set the encrypted value explicitly on insert.",
+        ));
+    }
+    Ok(())
 }
 
 /// Parse the struct-level language dictionary configuration from `#[searchable(language = "...")]`

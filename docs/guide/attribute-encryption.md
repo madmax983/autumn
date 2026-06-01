@@ -165,6 +165,13 @@ with the current key. You may also run a one-off task that loads and re-saves
 rows to migrate eagerly. A retired key can be dropped from `retired_keys` only
 once no row references its `key_id` anymore.
 
+The **deterministic key** rotates the same way: set the new `deterministic_key`
+and move the previous one into `retired_keys`. Each retired key is derived in
+both the randomized and deterministic domains, so existing deterministic rows
+keep decrypting by `key_id`. Note that equality lookups only match rows written
+under the *current* deterministic key, so re-encrypt deterministic columns
+promptly after rotating their key if you rely on lookups.
+
 ## Backfilling an existing plaintext column
 
 Converting an existing plaintext column to encrypted is an **offline backfill**.

@@ -280,10 +280,21 @@ pub fn encrypt_columns_up_sql(table: &str, columns: &[String]) -> String {
         "-- The envelope is base64 text, so no column type change is needed."
     );
     let _ = writeln!(out, "--");
-    let _ = writeln!(out, "-- 1. Configure keys (once):");
+    let _ = writeln!(out, "-- 1. Configure keys (once). The salt is required:");
     let _ = writeln!(out, "--      autumn credentials edit");
     let _ = writeln!(out, "--      [active_record_encryption]");
-    let _ = writeln!(out, "--      primary_key = \"<openssl rand -hex 32>\"");
+    let _ = writeln!(
+        out,
+        "--      primary_key         = \"<openssl rand -hex 32>\""
+    );
+    let _ = writeln!(
+        out,
+        "--      key_derivation_salt = \"<openssl rand -hex 16>\""
+    );
+    let _ = writeln!(
+        out,
+        "--      # deterministic_key = \"<openssl rand -hex 32>\"  # for deterministic / versioned_ciphertext"
+    );
     let _ = writeln!(out, "--");
     let _ = writeln!(
         out,

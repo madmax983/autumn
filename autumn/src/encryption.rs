@@ -213,6 +213,9 @@ pub struct KeyRing {
     primary: DataKey,
     retired: Vec<DataKey>,
     deterministic: Option<DataKey>,
+    /// Deterministic keys derived from the retired key list, so rows written
+    /// before a deterministic-key rotation remain readable by `key_id`.
+    retired_deterministic: Vec<DataKey>,
 }
 
 impl KeyRing {
@@ -223,8 +226,12 @@ impl KeyRing {
     ///   remain readable. Rotating retires the old primary here without
     ///   rewriting any rows.
     /// * `deterministic_hex` — optional; required only if any column uses
-    ///   deterministic mode.
+    ///   deterministic mode (or `versioned_ciphertext`).
     /// * `salt` — the `key_derivation_salt`; mixed into key derivation.
+    ///
+    /// Each entry in `retired_hex` is derived in **both** the randomized and the
+    /// deterministic key domains, so a key rotated out of either role (former
+    /// `primary_key` or former `deterministic_key`) keeps its rows readable.
     ///
     /// # Errors
     ///
@@ -241,12 +248,11 @@ impl KeyRing {
             b"autumn:data:v1:",
         );
         let mut retired = Vec::with_capacity(retired_hex.len());
+        let mut retired_deterministic = Vec::with_capacity(retired_hex.len());
         for (i, k) in retired_hex.iter().enumerate() {
-            retired.push(derive_data_key(
-                &decode_master_hex(k, &format!("retired_keys[{i}]"))?,
-                salt,
-                b"autumn:data:v1:",
-            ));
+            let bytes = decode_master_hex(k, &format!("retired_keys[{i}]"))?;
+            retired.push(derive_data_key(&bytes, salt, b"autumn:data:v1:"));
+            retired_deterministic.push(derive_data_key(&bytes, salt, b"autumn:det:v1:"));
         }
         let deterministic = match deterministic_hex {
             Some(k) => Some(derive_data_key(
@@ -260,6 +266,7 @@ impl KeyRing {
             primary,
             retired,
             deterministic,
+            retired_deterministic,
         })
     }
 
@@ -271,7 +278,11 @@ impl KeyRing {
 
     fn find_key(&self, mode: u8, key_id: u32) -> Option<&DataKey> {
         if mode == MODE_DETERMINISTIC {
-            return self.deterministic.as_ref().filter(|k| k.id == key_id);
+            return self
+                .deterministic
+                .as_ref()
+                .filter(|k| k.id == key_id)
+                .or_else(|| self.retired_deterministic.iter().find(|k| k.id == key_id));
         }
         if self.primary.id == key_id {
             return Some(&self.primary);
@@ -669,13 +680,19 @@ pub fn init_attribute_encryption(
     store: &crate::credentials::CredentialsStore,
 ) -> Result<(), String> {
     let columns = registered_encrypted_columns();
-    let any_deterministic = columns.iter().any(|c| c.deterministic);
+    // The deterministic key is needed both for deterministic-mode columns and for
+    // `versioned_ciphertext` columns (whose history snapshots are encrypted
+    // deterministically so the version diff stays accurate).
+    let needs_deterministic = columns
+        .iter()
+        .any(|c| c.deterministic || c.versioned_ciphertext);
 
     match key_ring_from_credentials(store) {
         Ok(Some(ring)) => {
-            if any_deterministic && ring.deterministic.is_none() {
+            if needs_deterministic && ring.deterministic.is_none() {
                 return Err(format!(
-                    "Encrypted column requires deterministic mode but `{CREDENTIALS_NAMESPACE}.deterministic_key` is missing.\n  \
+                    "An encrypted column requires deterministic encryption (deterministic mode \
+                     or `versioned_ciphertext`) but `{CREDENTIALS_NAMESPACE}.deterministic_key` is missing.\n  \
                      hint: add it with `autumn credentials edit` (generate one with `openssl rand -hex 32`)."
                 ));
             }
@@ -768,6 +785,23 @@ mod tests {
         let r = ring();
         let env = r.encrypt(Mode::Randomized, b"hello").unwrap();
         assert_eq!(r.decrypt(&env).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn deterministic_key_rotation_reads_old_rows() {
+        // Row written under DET as the deterministic key.
+        let old = KeyRing::from_master_hex(KEY_A, &[], Some(DET), salt()).unwrap();
+        let written = old.encrypt(Mode::Deterministic, b"pii").unwrap();
+
+        // Rotate the deterministic key to KEY_B; the former DET is retired.
+        let rotated =
+            KeyRing::from_master_hex(KEY_A, &[DET.to_string()], Some(KEY_B), salt()).unwrap();
+        // Old deterministic row still decrypts via the retired deterministic key.
+        assert_eq!(rotated.decrypt(&written).unwrap(), b"pii");
+        // New deterministic writes use the new key.
+        let fresh = rotated.encrypt(Mode::Deterministic, b"pii").unwrap();
+        assert_ne!(fresh, written, "new det key produces different ciphertext");
+        assert_eq!(rotated.decrypt(&fresh).unwrap(), b"pii");
     }
 
     #[test]

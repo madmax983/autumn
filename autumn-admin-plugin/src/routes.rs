@@ -998,9 +998,15 @@ fn strip_meta_fields(mut data: Value, fields: &[AdminField]) -> Value {
                 // Readonly field — drop it regardless of submitted value.
                 return false;
             }
-            // Drop blank string values on Password fields so admins editing
-            // unrelated fields don't overwrite stored hashes.
-            !matches!(v, Value::String(s) if s.is_empty() && matches!(field.kind, AdminFieldKind::Password))
+            // Drop blank string values on Password fields (so admins editing
+            // unrelated fields don't overwrite stored hashes) and on encrypted
+            // columns (#805) — their forms are intentionally rendered blank, so a
+            // blank submission means "leave the stored ciphertext unchanged"
+            // rather than "overwrite the secret with an encrypted empty string".
+            let blank = matches!(v, Value::String(s) if s.is_empty());
+            let preserve_on_blank = matches!(field.kind, AdminFieldKind::Password)
+                || autumn_web::encryption::is_encrypted_column_name(field.name);
+            !(blank && preserve_on_blank)
         });
     }
     data
