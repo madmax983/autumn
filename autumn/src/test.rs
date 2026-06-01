@@ -740,25 +740,31 @@ impl TestApp {
                 .wait_timeout(Some(timeout))
                 .create_timeout(Some(timeout))
                 .runtime(deadpool::Runtime::Tokio1)
-                .post_create(deadpool::managed::Hook::async_fn(|conn: &mut diesel_async::AsyncPgConnection, _metrics| {
-                    Box::pin(async move {
-                        use diesel_async::AsyncConnection;
-                        use diesel_async::RunQueryDsl;
+                .post_create(deadpool::managed::Hook::async_fn(
+                    |conn: &mut diesel_async::AsyncPgConnection, _metrics| {
+                        Box::pin(async move {
+                            use diesel_async::AsyncConnection;
+                            use diesel_async::RunQueryDsl;
 
-                        conn.begin_test_transaction().await.map_err(|e| {
-                            deadpool::managed::HookError::Backend(diesel_async::pooled_connection::PoolError::QueryError(e))
-                        })?;
-
-                        diesel::sql_query("SET autumn.test_transaction_started = 'true'")
-                            .execute(conn)
-                            .await
-                            .map_err(|e| {
-                                deadpool::managed::HookError::Backend(diesel_async::pooled_connection::PoolError::QueryError(e))
+                            conn.begin_test_transaction().await.map_err(|e| {
+                                deadpool::managed::HookError::Backend(
+                                    diesel_async::pooled_connection::PoolError::QueryError(e),
+                                )
                             })?;
 
-                        Ok(())
-                    })
-                }))
+                            diesel::sql_query("SET autumn.test_transaction_started = 'true'")
+                                .execute(conn)
+                                .await
+                                .map_err(|e| {
+                                    deadpool::managed::HookError::Backend(
+                                        diesel_async::pooled_connection::PoolError::QueryError(e),
+                                    )
+                                })?;
+
+                            Ok(())
+                        })
+                    },
+                ))
                 .build()
                 .expect("failed to build transactional pool of size 1");
 
