@@ -408,14 +408,22 @@ fn origin_matches_request(origin: &str, headers: &http::HeaderMap) -> bool {
         return false;
     };
 
-    let expected_host = headers
-        .get("x-forwarded-host")
-        .and_then(|v| v.to_str().ok())
-        .or_else(|| {
-            headers
-                .get(http::header::HOST)
-                .and_then(|v| v.to_str().ok())
-        });
+    #[allow(clippy::double_ended_iterator_last)]
+    let forwarded_host = headers
+        .get_all("x-forwarded-host")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|s| s.split(','))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .last();
+
+    let expected_host = forwarded_host.or_else(|| {
+        headers
+            .get(http::header::HOST)
+            .and_then(|v| v.to_str().ok())
+    });
+
     let Some(expected_host) = expected_host else {
         return false;
     };
@@ -423,14 +431,20 @@ fn origin_matches_request(origin: &str, headers: &http::HeaderMap) -> bool {
         return false;
     }
 
-    if let Some(scheme) = headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-    {
+    #[allow(clippy::double_ended_iterator_last)]
+    let forwarded_proto = headers
+        .get_all("x-forwarded-proto")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|s| s.split(','))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .last();
+
+    if let Some(outermost) = forwarded_proto {
         // Multiple `X-Forwarded-Proto` values can be chained by
-        // intermediaries; the leftmost (client-facing) is the one
-        // that matters here.
-        let outermost = scheme.split(',').next().unwrap_or(scheme).trim();
+        // intermediaries; the rightmost (proxy-appended) is the one
+        // that matters here because we must trust the proxy.
         return outermost.eq_ignore_ascii_case(origin_scheme);
     }
 
@@ -1202,8 +1216,9 @@ mod tests {
     }
 
     /// `X-Forwarded-Proto` may carry a chained list (e.g. through
-    /// nested proxies). The leftmost (client-facing) value is what
-    /// the browser saw; that's the value we must compare against.
+    /// nested proxies). We must compare against the rightmost value appended
+    /// by the trusted proxy, not the leftmost value which could be spoofed
+    /// by the client.
     #[tokio::test]
     async fn origin_scheme_match_via_chained_forwarded_proto() {
         let app = layered_router();
@@ -1215,10 +1230,9 @@ mod tests {
                     .header("content-type", "application/x-www-form-urlencoded")
                     .header("origin", "https://app.example")
                     .header("host", "app.example")
-                    // First hop saw HTTPS; later hops were HTTP between
-                    // proxy and app. Only the client-facing scheme
-                    // matters for the same-origin comparison.
-                    .header("x-forwarded-proto", "https, http")
+                    // Client spoofed HTTP; proxy correctly appended HTTPS.
+                    // The rightmost proxy value is trusted.
+                    .header("x-forwarded-proto", "http, https")
                     .body(Body::from("_method=DELETE"))
                     .unwrap(),
             )
@@ -1226,6 +1240,52 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn forwarded_host_rejects_spoofed_prepend() {
+        let app = layered_router();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/items/1")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .header("origin", "https://spoofed.example")
+                    // Attacker prepends their host, proxy appends the real host.
+                    .header("x-forwarded-host", "spoofed.example, app.example")
+                    .header("x-forwarded-proto", "https")
+                    .body(Body::from("_method=DELETE"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // The override must be rejected since the true host is app.example
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn forwarded_proto_rejects_spoofed_prepend() {
+        let app = layered_router();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/items/1")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .header("origin", "https://app.example")
+                    .header("host", "app.example")
+                    // Attacker prepends 'https', proxy appended 'http' because the real client used http
+                    .header("x-forwarded-proto", "https, http")
+                    .body(Body::from("_method=DELETE"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // The override must be rejected since the true protocol is http
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
     }
 
     /// When the proxy surfaces a different `X-Forwarded-Host`, that's

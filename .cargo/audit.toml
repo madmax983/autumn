@@ -1,0 +1,8 @@
+[advisories]
+ignore = [
+    "RUSTSEC-2023-0071", # rsa - No fixed upgrade available yet
+    "RUSTSEC-2026-0098", # rustls-webpki - aws-config is locked to an older rustls ecosystem.
+    "RUSTSEC-2026-0099", # rustls-webpki
+    "RUSTSEC-2026-0104", # rustls-webpki
+    "RUSTSEC-2026-0138"  # diesel-async - The vulnerability only affects the MySQL backend, but we exclusively use PostgreSQL. Upgrading to 0.9.0 introduces severe breaking changes (e.g., `AsyncConnection::transaction`).
+]
