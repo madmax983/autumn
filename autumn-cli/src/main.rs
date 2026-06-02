@@ -911,6 +911,13 @@ enum GenerateCommands {
         /// the `oauth2` feature on `autumn-web`, and `docs/guide/oauth.md`.
         #[arg(long, value_delimiter = ',', value_name = "PROVIDER")]
         oauth: Vec<String>,
+        /// Scaffold optional TOTP two-factor authentication (off by default).
+        /// Adds `totp_secret_encrypted` / `totp_enabled` columns to the user
+        /// model, a `recovery_codes` table, enrollment + login-verify handlers,
+        /// encrypted-at-rest secrets, single-use recovery codes, and generated
+        /// 2FA integration tests.
+        #[arg(long)]
+        totp: bool,
         /// Print the file plan and exit without writing anything.
         #[arg(long)]
         dry_run: bool,
@@ -1409,6 +1416,7 @@ fn run_generate_command(cmd: GenerateCommands) {
         GenerateCommands::Auth {
             name,
             oauth,
+            totp,
             dry_run,
             force,
         } => {
@@ -1417,6 +1425,7 @@ fn run_generate_command(cmd: GenerateCommands) {
                 &name,
                 generate::Flags { dry_run, force },
                 &oauth_options,
+                totp,
             );
         }
         GenerateCommands::Admin {
@@ -1563,6 +1572,29 @@ mod tests {
     #[test]
     fn no_args_is_error() {
         assert!(Cli::try_parse_from(["autumn"]).is_err());
+    }
+
+    #[test]
+    fn parse_generate_auth_totp_flag() {
+        let cli = Cli::try_parse_from(["autumn", "generate", "auth", "User", "--totp"]).unwrap();
+        match cli.command {
+            Commands::Generate(GenerateCommands::Auth { name, totp, .. }) => {
+                assert_eq!(name, "User");
+                assert!(totp, "--totp must set the totp flag");
+            }
+            _ => panic!("expected Generate Auth command"),
+        }
+    }
+
+    #[test]
+    fn generate_auth_totp_defaults_off() {
+        let cli = Cli::try_parse_from(["autumn", "generate", "auth", "User"]).unwrap();
+        match cli.command {
+            Commands::Generate(GenerateCommands::Auth { totp, .. }) => {
+                assert!(!totp, "totp must default to off");
+            }
+            _ => panic!("expected Generate Auth command"),
+        }
     }
 
     #[test]
