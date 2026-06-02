@@ -2053,6 +2053,7 @@ fn render_oauth_routes_file(
 //!   GET  /auth/:provider/callback  → exchanges the code and logs the user in
 
 use autumn_web::auth::{{OAuth2Callback, OidcIdentity, oauth2_authorize_url, oauth2_finish_login}};
+use autumn_web::config::AutumnConfig;
 use autumn_web::prelude::*;
 use autumn_web::{{get, oauth2_callback, AppState, State}};
 use axum::extract::{{Path, Query}};
@@ -2069,14 +2070,14 @@ const SUPPORTED_PROVIDERS: &[&str] = &[{provider_list}];
 #[get("/auth/{{provider}}/redirect")]
 pub async fn oauth_redirect(
     Path(provider_name): Path<String>,
-    State(state): State<AppState>,
+    config: AutumnConfig,
     session: Session,
 ) -> impl IntoResponse {{
     if !SUPPORTED_PROVIDERS.contains(&provider_name.as_str()) {{
         return Redirect::to("/login?error=unknown_provider").into_response();
     }}
 
-    let auth_cfg = state.config().auth;
+    let auth_cfg = config.auth;
     let Some(provider) = auth_cfg.oauth2.providers.get(&provider_name) else {{
         warn!(provider = %provider_name, "oauth provider not configured in autumn.toml");
         return Redirect::to("/login?error=provider_not_configured").into_response();
@@ -2096,21 +2097,25 @@ pub async fn oauth_redirect(
 /// On success the user is redirected to `/account`. A missing or mismatched state
 /// returns a non-revealing error redirect without logging the offending values.
 ///
-/// **Important:** `oauth2_finish_login` does NOT set the application session key.
-/// You must resolve (or create) the local {pascal_name} row and call
-/// `session.insert(&auth_cfg.session_key, local_user_id.to_string())` before redirecting.
+/// **Important:** `oauth2_finish_login` provisionally marks the session
+/// authenticated by writing the provider *subject* under the auth session key
+/// (and rotating the session id). That subject is NOT your local account id, so
+/// you must resolve (or create) the local {pascal_name} row and overwrite the key
+/// with `session.insert(&auth_cfg.session_key, local_user_id.to_string())` before
+/// redirecting — otherwise `#[secured]` routes would key off the raw subject.
 #[oauth2_callback("/auth/{{provider}}/callback")]
 pub async fn oauth_callback(
     Path(provider_name): Path<String>,
     Query(callback): Query<OAuth2Callback>,
     State(state): State<AppState>,
+    config: AutumnConfig,
     session: Session,
 ) -> impl IntoResponse {{
     if !SUPPORTED_PROVIDERS.contains(&provider_name.as_str()) {{
         return Redirect::to("/login?error=unknown_provider").into_response();
     }}
 
-    let auth_cfg = state.config().auth;
+    let auth_cfg = config.auth;
     let Some(provider) = auth_cfg.oauth2.providers.get(&provider_name) else {{
         warn!(provider = %provider_name, "oauth provider not configured in autumn.toml");
         return Redirect::to("/login?error=provider_not_configured").into_response();
@@ -2118,6 +2123,7 @@ pub async fn oauth_callback(
 
     let identity: OidcIdentity = match oauth2_finish_login(
         &session,
+        state.auth_session_key(),
         &provider_name,
         provider,
         &callback,
@@ -2131,9 +2137,13 @@ pub async fn oauth_callback(
         }}
     }};
 
-    // TODO: resolve or create a local {pascal_name} record, then set the session.
+    // TODO: resolve or create a local {pascal_name} record, then OVERWRITE the
+    // session key with its id.
     //
-    // Example (fill in your actual DB query):
+    // `oauth2_finish_login` above already wrote the provider *subject* under the
+    // auth session key, so until you replace it the session is authenticated as
+    // the raw subject rather than your local account. Resolve/link the account
+    // and overwrite it:
     //
     //   let local_user_id: i64 = link_or_create_{snake_name}(
     //       &mut db,
@@ -2143,9 +2153,6 @@ pub async fn oauth_callback(
     //   ).await?;
     //
     //   session.insert(&auth_cfg.session_key, local_user_id.to_string()).await;
-    //
-    // Until the above is implemented the user will NOT be logged in after the OAuth
-    // callback — that is intentional to avoid authenticating without a local account.
 {totp_callback_note}    let _ = identity;
     let _ = user_table_placeholder_{snake_name}();
 
@@ -3885,6 +3892,17 @@ mod tests {
         assert!(
             routes.contains("oauth2_finish_login"),
             "oauth_callback must call oauth2_finish_login: {routes}"
+        );
+        // The generated handlers must use the published autumn-web 0.4 API: the
+        // `AutumnConfig` extractor (not the removed `state.config()`) and the
+        // 5-arg `oauth2_finish_login` that takes the auth session key.
+        assert!(
+            routes.contains("config: AutumnConfig") && !routes.contains("state.config()"),
+            "oauth handlers must use the AutumnConfig extractor: {routes}"
+        );
+        assert!(
+            routes.contains("state.auth_session_key()"),
+            "oauth2_finish_login must be passed the auth session key: {routes}"
         );
     }
 
