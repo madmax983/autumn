@@ -75,10 +75,13 @@
 //! The `title` field is required; `description` and `order` are optional
 //! (defaulting to `""` and `0` respectively).
 
+mod preview;
 mod registry;
 mod renderer;
 mod types;
 
+#[cfg(feature = "maud")]
+pub use preview::{MarkdownInput, live_preview};
 pub use registry::MarkdownRegistry;
 pub use renderer::{heading_id, render};
 pub use types::{
