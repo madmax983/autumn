@@ -123,4 +123,25 @@ mod tests {
             "/x?tag=hello-world_foo.bar~baz"
         );
     }
+
+    #[test]
+    fn encode_path_segment_edge_cases() {
+        let cases = vec![
+            ("hello", "hello"),
+            ("a/b", "a%2Fb"),
+            ("hello world", "hello%20world"),
+            ("🚀", "%F0%9F%9A%80"),
+            ("äöü", "%C3%A4%C3%B6%C3%BC"),
+            ("-_.~", "-_.~"),
+            ("?&=", "%3F%26%3D"),
+            ("", ""),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                encode_path_segment(input),
+                expected,
+                "failed for input: {input}"
+            );
+        }
+    }
 }
