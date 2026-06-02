@@ -163,3 +163,31 @@ async fn main() {
         .run()
         .await;
 }
+
+#[cfg(test)]
+mod mutant_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_index_html_contains_required_elements() {
+        let html = index().await.into_string();
+        assert!(html.contains("Live list"));
+        assert!(html.contains("hx-ext=\"sse\""));
+        assert!(html.contains("sse-connect="));
+    }
+
+    #[test]
+    fn test_item_fragment_structure() {
+        let fragment = item_fragment(1, "test message");
+        let html = fragment.into_string();
+        assert!(html.contains("<li id=\"item-1\">test message</li>"));
+    }
+
+    #[test]
+    fn test_list_insert_fragment_structure() {
+        let fragment = list_insert_fragment(2, "inserted message");
+        let html = fragment.into_string();
+        assert!(html.contains("hx-swap-oob=\"beforeend\""));
+        assert!(html.contains("<li id=\"item-2\">inserted message</li>"));
+    }
+}
