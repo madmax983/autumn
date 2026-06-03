@@ -94,6 +94,7 @@ impl CsvRowError {
 ///
 /// `inserted + updated + skipped + errors.len()` equals the total number of
 /// data rows (non-header rows) in the CSV.
+#[non_exhaustive]
 #[derive(Debug, Default, Clone)]
 pub struct ImportReport {
     /// Rows that were inserted as new records.
@@ -123,6 +124,7 @@ impl ImportReport {
 // ── Import mode ───────────────────────────────────────────────────────────────
 
 /// Controls how imported rows are written to the database.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub enum ImportMode {
     /// Every row is inserted as a new record. Duplicate key errors are

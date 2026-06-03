@@ -1167,25 +1167,6 @@ pub fn model_import_form_page(
                     }
                 }
 
-                // multipart/form-data submissions bypass form-field CSRF scanning;
-                // send the token as a header instead (already checked by CsrfLayer step 1).
-                script {
-                    (maud::PreEscaped(r#"
-(function(){
-  var f=document.getElementById('autumn-csv-import-form');
-  if(!f)return;
-  f.addEventListener('submit',function(e){
-    e.preventDefault();
-    var tok=f.querySelector('[name="_csrf"]');
-    var hdr=tok?{'X-CSRF-Token':tok.value}:{};
-    fetch(f.action,{method:'POST',headers:hdr,body:new FormData(f)})
-      .then(function(r){return r.text();})
-      .then(function(h){document.open();document.write(h);document.close();});
-  });
-})();
-"#))
-                }
-
                 div style="margin-top: 2rem; padding-top: 1rem; border-top: 1px solid var(--border);" {
                     h3 style="font-size: 0.875rem; font-weight: 600; margin-bottom: 0.5rem;" {
                         "Tips"

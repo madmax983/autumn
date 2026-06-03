@@ -587,6 +587,10 @@ enum DataCommands {
         /// model's `list` implementation must honour the `search` field).
         #[arg(long, value_name = "EXPR")]
         r#where: Option<String>,
+        /// Raw `Cookie` header value for authenticated admin installs.
+        /// Copy from browser dev tools, e.g. `autumn_session=abc123`.
+        #[arg(long, value_name = "COOKIE")]
+        cookie: Option<String>,
     },
     /// Import rows from a CSV file into a model.
     ///
@@ -615,6 +619,10 @@ enum DataCommands {
         /// Column to use as the upsert key (enables upsert mode).
         #[arg(long, value_name = "COL")]
         upsert_by: Option<String>,
+        /// Raw `Cookie` header value for authenticated admin installs.
+        /// Copy from browser dev tools, e.g. `autumn_session=abc123`.
+        #[arg(long, value_name = "COOKIE")]
+        cookie: Option<String>,
     },
 }
 
@@ -1139,14 +1147,29 @@ fn run_command(command: Commands) {
             url,
             out,
             r#where,
-        }) => data::run_export(&model, &url, out.as_deref(), r#where.as_deref()),
+            cookie,
+        }) => data::run_export(
+            &model,
+            &url,
+            out.as_deref(),
+            r#where.as_deref(),
+            cookie.as_deref(),
+        ),
         Commands::Data(DataCommands::Import {
             model,
             url,
             input,
             dry_run,
             upsert_by,
-        }) => data::run_import(&model, &url, &input, dry_run, upsert_by.as_deref()),
+            cookie,
+        }) => data::run_import(
+            &model,
+            &url,
+            &input,
+            dry_run,
+            upsert_by.as_deref(),
+            cookie.as_deref(),
+        ),
         Commands::New {
             name,
             with_i18n,

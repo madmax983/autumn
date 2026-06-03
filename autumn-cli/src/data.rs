@@ -20,10 +20,16 @@ fn make_client() -> Result<Client, String> {
 
 /// `autumn data export <model> [options]`
 ///
-/// Calls `GET {url}/admin/{model}/export.csv` and writes the response body to
+/// Calls `GET {url}/{model}/export.csv` and writes the response body to
 /// `out` (or `{model}.csv` when omitted).
-pub fn run_export(model: &str, base_url: &str, out: Option<&str>, filter: Option<&str>) {
-    if let Err(e) = run_export_inner(model, base_url, out, filter) {
+pub fn run_export(
+    model: &str,
+    base_url: &str,
+    out: Option<&str>,
+    filter: Option<&str>,
+    cookie: Option<&str>,
+) {
+    if let Err(e) = run_export_inner(model, base_url, out, filter, cookie) {
         eprintln!("autumn data export: {e}");
         std::process::exit(1);
     }
@@ -34,6 +40,7 @@ fn run_export_inner(
     base_url: &str,
     out: Option<&str>,
     filter: Option<&str>,
+    cookie: Option<&str>,
 ) -> Result<(), String> {
     let client = make_client()?;
     let base = base_url.trim_end_matches('/');
@@ -47,10 +54,11 @@ fn run_export_inner(
 
     println!("Exporting {model} from {url}");
 
-    let response = client
-        .get(&url)
-        .send()
-        .map_err(|e| format!("Request failed: {e}"))?;
+    let mut req = client.get(&url);
+    if let Some(c) = cookie {
+        req = req.header("Cookie", c);
+    }
+    let response = req.send().map_err(|e| format!("Request failed: {e}"))?;
 
     if !response.status().is_success() {
         return Err(format!(
@@ -79,7 +87,7 @@ fn run_export_inner(
 
 /// `autumn data import <model> --in <file> [options]`
 ///
-/// Uploads `input` as a multipart CSV to `POST {url}/admin/{model}/import`.
+/// Uploads `input` as a multipart CSV to `POST {url}/{model}/import`.
 /// Prints the resulting `ImportReport` summary to stdout.
 pub fn run_import(
     model: &str,
@@ -87,6 +95,7 @@ pub fn run_import(
     input: &str,
     dry_run: bool,
     upsert_by: Option<&str>,
+    cookie: Option<&str>,
 ) {
     if upsert_by.is_some() {
         eprintln!(
@@ -95,13 +104,19 @@ pub fn run_import(
         );
         std::process::exit(1);
     }
-    if let Err(e) = run_import_inner(model, base_url, input, dry_run) {
+    if let Err(e) = run_import_inner(model, base_url, input, dry_run, cookie) {
         eprintln!("autumn data import: {e}");
         std::process::exit(1);
     }
 }
 
-fn run_import_inner(model: &str, base_url: &str, input: &str, dry_run: bool) -> Result<(), String> {
+fn run_import_inner(
+    model: &str,
+    base_url: &str,
+    input: &str,
+    dry_run: bool,
+    cookie: Option<&str>,
+) -> Result<(), String> {
     let client = make_client()?;
     let base = base_url.trim_end_matches('/');
     let url = format!("{base}/{model}/import");
@@ -115,8 +130,11 @@ fn run_import_inner(model: &str, base_url: &str, input: &str, dry_run: bool) -> 
     // we can extract the matching token value from the hidden input. This two-step
     // GET→POST is required because Autumn's CSRF middleware rejects unsafe methods
     // that lack a matching cookie+form-field pair.
-    let form_html = client
-        .get(&url)
+    let mut get_req = client.get(&url);
+    if let Some(c) = cookie {
+        get_req = get_req.header("Cookie", c);
+    }
+    let form_html = get_req
         .send()
         .map_err(|e| format!("Failed to fetch import form: {e}"))?
         .text()
@@ -146,9 +164,11 @@ fn run_import_inner(model: &str, base_url: &str, input: &str, dry_run: bool) -> 
         form = form.text("_csrf", csrf_token);
     }
 
-    let response = client
-        .post(&url)
-        .multipart(form)
+    let mut post_req = client.post(&url).multipart(form);
+    if let Some(c) = cookie {
+        post_req = post_req.header("Cookie", c);
+    }
+    let response = post_req
         .send()
         .map_err(|e| format!("Request failed: {e}"))?;
 

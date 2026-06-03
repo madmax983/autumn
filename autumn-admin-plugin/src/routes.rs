@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::LazyLock;
 
+use autumn_web::extract::Multipart;
 use autumn_web::flash::Flash;
 use autumn_web::job::{JobAdminQuery, JobAdminSnapshot, JobScheduleSummary, job_admin_backend};
 use autumn_web::prelude::HxResponseExt;
@@ -1004,7 +1005,7 @@ async fn model_import_csv(
     Path(slug): Path<String>,
     csrf: AdminCsrf,
     flash: Flash,
-    mut multipart: axum::extract::Multipart,
+    mut multipart: Multipart,
 ) -> AutumnResult<Response> {
     let (pool, model) = resolve(&state, &registry, &slug)?;
 
@@ -1018,26 +1019,14 @@ async fn model_import_csv(
     let mut csv_bytes: Option<Vec<u8>> = None;
     let mut import_mode = CsvImportMode::Insert;
 
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|e| AutumnError::bad_request_msg(format!("Multipart error: {e}")))?
-    {
+    while let Some(field) = multipart.next_field().await? {
         match field.name() {
             Some("file") => {
-                csv_bytes = Some(
-                    field
-                        .bytes()
-                        .await
-                        .map_err(|e| AutumnError::bad_request_msg(format!("File read error: {e}")))?
-                        .to_vec(),
-                );
+                csv_bytes = Some(field.bytes_limited().await?);
             }
             Some("mode") => {
-                let val = field
-                    .text()
-                    .await
-                    .map_err(|e| AutumnError::bad_request_msg(format!("Mode field error: {e}")))?;
+                let bytes = field.bytes_limited().await?;
+                let val = String::from_utf8_lossy(&bytes).into_owned();
                 import_mode = CsvImportMode::from_form_value(&val);
             }
             _ => {}
