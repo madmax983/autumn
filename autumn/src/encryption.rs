@@ -1135,18 +1135,57 @@ mod tests {
             "must equal the deterministic ciphertext used on write"
         );
 
-        // Randomized column: equality lookups are impossible by design -> error.
+        // Randomized column: equality lookups are impossible by design -> error,
+        // and the message names the offending column and the fix.
         let err = encode_derived_query_param("dq_table", "rnd_col", "x").unwrap_err();
         assert!(matches!(
             err,
             EncryptionError::RandomizedEqualityLookup { .. }
         ));
+        let msg = err.to_string();
+        assert!(msg.contains("dq_table.rnd_col"), "names the column: {msg}");
+        assert!(msg.contains("deterministic"), "suggests the fix: {msg}");
 
         // Non-encrypted column: pure passthrough.
         assert_eq!(
             encode_derived_query_param("dq_table", "not_encrypted", "plain").unwrap(),
             "plain"
         );
+    }
+
+    #[test]
+    fn decrypt_persisted_columns_handles_each_branch() {
+        install_key_ring(KeyRing::from_master_hex(KEY_A, &[], Some(DET), salt()).unwrap());
+
+        // A persisted snapshot: a recoverable envelope, a null, and a column that
+        // is not registered as encrypted.
+        let envelope = encrypt_text(Mode::Deterministic, "secret@x.com").unwrap();
+        let mut v = serde_json::json!({
+            "det_col": envelope,
+            "rnd_col": serde_json::Value::Null,
+            "not_registered": "plain",
+        });
+        decrypt_persisted_columns_in_value("dq_table", &mut v);
+        assert_eq!(
+            v["det_col"], "secret@x.com",
+            "recoverable envelope decrypts"
+        );
+        assert!(v["rnd_col"].is_null(), "null is left untouched");
+        assert_eq!(
+            v["not_registered"], "plain",
+            "unregistered column untouched"
+        );
+
+        // A non-recoverable value (e.g. the `<encrypted>` fallback marker or a
+        // legacy plaintext row) is left exactly as-is so reconstruction proceeds.
+        let mut marker = serde_json::json!({ "det_col": "<encrypted>" });
+        decrypt_persisted_columns_in_value("dq_table", &mut marker);
+        assert_eq!(marker["det_col"], "<encrypted>");
+
+        // A non-object value passes through without panicking.
+        let mut arr = serde_json::json!([1, 2, 3]);
+        decrypt_persisted_columns_in_value("dq_table", &mut arr);
+        assert!(arr.is_array());
     }
 
     #[test]
