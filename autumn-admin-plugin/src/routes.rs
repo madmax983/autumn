@@ -15,7 +15,7 @@ use autumn_web::extract::Multipart;
 use autumn_web::flash::Flash;
 use autumn_web::job::{JobAdminQuery, JobAdminSnapshot, JobScheduleSummary, job_admin_backend};
 use autumn_web::prelude::HxResponseExt;
-use autumn_web::security::{CsrfFormField, CsrfToken};
+use autumn_web::security::{CsrfFormField, CsrfToken, CsrfTokenHeader};
 use autumn_web::{AppState, AutumnError, AutumnResult};
 use axum::extract::{FromRequestParts, Path, Query, State};
 use axum::http::request::Parts;
@@ -49,6 +49,7 @@ use crate::traits::{
 pub struct AdminCsrf {
     token: String,
     form_field: String,
+    token_header: String,
 }
 
 impl AdminCsrf {
@@ -67,6 +68,16 @@ impl AdminCsrf {
             &self.form_field
         }
     }
+
+    /// The configured CSRF token header name, or `"X-CSRF-Token"` when CSRF is absent.
+    #[must_use]
+    pub fn token_header(&self) -> &str {
+        if self.token_header.is_empty() {
+            "X-CSRF-Token"
+        } else {
+            &self.token_header
+        }
+    }
 }
 
 impl<S: Send + Sync> FromRequestParts<S> for AdminCsrf {
@@ -82,7 +93,15 @@ impl<S: Send + Sync> FromRequestParts<S> for AdminCsrf {
             .extensions
             .get::<CsrfFormField>()
             .map_or_else(|| "_csrf".to_owned(), |field| field.0.clone());
-        Ok(Self { token, form_field })
+        let token_header = parts
+            .extensions
+            .get::<CsrfTokenHeader>()
+            .map_or_else(|| "X-CSRF-Token".to_owned(), |h| h.0.clone());
+        Ok(Self {
+            token,
+            form_field,
+            token_header,
+        })
     }
 }
 
@@ -384,6 +403,7 @@ async fn dashboard(
         &counts,
         &messages,
         csrf.token(),
+        csrf.token_header(),
         &prefix,
         &actuator_prefix,
         show_config,
@@ -415,6 +435,7 @@ async fn jobs_dashboard(
         &messages,
         csrf.token(),
         csrf.form_field(),
+        csrf.token_header(),
         &prefix,
         &actuator_prefix,
         show_config,
@@ -561,6 +582,7 @@ async fn model_list(
         &messages,
         csrf.token(),
         csrf.form_field(),
+        csrf.token_header(),
         &prefix,
         &actuator_prefix,
         show_config,
@@ -596,6 +618,7 @@ async fn model_new_form(
         &messages,
         csrf.token(),
         csrf.form_field(),
+        csrf.token_header(),
         &prefix,
         &actuator_prefix,
         show_config,
@@ -670,6 +693,7 @@ async fn model_detail(
         id,
         &messages,
         csrf.token(),
+        csrf.token_header(),
         &prefix,
         &actuator_prefix,
         model.has_history(),
@@ -690,6 +714,7 @@ async fn model_history(
     axum::Extension(HasRuntimeConfig(show_config)): axum::Extension<HasRuntimeConfig>,
     Path((slug, id)): Path<(String, i64)>,
     Query(params): Query<HashMap<String, String>>,
+    csrf: AdminCsrf,
 ) -> AutumnResult<Response> {
     let (pool, model) = resolve(&state, &registry, &slug)?;
 
@@ -720,6 +745,7 @@ async fn model_history(
         &history,
         &prefix,
         &actuator_prefix,
+        csrf.token_header(),
         show_config,
     )))
 }
@@ -759,6 +785,7 @@ async fn model_edit_form(
         &messages,
         csrf.token(),
         csrf.form_field(),
+        csrf.token_header(),
         &prefix,
         &actuator_prefix,
         show_config,
@@ -988,6 +1015,7 @@ async fn model_import_form(
         &messages,
         csrf.token(),
         csrf.form_field(),
+        csrf.token_header(),
         &prefix,
         &actuator_prefix,
         show_config,
@@ -1105,6 +1133,7 @@ async fn model_import_csv(
         import_mode,
         &messages,
         csrf.token(),
+        csrf.token_header(),
         &prefix,
         &actuator_prefix,
         show_config,
@@ -1132,6 +1161,7 @@ async fn config_list(
         &messages,
         csrf.token(),
         csrf.form_field(),
+        csrf.token_header(),
         &prefix,
         &actuator_prefix,
     )))
@@ -1200,6 +1230,7 @@ async fn config_key_history(
         &history,
         &messages,
         csrf.token(),
+        csrf.token_header(),
         &prefix,
         &actuator_prefix,
     )))

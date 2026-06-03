@@ -402,6 +402,7 @@ pub fn admin_layout(
     prefix: &str,
     actuator_prefix: &str,
     csrf_token: &str,
+    csrf_token_header: &str,
     messages: &[FlashMessage],
     show_config: bool,
     content: &Markup,
@@ -414,8 +415,10 @@ pub fn admin_layout(
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 // CSRF token for HTMX requests (hx-delete, hx-post). The
                 // companion script at HTMX_CSRF_JS_PATH reads this meta tag
-                // and attaches `X-CSRF-Token` to outgoing htmx requests.
-                meta name="csrf-token" content=(csrf_token);
+                // and attaches the configured header to outgoing htmx requests.
+                // The admin JS multipart handler uses data-header to send the
+                // right header name when security.csrf.token_header is customised.
+                meta name="csrf-token" content=(csrf_token) data-header=(csrf_token_header);
                 title { (title) " — Autumn Admin" }
                 script src=(HTMX_JS_PATH) {}
                 script src=(HTMX_CSRF_JS_PATH) {}
@@ -502,6 +505,7 @@ pub fn jobs_page(
     messages: &[FlashMessage],
     csrf_token: &str,
     csrf_form_field: &str,
+    csrf_token_header: &str,
     prefix: &str,
     actuator_prefix: &str,
     show_config: bool,
@@ -570,6 +574,7 @@ pub fn jobs_page(
         prefix,
         actuator_prefix,
         csrf_token,
+        csrf_token_header,
         messages,
         show_config,
         &content,
@@ -809,11 +814,13 @@ fn optional_text(value: Option<&str>) -> Markup {
 // ── Dashboard ───────────────────────────────────────────────────────
 
 /// Render the admin dashboard with model counts.
+#[allow(clippy::too_many_arguments)]
 pub fn dashboard_page(
     registry: &AdminRegistry,
     model_counts: &[(&str, &str, u64)], // (slug, display_name_plural, count)
     messages: &[FlashMessage],
     csrf_token: &str,
+    csrf_token_header: &str,
     prefix: &str,
     actuator_prefix: &str,
     show_config: bool,
@@ -853,6 +860,7 @@ pub fn dashboard_page(
         prefix,
         actuator_prefix,
         csrf_token,
+        csrf_token_header,
         messages,
         show_config,
         &content,
@@ -880,6 +888,7 @@ pub fn model_list_page(
     messages: &[FlashMessage],
     csrf_token: &str,
     csrf_form_field: &str,
+    csrf_token_header: &str,
     prefix: &str,
     actuator_prefix: &str,
     show_config: bool,
@@ -1093,6 +1102,7 @@ pub fn model_list_page(
         prefix,
         actuator_prefix,
         csrf_token,
+        csrf_token_header,
         messages,
         show_config,
         &content,
@@ -1110,6 +1120,7 @@ pub fn model_import_form_page(
     messages: &[FlashMessage],
     csrf_token: &str,
     csrf_form_field: &str,
+    csrf_token_header: &str,
     prefix: &str,
     actuator_prefix: &str,
     show_config: bool,
@@ -1192,6 +1203,7 @@ pub fn model_import_form_page(
         prefix,
         actuator_prefix,
         csrf_token,
+        csrf_token_header,
         messages,
         show_config,
         &content,
@@ -1208,6 +1220,7 @@ pub fn model_import_result_page(
     mode: CsvImportMode,
     messages: &[FlashMessage],
     csrf_token: &str,
+    csrf_token_header: &str,
     prefix: &str,
     actuator_prefix: &str,
     show_config: bool,
@@ -1306,6 +1319,7 @@ pub fn model_import_result_page(
         prefix,
         actuator_prefix,
         csrf_token,
+        csrf_token_header,
         messages,
         show_config,
         &content,
@@ -1330,6 +1344,7 @@ pub fn model_detail_page(
     id: i64,
     messages: &[FlashMessage],
     csrf_token: &str,
+    csrf_token_header: &str,
     prefix: &str,
     actuator_prefix: &str,
     has_history: bool,
@@ -1382,6 +1397,7 @@ pub fn model_detail_page(
         prefix,
         actuator_prefix,
         csrf_token,
+        csrf_token_header,
         messages,
         show_config,
         &content,
@@ -1405,6 +1421,7 @@ pub fn model_form_page(
     messages: &[FlashMessage],
     csrf_token: &str,
     csrf_form_field: &str,
+    csrf_token_header: &str,
     prefix: &str,
     actuator_prefix: &str,
     show_config: bool,
@@ -1472,6 +1489,7 @@ pub fn model_form_page(
         prefix,
         actuator_prefix,
         csrf_token,
+        csrf_token_header,
         messages,
         show_config,
         &content,
@@ -1488,6 +1506,7 @@ pub fn config_page(
     messages: &[FlashMessage],
     csrf_token: &str,
     csrf_form_field: &str,
+    csrf_token_header: &str,
     prefix: &str,
     actuator_prefix: &str,
 ) -> Markup {
@@ -1594,6 +1613,7 @@ pub fn config_page(
         prefix,
         actuator_prefix,
         csrf_token,
+        csrf_token_header,
         messages,
         true,
         &content,
@@ -1608,6 +1628,7 @@ pub fn config_history_page(
     history: &[ConfigChangeRecord],
     messages: &[FlashMessage],
     csrf_token: &str,
+    csrf_token_header: &str,
     prefix: &str,
     actuator_prefix: &str,
 ) -> Markup {
@@ -1689,6 +1710,7 @@ pub fn config_history_page(
         prefix,
         actuator_prefix,
         csrf_token,
+        csrf_token_header,
         messages,
         true,
         &content,
@@ -2100,6 +2122,7 @@ pub fn model_history_page(
     history: &AdminHistoryPage,
     prefix: &str,
     actuator_prefix: &str,
+    csrf_token_header: &str,
     show_config: bool,
 ) -> Markup {
     let record_display = format!("{model_name} #{record_id_val}");
@@ -2225,6 +2248,7 @@ pub fn model_history_page(
         prefix,
         actuator_prefix,
         "",
+        csrf_token_header,
         empty_messages,
         show_config,
         &content,

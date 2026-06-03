@@ -317,6 +317,14 @@ impl AdminModel for PostAdmin {
                 body,
                 published,
             };
+            let new_post = match new_post.validated() {
+                Ok(p) => p,
+                Err(e) => {
+                    return Ok(AdminImportRowResult::RowError(format!(
+                        "line {line}: validation failed: {e}"
+                    )));
+                }
+            };
 
             let conn_result = pool.get().await;
             let mut conn = match conn_result {
