@@ -1580,10 +1580,10 @@ fn tailwind_enabled() -> bool {
 
 fn resolve_compression_enabled() -> bool {
     // 1. Env var takes highest precedence (matches apply_compression_env_overrides_with_env).
-    if let Ok(val) = std::env::var("AUTUMN_COMPRESSION__ENABLED") {
-        if let Some(enabled) = parse_config_bool(&val) {
-            return enabled;
-        }
+    if let Ok(val) = std::env::var("AUTUMN_COMPRESSION__ENABLED")
+        && let Some(enabled) = parse_config_bool(&val)
+    {
+        return enabled;
     }
 
     // 2. Read TOML, applying profile-specific override when a profile is active
@@ -1604,15 +1604,14 @@ fn resolve_compression_enabled() -> bool {
     };
 
     // Profile-specific section takes precedence over base config.
-    if !profile.is_empty() {
-        if let Some(enabled) = table
+    if !profile.is_empty()
+        && let Some(enabled) = table
             .get("profile")
             .and_then(|v| v.get(&profile))
             .and_then(toml::Value::as_table)
-            .and_then(|t| parse_enabled(t))
-        {
-            return enabled;
-        }
+            .and_then(&parse_enabled)
+    {
+        return enabled;
     }
 
     parse_enabled(&table).unwrap_or(false)
