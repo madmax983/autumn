@@ -568,6 +568,90 @@ fn version_history_migration_has_tenant_scope_column_and_index() {
     );
 }
 
+// ── Generator conformance CI gate (issue #1017) ───────────────────────────────
+
+#[test]
+fn generator_conformance_ci_gate_is_configured() {
+    let root = workspace_root();
+
+    // AC-1 / AC-2: A dedicated workflow file must exist that runs the ignored
+    // generator conformance tests (compiled compile/serve gates) — NOT just
+    // `cargo test --workspace` which skips all `#[ignore]`d tests.
+    let workflow_path = root.join(".github/workflows/generator-conformance.yml");
+    let workflow = std::fs::read_to_string(&workflow_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", workflow_path.display()));
+
+    // The three non-Postgres gates must be invoked explicitly via --ignored.
+    for test_name in [
+        "generated_project_compiles_runs_and_serves",
+        "generated_scaffold_cargo_checks",
+        "generated_scaffold_config_cargo_checks",
+    ] {
+        assert!(
+            workflow.contains(test_name),
+            "generator-conformance.yml must invoke `{test_name}` via --ignored; \
+             these tests are CI-gated, not abandoned — see CONTRIBUTING.md",
+        );
+    }
+
+    // The Postgres-dependent gate must also be present (AC-2).
+    assert!(
+        workflow.contains("generated_scaffold_serves_posts_index_and_json_api"),
+        "generator-conformance.yml must run the Postgres e2e gate \
+         `generated_scaffold_serves_posts_index_and_json_api`",
+    );
+
+    // AC-4: path filters must cover the generator template surface and the
+    // autumn-web public API so the gate only fires on relevant changes.
+    for path_fragment in [
+        "autumn-cli/src/generate",
+        "autumn-cli/src/templates",
+        "autumn-cli/src/new.rs",
+        "autumn/src/lib.rs",
+        "autumn-macros",
+    ] {
+        assert!(
+            workflow.contains(path_fragment),
+            "generator-conformance.yml must declare a path filter covering `{path_fragment}`",
+        );
+    }
+
+    // AC-4: a scheduled run catches regressions on branches where the path
+    // filter would not trigger.
+    assert!(
+        workflow.contains("schedule"),
+        "generator-conformance.yml must include a cron schedule so generator rot \
+         is caught even when no template or prelude file was touched directly",
+    );
+}
+
+#[test]
+fn contributing_documents_ignored_generator_tests() {
+    let root = workspace_root();
+
+    // AC-6: CONTRIBUTING.md must explain that the generator conformance tests
+    // carry #[ignore] annotations but are still machine-verified by CI, so
+    // contributors do not assume these tests are abandoned.
+    let contributing_path = root.join("CONTRIBUTING.md");
+    let contributing = std::fs::read_to_string(&contributing_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", contributing_path.display()));
+
+    assert!(
+        contributing.contains("generator-conformance"),
+        "CONTRIBUTING.md must mention the `generator-conformance` CI gate",
+    );
+    assert!(
+        contributing.contains("#[ignore]"),
+        "CONTRIBUTING.md must explain that `#[ignore]` on generator tests means \
+         CI-gated, not abandoned",
+    );
+    assert!(
+        contributing.contains("autumn-cli/src/generate")
+            || contributing.contains("autumn-cli/src/templates"),
+        "CONTRIBUTING.md must name the generator template paths that trigger the gate",
+    );
+}
+
 #[test]
 fn runtime_config_migration_sorts_after_existing_framework_versions() {
     let root = workspace_root();
