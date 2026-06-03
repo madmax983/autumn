@@ -67,6 +67,15 @@ const CSRF_FORBIDDEN_MESSAGE: &str = "CSRF token missing or invalid";
 #[derive(Clone, Debug)]
 pub struct CsrfFormField(pub String);
 
+/// The configured CSRF token header name, placed in request extensions by [`CsrfLayer`].
+///
+/// Templates can read this to emit the correct `data-header` attribute on the
+/// `<meta name="csrf-token">` tag so JavaScript CSRF helpers (e.g. the admin panel
+/// multipart submit handler) use the configured header name rather than defaulting
+/// to `X-CSRF-Token`.
+#[derive(Clone, Debug)]
+pub struct CsrfTokenHeader(pub String);
+
 /// A CSRF token extracted from the request.
 ///
 /// Use this as a handler parameter to access the CSRF token for embedding
@@ -371,10 +380,14 @@ where
             }
         });
 
-        // Insert CsrfToken and the configured form field name into request extensions.
+        // Insert CsrfToken, the configured form field name, and the configured
+        // token header name into request extensions.
         req.extensions_mut().insert(CsrfToken(token.clone()));
         req.extensions_mut()
             .insert(CsrfFormField(self.settings.form_field.clone()));
+        req.extensions_mut().insert(CsrfTokenHeader(
+            self.settings.token_header.as_str().to_owned(),
+        ));
 
         // Check if we need to set a cookie
         let set_cookie = if cookie_token.is_none() {

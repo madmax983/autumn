@@ -23,6 +23,7 @@ multipart = ["axum/multipart"]
 tailwind = []
 http-client = ["dep:reqwest"]
 oauth2 = ["http-client"]
+webauthn = ["dep:webauthn-rs"]
 openapi = ["dep:serde_yaml"]
 # Optional Markdown rendering with frontmatter parsing and SSG integration.
 markdown = ["dep:pulldown-cmark"]
@@ -64,6 +65,12 @@ mail = ["dep:lettre", "maud"]
 # Depends on `db`; off by default so apps that don't seed pay zero compile cost.
 seed = ["db"]
 system-info = []
+# First-class CSV import and export for `#[repository]` models.
+# Adds `autumn_web::data::csv` (streaming export, row-by-row import with
+# structured error reporting) and the matching admin-panel routes and
+# `autumn data` CLI subcommand.  Off by default so the `csv` crate is
+# opt-in.
+csv = ["dep:csv"]
 
 [dependencies]
 autumn-macros = { version = "0.4.0", path = "../autumn-macros" }
@@ -119,6 +126,7 @@ base64 = "0.22"
 url = "2.5.8"
 percent-encoding = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
+webauthn-rs = { version = "0.5", features = ["danger-allow-state-serialisation"], optional = true }
 jsonwebtoken = { version = "10.1.0", default-features = false, features = ["rust_crypto"] }
 lru = "0.18.0"
 hmac = "0.12"
@@ -126,6 +134,7 @@ sha2 = "0.10"
 aes-gcm = "0.10"
 getrandom = "0.2"
 hex = "0.4"
+csv = { workspace = true, optional = true }
 lettre = { version = "0.11.21", default-features = false, features = ["builder", "smtp-transport", "tokio1-rustls-tls"], optional = true }
 
 [dev-dependencies]
@@ -157,7 +166,7 @@ features = [
   "maud", "htmx", "tailwind", "db", "cache-moka",
   "ws", "flash", "multipart", "http-client", "oauth2", "openapi",
   "redis", "i18n", "storage", "mail", "seed", "system-info", "markdown",
-  "reporting",
+  "reporting", "csv",
 ]
 rustdoc-args = ["--cfg", "docsrs"]
 

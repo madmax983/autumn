@@ -43,14 +43,16 @@ mod traits;
 pub use registry::AdminRegistry;
 pub use traits::{
     AdminAction, AdminError, AdminField, AdminFieldKind, AdminFuture, AdminHistoryEntry,
-    AdminHistoryPage, AdminModel, ListParams, ListResult, SelectOption, SortDirection,
+    AdminHistoryPage, AdminImportError, AdminImportReport, AdminImportRowResult, AdminModel,
+    CsvImportMode, ListParams, ListResult, SelectOption, SortDirection,
 };
 
 /// Common downstream imports for implementing admin models.
 pub mod prelude {
     pub use crate::{
         AdminError, AdminField, AdminFieldKind, AdminFuture, AdminHistoryEntry, AdminHistoryPage,
-        AdminModel, ListParams, ListResult, SelectOption, SortDirection,
+        AdminImportRowResult, AdminModel, CsvImportMode, ListParams, ListResult, SelectOption,
+        SortDirection,
     };
 }
 
@@ -242,6 +244,9 @@ pub(crate) fn admin_route_infos(prefix: &str, has_config: bool) -> Vec<RouteInfo
         ("GET", format!("{prefix}/{{slug}}")),
         ("POST", format!("{prefix}/{{slug}}")),
         ("GET", format!("{prefix}/{{slug}}/new")),
+        ("GET", format!("{prefix}/{{slug}}/export.csv")),
+        ("GET", format!("{prefix}/{{slug}}/import")),
+        ("POST", format!("{prefix}/{{slug}}/import")),
         ("GET", format!("{prefix}/{{slug}}/{{id}}")),
         ("POST", format!("{prefix}/{{slug}}/{{id}}")),
         ("DELETE", format!("{prefix}/{{slug}}/{{id}}")),

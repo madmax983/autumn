@@ -15,7 +15,8 @@ use serde_json::Value;
 use crate::registry::AdminRegistry;
 use crate::routes::ADMIN_JS_PATH;
 use crate::traits::{
-    AdminAction, AdminField, AdminFieldKind, AdminHistoryPage, ListResult, SortDirection, record_id,
+    AdminAction, AdminField, AdminFieldKind, AdminHistoryPage, AdminImportReport, CsvImportMode,
+    ListResult, SortDirection, record_id,
 };
 
 const HTMX_JS_PATH: &str = "/static/js/htmx.min.js";
@@ -401,6 +402,7 @@ pub fn admin_layout(
     prefix: &str,
     actuator_prefix: &str,
     csrf_token: &str,
+    csrf_token_header: &str,
     messages: &[FlashMessage],
     show_config: bool,
     content: &Markup,
@@ -413,8 +415,10 @@ pub fn admin_layout(
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 // CSRF token for HTMX requests (hx-delete, hx-post). The
                 // companion script at HTMX_CSRF_JS_PATH reads this meta tag
-                // and attaches `X-CSRF-Token` to outgoing htmx requests.
-                meta name="csrf-token" content=(csrf_token);
+                // and attaches the configured header to outgoing htmx requests.
+                // The admin JS multipart handler uses data-header to send the
+                // right header name when security.csrf.token_header is customised.
+                meta name="csrf-token" content=(csrf_token) data-header=(csrf_token_header);
                 title { (title) " — Autumn Admin" }
                 script src=(HTMX_JS_PATH) {}
                 script src=(HTMX_CSRF_JS_PATH) {}
@@ -501,6 +505,7 @@ pub fn jobs_page(
     messages: &[FlashMessage],
     csrf_token: &str,
     csrf_form_field: &str,
+    csrf_token_header: &str,
     prefix: &str,
     actuator_prefix: &str,
     show_config: bool,
@@ -569,6 +574,7 @@ pub fn jobs_page(
         prefix,
         actuator_prefix,
         csrf_token,
+        csrf_token_header,
         messages,
         show_config,
         &content,
@@ -808,11 +814,13 @@ fn optional_text(value: Option<&str>) -> Markup {
 // ── Dashboard ───────────────────────────────────────────────────────
 
 /// Render the admin dashboard with model counts.
+#[allow(clippy::too_many_arguments)]
 pub fn dashboard_page(
     registry: &AdminRegistry,
     model_counts: &[(&str, &str, u64)], // (slug, display_name_plural, count)
     messages: &[FlashMessage],
     csrf_token: &str,
+    csrf_token_header: &str,
     prefix: &str,
     actuator_prefix: &str,
     show_config: bool,
@@ -852,6 +860,7 @@ pub fn dashboard_page(
         prefix,
         actuator_prefix,
         csrf_token,
+        csrf_token_header,
         messages,
         show_config,
         &content,
@@ -879,9 +888,12 @@ pub fn model_list_page(
     messages: &[FlashMessage],
     csrf_token: &str,
     csrf_form_field: &str,
+    csrf_token_header: &str,
     prefix: &str,
     actuator_prefix: &str,
     show_config: bool,
+    supports_csv_export: bool,
+    supports_csv_import: bool,
 ) -> Markup {
     // Password fields are documented as write-only — never surface their
     // values (raw or hashed) in the index view. Hidden fields are
@@ -897,6 +909,26 @@ pub fn model_list_page(
     // Pre-encode active filters into a `&filter.<k>=<v>` suffix so
     // sort/pagination links carry filter state forward without rebuilding it.
     let filters_enc = encode_filter_suffix(filters);
+    // Export URL preserves the current search/sort/filter state so "Download CSV"
+    // exports exactly the rows shown on the page, not the whole table.
+    let export_csv_url = {
+        let mut params: Vec<String> = Vec::new();
+        if !search_enc.is_empty() {
+            params.push(format!("q={search_enc}"));
+        }
+        if let Some(sort) = sort_by {
+            params.push(format!("sort={}", url_encode(sort)));
+            params.push(format!("dir={}", sort_dir.as_str()));
+        }
+        for (k, v) in filters {
+            params.push(format!("filter.{}={}", url_encode(k), url_encode(v)));
+        }
+        if params.is_empty() {
+            format!("{prefix}/{model_slug}/export.csv")
+        } else {
+            format!("{prefix}/{model_slug}/export.csv?{}", params.join("&"))
+        }
+    };
 
     let content = html! {
         // Breadcrumbs
@@ -914,8 +946,22 @@ pub fn model_list_page(
                         "(" (result.total) ")"
                     }
                 }
-                a href={ (prefix) "/" (model_slug) "/new" } class="btn btn-primary" {
-                    "+ Add " (model_slug.trim_end_matches('s'))
+                div style="display: flex; gap: 0.5rem; align-items: center;" {
+                    @if supports_csv_export {
+                        a href=(export_csv_url) class="btn btn-sm"
+                            title="Download all matching records as CSV" {
+                            "⬇ Download CSV"
+                        }
+                    }
+                    @if supports_csv_import {
+                        a href={ (prefix) "/" (model_slug) "/import" } class="btn btn-sm"
+                            title="Upload a CSV file to import records" {
+                            "⬆ Import CSV"
+                        }
+                    }
+                    a href={ (prefix) "/" (model_slug) "/new" } class="btn btn-primary" {
+                        "+ Add " (model_slug.trim_end_matches('s'))
+                    }
                 }
             }
 
@@ -1056,6 +1102,224 @@ pub fn model_list_page(
         prefix,
         actuator_prefix,
         csrf_token,
+        csrf_token_header,
+        messages,
+        show_config,
+        &content,
+    )
+}
+
+// ── CSV import form ──────────────────────────────────────────────────
+
+/// Render the CSV import upload form.
+#[allow(clippy::too_many_arguments)]
+pub fn model_import_form_page(
+    registry: &AdminRegistry,
+    model_slug: &str,
+    model_name_plural: &str,
+    messages: &[FlashMessage],
+    csrf_token: &str,
+    csrf_form_field: &str,
+    csrf_token_header: &str,
+    prefix: &str,
+    actuator_prefix: &str,
+    show_config: bool,
+) -> Markup {
+    let content = html! {
+        div class="breadcrumbs" {
+            a href=(prefix) { "Admin" }
+            span class="sep" { "›" }
+            a href={ (prefix) "/" (model_slug) } { (model_name_plural) }
+            span class="sep" { "›" }
+            span { "Import CSV" }
+        }
+
+        div class="card" {
+            div class="card-header" {
+                span class="card-title" { "Import " (model_name_plural) " from CSV" }
+            }
+
+            div style="padding: 1.5rem;" {
+                p style="color: var(--text-muted); margin-bottom: 1rem;" {
+                    "Upload a CSV file with a header row. Column names must match the model's field names."
+                }
+
+                form id="autumn-csv-import-form"
+                    method="post"
+                    action={ (prefix) "/" (model_slug) "/import" }
+                    enctype="multipart/form-data" {
+
+                    (csrf_hidden_input(csrf_token, csrf_form_field))
+
+                    div style="margin-bottom: 1rem;" {
+                        label for="csv-file" style="display: block; margin-bottom: 0.25rem; font-weight: 500;" {
+                            "CSV File"
+                        }
+                        input type="file" id="csv-file" name="file"
+                            accept=".csv,text/csv"
+                            required
+                            class="form-input" {}
+                    }
+
+                    div style="margin-bottom: 1.5rem;" {
+                        label for="import-mode" style="display: block; margin-bottom: 0.25rem; font-weight: 500;" {
+                            "Import Mode"
+                        }
+                        select id="import-mode" name="mode" class="form-input"
+                            style="width: auto; display: inline-block;" {
+                            option value="insert" selected { "Insert (add as new records)" }
+                            option value="dry_run" { "Dry Run (validate only, no writes)" }
+                        }
+                    }
+
+                    div style="display: flex; gap: 0.75rem; align-items: center;" {
+                        button type="submit" class="btn btn-primary" { "Upload and Import" }
+                        a href={ (prefix) "/" (model_slug) } class="btn" { "Cancel" }
+                    }
+                }
+
+                div style="margin-top: 2rem; padding-top: 1rem; border-top: 1px solid var(--border);" {
+                    h3 style="font-size: 0.875rem; font-weight: 600; margin-bottom: 0.5rem;" {
+                        "Tips"
+                    }
+                    ul style="color: var(--text-muted); font-size: 0.875rem; padding-left: 1.25rem;" {
+                        li { "The first row must be a header row with column names." }
+                        li { "Column names must match the model's field names." }
+                        li { "Use Dry Run to preview the import and catch errors before writing." }
+                        li {
+                            "Download a template: "
+                            a href={ (prefix) "/" (model_slug) "/export.csv" } { "export.csv" }
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    admin_layout(
+        registry,
+        Some(model_slug),
+        model_name_plural,
+        prefix,
+        actuator_prefix,
+        csrf_token,
+        csrf_token_header,
+        messages,
+        show_config,
+        &content,
+    )
+}
+
+/// Render the result page after a CSV import.
+#[allow(clippy::too_many_arguments)]
+pub fn model_import_result_page(
+    registry: &AdminRegistry,
+    model_slug: &str,
+    model_name_plural: &str,
+    report: &AdminImportReport,
+    mode: CsvImportMode,
+    messages: &[FlashMessage],
+    csrf_token: &str,
+    csrf_token_header: &str,
+    prefix: &str,
+    actuator_prefix: &str,
+    show_config: bool,
+) -> Markup {
+    let mode_label = match mode {
+        CsvImportMode::DryRun => "Dry Run",
+        CsvImportMode::Insert => "Insert",
+    };
+    let total = report.inserted + report.updated + report.skipped + report.errors.len() as u64;
+
+    let content = html! {
+        div class="breadcrumbs" {
+            a href=(prefix) { "Admin" }
+            span class="sep" { "›" }
+            a href={ (prefix) "/" (model_slug) } { (model_name_plural) }
+            span class="sep" { "›" }
+            span { "Import Result" }
+        }
+
+        div class="card" {
+            div class="card-header" {
+                span class="card-title" { "Import Report — " (mode_label) }
+            }
+
+            div style="padding: 1.5rem;" {
+                div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 1rem; margin-bottom: 1.5rem;" {
+                    div style="text-align: center; padding: 1rem; background: var(--success-light); border-radius: 0.375rem;" {
+                        div style="font-size: 1.5rem; font-weight: 700; color: var(--success);" { (report.inserted) }
+                        div style="font-size: 0.75rem; color: var(--text-muted);" { "Inserted" }
+                    }
+                    div style="text-align: center; padding: 1rem; background: var(--primary-light); border-radius: 0.375rem;" {
+                        div style="font-size: 1.5rem; font-weight: 700; color: var(--primary);" { (report.updated) }
+                        div style="font-size: 0.75rem; color: var(--text-muted);" { "Updated" }
+                    }
+                    div style="text-align: center; padding: 1rem; background: var(--border); border-radius: 0.375rem;" {
+                        div style="font-size: 1.5rem; font-weight: 700;" { (report.skipped) }
+                        div style="font-size: 0.75rem; color: var(--text-muted);" { "Skipped" }
+                    }
+                    div style="text-align: center; padding: 1rem; background: var(--danger-light); border-radius: 0.375rem;" {
+                        div style="font-size: 1.5rem; font-weight: 700; color: var(--danger);" { (report.errors.len()) }
+                        div style="font-size: 0.75rem; color: var(--text-muted);" { "Errors" }
+                    }
+                }
+
+                p style="color: var(--text-muted); font-size: 0.875rem; margin-bottom: 1.5rem;" {
+                    "Processed " (total) " data rows."
+                    @if matches!(mode, CsvImportMode::DryRun) {
+                        " (Dry run — no records were written.)"
+                    }
+                }
+
+                @if !report.errors.is_empty() {
+                    h3 style="font-size: 0.875rem; font-weight: 600; margin-bottom: 0.75rem; color: var(--danger);" {
+                        "Row Errors"
+                    }
+                    div class="table-wrap" {
+                        table {
+                            thead {
+                                tr {
+                                    th { "Line" }
+                                    th { "Column" }
+                                    th { "Message" }
+                                }
+                            }
+                            tbody {
+                                @for err in &report.errors {
+                                    tr {
+                                        td { (err.line) }
+                                        td {
+                                            @if let Some(col) = &err.column {
+                                                code { (col) }
+                                            } @else {
+                                                span style="color: var(--text-muted);" { "—" }
+                                            }
+                                        }
+                                        td { (err.message) }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                div style="display: flex; gap: 0.75rem; margin-top: 1.5rem;" {
+                    a href={ (prefix) "/" (model_slug) } class="btn btn-primary" { "Back to list" }
+                    a href={ (prefix) "/" (model_slug) "/import" } class="btn" { "Import another file" }
+                }
+            }
+        }
+    };
+
+    admin_layout(
+        registry,
+        Some(model_slug),
+        model_name_plural,
+        prefix,
+        actuator_prefix,
+        csrf_token,
+        csrf_token_header,
         messages,
         show_config,
         &content,
@@ -1080,6 +1344,7 @@ pub fn model_detail_page(
     id: i64,
     messages: &[FlashMessage],
     csrf_token: &str,
+    csrf_token_header: &str,
     prefix: &str,
     actuator_prefix: &str,
     has_history: bool,
@@ -1132,6 +1397,7 @@ pub fn model_detail_page(
         prefix,
         actuator_prefix,
         csrf_token,
+        csrf_token_header,
         messages,
         show_config,
         &content,
@@ -1155,6 +1421,7 @@ pub fn model_form_page(
     messages: &[FlashMessage],
     csrf_token: &str,
     csrf_form_field: &str,
+    csrf_token_header: &str,
     prefix: &str,
     actuator_prefix: &str,
     show_config: bool,
@@ -1222,6 +1489,7 @@ pub fn model_form_page(
         prefix,
         actuator_prefix,
         csrf_token,
+        csrf_token_header,
         messages,
         show_config,
         &content,
@@ -1238,6 +1506,7 @@ pub fn config_page(
     messages: &[FlashMessage],
     csrf_token: &str,
     csrf_form_field: &str,
+    csrf_token_header: &str,
     prefix: &str,
     actuator_prefix: &str,
 ) -> Markup {
@@ -1344,6 +1613,7 @@ pub fn config_page(
         prefix,
         actuator_prefix,
         csrf_token,
+        csrf_token_header,
         messages,
         true,
         &content,
@@ -1358,6 +1628,7 @@ pub fn config_history_page(
     history: &[ConfigChangeRecord],
     messages: &[FlashMessage],
     csrf_token: &str,
+    csrf_token_header: &str,
     prefix: &str,
     actuator_prefix: &str,
 ) -> Markup {
@@ -1439,6 +1710,7 @@ pub fn config_history_page(
         prefix,
         actuator_prefix,
         csrf_token,
+        csrf_token_header,
         messages,
         true,
         &content,
@@ -1850,6 +2122,7 @@ pub fn model_history_page(
     history: &AdminHistoryPage,
     prefix: &str,
     actuator_prefix: &str,
+    csrf_token_header: &str,
     show_config: bool,
 ) -> Markup {
     let record_display = format!("{model_name} #{record_id_val}");
@@ -1975,6 +2248,7 @@ pub fn model_history_page(
         prefix,
         actuator_prefix,
         "",
+        csrf_token_header,
         empty_messages,
         show_config,
         &content,
@@ -2213,7 +2487,16 @@ mod tests {
         };
 
         let html = model_history_page(
-            &r, "posts", "Post", "Posts", 42, &history, "/admin", "/ops", false,
+            &r,
+            "posts",
+            "Post",
+            "Posts",
+            42,
+            &history,
+            "/admin",
+            "/ops",
+            "X-CSRF-Token",
+            false,
         )
         .into_string();
 
@@ -2230,7 +2513,17 @@ mod tests {
     #[test]
     fn dashboard_emits_csrf_meta_and_script() {
         let r = dummy_registry();
-        let html = dashboard_page(&r, &[], &[], "tok-123", "/admin", "/ops", false).into_string();
+        let html = dashboard_page(
+            &r,
+            &[],
+            &[],
+            "tok-123",
+            "X-CSRF-Token",
+            "/admin",
+            "/ops",
+            false,
+        )
+        .into_string();
         assert!(
             html.contains(r#"<meta name="csrf-token" content="tok-123""#),
             "CSRF meta tag missing: {html}"
@@ -2244,7 +2537,8 @@ mod tests {
     #[test]
     fn dashboard_uses_configured_actuator_prefix() {
         let r = dummy_registry();
-        let html = dashboard_page(&r, &[], &[], "tok", "/admin", "/ops", false).into_string();
+        let html = dashboard_page(&r, &[], &[], "tok", "X-CSRF-Token", "/admin", "/ops", false)
+            .into_string();
         assert!(
             html.contains(r#"href="/ops/ui""#),
             "sidebar link wrong: {html}"
@@ -2355,6 +2649,7 @@ mod tests {
             &[],
             "tok-job",
             "authenticity_token",
+            "X-CSRF-Token",
             "/admin",
             "/actuator",
             false,
@@ -2403,6 +2698,7 @@ mod tests {
             &[],
             "tok-xyz",
             "authenticity_token",
+            "X-CSRF-Token",
             "/admin",
             "/actuator",
             false,
@@ -2432,6 +2728,7 @@ mod tests {
             &[],
             "t",
             "_csrf",
+            "X-CSRF-Token",
             "/admin",
             "/actuator",
             false,
@@ -2465,6 +2762,7 @@ mod tests {
             &[],
             "t",
             "_csrf",
+            "X-CSRF-Token",
             "/admin",
             "/actuator",
             false,
@@ -2496,6 +2794,7 @@ mod tests {
             42,
             &[],
             "t",
+            "X-CSRF-Token",
             "/admin",
             "/actuator",
             false,
@@ -2537,6 +2836,7 @@ mod tests {
             1,
             &[],
             "t",
+            "X-CSRF-Token",
             "/admin",
             "/actuator",
             false,
@@ -2560,7 +2860,17 @@ mod tests {
         // Instead it must load the plugin-owned asset at a fingerprinted
         // `/{prefix}/static/admin.<hash>.js` URL.
         let r = dummy_registry();
-        let html = dashboard_page(&r, &[], &[], "t", "/admin", "/actuator", false).into_string();
+        let html = dashboard_page(
+            &r,
+            &[],
+            &[],
+            "t",
+            "X-CSRF-Token",
+            "/admin",
+            "/actuator",
+            false,
+        )
+        .into_string();
         let expected = format!(r#"src="/admin{}""#, &**ADMIN_JS_PATH);
         assert!(
             html.contains(&expected),
@@ -2617,8 +2927,11 @@ mod tests {
             &[],
             "t",
             "_csrf",
+            "X-CSRF-Token",
             "/admin",
             "/actuator",
+            false,
+            false,
             false,
         )
         .into_string();
@@ -2666,8 +2979,11 @@ mod tests {
             &[],
             "t",
             "_csrf",
+            "X-CSRF-Token",
             "/admin",
             "/actuator",
+            false,
+            false,
             false,
         )
         .into_string();
@@ -2712,8 +3028,11 @@ mod tests {
             &[],
             "t",
             "_csrf",
+            "X-CSRF-Token",
             "/admin",
             "/actuator",
+            false,
+            false,
             false,
         )
         .into_string();
@@ -2770,8 +3089,11 @@ mod tests {
             &[],
             "t",
             "_csrf",
+            "X-CSRF-Token",
             "/admin",
             "/actuator",
+            false,
+            false,
             false,
         )
         .into_string();
@@ -2823,8 +3145,11 @@ mod tests {
             &[],
             "t",
             "_csrf",
+            "X-CSRF-Token",
             "/admin",
             "/actuator",
+            false,
+            false,
             false,
         )
         .into_string();
@@ -2877,8 +3202,11 @@ mod tests {
             &[],
             "t",
             "_csrf",
+            "X-CSRF-Token",
             "/admin",
             "/actuator",
+            false,
+            false,
             false,
         )
         .into_string();
@@ -2927,8 +3255,11 @@ mod tests {
             &[],
             "tok",
             "admin_csrf",
+            "X-CSRF-Token",
             "/admin",
             "/actuator",
+            false,
+            false,
             false,
         )
         .into_string();
@@ -2977,8 +3308,11 @@ mod tests {
             &[],
             "t",
             "_csrf",
+            "X-CSRF-Token",
             "/admin",
             "/actuator",
+            false,
+            false,
             false,
         )
         .into_string();
@@ -3016,8 +3350,11 @@ mod tests {
             &[],
             "tok",
             "_csrf",
+            "X-CSRF-Token",
             "/admin",
             "/actuator",
+            false,
+            false,
             false,
         )
         .into_string();
@@ -3035,6 +3372,136 @@ mod tests {
         assert!(
             html.contains("Computed"),
             "label should still render: {html}"
+        );
+    }
+
+    #[test]
+    fn list_page_shows_csv_download_link_when_export_enabled() {
+        use crate::traits::ListResult;
+        let r = dummy_registry();
+        let fields = vec![AdminField::new("name", AdminFieldKind::Text)];
+        let result = ListResult {
+            records: vec![],
+            total: 0,
+            page: 1,
+            per_page: 25,
+        };
+        // supports_csv_export = true, supports_csv_import = false
+        let html = model_list_page(
+            &r,
+            "widgets",
+            "Widgets",
+            &fields,
+            &[],
+            &result,
+            "",
+            None,
+            SortDirection::Asc,
+            &[],
+            &[],
+            "t",
+            "_csrf",
+            "X-CSRF-Token",
+            "/admin",
+            "/actuator",
+            false, // show_config
+            true,  // supports_csv_export
+            false, // supports_csv_import
+        )
+        .into_string();
+        assert!(
+            html.contains(r#"href="/admin/widgets/export.csv""#),
+            "Download CSV link must appear when supports_csv_export=true: {html}"
+        );
+        assert!(
+            !html.contains("/import"),
+            "Import CSV link must not appear when supports_csv_import=false: {html}"
+        );
+    }
+
+    #[test]
+    fn list_page_shows_import_link_when_import_enabled() {
+        use crate::traits::ListResult;
+        let r = dummy_registry();
+        let fields = vec![AdminField::new("name", AdminFieldKind::Text)];
+        let result = ListResult {
+            records: vec![],
+            total: 0,
+            page: 1,
+            per_page: 25,
+        };
+        let html = model_list_page(
+            &r,
+            "widgets",
+            "Widgets",
+            &fields,
+            &[],
+            &result,
+            "",
+            None,
+            SortDirection::Asc,
+            &[],
+            &[],
+            "t",
+            "_csrf",
+            "X-CSRF-Token",
+            "/admin",
+            "/actuator",
+            false, // show_config
+            false, // supports_csv_export
+            true,  // supports_csv_import
+        )
+        .into_string();
+        assert!(
+            html.contains(r#"href="/admin/widgets/import""#),
+            "Import CSV link must appear when supports_csv_import=true: {html}"
+        );
+        assert!(
+            !html.contains("export.csv"),
+            "Download CSV link must not appear when supports_csv_export=false: {html}"
+        );
+    }
+
+    #[test]
+    fn list_page_hides_csv_buttons_when_both_disabled() {
+        use crate::traits::ListResult;
+        let r = dummy_registry();
+        let fields = vec![AdminField::new("name", AdminFieldKind::Text)];
+        let result = ListResult {
+            records: vec![],
+            total: 0,
+            page: 1,
+            per_page: 25,
+        };
+        let html = model_list_page(
+            &r,
+            "widgets",
+            "Widgets",
+            &fields,
+            &[],
+            &result,
+            "",
+            None,
+            SortDirection::Asc,
+            &[],
+            &[],
+            "t",
+            "_csrf",
+            "X-CSRF-Token",
+            "/admin",
+            "/actuator",
+            false,
+            false,
+            false,
+        )
+        .into_string();
+        assert!(
+            !html.contains("export.csv"),
+            "no export link when disabled: {html}"
+        );
+        assert!(
+            !html.contains("/import"),
+            "no import link when disabled: {html}"
         );
     }
 
@@ -3079,7 +3546,17 @@ mod tests {
     #[test]
     fn config_page_empty_shows_no_keys_registered_message() {
         let r = dummy_registry();
-        let html = config_page(&r, &[], &[], "tok", "_csrf", "/admin", "/actuator").into_string();
+        let html = config_page(
+            &r,
+            &[],
+            &[],
+            "tok",
+            "_csrf",
+            "X-CSRF-Token",
+            "/admin",
+            "/actuator",
+        )
+        .into_string();
         assert!(
             html.contains("No config keys have been registered"),
             "empty state message missing: {html}"
@@ -3103,8 +3580,17 @@ mod tests {
             is_overridden: false,
             description: Some("Max upload in MB".to_owned()),
         }];
-        let html =
-            config_page(&r, &entries, &[], "tok", "_csrf", "/admin", "/actuator").into_string();
+        let html = config_page(
+            &r,
+            &entries,
+            &[],
+            "tok",
+            "_csrf",
+            "X-CSRF-Token",
+            "/admin",
+            "/actuator",
+        )
+        .into_string();
         assert!(html.contains("max_upload_mb"), "key name missing: {html}");
         assert!(
             html.contains("Max upload in MB"),
@@ -3133,8 +3619,17 @@ mod tests {
             is_overridden: true,
             description: None,
         }];
-        let html =
-            config_page(&r, &entries, &[], "tok", "_csrf", "/admin", "/actuator").into_string();
+        let html = config_page(
+            &r,
+            &entries,
+            &[],
+            "tok",
+            "_csrf",
+            "X-CSRF-Token",
+            "/admin",
+            "/actuator",
+        )
+        .into_string();
         assert!(
             html.contains(r#"action="/admin/config/rate_limit/unset""#),
             "unset form should appear for overridden key: {html}"
@@ -3154,8 +3649,17 @@ mod tests {
             is_overridden: true,
             description: None,
         }];
-        let html =
-            config_page(&r, &entries, &[], "tok", "_csrf", "/admin", "/actuator").into_string();
+        let html = config_page(
+            &r,
+            &entries,
+            &[],
+            "tok",
+            "_csrf",
+            "X-CSRF-Token",
+            "/admin",
+            "/actuator",
+        )
+        .into_string();
         assert!(
             html.to_lowercase().contains("overridden"),
             "overridden status missing: {html}"
@@ -3175,8 +3679,17 @@ mod tests {
             is_overridden: false,
             description: None,
         }];
-        let html =
-            config_page(&r, &entries, &[], "tok", "_csrf", "/admin", "/actuator").into_string();
+        let html = config_page(
+            &r,
+            &entries,
+            &[],
+            "tok",
+            "_csrf",
+            "X-CSRF-Token",
+            "/admin",
+            "/actuator",
+        )
+        .into_string();
         assert!(
             html.to_lowercase().contains("default"),
             "default status missing: {html}"
@@ -3202,6 +3715,7 @@ mod tests {
             &[],
             "csrf-tok-789",
             "authenticity_token",
+            "X-CSRF-Token",
             "/admin",
             "/actuator",
         )
@@ -3215,8 +3729,17 @@ mod tests {
     #[test]
     fn config_history_page_shows_empty_state() {
         let r = dummy_registry();
-        let html = config_history_page(&r, "rate_limit", &[], &[], "tok", "/admin", "/actuator")
-            .into_string();
+        let html = config_history_page(
+            &r,
+            "rate_limit",
+            &[],
+            &[],
+            "tok",
+            "X-CSRF-Token",
+            "/admin",
+            "/actuator",
+        )
+        .into_string();
         assert!(
             html.contains("No changes recorded"),
             "empty history message missing: {html}"
@@ -3242,6 +3765,7 @@ mod tests {
             &history,
             &[],
             "tok",
+            "X-CSRF-Token",
             "/admin",
             "/actuator",
         )
@@ -3264,8 +3788,17 @@ mod tests {
             actor: None,
             timestamp_secs: 0,
         }];
-        let html = config_history_page(&r, "flag", &history, &[], "tok", "/admin", "/actuator")
-            .into_string();
+        let html = config_history_page(
+            &r,
+            "flag",
+            &history,
+            &[],
+            "tok",
+            "X-CSRF-Token",
+            "/admin",
+            "/actuator",
+        )
+        .into_string();
         assert!(html.contains("flag"), "key name missing: {html}");
         // The null actor should render as a dash placeholder.
         assert!(html.contains("—"), "null actor placeholder missing: {html}");

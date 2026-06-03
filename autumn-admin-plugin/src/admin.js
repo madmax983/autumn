@@ -50,6 +50,23 @@
     }
   });
 
+  // CSV import form: multipart/form-data bypasses form-field CSRF scanning, so
+  // send the token as a header (CsrfLayer checks headers before reading the body).
+  // Reads the token and optional custom header name from the existing csrf meta tag,
+  // consistent with how the HTMX CSRF companion script works.
+  document.addEventListener("submit", function (e) {
+    var form = e.target;
+    if (!form || !form.matches || !form.matches("#autumn-csv-import-form")) return;
+    e.preventDefault();
+    var meta = document.querySelector('meta[name="csrf-token"]');
+    var header = (meta && meta.getAttribute("data-header")) || "X-CSRF-Token";
+    var token = (meta && meta.getAttribute("content")) || "";
+    var headers = token ? { [header]: token } : {};
+    fetch(form.action, { method: "POST", headers: headers, body: new FormData(form) })
+      .then(function (r) { return r.text(); })
+      .then(function (h) { document.open(); document.write(h); document.close(); });
+  });
+
   // Cosmetic client-side strip of blank password inputs so they aren't sent.
   // The real safety net is server-side in strip_meta_fields() using the
   // declared AdminFieldKind::Password metadata; this just avoids shipping

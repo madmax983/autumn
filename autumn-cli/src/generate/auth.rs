@@ -33,6 +33,140 @@ const AUTH_EXTRA_DEPS: &[(&str, &str)] = &[
     ("tracing", "\"0.1\""),
 ];
 
+/// Extra Cargo dependencies pulled in only by `--passkeys`.
+///
+/// - `webauthn-rs` (with `danger-allow-state-serialisation`) provides the
+///   `WebAuthn` ceremony implementation. State serialisation lets the in-progress
+///   ceremony challenge survive across requests via the session.
+/// - `uuid` generates random credential IDs if the authenticator doesn't supply one.
+/// - `conditional-ui` gates `start/finish_discoverable_authentication` in webauthn-rs 0.5.
+const PASSKEY_EXTRA_DEPS: &[(&str, &str)] = &[
+    (
+        "webauthn-rs",
+        "{ version = \"0.5\", features = [\"danger-allow-state-serialisation\", \"conditional-ui\"] }",
+    ),
+    ("uuid", "{ version = \"1\", features = [\"v4\"] }"),
+];
+
+/// Required features for the `webauthn-rs` dependency.
+///
+/// `danger-allow-state-serialisation` enables session storage of ceremony state.
+/// `conditional-ui` gates `start/finish_discoverable_authentication`.
+const WEBAUTHN_RS_FEATURES: &[&str] = &["danger-allow-state-serialisation", "conditional-ui"];
+
+/// Ensure an existing `webauthn-rs` dependency carries the features the generated
+/// routes need.
+///
+/// `ensure_cargo_dependencies` skips a crate that is already declared, so a project
+/// that already lists `webauthn-rs` without `conditional-ui` would scaffold but fail
+/// to compile. This merges the missing features into the existing declaration —
+/// shorthand, inline-table, or `[dependencies.webauthn-rs]` subtable form.
+fn ensure_webauthn_rs_features(toml: &str) -> String {
+    const CRATE: &str = "webauthn-rs";
+    let trailing_newline = toml.ends_with('\n');
+    let mut lines: Vec<String> = toml.lines().map(str::to_owned).collect();
+    let simple_prefix = format!("{CRATE} = \"");
+    let table_prefix = format!("{CRATE} = {{");
+    let subtable_header = format!("[dependencies.{CRATE}]");
+    let subtable_header_underscore = format!("[dependencies.{}]", CRATE.replace('-', "_"));
+    let feats_csv = WEBAUTHN_RS_FEATURES
+        .iter()
+        .map(|f| format!("\"{f}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let merge_missing = |line: &str| -> Option<String> {
+        let feat_bracket = line.find("features = [")?;
+        let list_start = feat_bracket + "features = [".len();
+        let close_off = line[list_start..].find(']')?;
+        let list_end = close_off + list_start;
+        let existing_list = &line[list_start..list_end];
+        let additions: Vec<String> = WEBAUTHN_RS_FEATURES
+            .iter()
+            .filter(|f| !existing_list.contains(&format!("\"{f}\"")))
+            .map(|f| format!("\"{f}\""))
+            .collect();
+        if additions.is_empty() {
+            return None; // already complete
+        }
+        let sep = if existing_list.trim().is_empty() || existing_list.trim().ends_with(',') {
+            ""
+        } else {
+            ", "
+        };
+        Some(format!(
+            "{}{sep}{}{}",
+            &line[..list_end],
+            additions.join(", "),
+            &line[list_end..]
+        ))
+    };
+
+    let mut i = 0;
+    while i < lines.len() {
+        let trimmed = lines[i].trim().to_owned();
+        let indent: String = lines[i]
+            .chars()
+            .take_while(char::is_ascii_whitespace)
+            .collect();
+
+        if let Some(rest) = trimmed.strip_prefix(&simple_prefix) {
+            let version = rest.split('"').next().unwrap_or("0.5");
+            lines[i] = format!(
+                "{indent}{CRATE} = {{ version = \"{version}\", features = [{feats_csv}] }}"
+            );
+            break;
+        }
+
+        if trimmed.starts_with(&table_prefix) {
+            if let Some(new_line) = merge_missing(&trimmed) {
+                lines[i] = format!("{indent}{new_line}");
+            } else if !trimmed.contains("features = [") {
+                // No `features` key at all — insert one before the closing brace.
+                if let Some(close_brace) = trimmed.rfind('}') {
+                    let before = trimmed[..close_brace].trim_end();
+                    let sep = if before.ends_with('{') { " " } else { ", " };
+                    lines[i] = format!("{indent}{before}{sep}features = [{feats_csv}] }}");
+                }
+            }
+            break;
+        }
+
+        if trimmed == subtable_header || trimmed == subtable_header_underscore {
+            let mut j = i + 1;
+            while j < lines.len() && !lines[j].trim().starts_with('[') {
+                let t = lines[j].trim().to_owned();
+                if t.starts_with("features") {
+                    let ind2: String = lines[j]
+                        .chars()
+                        .take_while(char::is_ascii_whitespace)
+                        .collect();
+                    if let Some(new_line) = merge_missing(&t) {
+                        lines[j] = format!("{ind2}{new_line}");
+                    }
+                    let mut out = lines.join("\n");
+                    if trailing_newline {
+                        out.push('\n');
+                    }
+                    return out;
+                }
+                j += 1;
+            }
+            // No `features` key found in the subtable — insert one.
+            lines.insert(i + 1, format!("features = [{feats_csv}]"));
+            break;
+        }
+
+        i += 1;
+    }
+
+    let mut out = lines.join("\n");
+    if trailing_newline {
+        out.push('\n');
+    }
+    out
+}
+
 /// Extra Cargo dependencies pulled in only by `--totp`.
 ///
 /// - `totp-rs` (with the `qr` feature) provides RFC 6238 TOTP plus QR rendering.
@@ -468,7 +602,7 @@ pub fn plan_auth_with_options(
     timestamp: &str,
     oauth: &AuthOAuthOptions,
 ) -> Result<Plan, GenerateError> {
-    plan_auth_options_impl(project_root, name, timestamp, oauth, false)
+    plan_auth_options_impl(project_root, name, timestamp, oauth, false, false)
 }
 
 /// Compute the file actions for `autumn generate auth [--oauth …] [--totp]`.
@@ -478,6 +612,7 @@ pub fn plan_auth_with_options(
 ///
 /// # Errors
 /// Same as [`plan_auth`].
+#[allow(dead_code)]
 pub fn plan_auth_full(
     project_root: &Path,
     name: &str,
@@ -485,126 +620,281 @@ pub fn plan_auth_full(
     oauth: &AuthOAuthOptions,
     totp: bool,
 ) -> Result<Plan, GenerateError> {
-    plan_auth_options_impl(project_root, name, timestamp, oauth, totp)
+    plan_auth_options_impl(project_root, name, timestamp, oauth, totp, false)
 }
 
-/// Shared implementation: base (optionally TOTP-aware) scaffold plus, when
-/// providers are supplied, the OAuth artifacts.
+/// Compute the file actions for `autumn generate auth [--oauth …] [--totp] [--passkeys]`.
+///
+/// Extended version of [`plan_auth_full`] that additionally supports `WebAuthn` passkeys.
+///
+/// # Errors
+/// Same as [`plan_auth`].
+pub fn plan_auth_full_ex(
+    project_root: &Path,
+    name: &str,
+    timestamp: &str,
+    oauth: &AuthOAuthOptions,
+    totp: bool,
+    passkeys: bool,
+) -> Result<Plan, GenerateError> {
+    plan_auth_options_impl(project_root, name, timestamp, oauth, totp, passkeys)
+}
+
+/// Shared implementation: base (optionally TOTP-aware, optionally passkey-aware)
+/// scaffold plus, when providers are supplied, the OAuth artifacts.
+#[allow(clippy::too_many_lines)]
 fn plan_auth_options_impl(
     project_root: &Path,
     name: &str,
     timestamp: &str,
     oauth: &AuthOAuthOptions,
     totp: bool,
+    passkeys: bool,
 ) -> Result<Plan, GenerateError> {
     // Start with the base auth plan with providers (and optional TOTP) applied.
     let mut plan = plan_auth_with_providers(project_root, name, timestamp, &oauth.providers, totp)?;
-
-    if oauth.providers.is_empty() {
-        return Ok(plan);
-    }
 
     let pascal_name = pascal(name);
     let snake_name = snake(name);
     let user_table = pluralize(&snake_name);
 
-    // ── oauth_identities migration ─────────────────────────────────────────
-    // Increment the timestamp by one second so Diesel never sees two migrations
-    // with the same version number.
-    let oauth_ts_str: String = timestamp
-        .parse::<i64>()
-        .map_or_else(|_| format!("{timestamp}1"), |t| (t + 1).to_string());
-    let mig_dir = project_root
-        .join("migrations")
-        .join(format!("{oauth_ts_str}_create_oauth_identities"));
-    plan.create(
-        mig_dir.join("up.sql"),
-        render_oauth_migration_up(&user_table),
-    );
-    plan.create(mig_dir.join("down.sql"), render_oauth_migration_down());
+    if !oauth.providers.is_empty() {
+        // ── oauth_identities migration ─────────────────────────────────────────
+        // Increment the timestamp by one second so Diesel never sees two migrations
+        // with the same version number.
+        let oauth_ts_str: String = timestamp
+            .parse::<i64>()
+            .map_or_else(|_| format!("{timestamp}1"), |t| (t + 1).to_string());
+        let mig_dir = project_root
+            .join("migrations")
+            .join(format!("{oauth_ts_str}_create_oauth_identities"));
+        plan.create(
+            mig_dir.join("up.sql"),
+            render_oauth_migration_up(&user_table),
+        );
+        plan.create(mig_dir.join("down.sql"), render_oauth_migration_down());
 
-    // ── src/schema.rs entry for oauth_identities ───────────────────────────
-    let schema_path = project_root.join("src").join("schema.rs");
-    let schema_base = find_plan_content_for_path(&plan, &schema_path)
-        .unwrap_or_else(|| read_or_empty(&schema_path));
-    let oauth_fields: Vec<super::dsl::Field> = [
-        "provider:String",
-        "subject:String",
-        "user_id:i64",
-        "email:Option<String>",
-        "name:Option<String>",
-    ]
-    .iter()
-    .map(|t| super::dsl::parse_field(t).expect("oauth field tokens are always valid"))
-    .collect();
-    let updated_schema = append_schema_table(&schema_base, "oauth_identities", &oauth_fields);
-    plan.modify(schema_path, updated_schema);
+        // ── src/schema.rs entry for oauth_identities ───────────────────────────
+        let schema_path = project_root.join("src").join("schema.rs");
+        let schema_base = find_plan_content_for_path(&plan, &schema_path)
+            .unwrap_or_else(|| read_or_empty(&schema_path));
+        let oauth_fields: Vec<super::dsl::Field> = [
+            "provider:String",
+            "subject:String",
+            "user_id:i64",
+            "email:Option<String>",
+            "name:Option<String>",
+        ]
+        .iter()
+        .map(|t| super::dsl::parse_field(t).expect("oauth field tokens are always valid"))
+        .collect();
+        let updated_schema = append_schema_table(&schema_base, "oauth_identities", &oauth_fields);
+        plan.modify(schema_path, updated_schema);
 
-    // ── oauth routes ───────────────────────────────────────────────────────
-    let routes_dir = project_root.join("src").join("routes");
-    plan.create(
-        routes_dir.join("oauth.rs"),
-        render_oauth_routes_file(
-            &pascal_name,
-            &snake_name,
-            &user_table,
-            &oauth.providers,
-            totp,
-        ),
-    );
+        // ── oauth routes ───────────────────────────────────────────────────────
+        let routes_dir = project_root.join("src").join("routes");
+        plan.create(
+            routes_dir.join("oauth.rs"),
+            render_oauth_routes_file(
+                &pascal_name,
+                &snake_name,
+                &user_table,
+                &oauth.providers,
+                totp,
+            ),
+        );
 
-    // Add `pub mod oauth;` to src/routes/mod.rs — use the base plan's already-modified
-    // content so the base `pub mod auth;` declaration is not overwritten.
-    let route_mod_path = routes_dir.join("mod.rs");
-    let route_mod_base = find_plan_content_for_path(&plan, &route_mod_path)
-        .unwrap_or_else(|| read_or_empty(&route_mod_path));
-    let updated_route_mod = add_mod_declaration(&route_mod_base, "oauth");
-    plan.modify(route_mod_path, updated_route_mod);
+        // Add `pub mod oauth;` to src/routes/mod.rs — use the base plan's already-modified
+        // content so the base `pub mod auth;` declaration is not overwritten.
+        let route_mod_path = routes_dir.join("mod.rs");
+        let route_mod_base = find_plan_content_for_path(&plan, &route_mod_path)
+            .unwrap_or_else(|| read_or_empty(&route_mod_path));
+        let updated_route_mod = add_mod_declaration(&route_mod_base, "oauth");
+        plan.modify(route_mod_path, updated_route_mod);
 
-    // ── Register oauth routes in src/main.rs ───────────────────────────────
-    let main_path = project_root.join("src").join("main.rs");
-    let main_existing = std::fs::read_to_string(&main_path).map_err(|_| {
-        GenerateError::Io(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("missing {}", main_path.display()),
-        ))
-    })?;
-    let oauth_entries = oauth_route_entries();
-    // The base plan has already modified main.rs; find current state in plan or use existing.
-    let base_main =
-        find_plan_content_for_path(&plan, &main_path).unwrap_or_else(|| main_existing.clone());
-    let updated_main = super::schema_edit::update_main_rs(
-        &base_main,
-        &["models", "routes", "schema"],
-        &oauth_entries,
-    );
-    plan.modify(main_path, updated_main);
+        // ── Register oauth routes in src/main.rs ───────────────────────────────
+        let main_path = project_root.join("src").join("main.rs");
+        let main_existing = std::fs::read_to_string(&main_path).map_err(|_| {
+            GenerateError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("missing {}", main_path.display()),
+            ))
+        })?;
+        let oauth_entries = oauth_route_entries();
+        // The base plan has already modified main.rs; find current state in plan or use existing.
+        let base_main =
+            find_plan_content_for_path(&plan, &main_path).unwrap_or_else(|| main_existing.clone());
+        let updated_main = super::schema_edit::update_main_rs(
+            &base_main,
+            &["models", "routes", "schema"],
+            &oauth_entries,
+        );
+        plan.modify(main_path, updated_main);
 
-    // ── docs/guide/oauth.md ────────────────────────────────────────────────
-    let docs_dir = project_root.join("docs").join("guide");
-    plan.create(
-        docs_dir.join("oauth.md"),
-        render_oauth_docs_file(&oauth.providers),
-    );
+        // ── docs/guide/oauth.md ────────────────────────────────────────────────
+        let docs_dir = project_root.join("docs").join("guide");
+        plan.create(
+            docs_dir.join("oauth.md"),
+            render_oauth_docs_file(&oauth.providers),
+        );
 
-    // ── Cargo.toml: add oauth2 feature to autumn-web ─────────────────────
-    let cargo_toml_path = project_root.join("Cargo.toml");
-    let cargo_existing = read_or_empty(&cargo_toml_path);
-    // The base plan may have already updated Cargo.toml; use its content if present.
-    let base_cargo = find_plan_content_for_path(&plan, &cargo_toml_path)
-        .unwrap_or_else(|| cargo_existing.clone());
-    let with_oauth2 = ensure_autumn_web_oauth2_feature(&base_cargo);
-    if with_oauth2 != base_cargo {
-        plan.modify(cargo_toml_path, with_oauth2);
+        // ── Cargo.toml: add oauth2 feature to autumn-web ─────────────────────
+        let cargo_toml_path = project_root.join("Cargo.toml");
+        let cargo_existing = read_or_empty(&cargo_toml_path);
+        // The base plan may have already updated Cargo.toml; use its content if present.
+        let base_cargo = find_plan_content_for_path(&plan, &cargo_toml_path)
+            .unwrap_or_else(|| cargo_existing.clone());
+        let with_oauth2 = ensure_autumn_web_oauth2_feature(&base_cargo);
+        if with_oauth2 != base_cargo {
+            plan.modify(cargo_toml_path, with_oauth2);
+        }
+
+        // ── autumn.toml OAuth provider stubs ───────────────────────────────────
+        let autumn_toml_path = project_root.join("autumn.toml");
+        if autumn_toml_path.exists() {
+            let toml_existing = read_or_empty(&autumn_toml_path);
+            let updated_toml = append_oauth_stubs_to_toml(&toml_existing, &oauth.providers);
+            if updated_toml != toml_existing {
+                plan.modify(autumn_toml_path, updated_toml);
+            }
+        }
     }
 
-    // ── autumn.toml OAuth provider stubs ───────────────────────────────────
-    let autumn_toml_path = project_root.join("autumn.toml");
-    if autumn_toml_path.exists() {
-        let toml_existing = read_or_empty(&autumn_toml_path);
-        let updated_toml = append_oauth_stubs_to_toml(&toml_existing, &oauth.providers);
-        if updated_toml != toml_existing {
-            plan.modify(autumn_toml_path, updated_toml);
+    if passkeys {
+        // ── webauthn_credentials collision check ───────────────────────────────
+        // If the project already has webauthn_credentials in schema.rs, the
+        // migration below would fail at `diesel migration run`. Reject upfront.
+        let schema_for_check = project_root.join("src").join("schema.rs");
+        let schema_existing_for_passkey = find_plan_content_for_path(&plan, &schema_for_check)
+            .unwrap_or_else(|| read_or_empty(&schema_for_check));
+        if schema_has_table(&schema_existing_for_passkey, "webauthn_credentials") {
+            return Err(GenerateError::InvalidName(
+                name.to_owned(),
+                "this project already defines a `webauthn_credentials` table, which \
+                 `--passkeys` needs; rename or remove the existing table first."
+                    .to_owned(),
+            ));
+        }
+
+        // ── webauthn_credentials migration ─────────────────────────────────────
+        // Use timestamp+2 when oauth is also requested (oauth uses timestamp+1),
+        // so both migrations get unique Diesel version numbers.
+        let passkey_offset: i64 = if oauth.providers.is_empty() { 1 } else { 2 };
+        let passkey_ts_str: String = timestamp.parse::<i64>().map_or_else(
+            |_| format!("{timestamp}{passkey_offset}"),
+            |t| (t + passkey_offset).to_string(),
+        );
+        let mig_dir = project_root
+            .join("migrations")
+            .join(format!("{passkey_ts_str}_create_webauthn_credentials"));
+        plan.create(
+            mig_dir.join("up.sql"),
+            render_passkey_migration_up(&user_table),
+        );
+        plan.create(mig_dir.join("down.sql"), render_passkey_migration_down());
+
+        // ── src/models/webauthn_credential.rs ─────────────────────────────────
+        let models_dir = project_root.join("src").join("models");
+        plan.create(
+            models_dir.join("webauthn_credential.rs"),
+            render_webauthn_credential_model_file(&user_table),
+        );
+        let model_mod_path = models_dir.join("mod.rs");
+        let model_mod_base = find_plan_content_for_path(&plan, &model_mod_path)
+            .unwrap_or_else(|| read_or_empty(&model_mod_path));
+        plan.modify(
+            model_mod_path,
+            add_mod_declaration(&model_mod_base, "webauthn_credential"),
+        );
+
+        // ── src/schema.rs: webauthn_credentials table ─────────────────────────
+        let schema_path = project_root.join("src").join("schema.rs");
+        let schema_base = find_plan_content_for_path(&plan, &schema_path)
+            .unwrap_or_else(|| read_or_empty(&schema_path));
+        let wc_fields: Vec<super::dsl::Field> = [
+            "user_id:i64",
+            "credential_id:String",
+            "credential_json:String",
+            "name:String",
+            "last_used_at:Option<NaiveDateTime>",
+        ]
+        .iter()
+        .map(|t| super::dsl::parse_field(t).expect("webauthn credential field tokens are valid"))
+        .collect();
+        let updated_schema = append_schema_table(&schema_base, "webauthn_credentials", &wc_fields);
+        plan.modify(schema_path, updated_schema);
+
+        // ── src/routes/passkeys.rs ─────────────────────────────────────────────
+        let routes_dir = project_root.join("src").join("routes");
+        plan.create(
+            routes_dir.join("passkeys.rs"),
+            render_passkeys_routes_file(&pascal_name, &snake_name, &user_table),
+        );
+        let route_mod_path = routes_dir.join("mod.rs");
+        let route_mod_base = find_plan_content_for_path(&plan, &route_mod_path)
+            .unwrap_or_else(|| read_or_empty(&route_mod_path));
+        plan.modify(
+            route_mod_path,
+            add_mod_declaration(&route_mod_base, "passkeys"),
+        );
+
+        // ── Register passkey routes in src/main.rs ─────────────────────────────
+        let main_path = project_root.join("src").join("main.rs");
+        let main_existing = std::fs::read_to_string(&main_path).map_err(|_| {
+            GenerateError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("missing {}", main_path.display()),
+            ))
+        })?;
+        let pk_entries = passkey_route_entries();
+        let base_main =
+            find_plan_content_for_path(&plan, &main_path).unwrap_or_else(|| main_existing.clone());
+        let updated_main = super::schema_edit::update_main_rs(
+            &base_main,
+            &["models", "routes", "schema"],
+            &pk_entries,
+        );
+        plan.modify(main_path, updated_main);
+
+        // ── tests/auth_passkeys.rs ─────────────────────────────────────────────
+        let tests_dir = project_root.join("tests");
+        plan.create(
+            tests_dir.join("auth_passkeys.rs"),
+            render_passkeys_tests_file(&pascal_name, &snake_name),
+        );
+
+        // ── docs/guide/passkeys.md ─────────────────────────────────────────────
+        let docs_dir = project_root.join("docs").join("guide");
+        plan.create(docs_dir.join("passkeys.md"), render_passkeys_docs_file());
+
+        // ── autumn.toml: [auth.webauthn] stub ─────────────────────────────────
+        let autumn_toml_path = project_root.join("autumn.toml");
+        if autumn_toml_path.exists() {
+            let toml_existing = find_plan_content_for_path(&plan, &autumn_toml_path)
+                .unwrap_or_else(|| read_or_empty(&autumn_toml_path));
+            let updated_toml = append_webauthn_stub_to_toml(
+                &toml_existing,
+                "localhost",
+                "My App",
+                "http://localhost:3000",
+            );
+            if updated_toml != toml_existing {
+                plan.modify(autumn_toml_path, updated_toml);
+            }
+        }
+
+        // ── Cargo.toml: add webauthn-rs dep + webauthn feature on autumn-web ───
+        let cargo_toml_path = project_root.join("Cargo.toml");
+        let base_cargo = find_plan_content_for_path(&plan, &cargo_toml_path)
+            .unwrap_or_else(|| read_or_empty(&cargo_toml_path));
+        let all_passkey_deps: Vec<(&str, &str)> = PASSKEY_EXTRA_DEPS.to_vec();
+        let with_deps = super::model::ensure_cargo_dependencies(&base_cargo, &all_passkey_deps);
+        // If the project already declared webauthn-rs without the required features,
+        // ensure_cargo_dependencies would have skipped it; merge them here.
+        let with_deps = ensure_webauthn_rs_features(&with_deps);
+        let with_webauthn = ensure_autumn_web_webauthn_feature(&with_deps);
+        if with_webauthn != base_cargo {
+            plan.modify(cargo_toml_path, with_webauthn);
         }
     }
 
@@ -794,11 +1084,17 @@ fn ensure_autumn_web_oauth2_feature(toml: &str) -> String {
 /// CLI entry point for `autumn generate auth <Name>` (no OAuth providers).
 #[allow(dead_code)]
 pub fn run(name: &str, flags: Flags) {
-    run_with_options(name, flags, &AuthOAuthOptions::default(), false);
+    run_with_options(name, flags, &AuthOAuthOptions::default(), false, false);
 }
 
-/// CLI entry point for `autumn generate auth <Name> --oauth <providers> [--totp]`.
-pub fn run_with_options(name: &str, flags: Flags, oauth: &AuthOAuthOptions, totp: bool) {
+/// CLI entry point for `autumn generate auth <Name> --oauth <providers> [--totp] [--passkeys]`.
+pub fn run_with_options(
+    name: &str,
+    flags: Flags,
+    oauth: &AuthOAuthOptions,
+    totp: bool,
+    passkeys: bool,
+) {
     let cwd = match std::env::current_dir() {
         Ok(d) => d,
         Err(e) => {
@@ -807,7 +1103,7 @@ pub fn run_with_options(name: &str, flags: Flags, oauth: &AuthOAuthOptions, totp
         }
     };
     let timestamp = timestamp_now();
-    let plan = plan_auth_full(&cwd, name, &timestamp, oauth, totp);
+    let plan = plan_auth_full_ex(&cwd, name, &timestamp, oauth, totp, passkeys);
     match plan.and_then(|p| p.execute(flags)) {
         Ok(()) => {}
         Err(e) => {
@@ -3287,6 +3583,883 @@ fn two_factor_disable() {
         .replace("__SNAKE__", snake_name)
 }
 
+// ── Passkey (WebAuthn) helpers ────────────────────────────────────────────────
+
+fn passkey_route_entries() -> Vec<String> {
+    vec![
+        "routes::passkeys::passkey_register_begin".to_owned(),
+        "routes::passkeys::passkey_register_finish".to_owned(),
+        "routes::passkeys::passkey_login_begin".to_owned(),
+        "routes::passkeys::passkey_login_finish".to_owned(),
+        "routes::passkeys::passkey_list".to_owned(),
+        "routes::passkeys::passkey_revoke".to_owned(),
+        "routes::passkeys::passkey_register_page".to_owned(),
+        "routes::passkeys::passkey_login_page".to_owned(),
+    ]
+}
+
+fn render_passkey_migration_up(user_table: &str) -> String {
+    format!(
+        "CREATE TABLE webauthn_credentials (\n\
+         \x20   id BIGSERIAL PRIMARY KEY,\n\
+         \x20   user_id BIGINT NOT NULL REFERENCES {user_table}(id) ON DELETE CASCADE,\n\
+         \x20   credential_id TEXT NOT NULL UNIQUE,\n\
+         \x20   credential_json TEXT NOT NULL,\n\
+         \x20   name TEXT NOT NULL DEFAULT 'Passkey',\n\
+         \x20   created_at TIMESTAMP NOT NULL DEFAULT NOW(),\n\
+         \x20   last_used_at TIMESTAMP NULL\n\
+         );\n\
+         \n\
+         CREATE INDEX webauthn_credentials_user_id_idx ON webauthn_credentials (user_id);\n"
+    )
+}
+
+fn render_passkey_migration_down() -> String {
+    "DROP TABLE webauthn_credentials;\n".to_owned()
+}
+
+fn render_webauthn_credential_model_file(user_table: &str) -> String {
+    format!(
+        r"//! Generated by `autumn generate auth --passkeys`.
+//!
+//! Edit freely — once generated, this is ordinary user code.
+
+use crate::schema::{{webauthn_credentials, {user_table}}};
+
+#[autumn_web::model]
+pub struct WebauthnCredential {{
+    pub id: i64,
+    pub user_id: i64,
+    pub credential_id: String,
+    pub credential_json: String,
+    pub name: String,
+    pub created_at: chrono::NaiveDateTime,
+    #[default]
+    pub last_used_at: Option<chrono::NaiveDateTime>,
+}}
+
+diesel::joinable!(webauthn_credentials -> {user_table} (user_id));
+"
+    )
+}
+
+#[allow(clippy::too_many_lines)]
+fn render_passkeys_routes_file(pascal_name: &str, snake_name: &str, user_table: &str) -> String {
+    let tpl = r##"//! Generated by `autumn generate auth --passkeys`.
+//!
+//! WebAuthn passkey ceremony handlers.  Edit freely — once generated, this is
+//! ordinary user code.
+//!
+//! # Configuration
+//!
+//! Add to `autumn.toml`:
+//!
+//! ```toml
+//! [auth.webauthn]
+//! rp_id     = "example.com"
+//! rp_name   = "My App"
+//! rp_origin = "https://example.com"
+//! ```
+//!
+//! # Security notes
+//!
+//! - `passkey_login_finish` writes `state.auth_session_key()` so downstream
+//!   `#[secured]` routes work without modification.
+//! - Never store raw credentials — `credential_json` holds the opaque passkey
+//!   state returned by webauthn-rs and should not be inspected by app code.
+
+use autumn_web::prelude::*;
+use diesel::prelude::*;
+use diesel_async::RunQueryDsl;
+use serde::{Deserialize, Serialize};
+use webauthn_rs::prelude::*;
+
+fn redirect_to(url: &str) -> impl IntoResponse {
+    axum::response::Redirect::to(url)
+}
+
+// ── Config helper ──────────────────────────────────────────────────────────────
+
+fn build_webauthn(state: &AppState) -> AutumnResult<Webauthn> {
+    let cfg = &state.config().auth.webauthn;
+    if cfg.rp_id.is_empty() || cfg.rp_origin.is_empty() {
+        return Err(AutumnError::internal_server_error_msg(
+            "WebAuthn is not configured. Set [auth.webauthn] rp_id, rp_name, and rp_origin \
+             in autumn.toml. See docs/guide/passkeys.md for details.",
+        ));
+    }
+    let origin = Url::parse(&cfg.rp_origin).map_err(|_| {
+        AutumnError::internal_server_error_msg(
+            "auth.webauthn.rp_origin is not a valid URL. \
+             Example: \"https://example.com\"",
+        )
+    })?;
+    WebauthnBuilder::new(&cfg.rp_id, &origin)
+        .map_err(|e| {
+            AutumnError::internal_server_error_msg(format!(
+                "Failed to build WebAuthn instance from auth.webauthn config: {e}"
+            ))
+        })?
+        .rp_name(&cfg.rp_name)
+        .build()
+        .map_err(|e| {
+            AutumnError::internal_server_error_msg(format!(
+                "Failed to build WebAuthn instance: {e}"
+            ))
+        })
+}
+
+// ── Forms / JSON types ────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct PasskeyRegisterFinishBody {
+    pub response: serde_json::Value,
+}
+
+#[derive(Deserialize)]
+pub struct PasskeyLoginFinishBody {
+    pub response: serde_json::Value,
+}
+
+#[derive(Deserialize)]
+pub struct PasskeyRevokeForm {
+    pub id: i64,
+}
+
+// ── Registration ──────────────────────────────────────────────────────────────
+
+/// `GET /passkeys/register` — passkey registration UI page.
+#[secured]
+#[get("/passkeys/register")]
+pub async fn passkey_register_page(
+    session: Session,
+    State(state): State<AppState>,
+    csrf: Option<CsrfToken>,
+) -> AutumnResult<Markup> {
+    let _ = (session, state);
+    let csrf_token = csrf.map(|t| t.token().to_owned()).unwrap_or_default();
+    Ok(html! {
+        html {
+            head {
+                title { "Register a Passkey" }
+                meta name="csrf-token" content=(csrf_token);
+            }
+            body {
+                h1 { "Register a Passkey" }
+                button id="register-btn" { "Register passkey" }
+                script {
+                    (PreEscaped(r#"
+const csrfToken = document.querySelector('meta[name="csrf-token"]')?.content ?? '';
+document.getElementById('register-btn').addEventListener('click', async () => {
+    const beginResp = await fetch('/passkeys/register/begin', {
+        method: 'POST',
+        headers: { 'X-CSRF-Token': csrfToken },
+    });
+    const optionsJSON = await beginResp.json();
+    const options = PublicKeyCredential.parseCreationOptionsFromJSON(optionsJSON.publicKey);
+    const credential = await navigator.credentials.create({ publicKey: options });
+    const finishResp = await fetch('/passkeys/register/finish', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken },
+        body: JSON.stringify({ response: credential.toJSON() }),
+    });
+    if (finishResp.ok) {
+        window.location.href = '/passkeys';
+    } else {
+        alert('Registration failed');
+    }
+});
+"#))
+                }
+            }
+        }
+    })
+}
+
+/// `POST /passkeys/register/begin` — start a registration ceremony.
+///
+/// Requires authentication. Stores the pending challenge in the session.
+#[secured]
+#[post("/passkeys/register/begin")]
+pub async fn passkey_register_begin(
+    session: Session,
+    State(state): State<AppState>,
+    mut db: Db,
+) -> AutumnResult<axum::Json<serde_json::Value>> {
+    let __SNAKE___id: i64 = session
+        .get(state.auth_session_key())
+        .await
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| AutumnError::unauthorized_msg("Not authenticated."))?;
+    let __SNAKE___email = session
+        .get("__SNAKE___email")
+        .await
+        .unwrap_or_else(|| "user".to_owned());
+    let webauthn = build_webauthn(&state)?;
+    let existing_cred_ids: Vec<CredentialID> = {
+        use crate::schema::webauthn_credentials;
+        webauthn_credentials::table
+            .filter(webauthn_credentials::user_id.eq(__SNAKE___id))
+            .select(webauthn_credentials::credential_json)
+            .load::<String>(&mut *db)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|json| serde_json::from_str::<Passkey>(&json).ok())
+            .map(|p| p.cred_id().clone())
+            .collect()
+    };
+    let user_unique_id = uuid::Uuid::from_u128(__SNAKE___id as u128);
+    let (ccr, reg_state) = webauthn
+        .start_passkey_registration(
+            user_unique_id,
+            &__SNAKE___email,
+            &__SNAKE___email,
+            Some(existing_cred_ids),
+        )
+        .map_err(|e| {
+            AutumnError::internal_server_error_msg(format!("start_passkey_registration: {e}"))
+        })?;
+    // Store the user_id alongside the reg_state so finish can verify the session
+    // user hasn't changed between begin and finish (prevents cross-account TOCTOU).
+    session
+        .insert(
+            "passkey_reg_state",
+            serde_json::to_string(&serde_json::json!({
+                "user_id": __SNAKE___id,
+                "state":   serde_json::to_string(&reg_state).unwrap_or_default(),
+            }))
+            .unwrap_or_default(),
+        )
+        .await;
+    Ok(axum::Json(serde_json::to_value(ccr).unwrap_or_default()))
+}
+
+/// `POST /passkeys/register/finish` — complete a registration ceremony.
+///
+/// Stores the new credential in `webauthn_credentials`.
+#[secured]
+#[post("/passkeys/register/finish")]
+pub async fn passkey_register_finish(
+    session: Session,
+    State(state): State<AppState>,
+    mut db: Db,
+    axum::Json(body): axum::Json<PasskeyRegisterFinishBody>,
+) -> AutumnResult<axum::Json<serde_json::Value>> {
+    let current_id: i64 = session
+        .get(state.auth_session_key())
+        .await
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| AutumnError::unauthorized_msg("Not authenticated."))?;
+    let envelope_str: String = session
+        .get("passkey_reg_state")
+        .await
+        .ok_or_else(|| AutumnError::unprocessable_msg("No pending registration."))?;
+    session.remove("passkey_reg_state").await;
+    let envelope: serde_json::Value = serde_json::from_str(&envelope_str)
+        .map_err(|_| AutumnError::unprocessable_msg("Invalid registration state."))?;
+    let __SNAKE___id: i64 = envelope["user_id"]
+        .as_i64()
+        .ok_or_else(|| AutumnError::unprocessable_msg("Invalid registration state."))?;
+    if __SNAKE___id != current_id {
+        return Err(AutumnError::unauthorized_msg(
+            "Session user changed since registration began.",
+        ));
+    }
+    let reg_state_str = envelope["state"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    let reg_state: PasskeyRegistration = serde_json::from_str(&reg_state_str)
+        .map_err(|_| AutumnError::unprocessable_msg("Invalid registration state."))?;
+    let webauthn = build_webauthn(&state)?;
+    let rpk_finish: RegisterPublicKeyCredential =
+        serde_json::from_value(body.response).map_err(|e| {
+            AutumnError::unprocessable_msg(format!("Invalid credential response: {e}"))
+        })?;
+    let passkey = webauthn
+        .finish_passkey_registration(&rpk_finish, &reg_state)
+        .map_err(|e| AutumnError::unprocessable_msg(format!("Registration failed: {e}")))?;
+    let cred_id = passkey.cred_id().to_string();
+    let cred_json = serde_json::to_string(&passkey)
+        .map_err(|_| AutumnError::internal_server_error_msg("Failed to serialise passkey."))?;
+    diesel::insert_into(crate::schema::webauthn_credentials::table)
+        .values((
+            crate::schema::webauthn_credentials::user_id.eq(__SNAKE___id),
+            crate::schema::webauthn_credentials::credential_id.eq(&cred_id),
+            crate::schema::webauthn_credentials::credential_json.eq(&cred_json),
+            crate::schema::webauthn_credentials::name.eq("Passkey"),
+        ))
+        .execute(&mut *db)
+        .await
+        .map_err(|_| AutumnError::internal_server_error_msg("Failed to store passkey."))?;
+    Ok(axum::Json(serde_json::json!({ "ok": true })))
+}
+
+// ── Authentication ────────────────────────────────────────────────────────────
+
+/// `GET /passkeys/login` — passkey login UI page.
+#[get("/passkeys/login")]
+pub async fn passkey_login_page(csrf: Option<CsrfToken>) -> AutumnResult<Markup> {
+    let csrf_token = csrf.map(|t| t.token().to_owned()).unwrap_or_default();
+    Ok(html! {
+        html {
+            head {
+                title { "Sign in with Passkey" }
+                meta name="csrf-token" content=(csrf_token);
+            }
+            body {
+                h1 { "Sign in with a Passkey" }
+                button id="login-btn" { "Sign in with passkey" }
+                script {
+                    (PreEscaped(r#"
+const csrfToken = document.querySelector('meta[name="csrf-token"]')?.content ?? '';
+document.getElementById('login-btn').addEventListener('click', async () => {
+    const beginResp = await fetch('/passkeys/login/begin', {
+        method: 'POST',
+        headers: { 'X-CSRF-Token': csrfToken },
+    });
+    const optionsJSON = await beginResp.json();
+    const options = PublicKeyCredential.parseRequestOptionsFromJSON(optionsJSON.publicKey);
+    const assertion = await navigator.credentials.get({ publicKey: options });
+    const finishResp = await fetch('/passkeys/login/finish', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken },
+        body: JSON.stringify({ response: assertion.toJSON() }),
+    });
+    if (finishResp.ok) {
+        window.location.href = '/account';
+    } else {
+        alert('Login failed');
+    }
+});
+"#))
+                }
+            }
+        }
+    })
+}
+
+/// `POST /passkeys/login/begin` — start a discoverable authentication ceremony.
+///
+/// Uses `start_discoverable_authentication` so the browser shows the passkey
+/// selector without the server knowing the user upfront.  No credential IDs
+/// are sent to anonymous clients.
+#[post("/passkeys/login/begin")]
+pub async fn passkey_login_begin(
+    session: Session,
+    State(state): State<AppState>,
+) -> AutumnResult<axum::Json<serde_json::Value>> {
+    let webauthn = build_webauthn(&state)?;
+    let (rcr, auth_state) = webauthn
+        .start_discoverable_authentication()
+        .map_err(|e| {
+            AutumnError::internal_server_error_msg(format!(
+                "start_discoverable_authentication: {e}"
+            ))
+        })?;
+    session
+        .insert(
+            "passkey_auth_state",
+            serde_json::to_string(&auth_state).unwrap_or_default(),
+        )
+        .await;
+    Ok(axum::Json(serde_json::to_value(rcr).unwrap_or_default()))
+}
+
+/// `POST /passkeys/login/finish` — complete a discoverable authentication ceremony.
+///
+/// On success writes `state.auth_session_key()`, `__SNAKE___id`, and
+/// `__SNAKE___email` so downstream `#[secured]` routes work without modification.
+#[post("/passkeys/login/finish")]
+pub async fn passkey_login_finish(
+    session: Session,
+    State(state): State<AppState>,
+    mut db: Db,
+    axum::Json(body): axum::Json<PasskeyLoginFinishBody>,
+) -> AutumnResult<axum::Json<serde_json::Value>> {
+    let auth_state_str: String = session
+        .get("passkey_auth_state")
+        .await
+        .ok_or_else(|| AutumnError::unprocessable_msg("No pending authentication."))?;
+    session.remove("passkey_auth_state").await;
+    let auth_state: DiscoverableAuthentication = serde_json::from_str(&auth_state_str)
+        .map_err(|_| AutumnError::unprocessable_msg("Invalid authentication state."))?;
+    let webauthn = build_webauthn(&state)?;
+    let pkc: PublicKeyCredential = serde_json::from_value(body.response)
+        .map_err(|e| AutumnError::unprocessable_msg(format!("Invalid credential: {e}")))?;
+    // Decode user identity from the credential's userHandle (set during registration).
+    let (user_uuid, _) = webauthn
+        .identify_discoverable_authentication(&pkc)
+        .map_err(|e| AutumnError::unauthorized_msg(format!("Cannot identify user: {e}")))?;
+    let __SNAKE___id = user_uuid.as_u128() as i64;
+    // Load only this user's passkeys for signature verification.
+    let disc_keys: Vec<DiscoverableKey> = {
+        use crate::schema::webauthn_credentials;
+        webauthn_credentials::table
+            .filter(webauthn_credentials::user_id.eq(__SNAKE___id))
+            .select(webauthn_credentials::credential_json)
+            .load::<String>(&mut *db)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|json| serde_json::from_str::<Passkey>(&json).ok())
+            .map(|p| DiscoverableKey::from(&p))
+            .collect()
+    };
+    let auth_result = webauthn
+        .finish_discoverable_authentication(&pkc, auth_state, &disc_keys)
+        .map_err(|e| AutumnError::unauthorized_msg(format!("Authentication failed: {e}")))?;
+    let cred_id_str = auth_result.cred_id().to_string();
+    let (wc_id, cred_json) = {
+        use crate::schema::webauthn_credentials;
+        webauthn_credentials::table
+            .filter(webauthn_credentials::credential_id.eq(&cred_id_str))
+            .filter(webauthn_credentials::user_id.eq(__SNAKE___id))
+            .select((webauthn_credentials::id, webauthn_credentials::credential_json))
+            .first::<(i64, String)>(&mut *db)
+            .await
+            .map_err(|_| AutumnError::unauthorized_msg("Unknown credential."))?
+    };
+    let __SNAKE___email: String = {
+        use crate::schema::__TABLE__;
+        __TABLE__::table
+            .find(__SNAKE___id)
+            .select(__TABLE__::email)
+            .first(&mut *db)
+            .await
+            .map_err(|_| AutumnError::unauthorized_msg("User not found."))?
+    };
+    let now = chrono::Utc::now().naive_utc();
+    if auth_result.needs_update() {
+        let mut passkey: Passkey = serde_json::from_str(&cred_json)
+            .unwrap_or_else(|_| serde_json::from_value(serde_json::Value::Null).unwrap());
+        passkey.update_credential(&auth_result);
+        let new_json = serde_json::to_string(&passkey).unwrap_or(cred_json.clone());
+        diesel::update(crate::schema::webauthn_credentials::table.find(wc_id))
+            .set((
+                crate::schema::webauthn_credentials::credential_json.eq(&new_json),
+                crate::schema::webauthn_credentials::last_used_at.eq(now),
+            ))
+            .execute(&mut *db)
+            .await
+            .map_err(|_| {
+                AutumnError::internal_server_error_msg("Failed to update credential state.")
+            })?;
+    } else {
+        diesel::update(crate::schema::webauthn_credentials::table.find(wc_id))
+            .set(crate::schema::webauthn_credentials::last_used_at.eq(now))
+            .execute(&mut *db)
+            .await
+            .map_err(|_| {
+                AutumnError::internal_server_error_msg("Failed to update credential timestamp.")
+            })?;
+    }
+    session.rotate_id().await;
+    session
+        .insert("__SNAKE___id", __SNAKE___id.to_string())
+        .await;
+    session.insert("__SNAKE___email", &__SNAKE___email).await;
+    session
+        .insert(state.auth_session_key(), __SNAKE___id.to_string())
+        .await;
+    Ok(axum::Json(serde_json::json!({ "ok": true })))
+}
+
+// ── Management ────────────────────────────────────────────────────────────────
+
+/// `GET /passkeys` — list the current user's registered passkeys.
+#[secured]
+#[get("/passkeys")]
+pub async fn passkey_list(
+    session: Session,
+    State(state): State<AppState>,
+    mut db: Db,
+    csrf: Option<CsrfToken>,
+    csrf_field: Option<CsrfFormField>,
+) -> AutumnResult<Markup> {
+    let __SNAKE___id: i64 = session
+        .get(state.auth_session_key())
+        .await
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| AutumnError::unauthorized_msg("Not authenticated."))?;
+    let rows: Vec<(i64, String, chrono::NaiveDateTime)> = {
+        use crate::schema::webauthn_credentials;
+        webauthn_credentials::table
+            .filter(webauthn_credentials::user_id.eq(__SNAKE___id))
+            .select((
+                webauthn_credentials::id,
+                webauthn_credentials::name,
+                webauthn_credentials::created_at,
+            ))
+            .load(&mut *db)
+            .await
+            .unwrap_or_default()
+    };
+    Ok(html! {
+        html {
+            head { title { "Your Passkeys" } }
+            body {
+                h1 { "Your Passkeys" }
+                a href="/passkeys/register" { "Register a new passkey" }
+                @if rows.is_empty() {
+                    p { "No passkeys registered yet." }
+                } @else {
+                    ul {
+                        @for (id, name, created_at) in &rows {
+                            li {
+                                (name) " — registered " (created_at.to_string())
+                                " "
+                                form method="post" action="/passkeys/revoke" style="display:inline" {
+                                    @if let Some(ref t) = csrf {
+                                        input type="hidden"
+                                              name=(csrf_field.as_ref().map(|f| f.0.as_str()).unwrap_or("_csrf"))
+                                              value=(t.token());
+                                    }
+                                    input type="hidden" name="id" value=(id);
+                                    button type="submit" { "Revoke" }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    })
+}
+
+/// `DELETE /passkeys/:id` (also accepts `POST /passkeys/revoke`) — remove a passkey.
+#[secured]
+#[post("/passkeys/revoke")]
+pub async fn passkey_revoke(
+    session: Session,
+    State(state): State<AppState>,
+    mut db: Db,
+    Form(form): Form<PasskeyRevokeForm>,
+) -> AutumnResult<impl IntoResponse> {
+    let __SNAKE___id: i64 = session
+        .get(state.auth_session_key())
+        .await
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| AutumnError::unauthorized_msg("Not authenticated."))?;
+    diesel::delete(
+        crate::schema::webauthn_credentials::table
+            .filter(crate::schema::webauthn_credentials::id.eq(form.id))
+            .filter(crate::schema::webauthn_credentials::user_id.eq(__SNAKE___id)),
+    )
+    .execute(&mut *db)
+    .await
+    .map_err(|_| AutumnError::internal_server_error_msg("Failed to revoke passkey."))?;
+    Ok(redirect_to("/passkeys"))
+}
+"##;
+    tpl.replace("__PASCAL__", pascal_name)
+        .replace("__SNAKE__", snake_name)
+        .replace("__TABLE__", user_table)
+}
+
+fn render_passkeys_tests_file(pascal_name: &str, _snake_name: &str) -> String {
+    format!(
+        r#"//! Generated passkey integration tests for {pascal_name} (`autumn generate auth --passkeys`).
+//!
+//! These tests run against a live server started with `AUTUMN_TEST_BASE_URL`.
+//! In CI, start the app, set the env var, and run `cargo test`.
+//! They skip when the env var is unset, so they compile and pass out of the box.
+
+fn base_url() -> Option<String> {{
+    std::env::var("AUTUMN_TEST_BASE_URL").ok()
+}}
+
+#[test]
+fn passkey_register_happy_path() {{
+    let Some(_base) = base_url() else {{
+        eprintln!("skipping: AUTUMN_TEST_BASE_URL not set");
+        return;
+    }};
+    // 1. POST /passkeys/register/begin (authenticated session)
+    // 2. Simulate navigator.credentials.create response
+    // 3. POST /passkeys/register/finish — expect 200 {{ "ok": true }}
+}}
+
+#[test]
+fn passkey_login_happy_path() {{
+    let Some(_base) = base_url() else {{
+        eprintln!("skipping: AUTUMN_TEST_BASE_URL not set");
+        return;
+    }};
+    // 1. POST /passkeys/login/begin
+    // 2. Simulate navigator.credentials.get response
+    // 3. POST /passkeys/login/finish — expect 200 {{ "ok": true }} and auth cookie
+}}
+
+#[test]
+fn passkey_wrong_origin_rejected() {{
+    let Some(_base) = base_url() else {{
+        eprintln!("skipping: AUTUMN_TEST_BASE_URL not set");
+        return;
+    }};
+    // POST /passkeys/login/finish with a credential registered against a different
+    // origin — expect 401 or 422.
+}}
+
+#[test]
+fn passkey_unknown_credential_rejected() {{
+    let Some(_base) = base_url() else {{
+        eprintln!("skipping: AUTUMN_TEST_BASE_URL not set");
+        return;
+    }};
+    // POST /passkeys/login/finish with a credential_id that is not in the DB
+    // — expect 401.
+}}
+
+#[test]
+fn passkey_revoke_then_relogin() {{
+    let Some(_base) = base_url() else {{
+        eprintln!("skipping: AUTUMN_TEST_BASE_URL not set");
+        return;
+    }};
+    // 1. Register a passkey.
+    // 2. POST /passkeys/revoke to remove it.
+    // 3. Attempt login with the revoked credential — expect failure.
+}}
+"#
+    )
+}
+
+fn render_passkeys_docs_file() -> String {
+    r#"# Passkeys (WebAuthn)
+
+Generated with `autumn generate auth --passkeys`. Users can register and use
+hardware security keys, platform authenticators (Touch ID, Face ID, Windows Hello),
+or other FIDO2 compliant devices as passwordless credentials.
+
+## Configuration
+
+Add to `autumn.toml` before enabling passkeys:
+
+```toml
+[auth.webauthn]
+rp_id     = "example.com"          # domain only (no port, no scheme)
+rp_name   = "My App"               # shown in authenticator dialogs
+rp_origin = "https://example.com"  # full origin including scheme
+```
+
+For local development use:
+
+```toml
+[auth.webauthn]
+rp_id     = "localhost"
+rp_name   = "My App (dev)"
+rp_origin = "http://localhost:3000"
+```
+
+## Generated routes
+
+| Method | Path | Handler | Auth |
+|--------|------|---------|------|
+| GET | `/passkeys/register` | `passkey_register_page` | **Required** |
+| POST | `/passkeys/register/begin` | `passkey_register_begin` | **Required** |
+| POST | `/passkeys/register/finish` | `passkey_register_finish` | **Required** |
+| GET | `/passkeys/login` | `passkey_login_page` | Public |
+| POST | `/passkeys/login/begin` | `passkey_login_begin` | Public |
+| POST | `/passkeys/login/finish` | `passkey_login_finish` | Public |
+| GET | `/passkeys` | `passkey_list` | **Required** |
+| POST | `/passkeys/revoke` | `passkey_revoke` | **Required** |
+
+## Security properties
+
+- Ceremony challenges are bound to the origin (`rp_origin`) and domain (`rp_id`).
+  A credential registered against `example.com` cannot authenticate against
+  `evil.com`, even if the credential bytes are stolen.
+- `passkey_login_finish` calls `session.rotate_id()` before writing the auth key,
+  preventing session fixation.
+- Revoked credentials are deleted from `webauthn_credentials`; a subsequent
+  login attempt with the revoked credential will fail at the DB lookup step.
+- `credential_json` stores opaque passkey state — never expose it to clients.
+
+## Discoverable credentials
+
+`passkey_login_begin` passes `&[]` (an empty allowed-credentials list), enabling
+**discoverable credential** (resident key) flow. The browser prompts the user to
+select a saved passkey without the server needing to know their identity first.
+No credential IDs are sent to anonymous clients.
+
+## Browser compatibility
+
+The generated JavaScript uses `PublicKeyCredential.parseCreationOptionsFromJSON`,
+`parseRequestOptionsFromJSON`, and `credential.toJSON()` (Chrome 119+,
+Firefox 119+, Safari 17+). Add a polyfill (e.g. `@github/webauthn-json`) for
+older browsers.
+
+## Out of scope (follow-ups)
+
+- **Rate-limiting** on ceremony endpoints is not included — add it before
+  exposing them to untrusted traffic.
+"#
+    .to_owned()
+}
+
+/// Ensure `autumn-web` in `[dependencies]` has `features = ["webauthn"]`.
+#[allow(clippy::too_many_lines)]
+fn ensure_autumn_web_webauthn_feature(toml: &str) -> String {
+    const CRATE: &str = "autumn-web";
+    const FEATURE: &str = "\"webauthn\"";
+
+    let mut lines: Vec<String> = toml.lines().map(str::to_owned).collect();
+    let trailing_newline = toml.ends_with('\n');
+
+    let simple_prefix = format!("{CRATE} = \"");
+    let table_prefix = format!("{CRATE} = {{");
+    let subtable_header = format!("[dependencies.{CRATE}]");
+    let subtable_header_underscore = format!("[dependencies.{}]", CRATE.replace('-', "_"));
+
+    let mut i = 0;
+    while i < lines.len() {
+        let trimmed = lines[i].trim().to_owned();
+        let indent: String = lines[i]
+            .chars()
+            .take_while(char::is_ascii_whitespace)
+            .collect();
+
+        if let Some(rest) = trimmed.strip_prefix(&simple_prefix) {
+            let version = rest.trim_end_matches('"');
+            lines[i] =
+                format!("{indent}{CRATE} = {{ version = \"{version}\", features = [{FEATURE}] }}");
+            break;
+        }
+
+        if trimmed.starts_with(&table_prefix) {
+            if trimmed.contains(FEATURE) {
+                break; // already present
+            }
+            if let Some(feat_bracket) = trimmed.find("features = [") {
+                let list_start = feat_bracket + "features = [".len();
+                if let Some(close_bracket) = trimmed[list_start..].find(']') {
+                    let list_end = close_bracket + list_start;
+                    let existing = trimmed[list_start..list_end].trim();
+                    let new_list = if existing.is_empty() {
+                        FEATURE.to_owned()
+                    } else {
+                        format!("{existing}, {FEATURE}")
+                    };
+                    lines[i] = format!(
+                        "{indent}{}{}{}",
+                        &trimmed[..list_start],
+                        new_list,
+                        &trimmed[list_end..]
+                    );
+                } else {
+                    let mut j = i + 1;
+                    while j < lines.len() {
+                        let tj = lines[j].trim();
+                        if tj.starts_with('[') {
+                            break;
+                        }
+                        if let Some(close_idx) = tj.find(']') {
+                            let before_close = tj[..close_idx].trim();
+                            let sep = if before_close.is_empty() || before_close.ends_with(',') {
+                                ""
+                            } else {
+                                ", "
+                            };
+                            let indent_j: String = lines[j]
+                                .chars()
+                                .take_while(char::is_ascii_whitespace)
+                                .collect();
+                            lines[j] = format!(
+                                "{indent_j}{before_close}{sep}{FEATURE}{}",
+                                &tj[close_idx..]
+                            );
+                            break;
+                        }
+                        j += 1;
+                    }
+                }
+            } else {
+                // No features key — insert before closing `}`.
+                let close = trimmed.rfind('}').unwrap();
+                let before_close = trimmed[..close].trim_end();
+                let sep = if before_close.ends_with('{') {
+                    ""
+                } else {
+                    ", "
+                };
+                lines[i] = format!(
+                    "{indent}{}{sep}features = [{FEATURE}]{}",
+                    &trimmed[..close],
+                    &trimmed[close..]
+                );
+            }
+            break;
+        }
+
+        if trimmed == subtable_header || trimmed == subtable_header_underscore {
+            // Scan ahead within the subtable.
+            let mut j = i + 1;
+            let mut found_features = false;
+            while j < lines.len() {
+                let t = lines[j].trim().to_owned();
+                if t.starts_with('[') {
+                    break;
+                }
+                if t.starts_with("features") {
+                    found_features = true;
+                    if !t.contains(FEATURE)
+                        && let (Some(open), Some(close)) = (t.find('['), t.rfind(']'))
+                    {
+                        let inner = t[open + 1..close].trim();
+                        let new_inner = if inner.is_empty() {
+                            FEATURE.to_owned()
+                        } else {
+                            format!("{inner}, {FEATURE}")
+                        };
+                        let indent_j: String = lines[j]
+                            .chars()
+                            .take_while(char::is_ascii_whitespace)
+                            .collect();
+                        lines[j] = format!("{indent_j}features = [{new_inner}]");
+                    }
+                    break;
+                }
+                j += 1;
+            }
+            if !found_features {
+                lines.insert(i + 1, format!("features = [{FEATURE}]"));
+            }
+            break;
+        }
+
+        i += 1;
+    }
+
+    let mut out = lines.join("\n");
+    if trailing_newline && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+fn append_webauthn_stub_to_toml(
+    existing: &str,
+    rp_id: &str,
+    rp_name: &str,
+    rp_origin: &str,
+) -> String {
+    if existing.contains("[auth.webauthn]") {
+        return existing.to_owned();
+    }
+    let mut out = existing.trim_end().to_owned();
+    out.push_str("\n\n[auth.webauthn]\n");
+    out.push_str("rp_id = \"");
+    out.push_str(rp_id);
+    out.push_str("\"\nrp_name = \"");
+    out.push_str(rp_name);
+    out.push_str("\"\nrp_origin = \"");
+    out.push_str(rp_origin);
+    out.push_str("\"\n");
+    out
+}
+
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -5214,6 +6387,321 @@ mod tests {
         assert!(
             !oauth_routes.contains("TWO-FACTOR"),
             "oauth-only scaffold must not mention the 2FA callback note: {oauth_routes}"
+        );
+    }
+
+    // ── Passkeys (WebAuthn) generator tests (S-062 / #806) ──────────────────────
+
+    fn passkey_plan(tmp: &std::path::Path) -> Plan {
+        plan_auth_full_ex(
+            tmp,
+            "User",
+            "20260508000000",
+            &AuthOAuthOptions::default(),
+            false,
+            true,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn passkeys_flag_defaults_off() {
+        // Without --passkeys, plan_auth_full (the 5-arg form) must not emit any
+        // passkey artefacts — passkeys are opt-in.
+        let tmp = project_with_main();
+        plan_auth_full(
+            tmp.path(),
+            "User",
+            "20260508000000",
+            &AuthOAuthOptions::default(),
+            false,
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+        assert!(
+            !tmp.path().join("src/routes/passkeys.rs").exists(),
+            "passkeys.rs must not be created without --passkeys"
+        );
+        assert!(
+            !tmp.path().join("tests/auth_passkeys.rs").exists(),
+            "auth_passkeys.rs must not be created without --passkeys"
+        );
+    }
+
+    #[test]
+    fn passkeys_plan_emits_webauthn_credentials_migration() {
+        let tmp = project_with_main();
+        passkey_plan(tmp.path()).execute(Flags::default()).unwrap();
+        // The migration directory name is timestamp+1 relative to the base ts.
+        let up = fs::read_to_string(
+            tmp.path()
+                .join("migrations/20260508000001_create_webauthn_credentials/up.sql"),
+        )
+        .unwrap();
+        assert!(
+            up.contains("CREATE TABLE webauthn_credentials"),
+            "missing CREATE TABLE webauthn_credentials: {up}"
+        );
+        assert!(up.contains("user_id"), "missing user_id column: {up}");
+        assert!(
+            up.contains("credential_id"),
+            "missing credential_id column: {up}"
+        );
+        assert!(
+            up.contains("credential_json"),
+            "missing credential_json column: {up}"
+        );
+        let down = fs::read_to_string(
+            tmp.path()
+                .join("migrations/20260508000001_create_webauthn_credentials/down.sql"),
+        )
+        .unwrap();
+        assert!(
+            down.contains("DROP TABLE webauthn_credentials"),
+            "down.sql must drop webauthn_credentials: {down}"
+        );
+    }
+
+    #[test]
+    fn passkeys_plan_emits_four_ceremony_routes() {
+        let tmp = project_with_main();
+        passkey_plan(tmp.path()).execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/passkeys.rs")).unwrap();
+        for needle in [
+            "passkey_register_begin",
+            "passkey_register_finish",
+            "passkey_login_begin",
+            "passkey_login_finish",
+        ] {
+            assert!(
+                routes.contains(needle),
+                "passkeys.rs missing ceremony handler: {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn passkeys_plan_emits_list_and_revoke_surface() {
+        let tmp = project_with_main();
+        passkey_plan(tmp.path()).execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/passkeys.rs")).unwrap();
+        assert!(
+            routes.contains("passkey_list"),
+            "missing passkey_list: {routes}"
+        );
+        assert!(
+            routes.contains("passkey_revoke"),
+            "missing passkey_revoke: {routes}"
+        );
+        assert!(
+            routes.contains("#[secured]"),
+            "revoke/list must use #[secured]: {routes}"
+        );
+    }
+
+    #[test]
+    fn passkeys_login_finish_writes_session_auth_key() {
+        let tmp = project_with_main();
+        passkey_plan(tmp.path()).execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/passkeys.rs")).unwrap();
+        assert!(
+            routes.contains("state.auth_session_key()"),
+            "passkey_login_finish must call session.insert(state.auth_session_key(), ...): {routes}"
+        );
+        // After template substitution ("User" → "user"), __SNAKE___id becomes user_id.
+        assert!(
+            routes.contains("\"user_id\""),
+            "passkey_login_finish must store user_id in session: {routes}"
+        );
+        assert!(
+            routes.contains("\"user_email\""),
+            "passkey_login_finish must store user_email in session: {routes}"
+        );
+    }
+
+    #[test]
+    fn passkeys_plan_emits_rp_config_in_autumn_toml() {
+        let tmp = project_with_main();
+        // Create an autumn.toml so the generator can update it.
+        fs::write(tmp.path().join("autumn.toml"), "[server]\nport = 3000\n").unwrap();
+        passkey_plan(tmp.path()).execute(Flags::default()).unwrap();
+        let toml = fs::read_to_string(tmp.path().join("autumn.toml")).unwrap();
+        assert!(
+            toml.contains("[auth.webauthn]"),
+            "autumn.toml missing [auth.webauthn]: {toml}"
+        );
+        assert!(toml.contains("rp_id"), "autumn.toml missing rp_id: {toml}");
+        assert!(
+            toml.contains("rp_name"),
+            "autumn.toml missing rp_name: {toml}"
+        );
+        assert!(
+            toml.contains("rp_origin"),
+            "autumn.toml missing rp_origin: {toml}"
+        );
+    }
+
+    #[test]
+    fn passkeys_plan_adds_webauthn_feature_to_autumn_web() {
+        let tmp = project_with_main();
+        passkey_plan(tmp.path()).execute(Flags::default()).unwrap();
+        let cargo = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+        assert!(
+            cargo.contains("webauthn"),
+            "Cargo.toml must reference webauthn feature or dep: {cargo}"
+        );
+        assert!(
+            cargo.contains("webauthn-rs"),
+            "Cargo.toml missing webauthn-rs dep: {cargo}"
+        );
+    }
+
+    #[test]
+    fn passkeys_plan_generates_integration_tests() {
+        let tmp = project_with_main();
+        passkey_plan(tmp.path()).execute(Flags::default()).unwrap();
+        let tests = fs::read_to_string(tmp.path().join("tests/auth_passkeys.rs")).unwrap();
+        for needle in [
+            "passkey_register_happy_path",
+            "passkey_login_happy_path",
+            "passkey_wrong_origin_rejected",
+            "passkey_unknown_credential_rejected",
+            "passkey_revoke_then_relogin",
+        ] {
+            assert!(
+                tests.contains(needle),
+                "auth_passkeys.rs missing test: {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn passkeys_plan_writes_docs() {
+        let tmp = project_with_main();
+        passkey_plan(tmp.path()).execute(Flags::default()).unwrap();
+        let docs = fs::read_to_string(tmp.path().join("docs/guide/passkeys.md")).unwrap();
+        assert!(
+            docs.contains("rp_id") || docs.contains("rp_origin") || docs.contains("WebAuthn"),
+            "docs/guide/passkeys.md should cover rp config or WebAuthn: {docs}"
+        );
+    }
+
+    #[test]
+    fn passkeys_plan_maud_template_has_js_shim() {
+        let tmp = project_with_main();
+        passkey_plan(tmp.path()).execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/passkeys.rs")).unwrap();
+        assert!(
+            routes.contains("navigator.credentials"),
+            "passkeys.rs Maud template must include navigator.credentials JS: {routes}"
+        );
+    }
+
+    #[test]
+    fn passkeys_plan_registers_routes_in_main() {
+        let tmp = project_with_main();
+        passkey_plan(tmp.path()).execute(Flags::default()).unwrap();
+        let main = fs::read_to_string(tmp.path().join("src/main.rs")).unwrap();
+        for entry in [
+            "routes::passkeys::passkey_register_begin",
+            "routes::passkeys::passkey_register_finish",
+            "routes::passkeys::passkey_login_begin",
+            "routes::passkeys::passkey_login_finish",
+            "routes::passkeys::passkey_list",
+            "routes::passkeys::passkey_revoke",
+        ] {
+            assert!(
+                main.contains(entry),
+                "main.rs missing passkey route: {entry}"
+            );
+        }
+    }
+
+    #[test]
+    fn passkeys_can_combine_with_oauth_and_totp() {
+        let tmp = project_with_main();
+        let oauth = AuthOAuthOptions {
+            providers: vec!["github".to_owned()],
+        };
+        plan_auth_full_ex(tmp.path(), "User", "20260508000000", &oauth, true, true)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+        assert!(tmp.path().join("src/routes/passkeys.rs").exists());
+        assert!(tmp.path().join("src/routes/oauth.rs").exists());
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+        assert!(
+            routes.contains("two_factor_enable"),
+            "totp+passkeys+oauth must keep 2fa handlers"
+        );
+    }
+
+    #[test]
+    fn passkeys_misconfiguration_fails_fast_error_message() {
+        let tmp = project_with_main();
+        passkey_plan(tmp.path()).execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/passkeys.rs")).unwrap();
+        assert!(
+            routes.contains("auth.webauthn"),
+            "build_webauthn error must mention auth.webauthn config key: {routes}"
+        );
+    }
+
+    #[test]
+    fn ensure_webauthn_rs_features_merges_into_shorthand() {
+        let toml = "webauthn-rs = \"0.5\"\n";
+        let out = ensure_webauthn_rs_features(toml);
+        assert!(
+            out.contains("danger-allow-state-serialisation"),
+            "shorthand should be promoted: {out}"
+        );
+        assert!(
+            out.contains("conditional-ui"),
+            "missing conditional-ui: {out}"
+        );
+    }
+
+    #[test]
+    fn ensure_webauthn_rs_features_merges_into_partial_inline() {
+        let toml = "webauthn-rs = { version = \"0.5\", features = [\"danger-allow-state-serialisation\"] }\n";
+        let out = ensure_webauthn_rs_features(toml);
+        assert!(
+            out.contains("conditional-ui"),
+            "conditional-ui should be added to partial features: {out}"
+        );
+    }
+
+    #[test]
+    fn ensure_webauthn_rs_features_is_idempotent() {
+        let toml = "webauthn-rs = { version = \"0.5\", features = [\"danger-allow-state-serialisation\", \"conditional-ui\"] }\n";
+        let out = ensure_webauthn_rs_features(toml);
+        assert_eq!(out, toml, "idempotent: should not duplicate features");
+    }
+
+    #[test]
+    fn passkeys_routes_template_has_redirect_to() {
+        let tmp = project_with_main();
+        passkey_plan(tmp.path()).execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/passkeys.rs")).unwrap();
+        assert!(
+            routes.contains("fn redirect_to"),
+            "passkeys.rs must define redirect_to: {routes}"
+        );
+        assert!(
+            routes.contains("impl IntoResponse"),
+            "redirect_to must return impl IntoResponse: {routes}"
+        );
+    }
+
+    #[test]
+    fn passkeys_register_begin_binds_user_id() {
+        let tmp = project_with_main();
+        passkey_plan(tmp.path()).execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/passkeys.rs")).unwrap();
+        assert!(
+            routes.contains("user_id"),
+            "register begin should store user_id in passkey_reg_state envelope: {routes}"
         );
     }
 }

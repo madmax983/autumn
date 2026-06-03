@@ -11,10 +11,11 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::LazyLock;
 
+use autumn_web::extract::Multipart;
 use autumn_web::flash::Flash;
 use autumn_web::job::{JobAdminQuery, JobAdminSnapshot, JobScheduleSummary, job_admin_backend};
 use autumn_web::prelude::HxResponseExt;
-use autumn_web::security::{CsrfFormField, CsrfToken};
+use autumn_web::security::{CsrfFormField, CsrfToken, CsrfTokenHeader};
 use autumn_web::{AppState, AutumnError, AutumnResult};
 use axum::extract::{FromRequestParts, Path, Query, State};
 use axum::http::request::Parts;
@@ -32,7 +33,8 @@ use crate::auth::check_role;
 use crate::registry::AdminRegistry;
 use crate::templates;
 use crate::traits::{
-    AdminError, AdminField, AdminFieldKind, AdminModel, ListParams, SortDirection, record_id,
+    AdminError, AdminField, AdminFieldKind, AdminImportError, AdminImportReport,
+    AdminImportRowResult, AdminModel, CsvImportMode, ListParams, SortDirection, record_id,
 };
 
 /// Admin-owned CSRF extractor that tolerates a missing `CsrfLayer`.
@@ -47,6 +49,7 @@ use crate::traits::{
 pub struct AdminCsrf {
     token: String,
     form_field: String,
+    token_header: String,
 }
 
 impl AdminCsrf {
@@ -65,6 +68,16 @@ impl AdminCsrf {
             &self.form_field
         }
     }
+
+    /// The configured CSRF token header name, or `"X-CSRF-Token"` when CSRF is absent.
+    #[must_use]
+    pub fn token_header(&self) -> &str {
+        if self.token_header.is_empty() {
+            "X-CSRF-Token"
+        } else {
+            &self.token_header
+        }
+    }
 }
 
 impl<S: Send + Sync> FromRequestParts<S> for AdminCsrf {
@@ -80,7 +93,15 @@ impl<S: Send + Sync> FromRequestParts<S> for AdminCsrf {
             .extensions
             .get::<CsrfFormField>()
             .map_or_else(|| "_csrf".to_owned(), |field| field.0.clone());
-        Ok(Self { token, form_field })
+        let token_header = parts
+            .extensions
+            .get::<CsrfTokenHeader>()
+            .map_or_else(|| "X-CSRF-Token".to_owned(), |h| h.0.clone());
+        Ok(Self {
+            token,
+            form_field,
+            token_header,
+        })
     }
 }
 
@@ -163,6 +184,12 @@ pub fn admin_router(
         // name from the list-view form; dispatches to
         // `AdminModel::execute_action`.
         .route("/{slug}/actions", routing::post(model_action))
+        // CSV export (GET) and import (POST)
+        .route("/{slug}/export.csv", routing::get(model_export_csv))
+        .route(
+            "/{slug}/import",
+            routing::get(model_import_form).post(model_import_csv),
+        )
         .route(&ADMIN_JS_PATH, routing::get(serve_admin_js))
         .layer(axum::Extension(HasRuntimeConfig(has_config)))
         .layer(axum::Extension(AdminPrefix(prefix.to_owned())))
@@ -376,6 +403,7 @@ async fn dashboard(
         &counts,
         &messages,
         csrf.token(),
+        csrf.token_header(),
         &prefix,
         &actuator_prefix,
         show_config,
@@ -407,6 +435,7 @@ async fn jobs_dashboard(
         &messages,
         csrf.token(),
         csrf.form_field(),
+        csrf.token_header(),
         &prefix,
         &actuator_prefix,
         show_config,
@@ -553,9 +582,12 @@ async fn model_list(
         &messages,
         csrf.token(),
         csrf.form_field(),
+        csrf.token_header(),
         &prefix,
         &actuator_prefix,
         show_config,
+        model.supports_csv_export(),
+        model.supports_csv_import(),
     )))
 }
 
@@ -586,6 +618,7 @@ async fn model_new_form(
         &messages,
         csrf.token(),
         csrf.form_field(),
+        csrf.token_header(),
         &prefix,
         &actuator_prefix,
         show_config,
@@ -660,6 +693,7 @@ async fn model_detail(
         id,
         &messages,
         csrf.token(),
+        csrf.token_header(),
         &prefix,
         &actuator_prefix,
         model.has_history(),
@@ -680,6 +714,7 @@ async fn model_history(
     axum::Extension(HasRuntimeConfig(show_config)): axum::Extension<HasRuntimeConfig>,
     Path((slug, id)): Path<(String, i64)>,
     Query(params): Query<HashMap<String, String>>,
+    csrf: AdminCsrf,
 ) -> AutumnResult<Response> {
     let (pool, model) = resolve(&state, &registry, &slug)?;
 
@@ -710,6 +745,7 @@ async fn model_history(
         &history,
         &prefix,
         &actuator_prefix,
+        csrf.token_header(),
         show_config,
     )))
 }
@@ -749,6 +785,7 @@ async fn model_edit_form(
         &messages,
         csrf.token(),
         csrf.form_field(),
+        csrf.token_header(),
         &prefix,
         &actuator_prefix,
         show_config,
@@ -865,6 +902,257 @@ async fn model_delete(
     Ok(StatusCode::OK.hx_redirect(&format!("{prefix}/{slug}")))
 }
 
+// ── CSV export / import handlers ─────────────────────────────────────
+
+/// Records fetched per page during CSV export to bound peak JSON memory usage.
+const EXPORT_PAGE_SIZE: u64 = 500;
+
+/// `GET /admin/{slug}/export.csv` — Download all records as a CSV file.
+///
+/// The response respects active `?q=`, `?sort=`, `?dir=`, and `?filter.*`
+/// query parameters so the exported data matches what the user sees in the
+/// list view.
+#[allow(clippy::too_many_arguments)]
+async fn model_export_csv(
+    State(state): State<AppState>,
+    axum::Extension(registry): axum::Extension<Arc<AdminRegistry>>,
+    Path(slug): Path<String>,
+    Query(query): Query<ListQuery>,
+    Query(raw_query): Query<HashMap<String, String>>,
+) -> AutumnResult<Response> {
+    let (pool, model) = resolve(&state, &registry, &slug)?;
+
+    if !model.supports_csv_export() {
+        return Err(AutumnError::bad_request_msg(format!(
+            "Model '{slug}' does not support CSV export"
+        )));
+    }
+
+    let ListQuery {
+        page: _,
+        q,
+        sort,
+        dir,
+    } = query;
+    let fields = model.fields();
+    let sort_key = validate_sort_key(sort, &fields);
+    let filters = extract_filters(&raw_query, &fields);
+    let search = (!q.is_empty()).then_some(q);
+
+    // Page through records in batches to avoid buffering the entire dataset
+    // as JSON in memory at once.
+    let columns = model.csv_export_columns();
+    let mut buf = Vec::new();
+    {
+        let mut wtr = csv::WriterBuilder::new()
+            .has_headers(true)
+            .from_writer(&mut buf);
+
+        wtr.write_record(&columns)
+            .map_err(|e| AutumnError::internal_server_error_msg(format!("CSV write error: {e}")))?;
+
+        let mut page: u64 = 1;
+        loop {
+            let params = ListParams {
+                page,
+                per_page: EXPORT_PAGE_SIZE,
+                search: search.clone(),
+                sort_by: sort_key.clone(),
+                sort_dir: dir,
+                filters: filters.clone(),
+            };
+            let result = model
+                .list(&pool, params)
+                .await
+                .map_err(|e| admin_err("Export", e))?;
+            let done =
+                result.records.len() < usize::try_from(EXPORT_PAGE_SIZE).unwrap_or(usize::MAX);
+            for record in &result.records {
+                let row = model.csv_export_row(&columns, record);
+                wtr.write_record(&row).map_err(|e| {
+                    AutumnError::internal_server_error_msg(format!("CSV write error: {e}"))
+                })?;
+            }
+            if done {
+                break;
+            }
+            page += 1;
+        }
+
+        wtr.flush()
+            .map_err(|e| AutumnError::internal_server_error_msg(format!("CSV flush error: {e}")))?;
+    }
+
+    let filename = format!("{slug}.csv");
+    axum::response::Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/csv; charset=utf-8")
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{filename}\""),
+        )
+        .body(axum::body::Body::from(buf))
+        .map_err(|e| AutumnError::internal_server_error_msg(format!("Response error: {e}")))
+}
+
+/// `GET /admin/{slug}/import` — Render the CSV import form.
+#[allow(clippy::too_many_arguments)]
+async fn model_import_form(
+    State(state): State<AppState>,
+    axum::Extension(registry): axum::Extension<Arc<AdminRegistry>>,
+    axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
+    axum::Extension(ActuatorPrefix(actuator_prefix)): axum::Extension<ActuatorPrefix>,
+    axum::Extension(HasRuntimeConfig(show_config)): axum::Extension<HasRuntimeConfig>,
+    Path(slug): Path<String>,
+    csrf: AdminCsrf,
+    flash: Flash,
+) -> AutumnResult<Response> {
+    let model = registry
+        .get(&slug)
+        .ok_or_else(|| AutumnError::not_found_msg(format!("Model '{slug}' not found")))?;
+
+    if !model.supports_csv_import() {
+        return Err(AutumnError::bad_request_msg(format!(
+            "Model '{slug}' does not support CSV import"
+        )));
+    }
+
+    let _ = state; // pool not needed to render the form
+    let messages = flash.consume().await;
+    Ok(render(templates::model_import_form_page(
+        &registry,
+        &slug,
+        model.display_name_plural(),
+        &messages,
+        csrf.token(),
+        csrf.form_field(),
+        csrf.token_header(),
+        &prefix,
+        &actuator_prefix,
+        show_config,
+    )))
+}
+
+/// `POST /admin/{slug}/import` — Accept a multipart CSV upload and import rows.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+async fn model_import_csv(
+    State(state): State<AppState>,
+    axum::Extension(registry): axum::Extension<Arc<AdminRegistry>>,
+    axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
+    axum::Extension(ActuatorPrefix(actuator_prefix)): axum::Extension<ActuatorPrefix>,
+    axum::Extension(HasRuntimeConfig(show_config)): axum::Extension<HasRuntimeConfig>,
+    Path(slug): Path<String>,
+    csrf: AdminCsrf,
+    flash: Flash,
+    mut multipart: Multipart,
+) -> AutumnResult<Response> {
+    let (pool, model) = resolve(&state, &registry, &slug)?;
+
+    if !model.supports_csv_import() {
+        return Err(AutumnError::bad_request_msg(format!(
+            "Model '{slug}' does not support CSV import"
+        )));
+    }
+
+    // Read multipart fields: "file" (required) and "mode" (optional).
+    let mut csv_bytes: Option<Vec<u8>> = None;
+    let mut import_mode = CsvImportMode::Insert;
+
+    while let Some(field) = multipart.next_field().await? {
+        match field.name() {
+            Some("file") => {
+                csv_bytes = Some(field.bytes_limited().await?);
+            }
+            Some("mode") => {
+                let bytes = field.bytes_limited().await?;
+                let val = String::from_utf8_lossy(&bytes).into_owned();
+                import_mode = CsvImportMode::from_form_value(&val).ok_or_else(|| {
+                    AutumnError::bad_request_msg(format!("Unknown import mode: '{val}'"))
+                })?;
+            }
+            _ => {}
+        }
+    }
+
+    let csv_bytes = csv_bytes
+        .ok_or_else(|| AutumnError::bad_request_msg("No CSV file found in the multipart upload"))?;
+
+    // Parse CSV headers first, then process rows.
+    let mut rdr = csv::ReaderBuilder::new()
+        .has_headers(true)
+        .from_reader(csv_bytes.as_slice());
+
+    let headers: Vec<String> = rdr
+        .headers()
+        .map_err(|e| AutumnError::bad_request_msg(format!("CSV header error: {e}")))?
+        .iter()
+        .map(str::to_owned)
+        .collect();
+
+    let mut report = AdminImportReport::default();
+
+    for result in rdr.records() {
+        match result {
+            Ok(record) => {
+                let line = record.position().map_or(0, csv::Position::line);
+                let row: std::collections::HashMap<String, String> = headers
+                    .iter()
+                    .zip(record.iter())
+                    .map(|(k, v)| (k.clone(), v.to_owned()))
+                    .collect();
+
+                let outcome = model
+                    .import_csv_row(&pool, line, row, import_mode)
+                    .await
+                    .unwrap_or_else(|e| AdminImportRowResult::RowError(e.to_string()));
+
+                match outcome {
+                    AdminImportRowResult::Inserted => report.inserted += 1,
+                    AdminImportRowResult::Updated => report.updated += 1,
+                    AdminImportRowResult::Skipped => report.skipped += 1,
+                    AdminImportRowResult::RowError(msg) => {
+                        report.errors.push(AdminImportError {
+                            line,
+                            column: None,
+                            message: msg,
+                        });
+                    }
+                    AdminImportRowResult::FieldError { column, message } => {
+                        report.errors.push(AdminImportError {
+                            line,
+                            column: Some(column),
+                            message,
+                        });
+                    }
+                }
+            }
+            Err(e) => {
+                let line = e.position().map_or(0, csv::Position::line);
+                report.errors.push(AdminImportError {
+                    line,
+                    column: None,
+                    message: format!("CSV parse error: {e}"),
+                });
+            }
+        }
+    }
+
+    let messages = flash.consume().await;
+    Ok(render(templates::model_import_result_page(
+        &registry,
+        &slug,
+        model.display_name_plural(),
+        &report,
+        import_mode,
+        &messages,
+        csrf.token(),
+        csrf.token_header(),
+        &prefix,
+        &actuator_prefix,
+        show_config,
+    )))
+}
+
 // ── Runtime config handlers ──────────────────────────────────────────
 
 /// `GET /admin/config` — List all runtime config keys with their values.
@@ -886,6 +1174,7 @@ async fn config_list(
         &messages,
         csrf.token(),
         csrf.form_field(),
+        csrf.token_header(),
         &prefix,
         &actuator_prefix,
     )))
@@ -954,6 +1243,7 @@ async fn config_key_history(
         &history,
         &messages,
         csrf.token(),
+        csrf.token_header(),
         &prefix,
         &actuator_prefix,
     )))

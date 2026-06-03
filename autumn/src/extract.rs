@@ -259,6 +259,7 @@ struct MultipartFieldStreamState<'a> {
 }
 
 #[cfg(feature = "multipart")]
+#[allow(clippy::elidable_lifetime_names)]
 impl<'a> MultipartField<'a> {
     /// Field name from the multipart form.
     #[must_use]
