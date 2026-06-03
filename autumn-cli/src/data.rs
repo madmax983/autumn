@@ -276,7 +276,7 @@ mod tests {
         // We cannot connect to localhost:9 (IANA discard port)
         // so the function should fail gracefully. We test that the
         // inner function returns Err rather than testing that it exits.
-        let result = run_export_inner("posts", "http://127.0.0.1:9", None, None);
+        let result = run_export_inner("posts", "http://127.0.0.1:9", None, None, None);
         assert!(result.is_err(), "should fail with unreachable URL");
     }
 
@@ -287,6 +287,7 @@ mod tests {
             "http://127.0.0.1:3000",
             "/tmp/nonexistent_autumn_csv_import_test.csv",
             false,
+            None,
         );
         assert!(result.is_err(), "should fail when file doesn't exist");
         assert!(
