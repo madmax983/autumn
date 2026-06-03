@@ -55,10 +55,8 @@ async fn png_handler() -> impl IntoResponse {
 async fn pre_encoded_handler() -> Response {
     // Simulate a response that already has Content-Encoding set (e.g. pre-compressed asset).
     let mut resp = Response::new(axum::body::Body::from(vec![0u8; 32]));
-    resp.headers_mut().insert(
-        header::CONTENT_ENCODING,
-        "gzip".parse().unwrap(),
-    );
+    resp.headers_mut()
+        .insert(header::CONTENT_ENCODING, "gzip".parse().unwrap());
     resp.headers_mut().insert(
         header::CONTENT_TYPE,
         "text/html; charset=utf-8".parse().unwrap(),
@@ -79,9 +77,7 @@ fn compression_enabled_config() -> AutumnConfig {
 /// Compression is **off by default** — no Content-Encoding even with Accept-Encoding.
 #[tokio::test]
 async fn compression_disabled_by_default() {
-    let app = TestApp::new()
-        .routes(routes![html_handler])
-        .build();
+    let app = TestApp::new().routes(routes![html_handler]).build();
 
     let resp = app
         .get("/html")
