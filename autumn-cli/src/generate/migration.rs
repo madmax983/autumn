@@ -12,8 +12,9 @@ use super::emit::Plan;
 use super::naming::pascal_to_snake;
 use super::schema_edit::{
     MigrationShape, add_columns_down_sql, add_columns_up_sql, add_search_down_sql,
-    add_search_up_sql, detect_migration_shape, parse_model_search_config_for_table,
-    remove_columns_down_sql, remove_columns_up_sql, singularize,
+    add_search_up_sql, detect_migration_shape, encrypt_columns_down_sql, encrypt_columns_up_sql,
+    parse_model_search_config_for_table, remove_columns_down_sql, remove_columns_up_sql,
+    singularize,
 };
 use super::{Flags, GenerateError, ensure_project_root, timestamp_now};
 
@@ -63,6 +64,13 @@ pub fn plan_migration(
         MigrationShape::RemoveColumns { ref table } if !fields.is_empty() => (
             remove_columns_up_sql(table, &fields),
             remove_columns_down_sql(table, &fields),
+        ),
+        MigrationShape::EncryptColumns {
+            ref table,
+            ref columns,
+        } => (
+            encrypt_columns_up_sql(table, columns),
+            encrypt_columns_down_sql(table, columns),
         ),
         MigrationShape::AddSearch { ref table } => {
             let singular = singularize(table);

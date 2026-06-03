@@ -999,7 +999,11 @@ fn strip_meta_fields(mut data: Value, fields: &[AdminField]) -> Value {
                 return false;
             }
             // Drop blank string values on Password fields so admins editing
-            // unrelated fields don't overwrite stored hashes.
+            // unrelated fields don't overwrite stored hashes. (Encrypted columns
+            // are rendered as disabled, unsubmitted controls in the form, so they
+            // never reach this map and need no name-based special-casing here —
+            // which also avoids dropping blanks on same-named plaintext columns of
+            // other admin resources.)
             !matches!(v, Value::String(s) if s.is_empty() && matches!(field.kind, AdminFieldKind::Password))
         });
     }

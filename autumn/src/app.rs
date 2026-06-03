@@ -1892,6 +1892,7 @@ impl AppBuilder {
         // 4d. Validate signing secret — production must have a stable, private,
         // entropy-meeting secret before the server binds. Dev/test are exempt.
         fail_fast_on_invalid_signing_secret(&config);
+        fail_fast_on_missing_encryption_keys(&config);
         fail_fast_on_invalid_trusted_hosts(&config);
 
         // 4e. Signed webhook configs must resolve to usable key material
@@ -2471,6 +2472,7 @@ impl AppBuilder {
         // builds don't run migrations against a doomed boot either.
         fail_fast_on_invalid_session_config(&config, session_store.is_some());
         fail_fast_on_invalid_signing_secret(&config);
+        fail_fast_on_missing_encryption_keys(&config);
         fail_fast_on_invalid_trusted_hosts(&config);
 
         // Preflight the configured BlobStore the same way `run()` does.
@@ -2830,6 +2832,7 @@ impl AppBuilder {
 
         fail_fast_on_invalid_session_config(&config, session_store.is_some());
         fail_fast_on_invalid_signing_secret(&config);
+        fail_fast_on_missing_encryption_keys(&config);
         fail_fast_on_invalid_trusted_hosts(&config);
 
         #[cfg(feature = "storage")]
@@ -3679,6 +3682,30 @@ fn fail_fast_on_invalid_session_config(config: &AutumnConfig, has_custom_session
     if let Err(error) = config.session.backend_plan(config.profile.as_deref()) {
         eprintln!("Invalid session backend config: {error}");
         std::process::exit(1);
+    }
+}
+
+/// Resolve at-rest column-encryption keys at boot (#805).
+///
+/// On success this installs the process-global key ring. When encrypted columns
+/// are registered but the key material under `active_record_encryption` is
+/// missing or malformed, the behaviour mirrors the signing-secret check (#597):
+/// a **hard failure in production** (the server must not bind with unusable
+/// encryption), but only a **warning in dev/test** so zero-config local
+/// development and the example apps continue to run. Apps that do not opt into
+/// encrypted columns are unaffected (no registered columns -> no-op).
+fn fail_fast_on_missing_encryption_keys(config: &AutumnConfig) {
+    if let Err(diagnostic) = crate::encryption::init_attribute_encryption(config.credentials()) {
+        let is_production = matches!(config.profile.as_deref(), Some("prod" | "production"));
+        if is_production {
+            eprintln!("Attribute encryption misconfiguration: {diagnostic}");
+            std::process::exit(1);
+        }
+        eprintln!(
+            "warning: attribute encryption is not fully configured (dev): {diagnostic}\n  \
+             note: encrypted-column reads/writes will fail until keys are set; \
+             this is a hard error in production."
+        );
     }
 }
 

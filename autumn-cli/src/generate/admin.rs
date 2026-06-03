@@ -74,6 +74,13 @@ pub struct AdminOptions {
     pub select: Vec<SelectSpec>,
     /// Field names to omit from the generated `fields()` list entirely.
     pub exclude: Vec<String>,
+    /// Field names that are `#[encrypted]` at rest (#805): emit `.encrypted()` so
+    /// the admin redacts and disables them. Auto-detected from the model source.
+    pub encrypted: Vec<String>,
+    /// Field names that are `#[encrypted(admin_visible)]`: emit
+    /// `.encrypted_visible()` so the admin shows plaintext in read views but still
+    /// never pre-fills the edit form. Auto-detected from the model source.
+    pub encrypted_visible: Vec<String>,
 }
 
 /// Compute the file actions for `autumn generate admin` with default options.
@@ -124,6 +131,14 @@ pub fn plan_admin_with_options(
 
     let model_source = std::fs::read_to_string(&model_path).map_err(GenerateError::Io)?;
     let lock_version_field = detect_lock_version_field(&model_source, &pascal_name);
+
+    // Auto-detect at-rest encrypted columns from the model so the generated admin
+    // redacts/disables exactly those fields (#805), merged with any explicit opts.
+    let (det_encrypted, det_visible) = detect_encrypted_fields(&model_source, &pascal_name);
+    let mut options = options.clone();
+    options.encrypted.extend(det_encrypted);
+    options.encrypted_visible.extend(det_visible);
+    let options = &options;
 
     let fields = parse_fields(field_tokens)?;
     let plural = pluralize(&snake_name);
@@ -218,6 +233,54 @@ fn detect_lock_version_field(model_source: &str, pascal_name: &str) -> Option<St
     })
 }
 
+/// Detect `#[encrypted(...)]` fields on the model struct, partitioning them by
+/// whether they opted into `admin_visible`. Lets the generated admin mark exactly
+/// the encrypted columns (#805) — a per-field flag, not a global name lookup, so
+/// an unrelated same-named plaintext column on another model stays editable.
+///
+/// Returns `(encrypted_redacted, encrypted_visible)` field-name lists.
+fn detect_encrypted_fields(model_source: &str, pascal_name: &str) -> (Vec<String>, Vec<String>) {
+    let mut redacted = Vec::new();
+    let mut visible = Vec::new();
+    let Ok(parsed) = syn::parse_file(model_source) else {
+        return (redacted, visible);
+    };
+    for item in parsed.items {
+        let syn::Item::Struct(item_struct) = item else {
+            continue;
+        };
+        if item_struct.ident != pascal_name {
+            continue;
+        }
+        let syn::Fields::Named(fields) = item_struct.fields else {
+            continue;
+        };
+        for field in fields.named {
+            let Some(attr) = field.attrs.iter().find(|attr| {
+                attr.path()
+                    .segments
+                    .last()
+                    .is_some_and(|segment| segment.ident == "encrypted")
+            }) else {
+                continue;
+            };
+            let Some(name) = field.ident.as_ref().map(ToString::to_string) else {
+                continue;
+            };
+            // `admin_visible` opt-in appears in the attribute's token list, e.g.
+            // `#[encrypted(deterministic, admin_visible)]`.
+            let admin_visible = matches!(&attr.meta, syn::Meta::List(list)
+                if list.tokens.to_string().contains("admin_visible"));
+            if admin_visible {
+                visible.push(name);
+            } else {
+                redacted.push(name);
+            }
+        }
+    }
+    (redacted, visible)
+}
+
 // ── Field metadata derivation ────────────────────────────────────────────────
 
 const fn admin_field_kind(field: &Field) -> &'static str {
@@ -232,6 +295,13 @@ const fn admin_field_kind(field: &Field) -> &'static str {
         // binary blobs and file metadata aren't suitable for direct inline editing.
         FieldKind::Bytea | FieldKind::Attachment => "AdminFieldKind::Hidden",
     }
+}
+
+/// Whether a field is an at-rest encrypted column (#805), per the auto-detected
+/// `encrypted` / `encrypted_visible` option lists.
+fn admin_field_is_encrypted(options: &AdminOptions, name: &str) -> bool {
+    options.encrypted.iter().any(|c| c == name)
+        || options.encrypted_visible.iter().any(|c| c == name)
 }
 
 const fn is_default_searchable(field: &Field) -> bool {
@@ -529,9 +599,14 @@ fn render_fields_vec(
         if options.readonly.contains(&f.name) || is_default_readonly(f) {
             let _ = write!(out, "\n                .readonly()");
         }
-        // Select and hidden fields are not text-searchable.
+        // Select, hidden, and encrypted fields are not text-searchable. An
+        // encrypted column stores ciphertext envelopes, so an `ILIKE` against it
+        // for plaintext would never match (#805) — omit it from search.
         let is_select_or_hidden = select_spec.is_some() || options.hidden.contains(&f.name);
-        if is_default_searchable(f) && !is_select_or_hidden {
+        if is_default_searchable(f)
+            && !is_select_or_hidden
+            && !admin_field_is_encrypted(options, &f.name)
+        {
             let _ = write!(out, "\n                .searchable()");
         }
         if is_default_filterable(f) && !is_select_or_hidden {
@@ -542,6 +617,14 @@ fn render_fields_vec(
         }
         if is_default_hide_from_list(f) {
             let _ = write!(out, "\n                .hide_from_list()");
+        }
+        // At-rest encrypted columns (#805): redacted/disabled, or shown in read
+        // views when `admin_visible`. Per-field, so unrelated same-named plaintext
+        // columns elsewhere stay editable.
+        if options.encrypted_visible.contains(&f.name) {
+            let _ = write!(out, "\n                .encrypted_visible()");
+        } else if options.encrypted.contains(&f.name) {
+            let _ = write!(out, "\n                .encrypted()");
         }
         out.push_str(",\n");
     }
@@ -559,6 +642,8 @@ fn render_apply_filters(
         .filter(|f| !options.exclude.contains(&f.name))
         .filter(|f| !is_lock_version_field(f, lock_version_field))
         .filter(|f| is_default_searchable(f))
+        // Encrypted columns store ciphertext, so plaintext ILIKE never matches (#805).
+        .filter(|f| !admin_field_is_encrypted(options, &f.name))
         .collect();
 
     let filterable_bool: Vec<&Field> = fields
@@ -1292,6 +1377,69 @@ pub struct Post {
         assert!(
             !admin.contains("lock_version=test"),
             "smoke test form body must not submit lock_version"
+        );
+    }
+
+    #[test]
+    fn encrypted_columns_are_detected_and_marked_in_generated_admin() {
+        let tmp = project_with_model_source(
+            "account",
+            r"
+#[autumn_web::model]
+pub struct Account {
+    #[id]
+    pub id: i64,
+    pub username: String,
+    #[encrypted]
+    pub api_token: String,
+    #[encrypted(deterministic, admin_visible)]
+    pub email: String,
+}
+",
+        );
+        let plan = plan_admin(
+            tmp.path(),
+            "Account",
+            &[
+                "username:String".into(),
+                "api_token:String".into(),
+                "email:String".into(),
+            ],
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let admin = fs::read_to_string(tmp.path().join("src/admin/account.rs")).unwrap();
+        // Redacted-by-default encrypted column gets .encrypted().
+        assert!(
+            admin.contains("AdminField::new(\"api_token\", AdminFieldKind::Text)")
+                && admin.contains(".encrypted()"),
+            "randomized encrypted column must be marked .encrypted(): {admin}"
+        );
+        // admin_visible opt-in gets .encrypted_visible() (not plain .encrypted()).
+        assert!(
+            admin.contains(".encrypted_visible()"),
+            "admin_visible encrypted column must be marked .encrypted_visible(): {admin}"
+        );
+        // The non-encrypted column stays untouched (and remains searchable).
+        assert!(
+            !admin.contains(
+                "AdminField::new(\"username\", AdminFieldKind::Text)\n                .encrypted"
+            ),
+            "plaintext column must not be marked encrypted: {admin}"
+        );
+        assert!(
+            admin.contains(
+                "AdminField::new(\"username\", AdminFieldKind::Text)\n                .searchable()"
+            ),
+            "plaintext String column stays searchable: {admin}"
+        );
+        // Encrypted columns must NOT be marked searchable: ILIKE over ciphertext
+        // would never match plaintext (#805). The only `.searchable()` is username.
+        assert_eq!(
+            admin.matches(".searchable()").count(),
+            1,
+            "only the non-encrypted column is searchable: {admin}"
         );
     }
 

@@ -65,6 +65,19 @@ pub struct AdminField {
     pub editable: bool,
     /// Sort priority in list view (None = not sortable).
     pub sortable: bool,
+    /// Whether this column is encrypted at rest (#805). When set, the field is
+    /// rendered as a disabled, redacted, unsubmitted control in forms (so its
+    /// plaintext is never placed into the HTML and a save never overwrites the
+    /// stored ciphertext), and — unless [`Self::encrypted_visible`] is also set —
+    /// redacted (`••••••••`) in list and detail views.
+    ///
+    /// This is a per-field flag rather than a global column-name lookup so that an
+    /// unrelated resource with a same-named plaintext field stays fully editable.
+    pub encrypted: bool,
+    /// For an [`Self::encrypted`] column, show its decrypted plaintext in list and
+    /// detail (read) views — the `#[encrypted(admin_visible)]` opt-in. Edit forms
+    /// still never pre-fill the plaintext. Has no effect unless `encrypted` is set.
+    pub encrypted_visible: bool,
 }
 
 impl AdminField {
@@ -88,7 +101,27 @@ impl AdminField {
             required: true,
             editable,
             sortable: true,
+            encrypted: false,
+            encrypted_visible: false,
         }
+    }
+
+    /// Mark this column as encrypted at rest (#805): redacted in read views and
+    /// rendered as a disabled, unsubmitted control in forms.
+    #[must_use]
+    pub const fn encrypted(mut self) -> Self {
+        self.encrypted = true;
+        self
+    }
+
+    /// Mark this column as encrypted at rest but show its decrypted plaintext in
+    /// read views (the `#[encrypted(admin_visible)]` opt-in). Implies
+    /// [`Self::encrypted`]; edit forms still never pre-fill the plaintext.
+    #[must_use]
+    pub const fn encrypted_visible(mut self) -> Self {
+        self.encrypted = true;
+        self.encrypted_visible = true;
+        self
     }
 
     /// Set the human-readable label.

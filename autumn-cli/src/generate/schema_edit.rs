@@ -126,6 +126,10 @@ pub enum MigrationShape {
     RemoveColumns { table: String },
     /// `AddSearchTo<Table>` or `AddSearchableTo<Table>` or `AddSearchVectorTo<Table>`
     AddSearch { table: String },
+    /// `Encrypt<Columns>On<Table>` — convert existing plaintext column(s) to
+    /// at-rest encrypted (#805). Emits a documented offline-backfill migration
+    /// and a rollback that restores plaintext from ciphertext given the keys.
+    EncryptColumns { table: String, columns: Vec<String> },
     /// Anything else — emit empty `up.sql` / `down.sql` files.
     Empty,
 }
@@ -153,6 +157,19 @@ pub fn detect_migration_shape(pascal_name: &str) -> MigrationShape {
     {
         return MigrationShape::AddSearch {
             table: normalize_table_name(rest),
+        };
+    }
+
+    if let Some(rest) = pascal_name.strip_prefix("Encrypt")
+        && rest.chars().next().is_some_and(char::is_uppercase)
+        && let Some((cols, table)) = split_on_keyword(rest, "On")
+    {
+        // `cols` is a PascalCase column name (the common case: one column per
+        // encryption migration, e.g. `EncryptApiTokenOnAccounts`). Authors can
+        // edit the emitted file to backfill additional columns.
+        return MigrationShape::EncryptColumns {
+            table: normalize_table_name(&table),
+            columns: vec![super::naming::pascal_to_snake(&cols)],
         };
     }
 
@@ -243,6 +260,162 @@ pub fn add_columns_down_sql(table: &str, fields: &[Field]) -> String {
     for f in fields.iter().rev() {
         let _ = writeln!(out, "ALTER TABLE {table} DROP COLUMN {};", f.name);
     }
+    out
+}
+
+/// Document why bounded `VARCHAR(n)` columns must be widened to `TEXT` before an
+/// encryption backfill, and emit the `ALTER … TYPE TEXT` statements per column.
+fn write_widen_bounded_columns_note(out: &mut String, table: &str, columns: &[String]) {
+    let _ = writeln!(
+        out,
+        "-- The envelope is base64 text. An UNBOUNDED `TEXT` column needs no type"
+    );
+    let _ = writeln!(
+        out,
+        "-- change, but a BOUNDED `VARCHAR(n)` column almost certainly does: the"
+    );
+    let _ = writeln!(
+        out,
+        "-- envelope adds a 20-byte header + 16-byte GCM tag and is then base64-"
+    );
+    let _ = writeln!(
+        out,
+        "-- encoded (~1.37x), so e.g. a VARCHAR(255) value can grow past 255 chars"
+    );
+    let _ = writeln!(
+        out,
+        "-- and the backfill (or later writes) will fail with a length violation."
+    );
+    let _ = writeln!(
+        out,
+        "-- Widen bounded columns to TEXT (or a sufficiently larger limit) FIRST:"
+    );
+    for col in columns {
+        let _ = writeln!(
+            out,
+            "--      ALTER TABLE {table} ALTER COLUMN {col} TYPE TEXT;"
+        );
+    }
+}
+
+/// `up.sql` for converting plaintext column(s) to at-rest encrypted (#805).
+///
+/// Encrypted values are stored as a base64 AES-256-GCM envelope. An unbounded
+/// `TEXT` column needs no type change, but a bounded `VARCHAR(n)` column must be
+/// widened first (the envelope is larger than the plaintext), so the scaffold
+/// emits the `ALTER … TYPE TEXT` statements. The actual encryption of existing
+/// rows is an **offline backfill** that needs the application's key ring, so it
+/// runs as a one-off task rather than raw SQL. This file documents the procedure
+/// and serves as the migration record.
+#[must_use]
+pub fn encrypt_columns_up_sql(table: &str, columns: &[String]) -> String {
+    let mut out = String::with_capacity(1024);
+    let _ = writeln!(
+        out,
+        "-- autumn-safety: backfill \
+         -- run the offline encryption backfill BEFORE deploying readers that \
+         expect ciphertext"
+    );
+    let _ = writeln!(out, "--");
+    let _ = writeln!(
+        out,
+        "-- Convert plaintext column(s) on `{table}` to at-rest encryption (#805)."
+    );
+    write_widen_bounded_columns_note(&mut out, table, columns);
+    let _ = writeln!(out, "--");
+    let _ = writeln!(out, "-- 1. Configure keys (once). The salt is required:");
+    let _ = writeln!(out, "--      autumn credentials edit");
+    let _ = writeln!(out, "--      [active_record_encryption]");
+    let _ = writeln!(
+        out,
+        "--      primary_key         = \"<openssl rand -hex 32>\""
+    );
+    let _ = writeln!(
+        out,
+        "--      key_derivation_salt = \"<openssl rand -hex 16>\""
+    );
+    let _ = writeln!(
+        out,
+        "--      # deterministic_key = \"<openssl rand -hex 32>\"  # for deterministic / versioned_ciphertext"
+    );
+    let _ = writeln!(out, "--");
+    let _ = writeln!(
+        out,
+        "-- 2. Backfill BEFORE adding `#[encrypted]` to the model field. Once the"
+    );
+    let _ = writeln!(
+        out,
+        "--    attribute is present the column's reader decrypts on load, so any"
+    );
+    let _ = writeln!(
+        out,
+        "--    still-plaintext row would fail with a malformed-envelope error."
+    );
+    let _ = writeln!(
+        out,
+        "--    Run a one-off task over a TEMPORARY plaintext model (no `#[encrypted]`)"
+    );
+    let _ = writeln!(
+        out,
+        "--    that reads each row's plaintext and writes the envelope produced by"
+    );
+    let _ = writeln!(
+        out,
+        "--    autumn_web::encryption::encrypt_text(<mode>, &plaintext), where <mode> is"
+    );
+    let _ = writeln!(
+        out,
+        "--    Mode::Deterministic for columns you will deploy as"
+    );
+    let _ = writeln!(
+        out,
+        "--    `#[encrypted(deterministic)]` (so existing rows are found by equality"
+    );
+    let _ = writeln!(out, "--    lookups) and Mode::Randomized otherwise:");
+    for col in columns {
+        let _ = writeln!(
+            out,
+            "--      UPDATE {table} SET {col} = <encrypt_text({col})>;"
+        );
+    }
+    let _ = writeln!(out, "--");
+    let _ = writeln!(
+        out,
+        "-- 3. Only after every row is ciphertext, add `#[encrypted]` to the field"
+    );
+    let _ = writeln!(out, "--    and deploy the encrypted reader.");
+    let _ = writeln!(out, "--");
+    let _ = writeln!(
+        out,
+        "-- Take a backup first: a row encrypted with a lost key is unrecoverable."
+    );
+    out
+}
+
+/// `down.sql` companion to [`encrypt_columns_up_sql`]: restore plaintext from
+/// ciphertext, given the keys.
+#[must_use]
+pub fn encrypt_columns_down_sql(table: &str, columns: &[String]) -> String {
+    let mut out = String::with_capacity(512);
+    let _ = writeln!(
+        out,
+        "-- Rollback: restore plaintext from ciphertext on `{table}` (#805)."
+    );
+    let _ = writeln!(
+        out,
+        "-- Run a one-off task that decrypts each row with the configured keys via"
+    );
+    let _ = writeln!(
+        out,
+        "-- autumn_web::encryption::decrypt_text(&envelope) and writes plaintext back:"
+    );
+    for col in columns {
+        let _ = writeln!(out, "--      UPDATE {table} SET {col} = <decrypt({col})>;");
+    }
+    let _ = writeln!(
+        out,
+        "-- Then remove the `#[encrypted]` attribute from the model field."
+    );
     out
 }
 
@@ -1740,6 +1913,35 @@ mod tests {
             MigrationShape::AddColumns { table } => assert_eq!(table, "posts"),
             other => panic!("expected AddColumns, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn detect_encrypt_migration() {
+        match detect_migration_shape("EncryptApiTokenOnAccounts") {
+            MigrationShape::EncryptColumns { table, columns } => {
+                assert_eq!(table, "accounts");
+                assert_eq!(columns, vec!["api_token".to_string()]);
+            }
+            other => panic!("expected EncryptColumns, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn encrypt_migration_documents_backfill_and_rollback() {
+        let cols = vec!["api_token".to_string()];
+        let up = encrypt_columns_up_sql("accounts", &cols);
+        let down = encrypt_columns_down_sql("accounts", &cols);
+        // up.sql documents the offline backfill + key configuration.
+        assert!(up.contains("active_record_encryption"));
+        assert!(up.contains("encrypt_text"));
+        assert!(up.contains("autumn-safety: backfill"));
+        assert!(up.contains("api_token"));
+        // Bounded columns must be widened to TEXT before the envelope is stored.
+        assert!(up.contains("ALTER TABLE accounts ALTER COLUMN api_token TYPE TEXT;"));
+        // down.sql documents restoring plaintext from ciphertext given the keys.
+        assert!(down.contains("decrypt_text"));
+        assert!(down.contains("Rollback"));
+        assert!(down.contains("api_token"));
     }
 
     #[test]

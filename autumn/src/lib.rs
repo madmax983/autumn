@@ -84,6 +84,7 @@ pub mod config;
 pub mod credentials;
 #[cfg(feature = "db")]
 pub mod db;
+pub mod encryption;
 pub mod error;
 pub mod error_pages;
 pub mod extract;
