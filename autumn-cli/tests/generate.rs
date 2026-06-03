@@ -566,7 +566,7 @@ async fn generated_scaffold_serves_posts_index_and_json_api() {
     );
 
     let build = Command::new("cargo")
-        .args(["build", "--offline"])
+        .args(["build"])
         .current_dir(&project)
         .output()
         .expect("failed to run cargo build");
@@ -579,7 +579,7 @@ async fn generated_scaffold_serves_posts_index_and_json_api() {
 
     let port = free_port();
     let child = Command::new("cargo")
-        .args(["run", "--quiet", "--offline"])
+        .args(["run", "--quiet"])
         .current_dir(&project)
         .env("AUTUMN_SERVER__PORT", port.to_string())
         .env("AUTUMN_DATABASE__URL", &database_url)
@@ -706,7 +706,7 @@ fn generated_scaffold_cargo_checks() {
     }
 
     let check = Command::new("cargo")
-        .args(["check", "--tests", "--offline"])
+        .args(["check", "--tests"])
         .current_dir(&project)
         .output()
         .unwrap();
@@ -1088,7 +1088,7 @@ fn generated_auth_totp_cargo_checks() {
     }
 
     let check = Command::new("cargo")
-        .args(["check", "--tests", "--offline"])
+        .args(["check", "--tests"])
         .current_dir(&project)
         .output()
         .unwrap();
@@ -1357,7 +1357,7 @@ fn generated_scaffold_config_cargo_checks() {
     }
 
     let check = Command::new("cargo")
-        .args(["check", "--tests", "--offline"])
+        .args(["check", "--tests"])
         .current_dir(&project)
         .output()
         .unwrap();

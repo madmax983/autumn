@@ -102,10 +102,10 @@ jobs:
             generated_scaffold_config_cargo_checks -- --ignored --exact
 
       - name: Pre-fetch TOTP deps (absent from workspace Cargo.lock)
-        # generated_auth_totp_cargo_checks runs `cargo check --offline` on the
-        # generated project, which requires totp-rs in the local cargo registry
-        # cache. totp-rs is not a workspace dep, so it must be fetched here
-        # before the test runs or the offline check will fail on a cache miss.
+        # totp-rs is not a workspace dep, so it is absent from the workspace
+        # Cargo.lock and not covered by rust-cache. Pre-fetching it here
+        # ensures the cargo registry cache is warm before the auth gate runs,
+        # avoiding a full download on every CI run.
         run: |
           tmp=$(mktemp -d)
           cat > "$tmp/Cargo.toml" <<'TOML'
