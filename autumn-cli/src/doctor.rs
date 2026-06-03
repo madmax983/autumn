@@ -1580,8 +1580,8 @@ fn tailwind_enabled() -> bool {
 
 fn resolve_compression_enabled() -> bool {
     if let Ok(val) = std::env::var("AUTUMN_COMPRESSION__ENABLED") {
-        if matches!(val.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes") {
-            return true;
+        if let Some(enabled) = parse_config_bool(&val) {
+            return enabled;
         }
     }
     std::fs::read_to_string("autumn.toml")

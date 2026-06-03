@@ -1727,6 +1727,12 @@ pub fn try_build_router_with_static_inner(
         );
     }
 
+    // Compression must also be applied OUTSIDE the static-first middleware so
+    // that pre-rendered HTML pages (served directly by StaticFileLayer without
+    // reaching inner_router) are also compressed. This mirrors the placement in
+    // apply_middleware for the dynamic-only path.
+    router = apply_compression_middleware(router, config);
+
     let router = router.layer(crate::security::SecurityHeadersLayer::from_config(
         &config.security.headers,
     ));
