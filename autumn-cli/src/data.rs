@@ -127,9 +127,10 @@ fn run_import_inner(
     let label = if dry_run { "Dry run" } else { "Import" };
 
     // Fetch the import form first so the cookie jar captures the CSRF cookie and
-    // we can extract the matching token value from the hidden input. This two-step
+    // we can read the token + configured header name from the page. This two-step
     // GET→POST is required because Autumn's CSRF middleware rejects unsafe methods
-    // that lack a matching cookie+form-field pair.
+    // that lack a matching cookie+header pair. For multipart requests the middleware
+    // only checks the header (not the form body), so we must send the token there.
     let mut get_req = client.get(&url);
     if let Some(c) = cookie {
         get_req = get_req.header("Cookie", c);
@@ -141,10 +142,12 @@ fn run_import_inner(
         .map_err(|e| format!("Failed to read import form: {e}"))?;
 
     let csrf_token = extract_csrf_token(&form_html).unwrap_or_default();
+    let csrf_header =
+        extract_csrf_header_name(&form_html).unwrap_or_else(|| "X-CSRF-Token".to_owned());
 
     println!("{label}ing {model} from {input} → {url}");
 
-    let mut form = multipart::Form::new()
+    let form = multipart::Form::new()
         .part(
             "file",
             multipart::Part::bytes(csv_bytes)
@@ -160,13 +163,12 @@ fn run_import_inner(
         )
         .text("mode", mode_value.to_owned());
 
-    if !csrf_token.is_empty() {
-        form = form.text("_csrf", csrf_token);
-    }
-
     let mut post_req = client.post(&url).multipart(form);
     if let Some(c) = cookie {
         post_req = post_req.header("Cookie", c);
+    }
+    if !csrf_token.is_empty() {
+        post_req = post_req.header(csrf_header.as_str(), csrf_token.as_str());
     }
     let response = post_req
         .send()
@@ -228,17 +230,27 @@ fn print_import_summary(html: &str, dry_run: bool) {
     }
 }
 
-/// Extract the CSRF token value from a hidden `<input name="_csrf" value="...">`.
+/// Extract the CSRF token from `<meta name="csrf-token" content="...">`.
 fn extract_csrf_token(html: &str) -> Option<String> {
-    // Find the first hidden input whose `name` attribute is "_csrf" and return
-    // the contents of its `value` attribute. Autumn always renders these in
-    // attribute order: type → name → value, so we look for `name="_csrf"` and
-    // then find the immediately following `value="..."`.
-    let name_pos = html.find("name=\"_csrf\"")?;
-    let after_name = &html[name_pos..];
-    let val_start = after_name.find("value=\"")? + 7;
-    let val_end = after_name[val_start..].find('"')?;
-    Some(after_name[val_start..val_start + val_end].to_owned())
+    let meta_pos = html.find("name=\"csrf-token\"")?;
+    let after_meta = &html[meta_pos..];
+    let val_start = after_meta.find("content=\"")? + 9;
+    let val_end = after_meta[val_start..].find('"')?;
+    Some(after_meta[val_start..val_start + val_end].to_owned())
+}
+
+/// Extract the configured CSRF header name from `<meta name="csrf-token" data-header="...">`.
+fn extract_csrf_header_name(html: &str) -> Option<String> {
+    let meta_pos = html.find("name=\"csrf-token\"")?;
+    let after_meta = &html[meta_pos..];
+    let val_start = after_meta.find("data-header=\"")? + 13;
+    let val_end = after_meta[val_start..].find('"')?;
+    let header = after_meta[val_start..val_start + val_end].to_owned();
+    if header.is_empty() {
+        None
+    } else {
+        Some(header)
+    }
 }
 
 fn percent_encode(s: &str) -> String {
@@ -300,5 +312,31 @@ mod tests {
     fn print_import_summary_handles_incomplete_html_gracefully() {
         // Should not panic on HTML that doesn't have the expected grid structure
         print_import_summary("<html>Something went wrong</html>", false);
+    }
+
+    #[test]
+    fn extract_csrf_token_reads_from_meta_tag() {
+        let html = r#"<meta name="csrf-token" content="tok-abc" data-header="X-CSRF-Token">"#;
+        assert_eq!(extract_csrf_token(html), Some("tok-abc".to_owned()));
+    }
+
+    #[test]
+    fn extract_csrf_token_returns_none_when_meta_absent() {
+        assert_eq!(extract_csrf_token("<html></html>"), None);
+    }
+
+    #[test]
+    fn extract_csrf_header_name_reads_data_header() {
+        let html = r#"<meta name="csrf-token" content="tok" data-header="X-Custom-CSRF">"#;
+        assert_eq!(
+            extract_csrf_header_name(html),
+            Some("X-Custom-CSRF".to_owned())
+        );
+    }
+
+    #[test]
+    fn extract_csrf_header_name_returns_none_when_absent() {
+        let html = r#"<meta name="csrf-token" content="tok">"#;
+        assert_eq!(extract_csrf_header_name(html), None);
     }
 }
