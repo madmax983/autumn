@@ -261,7 +261,14 @@ impl AdminModel for PostAdmin {
     /// Export `id`, `title`, `slug`, `published`, and `created_at`.
     /// The `body` column is omitted by default to keep exports manageable.
     fn csv_export_columns(&self) -> Vec<&'static str> {
-        vec!["id", "title", "slug", "published", "created_at", "updated_at"]
+        vec![
+            "id",
+            "title",
+            "slug",
+            "published",
+            "created_at",
+            "updated_at",
+        ]
     }
 
     /// Enable CSV import for the blog Posts model.
@@ -315,7 +322,9 @@ impl AdminModel for PostAdmin {
             let mut conn = match conn_result {
                 Ok(c) => c,
                 Err(e) => {
-                    return Ok(AdminImportRowResult::RowError(format!("DB pool error: {e}")));
+                    return Ok(AdminImportRowResult::RowError(format!(
+                        "DB pool error: {e}"
+                    )));
                 }
             };
 

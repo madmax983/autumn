@@ -32,8 +32,8 @@ use crate::auth::check_role;
 use crate::registry::AdminRegistry;
 use crate::templates;
 use crate::traits::{
-    AdminError, AdminField, AdminFieldKind, AdminImportError, AdminImportReport, AdminImportRowResult,
-    AdminModel, CsvImportMode, ListParams, SortDirection, record_id,
+    AdminError, AdminField, AdminFieldKind, AdminImportError, AdminImportReport,
+    AdminImportRowResult, AdminModel, CsvImportMode, ListParams, SortDirection, record_id,
 };
 
 /// Admin-owned CSRF extractor that tolerates a missing `CsrfLayer`.
@@ -166,7 +166,10 @@ pub fn admin_router(
         .route("/{slug}/actions", routing::post(model_action))
         // CSV export (GET) and import (POST)
         .route("/{slug}/export.csv", routing::get(model_export_csv))
-        .route("/{slug}/import", routing::get(model_import_form).post(model_import_csv))
+        .route(
+            "/{slug}/import",
+            routing::get(model_import_form).post(model_import_csv),
+        )
         .route(&ADMIN_JS_PATH, routing::get(serve_admin_js))
         .layer(axum::Extension(HasRuntimeConfig(has_config)))
         .layer(axum::Extension(AdminPrefix(prefix.to_owned())))
@@ -894,7 +897,12 @@ async fn model_export_csv(
         )));
     }
 
-    let ListQuery { page: _, q, sort, dir } = query;
+    let ListQuery {
+        page: _,
+        q,
+        sort,
+        dir,
+    } = query;
     let fields = model.fields();
     let sort = validate_sort_key(sort, &fields);
     let filters = extract_filters(&raw_query, &fields);
@@ -932,9 +940,8 @@ async fn model_export_csv(
             })?;
         }
 
-        wtr.flush().map_err(|e| {
-            AutumnError::internal_server_error_msg(format!("CSV flush error: {e}"))
-        })?;
+        wtr.flush()
+            .map_err(|e| AutumnError::internal_server_error_msg(format!("CSV flush error: {e}")))?;
     }
 
     let filename = format!("{slug}.csv");
@@ -1021,9 +1028,7 @@ async fn model_import_csv(
                     field
                         .bytes()
                         .await
-                        .map_err(|e| {
-                            AutumnError::bad_request_msg(format!("File read error: {e}"))
-                        })?
+                        .map_err(|e| AutumnError::bad_request_msg(format!("File read error: {e}")))?
                         .to_vec(),
                 );
             }
@@ -1038,9 +1043,8 @@ async fn model_import_csv(
         }
     }
 
-    let csv_bytes = csv_bytes.ok_or_else(|| {
-        AutumnError::bad_request_msg("No CSV file found in the multipart upload")
-    })?;
+    let csv_bytes = csv_bytes
+        .ok_or_else(|| AutumnError::bad_request_msg("No CSV file found in the multipart upload"))?;
 
     // Parse CSV headers first, then process rows.
     let mut rdr = csv::ReaderBuilder::new()
@@ -1056,10 +1060,7 @@ async fn model_import_csv(
 
     let mut report = AdminImportReport::default();
 
-    let records: Vec<csv::StringRecord> = rdr
-        .records()
-        .filter_map(|r| r.ok())
-        .collect();
+    let records: Vec<csv::StringRecord> = rdr.records().filter_map(|r| r.ok()).collect();
 
     for record in records {
         let line = record.position().map_or(0, |p| p.line());
@@ -1072,14 +1073,20 @@ async fn model_import_csv(
         let outcome = model
             .import_csv_row(&pool, line, row, import_mode)
             .await
-            .unwrap_or(AdminImportRowResult::RowError("Handler returned an error".to_owned()));
+            .unwrap_or(AdminImportRowResult::RowError(
+                "Handler returned an error".to_owned(),
+            ));
 
         match outcome {
             AdminImportRowResult::Inserted => report.inserted += 1,
             AdminImportRowResult::Updated => report.updated += 1,
             AdminImportRowResult::Skipped => report.skipped += 1,
             AdminImportRowResult::RowError(msg) => {
-                report.errors.push(AdminImportError { line, column: None, message: msg });
+                report.errors.push(AdminImportError {
+                    line,
+                    column: None,
+                    message: msg,
+                });
             }
             AdminImportRowResult::FieldError { column, message } => {
                 report.errors.push(AdminImportError {

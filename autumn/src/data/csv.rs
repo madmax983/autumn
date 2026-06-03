@@ -70,13 +70,21 @@ impl CsvRowError {
     /// Construct a row-level error without a column name.
     #[must_use]
     pub fn row(line: u64, message: impl Into<String>) -> Self {
-        Self { line, column: None, message: message.into() }
+        Self {
+            line,
+            column: None,
+            message: message.into(),
+        }
     }
 
     /// Construct a field-level error with a column name.
     #[must_use]
     pub fn field(line: u64, column: impl Into<String>, message: impl Into<String>) -> Self {
-        Self { line, column: Some(column.into()), message: message.into() }
+        Self {
+            line,
+            column: Some(column.into()),
+            message: message.into(),
+        }
     }
 }
 
@@ -147,7 +155,10 @@ pub struct ImportOptions {
 
 impl Default for ImportOptions {
     fn default() -> Self {
-        Self { mode: ImportMode::Insert, batch_size: 500 }
+        Self {
+            mode: ImportMode::Insert,
+            batch_size: 500,
+        }
     }
 }
 
@@ -276,7 +287,9 @@ where
     let headers: Vec<String> = match rdr.headers() {
         Ok(h) => h.iter().map(str::to_owned).collect(),
         Err(e) => {
-            report.errors.push(CsvRowError::row(1, format!("CSV header error: {e}")));
+            report
+                .errors
+                .push(CsvRowError::row(1, format!("CSV header error: {e}")));
             return report;
         }
     };
@@ -289,7 +302,9 @@ where
             }
             Err(e) => {
                 let pos = e.position().map_or(0, |p| p.line());
-                report.errors.push(CsvRowError::row(pos, format!("CSV parse error: {e}")));
+                report
+                    .errors
+                    .push(CsvRowError::row(pos, format!("CSV parse error: {e}")));
                 continue;
             }
         };
@@ -311,7 +326,9 @@ where
                     report.errors.push(CsvRowError::row(line, msg));
                 }
                 ImportRowResult::FieldError { column, message } => {
-                    report.errors.push(CsvRowError::field(line, column, message));
+                    report
+                        .errors
+                        .push(CsvRowError::field(line, column, message));
                 }
             },
             _ => match outcome {
@@ -322,7 +339,9 @@ where
                     report.errors.push(CsvRowError::row(line, msg));
                 }
                 ImportRowResult::FieldError { column, message } => {
-                    report.errors.push(CsvRowError::field(line, column, message));
+                    report
+                        .errors
+                        .push(CsvRowError::field(line, column, message));
                 }
             },
         }
@@ -350,14 +369,26 @@ mod tests {
             &["id", "title", "published"]
         }
         fn to_csv_record(&self) -> Vec<String> {
-            vec![self.id.to_string(), self.title.clone(), self.published.to_string()]
+            vec![
+                self.id.to_string(),
+                self.title.clone(),
+                self.published.to_string(),
+            ]
         }
     }
 
     fn sample_posts() -> Vec<Post> {
         vec![
-            Post { id: 1, title: "Hello, World".to_string(), published: true },
-            Post { id: 2, title: "Goodbye cruel \"world\"".to_string(), published: false },
+            Post {
+                id: 1,
+                title: "Hello, World".to_string(),
+                published: true,
+            },
+            Post {
+                id: 2,
+                title: "Goodbye cruel \"world\"".to_string(),
+                published: false,
+            },
         ]
     }
 
@@ -422,7 +453,10 @@ mod tests {
         let mut out = Vec::new();
         export_csv(sample_posts(), &mut out).unwrap();
         let s = String::from_utf8(out).unwrap();
-        assert!(s.contains("\"Hello, World\""), "comma in title should be quoted: {s}");
+        assert!(
+            s.contains("\"Hello, World\""),
+            "comma in title should be quoted: {s}"
+        );
     }
 
     #[test]
@@ -502,7 +536,12 @@ mod tests {
     fn import_csv_field_error_records_column_name() {
         let csv = b"email\nbad-email\n";
         let report = import_csv(csv.as_ref(), &ImportOptions::default(), |_line, row| {
-            if !row.get("email").map(String::as_str).unwrap_or("").contains('@') {
+            if !row
+                .get("email")
+                .map(String::as_str)
+                .unwrap_or("")
+                .contains('@')
+            {
                 ImportRowResult::FieldError {
                     column: "email".into(),
                     message: "must be a valid email".into(),
@@ -520,13 +559,19 @@ mod tests {
     fn import_csv_dry_run_counts_but_does_not_write() {
         let csv = b"id,title\n1,Hello\n2,World\n";
         let mut write_called = false;
-        let opts = ImportOptions { mode: ImportMode::DryRun, batch_size: 100 };
+        let opts = ImportOptions {
+            mode: ImportMode::DryRun,
+            batch_size: 100,
+        };
         let report = import_csv(csv.as_ref(), &opts, |_line, _row| {
             write_called = true; // handler IS called in dry-run
             ImportRowResult::Inserted
         });
         // DryRun: handler is called but we note that callers should gate writes on mode
-        assert!(write_called, "handler must be invoked in dry-run to gather counts");
+        assert!(
+            write_called,
+            "handler must be invoked in dry-run to gather counts"
+        );
         assert_eq!(report.inserted, 2, "dry-run should still count rows");
     }
 
@@ -534,7 +579,9 @@ mod tests {
     fn import_csv_upsert_mode_counts_updated() {
         let csv = b"id,title\n1,Hello\n2,World\n";
         let opts = ImportOptions {
-            mode: ImportMode::Upsert { by: vec!["id".into()] },
+            mode: ImportMode::Upsert {
+                by: vec!["id".into()],
+            },
             batch_size: 100,
         };
         let report = import_csv(csv.as_ref(), &opts, |_line, _row| ImportRowResult::Updated);
@@ -556,17 +603,13 @@ mod tests {
             }
         }
 
-        let report = import_csv(
-            csv.as_bytes(),
-            &ImportOptions::default(),
-            |_line, row| {
-                if row.get("value").map(String::as_str) == Some("BAD") {
-                    ImportRowResult::RowError("value is BAD".into())
-                } else {
-                    ImportRowResult::Inserted
-                }
-            },
-        );
+        let report = import_csv(csv.as_bytes(), &ImportOptions::default(), |_line, row| {
+            if row.get("value").map(String::as_str) == Some("BAD") {
+                ImportRowResult::RowError("value is BAD".into())
+            } else {
+                ImportRowResult::Inserted
+            }
+        });
         assert_eq!(report.errors.len(), 1, "exactly one error expected");
         assert!(!report.errors.is_empty());
         assert_eq!(report.errors[0].message, "value is BAD");
@@ -603,11 +646,18 @@ mod tests {
         export_csv(posts, &mut exported).unwrap();
 
         let mut titles_imported = Vec::new();
-        import_csv(exported.as_slice(), &ImportOptions::default(), |_line, row| {
-            titles_imported.push(row.get("title").cloned().unwrap_or_default());
-            ImportRowResult::Inserted
-        });
+        import_csv(
+            exported.as_slice(),
+            &ImportOptions::default(),
+            |_line, row| {
+                titles_imported.push(row.get("title").cloned().unwrap_or_default());
+                ImportRowResult::Inserted
+            },
+        );
 
-        assert_eq!(titles_imported, vec!["Hello, World", "Goodbye cruel \"world\""]);
+        assert_eq!(
+            titles_imported,
+            vec!["Hello, World", "Goodbye cruel \"world\""]
+        );
     }
 }

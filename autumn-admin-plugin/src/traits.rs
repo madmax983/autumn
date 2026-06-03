@@ -635,9 +635,7 @@ pub trait AdminModel: Send + Sync + 'static {
     /// [`supports_csv_import`]: AdminModel::supports_csv_import
     fn import_csv_row<'a>(
         &'a self,
-        _pool: &'a diesel_async::pooled_connection::deadpool::Pool<
-            diesel_async::AsyncPgConnection,
-        >,
+        _pool: &'a diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
         _line: u64,
         _row: std::collections::HashMap<String, String>,
         _mode: CsvImportMode,

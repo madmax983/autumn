@@ -3290,12 +3290,29 @@ mod tests {
         use crate::traits::ListResult;
         let r = dummy_registry();
         let fields = vec![AdminField::new("name", AdminFieldKind::Text)];
-        let result = ListResult { records: vec![], total: 0, page: 1, per_page: 25 };
+        let result = ListResult {
+            records: vec![],
+            total: 0,
+            page: 1,
+            per_page: 25,
+        };
         // supports_csv_export = true, supports_csv_import = false
         let html = model_list_page(
-            &r, "widgets", "Widgets", &fields, &[], &result,
-            "", None, SortDirection::Asc, &[], &[], "t", "_csrf",
-            "/admin", "/actuator",
+            &r,
+            "widgets",
+            "Widgets",
+            &fields,
+            &[],
+            &result,
+            "",
+            None,
+            SortDirection::Asc,
+            &[],
+            &[],
+            "t",
+            "_csrf",
+            "/admin",
+            "/actuator",
             false, // show_config
             true,  // supports_csv_export
             false, // supports_csv_import
@@ -3316,11 +3333,28 @@ mod tests {
         use crate::traits::ListResult;
         let r = dummy_registry();
         let fields = vec![AdminField::new("name", AdminFieldKind::Text)];
-        let result = ListResult { records: vec![], total: 0, page: 1, per_page: 25 };
+        let result = ListResult {
+            records: vec![],
+            total: 0,
+            page: 1,
+            per_page: 25,
+        };
         let html = model_list_page(
-            &r, "widgets", "Widgets", &fields, &[], &result,
-            "", None, SortDirection::Asc, &[], &[], "t", "_csrf",
-            "/admin", "/actuator",
+            &r,
+            "widgets",
+            "Widgets",
+            &fields,
+            &[],
+            &result,
+            "",
+            None,
+            SortDirection::Asc,
+            &[],
+            &[],
+            "t",
+            "_csrf",
+            "/admin",
+            "/actuator",
             false, // show_config
             false, // supports_csv_export
             true,  // supports_csv_import
@@ -3341,16 +3375,41 @@ mod tests {
         use crate::traits::ListResult;
         let r = dummy_registry();
         let fields = vec![AdminField::new("name", AdminFieldKind::Text)];
-        let result = ListResult { records: vec![], total: 0, page: 1, per_page: 25 };
+        let result = ListResult {
+            records: vec![],
+            total: 0,
+            page: 1,
+            per_page: 25,
+        };
         let html = model_list_page(
-            &r, "widgets", "Widgets", &fields, &[], &result,
-            "", None, SortDirection::Asc, &[], &[], "t", "_csrf",
-            "/admin", "/actuator",
-            false, false, false,
+            &r,
+            "widgets",
+            "Widgets",
+            &fields,
+            &[],
+            &result,
+            "",
+            None,
+            SortDirection::Asc,
+            &[],
+            &[],
+            "t",
+            "_csrf",
+            "/admin",
+            "/actuator",
+            false,
+            false,
+            false,
         )
         .into_string();
-        assert!(!html.contains("export.csv"), "no export link when disabled: {html}");
-        assert!(!html.contains("/import"), "no import link when disabled: {html}");
+        assert!(
+            !html.contains("export.csv"),
+            "no export link when disabled: {html}"
+        );
+        assert!(
+            !html.contains("/import"),
+            "no import link when disabled: {html}"
+        );
     }
 
     #[test]

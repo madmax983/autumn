@@ -66,10 +66,13 @@ fn run_export_inner(
         .map(str::to_owned)
         .unwrap_or_else(|| format!("{model}.csv"));
 
-    fs::write(&output_path, &bytes)
-        .map_err(|e| format!("Failed to write '{output_path}': {e}"))?;
+    fs::write(&output_path, &bytes).map_err(|e| format!("Failed to write '{output_path}': {e}"))?;
 
-    let row_count = bytes.iter().filter(|&&b| b == b'\n').count().saturating_sub(1);
+    let row_count = bytes
+        .iter()
+        .filter(|&&b| b == b'\n')
+        .count()
+        .saturating_sub(1);
     println!("Exported {row_count} rows to {output_path}");
     Ok(())
 }
@@ -91,18 +94,12 @@ pub fn run_import(
     }
 }
 
-fn run_import_inner(
-    model: &str,
-    base_url: &str,
-    input: &str,
-    dry_run: bool,
-) -> Result<(), String> {
+fn run_import_inner(model: &str, base_url: &str, input: &str, dry_run: bool) -> Result<(), String> {
     let client = make_client()?;
     let base = base_url.trim_end_matches('/');
     let url = format!("{base}/admin/{model}/import");
 
-    let csv_bytes =
-        fs::read(input).map_err(|e| format!("Failed to read '{input}': {e}"))?;
+    let csv_bytes = fs::read(input).map_err(|e| format!("Failed to read '{input}': {e}"))?;
 
     let mode_value = if dry_run { "dry_run" } else { "insert" };
     let label = if dry_run { "Dry run" } else { "Import" };
@@ -158,16 +155,26 @@ fn print_import_summary(html: &str, dry_run: bool) {
         .filter_map(|chunk| {
             chunk
                 .find('>')
-                .and_then(|start| chunk[start + 1..].find('<').map(|end| (start + 1, start + 1 + end)))
+                .and_then(|start| {
+                    chunk[start + 1..]
+                        .find('<')
+                        .map(|end| (start + 1, start + 1 + end))
+                })
                 .and_then(|(s, e)| chunk[s..e].trim().parse::<u64>().ok())
         })
         .collect();
 
     if counts.len() == 4 {
         let prefix = if dry_run { "(dry run) " } else { "" };
-        println!("{prefix}inserted={} updated={} skipped={} errors={}", counts[0], counts[1], counts[2], counts[3]);
+        println!(
+            "{prefix}inserted={} updated={} skipped={} errors={}",
+            counts[0], counts[1], counts[2], counts[3]
+        );
         if counts[3] > 0 {
-            eprintln!("Import completed with {} errors. Check the admin UI for details.", counts[3]);
+            eprintln!(
+                "Import completed with {} errors. Check the admin UI for details.",
+                counts[3]
+            );
             std::process::exit(1);
         } else {
             println!("Import completed successfully.");
