@@ -3170,12 +3170,12 @@ const fn default_cors_max_age() -> u64 {
 /// |----------|-------|------|
 /// | `AUTUMN_COMPRESSION__ENABLED` | `enabled` | `bool` |
 ///
-/// # ETag compatibility
+/// # `ETag` compatibility
 ///
 /// Autumn's framework-managed compression layer is applied **outside** any
-/// user-registered `EtagLayer`, so ETags are computed on the uncompressed body.
+/// user-registered `EtagLayer`, so `ETags` are computed on the uncompressed body.
 /// Because `CompressionLayer` sets `Vary: Accept-Encoding`, caches correctly
-/// store separate entries per encoding. Using weak ETags (`W/`) when
+/// store separate entries per encoding. Using weak `ETags` (`W/`) when
 /// compression is enabled is safe per RFC 7232 §2.1 (weak comparison allows
 /// encoding variations).
 ///
@@ -3187,7 +3187,7 @@ const fn default_cors_max_age() -> u64 {
 /// let cfg = CompressionConfig::default();
 /// assert!(!cfg.enabled);
 /// ```
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct CompressionConfig {
     /// Enable response compression. Default: `false`.
     ///
@@ -3198,12 +3198,6 @@ pub struct CompressionConfig {
     /// already carry `Content-Encoding` are passed through unchanged.
     #[serde(default)]
     pub enabled: bool,
-}
-
-impl Default for CompressionConfig {
-    fn default() -> Self {
-        Self { enabled: false }
-    }
 }
 
 /// Parse an environment variable into a typed target, logging a warning on failure.
