@@ -1530,4 +1530,128 @@ mod tests {
         assert!(admin_entry.request_id.is_none());
         assert_eq!(admin_entry.changes.len(), 1);
     }
+
+    // ── CsvImportMode ────────────────────────────────────────────────
+
+    #[test]
+    fn csv_import_mode_from_form_value_recognises_insert() {
+        assert_eq!(
+            CsvImportMode::from_form_value("insert"),
+            Some(CsvImportMode::Insert)
+        );
+        assert_eq!(
+            CsvImportMode::from_form_value("Insert"),
+            Some(CsvImportMode::Insert)
+        );
+    }
+
+    #[test]
+    fn csv_import_mode_from_form_value_recognises_dry_run() {
+        assert_eq!(
+            CsvImportMode::from_form_value("dry_run"),
+            Some(CsvImportMode::DryRun)
+        );
+        assert_eq!(
+            CsvImportMode::from_form_value("DryRun"),
+            Some(CsvImportMode::DryRun)
+        );
+        assert_eq!(
+            CsvImportMode::from_form_value("dry-run"),
+            Some(CsvImportMode::DryRun)
+        );
+    }
+
+    #[test]
+    fn csv_import_mode_from_form_value_rejects_unknown() {
+        assert_eq!(CsvImportMode::from_form_value("upsert"), None);
+        assert_eq!(CsvImportMode::from_form_value(""), None);
+        assert_eq!(CsvImportMode::from_form_value("INSERT"), None);
+        assert_eq!(CsvImportMode::from_form_value("DRY_RUN"), None);
+    }
+
+    #[test]
+    fn csv_import_mode_default_is_insert() {
+        assert_eq!(CsvImportMode::default(), CsvImportMode::Insert);
+    }
+
+    // ── escape_csv_formula ──────────────────────────────────────────
+
+    #[test]
+    fn escape_csv_formula_prefixes_equals_sign() {
+        assert_eq!(escape_csv_formula("=SUM(A1)"), "'=SUM(A1)");
+    }
+
+    #[test]
+    fn escape_csv_formula_prefixes_plus_and_minus_and_at() {
+        assert_eq!(escape_csv_formula("+cmd"), "'+cmd");
+        assert_eq!(escape_csv_formula("-1+1"), "'-1+1");
+        assert_eq!(escape_csv_formula("@A1"), "'@A1");
+    }
+
+    #[test]
+    fn escape_csv_formula_prefixes_tab_and_cr() {
+        assert_eq!(escape_csv_formula("\thello"), "'\thello");
+        assert_eq!(escape_csv_formula("\rhello"), "'\rhello");
+    }
+
+    #[test]
+    fn escape_csv_formula_leaves_normal_strings_unchanged() {
+        assert_eq!(escape_csv_formula("hello world"), "hello world");
+        assert_eq!(escape_csv_formula("123"), "123");
+        assert_eq!(escape_csv_formula(""), "");
+        assert_eq!(escape_csv_formula("normal,value"), "normal,value");
+    }
+
+    // ── AdminModel CSV defaults ──────────────────────────────────────
+
+    #[test]
+    fn admin_model_supports_csv_export_defaults_to_false() {
+        let model = DeletingModel {
+            deleted: Mutex::new(vec![]),
+            fail_on: None,
+        };
+        assert!(
+            !model.supports_csv_export(),
+            "supports_csv_export must default to false to require explicit opt-in"
+        );
+    }
+
+    #[test]
+    fn admin_model_supports_csv_import_defaults_to_false() {
+        let model = DeletingModel {
+            deleted: Mutex::new(vec![]),
+            fail_on: None,
+        };
+        assert!(
+            !model.supports_csv_import(),
+            "supports_csv_import must default to false"
+        );
+    }
+
+    #[test]
+    fn csv_export_row_extracts_columns_and_escapes_formulas() {
+        let model = DeletingModel {
+            deleted: Mutex::new(vec![]),
+            fail_on: None,
+        };
+        let record = serde_json::json!({
+            "id": 1,
+            "name": "Alice",
+            "formula": "=EVIL()",
+            "amount": 42.5,
+            "active": true,
+            "notes": null,
+        });
+        let columns = &[
+            "id", "name", "formula", "amount", "active", "notes", "missing",
+        ];
+        let row = model.csv_export_row(columns, &record);
+        assert_eq!(row[0], "1");
+        assert_eq!(row[1], "Alice");
+        assert_eq!(row[2], "'=EVIL()", "formula-leading value must be escaped");
+        assert_eq!(row[3], "42.5");
+        assert_eq!(row[4], "true");
+        assert_eq!(row[5], "", "null becomes empty string");
+        assert_eq!(row[6], "", "missing column becomes empty string");
+    }
 }
