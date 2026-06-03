@@ -268,10 +268,10 @@ fn compression_config_disabled_by_default() {
 
 #[test]
 fn compression_config_toml_round_trips() {
-    let toml_str = r#"
+    let toml_str = r"
 [compression]
 enabled = true
-"#;
+";
     let config: AutumnConfig = toml::from_str(toml_str).unwrap();
     assert!(config.compression.enabled);
 }
