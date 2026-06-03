@@ -3653,7 +3653,7 @@ pub async fn passkey_register_begin(
         .await
         .unwrap_or_else(|| "user".to_owned());
     let webauthn = build_webauthn(&state)?;
-    let existing_creds: Vec<Passkey> = {
+    let existing_cred_ids: Vec<CredentialID> = {
         use crate::schema::webauthn_credentials;
         webauthn_credentials::table
             .filter(webauthn_credentials::user_id.eq(__SNAKE___id))
@@ -3662,7 +3662,8 @@ pub async fn passkey_register_begin(
             .await
             .unwrap_or_default()
             .into_iter()
-            .filter_map(|json| serde_json::from_str(&json).ok())
+            .filter_map(|json| serde_json::from_str::<Passkey>(&json).ok())
+            .map(|p| p.cred_id().clone())
             .collect()
     };
     let user_unique_id = uuid::Uuid::from_u128(__SNAKE___id as u128);
@@ -3671,7 +3672,7 @@ pub async fn passkey_register_begin(
             user_unique_id,
             &__SNAKE___email,
             &__SNAKE___email,
-            Some(existing_creds),
+            Some(existing_cred_ids),
         )
         .map_err(|e| {
             AutumnError::internal_server_error_msg(format!("start_passkey_registration: {e}"))
@@ -3776,11 +3777,11 @@ document.getElementById('login-btn').addEventListener('click', async () => {
     })
 }
 
-/// `POST /passkeys/login/begin` — start an authentication ceremony.
+/// `POST /passkeys/login/begin` — start a discoverable authentication ceremony.
 ///
-/// Uses discoverable credentials (`&[]`) so the browser prompts the user to
-/// pick a passkey — no DB query needed and no credential IDs are leaked to
-/// anonymous clients.
+/// Uses `start_discoverable_authentication` so the browser shows the passkey
+/// selector without the server knowing the user upfront.  No credential IDs
+/// are sent to anonymous clients.
 #[post("/passkeys/login/begin")]
 pub async fn passkey_login_begin(
     session: Session,
@@ -3788,9 +3789,11 @@ pub async fn passkey_login_begin(
 ) -> AutumnResult<axum::Json<serde_json::Value>> {
     let webauthn = build_webauthn(&state)?;
     let (rcr, auth_state) = webauthn
-        .start_passkey_authentication(&[])
+        .start_discoverable_authentication()
         .map_err(|e| {
-            AutumnError::internal_server_error_msg(format!("start_passkey_authentication: {e}"))
+            AutumnError::internal_server_error_msg(format!(
+                "start_discoverable_authentication: {e}"
+            ))
         })?;
     session
         .insert(
@@ -3801,10 +3804,10 @@ pub async fn passkey_login_begin(
     Ok(axum::Json(serde_json::to_value(rcr).unwrap_or_default()))
 }
 
-/// `POST /passkeys/login/finish` — complete an authentication ceremony.
+/// `POST /passkeys/login/finish` — complete a discoverable authentication ceremony.
 ///
-/// On success writes `state.auth_session_key()` so downstream `#[secured]`
-/// routes work without modification.
+/// On success writes `state.auth_session_key()`, `__SNAKE___id`, and
+/// `__SNAKE___email` so downstream `#[secured]` routes work without modification.
 #[post("/passkeys/login/finish")]
 pub async fn passkey_login_finish(
     session: Session,
@@ -3817,25 +3820,44 @@ pub async fn passkey_login_finish(
         .await
         .ok_or_else(|| AutumnError::unprocessable_msg("No pending authentication."))?;
     session.remove("passkey_auth_state").await;
-    let auth_state: PasskeyAuthentication = serde_json::from_str(&auth_state_str)
+    let auth_state: DiscoverableAuthentication = serde_json::from_str(&auth_state_str)
         .map_err(|_| AutumnError::unprocessable_msg("Invalid authentication state."))?;
     let webauthn = build_webauthn(&state)?;
     let pkc: PublicKeyCredential = serde_json::from_value(body.response)
         .map_err(|e| AutumnError::unprocessable_msg(format!("Invalid credential: {e}")))?;
+    // Decode user identity from the credential's userHandle (set during registration).
+    let (user_uuid, _) = webauthn
+        .identify_discoverable_authentication(&pkc)
+        .map_err(|e| AutumnError::unauthorized_msg(format!("Cannot identify user: {e}")))?;
+    let __SNAKE___id = user_uuid.as_u128() as i64;
+    // Load only this user's passkeys for signature verification.
+    let disc_keys: Vec<DiscoverableKey> = {
+        use crate::schema::webauthn_credentials;
+        webauthn_credentials::table
+            .filter(webauthn_credentials::user_id.eq(__SNAKE___id))
+            .select(webauthn_credentials::credential_json)
+            .load::<String>(&mut *db)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|json| serde_json::from_str::<Passkey>(&json).ok())
+            .map(|p| DiscoverableKey::from(&p))
+            .collect()
+    };
     let auth_result = webauthn
-        .finish_passkey_authentication(&pkc, &auth_state)
+        .finish_discoverable_authentication(&pkc, auth_state, &disc_keys)
         .map_err(|e| AutumnError::unauthorized_msg(format!("Authentication failed: {e}")))?;
     let cred_id_str = auth_result.cred_id().to_string();
-    let row = {
+    let (wc_id, cred_json) = {
         use crate::schema::webauthn_credentials;
         webauthn_credentials::table
             .filter(webauthn_credentials::credential_id.eq(&cred_id_str))
-            .select((webauthn_credentials::id, webauthn_credentials::user_id, webauthn_credentials::credential_json))
-            .first::<(i64, i64, String)>(&mut *db)
+            .filter(webauthn_credentials::user_id.eq(__SNAKE___id))
+            .select((webauthn_credentials::id, webauthn_credentials::credential_json))
+            .first::<(i64, String)>(&mut *db)
             .await
             .map_err(|_| AutumnError::unauthorized_msg("Unknown credential."))?
     };
-    let (wc_id, __SNAKE___id, cred_json) = row;
     let __SNAKE___email: String = {
         use crate::schema::__TABLE__;
         __TABLE__::table
@@ -3858,13 +3880,17 @@ pub async fn passkey_login_finish(
             ))
             .execute(&mut *db)
             .await
-            .ok();
+            .map_err(|_| {
+                AutumnError::internal_server_error_msg("Failed to update credential state.")
+            })?;
     } else {
         diesel::update(crate::schema::webauthn_credentials::table.find(wc_id))
             .set(crate::schema::webauthn_credentials::last_used_at.eq(now))
             .execute(&mut *db)
             .await
-            .ok();
+            .map_err(|_| {
+                AutumnError::internal_server_error_msg("Failed to update credential timestamp.")
+            })?;
     }
     session.rotate_id().await;
     session
@@ -3887,6 +3913,7 @@ pub async fn passkey_list(
     State(state): State<AppState>,
     mut db: Db,
     csrf: Option<CsrfToken>,
+    csrf_field: Option<CsrfFormField>,
 ) -> AutumnResult<Markup> {
     let __SNAKE___id: i64 = session
         .get(state.auth_session_key())
@@ -3921,7 +3948,11 @@ pub async fn passkey_list(
                                 (name) " — registered " (created_at.to_string())
                                 " "
                                 form method="post" action="/passkeys/revoke" style="display:inline" {
-                                    @if let Some(ref t) = csrf { input type="hidden" name="_csrf" value=(t.token()); }
+                                    @if let Some(ref t) = csrf {
+                                        input type="hidden"
+                                              name=(csrf_field.as_ref().map(|f| f.0.as_str()).unwrap_or("_csrf"))
+                                              value=(t.token());
+                                    }
                                     input type="hidden" name="id" value=(id);
                                     button type="submit" { "Revoke" }
                                 }
