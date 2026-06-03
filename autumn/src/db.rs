@@ -758,6 +758,7 @@ pub struct Db {
     metrics: Option<crate::middleware::MetricsCollector>,
     slow_query_threshold: std::time::Duration,
     start_time: std::time::Instant,
+    is_test_tx: bool,
 }
 
 impl Db {
@@ -851,12 +852,17 @@ impl Db {
         // connection, but await them sequentially inside that task so callback
         // dependencies observe registration order.
         // Errors are counted and logged; they do NOT affect the committed tx.
+        // In transactional tests (outer transaction is rolled back), we suppress
+        // spawning these callbacks to prevent observing uncommitted side effects.
         if result.is_ok() {
             let callbacks: Vec<CommitCallback> = {
                 let mut reg = registry.lock().expect("registry lock");
                 std::mem::take(&mut *reg)
             };
-            let _ = spawn_committed_after_commit_callbacks(callbacks);
+
+            if !callbacks.is_empty() && !self.is_test_tx {
+                let _ = spawn_committed_after_commit_callbacks(callbacks);
+            }
         }
 
         result
@@ -961,6 +967,7 @@ where
         let metrics = state.metrics();
         let slow_query_threshold = state.slow_query_threshold();
         let start_time = std::time::Instant::now();
+        let is_test_tx = interceptors.iter().any(|i| i.is_transactional_test());
 
         Ok(Self {
             conn,
@@ -971,6 +978,7 @@ where
             metrics: metrics.cloned(),
             slow_query_threshold,
             start_time,
+            is_test_tx,
         })
     }
 }

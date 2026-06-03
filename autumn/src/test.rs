@@ -130,6 +130,8 @@ use crate::state::AppState;
 #[cfg(feature = "db")]
 use diesel_async::AsyncPgConnection;
 #[cfg(feature = "db")]
+use diesel_async::RunQueryDsl;
+#[cfg(feature = "db")]
 use diesel_async::pooled_connection::deadpool::Pool;
 
 // ── TestApp ────────────────────────────────────────────────────
@@ -171,6 +173,10 @@ pub struct TestApp {
     pool: Option<Pool<AsyncPgConnection>>,
     #[cfg(feature = "db")]
     replica_pool: Option<Pool<AsyncPgConnection>>,
+    #[cfg(feature = "db")]
+    transactional: bool,
+    #[cfg(feature = "db")]
+    transactional_url: Option<String>,
     /// Deferred policy / scope registrations applied during
     /// [`TestApp::build`].
     policy_registrations: Vec<TestPolicyRegistration>,
@@ -228,6 +234,10 @@ impl TestApp {
             pool: None,
             #[cfg(feature = "db")]
             replica_pool: None,
+            #[cfg(feature = "db")]
+            transactional: false,
+            #[cfg(feature = "db")]
+            transactional_url: None,
             policy_registrations: Vec::new(),
             forbidden_response_override: None,
             #[cfg(feature = "mail")]
@@ -634,6 +644,24 @@ impl TestApp {
         self
     }
 
+    /// Enable transactional test isolation using the database URL configured
+    /// in the application's configuration.
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub const fn transactional(mut self) -> Self {
+        self.transactional = true;
+        self
+    }
+
+    /// Enable transactional test isolation with an explicit database URL.
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn with_transactional_db(mut self, url: impl Into<String>) -> Self {
+        self.transactional = true;
+        self.transactional_url = Some(url.into());
+        self
+    }
+
     /// Register a canned HTTP response for outbound requests made via the
     /// [`Client`](crate::http_client::Client) extractor during this test.
     ///
@@ -695,6 +723,67 @@ impl TestApp {
         // Reset the global cache to prevent cross-test contamination.
         crate::cache::clear_global_cache();
 
+        #[cfg(feature = "db")]
+        let (pool, replica_pool, db_interceptor) = if self.transactional {
+            let url = self.transactional_url.as_deref()
+                .or_else(|| self.config.database.effective_primary_url())
+                .expect("Transactional isolation enabled but database URL is not configured. Use `with_transactional_db(url)` or configure database.primary_url/database.url");
+
+            let connect_timeout_secs = self.config.database.connect_timeout_secs;
+            let timeout = std::time::Duration::from_secs(connect_timeout_secs);
+
+            let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+                diesel_async::AsyncPgConnection,
+            >::new(url);
+            let pool = Pool::builder(manager)
+                .max_size(1)
+                .wait_timeout(Some(timeout))
+                .create_timeout(Some(timeout))
+                .runtime(deadpool::Runtime::Tokio1)
+                .post_create(deadpool::managed::Hook::async_fn(
+                    |conn: &mut diesel_async::AsyncPgConnection, _metrics| {
+                        Box::pin(async move {
+                            use diesel_async::AsyncConnection;
+                            use diesel_async::RunQueryDsl;
+
+                            conn.begin_test_transaction().await.map_err(|e| {
+                                deadpool::managed::HookError::Backend(
+                                    diesel_async::pooled_connection::PoolError::QueryError(e),
+                                )
+                            })?;
+
+                            diesel::sql_query("SET autumn.test_transaction_started = 'true'")
+                                .execute(conn)
+                                .await
+                                .map_err(|e| {
+                                    deadpool::managed::HookError::Backend(
+                                        diesel_async::pooled_connection::PoolError::QueryError(e),
+                                    )
+                                })?;
+
+                            Ok(())
+                        })
+                    },
+                ))
+                .build()
+                .expect("failed to build transactional pool of size 1");
+
+            let trans_interceptor = std::sync::Arc::new(TransactionalDbInterceptor);
+            let interceptor = if let Some(user_interceptor) = self.db_interceptor {
+                std::sync::Arc::new(ComposedDbInterceptor {
+                    first: user_interceptor,
+                    second: trans_interceptor,
+                })
+                    as std::sync::Arc<dyn crate::interceptor::DbConnectionInterceptor>
+            } else {
+                trans_interceptor as std::sync::Arc<dyn crate::interceptor::DbConnectionInterceptor>
+            };
+
+            (Some(pool), None, Some(interceptor))
+        } else {
+            (self.pool, self.replica_pool, self.db_interceptor)
+        };
+
         let probes = crate::probe::ProbeState::ready_for_test();
         #[cfg(feature = "ws")]
         let test_channels = crate::channels::Channels::new(32);
@@ -704,9 +793,9 @@ impl TestApp {
                 std::collections::HashMap::new(),
             )),
             #[cfg(feature = "db")]
-            pool: self.pool,
+            pool,
             #[cfg(feature = "db")]
-            replica_pool: self.replica_pool,
+            replica_pool,
             profile: self.config.profile.clone(),
             started_at: std::time::Instant::now(),
             health_detailed: self.config.health.detailed,
@@ -752,7 +841,7 @@ impl TestApp {
             state.insert_extension(interceptor);
         }
         #[cfg(feature = "db")]
-        if let Some(interceptor) = self.db_interceptor {
+        if let Some(interceptor) = db_interceptor {
             state.insert_extension(interceptor);
         }
         #[cfg(feature = "ws")]
@@ -1285,6 +1374,115 @@ impl TestResponse {
             String::from_utf8_lossy(&self.body)
         );
         self
+    }
+}
+
+#[cfg(feature = "db")]
+struct TransactionalDbInterceptor;
+
+#[cfg(feature = "db")]
+impl crate::interceptor::DbConnectionInterceptor for TransactionalDbInterceptor {
+    fn intercept_checkout<'a>(
+        &'a self,
+        _ctx: crate::interceptor::DbCheckoutContext,
+        next: std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<crate::db::PooledConnection, crate::AutumnError>,
+                    > + Send
+                    + 'a,
+            >,
+        >,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<crate::db::PooledConnection, crate::AutumnError>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let mut conn = next.await?;
+
+            // Check if transaction has already been started on this connection
+            let guc_result = diesel::select(diesel::dsl::sql::<
+                diesel::sql_types::Nullable<diesel::sql_types::Text>,
+            >(
+                "current_setting('autumn.test_transaction_started', true)",
+            ))
+            .get_result::<Option<String>>(&mut *conn)
+            .await;
+
+            match guc_result {
+                Ok(Some(ref s)) if s == "true" => {
+                    // Already started and healthy
+                }
+                Ok(_) => {
+                    use diesel_async::AsyncConnection;
+                    use diesel_async::RunQueryDsl;
+
+                    conn.begin_test_transaction().await.map_err(|e| {
+                        crate::AutumnError::internal_server_error_msg(format!(
+                            "failed to start test transaction: {e}"
+                        ))
+                    })?;
+
+                    diesel::sql_query("SET autumn.test_transaction_started = 'true'")
+                        .execute(&mut *conn)
+                        .await
+                        .map_err(|e| {
+                            crate::AutumnError::internal_server_error_msg(format!(
+                                "failed to set transaction session GUC: {e}"
+                            ))
+                        })?;
+                }
+                Err(_) => {
+                    // The GUC query failed. This happens when the connection is in a failed/aborted transaction block.
+                    // Since the transaction is already active (but aborted), do not retry begin_test_transaction!
+                }
+            }
+            Ok(conn)
+        })
+    }
+
+    fn is_transactional_test(&self) -> bool {
+        true
+    }
+}
+
+#[cfg(feature = "db")]
+struct ComposedDbInterceptor {
+    first: std::sync::Arc<dyn crate::interceptor::DbConnectionInterceptor>,
+    second: std::sync::Arc<dyn crate::interceptor::DbConnectionInterceptor>,
+}
+
+#[cfg(feature = "db")]
+impl crate::interceptor::DbConnectionInterceptor for ComposedDbInterceptor {
+    fn intercept_checkout<'a>(
+        &'a self,
+        ctx: crate::interceptor::DbCheckoutContext,
+        next: std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<crate::db::PooledConnection, crate::AutumnError>,
+                    > + Send
+                    + 'a,
+            >,
+        >,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<crate::db::PooledConnection, crate::AutumnError>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        let next_wrapped = self.second.intercept_checkout(ctx.clone(), next);
+        self.first.intercept_checkout(ctx, next_wrapped)
+    }
+
+    fn is_transactional_test(&self) -> bool {
+        self.first.is_transactional_test() || self.second.is_transactional_test()
     }
 }
 
