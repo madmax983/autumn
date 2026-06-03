@@ -39,10 +39,11 @@ const AUTH_EXTRA_DEPS: &[(&str, &str)] = &[
 ///   `WebAuthn` ceremony implementation. State serialisation lets the in-progress
 ///   ceremony challenge survive across requests via the session.
 /// - `uuid` generates random credential IDs if the authenticator doesn't supply one.
+/// - `conditional-ui` gates `start/finish_discoverable_authentication` in webauthn-rs 0.5.
 const PASSKEY_EXTRA_DEPS: &[(&str, &str)] = &[
     (
         "webauthn-rs",
-        "{ version = \"0.5\", features = [\"danger-allow-state-serialisation\"] }",
+        "{ version = \"0.5\", features = [\"danger-allow-state-serialisation\", \"conditional-ui\"] }",
     ),
     ("uuid", "{ version = \"1\", features = [\"v4\"] }"),
 ];
@@ -681,7 +682,6 @@ fn plan_auth_options_impl(
             "credential_id:String",
             "credential_json:String",
             "name:String",
-            "created_at:NaiveDateTime",
             "last_used_at:Option<NaiveDateTime>",
         ]
         .iter()
@@ -3487,7 +3487,7 @@ fn render_webauthn_credential_model_file(user_table: &str) -> String {
 //!
 //! Edit freely — once generated, this is ordinary user code.
 
-use crate::schema::webauthn_credentials;
+use crate::schema::{{webauthn_credentials, {user_table}}};
 
 #[autumn_web::model]
 pub struct WebauthnCredential {{
@@ -3532,8 +3532,14 @@ fn render_passkeys_routes_file(pascal_name: &str, snake_name: &str, user_table: 
 //!   state returned by webauthn-rs and should not be inspected by app code.
 
 use autumn_web::prelude::*;
+use diesel::prelude::*;
+use diesel_async::RunQueryDsl;
 use serde::{Deserialize, Serialize};
 use webauthn_rs::prelude::*;
+
+fn redirect_to(url: &str) -> Response {
+    axum::response::Redirect::to(url).into_response()
+}
 
 // ── Config helper ──────────────────────────────────────────────────────────────
 
