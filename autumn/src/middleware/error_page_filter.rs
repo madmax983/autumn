@@ -70,6 +70,8 @@ pub struct ErrorPageRequestContext {
     pub matched_path: Option<String>,
     /// Scrubbed cookies parsed from the Cookie header.
     pub cookies: Option<serde_json::Value>,
+    /// Raw path parameters (e.g. `{"id": "42"}`), captured in dev mode.
+    pub path_params: Option<serde_json::Value>,
 }
 
 /// Tower layer that annotates requests with Accept header preference
@@ -172,6 +174,9 @@ where
                     .extensions()
                     .get::<crate::middleware::dev::DevMatchedPath>()
                     .map(|m| m.0.clone());
+                let path_params = matched_path
+                    .as_deref()
+                    .map(|pattern| extract_path_params(pattern, this.uri.path()));
                 let cookies = this
                     .headers
                     .as_ref()
@@ -186,6 +191,7 @@ where
                     method: this.method.clone(),
                     matched_path,
                     cookies,
+                    path_params,
                 });
                 std::task::Poll::Ready(Ok(response))
             }
@@ -273,6 +279,27 @@ pub fn accept_prefers_html(headers: &axum::http::HeaderMap) -> bool {
     }
 }
 
+/// Derive path parameters by matching URI segments against a route pattern.
+///
+/// Pattern segments starting with `:` are treated as named captures.
+/// Returns an empty object when segment counts differ (wildcard routes, etc.).
+fn extract_path_params(pattern: &str, uri_path: &str) -> serde_json::Value {
+    let pat_segs: Vec<&str> = pattern.split('/').collect();
+    let uri_segs: Vec<&str> = uri_path.split('/').collect();
+    let mut map = serde_json::Map::new();
+    if pat_segs.len() == uri_segs.len() {
+        for (pat, val) in pat_segs.iter().zip(uri_segs.iter()) {
+            if let Some(name) = pat.strip_prefix(':') {
+                map.insert(
+                    name.to_owned(),
+                    serde_json::Value::String((*val).to_owned()),
+                );
+            }
+        }
+    }
+    serde_json::Value::Object(map)
+}
+
 /// Parse `Cookie: name=value; name2=value2` into a JSON object.
 ///
 /// Returns an object where each cookie name maps to its (possibly filtered) value.
@@ -281,7 +308,10 @@ fn parse_cookie_header(raw: &str) -> serde_json::Value {
     for pair in raw.split(';') {
         let pair = pair.trim();
         if let Some((name, value)) = pair.split_once('=') {
-            map.insert(name.trim().to_owned(), serde_json::Value::String(value.trim().to_owned()));
+            map.insert(
+                name.trim().to_owned(),
+                serde_json::Value::String(value.trim().to_owned()),
+            );
         } else if !pair.is_empty() {
             map.insert(pair.to_owned(), serde_json::Value::String(String::new()));
         }
@@ -356,9 +386,7 @@ impl ErrorPageFilter {
         let stack_frames = error
             .backtrace_string
             .as_deref()
-            .map(|bt| {
-                crate::error_pages::source::parse_backtrace_string(bt, 24)
-            })
+            .map(|bt| crate::error_pages::source::parse_backtrace_string(bt, 24))
             .unwrap_or_default();
 
         let raw_cookies = req_ctx
@@ -379,15 +407,16 @@ impl ErrorPageFilter {
             request_id: ctx.request_id.clone(),
             source_location: None,
             query: req_ctx.and_then(|c| c.query.clone()),
-            headers: req_ctx
-                .and_then(|c| c.headers.as_ref())
-                .map_or_else(
-                    || serde_json::json!({}),
-                    |h| scrub_headers(h, &self.parameter_filter),
-                ),
+            headers: req_ctx.and_then(|c| c.headers.as_ref()).map_or_else(
+                || serde_json::json!({}),
+                |h| scrub_headers(h, &self.parameter_filter),
+            ),
             method: req_ctx.and_then(|c| c.method.clone()),
             route_pattern: req_ctx.and_then(|c| c.matched_path.clone()),
-            path_params: serde_json::json!({}),
+            path_params: req_ctx.and_then(|c| c.path_params.as_ref()).map_or_else(
+                || serde_json::json!({}),
+                |p| self.parameter_filter.scrub_json(p),
+            ),
             cookies,
             stack_frames,
             sql_queries: Vec::new(),

@@ -167,11 +167,11 @@ fn live_reload_script() -> String {
 #[derive(Clone, Debug)]
 pub struct DevMatchedPath(pub String);
 
-/// Axum `from_fn` middleware that captures the matched route pattern and stores
+/// Axum `from_fn` middleware that captures the matched route pattern, storing
 /// it in response extensions for the dev error overlay.
 ///
 /// Applied via `router.route_layer(...)` in dev profile so it runs *after*
-/// route matching (where `MatchedPath` is available in request extensions).
+/// route matching (where `MatchedPath` is available).
 pub async fn capture_matched_path_middleware(
     matched_path: Option<axum::extract::MatchedPath>,
     request: Request<Body>,

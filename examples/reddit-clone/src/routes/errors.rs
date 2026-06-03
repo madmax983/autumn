@@ -17,9 +17,9 @@ use autumn_web::prelude::*;
 /// the source context for this file, and shows the full request context.
 #[get("/dev/trigger-error")]
 pub async fn trigger_error() -> AutumnResult<&'static str> {
-    let result: Result<i32, _> = "not_a_number".parse::<i32>().map_err(|e| {
-        AutumnError::from(e)
-    });
+    let result: Result<i32, _> = "not_a_number"
+        .parse::<i32>()
+        .map_err(AutumnError::from);
     // Propagate through `?` — this is the line the overlay should highlight.
     let _n = result?;
     Ok("(this line is never reached)")

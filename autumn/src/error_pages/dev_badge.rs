@@ -113,6 +113,7 @@ impl Default for DevBadgeContext {
 /// Uses inline CSS (not Tailwind) so it works even if the CSS build fails.
 /// Styled like Next.js/Phoenix: dark overlay, monospace font, red accent,
 /// expandable stack frames with source context.
+#[allow(clippy::too_many_lines)]
 pub fn dev_error_badge_html(ctx: &DevBadgeContext) -> Markup {
     let status = ctx.status_code;
     let reason = &ctx.status_reason;
@@ -122,8 +123,14 @@ pub fn dev_error_badge_html(ctx: &DevBadgeContext) -> Markup {
     let source_loc = ctx.source_location.as_deref().unwrap_or("");
     let query = ctx.query.as_deref().unwrap_or("n/a");
     let headers_str = ctx.headers.to_string();
-    let has_path_params = !ctx.path_params.as_object().map_or(true, |m| m.is_empty());
-    let has_cookies = !ctx.cookies.as_object().map_or(true, |m| m.is_empty());
+    let has_path_params = !ctx
+        .path_params
+        .as_object()
+        .is_none_or(serde_json::Map::is_empty);
+    let has_cookies = !ctx
+        .cookies
+        .as_object()
+        .is_none_or(serde_json::Map::is_empty);
 
     html! {
         (PreEscaped(DEV_BADGE_STYLES))
@@ -612,7 +619,10 @@ mod tests {
         let s = html.into_string();
         // The label ">Source<" in the HTML body must not appear when no source_location is set.
         // CSS class names containing "source" (lowercase) are always present.
-        assert!(!s.contains(">Source<"), "no source section label without location");
+        assert!(
+            !s.contains(">Source<"),
+            "no source section label without location"
+        );
     }
 
     // ── RED-phase tests: new fields and types ───────────────────────
@@ -646,7 +656,10 @@ mod tests {
         let html = dev_error_badge_html(&ctx);
         let s = html.into_string();
         assert!(s.contains("src/routes/posts.rs"), "should show file path");
-        assert!(s.contains("reddit_clone::routes::posts::create"), "should show function");
+        assert!(
+            s.contains("reddit_clone::routes::posts::create"),
+            "should show function"
+        );
     }
 
     #[test]
@@ -707,8 +720,14 @@ mod tests {
         ctx.path_params = serde_json::json!({"id": "42", "slug": "hello-world"});
         let html = dev_error_badge_html(&ctx);
         let s = html.into_string();
-        assert!(s.contains("hello-world") || s.contains("slug"), "should show path params");
-        assert!(s.contains("Params") || s.contains("Path"), "should have params label");
+        assert!(
+            s.contains("hello-world") || s.contains("slug"),
+            "should show path params"
+        );
+        assert!(
+            s.contains("Params") || s.contains("Path"),
+            "should have params label"
+        );
     }
 
     #[test]
@@ -725,7 +744,10 @@ mod tests {
             s.contains("SELECT * FROM posts"),
             "should show SQL statement"
         );
-        assert!(s.contains("SQL") || s.contains("Queries"), "should have SQL section label");
+        assert!(
+            s.contains("SQL") || s.contains("Queries"),
+            "should have SQL section label"
+        );
     }
 
     #[test]
@@ -743,7 +765,10 @@ mod tests {
         let html = dev_error_badge_html(&ctx);
         let s = html.into_string();
         assert!(s.contains("Cookies"), "should have Cookies section");
-        assert!(s.contains("theme"), "should show non-sensitive cookie names");
+        assert!(
+            s.contains("theme"),
+            "should show non-sensitive cookie names"
+        );
     }
 
     #[test]
@@ -773,7 +798,13 @@ mod tests {
         let html = dev_error_badge_html(&ctx);
         let s = html.into_string();
         assert!(s.contains("SELECT * FROM users"), "should show first query");
-        assert!(s.contains("SELECT * FROM posts"), "should show second query");
-        assert!(s.contains("ms") || s.contains("1.50") || s.contains("2.30"), "should show duration");
+        assert!(
+            s.contains("SELECT * FROM posts"),
+            "should show second query"
+        );
+        assert!(
+            s.contains("ms") || s.contains("1.50") || s.contains("2.30"),
+            "should show duration"
+        );
     }
 }

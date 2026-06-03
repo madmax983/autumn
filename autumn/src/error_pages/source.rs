@@ -25,7 +25,9 @@ pub fn read_source_context(file_path: &str, failing_line: u32) -> Vec<SourceLine
     };
 
     let all_lines: Vec<&str> = contents.lines().collect();
-    let total = all_lines.len() as u32;
+    let Ok(total) = u32::try_from(all_lines.len()) else {
+        return Vec::new();
+    };
 
     if failing_line > total {
         return Vec::new();
@@ -64,9 +66,11 @@ pub fn is_workspace_file(file_path: &str) -> bool {
     if file_path.is_empty() {
         return false;
     }
-    if file_path.contains("/rustc/")
-        || file_path.contains("/.cargo/registry/")
-        || file_path.contains("/.cargo/git/")
+    // Normalize separators so Windows backslash paths match the same checks.
+    let normalized = file_path.replace('\\', "/");
+    if normalized.contains("/rustc/")
+        || normalized.contains("/.cargo/registry/")
+        || normalized.contains("/.cargo/git/")
     {
         return false;
     }
@@ -74,11 +78,7 @@ pub fn is_workspace_file(file_path: &str) -> bool {
     if !p.is_absolute() {
         return true;
     }
-    if let Ok(cwd) = std::env::current_dir() {
-        p.starts_with(&cwd)
-    } else {
-        false
-    }
+    std::env::current_dir().is_ok_and(|cwd| p.starts_with(&cwd))
 }
 
 /// Parse a `std::backtrace::Backtrace` display string into structured frames.
@@ -105,7 +105,9 @@ pub fn parse_backtrace_string(
         // Frame index lines look like: "   0: symbol_name"
         if let Some(colon_pos) = trimmed.find(": ") {
             let index_part = &trimmed[..colon_pos];
-            if !index_part.chars().all(|c| c.is_ascii_digit()) {
+            // Reject empty index_part: `all()` on an empty iterator returns true,
+            // which would incorrectly accept lines starting with ": ".
+            if index_part.is_empty() || !index_part.chars().all(|c| c.is_ascii_digit()) {
                 continue;
             }
             let function = trimmed[colon_pos + 2..].trim().to_owned();
@@ -114,17 +116,20 @@ pub fn parse_backtrace_string(
             }
 
             // Next line may be the location: "              at FILE:LINE:COL"
-            let (file, line_no) = if let Some(next) = lines.peek() {
-                let nt = next.trim();
-                if let Some(at_rest) = nt.strip_prefix("at ") {
+            // Peek-then-advance: materialise the "at FILE:LINE" portion as an
+            // owned String first so the peek borrow is released before calling
+            // `lines.next()` below.
+            let at_rest_owned = lines
+                .peek()
+                .and_then(|s| s.trim().strip_prefix("at "))
+                .map(str::to_owned);
+            let (file, line_no) = at_rest_owned.map_or_else(
+                || (String::new(), 0),
+                |at_rest| {
                     lines.next();
-                    parse_location(at_rest)
-                } else {
-                    (String::new(), 0)
-                }
-            } else {
-                (String::new(), 0)
-            };
+                    parse_location(&at_rest)
+                },
+            );
 
             let in_workspace = is_workspace_file(&file);
             let source_context = if in_workspace && line_no > 0 {
@@ -151,31 +156,31 @@ pub fn parse_backtrace_string(
 }
 
 /// Parse a `FILE:LINE:COL` or `FILE:LINE` location string.
+///
+/// Uses a segment-based approach working from the right of the string so that
+/// Windows drive-letter colons (e.g. `C:\path\file.rs:42`) are handled
+/// correctly — the drive letter colon is not mistaken for a line/col separator.
 fn parse_location(s: &str) -> (String, u32) {
-    // Strip optional column (:COL at end)
-    let without_col = if let Some(last_colon) = s.rfind(':') {
-        let after = &s[last_colon + 1..];
-        if after.chars().all(|c| c.is_ascii_digit()) && !after.is_empty() {
-            let candidate = &s[..last_colon];
-            // Make sure what's left still has a line number
-            if candidate.rfind(':').is_some() {
-                candidate
-            } else {
-                s
+    let parts: Vec<&str> = s.split(':').collect();
+    let n = parts.len();
+    if n >= 2
+        && let Some(&last) = parts.last()
+        && last.parse::<u32>().is_ok()
+    {
+        {
+            // Last part is numeric — could be COL. Check if second-last is LINE.
+            if n >= 3
+                && let Ok(line_no) = parts[n - 2].parse::<u32>()
+            {
+                let file = parts[..n - 2].join(":");
+                return (file, line_no);
             }
-        } else {
-            s
-        }
-    } else {
-        s
-    };
-
-    // Now parse FILE:LINE
-    if let Some(last_colon) = without_col.rfind(':') {
-        let line_str = &without_col[last_colon + 1..];
-        if let Ok(line_no) = line_str.parse::<u32>() {
-            let file = without_col[..last_colon].to_owned();
-            return (file, line_no);
+            // No COL: last part is LINE.
+            let line_no = last.parse::<u32>().unwrap_or(0);
+            if line_no > 0 {
+                let file = parts[..n - 1].join(":");
+                return (file, line_no);
+            }
         }
     }
     (s.to_owned(), 0)
