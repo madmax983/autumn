@@ -2487,7 +2487,16 @@ mod tests {
         };
 
         let html = model_history_page(
-            &r, "posts", "Post", "Posts", 42, &history, "/admin", "/ops", false,
+            &r,
+            "posts",
+            "Post",
+            "Posts",
+            42,
+            &history,
+            "/admin",
+            "/ops",
+            "X-CSRF-Token",
+            false,
         )
         .into_string();
 
@@ -2504,7 +2513,17 @@ mod tests {
     #[test]
     fn dashboard_emits_csrf_meta_and_script() {
         let r = dummy_registry();
-        let html = dashboard_page(&r, &[], &[], "tok-123", "/admin", "/ops", false).into_string();
+        let html = dashboard_page(
+            &r,
+            &[],
+            &[],
+            "tok-123",
+            "X-CSRF-Token",
+            "/admin",
+            "/ops",
+            false,
+        )
+        .into_string();
         assert!(
             html.contains(r#"<meta name="csrf-token" content="tok-123""#),
             "CSRF meta tag missing: {html}"
@@ -2518,7 +2537,8 @@ mod tests {
     #[test]
     fn dashboard_uses_configured_actuator_prefix() {
         let r = dummy_registry();
-        let html = dashboard_page(&r, &[], &[], "tok", "/admin", "/ops", false).into_string();
+        let html = dashboard_page(&r, &[], &[], "tok", "X-CSRF-Token", "/admin", "/ops", false)
+            .into_string();
         assert!(
             html.contains(r#"href="/ops/ui""#),
             "sidebar link wrong: {html}"
@@ -2629,6 +2649,7 @@ mod tests {
             &[],
             "tok-job",
             "authenticity_token",
+            "X-CSRF-Token",
             "/admin",
             "/actuator",
             false,
@@ -2677,6 +2698,7 @@ mod tests {
             &[],
             "tok-xyz",
             "authenticity_token",
+            "X-CSRF-Token",
             "/admin",
             "/actuator",
             false,
@@ -2706,6 +2728,7 @@ mod tests {
             &[],
             "t",
             "_csrf",
+            "X-CSRF-Token",
             "/admin",
             "/actuator",
             false,
@@ -2739,6 +2762,7 @@ mod tests {
             &[],
             "t",
             "_csrf",
+            "X-CSRF-Token",
             "/admin",
             "/actuator",
             false,
@@ -2770,6 +2794,7 @@ mod tests {
             42,
             &[],
             "t",
+            "X-CSRF-Token",
             "/admin",
             "/actuator",
             false,
@@ -2811,6 +2836,7 @@ mod tests {
             1,
             &[],
             "t",
+            "X-CSRF-Token",
             "/admin",
             "/actuator",
             false,
@@ -2834,7 +2860,17 @@ mod tests {
         // Instead it must load the plugin-owned asset at a fingerprinted
         // `/{prefix}/static/admin.<hash>.js` URL.
         let r = dummy_registry();
-        let html = dashboard_page(&r, &[], &[], "t", "/admin", "/actuator", false).into_string();
+        let html = dashboard_page(
+            &r,
+            &[],
+            &[],
+            "t",
+            "X-CSRF-Token",
+            "/admin",
+            "/actuator",
+            false,
+        )
+        .into_string();
         let expected = format!(r#"src="/admin{}""#, &**ADMIN_JS_PATH);
         assert!(
             html.contains(&expected),
@@ -2891,6 +2927,7 @@ mod tests {
             &[],
             "t",
             "_csrf",
+            "X-CSRF-Token",
             "/admin",
             "/actuator",
             false,
@@ -2942,6 +2979,7 @@ mod tests {
             &[],
             "t",
             "_csrf",
+            "X-CSRF-Token",
             "/admin",
             "/actuator",
             false,
@@ -2990,6 +3028,7 @@ mod tests {
             &[],
             "t",
             "_csrf",
+            "X-CSRF-Token",
             "/admin",
             "/actuator",
             false,
@@ -3050,6 +3089,7 @@ mod tests {
             &[],
             "t",
             "_csrf",
+            "X-CSRF-Token",
             "/admin",
             "/actuator",
             false,
@@ -3105,6 +3145,7 @@ mod tests {
             &[],
             "t",
             "_csrf",
+            "X-CSRF-Token",
             "/admin",
             "/actuator",
             false,
@@ -3161,6 +3202,7 @@ mod tests {
             &[],
             "t",
             "_csrf",
+            "X-CSRF-Token",
             "/admin",
             "/actuator",
             false,
@@ -3213,6 +3255,7 @@ mod tests {
             &[],
             "tok",
             "admin_csrf",
+            "X-CSRF-Token",
             "/admin",
             "/actuator",
             false,
@@ -3265,6 +3308,7 @@ mod tests {
             &[],
             "t",
             "_csrf",
+            "X-CSRF-Token",
             "/admin",
             "/actuator",
             false,
@@ -3306,6 +3350,7 @@ mod tests {
             &[],
             "tok",
             "_csrf",
+            "X-CSRF-Token",
             "/admin",
             "/actuator",
             false,
@@ -3356,6 +3401,7 @@ mod tests {
             &[],
             "t",
             "_csrf",
+            "X-CSRF-Token",
             "/admin",
             "/actuator",
             false, // show_config
@@ -3398,6 +3444,7 @@ mod tests {
             &[],
             "t",
             "_csrf",
+            "X-CSRF-Token",
             "/admin",
             "/actuator",
             false, // show_config
@@ -3440,6 +3487,7 @@ mod tests {
             &[],
             "t",
             "_csrf",
+            "X-CSRF-Token",
             "/admin",
             "/actuator",
             false,
@@ -3498,7 +3546,17 @@ mod tests {
     #[test]
     fn config_page_empty_shows_no_keys_registered_message() {
         let r = dummy_registry();
-        let html = config_page(&r, &[], &[], "tok", "_csrf", "/admin", "/actuator").into_string();
+        let html = config_page(
+            &r,
+            &[],
+            &[],
+            "tok",
+            "_csrf",
+            "X-CSRF-Token",
+            "/admin",
+            "/actuator",
+        )
+        .into_string();
         assert!(
             html.contains("No config keys have been registered"),
             "empty state message missing: {html}"
@@ -3522,8 +3580,17 @@ mod tests {
             is_overridden: false,
             description: Some("Max upload in MB".to_owned()),
         }];
-        let html =
-            config_page(&r, &entries, &[], "tok", "_csrf", "/admin", "/actuator").into_string();
+        let html = config_page(
+            &r,
+            &entries,
+            &[],
+            "tok",
+            "_csrf",
+            "X-CSRF-Token",
+            "/admin",
+            "/actuator",
+        )
+        .into_string();
         assert!(html.contains("max_upload_mb"), "key name missing: {html}");
         assert!(
             html.contains("Max upload in MB"),
@@ -3552,8 +3619,17 @@ mod tests {
             is_overridden: true,
             description: None,
         }];
-        let html =
-            config_page(&r, &entries, &[], "tok", "_csrf", "/admin", "/actuator").into_string();
+        let html = config_page(
+            &r,
+            &entries,
+            &[],
+            "tok",
+            "_csrf",
+            "X-CSRF-Token",
+            "/admin",
+            "/actuator",
+        )
+        .into_string();
         assert!(
             html.contains(r#"action="/admin/config/rate_limit/unset""#),
             "unset form should appear for overridden key: {html}"
@@ -3573,8 +3649,17 @@ mod tests {
             is_overridden: true,
             description: None,
         }];
-        let html =
-            config_page(&r, &entries, &[], "tok", "_csrf", "/admin", "/actuator").into_string();
+        let html = config_page(
+            &r,
+            &entries,
+            &[],
+            "tok",
+            "_csrf",
+            "X-CSRF-Token",
+            "/admin",
+            "/actuator",
+        )
+        .into_string();
         assert!(
             html.to_lowercase().contains("overridden"),
             "overridden status missing: {html}"
@@ -3594,8 +3679,17 @@ mod tests {
             is_overridden: false,
             description: None,
         }];
-        let html =
-            config_page(&r, &entries, &[], "tok", "_csrf", "/admin", "/actuator").into_string();
+        let html = config_page(
+            &r,
+            &entries,
+            &[],
+            "tok",
+            "_csrf",
+            "X-CSRF-Token",
+            "/admin",
+            "/actuator",
+        )
+        .into_string();
         assert!(
             html.to_lowercase().contains("default"),
             "default status missing: {html}"
@@ -3621,6 +3715,7 @@ mod tests {
             &[],
             "csrf-tok-789",
             "authenticity_token",
+            "X-CSRF-Token",
             "/admin",
             "/actuator",
         )
@@ -3634,8 +3729,17 @@ mod tests {
     #[test]
     fn config_history_page_shows_empty_state() {
         let r = dummy_registry();
-        let html = config_history_page(&r, "rate_limit", &[], &[], "tok", "/admin", "/actuator")
-            .into_string();
+        let html = config_history_page(
+            &r,
+            "rate_limit",
+            &[],
+            &[],
+            "tok",
+            "X-CSRF-Token",
+            "/admin",
+            "/actuator",
+        )
+        .into_string();
         assert!(
             html.contains("No changes recorded"),
             "empty history message missing: {html}"
@@ -3661,6 +3765,7 @@ mod tests {
             &history,
             &[],
             "tok",
+            "X-CSRF-Token",
             "/admin",
             "/actuator",
         )
@@ -3683,8 +3788,17 @@ mod tests {
             actor: None,
             timestamp_secs: 0,
         }];
-        let html = config_history_page(&r, "flag", &history, &[], "tok", "/admin", "/actuator")
-            .into_string();
+        let html = config_history_page(
+            &r,
+            "flag",
+            &history,
+            &[],
+            "tok",
+            "X-CSRF-Token",
+            "/admin",
+            "/actuator",
+        )
+        .into_string();
         assert!(html.contains("flag"), "key name missing: {html}");
         // The null actor should render as a dash placeholder.
         assert!(html.contains("—"), "null actor placeholder missing: {html}");
