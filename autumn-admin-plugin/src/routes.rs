@@ -945,7 +945,7 @@ async fn model_export_csv(
     }
 
     let filename = format!("{slug}.csv");
-    Ok(axum::response::Response::builder()
+    axum::response::Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/csv; charset=utf-8")
         .header(
@@ -953,7 +953,7 @@ async fn model_export_csv(
             format!("attachment; filename=\"{filename}\""),
         )
         .body(axum::body::Body::from(buf))
-        .map_err(|e| AutumnError::internal_server_error_msg(format!("Response error: {e}")))?)
+        .map_err(|e| AutumnError::internal_server_error_msg(format!("Response error: {e}")))
 }
 
 /// `GET /admin/{slug}/import` — Render the CSV import form.
