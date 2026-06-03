@@ -251,11 +251,10 @@ impl AdminModel for PostAdmin {
 
     // ── Version history (issue #700) ─────────────────────────────────
 
-    /// Posts opt into the History pane in the admin panel.
-    ///
-    /// In an application that uses `#[repository(Post, versioned = true)]`,
-    /// this returns `true` automatically (the macro generates the override).
-    /// This example wires it manually to demonstrate the History pane UI.
+    // Posts opt into the History pane in the admin panel.
+    // In an application that uses `#[repository(Post, versioned = true)]`,
+    // this returns `true` automatically (the macro generates the override).
+    // This example wires it manually to demonstrate the History pane UI.
     // ── CSV export / import ──────────────────────────────────────────
 
     /// Export `id`, `title`, `slug`, `published`, and `created_at`.
