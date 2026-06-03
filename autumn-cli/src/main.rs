@@ -111,7 +111,7 @@ enum Commands {
     /// # Examples
     ///
     ///   autumn data export posts --out posts.csv
-    ///   autumn data export posts --where "published=true" --out published.csv
+    ///   autumn data export posts --search hello --out results.csv
     ///   autumn data import posts --in posts.csv
     ///   autumn data import posts --in posts.csv --dry-run
     ///   autumn data import posts --in posts.csv --upsert-by id
@@ -582,11 +582,12 @@ enum DataCommands {
         /// Output file path (defaults to `<model>.csv`).
         #[arg(short, long, value_name = "FILE")]
         out: Option<String>,
-        /// Optional SQL-style WHERE clause forwarded as `?q=<expr>` to the
-        /// admin export endpoint (not all backends support it — the admin
-        /// model's `list` implementation must honour the `search` field).
-        #[arg(long, value_name = "EXPR")]
-        r#where: Option<String>,
+        /// Free-text search forwarded as `?q=<text>` to the admin export
+        /// endpoint. The admin model's `list` implementation must honour the
+        /// `search` field; use `filter.<field>=<value>` query params for
+        /// exact field filtering.
+        #[arg(long, value_name = "TEXT")]
+        search: Option<String>,
         /// Raw `Cookie` header value for authenticated admin installs.
         /// Copy from browser dev tools, e.g. `autumn_session=abc123`.
         #[arg(long, value_name = "COOKIE")]
@@ -1146,13 +1147,13 @@ fn run_command(command: Commands) {
             model,
             url,
             out,
-            r#where,
+            search,
             cookie,
         }) => data::run_export(
             &model,
             &url,
             out.as_deref(),
-            r#where.as_deref(),
+            search.as_deref(),
             cookie.as_deref(),
         ),
         Commands::Data(DataCommands::Import {

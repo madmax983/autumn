@@ -1063,9 +1063,7 @@ async fn model_import_csv(
                 let outcome = model
                     .import_csv_row(&pool, line, row, import_mode)
                     .await
-                    .unwrap_or_else(|_| {
-                        AdminImportRowResult::RowError("Handler returned an error".to_owned())
-                    });
+                    .unwrap_or_else(|e| AdminImportRowResult::RowError(e.to_string()));
 
                 match outcome {
                     AdminImportRowResult::Inserted => report.inserted += 1,
