@@ -630,9 +630,15 @@ fn operation_for(api_doc: &ApiDoc, api_versions: &[crate::app::ApiVersion]) -> O
     }
 
     let is_deprecated = if let Some(version) = api_doc.api_version {
-        api_versions.iter().find(|av| av.version == version).and_then(|av| {
-            av.deprecated_at.map(|d| chrono::Utc::now() >= d)
-        }).unwrap_or(false)
+        api_versions
+            .iter()
+            .find(|av| av.version == version)
+            .map(|av| {
+                let is_dep = av.deprecated_at.map_or(false, |d| chrono::Utc::now() >= d);
+                let is_sun = av.sunset_at.map_or(false, |s| chrono::Utc::now() >= s);
+                is_dep || is_sun
+            })
+            .unwrap_or(false)
     } else {
         false
     };
