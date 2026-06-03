@@ -1,5 +1,7 @@
 use autumn_admin_plugin::prelude::*;
-use autumn_admin_plugin::{AdminHistoryEntry, AdminHistoryPage};
+use autumn_admin_plugin::{
+    AdminHistoryEntry, AdminHistoryPage, AdminImportRowResult, CsvImportMode,
+};
 use diesel::OptionalExtension;
 use diesel::prelude::*;
 use diesel_async::AsyncPgConnection;
@@ -254,6 +256,81 @@ impl AdminModel for PostAdmin {
     /// In an application that uses `#[repository(Post, versioned = true)]`,
     /// this returns `true` automatically (the macro generates the override).
     /// This example wires it manually to demonstrate the History pane UI.
+    // ── CSV export / import ──────────────────────────────────────────
+
+    /// Export `id`, `title`, `slug`, `published`, and `created_at`.
+    /// The `body` column is omitted by default to keep exports manageable.
+    fn csv_export_columns(&self) -> Vec<&'static str> {
+        vec!["id", "title", "slug", "published", "created_at", "updated_at"]
+    }
+
+    /// Enable CSV import for the blog Posts model.
+    fn supports_csv_import(&self) -> bool {
+        true
+    }
+
+    /// Process a single CSV row: create a new post from the uploaded data.
+    fn import_csv_row<'a>(
+        &'a self,
+        pool: &'a Pool<AsyncPgConnection>,
+        line: u64,
+        row: std::collections::HashMap<String, String>,
+        mode: CsvImportMode,
+    ) -> AdminFuture<'a, AdminImportRowResult> {
+        let pool = pool.clone();
+        Box::pin(async move {
+            let title = row.get("title").cloned().unwrap_or_default();
+            let slug = row.get("slug").cloned().unwrap_or_default();
+            let body = row.get("body").cloned().unwrap_or_default();
+
+            if title.trim().is_empty() {
+                return Ok(AdminImportRowResult::FieldError {
+                    column: "title".to_owned(),
+                    message: format!("line {line}: title must not be empty"),
+                });
+            }
+
+            // Dry-run: validate but don't write.
+            if matches!(mode, CsvImportMode::DryRun) {
+                return Ok(AdminImportRowResult::Inserted);
+            }
+
+            let published = row
+                .get("published")
+                .map(|v| v == "true" || v == "1")
+                .unwrap_or(false);
+
+            let new_post = crate::models::NewPost {
+                title,
+                slug: if slug.is_empty() {
+                    crate::models::slugify(row.get("title").map(String::as_str).unwrap_or(""))
+                } else {
+                    slug
+                },
+                body,
+                published,
+            };
+
+            let conn_result = pool.get().await;
+            let mut conn = match conn_result {
+                Ok(c) => c,
+                Err(e) => {
+                    return Ok(AdminImportRowResult::RowError(format!("DB pool error: {e}")));
+                }
+            };
+
+            let insert_result = diesel::insert_into(crate::schema::posts::table)
+                .values(&new_post)
+                .execute(&mut conn)
+                .await;
+
+            match insert_result {
+                Ok(_) => Ok(AdminImportRowResult::Inserted),
+                Err(e) => Ok(AdminImportRowResult::RowError(format!("Insert error: {e}"))),
+            }
+        })
+    }
+
     fn has_history(&self) -> bool {
         true
     }

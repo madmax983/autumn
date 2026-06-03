@@ -32,7 +32,8 @@ use crate::auth::check_role;
 use crate::registry::AdminRegistry;
 use crate::templates;
 use crate::traits::{
-    AdminError, AdminField, AdminFieldKind, AdminModel, ListParams, SortDirection, record_id,
+    AdminError, AdminField, AdminFieldKind, AdminImportError, AdminImportReport, AdminImportRowResult,
+    AdminModel, CsvImportMode, ListParams, SortDirection, record_id,
 };
 
 /// Admin-owned CSRF extractor that tolerates a missing `CsrfLayer`.
@@ -163,6 +164,9 @@ pub fn admin_router(
         // name from the list-view form; dispatches to
         // `AdminModel::execute_action`.
         .route("/{slug}/actions", routing::post(model_action))
+        // CSV export (GET) and import (POST)
+        .route("/{slug}/export.csv", routing::get(model_export_csv))
+        .route("/{slug}/import", routing::get(model_import_form).post(model_import_csv))
         .route(&ADMIN_JS_PATH, routing::get(serve_admin_js))
         .layer(axum::Extension(HasRuntimeConfig(has_config)))
         .layer(axum::Extension(AdminPrefix(prefix.to_owned())))
@@ -556,6 +560,8 @@ async fn model_list(
         &prefix,
         &actuator_prefix,
         show_config,
+        model.supports_csv_export(),
+        model.supports_csv_import(),
     )))
 }
 
@@ -863,6 +869,241 @@ async fn model_delete(
         .success(format!("{} #{id} deleted.", model.display_name()))
         .await;
     Ok(StatusCode::OK.hx_redirect(&format!("{prefix}/{slug}")))
+}
+
+// ── CSV export / import handlers ─────────────────────────────────────
+
+/// `GET /admin/{slug}/export.csv` — Download all records as a CSV file.
+///
+/// The response respects active `?q=`, `?sort=`, `?dir=`, and `?filter.*`
+/// query parameters so the exported data matches what the user sees in the
+/// list view.
+#[allow(clippy::too_many_arguments)]
+async fn model_export_csv(
+    State(state): State<AppState>,
+    axum::Extension(registry): axum::Extension<Arc<AdminRegistry>>,
+    Path(slug): Path<String>,
+    Query(query): Query<ListQuery>,
+    Query(raw_query): Query<HashMap<String, String>>,
+) -> AutumnResult<Response> {
+    let (pool, model) = resolve(&state, &registry, &slug)?;
+
+    if !model.supports_csv_export() {
+        return Err(AutumnError::bad_request_msg(format!(
+            "Model '{slug}' does not support CSV export"
+        )));
+    }
+
+    let ListQuery { page: _, q, sort, dir } = query;
+    let fields = model.fields();
+    let sort = validate_sort_key(sort, &fields);
+    let filters = extract_filters(&raw_query, &fields);
+
+    // Load ALL records (per_page = 0) with the active filter/sort/search.
+    let params = ListParams {
+        page: 1,
+        per_page: 0,
+        search: (!q.is_empty()).then(|| q.clone()),
+        sort_by: sort,
+        sort_dir: dir,
+        filters,
+    };
+
+    let result = model
+        .list(&pool, params)
+        .await
+        .map_err(|e| admin_err("Export", e))?;
+
+    let columns = model.csv_export_columns();
+
+    let mut buf = Vec::new();
+    {
+        let mut wtr = csv::WriterBuilder::new()
+            .has_headers(true)
+            .from_writer(&mut buf);
+
+        wtr.write_record(&columns)
+            .map_err(|e| AutumnError::internal_server_error_msg(format!("CSV write error: {e}")))?;
+
+        for record in &result.records {
+            let row = model.csv_export_row(&columns, record);
+            wtr.write_record(&row).map_err(|e| {
+                AutumnError::internal_server_error_msg(format!("CSV write error: {e}"))
+            })?;
+        }
+
+        wtr.flush().map_err(|e| {
+            AutumnError::internal_server_error_msg(format!("CSV flush error: {e}"))
+        })?;
+    }
+
+    let filename = format!("{slug}.csv");
+    Ok(axum::response::Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/csv; charset=utf-8")
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{filename}\""),
+        )
+        .body(axum::body::Body::from(buf))
+        .map_err(|e| AutumnError::internal_server_error_msg(format!("Response error: {e}")))?)
+}
+
+/// `GET /admin/{slug}/import` — Render the CSV import form.
+async fn model_import_form(
+    State(state): State<AppState>,
+    axum::Extension(registry): axum::Extension<Arc<AdminRegistry>>,
+    axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
+    axum::Extension(ActuatorPrefix(actuator_prefix)): axum::Extension<ActuatorPrefix>,
+    axum::Extension(HasRuntimeConfig(show_config)): axum::Extension<HasRuntimeConfig>,
+    Path(slug): Path<String>,
+    csrf: AdminCsrf,
+    flash: Flash,
+) -> AutumnResult<Response> {
+    let model = registry
+        .get(&slug)
+        .ok_or_else(|| AutumnError::not_found_msg(format!("Model '{slug}' not found")))?;
+
+    if !model.supports_csv_import() {
+        return Err(AutumnError::bad_request_msg(format!(
+            "Model '{slug}' does not support CSV import"
+        )));
+    }
+
+    let _ = state; // pool not needed to render the form
+    let messages = flash.consume().await;
+    Ok(render(templates::model_import_form_page(
+        &registry,
+        &slug,
+        model.display_name_plural(),
+        &messages,
+        csrf.token(),
+        csrf.form_field(),
+        &prefix,
+        &actuator_prefix,
+        show_config,
+    )))
+}
+
+/// `POST /admin/{slug}/import` — Accept a multipart CSV upload and import rows.
+#[allow(clippy::too_many_lines)]
+async fn model_import_csv(
+    State(state): State<AppState>,
+    axum::Extension(registry): axum::Extension<Arc<AdminRegistry>>,
+    axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
+    axum::Extension(ActuatorPrefix(actuator_prefix)): axum::Extension<ActuatorPrefix>,
+    axum::Extension(HasRuntimeConfig(show_config)): axum::Extension<HasRuntimeConfig>,
+    Path(slug): Path<String>,
+    csrf: AdminCsrf,
+    flash: Flash,
+    mut multipart: axum::extract::Multipart,
+) -> AutumnResult<Response> {
+    let (pool, model) = resolve(&state, &registry, &slug)?;
+
+    if !model.supports_csv_import() {
+        return Err(AutumnError::bad_request_msg(format!(
+            "Model '{slug}' does not support CSV import"
+        )));
+    }
+
+    // Read multipart fields: "file" (required) and "mode" (optional).
+    let mut csv_bytes: Option<Vec<u8>> = None;
+    let mut import_mode = CsvImportMode::Insert;
+
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| AutumnError::bad_request_msg(format!("Multipart error: {e}")))?
+    {
+        match field.name() {
+            Some("file") => {
+                csv_bytes = Some(
+                    field
+                        .bytes()
+                        .await
+                        .map_err(|e| {
+                            AutumnError::bad_request_msg(format!("File read error: {e}"))
+                        })?
+                        .to_vec(),
+                );
+            }
+            Some("mode") => {
+                let val = field
+                    .text()
+                    .await
+                    .map_err(|e| AutumnError::bad_request_msg(format!("Mode field error: {e}")))?;
+                import_mode = CsvImportMode::from_str(&val);
+            }
+            _ => {}
+        }
+    }
+
+    let csv_bytes = csv_bytes.ok_or_else(|| {
+        AutumnError::bad_request_msg("No CSV file found in the multipart upload")
+    })?;
+
+    // Parse CSV headers first, then process rows.
+    let mut rdr = csv::ReaderBuilder::new()
+        .has_headers(true)
+        .from_reader(csv_bytes.as_slice());
+
+    let headers: Vec<String> = rdr
+        .headers()
+        .map_err(|e| AutumnError::bad_request_msg(format!("CSV header error: {e}")))?
+        .iter()
+        .map(str::to_owned)
+        .collect();
+
+    let mut report = AdminImportReport::default();
+
+    let records: Vec<csv::StringRecord> = rdr
+        .records()
+        .filter_map(|r| r.ok())
+        .collect();
+
+    for record in records {
+        let line = record.position().map_or(0, |p| p.line());
+        let row: std::collections::HashMap<String, String> = headers
+            .iter()
+            .zip(record.iter())
+            .map(|(k, v)| (k.clone(), v.to_owned()))
+            .collect();
+
+        let outcome = model
+            .import_csv_row(&pool, line, row, import_mode)
+            .await
+            .unwrap_or(AdminImportRowResult::RowError("Handler returned an error".to_owned()));
+
+        match outcome {
+            AdminImportRowResult::Inserted => report.inserted += 1,
+            AdminImportRowResult::Updated => report.updated += 1,
+            AdminImportRowResult::Skipped => report.skipped += 1,
+            AdminImportRowResult::RowError(msg) => {
+                report.errors.push(AdminImportError { line, column: None, message: msg });
+            }
+            AdminImportRowResult::FieldError { column, message } => {
+                report.errors.push(AdminImportError {
+                    line,
+                    column: Some(column),
+                    message,
+                });
+            }
+        }
+    }
+
+    let messages = flash.consume().await;
+    Ok(render(templates::model_import_result_page(
+        &registry,
+        &slug,
+        model.display_name_plural(),
+        &report,
+        import_mode,
+        &messages,
+        csrf.token(),
+        &prefix,
+        &actuator_prefix,
+        show_config,
+    )))
 }
 
 // ── Runtime config handlers ──────────────────────────────────────────

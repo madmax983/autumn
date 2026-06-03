@@ -15,7 +15,8 @@ use serde_json::Value;
 use crate::registry::AdminRegistry;
 use crate::routes::ADMIN_JS_PATH;
 use crate::traits::{
-    AdminAction, AdminField, AdminFieldKind, AdminHistoryPage, ListResult, SortDirection, record_id,
+    AdminAction, AdminField, AdminFieldKind, AdminHistoryPage, AdminImportReport, CsvImportMode,
+    ListResult, SortDirection, record_id,
 };
 
 const HTMX_JS_PATH: &str = "/static/js/htmx.min.js";
@@ -882,6 +883,8 @@ pub fn model_list_page(
     prefix: &str,
     actuator_prefix: &str,
     show_config: bool,
+    supports_csv_export: bool,
+    supports_csv_import: bool,
 ) -> Markup {
     // Password fields are documented as write-only — never surface their
     // values (raw or hashed) in the index view. Hidden fields are
@@ -914,8 +917,22 @@ pub fn model_list_page(
                         "(" (result.total) ")"
                     }
                 }
-                a href={ (prefix) "/" (model_slug) "/new" } class="btn btn-primary" {
-                    "+ Add " (model_slug.trim_end_matches('s'))
+                div style="display: flex; gap: 0.5rem; align-items: center;" {
+                    @if supports_csv_export {
+                        a href={ (prefix) "/" (model_slug) "/export.csv" } class="btn btn-sm"
+                            title="Download all matching records as CSV" {
+                            "⬇ Download CSV"
+                        }
+                    }
+                    @if supports_csv_import {
+                        a href={ (prefix) "/" (model_slug) "/import" } class="btn btn-sm"
+                            title="Upload a CSV file to import records" {
+                            "⬆ Import CSV"
+                        }
+                    }
+                    a href={ (prefix) "/" (model_slug) "/new" } class="btn btn-primary" {
+                        "+ Add " (model_slug.trim_end_matches('s'))
+                    }
                 }
             }
 
@@ -1049,6 +1066,218 @@ pub fn model_list_page(
             }
         }
     };
+    admin_layout(
+        registry,
+        Some(model_slug),
+        model_name_plural,
+        prefix,
+        actuator_prefix,
+        csrf_token,
+        messages,
+        show_config,
+        &content,
+    )
+}
+
+// ── CSV import form ──────────────────────────────────────────────────
+
+/// Render the CSV import upload form.
+#[allow(clippy::too_many_arguments)]
+pub fn model_import_form_page(
+    registry: &AdminRegistry,
+    model_slug: &str,
+    model_name_plural: &str,
+    messages: &[FlashMessage],
+    csrf_token: &str,
+    csrf_form_field: &str,
+    prefix: &str,
+    actuator_prefix: &str,
+    show_config: bool,
+) -> Markup {
+    let content = html! {
+        div class="breadcrumbs" {
+            a href=(prefix) { "Admin" }
+            span class="sep" { "›" }
+            a href={ (prefix) "/" (model_slug) } { (model_name_plural) }
+            span class="sep" { "›" }
+            span { "Import CSV" }
+        }
+
+        div class="card" {
+            div class="card-header" {
+                span class="card-title" { "Import " (model_name_plural) " from CSV" }
+            }
+
+            div style="padding: 1.5rem;" {
+                p style="color: var(--text-muted); margin-bottom: 1rem;" {
+                    "Upload a CSV file with a header row. Column names must match the model's field names."
+                }
+
+                form method="post"
+                    action={ (prefix) "/" (model_slug) "/import" }
+                    enctype="multipart/form-data" {
+
+                    (csrf_hidden_input(csrf_token, csrf_form_field))
+
+                    div style="margin-bottom: 1rem;" {
+                        label for="csv-file" style="display: block; margin-bottom: 0.25rem; font-weight: 500;" {
+                            "CSV File"
+                        }
+                        input type="file" id="csv-file" name="file"
+                            accept=".csv,text/csv"
+                            required
+                            class="form-input" {}
+                    }
+
+                    div style="margin-bottom: 1.5rem;" {
+                        label for="import-mode" style="display: block; margin-bottom: 0.25rem; font-weight: 500;" {
+                            "Import Mode"
+                        }
+                        select id="import-mode" name="mode" class="form-input"
+                            style="width: auto; display: inline-block;" {
+                            option value="insert" selected { "Insert (add as new records)" }
+                            option value="dry_run" { "Dry Run (validate only, no writes)" }
+                        }
+                    }
+
+                    div style="display: flex; gap: 0.75rem; align-items: center;" {
+                        button type="submit" class="btn btn-primary" { "Upload and Import" }
+                        a href={ (prefix) "/" (model_slug) } class="btn" { "Cancel" }
+                    }
+                }
+
+                div style="margin-top: 2rem; padding-top: 1rem; border-top: 1px solid var(--border);" {
+                    h3 style="font-size: 0.875rem; font-weight: 600; margin-bottom: 0.5rem;" {
+                        "Tips"
+                    }
+                    ul style="color: var(--text-muted); font-size: 0.875rem; padding-left: 1.25rem;" {
+                        li { "The first row must be a header row with column names." }
+                        li { "Column names must match the model's field names." }
+                        li { "Use Dry Run to preview the import and catch errors before writing." }
+                        li {
+                            "Download a template: "
+                            a href={ (prefix) "/" (model_slug) "/export.csv" } { "export.csv" }
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    admin_layout(
+        registry,
+        Some(model_slug),
+        model_name_plural,
+        prefix,
+        actuator_prefix,
+        csrf_token,
+        messages,
+        show_config,
+        &content,
+    )
+}
+
+/// Render the result page after a CSV import.
+#[allow(clippy::too_many_arguments)]
+pub fn model_import_result_page(
+    registry: &AdminRegistry,
+    model_slug: &str,
+    model_name_plural: &str,
+    report: &AdminImportReport,
+    mode: CsvImportMode,
+    messages: &[FlashMessage],
+    csrf_token: &str,
+    prefix: &str,
+    actuator_prefix: &str,
+    show_config: bool,
+) -> Markup {
+    let mode_label = match mode {
+        CsvImportMode::DryRun => "Dry Run",
+        CsvImportMode::Insert => "Insert",
+    };
+    let total = report.inserted + report.updated + report.skipped + report.errors.len() as u64;
+
+    let content = html! {
+        div class="breadcrumbs" {
+            a href=(prefix) { "Admin" }
+            span class="sep" { "›" }
+            a href={ (prefix) "/" (model_slug) } { (model_name_plural) }
+            span class="sep" { "›" }
+            span { "Import Result" }
+        }
+
+        div class="card" {
+            div class="card-header" {
+                span class="card-title" { "Import Report — " (mode_label) }
+            }
+
+            div style="padding: 1.5rem;" {
+                div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 1rem; margin-bottom: 1.5rem;" {
+                    div style="text-align: center; padding: 1rem; background: var(--success-light); border-radius: 0.375rem;" {
+                        div style="font-size: 1.5rem; font-weight: 700; color: var(--success);" { (report.inserted) }
+                        div style="font-size: 0.75rem; color: var(--text-muted);" { "Inserted" }
+                    }
+                    div style="text-align: center; padding: 1rem; background: var(--primary-light); border-radius: 0.375rem;" {
+                        div style="font-size: 1.5rem; font-weight: 700; color: var(--primary);" { (report.updated) }
+                        div style="font-size: 0.75rem; color: var(--text-muted);" { "Updated" }
+                    }
+                    div style="text-align: center; padding: 1rem; background: var(--border); border-radius: 0.375rem;" {
+                        div style="font-size: 1.5rem; font-weight: 700;" { (report.skipped) }
+                        div style="font-size: 0.75rem; color: var(--text-muted);" { "Skipped" }
+                    }
+                    div style="text-align: center; padding: 1rem; background: var(--danger-light); border-radius: 0.375rem;" {
+                        div style="font-size: 1.5rem; font-weight: 700; color: var(--danger);" { (report.errors.len()) }
+                        div style="font-size: 0.75rem; color: var(--text-muted);" { "Errors" }
+                    }
+                }
+
+                p style="color: var(--text-muted); font-size: 0.875rem; margin-bottom: 1.5rem;" {
+                    "Processed " (total) " data rows."
+                    @if matches!(mode, CsvImportMode::DryRun) {
+                        " (Dry run — no records were written.)"
+                    }
+                }
+
+                @if !report.errors.is_empty() {
+                    h3 style="font-size: 0.875rem; font-weight: 600; margin-bottom: 0.75rem; color: var(--danger);" {
+                        "Row Errors"
+                    }
+                    div class="table-wrap" {
+                        table {
+                            thead {
+                                tr {
+                                    th { "Line" }
+                                    th { "Column" }
+                                    th { "Message" }
+                                }
+                            }
+                            tbody {
+                                @for err in &report.errors {
+                                    tr {
+                                        td { (err.line) }
+                                        td {
+                                            @if let Some(col) = &err.column {
+                                                code { (col) }
+                                            } @else {
+                                                span style="color: var(--text-muted);" { "—" }
+                                            }
+                                        }
+                                        td { (err.message) }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                div style="display: flex; gap: 0.75rem; margin-top: 1.5rem;" {
+                    a href={ (prefix) "/" (model_slug) } class="btn btn-primary" { "Back to list" }
+                    a href={ (prefix) "/" (model_slug) "/import" } class="btn" { "Import another file" }
+                }
+            }
+        }
+    };
+
     admin_layout(
         registry,
         Some(model_slug),
@@ -2620,6 +2849,8 @@ mod tests {
             "/admin",
             "/actuator",
             false,
+            false,
+            false,
         )
         .into_string();
         assert!(
@@ -2669,6 +2900,8 @@ mod tests {
             "/admin",
             "/actuator",
             false,
+            false,
+            false,
         )
         .into_string();
         assert!(
@@ -2714,6 +2947,8 @@ mod tests {
             "_csrf",
             "/admin",
             "/actuator",
+            false,
+            false,
             false,
         )
         .into_string();
@@ -2773,6 +3008,8 @@ mod tests {
             "/admin",
             "/actuator",
             false,
+            false,
+            false,
         )
         .into_string();
         // Sort header link carries both filters.
@@ -2825,6 +3062,8 @@ mod tests {
             "_csrf",
             "/admin",
             "/actuator",
+            false,
+            false,
             false,
         )
         .into_string();
@@ -2880,6 +3119,8 @@ mod tests {
             "/admin",
             "/actuator",
             false,
+            false,
+            false,
         )
         .into_string();
         assert!(
@@ -2929,6 +3170,8 @@ mod tests {
             "admin_csrf",
             "/admin",
             "/actuator",
+            false,
+            false,
             false,
         )
         .into_string();
@@ -2980,6 +3223,8 @@ mod tests {
             "/admin",
             "/actuator",
             false,
+            false,
+            false,
         )
         .into_string();
         assert!(
@@ -3019,6 +3264,8 @@ mod tests {
             "/admin",
             "/actuator",
             false,
+            false,
+            false,
         )
         .into_string();
         // Sortable field gets a sort link.
@@ -3036,6 +3283,74 @@ mod tests {
             html.contains("Computed"),
             "label should still render: {html}"
         );
+    }
+
+    #[test]
+    fn list_page_shows_csv_download_link_when_export_enabled() {
+        use crate::traits::ListResult;
+        let r = dummy_registry();
+        let fields = vec![AdminField::new("name", AdminFieldKind::Text)];
+        let result = ListResult { records: vec![], total: 0, page: 1, per_page: 25 };
+        // supports_csv_export = true, supports_csv_import = false
+        let html = model_list_page(
+            &r, "widgets", "Widgets", &fields, &[], &result,
+            "", None, SortDirection::Asc, &[], &[], "t", "_csrf",
+            "/admin", "/actuator",
+            false, // show_config
+            true,  // supports_csv_export
+            false, // supports_csv_import
+        )
+        .into_string();
+        assert!(
+            html.contains(r#"href="/admin/widgets/export.csv""#),
+            "Download CSV link must appear when supports_csv_export=true: {html}"
+        );
+        assert!(
+            !html.contains("/import"),
+            "Import CSV link must not appear when supports_csv_import=false: {html}"
+        );
+    }
+
+    #[test]
+    fn list_page_shows_import_link_when_import_enabled() {
+        use crate::traits::ListResult;
+        let r = dummy_registry();
+        let fields = vec![AdminField::new("name", AdminFieldKind::Text)];
+        let result = ListResult { records: vec![], total: 0, page: 1, per_page: 25 };
+        let html = model_list_page(
+            &r, "widgets", "Widgets", &fields, &[], &result,
+            "", None, SortDirection::Asc, &[], &[], "t", "_csrf",
+            "/admin", "/actuator",
+            false, // show_config
+            false, // supports_csv_export
+            true,  // supports_csv_import
+        )
+        .into_string();
+        assert!(
+            html.contains(r#"href="/admin/widgets/import""#),
+            "Import CSV link must appear when supports_csv_import=true: {html}"
+        );
+        assert!(
+            !html.contains("export.csv"),
+            "Download CSV link must not appear when supports_csv_export=false: {html}"
+        );
+    }
+
+    #[test]
+    fn list_page_hides_csv_buttons_when_both_disabled() {
+        use crate::traits::ListResult;
+        let r = dummy_registry();
+        let fields = vec![AdminField::new("name", AdminFieldKind::Text)];
+        let result = ListResult { records: vec![], total: 0, page: 1, per_page: 25 };
+        let html = model_list_page(
+            &r, "widgets", "Widgets", &fields, &[], &result,
+            "", None, SortDirection::Asc, &[], &[], "t", "_csrf",
+            "/admin", "/actuator",
+            false, false, false,
+        )
+        .into_string();
+        assert!(!html.contains("export.csv"), "no export link when disabled: {html}");
+        assert!(!html.contains("/import"), "no import link when disabled: {html}");
     }
 
     #[test]

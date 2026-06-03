@@ -13,7 +13,8 @@ categories = ["web-programming", "web-programming::http-server"]
 
 [dependencies]
 autumn-web = { version = "0.4.0", path = "../autumn", features = ["maud", "htmx", "db", "flash"] }
-axum = { workspace = true }
+axum = { workspace = true, features = ["multipart"] }
+csv = { workspace = true }
 diesel = { workspace = true }
 diesel-async = { workspace = true }
 form_urlencoded = "1"
