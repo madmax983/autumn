@@ -57,7 +57,8 @@ mod transactional_tests {
         Ok((axum::http::StatusCode::CREATED, Json(item)))
     }
 
-    static AFTER_COMMIT_RUN_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static AFTER_COMMIT_RUN_COUNT: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
 
     #[post("/items-with-callback")]
     async fn create_item_with_callback(
@@ -72,13 +73,13 @@ mod transactional_tests {
                     .returning(Item::as_returning())
                     .get_result(conn)
                     .await?;
-                
+
                 autumn_web::db::register_after_commit(|| async move {
                     AFTER_COMMIT_RUN_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     Ok(())
                 })
                 .await;
-                
+
                 Ok::<_, diesel::result::Error>(item)
             }
             .scope_boxed()
@@ -193,7 +194,10 @@ mod transactional_tests {
 
         // Verify that the callback was NOT run (suppressed due to transactional test mode)
         assert_eq!(
-            std::sync::atomic::AtomicUsize::load(&AFTER_COMMIT_RUN_COUNT, std::sync::atomic::Ordering::SeqCst),
+            std::sync::atomic::AtomicUsize::load(
+                &AFTER_COMMIT_RUN_COUNT,
+                std::sync::atomic::Ordering::SeqCst
+            ),
             0,
             "after_commit callback should be suppressed in transactional test mode"
         );

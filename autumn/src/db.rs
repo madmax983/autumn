@@ -869,7 +869,8 @@ impl Db {
             .await
             .ok()
             .flatten()
-            .as_deref() == Some("true");
+            .as_deref()
+                == Some("true");
 
             if !is_test_tx {
                 let _ = spawn_committed_after_commit_callbacks(callbacks);
