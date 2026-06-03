@@ -70,8 +70,11 @@ jobs:
   # the full compiler stdout+stderr so the breakage is diagnosable from the
   # CI summary without fetching build logs manually.
   compile-and-serve:
-    name: Compile-and-serve gates (no Postgres)
+    name: Compile-and-serve gates (${{ matrix.toolchain }})
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        toolchain: [stable, "1.88.0"]
     steps:
       - uses: actions/checkout@v4
 
@@ -81,7 +84,9 @@ jobs:
                       /opt/ghc /opt/hostedtoolcache/CodeQL
           df -h
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
 
       - uses: Swatinem/rust-cache@v2.7.8
         continue-on-error: true
@@ -137,8 +142,11 @@ jobs:
   # CLI, which must be installed before the test runs. Failure surfaces the
   # full `cargo build` stdout+stderr captured by the test assertions.
   scaffold-postgres:
-    name: Scaffold Postgres e2e gate
+    name: Scaffold Postgres e2e gate (${{ matrix.toolchain }})
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        toolchain: [stable, "1.88.0"]
     steps:
       - uses: actions/checkout@v4
 
@@ -148,13 +156,15 @@ jobs:
                       /opt/ghc /opt/hostedtoolcache/CodeQL
           df -h
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
 
       - uses: Swatinem/rust-cache@v2.7.8
         continue-on-error: true
 
       - name: Install diesel_cli
-        run: cargo install diesel_cli --no-default-features --features postgres --locked
+        run: cargo install diesel_cli --version "=2.2.0" --no-default-features --features postgres --locked
 
       - name: generated_scaffold_serves_posts_index_and_json_api
         run: |
