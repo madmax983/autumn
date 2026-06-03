@@ -642,12 +642,13 @@ fn plan_auth_options_impl(
 
     if passkeys {
         // ── webauthn_credentials migration ─────────────────────────────────────
-        // Timestamp+1 (relative to the base ts) keeps migration versions unique even
-        // when oauth is also requested; oauth uses timestamp+1 too, but passkeys uses
-        // a separate directory name so there is no collision.
-        let passkey_ts_str: String = timestamp
-            .parse::<i64>()
-            .map_or_else(|_| format!("{timestamp}1"), |t| (t + 1).to_string());
+        // Use timestamp+2 when oauth is also requested (oauth uses timestamp+1),
+        // so both migrations get unique Diesel version numbers.
+        let passkey_offset: i64 = if !oauth.providers.is_empty() { 2 } else { 1 };
+        let passkey_ts_str: String = timestamp.parse::<i64>().map_or_else(
+            |_| format!("{timestamp}{passkey_offset}"),
+            |t| (t + passkey_offset).to_string(),
+        );
         let mig_dir = project_root
             .join("migrations")
             .join(format!("{passkey_ts_str}_create_webauthn_credentials"));
@@ -680,6 +681,8 @@ fn plan_auth_options_impl(
             "credential_id:String",
             "credential_json:String",
             "name:String",
+            "created_at:NaiveDateTime",
+            "last_used_at:Option<NaiveDateTime>",
         ]
         .iter()
         .map(|t| super::dsl::parse_field(t).expect("webauthn credential field tokens are valid"))
@@ -3588,26 +3591,34 @@ pub struct PasskeyRevokeForm {
 pub async fn passkey_register_page(
     session: Session,
     State(state): State<AppState>,
+    csrf: Option<CsrfToken>,
 ) -> AutumnResult<Markup> {
     let _ = (session, state);
+    let csrf_token = csrf.map(|t| t.token().to_owned()).unwrap_or_default();
     Ok(html! {
         html {
             head {
                 title { "Register a Passkey" }
+                meta name="csrf-token" content=(csrf_token);
             }
             body {
                 h1 { "Register a Passkey" }
                 button id="register-btn" { "Register passkey" }
                 script {
                     (PreEscaped(r#"
+const csrfToken = document.querySelector('meta[name="csrf-token"]')?.content ?? '';
 document.getElementById('register-btn').addEventListener('click', async () => {
-    const beginResp = await fetch('/passkeys/register/begin', { method: 'POST' });
-    const options = await beginResp.json();
+    const beginResp = await fetch('/passkeys/register/begin', {
+        method: 'POST',
+        headers: { 'X-CSRF-Token': csrfToken },
+    });
+    const optionsJSON = await beginResp.json();
+    const options = PublicKeyCredential.parseCreationOptionsFromJSON(optionsJSON.publicKey);
     const credential = await navigator.credentials.create({ publicKey: options });
     const finishResp = await fetch('/passkeys/register/finish', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ response: credential }),
+        headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken },
+        body: JSON.stringify({ response: credential.toJSON() }),
     });
     if (finishResp.ok) {
         window.location.href = '/passkeys';
@@ -3637,6 +3648,10 @@ pub async fn passkey_register_begin(
         .await
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| AutumnError::unauthorized_msg("Not authenticated."))?;
+    let __SNAKE___email = session
+        .get("__SNAKE___email")
+        .await
+        .unwrap_or_else(|| "user".to_owned());
     let webauthn = build_webauthn(&state)?;
     let existing_creds: Vec<Passkey> = {
         use crate::schema::webauthn_credentials;
@@ -3652,7 +3667,12 @@ pub async fn passkey_register_begin(
     };
     let user_unique_id = uuid::Uuid::from_u128(__SNAKE___id as u128);
     let (ccr, reg_state) = webauthn
-        .start_passkey_registration(user_unique_id, "user", "user", Some(existing_creds))
+        .start_passkey_registration(
+            user_unique_id,
+            &__SNAKE___email,
+            &__SNAKE___email,
+            Some(existing_creds),
+        )
         .map_err(|e| {
             AutumnError::internal_server_error_msg(format!("start_passkey_registration: {e}"))
         })?;
@@ -3716,25 +3736,32 @@ pub async fn passkey_register_finish(
 
 /// `GET /passkeys/login` — passkey login UI page.
 #[get("/passkeys/login")]
-pub async fn passkey_login_page() -> AutumnResult<Markup> {
+pub async fn passkey_login_page(csrf: Option<CsrfToken>) -> AutumnResult<Markup> {
+    let csrf_token = csrf.map(|t| t.token().to_owned()).unwrap_or_default();
     Ok(html! {
         html {
             head {
                 title { "Sign in with Passkey" }
+                meta name="csrf-token" content=(csrf_token);
             }
             body {
                 h1 { "Sign in with a Passkey" }
                 button id="login-btn" { "Sign in with passkey" }
                 script {
                     (PreEscaped(r#"
+const csrfToken = document.querySelector('meta[name="csrf-token"]')?.content ?? '';
 document.getElementById('login-btn').addEventListener('click', async () => {
-    const beginResp = await fetch('/passkeys/login/begin', { method: 'POST' });
-    const options = await beginResp.json();
+    const beginResp = await fetch('/passkeys/login/begin', {
+        method: 'POST',
+        headers: { 'X-CSRF-Token': csrfToken },
+    });
+    const optionsJSON = await beginResp.json();
+    const options = PublicKeyCredential.parseRequestOptionsFromJSON(optionsJSON.publicKey);
     const assertion = await navigator.credentials.get({ publicKey: options });
     const finishResp = await fetch('/passkeys/login/finish', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ response: assertion }),
+        headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken },
+        body: JSON.stringify({ response: assertion.toJSON() }),
     });
     if (finishResp.ok) {
         window.location.href = '/account';
@@ -3750,26 +3777,18 @@ document.getElementById('login-btn').addEventListener('click', async () => {
 }
 
 /// `POST /passkeys/login/begin` — start an authentication ceremony.
+///
+/// Uses discoverable credentials (`&[]`) so the browser prompts the user to
+/// pick a passkey — no DB query needed and no credential IDs are leaked to
+/// anonymous clients.
 #[post("/passkeys/login/begin")]
 pub async fn passkey_login_begin(
     session: Session,
     State(state): State<AppState>,
-    mut db: Db,
 ) -> AutumnResult<axum::Json<serde_json::Value>> {
     let webauthn = build_webauthn(&state)?;
-    let all_creds: Vec<Passkey> = {
-        use crate::schema::webauthn_credentials;
-        webauthn_credentials::table
-            .select(webauthn_credentials::credential_json)
-            .load::<String>(&mut *db)
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|json| serde_json::from_str(&json).ok())
-            .collect()
-    };
     let (rcr, auth_state) = webauthn
-        .start_passkey_authentication(&all_creds)
+        .start_passkey_authentication(&[])
         .map_err(|e| {
             AutumnError::internal_server_error_msg(format!("start_passkey_authentication: {e}"))
         })?;
@@ -3817,12 +3836,21 @@ pub async fn passkey_login_finish(
             .map_err(|_| AutumnError::unauthorized_msg("Unknown credential."))?
     };
     let (wc_id, __SNAKE___id, cred_json) = row;
+    let __SNAKE___email: String = {
+        use crate::schema::__TABLE__;
+        __TABLE__::table
+            .find(__SNAKE___id)
+            .select(__TABLE__::email)
+            .first(&mut *db)
+            .await
+            .map_err(|_| AutumnError::unauthorized_msg("User not found."))?
+    };
+    let now = chrono::Utc::now().naive_utc();
     if auth_result.needs_update() {
         let mut passkey: Passkey = serde_json::from_str(&cred_json)
             .unwrap_or_else(|_| serde_json::from_value(serde_json::Value::Null).unwrap());
         passkey.update_credential(&auth_result);
         let new_json = serde_json::to_string(&passkey).unwrap_or(cred_json.clone());
-        let now = chrono::Utc::now().naive_utc();
         diesel::update(crate::schema::webauthn_credentials::table.find(wc_id))
             .set((
                 crate::schema::webauthn_credentials::credential_json.eq(&new_json),
@@ -3831,9 +3859,21 @@ pub async fn passkey_login_finish(
             .execute(&mut *db)
             .await
             .ok();
+    } else {
+        diesel::update(crate::schema::webauthn_credentials::table.find(wc_id))
+            .set(crate::schema::webauthn_credentials::last_used_at.eq(now))
+            .execute(&mut *db)
+            .await
+            .ok();
     }
     session.rotate_id().await;
-    session.insert(state.auth_session_key(), __SNAKE___id.to_string()).await;
+    session
+        .insert("__SNAKE___id", __SNAKE___id.to_string())
+        .await;
+    session.insert("__SNAKE___email", &__SNAKE___email).await;
+    session
+        .insert(state.auth_session_key(), __SNAKE___id.to_string())
+        .await;
     Ok(axum::Json(serde_json::json!({ "ok": true })))
 }
 
@@ -3846,6 +3886,7 @@ pub async fn passkey_list(
     session: Session,
     State(state): State<AppState>,
     mut db: Db,
+    csrf: Option<CsrfToken>,
 ) -> AutumnResult<Markup> {
     let __SNAKE___id: i64 = session
         .get(state.auth_session_key())
@@ -3880,6 +3921,7 @@ pub async fn passkey_list(
                                 (name) " — registered " (created_at.to_string())
                                 " "
                                 form method="post" action="/passkeys/revoke" style="display:inline" {
+                                    @if let Some(ref t) = csrf { input type="hidden" name="_csrf" value=(t.token()); }
                                     input type="hidden" name="id" value=(id);
                                     button type="submit" { "Revoke" }
                                 }
@@ -4041,12 +4083,24 @@ rp_origin = "http://localhost:3000"
   login attempt with the revoked credential will fail at the DB lookup step.
 - `credential_json` stores opaque passkey state — never expose it to clients.
 
+## Discoverable credentials
+
+`passkey_login_begin` passes `&[]` (an empty allowed-credentials list), enabling
+**discoverable credential** (resident key) flow. The browser prompts the user to
+select a saved passkey without the server needing to know their identity first.
+No credential IDs are sent to anonymous clients.
+
+## Browser compatibility
+
+The generated JavaScript uses `PublicKeyCredential.parseCreationOptionsFromJSON`,
+`parseRequestOptionsFromJSON`, and `credential.toJSON()` (Chrome 119+,
+Firefox 119+, Safari 17+). Add a polyfill (e.g. `@github/webauthn-json`) for
+older browsers.
+
 ## Out of scope (follow-ups)
 
 - **Rate-limiting** on ceremony endpoints is not included — add it before
   exposing them to untrusted traffic.
-- **Resident keys / usernameless login** requires additional webauthn-rs
-  configuration beyond what is generated here.
 "#
     .to_owned()
 }
@@ -6258,8 +6312,17 @@ mod tests {
         passkey_plan(tmp.path()).execute(Flags::default()).unwrap();
         let routes = fs::read_to_string(tmp.path().join("src/routes/passkeys.rs")).unwrap();
         assert!(
-            routes.contains("session.insert(state.auth_session_key()"),
+            routes.contains("state.auth_session_key()"),
             "passkey_login_finish must call session.insert(state.auth_session_key(), ...): {routes}"
+        );
+        // After template substitution ("User" → "user"), __SNAKE___id becomes user_id.
+        assert!(
+            routes.contains("\"user_id\""),
+            "passkey_login_finish must store user_id in session: {routes}"
+        );
+        assert!(
+            routes.contains("\"user_email\""),
+            "passkey_login_finish must store user_email in session: {routes}"
         );
     }
 
