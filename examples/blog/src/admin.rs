@@ -296,11 +296,6 @@ impl AdminModel for PostAdmin {
                 });
             }
 
-            // Dry-run: validate but don't write.
-            if matches!(mode, CsvImportMode::DryRun) {
-                return Ok(AdminImportRowResult::Inserted);
-            }
-
             let published = row
                 .get("published")
                 .map(|v| v == "true" || v == "1")
@@ -325,6 +320,11 @@ impl AdminModel for PostAdmin {
                     )));
                 }
             };
+
+            // Dry-run: validated above, but don't write.
+            if matches!(mode, CsvImportMode::DryRun) {
+                return Ok(AdminImportRowResult::Inserted);
+            }
 
             let conn_result = pool.get().await;
             let mut conn = match conn_result {

@@ -126,18 +126,30 @@ fn run_import_inner(
     let mode_value = if dry_run { "dry_run" } else { "insert" };
     let label = if dry_run { "Dry run" } else { "Import" };
 
-    // Fetch the import form first so the cookie jar captures the CSRF cookie and
-    // we can read the token + configured header name from the page. This two-step
-    // GET→POST is required because Autumn's CSRF middleware rejects unsafe methods
-    // that lack a matching cookie+header pair. For multipart requests the middleware
-    // only checks the header (not the form body), so we must send the token there.
     let mut get_req = client.get(&url);
     if let Some(c) = cookie {
         get_req = get_req.header("Cookie", c);
     }
-    let form_html = get_req
+    let get_resp = get_req
         .send()
-        .map_err(|e| format!("Failed to fetch import form: {e}"))?
+        .map_err(|e| format!("Failed to fetch import form: {e}"))?;
+
+    // Collect cookies issued by the server during the GET (the CSRF cookie) so we
+    // can merge them with the user-supplied session cookie on the POST. Setting an
+    // explicit Cookie header suppresses reqwest's internal cookie jar, so we build
+    // the merged cookie string ourselves when --cookie is provided.
+    let server_cookies: Vec<String> = get_resp
+        .headers()
+        .get_all(reqwest::header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .filter_map(|v| v.split(';').next())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect();
+
+    let form_html = get_resp
         .text()
         .map_err(|e| format!("Failed to read import form: {e}"))?;
 
@@ -165,7 +177,13 @@ fn run_import_inner(
 
     let mut post_req = client.post(&url).multipart(form);
     if let Some(c) = cookie {
-        post_req = post_req.header("Cookie", c);
+        // Merge the user-supplied session cookie with server-issued cookies (the
+        // CSRF cookie). We must do this explicitly because setting a Cookie header
+        // prevents reqwest from appending its jar cookies automatically.
+        let mut parts = vec![c];
+        let sc_refs: Vec<&str> = server_cookies.iter().map(String::as_str).collect();
+        parts.extend_from_slice(&sc_refs);
+        post_req = post_req.header("Cookie", parts.join("; "));
     }
     if !csrf_token.is_empty() {
         post_req = post_req.header(csrf_header.as_str(), csrf_token.as_str());
