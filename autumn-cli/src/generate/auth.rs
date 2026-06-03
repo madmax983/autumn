@@ -121,6 +121,13 @@ fn ensure_webauthn_rs_features(toml: &str) -> String {
         if trimmed.starts_with(&table_prefix) {
             if let Some(new_line) = merge_missing(&trimmed) {
                 lines[i] = format!("{indent}{new_line}");
+            } else if !trimmed.contains("features = [") {
+                // No `features` key at all — insert one before the closing brace.
+                if let Some(close_brace) = trimmed.rfind('}') {
+                    let before = trimmed[..close_brace].trim_end();
+                    let sep = if before.ends_with('{') { " " } else { ", " };
+                    lines[i] = format!("{indent}{before}{sep}features = [{feats_csv}] }}");
+                }
             }
             break;
         }
@@ -754,6 +761,21 @@ fn plan_auth_options_impl(
     }
 
     if passkeys {
+        // ── webauthn_credentials collision check ───────────────────────────────
+        // If the project already has webauthn_credentials in schema.rs, the
+        // migration below would fail at `diesel migration run`. Reject upfront.
+        let schema_for_check = project_root.join("src").join("schema.rs");
+        let schema_existing_for_passkey = find_plan_content_for_path(&plan, &schema_for_check)
+            .unwrap_or_else(|| read_or_empty(&schema_for_check));
+        if schema_has_table(&schema_existing_for_passkey, "webauthn_credentials") {
+            return Err(GenerateError::InvalidName(
+                name.to_owned(),
+                "this project already defines a `webauthn_credentials` table, which \
+                 `--passkeys` needs; rename or remove the existing table first."
+                    .to_owned(),
+            ));
+        }
+
         // ── webauthn_credentials migration ─────────────────────────────────────
         // Use timestamp+2 when oauth is also requested (oauth uses timestamp+1),
         // so both migrations get unique Diesel version numbers.

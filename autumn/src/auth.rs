@@ -454,7 +454,7 @@ impl Default for WebAuthnConfig {
 
 #[cfg(feature = "webauthn")]
 fn default_rp_id() -> String {
-    "localhost".to_owned()
+    String::new()
 }
 
 #[cfg(feature = "webauthn")]
@@ -464,7 +464,7 @@ fn default_rp_name() -> String {
 
 #[cfg(feature = "webauthn")]
 fn default_rp_origin() -> String {
-    "http://localhost:3000".to_owned()
+    String::new()
 }
 
 const fn default_bcrypt_cost() -> u32 {
