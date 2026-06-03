@@ -124,3 +124,41 @@ mod tests {
         );
     }
 }
+
+/// Normalizes a request path by resolving `..` and `.` segments, mimicking routing behavior
+/// to prevent path traversal bypasses in middleware prefix matching.
+pub(crate) fn normalize_path_for_routing(path: &str) -> String {
+    // Fast path: if the path has no traversal segments, it's already normalized
+    if !path.contains('.') {
+        return path.to_owned();
+    }
+
+    let mut segments = Vec::new();
+    let is_absolute = path.starts_with('/');
+
+    for segment in path.split('/') {
+        if segment == ".." {
+            segments.pop();
+        } else if segment == "." || segment.is_empty() {
+            // Do nothing
+        } else {
+            segments.push(segment);
+        }
+    }
+
+    let mut result = String::with_capacity(path.len());
+    if is_absolute {
+        result.push('/');
+    }
+    result.push_str(&segments.join("/"));
+
+    if path.ends_with('/') && result.len() > 1 {
+        result.push('/');
+    }
+
+    if result.is_empty() {
+        result.push('/');
+    }
+
+    result
+}

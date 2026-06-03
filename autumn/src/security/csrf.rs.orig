@@ -182,7 +182,6 @@ struct CsrfSettings {
     safe_methods: Vec<http::Method>,
     exempt_paths: Vec<String>,
     signing_keys: Option<Arc<crate::security::config::ResolvedSigningKeys>>,
-    max_scan_bytes: usize,
 }
 
 /// Tower [`Layer`] that applies CSRF protection.
@@ -216,18 +215,8 @@ impl CsrfLayer {
                 safe_methods,
                 exempt_paths: config.exempt_paths.clone(),
                 signing_keys: None,
-                max_scan_bytes: 2 * 1024 * 1024,
             }),
         }
-    }
-
-    /// Limit the form-body bytes read when scanning for the CSRF token field.
-    /// The effective limit is `min(n, 2 MiB)`.
-    #[must_use]
-    pub(crate) fn with_max_scan_bytes(mut self, n: usize) -> Self {
-        let settings = Arc::make_mut(&mut self.settings);
-        settings.max_scan_bytes = n.min(2 * 1024 * 1024);
-        self
     }
 
     /// Attach signing keys so CSRF tokens are HMAC-signed.
@@ -346,12 +335,13 @@ where
 
         // Normalize path for accurate exemption checking (prevents path traversal bypasses like `/api/../protected`)
         let normalized_path = crate::paths::normalize_path_for_routing(path);
+        let path_to_check = if normalized_path.is_empty() { path } else { &normalized_path };
 
         let is_exempt = self
             .settings
             .exempt_paths
             .iter()
-            .any(|prefix| normalized_path.starts_with(prefix.as_str()));
+            .any(|prefix| path_to_check.starts_with(prefix.as_str()));
         let is_safe = is_exempt || self.settings.safe_methods.contains(req.method());
         let raw_cookie_token = extract_cookie_token(req.headers(), &self.settings.cookie_name);
 
@@ -513,7 +503,7 @@ async fn verify_csrf_token(
     let body = std::mem::replace(req.body_mut(), axum::body::Body::empty());
 
     // Limit body size to avoid DoS when extracting form field
-    let bytes = axum::body::to_bytes(body, settings.max_scan_bytes)
+    let bytes = axum::body::to_bytes(body, 2 * 1024 * 1024)
         .await
         .unwrap_or_else(|_| axum::body::Bytes::new());
 
