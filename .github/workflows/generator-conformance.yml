@@ -16,10 +16,14 @@ on:
   push:
     branches: [trunk, trunk-dev]
     paths:
+      - ".github/workflows/generator-conformance.yml"
       - "autumn-cli/src/generate/**"
       - "autumn-cli/src/templates/**"
       - "autumn-cli/src/new.rs"
+      - "autumn-cli/src/main.rs"
       - "autumn-cli/Cargo.toml"
+      - "autumn-cli/tests/e2e.rs"
+      - "autumn-cli/tests/generate.rs"
       - "autumn/src/**"
       - "autumn/Cargo.toml"
       - "autumn-macros/**"
@@ -27,10 +31,14 @@ on:
   pull_request:
     branches: [trunk, trunk-dev]
     paths:
+      - ".github/workflows/generator-conformance.yml"
       - "autumn-cli/src/generate/**"
       - "autumn-cli/src/templates/**"
       - "autumn-cli/src/new.rs"
+      - "autumn-cli/src/main.rs"
       - "autumn-cli/Cargo.toml"
+      - "autumn-cli/tests/e2e.rs"
+      - "autumn-cli/tests/generate.rs"
       - "autumn/src/**"
       - "autumn/Cargo.toml"
       - "autumn-macros/**"
