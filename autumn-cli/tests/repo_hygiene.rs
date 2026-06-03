@@ -608,6 +608,7 @@ fn generator_conformance_ci_gate_is_configured() {
         "autumn-cli/src/templates",
         "autumn-cli/src/new.rs",
         "autumn/src/lib.rs",
+        "autumn/src/prelude.rs",
         "autumn-macros",
     ] {
         assert!(
@@ -647,7 +648,7 @@ fn contributing_documents_ignored_generator_tests() {
     );
     assert!(
         contributing.contains("autumn-cli/src/generate")
-            || contributing.contains("autumn-cli/src/templates"),
+            && contributing.contains("autumn-cli/src/templates"),
         "CONTRIBUTING.md must name the generator template paths that trigger the gate",
     );
 }
