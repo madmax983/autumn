@@ -46,6 +46,9 @@ pub use crate::assets::asset_url;
 pub use maud::{Markup, PreEscaped, html};
 
 // ── Extractors ───────────────────────────────────────────────────
+/// CSV request body extractor and response type.
+#[cfg(feature = "csv")]
+pub use crate::csv::Csv;
 /// Database connection extractor.
 #[cfg(feature = "db")]
 pub use crate::db::Db;
