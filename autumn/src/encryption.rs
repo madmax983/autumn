@@ -700,6 +700,35 @@ pub fn encrypt_persisted_columns_in_value(table: &str, value: &mut serde_json::V
     }
 }
 
+/// Inverse of [`encrypt_persisted_columns_in_value`].
+///
+/// Decrypts a model's JSON snapshot read back from the durable
+/// `autumn_repository_commit_hooks` table so that replayed `after_*_commit` hooks
+/// receive plaintext model values — exactly as on the normal repository path.
+///
+/// Only string fields that successfully decrypt are rewritten; a value that is
+/// not a recoverable envelope (e.g. an already-plaintext legacy record, or the
+/// `"<encrypted>"` fallback marker) is left untouched so reconstruction still
+/// succeeds. Non-string and null fields are ignored.
+pub fn decrypt_persisted_columns_in_value(table: &str, value: &mut serde_json::Value) {
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
+    for d in registered_encrypted_columns() {
+        if d.table != table {
+            continue;
+        }
+        if let Some(field) = obj.get_mut(d.column) {
+            let Some(envelope) = field.as_str() else {
+                continue;
+            };
+            if let Ok(plaintext) = decrypt_text(envelope) {
+                *field = serde_json::Value::String(plaintext);
+            }
+        }
+    }
+}
+
 /// Boot validation for attribute encryption.
 ///
 /// If any encrypted columns are registered, the key material must resolve.
@@ -716,6 +745,13 @@ pub fn init_attribute_encryption(
     store: &crate::credentials::CredentialsStore,
 ) -> Result<(), String> {
     let columns = registered_encrypted_columns();
+    // No `#[encrypted]` columns anywhere means encryption is not in use: this is a
+    // pure no-op. Return before touching the credentials store, so an app that
+    // never opted into attribute encryption can never fail boot over a partial or
+    // malformed `active_record_encryption` namespace it does not rely on.
+    if columns.is_empty() {
+        return Ok(());
+    }
     // The deterministic key is needed both for deterministic-mode columns and for
     // `versioned_ciphertext` columns (whose history snapshots are encrypted
     // deterministically so the version diff stays accurate).
@@ -736,10 +772,7 @@ pub fn init_attribute_encryption(
             Ok(())
         }
         Ok(None) => {
-            if columns.is_empty() {
-                // No encryption in use; nothing to validate.
-                return Ok(());
-            }
+            // `columns` is non-empty here (the empty case returned early above).
             let first = columns[0];
             Err(format!(
                 "Encrypted column `{}.{}` requires a master key, but `{CREDENTIALS_NAMESPACE}.primary_key` \

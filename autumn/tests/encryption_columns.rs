@@ -247,6 +247,31 @@ fn commit_hook_payload_encrypts_encrypted_columns_recoverably() {
 }
 
 #[test]
+fn commit_hook_codec_round_trips_plaintext_through_ciphertext() {
+    install_ring();
+    let original = Secret {
+        id: 9,
+        email: "round@trip.com".into(),
+        api_token: "sk_live_round_trip".into(),
+        note: "plain".into(),
+    };
+
+    // The durable payload (what lands in autumn_repository_commit_hooks) must be
+    // ciphertext for encrypted columns — never plaintext.
+    let payload = original.__autumn_commit_hook_to_value().unwrap();
+    assert_ne!(payload["email"], "round@trip.com");
+    assert_ne!(payload["api_token"], "sk_live_round_trip");
+    assert!(!payload.to_string().contains("sk_live_round_trip"));
+
+    // Reconstructing the model for a replayed after_*_commit hook recovers the
+    // plaintext, matching the normal repository path.
+    let restored = Secret::__autumn_commit_hook_from_value(payload).unwrap();
+    assert_eq!(restored.email, "round@trip.com");
+    assert_eq!(restored.api_token, "sk_live_round_trip");
+    assert_eq!(restored.note, "plain");
+}
+
+#[test]
 fn encrypted_columns_are_registered_for_composition() {
     // The macro registers encrypted columns for log-scrub / version-history /
     // admin composition.

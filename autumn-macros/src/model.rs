@@ -841,6 +841,19 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             );
         }
     };
+    // Symmetric inverse: when a durable commit-hook record is read back to drive
+    // `after_*_commit`, decrypt the encrypted columns first so replayed hooks
+    // receive plaintext model values, exactly as on the normal repository path.
+    let commit_hook_decrypt_stmt = if encrypted_columns.is_empty() {
+        quote! {}
+    } else {
+        quote! {
+            ::autumn_web::encryption::decrypt_persisted_columns_in_value(
+                #table_name,
+                &mut __autumn_decoded_value,
+            );
+        }
+    };
     // For models with encrypted columns, replace the derived `Debug` on every
     // plaintext-holding struct (query, New*, Update*, Changeset) with a redacting
     // manual impl so values never leak through `Debug`/panic output — including
@@ -2119,7 +2132,12 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             ) -> ::autumn_web::AutumnResult<Self>
             #commit_hook_deserialize_where
             {
-                let mut __autumn_object = match __autumn_value {
+                // Encrypted columns are persisted as ciphertext (see
+                // `__autumn_commit_hook_to_value`); recover plaintext before the
+                // model is reconstructed so replayed hooks see real values.
+                let mut __autumn_decoded_value = __autumn_value;
+                #commit_hook_decrypt_stmt
+                let mut __autumn_object = match __autumn_decoded_value {
                     ::autumn_web::reexports::serde_json::Value::Object(__autumn_object) => __autumn_object,
                     __autumn_other => {
                         return Err(::autumn_web::AutumnError::internal_server_error_msg(format!(
