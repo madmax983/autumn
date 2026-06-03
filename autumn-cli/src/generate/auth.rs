@@ -48,6 +48,118 @@ const PASSKEY_EXTRA_DEPS: &[(&str, &str)] = &[
     ("uuid", "{ version = \"1\", features = [\"v4\"] }"),
 ];
 
+/// Required features for the `webauthn-rs` dependency.
+///
+/// `danger-allow-state-serialisation` enables session storage of ceremony state.
+/// `conditional-ui` gates `start/finish_discoverable_authentication`.
+const WEBAUTHN_RS_FEATURES: &[&str] = &["danger-allow-state-serialisation", "conditional-ui"];
+
+/// Ensure an existing `webauthn-rs` dependency carries the features the generated
+/// routes need.
+///
+/// `ensure_cargo_dependencies` skips a crate that is already declared, so a project
+/// that already lists `webauthn-rs` without `conditional-ui` would scaffold but fail
+/// to compile. This merges the missing features into the existing declaration —
+/// shorthand, inline-table, or `[dependencies.webauthn-rs]` subtable form.
+fn ensure_webauthn_rs_features(toml: &str) -> String {
+    const CRATE: &str = "webauthn-rs";
+    let trailing_newline = toml.ends_with('\n');
+    let mut lines: Vec<String> = toml.lines().map(str::to_owned).collect();
+    let simple_prefix = format!("{CRATE} = \"");
+    let table_prefix = format!("{CRATE} = {{");
+    let subtable_header = format!("[dependencies.{CRATE}]");
+    let subtable_header_underscore = format!("[dependencies.{}]", CRATE.replace('-', "_"));
+    let feats_csv = WEBAUTHN_RS_FEATURES
+        .iter()
+        .map(|f| format!("\"{f}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let merge_missing = |line: &str| -> Option<String> {
+        let feat_bracket = line.find("features = [")?;
+        let list_start = feat_bracket + "features = [".len();
+        let close_off = line[list_start..].find(']')?;
+        let list_end = close_off + list_start;
+        let existing_list = &line[list_start..list_end];
+        let additions: Vec<String> = WEBAUTHN_RS_FEATURES
+            .iter()
+            .filter(|f| !existing_list.contains(&format!("\"{f}\"")))
+            .map(|f| format!("\"{f}\""))
+            .collect();
+        if additions.is_empty() {
+            return None; // already complete
+        }
+        let sep = if existing_list.trim().is_empty() || existing_list.trim().ends_with(',') {
+            ""
+        } else {
+            ", "
+        };
+        Some(format!(
+            "{}{sep}{}{}",
+            &line[..list_end],
+            additions.join(", "),
+            &line[list_end..]
+        ))
+    };
+
+    let mut i = 0;
+    while i < lines.len() {
+        let trimmed = lines[i].trim().to_owned();
+        let indent: String = lines[i]
+            .chars()
+            .take_while(char::is_ascii_whitespace)
+            .collect();
+
+        if let Some(rest) = trimmed.strip_prefix(&simple_prefix) {
+            let version = rest.split('"').next().unwrap_or("0.5");
+            lines[i] = format!(
+                "{indent}{CRATE} = {{ version = \"{version}\", features = [{feats_csv}] }}"
+            );
+            break;
+        }
+
+        if trimmed.starts_with(&table_prefix) {
+            if let Some(new_line) = merge_missing(&trimmed) {
+                lines[i] = format!("{indent}{new_line}");
+            }
+            break;
+        }
+
+        if trimmed == subtable_header || trimmed == subtable_header_underscore {
+            let mut j = i + 1;
+            while j < lines.len() && !lines[j].trim().starts_with('[') {
+                let t = lines[j].trim().to_owned();
+                if t.starts_with("features") {
+                    let ind2: String = lines[j]
+                        .chars()
+                        .take_while(char::is_ascii_whitespace)
+                        .collect();
+                    if let Some(new_line) = merge_missing(&t) {
+                        lines[j] = format!("{ind2}{new_line}");
+                    }
+                    let mut out = lines.join("\n");
+                    if trailing_newline {
+                        out.push('\n');
+                    }
+                    return out;
+                }
+                j += 1;
+            }
+            // No `features` key found in the subtable — insert one.
+            lines.insert(i + 1, format!("features = [{feats_csv}]"));
+            break;
+        }
+
+        i += 1;
+    }
+
+    let mut out = lines.join("\n");
+    if trailing_newline {
+        out.push('\n');
+    }
+    out
+}
+
 /// Extra Cargo dependencies pulled in only by `--totp`.
 ///
 /// - `totp-rs` (with the `qr` feature) provides RFC 6238 TOTP plus QR rendering.
@@ -755,6 +867,9 @@ fn plan_auth_options_impl(
             .unwrap_or_else(|| read_or_empty(&cargo_toml_path));
         let all_passkey_deps: Vec<(&str, &str)> = PASSKEY_EXTRA_DEPS.to_vec();
         let with_deps = super::model::ensure_cargo_dependencies(&base_cargo, &all_passkey_deps);
+        // If the project already declared webauthn-rs without the required features,
+        // ensure_cargo_dependencies would have skipped it; merge them here.
+        let with_deps = ensure_webauthn_rs_features(&with_deps);
         let with_webauthn = ensure_autumn_web_webauthn_feature(&with_deps);
         if with_webauthn != base_cargo {
             plan.modify(cargo_toml_path, with_webauthn);
@@ -3537,8 +3652,8 @@ use diesel_async::RunQueryDsl;
 use serde::{Deserialize, Serialize};
 use webauthn_rs::prelude::*;
 
-fn redirect_to(url: &str) -> Response {
-    axum::response::Redirect::to(url).into_response()
+fn redirect_to(url: &str) -> impl IntoResponse {
+    axum::response::Redirect::to(url)
 }
 
 // ── Config helper ──────────────────────────────────────────────────────────────
@@ -3683,10 +3798,16 @@ pub async fn passkey_register_begin(
         .map_err(|e| {
             AutumnError::internal_server_error_msg(format!("start_passkey_registration: {e}"))
         })?;
+    // Store the user_id alongside the reg_state so finish can verify the session
+    // user hasn't changed between begin and finish (prevents cross-account TOCTOU).
     session
         .insert(
             "passkey_reg_state",
-            serde_json::to_string(&reg_state).unwrap_or_default(),
+            serde_json::to_string(&serde_json::json!({
+                "user_id": __SNAKE___id,
+                "state":   serde_json::to_string(&reg_state).unwrap_or_default(),
+            }))
+            .unwrap_or_default(),
         )
         .await;
     Ok(axum::Json(serde_json::to_value(ccr).unwrap_or_default()))
@@ -3703,16 +3824,30 @@ pub async fn passkey_register_finish(
     mut db: Db,
     axum::Json(body): axum::Json<PasskeyRegisterFinishBody>,
 ) -> AutumnResult<axum::Json<serde_json::Value>> {
-    let __SNAKE___id: i64 = session
+    let current_id: i64 = session
         .get(state.auth_session_key())
         .await
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| AutumnError::unauthorized_msg("Not authenticated."))?;
-    let reg_state_str: String = session
+    let envelope_str: String = session
         .get("passkey_reg_state")
         .await
         .ok_or_else(|| AutumnError::unprocessable_msg("No pending registration."))?;
     session.remove("passkey_reg_state").await;
+    let envelope: serde_json::Value = serde_json::from_str(&envelope_str)
+        .map_err(|_| AutumnError::unprocessable_msg("Invalid registration state."))?;
+    let __SNAKE___id: i64 = envelope["user_id"]
+        .as_i64()
+        .ok_or_else(|| AutumnError::unprocessable_msg("Invalid registration state."))?;
+    if __SNAKE___id != current_id {
+        return Err(AutumnError::unauthorized_msg(
+            "Session user changed since registration began.",
+        ));
+    }
+    let reg_state_str = envelope["state"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
     let reg_state: PasskeyRegistration = serde_json::from_str(&reg_state_str)
         .map_err(|_| AutumnError::unprocessable_msg("Invalid registration state."))?;
     let webauthn = build_webauthn(&state)?;
@@ -6488,6 +6623,63 @@ mod tests {
         assert!(
             routes.contains("auth.webauthn"),
             "build_webauthn error must mention auth.webauthn config key: {routes}"
+        );
+    }
+
+    #[test]
+    fn ensure_webauthn_rs_features_merges_into_shorthand() {
+        let toml = "webauthn-rs = \"0.5\"\n";
+        let out = ensure_webauthn_rs_features(toml);
+        assert!(
+            out.contains("danger-allow-state-serialisation"),
+            "shorthand should be promoted: {out}"
+        );
+        assert!(
+            out.contains("conditional-ui"),
+            "missing conditional-ui: {out}"
+        );
+    }
+
+    #[test]
+    fn ensure_webauthn_rs_features_merges_into_partial_inline() {
+        let toml = "webauthn-rs = { version = \"0.5\", features = [\"danger-allow-state-serialisation\"] }\n";
+        let out = ensure_webauthn_rs_features(toml);
+        assert!(
+            out.contains("conditional-ui"),
+            "conditional-ui should be added to partial features: {out}"
+        );
+    }
+
+    #[test]
+    fn ensure_webauthn_rs_features_is_idempotent() {
+        let toml = "webauthn-rs = { version = \"0.5\", features = [\"danger-allow-state-serialisation\", \"conditional-ui\"] }\n";
+        let out = ensure_webauthn_rs_features(toml);
+        assert_eq!(out, toml, "idempotent: should not duplicate features");
+    }
+
+    #[test]
+    fn passkeys_routes_template_has_redirect_to() {
+        let tmp = project_with_main();
+        passkey_plan(tmp.path()).execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/passkeys.rs")).unwrap();
+        assert!(
+            routes.contains("fn redirect_to"),
+            "passkeys.rs must define redirect_to: {routes}"
+        );
+        assert!(
+            routes.contains("impl IntoResponse"),
+            "redirect_to must return impl IntoResponse: {routes}"
+        );
+    }
+
+    #[test]
+    fn passkeys_register_begin_binds_user_id() {
+        let tmp = project_with_main();
+        passkey_plan(tmp.path()).execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/passkeys.rs")).unwrap();
+        assert!(
+            routes.contains("user_id"),
+            "register begin should store user_id in passkey_reg_state envelope: {routes}"
         );
     }
 }
