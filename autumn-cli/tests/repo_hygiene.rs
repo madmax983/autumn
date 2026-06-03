@@ -609,14 +609,16 @@ fn generator_conformance_ci_gate_is_configured() {
          auth generator changes are compile-verified alongside scaffold changes",
     );
 
-    // AC-4: path filters must cover the generator template surface and the
-    // entire autumn-web public API (autumn/src/**) so changes to any crate
-    // source file — not just lib.rs / prelude.rs — trigger the gate.
+    // AC-4: path filters must cover the generator template surface, the
+    // entire autumn-web public API (autumn/src/**), and crate manifests so
+    // that manifest-only dependency/feature changes also trigger the gate.
     for path_fragment in [
         "autumn-cli/src/generate",
         "autumn-cli/src/templates",
         "autumn-cli/src/new.rs",
+        "autumn-cli/Cargo.toml",
         "autumn/src/",
+        "autumn/Cargo.toml",
         "autumn-macros",
     ] {
         assert!(

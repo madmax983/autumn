@@ -19,16 +19,22 @@ on:
       - "autumn-cli/src/generate/**"
       - "autumn-cli/src/templates/**"
       - "autumn-cli/src/new.rs"
+      - "autumn-cli/Cargo.toml"
       - "autumn/src/**"
+      - "autumn/Cargo.toml"
       - "autumn-macros/**"
+      - "Cargo.toml"
   pull_request:
     branches: [trunk, trunk-dev]
     paths:
       - "autumn-cli/src/generate/**"
       - "autumn-cli/src/templates/**"
       - "autumn-cli/src/new.rs"
+      - "autumn-cli/Cargo.toml"
       - "autumn/src/**"
+      - "autumn/Cargo.toml"
       - "autumn-macros/**"
+      - "Cargo.toml"
   schedule:
     # Weekly on Monday at 04:00 UTC — catches rot from transitive dep updates
     # that do not touch the path-filtered files above.
@@ -86,6 +92,25 @@ jobs:
         run: |
           cargo test -p autumn-cli --test generate \
             generated_scaffold_config_cargo_checks -- --ignored --exact
+
+      - name: Pre-fetch TOTP deps (absent from workspace Cargo.lock)
+        # generated_auth_totp_cargo_checks runs `cargo check --offline` on the
+        # generated project, which requires totp-rs in the local cargo registry
+        # cache. totp-rs is not a workspace dep, so it must be fetched here
+        # before the test runs or the offline check will fail on a cache miss.
+        run: |
+          tmp=$(mktemp -d)
+          cat > "$tmp/Cargo.toml" <<'TOML'
+          [package]
+          name    = "totp-prefetch"
+          version = "0.0.0"
+          edition = "2024"
+          [dependencies]
+          totp-rs = { version = "5", features = ["qr", "gen_secret", "otpauth"] }
+          TOML
+          mkdir -p "$tmp/src"
+          printf 'fn main() {}' > "$tmp/src/main.rs"
+          cargo fetch --manifest-path "$tmp/Cargo.toml"
 
       - name: generated_auth_totp_cargo_checks
         run: |
