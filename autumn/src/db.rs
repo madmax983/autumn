@@ -290,20 +290,35 @@ fn consume_estring_body(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
 /// Called after the opening `$tag$` delimiter has already been consumed.
 /// Uses a simple sliding-window match — sufficient for valid SQL.
 fn consume_dollar_quoted_body(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, tag: &str) {
-    let closing: Vec<char> = format!("${tag}$").chars().collect();
-    let clen = closing.len();
-    let mut match_count = 0usize;
+    let expected_iter = || {
+        std::iter::once('$')
+            .chain(tag.chars())
+            .chain(std::iter::once('$'))
+    };
+    let mut current_expected = expected_iter();
+    let mut expected_char = current_expected
+        .next()
+        .expect("iterator has at least one item");
+
     for sc in chars.by_ref() {
-        if sc == closing[match_count] {
-            match_count += 1;
-            if match_count == clen {
+        if sc == expected_char {
+            if let Some(next) = current_expected.next() {
+                expected_char = next;
+            } else {
                 break; // Found the closing delimiter.
             }
         } else {
-            match_count = 0;
+            current_expected = expected_iter();
+            // The first character is always '$'
+            expected_char = current_expected
+                .next()
+                .expect("iterator has at least one item");
+
             // The current char may start a new partial match.
-            if sc == closing[0] {
-                match_count = 1;
+            if sc == expected_char {
+                expected_char = current_expected
+                    .next()
+                    .expect("iterator has at least two items");
             }
         }
     }
