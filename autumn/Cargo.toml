@@ -65,6 +65,12 @@ mail = ["dep:lettre", "maud"]
 # Depends on `db`; off by default so apps that don't seed pay zero compile cost.
 seed = ["db"]
 system-info = []
+# First-class CSV import and export for `#[repository]` models.
+# Adds `autumn_web::data::csv` (streaming export, row-by-row import with
+# structured error reporting) and the matching admin-panel routes and
+# `autumn data` CLI subcommand.  Off by default so the `csv` crate is
+# opt-in.
+csv = ["dep:csv"]
 
 [dependencies]
 autumn-macros = { version = "0.4.0", path = "../autumn-macros" }
@@ -128,6 +134,7 @@ sha2 = "0.10"
 aes-gcm = "0.10"
 getrandom = "0.2"
 hex = "0.4"
+csv = { workspace = true, optional = true }
 lettre = { version = "0.11.21", default-features = false, features = ["builder", "smtp-transport", "tokio1-rustls-tls"], optional = true }
 
 [dev-dependencies]
@@ -159,7 +166,7 @@ features = [
   "maud", "htmx", "tailwind", "db", "cache-moka",
   "ws", "flash", "multipart", "http-client", "oauth2", "openapi",
   "redis", "i18n", "storage", "mail", "seed", "system-info", "markdown",
-  "reporting",
+  "reporting", "csv",
 ]
 rustdoc-args = ["--cfg", "docsrs"]
 

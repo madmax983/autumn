@@ -4,6 +4,7 @@ mod build;
 mod check;
 mod config;
 mod credentials;
+mod data;
 mod dev;
 mod dev_loop_bench;
 mod doctor;
@@ -99,6 +100,24 @@ enum Commands {
         #[arg(short, long, default_value = "autumn-diag.json")]
         output: String,
     },
+    /// Export or import model data as CSV.
+    ///
+    /// `autumn data export` streams all rows of a model to a CSV file.
+    /// `autumn data import` reads a CSV file and inserts (or upserts) rows.
+    ///
+    /// Both commands call the application's admin HTTP layer, so the app must
+    /// be running and the admin plugin must be mounted.
+    ///
+    /// # Examples
+    ///
+    ///   autumn data export posts --out posts.csv
+    ///   autumn data export posts --search hello --out results.csv
+    ///   autumn data import posts --in posts.csv
+    ///   autumn data import posts --in posts.csv --dry-run
+    ///   autumn data import posts --in posts.csv --upsert-by id
+    #[command(subcommand, verbatim_doc_comment, name = "data")]
+    Data(DataCommands),
+
     /// Run the project's seed binary to populate the database with representative data.
     ///
     /// Requires `src/bin/seed.rs` (a Cargo binary named `seed`) to exist.
@@ -539,6 +558,73 @@ enum MigrateCommands {
     ///   autumn migrate check
     #[command(verbatim_doc_comment)]
     Check,
+}
+
+/// Subcommands for `autumn data`.
+#[derive(Subcommand)]
+enum DataCommands {
+    /// Export all rows of a model to a CSV file.
+    ///
+    /// Calls `GET {url}/{model}/export.csv` on the running application.
+    /// The admin plugin must be mounted and the model must support CSV export.
+    ///
+    /// # Examples
+    ///
+    ///   autumn data export posts --out posts.csv
+    ///   autumn data export posts --out posts.csv --url <http://localhost:3000/admin>
+    #[command(verbatim_doc_comment)]
+    Export {
+        /// Model slug (e.g. `posts`, `users`).
+        model: String,
+        /// Admin prefix URL including the mount path (e.g. `http://host/admin`).
+        #[arg(short, long, default_value = "http://localhost:3000/admin")]
+        url: String,
+        /// Output file path (defaults to `<model>.csv`).
+        #[arg(short, long, value_name = "FILE")]
+        out: Option<String>,
+        /// Free-text search forwarded as `?q=<text>` to the admin export
+        /// endpoint. The admin model's `list` implementation must honour the
+        /// `search` field; use `filter.<field>=<value>` query params for
+        /// exact field filtering.
+        #[arg(long, value_name = "TEXT")]
+        search: Option<String>,
+        /// Raw `Cookie` header value for authenticated admin installs.
+        /// Copy from browser dev tools, e.g. `autumn_session=abc123`.
+        #[arg(long, value_name = "COOKIE")]
+        cookie: Option<String>,
+    },
+    /// Import rows from a CSV file into a model.
+    ///
+    /// Calls `POST {url}/{model}/import` on the running application with the
+    /// CSV file as a multipart upload.  The admin plugin must be mounted and
+    /// the model must have `supports_csv_import()` returning `true`.
+    ///
+    /// # Examples
+    ///
+    ///   autumn data import posts --in posts.csv
+    ///   autumn data import posts --in posts.csv --dry-run
+    ///   autumn data import posts --in posts.csv --upsert-by id
+    #[command(verbatim_doc_comment)]
+    Import {
+        /// Model slug (e.g. `posts`, `users`).
+        model: String,
+        /// Admin prefix URL including the mount path (e.g. `http://host/admin`).
+        #[arg(short, long, default_value = "http://localhost:3000/admin")]
+        url: String,
+        /// Path to the CSV file to import.
+        #[arg(short = 'i', long = "in", value_name = "FILE")]
+        input: String,
+        /// Validate rows but do not write to the database.
+        #[arg(long)]
+        dry_run: bool,
+        /// Column to use as the upsert key (enables upsert mode).
+        #[arg(long, value_name = "COL")]
+        upsert_by: Option<String>,
+        /// Raw `Cookie` header value for authenticated admin installs.
+        /// Copy from browser dev tools, e.g. `autumn_session=abc123`.
+        #[arg(long, value_name = "COOKIE")]
+        cookie: Option<String>,
+    },
 }
 
 /// Subcommands for `autumn maintenance`.
@@ -1063,6 +1149,34 @@ fn run_command(command: Commands) {
         },
         Commands::Monitor { url, interval } => monitor::run(&url, interval),
         Commands::Export { url, output } => export::run(&url, &output),
+        Commands::Data(DataCommands::Export {
+            model,
+            url,
+            out,
+            search,
+            cookie,
+        }) => data::run_export(
+            &model,
+            &url,
+            out.as_deref(),
+            search.as_deref(),
+            cookie.as_deref(),
+        ),
+        Commands::Data(DataCommands::Import {
+            model,
+            url,
+            input,
+            dry_run,
+            upsert_by,
+            cookie,
+        }) => data::run_import(
+            &model,
+            &url,
+            &input,
+            dry_run,
+            upsert_by.as_deref(),
+            cookie.as_deref(),
+        ),
         Commands::New {
             name,
             with_i18n,

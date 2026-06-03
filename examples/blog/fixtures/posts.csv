@@ -1,0 +1,5 @@
+title,slug,body,published
+Hello World,hello-world,"This is the first post. Welcome to the Autumn blog example.",true
+Getting Started with Autumn,getting-started,"Autumn is an opinionated web framework for Rust. It combines Axum, Maud, and Diesel into a productive developer experience.",true
+Draft Post: Work in Progress,draft-wip,"This post is still being written. Check back soon!",false
+CSV Import Round-Trip,csv-import-round-trip,"This post was imported from a CSV file using the autumn data import command. The round-trip works!",true

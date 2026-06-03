@@ -261,6 +261,69 @@ pub enum AdminError {
     Other(String),
 }
 
+// ── CSV import types ────────────────────────────────────────────────
+
+/// Mode for an admin CSV import operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CsvImportMode {
+    /// Insert every row as a new record.
+    #[default]
+    Insert,
+    /// Dry-run: validate rows but do not write anything.
+    DryRun,
+}
+
+impl CsvImportMode {
+    /// Parse from a form field value.
+    ///
+    /// Returns `None` for unrecognised values so callers can reject them with a
+    /// 400 instead of silently falling back to the destructive `Insert` path.
+    /// An *absent* mode field should default to `Insert` without calling this.
+    #[must_use]
+    pub fn from_form_value(s: &str) -> Option<Self> {
+        match s {
+            "insert" | "Insert" => Some(Self::Insert),
+            "dry_run" | "DryRun" | "dry-run" => Some(Self::DryRun),
+            _ => None,
+        }
+    }
+}
+
+/// The outcome of processing a single imported CSV row.
+#[derive(Debug)]
+pub enum AdminImportRowResult {
+    /// The row was inserted as a new record.
+    Inserted,
+    /// The row updated an existing record.
+    Updated,
+    /// The row was intentionally skipped.
+    Skipped,
+    /// A row-level error (no specific column).
+    RowError(String),
+    /// A field-level error with a column name.
+    FieldError { column: String, message: String },
+}
+
+/// Summary of a completed (or dry-run) admin CSV import.
+#[derive(Debug, Default, Clone)]
+pub struct AdminImportReport {
+    pub inserted: u64,
+    pub updated: u64,
+    pub skipped: u64,
+    pub errors: Vec<AdminImportError>,
+}
+
+/// A single parse/validation error from an admin CSV import.
+#[derive(Debug, Clone)]
+pub struct AdminImportError {
+    /// 1-based CSV line number (header = line 1).
+    pub line: u64,
+    /// Column name, if known.
+    pub column: Option<String>,
+    /// Human-readable description.
+    pub message: String,
+}
+
 /// The core trait that enables a model to be managed in the admin panel.
 ///
 /// Implementors provide field metadata, CRUD operations, and display
@@ -498,6 +561,96 @@ pub trait AdminModel: Send + Sync + 'static {
         Box::pin(async move { fut.await.map(|r| r.total) })
     }
 
+    // ── CSV import / export ─────────────────────────────────────────
+
+    /// Whether this model exposes a `GET /admin/{slug}/export.csv` link.
+    ///
+    /// Defaults to `false` — export must be explicitly opted into to avoid
+    /// silently exposing model data on upgrade. Override to `true` to enable
+    /// the CSV export button and route.
+    fn supports_csv_export(&self) -> bool {
+        false
+    }
+
+    /// Column names written to the CSV header row during export.
+    ///
+    /// Defaults to the ordered names of all non-password, non-hidden fields
+    /// declared in [`fields`]. Override to add computed columns (e.g. a
+    /// joined display value) or to omit sensitive columns (PII redaction).
+    ///
+    /// # PII redaction strategy
+    ///
+    /// To redact a column: remove it from this list. To include a placeholder
+    /// instead of the real value, add the column here and override
+    /// [`AdminModel::csv_export_row`] to return `"[REDACTED]"` for that key.
+    ///
+    /// [`fields`]: AdminModel::fields
+    fn csv_export_columns(&self) -> Vec<&'static str> {
+        self.fields()
+            .into_iter()
+            .filter(|f| {
+                !matches!(f.kind, AdminFieldKind::Password | AdminFieldKind::Hidden) && !f.encrypted
+            })
+            .map(|f| f.name)
+            .collect()
+    }
+
+    /// Serialize a single record (as returned by [`list`]) into an ordered
+    /// list of string values for CSV export.
+    ///
+    /// The default implementation extracts values for each column in
+    /// [`csv_export_columns`] from the JSON record. Override to add computed
+    /// columns (joined values, formatted timestamps, etc.).
+    ///
+    /// [`list`]: AdminModel::list
+    /// [`csv_export_columns`]: AdminModel::csv_export_columns
+    fn csv_export_row(&self, columns: &[&str], record: &Value) -> Vec<String> {
+        columns
+            .iter()
+            .map(|col| {
+                record
+                    .get(*col)
+                    .map(|v| match v {
+                        Value::String(s) => escape_csv_formula(s),
+                        Value::Null => String::new(),
+                        other => other.to_string(),
+                    })
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+
+    /// Whether this model accepts `POST /admin/{slug}/import` CSV uploads.
+    ///
+    /// Defaults to `false` — import must be explicitly opted into because it
+    /// performs bulk writes. Override to `true` and implement
+    /// [`import_csv_row`] to enable the import UI.
+    ///
+    /// [`import_csv_row`]: AdminModel::import_csv_row
+    fn supports_csv_import(&self) -> bool {
+        false
+    }
+
+    /// Process a single CSV row during an admin import.
+    ///
+    /// Receives the **1-based line number** in the CSV file and a map of
+    /// `column_name → value` (all strings; coerce as needed). Return the
+    /// appropriate [`AdminImportRowResult`].
+    ///
+    /// The default always returns `AdminImportRowResult::Skipped` — models
+    /// that set [`supports_csv_import`] to `true` should override this.
+    ///
+    /// [`supports_csv_import`]: AdminModel::supports_csv_import
+    fn import_csv_row<'a>(
+        &'a self,
+        _pool: &'a diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+        _line: u64,
+        _row: std::collections::HashMap<String, String>,
+        _mode: CsvImportMode,
+    ) -> AdminFuture<'a, AdminImportRowResult> {
+        Box::pin(async move { Ok(AdminImportRowResult::Skipped) })
+    }
+
     /// Whether this model has automatic record version history enabled.
     ///
     /// When `true`, the admin panel renders a **History** affordance on the
@@ -664,6 +817,21 @@ impl ListResult {
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
+
+/// Prefix a CSV cell value with `'` when it starts with a formula-triggering
+/// character (`=`, `+`, `-`, `@`, tab, or CR) to prevent spreadsheet formula
+/// injection.
+fn escape_csv_formula(s: &str) -> String {
+    match s.bytes().next() {
+        Some(b'=' | b'+' | b'-' | b'@' | b'\t' | b'\r') => {
+            let mut out = String::with_capacity(s.len() + 1);
+            out.push('\'');
+            out.push_str(s);
+            out
+        }
+        _ => s.to_owned(),
+    }
+}
 
 /// Convert a `snake_case` field name to a human-readable label.
 ///
@@ -1361,5 +1529,129 @@ mod tests {
         assert_eq!(admin_entry.op, "delete");
         assert!(admin_entry.request_id.is_none());
         assert_eq!(admin_entry.changes.len(), 1);
+    }
+
+    // ── CsvImportMode ────────────────────────────────────────────────
+
+    #[test]
+    fn csv_import_mode_from_form_value_recognises_insert() {
+        assert_eq!(
+            CsvImportMode::from_form_value("insert"),
+            Some(CsvImportMode::Insert)
+        );
+        assert_eq!(
+            CsvImportMode::from_form_value("Insert"),
+            Some(CsvImportMode::Insert)
+        );
+    }
+
+    #[test]
+    fn csv_import_mode_from_form_value_recognises_dry_run() {
+        assert_eq!(
+            CsvImportMode::from_form_value("dry_run"),
+            Some(CsvImportMode::DryRun)
+        );
+        assert_eq!(
+            CsvImportMode::from_form_value("DryRun"),
+            Some(CsvImportMode::DryRun)
+        );
+        assert_eq!(
+            CsvImportMode::from_form_value("dry-run"),
+            Some(CsvImportMode::DryRun)
+        );
+    }
+
+    #[test]
+    fn csv_import_mode_from_form_value_rejects_unknown() {
+        assert_eq!(CsvImportMode::from_form_value("upsert"), None);
+        assert_eq!(CsvImportMode::from_form_value(""), None);
+        assert_eq!(CsvImportMode::from_form_value("INSERT"), None);
+        assert_eq!(CsvImportMode::from_form_value("DRY_RUN"), None);
+    }
+
+    #[test]
+    fn csv_import_mode_default_is_insert() {
+        assert_eq!(CsvImportMode::default(), CsvImportMode::Insert);
+    }
+
+    // ── escape_csv_formula ──────────────────────────────────────────
+
+    #[test]
+    fn escape_csv_formula_prefixes_equals_sign() {
+        assert_eq!(escape_csv_formula("=SUM(A1)"), "'=SUM(A1)");
+    }
+
+    #[test]
+    fn escape_csv_formula_prefixes_plus_and_minus_and_at() {
+        assert_eq!(escape_csv_formula("+cmd"), "'+cmd");
+        assert_eq!(escape_csv_formula("-1+1"), "'-1+1");
+        assert_eq!(escape_csv_formula("@A1"), "'@A1");
+    }
+
+    #[test]
+    fn escape_csv_formula_prefixes_tab_and_cr() {
+        assert_eq!(escape_csv_formula("\thello"), "'\thello");
+        assert_eq!(escape_csv_formula("\rhello"), "'\rhello");
+    }
+
+    #[test]
+    fn escape_csv_formula_leaves_normal_strings_unchanged() {
+        assert_eq!(escape_csv_formula("hello world"), "hello world");
+        assert_eq!(escape_csv_formula("123"), "123");
+        assert_eq!(escape_csv_formula(""), "");
+        assert_eq!(escape_csv_formula("normal,value"), "normal,value");
+    }
+
+    // ── AdminModel CSV defaults ──────────────────────────────────────
+
+    #[test]
+    fn admin_model_supports_csv_export_defaults_to_false() {
+        let model = DeletingModel {
+            deleted: Mutex::new(vec![]),
+            fail_on: None,
+        };
+        assert!(
+            !model.supports_csv_export(),
+            "supports_csv_export must default to false to require explicit opt-in"
+        );
+    }
+
+    #[test]
+    fn admin_model_supports_csv_import_defaults_to_false() {
+        let model = DeletingModel {
+            deleted: Mutex::new(vec![]),
+            fail_on: None,
+        };
+        assert!(
+            !model.supports_csv_import(),
+            "supports_csv_import must default to false"
+        );
+    }
+
+    #[test]
+    fn csv_export_row_extracts_columns_and_escapes_formulas() {
+        let model = DeletingModel {
+            deleted: Mutex::new(vec![]),
+            fail_on: None,
+        };
+        let record = serde_json::json!({
+            "id": 1,
+            "name": "Alice",
+            "formula": "=EVIL()",
+            "amount": 42.5,
+            "active": true,
+            "notes": null,
+        });
+        let columns = &[
+            "id", "name", "formula", "amount", "active", "notes", "missing",
+        ];
+        let row = model.csv_export_row(columns, &record);
+        assert_eq!(row[0], "1");
+        assert_eq!(row[1], "Alice");
+        assert_eq!(row[2], "'=EVIL()", "formula-leading value must be escaped");
+        assert_eq!(row[3], "42.5");
+        assert_eq!(row[4], "true");
+        assert_eq!(row[5], "", "null becomes empty string");
+        assert_eq!(row[6], "", "missing column becomes empty string");
     }
 }
