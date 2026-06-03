@@ -1127,6 +1127,47 @@ mod tests {
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::time::Duration;
 
+    // ── is_query_canceled tests ───────────────────────────────────
+
+    #[test]
+    fn is_query_canceled_matches_string_patterns() {
+        // String matching patterns that should be detected as canceled queries
+        let canceled_messages = vec![
+            "57014",
+            "query_canceled",
+            "canceling statement due to statement timeout",
+            "statement timeout",
+            "query canceled",
+            "ERROR 57014: query_canceled",
+        ];
+
+        for msg in canceled_messages {
+            // Use DeserializationError as a dummy to wrap the string
+            let err = diesel::result::Error::DeserializationError(msg.into());
+            assert!(
+                super::is_query_canceled(&err),
+                "Expected is_query_canceled to return true for message: {msg}"
+            );
+        }
+
+        // Messages that should NOT be detected as canceled queries
+        let normal_messages = vec![
+            "connection refused",
+            "syntax error",
+            "division by zero",
+            "deadlock detected",
+            "unique constraint violation",
+        ];
+
+        for msg in normal_messages {
+            let err = diesel::result::Error::DeserializationError(msg.into());
+            assert!(
+                !super::is_query_canceled(&err),
+                "Expected is_query_canceled to return false for message: {msg}"
+            );
+        }
+    }
+
     // ── after_commit tests ───────────────────────────────────────
 
     #[tokio::test]
