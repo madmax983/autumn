@@ -60,6 +60,11 @@ pub trait DbConnectionInterceptor: Send + Sync + 'static {
                 + 'a,
         >,
     >;
+
+    /// Returns whether this interceptor enables transactional test isolation mode.
+    fn is_transactional_test(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(feature = "ws")]

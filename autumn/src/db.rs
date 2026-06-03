@@ -758,6 +758,7 @@ pub struct Db {
     metrics: Option<crate::middleware::MetricsCollector>,
     slow_query_threshold: std::time::Duration,
     start_time: std::time::Instant,
+    is_test_tx: bool,
 }
 
 impl Db {
@@ -815,7 +816,6 @@ impl Db {
             + 'a,
     {
         use diesel_async::AsyncConnection as _;
-        use diesel_async::RunQueryDsl as _;
 
         if self.tx_poisoned {
             return Err(crate::error::AutumnError::service_unavailable_msg(
@@ -860,19 +860,7 @@ impl Db {
                 std::mem::take(&mut *reg)
             };
 
-            let is_test_tx = diesel::select(diesel::dsl::sql::<
-                diesel::sql_types::Nullable<diesel::sql_types::Text>,
-            >(
-                "current_setting('autumn.test_transaction_started', true)",
-            ))
-            .get_result::<Option<String>>(&mut *self.conn)
-            .await
-            .ok()
-            .flatten()
-            .as_deref()
-                == Some("true");
-
-            if !is_test_tx {
+            if !callbacks.is_empty() && !self.is_test_tx {
                 let _ = spawn_committed_after_commit_callbacks(callbacks);
             }
         }
@@ -979,6 +967,7 @@ where
         let metrics = state.metrics();
         let slow_query_threshold = state.slow_query_threshold();
         let start_time = std::time::Instant::now();
+        let is_test_tx = interceptors.iter().any(|i| i.is_transactional_test());
 
         Ok(Self {
             conn,
@@ -989,6 +978,7 @@ where
             metrics: metrics.cloned(),
             slow_query_threshold,
             start_time,
+            is_test_tx,
         })
     }
 }

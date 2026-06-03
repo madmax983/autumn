@@ -1444,6 +1444,10 @@ impl crate::interceptor::DbConnectionInterceptor for TransactionalDbInterceptor 
             Ok(conn)
         })
     }
+
+    fn is_transactional_test(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(feature = "db")]
@@ -1475,6 +1479,10 @@ impl crate::interceptor::DbConnectionInterceptor for ComposedDbInterceptor {
     > {
         let next_wrapped = self.second.intercept_checkout(ctx.clone(), next);
         self.first.intercept_checkout(ctx, next_wrapped)
+    }
+
+    fn is_transactional_test(&self) -> bool {
+        self.first.is_transactional_test() || self.second.is_transactional_test()
     }
 }
 

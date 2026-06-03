@@ -192,6 +192,9 @@ mod transactional_tests {
             .await
             .assert_status(201);
 
+        // Sleep to yield control and let any background task execute if suppression failed
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
         // Verify that the callback was NOT run (suppressed due to transactional test mode)
         assert_eq!(
             std::sync::atomic::AtomicUsize::load(
