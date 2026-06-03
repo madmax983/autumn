@@ -112,6 +112,8 @@ pub struct ApiDoc {
     /// Optional runtime hook that lets a handler register any extra
     /// component schemas with the generator.
     pub register_schemas: Option<fn(&mut SchemaRegistry)>,
+    /// Optional API version associated with this route.
+    pub api_version: Option<&'static str>,
 }
 
 /// Reference to a schema definition, produced by the route macros.
@@ -171,6 +173,8 @@ pub struct OpenApiConfig {
     pub session_cookie_name: String,
     /// User-registered component schemas keyed by schema name.
     pub additional_schemas: BTreeMap<String, serde_json::Value>,
+    /// API versions registry.
+    pub api_versions: Vec<crate::app::ApiVersion>,
 }
 
 #[cfg(feature = "openapi")]
@@ -186,6 +190,7 @@ impl OpenApiConfig {
             swagger_ui_path: Some("/swagger-ui".to_owned()),
             session_cookie_name: "autumn.sid".to_owned(),
             additional_schemas: BTreeMap::new(),
+            api_versions: Vec::new(),
         }
     }
 
@@ -398,6 +403,9 @@ pub struct Operation {
     /// Security requirements for this operation. Non-empty when the route uses `#[secured]`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub security: Vec<BTreeMap<String, Vec<String>>>,
+    /// Declares this operation to be deprecated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deprecated: Option<bool>,
 }
 
 #[cfg(feature = "openapi")]
@@ -539,7 +547,7 @@ pub fn generate_spec(config: &OpenApiConfig, routes: &[&ApiDoc]) -> OpenApiSpec 
             collect_ref_names(entry, &mut referenced_names);
         }
 
-        let operation = operation_for(api_doc);
+        let operation = operation_for(api_doc, &config.api_versions);
         let entry = paths.entry(api_doc.path.to_owned()).or_default();
         match api_doc.method {
             "GET" => entry.get = Some(operation),
@@ -606,14 +614,27 @@ pub fn generate_spec(config: &OpenApiConfig, routes: &[&ApiDoc]) -> OpenApiSpec 
 }
 
 #[cfg(feature = "openapi")]
-fn operation_for(api_doc: &ApiDoc) -> Operation {
-    let tags = if api_doc.tags.is_empty() {
+fn operation_for(api_doc: &ApiDoc, api_versions: &[crate::app::ApiVersion]) -> Operation {
+    let mut tags = if api_doc.tags.is_empty() {
         default_tag(api_doc.path)
             .map(|t| vec![t.to_owned()])
             .unwrap_or_default()
     } else {
         api_doc.tags.iter().map(|s| (*s).to_owned()).collect()
     };
+
+    if let Some(version) = api_doc.api_version {
+        tags.push(version.to_string());
+    }
+
+    let is_deprecated = if let Some(version) = api_doc.api_version {
+        api_versions.iter().find(|av| av.version == version).and_then(|av| {
+            av.deprecated_at.map(|d| chrono::Utc::now() >= d)
+        }).unwrap_or(false)
+    } else {
+        false
+    };
+    let deprecated = if is_deprecated { Some(true) } else { None };
 
     // Path parameters — always required.
     let mut parameters: Vec<Parameter> = api_doc
@@ -704,6 +725,7 @@ fn operation_for(api_doc: &ApiDoc) -> Operation {
         request_body,
         responses,
         security,
+        deprecated,
     }
 }
 
@@ -1003,6 +1025,7 @@ mod tests {
             secured: false,
             required_roles: &[],
             register_schemas: None,
+            api_version: None,
         }
     }
 

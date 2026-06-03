@@ -732,6 +732,8 @@ async fn test_manual_route_registered_through_routes_fails_closed_without_replay
         api_doc: autumn_web::openapi::ApiDoc::default(),
         repository: None,
         idempotency: RouteIdempotency::Direct,
+        api_version: None,
+        sunset_opt_out: false,
     };
 
     let client = TestApp::new().routes(vec![route]).idempotent().build();
@@ -775,6 +777,8 @@ async fn test_manual_route_with_openapi_method_fails_closed_without_replay_stop(
         },
         repository: None,
         idempotency: RouteIdempotency::Direct,
+        api_version: None,
+        sunset_opt_out: false,
     };
 
     let client = TestApp::new().routes(vec![route]).idempotent().build();
@@ -811,6 +815,8 @@ async fn test_manual_scoped_route_registered_through_routes_fails_closed_without
         api_doc: autumn_web::openapi::ApiDoc::default(),
         repository: None,
         idempotency: RouteIdempotency::Direct,
+        api_version: None,
+        sunset_opt_out: false,
     };
 
     let client = TestApp::new()
@@ -1458,6 +1464,8 @@ async fn test_manual_layered_route_can_check_access_before_replay_stop() {
         api_doc: autumn_web::openapi::ApiDoc::default(),
         repository: None,
         idempotency: RouteIdempotency::ReplayThroughInner,
+        api_version: None,
+        sunset_opt_out: false,
     };
 
     let client = TestApp::new().routes(vec![route]).idempotent().build();
@@ -1505,6 +1513,8 @@ async fn test_manual_layered_direct_route_fails_closed_instead_of_stale_replay()
         api_doc: autumn_web::openapi::ApiDoc::default(),
         repository: None,
         idempotency: RouteIdempotency::Direct,
+        api_version: None,
+        sunset_opt_out: false,
     };
 
     let client = TestApp::new().routes(vec![route]).idempotent().build();

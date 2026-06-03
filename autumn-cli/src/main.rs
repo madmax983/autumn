@@ -23,6 +23,20 @@ mod setup;
 mod task;
 mod token;
 mod webhook;
+/// Subcommands for `autumn check`.
+#[derive(Subcommand, Clone, Debug, PartialEq, Eq)]
+pub enum CheckSubcommands {
+    /// Check for active routes past their sunset date
+    Deprecations {
+        /// Package to build/check (for workspaces)
+        #[arg(short, long)]
+        package: Option<String>,
+        /// Binary target to check (for packages with multiple bin targets)
+        #[arg(long, value_name = "BIN")]
+        bin: Option<String>,
+    },
+}
+
 /// The Autumn web framework CLI.
 #[derive(Parser)]
 #[command(name = "autumn", version, about = "The Autumn web framework CLI")]
@@ -266,6 +280,9 @@ enum Commands {
         /// Fail only on Critical violations; treat Serious as warnings.
         #[arg(long)]
         critical_only: bool,
+
+        #[command(subcommand)]
+        subcommand: Option<CheckSubcommands>,
     },
 
     /// Check the local environment and project configuration for common
@@ -1119,8 +1136,15 @@ fn run_command(command: Commands) {
             url,
             html,
             critical_only,
+            subcommand,
         } => {
-            if a11y {
+            if let Some(sub) = subcommand {
+                match sub {
+                    CheckSubcommands::Deprecations { package, bin } => {
+                        run_deprecations_check(package.as_deref(), bin.as_deref());
+                    }
+                }
+            } else if a11y {
                 let opts = check::A11yCheckOptions {
                     url: url.clone(),
                     html,
@@ -1138,7 +1162,7 @@ fn run_command(command: Commands) {
                     }
                 }
             } else {
-                eprintln!("autumn check: specify at least one check flag (e.g. --a11y)");
+                eprintln!("autumn check: specify at least one check flag (e.g. --a11y) or a subcommand (e.g. deprecations)");
                 std::process::exit(1);
             }
         }
@@ -1325,6 +1349,62 @@ fn run_plugin_check_command(
         sensitive_routes: &sensitive_routes,
         format: fmt,
     });
+}
+
+fn run_deprecations_check(package: Option<&str>, bin: Option<&str>) {
+    routes::compile_binary(package, bin);
+    let binary = routes::find_binary(package, bin);
+
+    let output = std::process::Command::new(&binary)
+        .env("AUTUMN_DUMP_ROUTES", "1")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .output()
+        .unwrap_or_else(|e| {
+            eprintln!("\u{2717} Failed to run {}: {e}", binary.display());
+            std::process::exit(1);
+        });
+
+    if !output.status.success() {
+        eprintln!(
+            "\u{2717} Binary exited with status {} while dumping routes",
+            output.status
+        );
+        std::process::exit(output.status.code().unwrap_or(1));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let routes: Vec<routes::RouteInfo> = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        eprintln!("\u{2717} Failed to parse route listing JSON: {e}");
+        eprintln!("Raw output: {stdout}");
+        std::process::exit(1);
+    });
+
+    let mut sunsetted_routes = Vec::new();
+    for route in &routes {
+        if route.status.as_deref() == Some("sunset") && route.sunset_opt_out != Some(true) {
+            sunsetted_routes.push(route);
+        }
+    }
+
+    if !sunsetted_routes.is_empty() {
+        eprintln!(
+            "\u{2717} Found {} route(s) past sunset date that have not opted out:",
+            sunsetted_routes.len()
+        );
+        for route in &sunsetted_routes {
+            eprintln!(
+                "  {} {} (handler: {}, version: {})",
+                route.method,
+                route.path,
+                route.handler,
+                route.api_version.as_deref().unwrap_or("-")
+            );
+        }
+        std::process::exit(1);
+    } else {
+        println!("\u{2705} No active past-sunset routes detected.");
+    }
 }
 
 fn run_routes_command(
@@ -3335,6 +3415,42 @@ mod tests {
         assert!(
             oauth.is_empty(),
             "oauth must default to empty when flag not given"
+        );
+    }
+
+    #[test]
+    fn parse_check_deprecations() {
+        let cli = Cli::try_parse_from(["autumn", "check", "deprecations"]).unwrap();
+        let Commands::Check { subcommand, .. } = cli.command else {
+            panic!("expected check");
+        };
+        assert!(matches!(
+            subcommand,
+            Some(CheckSubcommands::Deprecations { package: None, bin: None })
+        ));
+    }
+
+    #[test]
+    fn parse_check_deprecations_with_package_and_bin() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "check",
+            "deprecations",
+            "-p",
+            "my-app",
+            "--bin",
+            "my-bin",
+        ])
+        .unwrap();
+        let Commands::Check { subcommand, .. } = cli.command else {
+            panic!("expected check");
+        };
+        assert_eq!(
+            subcommand,
+            Some(CheckSubcommands::Deprecations {
+                package: Some("my-app".to_string()),
+                bin: Some("my-bin".to_string())
+            })
         );
     }
 }

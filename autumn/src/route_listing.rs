@@ -64,6 +64,15 @@ pub struct RouteInfo {
     pub source: RouteSource,
     /// Active middleware on this route (compact labels, e.g. `"secured"`, `"cached(60s)"`).
     pub middleware: Vec<String>,
+    /// API version of the route (e.g. "v1")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_version: Option<String>,
+    /// Status of the version ("active", "deprecated", "sunset")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// Whether this route opts out of sunset 410 Gone response
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sunset_opt_out: Option<bool>,
 }
 
 /// Collect [`RouteInfo`] entries from user routes and scoped groups.
@@ -74,37 +83,63 @@ pub struct RouteInfo {
 ///
 /// Does not include framework-internal routes (probes, actuator, htmx).
 /// Call [`append_framework_routes`] with a loaded config to add those.
-pub(crate) fn collect_route_infos(
+pub fn collect_route_infos(
     routes: &[Route],
     route_sources: &[RouteSource],
     scoped_groups: &[ScopedGroup],
+    api_versions: &[crate::app::ApiVersion],
 ) -> Vec<RouteInfo> {
     let mut infos = Vec::with_capacity(routes.len());
+    let now = chrono::Utc::now();
+
+    let resolve_status = |api_version: Option<&str>, sunset_opt_out: bool| -> (Option<String>, Option<String>, Option<bool>) {
+        let Some(ver) = api_version else {
+            return (None, None, None);
+        };
+        let status = if let Some(av) = api_versions.iter().find(|av| av.version == ver) {
+            let is_sunset = av.sunset_at.map_or(false, |s| now >= s);
+            let is_dep = av.deprecated_at.map_or(false, |d| now >= d);
+            if is_sunset {
+                "sunset"
+            } else if is_dep {
+                "deprecated"
+            } else {
+                "active"
+            }
+        } else {
+            "active"
+        };
+        (Some(ver.to_string()), Some(status.to_string()), Some(sunset_opt_out))
+    };
 
     for (i, route) in routes.iter().enumerate() {
         let source = route_sources.get(i).cloned().unwrap_or(RouteSource::User);
+        let (api_version, status, sunset_opt_out) = resolve_status(route.api_version, route.sunset_opt_out);
         infos.push(RouteInfo {
             method: route.method.to_string(),
             path: route.path.to_owned(),
             handler: route.name.to_owned(),
             source,
-            // Tower layers are opaque — there is no runtime API to enumerate
-            // which layers a MethodRouter carries. The middleware field is
-            // reserved for future population via proc-macro attributes (e.g.
-            // `#[middleware("secured")]`) on route handler functions.
             middleware: Vec::new(),
+            api_version,
+            status,
+            sunset_opt_out,
         });
     }
 
     for group in scoped_groups {
         for route in &group.routes {
             let full_path = join_scope_path(&group.prefix, route.path);
+            let (api_version, status, sunset_opt_out) = resolve_status(route.api_version, route.sunset_opt_out);
             infos.push(RouteInfo {
                 method: route.method.to_string(),
                 path: full_path,
                 handler: route.name.to_owned(),
                 source: group.source.clone(),
                 middleware: Vec::new(),
+                api_version,
+                status,
+                sunset_opt_out,
             });
         }
     }
@@ -134,6 +169,9 @@ pub(crate) fn append_framework_routes(
                 handler: name.to_owned(),
                 source: RouteSource::Framework,
                 middleware: Vec::new(),
+                api_version: None,
+                status: None,
+                sunset_opt_out: None,
             });
         }
     }
@@ -147,6 +185,9 @@ pub(crate) fn append_framework_routes(
             handler: "actuator".to_owned(),
             source: RouteSource::Framework,
             middleware: Vec::new(),
+            api_version: None,
+            status: None,
+            sunset_opt_out: None,
         });
     }
 
@@ -158,6 +199,9 @@ pub(crate) fn append_framework_routes(
             handler: "htmx".to_owned(),
             source: RouteSource::Framework,
             middleware: Vec::new(),
+            api_version: None,
+            status: None,
+            sunset_opt_out: None,
         });
         infos.push(RouteInfo {
             method: "GET".to_owned(),
@@ -165,6 +209,9 @@ pub(crate) fn append_framework_routes(
             handler: "htmx_csrf".to_owned(),
             source: RouteSource::Framework,
             middleware: Vec::new(),
+            api_version: None,
+            status: None,
+            sunset_opt_out: None,
         });
     }
 
@@ -190,6 +237,9 @@ pub(crate) fn append_framework_routes(
                 handler: handler.to_owned(),
                 source: RouteSource::Framework,
                 middleware: Vec::new(),
+                api_version: None,
+                status: None,
+                sunset_opt_out: None,
             });
         }
     }
@@ -208,6 +258,9 @@ pub(crate) fn append_framework_routes(
                 handler: handler.to_owned(),
                 source: RouteSource::Framework,
                 middleware: Vec::new(),
+                api_version: None,
+                status: None,
+                sunset_opt_out: None,
             });
         }
     }
@@ -219,6 +272,9 @@ pub(crate) fn append_framework_routes(
         handler: "static_files".to_owned(),
         source: RouteSource::Framework,
         middleware: Vec::new(),
+        api_version: None,
+        status: None,
+        sunset_opt_out: None,
     });
 }
 
@@ -236,6 +292,9 @@ pub(crate) fn append_openapi_routes(
         handler: "openapi_json".to_owned(),
         source: RouteSource::Framework,
         middleware: Vec::new(),
+        api_version: None,
+        status: None,
+        sunset_opt_out: None,
     });
     if let Some(ui_path) = &openapi.swagger_ui_path {
         infos.push(RouteInfo {
@@ -244,6 +303,9 @@ pub(crate) fn append_openapi_routes(
             handler: "swagger_ui".to_owned(),
             source: RouteSource::Framework,
             middleware: Vec::new(),
+            api_version: None,
+            status: None,
+            sunset_opt_out: None,
         });
     }
 }
@@ -267,6 +329,9 @@ pub(crate) fn append_dev_reload_routes(infos: &mut Vec<RouteInfo>) {
                 handler: handler.to_owned(),
                 source: RouteSource::Framework,
                 middleware: Vec::new(),
+                api_version: None,
+                status: None,
+                sunset_opt_out: None,
             });
         }
     }
@@ -324,6 +389,8 @@ mod tests {
             api_doc: dummy_api_doc(),
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
+            api_version: None,
+            sunset_opt_out: false,
         }
     }
 
@@ -331,7 +398,7 @@ mod tests {
 
     #[test]
     fn collect_route_infos_empty_produces_empty() {
-        let infos = collect_route_infos(&[], &[], &[]);
+        let infos = collect_route_infos(&[], &[], &[], &[]);
         assert!(infos.is_empty());
     }
 
@@ -339,7 +406,7 @@ mod tests {
     fn collect_route_infos_single_user_route() {
         let routes = vec![make_route(Method::GET, "/posts", "list_posts")];
         let sources = vec![RouteSource::User];
-        let infos = collect_route_infos(&routes, &sources, &[]);
+        let infos = collect_route_infos(&routes, &sources, &[], &[]);
         assert_eq!(infos.len(), 1);
         assert_eq!(infos[0].method, "GET");
         assert_eq!(infos[0].path, "/posts");
@@ -355,7 +422,7 @@ mod tests {
             make_route(Method::POST, "/posts", "create_post"),
         ];
         let sources = vec![RouteSource::User, RouteSource::User];
-        let infos = collect_route_infos(&routes, &sources, &[]);
+        let infos = collect_route_infos(&routes, &sources, &[], &[]);
         assert_eq!(infos.len(), 2);
     }
 
@@ -377,7 +444,7 @@ mod tests {
             make_route(Method::DELETE, "/posts/{id}", "delete_post"),
         ];
         let sources = vec![RouteSource::User; 3];
-        let infos = collect_route_infos(&routes, &sources, &[]);
+        let infos = collect_route_infos(&routes, &sources, &[], &[]);
         let methods: Vec<&str> = infos.iter().map(|i| i.method.as_str()).collect();
         assert_eq!(methods, vec!["PUT", "PATCH", "DELETE"]);
         // The transport method browsers actually use must never appear in
@@ -393,7 +460,7 @@ mod tests {
             source: RouteSource::User,
             apply_layer: Box::new(|r| r),
         };
-        let infos = collect_route_infos(&[], &[], &[group]);
+        let infos = collect_route_infos(&[], &[], &[group], &[]);
         assert_eq!(infos.len(), 1);
         assert_eq!(infos[0].path, "/api/posts");
         assert_eq!(infos[0].handler, "api_list_posts");
@@ -407,7 +474,7 @@ mod tests {
             source: RouteSource::User,
             apply_layer: Box::new(|r| r),
         };
-        let infos = collect_route_infos(&[], &[], &[group]);
+        let infos = collect_route_infos(&[], &[], &[group], &[]);
         assert_eq!(infos.len(), 1);
         assert_eq!(infos[0].path, "/api");
     }
@@ -416,7 +483,7 @@ mod tests {
     fn collect_route_infos_marks_user_source() {
         let routes = vec![make_route(Method::POST, "/items", "create_item")];
         let sources = vec![RouteSource::User];
-        let infos = collect_route_infos(&routes, &sources, &[]);
+        let infos = collect_route_infos(&routes, &sources, &[], &[]);
         assert_eq!(infos[0].source, RouteSource::User);
     }
 
@@ -424,7 +491,7 @@ mod tests {
     fn collect_route_infos_plugin_source_from_parallel_slice() {
         let routes = vec![make_route(Method::GET, "/admin", "admin_index")];
         let sources = vec![RouteSource::Plugin("admin".to_owned())];
-        let infos = collect_route_infos(&routes, &sources, &[]);
+        let infos = collect_route_infos(&routes, &sources, &[], &[]);
         assert_eq!(infos[0].source, RouteSource::Plugin("admin".to_owned()));
     }
 
@@ -436,7 +503,7 @@ mod tests {
             source: RouteSource::Plugin("admin".to_owned()),
             apply_layer: Box::new(|r| r),
         };
-        let infos = collect_route_infos(&[], &[], &[group]);
+        let infos = collect_route_infos(&[], &[], &[group], &[]);
         assert_eq!(infos[0].source, RouteSource::Plugin("admin".to_owned()));
         assert_eq!(infos[0].path, "/admin/users");
     }
@@ -445,7 +512,7 @@ mod tests {
     fn collect_route_infos_missing_source_defaults_to_user() {
         let routes = vec![make_route(Method::GET, "/x", "x")];
         // empty sources slice — should fall back to User
-        let infos = collect_route_infos(&routes, &[], &[]);
+        let infos = collect_route_infos(&routes, &[], &[], &[]);
         assert_eq!(infos[0].source, RouteSource::User);
     }
 
@@ -460,6 +527,9 @@ mod tests {
                 handler: "create".to_owned(),
                 source: RouteSource::User,
                 middleware: vec![],
+                api_version: None,
+                status: None,
+                sunset_opt_out: None,
             },
             RouteInfo {
                 method: "GET".to_owned(),
@@ -467,6 +537,9 @@ mod tests {
                 handler: "list".to_owned(),
                 source: RouteSource::User,
                 middleware: vec![],
+                api_version: None,
+                status: None,
+                sunset_opt_out: None,
             },
             RouteInfo {
                 method: "GET".to_owned(),
@@ -474,6 +547,9 @@ mod tests {
                 handler: "about".to_owned(),
                 source: RouteSource::User,
                 middleware: vec![],
+                api_version: None,
+                status: None,
+                sunset_opt_out: None,
             },
         ];
         sort_route_infos(&mut infos);
@@ -493,6 +569,9 @@ mod tests {
                 handler: "z".to_owned(),
                 source: RouteSource::User,
                 middleware: vec![],
+                api_version: None,
+                status: None,
+                sunset_opt_out: None,
             },
             RouteInfo {
                 method: "GET".to_owned(),
@@ -500,6 +579,9 @@ mod tests {
                 handler: "a".to_owned(),
                 source: RouteSource::User,
                 middleware: vec![],
+                api_version: None,
+                status: None,
+                sunset_opt_out: None,
             },
         ];
         sort_route_infos(&mut infos);
@@ -648,6 +730,9 @@ mod tests {
             handler: "posts::show".to_owned(),
             source: RouteSource::User,
             middleware: vec!["secured".to_owned()],
+            api_version: None,
+            status: None,
+            sunset_opt_out: None,
         };
         let json = serde_json::to_string(&info).unwrap();
         let decoded: RouteInfo = serde_json::from_str(&json).unwrap();

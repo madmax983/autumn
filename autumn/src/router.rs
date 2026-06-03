@@ -84,6 +84,12 @@ pub enum RouterBuildError {
         /// The colliding path.
         path: String,
     },
+    /// A route is annotated with an API version that is not registered.
+    #[error("route '{route_name}' uses unregistered API version '{version}'")]
+    UnregisteredApiVersion {
+        route_name: String,
+        version: String,
+    },
 }
 
 /// Build the fully-configured Axum router from routes, config, and state.
@@ -266,6 +272,34 @@ fn build_router_pre_state(
     // the real layer list even though ctx.custom_layers is empty.
     opaque_app_layers_override: Option<bool>,
 ) -> Result<axum::Router<AppState>, RouterBuildError> {
+    // Verify registered API versions
+    let versions = state.extension::<crate::app::RegisteredApiVersions>();
+    let registered_versions: std::collections::HashSet<&str> = versions
+        .as_ref()
+        .map(|v| v.0.iter().map(|av| av.version.as_str()).collect())
+        .unwrap_or_default();
+
+    let check_route_version = |route: &Route| -> Result<(), RouterBuildError> {
+        if let Some(version) = route.api_version {
+            if !registered_versions.contains(version) {
+                return Err(RouterBuildError::UnregisteredApiVersion {
+                    route_name: route.name.to_string(),
+                    version: version.to_string(),
+                });
+            }
+        }
+        Ok(())
+    };
+
+    for route in &route_list {
+        check_route_version(route)?;
+    }
+    for group in &ctx.scoped_groups {
+        for route in &group.routes {
+            check_route_version(route)?;
+        }
+    }
+
     // Fail-fast if an OpenAPI mount path collides with a user or
     // framework GET route — axum panics on overlapping method routes,
     // so surface this as a recoverable error before we start merging.
@@ -287,6 +321,7 @@ fn build_router_pre_state(
         &ctx.scoped_groups,
         ctx.openapi.as_ref(),
         &config.session.cookie_name,
+        versions.as_ref().map(|v| v.0.as_slice()).unwrap_or(&[]),
     )?;
 
     let idempotency_layers = build_idempotency_layers(config, state)?;
@@ -296,6 +331,7 @@ fn build_router_pre_state(
         route_list,
         idempotency_layers.as_ref(),
         opaque_app_layers_present,
+        state,
     );
 
     let dev_reload_enabled = dev::is_enabled_with_env(&crate::config::OsEnv);
@@ -321,7 +357,7 @@ fn build_router_pre_state(
     router = router.nest_service("/static", tower_http::services::ServeDir::new(&static_dir));
     router = router.layer(axum::middleware::from_fn(asset_cache_control));
 
-    router = mount_scoped_groups(router, ctx.scoped_groups, idempotency_layers.as_ref());
+    router = mount_scoped_groups(router, ctx.scoped_groups, idempotency_layers.as_ref(), state);
 
     router = mount_raw_routers(
         router,
@@ -422,12 +458,14 @@ fn build_openapi_router(
     scoped_groups: &[ScopedGroup],
     openapi_config: Option<&crate::openapi::OpenApiConfig>,
     session_cookie_name: &str,
+    api_versions: &[crate::app::ApiVersion],
 ) -> Result<Option<axum::Router<AppState>>, RouterBuildError> {
     let Some(config) = openapi_config else {
         return Ok(None);
     };
     let mut config = config.clone();
     session_cookie_name.clone_into(&mut config.session_cookie_name);
+    config.api_versions = api_versions.to_vec();
 
     // Validate user-provided paths up front so a typo like
     // `"openapi.json"` surfaces as a recoverable RouterBuildError
@@ -727,6 +765,7 @@ fn group_and_mount_routes(
     route_list: Vec<Route>,
     idempotency_layers: Option<&BuiltIdempotencyLayers>,
     opaque_app_layers_present: bool,
+    state: &AppState,
 ) -> axum::Router<AppState> {
     // Group routes by path so multiple methods on the same path
     // (e.g. GET /admin + POST /admin) are merged into a single
@@ -748,6 +787,16 @@ fn group_and_mount_routes(
         let mut handler = route.handler;
         if let Some(layer) = selected_layer {
             handler = handler.layer(layer.clone());
+        }
+        if let Some(version) = route.api_version {
+            handler = handler.layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                api_versioning_middleware,
+            ));
+            handler = handler.layer(axum::Extension(RouteVersionMetadata {
+                version: version.to_string(),
+                sunset_opt_out: route.sunset_opt_out,
+            }));
         }
         grouped
             .entry(route.path)
@@ -971,6 +1020,7 @@ fn mount_scoped_groups(
     mut router: axum::Router<AppState>,
     scoped_groups: Vec<ScopedGroup>,
     idempotency_layers: Option<&BuiltIdempotencyLayers>,
+    state: &AppState,
 ) -> axum::Router<AppState> {
     // Mount scoped route groups (each with its own middleware layer).
     for group in scoped_groups {
@@ -993,6 +1043,16 @@ fn mount_scoped_groups(
             let mut handler = route.handler;
             if let Some(layer) = selected_layer {
                 handler = handler.layer(layer.clone());
+            }
+            if let Some(version) = route.api_version {
+                handler = handler.layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    api_versioning_middleware,
+                ));
+                handler = handler.layer(axum::Extension(RouteVersionMetadata {
+                    version: version.to_string(),
+                    sunset_opt_out: route.sunset_opt_out,
+                }));
             }
             sub_router = sub_router.route(route.path, handler);
         }
@@ -2641,6 +2701,8 @@ mod tests {
                 },
                 repository: None,
                 idempotency: crate::route::RouteIdempotency::Direct,
+                api_version: None,
+                sunset_opt_out: false,
             }],
             source: crate::route_listing::RouteSource::User,
             apply_layer: Box::new(|r| r),
@@ -2710,6 +2772,8 @@ mod tests {
             },
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
+            api_version: None,
+            sunset_opt_out: false,
         };
         let group = crate::app::ScopedGroup {
             prefix: "/orgs/{org_id}".to_owned(),
@@ -2719,7 +2783,7 @@ mod tests {
         };
 
         let config = OpenApiConfig::new("Demo", "1.0.0");
-        let router = super::build_openapi_router(&[], &[group], Some(&config), "autumn.sid")
+        let router = super::build_openapi_router(&[], &[group], Some(&config), "autumn.sid", &[])
             .expect("openapi sub-router builds")
             .expect("openapi sub-router present when config is Some");
         let state = test_state();
@@ -2774,12 +2838,14 @@ mod tests {
             },
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
+            api_version: None,
+            sunset_opt_out: false,
         };
 
         let protected_routes = vec![route];
         let config = OpenApiConfig::new("Demo", "1.0.0");
         let docs_router =
-            super::build_openapi_router(&protected_routes, &[], Some(&config), "demo.sid")
+            super::build_openapi_router(&protected_routes, &[], Some(&config), "demo.sid", &[])
                 .expect("openapi sub-router builds")
                 .expect("openapi sub-router present when config is Some");
         let docs_router = docs_router.with_state(test_state());
@@ -2814,7 +2880,7 @@ mod tests {
     fn openapi_rejects_json_path_without_leading_slash() {
         let config =
             crate::openapi::OpenApiConfig::new("Demo", "1.0.0").openapi_json_path("openapi.json");
-        let err = super::build_openapi_router(&[], &[], Some(&config), "autumn.sid")
+        let err = super::build_openapi_router(&[], &[], Some(&config), "autumn.sid", &[])
             .expect_err("non-slash path should be rejected");
         assert!(matches!(
             err,
@@ -2832,7 +2898,7 @@ mod tests {
         // endpoints are static. Catch it before axum panics.
         let config =
             crate::openapi::OpenApiConfig::new("Demo", "1.0.0").openapi_json_path("/docs/{id}");
-        let err = super::build_openapi_router(&[], &[], Some(&config), "autumn.sid")
+        let err = super::build_openapi_router(&[], &[], Some(&config), "autumn.sid", &[])
             .expect_err("captures should be rejected");
         assert!(matches!(err, RouterBuildError::InvalidOpenApiPath { .. }));
     }
@@ -2842,7 +2908,7 @@ mod tests {
     fn openapi_rejects_path_with_unbalanced_brace() {
         let config =
             crate::openapi::OpenApiConfig::new("Demo", "1.0.0").openapi_json_path("/docs/{id");
-        let err = super::build_openapi_router(&[], &[], Some(&config), "autumn.sid")
+        let err = super::build_openapi_router(&[], &[], Some(&config), "autumn.sid", &[])
             .expect_err("unbalanced brace should be rejected");
         assert!(matches!(err, RouterBuildError::InvalidOpenApiPath { .. }));
     }
@@ -2852,7 +2918,7 @@ mod tests {
     fn openapi_rejects_path_with_wildcard() {
         let config =
             crate::openapi::OpenApiConfig::new("Demo", "1.0.0").openapi_json_path("/docs/*rest");
-        let err = super::build_openapi_router(&[], &[], Some(&config), "autumn.sid")
+        let err = super::build_openapi_router(&[], &[], Some(&config), "autumn.sid", &[])
             .expect_err("wildcard should be rejected");
         assert!(matches!(err, RouterBuildError::InvalidOpenApiPath { .. }));
     }
@@ -2862,7 +2928,7 @@ mod tests {
     fn openapi_rejects_path_with_double_slash() {
         let config =
             crate::openapi::OpenApiConfig::new("Demo", "1.0.0").openapi_json_path("//docs");
-        let err = super::build_openapi_router(&[], &[], Some(&config), "autumn.sid")
+        let err = super::build_openapi_router(&[], &[], Some(&config), "autumn.sid", &[])
             .expect_err("double-slash should be rejected");
         assert!(matches!(err, RouterBuildError::InvalidOpenApiPath { .. }));
     }
@@ -2872,7 +2938,7 @@ mod tests {
     fn openapi_rejects_swagger_ui_path_without_leading_slash() {
         let config = crate::openapi::OpenApiConfig::new("Demo", "1.0.0")
             .swagger_ui_path(Some("docs".to_owned()));
-        let err = super::build_openapi_router(&[], &[], Some(&config), "autumn.sid")
+        let err = super::build_openapi_router(&[], &[], Some(&config), "autumn.sid", &[])
             .expect_err("non-slash path should be rejected");
         assert!(matches!(
             err,
@@ -2887,7 +2953,7 @@ mod tests {
     #[test]
     fn openapi_rejects_empty_json_path() {
         let config = crate::openapi::OpenApiConfig::new("Demo", "1.0.0").openapi_json_path("");
-        let err = super::build_openapi_router(&[], &[], Some(&config), "autumn.sid")
+        let err = super::build_openapi_router(&[], &[], Some(&config), "autumn.sid", &[])
             .expect_err("empty path should be rejected");
         assert!(matches!(err, RouterBuildError::InvalidOpenApiPath { .. }));
     }
@@ -2898,7 +2964,7 @@ mod tests {
         let config = crate::openapi::OpenApiConfig::new("Demo", "1.0.0")
             .openapi_json_path("/api-docs")
             .swagger_ui_path(Some("/ui".to_owned()));
-        let out = super::build_openapi_router(&[], &[], Some(&config), "autumn.sid")
+        let out = super::build_openapi_router(&[], &[], Some(&config), "autumn.sid", &[])
             .expect("valid paths must not error");
         assert!(out.is_some());
     }
@@ -2909,7 +2975,7 @@ mod tests {
         let config = crate::openapi::OpenApiConfig::new("Demo", "1.0.0")
             .openapi_json_path("/docs")
             .swagger_ui_path(Some("/docs".to_owned()));
-        let err = super::build_openapi_router(&[], &[], Some(&config), "autumn.sid")
+        let err = super::build_openapi_router(&[], &[], Some(&config), "autumn.sid", &[])
             .expect_err("colliding paths should be rejected before axum panics");
         assert!(matches!(
             err,
@@ -2944,6 +3010,8 @@ mod tests {
             },
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
+            api_version: None,
+            sunset_opt_out: false,
         };
 
         let ctx = RouterContext {
@@ -3011,6 +3079,8 @@ mod tests {
             },
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
+            api_version: None,
+            sunset_opt_out: false,
         };
 
         let ctx = RouterContext {
@@ -3911,4 +3981,74 @@ impl TrustedHostPolicy {
             )
         })
     }
+}
+
+/// Metadata carrying API version and sunset opt-out configuration for a route.
+#[derive(Clone, Debug)]
+pub struct RouteVersionMetadata {
+    pub version: String,
+    pub sunset_opt_out: bool,
+}
+
+/// Middleware that handles API deprecation, sunsets, and Gone responses.
+async fn api_versioning_middleware(
+    state: axum::extract::State<AppState>,
+    route_version: Option<axum::extract::Extension<RouteVersionMetadata>>,
+    request: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let Some(axum::extract::Extension(meta)) = route_version else {
+        return next.run(request).await;
+    };
+
+    let clock = state.clock();
+    let now = clock.now();
+
+    let versions = state.extension::<crate::app::RegisteredApiVersions>();
+    let matching_version = versions.as_ref().and_then(|v| {
+        v.0.iter().find(|av| av.version == meta.version)
+    });
+
+    let Some(version) = matching_version else {
+        return next.run(request).await;
+    };
+
+    let is_deprecated = version.deprecated_at.map_or(false, |d| now >= d);
+    let is_sunset = version.sunset_at.map_or(false, |s| now >= s);
+
+    if is_sunset && !meta.sunset_opt_out {
+        let err = crate::error::AutumnError::gone_msg(format!(
+            "API version '{}' has been sunsetted.",
+            meta.version
+        ));
+        let mut response = err.into_response();
+        if let Some(sunset) = version.sunset_at {
+            let http_date = sunset.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+            if let Ok(val) = axum::http::HeaderValue::from_str(&http_date) {
+                response.headers_mut().insert("Sunset", val);
+            }
+        }
+        if let Ok(val) = axum::http::HeaderValue::from_str("true") {
+            response.headers_mut().insert("Deprecation", val);
+        }
+        return response;
+    }
+
+    let mut response = next.run(request).await;
+
+    if is_deprecated {
+        if let Ok(val) = axum::http::HeaderValue::from_str("true") {
+            response.headers_mut().insert("Deprecation", val);
+        }
+    }
+    if let Some(sunset) = version.sunset_at {
+        if is_deprecated || is_sunset {
+            let http_date = sunset.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+            if let Ok(val) = axum::http::HeaderValue::from_str(&http_date) {
+                response.headers_mut().insert("Sunset", val);
+            }
+        }
+    }
+
+    response
 }

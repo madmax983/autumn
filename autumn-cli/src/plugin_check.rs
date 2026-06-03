@@ -500,6 +500,9 @@ mod tests {
             handler: format!("{}_handler", path.trim_start_matches('/').replace('/', "_")),
             source: source.to_owned(),
             middleware: vec![],
+            api_version: None,
+            status: None,
+            sunset_opt_out: None,
         }
     }
 

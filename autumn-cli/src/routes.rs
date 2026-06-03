@@ -31,7 +31,6 @@ impl std::str::FromStr for OutputFormat {
     }
 }
 
-/// Deserialized route entry received from the binary's JSON output.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouteInfo {
     pub method: String,
@@ -39,6 +38,12 @@ pub struct RouteInfo {
     pub handler: String,
     pub source: String,
     pub middleware: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sunset_opt_out: Option<bool>,
 }
 
 /// Options controlling `autumn routes` behaviour.
@@ -135,7 +140,7 @@ pub fn print_table(routes: &[RouteInfo]) {
 
 /// Build the table string (extracted for testability).
 pub fn format_table(routes: &[RouteInfo]) -> String {
-    const HEADERS: [&str; 5] = ["Method", "Path", "Handler", "Source", "Middleware"];
+    const HEADERS: [&str; 7] = ["Method", "Path", "Handler", "Version", "Status", "Source", "Middleware"];
 
     // Compute column widths
     let widths = compute_column_widths(routes, &HEADERS);
@@ -165,10 +170,14 @@ pub fn format_table(routes: &[RouteInfo]) -> String {
         } else {
             route.middleware.join(", ")
         };
+        let version = route.api_version.as_deref().unwrap_or("-");
+        let status = route.status.as_deref().unwrap_or("-");
         let cells = [
             route.method.clone(),
             route.path.clone(),
             route.handler.clone(),
+            version.to_string(),
+            status.to_string(),
             route.source.clone(),
             middleware,
         ];
@@ -179,8 +188,8 @@ pub fn format_table(routes: &[RouteInfo]) -> String {
     out
 }
 
-fn compute_column_widths(routes: &[RouteInfo], headers: &[&str; 5]) -> [usize; 5] {
-    let mut widths = [0usize; 5];
+fn compute_column_widths(routes: &[RouteInfo], headers: &[&str; 7]) -> [usize; 7] {
+    let mut widths = [0usize; 7];
     for (i, h) in headers.iter().enumerate() {
         widths[i] = h.len();
     }
@@ -190,10 +199,14 @@ fn compute_column_widths(routes: &[RouteInfo], headers: &[&str; 5]) -> [usize; 5
         } else {
             route.middleware.join(", ")
         };
+        let version = route.api_version.as_deref().unwrap_or("-");
+        let status = route.status.as_deref().unwrap_or("-");
         let cols = [
             route.method.len(),
             route.path.len(),
             route.handler.len(),
+            version.len(),
+            status.len(),
             route.source.len(),
             middleware.len(),
         ];
@@ -206,7 +219,7 @@ fn compute_column_widths(routes: &[RouteInfo], headers: &[&str; 5]) -> [usize; 5
     widths
 }
 
-fn format_row(cells: &[String; 5], widths: &[usize; 5]) -> String {
+fn format_row(cells: &[String; 7], widths: &[usize; 7]) -> String {
     cells
         .iter()
         .zip(widths.iter())
@@ -398,6 +411,9 @@ mod tests {
             handler: format!("{}_handler", path.trim_start_matches('/').replace('/', "_")),
             source: source.to_owned(),
             middleware: vec![],
+            api_version: None,
+            status: None,
+            sunset_opt_out: None,
         }
     }
 
@@ -595,6 +611,9 @@ mod tests {
             handler: "admin".to_owned(),
             source: "user".to_owned(),
             middleware: vec!["secured".to_owned(), "cached(60s)".to_owned()],
+            api_version: None,
+            status: None,
+            sunset_opt_out: None,
         };
         let table = format_table(&[route]);
         assert!(table.contains("secured"), "missing middleware label");

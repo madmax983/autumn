@@ -520,6 +520,42 @@ impl AutumnError {
         Self::conflict(StringError(msg.into()))
     }
 
+    /// Create a `410 Gone` error.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use autumn_web::error::AutumnError;
+    /// use http::StatusCode;
+    ///
+    /// let err = AutumnError::gone(std::io::Error::other("sunsetted"));
+    /// assert_eq!(err.status(), StatusCode::GONE);
+    /// ```
+    pub fn gone(err: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self {
+            inner: Box::new(err),
+            status: StatusCode::GONE,
+            details: None,
+            problem_type: Some("https://autumn.dev/problems/gone"),
+            cache_idempotency_response: false,
+        }
+    }
+
+    /// Create a `410 Gone` error from a plain string message.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use autumn_web::error::AutumnError;
+    /// use http::StatusCode;
+    ///
+    /// let err = AutumnError::gone_msg("API version has been sunsetted");
+    /// assert_eq!(err.status(), StatusCode::GONE);
+    /// ```
+    pub fn gone_msg(msg: impl Into<String>) -> Self {
+        Self::gone(StringError(msg.into()))
+    }
+
     /// Create a `503 Service Unavailable` error indicating that a database
     /// query was cancelled due to a statement timeout (Postgres `57014`).
     ///
@@ -728,6 +764,7 @@ const fn problem_type_for(status: StatusCode, has_validation_errors: bool) -> &'
         StatusCode::UNAUTHORIZED => "https://autumn.dev/problems/unauthorized",
         StatusCode::FORBIDDEN => "https://autumn.dev/problems/forbidden",
         StatusCode::NOT_FOUND => "https://autumn.dev/problems/not-found",
+        StatusCode::GONE => "https://autumn.dev/problems/gone",
         StatusCode::CONFLICT => "https://autumn.dev/problems/conflict",
         StatusCode::PAYLOAD_TOO_LARGE => "https://autumn.dev/problems/payload-too-large",
         StatusCode::UNPROCESSABLE_ENTITY => "https://autumn.dev/problems/unprocessable-entity",
@@ -748,6 +785,7 @@ fn problem_title_for(status: StatusCode, has_validation_errors: bool) -> &'stati
         StatusCode::UNAUTHORIZED => "Unauthorized",
         StatusCode::FORBIDDEN => "Forbidden",
         StatusCode::NOT_FOUND => "Not Found",
+        StatusCode::GONE => "Gone",
         StatusCode::CONFLICT => "Conflict",
         StatusCode::PAYLOAD_TOO_LARGE => "Payload Too Large",
         StatusCode::UNPROCESSABLE_ENTITY => "Unprocessable Entity",
@@ -768,6 +806,7 @@ fn problem_code_for(status: StatusCode, has_validation_errors: bool) -> &'static
         StatusCode::UNAUTHORIZED => "autumn.unauthorized",
         StatusCode::FORBIDDEN => "autumn.forbidden",
         StatusCode::NOT_FOUND => "autumn.not_found",
+        StatusCode::GONE => "autumn.gone",
         StatusCode::CONFLICT => "autumn.conflict",
         StatusCode::PAYLOAD_TOO_LARGE => "autumn.payload_too_large",
         StatusCode::UNPROCESSABLE_ENTITY => "autumn.unprocessable_entity",

@@ -67,6 +67,7 @@ use crate::state::AppState;
 pub fn app() -> AppBuilder {
     AppBuilder {
         routes: Vec::new(),
+        api_versions: Vec::new(),
         route_sources: Vec::new(),
         current_plugin: None,
         tasks: Vec::new(),
@@ -187,8 +188,25 @@ type PolicyRegistration = Box<dyn FnOnce(&crate::authorization::PolicyRegistry) 
 ///         .await;
 /// }
 /// ```
+/// Represents an API version registration.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct ApiVersion {
+    /// The version name (e.g. "v1", "v2").
+    pub version: String,
+    /// When this version was deprecated.
+    pub deprecated_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// When this version was sunsetted.
+    pub sunset_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// A wrapper for registered API versions in the app state.
+#[derive(Clone, Debug)]
+pub struct RegisteredApiVersions(pub Vec<ApiVersion>);
+
 pub struct AppBuilder {
     pub(crate) routes: Vec<Route>,
+    /// Registered API versions.
+    pub api_versions: Vec<ApiVersion>,
     /// Parallel to `routes`: registration origin for each route.
     route_sources: Vec<crate::route_listing::RouteSource>,
     /// Non-None while a plugin's `build()` is executing; routes and scoped
@@ -316,13 +334,13 @@ pub(crate) type MailDeliveryQueueFactory = Box<
 ///
 /// Created by [`AppBuilder::scoped`]. The routes are mounted under the
 /// prefix with the middleware applied only to this group.
-pub(crate) struct ScopedGroup {
-    pub(crate) prefix: String,
-    pub(crate) routes: Vec<Route>,
+pub struct ScopedGroup {
+    pub prefix: String,
+    pub routes: Vec<Route>,
     /// Registration origin: user application or a named plugin.
-    pub(crate) source: crate::route_listing::RouteSource,
+    pub source: crate::route_listing::RouteSource,
     /// Closure that applies the layer to a sub-router.
-    pub(crate) apply_layer:
+    pub apply_layer:
         Box<dyn FnOnce(axum::Router<AppState>) -> axum::Router<AppState> + Send>,
 }
 
@@ -957,6 +975,20 @@ impl AppBuilder {
         Fut: Future<Output = ()> + Send + 'static,
     {
         self.shutdown_hooks.push(Box::new(move || Box::pin(hook())));
+        self
+    }
+
+    /// Register a single API version.
+    #[must_use]
+    pub fn api_version(mut self, version: ApiVersion) -> Self {
+        self.api_versions.push(version);
+        self
+    }
+
+    /// Register multiple API versions.
+    #[must_use]
+    pub fn api_versions(mut self, versions: impl IntoIterator<Item = ApiVersion>) -> Self {
+        self.api_versions.extend(versions);
         self
     }
 
@@ -1783,6 +1815,7 @@ impl AppBuilder {
 
         let Self {
             routes,
+            api_versions,
             route_sources: _,
             current_plugin: _,
             tasks,
@@ -2010,6 +2043,8 @@ impl AppBuilder {
         } else {
             crate::cache::clear_global_cache();
         }
+        state.insert_extension(RegisteredApiVersions(api_versions));
+
         // Install registered error reporters so the reporting layer (wired in
         // `apply_middleware`) can deliver panic + 5xx events. Empty is fine —
         // the layer falls back to the built-in `LogReporter`.
@@ -2353,6 +2388,7 @@ impl AppBuilder {
     async fn run_build_mode(self) {
         let Self {
             routes,
+            api_versions,
             route_sources: _,
             current_plugin: _,
             tasks: _,
@@ -2412,6 +2448,7 @@ impl AppBuilder {
             http_interceptor,
         } = self;
 
+        let _ = &api_versions;
         let all_routes = routes;
 
         // Load config (same as normal startup)
@@ -2663,7 +2700,8 @@ impl AppBuilder {
         // When OpenAPI is configured, write the spec to dist/ so consumers
         // can retrieve a machine-readable API contract alongside the HTML.
         #[cfg(feature = "openapi")]
-        if let Some(openapi_config) = openapi {
+        if let Some(mut openapi_config) = openapi {
+            openapi_config.api_versions = api_versions;
             let openapi_config =
                 openapi_config.session_cookie_name(config.session.cookie_name.clone());
             let docs: Vec<&crate::openapi::ApiDoc> = api_docs_snapshot.iter().collect();
@@ -2690,6 +2728,7 @@ impl AppBuilder {
     async fn run_dump_routes_mode(self) {
         let Self {
             routes,
+            api_versions,
             route_sources,
             scoped_groups,
             merge_routers,
@@ -2717,7 +2756,7 @@ impl AppBuilder {
             load_config_and_telemetry(config_loader_factory, telemetry_provider).await;
 
         let mut infos =
-            crate::route_listing::collect_route_infos(&routes, &route_sources, &scoped_groups);
+            crate::route_listing::collect_route_infos(&routes, &route_sources, &scoped_groups, &api_versions);
         infos.extend(declared_routes);
         crate::route_listing::append_framework_routes(&mut infos, &config);
         #[cfg(feature = "openapi")]
@@ -4528,6 +4567,8 @@ mod validate_repository_api_policies_tests {
             api_doc: crate::openapi::ApiDoc::default(),
             repository: meta,
             idempotency: crate::route::RouteIdempotency::Direct,
+            api_version: None,
+            sunset_opt_out: false,
         }
     }
 
@@ -5655,6 +5696,8 @@ mod tests {
             },
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
+            api_version: None,
+            sunset_opt_out: false,
         }
     }
 
@@ -5771,6 +5814,8 @@ mod tests {
                 },
                 repository: None,
                 idempotency: crate::route::RouteIdempotency::Direct,
+                api_version: None,
+                sunset_opt_out: false,
             }],
             &config,
             state,
@@ -6202,6 +6247,8 @@ mod tests {
             },
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
+            api_version: None,
+            sunset_opt_out: false,
         }];
         let config = AutumnConfig::default();
         let state = AppState {
@@ -6266,6 +6313,8 @@ mod tests {
                 },
                 repository: None,
                 idempotency: crate::route::RouteIdempotency::Direct,
+                api_version: None,
+                sunset_opt_out: false,
             },
             Route {
                 method: http::Method::POST,
@@ -6281,6 +6330,8 @@ mod tests {
                 },
                 repository: None,
                 idempotency: crate::route::RouteIdempotency::Direct,
+                api_version: None,
+                sunset_opt_out: false,
             },
         ];
         let config = AutumnConfig::default();
@@ -6657,6 +6708,8 @@ mod tests {
                     },
                     repository: None,
                     idempotency: crate::route::RouteIdempotency::Direct,
+                    api_version: None,
+                    sunset_opt_out: false,
                 }],
                 &config,
                 state,
@@ -6712,6 +6765,8 @@ mod tests {
                     },
                     repository: None,
                     idempotency: crate::route::RouteIdempotency::Direct,
+                    api_version: None,
+                    sunset_opt_out: false,
                 }]);
 
                 let response = router
