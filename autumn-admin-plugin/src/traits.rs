@@ -276,7 +276,7 @@ pub enum CsvImportMode {
 impl CsvImportMode {
     /// Parse from a form field value.
     #[must_use]
-    pub fn from_str(s: &str) -> Self {
+    pub fn from_form_value(s: &str) -> Self {
         match s {
             "dry_run" | "DryRun" | "dry-run" => Self::DryRun,
             _ => Self::Insert,
@@ -582,7 +582,9 @@ pub trait AdminModel: Send + Sync + 'static {
     fn csv_export_columns(&self) -> Vec<&'static str> {
         self.fields()
             .into_iter()
-            .filter(|f| !matches!(f.kind, AdminFieldKind::Password | AdminFieldKind::Hidden))
+            .filter(|f| {
+                !matches!(f.kind, AdminFieldKind::Password | AdminFieldKind::Hidden) && !f.encrypted
+            })
             .map(|f| f.name)
             .collect()
     }

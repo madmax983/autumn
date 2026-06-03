@@ -900,6 +900,26 @@ pub fn model_list_page(
     // Pre-encode active filters into a `&filter.<k>=<v>` suffix so
     // sort/pagination links carry filter state forward without rebuilding it.
     let filters_enc = encode_filter_suffix(filters);
+    // Export URL preserves the current search/sort/filter state so "Download CSV"
+    // exports exactly the rows shown on the page, not the whole table.
+    let export_csv_url = {
+        let mut params: Vec<String> = Vec::new();
+        if !search_enc.is_empty() {
+            params.push(format!("q={search_enc}"));
+        }
+        if let Some(sort) = sort_by {
+            params.push(format!("sort={}", url_encode(sort)));
+            params.push(format!("dir={}", sort_dir.as_str()));
+        }
+        for (k, v) in filters {
+            params.push(format!("filter.{}={}", url_encode(k), url_encode(v)));
+        }
+        if params.is_empty() {
+            format!("{prefix}/{model_slug}/export.csv")
+        } else {
+            format!("{prefix}/{model_slug}/export.csv?{}", params.join("&"))
+        }
+    };
 
     let content = html! {
         // Breadcrumbs
@@ -919,7 +939,7 @@ pub fn model_list_page(
                 }
                 div style="display: flex; gap: 0.5rem; align-items: center;" {
                     @if supports_csv_export {
-                        a href={ (prefix) "/" (model_slug) "/export.csv" } class="btn btn-sm"
+                        a href=(export_csv_url) class="btn btn-sm"
                             title="Download all matching records as CSV" {
                             "⬇ Download CSV"
                         }

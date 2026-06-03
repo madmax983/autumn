@@ -310,7 +310,7 @@ impl AdminModel for PostAdmin {
             let new_post = crate::models::NewPost {
                 title,
                 slug: if slug.is_empty() {
-                    crate::models::slugify(row.get("title").map(String::as_str).unwrap_or(""))
+                    crate::models::slugify(&title)
                 } else {
                     slug
                 },

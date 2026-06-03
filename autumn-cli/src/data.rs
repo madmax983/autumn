@@ -4,7 +4,6 @@
 //! The admin plugin must be mounted at `/admin` (or the URL base you
 //! specify) and the model must have CSV export/import enabled.
 
-use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::time::Duration;
 
@@ -14,6 +13,7 @@ fn make_client() -> Result<Client, String> {
     Client::builder()
         .timeout(Duration::from_secs(60))
         .no_proxy()
+        .cookie_store(true)
         .build()
         .map_err(|e| format!("Failed to create HTTP client: {e}"))
 }
@@ -86,8 +86,15 @@ pub fn run_import(
     base_url: &str,
     input: &str,
     dry_run: bool,
-    _upsert_by: Option<&str>,
+    upsert_by: Option<&str>,
 ) {
+    if upsert_by.is_some() {
+        eprintln!(
+            "autumn data import: --upsert-by is not yet supported via the admin HTTP API; \
+             omit the flag to use insert mode, or implement upsert in a custom migration script"
+        );
+        std::process::exit(1);
+    }
     if let Err(e) = run_import_inner(model, base_url, input, dry_run) {
         eprintln!("autumn data import: {e}");
         std::process::exit(1);
@@ -104,9 +111,22 @@ fn run_import_inner(model: &str, base_url: &str, input: &str, dry_run: bool) -> 
     let mode_value = if dry_run { "dry_run" } else { "insert" };
     let label = if dry_run { "Dry run" } else { "Import" };
 
+    // Fetch the import form first so the cookie jar captures the CSRF cookie and
+    // we can extract the matching token value from the hidden input. This two-step
+    // GET→POST is required because Autumn's CSRF middleware rejects unsafe methods
+    // that lack a matching cookie+form-field pair.
+    let form_html = client
+        .get(&url)
+        .send()
+        .map_err(|e| format!("Failed to fetch import form: {e}"))?
+        .text()
+        .map_err(|e| format!("Failed to read import form: {e}"))?;
+
+    let csrf_token = extract_csrf_token(&form_html).unwrap_or_default();
+
     println!("{label}ing {model} from {input} → {url}");
 
-    let form = multipart::Form::new()
+    let mut form = multipart::Form::new()
         .part(
             "file",
             multipart::Part::bytes(csv_bytes)
@@ -121,6 +141,10 @@ fn run_import_inner(model: &str, base_url: &str, input: &str, dry_run: bool) -> 
                 .map_err(|e| format!("MIME type error: {e}"))?,
         )
         .text("mode", mode_value.to_owned());
+
+    if !csrf_token.is_empty() {
+        form = form.text("_csrf", csrf_token);
+    }
 
     let response = client
         .post(&url)
@@ -184,7 +208,21 @@ fn print_import_summary(html: &str, dry_run: bool) {
     }
 }
 
+/// Extract the CSRF token value from a hidden `<input name="_csrf" value="...">`.
+fn extract_csrf_token(html: &str) -> Option<String> {
+    // Find the first hidden input whose `name` attribute is "_csrf" and return
+    // the contents of its `value` attribute. Autumn always renders these in
+    // attribute order: type → name → value, so we look for `name="_csrf"` and
+    // then find the immediately following `value="..."`.
+    let name_pos = html.find("name=\"_csrf\"")?;
+    let after_name = &html[name_pos..];
+    let val_start = after_name.find("value=\"")? + 7;
+    let val_end = after_name[val_start..].find('"')?;
+    Some(after_name[val_start..val_start + val_end].to_owned())
+}
+
 fn percent_encode(s: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut out = String::with_capacity(s.len());
     for byte in s.bytes() {
         match byte {
@@ -193,7 +231,9 @@ fn percent_encode(s: &str) -> String {
             }
             b' ' => out.push('+'),
             b => {
-                let _ = write!(out, "%{b:02X}"); // FmtWrite for String
+                out.push('%');
+                out.push(HEX[(b >> 4) as usize] as char);
+                out.push(HEX[(b & 0xf) as usize] as char);
             }
         }
     }

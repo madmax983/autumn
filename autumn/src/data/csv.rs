@@ -42,7 +42,7 @@
 //! let report = import_csv(
 //!     csv_data.as_ref(),
 //!     &ImportOptions::default(),
-//!     |_line, row| {
+//!     |_line, row, _mode| {
 //!         println!("Importing: {:?}", row);
 //!         ImportRowResult::Inserted
 //!     },
@@ -204,7 +204,7 @@ pub trait CsvSchema {
     /// Ordered list of CSV column headers.
     ///
     /// The order here determines column order in the exported file and must
-    /// match the order of values returned by [`to_csv_record`].
+    /// match the order of values returned by [`CsvSchema::to_csv_record`].
     fn csv_columns() -> &'static [&'static str]
     where
         Self: Sized;
@@ -276,7 +276,7 @@ where
 pub fn import_csv<R, F>(reader: R, opts: &ImportOptions, mut handler: F) -> ImportReport
 where
     R: io::Read,
-    F: FnMut(u64, HashMap<String, String>) -> ImportRowResult,
+    F: FnMut(u64, HashMap<String, String>, &ImportMode) -> ImportRowResult,
 {
     let mut report = ImportReport::default();
 
@@ -315,35 +315,20 @@ where
             .map(|(k, v)| (k.clone(), v.to_owned()))
             .collect();
 
-        let outcome = handler(line, row);
+        let outcome = handler(line, row, &opts.mode);
 
-        match opts.mode {
-            ImportMode::DryRun => match outcome {
-                ImportRowResult::Inserted => report.inserted += 1,
-                ImportRowResult::Updated => report.updated += 1,
-                ImportRowResult::Skipped => report.skipped += 1,
-                ImportRowResult::RowError(msg) => {
-                    report.errors.push(CsvRowError::row(line, msg));
-                }
-                ImportRowResult::FieldError { column, message } => {
-                    report
-                        .errors
-                        .push(CsvRowError::field(line, column, message));
-                }
-            },
-            _ => match outcome {
-                ImportRowResult::Inserted => report.inserted += 1,
-                ImportRowResult::Updated => report.updated += 1,
-                ImportRowResult::Skipped => report.skipped += 1,
-                ImportRowResult::RowError(msg) => {
-                    report.errors.push(CsvRowError::row(line, msg));
-                }
-                ImportRowResult::FieldError { column, message } => {
-                    report
-                        .errors
-                        .push(CsvRowError::field(line, column, message));
-                }
-            },
+        match outcome {
+            ImportRowResult::Inserted => report.inserted += 1,
+            ImportRowResult::Updated => report.updated += 1,
+            ImportRowResult::Skipped => report.skipped += 1,
+            ImportRowResult::RowError(msg) => {
+                report.errors.push(CsvRowError::row(line, msg));
+            }
+            ImportRowResult::FieldError { column, message } => {
+                report
+                    .errors
+                    .push(CsvRowError::field(line, column, message));
+            }
         }
     }
 
@@ -494,9 +479,11 @@ mod tests {
     #[test]
     fn import_csv_insert_mode_counts_inserted() {
         let csv = b"id,title,published\n1,Hello,true\n2,World,false\n";
-        let report = import_csv(csv.as_ref(), &ImportOptions::default(), |_line, _row| {
-            ImportRowResult::Inserted
-        });
+        let report = import_csv(
+            csv.as_ref(),
+            &ImportOptions::default(),
+            |_line, _row, _mode| ImportRowResult::Inserted,
+        );
         assert_eq!(report.inserted, 2);
         assert_eq!(report.updated, 0);
         assert_eq!(report.skipped, 0);
@@ -507,10 +494,14 @@ mod tests {
     fn import_csv_handler_receives_column_values_as_map() {
         let csv = b"title,published\nHello,true\n";
         let mut seen: Option<HashMap<String, String>> = None;
-        import_csv(csv.as_ref(), &ImportOptions::default(), |_line, row| {
-            seen = Some(row);
-            ImportRowResult::Inserted
-        });
+        import_csv(
+            csv.as_ref(),
+            &ImportOptions::default(),
+            |_line, row, _mode| {
+                seen = Some(row);
+                ImportRowResult::Inserted
+            },
+        );
         let row = seen.unwrap();
         assert_eq!(row.get("title").map(String::as_str), Some("Hello"));
         assert_eq!(row.get("published").map(String::as_str), Some("true"));
@@ -519,14 +510,18 @@ mod tests {
     #[test]
     fn import_csv_row_error_is_captured_with_line_number() {
         let csv = b"title\nGood row\nBad row\nAnother good\n";
-        let report = import_csv(csv.as_ref(), &ImportOptions::default(), |line, row| {
-            if row.get("title").map(String::as_str) == Some("Bad row") {
-                ImportRowResult::RowError("title must not be 'Bad row'".into())
-            } else {
-                let _ = line;
-                ImportRowResult::Inserted
-            }
-        });
+        let report = import_csv(
+            csv.as_ref(),
+            &ImportOptions::default(),
+            |line, row, _mode| {
+                if row.get("title").map(String::as_str) == Some("Bad row") {
+                    ImportRowResult::RowError("title must not be 'Bad row'".into())
+                } else {
+                    let _ = line;
+                    ImportRowResult::Inserted
+                }
+            },
+        );
         assert_eq!(report.inserted, 2);
         assert_eq!(report.errors.len(), 1);
         assert_eq!(report.errors[0].message, "title must not be 'Bad row'");
@@ -535,21 +530,25 @@ mod tests {
     #[test]
     fn import_csv_field_error_records_column_name() {
         let csv = b"email\nbad-email\n";
-        let report = import_csv(csv.as_ref(), &ImportOptions::default(), |_line, row| {
-            if !row
-                .get("email")
-                .map(String::as_str)
-                .unwrap_or("")
-                .contains('@')
-            {
-                ImportRowResult::FieldError {
-                    column: "email".into(),
-                    message: "must be a valid email".into(),
+        let report = import_csv(
+            csv.as_ref(),
+            &ImportOptions::default(),
+            |_line, row, _mode| {
+                if !row
+                    .get("email")
+                    .map(String::as_str)
+                    .unwrap_or("")
+                    .contains('@')
+                {
+                    ImportRowResult::FieldError {
+                        column: "email".into(),
+                        message: "must be a valid email".into(),
+                    }
+                } else {
+                    ImportRowResult::Inserted
                 }
-            } else {
-                ImportRowResult::Inserted
-            }
-        });
+            },
+        );
         assert_eq!(report.errors.len(), 1);
         assert_eq!(report.errors[0].column.as_deref(), Some("email"));
         assert_eq!(report.errors[0].message, "must be a valid email");
@@ -563,15 +562,14 @@ mod tests {
             mode: ImportMode::DryRun,
             batch_size: 100,
         };
-        let report = import_csv(csv.as_ref(), &opts, |_line, _row| {
-            write_called = true; // handler IS called in dry-run
+        let report = import_csv(csv.as_ref(), &opts, |_line, _row, mode| {
+            // A correctly-implemented handler gates writes on mode.
+            if !matches!(mode, ImportMode::DryRun) {
+                write_called = true;
+            }
             ImportRowResult::Inserted
         });
-        // DryRun: handler is called but we note that callers should gate writes on mode
-        assert!(
-            write_called,
-            "handler must be invoked in dry-run to gather counts"
-        );
+        assert!(!write_called, "handler must not write in dry-run mode");
         assert_eq!(report.inserted, 2, "dry-run should still count rows");
     }
 
@@ -584,7 +582,9 @@ mod tests {
             },
             batch_size: 100,
         };
-        let report = import_csv(csv.as_ref(), &opts, |_line, _row| ImportRowResult::Updated);
+        let report = import_csv(csv.as_ref(), &opts, |_line, _row, _mode| {
+            ImportRowResult::Updated
+        });
         assert_eq!(report.updated, 2);
         assert_eq!(report.inserted, 0);
     }
@@ -603,13 +603,17 @@ mod tests {
             }
         }
 
-        let report = import_csv(csv.as_bytes(), &ImportOptions::default(), |_line, row| {
-            if row.get("value").map(String::as_str) == Some("BAD") {
-                ImportRowResult::RowError("value is BAD".into())
-            } else {
-                ImportRowResult::Inserted
-            }
-        });
+        let report = import_csv(
+            csv.as_bytes(),
+            &ImportOptions::default(),
+            |_line, row, _mode| {
+                if row.get("value").map(String::as_str) == Some("BAD") {
+                    ImportRowResult::RowError("value is BAD".into())
+                } else {
+                    ImportRowResult::Inserted
+                }
+            },
+        );
         assert_eq!(report.errors.len(), 1, "exactly one error expected");
         assert!(!report.errors.is_empty());
         assert_eq!(report.errors[0].message, "value is BAD");
@@ -618,13 +622,17 @@ mod tests {
     #[test]
     fn import_csv_skipped_rows_counted() {
         let csv = b"status\nactive\narchived\nactive\n";
-        let report = import_csv(csv.as_ref(), &ImportOptions::default(), |_line, row| {
-            if row.get("status").map(String::as_str) == Some("archived") {
-                ImportRowResult::Skipped
-            } else {
-                ImportRowResult::Inserted
-            }
-        });
+        let report = import_csv(
+            csv.as_ref(),
+            &ImportOptions::default(),
+            |_line, row, _mode| {
+                if row.get("status").map(String::as_str) == Some("archived") {
+                    ImportRowResult::Skipped
+                } else {
+                    ImportRowResult::Inserted
+                }
+            },
+        );
         assert_eq!(report.inserted, 2);
         assert_eq!(report.skipped, 1);
         assert_eq!(report.total_rows(), 3);
@@ -649,7 +657,7 @@ mod tests {
         import_csv(
             exported.as_slice(),
             &ImportOptions::default(),
-            |_line, row| {
+            |_line, row, _mode| {
                 titles_imported.push(row.get("title").cloned().unwrap_or_default());
                 ImportRowResult::Inserted
             },

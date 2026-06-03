@@ -957,6 +957,7 @@ async fn model_export_csv(
 }
 
 /// `GET /admin/{slug}/import` — Render the CSV import form.
+#[allow(clippy::too_many_arguments)]
 async fn model_import_form(
     State(state): State<AppState>,
     axum::Extension(registry): axum::Extension<Arc<AdminRegistry>>,
@@ -993,7 +994,7 @@ async fn model_import_form(
 }
 
 /// `POST /admin/{slug}/import` — Accept a multipart CSV upload and import rows.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn model_import_csv(
     State(state): State<AppState>,
     axum::Extension(registry): axum::Extension<Arc<AdminRegistry>>,
@@ -1037,7 +1038,7 @@ async fn model_import_csv(
                     .text()
                     .await
                     .map_err(|e| AutumnError::bad_request_msg(format!("Mode field error: {e}")))?;
-                import_mode = CsvImportMode::from_str(&val);
+                import_mode = CsvImportMode::from_form_value(&val);
             }
             _ => {}
         }
@@ -1060,39 +1061,49 @@ async fn model_import_csv(
 
     let mut report = AdminImportReport::default();
 
-    let records: Vec<csv::StringRecord> = rdr.records().filter_map(|r| r.ok()).collect();
+    for result in rdr.records() {
+        match result {
+            Ok(record) => {
+                let line = record.position().map_or(0, csv::Position::line);
+                let row: std::collections::HashMap<String, String> = headers
+                    .iter()
+                    .zip(record.iter())
+                    .map(|(k, v)| (k.clone(), v.to_owned()))
+                    .collect();
 
-    for record in records {
-        let line = record.position().map_or(0, |p| p.line());
-        let row: std::collections::HashMap<String, String> = headers
-            .iter()
-            .zip(record.iter())
-            .map(|(k, v)| (k.clone(), v.to_owned()))
-            .collect();
+                let outcome = model
+                    .import_csv_row(&pool, line, row, import_mode)
+                    .await
+                    .unwrap_or_else(|_| {
+                        AdminImportRowResult::RowError("Handler returned an error".to_owned())
+                    });
 
-        let outcome = model
-            .import_csv_row(&pool, line, row, import_mode)
-            .await
-            .unwrap_or(AdminImportRowResult::RowError(
-                "Handler returned an error".to_owned(),
-            ));
-
-        match outcome {
-            AdminImportRowResult::Inserted => report.inserted += 1,
-            AdminImportRowResult::Updated => report.updated += 1,
-            AdminImportRowResult::Skipped => report.skipped += 1,
-            AdminImportRowResult::RowError(msg) => {
+                match outcome {
+                    AdminImportRowResult::Inserted => report.inserted += 1,
+                    AdminImportRowResult::Updated => report.updated += 1,
+                    AdminImportRowResult::Skipped => report.skipped += 1,
+                    AdminImportRowResult::RowError(msg) => {
+                        report.errors.push(AdminImportError {
+                            line,
+                            column: None,
+                            message: msg,
+                        });
+                    }
+                    AdminImportRowResult::FieldError { column, message } => {
+                        report.errors.push(AdminImportError {
+                            line,
+                            column: Some(column),
+                            message,
+                        });
+                    }
+                }
+            }
+            Err(e) => {
+                let line = e.position().map_or(0, csv::Position::line);
                 report.errors.push(AdminImportError {
                     line,
                     column: None,
-                    message: msg,
-                });
-            }
-            AdminImportRowResult::FieldError { column, message } => {
-                report.errors.push(AdminImportError {
-                    line,
-                    column: Some(column),
-                    message,
+                    message: format!("CSV parse error: {e}"),
                 });
             }
         }
