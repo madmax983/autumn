@@ -307,13 +307,14 @@ impl AdminModel for PostAdmin {
                 .map(|v| v == "true" || v == "1")
                 .unwrap_or(false);
 
+            let slug = if slug.is_empty() {
+                crate::models::slugify(&title)
+            } else {
+                slug
+            };
             let new_post = crate::models::NewPost {
                 title,
-                slug: if slug.is_empty() {
-                    crate::models::slugify(&title)
-                } else {
-                    slug
-                },
+                slug,
                 body,
                 published,
             };
