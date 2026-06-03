@@ -86,10 +86,7 @@ pub enum RouterBuildError {
     },
     /// A route is annotated with an API version that is not registered.
     #[error("route '{route_name}' uses unregistered API version '{version}'")]
-    UnregisteredApiVersion {
-        route_name: String,
-        version: String,
-    },
+    UnregisteredApiVersion { route_name: String, version: String },
 }
 
 /// Build the fully-configured Axum router from routes, config, and state.
@@ -357,7 +354,12 @@ fn build_router_pre_state(
     router = router.nest_service("/static", tower_http::services::ServeDir::new(&static_dir));
     router = router.layer(axum::middleware::from_fn(asset_cache_control));
 
-    router = mount_scoped_groups(router, ctx.scoped_groups, idempotency_layers.as_ref(), state);
+    router = mount_scoped_groups(
+        router,
+        ctx.scoped_groups,
+        idempotency_layers.as_ref(),
+        state,
+    );
 
     router = mount_raw_routers(
         router,
@@ -444,14 +446,36 @@ pub fn extract_path_params(path: &str) -> Vec<String> {
     out
 }
 
+/// Handler that dynamically constructs the OpenAPI specification document per request
+/// so deprecation and sunset statuses do not go stale.
+#[cfg(feature = "openapi")]
+async fn serve_openapi_spec(
+    axum::extract::Extension(config): axum::extract::Extension<
+        std::sync::Arc<crate::openapi::OpenApiConfig>,
+    >,
+    axum::extract::Extension(docs): axum::extract::Extension<
+        std::sync::Arc<Vec<crate::openapi::ApiDoc>>,
+    >,
+) -> impl axum::response::IntoResponse {
+    use axum::response::IntoResponse;
+    let refs: Vec<&crate::openapi::ApiDoc> = docs.iter().collect();
+    let spec = crate::openapi::generate_spec(&config, &refs);
+    let spec_json = serde_json::to_string_pretty(&spec)
+        .unwrap_or_else(|e| format!("{{\"error\": \"failed to serialize spec: {e}\"}}"));
+    (
+        [(http::header::CONTENT_TYPE, "application/json")],
+        spec_json,
+    )
+        .into_response()
+}
+
 /// Build an Axum sub-router that serves the generated `OpenAPI` document
 /// and (optionally) a Swagger UI HTML page.
 ///
 /// Returns `None` when `OpenAPI` generation is disabled, i.e. the user
 /// never called [`AppBuilder::openapi`](crate::app::AppBuilder::openapi).
 ///
-/// The spec is rendered once at build time and stored in an `Arc<String>`
-/// so the `/v3/api-docs` handler performs no serialization per request.
+/// The spec is dynamically generated on request to prevent lifecycle status from going stale.
 #[cfg(feature = "openapi")]
 fn build_openapi_router(
     route_list: &[Route],
@@ -483,30 +507,16 @@ fn build_openapi_router(
 
     let docs = collect_openapi_docs(route_list, scoped_groups);
 
-    let refs: Vec<&crate::openapi::ApiDoc> = docs.iter().collect();
-    let spec = crate::openapi::generate_spec(&config, &refs);
-    let spec_json = serde_json::to_string_pretty(&spec)
-        .unwrap_or_else(|e| format!("{{\"error\": \"failed to serialize spec: {e}\"}}"));
-
-    let spec_body = Arc::new(spec_json);
     let json_path = config.openapi_json_path.clone();
     let swagger_path = config.swagger_ui_path.clone();
     let title = config.title.clone();
 
-    let mut router = axum::Router::<AppState>::new().route(
-        &json_path,
-        axum::routing::get(move || {
-            let spec = spec_body.clone();
-            async move {
-                use axum::response::IntoResponse;
-                (
-                    [(http::header::CONTENT_TYPE, "application/json")],
-                    (*spec).clone(),
-                )
-                    .into_response()
-            }
-        }),
-    );
+    let mut router = axum::Router::<AppState>::new()
+        .route(&json_path, axum::routing::get(serve_openapi_spec))
+        .layer(axum::extract::Extension(std::sync::Arc::new(
+            config.clone(),
+        )))
+        .layer(axum::extract::Extension(std::sync::Arc::new(docs)));
 
     if let Some(path) = swagger_path {
         router = mount_swagger_ui_routes(router, &path, &title, &json_path);
@@ -4005,16 +4015,16 @@ async fn api_versioning_middleware(
     let now = clock.now();
 
     let versions = state.extension::<crate::app::RegisteredApiVersions>();
-    let matching_version = versions.as_ref().and_then(|v| {
-        v.0.iter().find(|av| av.version == meta.version)
-    });
+    let matching_version = versions
+        .as_ref()
+        .and_then(|v| v.0.iter().find(|av| av.version == meta.version));
 
     let Some(version) = matching_version else {
         return next.run(request).await;
     };
 
-    let is_deprecated = version.deprecated_at.map_or(false, |d| now >= d);
-    let is_sunset = version.sunset_at.map_or(false, |s| now >= s);
+    let is_deprecated = version.deprecated_at.is_some_and(|d| now >= d);
+    let is_sunset = version.sunset_at.is_some_and(|s| now >= s);
 
     if is_sunset && !meta.sunset_opt_out {
         let err = crate::error::AutumnError::gone_msg(format!(
@@ -4028,8 +4038,12 @@ async fn api_versioning_middleware(
                 response.headers_mut().insert("Sunset", val);
             }
         }
-        if let Ok(val) = axum::http::HeaderValue::from_str("true") {
-            response.headers_mut().insert("Deprecation", val);
+        let deprecation_date = version.deprecated_at.or(version.sunset_at);
+        if let Some(date) = deprecation_date {
+            let timestamp = date.timestamp();
+            if let Ok(val) = axum::http::HeaderValue::from_str(&format!("@{timestamp}")) {
+                response.headers_mut().insert("Deprecation", val);
+            }
         }
         return response;
     }
@@ -4037,16 +4051,18 @@ async fn api_versioning_middleware(
     let mut response = next.run(request).await;
 
     if is_deprecated || is_sunset {
-        if let Ok(val) = axum::http::HeaderValue::from_str("true") {
-            response.headers_mut().insert("Deprecation", val);
+        let deprecation_date = version.deprecated_at.or(version.sunset_at);
+        if let Some(date) = deprecation_date {
+            let timestamp = date.timestamp();
+            if let Ok(val) = axum::http::HeaderValue::from_str(&format!("@{timestamp}")) {
+                response.headers_mut().insert("Deprecation", val);
+            }
         }
     }
-    if let Some(sunset) = version.sunset_at {
-        if is_deprecated || is_sunset {
-            let http_date = sunset.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
-            if let Ok(val) = axum::http::HeaderValue::from_str(&http_date) {
-                response.headers_mut().insert("Sunset", val);
-            }
+    if let Some(sunset) = version.sunset_at.filter(|_| is_deprecated || is_sunset) {
+        let http_date = sunset.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+        if let Ok(val) = axum::http::HeaderValue::from_str(&http_date) {
+            response.headers_mut().insert("Sunset", val);
         }
     }
 

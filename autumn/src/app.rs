@@ -340,8 +340,7 @@ pub struct ScopedGroup {
     /// Registration origin: user application or a named plugin.
     pub source: crate::route_listing::RouteSource,
     /// Closure that applies the layer to a sub-router.
-    pub apply_layer:
-        Box<dyn FnOnce(axum::Router<AppState>) -> axum::Router<AppState> + Send>,
+    pub apply_layer: Box<dyn FnOnce(axum::Router<AppState>) -> axum::Router<AppState> + Send>,
 }
 
 /// A deferred router mutator that applies a user-registered
@@ -2742,6 +2741,36 @@ impl AppBuilder {
             ..
         } = self;
 
+        // Validate that all versioned routes use a registered API version
+        let registered_versions: std::collections::HashSet<&str> =
+            api_versions.iter().map(|av| av.version.as_str()).collect();
+
+        for route in &routes {
+            if let Some(ver) = route.api_version {
+                if !registered_versions.contains(ver) {
+                    eprintln!(
+                        "Failed to build router: route '{}' uses unregistered API version '{}'",
+                        route.name, ver
+                    );
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        for group in &scoped_groups {
+            for route in &group.routes {
+                if let Some(ver) = route.api_version {
+                    if !registered_versions.contains(ver) {
+                        eprintln!(
+                            "Failed to build router: route '{}' uses unregistered API version '{}'",
+                            route.name, ver
+                        );
+                        std::process::exit(1);
+                    }
+                }
+            }
+        }
+
         // Raw Axum routers registered via .merge()/.nest() are opaque: there is
         // no public API to enumerate their routes. Always warn so callers know
         // some routes may be missing even if declare_plugin_routes was used.
@@ -2756,8 +2785,18 @@ impl AppBuilder {
         let (config, _telemetry_guard) =
             load_config_and_telemetry(config_loader_factory, telemetry_provider).await;
 
-        let mut infos =
-            crate::route_listing::collect_route_infos(&routes, &route_sources, &scoped_groups, &api_versions);
+        let mut infos = match crate::route_listing::collect_route_infos(
+            &routes,
+            &route_sources,
+            &scoped_groups,
+            &api_versions,
+        ) {
+            Ok(infos) => infos,
+            Err(e) => {
+                eprintln!("Failed to build router: {e}");
+                std::process::exit(1);
+            }
+        };
         infos.extend(declared_routes);
         crate::route_listing::append_framework_routes(&mut infos, &config);
         #[cfg(feature = "openapi")]

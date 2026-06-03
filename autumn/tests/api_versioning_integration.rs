@@ -14,7 +14,11 @@ async fn api_info_v1_opt() -> &'static str {
     "v1 info opt"
 }
 
-#[get("/api/sunset-only-opt", api_version = "v_sunset_only", sunset_opt_out = true)]
+#[get(
+    "/api/sunset-only-opt",
+    api_version = "v_sunset_only",
+    sunset_opt_out = true
+)]
 async fn api_sunset_only_opt() -> &'static str {
     "sunset only opt"
 }
@@ -33,7 +37,12 @@ async fn test_api_versioning_integration() {
     let clock = TickingClock::starting_at(start_time);
 
     let client = TestApp::new()
-        .routes(routes![api_info_v1, api_info_v1_opt, api_plain, api_sunset_only_opt])
+        .routes(routes![
+            api_info_v1,
+            api_info_v1_opt,
+            api_plain,
+            api_sunset_only_opt
+        ])
         .api_version(autumn_web::app::ApiVersion {
             version: "v1".to_string(),
             deprecated_at: Some(deprecated_at),
@@ -59,11 +68,15 @@ async fn test_api_versioning_integration() {
     assert!(resp.header("Deprecation").is_none());
     assert!(resp.header("Sunset").is_none());
 
-    // 3. Move past deprecation: Deprecation: true, Sunset: date headers are emitted
+    // 3. Move past deprecation: Deprecation: structured date, Sunset: date headers are emitted
     client.advance_clock(Duration::from_secs(24 * 3600 + 10)); // past deprecation (June 2)
     let resp = client.get("/api/info").send().await;
     resp.assert_ok();
-    assert_eq!(resp.header("Deprecation").unwrap(), "true");
+    let expected_deprecation_header = format!("@{}", deprecated_at.timestamp());
+    assert_eq!(
+        resp.header("Deprecation").unwrap(),
+        expected_deprecation_header
+    );
     let expected_sunset_header = sunset_at.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
     assert_eq!(resp.header("Sunset").unwrap(), expected_sunset_header);
 
@@ -72,20 +85,30 @@ async fn test_api_versioning_integration() {
     let resp = client.get("/api/info").send().await;
     resp.assert_status(410);
     assert_eq!(resp.header("Sunset").unwrap(), expected_sunset_header);
-    assert_eq!(resp.header("Deprecation").unwrap(), "true");
-    
+    assert_eq!(
+        resp.header("Deprecation").unwrap(),
+        expected_deprecation_header
+    );
+
     let body = resp.text();
     assert!(body.contains("autumn.gone"));
 
     // 5. Opt-out route past sunset bypasses 410 Gone but still emits headers
     let resp = client.get("/api/info-opt").send().await;
     resp.assert_ok();
-    assert_eq!(resp.header("Deprecation").unwrap(), "true");
+    assert_eq!(
+        resp.header("Deprecation").unwrap(),
+        expected_deprecation_header
+    );
     assert_eq!(resp.header("Sunset").unwrap(), expected_sunset_header);
 
     // 6. Opt-out route past sunset (with no deprecation_at configured) still emits Deprecation header
     let resp = client.get("/api/sunset-only-opt").send().await;
     resp.assert_ok();
-    assert_eq!(resp.header("Deprecation").unwrap(), "true");
+    let expected_sunset_deprecation_header = format!("@{}", sunset_at.timestamp());
+    assert_eq!(
+        resp.header("Deprecation").unwrap(),
+        expected_sunset_deprecation_header
+    );
     assert_eq!(resp.header("Sunset").unwrap(), expected_sunset_header);
 }

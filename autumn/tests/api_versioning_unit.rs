@@ -19,7 +19,7 @@ fn test_route_version_fields() {
             ..Default::default()
         },
         repository: None,
-        idempotency: Default::default(),
+        idempotency: autumn_web::RouteIdempotency::default(),
     };
 
     assert_eq!(route.api_version, Some("v1"));
@@ -35,19 +35,18 @@ fn test_autumn_error_gone() {
 
 #[test]
 fn test_app_builder_api_version_registry() {
-    let app = autumn_web::app()
-        .api_version(autumn_web::app::ApiVersion {
-            version: "v1".to_string(),
-            deprecated_at: None,
-            sunset_at: None,
-        });
+    let app = autumn_web::app().api_version(autumn_web::app::ApiVersion {
+        version: "v1".to_string(),
+        deprecated_at: None,
+        sunset_at: None,
+    });
     assert_eq!(app.api_versions.len(), 1);
 }
 
 #[tokio::test]
 async fn test_startup_validation_rejects_unregistered_version() {
-    use autumn_web::{get, routes};
     use autumn_web::test::TestApp;
+    use autumn_web::{get, routes};
 
     #[get("/v2/test", api_version = "v2")]
     async fn versioned_handler() -> &'static str {
@@ -55,9 +54,7 @@ async fn test_startup_validation_rejects_unregistered_version() {
     }
 
     let result = std::panic::catch_unwind(|| {
-        let _client = TestApp::new()
-            .routes(routes![versioned_handler])
-            .build();
+        let _client = TestApp::new().routes(routes![versioned_handler]).build();
     });
 
     assert!(result.is_err());
@@ -95,7 +92,7 @@ fn test_route_listing_with_version_and_status() {
             sunset_opt_out: false,
             api_doc: ApiDoc::default(),
             repository: None,
-            idempotency: Default::default(),
+            idempotency: autumn_web::RouteIdempotency::default(),
         },
         autumn_web::Route {
             method: http::Method::GET,
@@ -106,7 +103,7 @@ fn test_route_listing_with_version_and_status() {
             sunset_opt_out: true,
             api_doc: ApiDoc::default(),
             repository: None,
-            idempotency: Default::default(),
+            idempotency: autumn_web::RouteIdempotency::default(),
         },
         autumn_web::Route {
             method: http::Method::GET,
@@ -117,7 +114,7 @@ fn test_route_listing_with_version_and_status() {
             sunset_opt_out: false,
             api_doc: ApiDoc::default(),
             repository: None,
-            idempotency: Default::default(),
+            idempotency: autumn_web::RouteIdempotency::default(),
         },
         autumn_web::Route {
             method: http::Method::GET,
@@ -128,15 +125,15 @@ fn test_route_listing_with_version_and_status() {
             sunset_opt_out: false,
             api_doc: ApiDoc::default(),
             repository: None,
-            idempotency: Default::default(),
+            idempotency: autumn_web::RouteIdempotency::default(),
         },
     ];
 
     let registry = vec![active_version, deprecated_version, sunset_version];
-    let infos = collect_route_infos(&routes, &[], &[], &registry);
+    let infos = collect_route_infos(&routes, &[], &[], &registry).unwrap();
 
     assert_eq!(infos.len(), 4);
-    
+
     // v1: active
     assert_eq!(infos[0].api_version, Some("v1".to_string()));
     assert_eq!(infos[0].status, Some("active".to_string()));

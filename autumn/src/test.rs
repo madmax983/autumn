@@ -647,7 +647,10 @@ impl TestApp {
 
     /// Register multiple API versions for testing.
     #[must_use]
-    pub fn api_versions(mut self, versions: impl IntoIterator<Item = crate::app::ApiVersion>) -> Self {
+    pub fn api_versions(
+        mut self,
+        versions: impl IntoIterator<Item = crate::app::ApiVersion>,
+    ) -> Self {
         self.api_versions.extend(versions);
         self
     }

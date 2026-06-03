@@ -1,14 +1,14 @@
-//! OpenAPI versioning integration tests.
+//! `OpenAPI` versioning integration tests.
 //!
-//! Verifies that OpenAPI spec generation correctly tags operations with their
+//! Verifies that `OpenAPI` spec generation correctly tags operations with their
 //! API version names and sets the `deprecated: true` property when a route
 //! is associated with a version whose deprecation date is in the past.
 
 #![cfg(feature = "openapi")]
 
+use autumn_web::app::ApiVersion;
 use autumn_web::openapi::OpenApiConfig;
 use autumn_web::prelude::*;
-use autumn_web::app::ApiVersion;
 use chrono::{TimeZone, Utc};
 
 #[get("/v1/items", api_version = "v1")]

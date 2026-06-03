@@ -140,7 +140,15 @@ pub fn print_table(routes: &[RouteInfo]) {
 
 /// Build the table string (extracted for testability).
 pub fn format_table(routes: &[RouteInfo]) -> String {
-    const HEADERS: [&str; 7] = ["Method", "Path", "Handler", "Version", "Status", "Source", "Middleware"];
+    const HEADERS: [&str; 7] = [
+        "Method",
+        "Path",
+        "Handler",
+        "Version",
+        "Status",
+        "Source",
+        "Middleware",
+    ];
 
     // Compute column widths
     let widths = compute_column_widths(routes, &HEADERS);

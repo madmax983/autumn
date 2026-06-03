@@ -88,33 +88,47 @@ pub fn collect_route_infos(
     route_sources: &[RouteSource],
     scoped_groups: &[ScopedGroup],
     api_versions: &[crate::app::ApiVersion],
-) -> Vec<RouteInfo> {
+) -> Result<Vec<RouteInfo>, crate::router::RouterBuildError> {
     let mut infos = Vec::with_capacity(routes.len());
     let now = chrono::Utc::now();
 
-    let resolve_status = |api_version: Option<&str>, sunset_opt_out: bool| -> (Option<String>, Option<String>, Option<bool>) {
+    let resolve_status = |route_name: &str,
+                          api_version: Option<&str>,
+                          sunset_opt_out: bool|
+     -> Result<
+        (Option<String>, Option<String>, Option<bool>),
+        crate::router::RouterBuildError,
+    > {
         let Some(ver) = api_version else {
-            return (None, None, None);
+            return Ok((None, None, None));
         };
-        let status = if let Some(av) = api_versions.iter().find(|av| av.version == ver) {
-            let is_sunset = av.sunset_at.map_or(false, |s| now >= s);
-            let is_dep = av.deprecated_at.map_or(false, |d| now >= d);
-            if is_sunset {
+        if let Some(av) = api_versions.iter().find(|av| av.version == ver) {
+            let is_sunset = av.sunset_at.is_some_and(|s| now >= s);
+            let is_dep = av.deprecated_at.is_some_and(|d| now >= d);
+            let status = if is_sunset {
                 "sunset"
             } else if is_dep {
                 "deprecated"
             } else {
                 "active"
-            }
+            };
+            Ok((
+                Some(ver.to_string()),
+                Some(status.to_string()),
+                Some(sunset_opt_out),
+            ))
         } else {
-            "active"
-        };
-        (Some(ver.to_string()), Some(status.to_string()), Some(sunset_opt_out))
+            Err(crate::router::RouterBuildError::UnregisteredApiVersion {
+                route_name: route_name.to_string(),
+                version: ver.to_string(),
+            })
+        }
     };
 
     for (i, route) in routes.iter().enumerate() {
         let source = route_sources.get(i).cloned().unwrap_or(RouteSource::User);
-        let (api_version, status, sunset_opt_out) = resolve_status(route.api_version, route.sunset_opt_out);
+        let (api_version, status, sunset_opt_out) =
+            resolve_status(route.name, route.api_version, route.sunset_opt_out)?;
         infos.push(RouteInfo {
             method: route.method.to_string(),
             path: route.path.to_owned(),
@@ -130,7 +144,8 @@ pub fn collect_route_infos(
     for group in scoped_groups {
         for route in &group.routes {
             let full_path = join_scope_path(&group.prefix, route.path);
-            let (api_version, status, sunset_opt_out) = resolve_status(route.api_version, route.sunset_opt_out);
+            let (api_version, status, sunset_opt_out) =
+                resolve_status(route.name, route.api_version, route.sunset_opt_out)?;
             infos.push(RouteInfo {
                 method: route.method.to_string(),
                 path: full_path,
@@ -144,7 +159,7 @@ pub fn collect_route_infos(
         }
     }
 
-    infos
+    Ok(infos)
 }
 
 /// Append framework-internal routes (probes, actuator, htmx assets).
@@ -398,7 +413,7 @@ mod tests {
 
     #[test]
     fn collect_route_infos_empty_produces_empty() {
-        let infos = collect_route_infos(&[], &[], &[], &[]);
+        let infos = collect_route_infos(&[], &[], &[], &[]).unwrap();
         assert!(infos.is_empty());
     }
 
@@ -406,7 +421,7 @@ mod tests {
     fn collect_route_infos_single_user_route() {
         let routes = vec![make_route(Method::GET, "/posts", "list_posts")];
         let sources = vec![RouteSource::User];
-        let infos = collect_route_infos(&routes, &sources, &[], &[]);
+        let infos = collect_route_infos(&routes, &sources, &[], &[]).unwrap();
         assert_eq!(infos.len(), 1);
         assert_eq!(infos[0].method, "GET");
         assert_eq!(infos[0].path, "/posts");
@@ -422,7 +437,7 @@ mod tests {
             make_route(Method::POST, "/posts", "create_post"),
         ];
         let sources = vec![RouteSource::User, RouteSource::User];
-        let infos = collect_route_infos(&routes, &sources, &[], &[]);
+        let infos = collect_route_infos(&routes, &sources, &[], &[]).unwrap();
         assert_eq!(infos.len(), 2);
     }
 
@@ -444,7 +459,7 @@ mod tests {
             make_route(Method::DELETE, "/posts/{id}", "delete_post"),
         ];
         let sources = vec![RouteSource::User; 3];
-        let infos = collect_route_infos(&routes, &sources, &[], &[]);
+        let infos = collect_route_infos(&routes, &sources, &[], &[]).unwrap();
         let methods: Vec<&str> = infos.iter().map(|i| i.method.as_str()).collect();
         assert_eq!(methods, vec!["PUT", "PATCH", "DELETE"]);
         // The transport method browsers actually use must never appear in
@@ -460,7 +475,7 @@ mod tests {
             source: RouteSource::User,
             apply_layer: Box::new(|r| r),
         };
-        let infos = collect_route_infos(&[], &[], &[group], &[]);
+        let infos = collect_route_infos(&[], &[], &[group], &[]).unwrap();
         assert_eq!(infos.len(), 1);
         assert_eq!(infos[0].path, "/api/posts");
         assert_eq!(infos[0].handler, "api_list_posts");
@@ -474,7 +489,7 @@ mod tests {
             source: RouteSource::User,
             apply_layer: Box::new(|r| r),
         };
-        let infos = collect_route_infos(&[], &[], &[group], &[]);
+        let infos = collect_route_infos(&[], &[], &[group], &[]).unwrap();
         assert_eq!(infos.len(), 1);
         assert_eq!(infos[0].path, "/api");
     }
@@ -483,7 +498,7 @@ mod tests {
     fn collect_route_infos_marks_user_source() {
         let routes = vec![make_route(Method::POST, "/items", "create_item")];
         let sources = vec![RouteSource::User];
-        let infos = collect_route_infos(&routes, &sources, &[], &[]);
+        let infos = collect_route_infos(&routes, &sources, &[], &[]).unwrap();
         assert_eq!(infos[0].source, RouteSource::User);
     }
 
@@ -491,7 +506,7 @@ mod tests {
     fn collect_route_infos_plugin_source_from_parallel_slice() {
         let routes = vec![make_route(Method::GET, "/admin", "admin_index")];
         let sources = vec![RouteSource::Plugin("admin".to_owned())];
-        let infos = collect_route_infos(&routes, &sources, &[], &[]);
+        let infos = collect_route_infos(&routes, &sources, &[], &[]).unwrap();
         assert_eq!(infos[0].source, RouteSource::Plugin("admin".to_owned()));
     }
 
@@ -503,7 +518,7 @@ mod tests {
             source: RouteSource::Plugin("admin".to_owned()),
             apply_layer: Box::new(|r| r),
         };
-        let infos = collect_route_infos(&[], &[], &[group], &[]);
+        let infos = collect_route_infos(&[], &[], &[group], &[]).unwrap();
         assert_eq!(infos[0].source, RouteSource::Plugin("admin".to_owned()));
         assert_eq!(infos[0].path, "/admin/users");
     }
@@ -512,7 +527,7 @@ mod tests {
     fn collect_route_infos_missing_source_defaults_to_user() {
         let routes = vec![make_route(Method::GET, "/x", "x")];
         // empty sources slice — should fall back to User
-        let infos = collect_route_infos(&routes, &[], &[], &[]);
+        let infos = collect_route_infos(&routes, &[], &[], &[]).unwrap();
         assert_eq!(infos[0].source, RouteSource::User);
     }
 

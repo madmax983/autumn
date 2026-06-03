@@ -1162,7 +1162,9 @@ fn run_command(command: Commands) {
                     }
                 }
             } else {
-                eprintln!("autumn check: specify at least one check flag (e.g. --a11y) or a subcommand (e.g. deprecations)");
+                eprintln!(
+                    "autumn check: specify at least one check flag (e.g. --a11y) or a subcommand (e.g. deprecations)"
+                );
                 std::process::exit(1);
             }
         }
@@ -1381,15 +1383,38 @@ fn run_deprecations_check(package: Option<&str>, bin: Option<&str>) {
     });
 
     let mut sunsetted_routes = Vec::new();
+    let mut opted_out_routes = Vec::new();
     for route in &routes {
-        if route.status.as_deref() == Some("sunset") && route.sunset_opt_out != Some(true) {
-            sunsetted_routes.push(route);
+        if route.status.as_deref() == Some("sunset") {
+            if route.sunset_opt_out == Some(true) {
+                opted_out_routes.push(route);
+            } else {
+                sunsetted_routes.push(route);
+            }
+        }
+    }
+
+    let failed = !opted_out_routes.is_empty() || !sunsetted_routes.is_empty();
+
+    if !opted_out_routes.is_empty() {
+        eprintln!(
+            "\u{2717} Found {} active past-sunset route(s) (opted out):",
+            opted_out_routes.len()
+        );
+        for route in &opted_out_routes {
+            eprintln!(
+                "  {} {} (handler: {}, version: {})",
+                route.method,
+                route.path,
+                route.handler,
+                route.api_version.as_deref().unwrap_or("-")
+            );
         }
     }
 
     if !sunsetted_routes.is_empty() {
         eprintln!(
-            "\u{2717} Found {} route(s) past sunset date that have not opted out:",
+            "\u{2717} Found {} inactive past-sunset route(s) (returning 410 Gone):",
             sunsetted_routes.len()
         );
         for route in &sunsetted_routes {
@@ -1401,9 +1426,12 @@ fn run_deprecations_check(package: Option<&str>, bin: Option<&str>) {
                 route.api_version.as_deref().unwrap_or("-")
             );
         }
+    }
+
+    if failed {
         std::process::exit(1);
     } else {
-        println!("\u{2705} No active past-sunset routes detected.");
+        println!("\u{2705} No past-sunset routes detected.");
     }
 }
 
@@ -3426,7 +3454,10 @@ mod tests {
         };
         assert!(matches!(
             subcommand,
-            Some(CheckSubcommands::Deprecations { package: None, bin: None })
+            Some(CheckSubcommands::Deprecations {
+                package: None,
+                bin: None
+            })
         ));
     }
 

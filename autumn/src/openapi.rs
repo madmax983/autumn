@@ -629,19 +629,16 @@ fn operation_for(api_doc: &ApiDoc, api_versions: &[crate::app::ApiVersion]) -> O
         tags.push(version.to_string());
     }
 
-    let is_deprecated = if let Some(version) = api_doc.api_version {
+    let is_deprecated = api_doc.api_version.is_some_and(|version| {
         api_versions
             .iter()
             .find(|av| av.version == version)
-            .map(|av| {
-                let is_dep = av.deprecated_at.map_or(false, |d| chrono::Utc::now() >= d);
-                let is_sun = av.sunset_at.map_or(false, |s| chrono::Utc::now() >= s);
+            .is_some_and(|av| {
+                let is_dep = av.deprecated_at.is_some_and(|d| chrono::Utc::now() >= d);
+                let is_sun = av.sunset_at.is_some_and(|s| chrono::Utc::now() >= s);
                 is_dep || is_sun
             })
-            .unwrap_or(false)
-    } else {
-        false
-    };
+    });
     let deprecated = if is_deprecated { Some(true) } else { None };
 
     // Path parameters — always required.
@@ -714,16 +711,13 @@ fn operation_for(api_doc: &ApiDoc, api_versions: &[crate::app::ApiVersion]) -> O
     insert_problem_responses(&mut responses);
 
     // If this route version has a sunset schedule and is not opted out, document 410 Gone
-    let is_subject_to_sunset = if let Some(version) = api_doc.api_version {
+    let is_subject_to_sunset = api_doc.api_version.is_some_and(|version| {
         api_versions
             .iter()
             .find(|av| av.version == version)
-            .and_then(|av| av.sunset_at)
-            .is_some()
+            .is_some_and(|av| av.sunset_at.is_some())
             && !api_doc.sunset_opt_out
-    } else {
-        false
-    };
+    });
 
     if is_subject_to_sunset {
         responses.entry("410".to_owned()).or_insert_with(|| {
