@@ -1440,6 +1440,8 @@ fn run_generate_command(cmd: GenerateCommands) {
                 password,
                 select: select_specs,
                 exclude,
+                // Encrypted-column flags are auto-detected from the model source.
+                ..Default::default()
             };
             generate::admin::run(&name, &fields, generate::Flags { dry_run, force }, &options);
         }

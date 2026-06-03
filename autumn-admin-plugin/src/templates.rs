@@ -1465,9 +1465,11 @@ fn render_cell_value(record: &Value, field: &AdminField) -> Markup {
         return html! { "••••••••" };
     }
     // At-rest encrypted columns (#805) are redacted in admin views by default.
-    // Rendering decrypted plaintext is a documented per-field opt-in gated
-    // through the admin policy machinery (#496).
-    if autumn_web::encryption::admin_redacts_column_name(field.name) {
+    // Rendering decrypted plaintext is a per-field opt-in (`encrypted_visible`,
+    // from `#[encrypted(admin_visible)]`) gated through the admin policy
+    // machinery (#496). The flag is per-field (not a global column-name lookup)
+    // so an unrelated same-named plaintext column is unaffected.
+    if field.encrypted && !field.encrypted_visible {
         return html! { span title="encrypted at rest" { "••••••••" } };
     }
     let val = record.get(field.name);
@@ -1593,8 +1595,9 @@ fn normalize_datetime_local_input(s: &str) -> String {
 
 /// Render a field value in the detail view.
 fn render_detail_value(record: &Value, field: &AdminField) -> Markup {
-    // Encrypted columns (#805) are redacted by default in admin detail views.
-    if autumn_web::encryption::admin_redacts_column_name(field.name) {
+    // Encrypted columns (#805) are redacted by default in admin detail views; the
+    // `encrypted_visible` opt-in shows plaintext. Per-field, not a name lookup.
+    if field.encrypted && !field.encrypted_visible {
         return html! { span title="encrypted at rest" { "••••••••" } };
     }
     let val = record.get(field.name);
@@ -1631,11 +1634,12 @@ fn render_detail_value(record: &Value, field: &AdminField) -> Markup {
 
 /// Render a form widget for a field.
 fn render_form_widget(field: &AdminField, record: Option<&Value>) -> Markup {
-    // Encrypted columns (#805) are not editable in the admin by default: render a
-    // disabled, redacted control with no `name`, so the plaintext is never placed
-    // into the form HTML and a save never submits (and thus never overwrites) the
-    // stored ciphertext. Set encrypted values out-of-band (e.g. via the API).
-    if autumn_web::encryption::is_encrypted_column_name(field.name) {
+    // Encrypted columns (#805) are not editable in the admin: render a disabled,
+    // redacted control with no `name`, so the plaintext is never placed into the
+    // form HTML and a save never submits (and thus never overwrites) the stored
+    // ciphertext. Set encrypted values out-of-band (e.g. via the API). The flag is
+    // per-field, so an unrelated same-named plaintext column stays editable.
+    if field.encrypted {
         return html! {
             input type="text" class="form-input" value="••••••••" disabled
                 title="Encrypted at rest — managed outside the admin";
@@ -1978,33 +1982,14 @@ pub fn model_history_page(
 mod tests {
     use super::*;
 
-    // Simulate a model that registered an at-rest encrypted column (#805):
-    // `ssn` is redacted by default; `audit_note` opts into `admin_visible`.
-    autumn_web::reexports::inventory::submit! {
-        autumn_web::encryption::EncryptedColumnDescriptor {
-            model: "AdminTestModel",
-            table: "admin_test_models",
-            column: "ssn",
-            deterministic: false,
-            admin_visible: false,
-            versioned_ciphertext: false,
-        }
-    }
-    autumn_web::reexports::inventory::submit! {
-        autumn_web::encryption::EncryptedColumnDescriptor {
-            model: "AdminTestModel",
-            table: "admin_test_models",
-            column: "audit_note",
-            deterministic: false,
-            admin_visible: true,
-            versioned_ciphertext: false,
-        }
-    }
+    // A model with at-rest encrypted columns (#805): `ssn` is redacted by default;
+    // `audit_note` opts into `admin_visible` (shown in read views). The per-field
+    // flag on `AdminField` carries this — no global column-name lookup.
 
     #[test]
     fn encrypted_columns_are_redacted_in_admin_views() {
         let record = serde_json::json!({ "id": 1, "ssn": "123-45-6789" });
-        let field = AdminField::new("ssn", AdminFieldKind::Text);
+        let field = AdminField::new("ssn", AdminFieldKind::Text).encrypted();
         let cell = render_cell_value(&record, &field).into_string();
         let detail = render_detail_value(&record, &field).into_string();
         assert!(
@@ -2024,7 +2009,7 @@ mod tests {
         // The decrypted record (admin loads it through the model) is shown for
         // an `admin_visible` column in list/detail views.
         let record = serde_json::json!({ "id": 1, "audit_note": "visible-note" });
-        let field = AdminField::new("audit_note", AdminFieldKind::Text);
+        let field = AdminField::new("audit_note", AdminFieldKind::Text).encrypted_visible();
         let cell = render_cell_value(&record, &field).into_string();
         let detail = render_detail_value(&record, &field).into_string();
         assert!(cell.contains("visible-note"), "admin_visible cell: {cell}");
@@ -2039,8 +2024,11 @@ mod tests {
         // Even an admin_visible column must not pre-fill its secret into the
         // editable form control.
         let record = serde_json::json!({ "ssn": "123-45-6789", "audit_note": "visible-note" });
-        for col in ["ssn", "audit_note"] {
-            let field = AdminField::new(col, AdminFieldKind::Text);
+        for field in [
+            AdminField::new("ssn", AdminFieldKind::Text).encrypted(),
+            AdminField::new("audit_note", AdminFieldKind::Text).encrypted_visible(),
+        ] {
+            let col = field.name;
             let form = render_form_widget(&field, Some(&record)).into_string();
             assert!(
                 !form.contains("123-45-6789") && !form.contains("visible-note"),
