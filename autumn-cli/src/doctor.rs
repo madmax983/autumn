@@ -1579,20 +1579,43 @@ fn tailwind_enabled() -> bool {
 }
 
 fn resolve_compression_enabled() -> bool {
+    // 1. Env var takes highest precedence (matches apply_compression_env_overrides_with_env).
     if let Ok(val) = std::env::var("AUTUMN_COMPRESSION__ENABLED") {
         if let Some(enabled) = parse_config_bool(&val) {
             return enabled;
         }
     }
-    std::fs::read_to_string("autumn.toml")
+
+    // 2. Read TOML, applying profile-specific override when a profile is active
+    //    (mirrors the five-layer config system so `[profile.prod] compression.enabled`
+    //    doesn't cause a spurious doctor warning in production).
+    let table = read_autumn_toml_table().unwrap_or_default();
+    let profile = std::env::var("AUTUMN_ENV")
         .ok()
-        .and_then(|c| toml::from_str::<toml::Table>(&c).ok())
-        .and_then(|t| {
-            t.get("compression")
-                .and_then(|v| v.get("enabled"))
-                .and_then(toml::Value::as_bool)
-        })
-        .unwrap_or(false)
+        .or_else(|| std::env::var("AUTUMN_PROFILE").ok())
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+
+    let parse_enabled = |root: &toml::Table| {
+        root.get("compression")
+            .and_then(|v| v.get("enabled"))
+            .and_then(toml::Value::as_bool)
+    };
+
+    // Profile-specific section takes precedence over base config.
+    if !profile.is_empty() {
+        if let Some(enabled) = table
+            .get("profile")
+            .and_then(|v| v.get(&profile))
+            .and_then(toml::Value::as_table)
+            .and_then(|t| parse_enabled(t))
+        {
+            return enabled;
+        }
+    }
+
+    parse_enabled(&table).unwrap_or(false)
 }
 
 // ─── Main entry point ─────────────────────────────────────────────────────────
@@ -2808,5 +2831,18 @@ redirect_uri = "http://localhost/callback"
             "expected Pass in dev profile, got {:?}",
             result.status
         );
+    }
+
+    #[test]
+    fn parse_config_bool_handles_false_values() {
+        assert_eq!(parse_config_bool("false"), Some(false));
+        assert_eq!(parse_config_bool("0"), Some(false));
+        assert_eq!(parse_config_bool("no"), Some(false));
+        assert_eq!(parse_config_bool("off"), Some(false));
+        assert_eq!(parse_config_bool("true"), Some(true));
+        assert_eq!(parse_config_bool("1"), Some(true));
+        assert_eq!(parse_config_bool("yes"), Some(true));
+        assert_eq!(parse_config_bool("on"), Some(true));
+        assert_eq!(parse_config_bool("garbage"), None);
     }
 }

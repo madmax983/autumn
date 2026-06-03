@@ -51,6 +51,15 @@ async fn png_handler() -> impl IntoResponse {
     )
 }
 
+#[get("/zip")]
+async fn zip_handler() -> impl IntoResponse {
+    // Simulate a dynamic zip archive download (already compressed — should not be re-compressed).
+    (
+        [(header::CONTENT_TYPE, "application/zip")],
+        b"PK\x03\x04fake-zip-content-for-testing-purposes-only-padded".as_slice(),
+    )
+}
+
 #[get("/pre-encoded")]
 async fn pre_encoded_handler() -> Response {
     // Simulate a response that already has Content-Encoding set (e.g. pre-compressed asset).
@@ -223,6 +232,29 @@ async fn no_compression_when_client_does_not_accept() {
         resp.header("content-encoding"),
         None,
         "no Accept-Encoding → no Content-Encoding"
+    );
+}
+
+/// Archive content types (application/zip etc.) must not be compressed — they're
+/// already compressed and re-compressing wastes CPU and increases transfer size.
+#[tokio::test]
+async fn archive_content_type_not_compressed() {
+    let app = TestApp::new()
+        .routes(routes![zip_handler])
+        .config(compression_enabled_config())
+        .build();
+
+    let resp = app
+        .get("/zip")
+        .header("accept-encoding", "gzip")
+        .send()
+        .await;
+
+    resp.assert_ok();
+    assert_eq!(
+        resp.header("content-encoding"),
+        None,
+        "application/zip must not be compressed by the framework"
     );
 }
 

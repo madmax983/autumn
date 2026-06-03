@@ -1045,7 +1045,22 @@ where
     S: Clone + Send + Sync + 'static,
 {
     if config.compression.enabled {
-        router = router.layer(tower_http::compression::CompressionLayer::new());
+        use tower_http::compression::predicate::{DefaultPredicate, NotForContentType, Predicate};
+        // Extend the default predicate (skips images, gRPC, SSE, small bodies) to also
+        // skip already-compressed archive types — compressing a zip/gz a second time
+        // wastes CPU and often increases transfer size.
+        let predicate = DefaultPredicate::new()
+            .and(NotForContentType::const_new("application/zip"))
+            .and(NotForContentType::const_new("application/gzip"))
+            .and(NotForContentType::const_new("application/x-gzip"))
+            .and(NotForContentType::const_new("application/zstd"))
+            .and(NotForContentType::const_new("application/x-bzip2"))
+            .and(NotForContentType::const_new("application/x-bzip"))
+            .and(NotForContentType::const_new("application/x-rar-compressed"))
+            .and(NotForContentType::const_new("application/vnd.rar"))
+            .and(NotForContentType::const_new("application/x-7z-compressed"));
+        router =
+            router.layer(tower_http::compression::CompressionLayer::new().compress_when(predicate));
         tracing::info!("Response compression enabled (gzip/brotli)");
     }
     router
