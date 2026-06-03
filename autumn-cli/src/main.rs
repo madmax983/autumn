@@ -565,19 +565,19 @@ enum MigrateCommands {
 enum DataCommands {
     /// Export all rows of a model to a CSV file.
     ///
-    /// Calls `GET /admin/{model}/export.csv` on the running application.
+    /// Calls `GET {url}/{model}/export.csv` on the running application.
     /// The admin plugin must be mounted and the model must support CSV export.
     ///
     /// # Examples
     ///
     ///   autumn data export posts --out posts.csv
-    ///   autumn data export posts --out posts.csv --url http://localhost:3000
+    ///   autumn data export posts --out posts.csv --url <http://localhost:3000/admin>
     #[command(verbatim_doc_comment)]
     Export {
         /// Model slug (e.g. `posts`, `users`).
         model: String,
-        /// Admin base URL of the running application.
-        #[arg(short, long, default_value = "http://localhost:3000")]
+        /// Admin prefix URL including the mount path (e.g. `http://host/admin`).
+        #[arg(short, long, default_value = "http://localhost:3000/admin")]
         url: String,
         /// Output file path (defaults to `<model>.csv`).
         #[arg(short, long, value_name = "FILE")]
@@ -590,7 +590,7 @@ enum DataCommands {
     },
     /// Import rows from a CSV file into a model.
     ///
-    /// Calls `POST /admin/{model}/import` on the running application with the
+    /// Calls `POST {url}/{model}/import` on the running application with the
     /// CSV file as a multipart upload.  The admin plugin must be mounted and
     /// the model must have `supports_csv_import()` returning `true`.
     ///
@@ -603,8 +603,8 @@ enum DataCommands {
     Import {
         /// Model slug (e.g. `posts`, `users`).
         model: String,
-        /// Admin base URL of the running application.
-        #[arg(short, long, default_value = "http://localhost:3000")]
+        /// Admin prefix URL including the mount path (e.g. `http://host/admin`).
+        #[arg(short, long, default_value = "http://localhost:3000/admin")]
         url: String,
         /// Path to the CSV file to import.
         #[arg(short = 'i', long = "in", value_name = "FILE")]

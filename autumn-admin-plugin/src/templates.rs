@@ -1133,7 +1133,8 @@ pub fn model_import_form_page(
                     "Upload a CSV file with a header row. Column names must match the model's field names."
                 }
 
-                form method="post"
+                form id="autumn-csv-import-form"
+                    method="post"
                     action={ (prefix) "/" (model_slug) "/import" }
                     enctype="multipart/form-data" {
 
@@ -1164,6 +1165,25 @@ pub fn model_import_form_page(
                         button type="submit" class="btn btn-primary" { "Upload and Import" }
                         a href={ (prefix) "/" (model_slug) } class="btn" { "Cancel" }
                     }
+                }
+
+                // multipart/form-data submissions bypass form-field CSRF scanning;
+                // send the token as a header instead (already checked by CsrfLayer step 1).
+                script {
+                    (maud::PreEscaped(r#"
+(function(){
+  var f=document.getElementById('autumn-csv-import-form');
+  if(!f)return;
+  f.addEventListener('submit',function(e){
+    e.preventDefault();
+    var tok=f.querySelector('[name="_csrf"]');
+    var hdr=tok?{'X-CSRF-Token':tok.value}:{};
+    fetch(f.action,{method:'POST',headers:hdr,body:new FormData(f)})
+      .then(function(r){return r.text();})
+      .then(function(h){document.open();document.write(h);document.close();});
+  });
+})();
+"#))
                 }
 
                 div style="margin-top: 2rem; padding-top: 1rem; border-top: 1px solid var(--border);" {

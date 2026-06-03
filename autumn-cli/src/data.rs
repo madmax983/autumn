@@ -37,11 +37,12 @@ fn run_export_inner(
 ) -> Result<(), String> {
     let client = make_client()?;
     let base = base_url.trim_end_matches('/');
-    let mut url = format!("{base}/admin/{model}/export.csv");
+    let mut url = format!("{base}/{model}/export.csv");
 
     if let Some(q) = filter {
         let encoded = percent_encode(q);
-        url.push_str(&format!("?q={encoded}"));
+        url.push_str("?q=");
+        url.push_str(&encoded);
     }
 
     println!("Exporting {model} from {url}");
@@ -62,12 +63,11 @@ fn run_export_inner(
         .bytes()
         .map_err(|e| format!("Failed to read response body: {e}"))?;
 
-    let output_path = out
-        .map(str::to_owned)
-        .unwrap_or_else(|| format!("{model}.csv"));
+    let output_path = out.map_or_else(|| format!("{model}.csv"), str::to_owned);
 
     fs::write(&output_path, &bytes).map_err(|e| format!("Failed to write '{output_path}': {e}"))?;
 
+    #[allow(clippy::naive_bytecount)]
     let row_count = bytes
         .iter()
         .filter(|&&b| b == b'\n')
@@ -104,7 +104,7 @@ pub fn run_import(
 fn run_import_inner(model: &str, base_url: &str, input: &str, dry_run: bool) -> Result<(), String> {
     let client = make_client()?;
     let base = base_url.trim_end_matches('/');
-    let url = format!("{base}/admin/{model}/import");
+    let url = format!("{base}/{model}/import");
 
     let csv_bytes = fs::read(input).map_err(|e| format!("Failed to read '{input}': {e}"))?;
 
