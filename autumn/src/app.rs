@@ -2556,6 +2556,7 @@ impl AppBuilder {
             #[cfg(feature = "ws")]
             channels_backend,
         );
+        state.insert_extension(RegisteredApiVersions(api_versions.clone()));
         #[cfg(feature = "mail")]
         if let Some(interceptor) = mail_interceptor {
             state.insert_extension(interceptor);

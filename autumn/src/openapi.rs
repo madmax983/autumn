@@ -114,6 +114,8 @@ pub struct ApiDoc {
     pub register_schemas: Option<fn(&mut SchemaRegistry)>,
     /// Optional API version associated with this route.
     pub api_version: Option<&'static str>,
+    /// Whether this route opts out of sunset 410 responses.
+    pub sunset_opt_out: bool,
 }
 
 /// Reference to a schema definition, produced by the route macros.
@@ -705,7 +707,35 @@ fn operation_for(api_doc: &ApiDoc, api_versions: &[crate::app::ApiVersion]) -> O
     );
     insert_problem_responses(&mut responses);
 
-    insert_problem_responses(&mut responses);
+    // If this route version has a sunset schedule and is not opted out, document 410 Gone
+    let is_subject_to_sunset = if let Some(version) = api_doc.api_version {
+        api_versions
+            .iter()
+            .find(|av| av.version == version)
+            .and_then(|av| av.sunset_at)
+            .is_some()
+            && !api_doc.sunset_opt_out
+    } else {
+        false
+    };
+
+    if is_subject_to_sunset {
+        responses.entry("410".to_owned()).or_insert_with(|| {
+            let mut content = BTreeMap::new();
+            content.insert(
+                "application/problem+json".to_owned(),
+                MediaType {
+                    schema: serde_json::json!({
+                        "$ref": "#/components/schemas/ProblemDetails",
+                    }),
+                },
+            );
+            Response {
+                description: status_description(410).to_owned(),
+                content,
+            }
+        });
+    }
 
     // Security requirement: `#[secured]` is backed by the Autumn session cookie.
     let security = if api_doc.secured {
@@ -1026,6 +1056,7 @@ mod tests {
             required_roles: &[],
             register_schemas: None,
             api_version: None,
+            ..Default::default()
         }
     }
 

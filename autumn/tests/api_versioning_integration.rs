@@ -14,6 +14,11 @@ async fn api_info_v1_opt() -> &'static str {
     "v1 info opt"
 }
 
+#[get("/api/sunset-only-opt", api_version = "v_sunset_only", sunset_opt_out = true)]
+async fn api_sunset_only_opt() -> &'static str {
+    "sunset only opt"
+}
+
 #[get("/api/plain")]
 async fn api_plain() -> &'static str {
     "plain info"
@@ -28,10 +33,15 @@ async fn test_api_versioning_integration() {
     let clock = TickingClock::starting_at(start_time);
 
     let client = TestApp::new()
-        .routes(routes![api_info_v1, api_info_v1_opt, api_plain])
+        .routes(routes![api_info_v1, api_info_v1_opt, api_plain, api_sunset_only_opt])
         .api_version(autumn_web::app::ApiVersion {
             version: "v1".to_string(),
             deprecated_at: Some(deprecated_at),
+            sunset_at: Some(sunset_at),
+        })
+        .api_version(autumn_web::app::ApiVersion {
+            version: "v_sunset_only".to_string(),
+            deprecated_at: None,
             sunset_at: Some(sunset_at),
         })
         .with_clock(clock.clone())
@@ -69,6 +79,12 @@ async fn test_api_versioning_integration() {
 
     // 5. Opt-out route past sunset bypasses 410 Gone but still emits headers
     let resp = client.get("/api/info-opt").send().await;
+    resp.assert_ok();
+    assert_eq!(resp.header("Deprecation").unwrap(), "true");
+    assert_eq!(resp.header("Sunset").unwrap(), expected_sunset_header);
+
+    // 6. Opt-out route past sunset (with no deprecation_at configured) still emits Deprecation header
+    let resp = client.get("/api/sunset-only-opt").send().await;
     resp.assert_ok();
     assert_eq!(resp.header("Deprecation").unwrap(), "true");
     assert_eq!(resp.header("Sunset").unwrap(), expected_sunset_header);

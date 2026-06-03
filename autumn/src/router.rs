@@ -4036,7 +4036,7 @@ async fn api_versioning_middleware(
 
     let mut response = next.run(request).await;
 
-    if is_deprecated {
+    if is_deprecated || is_sunset {
         if let Ok(val) = axum::http::HeaderValue::from_str("true") {
             response.headers_mut().insert("Deprecation", val);
         }

@@ -21,10 +21,22 @@ async fn get_v2_items() -> &'static str {
     "v2"
 }
 
+#[get("/v1/sunset", api_version = "v1")]
+async fn get_v1_sunset() -> &'static str {
+    "sunset"
+}
+
+#[get("/v1/sunset-opt-out", api_version = "v1", sunset_opt_out = true)]
+async fn get_v1_sunset_opt_out() -> &'static str {
+    "opt-out"
+}
+
 #[test]
 fn test_openapi_spec_version_tagging_and_deprecation() {
     let route_v1 = __autumn_route_info_get_v1_items();
     let route_v2 = __autumn_route_info_get_v2_items();
+    let route_sunset = __autumn_route_info_get_v1_sunset();
+    let route_sunset_opt_out = __autumn_route_info_get_v1_sunset_opt_out();
 
     // v1 is deprecated (2020), v2 is active (2035)
     let v1 = ApiVersion {
@@ -41,7 +53,12 @@ fn test_openapi_spec_version_tagging_and_deprecation() {
     let mut config = OpenApiConfig::new("Versioning Test API", "1.0.0");
     config.api_versions = vec![v1, v2];
 
-    let docs = vec![&route_v1.api_doc, &route_v2.api_doc];
+    let docs = vec![
+        &route_v1.api_doc,
+        &route_v2.api_doc,
+        &route_sunset.api_doc,
+        &route_sunset_opt_out.api_doc,
+    ];
     let spec = autumn_web::openapi::generate_spec(&config, &docs);
 
     // v1 route path should exist
@@ -59,4 +76,14 @@ fn test_openapi_spec_version_tagging_and_deprecation() {
     assert!(op_v2.tags.contains(&"v2".to_string()));
     // v2 should NOT be marked deprecated (None)
     assert_eq!(op_v2.deprecated, None);
+
+    // /v1/sunset should have 410 Gone response documented
+    assert!(spec.paths.contains_key("/v1/sunset"));
+    let op_sunset = spec.paths["/v1/sunset"].get.as_ref().unwrap();
+    assert!(op_sunset.responses.contains_key("410"));
+
+    // /v1/sunset-opt-out should NOT have 410 Gone response documented
+    assert!(spec.paths.contains_key("/v1/sunset-opt-out"));
+    let op_sunset_opt_out = spec.paths["/v1/sunset-opt-out"].get.as_ref().unwrap();
+    assert!(!op_sunset_opt_out.responses.contains_key("410"));
 }

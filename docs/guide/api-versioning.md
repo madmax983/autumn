@@ -88,9 +88,9 @@ When a route is past its sunset date and has not opted out, Autumn automatically
 
 ```json
 {
-  "type": "https://autumn.rs/errors/gone",
+  "type": "https://autumn.dev/problems/gone",
   "title": "Gone",
-  "status": 408,
+  "status": 410,
   "detail": "API version 'v1' has been sunsetted."
 }
 ```

@@ -177,6 +177,7 @@ pub fn route_macro(
                     required_roles: #required_roles,
                     register_schemas: ::core::option::Option::None,
                     api_version: #api_version_expr,
+                    sunset_opt_out: #sunset_opt_out_val,
                     #api_doc_fields
                 },
                 repository: ::core::option::Option::None,
