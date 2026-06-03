@@ -648,9 +648,11 @@ pub(crate) fn problem_details(
     // prefixed with "autumn."). This avoids having to enumerate every error type
     // in a separate match table.
     //
+    let meta = problem_metadata_for(status, has_validation_errors);
+
     // Example: "https://autumn.dev/problems/query-timeout" → "autumn.query_timeout"
     let code = explicit_type.map_or_else(
-        || problem_code_for(status, has_validation_errors).to_owned(),
+        || meta.code.to_owned(),
         |etype| {
             let slug = etype.rsplit('/').next().unwrap_or(etype);
             format!("autumn.{}", slug.replace('-', "_"))
@@ -658,10 +660,8 @@ pub(crate) fn problem_details(
     );
 
     ProblemDetails {
-        type_uri: explicit_type
-            .unwrap_or_else(|| problem_type_for(status, has_validation_errors))
-            .to_owned(),
-        title: problem_title_for(status, has_validation_errors).to_owned(),
+        type_uri: explicit_type.unwrap_or(meta.type_uri).to_owned(),
+        title: meta.title.to_owned(),
         status: status.as_u16(),
         detail: safe_detail,
         instance,
@@ -718,65 +718,83 @@ fn validation_errors(
     errors
 }
 
-const fn problem_type_for(status: StatusCode, has_validation_errors: bool) -> &'static str {
-    if has_validation_errors {
-        return "https://autumn.dev/problems/validation-failed";
-    }
-
-    match status {
-        StatusCode::BAD_REQUEST => "https://autumn.dev/problems/bad-request",
-        StatusCode::UNAUTHORIZED => "https://autumn.dev/problems/unauthorized",
-        StatusCode::FORBIDDEN => "https://autumn.dev/problems/forbidden",
-        StatusCode::NOT_FOUND => "https://autumn.dev/problems/not-found",
-        StatusCode::CONFLICT => "https://autumn.dev/problems/conflict",
-        StatusCode::PAYLOAD_TOO_LARGE => "https://autumn.dev/problems/payload-too-large",
-        StatusCode::UNPROCESSABLE_ENTITY => "https://autumn.dev/problems/unprocessable-entity",
-        StatusCode::INTERNAL_SERVER_ERROR => "https://autumn.dev/problems/internal-server-error",
-        StatusCode::NOT_IMPLEMENTED => "https://autumn.dev/problems/not-implemented",
-        StatusCode::SERVICE_UNAVAILABLE => "https://autumn.dev/problems/service-unavailable",
-        _ => "about:blank",
-    }
+struct ProblemMetadata {
+    type_uri: &'static str,
+    title: &'static str,
+    code: &'static str,
 }
 
-fn problem_title_for(status: StatusCode, has_validation_errors: bool) -> &'static str {
+fn problem_metadata_for(status: StatusCode, has_validation_errors: bool) -> ProblemMetadata {
     if has_validation_errors {
-        return "Validation Failed";
+        return ProblemMetadata {
+            type_uri: "https://autumn.dev/problems/validation-failed",
+            title: "Validation Failed",
+            code: "autumn.validation_failed",
+        };
     }
 
     match status {
-        StatusCode::BAD_REQUEST => "Bad Request",
-        StatusCode::UNAUTHORIZED => "Unauthorized",
-        StatusCode::FORBIDDEN => "Forbidden",
-        StatusCode::NOT_FOUND => "Not Found",
-        StatusCode::CONFLICT => "Conflict",
-        StatusCode::PAYLOAD_TOO_LARGE => "Payload Too Large",
-        StatusCode::UNPROCESSABLE_ENTITY => "Unprocessable Entity",
-        StatusCode::INTERNAL_SERVER_ERROR => "Internal Server Error",
-        StatusCode::NOT_IMPLEMENTED => "Not Implemented",
-        StatusCode::SERVICE_UNAVAILABLE => "Service Unavailable",
-        _ => status.canonical_reason().unwrap_or("Error"),
-    }
-}
-
-fn problem_code_for(status: StatusCode, has_validation_errors: bool) -> &'static str {
-    if has_validation_errors {
-        return "autumn.validation_failed";
-    }
-
-    match status {
-        StatusCode::BAD_REQUEST => "autumn.bad_request",
-        StatusCode::UNAUTHORIZED => "autumn.unauthorized",
-        StatusCode::FORBIDDEN => "autumn.forbidden",
-        StatusCode::NOT_FOUND => "autumn.not_found",
-        StatusCode::CONFLICT => "autumn.conflict",
-        StatusCode::PAYLOAD_TOO_LARGE => "autumn.payload_too_large",
-        StatusCode::UNPROCESSABLE_ENTITY => "autumn.unprocessable_entity",
-        StatusCode::INTERNAL_SERVER_ERROR => "autumn.internal_server_error",
-        StatusCode::NOT_IMPLEMENTED => "autumn.not_implemented",
-        StatusCode::SERVICE_UNAVAILABLE => "autumn.service_unavailable",
-        _ if status.is_client_error() => "autumn.client_error",
-        _ if status.is_server_error() => "autumn.server_error",
-        _ => "autumn.error",
+        StatusCode::BAD_REQUEST => ProblemMetadata {
+            type_uri: "https://autumn.dev/problems/bad-request",
+            title: "Bad Request",
+            code: "autumn.bad_request",
+        },
+        StatusCode::UNAUTHORIZED => ProblemMetadata {
+            type_uri: "https://autumn.dev/problems/unauthorized",
+            title: "Unauthorized",
+            code: "autumn.unauthorized",
+        },
+        StatusCode::FORBIDDEN => ProblemMetadata {
+            type_uri: "https://autumn.dev/problems/forbidden",
+            title: "Forbidden",
+            code: "autumn.forbidden",
+        },
+        StatusCode::NOT_FOUND => ProblemMetadata {
+            type_uri: "https://autumn.dev/problems/not-found",
+            title: "Not Found",
+            code: "autumn.not_found",
+        },
+        StatusCode::CONFLICT => ProblemMetadata {
+            type_uri: "https://autumn.dev/problems/conflict",
+            title: "Conflict",
+            code: "autumn.conflict",
+        },
+        StatusCode::PAYLOAD_TOO_LARGE => ProblemMetadata {
+            type_uri: "https://autumn.dev/problems/payload-too-large",
+            title: "Payload Too Large",
+            code: "autumn.payload_too_large",
+        },
+        StatusCode::UNPROCESSABLE_ENTITY => ProblemMetadata {
+            type_uri: "https://autumn.dev/problems/unprocessable-entity",
+            title: "Unprocessable Entity",
+            code: "autumn.unprocessable_entity",
+        },
+        StatusCode::INTERNAL_SERVER_ERROR => ProblemMetadata {
+            type_uri: "https://autumn.dev/problems/internal-server-error",
+            title: "Internal Server Error",
+            code: "autumn.internal_server_error",
+        },
+        StatusCode::NOT_IMPLEMENTED => ProblemMetadata {
+            type_uri: "https://autumn.dev/problems/not-implemented",
+            title: "Not Implemented",
+            code: "autumn.not_implemented",
+        },
+        StatusCode::SERVICE_UNAVAILABLE => ProblemMetadata {
+            type_uri: "https://autumn.dev/problems/service-unavailable",
+            title: "Service Unavailable",
+            code: "autumn.service_unavailable",
+        },
+        _ => ProblemMetadata {
+            type_uri: "about:blank",
+            title: status.canonical_reason().unwrap_or("Error"),
+            code: if status.is_client_error() {
+                "autumn.client_error"
+            } else if status.is_server_error() {
+                "autumn.server_error"
+            } else {
+                "autumn.error"
+            },
+        },
     }
 }
 

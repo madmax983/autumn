@@ -1231,11 +1231,7 @@ pub fn parse_model_search_config_for_table(
                     rest_before_aw = &rest_before_aw[..p];
                 }
 
-                let best_pos = match (m_pos_opt, aw_pos_opt) {
-                    (Some(p1), Some(p2)) => Some(std::cmp::max(p1, p2)),
-                    (Some(p), None) | (None, Some(p)) => Some(p),
-                    (None, None) => None,
-                };
+                let best_pos = m_pos_opt.max(aw_pos_opt);
 
                 if let Some(pos) = best_pos {
                     let in_between = &before_struct[pos..];
