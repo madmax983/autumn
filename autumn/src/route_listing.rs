@@ -75,6 +75,9 @@ pub struct RouteInfo {
     pub sunset_opt_out: Option<bool>,
 }
 
+/// Helper type alias representing version name, status string, and sunset opt-out flag.
+type RouteVersionInfo = (Option<String>, Option<String>, Option<bool>);
+
 /// Collect [`RouteInfo`] entries from user routes and scoped groups.
 ///
 /// `route_sources` is a parallel slice to `routes`; each element is the
@@ -83,6 +86,10 @@ pub struct RouteInfo {
 ///
 /// Does not include framework-internal routes (probes, actuator, htmx).
 /// Call `append_framework_routes` with a loaded config to add those.
+///
+/// # Errors
+///
+/// Returns [`crate::router::RouterBuildError::UnregisteredApiVersion`] if a route's version is not registered.
 pub fn collect_route_infos(
     routes: &[Route],
     route_sources: &[RouteSource],
@@ -95,34 +102,37 @@ pub fn collect_route_infos(
     let resolve_status = |route_name: &str,
                           api_version: Option<&str>,
                           sunset_opt_out: bool|
-     -> Result<
-        (Option<String>, Option<String>, Option<bool>),
-        crate::router::RouterBuildError,
-    > {
+     -> Result<RouteVersionInfo, crate::router::RouterBuildError> {
         let Some(ver) = api_version else {
             return Ok((None, None, None));
         };
-        if let Some(av) = api_versions.iter().find(|av| av.version == ver) {
-            let is_sunset = av.sunset_at.is_some_and(|s| now >= s);
-            let is_dep = av.deprecated_at.is_some_and(|d| now >= d);
-            let status = if is_sunset {
-                "sunset"
-            } else if is_dep {
-                "deprecated"
-            } else {
-                "active"
-            };
-            Ok((
-                Some(ver.to_string()),
-                Some(status.to_string()),
-                Some(sunset_opt_out),
-            ))
-        } else {
-            Err(crate::router::RouterBuildError::UnregisteredApiVersion {
-                route_name: route_name.to_string(),
-                version: ver.to_string(),
-            })
-        }
+        api_versions
+            .iter()
+            .find(|av| av.version == ver)
+            .map_or_else(
+                || {
+                    Err(crate::router::RouterBuildError::UnregisteredApiVersion {
+                        route_name: route_name.to_string(),
+                        version: ver.to_string(),
+                    })
+                },
+                |av| {
+                    let is_sunset = av.sunset_at.is_some_and(|s| now >= s);
+                    let is_dep = av.deprecated_at.is_some_and(|d| now >= d);
+                    let status = if is_sunset {
+                        "sunset"
+                    } else if is_dep {
+                        "deprecated"
+                    } else {
+                        "active"
+                    };
+                    Ok((
+                        Some(ver.to_string()),
+                        Some(status.to_string()),
+                        Some(sunset_opt_out),
+                    ))
+                },
+            )
     };
 
     for (i, route) in routes.iter().enumerate() {
@@ -166,6 +176,7 @@ pub fn collect_route_infos(
 ///
 /// Paths are taken from `config` so custom probe/actuator prefix settings
 /// are reflected accurately.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn append_framework_routes(
     infos: &mut Vec<RouteInfo>,
     config: &crate::config::AutumnConfig,

@@ -2746,27 +2746,29 @@ impl AppBuilder {
             api_versions.iter().map(|av| av.version.as_str()).collect();
 
         for route in &routes {
-            if let Some(ver) = route.api_version {
-                if !registered_versions.contains(ver) {
-                    eprintln!(
-                        "Failed to build router: route '{}' uses unregistered API version '{}'",
-                        route.name, ver
-                    );
-                    std::process::exit(1);
-                }
+            if let Some(ver) = route
+                .api_version
+                .filter(|ver| !registered_versions.contains(*ver))
+            {
+                eprintln!(
+                    "Failed to build router: route '{}' uses unregistered API version '{}'",
+                    route.name, ver
+                );
+                std::process::exit(1);
             }
         }
 
         for group in &scoped_groups {
             for route in &group.routes {
-                if let Some(ver) = route.api_version {
-                    if !registered_versions.contains(ver) {
-                        eprintln!(
-                            "Failed to build router: route '{}' uses unregistered API version '{}'",
-                            route.name, ver
-                        );
-                        std::process::exit(1);
-                    }
+                if let Some(ver) = route
+                    .api_version
+                    .filter(|ver| !registered_versions.contains(*ver))
+                {
+                    eprintln!(
+                        "Failed to build router: route '{}' uses unregistered API version '{}'",
+                        route.name, ver
+                    );
+                    std::process::exit(1);
                 }
             }
         }

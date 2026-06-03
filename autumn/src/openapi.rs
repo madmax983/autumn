@@ -510,6 +510,16 @@ pub fn write_openapi_spec_to_dist(
 #[cfg(feature = "openapi")]
 #[must_use]
 pub fn generate_spec(config: &OpenApiConfig, routes: &[&ApiDoc]) -> OpenApiSpec {
+    generate_spec_at(config, routes, chrono::Utc::now())
+}
+
+#[cfg(feature = "openapi")]
+#[must_use]
+pub fn generate_spec_at(
+    config: &OpenApiConfig,
+    routes: &[&ApiDoc],
+    now: chrono::DateTime<chrono::Utc>,
+) -> OpenApiSpec {
     let mut paths: BTreeMap<String, PathItem> = BTreeMap::new();
     let mut registry = SchemaRegistry::default();
 
@@ -549,7 +559,7 @@ pub fn generate_spec(config: &OpenApiConfig, routes: &[&ApiDoc]) -> OpenApiSpec 
             collect_ref_names(entry, &mut referenced_names);
         }
 
-        let operation = operation_for(api_doc, &config.api_versions);
+        let operation = operation_for(api_doc, &config.api_versions, now);
         let entry = paths.entry(api_doc.path.to_owned()).or_default();
         match api_doc.method {
             "GET" => entry.get = Some(operation),
@@ -616,7 +626,12 @@ pub fn generate_spec(config: &OpenApiConfig, routes: &[&ApiDoc]) -> OpenApiSpec 
 }
 
 #[cfg(feature = "openapi")]
-fn operation_for(api_doc: &ApiDoc, api_versions: &[crate::app::ApiVersion]) -> Operation {
+#[allow(clippy::too_many_lines)]
+fn operation_for(
+    api_doc: &ApiDoc,
+    api_versions: &[crate::app::ApiVersion],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Operation {
     let mut tags = if api_doc.tags.is_empty() {
         default_tag(api_doc.path)
             .map(|t| vec![t.to_owned()])
@@ -634,8 +649,8 @@ fn operation_for(api_doc: &ApiDoc, api_versions: &[crate::app::ApiVersion]) -> O
             .iter()
             .find(|av| av.version == version)
             .is_some_and(|av| {
-                let is_dep = av.deprecated_at.is_some_and(|d| chrono::Utc::now() >= d);
-                let is_sun = av.sunset_at.is_some_and(|s| chrono::Utc::now() >= s);
+                let is_dep = av.deprecated_at.is_some_and(|d| now >= d);
+                let is_sun = av.sunset_at.is_some_and(|s| now >= s);
                 is_dep || is_sun
             })
     });

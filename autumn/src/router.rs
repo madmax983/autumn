@@ -259,6 +259,7 @@ pub fn try_build_router_inner(
 /// [`with_state`](axum::Router::with_state) is called.  Used by
 /// [`try_build_router_with_static_inner`] so that user layers and the static
 /// file middleware can be applied to the typed router before state is baked in.
+#[allow(clippy::too_many_lines)]
 fn build_router_pre_state(
     route_list: Vec<Route>,
     config: &AutumnConfig,
@@ -277,13 +278,14 @@ fn build_router_pre_state(
         .unwrap_or_default();
 
     let check_route_version = |route: &Route| -> Result<(), RouterBuildError> {
-        if let Some(version) = route.api_version {
-            if !registered_versions.contains(version) {
-                return Err(RouterBuildError::UnregisteredApiVersion {
-                    route_name: route.name.to_string(),
-                    version: version.to_string(),
-                });
-            }
+        if let Some(version) = route
+            .api_version
+            .filter(|ver| !registered_versions.contains(*ver))
+        {
+            return Err(RouterBuildError::UnregisteredApiVersion {
+                route_name: route.name.to_string(),
+                version: version.to_string(),
+            });
         }
         Ok(())
     };
@@ -318,7 +320,7 @@ fn build_router_pre_state(
         &ctx.scoped_groups,
         ctx.openapi.as_ref(),
         &config.session.cookie_name,
-        versions.as_ref().map(|v| v.0.as_slice()).unwrap_or(&[]),
+        versions.as_ref().map_or(&[], |v| v.0.as_slice()),
     )?;
 
     let idempotency_layers = build_idempotency_layers(config, state)?;
@@ -446,10 +448,11 @@ pub fn extract_path_params(path: &str) -> Vec<String> {
     out
 }
 
-/// Handler that dynamically constructs the OpenAPI specification document per request
+/// Handler that dynamically constructs the `OpenAPI` specification document per request
 /// so deprecation and sunset statuses do not go stale.
 #[cfg(feature = "openapi")]
 async fn serve_openapi_spec(
+    state: axum::extract::State<AppState>,
     axum::extract::Extension(config): axum::extract::Extension<
         std::sync::Arc<crate::openapi::OpenApiConfig>,
     >,
@@ -459,7 +462,8 @@ async fn serve_openapi_spec(
 ) -> impl axum::response::IntoResponse {
     use axum::response::IntoResponse;
     let refs: Vec<&crate::openapi::ApiDoc> = docs.iter().collect();
-    let spec = crate::openapi::generate_spec(&config, &refs);
+    let now = state.clock().now();
+    let spec = crate::openapi::generate_spec_at(&config, &refs, now);
     let spec_json = serde_json::to_string_pretty(&spec)
         .unwrap_or_else(|e| format!("{{\"error\": \"failed to serialize spec: {e}\"}}"));
     (
@@ -4038,7 +4042,10 @@ async fn api_versioning_middleware(
                 response.headers_mut().insert("Sunset", val);
             }
         }
-        let deprecation_date = version.deprecated_at.or(version.sunset_at);
+        let deprecation_date = match (version.deprecated_at, version.sunset_at) {
+            (Some(d), Some(s)) => Some(d.min(s)),
+            (d, s) => d.or(s),
+        };
         if let Some(date) = deprecation_date {
             let timestamp = date.timestamp();
             if let Ok(val) = axum::http::HeaderValue::from_str(&format!("@{timestamp}")) {
@@ -4051,7 +4058,10 @@ async fn api_versioning_middleware(
     let mut response = next.run(request).await;
 
     if is_deprecated || is_sunset {
-        let deprecation_date = version.deprecated_at.or(version.sunset_at);
+        let deprecation_date = match (version.deprecated_at, version.sunset_at) {
+            (Some(d), Some(s)) => Some(d.min(s)),
+            (d, s) => d.or(s),
+        };
         if let Some(date) = deprecation_date {
             let timestamp = date.timestamp();
             if let Ok(val) = axum::http::HeaderValue::from_str(&format!("@{timestamp}")) {
