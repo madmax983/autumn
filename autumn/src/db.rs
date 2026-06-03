@@ -815,6 +815,7 @@ impl Db {
             + 'a,
     {
         use diesel_async::AsyncConnection as _;
+        use diesel_async::RunQueryDsl as _;
 
         if self.tx_poisoned {
             return Err(crate::error::AutumnError::service_unavailable_msg(
@@ -859,7 +860,6 @@ impl Db {
                 std::mem::take(&mut *reg)
             };
 
-            use diesel_async::RunQueryDsl;
             let is_test_tx = diesel::select(diesel::dsl::sql::<
                 diesel::sql_types::Nullable<diesel::sql_types::Text>,
             >(
