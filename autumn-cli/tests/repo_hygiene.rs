@@ -616,6 +616,7 @@ fn generator_conformance_ci_gate_is_configured() {
         "autumn-cli/src/generate",
         "autumn-cli/src/templates",
         "autumn-cli/src/new.rs",
+        "autumn-cli/src/migrate.rs",
         "autumn-cli/Cargo.toml",
         "autumn/src/",
         "autumn/Cargo.toml",

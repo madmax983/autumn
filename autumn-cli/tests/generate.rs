@@ -534,7 +534,6 @@ async fn generated_scaffold_serves_posts_index_and_json_api() {
 
     let (_tmp, project) = fresh_project("scaffold-live");
     patch_generated_cargo_toml(&project);
-    let _ = fs::remove_file(project.join("build.rs"));
 
     run_autumn(
         &project,
@@ -668,8 +667,6 @@ fn generated_scaffold_cargo_checks() {
     // supposed to do automatically.
     let cargo_toml_path = project.join("Cargo.toml");
     patch_generated_cargo_toml(&project);
-    // Drop build.rs so we don't need the Tailwind CLI installed.
-    let _ = fs::remove_file(project.join("build.rs"));
 
     run_autumn(
         &project,
@@ -1075,7 +1072,6 @@ fn generate_auth_without_totp_has_no_totp_artifacts() {
 fn generated_auth_totp_cargo_checks() {
     let (_tmp, project) = fresh_project("auth-totp-build");
     patch_generated_cargo_toml(&project);
-    let _ = fs::remove_file(project.join("build.rs"));
 
     run_autumn(&project, &["generate", "auth", "User", "--totp"]);
 
@@ -1315,7 +1311,6 @@ fn generated_scaffold_config_cargo_checks() {
     let (_tmp, project) = fresh_project("scaffold-config-build");
 
     patch_generated_cargo_toml(&project);
-    let _ = fs::remove_file(project.join("build.rs"));
 
     fs::write(
         project.join("autumn.generate.toml"),
