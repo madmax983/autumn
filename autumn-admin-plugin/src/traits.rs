@@ -576,7 +576,7 @@ pub trait AdminModel: Send + Sync + 'static {
     ///
     /// To redact a column: remove it from this list. To include a placeholder
     /// instead of the real value, add the column here and override
-    /// [`csv_export_row`] to return `"[REDACTED]"` for that key.
+    /// [`AdminModel::csv_export_row`] to return `"[REDACTED]"` for that key.
     ///
     /// [`fields`]: AdminModel::fields
     fn csv_export_columns(&self) -> Vec<&'static str> {
