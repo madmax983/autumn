@@ -265,16 +265,39 @@ fn generate_derived_query_for_source(
     model_name: &Ident,
     soft_delete: bool,
     query_source: &TokenStream,
+    string_fields: &std::collections::HashSet<String>,
 ) -> TokenStream {
     let field_idents: Vec<Ident> = query.fields.iter().map(|f| format_ident!("{f}")).collect();
     let param_names: Vec<Ident> = query.fields.iter().map(|f| format_ident!("{f}")).collect();
+    let table_name_str = table_ident.to_string();
 
-    // Build filter chain
+    // Build the filter chain. For `String`-typed parameters we route the value
+    // through the encrypted-column registry at runtime: a deterministic-encrypted
+    // column is matched by its stable ciphertext, a randomized one errors (equality
+    // is impossible), and a plain column passes through unchanged (#805). Non-string
+    // params (e.g. an i64 id) can never target an encrypted column, so they filter
+    // directly. The encoded value is bound to a `let` so its `?` lives in the async
+    // method body rather than inside the Diesel expression.
+    let mut encode_lets: Vec<TokenStream> = Vec::new();
     let filters: Vec<TokenStream> = field_idents
         .iter()
         .zip(param_names.iter())
         .map(|(field, param)| {
-            quote! { .filter(#table_ident::#field.eq(&#param)) }
+            if string_fields.contains(&field.to_string()) {
+                let field_str = field.to_string();
+                let enc_ident = format_ident!("__autumn_q_{field}");
+                encode_lets.push(quote! {
+                    let #enc_ident = ::autumn_web::encryption::encode_derived_query_param(
+                        #table_name_str, #field_str, &#param,
+                    )
+                    .map_err(|__e| ::autumn_web::AutumnError::internal_server_error_msg(
+                        __e.to_string(),
+                    ))?;
+                });
+                quote! { .filter(#table_ident::#field.eq(&#enc_ident)) }
+            } else {
+                quote! { .filter(#table_ident::#field.eq(&#param)) }
+            }
         })
         .collect();
 
@@ -288,6 +311,7 @@ fn generate_derived_query_for_source(
     match query.prefix.as_str() {
         "find" => {
             quote! {
+                #(#encode_lets)*
                 let mut conn = self.__autumn_acquire_conn().await?;
                 #query_source
                     #(#filters)*
@@ -299,6 +323,7 @@ fn generate_derived_query_for_source(
         }
         "count" => {
             quote! {
+                #(#encode_lets)*
                 let mut conn = self.__autumn_acquire_conn().await?;
                 #query_source
                     #(#filters)*
@@ -312,6 +337,7 @@ fn generate_derived_query_for_source(
         "delete" => {
             if soft_delete {
                 quote! {
+                    #(#encode_lets)*
                     let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
                     let mut conn = self.__autumn_acquire_conn().await?;
                     ::autumn_web::reexports::diesel::update(
@@ -325,6 +351,7 @@ fn generate_derived_query_for_source(
                 }
             } else {
                 quote! {
+                    #(#encode_lets)*
                     let mut conn = self.__autumn_acquire_conn().await?;
                     ::autumn_web::reexports::diesel::delete(#query_source #(#filters)*)
                         .execute(&mut conn)
@@ -336,6 +363,7 @@ fn generate_derived_query_for_source(
         }
         "exists" => {
             quote! {
+                #(#encode_lets)*
                 let mut conn = self.__autumn_acquire_conn().await?;
                 ::autumn_web::reexports::diesel::select(
                     ::autumn_web::reexports::diesel::dsl::exists(
@@ -363,6 +391,7 @@ fn generate_derived_query(
     model_name: &Ident,
     soft_delete: bool,
     tenant_scoped: bool,
+    string_fields: &std::collections::HashSet<String>,
 ) -> TokenStream {
     if tenant_scoped {
         let across_tenants_query = generate_derived_query_for_source(
@@ -371,6 +400,7 @@ fn generate_derived_query(
             model_name,
             soft_delete,
             &quote! { #table_ident::table },
+            string_fields,
         );
         let scoped_query = generate_derived_query_for_source(
             query,
@@ -378,6 +408,7 @@ fn generate_derived_query(
             model_name,
             soft_delete,
             &quote! { #table_ident::table.filter(#table_ident::tenant_id.eq(tenant_id)) },
+            string_fields,
         );
         quote! {
             if self.across_tenants {
@@ -401,7 +432,24 @@ fn generate_derived_query(
             model_name,
             soft_delete,
             &quote! { #table_ident::table },
+            string_fields,
         )
+    }
+}
+
+/// Whether a derived-query parameter type is a string (`String`, `&str`,
+/// `&String`, …). Only string params can target an at-rest encrypted column
+/// (encrypted columns are non-null `String` in v1), so only these are routed
+/// through the runtime registry encoder.
+fn is_string_param_type(ty: &syn::Type) -> bool {
+    match ty {
+        syn::Type::Reference(r) => is_string_param_type(&r.elem),
+        syn::Type::Path(p) => p
+            .path
+            .segments
+            .last()
+            .is_some_and(|s| s.ident == "String" || s.ident == "str"),
+        _ => false,
     }
 }
 
@@ -571,6 +619,24 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     })
                     .collect();
 
+                // The subset of parameters whose type is a string — only these can
+                // bind an at-rest encrypted column, so only these are routed through
+                // the runtime registry encoder in the filter chain (#805).
+                let string_fields: std::collections::HashSet<String> = method
+                    .sig
+                    .inputs
+                    .iter()
+                    .filter_map(|arg| {
+                        let syn::FnArg::Typed(pat_type) = arg else {
+                            return None;
+                        };
+                        let syn::Pat::Ident(pat_ident) = pat_type.pat.as_ref() else {
+                            return None;
+                        };
+                        is_string_param_type(&pat_type.ty).then(|| pat_ident.ident.to_string())
+                    })
+                    .collect();
+
                 // Determine return type from prefix
                 let return_type = match query.prefix.as_str() {
                     "find" => quote! { Vec<#model_name> },
@@ -587,6 +653,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     model_name,
                     config.soft_delete,
                     config.tenant_scoped,
+                    &string_fields,
                 );
 
                 derived_trait_methods.push(quote! {

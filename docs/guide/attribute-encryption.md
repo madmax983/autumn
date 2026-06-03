@@ -141,8 +141,18 @@ value. Key derivation:
 ```text
 data_key = HMAC-SHA256(master_bytes, b"autumn:data:v1:" || salt)   # randomized
 det_key  = HMAC-SHA256(master_bytes, b"autumn:det:v1:"  || salt)   # deterministic
-key_id   = u32::from_be_bytes( SHA256(b"autumn:id:v1:" || data_key)[0..4] )
+
+# key_id identifies the *derived key that encrypted this value*, so it depends on
+# the envelope's mode byte: data_key for a randomized envelope (mode = 0x00),
+# det_key for a deterministic one (mode = 0x01).
+derived_key = data_key  if mode == 0x00 (randomized)
+            = det_key   if mode == 0x01 (deterministic)
+key_id      = u32::from_be_bytes( SHA256(b"autumn:id:v1:" || derived_key)[0..4] )
 ```
+
+To decrypt a deterministic envelope, derive `det_key` and compute its `key_id`
+from `det_key` (not `data_key`); otherwise the id will not match the envelope and
+the right key cannot be selected.
 
 ## Key rotation
 
@@ -161,10 +171,16 @@ Rotation never rewrites existing rows. To rotate:
 3. Deploy. New writes use the new key; existing rows still decrypt because the
    envelope's `key_id` selects the retired key transparently.
 
-Old rows are re-encrypted lazily — whenever a row is next updated it is written
-with the current key. You may also run a one-off task that loads and re-saves
-rows to migrate eagerly. A retired key can be dropped from `retired_keys` only
-once no row references its `key_id` anymore.
+An encrypted column is rewritten with the current key **only when that column is
+itself part of a write** — i.e. a save that sets it, or an `UpdateX` whose patch
+includes that field. Ordinary edit traffic that changes *other* fields leaves the
+encrypted column out of the generated changeset, so its ciphertext keeps
+referencing the retired key. **Do not assume normal updates migrate old rows.** To
+migrate eagerly, run a one-off task that loads each row and re-saves the encrypted
+column(s) explicitly (read the plaintext, write it back so the wrapper re-encrypts
+under the current key). A retired key can be dropped from `retired_keys` only once
+no row's encrypted columns reference its `key_id` anymore — verify with a scan, not
+by assuming update activity has covered every row.
 
 The **deterministic key** rotates the same way: set the new `deterministic_key`
 and move the previous one into `retired_keys`. Each retired key is derived in
@@ -185,8 +201,13 @@ autumn generate migration EncryptApiTokenOnAccounts
 
 This emits a migration whose `up.sql` documents the key configuration and the
 encrypt backfill, and whose `down.sql` documents the reverse (restoring plaintext
-from ciphertext given the keys). The column stays `TEXT` — the envelope is base64
-text, so no type change is needed.
+from ciphertext given the keys). An unbounded `TEXT` column needs no type change.
+A **bounded `VARCHAR(n)` column must be widened first** (e.g. `ALTER TABLE … ALTER
+COLUMN … TYPE TEXT`): the envelope adds a 20-byte header and a 16-byte GCM tag and
+is then base64-encoded (~1.37×), so the ciphertext can exceed the original limit
+(a `VARCHAR(255)` value easily grows past 255 chars) and the backfill or later
+writes would fail with a length violation. The generated scaffold emits the
+widening `ALTER` statements for you.
 
 Order matters. **Backfill before adding `#[encrypted]` to the model field.**
 Once the attribute is present the column's reader decrypts on load, so any

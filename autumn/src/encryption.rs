@@ -36,7 +36,10 @@
 //! ```text
 //! data_key   = HMAC-SHA256(master_bytes, b"autumn:data:v1:" || salt)   // randomized
 //! det_key    = HMAC-SHA256(master_bytes, b"autumn:det:v1:"  || salt)   // deterministic
-//! key_id     = u32::from_be_bytes(SHA256(b"autumn:id:v1:" || data_key)[0..4])
+//! // key_id identifies the key that encrypted the value, so it is derived from
+//! // the mode-specific key: data_key for randomized envelopes (mode 0x00),
+//! // det_key for deterministic ones (mode 0x01).
+//! key_id     = u32::from_be_bytes(SHA256(b"autumn:id:v1:" || derived_key)[0..4])
 //! ```
 //!
 //! `key_id` is a stable function of the derived key, so a key keeps the same id
@@ -133,6 +136,21 @@ pub enum EncryptionError {
     /// AEAD authentication failed (wrong key or corrupted ciphertext).
     #[error("decryption failed: wrong key or corrupted ciphertext")]
     DecryptionFailed,
+
+    /// An equality lookup (e.g. a derived `find_by_<col>`) targeted a
+    /// randomized-encrypted column. Randomized encryption uses a fresh nonce per
+    /// write, so equal plaintexts never produce equal ciphertext and the lookup
+    /// can never match — use `#[encrypted(deterministic)]` if you need lookups.
+    #[error(
+        "equality lookup on randomized-encrypted column `{table}.{column}` is impossible; \
+         mark it `#[encrypted(deterministic)]` to support `find_by`/`exists_by` lookups"
+    )]
+    RandomizedEqualityLookup {
+        /// Table the column belongs to.
+        table: String,
+        /// The randomized-encrypted column name.
+        column: String,
+    },
 }
 
 /// Encryption mode for a column.
@@ -575,6 +593,46 @@ pub fn is_encrypted_column(table: &str, column: &str) -> bool {
         .any(|d| d.table == table && d.column == column)
 }
 
+/// Encode a derived-query equality parameter for a column that may be encrypted.
+///
+/// Generated repository derived queries (`find_by_email`, `exists_by_*`,
+/// `count_by_*`, `delete_by_*`) compare a user-supplied value against the stored
+/// column. When the column is encrypted at rest the stored value is ciphertext,
+/// so the plaintext parameter has to be transformed to match:
+///
+/// * **deterministic** column → its stable deterministic ciphertext, so the
+///   equality predicate matches the rows stored under the current key;
+/// * **randomized** column → [`EncryptionError::RandomizedEqualityLookup`]:
+///   equality lookups are impossible by design (a fresh nonce per write means
+///   ciphertext never repeats);
+/// * **non-encrypted** column → the plaintext unchanged (a pure passthrough).
+///
+/// This is a runtime registry lookup because the repository macro cannot see a
+/// column's encryption mode at compile time (it is declared on the model).
+///
+/// # Errors
+/// Returns [`EncryptionError::RandomizedEqualityLookup`] for a randomized column,
+/// or any error from deterministic encryption (e.g. a missing deterministic key).
+pub fn encode_derived_query_param(
+    table: &str,
+    column: &str,
+    plaintext: impl AsRef<str>,
+) -> Result<String, EncryptionError> {
+    let plaintext = plaintext.as_ref();
+    for d in registered_encrypted_columns() {
+        if d.table == table && d.column == column {
+            if d.deterministic {
+                return encrypt_text(Mode::Deterministic, plaintext);
+            }
+            return Err(EncryptionError::RandomizedEqualityLookup {
+                table: table.to_owned(),
+                column: column.to_owned(),
+            });
+        }
+    }
+    Ok(plaintext.to_owned())
+}
+
 /// Whether any registered encrypted column has this name (table-agnostic).
 ///
 /// Used by surfaces that lack table context — e.g. the admin plugin's cell
@@ -819,6 +877,28 @@ mod tests {
             versioned_ciphertext: false,
         }
     }
+    // Columns for the derived-query param-encoding test: a deterministic column
+    // (equality lookups supported) and a randomized one (lookups impossible).
+    inventory::submit! {
+        EncryptedColumnDescriptor {
+            model: "DqModel",
+            table: "dq_table",
+            column: "det_col",
+            deterministic: true,
+            admin_visible: false,
+            versioned_ciphertext: false,
+        }
+    }
+    inventory::submit! {
+        EncryptedColumnDescriptor {
+            model: "DqModel",
+            table: "dq_table",
+            column: "rnd_col",
+            deterministic: false,
+            admin_visible: false,
+            versioned_ciphertext: false,
+        }
+    }
 
     const KEY_A: &str = "1111111111111111111111111111111111111111111111111111111111111111";
     const KEY_B: &str = "2222222222222222222222222222222222222222222222222222222222222222";
@@ -1037,6 +1117,35 @@ mod tests {
         assert_eq!(
             String::from_utf8(ring.decrypt(stored).unwrap()).unwrap(),
             "topsecret"
+        );
+    }
+
+    #[test]
+    fn derived_query_param_encoding_matches_column_mode() {
+        install_key_ring(KeyRing::from_master_hex(KEY_A, &[], Some(DET), salt()).unwrap());
+
+        // Deterministic column: param is encoded to the same stable ciphertext the
+        // wrapper writes, so the equality predicate matches stored rows.
+        let encoded =
+            encode_derived_query_param("dq_table", "det_col", "alice@example.com").unwrap();
+        assert_ne!(encoded, "alice@example.com", "must be ciphertext");
+        assert_eq!(
+            encoded,
+            deterministic_ciphertext("alice@example.com").unwrap(),
+            "must equal the deterministic ciphertext used on write"
+        );
+
+        // Randomized column: equality lookups are impossible by design -> error.
+        let err = encode_derived_query_param("dq_table", "rnd_col", "x").unwrap_err();
+        assert!(matches!(
+            err,
+            EncryptionError::RandomizedEqualityLookup { .. }
+        ));
+
+        // Non-encrypted column: pure passthrough.
+        assert_eq!(
+            encode_derived_query_param("dq_table", "not_encrypted", "plain").unwrap(),
+            "plain"
         );
     }
 

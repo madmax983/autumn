@@ -254,13 +254,50 @@ pub fn add_columns_down_sql(table: &str, fields: &[Field]) -> String {
     out
 }
 
+/// Document why bounded `VARCHAR(n)` columns must be widened to `TEXT` before an
+/// encryption backfill, and emit the `ALTER … TYPE TEXT` statements per column.
+fn write_widen_bounded_columns_note(out: &mut String, table: &str, columns: &[String]) {
+    let _ = writeln!(
+        out,
+        "-- The envelope is base64 text. An UNBOUNDED `TEXT` column needs no type"
+    );
+    let _ = writeln!(
+        out,
+        "-- change, but a BOUNDED `VARCHAR(n)` column almost certainly does: the"
+    );
+    let _ = writeln!(
+        out,
+        "-- envelope adds a 20-byte header + 16-byte GCM tag and is then base64-"
+    );
+    let _ = writeln!(
+        out,
+        "-- encoded (~1.37x), so e.g. a VARCHAR(255) value can grow past 255 chars"
+    );
+    let _ = writeln!(
+        out,
+        "-- and the backfill (or later writes) will fail with a length violation."
+    );
+    let _ = writeln!(
+        out,
+        "-- Widen bounded columns to TEXT (or a sufficiently larger limit) FIRST:"
+    );
+    for col in columns {
+        let _ = writeln!(
+            out,
+            "--      ALTER TABLE {table} ALTER COLUMN {col} TYPE TEXT;"
+        );
+    }
+}
+
 /// `up.sql` for converting plaintext column(s) to at-rest encrypted (#805).
 ///
-/// Encrypted values are stored as a base64 AES-256-GCM envelope, so the column
-/// stays `TEXT`/`VARCHAR` — no type change is required. The actual encryption
-/// of existing rows is an **offline backfill** that needs the application's key
-/// ring, so it runs as a one-off task rather than raw SQL. This file documents
-/// the procedure and serves as the migration record.
+/// Encrypted values are stored as a base64 AES-256-GCM envelope. An unbounded
+/// `TEXT` column needs no type change, but a bounded `VARCHAR(n)` column must be
+/// widened first (the envelope is larger than the plaintext), so the scaffold
+/// emits the `ALTER … TYPE TEXT` statements. The actual encryption of existing
+/// rows is an **offline backfill** that needs the application's key ring, so it
+/// runs as a one-off task rather than raw SQL. This file documents the procedure
+/// and serves as the migration record.
 #[must_use]
 pub fn encrypt_columns_up_sql(table: &str, columns: &[String]) -> String {
     let mut out = String::with_capacity(1024);
@@ -275,10 +312,7 @@ pub fn encrypt_columns_up_sql(table: &str, columns: &[String]) -> String {
         out,
         "-- Convert plaintext column(s) on `{table}` to at-rest encryption (#805)."
     );
-    let _ = writeln!(
-        out,
-        "-- The envelope is base64 text, so no column type change is needed."
-    );
+    write_widen_bounded_columns_note(&mut out, table, columns);
     let _ = writeln!(out, "--");
     let _ = writeln!(out, "-- 1. Configure keys (once). The salt is required:");
     let _ = writeln!(out, "--      autumn credentials edit");
@@ -1893,6 +1927,8 @@ mod tests {
         assert!(up.contains("encrypt_text"));
         assert!(up.contains("autumn-safety: backfill"));
         assert!(up.contains("api_token"));
+        // Bounded columns must be widened to TEXT before the envelope is stored.
+        assert!(up.contains("ALTER TABLE accounts ALTER COLUMN api_token TYPE TEXT;"));
         // down.sql documents restoring plaintext from ciphertext given the keys.
         assert!(down.contains("decrypt_text"));
         assert!(down.contains("Rollback"));
