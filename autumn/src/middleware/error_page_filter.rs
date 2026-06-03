@@ -64,6 +64,12 @@ pub struct ErrorPageRequestContext {
     pub request_id: Option<String>,
     pub query: Option<String>,
     pub headers: Option<axum::http::HeaderMap>,
+    /// HTTP method (e.g. "GET").
+    pub method: Option<String>,
+    /// Matched route pattern (e.g. `/posts/{id}`), set by `DevRouteInfoLayer` in dev mode.
+    pub matched_path: Option<String>,
+    /// Scrubbed cookies parsed from the Cookie header.
+    pub cookies: Option<serde_json::Value>,
 }
 
 /// Tower layer that annotates requests with Accept header preference
@@ -112,6 +118,7 @@ where
 
         let query = uri.query().map(str::to_owned);
         let headers = Some(req.headers().clone());
+        let method = Some(req.method().to_string());
 
         ErrorPageContextFuture {
             inner: self.inner.call(req),
@@ -120,6 +127,7 @@ where
             request_id,
             query,
             headers,
+            method,
         }
     }
 }
@@ -133,6 +141,7 @@ pin_project_lite::pin_project! {
         request_id: Option<String>,
         query: Option<String>,
         headers: Option<axum::http::HeaderMap>,
+        method: Option<String>,
     }
 }
 
@@ -159,11 +168,24 @@ where
                         .and_then(|value| value.to_str().ok())
                         .map(str::to_owned)
                 });
+                let matched_path = response
+                    .extensions()
+                    .get::<crate::middleware::dev::DevMatchedPath>()
+                    .map(|m| m.0.clone());
+                let cookies = this
+                    .headers
+                    .as_ref()
+                    .and_then(|h| h.get(axum::http::header::COOKIE))
+                    .and_then(|v| v.to_str().ok())
+                    .map(parse_cookie_header);
                 response.extensions_mut().insert(ErrorPageRequestContext {
                     uri: this.uri.clone(),
                     request_id,
                     query: this.query.clone(),
                     headers: this.headers.clone(),
+                    method: this.method.clone(),
+                    matched_path,
+                    cookies,
                 });
                 std::task::Poll::Ready(Ok(response))
             }
@@ -251,6 +273,22 @@ pub fn accept_prefers_html(headers: &axum::http::HeaderMap) -> bool {
     }
 }
 
+/// Parse `Cookie: name=value; name2=value2` into a JSON object.
+///
+/// Returns an object where each cookie name maps to its (possibly filtered) value.
+fn parse_cookie_header(raw: &str) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    for pair in raw.split(';') {
+        let pair = pair.trim();
+        if let Some((name, value)) = pair.split_once('=') {
+            map.insert(name.trim().to_owned(), serde_json::Value::String(value.trim().to_owned()));
+        } else if !pair.is_empty() {
+            map.insert(pair.to_owned(), serde_json::Value::String(String::new()));
+        }
+    }
+    serde_json::Value::Object(map)
+}
+
 fn scrub_headers(
     headers: &axum::http::HeaderMap,
     parameter_filter: &crate::log::filter::ParameterFilter,
@@ -313,6 +351,22 @@ impl ErrorPageFilter {
         ctx: &ErrorContext,
         response: &Response,
     ) {
+        let req_ctx = response.extensions().get::<ErrorPageRequestContext>();
+
+        let stack_frames = error
+            .backtrace_string
+            .as_deref()
+            .map(|bt| {
+                crate::error_pages::source::parse_backtrace_string(bt, 24)
+            })
+            .unwrap_or_default();
+
+        let raw_cookies = req_ctx
+            .and_then(|c| c.cookies.as_ref())
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        let cookies = self.parameter_filter.scrub_json(&raw_cookies);
+
         let badge_ctx = DevBadgeContext {
             status_code: error.status.as_u16(),
             status_reason: error
@@ -324,18 +378,19 @@ impl ErrorPageFilter {
             path: ctx.path.clone(),
             request_id: ctx.request_id.clone(),
             source_location: None,
-            query: response
-                .extensions()
-                .get::<ErrorPageRequestContext>()
-                .and_then(|ctx| ctx.query.clone()),
-            headers: response
-                .extensions()
-                .get::<ErrorPageRequestContext>()
-                .and_then(|ctx| ctx.headers.as_ref())
+            query: req_ctx.and_then(|c| c.query.clone()),
+            headers: req_ctx
+                .and_then(|c| c.headers.as_ref())
                 .map_or_else(
                     || serde_json::json!({}),
                     |h| scrub_headers(h, &self.parameter_filter),
                 ),
+            method: req_ctx.and_then(|c| c.method.clone()),
+            route_pattern: req_ctx.and_then(|c| c.matched_path.clone()),
+            path_params: serde_json::json!({}),
+            cookies,
+            stack_frames,
+            sql_queries: Vec::new(),
         };
         let badge = dev_badge::dev_error_badge_html(&badge_ctx).into_string();
         if let Some(pos) = html_body.rfind("</body>") {

@@ -73,6 +73,9 @@ pub struct AutumnErrorInfo {
     pub details: Option<std::collections::HashMap<String, Vec<String>>>,
     /// Optional explicit Problem Details type URI.
     pub problem_type: Option<&'static str>,
+    /// Formatted backtrace string captured at error creation time (debug builds only).
+    /// Used by the dev error overlay to render the stack trace section.
+    pub backtrace_string: Option<String>,
 }
 
 impl AutumnErrorInfo {
@@ -360,6 +363,7 @@ mod tests {
             message: "database unavailable".into(),
             details: None,
             problem_type: None,
+            backtrace_string: None,
         };
         let mut original = (StatusCode::INTERNAL_SERVER_ERROR, "old error body").into_response();
         original.headers_mut().insert(
@@ -469,6 +473,7 @@ mod tests {
             message: "not found".into(),
             details: None,
             problem_type: None,
+            backtrace_string: None,
         };
         let response = info.into_default_response();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
@@ -481,6 +486,7 @@ mod tests {
             message: "database password leaked".into(),
             details: None,
             problem_type: None,
+            backtrace_string: None,
         };
         let response = info.into_default_response();
 

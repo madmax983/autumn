@@ -138,6 +138,10 @@ pub struct AutumnError {
     details: Option<std::collections::HashMap<String, Vec<String>>>,
     problem_type: Option<&'static str>,
     cache_idempotency_response: bool,
+    /// Backtrace captured at error creation time in debug builds.
+    /// Transferred to `AutumnErrorInfo` for the dev overlay.
+    #[cfg(debug_assertions)]
+    pub(crate) backtrace_string: Option<String>,
 }
 
 /// Convenience alias -- the standard return type for Autumn handlers.
@@ -168,6 +172,8 @@ where
             details: None,
             problem_type: None,
             cache_idempotency_response: false,
+            #[cfg(debug_assertions)]
+            backtrace_string: Some(format!("{}", std::backtrace::Backtrace::force_capture())),
         }
     }
 }
@@ -209,6 +215,8 @@ impl AutumnError {
             details: None,
             problem_type: None,
             cache_idempotency_response: false,
+            #[cfg(debug_assertions)]
+            backtrace_string: Some(format!("{}", std::backtrace::Backtrace::force_capture())),
         }
     }
 
@@ -230,6 +238,8 @@ impl AutumnError {
             details: None,
             problem_type: None,
             cache_idempotency_response: false,
+            #[cfg(debug_assertions)]
+            backtrace_string: Some(format!("{}", std::backtrace::Backtrace::force_capture())),
         }
     }
 
@@ -251,6 +261,8 @@ impl AutumnError {
             details: None,
             problem_type: None,
             cache_idempotency_response: false,
+            #[cfg(debug_assertions)]
+            backtrace_string: Some(format!("{}", std::backtrace::Backtrace::force_capture())),
         }
     }
 
@@ -275,6 +287,8 @@ impl AutumnError {
             details: None,
             problem_type: None,
             cache_idempotency_response: false,
+            #[cfg(debug_assertions)]
+            backtrace_string: Some(format!("{}", std::backtrace::Backtrace::force_capture())),
         }
     }
 
@@ -296,6 +310,8 @@ impl AutumnError {
             details: None,
             problem_type: None,
             cache_idempotency_response: false,
+            #[cfg(debug_assertions)]
+            backtrace_string: Some(format!("{}", std::backtrace::Backtrace::force_capture())),
         }
     }
 
@@ -317,6 +333,8 @@ impl AutumnError {
             details: None,
             problem_type: None,
             cache_idempotency_response: false,
+            #[cfg(debug_assertions)]
+            backtrace_string: Some(format!("{}", std::backtrace::Backtrace::force_capture())),
         }
     }
 
@@ -338,6 +356,8 @@ impl AutumnError {
             details: None,
             problem_type: None,
             cache_idempotency_response: false,
+            #[cfg(debug_assertions)]
+            backtrace_string: Some(format!("{}", std::backtrace::Backtrace::force_capture())),
         }
     }
 
@@ -370,6 +390,8 @@ impl AutumnError {
             details: Some(details),
             problem_type: None,
             cache_idempotency_response: false,
+            #[cfg(debug_assertions)]
+            backtrace_string: Some(format!("{}", std::backtrace::Backtrace::force_capture())),
         }
     }
 
@@ -502,6 +524,8 @@ impl AutumnError {
             details: None,
             problem_type: Some("https://autumn.dev/problems/conflict"),
             cache_idempotency_response: false,
+            #[cfg(debug_assertions)]
+            backtrace_string: Some(format!("{}", std::backtrace::Backtrace::force_capture())),
         }
     }
 
@@ -543,6 +567,8 @@ impl AutumnError {
             details: None,
             problem_type: Some("https://autumn.dev/problems/query-timeout"),
             cache_idempotency_response: false,
+            #[cfg(debug_assertions)]
+            backtrace_string: Some(format!("{}", std::backtrace::Backtrace::force_capture())),
         }
     }
 
@@ -816,6 +842,10 @@ impl IntoResponse for AutumnError {
             message: message.clone(),
             details: details.clone(),
             problem_type,
+            #[cfg(debug_assertions)]
+            backtrace_string: self.backtrace_string.clone(),
+            #[cfg(not(debug_assertions))]
+            backtrace_string: None,
         };
 
         let body = problem_details(
