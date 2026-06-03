@@ -23,6 +23,7 @@ multipart = ["axum/multipart"]
 tailwind = []
 http-client = ["dep:reqwest"]
 oauth2 = ["http-client"]
+webauthn = ["dep:webauthn-rs"]
 openapi = ["dep:serde_yaml"]
 # Optional Markdown rendering with frontmatter parsing and SSG integration.
 markdown = ["dep:pulldown-cmark"]
@@ -119,6 +120,7 @@ base64 = "0.22"
 url = "2.5.8"
 percent-encoding = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
+webauthn-rs = { version = "0.5", features = ["danger-allow-state-serialisation"], optional = true }
 jsonwebtoken = { version = "10.1.0", default-features = false, features = ["rust_crypto"] }
 lru = "0.18.0"
 hmac = "0.12"

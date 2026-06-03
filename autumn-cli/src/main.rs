@@ -918,6 +918,12 @@ enum GenerateCommands {
         /// 2FA integration tests.
         #[arg(long)]
         totp: bool,
+        /// Scaffold `WebAuthn` passkey authentication (off by default).
+        /// Adds a `webauthn_credentials` table, ceremony handlers for
+        /// register/login begin+finish, a passkey list/revoke surface,
+        /// Maud templates with navigator.credentials JS, and integration tests.
+        #[arg(long)]
+        passkeys: bool,
         /// Print the file plan and exit without writing anything.
         #[arg(long)]
         dry_run: bool,
@@ -1417,6 +1423,7 @@ fn run_generate_command(cmd: GenerateCommands) {
             name,
             oauth,
             totp,
+            passkeys,
             dry_run,
             force,
         } => {
@@ -1426,6 +1433,7 @@ fn run_generate_command(cmd: GenerateCommands) {
                 generate::Flags { dry_run, force },
                 &oauth_options,
                 totp,
+                passkeys,
             );
         }
         GenerateCommands::Admin {
@@ -3334,5 +3342,25 @@ mod tests {
             oauth.is_empty(),
             "oauth must default to empty when flag not given"
         );
+    }
+
+    #[test]
+    fn parse_generate_auth_passkeys_flag() {
+        let cli =
+            Cli::try_parse_from(["autumn", "generate", "auth", "User", "--passkeys"]).unwrap();
+        let Commands::Generate(GenerateCommands::Auth { name, passkeys, .. }) = cli.command else {
+            panic!("wrong variant");
+        };
+        assert_eq!(name, "User");
+        assert!(passkeys, "--passkeys must set the passkeys flag");
+    }
+
+    #[test]
+    fn generate_auth_passkeys_defaults_off() {
+        let cli = Cli::try_parse_from(["autumn", "generate", "auth", "User"]).unwrap();
+        let Commands::Generate(GenerateCommands::Auth { passkeys, .. }) = cli.command else {
+            panic!("wrong variant");
+        };
+        assert!(!passkeys, "passkeys must default to off");
     }
 }

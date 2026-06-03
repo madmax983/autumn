@@ -408,6 +408,63 @@ pub struct AuthConfig {
     #[cfg(feature = "oauth2")]
     #[serde(default)]
     pub oauth_linking_policy: OAuthLinkingPolicy,
+
+    /// WebAuthn / passkey configuration.
+    ///
+    /// Required when using `autumn generate auth --passkeys`. Set in `autumn.toml`:
+    ///
+    /// ```toml
+    /// [auth.webauthn]
+    /// rp_id = "example.com"
+    /// rp_name = "My App"
+    /// rp_origin = "https://example.com"
+    /// ```
+    #[cfg(feature = "webauthn")]
+    #[serde(default)]
+    pub webauthn: WebAuthnConfig,
+}
+
+/// WebAuthn / passkey Relying Party configuration.
+///
+/// Read from the `[auth.webauthn]` section of `autumn.toml`.
+#[cfg(feature = "webauthn")]
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct WebAuthnConfig {
+    /// The Relying Party ID (typically the domain, e.g. `"example.com"`).
+    #[serde(default = "default_rp_id")]
+    pub rp_id: String,
+    /// A human-readable name for the Relying Party shown in authenticator dialogs.
+    #[serde(default = "default_rp_name")]
+    pub rp_name: String,
+    /// The full origin of the Relying Party (e.g. `"https://example.com"`).
+    #[serde(default = "default_rp_origin")]
+    pub rp_origin: String,
+}
+
+#[cfg(feature = "webauthn")]
+impl Default for WebAuthnConfig {
+    fn default() -> Self {
+        Self {
+            rp_id: default_rp_id(),
+            rp_name: default_rp_name(),
+            rp_origin: default_rp_origin(),
+        }
+    }
+}
+
+#[cfg(feature = "webauthn")]
+fn default_rp_id() -> String {
+    "localhost".to_owned()
+}
+
+#[cfg(feature = "webauthn")]
+fn default_rp_name() -> String {
+    "My App".to_owned()
+}
+
+#[cfg(feature = "webauthn")]
+fn default_rp_origin() -> String {
+    "http://localhost:3000".to_owned()
 }
 
 const fn default_bcrypt_cost() -> u32 {
@@ -1180,6 +1237,8 @@ impl Default for AuthConfig {
             oauth2: OAuth2Config::default(),
             #[cfg(feature = "oauth2")]
             oauth_linking_policy: OAuthLinkingPolicy::default(),
+            #[cfg(feature = "webauthn")]
+            webauthn: WebAuthnConfig::default(),
         }
     }
 }
