@@ -82,6 +82,8 @@ pub use channels::{
 };
 pub mod config;
 pub mod credentials;
+#[cfg(feature = "csv")]
+pub mod csv;
 #[cfg(feature = "db")]
 pub mod db;
 pub mod error;
