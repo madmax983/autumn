@@ -2041,7 +2041,10 @@ fn collect_openapi_docs(
     // user will call.
     let mut docs: Vec<crate::openapi::ApiDoc> = Vec::new();
     for route in route_list {
-        docs.push(route.api_doc.clone());
+        let mut doc = route.api_doc.clone();
+        doc.api_version = route.api_version;
+        doc.sunset_opt_out = route.sunset_opt_out;
+        docs.push(doc);
     }
     for group in scoped_groups {
         // Extract `{name}` captures from the scope prefix so parameters
@@ -2050,6 +2053,8 @@ fn collect_openapi_docs(
         let prefix_params = extract_path_params(&group.prefix);
         for route in &group.routes {
             let mut doc = route.api_doc.clone();
+            doc.api_version = route.api_version;
+            doc.sunset_opt_out = route.sunset_opt_out;
             // Leak the combined path so it fits the `&'static str` shape of
             // ApiDoc. The spec is built once per process; the leak is
             // bounded by the route table size. Using the same

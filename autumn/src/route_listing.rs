@@ -89,7 +89,7 @@ type RouteVersionInfo = (Option<String>, Option<String>, Option<bool>);
 ///
 /// # Errors
 ///
-/// Returns [`crate::router::RouterBuildError::UnregisteredApiVersion`] if a route's version is not registered.
+/// Returns `RouterBuildError::UnregisteredApiVersion` if a route's version is not registered.
 pub fn collect_route_infos(
     routes: &[Route],
     route_sources: &[RouteSource],

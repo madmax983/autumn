@@ -14,7 +14,7 @@ use chrono::TimeZone;
 
 #[autumn_web::main]
 async fn main() -> Result<(), autumn_web::Error> {
-    let app = AppBuilder::new()
+    let app = autumn_web::app()
         // Register API v1: Deprecated on 2026-06-01, Sunset on 2026-12-01
         .api_version(ApiVersion {
             version: "v1".to_string(),
@@ -78,9 +78,9 @@ Once configured, Autumn automatically injects RFC 9745 headers and routes traffi
 | Route State | HTTP Status | Response Headers |
 |:---|:---|:---|
 | **Active** (Not Deprecated) | `200 OK` (normal) | *(None)* |
-| **Deprecated** (Past `deprecated_at` date) | `200 OK` (normal) | `Deprecation: true`<br>`Sunset: <sunset_date_gmt>` |
-| **Sunset** (Past `sunset_at` date) | `410 Gone` | `Deprecation: true`<br>`Sunset: <sunset_date_gmt>` |
-| **Sunset with Opt-Out** (Past `sunset_at`, `sunset_opt_out = true`) | `200 OK` (normal) | `Deprecation: true`<br>`Sunset: <sunset_date_gmt>` |
+| **Deprecated** (Past `deprecated_at` date) | `200 OK` (normal) | `Deprecation: @<timestamp>`<br>`Sunset: <sunset_date_gmt>` |
+| **Sunset** (Past `sunset_at` date) | `410 Gone` | `Deprecation: @<timestamp>`<br>`Sunset: <sunset_date_gmt>` |
+| **Sunset with Opt-Out** (Past `sunset_at`, `sunset_opt_out = true`) | `200 OK` (normal) | `Deprecation: @<timestamp>`<br>`Sunset: <sunset_date_gmt>` |
 
 ### RFC 7807 Problem Details Response
 
