@@ -126,7 +126,7 @@ fn generated_project_compiles_runs_and_serves() {
     assert_eq!(resp.status(), 200, "GET / status");
     let body = resp.text().unwrap();
     assert!(
-        body.contains("Welcome to Autumn!"),
+        body.contains("Welcome to test-app!"),
         "GET / body missing welcome text, got: {body}",
     );
 

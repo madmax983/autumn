@@ -19,8 +19,7 @@ on:
       - "autumn-cli/src/generate/**"
       - "autumn-cli/src/templates/**"
       - "autumn-cli/src/new.rs"
-      - "autumn/src/lib.rs"
-      - "autumn/src/prelude.rs"
+      - "autumn/src/**"
       - "autumn-macros/**"
   pull_request:
     branches: [trunk, trunk-dev]
@@ -28,8 +27,7 @@ on:
       - "autumn-cli/src/generate/**"
       - "autumn-cli/src/templates/**"
       - "autumn-cli/src/new.rs"
-      - "autumn/src/lib.rs"
-      - "autumn/src/prelude.rs"
+      - "autumn/src/**"
       - "autumn-macros/**"
   schedule:
     # Weekly on Monday at 04:00 UTC — catches rot from transitive dep updates
@@ -51,6 +49,7 @@ jobs:
   #   generated_project_compiles_runs_and_serves  (e2e.rs)
   #   generated_scaffold_cargo_checks             (generate.rs)
   #   generated_scaffold_config_cargo_checks      (generate.rs)
+  #   generated_auth_totp_cargo_checks            (generate.rs)
   #
   # Each test scaffolds a project, patches Cargo.toml to point at the local
   # autumn-web crate, and runs `cargo build` / `cargo check`. Failures include
@@ -88,6 +87,11 @@ jobs:
           cargo test -p autumn-cli --test generate \
             generated_scaffold_config_cargo_checks -- --ignored --exact
 
+      - name: generated_auth_totp_cargo_checks
+        run: |
+          cargo test -p autumn-cli --test generate \
+            generated_auth_totp_cargo_checks -- --ignored --exact
+
   # ── Postgres e2e gate ────────────────────────────────────────────────────────
   #
   # Runs:
@@ -96,8 +100,9 @@ jobs:
   # Scaffolds a Post resource, runs Diesel migrations against a Postgres
   # testcontainer, builds the generated app, boots it, and asserts the HTML
   # index page and JSON API route both respond with 200. Docker is required
-  # (available on ubuntu-latest). Failure surfaces the full `cargo build`
-  # stdout+stderr captured by the test assertions.
+  # (available on ubuntu-latest). `autumn migrate` shells out to the `diesel`
+  # CLI, which must be installed before the test runs. Failure surfaces the
+  # full `cargo build` stdout+stderr captured by the test assertions.
   scaffold-postgres:
     name: Scaffold Postgres e2e gate
     runs-on: ubuntu-latest
@@ -114,6 +119,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2.7.8
         continue-on-error: true
+
+      - name: Install diesel_cli
+        run: cargo install diesel_cli --no-default-features --features postgres --locked
 
       - name: generated_scaffold_serves_posts_index_and_json_api
         run: |

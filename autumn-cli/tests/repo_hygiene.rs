@@ -601,14 +601,22 @@ fn generator_conformance_ci_gate_is_configured() {
          `generated_scaffold_serves_posts_index_and_json_api`",
     );
 
+    // The auth/TOTP generator gate must also be included so that changes to
+    // autumn-cli/src/generate/auth.rs are caught alongside scaffold changes.
+    assert!(
+        workflow.contains("generated_auth_totp_cargo_checks"),
+        "generator-conformance.yml must run `generated_auth_totp_cargo_checks` so \
+         auth generator changes are compile-verified alongside scaffold changes",
+    );
+
     // AC-4: path filters must cover the generator template surface and the
-    // autumn-web public API so the gate only fires on relevant changes.
+    // entire autumn-web public API (autumn/src/**) so changes to any crate
+    // source file — not just lib.rs / prelude.rs — trigger the gate.
     for path_fragment in [
         "autumn-cli/src/generate",
         "autumn-cli/src/templates",
         "autumn-cli/src/new.rs",
-        "autumn/src/lib.rs",
-        "autumn/src/prelude.rs",
+        "autumn/src/",
         "autumn-macros",
     ] {
         assert!(
