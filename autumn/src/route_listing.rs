@@ -82,7 +82,7 @@ pub struct RouteInfo {
 /// `routes`, remaining routes are attributed to [`RouteSource::User`].
 ///
 /// Does not include framework-internal routes (probes, actuator, htmx).
-/// Call [`append_framework_routes`] with a loaded config to add those.
+/// Call `append_framework_routes` with a loaded config to add those.
 pub fn collect_route_infos(
     routes: &[Route],
     route_sources: &[RouteSource],

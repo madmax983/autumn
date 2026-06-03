@@ -141,10 +141,10 @@ pub fn route_macro(
     };
     let api_doc_fields = api_doc_attr.emit_ident_fields(fn_name);
     let http_method_lit = LitStr::new(http_method, Span::call_site());
-    let api_version_expr = match &route_args.api_version {
-        Some(lit) => quote! { ::core::option::Option::Some(#lit) },
-        None => quote! { ::core::option::Option::None },
-    };
+    let api_version_expr = route_args.api_version.as_ref().map_or_else(
+        || quote! { ::core::option::Option::None },
+        |lit| quote! { ::core::option::Option::Some(#lit) },
+    );
     let sunset_opt_out_val = route_args.sunset_opt_out;
 
     // ── Path helper ─────────────────────────────────────────────

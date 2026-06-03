@@ -160,6 +160,21 @@ type PoolProviderFactory = Box<
 /// [`PolicyRegistry`](crate::authorization::PolicyRegistry).
 type PolicyRegistration = Box<dyn FnOnce(&crate::authorization::PolicyRegistry) + Send>;
 
+/// Represents an API version registration.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct ApiVersion {
+    /// The version name (e.g. "v1", "v2").
+    pub version: String,
+    /// When this version was deprecated.
+    pub deprecated_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// When this version was sunsetted.
+    pub sunset_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// A wrapper for registered API versions in the app state.
+#[derive(Clone, Debug)]
+pub struct RegisteredApiVersions(pub Vec<ApiVersion>);
+
 /// Builder for configuring and launching an Autumn application.
 ///
 /// Created by [`app()`]. Collect routes with [`.routes()`](Self::routes),
@@ -188,21 +203,6 @@ type PolicyRegistration = Box<dyn FnOnce(&crate::authorization::PolicyRegistry) 
 ///         .await;
 /// }
 /// ```
-/// Represents an API version registration.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct ApiVersion {
-    /// The version name (e.g. "v1", "v2").
-    pub version: String,
-    /// When this version was deprecated.
-    pub deprecated_at: Option<chrono::DateTime<chrono::Utc>>,
-    /// When this version was sunsetted.
-    pub sunset_at: Option<chrono::DateTime<chrono::Utc>>,
-}
-
-/// A wrapper for registered API versions in the app state.
-#[derive(Clone, Debug)]
-pub struct RegisteredApiVersions(pub Vec<ApiVersion>);
-
 pub struct AppBuilder {
     pub(crate) routes: Vec<Route>,
     /// Registered API versions.
