@@ -110,13 +110,13 @@ pub struct ImportReport {
 impl ImportReport {
     /// Total data rows processed (inserted + updated + skipped + errors).
     #[must_use]
-    pub fn total_rows(&self) -> u64 {
+    pub const fn total_rows(&self) -> u64 {
         self.inserted + self.updated + self.skipped + self.errors.len() as u64
     }
 
     /// `true` if no errors were recorded.
     #[must_use]
-    pub fn is_ok(&self) -> bool {
+    pub const fn is_ok(&self) -> bool {
         self.errors.is_empty()
     }
 }
@@ -299,11 +299,11 @@ where
     for result in rdr.records() {
         let (line, record) = match result {
             Ok(r) => {
-                let pos = r.position().map_or(0, |p| p.line());
+                let pos = r.position().map_or(0, csv::Position::line);
                 (pos, r)
             }
             Err(e) => {
-                let pos = e.position().map_or(0, |p| p.line());
+                let pos = e.position().map_or(0, csv::Position::line);
                 report
                     .errors
                     .push(CsvRowError::row(pos, format!("CSV parse error: {e}")));
@@ -536,18 +536,14 @@ mod tests {
             csv.as_ref(),
             &ImportOptions::default(),
             |_line, row, _mode| {
-                if !row
-                    .get("email")
-                    .map(String::as_str)
-                    .unwrap_or("")
-                    .contains('@')
-                {
+                let is_valid_email = row.get("email").is_some_and(|s| s.contains('@'));
+                if is_valid_email {
+                    ImportRowResult::Inserted
+                } else {
                     ImportRowResult::FieldError {
                         column: "email".into(),
                         message: "must be a valid email".into(),
                     }
-                } else {
-                    ImportRowResult::Inserted
                 }
             },
         );
