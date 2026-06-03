@@ -1037,6 +1037,20 @@ fn mount_raw_routers(
     router
 }
 
+fn apply_compression_middleware<S>(
+    mut router: axum::Router<S>,
+    config: &AutumnConfig,
+) -> axum::Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    if config.compression.enabled {
+        router = router.layer(tower_http::compression::CompressionLayer::new());
+        tracing::info!("Response compression enabled (gzip/brotli)");
+    }
+    router
+}
+
 fn apply_cors_middleware<S>(mut router: axum::Router<S>, config: &AutumnConfig) -> axum::Router<S>
 where
     S: Clone + Send + Sync + 'static,
@@ -1319,6 +1333,13 @@ fn apply_middleware(
         tracing::debug!(count = custom_layer_count, "Custom Tower layers applied");
     }
 
+    // Response compression. Applied AFTER user custom layers so that user-registered
+    // middleware (e.g. EtagLayer) runs first on the response path: ETags are computed
+    // on the uncompressed body, then the body is compressed. CompressionLayer honors
+    // Accept-Encoding, adds Vary: Accept-Encoding, skips already-encoded responses,
+    // and never compresses non-compressible content types (images, archives, etc.).
+    router = apply_compression_middleware(router, config);
+
     let mut router = router;
 
     if config.tenancy.enabled {
@@ -1334,7 +1355,7 @@ fn apply_middleware(
     //
     // Full ingress layer order (outermost → innermost):
     //   TraceContext → Metrics → ExceptionFilter → ErrorPageContext → Session →
-    //   SecurityHeaders → RequestId → Timeout → [user layers] → Tenancy →
+    //   SecurityHeaders → RequestId → Timeout → [user layers] → Compression → Tenancy →
     //   BodyLimit/UploadConfig → MethodOverride → RateLimit → CSRF → CORS → handler
     router = apply_request_timeout_middleware(router, config, state.metrics.clone());
 

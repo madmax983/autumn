@@ -54,6 +54,7 @@ const KNOWN_TOML_SECTIONS: &[&str] = &[
     "storage",
     "mail",
     "profile",
+    "compression",
 ];
 
 /// Result status for a single diagnostic check.
@@ -1577,6 +1578,23 @@ fn tailwind_enabled() -> bool {
         .unwrap_or_else(|| std::path::Path::new("build.rs").exists())
 }
 
+fn resolve_compression_enabled() -> bool {
+    if let Ok(val) = std::env::var("AUTUMN_COMPRESSION__ENABLED") {
+        if matches!(val.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes") {
+            return true;
+        }
+    }
+    std::fs::read_to_string("autumn.toml")
+        .ok()
+        .and_then(|c| toml::from_str::<toml::Table>(&c).ok())
+        .and_then(|t| {
+            t.get("compression")
+                .and_then(|v| v.get("enabled"))
+                .and_then(toml::Value::as_bool)
+        })
+        .unwrap_or(false)
+}
+
 // ─── Main entry point ─────────────────────────────────────────────────────────
 
 /// Run all doctor checks and report results.
@@ -1615,6 +1633,7 @@ pub fn run(opts: DoctorOptions) {
     let is_production = resolve_is_production();
     let rate_limit_key_strategy = resolve_rate_limit_key_strategy();
     let auth_extractor_mounted = resolve_auth_extractor_mounted();
+    let compression_enabled = resolve_compression_enabled();
 
     // ── Phase 2: build tasks in display order ────────────────────────────────
     let mut tasks: Vec<Task> = Vec::new();
@@ -1703,6 +1722,11 @@ pub fn run(opts: DoctorOptions) {
     // 11. Maintenance mode state
     tasks.push(Box::new(check_maintenance_mode));
 
+    // 12. Compression (warn in production when disabled)
+    tasks.push(Box::new(move || {
+        check_compression_impl(compression_enabled, is_production)
+    }));
+
     // ── Phase 3: spawn all tasks concurrently ────────────────────────────────
     let handles: Vec<thread::JoinHandle<CheckResult>> =
         tasks.into_iter().map(thread::spawn).collect();
@@ -1739,6 +1763,41 @@ pub fn run(opts: DoctorOptions) {
 /// Check whether maintenance mode is currently active.
 ///
 /// Warns (not fails) so `autumn doctor` stays green during planned windows.
+/// Check whether response compression is configured for a production profile.
+///
+/// Compression is off by default (for BREACH/CRIME safety). When running in
+/// production without compression this check emits a `Warn` so operators know
+/// they may want to enable it (or document the deliberate choice to rely on a
+/// CDN / reverse-proxy for compression instead).
+pub fn check_compression_impl(compression_enabled: bool, is_production: bool) -> CheckResult {
+    if is_production && !compression_enabled {
+        return CheckResult {
+            name: "compression",
+            status: CheckStatus::Warn,
+            detail: Some(
+                "response compression is disabled in production; \
+                 text payloads (HTML/JSON/CSS) are served uncompressed"
+                    .into(),
+            ),
+            hint: Some(
+                "Set [compression] enabled = true in autumn.toml (or AUTUMN_COMPRESSION__ENABLED=true) \
+                 if you are not using a CDN or reverse-proxy that compresses for you. \
+                 Read the BREACH/CRIME tradeoff in docs/guide/compression.md before enabling.",
+            ),
+        };
+    }
+    CheckResult {
+        name: "compression",
+        status: CheckStatus::Pass,
+        detail: Some(if compression_enabled {
+            "response compression is enabled".into()
+        } else {
+            "response compression is disabled (off by default; use CDN or enable explicitly)".into()
+        }),
+        hint: None,
+    }
+}
+
 pub fn check_maintenance_mode() -> CheckResult {
     use autumn_web::maintenance::{MAINTENANCE_FLAG_FILE, MaintenanceState};
     let path = std::path::Path::new(MAINTENANCE_FLAG_FILE);
@@ -2713,6 +2772,41 @@ redirect_uri = "http://localhost/callback"
         assert_eq!(
             p.client_secret, "ghp_test_secret",
             "env var must override empty TOML client_secret"
+        );
+    }
+
+    // ── check_compression ────────────────────────────────────────────────────
+
+    #[test]
+    fn compression_warns_in_production_when_disabled() {
+        let result = check_compression_impl(false, true);
+        assert_eq!(result.name, "compression");
+        assert!(
+            matches!(result.status, CheckStatus::Warn),
+            "expected Warn, got {:?}",
+            result.status
+        );
+    }
+
+    #[test]
+    fn compression_passes_in_production_when_enabled() {
+        let result = check_compression_impl(true, true);
+        assert_eq!(result.name, "compression");
+        assert!(
+            matches!(result.status, CheckStatus::Pass),
+            "expected Pass, got {:?}",
+            result.status
+        );
+    }
+
+    #[test]
+    fn compression_passes_in_dev_when_disabled() {
+        let result = check_compression_impl(false, false);
+        assert_eq!(result.name, "compression");
+        assert!(
+            matches!(result.status, CheckStatus::Pass),
+            "expected Pass in dev profile, got {:?}",
+            result.status
         );
     }
 }
