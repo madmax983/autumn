@@ -275,11 +275,16 @@ pub enum CsvImportMode {
 
 impl CsvImportMode {
     /// Parse from a form field value.
+    ///
+    /// Returns `None` for unrecognised values so callers can reject them with a
+    /// 400 instead of silently falling back to the destructive `Insert` path.
+    /// An *absent* mode field should default to `Insert` without calling this.
     #[must_use]
-    pub fn from_form_value(s: &str) -> Self {
+    pub fn from_form_value(s: &str) -> Option<Self> {
         match s {
-            "dry_run" | "DryRun" | "dry-run" => Self::DryRun,
-            _ => Self::Insert,
+            "insert" | "Insert" => Some(Self::Insert),
+            "dry_run" | "DryRun" | "dry-run" => Some(Self::DryRun),
+            _ => None,
         }
     }
 }
@@ -560,10 +565,11 @@ pub trait AdminModel: Send + Sync + 'static {
 
     /// Whether this model exposes a `GET /admin/{slug}/export.csv` link.
     ///
-    /// Defaults to `true`. Override to `false` to hide the CSV export button
-    /// for sensitive models.
+    /// Defaults to `false` — export must be explicitly opted into to avoid
+    /// silently exposing model data on upgrade. Override to `true` to enable
+    /// the CSV export button and route.
     fn supports_csv_export(&self) -> bool {
-        true
+        false
     }
 
     /// Column names written to the CSV header row during export.
@@ -605,7 +611,7 @@ pub trait AdminModel: Send + Sync + 'static {
                 record
                     .get(*col)
                     .map(|v| match v {
-                        Value::String(s) => s.clone(),
+                        Value::String(s) => escape_csv_formula(s),
                         Value::Null => String::new(),
                         other => other.to_string(),
                     })
@@ -811,6 +817,21 @@ impl ListResult {
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
+
+/// Prefix a CSV cell value with `'` when it starts with a formula-triggering
+/// character (`=`, `+`, `-`, `@`, tab, or CR) to prevent spreadsheet formula
+/// injection.
+fn escape_csv_formula(s: &str) -> String {
+    match s.bytes().next() {
+        Some(b'=' | b'+' | b'-' | b'@' | b'\t' | b'\r') => {
+            let mut out = String::with_capacity(s.len() + 1);
+            out.push('\'');
+            out.push_str(s);
+            out
+        }
+        _ => s.to_owned(),
+    }
+}
 
 /// Convert a `snake_case` field name to a human-readable label.
 ///

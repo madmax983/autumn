@@ -904,6 +904,9 @@ async fn model_delete(
 
 // ── CSV export / import handlers ─────────────────────────────────────
 
+/// Records fetched per page during CSV export to bound peak JSON memory usage.
+const EXPORT_PAGE_SIZE: u64 = 500;
+
 /// `GET /admin/{slug}/export.csv` — Download all records as a CSV file.
 ///
 /// The response respects active `?q=`, `?sort=`, `?dir=`, and `?filter.*`
@@ -932,26 +935,13 @@ async fn model_export_csv(
         dir,
     } = query;
     let fields = model.fields();
-    let sort = validate_sort_key(sort, &fields);
+    let sort_key = validate_sort_key(sort, &fields);
     let filters = extract_filters(&raw_query, &fields);
+    let search = (!q.is_empty()).then_some(q);
 
-    // Load ALL records (per_page = 0) with the active filter/sort/search.
-    let params = ListParams {
-        page: 1,
-        per_page: 0,
-        search: (!q.is_empty()).then(|| q.clone()),
-        sort_by: sort,
-        sort_dir: dir,
-        filters,
-    };
-
-    let result = model
-        .list(&pool, params)
-        .await
-        .map_err(|e| admin_err("Export", e))?;
-
+    // Page through records in batches to avoid buffering the entire dataset
+    // as JSON in memory at once.
     let columns = model.csv_export_columns();
-
     let mut buf = Vec::new();
     {
         let mut wtr = csv::WriterBuilder::new()
@@ -961,11 +951,32 @@ async fn model_export_csv(
         wtr.write_record(&columns)
             .map_err(|e| AutumnError::internal_server_error_msg(format!("CSV write error: {e}")))?;
 
-        for record in &result.records {
-            let row = model.csv_export_row(&columns, record);
-            wtr.write_record(&row).map_err(|e| {
-                AutumnError::internal_server_error_msg(format!("CSV write error: {e}"))
-            })?;
+        let mut page: u64 = 1;
+        loop {
+            let params = ListParams {
+                page,
+                per_page: EXPORT_PAGE_SIZE,
+                search: search.clone(),
+                sort_by: sort_key.clone(),
+                sort_dir: dir,
+                filters: filters.clone(),
+            };
+            let result = model
+                .list(&pool, params)
+                .await
+                .map_err(|e| admin_err("Export", e))?;
+            let done =
+                result.records.len() < usize::try_from(EXPORT_PAGE_SIZE).unwrap_or(usize::MAX);
+            for record in &result.records {
+                let row = model.csv_export_row(&columns, record);
+                wtr.write_record(&row).map_err(|e| {
+                    AutumnError::internal_server_error_msg(format!("CSV write error: {e}"))
+                })?;
+            }
+            if done {
+                break;
+            }
+            page += 1;
         }
 
         wtr.flush()
@@ -1055,7 +1066,9 @@ async fn model_import_csv(
             Some("mode") => {
                 let bytes = field.bytes_limited().await?;
                 let val = String::from_utf8_lossy(&bytes).into_owned();
-                import_mode = CsvImportMode::from_form_value(&val);
+                import_mode = CsvImportMode::from_form_value(&val).ok_or_else(|| {
+                    AutumnError::bad_request_msg(format!("Unknown import mode: '{val}'"))
+                })?;
             }
             _ => {}
         }

@@ -257,6 +257,10 @@ impl AdminModel for PostAdmin {
     // This example wires it manually to demonstrate the History pane UI.
     // ── CSV export / import ──────────────────────────────────────────
 
+    fn supports_csv_export(&self) -> bool {
+        true
+    }
+
     /// Export `id`, `title`, `slug`, `published`, and `created_at`.
     /// The `body` column is omitted by default to keep exports manageable.
     fn csv_export_columns(&self) -> Vec<&'static str> {
