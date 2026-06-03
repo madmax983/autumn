@@ -644,7 +644,7 @@ fn plan_auth_options_impl(
         // ── webauthn_credentials migration ─────────────────────────────────────
         // Use timestamp+2 when oauth is also requested (oauth uses timestamp+1),
         // so both migrations get unique Diesel version numbers.
-        let passkey_offset: i64 = if !oauth.providers.is_empty() { 2 } else { 1 };
+        let passkey_offset: i64 = if oauth.providers.is_empty() { 1 } else { 2 };
         let passkey_ts_str: String = timestamp.parse::<i64>().map_or_else(
             |_| format!("{timestamp}{passkey_offset}"),
             |t| (t + passkey_offset).to_string(),
