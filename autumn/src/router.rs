@@ -1353,13 +1353,6 @@ fn apply_middleware(
         tracing::debug!(count = custom_layer_count, "Custom Tower layers applied");
     }
 
-    // Response compression. Applied AFTER user custom layers so that user-registered
-    // middleware (e.g. EtagLayer) runs first on the response path: ETags are computed
-    // on the uncompressed body, then the body is compressed. CompressionLayer honors
-    // Accept-Encoding, adds Vary: Accept-Encoding, skips already-encoded responses,
-    // and never compresses non-compressible content types (images, archives, etc.).
-    router = apply_compression_middleware(router, config);
-
     let mut router = router;
 
     if config.tenancy.enabled {
@@ -1374,8 +1367,8 @@ fn apply_middleware(
     // layer is available when the timeout fires — see request_timeout_handler).
     //
     // Full ingress layer order (outermost → innermost):
-    //   TraceContext → Metrics → ExceptionFilter → ErrorPageContext → Session →
-    //   SecurityHeaders → RequestId → Timeout → [user layers] → Compression → Tenancy →
+    //   TraceContext → Compression → Metrics → ExceptionFilter → ErrorPageContext → Session →
+    //   SecurityHeaders → RequestId → Timeout → [user layers] → Tenancy →
     //   BodyLimit/UploadConfig → MethodOverride → RateLimit → CSRF → CORS → handler
     router = apply_request_timeout_middleware(router, config, state.metrics.clone());
 
@@ -1445,15 +1438,26 @@ fn apply_middleware(
     // Full ingress layer order (outermost -> innermost):
     //   TraceContext (applied outside the startup barrier so short-circuit
     //   responses still carry traceparent) ->
+    //   Compression (outer to ExceptionFilter — see note below) ->
     //   [user layers, when SSG/ISG dist dir active] ->
     //   StaticFileMiddleware (when SSG/ISG enabled) ->
     //   Metrics -> ExceptionFilter -> ErrorPageContext -> Session ->
     //   SecurityHeaders -> RequestId -> [user layers, non-static build] ->
-    //   RateLimit -> CSRF -> CORS -> handler
+    //   Tenancy -> RateLimit -> CSRF -> CORS -> handler
     let router = router
         .layer(crate::middleware::error_page_filter::ErrorPageContextLayer)
         .layer(ExceptionFilterLayer::new(all_filters))
         .layer(crate::middleware::MetricsLayer::new(state.metrics.clone()));
+
+    // Response compression is applied outermost (outside ExceptionFilter) so that
+    // exception filters which rebuild the response body (e.g. ProblemDetailsFilter
+    // normalising AutumnErrors to JSON Problem Details) do so before the body is
+    // encoded. If compression were inner to ExceptionFilter, the filter would
+    // inherit a Content-Encoding: gzip header on the rebuilt uncompressed body,
+    // causing clients to receive uncompressed bytes labeled as gzip.
+    // User-registered layers (EtagLayer etc.) remain inner to Compression, so
+    // ETags are still computed on the uncompressed body before encoding occurs.
+    let router = apply_compression_middleware(router, config);
 
     Ok(router)
 }
