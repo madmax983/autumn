@@ -1579,11 +1579,15 @@ fn tailwind_enabled() -> bool {
 }
 
 fn resolve_compression_enabled() -> bool {
-    // 1. Env var takes highest precedence (matches apply_compression_env_overrides_with_env).
-    if let Ok(val) = std::env::var("AUTUMN_COMPRESSION__ENABLED")
-        && let Some(enabled) = parse_config_bool(&val)
-    {
-        return enabled;
+    // 1. Env var takes highest precedence. Use the same accepted values as the
+    //    runtime's parse_env_bool ("true"/"1"/"false"/"0") so doctor never
+    //    reports a different state than the app would observe.
+    if let Ok(val) = std::env::var("AUTUMN_COMPRESSION__ENABLED") {
+        match val.as_str() {
+            "true" | "1" => return true,
+            "false" | "0" => return false,
+            _ => {}
+        }
     }
 
     // 2. Read TOML, applying profile-specific override when a profile is active

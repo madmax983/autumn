@@ -1047,9 +1047,14 @@ where
     if config.compression.enabled {
         use tower_http::compression::predicate::{DefaultPredicate, NotForContentType, Predicate};
         // Extend the default predicate (skips images, gRPC, SSE, small bodies) to also
-        // skip already-compressed archive types — compressing a zip/gz a second time
-        // wastes CPU and often increases transfer size.
+        // skip binary media and already-compressed formats — compressing these wastes
+        // CPU, increases transfer size for archives, and can confuse media players.
         let predicate = DefaultPredicate::new()
+            // Binary media — already-encoded by codec, not compressible by gzip/br.
+            .and(NotForContentType::const_new("audio/"))
+            .and(NotForContentType::const_new("video/"))
+            .and(NotForContentType::const_new("application/octet-stream"))
+            // Compressed archive formats — re-compressing wastes CPU.
             .and(NotForContentType::const_new("application/zip"))
             .and(NotForContentType::const_new("application/gzip"))
             .and(NotForContentType::const_new("application/x-gzip"))

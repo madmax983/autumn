@@ -122,11 +122,17 @@ doctor check is informational only.
 
 ## Interaction with static asset serving
 
-Static files served from the `static/` directory (fingerprinted CSS/JS, images)
-are handled by `ServeDir` and are not affected by the `CompressionLayer`. If you
-want pre-compressed static assets, generate `.gz` or `.br` sidecar files during
-your build and configure `ServeDir` with `precompressed(true)`. See issue #752
-for the static-first SSG/ISG path.
+The `CompressionLayer` wraps the entire router, so static files under `/static`
+(fingerprinted CSS/JS etc.) **are** compressed on-the-fly when the client
+advertises `Accept-Encoding` and the content type is compressible. Images are
+excluded by `DefaultPredicate` and are served uncompressed regardless.
+
+If you prefer to serve pre-compressed sidecar files (`.gz` / `.br`) and skip
+on-the-fly CPU work, generate them during your build and configure `ServeDir`
+with `precompressed(true)`. When a sidecar is served, `ServeDir` sets
+`Content-Encoding` directly and the `CompressionLayer` skips re-encoding (the
+double-compression guard applies). See issue #752 for the static-first SSG/ISG
+path.
 
 ## Configuration reference
 
