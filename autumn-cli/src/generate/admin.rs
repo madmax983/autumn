@@ -297,6 +297,13 @@ const fn admin_field_kind(field: &Field) -> &'static str {
     }
 }
 
+/// Whether a field is an at-rest encrypted column (#805), per the auto-detected
+/// `encrypted` / `encrypted_visible` option lists.
+fn admin_field_is_encrypted(options: &AdminOptions, name: &str) -> bool {
+    options.encrypted.iter().any(|c| c == name)
+        || options.encrypted_visible.iter().any(|c| c == name)
+}
+
 const fn is_default_searchable(field: &Field) -> bool {
     matches!(field.kind, FieldKind::String | FieldKind::Text)
 }
@@ -592,9 +599,14 @@ fn render_fields_vec(
         if options.readonly.contains(&f.name) || is_default_readonly(f) {
             let _ = write!(out, "\n                .readonly()");
         }
-        // Select and hidden fields are not text-searchable.
+        // Select, hidden, and encrypted fields are not text-searchable. An
+        // encrypted column stores ciphertext envelopes, so an `ILIKE` against it
+        // for plaintext would never match (#805) — omit it from search.
         let is_select_or_hidden = select_spec.is_some() || options.hidden.contains(&f.name);
-        if is_default_searchable(f) && !is_select_or_hidden {
+        if is_default_searchable(f)
+            && !is_select_or_hidden
+            && !admin_field_is_encrypted(options, &f.name)
+        {
             let _ = write!(out, "\n                .searchable()");
         }
         if is_default_filterable(f) && !is_select_or_hidden {
@@ -630,6 +642,8 @@ fn render_apply_filters(
         .filter(|f| !options.exclude.contains(&f.name))
         .filter(|f| !is_lock_version_field(f, lock_version_field))
         .filter(|f| is_default_searchable(f))
+        // Encrypted columns store ciphertext, so plaintext ILIKE never matches (#805).
+        .filter(|f| !admin_field_is_encrypted(options, &f.name))
         .collect();
 
     let filterable_bool: Vec<&Field> = fields
@@ -1407,12 +1421,25 @@ pub struct Account {
             admin.contains(".encrypted_visible()"),
             "admin_visible encrypted column must be marked .encrypted_visible(): {admin}"
         );
-        // The non-encrypted column stays untouched.
+        // The non-encrypted column stays untouched (and remains searchable).
         assert!(
             !admin.contains(
                 "AdminField::new(\"username\", AdminFieldKind::Text)\n                .encrypted"
             ),
             "plaintext column must not be marked encrypted: {admin}"
+        );
+        assert!(
+            admin.contains(
+                "AdminField::new(\"username\", AdminFieldKind::Text)\n                .searchable()"
+            ),
+            "plaintext String column stays searchable: {admin}"
+        );
+        // Encrypted columns must NOT be marked searchable: ILIKE over ciphertext
+        // would never match plaintext (#805). The only `.searchable()` is username.
+        assert_eq!(
+            admin.matches(".searchable()").count(),
+            1,
+            "only the non-encrypted column is searchable: {admin}"
         );
     }
 

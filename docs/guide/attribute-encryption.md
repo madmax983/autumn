@@ -214,10 +214,20 @@ Once the attribute is present the column's reader decrypts on load, so any
 still-plaintext row would fail with a malformed-envelope error. Run a one-off
 task over a *temporary* plaintext model (one without `#[encrypted]`) that reads
 each row's plaintext and writes the envelope produced by
-`autumn_web::encryption::encrypt_text(Mode::Randomized, &plaintext)`. Only after
-every row is ciphertext do you add `#[encrypted]` and deploy the encrypted
-reader. The **rollback** task does the inverse with `decrypt_text(&envelope)`
-(again via a temporary plaintext model), then you remove the attribute.
+`autumn_web::encryption::encrypt_text(<mode>, &plaintext)`.
+
+**Use the mode the column will be deployed with.** For a column you will mark
+`#[encrypted(deterministic)]`, backfill with `Mode::Deterministic` — otherwise the
+pre-existing rows are written as randomized envelopes, and `find_by_*` /
+`exists_by_*` (which encode the query value as *deterministic* ciphertext and
+compare with `=`) will never match them until they are rewritten. Use
+`Mode::Randomized` for plain `#[encrypted]` columns. The generated migration
+scaffold notes the same rule.
+
+Only after every row is ciphertext do you add `#[encrypted]` and deploy the
+encrypted reader. The **rollback** task does the inverse with
+`decrypt_text(&envelope)` (again via a temporary plaintext model), then you
+remove the attribute.
 
 > Always take a backup before a backfill, and keep the keys: a row encrypted with
 > a key you have lost is unrecoverable by design.

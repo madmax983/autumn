@@ -1634,12 +1634,15 @@ fn render_detail_value(record: &Value, field: &AdminField) -> Markup {
 
 /// Render a form widget for a field.
 fn render_form_widget(field: &AdminField, record: Option<&Value>) -> Markup {
-    // Encrypted columns (#805) are not editable in the admin: render a disabled,
-    // redacted control with no `name`, so the plaintext is never placed into the
-    // form HTML and a save never submits (and thus never overwrites) the stored
-    // ciphertext. Set encrypted values out-of-band (e.g. via the API). The flag is
-    // per-field, so an unrelated same-named plaintext column stays editable.
-    if field.encrypted {
+    // Encrypted columns (#805). On EDIT (`record` is `Some`) we must never reveal
+    // or overwrite the stored ciphertext, so render a disabled, redacted control
+    // with no `name`: the plaintext never reaches the HTML and a save never
+    // submits (and thus never overwrites) it. On CREATE (`record` is `None`) there
+    // is no stored secret to protect and the generated `New*` DTO requires the
+    // value, so fall through to a normal editable input that captures the initial
+    // plaintext (the wrapper encrypts it on insert). The flag is per-field, so an
+    // unrelated same-named plaintext column stays editable.
+    if field.encrypted && record.is_some() {
         return html! {
             input type="text" class="form-input" value="••••••••" disabled
                 title="Encrypted at rest — managed outside the admin";
@@ -2034,7 +2037,36 @@ mod tests {
                 !form.contains("123-45-6789") && !form.contains("visible-note"),
                 "edit form must not pre-fill encrypted plaintext for {col}: {form}"
             );
+            // The edit control is disabled and carries no `name`, so it is not
+            // submitted (and cannot overwrite the stored ciphertext).
+            assert!(form.contains("disabled"), "edit control disabled: {form}");
+            assert!(
+                !form.contains("name="),
+                "edit control must not submit: {form}"
+            );
         }
+    }
+
+    #[test]
+    fn create_form_allows_setting_initial_encrypted_value() {
+        // On CREATE (`record` is None) there is no stored secret to protect and the
+        // New* DTO needs the value, so the encrypted field must be an editable,
+        // submittable, empty input — otherwise the default "New" flow can't create
+        // a record with a required encrypted column (#805).
+        let field = AdminField::new("ssn", AdminFieldKind::Text).encrypted();
+        let form = render_form_widget(&field, None).into_string();
+        assert!(
+            form.contains("name=\"ssn\""),
+            "create control must submit the value: {form}"
+        );
+        assert!(
+            !form.contains("disabled"),
+            "create control editable: {form}"
+        );
+        assert!(
+            !form.contains("••••••••"),
+            "create control is an empty input, not the redaction mask: {form}"
+        );
     }
 
     #[test]

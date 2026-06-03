@@ -228,6 +228,19 @@ fn validate_encrypted_field(field: &syn::Field) -> syn::Result<()> {
              store an unencrypted value. Set the encrypted value explicitly on insert.",
         ));
     }
+    // Full-text search builds the stored `search_vector` from the database column
+    // value, which for an encrypted field is ciphertext. Indexing/querying that
+    // would match envelope tokens, not the plaintext, so the repository's `search`
+    // would silently miss encrypted content. Reject the combination.
+    if has_attr(field, "searchable") {
+        return Err(syn::Error::new_spanned(
+            field,
+            "`#[encrypted]` cannot be combined with `#[searchable]`: full-text search \
+             indexes the stored column, which holds ciphertext, so plaintext searches \
+             would never match. Remove `#[searchable]` from the encrypted field (keep a \
+             separate non-encrypted column if you need to search).",
+        ));
+    }
     // The encrypted column is registered under its Rust field name, which the
     // log-scrub / version-history / admin compositions match against the
     // serde-serialized key. A `#[serde(rename)]` would desync those, leaking the
@@ -2280,6 +2293,28 @@ mod tests {
             pub id: i64
         };
         assert!(excluded_from_new(&field));
+    }
+
+    #[test]
+    fn encrypted_string_field_is_accepted() {
+        let field: syn::Field = syn::parse_quote! {
+            #[encrypted]
+            pub token: String
+        };
+        assert!(validate_encrypted_field(&field).is_ok());
+    }
+
+    #[test]
+    fn encrypted_plus_searchable_is_rejected() {
+        // Search indexes the stored ciphertext, so plaintext queries would miss —
+        // the combination must be a compile error (#805).
+        let field: syn::Field = syn::parse_quote! {
+            #[encrypted]
+            #[searchable]
+            pub token: String
+        };
+        let err = validate_encrypted_field(&field).unwrap_err();
+        assert!(err.to_string().contains("searchable"));
     }
 
     #[test]
