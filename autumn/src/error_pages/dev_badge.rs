@@ -81,6 +81,10 @@ pub struct DevBadgeContext {
     pub stack_frames: Vec<StackFrame>,
     /// SQL queries executed during this request (from harvest instrumentation).
     pub sql_queries: Vec<SqlQueryInfo>,
+    /// Parsed and scrubbed request body (JSON or form). `None` for GET or when
+    /// body capture is disabled (production). `Some(Value::String(...))` is used
+    /// to convey a truncation notice when the raw body exceeded the size cap.
+    pub body_preview: Option<serde_json::Value>,
 }
 
 impl Default for DevBadgeContext {
@@ -100,6 +104,7 @@ impl Default for DevBadgeContext {
             cookies: serde_json::json!({}),
             stack_frames: Vec::new(),
             sql_queries: Vec::new(),
+            body_preview: None,
         }
     }
 }
@@ -261,6 +266,12 @@ pub fn dev_error_badge_html(ctx: &DevBadgeContext) -> Markup {
                         div class="autumn-dev-overlay-section" {
                             div class="autumn-dev-overlay-label" { "Cookies" }
                             div class="autumn-dev-overlay-value autumn-dev-mono" { (ctx.cookies.to_string()) }
+                        }
+                    }
+                    @if let Some(body) = &ctx.body_preview {
+                        div class="autumn-dev-overlay-section" {
+                            div class="autumn-dev-overlay-label" { "Body" }
+                            div class="autumn-dev-overlay-value autumn-dev-mono" { (body.to_string()) }
                         }
                     }
                     @if !source_loc.is_empty() {
@@ -558,6 +569,7 @@ mod tests {
             cookies: serde_json::json!({}),
             stack_frames: Vec::new(),
             sql_queries: Vec::new(),
+            body_preview: None,
         }
     }
 
