@@ -1527,4 +1527,37 @@ mod tests {
             "oversized body should show a truncation notice, got:\n{body_str}"
         );
     }
+
+    #[tokio::test]
+    async fn dev_badge_truncates_when_content_length_header_exceeds_limit() {
+        // When Content-Length is declared over the cap the body stream is left
+        // unconsumed and the overlay shows a truncation notice immediately.
+        let app = test_router_with_error_pages(true);
+
+        let over_limit = (BODY_CAPTURE_LIMIT + 1).to_string();
+        let response = tower::ServiceExt::oneshot(
+            app,
+            Request::builder()
+                .method("POST")
+                .uri("/nope")
+                .header("accept", "text/html")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("content-length", over_limit)
+                // Actual body is small — only Content-Length matters for the early-exit path.
+                .body(Body::from("x=1"))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("bytes");
+        let body_str = String::from_utf8(body.to_vec()).expect("utf8");
+
+        assert!(
+            body_str.contains("truncated"),
+            "declared-oversized body should show truncation notice"
+        );
+    }
 }
