@@ -398,15 +398,74 @@ fn parse_body_preview(
     if ct.contains("application/json") {
         serde_json::from_slice(bytes).ok()
     } else if ct.contains("application/x-www-form-urlencoded") {
-        let map: std::collections::HashMap<String, String> =
-            serde_urlencoded::from_bytes(bytes).ok()?;
-        if map.is_empty() {
+        // Deserialize as ordered pairs so bracket-notation keys like
+        // `user[password]` can be expanded into nested JSON before scrubbing.
+        let pairs: Vec<(String, String)> = serde_urlencoded::from_bytes(bytes).ok()?;
+        if pairs.is_empty() {
             None
         } else {
-            Some(serde_json::to_value(map).unwrap_or_else(|_| serde_json::json!({})))
+            Some(form_pairs_to_nested_json(pairs))
         }
     } else {
         None
+    }
+}
+
+/// Convert URL-encoded form pairs into a nested JSON object, expanding
+/// bracket notation so that `user[password]=secret` becomes
+/// `{"user": {"password": "secret"}}`.  This lets `ParameterFilter::scrub_json`
+/// match sensitive leaf keys regardless of their parent prefix.
+fn form_pairs_to_nested_json(pairs: Vec<(String, String)>) -> serde_json::Value {
+    let mut root = serde_json::Map::new();
+    for (key, value) in pairs {
+        let path = bracket_key_segments(&key);
+        form_insert_at_path(&mut root, &path, serde_json::Value::String(value));
+    }
+    serde_json::Value::Object(root)
+}
+
+/// Split a form key on bracket notation into path segments.
+///
+/// `"user[password]"` → `["user", "password"]`
+/// `"a[b][c]"` → `["a", "b", "c"]`
+/// `"simple"` → `["simple"]`
+fn bracket_key_segments(key: &str) -> Vec<String> {
+    if let Some(pos) = key.find('[') {
+        let mut parts = vec![key[..pos].to_owned()];
+        for seg in key[pos + 1..].split('[') {
+            let seg = seg.trim_end_matches(']');
+            if !seg.is_empty() {
+                parts.push(seg.to_owned());
+            }
+        }
+        parts
+    } else {
+        vec![key.to_owned()]
+    }
+}
+
+fn form_insert_at_path(
+    map: &mut serde_json::Map<String, serde_json::Value>,
+    path: &[String],
+    value: serde_json::Value,
+) {
+    if path.is_empty() {
+        return;
+    }
+    if path.len() == 1 {
+        map.insert(path[0].clone(), value);
+        return;
+    }
+    let entry = map
+        .entry(path[0].clone())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if let serde_json::Value::Object(child) = entry {
+        form_insert_at_path(child, &path[1..], value);
+    } else {
+        // Key collision between a scalar value and a nested key: replace with object.
+        let mut new_map = serde_json::Map::new();
+        form_insert_at_path(&mut new_map, &path[1..], value);
+        *entry = serde_json::Value::Object(new_map);
     }
 }
 
@@ -1559,5 +1618,62 @@ mod tests {
             body_str.contains("truncated"),
             "declared-oversized body should show truncation notice"
         );
+    }
+
+    #[tokio::test]
+    async fn dev_badge_scrubs_bracket_notation_form_body_fields() {
+        // user[password]=secret should be treated the same as password=secret.
+        let app = test_router_with_error_pages(true);
+
+        let response = tower::ServiceExt::oneshot(
+            app,
+            Request::builder()
+                .method("POST")
+                .uri("/nope")
+                .header("accept", "text/html")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from("user[name]=alice&user[password]=secret123"))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("bytes");
+        let body_str = String::from_utf8(body.to_vec()).expect("utf8");
+
+        assert!(
+            body_str.contains("password"),
+            "should show the password key"
+        );
+        assert!(
+            !body_str.contains("secret123"),
+            "bracket-prefixed password value must be filtered"
+        );
+        assert!(body_str.contains("[FILTERED]"), "should show [FILTERED]");
+        // The non-sensitive sibling field should still be visible.
+        assert!(
+            body_str.contains("alice"),
+            "non-sensitive field should remain"
+        );
+    }
+
+    #[test]
+    fn bracket_key_segments_handles_simple_key() {
+        assert_eq!(bracket_key_segments("simple"), vec!["simple"]);
+    }
+
+    #[test]
+    fn bracket_key_segments_handles_one_level() {
+        assert_eq!(
+            bracket_key_segments("user[password]"),
+            vec!["user", "password"]
+        );
+    }
+
+    #[test]
+    fn bracket_key_segments_handles_multi_level() {
+        assert_eq!(bracket_key_segments("a[b][c]"), vec!["a", "b", "c"]);
     }
 }
