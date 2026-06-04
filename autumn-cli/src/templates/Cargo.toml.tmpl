@@ -7,6 +7,8 @@ edition = "2024"
 # Enable optional subsystems later by switching to:
 # autumn-web = { version = "{{autumn_version}}", features = ["redis", "mail"] }
 autumn-web = "{{autumn_version}}"
+maud = { version = "0.27", features = ["axum"] }
+diesel_migrations = "2"
 
 [dev-dependencies]
 # tokio runtime macros are needed for #[tokio::test] in integration tests.

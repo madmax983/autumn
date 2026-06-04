@@ -116,9 +116,14 @@ fn child_output(child: &mut Child) -> (String, String) {
     (stdout, stderr)
 }
 
-fn wait_for_server_ready(
+// Async HTTP poll used by tests that already run inside a Tokio runtime
+// (e.g. #[tokio::test] tests that also drive async testcontainers).
+// Using reqwest::blocking inside an existing Tokio runtime panics when the
+// blocking client's internal runtime is dropped, so these tests use the
+// native async reqwest::Client instead.
+async fn wait_for_server_ready_async(
     mut child: Child,
-    client: &reqwest::blocking::Client,
+    client: &reqwest::Client,
     base: &str,
 ) -> ServerGuard {
     for _ in 0..60 {
@@ -129,10 +134,10 @@ fn wait_for_server_ready(
             );
         }
 
-        if client.get(format!("{base}/health")).send().is_ok() {
+        if client.get(format!("{base}/health")).send().await.is_ok() {
             return ServerGuard(child);
         }
-        std::thread::sleep(Duration::from_millis(500));
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
     let _ = child.kill();
@@ -534,7 +539,6 @@ async fn generated_scaffold_serves_posts_index_and_json_api() {
 
     let (_tmp, project) = fresh_project("scaffold-live");
     patch_generated_cargo_toml(&project);
-    let _ = fs::remove_file(project.join("build.rs"));
 
     run_autumn(
         &project,
@@ -566,7 +570,7 @@ async fn generated_scaffold_serves_posts_index_and_json_api() {
     );
 
     let build = Command::new("cargo")
-        .args(["build", "--offline"])
+        .args(["build"])
         .current_dir(&project)
         .output()
         .expect("failed to run cargo build");
@@ -579,7 +583,7 @@ async fn generated_scaffold_serves_posts_index_and_json_api() {
 
     let port = free_port();
     let child = Command::new("cargo")
-        .args(["run", "--quiet", "--offline"])
+        .args(["run", "--quiet"])
         .current_dir(&project)
         .env("AUTUMN_SERVER__PORT", port.to_string())
         .env("AUTUMN_DATABASE__URL", &database_url)
@@ -588,16 +592,17 @@ async fn generated_scaffold_serves_posts_index_and_json_api() {
         .spawn()
         .expect("failed to spawn generated server");
 
-    let client = reqwest::blocking::Client::new();
+    let client = reqwest::Client::new();
     let base = format!("http://127.0.0.1:{port}");
-    let _server = wait_for_server_ready(child, &client, &base);
+    let _server = wait_for_server_ready_async(child, &client, &base).await;
 
     let response = client
         .get(format!("{base}/posts"))
         .send()
+        .await
         .expect("GET /posts failed");
     assert_eq!(response.status(), 200, "GET /posts status");
-    let html = response.text().expect("GET /posts body");
+    let html = response.text().await.expect("GET /posts body");
     assert!(
         html.contains("<h1>Posts</h1>") && html.contains("New Post"),
         "GET /posts did not render the generated index template:\n{html}",
@@ -606,9 +611,10 @@ async fn generated_scaffold_serves_posts_index_and_json_api() {
     let response = client
         .get(format!("{base}/api/posts"))
         .send()
+        .await
         .expect("GET /api/posts failed");
     assert_eq!(response.status(), 200, "GET /api/posts status");
-    let body = response.text().expect("GET /api/posts body");
+    let body = response.text().await.expect("GET /api/posts body");
     assert_eq!(body.trim(), "[]", "empty JSON index body");
 }
 
@@ -668,8 +674,6 @@ fn generated_scaffold_cargo_checks() {
     // supposed to do automatically.
     let cargo_toml_path = project.join("Cargo.toml");
     patch_generated_cargo_toml(&project);
-    // Drop build.rs so we don't need the Tailwind CLI installed.
-    let _ = fs::remove_file(project.join("build.rs"));
 
     run_autumn(
         &project,
@@ -706,7 +710,7 @@ fn generated_scaffold_cargo_checks() {
     }
 
     let check = Command::new("cargo")
-        .args(["check", "--tests", "--offline"])
+        .args(["check", "--tests"])
         .current_dir(&project)
         .output()
         .unwrap();
@@ -1075,7 +1079,6 @@ fn generate_auth_without_totp_has_no_totp_artifacts() {
 fn generated_auth_totp_cargo_checks() {
     let (_tmp, project) = fresh_project("auth-totp-build");
     patch_generated_cargo_toml(&project);
-    let _ = fs::remove_file(project.join("build.rs"));
 
     run_autumn(&project, &["generate", "auth", "User", "--totp"]);
 
@@ -1088,7 +1091,7 @@ fn generated_auth_totp_cargo_checks() {
     }
 
     let check = Command::new("cargo")
-        .args(["check", "--tests", "--offline"])
+        .args(["check", "--tests"])
         .current_dir(&project)
         .output()
         .unwrap();
@@ -1315,7 +1318,6 @@ fn generated_scaffold_config_cargo_checks() {
     let (_tmp, project) = fresh_project("scaffold-config-build");
 
     patch_generated_cargo_toml(&project);
-    let _ = fs::remove_file(project.join("build.rs"));
 
     fs::write(
         project.join("autumn.generate.toml"),
@@ -1357,7 +1359,7 @@ fn generated_scaffold_config_cargo_checks() {
     }
 
     let check = Command::new("cargo")
-        .args(["check", "--tests", "--offline"])
+        .args(["check", "--tests"])
         .current_dir(&project)
         .output()
         .unwrap();
