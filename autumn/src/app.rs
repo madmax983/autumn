@@ -246,7 +246,7 @@ pub struct AppBuilder {
     /// Error reporters registered via [`AppBuilder::with_error_reporter`].
     /// Installed onto `AppState` so the
     /// [`ReportingLayer`](crate::reporting::ReportingLayer) delivers panic and
-    /// 5xx [`ErrorEvent`](crate::reporting::ErrorEvent)s to each. Empty means
+    /// 5xx [`crate::reporting::ErrorEvent`]s to each. Empty means
     /// the built-in [`LogReporter`](crate::reporting::LogReporter) is used.
     #[cfg(feature = "reporting")]
     pub(crate) error_reporters: Vec<Arc<dyn crate::reporting::ErrorReporter>>,
@@ -1311,7 +1311,7 @@ impl AppBuilder {
     /// unhandled panics and 5xx responses.
     ///
     /// Reporters receive a structured
-    /// [`ErrorEvent`](crate::reporting::ErrorEvent) for every caught handler
+    /// [`crate::reporting::ErrorEvent`] for every caught handler
     /// panic and every server-error response, carrying request context (route,
     /// method, request id, status) and — for panics — the panic payload and a
     /// backtrace (when `RUST_BACKTRACE` is set). Call this multiple times to
