@@ -50,6 +50,44 @@ pub fn encode_path_segment(value: impl std::fmt::Display) -> String {
     percent_encode(&value.to_string())
 }
 
+/// Normalize a raw HTTP request path by percent-decoding it and resolving `.` and `..` segments.
+///
+/// Ensures security checks (like CSRF and rate limits) operate on the logical path
+/// intended by the client, preventing traversal bypasses (e.g., `/api/../protected`).
+pub(crate) fn normalize_path(path: &str) -> String {
+    let decoded = percent_encoding::percent_decode_str(path).decode_utf8_lossy();
+    let has_trailing = decoded.ends_with('/') && decoded.len() > 1;
+
+    let mut segments = Vec::new();
+    for segment in decoded.split('/') {
+        if segment == ".." {
+            segments.pop();
+        } else if segment != "." && !segment.is_empty() {
+            segments.push(segment);
+        }
+    }
+
+    let mut res = if decoded.starts_with('/') {
+        format!("/{}", segments.join("/"))
+    } else {
+        segments.join("/")
+    };
+
+    if res.is_empty() {
+        res = if decoded.starts_with('/') {
+            "/".to_string()
+        } else {
+            String::new()
+        };
+    }
+
+    if has_trailing && !res.ends_with('/') {
+        format!("{res}/")
+    } else {
+        res
+    }
+}
+
 /// Percent-encode a query component per RFC 3986.
 ///
 /// Unreserved characters (ALPHA / DIGIT / `-` / `_` / `.` / `~`) are left

@@ -588,9 +588,9 @@ impl Limiter {
     /// is non-empty when a path override matched (used to isolate buckets from the
     /// global default pool).
     fn effective_params_with_ns<B>(&self, req: &Request<B>) -> (Option<f64>, Option<f64>, &str) {
-        let path = req.uri().path();
+        let normalized_path = crate::paths::normalize_path(req.uri().path());
         for (prefix, override_) in &self.path_overrides {
-            if path.starts_with(prefix.as_str()) {
+            if normalized_path.starts_with(prefix.as_str()) {
                 let burst = override_.burst.map(|b| f64::from(b.max(1)));
                 let rps = override_
                     .requests_per_second

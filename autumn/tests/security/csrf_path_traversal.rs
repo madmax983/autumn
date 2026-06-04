@@ -30,7 +30,7 @@ async fn eris_csrf_path_traversal_bypass() {
     let response = app.clone().oneshot(malicious_req).await.unwrap();
 
     // Axum routes strictly based on exact URI match and does not resolve '..'.
-    // Therefore, the request to /api/../submit safely falls through to a 404
+    // Therefore, the request to /api/../submit safely returns 403
     // instead of executing the /submit handler, averting the CSRF bypass entirely.
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
 }

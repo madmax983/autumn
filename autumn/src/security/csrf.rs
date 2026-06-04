@@ -351,12 +351,12 @@ where
     }
 
     fn call(&mut self, mut req: Request<axum::body::Body>) -> Self::Future {
-        let path = req.uri().path();
+        let normalized_path = crate::paths::normalize_path(req.uri().path());
         let is_exempt = self
             .settings
             .exempt_paths
             .iter()
-            .any(|prefix| path.starts_with(prefix.as_str()));
+            .any(|prefix| normalized_path.starts_with(prefix.as_str()));
         let is_safe = is_exempt || self.settings.safe_methods.contains(req.method());
         let raw_cookie_token = extract_cookie_token(req.headers(), &self.settings.cookie_name);
 
