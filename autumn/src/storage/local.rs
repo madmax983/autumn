@@ -612,7 +612,7 @@ pub(crate) fn verify_upload_with_rotation(
     )
 }
 
-/// Clock-injectable variant of [`verify_upload_with_rotation`].
+/// Clock-injectable variant of `verify_upload_with_rotation`.
 pub(crate) fn verify_upload_rotation_with_now(
     current: &SigningKey,
     previous: &[SigningKey],
@@ -1008,7 +1008,7 @@ pub(crate) fn verify_with_rotation(
     verify_with_rotation_with_now(current, previous, blob_key, expires_at, signature, now)
 }
 
-/// Clock-injectable variant of [`verify_with_rotation`].
+/// Clock-injectable variant of `verify_with_rotation`.
 pub(crate) fn verify_with_rotation_with_now(
     current: &SigningKey,
     previous: &[SigningKey],
