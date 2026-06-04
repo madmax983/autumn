@@ -171,18 +171,24 @@ where
                     .and_then(|v| v.to_str().ok())
                     .and_then(|s| s.parse::<usize>().ok());
 
-                if declared_len.is_some_and(|len| len > BODY_CAPTURE_LIMIT) {
-                    // Body is known to be too large — don't consume it at all.
-                    (req, None, true)
+                if declared_len.is_none_or(|len| len > BODY_CAPTURE_LIMIT) {
+                    // Body size is unknown or known to be too large — don't consume
+                    // the stream at all so the downstream handler receives it intact.
+                    (
+                        req,
+                        None,
+                        declared_len.is_some_and(|len| len > BODY_CAPTURE_LIMIT),
+                    )
                 } else {
+                    // Content-Length is present and within cap; read the full body
+                    // so we can reconstruct it exactly for the downstream handler.
                     let (parts, body) = req.into_parts();
-                    // Collect frames manually so we always have the bytes we read
-                    // and can reconstruct a valid body for the downstream handler,
-                    // even when the stream exceeds the capture cap.
-                    let (captured, truncated) = collect_up_to(body, BODY_CAPTURE_LIMIT).await;
-                    let new_body = axum::body::Body::from(captured.clone());
+                    let bytes = axum::body::to_bytes(body, BODY_CAPTURE_LIMIT + 1)
+                        .await
+                        .unwrap_or_default();
+                    let new_body = axum::body::Body::from(bytes.clone());
                     let req = axum::http::Request::from_parts(parts, new_body);
-                    (req, Some(captured), truncated)
+                    (req, Some(bytes), false)
                 }
             } else {
                 (req, None, false)
@@ -232,31 +238,6 @@ where
             Ok(response)
         })
     }
-}
-
-/// Reads body frames up to `limit` bytes. Returns the collected bytes and
-/// whether the stream was truncated. Always returns the bytes it did read,
-/// so the caller can reconstruct a valid body for downstream handlers even
-/// when the stream exceeds the cap.
-async fn collect_up_to(body: axum::body::Body, limit: usize) -> (bytes::Bytes, bool) {
-    use http_body_util::BodyExt as _;
-    let mut buf = bytes::BytesMut::new();
-    let mut stream = body;
-    let mut truncated = false;
-    while let Some(frame) = stream.frame().await {
-        let Ok(frame) = frame else { break };
-        let Some(chunk) = frame.into_data().ok() else {
-            continue;
-        };
-        let remaining = limit.saturating_sub(buf.len());
-        if chunk.len() >= remaining {
-            buf.extend_from_slice(&chunk[..remaining]);
-            truncated = chunk.len() > remaining;
-            break;
-        }
-        buf.extend_from_slice(&chunk);
-    }
-    (buf.freeze(), truncated)
 }
 
 /// Returns true for HTTP methods that typically carry a request body.
@@ -439,25 +420,32 @@ fn form_pairs_to_nested_json(pairs: Vec<(String, String)>) -> serde_json::Value 
     serde_json::Value::Object(root)
 }
 
-/// Split a form key on bracket notation into path segments.
+/// Split a form key on bracket or dot notation into path segments.
 ///
 /// `"user[password]"` → `["user", "password"]`
+/// `"user.password"` → `["user", "password"]`
 /// `"a[b][c]"` → `["a", "b", "c"]`
 /// `"simple"` → `["simple"]`
 fn bracket_key_segments(key: &str) -> Vec<String> {
-    key.find('[').map_or_else(
-        || vec![key.to_owned()],
-        |pos| {
-            let mut parts = vec![key[..pos].to_owned()];
-            for seg in key[pos + 1..].split('[') {
-                let seg = seg.trim_end_matches(']');
-                if !seg.is_empty() {
-                    parts.push(seg.to_owned());
-                }
+    // Dot notation: split on '.' first (only if no brackets present)
+    if key.contains('[') {
+        let pos = key.find('[').unwrap();
+        let mut parts = vec![key[..pos].to_owned()];
+        for seg in key[pos + 1..].split('[') {
+            let seg = seg.trim_end_matches(']');
+            if !seg.is_empty() {
+                parts.push(seg.to_owned());
             }
-            parts
-        },
-    )
+        }
+        parts
+    } else if key.contains('.') {
+        key.split('.')
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect()
+    } else {
+        vec![key.to_owned()]
+    }
 }
 
 fn form_insert_at_path(
@@ -1391,6 +1379,7 @@ mod tests {
                 .uri("/nope")
                 .header("accept", "text/html")
                 .header("content-type", "application/x-www-form-urlencoded")
+                .header("content-length", "20")
                 .body(Body::from("username=alice&age=30"))
                 .expect("request"),
         )
@@ -1423,6 +1412,7 @@ mod tests {
                 .uri("/nope")
                 .header("accept", "text/html")
                 .header("content-type", "application/json")
+                .header("content-length", "24")
                 .body(Body::from(r#"{"user":"bob","score":42}"#))
                 .expect("request"),
         )
@@ -1455,6 +1445,7 @@ mod tests {
                 .uri("/nope")
                 .header("accept", "text/html")
                 .header("content-type", "application/x-www-form-urlencoded")
+                .header("content-length", "33")
                 .body(Body::from("username=alice&password=secret123"))
                 .expect("request"),
         )
@@ -1491,6 +1482,7 @@ mod tests {
                 .uri("/nope")
                 .header("accept", "text/html")
                 .header("content-type", "application/json")
+                .header("content-length", "33")
                 .body(Body::from(r#"{"user":"alice","token":"abc123"}"#))
                 .expect("request"),
         )
@@ -1573,10 +1565,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dev_badge_truncates_oversized_body() {
+    async fn dev_badge_skips_body_capture_when_no_content_length() {
+        // Without a Content-Length header the body stream is left unconsumed
+        // so that downstream handlers receive it intact. The overlay simply
+        // shows no body section rather than a potentially truncated preview.
         let app = test_router_with_error_pages(true);
 
-        // Build a body larger than the 64 KB cap
+        // Build a body larger than the 64 KB cap but send no Content-Length.
         let large_body = "x=".to_owned() + &"a".repeat(70 * 1024);
 
         let response = tower::ServiceExt::oneshot(
@@ -1597,9 +1592,10 @@ mod tests {
             .expect("bytes");
         let body_str = String::from_utf8(body.to_vec()).expect("utf8");
 
+        // No body section and no truncation notice — stream was not consumed.
         assert!(
-            body_str.contains("truncated"),
-            "oversized body should show a truncation notice, got:\n{body_str}"
+            !body_str.contains("truncated"),
+            "body without Content-Length should not show a truncation notice, got:\n{body_str}"
         );
     }
 
@@ -1648,6 +1644,7 @@ mod tests {
                 .uri("/nope")
                 .header("accept", "text/html")
                 .header("content-type", "application/x-www-form-urlencoded")
+                .header("content-length", "41")
                 .body(Body::from("user[name]=alice&user[password]=secret123"))
                 .expect("request"),
         )
@@ -1669,6 +1666,46 @@ mod tests {
         );
         assert!(body_str.contains("[FILTERED]"), "should show [FILTERED]");
         // The non-sensitive sibling field should still be visible.
+        assert!(
+            body_str.contains("alice"),
+            "non-sensitive field should remain"
+        );
+    }
+
+    #[tokio::test]
+    async fn dev_badge_scrubs_dotted_notation_form_body_fields() {
+        // user.password=secret uses dot notation; must be split and scrubbed.
+        let app = test_router_with_error_pages(true);
+        let body_str_literal = "user.name=alice&user.password=secret123";
+
+        let response = tower::ServiceExt::oneshot(
+            app,
+            Request::builder()
+                .method("POST")
+                .uri("/nope")
+                .header("accept", "text/html")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("content-length", body_str_literal.len().to_string())
+                .body(Body::from(body_str_literal))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("bytes");
+        let body_str = String::from_utf8(body.to_vec()).expect("utf8");
+
+        assert!(
+            body_str.contains("password"),
+            "should show the password key"
+        );
+        assert!(
+            !body_str.contains("secret123"),
+            "dot-prefixed password value must be filtered"
+        );
+        assert!(body_str.contains("[FILTERED]"), "should show [FILTERED]");
         assert!(
             body_str.contains("alice"),
             "non-sensitive field should remain"
