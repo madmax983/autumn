@@ -1043,6 +1043,175 @@ mod tests {
         assert_eq!(v.as_object().unwrap().len(), 0);
     }
 
+    #[test]
+    fn extract_path_params_segment_count_mismatch_returns_empty() {
+        let v = super::extract_path_params("/posts/{id}", "/posts/42/extra");
+        assert_eq!(
+            v.as_object().unwrap().len(),
+            0,
+            "mismatched segments should yield empty map"
+        );
+    }
+
+    #[test]
+    fn extract_path_params_root_wildcard_returns_empty_for_multisegment_uri() {
+        // A wildcard capture like `{*rest}` spans multiple URI segments but the
+        // naive segment-split produces a length mismatch; we should return empty
+        // rather than crashing or silently dropping segments.
+        let v = super::extract_path_params("/files/{*rest}", "/files/foo/bar/baz");
+        assert_eq!(
+            v.as_object().unwrap().len(),
+            0,
+            "wildcard glob should yield empty map"
+        );
+    }
+
+    // ── AC2: path param values scrubbed via ParameterFilter ──────────────────
+
+    #[test]
+    fn extract_path_params_scrubbed_by_parameter_filter() {
+        // A route like /reset/{token} would expose a sensitive value; the
+        // ParameterFilter should mask it before it appears in the overlay.
+        let raw = super::extract_path_params("/reset/{token}", "/reset/abc123secret");
+        let filter = crate::log::filter::ParameterFilter::default();
+        let scrubbed = filter.scrub_json(&raw);
+        assert_eq!(
+            scrubbed["token"], "[FILTERED]",
+            "token param value should be scrubbed by the default filter"
+        );
+    }
+
+    // ── AC3: Path Params section hidden when route has no path params ─────────
+
+    #[tokio::test]
+    async fn dev_badge_hides_path_params_section_for_static_route() {
+        // A route with no `{param}` segments must NOT render the Path Params
+        // section in the overlay.
+        let app = test_router_with_error_pages_and_matched_path(true);
+        let resp = tower::ServiceExt::oneshot(
+            app,
+            Request::builder()
+                .uri("/fail")
+                .header("accept", "text/html")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            !body_str.contains("Path Params"),
+            "static route overlay must not include Path Params section, got:\n{body_str}"
+        );
+    }
+
+    // ── AC1: overlay shows parsed path params ────────────────────────────────
+
+    #[tokio::test]
+    async fn dev_badge_shows_path_params_in_overlay() {
+        // A route with a `{id}` param must render the parsed value in the overlay.
+        let app = test_router_with_error_pages_and_matched_path(true);
+        let resp = tower::ServiceExt::oneshot(
+            app,
+            Request::builder()
+                .uri("/items/99")
+                .header("accept", "text/html")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            body_str.contains("Path Params"),
+            "overlay must include Path Params section for parametric route"
+        );
+        assert!(
+            body_str.contains("99"),
+            "overlay must show extracted path param value"
+        );
+    }
+
+    // ── AC2 integration: sensitive path param scrubbed in overlay ────────────
+
+    #[tokio::test]
+    async fn dev_badge_scrubs_sensitive_path_param_in_overlay() {
+        // Route is /tokens/{token}; "token" is a DEFAULT_FILTER_KEYS entry.
+        // The Path Params table must show [FILTERED], not the raw value.
+        // Note: the raw URI path still appears in the "Path" row — only the
+        // *parsed* params map is scrubbed by ParameterFilter.
+        let app = test_router_with_error_pages_and_matched_path(true);
+        let resp = tower::ServiceExt::oneshot(
+            app,
+            Request::builder()
+                .uri("/tokens/supersecret")
+                .header("accept", "text/html")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            body_str.contains("Path Params"),
+            "overlay must show Path Params section even when value is filtered"
+        );
+        assert!(
+            body_str.contains("[FILTERED]"),
+            "sensitive path param value must be scrubbed in the Path Params map"
+        );
+    }
+
+    /// Build a test router that additionally applies `capture_matched_path_middleware`
+    /// (simulating dev profile) and includes routes with path parameters.
+    fn test_router_with_error_pages_and_matched_path(is_dev: bool) -> axum::Router {
+        use crate::middleware::dev::capture_matched_path_middleware;
+        use axum::routing::get;
+
+        let renderer = error_pages::default_renderer();
+        let error_page_filter = ErrorPageFilter {
+            renderer,
+            is_dev,
+            parameter_filter: crate::log::filter::ParameterFilter::default(),
+        };
+        let filters: Vec<Arc<dyn crate::middleware::ExceptionFilter>> =
+            vec![Arc::new(error_page_filter)];
+
+        axum::Router::new()
+            .route(
+                "/fail",
+                get(|| async { Err::<String, AutumnError>(AutumnError::not_found_msg("gone")) }),
+            )
+            .route(
+                "/items/{id}",
+                get(|| async {
+                    Err::<String, AutumnError>(AutumnError::not_found_msg("item not found"))
+                }),
+            )
+            .route(
+                "/tokens/{token}",
+                get(|| async {
+                    Err::<String, AutumnError>(AutumnError::not_found_msg("token not found"))
+                }),
+            )
+            .route_layer(axum::middleware::from_fn(capture_matched_path_middleware))
+            .fallback(fallback_404_handler)
+            .layer(ErrorPageContextLayer)
+            .layer(ExceptionFilterLayer::new(filters))
+    }
+
     #[tokio::test]
     async fn fallback_404_handler_keeps_non_get_favicon_requests_as_not_found() {
         let response = fallback_404_handler(

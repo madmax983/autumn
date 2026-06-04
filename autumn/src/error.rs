@@ -562,6 +562,8 @@ impl AutumnError {
             details: None,
             problem_type: Some("https://autumn.dev/problems/gone"),
             cache_idempotency_response: false,
+            #[cfg(debug_assertions)]
+            backtrace_string: Some(format!("{}", std::backtrace::Backtrace::force_capture())),
         }
     }
 
