@@ -134,6 +134,12 @@ struct ChannelsResponse {
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
+struct ExperimentsResponse {
+    #[serde(default)]
+    experiments: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize, Default, Clone)]
 struct TasksResponse {
     #[serde(default)]
     scheduled_tasks: HashMap<String, TaskStatus>,
@@ -171,6 +177,7 @@ struct DashboardState {
     tasks: TasksResponse,
     loggers: LoggersResponse,
     channels: ChannelsResponse,
+    experiments: ExperimentsResponse,
     /// Rolling throughput samples (requests in last interval).
     throughput_history: VecDeque<u64>,
     /// Rolling p50 latency samples.
@@ -202,6 +209,7 @@ impl DashboardState {
             tasks: TasksResponse::default(),
             loggers: LoggersResponse::default(),
             channels: ChannelsResponse::default(),
+            experiments: ExperimentsResponse::default(),
             throughput_history: VecDeque::with_capacity(SPARKLINE_DEPTH),
             latency_p50_history: VecDeque::with_capacity(SPARKLINE_DEPTH),
             latency_p99_history: VecDeque::with_capacity(SPARKLINE_DEPTH),
@@ -237,6 +245,7 @@ impl DashboardState {
         self.fetch_tasks(&client);
         self.fetch_loggers(&client);
         self.fetch_channels(&client);
+        self.fetch_experiments(&client);
 
         self.last_poll = Instant::now();
     }
@@ -332,6 +341,16 @@ impl DashboardState {
             self.channels = c;
         }
     }
+
+    fn fetch_experiments(&mut self, client: &reqwest::blocking::Client) {
+        if let Ok(resp) = client
+            .get(format!("{}/actuator/experiments", self.base_url))
+            .send()
+            && let Ok(e) = resp.json::<ExperimentsResponse>()
+        {
+            self.experiments = e;
+        }
+    }
 }
 
 // ── TUI rendering ─────────────────────────────────────────────
@@ -384,11 +403,11 @@ fn run_loop(
                 }
                 KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
                 KeyCode::Tab => {
-                    state.active_tab = (state.active_tab + 1) % 4;
+                    state.active_tab = (state.active_tab + 1) % 5;
                 }
                 KeyCode::BackTab => {
                     if state.active_tab == 0 {
-                        state.active_tab = 3;
+                        state.active_tab = 4;
                     } else {
                         state.active_tab -= 1;
                     }
@@ -435,6 +454,7 @@ fn draw(frame: &mut ratatui::Frame, state: &DashboardState) {
         1 => draw_routes_tab(frame, main_chunks[1], state),
         2 => draw_loggers_tab(frame, main_chunks[1], state),
         3 => draw_channels_tab(frame, main_chunks[1], state),
+        4 => draw_experiments_tab(frame, main_chunks[1], state),
         _ => {}
     }
 
@@ -478,7 +498,7 @@ fn draw_header(frame: &mut ratatui::Frame, area: Rect, state: &DashboardState) {
     frame.render_widget(title, chunks[0]);
 
     // Tabs
-    let tab_titles = vec!["Overview", "Routes", "Loggers", "Channels"];
+    let tab_titles = vec!["Overview", "Routes", "Loggers", "Channels", "Experiments"];
     let tabs = Tabs::new(tab_titles)
         .select(state.active_tab)
         .style(Style::default().fg(Color::DarkGray))
@@ -999,6 +1019,113 @@ fn draw_loggers_tab(frame: &mut ratatui::Frame, area: Rect, state: &DashboardSta
     .header(header)
     .block(block)
     .column_spacing(2);
+
+    frame.render_widget(table, area);
+}
+
+fn draw_experiments_tab(frame: &mut ratatui::Frame, area: Rect, state: &DashboardState) {
+    let block = Block::default()
+        .title(Span::styled(
+            " Experiments ",
+            Style::default()
+                .fg(Color::Rgb(204, 120, 50))
+                .add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .padding(Padding::new(1, 1, 0, 0));
+
+    let header = Row::new(vec![
+        Cell::from("Name").style(
+            Style::default()
+                .fg(Color::Rgb(204, 120, 50))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Cell::from("State").style(
+            Style::default()
+                .fg(Color::Rgb(204, 120, 50))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Cell::from("Winner").style(
+            Style::default()
+                .fg(Color::Rgb(204, 120, 50))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Cell::from("Variants").style(
+            Style::default()
+                .fg(Color::Rgb(204, 120, 50))
+                .add_modifier(Modifier::BOLD),
+        ),
+    ])
+    .height(1)
+    .bottom_margin(1);
+
+    let mut rows = Vec::new();
+
+    if state.experiments.experiments.is_empty() {
+        rows.push(Row::new(vec![
+            Cell::from("No experiments found").style(Style::default().fg(Color::DarkGray)),
+            Cell::from(""),
+            Cell::from(""),
+            Cell::from(""),
+        ]));
+    } else {
+        for exp in &state.experiments.experiments {
+            let name = exp
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let state_str = exp
+                .get("state")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let winner = exp.get("winner").and_then(|v| v.as_str()).unwrap_or("-");
+
+            let state_color = match state_str {
+                "running" => Color::Green,
+                "draft" => Color::DarkGray,
+                "concluded" => Color::Yellow,
+                "archived" => Color::Red,
+                _ => Color::White,
+            };
+
+            let variants_val = exp.get("variants").and_then(|v| v.as_array());
+            #[allow(clippy::option_if_let_else)]
+            let variants_str = if let Some(arr) = variants_val {
+                let mut v_strs = Vec::new();
+                for v in arr {
+                    let v_name = v.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                    let v_weight = v
+                        .get("weight")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
+                    v_strs.push(format!("{v_name} ({v_weight})"));
+                }
+                v_strs.join(", ")
+            } else {
+                "-".to_string()
+            };
+
+            rows.push(Row::new(vec![
+                Cell::from(name.to_string()).style(Style::default().fg(Color::White)),
+                Cell::from(state_str.to_string()).style(Style::default().fg(state_color)),
+                Cell::from(winner.to_string()).style(Style::default().fg(Color::White)),
+                Cell::from(variants_str).style(Style::default().fg(Color::Gray)),
+            ]));
+        }
+    }
+
+    let widths = [
+        Constraint::Min(20),
+        Constraint::Length(12),
+        Constraint::Length(15),
+        Constraint::Min(30),
+    ];
+
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(block)
+        .column_spacing(2);
 
     frame.render_widget(table, area);
 }
@@ -1754,6 +1881,30 @@ mod tests {
     }
 
     #[test]
+    fn render_experiments_tab() {
+        let mut state = test_state();
+        state.active_tab = 4;
+        state.experiments.experiments = vec![
+            serde_json::json!({
+                "name": "checkout_v2",
+                "state": "running",
+                "winner": null,
+                "variants": [
+                    {"name": "control", "weight": 50},
+                    {"name": "treatment", "weight": 50}
+                ]
+            }),
+            serde_json::json!({
+                "name": "old_experiment",
+                "state": "concluded",
+                "winner": "control",
+                "variants": []
+            }),
+        ];
+        render_frame(&state, 120, 40);
+    }
+
+    #[test]
     fn render_loggers_tab() {
         let mut state = test_state();
         state.active_tab = 2;
@@ -1930,18 +2081,18 @@ mod tests {
         state.active_tab = 0;
 
         if state.active_tab == 0 {
-            state.active_tab = 3;
+            state.active_tab = 4;
+        } else {
+            state.active_tab -= 1;
+        }
+        assert_eq!(state.active_tab, 4);
+
+        if state.active_tab == 0 {
+            state.active_tab = 4;
         } else {
             state.active_tab -= 1;
         }
         assert_eq!(state.active_tab, 3);
-
-        if state.active_tab == 0 {
-            state.active_tab = 3;
-        } else {
-            state.active_tab -= 1;
-        }
-        assert_eq!(state.active_tab, 2);
     }
 
     #[test]

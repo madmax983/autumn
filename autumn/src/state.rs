@@ -713,6 +713,11 @@ impl crate::actuator::ProvideActuatorState for AppState {
         self.extension::<crate::webhook_outbound::WebhookOutboundManager>()
             .map(|x| (*x).clone())
     }
+
+    fn experiment_service(&self) -> Option<crate::experiments::ExperimentService> {
+        self.extension::<crate::experiments::ExperimentService>()
+            .map(|x| (*x).clone())
+    }
 }
 
 impl std::fmt::Debug for AppState {

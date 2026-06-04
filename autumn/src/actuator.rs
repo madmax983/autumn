@@ -104,6 +104,11 @@ pub trait ProvideActuatorState {
     fn webhook_outbound(&self) -> Option<crate::webhook_outbound::WebhookOutboundManager> {
         None
     }
+
+    /// Returns the system [`crate::experiments::ExperimentService`], if installed.
+    fn experiment_service(&self) -> Option<crate::experiments::ExperimentService> {
+        None
+    }
 }
 
 // ── Shared types for AppState ──────────────────────────────────
@@ -1617,6 +1622,23 @@ pub(crate) async fn channels_endpoint<S: ProvideActuatorState + Send + Sync + 's
     }))
 }
 
+// ── Experiments (sensitive) ────────────────────────────────────
+
+/// `GET <actuator-prefix>/experiments` -- get all registered experiments.
+pub(crate) async fn experiments_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
+    State(state): State<S>,
+) -> Json<serde_json::Value> {
+    #[allow(clippy::option_if_let_else)]
+    let experiments = if let Some(svc) = state.experiment_service() {
+        svc.list().unwrap_or_default()
+    } else {
+        vec![]
+    };
+    Json(serde_json::json!({
+        "experiments": experiments,
+    }))
+}
+
 // ── Tasks Stream (WebSocket) ───────────────────────────────────
 
 /// `GET <actuator-prefix>/tasks/stream` -- stream scheduled task events.
@@ -1706,6 +1728,8 @@ pub(crate) fn actuator_endpoint_paths(prefix: &str, sensitive: bool) -> Vec<Stri
         paths.push(actuator_route_path(prefix, "/tasks"));
         paths.push(actuator_route_path(prefix, "/jobs"));
         paths.push(actuator_route_path(prefix, "/ui/tasks"));
+
+        paths.push(actuator_route_path(prefix, "/experiments"));
         #[cfg(feature = "http-client")]
         {
             paths.push(actuator_route_path(prefix, "/webhooks/dlq"));
@@ -1787,6 +1811,10 @@ pub(crate) fn actuator_router_with_prefix<
             .route(
                 &actuator_route_path(prefix, "/jobs"),
                 axum::routing::get(jobs_endpoint::<S>),
+            )
+            .route(
+                &actuator_route_path(prefix, "/experiments"),
+                axum::routing::get(experiments_endpoint::<S>),
             )
             .route(
                 &actuator_route_path(prefix, "/ui/tasks"),
