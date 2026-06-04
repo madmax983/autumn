@@ -1288,7 +1288,7 @@ mod tests {
             )
             .route_layer(axum::middleware::from_fn(capture_matched_path_middleware))
             .fallback(fallback_404_handler)
-            .layer(ErrorPageContextLayer)
+            .layer(ErrorPageContextLayer { is_dev })
             .layer(ExceptionFilterLayer::new(filters))
     }
 
