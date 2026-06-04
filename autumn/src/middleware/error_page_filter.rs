@@ -163,16 +163,40 @@ where
 
         Box::pin(async move {
             let (req, body_bytes, body_truncated) = if captures_body {
-                let (parts, body) = req.into_parts();
-                // Read up to BODY_CAPTURE_LIMIT + 1 bytes to detect truncation
-                let cap = BODY_CAPTURE_LIMIT + 1;
-                let bytes = axum::body::to_bytes(body, cap).await.unwrap_or_default();
-                let truncated = bytes.len() > BODY_CAPTURE_LIMIT;
-                let captured = bytes.slice(..bytes.len().min(BODY_CAPTURE_LIMIT));
-                // Rebuild the full request body from what we captured (truncated to limit)
-                let new_body = axum::body::Body::from(captured.clone());
-                let req = axum::http::Request::from_parts(parts, new_body);
-                (req, Some(captured), truncated)
+                // Check Content-Length first to avoid consuming the body when it's
+                // clearly over the cap (preserving the stream for the inner service).
+                let declared_len = req
+                    .headers()
+                    .get(axum::http::header::CONTENT_LENGTH)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse::<usize>().ok());
+
+                if declared_len.is_some_and(|len| len > BODY_CAPTURE_LIMIT) {
+                    // Body is known to be too large — don't consume it at all.
+                    (req, None, true)
+                } else {
+                    let (parts, body) = req.into_parts();
+                    // Read up to BODY_CAPTURE_LIMIT + 1 bytes to detect truncation.
+                    // to_bytes returns Err if the stream exceeds the limit; treat
+                    // that as a truncated body and pass an empty body downstream
+                    // (better than silently truncating mid-stream with no signal).
+                    if let Ok(bytes) =
+                        axum::body::to_bytes(body, BODY_CAPTURE_LIMIT + 1).await
+                    {
+                        let truncated = bytes.len() > BODY_CAPTURE_LIMIT;
+                        let captured = bytes.slice(..bytes.len().min(BODY_CAPTURE_LIMIT));
+                        let new_body = axum::body::Body::from(captured.clone());
+                        let req = axum::http::Request::from_parts(parts, new_body);
+                        (req, Some(captured), truncated)
+                    } else {
+                        // Body exceeded the limit mid-stream; forward empty body
+                        // and show truncation notice. The handler will see an
+                        // empty body in dev mode, which is acceptable.
+                        let req =
+                            axum::http::Request::from_parts(parts, axum::body::Body::empty());
+                        (req, None, true)
+                    }
+                }
             } else {
                 (req, None, false)
             };
@@ -227,7 +251,7 @@ where
 
 /// Returns true for HTTP methods that typically carry a request body.
 fn should_capture_body(method: Option<&str>) -> bool {
-    matches!(method, Some("POST") | Some("PUT") | Some("PATCH"))
+    matches!(method, Some("POST" | "PUT" | "PATCH"))
 }
 
 /// Check if the request's Accept header indicates a preference for HTML.
@@ -381,7 +405,7 @@ fn parse_body_preview(bytes: &bytes::Bytes, content_type: Option<&str>) -> Optio
         if map.is_empty() {
             None
         } else {
-            Some(serde_json::to_value(map).unwrap_or(serde_json::json!({})))
+            Some(serde_json::to_value(map).unwrap_or_else(|_| serde_json::json!({})))
         }
     } else {
         None
