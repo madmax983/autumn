@@ -1046,7 +1046,11 @@ mod tests {
     #[test]
     fn extract_path_params_segment_count_mismatch_returns_empty() {
         let v = super::extract_path_params("/posts/{id}", "/posts/42/extra");
-        assert_eq!(v.as_object().unwrap().len(), 0, "mismatched segments should yield empty map");
+        assert_eq!(
+            v.as_object().unwrap().len(),
+            0,
+            "mismatched segments should yield empty map"
+        );
     }
 
     #[test]
@@ -1055,7 +1059,11 @@ mod tests {
         // naive segment-split produces a length mismatch; we should return empty
         // rather than crashing or silently dropping segments.
         let v = super::extract_path_params("/files/{*rest}", "/files/foo/bar/baz");
-        assert_eq!(v.as_object().unwrap().len(), 0, "wildcard glob should yield empty map");
+        assert_eq!(
+            v.as_object().unwrap().len(),
+            0,
+            "wildcard glob should yield empty map"
+        );
     }
 
     // ── AC2: path param values scrubbed via ParameterFilter ──────────────────
@@ -1079,8 +1087,6 @@ mod tests {
     async fn dev_badge_hides_path_params_section_for_static_route() {
         // A route with no `{param}` segments must NOT render the Path Params
         // section in the overlay.
-        use crate::middleware::dev::DevMatchedPath;
-
         let app = test_router_with_error_pages_and_matched_path(true);
         let resp = tower::ServiceExt::oneshot(
             app,
@@ -1171,8 +1177,8 @@ mod tests {
     /// Build a test router that additionally applies `capture_matched_path_middleware`
     /// (simulating dev profile) and includes routes with path parameters.
     fn test_router_with_error_pages_and_matched_path(is_dev: bool) -> axum::Router {
-        use axum::routing::get;
         use crate::middleware::dev::capture_matched_path_middleware;
+        use axum::routing::get;
 
         let renderer = error_pages::default_renderer();
         let error_page_filter = ErrorPageFilter {
@@ -1190,11 +1196,15 @@ mod tests {
             )
             .route(
                 "/items/{id}",
-                get(|| async { Err::<String, AutumnError>(AutumnError::not_found_msg("item not found")) }),
+                get(|| async {
+                    Err::<String, AutumnError>(AutumnError::not_found_msg("item not found"))
+                }),
             )
             .route(
                 "/tokens/{token}",
-                get(|| async { Err::<String, AutumnError>(AutumnError::not_found_msg("token not found")) }),
+                get(|| async {
+                    Err::<String, AutumnError>(AutumnError::not_found_msg("token not found"))
+                }),
             )
             .route_layer(axum::middleware::from_fn(capture_matched_path_middleware))
             .fallback(fallback_404_handler)
