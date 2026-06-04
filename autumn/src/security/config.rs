@@ -423,15 +423,19 @@ impl SecurityConfig {
     /// caller (e.g. `autumn doctor --strict`) should treat this as a failure.
     #[must_use]
     pub fn trusted_proxies_conflict(&self) -> Option<String> {
-        let new_set = self.trusted_proxies.trust_forwarded_headers
-            || !self.trusted_proxies.ranges.is_empty();
-        let old_set = self.rate_limit.trust_forwarded_headers
-            || !self.rate_limit.trusted_proxies.is_empty();
+        let new_set =
+            self.trusted_proxies.trust_forwarded_headers || !self.trusted_proxies.ranges.is_empty();
+        let old_set =
+            self.rate_limit.trust_forwarded_headers || !self.rate_limit.trusted_proxies.is_empty();
 
         if new_set && old_set {
             // Check for value-level conflicts.
-            let new_ranges: std::collections::HashSet<&str> =
-                self.trusted_proxies.ranges.iter().map(String::as_str).collect();
+            let new_ranges: std::collections::HashSet<&str> = self
+                .trusted_proxies
+                .ranges
+                .iter()
+                .map(String::as_str)
+                .collect();
             let old_ranges: std::collections::HashSet<&str> = self
                 .rate_limit
                 .trusted_proxies

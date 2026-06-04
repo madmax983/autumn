@@ -115,9 +115,9 @@ pub use config::{
     RateLimitTierConfig, SecurityConfig, TrustedProxiesConfig, UploadConfig,
     default_content_security_policy, hmac_sha256_hex,
 };
-pub use trusted_proxies::{ProxyResolver, ResolvedClientIdentity};
 #[cfg(feature = "redis")]
 pub use config::{RateLimitBackendFailure, RateLimitRedisConfig};
 pub use csrf::{CsrfFormField, CsrfLayer, CsrfToken, CsrfTokenHeader};
 pub use headers::{CspNonce, SecurityHeadersLayer};
 pub use rate_limit::{RateLimitLayer, RateLimitOverride, RateLimitPrincipal};
+pub use trusted_proxies::{ProxyResolver, ResolvedClientIdentity};
