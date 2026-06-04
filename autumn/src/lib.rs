@@ -966,6 +966,8 @@ pub(crate) mod state;
     clippy::field_reassign_with_default
 )]
 pub mod test;
+#[cfg(feature = "system-tests")]
+pub mod system_test;
 pub use state::AppState;
 
 #[cfg(test)]

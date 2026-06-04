@@ -1,0 +1,294 @@
+# System Tests
+
+Autumn ships first-class _system tests_: integration tests that drive a real
+headless Chromium browser against your running application. Unlike HTTP-level
+integration tests (which see response bodies but not what the browser does
+_after_ a response lands), system tests verify the full browser stack — htmx
+swaps, form flows, SSE-driven DOM updates, and navigation — exactly as a real
+user would experience them.
+
+```
+┌─────────────────────────┐
+│   cargo test --features │
+│      system-tests       │
+└────────────┬────────────┘
+             │
+     ┌───────▼────────┐     CDP        ┌──────────────┐
+     │ SystemTest API │ ◄───────────── │  Chromium    │
+     └───────┬────────┘                └──────────────┘
+             │ HTTP
+     ┌───────▼────────┐
+     │ Autumn app     │  (ephemeral port, in-process)
+     └────────────────┘
+```
+
+---
+
+## Quick start
+
+### 1. Install Chromium
+
+```bash
+# Ubuntu / Debian / GitHub Actions ubuntu-latest
+sudo apt-get install -y chromium-browser
+
+# macOS (Homebrew)
+brew install --cask chromium
+
+# Or set a custom binary path
+export AUTUMN_CHROMIUM=/path/to/chrome
+```
+
+### 2. Add the feature flag
+
+In your app's `Cargo.toml`:
+
+```toml
+[dev-dependencies]
+autumn-web = { version = "0.4", features = ["system-tests"] }
+```
+
+### 3. Generate your first test
+
+```bash
+autumn generate system-test TodoFlow
+```
+
+This creates `tests/system/todo_flow.rs`:
+
+```rust
+#![cfg(feature = "system-tests")]
+
+use autumn_web::prelude::*;
+use autumn_web::system_test::SystemTest;
+
+#[tokio::test]
+#[ignore = "requires Chromium — set AUTUMN_CHROMIUM or install chromium-browser"]
+async fn todo_flow_index_renders() {
+    let mut runner = SystemTest::new()
+        .routes(routes![index])
+        .build()
+        .await
+        .expect("system test runner");
+
+    let page = runner.page().await.expect("page");
+    page.visit("/").await.expect("visit /");
+    page.expect_text("TodoFlow").await.expect("page title visible");
+}
+```
+
+### 4. Run it
+
+```bash
+# Run all system tests (requires Chromium)
+cargo test --features system-tests
+
+# Run a specific test file
+cargo test --features system-tests --test todo_flow
+
+# Run ignoring the #[ignore] guard (when Chromium is available)
+cargo test --features system-tests --test todo_flow -- --include-ignored
+```
+
+---
+
+## Page API
+
+All `Page` methods return `Result<&Self, SystemTestError>` and can be chained.
+
+| Method | Description |
+|--------|-------------|
+| `page.visit(path)` | Navigate to a relative path |
+| `page.fill(selector, value)` | Fill a form input |
+| `page.click(selector)` | Click an element (CSS selector) |
+| `page.expect_text(text)` | Assert text appears in the DOM |
+| `page.expect_url(pattern)` | Assert URL contains pattern |
+| `page.expect_attribute(sel, attr, value)` | Assert element attribute value |
+| `page.snapshot()` | Save a PNG screenshot to artifact dir |
+| `page.expect_hx_settle()` | Explicitly wait for htmx to finish |
+| `page.expect_sse_event(id, predicate)` | Wait for SSE content in DOM |
+
+### htmx auto-waiting
+
+`click()` automatically waits for htmx to finish settling before returning.
+This is implemented by polling `document.querySelectorAll('.htmx-request').length === 0`
+with a 2 s default timeout. You can tune it:
+
+```rust
+SystemTest::new()
+    .routes(routes![index, action])
+    .hx_settle_timeout(Duration::from_secs(5))
+    .build()
+    .await
+```
+
+Use `expect_hx_settle()` for an explicit fence after custom JavaScript triggers:
+
+```rust
+page.evaluate("htmx.trigger('#myForm', 'submit')").await?;
+page.expect_hx_settle().await?;
+page.expect_text("Saved").await?;
+```
+
+### SSE helper
+
+```rust
+page.expect_sse_event("notifications", |text| text.contains("Hello")).await?;
+```
+
+`stream_id` can be a bare id (`"notifications"` → `#notifications`) or a
+full CSS selector (`"#notifications"`, `".sse-target"`).
+
+---
+
+## Failure artifacts
+
+On any assertion failure, autumn writes two files to
+`target/system-tests/<test-name>/`:
+
+| File | Description |
+|------|-------------|
+| `<label>.png` | Full-page screenshot at the moment of failure |
+| `<label>.html` | Complete HTML of the page at the moment of failure |
+
+```
+target/system-tests/
+└── expect_text/
+    ├── expect_text.png
+    └── expect_text.html
+```
+
+Override the output directory:
+
+```rust
+SystemTest::new()
+    .artifact_dir("/tmp/my-artifacts")
+    .build()
+    .await
+```
+
+---
+
+## Browser resolution
+
+The harness looks for Chromium in this order:
+
+1. `AUTUMN_CHROMIUM` environment variable (full path)
+2. `PLAYWRIGHT_BROWSERS_PATH` directory (scans `chromium-*/chrome-linux/chrome`)
+3. Common system paths:
+   - `/usr/bin/chromium-browser` (Ubuntu/Debian)
+   - `/usr/bin/chromium`
+   - `/usr/bin/google-chrome`
+   - `/usr/bin/google-chrome-stable`
+   - `/snap/bin/chromium`
+   - `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome` (macOS)
+   - `/Applications/Chromium.app/Contents/MacOS/Chromium` (macOS)
+
+Run `autumn doctor` to check whether a browser is detected:
+
+```
+🍂 autumn doctor
+
+  ✅ system_test_browser  Chromium for system tests: Chromium 122.0.6261.111 (/usr/bin/chromium-browser)
+```
+
+---
+
+## Test isolation
+
+Each test boots an independent app server on an ephemeral port; the server is
+shut down when the `SystemTestRunner` is dropped. Database state is **not**
+automatically isolated — use the same teardown patterns from the
+[integration tests guide](testing.md):
+
+```rust
+// Explicit truncate before each browser test
+async fn truncate_todos(pool: &Pool<AsyncPgConnection>) {
+    diesel::delete(todos::table).execute(&mut *pool.get().await.unwrap()).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn add_todo_flow() {
+    let db = TestDb::shared().await;
+    truncate_todos(&db.pool()).await;
+
+    let mut runner = SystemTest::new()
+        .routes(routes![index, create_todo])
+        .build()
+        .await
+        .unwrap();
+
+    let page = runner.page().await.unwrap();
+    // ...
+}
+```
+
+Transaction-based rollback (from [#807](https://github.com/madmax983/autumn/issues/807))
+is not yet available for system tests because the browser drives a real HTTP
+server on a separate TCP connection; per-test transaction wrapping would
+require a proxy layer not yet shipped.
+
+---
+
+## GitHub Actions setup
+
+```yaml
+name: System Tests
+
+on: [push, pull_request]
+
+jobs:
+  system-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Chromium
+        run: sudo apt-get install -y chromium-browser
+      - name: Run system tests
+        run: cargo test --features system-tests -- --include-ignored
+        env:
+          RUST_LOG: info
+```
+
+> **Tip:** System tests run sequentially by default (`cargo test` uses
+> `--test-threads=1` in practice for binary tests). If you have many system
+> tests and want to parallelise, set `--test-threads=N` but be careful with
+> shared database state (see _Test isolation_ above).
+
+---
+
+## Parallelisation caveats
+
+- Each test spawns its own browser **page** (tab), not a new browser process.
+  The `SystemTestRunner` holds one `Browser` instance; call `runner.page()`
+  multiple times for concurrent tabs within a single test.
+- Across tests, each `SystemTest::build()` launches a **separate** browser
+  process, which can be expensive. For many tests in one binary, consider
+  sharing a browser via a `tokio::sync::OnceCell<SystemTestRunner>`.
+- `--test-threads=1` is the safest default for system tests that share a
+  single test database.
+
+---
+
+## Integrating with `autumn generate scaffold`
+
+When you run `autumn generate scaffold Post title:String body:Text`, the
+scaffold generator also emits a smoke test in `tests/<model>.rs`. A companion
+happy-path system test is **not** generated by default (to avoid requiring
+Chromium in basic scaffolding workflows), but you can add one immediately:
+
+```bash
+autumn generate system-test Post
+```
+
+---
+
+## Checking browser availability
+
+```bash
+autumn doctor
+# or the dedicated check:
+autumn system-test check   # planned; use `autumn doctor` today
+```

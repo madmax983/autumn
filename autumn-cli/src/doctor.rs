@@ -1753,6 +1753,9 @@ pub fn run(opts: DoctorOptions) {
         check_compression_impl(compression_enabled, is_production)
     }));
 
+    // 13. System-test browser (warn if missing; not all projects use system tests)
+    tasks.push(Box::new(check_system_test_browser));
+
     // ── Phase 3: spawn all tasks concurrently ────────────────────────────────
     let handles: Vec<thread::JoinHandle<CheckResult>> =
         tasks.into_iter().map(thread::spawn).collect();
@@ -1846,6 +1849,94 @@ pub fn check_maintenance_mode() -> CheckResult {
             detail: Some("maintenance mode is off".into()),
             hint: None,
         },
+    }
+}
+
+// ── System-test browser check ─────────────────────────────────────────────
+
+/// Candidate paths probed for a Chromium binary, in resolution order.
+pub fn browser_candidate_paths() -> Vec<std::path::PathBuf> {
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+
+    if let Ok(p) = std::env::var("AUTUMN_CHROMIUM") {
+        candidates.push(std::path::PathBuf::from(p));
+    }
+
+    if let Ok(base) = std::env::var("PLAYWRIGHT_BROWSERS_PATH") {
+        let base = std::path::PathBuf::from(base);
+        if let Ok(entries) = std::fs::read_dir(&base) {
+            let mut pw_paths: Vec<_> = entries
+                .flatten()
+                .filter(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .starts_with("chromium-")
+                })
+                .map(|e| e.path().join("chrome-linux").join("chrome"))
+                .collect();
+            pw_paths.sort();
+            pw_paths.reverse();
+            candidates.extend(pw_paths);
+        }
+    }
+
+    candidates.extend(
+        [
+            "/usr/bin/chromium-browser",
+            "/usr/bin/chromium",
+            "/usr/bin/google-chrome",
+            "/usr/bin/google-chrome-stable",
+            "/snap/bin/chromium",
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        ]
+        .map(std::path::PathBuf::from),
+    );
+
+    candidates
+}
+
+/// Run `<path> --version` and return the trimmed output on success.
+fn probe_browser_version(path: &std::path::Path) -> Option<String> {
+    std::process::Command::new(path)
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+}
+
+/// Check whether a Chromium binary is available for system tests.
+///
+/// Reports `Warn` (not `Fail`) so that projects that don't use system tests
+/// are not penalized. If you _do_ run system tests you'll get a clear
+/// actionable message in `autumn doctor` output.
+pub fn check_system_test_browser() -> CheckResult {
+    let candidates = browser_candidate_paths();
+    for path in &candidates {
+        if path.is_file() {
+            if let Some(version) = probe_browser_version(path) {
+                return CheckResult {
+                    name: "system_test_browser",
+                    status: CheckStatus::Pass,
+                    detail: Some(format!(
+                        "Chromium for system tests: {version} ({})",
+                        path.display()
+                    )),
+                    hint: None,
+                };
+            }
+        }
+    }
+
+    CheckResult {
+        name: "system_test_browser",
+        status: CheckStatus::Warn,
+        detail: Some("no Chromium binary found — system tests will be skipped".into()),
+        hint: Some(
+            "Install: apt-get install chromium-browser  \
+             or set AUTUMN_CHROMIUM=/path/to/chrome",
+        ),
     }
 }
 
@@ -2847,5 +2938,42 @@ redirect_uri = "http://localhost/callback"
         assert_eq!(parse_config_bool("yes"), Some(true));
         assert_eq!(parse_config_bool("on"), Some(true));
         assert_eq!(parse_config_bool("garbage"), None);
+    }
+
+    // ── system_test_browser ───────────────────────────────────────────────────
+
+    #[test]
+    fn browser_check_not_found_is_warn_not_fail() {
+        // Simulate: no browser in an empty candidate list.  The check must
+        // return Warn so projects that don't use system tests aren't penalized.
+        let result = check_system_test_browser();
+        // Accept Pass (if Chrome is on the host) or Warn (if not).
+        assert!(
+            result.status == CheckStatus::Pass || result.status == CheckStatus::Warn,
+            "browser check must be Pass or Warn, got {:?}",
+            result.status
+        );
+    }
+
+    #[test]
+    fn browser_candidate_paths_includes_common_locations() {
+        let paths = browser_candidate_paths();
+        let as_strs: Vec<_> = paths.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+        assert!(
+            as_strs.iter().any(|s| s.contains("chromium") || s.contains("chrome")),
+            "candidate list must include common Chrome paths; got {as_strs:?}"
+        );
+    }
+
+    #[test]
+    fn browser_check_hint_mentions_apt_get() {
+        let result = check_system_test_browser();
+        if result.status == CheckStatus::Warn {
+            let hint = result.hint.unwrap_or("");
+            assert!(
+                hint.contains("apt-get") || hint.contains("AUTUMN_CHROMIUM"),
+                "hint must mention install command; got: {hint}"
+            );
+        }
     }
 }

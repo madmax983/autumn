@@ -8,6 +8,11 @@ publish = false
 name = "seed"
 path = "src/bin/seed.rs"
 
+[features]
+# Enable headless-browser system tests. Requires Chromium on the host.
+#   cargo test -p todo-app --features system-tests -- --include-ignored
+system-tests = ["autumn-web/system-tests"]
+
 [dependencies]
 autumn-web = { path = "../../autumn", features = ["seed"] }
 chrono = { version = "0.4", features = ["serde"] }
@@ -26,6 +31,10 @@ validator = { version = "0.20", features = ["derive"] }
 # Enables TestDb (shared Postgres testcontainer) for integration tests.
 autumn-web = { path = "../../autumn", features = ["test-support"] }
 serde_json = "1"
+
+[[test]]
+name = "todo_htmx_flow"
+path = "tests/system/todo_htmx_flow.rs"
 
 [lints.rust]
 unsafe_code = "forbid"
