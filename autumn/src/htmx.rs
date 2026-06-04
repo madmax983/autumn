@@ -175,6 +175,11 @@ pub trait HxResponseExt: IntoResponse + Sized {
         append_hx_header(self, "hx-reswap", swap)
     }
 
+    /// Specifies a CSS selector to use to choose which part of the response should be used to be swapped in (`HX-Reselect`).
+    fn hx_reselect(self, selector: &str) -> Response {
+        append_hx_header(self, "hx-reselect", selector)
+    }
+
     /// Specifies the target element to update (`HX-Retarget`).
     fn hx_retarget(self, target: &str) -> Response {
         append_hx_header(self, "hx-retarget", target)
@@ -284,6 +289,7 @@ mod tests {
             .hx_refresh()
             .hx_replace_url("/old-url")
             .hx_reswap("innerHTML")
+            .hx_reselect("#some-content")
             .hx_retarget("#target")
             .hx_trigger("my-event")
             .hx_trigger_after_settle("settled-event")
@@ -297,6 +303,7 @@ mod tests {
         assert_eq!(headers.get("hx-refresh").unwrap(), "true");
         assert_eq!(headers.get("hx-replace-url").unwrap(), "/old-url");
         assert_eq!(headers.get("hx-reswap").unwrap(), "innerHTML");
+        assert_eq!(headers.get("hx-reselect").unwrap(), "#some-content");
         assert_eq!(headers.get("hx-retarget").unwrap(), "#target");
         assert_eq!(headers.get("hx-trigger").unwrap(), "my-event");
         assert_eq!(
@@ -324,6 +331,7 @@ mod tests {
             .hx_refresh() // valid by default
             .hx_replace_url(invalid_header_value)
             .hx_reswap(invalid_header_value)
+            .hx_reselect(invalid_header_value)
             .hx_retarget(invalid_header_value)
             .hx_trigger(invalid_header_value)
             .hx_trigger_after_settle(invalid_header_value)
@@ -338,6 +346,7 @@ mod tests {
         assert_eq!(headers.get("hx-refresh").unwrap(), "true");
         assert!(headers.get("hx-replace-url").is_none());
         assert!(headers.get("hx-reswap").is_none());
+        assert!(headers.get("hx-reselect").is_none());
         assert!(headers.get("hx-retarget").is_none());
         assert!(headers.get("hx-trigger").is_none());
         assert!(headers.get("hx-trigger-after-settle").is_none());
