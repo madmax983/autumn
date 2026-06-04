@@ -1354,6 +1354,9 @@ fn apply_middleware(
 
     let router = router.layer(RequestIdLayer).layer(security_headers);
 
+    #[cfg(feature = "flash")]
+    let router = router.layer(crate::middleware::flash::FlashInjectionLayer);
+
     let router = crate::session::apply_session_layer(
         router,
         &config.session,

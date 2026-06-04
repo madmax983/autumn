@@ -20,6 +20,8 @@ pub(crate) mod dev;
 pub(crate) mod error_page_filter;
 pub(crate) mod exception_filter;
 pub mod maintenance;
+#[cfg(feature = "flash")]
+pub mod flash;
 pub(crate) mod method_override;
 pub(crate) mod metrics;
 pub(crate) mod request_id;
@@ -37,3 +39,5 @@ pub use metrics::{MetricsCollector, MetricsLayer};
 pub use request_id::{RequestId, RequestIdLayer};
 #[cfg(feature = "telemetry-otlp")]
 pub use trace_context::{TraceContextLayer, TraceContextService};
+#[cfg(feature = "flash")]
+pub use flash::FlashInjectionLayer;
