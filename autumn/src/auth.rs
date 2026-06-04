@@ -409,7 +409,7 @@ pub struct AuthConfig {
     #[serde(default)]
     pub oauth_linking_policy: OAuthLinkingPolicy,
 
-    /// WebAuthn / passkey configuration.
+    /// `WebAuthn` / passkey configuration.
     ///
     /// Required when using `autumn generate auth --passkeys`. Set in `autumn.toml`:
     ///
@@ -424,7 +424,7 @@ pub struct AuthConfig {
     pub webauthn: WebAuthnConfig,
 }
 
-/// WebAuthn / passkey Relying Party configuration.
+/// `WebAuthn` / passkey Relying Party configuration.
 ///
 /// Read from the `[auth.webauthn]` section of `autumn.toml`.
 #[cfg(feature = "webauthn")]
@@ -453,7 +453,7 @@ impl Default for WebAuthnConfig {
 }
 
 #[cfg(feature = "webauthn")]
-fn default_rp_id() -> String {
+const fn default_rp_id() -> String {
     String::new()
 }
 
@@ -463,7 +463,7 @@ fn default_rp_name() -> String {
 }
 
 #[cfg(feature = "webauthn")]
-fn default_rp_origin() -> String {
+const fn default_rp_origin() -> String {
     String::new()
 }
 
