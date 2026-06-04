@@ -914,6 +914,15 @@ pub use crate::extract::Form;
 /// Query extractor.
 pub use crate::extract::Query;
 
+/// Resolved client IP address after trusted-proxy evaluation.
+pub use crate::extract::ClientAddr;
+
+/// Resolved external host after trusted-proxy evaluation.
+pub use crate::extract::ClientHost;
+
+/// Resolved external scheme (`"http"` / `"https"`) after trusted-proxy evaluation.
+pub use crate::extract::ClientScheme;
+
 /// State extractor.
 /// Re-exported from [Axum](https://docs.rs/axum).
 pub use axum::extract::State;

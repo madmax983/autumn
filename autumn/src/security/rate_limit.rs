@@ -73,7 +73,10 @@ use tower::{Layer, Service};
 
 #[cfg(feature = "redis")]
 use super::config::RateLimitBackendFailure;
-use super::config::{KeyStrategy, RateLimitBackend, RateLimitConfig, RateLimitTierConfig};
+use super::config::{
+    KeyStrategy, RateLimitBackend, RateLimitConfig, RateLimitTierConfig, TrustedProxiesConfig,
+};
+use super::trusted_proxies::ProxyResolver;
 
 const X_RATELIMIT_LIMIT: HeaderName = HeaderName::from_static("x-ratelimit-limit");
 const X_RATELIMIT_REMAINING: HeaderName = HeaderName::from_static("x-ratelimit-remaining");
@@ -419,9 +422,11 @@ struct Limiter {
     refill_per_sec: f64,
     burst: f64,
     burst_header: HeaderValue,
+    // Kept for legacy deep_clone; actual resolution goes through `resolver`.
     trust_forwarded_headers: bool,
     trusted_proxies_configured: bool,
     trusted_proxies: Vec<TrustedProxy>,
+    resolver: Arc<ProxyResolver>,
     key_strategy: KeyStrategy,
     tiers: Arc<std::collections::HashMap<String, RateLimitTierConfig>>,
     tier_hook: Option<TierHookFn>,
@@ -490,11 +495,18 @@ impl TrustedProxy {
 
 impl Limiter {
     fn from_config(config: &RateLimitConfig) -> Self {
+        Self::from_config_with_resolver(config, None)
+    }
+
+    fn from_config_with_resolver(
+        config: &RateLimitConfig,
+        top_level_resolver: Option<ProxyResolver>,
+    ) -> Self {
         let burst = f64::from(config.burst.max(1));
         let refill_per_sec = config.requests_per_second.max(f64::MIN_POSITIVE);
         let burst_header = HeaderValue::from(config.burst.max(1));
         let trusted_proxies_configured = !config.trusted_proxies.is_empty();
-        let trusted_proxies = config
+        let trusted_proxies: Vec<TrustedProxy> = config
             .trusted_proxies
             .iter()
             .filter_map(|proxy| {
@@ -508,6 +520,30 @@ impl Limiter {
             })
             .collect();
 
+        // Emit deprecation warning when the rate-limit-scoped proxy fields are
+        // in use but the caller didn't supply a top-level resolver.
+        if top_level_resolver.is_none()
+            && (config.trust_forwarded_headers || !config.trusted_proxies.is_empty())
+        {
+            tracing::warn!(
+                "security.rate_limit.trust_forwarded_headers and \
+                 security.rate_limit.trusted_proxies are deprecated. \
+                 Configure [security.trusted_proxies] instead and the \
+                 rate limiter will use the shared policy automatically."
+            );
+        }
+
+        // Prefer the top-level resolver when provided; otherwise build one
+        // from the legacy rate-limit-scoped config so existing deployments
+        // continue to work without changes.
+        let resolver = top_level_resolver.unwrap_or_else(|| {
+            ProxyResolver::from_config(&TrustedProxiesConfig {
+                ranges: config.trusted_proxies.clone(),
+                trusted_hops: None,
+                trust_forwarded_headers: config.trust_forwarded_headers,
+            })
+        });
+
         let backend = Self::build_backend(config);
 
         Self {
@@ -517,6 +553,7 @@ impl Limiter {
             trust_forwarded_headers: config.trust_forwarded_headers,
             trusted_proxies_configured,
             trusted_proxies,
+            resolver: Arc::new(resolver),
             key_strategy: config.key_strategy,
             tiers: Arc::new(config.tiers.clone()),
             tier_hook: None,
@@ -706,97 +743,12 @@ fn extract_bearer_token<B>(req: &Request<B>) -> Option<String> {
 }
 
 impl Limiter {
-    /// Extract the originating client IP from a request, honoring this
-    /// limiter's trusted-proxy policy.
+    /// Extract the originating client IP from a request, honoring the
+    /// centralized trusted-proxy policy.
     fn client_ip<B>(&self, req: &Request<B>) -> Option<String> {
-        let peer_ip = Self::peer_ip(req);
-
-        if self.trust_forwarded_headers && self.forwarded_headers_allowed(req) {
-            let xff_ip = {
-                let all_xff: Vec<&str> = req
-                    .headers()
-                    .get_all("x-forwarded-for")
-                    .iter()
-                    .filter_map(|v| v.to_str().ok())
-                    .collect();
-
-                if all_xff.is_empty() {
-                    None
-                } else {
-                    let joined = all_xff.join(", ");
-                    self.client_ip_from_x_forwarded_for(&joined, peer_ip)
-                }
-            };
-
-            if xff_ip.is_some() {
-                return xff_ip;
-            }
-
-            let real_ip = req
-                .headers()
-                .get("x-real-ip")
-                .and_then(|v| v.to_str().ok())
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(ToOwned::to_owned);
-
-            if real_ip.is_some() {
-                return real_ip;
-            }
-        }
-
-        peer_ip.map(|ip| ip.to_string())
-    }
-
-    fn peer_ip<B>(req: &Request<B>) -> Option<IpAddr> {
-        req.extensions()
-            .get::<ConnectInfo<SocketAddr>>()
-            .map(|ConnectInfo(addr)| addr.ip())
-    }
-
-    fn forwarded_headers_allowed<B>(&self, req: &Request<B>) -> bool {
-        if !self.trusted_proxies_configured {
-            return true;
-        }
-
-        Self::peer_ip(req).is_some_and(|peer_ip| self.is_trusted_proxy(peer_ip))
-    }
-
-    fn client_ip_from_x_forwarded_for(
-        &self,
-        header: &str,
-        peer_ip: Option<IpAddr>,
-    ) -> Option<String> {
-        if !self.trusted_proxies_configured {
-            let mut entries = header.rsplit(',').map(str::trim).filter(|s| !s.is_empty());
-            let last = entries.next()?;
-
-            if peer_ip.is_some_and(|peer_ip| last.parse::<IpAddr>().is_ok_and(|ip| ip == peer_ip)) {
-                return entries
-                    .next()
-                    .map_or_else(|| Some(last.to_owned()), |entry| Some(entry.to_owned()));
-            }
-
-            return Some(last.to_owned());
-        }
-
-        for entry in header.rsplit(',').map(str::trim).filter(|s| !s.is_empty()) {
-            let Ok(ip) = entry.parse::<IpAddr>() else {
-                continue;
-            };
-
-            if !self.is_trusted_proxy(ip) {
-                return Some(ip.to_string());
-            }
-        }
-
-        None
-    }
-
-    fn is_trusted_proxy(&self, ip: IpAddr) -> bool {
-        self.trusted_proxies
-            .iter()
-            .any(|trusted_proxy| trusted_proxy.contains(ip))
+        self.resolver
+            .resolve_client_addr(req)
+            .map(|ip| ip.to_string())
     }
 }
 
@@ -875,6 +827,25 @@ impl RateLimitLayer {
         }
     }
 
+    /// Override the proxy resolver with a pre-built [`ProxyResolver`].
+    ///
+    /// Use this to wire the top-level `[security.trusted_proxies]` policy into
+    /// the rate limiter so all middleware share a single trust boundary.
+    ///
+    /// ```rust,ignore
+    /// let resolver = ProxyResolver::from_config(&security_config.trusted_proxies);
+    /// let layer = RateLimitLayer::from_config(&security_config.rate_limit)
+    ///     .with_proxy_resolver(resolver);
+    /// ```
+    #[must_use]
+    pub fn with_proxy_resolver(self, resolver: ProxyResolver) -> Self {
+        let mut limiter = Arc::try_unwrap(self.limiter).unwrap_or_else(|arc| (*arc).deep_clone());
+        limiter.resolver = Arc::new(resolver);
+        Self {
+            limiter: Arc::new(limiter),
+        }
+    }
+
     /// Register an app-supplied tier-assignment hook.
     ///
     /// The hook receives the extracted bucket key (principal ID or token, without
@@ -939,6 +910,7 @@ impl Limiter {
             trust_forwarded_headers: self.trust_forwarded_headers,
             trusted_proxies_configured: self.trusted_proxies_configured,
             trusted_proxies: self.trusted_proxies.clone(),
+            resolver: Arc::clone(&self.resolver),
             key_strategy: self.key_strategy,
             tiers: Arc::clone(&self.tiers),
             tier_hook: self.tier_hook.clone(),
@@ -1909,17 +1881,28 @@ mod tests {
         assert!(matches!(limiter.backend, BucketBackend::Memory(_)));
     }
 
-    #[tokio::test]
-    async fn is_trusted_proxy_returns_false_for_untrusted_ip() {
-        let config = RateLimitConfig {
-            enabled: true,
-            trusted_proxies: vec!["10.0.0.0/8".to_string()],
-            ..RateLimitConfig::default()
-        };
-        let limiter = Limiter::from_config(&config);
+    #[test]
+    fn is_trusted_proxy_returns_false_for_untrusted_ip() {
+        use crate::security::trusted_proxies::ProxyResolver;
+        use crate::security::config::TrustedProxiesConfig;
+
+        let resolver = ProxyResolver::from_config(&TrustedProxiesConfig {
+            ranges: vec!["10.0.0.0/8".to_string()],
+            trusted_hops: None,
+            trust_forwarded_headers: true,
+        });
 
         let untrusted_ip: IpAddr = "192.168.1.1".parse().unwrap();
-        assert!(!limiter.is_trusted_proxy(untrusted_ip));
+        // Build a request with this peer IP and verify XFF is NOT trusted.
+        let addr: std::net::SocketAddr = format!("{untrusted_ip}:1234").parse().unwrap();
+        let mut req: axum::http::Request<()> = axum::http::Request::builder()
+            .header("x-forwarded-for", "10.0.0.1")
+            .body(())
+            .unwrap();
+        req.extensions_mut().insert(axum::extract::ConnectInfo(addr));
+        // Untrusted peer: should return peer IP, not XFF value.
+        let resolved = resolver.resolve_client_addr(&req).unwrap();
+        assert_eq!(resolved, untrusted_ip);
     }
 
     // ── Path override tests ───────────────────────────────────────────────────

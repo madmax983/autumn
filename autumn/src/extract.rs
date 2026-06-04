@@ -735,3 +735,308 @@ mod tests {
         assert_eq!(not_tighter.max_file_size_bytes, 50); // should not relax
     }
 }
+
+// ── Trusted-proxy client-identity extractors ─────────────────────────────────
+
+use crate::security::trusted_proxies::ResolvedClientIdentity;
+
+/// The resolved client IP address after trusted-proxy evaluation.
+///
+/// Populated by the framework's proxy-resolver middleware from the operator's
+/// `[security.trusted_proxies]` configuration.
+///
+/// # Plugin authors
+///
+/// > **Never read `X-Forwarded-*` headers directly.  Use this extractor.**
+///
+/// This is the only blessed way to obtain the real client IP in handlers and
+/// middleware.  Direct reads of `X-Forwarded-For` or `X-Real-IP` will be
+/// rejected by the `grep` CI guard introduced in #812.
+///
+/// # Failure
+///
+/// Returns `500 Internal Server Error` when the proxy-resolver middleware is
+/// not installed.  Use `Option<ClientAddr>` for routes where the middleware may
+/// be absent.
+pub struct ClientAddr(pub std::net::IpAddr);
+
+impl ClientAddr {
+    /// The resolved client IP.
+    #[must_use]
+    pub fn ip(&self) -> std::net::IpAddr {
+        self.0
+    }
+}
+
+impl<S> FromRequestParts<S> for ClientAddr
+where
+    S: Send + Sync,
+{
+    type Rejection = (axum::http::StatusCode, &'static str);
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        parts
+            .extensions
+            .get::<ResolvedClientIdentity>()
+            .and_then(|id| id.addr)
+            .map(ClientAddr)
+            .ok_or((
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "ClientAddr not resolved. Is the TrustedProxiesLayer installed?",
+            ))
+    }
+}
+
+impl<S> axum::extract::OptionalFromRequestParts<S> for ClientAddr
+where
+    S: Send + Sync,
+{
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Option<Self>, Self::Rejection> {
+        Ok(parts
+            .extensions
+            .get::<ResolvedClientIdentity>()
+            .and_then(|id| id.addr)
+            .map(ClientAddr))
+    }
+}
+
+/// The resolved external host as seen by the client after trusted-proxy evaluation.
+///
+/// Returns the value of `X-Forwarded-Host` when the proxy is trusted, otherwise
+/// falls back to the `Host` header.
+///
+/// # Plugin authors
+///
+/// > **Never read `X-Forwarded-Host` directly.  Use this extractor.**
+pub struct ClientHost(pub String);
+
+impl ClientHost {
+    /// The resolved host string.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<S> FromRequestParts<S> for ClientHost
+where
+    S: Send + Sync,
+{
+    type Rejection = (axum::http::StatusCode, &'static str);
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        parts
+            .extensions
+            .get::<ResolvedClientIdentity>()
+            .and_then(|id| id.host.clone())
+            .map(ClientHost)
+            .ok_or((
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "ClientHost not resolved. Is the TrustedProxiesLayer installed?",
+            ))
+    }
+}
+
+impl<S> axum::extract::OptionalFromRequestParts<S> for ClientHost
+where
+    S: Send + Sync,
+{
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Option<Self>, Self::Rejection> {
+        Ok(parts
+            .extensions
+            .get::<ResolvedClientIdentity>()
+            .and_then(|id| id.host.clone())
+            .map(ClientHost))
+    }
+}
+
+/// The resolved external scheme (`"http"` or `"https"`) after trusted-proxy evaluation.
+///
+/// Returns the leftmost value of `X-Forwarded-Proto` when the proxy is trusted,
+/// otherwise falls back to the request URI scheme or `"http"`.
+///
+/// # Plugin authors
+///
+/// > **Never read `X-Forwarded-Proto` directly.  Use this extractor.**
+pub struct ClientScheme(pub String);
+
+impl ClientScheme {
+    /// The resolved scheme string (`"http"` or `"https"`).
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Returns `true` when the resolved scheme is `"https"`.
+    #[must_use]
+    pub fn is_https(&self) -> bool {
+        self.0.eq_ignore_ascii_case("https")
+    }
+}
+
+impl<S> FromRequestParts<S> for ClientScheme
+where
+    S: Send + Sync,
+{
+    type Rejection = (axum::http::StatusCode, &'static str);
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        parts
+            .extensions
+            .get::<ResolvedClientIdentity>()
+            .map(|id| ClientScheme(id.scheme.clone()))
+            .ok_or((
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "ClientScheme not resolved. Is the TrustedProxiesLayer installed?",
+            ))
+    }
+}
+
+impl<S> axum::extract::OptionalFromRequestParts<S> for ClientScheme
+where
+    S: Send + Sync,
+{
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Option<Self>, Self::Rejection> {
+        Ok(parts
+            .extensions
+            .get::<ResolvedClientIdentity>()
+            .map(|id| ClientScheme(id.scheme.clone())))
+    }
+}
+
+#[cfg(test)]
+mod trusted_proxy_extractor_tests {
+    use super::*;
+    use axum::Router;
+    use axum::body::Body;
+    use axum::routing::get;
+    use tower::ServiceExt;
+
+    fn make_identity(addr: &str, host: &str, scheme: &str) -> ResolvedClientIdentity {
+        ResolvedClientIdentity {
+            addr: Some(addr.parse().unwrap()),
+            host: Some(host.to_owned()),
+            scheme: scheme.to_owned(),
+        }
+    }
+
+    #[tokio::test]
+    async fn client_addr_extractor_reads_from_extension() {
+        async fn handler(ClientAddr(ip): ClientAddr) -> String {
+            ip.to_string()
+        }
+
+        let app = Router::new().route("/", get(handler));
+
+        let mut req = axum::http::Request::builder()
+            .uri("/")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut()
+            .insert(make_identity("192.0.2.1", "app.example", "https"));
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 64).await.unwrap();
+        assert_eq!(&body[..], b"192.0.2.1");
+    }
+
+    #[tokio::test]
+    async fn client_host_extractor_reads_from_extension() {
+        async fn handler(ClientHost(host): ClientHost) -> String {
+            host
+        }
+
+        let app = Router::new().route("/", get(handler));
+
+        let mut req = axum::http::Request::builder()
+            .uri("/")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut()
+            .insert(make_identity("192.0.2.1", "app.example", "https"));
+
+        let resp = app.oneshot(req).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 64).await.unwrap();
+        assert_eq!(&body[..], b"app.example");
+    }
+
+    #[tokio::test]
+    async fn client_scheme_extractor_reads_from_extension() {
+        async fn handler(ClientScheme(scheme): ClientScheme) -> String {
+            scheme
+        }
+
+        let app = Router::new().route("/", get(handler));
+
+        let mut req = axum::http::Request::builder()
+            .uri("/")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut()
+            .insert(make_identity("192.0.2.1", "app.example", "https"));
+
+        let resp = app.oneshot(req).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 64).await.unwrap();
+        assert_eq!(&body[..], b"https");
+    }
+
+    #[tokio::test]
+    async fn client_addr_missing_returns_500() {
+        async fn handler(_: ClientAddr) -> &'static str {
+            "ok"
+        }
+
+        let app = Router::new().route("/", get(handler));
+        let req = axum::http::Request::builder()
+            .uri("/")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn optional_client_addr_returns_none_when_missing() {
+        async fn handler(addr: Option<ClientAddr>) -> String {
+            if addr.is_some() {
+                "some".to_owned()
+            } else {
+                "none".to_owned()
+            }
+        }
+
+        let app = Router::new().route("/", get(handler));
+        let req = axum::http::Request::builder()
+            .uri("/")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 64).await.unwrap();
+        assert_eq!(&body[..], b"none");
+    }
+}

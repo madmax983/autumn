@@ -403,12 +403,110 @@ pub struct SecurityConfig {
     /// Trusted Host header allow-list.
     #[serde(default)]
     pub trusted_hosts: TrustedHostsConfig,
+
+    /// Top-level trusted-proxy policy for `X-Forwarded-*` headers.
+    ///
+    /// When configured, every forwarding-aware middleware (rate limiter, CSRF
+    /// origin check, method-override, HSTS detection, tracing fields) honours
+    /// this policy.  The old per-subsystem `security.rate_limit.trusted_proxies`
+    /// and `security.rate_limit.trust_forwarded_headers` fields continue to work
+    /// for one minor release but are deprecated; configure this block instead.
+    #[serde(default)]
+    pub trusted_proxies: TrustedProxiesConfig,
+}
+
+impl SecurityConfig {
+    /// Check for conflicting configuration between the new top-level
+    /// `[security.trusted_proxies]` and the deprecated rate-limit-scoped fields.
+    ///
+    /// Returns `Some(message)` when both are set with values that differ; the
+    /// caller (e.g. `autumn doctor --strict`) should treat this as a failure.
+    #[must_use]
+    pub fn trusted_proxies_conflict(&self) -> Option<String> {
+        let new_set = self.trusted_proxies.trust_forwarded_headers
+            || !self.trusted_proxies.ranges.is_empty();
+        let old_set = self.rate_limit.trust_forwarded_headers
+            || !self.rate_limit.trusted_proxies.is_empty();
+
+        if new_set && old_set {
+            // Check for value-level conflicts.
+            let new_ranges: std::collections::HashSet<&str> =
+                self.trusted_proxies.ranges.iter().map(String::as_str).collect();
+            let old_ranges: std::collections::HashSet<&str> = self
+                .rate_limit
+                .trusted_proxies
+                .iter()
+                .map(String::as_str)
+                .collect();
+
+            if new_ranges != old_ranges
+                || self.trusted_proxies.trust_forwarded_headers
+                    != self.rate_limit.trust_forwarded_headers
+            {
+                return Some(
+                    "[security.trusted_proxies] and \
+                     [security.rate_limit] trusted_proxies/trust_forwarded_headers \
+                     are both set with conflicting values. Remove the deprecated \
+                     rate_limit fields and keep only [security.trusted_proxies]."
+                        .to_owned(),
+                );
+            }
+        }
+
+        None
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct TrustedHostsConfig {
     #[serde(default)]
     pub hosts: Vec<String>,
+}
+
+/// Top-level trusted-proxy policy applied by every forwarding-aware middleware.
+///
+/// Declare this once under `[security.trusted_proxies]` and every framework
+/// middleware that reads `X-Forwarded-*` headers (rate limiter, CSRF origin
+/// check, method-override, HSTS detection, tracing fields) will honour it
+/// automatically.
+///
+/// # Examples
+///
+/// ```toml
+/// # Behind Cloudflare (known IP ranges) + an ALB in 10.0.0.0/8
+/// [security.trusted_proxies]
+/// ranges = ["173.245.48.0/20", "103.21.244.0/22", "10.0.0.0/8"]
+/// trust_forwarded_headers = true
+///
+/// # Behind exactly one ALB with dynamic IPs — trust the rightmost 1 hop
+/// [security.trusted_proxies]
+/// trusted_hops = 1
+/// trust_forwarded_headers = true
+/// ```
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TrustedProxiesConfig {
+    /// Trusted proxy IP addresses or CIDR ranges.
+    ///
+    /// Walk the `X-Forwarded-For` chain from the right, skipping IPs in these
+    /// ranges.  The first IP that falls outside the ranges is the real client.
+    #[serde(default)]
+    pub ranges: Vec<String>,
+
+    /// Trust exactly this many proxy hops from the right of the
+    /// `X-Forwarded-For` chain, regardless of their IPs.
+    ///
+    /// Use when proxy IPs are dynamic (e.g., AWS ALB).  Takes precedence over
+    /// `ranges` when set.
+    #[serde(default)]
+    pub trusted_hops: Option<u32>,
+
+    /// Whether to consult `X-Forwarded-*` headers at all.
+    ///
+    /// Defaults to `false` in `prod` (safe default — no forwarding trust until
+    /// explicitly configured).  Set `true` when the application is behind a
+    /// reverse proxy that sets these headers.
+    #[serde(default)]
+    pub trust_forwarded_headers: bool,
 }
 
 /// Security response headers configuration.
@@ -785,23 +883,25 @@ pub struct RateLimitConfig {
     #[serde(default = "default_burst")]
     pub burst: u32,
 
+    /// **Deprecated** — use `[security.trusted_proxies]` instead.
+    ///
     /// Consult `X-Forwarded-For` / `X-Real-IP` before the connection peer
     /// when identifying the client. Default: `false`.
     ///
-    /// Enable ONLY when the server is behind a trusted reverse proxy that
-    /// fully overrides these headers on every request. Otherwise a client
-    /// can rotate header values to bypass throttling.
+    /// This field is honoured for one minor release and emits a startup
+    /// warning.  Configure [`SecurityConfig::trusted_proxies`] to silence
+    /// the warning and share the policy with all middleware.
     #[serde(default)]
     pub trust_forwarded_headers: bool,
 
+    /// **Deprecated** — use `[security.trusted_proxies]` instead.
+    ///
     /// Trusted proxy IP addresses or CIDR ranges to skip at the right
     /// side of an appended `X-Forwarded-For` chain.
     ///
-    /// This is only used when `trust_forwarded_headers = true`. Include
-    /// the immediate peer proxy when `ConnectInfo` is available; forwarded
-    /// headers from non-trusted peers, or requests without peer metadata,
-    /// are ignored. Invalid entries are ignored; if every configured
-    /// entry is invalid, forwarded headers are ignored rather than trusted.
+    /// This field is honoured for one minor release and emits a startup
+    /// warning.  Configure [`SecurityConfig::trusted_proxies`] to silence
+    /// the warning and share the policy with all middleware.
     #[serde(default)]
     pub trusted_proxies: Vec<String>,
 
@@ -1644,5 +1744,85 @@ mod tests {
     fn csp_nonce_config_disabled_by_default_in_standalone() {
         let config: CspNonceConfig = toml::from_str("").unwrap();
         assert!(!config.enabled);
+    }
+
+    // ── TrustedProxiesConfig & conflict detection ─────────────────────────────
+
+    #[test]
+    fn trusted_proxies_config_parses_from_toml() {
+        let toml = r#"
+[trusted_proxies]
+ranges = ["10.0.0.0/8", "203.0.113.0/24"]
+trusted_hops = 2
+trust_forwarded_headers = true
+"#;
+        let config: SecurityConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.trusted_proxies.ranges.len(), 2);
+        assert_eq!(config.trusted_proxies.trusted_hops, Some(2));
+        assert!(config.trusted_proxies.trust_forwarded_headers);
+    }
+
+    #[test]
+    fn trusted_proxies_config_defaults_to_no_trust() {
+        let config: SecurityConfig = toml::from_str("").unwrap();
+        assert!(config.trusted_proxies.ranges.is_empty());
+        assert!(config.trusted_proxies.trusted_hops.is_none());
+        assert!(!config.trusted_proxies.trust_forwarded_headers);
+    }
+
+    #[test]
+    fn trusted_proxies_conflict_detected_when_both_set_with_different_values() {
+        let toml = r#"
+[trusted_proxies]
+ranges = ["10.0.0.0/8"]
+trust_forwarded_headers = true
+
+[rate_limit]
+trusted_proxies = ["192.168.0.0/16"]
+trust_forwarded_headers = true
+"#;
+        let config: SecurityConfig = toml::from_str(toml).unwrap();
+        assert!(
+            config.trusted_proxies_conflict().is_some(),
+            "conflicting proxy configs must be detected"
+        );
+    }
+
+    #[test]
+    fn trusted_proxies_no_conflict_when_only_new_set() {
+        let toml = r#"
+[trusted_proxies]
+ranges = ["10.0.0.0/8"]
+trust_forwarded_headers = true
+"#;
+        let config: SecurityConfig = toml::from_str(toml).unwrap();
+        assert!(config.trusted_proxies_conflict().is_none());
+    }
+
+    #[test]
+    fn trusted_proxies_no_conflict_when_only_old_set() {
+        let toml = r#"
+[rate_limit]
+trusted_proxies = ["10.0.0.0/8"]
+trust_forwarded_headers = true
+"#;
+        let config: SecurityConfig = toml::from_str(toml).unwrap();
+        assert!(config.trusted_proxies_conflict().is_none());
+    }
+
+    #[test]
+    fn trusted_proxies_no_conflict_when_same_values_in_both() {
+        let toml = r#"
+[trusted_proxies]
+ranges = ["10.0.0.0/8"]
+trust_forwarded_headers = true
+
+[rate_limit]
+trusted_proxies = ["10.0.0.0/8"]
+trust_forwarded_headers = true
+"#;
+        let config: SecurityConfig = toml::from_str(toml).unwrap();
+        // Same values — no conflict (though old fields still warn at startup).
+        assert!(config.trusted_proxies_conflict().is_none());
     }
 }

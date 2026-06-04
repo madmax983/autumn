@@ -192,3 +192,47 @@ header for downstream services.
 [`tower::Layer`]: https://docs.rs/tower/latest/tower/trait.Layer.html
 [`tower::ServiceBuilder`]: https://docs.rs/tower/latest/tower/struct.ServiceBuilder.html
 [`axum::error_handling::HandleErrorLayer`]: https://docs.rs/axum/latest/axum/error_handling/struct.HandleErrorLayer.html
+
+---
+
+## Forwarded-header client identity (plugin author guidance)
+
+When writing middleware that needs the real client IP, hostname, or scheme,
+**never read `X-Forwarded-*` headers directly.** Direct reads are fragile,
+bypass the operator's trust policy, and can introduce SSRF / IP-spoofing
+vulnerabilities. Use the blessed extractors instead:
+
+| Extractor | What it resolves |
+|-----------|-----------------|
+| `ClientAddr` | Real client IP after trust evaluation |
+| `ClientHost` | External host (`X-Forwarded-Host` or `Host`) |
+| `ClientScheme` | External scheme (`X-Forwarded-Proto` or URI scheme) |
+
+```rust,no_run
+use autumn_web::extract::{ClientAddr, ClientHost, ClientScheme};
+use autumn_web::prelude::*;
+
+#[get("/info")]
+async fn info(
+    ClientAddr(ip): ClientAddr,
+    ClientHost(host): ClientHost,
+    ClientScheme(scheme): ClientScheme,
+) -> String {
+    format!("client={ip} host={host} scheme={scheme}")
+}
+```
+
+The values are resolved once per request by the framework's
+`TrustedProxiesLayer`, using the operator's `[security.trusted_proxies]`
+configuration. Middleware written inside the framework stack can read
+`ResolvedClientIdentity` directly from request extensions:
+
+```rust,no_run
+use autumn_web::security::ResolvedClientIdentity;
+
+// Inside a Tower Service::call:
+let identity = req.extensions().get::<ResolvedClientIdentity>();
+```
+
+See [`security.trusted_proxies` configuration](../guide/getting-started.md)
+for operator setup instructions.

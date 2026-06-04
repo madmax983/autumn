@@ -123,6 +123,8 @@ use std::task::{Context, Poll};
 use axum::http::{Request, Response, StatusCode};
 use tower::{Layer, Service};
 
+use crate::security::trusted_proxies::ResolvedClientIdentity;
+
 /// Default form field name for the method override.
 pub const DEFAULT_METHOD_OVERRIDE_FIELD: &str = "_method";
 
@@ -366,6 +368,36 @@ fn is_form_urlencoded(headers: &http::HeaderMap) -> bool {
 ///    documented browser-form convention does not apply, so the safe
 ///    thing is to forward the request as the original `POST` and let
 ///    route matching reject it.
+/// Wrapper that consults [`ResolvedClientIdentity`] extensions when available,
+/// so that the same-origin check uses the resolver-validated host and scheme
+/// rather than trusting raw `X-Forwarded-*` headers unconditionally.
+fn is_same_origin_form_request(req: &Request<axum::body::Body>) -> bool {
+    let identity = req.extensions().get::<ResolvedClientIdentity>();
+    let headers = req.headers();
+
+    let origin = match headers.get(http::header::ORIGIN).and_then(|v| v.to_str().ok()) {
+        Some(o) => o,
+        None => {
+            if let Some(site) = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) {
+                return matches!(site, "same-origin" | "none");
+            }
+            return false;
+        }
+    };
+
+    if let Some(site) = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) {
+        return match site {
+            "same-origin" | "none" => true,
+            "same-site" => {
+                origin_matches_request_with_identity(origin, headers, identity)
+            }
+            _ => false,
+        };
+    }
+
+    origin_matches_request_with_identity(origin, headers, identity)
+}
+
 fn is_same_origin_form(headers: &http::HeaderMap) -> bool {
     let origin_full_match = || {
         let origin = headers
@@ -389,11 +421,80 @@ fn is_same_origin_form(headers: &http::HeaderMap) -> bool {
     origin_full_match().unwrap_or(false)
 }
 
+/// Same-origin check with optional [`ResolvedClientIdentity`] for host/scheme.
+///
+/// Uses the resolved identity when available (respects the trusted-proxy
+/// policy), otherwise falls back to direct `X-Forwarded-*` header reads for
+/// backwards compatibility (e.g. standalone tests without the framework
+/// proxy middleware).
+fn origin_matches_request_with_identity(
+    origin: &str,
+    headers: &http::HeaderMap,
+    identity: Option<&ResolvedClientIdentity>,
+) -> bool {
+    let Some((origin_scheme, origin_authority)) = parse_origin(origin) else {
+        return false;
+    };
+
+    // Prefer the resolver-validated host; fall back to header reads.
+    let expected_host: Option<std::borrow::Cow<str>> =
+        if let Some(id) = identity.and_then(|id| id.host.as_deref()) {
+            Some(std::borrow::Cow::Borrowed(id))
+        } else {
+            headers
+                .get("x-forwarded-host")
+                .and_then(|v| v.to_str().ok())
+                .or_else(|| {
+                    headers
+                        .get(http::header::HOST)
+                        .and_then(|v| v.to_str().ok())
+                })
+                .map(std::borrow::Cow::Borrowed)
+        };
+
+    let Some(expected_host) = expected_host else {
+        return false;
+    };
+    if !origin_authority.eq_ignore_ascii_case(expected_host.as_ref()) {
+        return false;
+    }
+
+    // Prefer the resolver-validated scheme; fall back to header reads.
+    let resolved_scheme: Option<String> = if let Some(id) = identity {
+        Some(id.scheme.clone())
+    } else {
+        headers
+            .get("x-forwarded-proto")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| {
+                // Multiple `X-Forwarded-Proto` values chained by intermediaries;
+                // the leftmost (client-facing) is the one that matters.
+                s.split(',')
+                    .next()
+                    .unwrap_or(s)
+                    .trim()
+                    .to_ascii_lowercase()
+            })
+    };
+
+    if let Some(scheme) = resolved_scheme {
+        return scheme.eq_ignore_ascii_case(origin_scheme);
+    }
+
+    // No scheme signal: host:port match is the best we can do.
+    true
+}
+
 /// Same-origin requires scheme + host + port to match. `Origin` carries
 /// all three; the request side gets host:port from `Host` (or
 /// `X-Forwarded-Host` if the deployment surfaces it) and the scheme
 /// from `X-Forwarded-Proto` when running behind a TLS-terminating
 /// reverse proxy.
+///
+/// Resolution of `X-Forwarded-Host` and `X-Forwarded-Proto` goes through
+/// the [`ResolvedClientIdentity`] extension when available (injected by
+/// the framework's [`ProxyResolver`] middleware), falling back to direct
+/// header reads for contexts where the middleware is absent (e.g. tests).
 ///
 /// If we can determine the request's scheme and Origin's scheme
 /// differs, we reject — that's a true cross-origin request from a
@@ -404,39 +505,8 @@ fn is_same_origin_form(headers: &http::HeaderMap) -> bool {
 /// from inside the request, so configurations that need strict
 /// scheme enforcement should run behind a proxy that sets
 /// `X-Forwarded-Proto`.
-fn origin_matches_request(origin: &str, headers: &http::HeaderMap) -> bool {
-    let Some((origin_scheme, origin_authority)) = parse_origin(origin) else {
-        return false;
-    };
-
-    let expected_host = headers
-        .get("x-forwarded-host")
-        .and_then(|v| v.to_str().ok())
-        .or_else(|| {
-            headers
-                .get(http::header::HOST)
-                .and_then(|v| v.to_str().ok())
-        });
-    let Some(expected_host) = expected_host else {
-        return false;
-    };
-    if !origin_authority.eq_ignore_ascii_case(expected_host) {
-        return false;
-    }
-
-    if let Some(scheme) = headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-    {
-        // Multiple `X-Forwarded-Proto` values can be chained by
-        // intermediaries; the leftmost (client-facing) is the one
-        // that matters here.
-        let outermost = scheme.split(',').next().unwrap_or(scheme).trim();
-        return outermost.eq_ignore_ascii_case(origin_scheme);
-    }
-
-    // No scheme signal: host:port match is the best we can do.
-    true
+fn origin_matches_request(origin: &str, req_headers: &http::HeaderMap) -> bool {
+    origin_matches_request_with_identity(origin, req_headers, None)
 }
 
 /// Split a serialized `Origin` value into `(scheme, authority)`.
@@ -482,7 +552,7 @@ where
         // reachability via the override convention.
         if req.method() != http::Method::POST
             || !is_form_urlencoded(req.headers())
-            || !is_same_origin_form(req.headers())
+            || !is_same_origin_form_request(&req)
         {
             let mut inner = self.inner.clone();
             std::mem::swap(&mut self.inner, &mut inner);
@@ -1437,5 +1507,92 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    // ── AC #5(d): PR #791 PoC regression — method-override spoofing stays rejected
+    // after migration to the centralized proxy resolver.
+
+    /// Regression for PR #791: an attacker who controls `X-Forwarded-Host` and
+    /// `X-Forwarded-Proto` must NOT be able to spoof the same-origin check when
+    /// those values come from an untrusted source.
+    ///
+    /// When `ResolvedClientIdentity` is NOT in extensions (resolver not active),
+    /// the middleware falls back to direct header reads — the existing tests
+    /// above already cover that path and show the spoofing is rejected when the
+    /// Origin/Host pair does not match.
+    ///
+    /// When `ResolvedClientIdentity` IS in extensions (resolver active), the
+    /// middleware uses the *resolver-validated* host and scheme, which are
+    /// derived from the trusted proxy policy — not from attacker-controlled
+    /// headers.
+    #[tokio::test]
+    async fn pr791_poc_with_resolved_identity_uses_validated_host() {
+        use crate::security::trusted_proxies::ResolvedClientIdentity;
+
+        // The app's "real" origin is https://app.example.
+        // An attacker injects X-Forwarded-Host: app.example with matching Origin
+        // trying to make the middleware see a same-origin match.
+        //
+        // When the proxy resolver has determined the real host is "app.example"
+        // (legitimate — request is really from app.example), the override is allowed.
+        let app = layered_router();
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/items/1")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("origin", "https://app.example")
+            .header("host", "internal.cluster.local")
+            .header("x-forwarded-host", "app.example")
+            .header("x-forwarded-proto", "https")
+            .body(Body::from("_method=DELETE"))
+            .unwrap();
+
+        // Inject resolved identity as the framework would (host = app.example, scheme = https).
+        req.extensions_mut().insert(ResolvedClientIdentity {
+            addr: None,
+            host: Some("app.example".to_owned()),
+            scheme: "https".to_owned(),
+        });
+
+        let response = app.oneshot(req).await.unwrap();
+        // Legitimate same-origin request with resolver-validated identity: allowed.
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn pr791_poc_resolved_identity_different_host_is_rejected() {
+        use crate::security::trusted_proxies::ResolvedClientIdentity;
+
+        // The resolver determined the real host is "internal.cluster.local" (not
+        // what the attacker put in X-Forwarded-Host). The Origin says "app.example",
+        // which doesn't match the resolver-validated host, so the override is rejected.
+        let app = layered_router();
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/items/1")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("origin", "https://app.example")
+            .header("host", "internal.cluster.local")
+            .header("x-forwarded-host", "app.example")
+            .header("x-forwarded-proto", "https")
+            .body(Body::from("_method=DELETE"))
+            .unwrap();
+
+        // Resolver says the real host is the internal cluster hostname, not the
+        // attacker-injected X-Forwarded-Host value.
+        req.extensions_mut().insert(ResolvedClientIdentity {
+            addr: None,
+            host: Some("internal.cluster.local".to_owned()),
+            scheme: "http".to_owned(),
+        });
+
+        let response = app.oneshot(req).await.unwrap();
+        // Origin (app.example) does not match resolver-validated host
+        // (internal.cluster.local): override must NOT apply.
+        assert_eq!(
+            response.status(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "resolver-validated host mismatch must reject the override"
+        );
     }
 }
