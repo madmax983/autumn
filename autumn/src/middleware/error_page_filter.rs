@@ -176,23 +176,13 @@ where
                     (req, None, true)
                 } else {
                     let (parts, body) = req.into_parts();
-                    // Read up to BODY_CAPTURE_LIMIT + 1 bytes to detect truncation.
-                    // to_bytes returns Err if the stream exceeds the limit; treat
-                    // that as a truncated body and pass an empty body downstream
-                    // (better than silently truncating mid-stream with no signal).
-                    if let Ok(bytes) = axum::body::to_bytes(body, BODY_CAPTURE_LIMIT + 1).await {
-                        let truncated = bytes.len() > BODY_CAPTURE_LIMIT;
-                        let captured = bytes.slice(..bytes.len().min(BODY_CAPTURE_LIMIT));
-                        let new_body = axum::body::Body::from(captured.clone());
-                        let req = axum::http::Request::from_parts(parts, new_body);
-                        (req, Some(captured), truncated)
-                    } else {
-                        // Body exceeded the limit mid-stream; forward empty body
-                        // and show truncation notice. The handler will see an
-                        // empty body in dev mode, which is acceptable.
-                        let req = axum::http::Request::from_parts(parts, axum::body::Body::empty());
-                        (req, None, true)
-                    }
+                    // Collect frames manually so we always have the bytes we read
+                    // and can reconstruct a valid body for the downstream handler,
+                    // even when the stream exceeds the capture cap.
+                    let (captured, truncated) = collect_up_to(body, BODY_CAPTURE_LIMIT).await;
+                    let new_body = axum::body::Body::from(captured.clone());
+                    let req = axum::http::Request::from_parts(parts, new_body);
+                    (req, Some(captured), truncated)
                 }
             } else {
                 (req, None, false)
@@ -242,6 +232,31 @@ where
             Ok(response)
         })
     }
+}
+
+/// Reads body frames up to `limit` bytes. Returns the collected bytes and
+/// whether the stream was truncated. Always returns the bytes it did read,
+/// so the caller can reconstruct a valid body for downstream handlers even
+/// when the stream exceeds the cap.
+async fn collect_up_to(body: axum::body::Body, limit: usize) -> (bytes::Bytes, bool) {
+    use http_body_util::BodyExt as _;
+    let mut buf = bytes::BytesMut::new();
+    let mut stream = body;
+    let mut truncated = false;
+    while let Some(frame) = stream.frame().await {
+        let Ok(frame) = frame else { break };
+        let Some(chunk) = frame.into_data().ok() else {
+            continue;
+        };
+        let remaining = limit.saturating_sub(buf.len());
+        if chunk.len() >= remaining {
+            buf.extend_from_slice(&chunk[..remaining]);
+            truncated = chunk.len() > remaining;
+            break;
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    (buf.freeze(), truncated)
 }
 
 /// Returns true for HTTP methods that typically carry a request body.
