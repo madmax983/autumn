@@ -390,6 +390,13 @@ fn build_router_pre_state(
     // Only active when profile = "dev"; returns 404 for all other profiles.
     let is_dev_profile = matches!(config.profile.as_deref(), Some("dev" | "development"));
     if is_dev_profile {
+        // Capture the matched route pattern for the dev error overlay.
+        // Applied as a route_layer so MatchedPath is already set when this runs.
+        router = router.route_layer(axum::middleware::from_fn(
+            crate::middleware::dev::capture_matched_path_middleware,
+        ));
+    }
+    if is_dev_profile {
         let buf = crate::inspector::InspectorBuffer::new(config.dev.inspector_capacity);
         let inspector_path = config.dev.inspector_path.clone();
         let threshold = config.dev.inspector_n_plus_one_threshold;

@@ -64,6 +64,16 @@ pub struct ErrorPageRequestContext {
     pub request_id: Option<String>,
     pub query: Option<String>,
     pub headers: Option<axum::http::HeaderMap>,
+    /// HTTP method (e.g. "GET").
+    pub method: Option<String>,
+    /// Matched route pattern (e.g. `/posts/{id}`), set by `DevRouteInfoLayer` in dev mode.
+    pub matched_path: Option<String>,
+    /// Scrubbed cookies parsed from the Cookie header.
+    pub cookies: Option<serde_json::Value>,
+    /// Raw path parameters (e.g. `{"id": "42"}`), captured in dev mode.
+    pub path_params: Option<serde_json::Value>,
+    /// SQL queries recorded during this request by `InspectorLayer` (dev only).
+    pub sql_queries: Vec<crate::inspector::QueryRecord>,
 }
 
 /// Tower layer that annotates requests with Accept header preference
@@ -112,6 +122,7 @@ where
 
         let query = uri.query().map(str::to_owned);
         let headers = Some(req.headers().clone());
+        let method = Some(req.method().to_string());
 
         ErrorPageContextFuture {
             inner: self.inner.call(req),
@@ -120,6 +131,7 @@ where
             request_id,
             query,
             headers,
+            method,
         }
     }
 }
@@ -133,6 +145,7 @@ pin_project_lite::pin_project! {
         request_id: Option<String>,
         query: Option<String>,
         headers: Option<axum::http::HeaderMap>,
+        method: Option<String>,
     }
 }
 
@@ -159,11 +172,34 @@ where
                         .and_then(|value| value.to_str().ok())
                         .map(str::to_owned)
                 });
+                let matched_path = response
+                    .extensions()
+                    .get::<crate::middleware::dev::DevMatchedPath>()
+                    .map(|m| m.0.clone());
+                let path_params = matched_path
+                    .as_deref()
+                    .map(|pattern| extract_path_params(pattern, this.uri.path()));
+                let cookies = this
+                    .headers
+                    .as_ref()
+                    .and_then(|h| h.get(axum::http::header::COOKIE))
+                    .and_then(|v| v.to_str().ok())
+                    .map(parse_cookie_header);
+                let sql_queries = response
+                    .extensions()
+                    .get::<crate::inspector::RequestQueryList>()
+                    .map(crate::inspector::RequestQueryList::snapshot)
+                    .unwrap_or_default();
                 response.extensions_mut().insert(ErrorPageRequestContext {
                     uri: this.uri.clone(),
                     request_id,
                     query: this.query.clone(),
                     headers: this.headers.clone(),
+                    method: this.method.clone(),
+                    matched_path,
+                    cookies,
+                    path_params,
+                    sql_queries,
                 });
                 std::task::Poll::Ready(Ok(response))
             }
@@ -251,6 +287,61 @@ pub fn accept_prefers_html(headers: &axum::http::HeaderMap) -> bool {
     }
 }
 
+/// Derive path parameters by matching URI segments against a route pattern.
+///
+/// Handles both `{name}` (Axum/Autumn default) and `:name` (legacy) capture
+/// syntax. Returns an empty object when segment counts differ.
+fn extract_path_params(pattern: &str, uri_path: &str) -> serde_json::Value {
+    let pat_segs: Vec<&str> = pattern.split('/').collect();
+    let uri_segs: Vec<&str> = uri_path.split('/').collect();
+    let mut map = serde_json::Map::new();
+    if pat_segs.len() == uri_segs.len() {
+        for (pat, val) in pat_segs.iter().zip(uri_segs.iter()) {
+            let name = pat
+                .strip_prefix(':')
+                .or_else(|| pat.strip_prefix('{').and_then(|s| s.strip_suffix('}')));
+            if let Some(name) = name {
+                map.insert(
+                    name.to_owned(),
+                    serde_json::Value::String((*val).to_owned()),
+                );
+            }
+        }
+    }
+    serde_json::Value::Object(map)
+}
+
+/// Convert an inspector [`QueryRecord`] to the overlay's [`SqlQueryInfo`].
+fn query_record_to_sql_info(
+    r: &crate::inspector::QueryRecord,
+) -> crate::error_pages::dev_badge::SqlQueryInfo {
+    crate::error_pages::dev_badge::SqlQueryInfo {
+        statement: r.sql.clone(),
+        bind_count: r.params.len(),
+        #[allow(clippy::cast_precision_loss)]
+        duration_ms: r.elapsed_ms as f64,
+    }
+}
+
+/// Parse `Cookie: name=value; name2=value2` into a JSON object.
+///
+/// Returns an object where each cookie name maps to its (possibly filtered) value.
+fn parse_cookie_header(raw: &str) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    for pair in raw.split(';') {
+        let pair = pair.trim();
+        if let Some((name, value)) = pair.split_once('=') {
+            map.insert(
+                name.trim().to_owned(),
+                serde_json::Value::String(value.trim().to_owned()),
+            );
+        } else if !pair.is_empty() {
+            map.insert(pair.to_owned(), serde_json::Value::String(String::new()));
+        }
+    }
+    serde_json::Value::Object(map)
+}
+
 fn scrub_headers(
     headers: &axum::http::HeaderMap,
     parameter_filter: &crate::log::filter::ParameterFilter,
@@ -313,6 +404,20 @@ impl ErrorPageFilter {
         ctx: &ErrorContext,
         response: &Response,
     ) {
+        let req_ctx = response.extensions().get::<ErrorPageRequestContext>();
+
+        let stack_frames = error
+            .backtrace_string
+            .as_deref()
+            .map(|bt| crate::error_pages::source::parse_backtrace_string(bt, 24))
+            .unwrap_or_default();
+
+        let raw_cookies = req_ctx
+            .and_then(|c| c.cookies.as_ref())
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        let cookies = self.parameter_filter.scrub_json(&raw_cookies);
+
         let badge_ctx = DevBadgeContext {
             status_code: error.status.as_u16(),
             status_reason: error
@@ -324,18 +429,22 @@ impl ErrorPageFilter {
             path: ctx.path.clone(),
             request_id: ctx.request_id.clone(),
             source_location: None,
-            query: response
-                .extensions()
-                .get::<ErrorPageRequestContext>()
-                .and_then(|ctx| ctx.query.clone()),
-            headers: response
-                .extensions()
-                .get::<ErrorPageRequestContext>()
-                .and_then(|ctx| ctx.headers.as_ref())
-                .map_or_else(
-                    || serde_json::json!({}),
-                    |h| scrub_headers(h, &self.parameter_filter),
-                ),
+            query: req_ctx.and_then(|c| c.query.clone()),
+            headers: req_ctx.and_then(|c| c.headers.as_ref()).map_or_else(
+                || serde_json::json!({}),
+                |h| scrub_headers(h, &self.parameter_filter),
+            ),
+            method: req_ctx.and_then(|c| c.method.clone()),
+            route_pattern: req_ctx.and_then(|c| c.matched_path.clone()),
+            path_params: req_ctx.and_then(|c| c.path_params.as_ref()).map_or_else(
+                || serde_json::json!({}),
+                |p| self.parameter_filter.scrub_json(p),
+            ),
+            cookies,
+            stack_frames,
+            sql_queries: req_ctx
+                .map(|c| c.sql_queries.iter().map(query_record_to_sql_info).collect())
+                .unwrap_or_default(),
         };
         let badge = dev_badge::dev_error_badge_html(&badge_ctx).into_string();
         if let Some(pos) = html_body.rfind("</body>") {
@@ -912,6 +1021,26 @@ mod tests {
 
         assert!(body_str.contains("pin"));
         assert!(body_str.contains("[FILTERED]"));
+    }
+
+    #[test]
+    fn extract_path_params_brace_syntax() {
+        let v = super::extract_path_params("/posts/{id}/comments/{cid}", "/posts/42/comments/7");
+        assert_eq!(v["id"], "42");
+        assert_eq!(v["cid"], "7");
+    }
+
+    #[test]
+    fn extract_path_params_colon_syntax() {
+        let v = super::extract_path_params("/posts/:id/comments/:cid", "/posts/42/comments/7");
+        assert_eq!(v["id"], "42");
+        assert_eq!(v["cid"], "7");
+    }
+
+    #[test]
+    fn extract_path_params_static_route_returns_empty() {
+        let v = super::extract_path_params("/posts", "/posts");
+        assert_eq!(v.as_object().unwrap().len(), 0);
     }
 
     #[tokio::test]

@@ -446,7 +446,7 @@ where
         let fut = self.inner.call(req);
 
         Box::pin(async move {
-            let response = fut.await?;
+            let mut response = fut.await?;
             let elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
             let status = response.status().as_u16();
@@ -482,6 +482,10 @@ where
                 recorded_at,
             };
             buffer.push(record);
+
+            // Propagate the per-request query list to response extensions so
+            // the dev error overlay (ErrorPageContextLayer) can snapshot it.
+            response.extensions_mut().insert(query_list);
 
             Ok(response)
         })

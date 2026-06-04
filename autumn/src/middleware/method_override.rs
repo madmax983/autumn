@@ -227,6 +227,7 @@ pub async fn method_override_rejection_filter(
             message: message.to_owned(),
             details: None,
             problem_type: None,
+            backtrace_string: None,
         });
         return response;
     }

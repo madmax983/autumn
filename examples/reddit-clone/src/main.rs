@@ -93,6 +93,11 @@ async fn main() {
             repositories::subreddit_api_get,
             repositories::post_api_list,
             repositories::post_api_get,
+            // Dev-only error routes for smoke-testing the dev error overlay.
+            // These return 404 in production (profile guard is in ErrorPageFilter).
+            routes::errors::trigger_error,
+            routes::errors::trigger_panic,
+            routes::errors::trigger_404,
         ])
         .mail_previews(routes::auth::mail_previews())
         .policy::<Post, _>(PostPolicy)

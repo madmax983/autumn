@@ -1630,6 +1630,7 @@ fn api_token_error_response<ResBody: From<String> + Default>(
             message,
             details: None,
             problem_type: None,
+            backtrace_string: None,
         });
     response
 }
