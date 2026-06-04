@@ -120,6 +120,7 @@
 //! | `AUTUMN_DEV__INSPECTOR_PATH` | `dev.inspector_path` | `String` |
 //! | `AUTUMN_DEV__INSPECTOR_CAPACITY` | `dev.inspector_capacity` | `usize` |
 //! | `AUTUMN_DEV__INSPECTOR_N_PLUS_ONE_THRESHOLD` | `dev.inspector_n_plus_one_threshold` | `usize` |
+//! | `AUTUMN_COMPRESSION__ENABLED` | `compression.enabled` | `bool` |
 
 use std::path::{Path, PathBuf};
 
@@ -756,6 +757,17 @@ pub struct AutumnConfig {
     #[cfg(feature = "reporting")]
     #[serde(default)]
     pub reporting: ReportingConfig,
+
+    /// Response compression settings (`[compression]` section in `autumn.toml`).
+    ///
+    /// Compression is **off by default**. Enable with:
+    /// ```toml
+    /// [compression]
+    /// enabled = true
+    /// ```
+    /// or via `AUTUMN_COMPRESSION__ENABLED=true`.
+    #[serde(default)]
+    pub compression: CompressionConfig,
 }
 
 /// Error-reporting settings (`[reporting]` section in `autumn.toml`).
@@ -1776,6 +1788,7 @@ impl AutumnConfig {
         self.apply_security_env_overrides_with_env(env);
         self.apply_idempotency_env_overrides_with_env(env);
         self.apply_dev_env_overrides_with_env(env);
+        self.apply_compression_env_overrides_with_env(env);
         #[cfg(feature = "reporting")]
         self.apply_reporting_env_overrides_with_env(env);
         #[cfg(feature = "storage")]
@@ -1813,6 +1826,14 @@ impl AutumnConfig {
             env,
             "AUTUMN_DEV__INSPECTOR_N_PLUS_ONE_THRESHOLD",
             &mut self.dev.inspector_n_plus_one_threshold,
+        );
+    }
+
+    fn apply_compression_env_overrides_with_env(&mut self, env: &dyn Env) {
+        parse_env_bool(
+            env,
+            "AUTUMN_COMPRESSION__ENABLED",
+            &mut self.compression.enabled,
         );
     }
 
@@ -3121,6 +3142,62 @@ fn default_cors_headers() -> Vec<String> {
 
 const fn default_cors_max_age() -> u64 {
     86400
+}
+
+// ── CompressionConfig ──────────────────────────────────────────────────────
+
+/// Response compression settings (`[compression]` section in `autumn.toml`).
+///
+/// Compression is **off by default** to avoid the [BREACH/CRIME] class of
+/// compression side-channel attacks, where an attacker can infer secret
+/// content (e.g. CSRF tokens) by observing how the compressed size changes as
+/// they inject attacker-controlled bytes alongside the secret. Enable only when
+/// you understand the tradeoff — or when a CDN / reverse-proxy handles TLS and
+/// terminates there.
+///
+/// [BREACH/CRIME]: https://breachattack.com/
+///
+/// # One-liner opt-in
+///
+/// ```toml
+/// [compression]
+/// enabled = true
+/// ```
+///
+/// # Environment variable override
+///
+/// | Variable | Field | Type |
+/// |----------|-------|------|
+/// | `AUTUMN_COMPRESSION__ENABLED` | `enabled` | `bool` |
+///
+/// # `ETag` compatibility
+///
+/// Autumn's framework-managed compression layer is applied **outside** any
+/// user-registered `EtagLayer`, so `ETags` are computed on the uncompressed body.
+/// Because `CompressionLayer` sets `Vary: Accept-Encoding`, caches correctly
+/// store separate entries per encoding. Using weak `ETags` (`W/`) when
+/// compression is enabled is safe per RFC 7232 §2.1 (weak comparison allows
+/// encoding variations).
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_web::config::CompressionConfig;
+///
+/// let cfg = CompressionConfig::default();
+/// assert!(!cfg.enabled);
+/// ```
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct CompressionConfig {
+    /// Enable response compression. Default: `false`.
+    ///
+    /// When `true`, the framework inserts a `CompressionLayer` that honors the
+    /// client's `Accept-Encoding` header (gzip and brotli supported) and sets
+    /// `Vary: Accept-Encoding` on all compressible responses.
+    /// Non-compressible content types (images, archives) and responses that
+    /// already carry `Content-Encoding` are passed through unchanged.
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 /// Parse an environment variable into a typed target, logging a warning on failure.

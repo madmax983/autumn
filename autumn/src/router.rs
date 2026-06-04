@@ -1122,6 +1122,40 @@ fn mount_raw_routers(
     router
 }
 
+fn apply_compression_middleware<S>(
+    mut router: axum::Router<S>,
+    config: &AutumnConfig,
+) -> axum::Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    if config.compression.enabled {
+        use tower_http::compression::predicate::{DefaultPredicate, NotForContentType, Predicate};
+        // Extend the default predicate (skips images, gRPC, SSE, small bodies) to also
+        // skip binary media and already-compressed formats — compressing these wastes
+        // CPU, increases transfer size for archives, and can confuse media players.
+        let predicate = DefaultPredicate::new()
+            // Binary media — already-encoded by codec, not compressible by gzip/br.
+            .and(NotForContentType::const_new("audio/"))
+            .and(NotForContentType::const_new("video/"))
+            .and(NotForContentType::const_new("application/octet-stream"))
+            // Compressed archive formats — re-compressing wastes CPU.
+            .and(NotForContentType::const_new("application/zip"))
+            .and(NotForContentType::const_new("application/gzip"))
+            .and(NotForContentType::const_new("application/x-gzip"))
+            .and(NotForContentType::const_new("application/zstd"))
+            .and(NotForContentType::const_new("application/x-bzip2"))
+            .and(NotForContentType::const_new("application/x-bzip"))
+            .and(NotForContentType::const_new("application/x-rar-compressed"))
+            .and(NotForContentType::const_new("application/vnd.rar"))
+            .and(NotForContentType::const_new("application/x-7z-compressed"));
+        router =
+            router.layer(tower_http::compression::CompressionLayer::new().compress_when(predicate));
+        tracing::info!("Response compression enabled (gzip/brotli)");
+    }
+    router
+}
+
 fn apply_cors_middleware<S>(mut router: axum::Router<S>, config: &AutumnConfig) -> axum::Router<S>
 where
     S: Clone + Send + Sync + 'static,
@@ -1418,7 +1452,7 @@ fn apply_middleware(
     // layer is available when the timeout fires — see request_timeout_handler).
     //
     // Full ingress layer order (outermost → innermost):
-    //   TraceContext → Metrics → ExceptionFilter → ErrorPageContext → Session →
+    //   TraceContext → Compression → Metrics → ExceptionFilter → ErrorPageContext → Session →
     //   SecurityHeaders → RequestId → Timeout → [user layers] → Tenancy →
     //   BodyLimit/UploadConfig → MethodOverride → RateLimit → CSRF → CORS → handler
     router = apply_request_timeout_middleware(router, config, state.metrics.clone());
@@ -1489,15 +1523,26 @@ fn apply_middleware(
     // Full ingress layer order (outermost -> innermost):
     //   TraceContext (applied outside the startup barrier so short-circuit
     //   responses still carry traceparent) ->
+    //   Compression (outer to ExceptionFilter — see note below) ->
     //   [user layers, when SSG/ISG dist dir active] ->
     //   StaticFileMiddleware (when SSG/ISG enabled) ->
     //   Metrics -> ExceptionFilter -> ErrorPageContext -> Session ->
     //   SecurityHeaders -> RequestId -> [user layers, non-static build] ->
-    //   RateLimit -> CSRF -> CORS -> handler
+    //   Tenancy -> RateLimit -> CSRF -> CORS -> handler
     let router = router
         .layer(crate::middleware::error_page_filter::ErrorPageContextLayer)
         .layer(ExceptionFilterLayer::new(all_filters))
         .layer(crate::middleware::MetricsLayer::new(state.metrics.clone()));
+
+    // Response compression is applied outermost (outside ExceptionFilter) so that
+    // exception filters which rebuild the response body (e.g. ProblemDetailsFilter
+    // normalising AutumnErrors to JSON Problem Details) do so before the body is
+    // encoded. If compression were inner to ExceptionFilter, the filter would
+    // inherit a Content-Encoding: gzip header on the rebuilt uncompressed body,
+    // causing clients to receive uncompressed bytes labeled as gzip.
+    // User-registered layers (EtagLayer etc.) remain inner to Compression, so
+    // ETags are still computed on the uncompressed body before encoding occurs.
+    let router = apply_compression_middleware(router, config);
 
     Ok(router)
 }
@@ -1790,6 +1835,12 @@ pub fn try_build_router_with_static_inner(
             "Custom Tower layers applied outside static middleware"
         );
     }
+
+    // Compression must also be applied OUTSIDE the static-first middleware so
+    // that pre-rendered HTML pages (served directly by StaticFileLayer without
+    // reaching inner_router) are also compressed. This mirrors the placement in
+    // apply_middleware for the dynamic-only path.
+    router = apply_compression_middleware(router, config);
 
     let router = router.layer(crate::security::SecurityHeadersLayer::from_config(
         &config.security.headers,
