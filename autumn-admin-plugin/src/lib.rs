@@ -263,6 +263,9 @@ pub(crate) fn admin_route_infos(prefix: &str, has_config: bool) -> Vec<RouteInfo
             handler: format!("admin::{}", method.to_lowercase()),
             source: autumn_web::route_listing::RouteSource::User, // overwritten by declare_plugin_routes
             middleware: vec![],
+            api_version: None,
+            status: None,
+            sunset_opt_out: None,
         })
         .collect()
 }
@@ -465,6 +468,9 @@ mod conformance_tests {
             handler: "host::admin_redirect".to_owned(),
             source: RouteSource::User,
             middleware: vec![],
+            api_version: None,
+            status: None,
+            sunset_opt_out: None,
         });
         let (result, diagnostics) = autumn_web::plugin_conformance::check_collisions(&routes);
         assert_eq!(

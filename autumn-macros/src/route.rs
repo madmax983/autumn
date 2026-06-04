@@ -141,6 +141,11 @@ pub fn route_macro(
     };
     let api_doc_fields = api_doc_attr.emit_ident_fields(fn_name);
     let http_method_lit = LitStr::new(http_method, Span::call_site());
+    let api_version_expr = route_args.api_version.as_ref().map_or_else(
+        || quote! { ::core::option::Option::None },
+        |lit| quote! { ::core::option::Option::Some(#lit) },
+    );
+    let sunset_opt_out_val = route_args.sunset_opt_out;
 
     // ── Path helper ─────────────────────────────────────────────
     let path_helper = emit_path_helper(&path_helper_name, &path, &path_params);
@@ -159,6 +164,8 @@ pub fn route_macro(
                 path: #path,
                 handler: #handler_expr,
                 name: ::core::stringify!(#fn_name),
+                api_version: #api_version_expr,
+                sunset_opt_out: #sunset_opt_out_val,
                 api_doc: ::autumn_web::openapi::ApiDoc {
                     method: #http_method_lit,
                     path: #path,
@@ -169,6 +176,8 @@ pub fn route_macro(
                     secured: #secured,
                     required_roles: #required_roles,
                     register_schemas: ::core::option::Option::None,
+                    api_version: #api_version_expr,
+                    sunset_opt_out: #sunset_opt_out_val,
                     #api_doc_fields
                 },
                 repository: ::core::option::Option::None,
@@ -471,6 +480,31 @@ mod tests {
         assert!(
             !generated.contains("IdempotencyReplayLayer"),
             "intercepted routes must not advertise an implicit replay stop: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_parses_api_version_and_sunset_opt_out() {
+        let generated = route_macro(
+            "GET",
+            "get",
+            quote! { "/items", api_version = "v1", sunset_opt_out = true },
+            quote! {
+                async fn get_items() -> &'static str {
+                    "items"
+                }
+            },
+        )
+        .to_string();
+
+        // Check that api_version and sunset_opt_out are generated in Route constructor
+        assert!(
+            generated.contains("api_version"),
+            "should generate api_version field: {generated}"
+        );
+        assert!(
+            generated.contains("sunset_opt_out"),
+            "should generate sunset_opt_out field: {generated}"
         );
     }
 }

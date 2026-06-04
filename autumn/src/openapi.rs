@@ -112,6 +112,10 @@ pub struct ApiDoc {
     /// Optional runtime hook that lets a handler register any extra
     /// component schemas with the generator.
     pub register_schemas: Option<fn(&mut SchemaRegistry)>,
+    /// Optional API version associated with this route.
+    pub api_version: Option<&'static str>,
+    /// Whether this route opts out of sunset 410 responses.
+    pub sunset_opt_out: bool,
 }
 
 /// Reference to a schema definition, produced by the route macros.
@@ -171,6 +175,8 @@ pub struct OpenApiConfig {
     pub session_cookie_name: String,
     /// User-registered component schemas keyed by schema name.
     pub additional_schemas: BTreeMap<String, serde_json::Value>,
+    /// API versions registry.
+    pub api_versions: Vec<crate::app::ApiVersion>,
 }
 
 #[cfg(feature = "openapi")]
@@ -186,6 +192,7 @@ impl OpenApiConfig {
             swagger_ui_path: Some("/swagger-ui".to_owned()),
             session_cookie_name: "autumn.sid".to_owned(),
             additional_schemas: BTreeMap::new(),
+            api_versions: Vec::new(),
         }
     }
 
@@ -398,6 +405,9 @@ pub struct Operation {
     /// Security requirements for this operation. Non-empty when the route uses `#[secured]`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub security: Vec<BTreeMap<String, Vec<String>>>,
+    /// Declares this operation to be deprecated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deprecated: Option<bool>,
 }
 
 #[cfg(feature = "openapi")]
@@ -500,6 +510,16 @@ pub fn write_openapi_spec_to_dist(
 #[cfg(feature = "openapi")]
 #[must_use]
 pub fn generate_spec(config: &OpenApiConfig, routes: &[&ApiDoc]) -> OpenApiSpec {
+    generate_spec_at(config, routes, chrono::Utc::now())
+}
+
+#[cfg(feature = "openapi")]
+#[must_use]
+pub fn generate_spec_at(
+    config: &OpenApiConfig,
+    routes: &[&ApiDoc],
+    now: chrono::DateTime<chrono::Utc>,
+) -> OpenApiSpec {
     let mut paths: BTreeMap<String, PathItem> = BTreeMap::new();
     let mut registry = SchemaRegistry::default();
 
@@ -539,7 +559,7 @@ pub fn generate_spec(config: &OpenApiConfig, routes: &[&ApiDoc]) -> OpenApiSpec 
             collect_ref_names(entry, &mut referenced_names);
         }
 
-        let operation = operation_for(api_doc);
+        let operation = operation_for(api_doc, &config.api_versions, now);
         let entry = paths.entry(api_doc.path.to_owned()).or_default();
         match api_doc.method {
             "GET" => entry.get = Some(operation),
@@ -606,14 +626,35 @@ pub fn generate_spec(config: &OpenApiConfig, routes: &[&ApiDoc]) -> OpenApiSpec 
 }
 
 #[cfg(feature = "openapi")]
-fn operation_for(api_doc: &ApiDoc) -> Operation {
-    let tags = if api_doc.tags.is_empty() {
+#[allow(clippy::too_many_lines)]
+fn operation_for(
+    api_doc: &ApiDoc,
+    api_versions: &[crate::app::ApiVersion],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Operation {
+    let mut tags = if api_doc.tags.is_empty() {
         default_tag(api_doc.path)
             .map(|t| vec![t.to_owned()])
             .unwrap_or_default()
     } else {
         api_doc.tags.iter().map(|s| (*s).to_owned()).collect()
     };
+
+    if let Some(version) = api_doc.api_version {
+        tags.push(version.to_string());
+    }
+
+    let is_deprecated = api_doc.api_version.is_some_and(|version| {
+        api_versions
+            .iter()
+            .find(|av| av.version == version)
+            .is_some_and(|av| {
+                let is_dep = av.deprecated_at.is_some_and(|d| now >= d);
+                let is_sun = av.sunset_at.is_some_and(|s| now >= s);
+                is_dep || is_sun
+            })
+    });
+    let deprecated = if is_deprecated { Some(true) } else { None };
 
     // Path parameters — always required.
     let mut parameters: Vec<Parameter> = api_doc
@@ -684,7 +725,32 @@ fn operation_for(api_doc: &ApiDoc) -> Operation {
     );
     insert_problem_responses(&mut responses);
 
-    insert_problem_responses(&mut responses);
+    // If this route version has a sunset schedule and is not opted out, document 410 Gone
+    let is_subject_to_sunset = api_doc.api_version.is_some_and(|version| {
+        api_versions
+            .iter()
+            .find(|av| av.version == version)
+            .is_some_and(|av| av.sunset_at.is_some())
+            && !api_doc.sunset_opt_out
+    });
+
+    if is_subject_to_sunset {
+        responses.entry("410".to_owned()).or_insert_with(|| {
+            let mut content = BTreeMap::new();
+            content.insert(
+                "application/problem+json".to_owned(),
+                MediaType {
+                    schema: serde_json::json!({
+                        "$ref": "#/components/schemas/ProblemDetails",
+                    }),
+                },
+            );
+            Response {
+                description: status_description(410).to_owned(),
+                content,
+            }
+        });
+    }
 
     // Security requirement: `#[secured]` is backed by the Autumn session cookie.
     let security = if api_doc.secured {
@@ -704,6 +770,7 @@ fn operation_for(api_doc: &ApiDoc) -> Operation {
         request_body,
         responses,
         security,
+        deprecated,
     }
 }
 
@@ -1003,6 +1070,8 @@ mod tests {
             secured: false,
             required_roles: &[],
             register_schemas: None,
+            api_version: None,
+            ..Default::default()
         }
     }
 

@@ -122,6 +122,12 @@ pub struct Route {
     /// generating `/v3/api-docs`.
     pub api_doc: ApiDoc,
 
+    /// API version of the route (e.g. "v1")
+    pub api_version: Option<&'static str>,
+
+    /// Whether this route opts out of sunset 410 response
+    pub sunset_opt_out: bool,
+
     /// Repository auto-API metadata, populated by the
     /// `#[repository(api = ...)]` macro. `None` for hand-written
     /// route handlers.

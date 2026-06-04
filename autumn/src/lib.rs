@@ -274,6 +274,7 @@ pub mod __private {
 /// }
 /// ```
 pub use app::app;
+pub use app::{ApiVersion, RegisteredApiVersions};
 /// Async database connection extractor.
 ///
 /// Declare `db: Db` in a handler signature to get a pooled Postgres

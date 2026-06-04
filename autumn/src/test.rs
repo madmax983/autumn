@@ -208,6 +208,7 @@ pub struct TestApp {
     /// Retained as `Arc<dyn Any>` so `TestClient::advance_clock` can downcast
     /// to [`crate::time::TickingClock`] at runtime.
     clock_as_any: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
+    api_versions: Vec<crate::app::ApiVersion>,
 }
 
 type TestPolicyRegistration = Box<dyn FnOnce(&crate::authorization::PolicyRegistry) + Send>;
@@ -258,6 +259,7 @@ impl TestApp {
             extensions: std::collections::HashMap::new(),
             clock: None,
             clock_as_any: None,
+            api_versions: Vec::new(),
         }
     }
 
@@ -636,6 +638,23 @@ impl TestApp {
         self
     }
 
+    /// Register a single API version for testing.
+    #[must_use]
+    pub fn api_version(mut self, version: crate::app::ApiVersion) -> Self {
+        self.api_versions.push(version);
+        self
+    }
+
+    /// Register multiple API versions for testing.
+    #[must_use]
+    pub fn api_versions(
+        mut self,
+        versions: impl IntoIterator<Item = crate::app::ApiVersion>,
+    ) -> Self {
+        self.api_versions.extend(versions);
+        self
+    }
+
     /// Attach a database connection pool to the test app.
     #[cfg(feature = "db")]
     #[must_use]
@@ -826,6 +845,7 @@ impl TestApp {
         for register in self.policy_registrations {
             register(state.policy_registry());
         }
+        state.insert_extension(crate::app::RegisteredApiVersions(self.api_versions));
         crate::app::install_webhook_registry(&state, &self.config);
 
         // Install AutumnConfig so DbState::statement_timeout / slow_query_threshold
@@ -1675,6 +1695,8 @@ mod tests {
                 },
                 repository: None,
                 idempotency: crate::route::RouteIdempotency::Direct,
+                api_version: None,
+                sunset_opt_out: false,
             },
             Route {
                 method: Method::POST,
@@ -1690,6 +1712,8 @@ mod tests {
                 },
                 repository: None,
                 idempotency: crate::route::RouteIdempotency::Direct,
+                api_version: None,
+                sunset_opt_out: false,
             },
             Route {
                 method: Method::POST,
@@ -1705,6 +1729,8 @@ mod tests {
                 },
                 repository: None,
                 idempotency: crate::route::RouteIdempotency::Direct,
+                api_version: None,
+                sunset_opt_out: false,
             },
         ]
     }
@@ -1848,6 +1874,8 @@ mod tests {
             },
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
+            api_version: None,
+            sunset_opt_out: false,
         }];
         let client = TestApp::new().routes(routes).build();
 
