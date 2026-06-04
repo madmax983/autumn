@@ -430,18 +430,19 @@ fn form_pairs_to_nested_json(pairs: Vec<(String, String)>) -> serde_json::Value 
 /// `"a[b][c]"` → `["a", "b", "c"]`
 /// `"simple"` → `["simple"]`
 fn bracket_key_segments(key: &str) -> Vec<String> {
-    if let Some(pos) = key.find('[') {
-        let mut parts = vec![key[..pos].to_owned()];
-        for seg in key[pos + 1..].split('[') {
-            let seg = seg.trim_end_matches(']');
-            if !seg.is_empty() {
-                parts.push(seg.to_owned());
+    key.find('[').map_or_else(
+        || vec![key.to_owned()],
+        |pos| {
+            let mut parts = vec![key[..pos].to_owned()];
+            for seg in key[pos + 1..].split('[') {
+                let seg = seg.trim_end_matches(']');
+                if !seg.is_empty() {
+                    parts.push(seg.to_owned());
+                }
             }
-        }
-        parts
-    } else {
-        vec![key.to_owned()]
-    }
+            parts
+        },
+    )
 }
 
 fn form_insert_at_path(
