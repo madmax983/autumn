@@ -2395,10 +2395,7 @@ impl AppBuilder {
             jobs: _,
             static_metas,
             exception_filters: _,
-            #[cfg(feature = "openapi")]
             scoped_groups,
-            #[cfg(not(feature = "openapi"))]
-                scoped_groups: _,
             merge_routers: _,
             nest_routers: _,
             custom_layers,
@@ -2472,8 +2469,15 @@ impl AppBuilder {
         // the emitted dist/openapi.json matches what the runtime spec serves.
         #[cfg(feature = "openapi")]
         let api_docs_snapshot: Vec<crate::openapi::ApiDoc> = {
-            let mut docs: Vec<crate::openapi::ApiDoc> =
-                all_routes.iter().map(|r| r.api_doc.clone()).collect();
+            let mut docs: Vec<crate::openapi::ApiDoc> = all_routes
+                .iter()
+                .map(|r| {
+                    let mut doc = r.api_doc.clone();
+                    doc.api_version = r.api_version;
+                    doc.sunset_opt_out = r.sunset_opt_out;
+                    doc
+                })
+                .collect();
             for group in &scoped_groups {
                 // Mirror the same normalization as the runtime OpenAPI builder:
                 // use join_nested_path for correct trailing-slash handling, and
@@ -2481,6 +2485,8 @@ impl AppBuilder {
                 let prefix_params = crate::router::extract_path_params(&group.prefix);
                 for route in &group.routes {
                     let mut doc = route.api_doc.clone();
+                    doc.api_version = route.api_version;
+                    doc.sunset_opt_out = route.sunset_opt_out;
                     let full = crate::router::join_nested_path(&group.prefix, route.api_doc.path);
                     doc.path = Box::leak(full.into_boxed_str());
                     if !prefix_params.is_empty() {
@@ -2664,7 +2670,7 @@ impl AppBuilder {
             state,
             crate::router::RouterContext {
                 exception_filters: Vec::new(),
-                scoped_groups: Vec::new(),
+                scoped_groups,
                 merge_routers,
                 nest_routers: Vec::new(),
                 custom_layers,
