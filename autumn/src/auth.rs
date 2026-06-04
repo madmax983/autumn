@@ -422,6 +422,84 @@ pub struct AuthConfig {
     #[cfg(feature = "webauthn")]
     #[serde(default)]
     pub webauthn: WebAuthnConfig,
+
+    /// Account lockout policy for the generated login endpoint.
+    ///
+    /// Protects individual accounts from credential-stuffing attacks by locking
+    /// them after a burst of failed login attempts, even when those attempts
+    /// arrive from rotating source IPs.
+    ///
+    /// Configure in `autumn.toml`:
+    ///
+    /// ```toml
+    /// [auth.lockout]
+    /// enabled = true          # set to false to disable (e.g. when using external policy)
+    /// threshold = 10          # failed attempts before lockout
+    /// window_secs = 60        # sliding window for counting failures
+    /// cooloff_secs = 900      # lock duration in seconds (15 minutes)
+    /// ```
+    ///
+    /// Set `threshold = 0` or `enabled = false` to disable lockout entirely and
+    /// restore pre-lockout behaviour for apps with a stronger external policy.
+    #[serde(default)]
+    pub lockout: LockoutConfig,
+}
+
+/// Account lockout policy configuration.
+///
+/// Read from the `[auth.lockout]` section of `autumn.toml`.
+/// All fields have safe production defaults.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct LockoutConfig {
+    /// Whether account lockout is enabled (default: `true`).
+    ///
+    /// Set to `false` to disable lockout globally without removing the columns.
+    #[serde(default = "default_lockout_enabled")]
+    pub enabled: bool,
+
+    /// Number of consecutive failed login attempts before an account is locked
+    /// (default: `10`). Set to `0` to disable lockout.
+    #[serde(default = "default_lockout_threshold")]
+    pub threshold: i32,
+
+    /// Sliding window in seconds over which `threshold` failures trigger lockout
+    /// (default: `60`). Reserved for future per-window counting; current
+    /// implementation counts all failures since the last successful login.
+    #[serde(default = "default_lockout_window_secs")]
+    pub window_secs: u64,
+
+    /// Cool-off period in seconds before a locked account is automatically
+    /// unlocked (default: `900`, i.e. 15 minutes). An account also unlocks
+    /// immediately on the first successful login after cool-off elapses.
+    #[serde(default = "default_lockout_cooloff_secs")]
+    pub cooloff_secs: u64,
+}
+
+const fn default_lockout_enabled() -> bool {
+    true
+}
+
+const fn default_lockout_threshold() -> i32 {
+    10
+}
+
+const fn default_lockout_window_secs() -> u64 {
+    60
+}
+
+const fn default_lockout_cooloff_secs() -> u64 {
+    900
+}
+
+impl Default for LockoutConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_lockout_enabled(),
+            threshold: default_lockout_threshold(),
+            window_secs: default_lockout_window_secs(),
+            cooloff_secs: default_lockout_cooloff_secs(),
+        }
+    }
 }
 
 /// WebAuthn / passkey Relying Party configuration.
@@ -1239,6 +1317,7 @@ impl Default for AuthConfig {
             oauth_linking_policy: OAuthLinkingPolicy::default(),
             #[cfg(feature = "webauthn")]
             webauthn: WebAuthnConfig::default(),
+            lockout: LockoutConfig::default(),
         }
     }
 }
