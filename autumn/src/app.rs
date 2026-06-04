@@ -977,17 +977,35 @@ impl AppBuilder {
         self
     }
 
-    /// Register a single API version.
+    /// Register a single API version. If a version with the same name already exists, it is updated.
     #[must_use]
     pub fn api_version(mut self, version: ApiVersion) -> Self {
-        self.api_versions.push(version);
+        if let Some(pos) = self
+            .api_versions
+            .iter()
+            .position(|v| v.version == version.version)
+        {
+            self.api_versions[pos] = version;
+        } else {
+            self.api_versions.push(version);
+        }
         self
     }
 
-    /// Register multiple API versions.
+    /// Register multiple API versions, replacing duplicates.
     #[must_use]
     pub fn api_versions(mut self, versions: impl IntoIterator<Item = ApiVersion>) -> Self {
-        self.api_versions.extend(versions);
+        for version in versions {
+            if let Some(pos) = self
+                .api_versions
+                .iter()
+                .position(|v| v.version == version.version)
+            {
+                self.api_versions[pos] = version;
+            } else {
+                self.api_versions.push(version);
+            }
+        }
         self
     }
 

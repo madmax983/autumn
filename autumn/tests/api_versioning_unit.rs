@@ -35,12 +35,23 @@ fn test_autumn_error_gone() {
 
 #[test]
 fn test_app_builder_api_version_registry() {
-    let app = autumn_web::app().api_version(autumn_web::app::ApiVersion {
-        version: "v1".to_string(),
-        deprecated_at: None,
-        sunset_at: None,
-    });
+    use chrono::TimeZone;
+    let deprecated_date = chrono::Utc.with_ymd_and_hms(2026, 6, 2, 0, 0, 0).unwrap();
+
+    let app = autumn_web::app()
+        .api_version(autumn_web::app::ApiVersion {
+            version: "v1".to_string(),
+            deprecated_at: None,
+            sunset_at: None,
+        })
+        .api_version(autumn_web::app::ApiVersion {
+            version: "v1".to_string(),
+            deprecated_at: Some(deprecated_date),
+            sunset_at: None,
+        });
+
     assert_eq!(app.api_versions.len(), 1);
+    assert_eq!(app.api_versions[0].deprecated_at, Some(deprecated_date));
 }
 
 #[tokio::test]

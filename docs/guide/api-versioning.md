@@ -125,11 +125,11 @@ autumn check deprecations
 ```
 
 This command builds your project, queries the route table, and audits all routes.
-- If **any** route is past its sunset date and **has not opted out**, the command logs the offending routes and exits with a non-zero code (**1**), failing the build.
-- If no active sunsetted routes are found, it exits with code **0**.
+- If **any** route is past its sunset date (including opted-out routes), the command logs the offending routes and exits with a non-zero code (**1**), failing the build.
+- If no past-sunset routes are found, it exits with code **0**.
 
 ```text
-✗ Found 1 route(s) past sunset date that have not opted out:
+✗ Found 1 active past-sunset route(s) (opted out):
   GET /v1/users (handler: list_users_v1, version: v1)
 ```
 

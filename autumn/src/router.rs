@@ -810,6 +810,8 @@ fn group_and_mount_routes(
             handler = handler.layer(axum::Extension(RouteVersionMetadata {
                 version: version.to_string(),
                 sunset_opt_out: route.sunset_opt_out,
+                secured: route.api_doc.secured,
+                required_roles: route.api_doc.required_roles,
             }));
         }
         grouped
@@ -1066,6 +1068,8 @@ fn mount_scoped_groups(
                 handler = handler.layer(axum::Extension(RouteVersionMetadata {
                     version: version.to_string(),
                     sunset_opt_out: route.sunset_opt_out,
+                    secured: route.api_doc.secured,
+                    required_roles: route.api_doc.required_roles,
                 }));
             }
             sub_router = sub_router.route(route.path, handler);
@@ -4002,11 +4006,13 @@ impl TrustedHostPolicy {
     }
 }
 
-/// Metadata carrying API version and sunset opt-out configuration for a route.
+/// Metadata carrying API version, sunset opt-out, and security configuration for a route.
 #[derive(Clone, Debug)]
 pub struct RouteVersionMetadata {
     pub version: String,
     pub sunset_opt_out: bool,
+    pub secured: bool,
+    pub required_roles: &'static [&'static str],
 }
 
 /// Middleware that handles API deprecation, sunsets, and Gone responses.
@@ -4036,6 +4042,32 @@ async fn api_versioning_middleware(
     let is_sunset = version.sunset_at.is_some_and(|s| now >= s);
 
     if is_sunset && !meta.sunset_opt_out {
+        if meta.secured {
+            let session = request.extensions().get::<crate::session::Session>();
+            let mut auth_failed = false;
+            let mut auth_error = None;
+            if let Some(session) = session {
+                if let Err(err) = crate::auth::__check_secured_with_key(
+                    session,
+                    state.auth_session_key(),
+                    meta.required_roles,
+                )
+                .await
+                {
+                    auth_failed = true;
+                    auth_error = Some(err);
+                }
+            } else {
+                auth_failed = true;
+                auth_error = Some(crate::error::AutumnError::unauthorized_msg(
+                    "authentication required",
+                ));
+            }
+            if auth_failed {
+                return auth_error.unwrap().into_response();
+            }
+        }
+
         let err = crate::error::AutumnError::gone_msg(format!(
             "API version '{}' has been sunsetted.",
             meta.version

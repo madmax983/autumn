@@ -112,3 +112,97 @@ async fn test_api_versioning_integration() {
     );
     assert_eq!(resp.header("Sunset").unwrap(), expected_sunset_header);
 }
+
+#[get("/api/secured-sunset", api_version = "v1")]
+#[secured]
+async fn api_secured_sunset() -> &'static str {
+    "secured sunset info"
+}
+
+#[get("/api/secured-role-sunset", api_version = "v1")]
+#[secured("admin")]
+async fn api_secured_role_sunset() -> &'static str {
+    "secured role sunset info"
+}
+
+#[tokio::test]
+async fn test_api_versioning_auth_preservation() {
+    use autumn_web::session::{MemoryStore, SessionConfig, SessionLayer, SessionStore};
+
+    let start_time = Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
+    let deprecated_at = Utc.with_ymd_and_hms(2026, 6, 2, 0, 0, 0).unwrap();
+    let sunset_at = Utc.with_ymd_and_hms(2026, 6, 3, 0, 0, 0).unwrap();
+
+    let clock = TickingClock::starting_at(start_time);
+    let store = MemoryStore::new();
+
+    // Seed session data
+    let mut admin_data = std::collections::HashMap::new();
+    admin_data.insert("user_id".to_owned(), "1".to_owned());
+    admin_data.insert("role".to_owned(), "admin".to_owned());
+    store.save("sess-admin", admin_data).await.unwrap();
+
+    let mut user_data = std::collections::HashMap::new();
+    user_data.insert("user_id".to_owned(), "2".to_owned());
+    user_data.insert("role".to_owned(), "user".to_owned());
+    store.save("sess-user", user_data).await.unwrap();
+
+    let client = TestApp::new()
+        .routes(routes![api_secured_sunset, api_secured_role_sunset])
+        .api_version(autumn_web::app::ApiVersion {
+            version: "v1".to_string(),
+            deprecated_at: Some(deprecated_at),
+            sunset_at: Some(sunset_at),
+        })
+        .with_clock(clock.clone())
+        .layer(SessionLayer::new(store, SessionConfig::default()))
+        .build();
+
+    // 1. Before sunset:
+    // Unauthenticated -> 401
+    let resp = client.get("/api/secured-sunset").send().await;
+    resp.assert_status(401);
+
+    // Authenticated user -> 200
+    let resp = client
+        .get("/api/secured-sunset")
+        .header("Cookie", "autumn.sid=sess-user")
+        .send()
+        .await;
+    resp.assert_ok();
+
+    // 2. Advance clock past sunset
+    client.advance_clock(Duration::from_secs(48 * 3600 + 10)); // past sunset
+
+    // Unauthenticated request -> 401 Unauthorized (not 410 Gone!)
+    let resp = client.get("/api/secured-sunset").send().await;
+    resp.assert_status(401);
+
+    // Authenticated request -> 410 Gone
+    let resp = client
+        .get("/api/secured-sunset")
+        .header("Cookie", "autumn.sid=sess-user")
+        .send()
+        .await;
+    resp.assert_status(410);
+
+    // Unauthenticated role-secured request -> 401 Unauthorized (not 410 Gone!)
+    let resp = client.get("/api/secured-role-sunset").send().await;
+    resp.assert_status(401);
+
+    // Authenticated request with wrong role -> 403 Forbidden (not 410 Gone!)
+    let resp = client
+        .get("/api/secured-role-sunset")
+        .header("Cookie", "autumn.sid=sess-user")
+        .send()
+        .await;
+    resp.assert_status(403);
+
+    // Authenticated request with correct role -> 410 Gone
+    let resp = client
+        .get("/api/secured-role-sunset")
+        .header("Cookie", "autumn.sid=sess-admin")
+        .send()
+        .await;
+    resp.assert_status(410);
+}
