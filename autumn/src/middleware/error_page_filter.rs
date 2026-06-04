@@ -180,9 +180,7 @@ where
                     // to_bytes returns Err if the stream exceeds the limit; treat
                     // that as a truncated body and pass an empty body downstream
                     // (better than silently truncating mid-stream with no signal).
-                    if let Ok(bytes) =
-                        axum::body::to_bytes(body, BODY_CAPTURE_LIMIT + 1).await
-                    {
+                    if let Ok(bytes) = axum::body::to_bytes(body, BODY_CAPTURE_LIMIT + 1).await {
                         let truncated = bytes.len() > BODY_CAPTURE_LIMIT;
                         let captured = bytes.slice(..bytes.len().min(BODY_CAPTURE_LIMIT));
                         let new_body = axum::body::Body::from(captured.clone());
@@ -192,8 +190,7 @@ where
                         // Body exceeded the limit mid-stream; forward empty body
                         // and show truncation notice. The handler will see an
                         // empty body in dev mode, which is acceptable.
-                        let req =
-                            axum::http::Request::from_parts(parts, axum::body::Body::empty());
+                        let req = axum::http::Request::from_parts(parts, axum::body::Body::empty());
                         (req, None, true)
                     }
                 }
@@ -203,9 +200,7 @@ where
 
             let mut response = inner.call(req).await?;
 
-            response
-                .extensions_mut()
-                .insert(WantsHtml(wants_html));
+            response.extensions_mut().insert(WantsHtml(wants_html));
             let request_id = request_id.or_else(|| {
                 response
                     .headers()
@@ -392,7 +387,10 @@ fn parse_cookie_header(raw: &str) -> serde_json::Value {
 ///
 /// Understands `application/json` and `application/x-www-form-urlencoded`.
 /// Returns `None` for empty bodies or unrecognised content types.
-fn parse_body_preview(bytes: &bytes::Bytes, content_type: Option<&str>) -> Option<serde_json::Value> {
+fn parse_body_preview(
+    bytes: &bytes::Bytes,
+    content_type: Option<&str>,
+) -> Option<serde_json::Value> {
     if bytes.is_empty() {
         return None;
     }
