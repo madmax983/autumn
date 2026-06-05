@@ -1645,7 +1645,7 @@ pub struct LoginForm {{
 /// `UNSPECIFIED` so the handler compiles and runs correctly in both production
 /// (where `into_make_service_with_connect_info` injects the extension) and
 /// in test environments where it is absent.
-struct MaybeClientIp(std::net::IpAddr);
+pub struct MaybeClientIp(std::net::IpAddr);
 
 impl<S: Send + Sync> axum::extract::FromRequestParts<S> for MaybeClientIp {{
     type Rejection = std::convert::Infallible;
