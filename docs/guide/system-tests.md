@@ -251,8 +251,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Install Chromium
-        run: sudo apt-get install -y chromium-browser
+      - name: Install Chrome
+        # browser-actions/setup-chrome works reliably on all ubuntu-latest
+        # versions. Alternatively, Google Chrome is pre-installed on GitHub
+        # runners and the harness finds it at /usr/bin/google-chrome
+        # automatically — you can omit this step if that binary is present.
+        uses: browser-actions/setup-chrome@latest
       - name: Run system tests
         run: cargo test --features system-tests -- --include-ignored
         env:

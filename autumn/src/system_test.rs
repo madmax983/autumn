@@ -500,16 +500,24 @@ impl Page {
             // Walk all XPath matches in document order and click the first
             // visible, enabled one so that hidden/template duplicates with the
             // same label don't shadow the control the user can actually see.
+            //
+            // xpathLiteral() produces a syntactically valid XPath string for any
+            // label, including those containing both ' and " (uses concat()).
             let js = format!(
                 "(function() {{ \
                  var label = {}; \
-                 var q = label.indexOf(\"'\") >= 0 ? '\"' : \"'\"; \
-                 var xpath = \"//button[normalize-space(.)=\" + q + label + q + \"] \
-                   | //a[normalize-space(.)=\" + q + label + q + \"] \
-                   | //input[@value and normalize-space(@value)=\" + q + label + q + \"] \
-                   | //label[normalize-space(.)=\" + q + label + q + \"] \
-                   | //*[@role='button' and normalize-space(.)=\" + q + label + q + \"] \
-                   | //*[@role='link' and normalize-space(.)=\" + q + label + q + \"]\"; \
+                 function xpathLiteral(s) {{ \
+                   if (s.indexOf(\"'\") < 0) return \"'\" + s + \"'\"; \
+                   if (s.indexOf('\"') < 0) return '\"' + s + '\"'; \
+                   return \"concat('\" + s.split(\"'\").join(\"','\\\"'\\\",' \") + \"')\"; \
+                 }} \
+                 var lit = xpathLiteral(label); \
+                 var xpath = \"//button[normalize-space(.)=\" + lit + \"] \
+                   | //a[normalize-space(.)=\" + lit + \"] \
+                   | //input[@value and normalize-space(@value)=\" + lit + \"] \
+                   | //label[normalize-space(.)=\" + lit + \"] \
+                   | //*[@role='button' and normalize-space(.)=\" + lit + \"] \
+                   | //*[@role='link' and normalize-space(.)=\" + lit + \"]\"; \
                  var iter = document.evaluate(xpath, document, null, \
                    XPathResult.ORDERED_NODE_ITERATOR_TYPE, null); \
                  var node; \
