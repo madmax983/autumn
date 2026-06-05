@@ -497,7 +497,7 @@ impl Page {
                 "(function() {{ \
                  var label = {}; \
                  var q = label.indexOf(\"'\") >= 0 ? '\"' : \"'\"; \
-                 var xpath = \"//*[normalize-space(text())=\" + q + label + q + \"]\"; \
+                 var xpath = \"//*[normalize-space(.)=\" + q + label + q + \"]\"; \
                  var result = document.evaluate(xpath, document, null, \
                    XPathResult.FIRST_ORDERED_NODE_TYPE, null); \
                  var el = result.singleNodeValue; \
@@ -912,7 +912,10 @@ fn build_router_for_system_test(routes: Vec<Route>) -> axum::Router {
     let mut config = AutumnConfig::default();
     config.profile = Some("test".into());
     config.security.csrf.enabled = false;
-    let state = crate::state::AppState::for_test();
+    // Propagate the test config into AppState so handlers that read
+    // State<AppState>::config() or check the profile see consistent values.
+    let state = crate::state::AppState::for_test().with_profile("test");
+    state.insert_extension(config.clone());
     crate::router::build_router(routes, &config, state)
 }
 

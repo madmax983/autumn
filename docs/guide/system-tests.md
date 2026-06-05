@@ -46,7 +46,14 @@ In your app's `Cargo.toml`:
 ```toml
 [dev-dependencies]
 autumn-web = { version = "0.4", features = ["system-tests"] }
+
+[features]
+system-tests = ["autumn-web/system-tests"]
 ```
+
+> **Note:** The `[features]` entry is required because generated tests are guarded
+> by `#[cfg(feature = "system-tests")]` and run commands pass `--features system-tests`.
+> `autumn generate system-test` adds both sections automatically.
 
 ### 3. Generate your first test
 
@@ -79,14 +86,14 @@ async fn todo_flow_index_renders() {
 
 ### 4. Run it
 
+Generated tests are marked `#[ignore]` by default. Pass `-- --include-ignored`
+to actually run them:
+
 ```bash
 # Run all system tests (requires Chromium)
-cargo test --features system-tests
+cargo test --features system-tests -- --include-ignored
 
 # Run a specific test file
-cargo test --features system-tests --test todo_flow
-
-# Run ignoring the #[ignore] guard (when Chromium is available)
 cargo test --features system-tests --test todo_flow -- --include-ignored
 ```
 
@@ -252,10 +259,10 @@ jobs:
           RUST_LOG: info
 ```
 
-> **Tip:** System tests run sequentially by default (`cargo test` uses
-> `--test-threads=1` in practice for binary tests). If you have many system
-> tests and want to parallelise, set `--test-threads=N` but be careful with
-> shared database state (see _Test isolation_ above).
+> **Tip:** Rust runs integration tests in parallel by default. If your system
+> tests share state (e.g. a single test database or process-global store),
+> pass `--test-threads=1` to serialise them. If they are fully isolated you
+> can raise concurrency with `--test-threads=N`; see _Test isolation_ above.
 
 ---
 

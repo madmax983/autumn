@@ -76,6 +76,37 @@ fn features_section_has_key(cargo_toml: &str, key: &str) -> bool {
     false
 }
 
+/// Returns `true` if any `[[test]]` section in `cargo_toml` has `name = test_name`.
+///
+/// Scans section-by-section so key order and whitespace within the section
+/// don't cause false negatives.
+fn test_section_names_test(cargo_toml: &str, test_name: &str) -> bool {
+    let expected = format!("\"{test_name}\"");
+    let mut in_test = false;
+    for line in cargo_toml.lines() {
+        let trimmed = line.trim();
+        if trimmed == "[[test]]" {
+            in_test = true;
+            continue;
+        }
+        if in_test {
+            if trimmed.starts_with('[') {
+                in_test = false;
+                continue;
+            }
+            if let Some(after) = trimmed.strip_prefix("name") {
+                let after = after.trim_start();
+                if let Some(val) = after.strip_prefix('=')
+                    && val.trim() == expected
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Patch `Cargo.toml` content to add the `system-tests` feature (under
 /// `[features]` only, not in `[dependencies]`) and a `[[test]]` entry for this
 /// test file if they are not already present.
@@ -95,11 +126,9 @@ fn patch_cargo_toml(existing: &str, snake_name: &str) -> String {
         }
     }
 
-    // 2. Add [[test]] entry if no [[test]] block already names this test.
-    // We anchor the search to a [[test]] section to avoid false matches on the
-    // package name or other keys.
-    let test_section_marker = format!("[[test]]\nname = \"{snake_name}\"");
-    if !out.contains(&test_section_marker) {
+    // 2. Add [[test]] entry if no [[test]] section already names this test.
+    // Scan section-by-section so key order and whitespace don't matter.
+    if !test_section_names_test(&out, snake_name) {
         let _ = write!(
             out,
             "\n[[test]]\nname = \"{snake_name}\"\npath = \"tests/system/{snake_name}.rs\"\n"
