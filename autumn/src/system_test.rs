@@ -527,9 +527,10 @@ impl Page {
                    'button,a,input[value],label,[role=button],[role=link]')); \
                  for (var i = 0; i < nodes.length; i++) {{ \
                    var el = nodes[i]; \
+                   if (el.disabled) {{ continue; }} \
+                   if (el.getClientRects().length === 0) {{ continue; }} \
                    var cs = window.getComputedStyle(el); \
-                   if (cs.display === 'none' || cs.visibility === 'hidden' || \
-                       parseFloat(cs.opacity) === 0 || el.disabled) {{ continue; }} \
+                   if (parseFloat(cs.opacity) === 0) {{ continue; }} \
                    var text = el.tagName === 'INPUT' \
                      ? (el.value || '') \
                      : (el.textContent || ''); \
