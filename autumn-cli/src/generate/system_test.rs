@@ -21,14 +21,24 @@ use super::{Flags, GenerateError, ensure_project_root};
 /// contains a `[workspace]` section but no `[package]` section.  Cargo rejects
 /// `[features]` and `[[test]]` in virtual manifests, so the generator must
 /// refuse to patch them.
+/// Returns `true` if `trimmed` is a TOML section header matching `name`,
+/// with or without a trailing inline comment (e.g. `[workspace] # root`).
+fn is_toml_header(trimmed: &str, name: &str) -> bool {
+    let pat = format!("[{name}]");
+    trimmed == pat
+        || trimmed
+            .strip_prefix(pat.as_str())
+            .is_some_and(|rest| rest.trim_start().starts_with('#'))
+}
+
 fn is_virtual_workspace(cargo_toml: &str) -> bool {
     let mut has_workspace = false;
     let mut has_package = false;
     for line in cargo_toml.lines() {
         let trimmed = line.trim();
-        if trimmed == "[workspace]" {
+        if is_toml_header(trimmed, "workspace") {
             has_workspace = true;
-        } else if trimmed == "[package]" {
+        } else if is_toml_header(trimmed, "package") {
             has_package = true;
         }
     }
@@ -541,6 +551,21 @@ mod tests {
         assert!(
             msg.contains("virtual workspace"),
             "error should mention virtual workspace, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn plan_rejects_virtual_workspace_with_comment() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[workspace] # root manifest\nmembers = [\"app\"]\n",
+        )
+        .unwrap();
+        let result = plan_system_test(tmp.path(), "MyTest");
+        assert!(
+            result.is_err(),
+            "should reject a virtual workspace with a commented header"
         );
     }
 

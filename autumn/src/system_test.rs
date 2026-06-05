@@ -460,14 +460,14 @@ impl Page {
     pub async fn fill(&self, selector: &str, value: &str) -> Result<&Self, SystemTestError> {
         let element = self.inner.find_element(selector).await?;
         element.click().await?;
-        // Clear via JS: dispatch only 'input' (not 'change') so that
-        // hx-trigger="change" listeners don't fire with the empty intermediate
-        // value and race with or overwrite the intended filled-value request.
+        // Clear via JS without dispatching any DOM events. type_str() below
+        // fires native key events that trigger 'input' handlers naturally for
+        // each character, so the app never sees a transient empty-value event
+        // that could race with or overwrite the intended filled-value request.
         self.inner
             .evaluate(format!(
                 "(function() {{ var el = document.querySelector({}); \
-                 if (el) {{ el.value = ''; \
-                 el.dispatchEvent(new Event('input', {{ bubbles: true }})); }} }})()",
+                 if (el) {{ el.value = ''; }} }})()",
                 js_string_literal(selector)
             ))
             .await?;
