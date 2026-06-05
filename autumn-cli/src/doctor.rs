@@ -1943,8 +1943,7 @@ pub fn check_system_test_browser() -> CheckResult {
     let project_uses_system_tests = std::env::current_dir()
         .ok()
         .and_then(|d| std::fs::read_to_string(d.join("Cargo.toml")).ok())
-        .map(|s| s.contains("system-tests"))
-        .unwrap_or(false);
+        .is_some_and(|s| s.contains("system-tests"));
 
     if project_uses_system_tests {
         CheckResult {
