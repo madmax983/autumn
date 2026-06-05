@@ -1641,6 +1641,28 @@ pub struct LoginForm {{
     pub password: String,
 }}
 
+/// Extracts the client IP from `ConnectInfo` when present, or falls back to
+/// `UNSPECIFIED` so the handler compiles and runs correctly in both production
+/// (where `into_make_service_with_connect_info` injects the extension) and
+/// in test environments where it is absent.
+struct MaybeClientIp(std::net::IpAddr);
+
+#[axum::async_trait]
+impl<S: Send + Sync> axum::extract::FromRequestParts<S> for MaybeClientIp {{
+    type Rejection = std::convert::Infallible;
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {{
+        let ip = parts
+            .extensions
+            .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+            .map(|c| c.0.ip())
+            .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+        Ok(MaybeClientIp(ip))
+    }}
+}}
+
 /// `POST /login` — verify credentials and start a session.
 ///
 /// Non-enumerating: returns the same error for unknown email, wrong password,
@@ -1655,7 +1677,7 @@ pub async fn login(
     mut db: Db,
     State(state): State<AppState>,
     session: Session,
-    connect_info: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
+    MaybeClientIp(addr_ip): MaybeClientIp,
     Form(form): Form<LoginForm>,
 ) -> AutumnResult<Response> {{
     let email = form.email.trim().to_lowercase();
@@ -1749,10 +1771,6 @@ pub async fn login(
                     // Truncate to a coarse IP prefix (IPv4 /24, IPv6 /64) so
                     // the telemetry event enables incident response without
                     // logging a precise user identifier.
-                    let addr_ip = connect_info.map_or(
-                        std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-                        |c| c.0.ip(),
-                    );
                     let ip_prefix = match addr_ip {{
                         std::net::IpAddr::V4(ip) => {{
                             let [a, b, c, _] = ip.octets();
