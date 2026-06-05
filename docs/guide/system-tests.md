@@ -221,7 +221,7 @@ async fn add_todo_flow() {
     truncate_todos(&db.pool()).await;
 
     let state = AppState::for_test()
-        .with_db_pool(db.pool())
+        .with_pool(db.pool())
         .with_profile("test");
 
     let mut runner = SystemTest::new()

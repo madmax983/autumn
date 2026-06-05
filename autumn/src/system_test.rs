@@ -973,15 +973,15 @@ fn build_router_for_system_test(
     match state_override {
         Some(state) => {
             // Use the config already embedded in the caller-supplied state so
-            // that middleware (tenancy, auth, rate-limiting) is built from the
-            // same settings that handlers observe via AppState::config().
-            // CSRF is force-disabled so headless browser tests don't need to
-            // extract and replay tokens.
-            let mut config = state
+            // that middleware (tenancy, auth, rate-limiting, CSRF) is built
+            // from the same settings that handlers observe via AppState::config().
+            // Headless Chromium handles cookies normally, so CSRF works end-to-end:
+            // the browser receives the CSRF cookie on first visit and replays it
+            // on form submissions, exactly as a real user would.
+            let config = state
                 .extension::<AutumnConfig>()
                 .cloned()
                 .unwrap_or_default();
-            config.security.csrf.enabled = false;
             crate::router::build_router(routes, &config, state)
         }
         None => {
