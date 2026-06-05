@@ -6,6 +6,29 @@ use autumn_web::webhook_outbound::{
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Poll `condition` every 10 ms until it returns `true` or `timeout` elapses.
+///
+/// Replaces fixed `tokio::time::sleep` calls that are fragile on slow CI
+/// runners (especially Windows): the condition is checked as soon as the
+/// background work finishes rather than waiting a worst-case wall-clock time.
+async fn poll_until<F, Fut>(timeout: Duration, mut condition: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if condition().await {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            // Let the assertion that follows produce the real failure message.
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 #[tokio::test]
 async fn test_webhook_outbound_lifecycle() {
     use autumn_web::job::{self, JobInfo, clear_global_job_client, global_job_runtime_test_lock};
@@ -63,8 +86,19 @@ async fn test_webhook_outbound_lifecycle() {
         .await
         .unwrap();
 
-    // 5. Wait for background delivery job to execute
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // 5. Wait for background delivery job to execute.
+    //    response_status is set after the HTTP call; is_dlq covers permanent failure.
+    //    Do NOT poll on logs.is_empty() — the log is created BEFORE the HTTP call.
+    poll_until(Duration::from_secs(5), || {
+        let store = store.clone();
+        async move {
+            store
+                .get_delivery_logs()
+                .await
+                .is_ok_and(|logs| logs.iter().any(|l| l.response_status.is_some() || l.is_dlq))
+        }
+    })
+    .await;
 
     // 6. Assert mock was called
     mock.expect_called(1);
@@ -141,8 +175,19 @@ async fn test_webhook_outbound_retries_and_dlq() {
         .await
         .unwrap();
 
-    // Wait for the first attempt and all subsequent retries (max_attempts = 5)
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Wait for the first attempt and all subsequent retries (max_attempts = 5).
+    //    All retries update the same log entry in place; is_dlq is set only
+    //    after the final attempt exhausts max_attempts.
+    poll_until(Duration::from_secs(5), || {
+        let store = store.clone();
+        async move {
+            store
+                .get_delivery_logs()
+                .await
+                .is_ok_and(|logs| logs.iter().any(|l| l.is_dlq))
+        }
+    })
+    .await;
 
     // Verify mock was hit 5 times (1 original + 4 retries)
     mock.expect_called(5);
@@ -216,8 +261,19 @@ async fn test_webhook_outbound_failure_caps_deactivation() {
         .await
         .unwrap();
 
-    // Wait for attempts to fail
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Wait for attempts to fail and subscription to be marked Failed
+    poll_until(Duration::from_secs(5), || {
+        let store = store.clone();
+        async move {
+            store
+                .get_subscription("sub_cap")
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|s| s.status == WebhookSubscriptionStatus::Failed)
+        }
+    })
+    .await;
 
     // Verify subscription status is now Failed due to exceeding the cap of 50 failures
     let updated_sub = store.get_subscription("sub_cap").await.unwrap().unwrap();
@@ -290,7 +346,16 @@ async fn test_webhook_outbound_actuator_endpoints() {
         .unwrap();
 
     // Wait for it to fail permanently (5 attempts)
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    poll_until(Duration::from_secs(5), || {
+        let store = store.clone();
+        async move {
+            store
+                .get_delivery_logs()
+                .await
+                .is_ok_and(|logs| logs.iter().any(|l| l.is_dlq))
+        }
+    })
+    .await;
     mock.expect_called(5);
 
     // 3. DLQ should now have 1 item

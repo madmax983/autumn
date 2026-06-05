@@ -1080,6 +1080,30 @@ enum GenerateCommands {
         #[arg(long)]
         force: bool,
     },
+    /// Generate a system-test skeleton under `tests/system/`.
+    ///
+    /// The generated test is gated behind `#[cfg(feature = "system-tests")]` and
+    /// marked `#[ignore]` by default so it only runs when Chromium is available.
+    ///
+    /// Example:
+    ///
+    ///   autumn generate system-test <Name>
+    ///   autumn generate system-test <Name> --dry-run
+    ///
+    /// After generation, run with:
+    ///
+    ///   cargo test --features system-tests --test <name> -- --include-ignored
+    #[command(name = "system-test", verbatim_doc_comment)]
+    SystemTest {
+        /// Test name (`PascalCase` or `snake_case`, e.g. `TodoFlow`).
+        name: String,
+        /// Print the file plan and exit without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Overwrite existing files instead of erroring on collision.
+        #[arg(long)]
+        force: bool,
+    },
     /// Generate model, migration, repository, HTML routes, smoke test, and
     /// register the new routes in `src/main.rs`.
     Scaffold {
@@ -1641,6 +1665,11 @@ fn run_generate_command(cmd: GenerateCommands) {
             dry_run,
             force,
         } => generate::mailer::run(&name, generate::Flags { dry_run, force }),
+        GenerateCommands::SystemTest {
+            name,
+            dry_run,
+            force,
+        } => generate::system_test::run(&name, generate::Flags { dry_run, force }),
         GenerateCommands::Auth {
             name,
             oauth,
@@ -3625,5 +3654,41 @@ mod tests {
             panic!("wrong variant");
         };
         assert!(!passkeys, "passkeys must default to off");
+    }
+
+    #[test]
+    fn parse_generate_system_test() {
+        let cli = Cli::try_parse_from(["autumn", "generate", "system-test", "TodoFlow"]).unwrap();
+        let Commands::Generate(GenerateCommands::SystemTest {
+            ref name,
+            dry_run,
+            force,
+        }) = cli.command
+        else {
+            panic!("expected SystemTest variant");
+        };
+        assert_eq!(name, "TodoFlow");
+        assert!(!dry_run);
+        assert!(!force);
+    }
+
+    #[test]
+    fn parse_generate_system_test_dry_run() {
+        let cli = Cli::try_parse_from(["autumn", "generate", "system-test", "MyTest", "--dry-run"])
+            .unwrap();
+        let Commands::Generate(GenerateCommands::SystemTest { dry_run, .. }) = cli.command else {
+            panic!("expected SystemTest variant");
+        };
+        assert!(dry_run);
+    }
+
+    #[test]
+    fn parse_generate_system_test_force() {
+        let cli = Cli::try_parse_from(["autumn", "generate", "system-test", "MyTest", "--force"])
+            .unwrap();
+        let Commands::Generate(GenerateCommands::SystemTest { force, .. }) = cli.command else {
+            panic!("expected SystemTest variant");
+        };
+        assert!(force);
     }
 }
