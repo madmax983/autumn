@@ -62,9 +62,9 @@
 //!
 //! All page-mutating helpers (`click`, form submits) auto-wait for htmx to
 //! finish its settle phase before returning.  This is implemented by polling
-//! `document.querySelectorAll('.htmx-request').length === 0` with a
-//! configurable timeout (default 2 s).  Use [`Page::expect_hx_settle`] when
-//! you need an explicit fence.
+//! until `.htmx-request`, `.htmx-settling`, and `.htmx-swapping` are all
+//! absent, with a configurable timeout (default 2 s).  Use
+//! [`Page::expect_hx_settle`] when you need an explicit fence.
 
 #![cfg(feature = "system-tests")]
 
@@ -679,9 +679,9 @@ impl Page {
 
     /// Explicitly wait for htmx to finish all in-flight requests and settle.
     ///
-    /// Polls `document.querySelectorAll('.htmx-request').length === 0` until
-    /// the page is idle.  Use this as an explicit fence; `click()` already
-    /// calls it implicitly.
+    /// Polls until `.htmx-request`, `.htmx-settling`, and `.htmx-swapping`
+    /// are all absent from the DOM.  Use this as an explicit fence; `click()`
+    /// already calls it implicitly.
     ///
     /// # Errors
     /// [`SystemTestError::Timeout`] if htmx does not settle within the
@@ -784,7 +784,7 @@ impl Page {
         loop {
             let result = self
                 .inner
-                .evaluate("document.querySelectorAll('.htmx-request,.htmx-settling').length === 0")
+                .evaluate("document.querySelectorAll('.htmx-request,.htmx-settling,.htmx-swapping').length === 0")
                 .await?;
             let settled: bool = result.into_value().unwrap_or(true);
             if settled {
