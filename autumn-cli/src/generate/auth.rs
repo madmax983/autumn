@@ -1746,7 +1746,8 @@ pub async fn login(
                     // Cool-off reset path: atomically reset counter to 1 and clear
                     // locked_at in a single UPDATE. Concurrent requests hitting this
                     // branch all write the same values so races are benign (all still
-                    // count 1 failure each, not zero).
+                    // count 1 failure each, not zero). Propagate write errors so that
+                    // DB permission failures don't silently bypass the lockout threshold.
                     diesel::update({table}::table.find({snake_name}.id))
                         .set((
                             {table}::failed_attempts.eq(1i32),
@@ -1754,7 +1755,7 @@ pub async fn login(
                         ))
                         .execute(&mut *db)
                         .await
-                        .unwrap_or(0);
+                        .map_err(|e| AutumnError::internal_server_error_msg(&format!("Failed to reset lockout counter: {{e}}")))?;
                     1i32
                 }};
 
