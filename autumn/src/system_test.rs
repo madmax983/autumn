@@ -497,6 +497,9 @@ impl Page {
             // Restrict to interactive/visible elements so we pick the deepest
             // clickable node rather than an ancestor (html/body) whose aggregate
             // normalized text happens to equal the label.
+            // Walk all XPath matches in document order and click the first
+            // visible, enabled one so that hidden/template duplicates with the
+            // same label don't shadow the control the user can actually see.
             let js = format!(
                 "(function() {{ \
                  var label = {}; \
@@ -507,10 +510,15 @@ impl Page {
                    | //label[normalize-space(.)=\" + q + label + q + \"] \
                    | //*[@role='button' and normalize-space(.)=\" + q + label + q + \"] \
                    | //*[@role='link' and normalize-space(.)=\" + q + label + q + \"]\"; \
-                 var result = document.evaluate(xpath, document, null, \
-                   XPathResult.FIRST_ORDERED_NODE_TYPE, null); \
-                 var el = result.singleNodeValue; \
-                 if (el) {{ el.click(); return true; }} \
+                 var iter = document.evaluate(xpath, document, null, \
+                   XPathResult.ORDERED_NODE_ITERATOR_TYPE, null); \
+                 var node; \
+                 while ((node = iter.iterateNext())) {{ \
+                   var s = window.getComputedStyle(node); \
+                   if (s.display === 'none' || s.visibility === 'hidden' || \
+                       parseFloat(s.opacity) === 0 || node.disabled) {{ continue; }} \
+                   node.click(); return true; \
+                 }} \
                  return false; \
                  }})()",
                 js_string_literal(selector_or_label)
