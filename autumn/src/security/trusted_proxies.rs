@@ -208,8 +208,24 @@ impl ProxyResolver {
             return peer_ip;
         }
 
-        // Honour forwarding headers only when the immediate peer is trusted.
-        // "No ranges configured" means trust all peers.
+        // Hop-count mode: peel exactly N entries from the right regardless of peer
+        // IP ranges. The operator explicitly declared how many proxy hops to skip,
+        // so no range membership check is needed (and would break mixed topologies
+        // like a dynamic ALB peer plus CDN ranges in the XFF chain).
+        if let Some(hops) = self.trusted_hops {
+            if let Some(xff) = Self::x_forwarded_for(req) {
+                let mut entries = xff.rsplit(',').map(str::trim).filter(|s| !s.is_empty());
+                if let Some(entry) = entries.nth(hops as usize)
+                    && let Ok(ip) = entry.parse::<IpAddr>()
+                {
+                    return Some(ip);
+                }
+            }
+            return peer_ip;
+        }
+
+        // Range-based resolution: honour forwarding headers only when the immediate
+        // peer is trusted. "No ranges configured" means trust all peers.
         // "Ranges configured but all invalid" means trust no peers.
         let peer_is_trusted = peer_ip.is_some_and(|ip| self.is_trusted_ip(ip))
             || (!self.ranges_configured && peer_ip.is_none());
@@ -219,18 +235,6 @@ impl ProxyResolver {
         }
 
         if let Some(xff) = Self::x_forwarded_for(req) {
-            if let Some(hops) = self.trusted_hops {
-                // Peel exactly `hops` entries from the right; the next one is the client.
-                let mut entries = xff.rsplit(',').map(str::trim).filter(|s| !s.is_empty());
-
-                if let Some(entry) = entries.nth(hops as usize)
-                    && let Ok(ip) = entry.parse::<IpAddr>()
-                {
-                    return Some(ip);
-                }
-                return peer_ip;
-            }
-
             if self.ranges_configured {
                 for entry in xff.rsplit(',').map(str::trim).filter(|s| !s.is_empty()) {
                     let Ok(ip) = entry.parse::<IpAddr>() else {
@@ -524,6 +528,25 @@ mod tests {
         let req = req_with_xff("1.2.3.4, 5.6.7.8");
         let addr = resolver.resolve_client_addr(&req).unwrap();
         assert_eq!(addr, "5.6.7.8".parse::<IpAddr>().unwrap());
+    }
+
+    // ── AC (a2): hop-count with ranges list works even when peer not in ranges ─
+
+    #[test]
+    fn trusted_hops_with_ranges_does_not_require_peer_in_ranges() {
+        // Dynamic ALB (10.0.1.200) is NOT in the CDN CIDR range, but trusted_hops
+        // should bypass the peer-range check and peel exactly 1 hop regardless.
+        let resolver = ProxyResolver::from_config(&TrustedProxiesConfig {
+            ranges: vec!["203.0.113.0/24".to_owned()],
+            trusted_hops: Some(1),
+            trust_forwarded_headers: true,
+        });
+
+        // Peer is 10.0.1.200 (dynamic ALB, not in ranges). XFF: real-client, ALB.
+        let req = req_with_peer_and_xff("10.0.1.200", "192.0.2.1, 10.0.1.200");
+        // Peel 1 from right (10.0.1.200). The next entry is the real client.
+        let addr = resolver.resolve_client_addr(&req).unwrap();
+        assert_eq!(addr, "192.0.2.1".parse::<IpAddr>().unwrap());
     }
 
     // ── AC (b): two-hop CDN + ALB correctly identifies real client ────────────

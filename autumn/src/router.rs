@@ -1195,24 +1195,22 @@ where
 }
 
 fn apply_trusted_proxies_middleware<S>(
-    mut router: axum::Router<S>,
+    router: axum::Router<S>,
     config: &AutumnConfig,
 ) -> axum::Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
     let tp = &config.security.trusted_proxies;
+    let layer = crate::security::TrustedProxiesLayer::from_config(tp);
     if tp.trust_forwarded_headers || !tp.ranges.is_empty() || tp.trusted_hops.is_some() {
-        let layer =
-            crate::security::TrustedProxiesLayer::from_config(&config.security.trusted_proxies);
         tracing::info!(
             ranges = ?tp.ranges,
             trusted_hops = ?tp.trusted_hops,
             "Centralized trusted-proxy resolution enabled"
         );
-        router = router.layer(layer);
     }
-    router
+    router.layer(layer)
 }
 
 fn apply_rate_limit_middleware<S>(
@@ -1424,7 +1422,6 @@ fn apply_middleware(
     router = router.layer(axum::middleware::from_fn(move |req, next| {
         trusted_host_middleware(req, next, trusted_host_policy.clone())
     }));
-    router = apply_trusted_proxies_middleware(router, config);
     router = apply_csrf_middleware(router, config, signing_keys_opt.clone());
     // Method-override rejection filter. The outer `MethodOverrideLayer`
     // (applied at the `axum::serve` boundary so it can rewrite the
@@ -1465,6 +1462,11 @@ fn apply_middleware(
     if custom_layer_count > 0 {
         tracing::debug!(count = custom_layer_count, "Custom Tower layers applied");
     }
+
+    // TrustedProxiesLayer is applied after user layers so it is outermost in the
+    // ingress request path, stamping ResolvedClientIdentity before any user or
+    // framework middleware reads ClientAddr / ClientHost / ClientScheme.
+    router = apply_trusted_proxies_middleware(router, config);
 
     let mut router = router;
 

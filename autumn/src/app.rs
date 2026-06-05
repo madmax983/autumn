@@ -2207,10 +2207,16 @@ impl AppBuilder {
         // a layered service ever runs. Wrapping the whole router as a
         // tower::Service is the documented way to run middleware before
         // route matching.
-        let service = tower::Layer::layer(
+        // TrustedProxiesLayer must be outermost (stamped before MethodOverrideLayer
+        // reads ResolvedClientIdentity for its same-origin form check).
+        let after_method = tower::Layer::layer(
             &crate::middleware::MethodOverrideLayer::new()
                 .with_max_scan_bytes(config.security.upload.max_request_size_bytes),
             router,
+        );
+        let service = tower::Layer::layer(
+            &crate::security::TrustedProxiesLayer::from_config(&config.security.trusted_proxies),
+            after_method,
         );
         let make_service =
             axum::ServiceExt::<axum::extract::Request>::into_make_service_with_connect_info::<
