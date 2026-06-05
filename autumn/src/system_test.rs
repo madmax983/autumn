@@ -282,9 +282,10 @@ impl SystemTest {
         }
     }
 
-    /// Register routes to serve.
+    /// Register routes to serve.  May be called multiple times; each call
+    /// appends to the route list rather than replacing it.
     pub fn routes(mut self, routes: impl Into<Vec<Route>>) -> Self {
-        self.routes = routes.into();
+        self.routes.extend(routes.into());
         self
     }
 
@@ -924,7 +925,26 @@ fn browser_candidates() -> Vec<PathBuf> {
         }
     }
 
-    // 3. Well-known system paths.
+    // 3. PATH-based lookup — covers CI setups like browser-actions/setup-chrome
+    //    that install a `chrome` or `google-chrome` binary on PATH rather than
+    //    at a well-known fixed location.
+    for name in &[
+        "chrome",
+        "google-chrome",
+        "google-chrome-stable",
+        "chromium",
+        "chromium-browser",
+    ] {
+        if let Some(p) = std::env::var_os("PATH").and_then(|path_var| {
+            std::env::split_paths(&path_var)
+                .map(|dir| dir.join(name))
+                .find(|p| p.is_file())
+        }) {
+            candidates.push(p);
+        }
+    }
+
+    // 4. Well-known system paths.
     candidates.extend(
         [
             "/usr/bin/chromium-browser",

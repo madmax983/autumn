@@ -94,6 +94,54 @@ fn is_array_table_header(trimmed: &str, name: &str) -> bool {
             .is_some_and(|rest| rest.trim_start().starts_with('#'))
 }
 
+/// Find the local dependency key name for the `autumn-web` crate.
+///
+/// In the common case the key is `autumn-web`.  When a project renames the
+/// dependency (`autumn = { package = "autumn-web", ... }`), the feature line
+/// must reference the *alias* (`autumn/system-tests`), not
+/// `autumn-web/system-tests`, or Cargo rejects the manifest with
+/// "feature includes autumn-web/… but autumn-web is not a dependency".
+///
+/// Returns `"autumn-web"` when no renamed entry is found.
+fn resolve_autumn_web_dep_key(cargo_toml: &str) -> String {
+    let mut in_dep_section = false;
+    let mut pending_key: Option<String> = None;
+
+    for line in cargo_toml.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_dep_section = trimmed == "[dependencies]"
+                || trimmed == "[dev-dependencies]"
+                || trimmed.starts_with("[dependencies] #")
+                || trimmed.starts_with("[dev-dependencies] #");
+            pending_key = None;
+            continue;
+        }
+        if !in_dep_section || trimmed.starts_with('#') {
+            continue;
+        }
+        // Inline table: `autumn = { package = "autumn-web", ... }`
+        if let Some((key, rest)) = trimmed.split_once('=') {
+            let key = key.trim().trim_matches('"').to_owned();
+            let rest = rest.trim();
+            if rest.contains(r#"package = "autumn-web""#)
+                || rest.contains(r#"package="autumn-web""#)
+            {
+                return key;
+            }
+            pending_key = Some(key);
+        } else if let Some(ref key) = pending_key {
+            // Continuation line inside a multi-line table value.
+            if trimmed.contains(r#"package = "autumn-web""#)
+                || trimmed.contains(r#"package="autumn-web""#)
+            {
+                return key.clone();
+            }
+        }
+    }
+    "autumn-web".to_owned()
+}
+
 /// Returns `true` if `trimmed` is a `[features]` table header, with or without
 /// a trailing inline comment (e.g. `[features] # project features`).
 fn is_features_header(trimmed: &str) -> bool {
@@ -204,7 +252,8 @@ fn patch_cargo_toml(existing: &str, snake_name: &str) -> String {
     // We scan only the [features] section so that a dev-dependency enabling
     // autumn-web/system-tests does not suppress the local feature definition
     // (which is required by `--features system-tests` and `#[cfg(feature = ...)]`).
-    let feature_line = "system-tests = [\"autumn-web/system-tests\"]";
+    let dep_key = resolve_autumn_web_dep_key(&out);
+    let feature_line = format!("system-tests = [\"{dep_key}/system-tests\"]");
     if !features_section_has_key(&out, "system-tests") {
         // Find the byte offset of the end of the "[features]" header line so we
         // can insert immediately after it regardless of line ending style (LF or
