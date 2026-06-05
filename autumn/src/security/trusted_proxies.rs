@@ -285,12 +285,24 @@ impl ProxyResolver {
     /// Returns `X-Forwarded-Host` when `trust_forwarded_headers` is `true` and
     /// the peer is trusted; falls back to the `Host` header.
     pub fn resolve_client_host<B>(&self, req: &Request<B>) -> Option<String> {
-        let peer_ip = Self::peer_ip(req);
-        let peer_is_trusted =
-            peer_ip.is_some_and(|ip| self.is_trusted_ip(ip)) || !self.ranges_configured;
+        if !self.trust_forwarded_headers {
+            return req
+                .headers()
+                .get(axum::http::header::HOST)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.trim().to_owned());
+        }
 
-        if self.trust_forwarded_headers
-            && peer_is_trusted
+        // Hop-count mode: trust forwarded host without checking peer ranges
+        // (same rationale as resolve_client_addr — dynamic peer not in ranges).
+        let peer_ip = Self::peer_ip(req);
+        let peer_is_trusted = if self.trusted_hops.is_some() {
+            true
+        } else {
+            peer_ip.is_some_and(|ip| self.is_trusted_ip(ip)) || !self.ranges_configured
+        };
+
+        if peer_is_trusted
             && let Some(fwd_host) = req
                 .headers()
                 .get("x-forwarded-host")
@@ -313,22 +325,27 @@ impl ProxyResolver {
     /// `trust_forwarded_headers` is `true` and the peer is trusted;
     /// otherwise falls back to the request URI scheme, then `"http"`.
     pub fn resolve_client_scheme<B>(&self, req: &Request<B>) -> String {
-        let peer_ip = Self::peer_ip(req);
-        let peer_is_trusted =
-            peer_ip.is_some_and(|ip| self.is_trusted_ip(ip)) || !self.ranges_configured;
+        if self.trust_forwarded_headers {
+            // Hop-count mode: trust forwarded proto without checking peer ranges.
+            let peer_ip = Self::peer_ip(req);
+            let peer_is_trusted = if self.trusted_hops.is_some() {
+                true
+            } else {
+                peer_ip.is_some_and(|ip| self.is_trusted_ip(ip)) || !self.ranges_configured
+            };
 
-        if self.trust_forwarded_headers
-            && peer_is_trusted
-            && let Some(proto) = req
-                .headers()
-                .get("x-forwarded-proto")
-                .and_then(|v| v.to_str().ok())
-        {
-            // Multiple values are comma-separated; the leftmost is the
-            // client-facing scheme.
-            let outermost = proto.split(',').next().unwrap_or(proto).trim();
-            if !outermost.is_empty() {
-                return outermost.to_ascii_lowercase();
+            if peer_is_trusted
+                && let Some(proto) = req
+                    .headers()
+                    .get("x-forwarded-proto")
+                    .and_then(|v| v.to_str().ok())
+            {
+                // Multiple values are comma-separated; the leftmost is the
+                // client-facing scheme.
+                let outermost = proto.split(',').next().unwrap_or(proto).trim();
+                if !outermost.is_empty() {
+                    return outermost.to_ascii_lowercase();
+                }
             }
         }
 
@@ -680,6 +697,47 @@ mod tests {
             .unwrap();
         let host = resolver.resolve_client_host(&req).unwrap();
         assert_eq!(host, "app.example.com");
+    }
+
+    // ── Hop-count with ranges: host/scheme use forwarded headers too ──────────
+
+    #[test]
+    fn trusted_hops_with_ranges_resolves_forwarded_host() {
+        // Dynamic ALB peer not in ranges; hop-count should still trust X-Forwarded-Host.
+        let resolver = ProxyResolver::from_config(&TrustedProxiesConfig {
+            ranges: vec!["203.0.113.0/24".to_owned()],
+            trusted_hops: Some(1),
+            trust_forwarded_headers: true,
+        });
+
+        let mut req = Request::builder()
+            .header("host", "internal.cluster.local")
+            .header("x-forwarded-host", "public.example.com")
+            .body(())
+            .unwrap();
+        let addr: SocketAddr = "10.0.1.200:1234".parse().unwrap();
+        req.extensions_mut().insert(ConnectInfo(addr));
+
+        let host = resolver.resolve_client_host(&req).unwrap();
+        assert_eq!(host, "public.example.com");
+    }
+
+    #[test]
+    fn trusted_hops_with_ranges_resolves_forwarded_scheme() {
+        let resolver = ProxyResolver::from_config(&TrustedProxiesConfig {
+            ranges: vec!["203.0.113.0/24".to_owned()],
+            trusted_hops: Some(1),
+            trust_forwarded_headers: true,
+        });
+
+        let mut req = Request::builder()
+            .header("x-forwarded-proto", "https")
+            .body(())
+            .unwrap();
+        let addr: SocketAddr = "10.0.1.200:1234".parse().unwrap();
+        req.extensions_mut().insert(ConnectInfo(addr));
+
+        assert_eq!(resolver.resolve_client_scheme(&req), "https");
     }
 
     // ── Untrusted peer ignores forwarding headers ───────────────────────────
