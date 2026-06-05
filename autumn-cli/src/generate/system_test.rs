@@ -66,9 +66,8 @@ fn features_section_has_key(cargo_toml: &str, key: &str) -> bool {
                 break;
             }
             // Check if this line declares the key.
-            if trimmed.starts_with(key) {
-                let after = trimmed[key.len()..].trim_start();
-                if after.starts_with('=') {
+            if let Some(after) = trimmed.strip_prefix(key) {
+                if after.trim_start().starts_with('=') {
                     return true;
                 }
             }
