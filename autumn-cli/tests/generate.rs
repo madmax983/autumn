@@ -1701,7 +1701,10 @@ fn generate_auth_confirmation_only_digest_stored_in_db() {
     // Digest must be stored (not raw token).
     let stores_digest = routes.contains("confirm_token_digest.eq(Some(&confirm_digest")
         || routes.contains("confirm_token_digest.eq(Some(&token_digest");
-    assert!(stores_digest, "confirmation token digest (not raw token) must be stored");
+    assert!(
+        stores_digest,
+        "confirmation token digest (not raw token) must be stored"
+    );
 }
 
 /// AC4: Confirmation tokens expire after 24 hours (default).
