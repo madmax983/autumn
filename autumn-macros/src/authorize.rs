@@ -256,7 +256,7 @@ pub fn authorize_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
     input_fn.block = parse_quote! {
         {
-            if let ::core::result::Result::Err(__autumn_error) = ::autumn_web::authorization::__check_policy::<#resource_ident>(
+            if let ::core::result::Result::Err(__autumn_error) = ::autumn_web::authorization::__check_policy::<_, #resource_ident>(
                 &__autumn_state,
                 &__autumn_session,
                 #action_lit,

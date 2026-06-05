@@ -67,7 +67,8 @@ async fn update_note_inline(
     session: Session,
 ) -> AutumnResult<&'static str> {
     let _ = id;
-    autumn_web::authorization::authorize::<Note>(&state, &session, "update", &FIXED_NOTE).await?;
+    autumn_web::authorization::authorize::<_, Note>(&state, &session, "update", &FIXED_NOTE)
+        .await?;
     Ok("ok")
 }
 

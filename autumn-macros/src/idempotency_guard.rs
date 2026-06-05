@@ -581,7 +581,7 @@ mod tests {
     fn authorize_prologue_with_side_effect_argument_does_not_count() {
         let block: syn::Block = syn::parse_quote!({
             if let ::core::result::Result::Err(__autumn_error) =
-                ::autumn_web::authorization::__check_policy::<Post>(
+                ::autumn_web::authorization::__check_policy::<_, Post>(
                     &__autumn_state,
                     &__autumn_session,
                     side_effect_before_replay_stop(),
@@ -649,7 +649,7 @@ mod tests {
     fn generated_authorize_prologue_with_anonymous_session_replay_counts() {
         let block: syn::Block = syn::parse_quote!({
             if let ::core::result::Result::Err(__autumn_error) =
-                ::autumn_web::authorization::__check_policy::<Post>(
+                ::autumn_web::authorization::__check_policy::<_, Post>(
                     &__autumn_state,
                     &__autumn_session,
                     "update",
@@ -686,7 +686,7 @@ mod tests {
     fn generated_authorize_wrapper_can_find_nested_secured_replay_guard() {
         let block: syn::Block = syn::parse_quote!({
             if let ::core::result::Result::Err(__autumn_error) =
-                ::autumn_web::authorization::__check_policy::<Post>(
+                ::autumn_web::authorization::__check_policy::<_, Post>(
                     &__autumn_state,
                     &__autumn_session,
                     "update",
