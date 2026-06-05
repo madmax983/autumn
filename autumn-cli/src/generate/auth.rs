@@ -1688,6 +1688,11 @@ pub async fn login(
             let now = chrono::Utc::now().naive_utc();
             let cooloff = chrono::Duration::seconds(lockout_cfg.cooloff_secs as i64);
 
+            // Track local state; reset if cool-off has elapsed so the first new
+            // failure after expiry is counted as attempt #1, not a re-lock.
+            let mut current_attempts = {snake_name}.failed_attempts;
+            let mut current_locked_at = {snake_name}.locked_at;
+
             // Check if the account is currently locked: locked_at is set and
             // cool-off period has not elapsed. Non-enumerating: return the same
             // auth_err as wrong password so the response does not reveal lock state.
@@ -1695,12 +1700,15 @@ pub async fn login(
                 if now < locked_at + cooloff {{
                     return Err(auth_err());
                 }}
-                // Cool-off elapsed — auto-unlock by resetting on next successful login.
+                // Cool-off elapsed — treat the account as unlocked. Reset local
+                // counters so the next failure starts from 1, not from threshold.
+                current_attempts = 0;
+                current_locked_at = None;
             }}
 
             if !password_ok {{
                 // Increment failure counter and lock if threshold exceeded.
-                let new_attempts = {snake_name}.failed_attempts + 1;
+                let new_attempts = current_attempts + 1;
                 let new_locked_at = if new_attempts >= lockout_cfg.threshold {{
                     // Account transitions into locked state — emit telemetry event.
                     let account_id_digest = {{
@@ -1718,7 +1726,7 @@ pub async fn login(
                     );
                     Some(now)
                 }} else {{
-                    {snake_name}.locked_at
+                    current_locked_at
                 }};
                 let _ = diesel::update({table}::table.find({snake_name}.id))
                     .set((
