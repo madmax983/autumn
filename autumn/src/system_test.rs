@@ -489,6 +489,18 @@ impl Page {
             ))
             .await?;
         element.type_str(value).await?;
+        // When value is empty, type_str() emits no key/input events, so
+        // hx-trigger="input" handlers would never see the cleared state.
+        // Dispatch an explicit input event to cover that case.
+        if value.is_empty() {
+            self.inner
+                .evaluate(format!(
+                    "(function() {{ var el = document.querySelector({}); \
+                     if (el) {{ el.dispatchEvent(new Event('input', {{ bubbles: true }})); }} }})()",
+                    js_string_literal(selector)
+                ))
+                .await?;
+        }
         // Dispatch a final change event so `hx-trigger="change"` and validation
         // listeners see the fully typed value.
         self.inner
@@ -683,6 +695,14 @@ impl Page {
     /// Polls until `.htmx-request`, `.htmx-settling`, and `.htmx-swapping`
     /// are all absent from the DOM.  Use this as an explicit fence; `click()`
     /// already calls it implicitly.
+    ///
+    /// **Limitation — delayed triggers:** controls using
+    /// `hx-trigger="click delay:500ms"` or active-search debounce have a
+    /// window after user interaction where none of these classes exist yet
+    /// (htmx has scheduled the request but not yet sent it).  This helper
+    /// returns immediately in that window.  Work around it with an explicit
+    /// [`Page::evaluate`] call that waits for a specific DOM change, or by
+    /// sleeping for at least the configured `delay:` before asserting.
     ///
     /// # Errors
     /// [`SystemTestError::Timeout`] if htmx does not settle within the
@@ -950,17 +970,29 @@ fn build_router_for_system_test(
     routes: Vec<Route>,
     state_override: Option<crate::state::AppState>,
 ) -> axum::Router {
-    let mut config = AutumnConfig::default();
-    config.profile = Some("test".into());
-    config.security.csrf.enabled = false;
-    let state = state_override.unwrap_or_else(|| {
-        // Propagate the test config into AppState so handlers that read
-        // State<AppState>::config() or check the profile see consistent values.
-        let s = crate::state::AppState::for_test().with_profile("test");
-        s.insert_extension(config.clone());
-        s
-    });
-    crate::router::build_router(routes, &config, state)
+    match state_override {
+        Some(state) => {
+            // Use the config already embedded in the caller-supplied state so
+            // that middleware (tenancy, auth, rate-limiting) is built from the
+            // same settings that handlers observe via AppState::config().
+            // CSRF is force-disabled so headless browser tests don't need to
+            // extract and replay tokens.
+            let mut config = state
+                .extension::<AutumnConfig>()
+                .cloned()
+                .unwrap_or_default();
+            config.security.csrf.enabled = false;
+            crate::router::build_router(routes, &config, state)
+        }
+        None => {
+            let mut config = AutumnConfig::default();
+            config.profile = Some("test".into());
+            config.security.csrf.enabled = false;
+            let state = crate::state::AppState::for_test().with_profile("test");
+            state.insert_extension(config.clone());
+            crate::router::build_router(routes, &config, state)
+        }
+    }
 }
 
 /// Escape a string as a JSON-safe JavaScript string literal.

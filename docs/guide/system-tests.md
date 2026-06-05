@@ -220,9 +220,13 @@ async fn add_todo_flow() {
     let db = TestDb::shared().await;
     truncate_todos(&db.pool()).await;
 
+    let state = AppState::for_test()
+        .with_db_pool(db.pool())
+        .with_profile("test");
+
     let mut runner = SystemTest::new()
         .routes(routes![index, create_todo])
-        .state(db.app_state())
+        .state(state)
         .build()
         .await
         .unwrap();
