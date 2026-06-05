@@ -17,6 +17,24 @@ use super::model::validate_resource_name;
 use super::naming::{pascal, snake};
 use super::{Flags, GenerateError, ensure_project_root};
 
+/// Returns `true` if `cargo_toml` is a virtual workspace manifest — i.e. it
+/// contains a `[workspace]` section but no `[package]` section.  Cargo rejects
+/// `[features]` and `[[test]]` in virtual manifests, so the generator must
+/// refuse to patch them.
+fn is_virtual_workspace(cargo_toml: &str) -> bool {
+    let mut has_workspace = false;
+    let mut has_package = false;
+    for line in cargo_toml.lines() {
+        let trimmed = line.trim();
+        if trimmed == "[workspace]" {
+            has_workspace = true;
+        } else if trimmed == "[package]" {
+            has_package = true;
+        }
+    }
+    has_workspace && !has_package
+}
+
 /// Compute the file actions for `autumn generate system-test`.
 ///
 /// # Errors
@@ -41,6 +59,17 @@ pub fn plan_system_test(project_root: &Path, name: &str) -> Result<Plan, Generat
     // Patch Cargo.toml: add system-tests feature + [[test]] entry.
     let cargo_path = project_root.join("Cargo.toml");
     let existing = std::fs::read_to_string(&cargo_path).map_err(GenerateError::Io)?;
+
+    // Reject virtual workspace manifests (they have [workspace] but no
+    // [package]). Patching a virtual manifest with [features] or [[test]]
+    // would corrupt it; the user should run this command inside a package.
+    if is_virtual_workspace(&existing) {
+        return Err(GenerateError::Config(
+            "Cargo.toml is a virtual workspace manifest (no [package] section). \
+             Run `autumn generate system-test` from inside a package directory."
+                .to_owned(),
+        ));
+    }
     let patched = patch_cargo_toml(&existing, &snake_name);
     if patched != existing {
         plan.modify(cargo_path, patched);
@@ -107,10 +136,13 @@ fn test_section_names_test(cargo_toml: &str, test_name: &str) -> bool {
             }
             if let Some(after) = trimmed.strip_prefix("name") {
                 let after = after.trim_start();
-                if let Some(val) = after.strip_prefix('=')
-                    && val.trim() == expected
-                {
-                    return true;
+                if let Some(val) = after.strip_prefix('=') {
+                    // Strip any trailing TOML inline comment before comparing.
+                    let val = val.trim();
+                    let val = val.split_once(" #").map_or(val, |(v, _)| v.trim());
+                    if val == expected {
+                        return true;
+                    }
                 }
             }
         }
@@ -489,6 +521,38 @@ mod tests {
         assert!(
             !super::test_section_names_test(src, "missing"),
             "should return false for a name not in any section"
+        );
+    }
+
+    #[test]
+    #[test]
+    fn plan_rejects_virtual_workspace() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"app\"]\n",
+        )
+        .unwrap();
+        let result = plan_system_test(tmp.path(), "MyTest");
+        assert!(
+            result.is_err(),
+            "should reject a virtual workspace manifest"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("virtual workspace"),
+            "error should mention virtual workspace, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_section_names_test_inline_comment() {
+        // name values with trailing TOML inline comments must still be recognised.
+        let src =
+            "[[test]]\nname = \"todo_flow\" # browser test\npath = \"tests/system/todo_flow.rs\"\n";
+        assert!(
+            super::test_section_names_test(src, "todo_flow"),
+            "should match name even when it has a trailing inline comment"
         );
     }
 

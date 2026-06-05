@@ -344,6 +344,10 @@ impl SystemTest {
             .arg("--disable-dev-shm-usage")
             .arg("--disable-gpu")
             .arg("--headless")
+            // Forward the configured timeout into chromiumoxide's own launch
+            // watchdog so the inner and outer timeouts are consistent and the
+            // outer tokio::time::timeout always wins.
+            .launch_timeout(self.browser_timeout)
             .build()
             .map_err(|msg| SystemTestError::Browser(chromiumoxide::error::CdpError::msg(msg)))?;
 
