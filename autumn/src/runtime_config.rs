@@ -638,7 +638,12 @@ pub enum RegistryError {
     },
     /// The declared default value does not satisfy the declared validators.
     #[error("config key '{key}': default value is invalid: {reason}")]
-    InvalidDefault { key: String, reason: String },
+    InvalidDefault {
+        /// The name of the configuration key.
+        key: String,
+        /// The reason the default value failed validation.
+        reason: String,
+    },
     /// The key name is empty or contains disallowed characters (only `[a-z0-9_]` allowed).
     #[error("invalid config key name '{0}': must match [a-z][a-z0-9_]*")]
     InvalidKeyName(String),
@@ -1327,11 +1332,21 @@ pub enum ConfigError {
 
     /// The raw string could not be parsed as the key's declared type.
     #[error("config key '{key}': type error — {reason}")]
-    TypeMismatch { key: String, reason: String },
+    TypeMismatch {
+        /// The name of the configuration key.
+        key: String,
+        /// The parsing error reason.
+        reason: String,
+    },
 
     /// A declared validator rejected the value.
     #[error("config key '{key}': validation failed — {reason}")]
-    ValidationFailed { key: String, reason: String },
+    ValidationFailed {
+        /// The name of the configuration key.
+        key: String,
+        /// The validation error reason.
+        reason: String,
+    },
 
     /// The backing store returned an error.
     #[error("config store error: {0}")]
@@ -1343,11 +1358,17 @@ pub enum ConfigError {
 /// A snapshot of a single config key: schema defaults + current override.
 #[derive(Debug, Clone)]
 pub struct ConfigEntry {
+    /// The name of the configuration key.
     pub name: String,
+    /// The type of the value this key holds.
     pub value_type: ConfigValueType,
+    /// The currently active value (either the override or the default).
     pub current: ConfigValue,
+    /// The fallback default value declared in the schema.
     pub default: ConfigValue,
+    /// Whether the current value comes from an explicit override in the store.
     pub is_overridden: bool,
+    /// Human-readable description of what this key controls.
     pub description: Option<String>,
 }
 

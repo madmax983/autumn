@@ -538,6 +538,7 @@ impl TestApp {
         self
     }
 
+    /// Attach a test interceptor for outbound emails.
     #[cfg(feature = "mail")]
     #[must_use]
     pub fn with_mail_interceptor(
@@ -548,6 +549,7 @@ impl TestApp {
         self
     }
 
+    /// Attach a test interceptor for background jobs.
     #[must_use]
     pub fn with_job_interceptor(
         mut self,
@@ -557,6 +559,7 @@ impl TestApp {
         self
     }
 
+    /// Attach a test interceptor for database connections.
     #[cfg(feature = "db")]
     #[must_use]
     pub fn with_db_interceptor(
@@ -567,6 +570,7 @@ impl TestApp {
         self
     }
 
+    /// Attach a test interceptor for WebSocket channels.
     #[cfg(feature = "ws")]
     #[must_use]
     pub fn with_channels_interceptor(
@@ -577,6 +581,7 @@ impl TestApp {
         self
     }
 
+    /// Attach a test interceptor for outbound HTTP requests.
     #[cfg(feature = "oauth2")]
     #[must_use]
     pub fn with_http_interceptor(
