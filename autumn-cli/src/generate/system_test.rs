@@ -104,37 +104,94 @@ fn is_array_table_header(trimmed: &str, name: &str) -> bool {
 ///
 /// Returns `"autumn-web"` when no renamed entry is found.
 fn resolve_autumn_web_dep_key(cargo_toml: &str) -> String {
+    // Strip an inline TOML comment from a value fragment (everything after the
+    // first unquoted `#`).  This is a best-effort scan: it handles the common
+    // case of `foo = "bar" # package = "autumn-web"` correctly.
+    fn strip_inline_comment(s: &str) -> &str {
+        let mut in_str = false;
+        let mut prev_backslash = false;
+        for (i, ch) in s.char_indices() {
+            if in_str {
+                if ch == '\\' && !prev_backslash {
+                    prev_backslash = true;
+                    continue;
+                }
+                if ch == '"' && !prev_backslash {
+                    in_str = false;
+                }
+            } else if ch == '"' {
+                in_str = true;
+            } else if ch == '#' {
+                return s[..i].trim_end();
+            }
+            prev_backslash = false;
+        }
+        s
+    }
+
+    fn mentions_autumn_web(s: &str) -> bool {
+        let s = strip_inline_comment(s);
+        s.contains(r#"package = "autumn-web""#) || s.contains(r#"package="autumn-web""#)
+    }
+
     let mut in_dep_section = false;
+    // Key from a `[dependencies.KEY]` / `[dev-dependencies.KEY]` subtable header.
+    let mut subtable_key: Option<String> = None;
     let mut pending_key: Option<String> = None;
 
     for line in cargo_toml.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with('[') {
+            subtable_key = None;
+            pending_key = None;
+            // Plain `[dependencies]` / `[dev-dependencies]` (with optional comment)
             in_dep_section = trimmed == "[dependencies]"
                 || trimmed == "[dev-dependencies]"
                 || trimmed.starts_with("[dependencies] #")
                 || trimmed.starts_with("[dev-dependencies] #");
-            pending_key = None;
+            // Subtable form: `[dependencies.KEY]` or `[dev-dependencies.KEY]`
+            if !in_dep_section {
+                for prefix in &["[dependencies.", "[dev-dependencies."] {
+                    if let Some(rest) = trimmed.strip_prefix(prefix) {
+                        // rest is like `autumn]` or `autumn] # comment`
+                        let key = rest
+                            .split(']')
+                            .next()
+                            .unwrap_or("")
+                            .trim()
+                            .trim_matches('"')
+                            .to_owned();
+                        if !key.is_empty() {
+                            subtable_key = Some(key);
+                            in_dep_section = true;
+                        }
+                        break;
+                    }
+                }
+            }
             continue;
         }
         if !in_dep_section || trimmed.starts_with('#') {
             continue;
         }
-        // Inline table: `autumn = { package = "autumn-web", ... }`
+        // Inside a `[dependencies.KEY]` subtable — if we see `package = "autumn-web"`
+        // the key is the subtable name itself.
+        if let Some(ref key) = subtable_key {
+            if mentions_autumn_web(trimmed) {
+                return key.clone();
+            }
+            continue;
+        }
+        // Inline / multi-line table: `autumn = { package = "autumn-web", ... }`
         if let Some((key, rest)) = trimmed.split_once('=') {
             let key = key.trim().trim_matches('"').to_owned();
-            let rest = rest.trim();
-            if rest.contains(r#"package = "autumn-web""#)
-                || rest.contains(r#"package="autumn-web""#)
-            {
+            if mentions_autumn_web(rest) {
                 return key;
             }
             pending_key = Some(key);
         } else if let Some(ref key) = pending_key {
             // Continuation line inside a multi-line table value.
-            if trimmed.contains(r#"package = "autumn-web""#)
-                || trimmed.contains(r#"package="autumn-web""#)
-            {
+            if mentions_autumn_web(trimmed) {
                 return key.clone();
             }
         }
@@ -203,13 +260,17 @@ fn test_section_names_test(cargo_toml: &str, test_name: &str) -> bool {
                 in_test = is_array_table_header(trimmed, "test");
                 continue;
             }
-            if let Some(after) = trimmed.strip_prefix("name") {
+            // Accept both bare `name` and quoted `"name"` key forms.
+            let after_name = trimmed
+                .strip_prefix("\"name\"")
+                .or_else(|| trimmed.strip_prefix("name"));
+            if let Some(after) = after_name {
                 let after = after.trim_start();
                 if let Some(val) = after.strip_prefix('=') {
                     // Strip any trailing TOML inline comment before comparing.
                     let val = val.trim();
                     let val = val.split_once(" #").map_or(val, |(v, _)| v.trim());
-                    if val == expected {
+                    if val == test_name || val == expected {
                         return true;
                     }
                 }
@@ -659,6 +720,38 @@ mod tests {
         assert_eq!(
             orig_lines, patch_lines,
             "patching must not change the existing system-tests feature line"
+        );
+    }
+
+    #[test]
+    fn resolve_dep_key_subtable_syntax() {
+        // `[dev-dependencies.autumn]` with `package = "autumn-web"` in the body.
+        let src = "[package]\nname = \"x\"\n\n[dev-dependencies.autumn]\nversion = \"0.1\"\npackage = \"autumn-web\"\n";
+        assert_eq!(
+            super::resolve_autumn_web_dep_key(src),
+            "autumn",
+            "should resolve key from subtable header"
+        );
+    }
+
+    #[test]
+    fn resolve_dep_key_ignores_inline_comment_mention() {
+        // A comment mentioning package = "autumn-web" must not fool the resolver.
+        let src = "[dependencies]\nfoo = \"1\" # package = \"autumn-web\"\nautumn-web = \"0.1\"\n";
+        assert_eq!(
+            super::resolve_autumn_web_dep_key(src),
+            "autumn-web",
+            "comment mention must not be treated as a package alias"
+        );
+    }
+
+    #[test]
+    fn test_section_names_test_quoted_name_key() {
+        // A valid TOML quoted key `"name" = "todo_flow"` must be recognised.
+        let src = "[[test]]\n\"name\" = \"todo_flow\"\npath = \"tests/system/todo_flow.rs\"\n";
+        assert!(
+            super::test_section_names_test(src, "todo_flow"),
+            "should match quoted name key"
         );
     }
 
