@@ -421,16 +421,30 @@ fn semver_script_installs_tool_without_lto_hotspot() {
     let script_path = root.join("scripts/check-semver.sh");
     let script = std::fs::read_to_string(&script_path)
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", script_path.display()));
+    let release_lto_assignment = [
+        "CARGO_PROFILE_RELEASE_LTO=\"",
+        "$",
+        "{",
+        "CARGO_PROFILE_RELEASE_LTO:-false",
+        "}\"",
+    ]
+    .concat();
+    let release_codegen_units_assignment = [
+        "CARGO_PROFILE_RELEASE_CODEGEN_UNITS=\"",
+        "$",
+        "{",
+        "CARGO_PROFILE_RELEASE_CODEGEN_UNITS:-16",
+        "}\"",
+    ]
+    .concat();
 
     assert!(
-        script.contains(r#"CARGO_PROFILE_RELEASE_LTO="${CARGO_PROFILE_RELEASE_LTO:-false}""#),
+        script.contains(&release_lto_assignment),
         "{} must disable release LTO only for auto-installing cargo-semver-checks; Windows rustc has crashed in that installer profile",
         script_path.display(),
     );
     assert!(
-        script.contains(
-            r#"CARGO_PROFILE_RELEASE_CODEGEN_UNITS="${CARGO_PROFILE_RELEASE_CODEGEN_UNITS:-16}""#
-        ),
+        script.contains(&release_codegen_units_assignment),
         "{} must avoid codegen-units=1 only for auto-installing cargo-semver-checks",
         script_path.display(),
     );
