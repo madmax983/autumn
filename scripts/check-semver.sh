@@ -111,7 +111,7 @@ for crate in "${CRATES[@]}"; do
   # We distinguish these cases by parsing the output rather than relying on
   # exit codes alone.
   set +e
-  crate_output="$("${SEMVER_CARGO[@]}" semver-checks check-release --package "$crate" --default-features 2>&1)"
+  crate_output="$("${SEMVER_CARGO[@]}" semver-checks check-release --package "$crate" 2>&1)"
   exit_code=$?
   set -e
 

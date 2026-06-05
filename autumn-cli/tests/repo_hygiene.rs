@@ -442,6 +442,70 @@ fn semver_script_installs_tool_without_lto_hotspot() {
 }
 
 #[test]
+fn semver_script_checks_optional_features_with_pinned_rustdoc_toolchain() {
+    let root = workspace_root();
+    let script_path = root.join("scripts/check-semver.sh");
+    let script = std::fs::read_to_string(&script_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", script_path.display()));
+
+    assert!(
+        script.contains(r#"semver_toolchain="${AUTUMN_SEMVER_RUST_VERSION:-1.92.0}""#),
+        "{} must pin the semver rustdoc toolchain to Rust 1.92.0 by default",
+        script_path.display(),
+    );
+    assert!(
+        script.contains(r#"SEMVER_CARGO=(rustup run "$semver_toolchain" cargo)"#),
+        "{} must run cargo-semver-checks through the pinned semver toolchain",
+        script_path.display(),
+    );
+    assert!(
+        !script.contains("--default-features"),
+        "{} must not narrow SemVer coverage to default features only",
+        script_path.display(),
+    );
+    assert!(
+        !script.contains("--all-features"),
+        "{} should use cargo-semver-checks' default feature heuristic, not force every internal/test feature",
+        script_path.display(),
+    );
+
+    let workflow_path = root.join(".github/workflows/publish-gate.yml");
+    let workflow = std::fs::read_to_string(&workflow_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", workflow_path.display()));
+    let semver_job = workflow
+        .split("  semver:")
+        .nth(1)
+        .and_then(|job| job.split("\n  # ---").next())
+        .unwrap_or_else(|| panic!("{} must define a semver job", workflow_path.display()));
+    assert!(
+        semver_job.contains("dtolnay/rust-toolchain@1.92.0"),
+        "{} semver job must install the pinned Rust 1.92.0 toolchain",
+        workflow_path.display(),
+    );
+    assert!(
+        !semver_job.contains("dtolnay/rust-toolchain@stable"),
+        "{} semver job must not follow latest stable rustdoc JSON",
+        workflow_path.display(),
+    );
+}
+
+#[test]
+fn webauthn_docs_explain_native_openssl_vcpkg_prerequisite() {
+    let root = workspace_root();
+    let guide_path = root.join("docs/guide/generators.md");
+    let guide = std::fs::read_to_string(&guide_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", guide_path.display()));
+
+    for required in ["WebAuthn", "OpenSSL", "vcpkg", "VCPKG_ROOT"] {
+        assert!(
+            guide.contains(required),
+            "{} must document the WebAuthn/OpenSSL native dependency prerequisite `{required}`",
+            guide_path.display(),
+        );
+    }
+}
+
+#[test]
 fn publish_gate_prepare_release_does_not_mutate_changelog() {
     let root = workspace_root();
     let workflow_path = root.join(".github/workflows/publish-gate.yml");
