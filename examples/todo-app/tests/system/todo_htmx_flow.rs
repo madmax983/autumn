@@ -44,7 +44,7 @@ async fn index() -> Markup {
             head {
                 title { "Todos" }
                 // htmx so settle detection exercises the real htmx path.
-                script src="https://unpkg.com/htmx.org@1.9.10" {}
+                script src="/static/js/htmx.min.js" {}
             }
             body {
                 h1 { "My Todos" }

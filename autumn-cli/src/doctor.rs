@@ -1917,6 +1917,44 @@ fn probe_browser_version(path: &std::path::Path) -> Option<String> {
 
 /// Check whether a Chromium binary is available for system tests.
 ///
+/// Returns `true` if the `[features]` table in `cargo_toml` declares `key`.
+///
+/// Scans only the `[features]` section (not dev-dependencies that may also
+/// reference the feature) so a line like `autumn-web = { features = ["system-tests"] }`
+/// does not produce a false positive.
+fn cargo_toml_features_has_key(cargo_toml: &str, key: &str) -> bool {
+    let quoted_key = format!("\"{key}\"");
+    let mut in_features = false;
+    for line in cargo_toml.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        if trimmed == "[features]"
+            || (trimmed.starts_with("[features]")
+                && trimmed["[features]".len()..].trim_start().starts_with('#'))
+        {
+            in_features = true;
+            continue;
+        }
+        if in_features {
+            if trimmed.starts_with('[') {
+                break;
+            }
+            let bare = trimmed
+                .strip_prefix(key)
+                .is_some_and(|r| r.trim_start().starts_with('='));
+            let quoted = trimmed
+                .strip_prefix(quoted_key.as_str())
+                .is_some_and(|r| r.trim_start().starts_with('='));
+            if bare || quoted {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Reports `Warn` (not `Fail`) so that projects that don't use system tests
 /// are not penalized. If you _do_ run system tests you'll get a clear
 /// actionable message in `autumn doctor` output.
@@ -1943,7 +1981,7 @@ pub fn check_system_test_browser() -> CheckResult {
     let project_uses_system_tests = std::env::current_dir()
         .ok()
         .and_then(|d| std::fs::read_to_string(d.join("Cargo.toml")).ok())
-        .is_some_and(|s| s.contains("system-tests"));
+        .is_some_and(|s| cargo_toml_features_has_key(&s, "system-tests"));
 
     if project_uses_system_tests {
         CheckResult {

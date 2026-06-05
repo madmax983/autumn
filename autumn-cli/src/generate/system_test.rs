@@ -17,10 +17,6 @@ use super::model::validate_resource_name;
 use super::naming::{pascal, snake};
 use super::{Flags, GenerateError, ensure_project_root};
 
-/// Returns `true` if `cargo_toml` is a virtual workspace manifest — i.e. it
-/// contains a `[workspace]` section but no `[package]` section.  Cargo rejects
-/// `[features]` and `[[test]]` in virtual manifests, so the generator must
-/// refuse to patch them.
 /// Returns `true` if `trimmed` is a TOML section header matching `name`,
 /// with or without a trailing inline comment (e.g. `[workspace] # root`).
 fn is_toml_header(trimmed: &str, name: &str) -> bool {
@@ -88,6 +84,16 @@ pub fn plan_system_test(project_root: &Path, name: &str) -> Result<Plan, Generat
     Ok(plan)
 }
 
+/// Returns `true` if `trimmed` is a TOML array-of-tables header `[[name]]`,
+/// with or without a trailing inline comment.
+fn is_array_table_header(trimmed: &str, name: &str) -> bool {
+    let pat = format!("[[{name}]]");
+    trimmed == pat
+        || trimmed
+            .strip_prefix(pat.as_str())
+            .is_some_and(|rest| rest.trim_start().starts_with('#'))
+}
+
 /// Returns `true` if `trimmed` is a `[features]` table header, with or without
 /// a trailing inline comment (e.g. `[features] # project features`).
 fn is_features_header(trimmed: &str) -> bool {
@@ -138,7 +144,7 @@ fn test_section_names_test(cargo_toml: &str, test_name: &str) -> bool {
     let mut in_test = false;
     for line in cargo_toml.lines() {
         let trimmed = line.trim();
-        if trimmed == "[[test]]" {
+        if is_array_table_header(trimmed, "test") {
             in_test = true;
             continue;
         }
@@ -146,7 +152,7 @@ fn test_section_names_test(cargo_toml: &str, test_name: &str) -> bool {
             if trimmed.starts_with('[') {
                 // This header ends the current [[test]] section. If it's
                 // another [[test]], re-enter immediately so we don't skip it.
-                in_test = trimmed == "[[test]]";
+                in_test = is_array_table_header(trimmed, "test");
                 continue;
             }
             if let Some(after) = trimmed.strip_prefix("name") {

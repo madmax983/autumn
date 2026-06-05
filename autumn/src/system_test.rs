@@ -710,36 +710,22 @@ impl Page {
         let deadline = tokio::time::Instant::now() + timeout;
 
         loop {
-            // A "bare id" is a plain identifier: only ASCII alphanumerics, `-`,
-            // and `_`, with no leading `#`/`.` or embedded CSS metacharacters.
-            // Everything else is treated as a full CSS selector and passed to
-            // querySelector so that inputs like "div#notifications", ".sse-target",
-            // or "ul > li" all work correctly.
-            let is_bare_id = !stream_id.is_empty()
-                && stream_id
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
-            let js = if is_bare_id {
-                format!(
-                    "(function() {{ \
-                       var el = document.getElementById({id}); \
-                       return el ? el.innerText : null; \
-                     }})()",
-                    id = js_string_literal(stream_id)
-                )
-            } else {
-                format!(
-                    "(function() {{ \
-                       var sel = {sel}; \
-                       var el = sel.startsWith('#') && sel.slice(1).split('').every(function(c) {{ \
-                         return /[A-Za-z0-9_-]/.test(c); }}) \
-                         ? document.getElementById(sel.slice(1)) \
-                         : document.querySelector(sel); \
-                       return el ? el.innerText : null; \
-                     }})()",
-                    sel = js_string_literal(stream_id)
-                )
-            };
+            // Try getElementById(stream_id) first — this handles IDs with CSS
+            // metacharacters (e.g. "notifications:main") that would break
+            // querySelector. Fall back to querySelector only when getElementById
+            // returns null, so full selectors like ".sse-target" still work.
+            let js = format!(
+                "(function() {{ \
+                   var raw = {id}; \
+                   var el = document.getElementById(raw); \
+                   if (!el) {{ \
+                     var sel = raw.startsWith('#') ? raw : raw; \
+                     try {{ el = document.querySelector(raw); }} catch(e) {{}} \
+                   }} \
+                   return el ? el.innerText : null; \
+                 }})()",
+                id = js_string_literal(stream_id)
+            );
 
             let result = self.inner.evaluate(js).await?;
 
@@ -857,13 +843,17 @@ impl Page {
 
 // ── system_test! macro ─────────────────────────────────────────────────────
 
-/// Convenience macro that wraps a [`SystemTest`] builder call and ensures
-/// the runner is dropped (shutting down the embedded server) at test end.
+/// Convenience macro that builds a [`SystemTest`] runner and binds it to a
+/// named variable so the server stays alive for the full test body.
 ///
 /// ```rust,ignore
-/// system_test!(SystemTest::new().routes(routes![index]))
-///     .page().await.expect("page")
+/// let mut runner = system_test!(SystemTest::new().routes(routes![index]));
+/// let page = runner.page().await.expect("page");
 /// ```
+///
+/// **Important:** always bind the result with `let mut runner = system_test!(…);`.
+/// Chaining directly (`system_test!(…).page()…`) drops the runner immediately,
+/// shutting the server down before any page interaction can occur.
 #[macro_export]
 macro_rules! system_test {
     ($builder:expr) => {{
