@@ -49,6 +49,15 @@ pub fn plan_system_test(project_root: &Path, name: &str) -> Result<Plan, Generat
     Ok(plan)
 }
 
+/// Returns `true` if `trimmed` is a `[features]` table header, with or without
+/// a trailing inline comment (e.g. `[features] # project features`).
+fn is_features_header(trimmed: &str) -> bool {
+    trimmed == "[features]"
+        || trimmed
+            .strip_prefix("[features]")
+            .is_some_and(|rest| rest.trim_start().starts_with('#'))
+}
+
 /// Returns `true` if the `[features]` table in `cargo_toml` already contains
 /// a key named `key` (i.e. the key appears within the `[features]` section,
 /// not merely anywhere in the file).
@@ -56,7 +65,7 @@ fn features_section_has_key(cargo_toml: &str, key: &str) -> bool {
     let mut in_features = false;
     for line in cargo_toml.lines() {
         let trimmed = line.trim();
-        if trimmed == "[features]" {
+        if is_features_header(trimmed) {
             in_features = true;
             continue;
         }
@@ -114,11 +123,7 @@ fn find_features_header_end(cargo_toml: &str) -> Option<usize> {
     let mut pos = 0;
     for line in cargo_toml.lines() {
         let trimmed = line.trim();
-        // Accept bare "[features]" or "[features] # comment".
-        let is_header = trimmed == "[features]"
-            || trimmed
-                .strip_prefix("[features]")
-                .is_some_and(|rest| rest.trim_start().starts_with('#'));
+        let is_header = is_features_header(trimmed);
         // Advance pos past this line (include its line ending).
         pos += line.len();
         // Account for \r\n vs \n.
@@ -377,6 +382,19 @@ mod tests {
         assert!(
             patched.contains("system-tests"),
             "feature must be inserted after a commented header"
+        );
+    }
+
+    #[test]
+    fn patch_cargo_toml_idempotent_with_commented_features_header() {
+        // If [features] already has system-tests under a commented header,
+        // patching again must not insert a second key.
+        let src = "[package]\nname = \"x\"\n\n[features] # project features\nsystem-tests = [\"autumn-web/system-tests\"]\nother = []\n";
+        let patched = patch_cargo_toml(src, "my_test");
+        let count = patched.matches("system-tests =").count();
+        assert_eq!(
+            count, 1,
+            "system-tests key must appear exactly once; got {count}"
         );
     }
 
