@@ -113,10 +113,15 @@ fn features_section_has_key(cargo_toml: &str, key: &str) -> bool {
             if trimmed.starts_with('[') {
                 break;
             }
-            // Check if this line declares the key.
-            if let Some(after) = trimmed.strip_prefix(key)
-                && after.trim_start().starts_with('=')
-            {
+            // Check if this line declares the key (bare or TOML-quoted form).
+            let quoted_key = format!("\"{key}\"");
+            let bare_match = trimmed
+                .strip_prefix(key)
+                .is_some_and(|rest| rest.trim_start().starts_with('='));
+            let quoted_match = trimmed
+                .strip_prefix(quoted_key.as_str())
+                .is_some_and(|rest| rest.trim_start().starts_with('='));
+            if bare_match || quoted_match {
                 return true;
             }
         }
@@ -577,6 +582,30 @@ mod tests {
         assert!(
             super::test_section_names_test(src, "todo_flow"),
             "should match name even when it has a trailing inline comment"
+        );
+    }
+
+    #[test]
+    fn patch_cargo_toml_idempotent_with_quoted_feature_key() {
+        // A valid TOML manifest may quote the key: `"system-tests" = [...]`.
+        // The generator must recognise this and not insert a duplicate bare key.
+        let src = "[package]\nname = \"x\"\n\n[features]\n\"system-tests\" = [\"autumn-web/system-tests\"]\n";
+        let patched = patch_cargo_toml(src, "my_test");
+        // Confirm no bare (unquoted) system-tests key was inserted.
+        assert!(
+            !patched.contains("\nsystem-tests ="),
+            "must not insert a bare system-tests key when a quoted one already exists; patched: {patched:?}"
+        );
+        // The feature content should not have grown — the original and patched
+        // [features] section should be identical.
+        let orig_lines: Vec<_> = src.lines().filter(|l| l.contains("system-tests")).collect();
+        let patch_lines: Vec<_> = patched
+            .lines()
+            .filter(|l| l.contains("system-tests"))
+            .collect();
+        assert_eq!(
+            orig_lines, patch_lines,
+            "patching must not change the existing system-tests feature line"
         );
     }
 

@@ -255,6 +255,8 @@ pub struct SystemTest {
     artifact_dir_override: Option<PathBuf>,
     browser_timeout: Duration,
     hx_settle_timeout: Duration,
+    /// Optional pre-configured state; overrides the default `AppState::for_test()`.
+    state_override: Option<crate::state::AppState>,
 }
 
 impl Default for SystemTest {
@@ -276,12 +278,27 @@ impl SystemTest {
             artifact_dir_override: None,
             browser_timeout: DEFAULT_BROWSER_TIMEOUT,
             hx_settle_timeout: DEFAULT_HX_SETTLE_TIMEOUT,
+            state_override: None,
         }
     }
 
     /// Register routes to serve.
     pub fn routes(mut self, routes: impl Into<Vec<Route>>) -> Self {
         self.routes = routes.into();
+        self
+    }
+
+    /// Supply a pre-configured [`AppState`] to use instead of
+    /// [`AppState::for_test()`].
+    ///
+    /// Use this when the routes under test require a real database pool, API
+    /// version registrations, authorization policies, or any other state that
+    /// is set up by your `AppBuilder`.  The system test will use this state
+    /// as-is without further modification.
+    ///
+    /// [`AppState`]: crate::state::AppState
+    pub fn state(mut self, state: crate::state::AppState) -> Self {
+        self.state_override = Some(state);
         self
     }
 
@@ -325,7 +342,7 @@ impl SystemTest {
         let base_url = format!("http://127.0.0.1:{}", addr.port());
 
         // 3. Build the axum router from the registered routes.
-        let router = build_router_for_system_test(self.routes);
+        let router = build_router_for_system_test(self.routes, self.state_override);
 
         // 4. Spawn the server in a background task.
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -934,14 +951,24 @@ fn probe_version(path: &Path) -> Option<String> {
 }
 
 /// Build a minimal axum `Router` from a list of registered `Route`s.
-fn build_router_for_system_test(routes: Vec<Route>) -> axum::Router {
+///
+/// If `state_override` is `Some`, it is used as-is (caller is responsible for
+/// all required registrations such as DB pool, API versions, policies).
+/// Otherwise a default test state is constructed.
+fn build_router_for_system_test(
+    routes: Vec<Route>,
+    state_override: Option<crate::state::AppState>,
+) -> axum::Router {
     let mut config = AutumnConfig::default();
     config.profile = Some("test".into());
     config.security.csrf.enabled = false;
-    // Propagate the test config into AppState so handlers that read
-    // State<AppState>::config() or check the profile see consistent values.
-    let state = crate::state::AppState::for_test().with_profile("test");
-    state.insert_extension(config.clone());
+    let state = state_override.unwrap_or_else(|| {
+        // Propagate the test config into AppState so handlers that read
+        // State<AppState>::config() or check the profile see consistent values.
+        let s = crate::state::AppState::for_test().with_profile("test");
+        s.insert_extension(config.clone());
+        s
+    });
     crate::router::build_router(routes, &config, state)
 }
 
