@@ -3044,4 +3044,37 @@ redirect_uri = "http://localhost/callback"
             );
         }
     }
+
+    // ── cargo_toml_features_has_key ───────────────────────────────────────────
+
+    #[test]
+    fn features_has_key_detects_bare_key() {
+        let toml = "[features]\nsystem-tests = [\"autumn-web/system-tests\"]\n";
+        assert!(cargo_toml_features_has_key(toml, "system-tests"));
+    }
+
+    #[test]
+    fn features_has_key_detects_quoted_key() {
+        let toml = "[features]\n\"system-tests\" = [\"autumn-web/system-tests\"]\n";
+        assert!(cargo_toml_features_has_key(toml, "system-tests"));
+    }
+
+    #[test]
+    fn features_has_key_ignores_dev_dependency_mention() {
+        // The key appears in [dev-dependencies] but NOT in [features].
+        let toml = "[dev-dependencies]\nautumn-web = { features = [\"system-tests\"] }\n";
+        assert!(!cargo_toml_features_has_key(toml, "system-tests"));
+    }
+
+    #[test]
+    fn features_has_key_no_features_section() {
+        let toml = "[package]\nname = \"x\"\n";
+        assert!(!cargo_toml_features_has_key(toml, "system-tests"));
+    }
+
+    #[test]
+    fn features_has_key_commented_header() {
+        let toml = "[features] # project features\nsystem-tests = []\n";
+        assert!(cargo_toml_features_has_key(toml, "system-tests"));
+    }
 }
