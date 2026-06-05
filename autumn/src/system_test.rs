@@ -360,9 +360,16 @@ impl SystemTest {
             handler.for_each(|_| async {}).await;
         });
 
-        let artifact_dir = self
-            .artifact_dir_override
-            .unwrap_or_else(|| artifact_dir("system_test"));
+        let artifact_dir = self.artifact_dir_override.unwrap_or_else(|| {
+            // Use the Rust test thread name (set by the test harness) as the
+            // artifact subdirectory so concurrent tests don't overwrite each
+            // other's screenshots and HTML dumps.
+            let name = std::thread::current()
+                .name()
+                .unwrap_or("system_test")
+                .replace("::", "__");
+            artifact_dir(&name)
+        });
 
         Ok(SystemTestRunner {
             base_url,
@@ -668,27 +675,30 @@ impl Page {
         let deadline = tokio::time::Instant::now() + timeout;
 
         loop {
-            // Derive a CSS selector: treat bare word as an id, otherwise use
-            // as-is.
-            let selector = if stream_id.starts_with('#')
-                || stream_id.starts_with('.')
-                || stream_id.contains('[')
-            {
-                stream_id.to_owned()
-            } else {
-                format!("#{stream_id}")
-            };
-
-            let result = self
-                .inner
-                .evaluate(format!(
+            // Look up the SSE container element. Bare ids use getElementById so
+            // that metacharacters like `:` or `.` in the id don't break a CSS
+            // selector; full selectors are passed straight to querySelector.
+            let is_selector =
+                stream_id.starts_with('#') || stream_id.starts_with('.') || stream_id.contains('[');
+            let js = if is_selector {
+                format!(
                     "(function() {{ \
                        var el = document.querySelector({sel}); \
                        return el ? el.innerText : null; \
                      }})()",
-                    sel = js_string_literal(&selector)
-                ))
-                .await?;
+                    sel = js_string_literal(stream_id)
+                )
+            } else {
+                format!(
+                    "(function() {{ \
+                       var el = document.getElementById({id}); \
+                       return el ? el.innerText : null; \
+                     }})()",
+                    id = js_string_literal(stream_id)
+                )
+            };
+
+            let result = self.inner.evaluate(js).await?;
 
             let text: Option<String> = result.into_value().ok();
             if let Some(ref t) = text {

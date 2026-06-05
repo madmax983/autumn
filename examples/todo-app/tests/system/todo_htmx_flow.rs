@@ -7,8 +7,8 @@
 //!   4. Assert htmx settles (DOM swap completes).
 //!   5. Assert the new item appears in the DOM.
 //!
-//! Run:
-//!   cargo test -p todo-app --features system-tests -- --include-ignored
+//! Run (serial — tests share a process-global store):
+//!   cargo test -p todo-app --features system-tests -- --include-ignored --test-threads=1
 //!
 //! Requires Chromium:
 //!   apt-get install chromium-browser          # Ubuntu/Debian
@@ -111,6 +111,19 @@ async fn add_todo_htmx_swap() {
     page.expect_text("My Todos")
         .await
         .expect("page heading visible");
+
+    // Assert htmx loaded from CDN — fails fast if offline rather than silently
+    // falling back to a plain form submission that bypasses the swap path.
+    let htmx_loaded: bool = page
+        .evaluate("typeof htmx !== 'undefined'")
+        .await
+        .expect("evaluate htmx check")
+        .into_value()
+        .unwrap_or(false);
+    assert!(
+        htmx_loaded,
+        "htmx must be loaded from CDN for this test to exercise the swap path"
+    );
 
     // 2. Fill the title field.
     page.fill("input[name=title]", "Buy oat milk")
