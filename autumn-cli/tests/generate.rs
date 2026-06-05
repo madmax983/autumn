@@ -1607,8 +1607,8 @@ fn generate_mailer_preview_registry_wired_into_main() {
 // RED phase: these tests capture the full acceptance criteria from #823.
 // They fail until the email-confirmation feature is implemented in auth.rs.
 
-/// AC1, AC3, AC4: Migration includes email_confirmed_at, confirm_token_digest,
-/// and confirm_token_expires_at columns.
+/// AC1, AC3, AC4: Migration includes `email_confirmed_at`, `confirm_token_digest`,
+/// and `confirm_token_expires_at` columns.
 #[test]
 fn generate_auth_confirmation_migration_has_new_columns() {
     let (_tmp, project) = fresh_project("auth-confirm-migration");
@@ -1664,8 +1664,8 @@ fn generate_auth_confirmation_model_fields_and_signup_not_logged_in() {
     );
 }
 
-/// AC2: Confirmation route `GET /auth/confirm/:token` exists, stamps
-/// email_confirmed_at, and invalidates the token.
+/// AC2: Confirmation route `GET /auth/confirm/{token}` exists, stamps
+/// `email_confirmed_at`, and invalidates the token.
 #[test]
 fn generate_auth_confirmation_route_marks_confirmed_and_invalidates_token() {
     let (_tmp, project) = fresh_project("auth-confirm-route");
@@ -1760,7 +1760,7 @@ fn generate_auth_resend_confirmation_invalidates_old_token() {
 }
 
 /// AC7: The generated account route or a helper function demonstrates a
-/// confirmed-only gate (email_confirmed_at check).
+/// confirmed-only gate (`email_confirmed_at` check).
 #[test]
 fn generate_auth_confirmed_gate_present() {
     let (_tmp, project) = fresh_project("auth-confirm-gate");
@@ -1775,7 +1775,7 @@ fn generate_auth_confirmed_gate_present() {
     );
 }
 
-/// AC8: Password-reset completion does NOT stamp email_confirmed_at.
+/// AC8: Password-reset completion does NOT stamp `email_confirmed_at`.
 #[test]
 fn generate_auth_password_reset_does_not_confirm_email() {
     let (_tmp, project) = fresh_project("auth-confirm-reset-independence");
@@ -1791,8 +1791,7 @@ fn generate_auth_password_reset_does_not_confirm_email() {
     // Everything up to the next `pub async fn` is the handler body.
     let reset_body_end = rest[1..]
         .find("pub async fn ")
-        .map(|p| p + 1)
-        .unwrap_or(rest.len());
+        .map_or(rest.len(), |p| p + 1);
     let reset_body = &rest[..reset_body_end];
 
     assert!(
@@ -1801,7 +1800,7 @@ fn generate_auth_password_reset_does_not_confirm_email() {
     );
 }
 
-/// AC10: The signup handler checks mailer.is_disabled() and returns a clear
+/// AC10: The signup handler checks `mailer.is_disabled()` and returns a clear
 /// error when mail is not configured — matching the forgot-password precedent.
 #[test]
 fn generate_auth_confirmation_signup_fails_clearly_when_mail_disabled() {

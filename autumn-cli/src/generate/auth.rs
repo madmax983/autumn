@@ -1980,7 +1980,7 @@ pub async fn unlock_account(
 /// anonymous requests before the handler body runs.
 #[secured]
 #[get("/account")]
-pub async fn account(session: Session, mut db: Db, csrf: Option<CsrfToken>, csrf_field: Option<CsrfFormField>) -> AutumnResult<Markup> {{
+pub async fn account(session: Session, mut db: Db, csrf: Option<CsrfToken>, csrf_field: Option<CsrfFormField>) -> AutumnResult<Response> {{
     let {snake_name}_id: i64 = session
         .get("{snake_name}_id")
         .await
@@ -1999,7 +1999,7 @@ pub async fn account(session: Session, mut db: Db, csrf: Option<CsrfToken>, csrf
     // route, or replicate it on other routes that should require confirmation.
     // See docs/guide/authentication.md for the full pattern.
     if {snake_name}.email_confirmed_at.is_none() {{
-        return Ok(redirect_to("/check-your-email"));
+        return Ok(redirect_to("/check-your-email").into_response());
     }}
 
     Ok(layout("Your Account", html! {{
@@ -2013,7 +2013,7 @@ pub async fn account(session: Session, mut db: Db, csrf: Option<CsrfToken>, csrf
             @if let Some(ref csrf) = csrf {{ input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
             button type="submit" {{ "Log Out" }}
         }}
-    }}))
+    }}).into_response())
 }}
 
 // ── Forgot Password ───────────────────────────────────────────────────────────
@@ -2289,7 +2289,7 @@ pub struct ConfirmEmailPath {{
     pub token: String,
 }}
 
-/// `GET /auth/confirm/:token` — validate the confirmation token and mark the
+/// `GET /auth/confirm/{{token}}` — validate the confirmation token and mark the
 /// account as confirmed.
 ///
 /// On a valid unexpired token: stamps `email_confirmed_at`, invalidates the
@@ -2299,7 +2299,7 @@ pub struct ConfirmEmailPath {{
 ///
 /// Only the SHA-256 digest is stored; the raw token only exists in the email
 /// and the user's URL bar — never in the database, logs, or error reports.
-#[get("/auth/confirm/:token")]
+#[get("/auth/confirm/{{token}}")]
 pub async fn confirm_email(
     mut db: Db,
     State(state): State<AppState>,
@@ -2309,28 +2309,28 @@ pub async fn confirm_email(
     let token_digest = sha256_hex(&params.token);
     let now = chrono::Utc::now().naive_utc();
 
-    let {snake_name}: {pascal_name} = {table}::table
-        .filter({table}::confirm_token_digest.eq(Some(&token_digest)))
-        .filter({table}::confirm_token_expires_at.gt(now))
-        .select({pascal_name}::as_select())
-        .first(&mut *db)
-        .await
-        .map_err(|_| {{
-            AutumnError::unprocessable_msg(
-                "This confirmation link is invalid or has expired. \
-                 Please request a new confirmation email.",
-            )
-        }})?;
-
-    // Stamp email_confirmed_at and invalidate the token so it cannot be replayed.
-    diesel::update({table}::table.find({snake_name}.id))
-        .set((
-            {table}::email_confirmed_at.eq(Some(now)),
-            {table}::confirm_token_digest.eq(None::<String>),
-            {table}::confirm_token_expires_at.eq(None::<chrono::NaiveDateTime>),
-        ))
-        .execute(&mut *db)
-        .await?;
+    // Atomic UPDATE…RETURNING: filter, stamp, and invalidate in a single
+    // statement so concurrent requests with the same token cannot both
+    // succeed — the second UPDATE matches zero rows and returns an error.
+    let {snake_name}: {pascal_name} = diesel::update(
+        {table}::table
+            .filter({table}::confirm_token_digest.eq(Some(&token_digest)))
+            .filter({table}::confirm_token_expires_at.gt(now)),
+    )
+    .set((
+        {table}::email_confirmed_at.eq(Some(now)),
+        {table}::confirm_token_digest.eq(None::<String>),
+        {table}::confirm_token_expires_at.eq(None::<chrono::NaiveDateTime>),
+    ))
+    .returning({pascal_name}::as_returning())
+    .get_result(&mut *db)
+    .await
+    .map_err(|_| {{
+        AutumnError::unprocessable_msg(
+            "This confirmation link is invalid or has expired. \
+             Please request a new confirmation email.",
+        )
+    }})?;
 
     // Grant an authenticated session on confirmation.
     session.rotate_id().await;
@@ -2390,30 +2390,36 @@ pub async fn resend_confirmation(
     let email = form.email.trim().to_lowercase();
     let t0 = std::time::Instant::now();
 
-    // Non-enumerating: silently skip addresses that are unknown or already confirmed.
-    let maybe_{snake_name}: Option<{pascal_name}> = {table}::table
-        .filter({table}::email.eq(&email))
-        .filter({table}::email_confirmed_at.is_null())
-        .select({pascal_name}::as_select())
-        .first(&mut *db)
-        .await
-        .ok();
+    let raw_confirm_token = generate_confirmation_token();
+    let confirm_digest = sha256_hex(&raw_confirm_token);
+    let confirm_expires_at = chrono::Utc::now().naive_utc() + chrono::Duration::hours(24);
+    // Throttle: skip re-issue if a token was minted in the last 5 minutes
+    // (expires_at would still be > 23h55m from now).  Non-enumerating: whether
+    // the skip is due to throttling, unknown address, or already-confirmed
+    // account, the caller sees the same "check your email" page.
+    let throttle_threshold = chrono::Utc::now().naive_utc() + chrono::Duration::minutes(23 * 60 + 55);
 
-    if let Some({snake_name}) = maybe_{snake_name} {{
-        let raw_confirm_token = generate_confirmation_token();
-        let confirm_digest = sha256_hex(&raw_confirm_token);
-        let confirm_expires_at = chrono::Utc::now().naive_utc() + chrono::Duration::hours(24);
+    // Single UPDATE: no prior SELECT required.  Only fires when the account is
+    // unconfirmed and outside the throttle window.
+    let affected = diesel::update(
+        {table}::table
+            .filter({table}::email.eq(&email))
+            .filter({table}::email_confirmed_at.is_null())
+            .filter(
+                {table}::confirm_token_expires_at
+                    .is_null()
+                    .or({table}::confirm_token_expires_at.le(throttle_threshold)),
+            ),
+    )
+    .set((
+        {table}::confirm_token_digest.eq(Some(&confirm_digest)),
+        {table}::confirm_token_expires_at.eq(Some(confirm_expires_at)),
+    ))
+    .execute(&mut *db)
+    .await?;
 
-        // Overwrite any previously outstanding token (single-outstanding-token invariant).
-        diesel::update({table}::table.find({snake_name}.id))
-            .set((
-                {table}::confirm_token_digest.eq(Some(&confirm_digest)),
-                {table}::confirm_token_expires_at.eq(Some(confirm_expires_at)),
-            ))
-            .execute(&mut *db)
-            .await?;
-
-        if let Err(e) = send_confirmation_email(&mailer, &{snake_name}.email, &raw_confirm_token).await {{
+    if affected > 0 {{
+        if let Err(e) = send_confirmation_email(&mailer, &email, &raw_confirm_token).await {{
             tracing::error!("confirmation email failed on resend: {{e}}");
         }}
     }}
@@ -3204,7 +3210,12 @@ ALTER TABLE {{table}}
 # 3. Apply the migration
 autumn migrate
 
-# 4. Re-generate auth templates to pick up the confirmation handlers
+# 4. Regenerate src/schema.rs so Diesel knows about the new columns.
+#    (autumn generate auth only adds the table when it is absent; it cannot
+#    add columns to an existing table entry in schema.rs.)
+diesel print-schema > src/schema.rs
+
+# 5. Re-generate auth templates to pick up the confirmation handlers
 autumn generate auth {pascal_name} --force
 ```
 
