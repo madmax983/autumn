@@ -28,7 +28,7 @@
 //! #[tokio::test]
 //! #[ignore = "requires Chromium"]
 //! async fn hello_renders() {
-//!     let mut runner = SystemTest::new()
+//!     let runner = SystemTest::new()
 //!         .routes(routes![index])
 //!         .build()
 //!         .await
@@ -423,7 +423,7 @@ impl SystemTestRunner {
     ///
     /// # Errors
     /// Propagates CDP errors from `chromiumoxide`.
-    pub async fn page(&mut self) -> Result<Page, SystemTestError> {
+    pub async fn page(&self) -> Result<Page, SystemTestError> {
         let cdp_page = self.browser.new_page("about:blank").await?;
         Ok(Page {
             inner: cdp_page,
@@ -542,7 +542,7 @@ impl Page {
                    if (el.disabled) {{ continue; }} \
                    if (el.getClientRects().length === 0) {{ continue; }} \
                    var cs = window.getComputedStyle(el); \
-                   if (parseFloat(cs.opacity) === 0) {{ continue; }} \
+                   if (cs.visibility === 'hidden' || parseFloat(cs.opacity) === 0) {{ continue; }} \
                    var text = el.tagName === 'INPUT' \
                      ? (el.value || '') \
                      : (el.textContent || ''); \
@@ -868,11 +868,11 @@ impl Page {
 /// named variable so the server stays alive for the full test body.
 ///
 /// ```rust,ignore
-/// let mut runner = system_test!(SystemTest::new().routes(routes![index]));
+/// let runner = system_test!(SystemTest::new().routes(routes![index]));
 /// let page = runner.page().await.expect("page");
 /// ```
 ///
-/// **Important:** always bind the result with `let mut runner = system_test!(…);`.
+/// **Important:** always bind the result with `let runner = system_test!(…);`.
 /// Chaining directly (`system_test!(…).page()…`) drops the runner immediately,
 /// shutting the server down before any page interaction can occur.
 #[macro_export]

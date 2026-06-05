@@ -111,7 +111,7 @@ async fn system_test_boots_and_visits_page() {
         "<html><body><h1 id='greeting'>Hello from system test</h1></body></html>"
     }
 
-    let mut runner = SystemTest::new()
+    let runner = SystemTest::new()
         .routes(routes![index])
         .build()
         .await
@@ -136,7 +136,7 @@ async fn assertion_failure_writes_artifacts() {
         "<html><body><p>Only this text</p></body></html>"
     }
 
-    let mut runner = SystemTest::new()
+    let runner = SystemTest::new()
         .routes(routes![index])
         .artifact_dir("/tmp/autumn-system-test-artifacts")
         .build()
@@ -191,7 +191,7 @@ async fn expect_hx_settle_waits_for_htmx() {
         "<span>Swapped!</span>"
     }
 
-    let mut runner = SystemTest::new()
+    let runner = SystemTest::new()
         .routes(routes![index, swap])
         .build()
         .await

@@ -72,7 +72,7 @@ use autumn_web::system_test::SystemTest;
 #[tokio::test]
 #[ignore = "requires Chromium — set AUTUMN_CHROMIUM or install chromium-browser"]
 async fn todo_flow_index_renders() {
-    let mut runner = SystemTest::new()
+    let runner = SystemTest::new()
         .routes(routes![index])
         .build()
         .await
@@ -224,7 +224,7 @@ async fn add_todo_flow() {
         .with_pool(db.pool())
         .with_profile("test");
 
-    let mut runner = SystemTest::new()
+    let runner = SystemTest::new()
         .routes(routes![index, create_todo])
         .state(state)
         .build()
@@ -282,7 +282,8 @@ jobs:
   multiple times for concurrent tabs within a single test.
 - Across tests, each `SystemTest::build()` launches a **separate** browser
   process, which can be expensive. For many tests in one binary, consider
-  sharing a browser via a `tokio::sync::OnceCell<SystemTestRunner>`.
+  sharing a browser via a `tokio::sync::OnceCell<SystemTestRunner>`
+  (`page()` takes `&self` so no mutex is needed).
 - `--test-threads=1` is the safest default for system tests that share a
   single test database.
 

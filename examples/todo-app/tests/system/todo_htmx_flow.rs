@@ -98,7 +98,7 @@ async fn create_todo(
 async fn add_todo_htmx_swap() {
     reset_store();
 
-    let mut runner = SystemTest::new()
+    let runner = SystemTest::new()
         .routes(routes![index, create_todo])
         .build()
         .await
@@ -150,7 +150,7 @@ async fn add_todo_htmx_swap() {
 async fn empty_title_not_added() {
     reset_store();
 
-    let mut runner = SystemTest::new()
+    let runner = SystemTest::new()
         .routes(routes![index, create_todo])
         .build()
         .await

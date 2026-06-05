@@ -257,13 +257,11 @@ use autumn_web::system_test::SystemTest;
 // ── Route handlers under test ──────────────────────────────────────────────
 
 #[get("/")]
-async fn index() -> Markup {{
-    html! {{
-        html {{
-            head {{ title {{ "{pascal_name}" }} }}
-            body {{ h1 {{ "{pascal_name}" }} }}
-        }}
-    }}
+async fn index() -> String {{
+    format!(
+        "<!DOCTYPE html><html><head><title>{pascal_name}</title></head>\
+         <body><h1>{pascal_name}</h1></body></html>"
+    )
 }}
 
 // ── Tests ─────────────────────────────────────────────────────────────────
@@ -275,7 +273,7 @@ async fn index() -> Markup {{
 #[tokio::test]
 #[ignore = "requires Chromium — set AUTUMN_CHROMIUM or install chromium-browser"]
 async fn {snake_name}_index_renders() {{
-    let mut runner = SystemTest::new()
+    let runner = SystemTest::new()
         .routes(routes![index])
         .build()
         .await
