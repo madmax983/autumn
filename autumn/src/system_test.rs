@@ -1051,4 +1051,28 @@ mod tests {
             "should have at least one chrome path; got {as_strings:?}"
         );
     }
+
+    #[test]
+    fn build_router_default_state_does_not_panic() {
+        // Exercises the None branch of build_router_for_system_test.
+        let _router = build_router_for_system_test(vec![], None);
+    }
+
+    #[test]
+    fn build_router_with_state_override_uses_embedded_config() {
+        // Exercises the Some(state) branch: config is read from the supplied
+        // state rather than constructed from scratch.
+        let mut config = AutumnConfig::default();
+        config.profile = Some("custom".into());
+        let state = crate::state::AppState::for_test();
+        state.insert_extension(config);
+        let _router = build_router_for_system_test(vec![], Some(state));
+    }
+
+    #[test]
+    fn build_router_with_state_override_no_embedded_config_uses_default() {
+        // When the supplied state has no AutumnConfig extension, a default is used.
+        let state = crate::state::AppState::for_test();
+        let _router = build_router_for_system_test(vec![], Some(state));
+    }
 }
