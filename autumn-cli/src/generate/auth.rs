@@ -1821,15 +1821,24 @@ pub async fn login(
     let {snake_name} = found_{snake_name}.ok_or_else(auth_err)?;
 
     // Successful login: reset lockout counter only when the account is not
-    // currently locked. The WHERE locked_at IS NULL guard prevents clearing a
-    // lock that was stamped concurrently between our SELECT and this UPDATE.
-    // If zero rows are affected the account was just locked — reject the login
-    // so the attacker does not slip through on a stale correct password.
+    // currently locked. The WHERE clause accepts both:
+    //   - locked_at IS NULL (no lock ever set), and
+    //   - locked_at <= now - cooloff (lock expired via cool-off),
+    // so that a user who waited out the cool-off can log in with a correct
+    // password without requiring an operator unlock.
+    // If zero rows match after excluding active (non-expired) locks, the
+    // account was just locked concurrently — reject the login.
     if lockout_enabled {{
+        let cooloff = chrono::Duration::seconds(lockout_cfg.cooloff_secs as i64);
+        let lock_expired_before = chrono::Utc::now().naive_utc() - cooloff;
         let rows_cleared = diesel::update(
             {table}::table
                 .find({snake_name}.id)
-                .filter({table}::locked_at.is_null()),
+                .filter(
+                    {table}::locked_at.is_null().or(
+                        {table}::locked_at.le(lock_expired_before)
+                    )
+                ),
         )
         .set((
             {table}::failed_attempts.eq(0),
@@ -1837,7 +1846,7 @@ pub async fn login(
         ))
         .execute(&mut *db)
         .await
-        .unwrap_or(0);
+        .map_err(|e| AutumnError::internal_server_error_msg(&format!("Failed to reset lockout on login: {{e}}")))?;
         if rows_cleared == 0 {{
             return Err(auth_err());
         }}
