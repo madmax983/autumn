@@ -399,6 +399,63 @@ mod tests {
     }
 
     #[test]
+    fn find_features_header_end_no_trailing_newline() {
+        // [features] as the very last line with no trailing newline — pos does
+        // not advance past a newline but the header is still found.
+        let src = "[package]\nname = \"x\"\n\n[features]";
+        let pos = super::find_features_header_end(src);
+        // Should point to the byte just past "[features]" (end of string).
+        assert!(
+            pos.is_some(),
+            "should find header even without trailing newline"
+        );
+        let pos = pos.unwrap();
+        assert_eq!(pos, src.len(), "pos should be at end of string");
+    }
+
+    #[test]
+    fn find_features_header_end_no_features_section() {
+        let src = "[package]\nname = \"x\"\n";
+        assert!(
+            super::find_features_header_end(src).is_none(),
+            "should return None when no [features] header present"
+        );
+    }
+
+    #[test]
+    fn features_section_has_key_recognizes_commented_header_with_key() {
+        let src = "[features] # project features\nsystem-tests = [\"autumn-web/system-tests\"]\n";
+        assert!(
+            super::features_section_has_key(src, "system-tests"),
+            "should detect key under a commented [features] header"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plan_system_test_errors_on_unreadable_cargo_toml() {
+        use std::os::unix::fs::PermissionsExt;
+        // Skip when running as root (CI containers) since chmod 000 is ineffective.
+        if std::fs::read("/etc/shadow").is_ok() {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let cargo_path = tmp.path().join("Cargo.toml");
+        fs::write(
+            &cargo_path,
+            "[package]\nname = \"x\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&cargo_path, fs::Permissions::from_mode(0o000)).unwrap();
+        let result = plan_system_test(tmp.path(), "IoError");
+        fs::set_permissions(&cargo_path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            result.is_err(),
+            "plan_system_test must propagate Cargo.toml read errors"
+        );
+    }
+
+    #[test]
     fn plan_force_overwrites() {
         let tmp = temp_project();
         plan_system_test(tmp.path(), "Force")
