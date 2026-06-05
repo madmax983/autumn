@@ -980,7 +980,7 @@ fn build_router_for_system_test(
             // on form submissions, exactly as a real user would.
             let config = state
                 .extension::<AutumnConfig>()
-                .cloned()
+                .map(|arc| (*arc).clone())
                 .unwrap_or_default();
             crate::router::build_router(routes, &config, state)
         }
