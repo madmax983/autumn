@@ -488,7 +488,9 @@ impl Page {
         } else {
             let js = format!(
                 "(function() {{ \
-                 var xpath = \"//*[normalize-space(text())='\" + {} + \"']\"; \
+                 var label = {}; \
+                 var q = label.indexOf(\"'\") >= 0 ? '\"' : \"'\"; \
+                 var xpath = \"//*[normalize-space(text())=\" + q + label + q + \"]\"; \
                  var result = document.evaluate(xpath, document, null, \
                    XPathResult.FIRST_ORDERED_NODE_TYPE, null); \
                  var el = result.singleNodeValue; \

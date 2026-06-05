@@ -49,17 +49,46 @@ pub fn plan_system_test(project_root: &Path, name: &str) -> Result<Plan, Generat
     Ok(plan)
 }
 
+/// Returns `true` if the `[features]` table in `cargo_toml` already contains
+/// a key named `key` (i.e. the key appears within the `[features]` section,
+/// not merely anywhere in the file).
+fn features_section_has_key(cargo_toml: &str, key: &str) -> bool {
+    let mut in_features = false;
+    for line in cargo_toml.lines() {
+        let trimmed = line.trim();
+        if trimmed == "[features]" {
+            in_features = true;
+            continue;
+        }
+        if in_features {
+            // Another table header ends the [features] section.
+            if trimmed.starts_with('[') {
+                break;
+            }
+            // Check if this line declares the key.
+            if trimmed.starts_with(key) {
+                let after = trimmed[key.len()..].trim_start();
+                if after.starts_with('=') {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Patch `Cargo.toml` content to add the `system-tests` feature (under
 /// `[features]` only, not in `[dependencies]`) and a `[[test]]` entry for this
 /// test file if they are not already present.
 fn patch_cargo_toml(existing: &str, snake_name: &str) -> String {
     let mut out = existing.to_owned();
 
-    // 1. Add [features] system-tests entry if the key is not already present.
-    // We check for the key name only, not an exact value, to avoid duplicating
-    // an entry that already exists with a different (or empty) definition.
-    if !out.contains("system-tests") {
-        let feature_line = "system-tests = [\"autumn-web/system-tests\"]";
+    // 1. Add [features] system-tests entry if not already in the [features] table.
+    // We scan only the [features] section so that a dev-dependency enabling
+    // autumn-web/system-tests does not suppress the local feature definition
+    // (which is required by `--features system-tests` and `#[cfg(feature = ...)]`).
+    let feature_line = "system-tests = [\"autumn-web/system-tests\"]";
+    if !features_section_has_key(&out, "system-tests") {
         if out.contains("[features]") {
             out = out.replacen("[features]\n", &format!("[features]\n{feature_line}\n"), 1);
         } else {
@@ -104,7 +133,7 @@ use autumn_web::system_test::SystemTest;
 
 #[get("/")]
 async fn index() -> Markup {{
-    maud::html! {{
+    html! {{
         html {{
             head {{ title {{ "{pascal_name}" }} }}
             body {{ h1 {{ "{pascal_name}" }} }}
