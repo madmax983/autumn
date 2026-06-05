@@ -197,6 +197,7 @@ impl MetricsSourceRegistry {
             match result {
                 Ok(families) => results.push((name.clone(), families)),
                 Err(_) => {
+                    tracing::error!(source_name = %name, "MetricsSource panicked during collection");
                     panicked.push(name.clone());
                     results.push((name.clone(), vec![]));
                 }
@@ -1375,10 +1376,16 @@ pub(crate) async fn metrics_endpoint<S: ProvideActuatorState + Send + Sync + 'st
                         "name": f.name,
                         "help": f.help,
                         "kind": f.kind.as_str(),
-                        "samples": f.samples.iter().map(|s| serde_json::json!({
-                            "labels": s.labels.iter().map(|(k, v)| serde_json::json!({k: v})).collect::<Vec<_>>(),
-                            "value": s.value,
-                        })).collect::<Vec<_>>(),
+                        "samples": f.samples.iter().map(|s| {
+                            let labels: serde_json::Map<String, serde_json::Value> = s.labels
+                                .iter()
+                                .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                                .collect();
+                            serde_json::json!({
+                                "labels": labels,
+                                "value": s.value,
+                            })
+                        }).collect::<Vec<_>>(),
                     })
                 })
                 .collect();
@@ -1394,30 +1401,33 @@ pub(crate) async fn metrics_endpoint<S: ProvideActuatorState + Send + Sync + 'st
 
 // ── Prometheus ─────────────────────────────────────────────────
 
-/// Escape a Prometheus label value: backslash, newline, and double-quote need escaping.
-fn escape_label_value(v: &str) -> String {
-    let mut out = String::with_capacity(v.len());
-    for c in v.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '"' => out.push_str("\\\""),
-            other => out.push(other),
-        }
-    }
-    out
-}
-
 /// Render label set `{k="v",...}` or empty string for no labels.
+///
+/// Writes directly into a pre-allocated `String` to avoid per-pair heap allocations.
 fn render_labels(labels: &[(String, String)]) -> String {
     if labels.is_empty() {
         return String::new();
     }
-    let pairs: Vec<String> = labels
-        .iter()
-        .map(|(k, v)| format!("{}=\"{}\"", k, escape_label_value(v)))
-        .collect();
-    format!("{{{}}}", pairs.join(","))
+    let mut out = String::with_capacity(64);
+    out.push('{');
+    for (i, (k, v)) in labels.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(k);
+        out.push_str("=\"");
+        for c in v.chars() {
+            match c {
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '"' => out.push_str("\\\""),
+                other => out.push(other),
+            }
+        }
+        out.push('"');
+    }
+    out.push('}');
+    out
 }
 
 /// `GET <actuator-prefix>/prometheus` -- export metrics in Prometheus format.
@@ -1542,8 +1552,7 @@ pub(crate) async fn prometheus_endpoint<S: ProvideActuatorState + Send + Sync + 
                 let _ = writeln!(
                     out,
                     "autumn_metrics_source_errors_total{{source=\"{}\"}} {}",
-                    name,
-                    error_counts[name]
+                    name, error_counts[name]
                 );
             }
         }
@@ -3628,7 +3637,11 @@ mod tests {
 
         let all = registry.collect_all();
         assert_eq!(all.len(), 1);
-        assert_eq!(all[0].1.len(), 0, "panicking source should yield no families");
+        assert_eq!(
+            all[0].1.len(),
+            0,
+            "panicking source should yield no families"
+        );
 
         let errors = registry.error_counts();
         assert_eq!(errors.get("panicker"), Some(&1));

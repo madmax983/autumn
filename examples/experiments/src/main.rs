@@ -41,8 +41,8 @@
 //! curl http://localhost:3000/checkout/user:99
 //! ```
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use autumn_web::actuator::{MetricFamily, MetricKind, MetricSample, MetricsSource};
 use autumn_web::experiments::{

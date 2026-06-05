@@ -201,7 +201,7 @@ key, alongside the existing top-level HTTP and database keys:
         "name": "myapp_queue_depth",
         "help": "Current number of items in the processing queue",
         "kind": "gauge",
-        "samples": [{ "labels": [], "value": 42.0 }]
+        "samples": [{ "labels": {}, "value": 42.0 }]
       }
     ]
   }
