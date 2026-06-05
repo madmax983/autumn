@@ -1647,7 +1647,6 @@ pub struct LoginForm {{
 /// in test environments where it is absent.
 struct MaybeClientIp(std::net::IpAddr);
 
-#[axum::async_trait]
 impl<S: Send + Sync> axum::extract::FromRequestParts<S> for MaybeClientIp {{
     type Rejection = std::convert::Infallible;
     async fn from_request_parts(
@@ -1821,13 +1820,13 @@ pub async fn login(
 
     let {snake_name} = found_{snake_name}.ok_or_else(auth_err)?;
 
-    // Successful login: reset lockout counter only when the account was not
-    // locked concurrently after we read it. The WHERE clause guards against
-    // a race where a concurrent bad-password request stamps locked_at between
-    // our SELECT and this UPDATE — without it a stale successful login could
-    // clear a freshly acquired lock and admit an attacker.
+    // Successful login: reset lockout counter only when the account is not
+    // currently locked. The WHERE locked_at IS NULL guard prevents clearing a
+    // lock that was stamped concurrently between our SELECT and this UPDATE.
+    // If zero rows are affected the account was just locked — reject the login
+    // so the attacker does not slip through on a stale correct password.
     if lockout_enabled {{
-        let _ = diesel::update(
+        let rows_cleared = diesel::update(
             {table}::table
                 .find({snake_name}.id)
                 .filter({table}::locked_at.is_null()),
@@ -1837,7 +1836,11 @@ pub async fn login(
             {table}::locked_at.eq(None::<chrono::NaiveDateTime>),
         ))
         .execute(&mut *db)
-        .await;
+        .await
+        .unwrap_or(0);
+        if rows_cleared == 0 {{
+            return Err(auth_err());
+        }}
     }}
 
 {totp_login_branch}
