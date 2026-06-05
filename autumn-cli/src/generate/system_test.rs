@@ -144,13 +144,15 @@ fn resolve_autumn_web_dep_key(cargo_toml: &str) -> String {
     let mut in_dep_section = false;
     // Key from a `[dependencies.KEY]` / `[dev-dependencies.KEY]` subtable header.
     let mut subtable_key: Option<String> = None;
-    let mut pending_key: Option<String> = None;
+    // Set when we open a multi-line inline table `key = {` with no closing `}`
+    // on the same line.  Only valid inside an open brace block; cleared on `}`.
+    let mut open_table_key: Option<String> = None;
 
     for line in cargo_toml.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with('[') {
             subtable_key = None;
-            pending_key = None;
+            open_table_key = None;
             // Plain `[dependencies]` / `[dev-dependencies]` (with optional comment)
             in_dep_section = trimmed == "[dependencies]"
                 || trimmed == "[dev-dependencies]"
@@ -189,25 +191,28 @@ fn resolve_autumn_web_dep_key(cargo_toml: &str) -> String {
             }
             continue;
         }
-        // Continuation line inside a multi-line table value — check before
-        // attempting split_once so that `package = "autumn-web"` on its own
-        // line is matched against the saved key, not treated as a new entry.
-        if pending_key
-            .as_deref()
-            .is_some_and(|_| mentions_autumn_web(trimmed))
-        {
-            return pending_key.unwrap();
+        // Inside an open multi-line table `key = {\n ... \n}` — every line
+        // belongs to the same entry until we see the closing `}`.
+        if let Some(ref key) = open_table_key {
+            if trimmed.contains('}') {
+                open_table_key = None;
+            } else if mentions_autumn_web(trimmed) {
+                return key.clone();
+            }
+            continue;
         }
-        // Inline / single-line table: `autumn = { package = "autumn-web", ... }`
+        // New key=value line.
         if let Some((key, rest)) = trimmed.split_once('=') {
             let key = key.trim().trim_matches('"').to_owned();
+            let rest = rest.trim();
             if mentions_autumn_web(rest) {
                 return key;
             }
-            // Only update pending_key when we start a new entry (not a
-            // continuation key=value pair inside the open table).
-            if pending_key.is_none() {
-                pending_key = Some(key);
+            // If the value opens a brace without closing it, enter multi-line mode.
+            let open_count = rest.chars().filter(|&c| c == '{').count();
+            let close_count = rest.chars().filter(|&c| c == '}').count();
+            if open_count > close_count {
+                open_table_key = Some(key);
             }
         }
     }
@@ -757,6 +762,17 @@ mod tests {
             super::resolve_autumn_web_dep_key(src),
             "autumn-web",
             "comment mention must not be treated as a package alias"
+        );
+    }
+
+    #[test]
+    fn resolve_dep_key_not_fooled_by_prior_dependency() {
+        // `serde` precedes `autumn`; stale pending_key must not return "serde".
+        let src = "[dependencies]\nserde = \"1\"\nautumn = { package = \"autumn-web\", version = \"0.1\" }\n";
+        assert_eq!(
+            super::resolve_autumn_web_dep_key(src),
+            "autumn",
+            "should not attribute the alias to a prior dependency entry"
         );
     }
 
