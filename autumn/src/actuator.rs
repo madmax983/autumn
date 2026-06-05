@@ -52,8 +52,6 @@ pub enum MetricKind {
     Counter,
     /// An arbitrary up-or-down value (e.g., queue depth, active connections).
     Gauge,
-    /// A sampled distribution (e.g., latency buckets).
-    Histogram,
 }
 
 impl MetricKind {
@@ -61,7 +59,6 @@ impl MetricKind {
         match self {
             Self::Counter => "counter",
             Self::Gauge => "gauge",
-            Self::Histogram => "histogram",
         }
     }
 }
@@ -100,7 +97,7 @@ pub struct MetricFamily {
 /// Contract for a subsystem that contributes metrics to the unified actuator endpoints.
 ///
 /// Implement this trait and register the implementation via
-/// [`AppBuilder::metrics_source`] to publish metric families that appear in
+/// [`crate::app::AppBuilder::metrics_source`] to publish metric families that appear in
 /// `/actuator/prometheus` alongside the built-in `autumn_http_*` families, and
 /// in `/actuator/metrics` under the `sources` key.
 ///
@@ -1549,10 +1546,11 @@ pub(crate) async fn prometheus_endpoint<S: ProvideActuatorState + Send + Sync + 
             let mut names: Vec<&String> = error_counts.keys().collect();
             names.sort();
             for name in names {
+                let label = render_labels(&[("source".to_string(), name.to_string())]);
                 let _ = writeln!(
                     out,
-                    "autumn_metrics_source_errors_total{{source=\"{}\"}} {}",
-                    name, error_counts[name]
+                    "autumn_metrics_source_errors_total{} {}",
+                    label, error_counts[name]
                 );
             }
         }
