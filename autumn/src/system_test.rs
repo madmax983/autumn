@@ -460,6 +460,15 @@ impl Page {
             ))
             .await?;
         element.type_str(value).await?;
+        // Dispatch a final change event so `hx-trigger="change"` and validation
+        // listeners see the fully typed value.
+        self.inner
+            .evaluate(format!(
+                "(function() {{ var el = document.querySelector({}); \
+                 if (el) {{ el.dispatchEvent(new Event('change', {{ bubbles: true }})); }} }})()",
+                js_string_literal(selector)
+            ))
+            .await?;
         self.wait_for_hx_settle().await?;
         Ok(self)
     }

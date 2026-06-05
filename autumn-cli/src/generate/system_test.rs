@@ -6,15 +6,15 @@
 //!
 //! # Usage
 //!
-//!   autumn generate system-test TodoFlow
-//!   autumn generate system-test TodoFlow --dry-run
+//!   autumn generate system-test `TodoFlow`
+//!   autumn generate system-test `TodoFlow` --dry-run
 
+use std::fmt::Write as _;
 use std::path::Path;
 
 use super::emit::Plan;
 use super::model::validate_resource_name;
 use super::naming::{pascal, snake};
-use super::schema_edit::ensure_autumn_web_feature;
 use super::{Flags, GenerateError, ensure_project_root};
 
 /// Compute the file actions for `autumn generate system-test`.
@@ -49,29 +49,33 @@ pub fn plan_system_test(project_root: &Path, name: &str) -> Result<Plan, Generat
     Ok(plan)
 }
 
-/// Patch `Cargo.toml` content to add the `system-tests` feature and a
-/// `[[test]]` entry for this test file if they are not already present.
+/// Patch `Cargo.toml` content to add the `system-tests` feature (under
+/// `[features]` only, not in `[dependencies]`) and a `[[test]]` entry for this
+/// test file if they are not already present.
 fn patch_cargo_toml(existing: &str, snake_name: &str) -> String {
-    // 1. Ensure autumn-web has the system-tests feature.
-    let mut out = ensure_autumn_web_feature(existing, "system-tests");
+    let mut out = existing.to_owned();
 
-    // 2. Add [features] system-tests entry if absent.
-    let feature_line = "system-tests = [\"autumn-web/system-tests\"]";
-    if !out.contains(feature_line) {
+    // 1. Add [features] system-tests entry if the key is not already present.
+    // We check for the key name only, not an exact value, to avoid duplicating
+    // an entry that already exists with a different (or empty) definition.
+    if !out.contains("system-tests") {
+        let feature_line = "system-tests = [\"autumn-web/system-tests\"]";
         if out.contains("[features]") {
-            // Append to existing [features] block (insert after the header).
             out = out.replacen("[features]\n", &format!("[features]\n{feature_line}\n"), 1);
         } else {
-            out.push_str(&format!("\n[features]\n{feature_line}\n"));
+            let _ = write!(out, "\n[features]\n{feature_line}\n");
         }
     }
 
-    // 3. Add [[test]] entry if absent.
-    let test_name_marker = format!("name = \"{snake_name}\"");
-    if !out.contains(&test_name_marker) {
-        out.push_str(&format!(
+    // 2. Add [[test]] entry if no [[test]] block already names this test.
+    // We anchor the search to a [[test]] section to avoid false matches on the
+    // package name or other keys.
+    let test_section_marker = format!("[[test]]\nname = \"{snake_name}\"");
+    if !out.contains(&test_section_marker) {
+        let _ = write!(
+            out,
             "\n[[test]]\nname = \"{snake_name}\"\npath = \"tests/system/{snake_name}.rs\"\n"
-        ));
+        );
     }
 
     out
@@ -127,9 +131,7 @@ async fn {snake_name}_index_renders() {{
     page.visit("/").await.expect("visit /");
     page.expect_text("{pascal_name}").await.expect("page title visible");
 }}
-"#,
-        pascal_name = pascal_name,
-        snake_name = snake_name,
+"#
     )
 }
 

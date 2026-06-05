@@ -1923,29 +1923,46 @@ fn probe_browser_version(path: &std::path::Path) -> Option<String> {
 pub fn check_system_test_browser() -> CheckResult {
     let candidates = browser_candidate_paths();
     for path in &candidates {
-        if path.is_file() {
-            if let Some(version) = probe_browser_version(path) {
-                return CheckResult {
-                    name: "system_test_browser",
-                    status: CheckStatus::Pass,
-                    detail: Some(format!(
-                        "Chromium for system tests: {version} ({})",
-                        path.display()
-                    )),
-                    hint: None,
-                };
-            }
+        if path.is_file()
+            && let Some(version) = probe_browser_version(path)
+        {
+            return CheckResult {
+                name: "system_test_browser",
+                status: CheckStatus::Pass,
+                detail: Some(format!(
+                    "Chromium for system tests: {version} ({})",
+                    path.display()
+                )),
+                hint: None,
+            };
         }
     }
 
-    CheckResult {
-        name: "system_test_browser",
-        status: CheckStatus::Warn,
-        detail: Some("no Chromium binary found — system tests will be skipped".into()),
-        hint: Some(
-            "Install: apt-get install chromium-browser  \
-             or set AUTUMN_CHROMIUM=/path/to/chrome",
-        ),
+    // Only warn when the project has opted into system tests; otherwise a
+    // missing browser is irrelevant and must not fail `autumn doctor --strict`.
+    let project_uses_system_tests = std::env::current_dir()
+        .ok()
+        .and_then(|d| std::fs::read_to_string(d.join("Cargo.toml")).ok())
+        .map(|s| s.contains("system-tests"))
+        .unwrap_or(false);
+
+    if project_uses_system_tests {
+        CheckResult {
+            name: "system_test_browser",
+            status: CheckStatus::Warn,
+            detail: Some("no Chromium binary found — system tests will be skipped".into()),
+            hint: Some(
+                "Install: apt-get install chromium-browser  \
+                 or set AUTUMN_CHROMIUM=/path/to/chrome",
+            ),
+        }
+    } else {
+        CheckResult {
+            name: "system_test_browser",
+            status: CheckStatus::Pass,
+            detail: Some("no Chromium binary found (project does not use system-tests)".into()),
+            hint: None,
+        }
     }
 }
 
