@@ -92,9 +92,10 @@ async fn test_webhook_outbound_lifecycle() {
     poll_until(Duration::from_secs(5), || {
         let store = store.clone();
         async move {
-            store.get_delivery_logs().await.map_or(false, |logs| {
-                logs.iter().any(|l| l.response_status.is_some() || l.is_dlq)
-            })
+            store
+                .get_delivery_logs()
+                .await
+                .is_ok_and(|logs| logs.iter().any(|l| l.response_status.is_some() || l.is_dlq))
         }
     })
     .await;
@@ -183,7 +184,7 @@ async fn test_webhook_outbound_retries_and_dlq() {
             store
                 .get_delivery_logs()
                 .await
-                .map_or(false, |logs| logs.iter().any(|l| l.is_dlq))
+                .is_ok_and(|logs| logs.iter().any(|l| l.is_dlq))
         }
     })
     .await;
@@ -269,7 +270,7 @@ async fn test_webhook_outbound_failure_caps_deactivation() {
                 .await
                 .ok()
                 .flatten()
-                .map_or(false, |s| s.status == WebhookSubscriptionStatus::Failed)
+                .is_some_and(|s| s.status == WebhookSubscriptionStatus::Failed)
         }
     })
     .await;
@@ -351,7 +352,7 @@ async fn test_webhook_outbound_actuator_endpoints() {
             store
                 .get_delivery_logs()
                 .await
-                .map_or(false, |logs| logs.iter().any(|l| l.is_dlq))
+                .is_ok_and(|logs| logs.iter().any(|l| l.is_dlq))
         }
     })
     .await;
