@@ -1489,10 +1489,14 @@ fn parse_config_bool(value: &str) -> Option<bool> {
 }
 
 fn resolve_proxy_conflict_data() -> ProxyConflictData {
-    let table = std::fs::read_to_string("autumn.toml")
-        .ok()
-        .and_then(|c| toml::from_str::<toml::Table>(&c).ok())
+    // Use the profile-merged table so that [profile.prod] / autumn-prod.toml
+    // overrides are included — matching the pattern used by resolve_trusted_hosts.
+    let raw_profile = std::env::var("AUTUMN_ENV")
+        .or_else(|_| std::env::var("AUTUMN_PROFILE"))
         .unwrap_or_default();
+    let profile = raw_profile.trim().to_ascii_lowercase();
+    let merged = get_merged_toml_table(if profile.is_empty() { "dev" } else { &profile });
+    let table = merged;
 
     let parse_csv_env = |var: &str| -> Option<Vec<String>> {
         std::env::var(var).ok().map(|v| {

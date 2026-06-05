@@ -303,14 +303,20 @@ impl ProxyResolver {
         };
 
         if peer_is_trusted
-            && let Some(fwd_host) = req
+            && let Some(fwd_host_raw) = req
                 .headers()
                 .get("x-forwarded-host")
                 .and_then(|v| v.to_str().ok())
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
         {
-            return Some(fwd_host.to_owned());
+            // Multiple proxies may comma-append; the leftmost is the client-facing host.
+            let host = fwd_host_raw
+                .split(',')
+                .next()
+                .unwrap_or(fwd_host_raw)
+                .trim();
+            if !host.is_empty() {
+                return Some(host.to_owned());
+            }
         }
 
         req.headers()
@@ -677,6 +683,26 @@ mod tests {
         let req = Request::builder()
             .header("host", "internal.cluster.local")
             .header("x-forwarded-host", "public.example.com")
+            .body(())
+            .unwrap();
+        let host = resolver.resolve_client_host(&req).unwrap();
+        assert_eq!(host, "public.example.com");
+    }
+
+    #[test]
+    fn resolve_host_returns_leftmost_when_chained() {
+        // Proxy chain appended to X-Forwarded-Host; leftmost is client-facing.
+        let resolver = ProxyResolver::from_config(&TrustedProxiesConfig {
+            ranges: Vec::new(),
+            trusted_hops: None,
+            trust_forwarded_headers: true,
+        });
+
+        let req = Request::builder()
+            .header(
+                "x-forwarded-host",
+                "public.example.com, internal.cluster.local",
+            )
             .body(())
             .unwrap();
         let host = resolver.resolve_client_host(&req).unwrap();
