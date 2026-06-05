@@ -2207,10 +2207,26 @@ impl AutumnConfig {
     fn apply_auth_env_overrides_with_env(&mut self, env: &dyn Env) {
         parse_env(env, "AUTUMN_AUTH__BCRYPT_COST", &mut self.auth.bcrypt_cost);
         parse_env_string(env, "AUTUMN_AUTH__SESSION_KEY", &mut self.auth.session_key);
-        parse_env(env, "AUTUMN_AUTH__LOCKOUT__ENABLED", &mut self.auth.lockout.enabled);
-        parse_env(env, "AUTUMN_AUTH__LOCKOUT__THRESHOLD", &mut self.auth.lockout.threshold);
-        parse_env(env, "AUTUMN_AUTH__LOCKOUT__WINDOW_SECS", &mut self.auth.lockout.window_secs);
-        parse_env(env, "AUTUMN_AUTH__LOCKOUT__COOLOFF_SECS", &mut self.auth.lockout.cooloff_secs);
+        parse_env(
+            env,
+            "AUTUMN_AUTH__LOCKOUT__ENABLED",
+            &mut self.auth.lockout.enabled,
+        );
+        parse_env(
+            env,
+            "AUTUMN_AUTH__LOCKOUT__THRESHOLD",
+            &mut self.auth.lockout.threshold,
+        );
+        parse_env(
+            env,
+            "AUTUMN_AUTH__LOCKOUT__WINDOW_SECS",
+            &mut self.auth.lockout.window_secs,
+        );
+        parse_env(
+            env,
+            "AUTUMN_AUTH__LOCKOUT__COOLOFF_SECS",
+            &mut self.auth.lockout.cooloff_secs,
+        );
         #[cfg(feature = "oauth2")]
         {
             let provider_names: Vec<String> = self.auth.oauth2.providers.keys().cloned().collect();

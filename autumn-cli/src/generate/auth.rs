@@ -7125,7 +7125,8 @@ mod tests {
         let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
         // Must check enabled flag or threshold so operators can disable lockout.
         assert!(
-            routes.contains("lockout") && (routes.contains("enabled") || routes.contains("threshold")),
+            routes.contains("lockout")
+                && (routes.contains("enabled") || routes.contains("threshold")),
             "routes must respect lockout enabled/threshold config for opt-out: {routes}"
         );
     }
