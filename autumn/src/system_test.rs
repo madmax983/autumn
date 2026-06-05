@@ -490,42 +490,31 @@ impl Page {
     /// # Errors
     /// CDP or assertion errors.
     pub async fn click(&self, selector_or_label: &str) -> Result<&Self, SystemTestError> {
-        // Try CSS selector first; fall back to XPath text match via JS.
+        // Try CSS selector first; fall back to JS text match.
         if let Ok(element) = self.inner.find_element(selector_or_label).await {
             element.click().await?;
         } else {
-            // Restrict to interactive/visible elements so we pick the deepest
-            // clickable node rather than an ancestor (html/body) whose aggregate
-            // normalized text happens to equal the label.
-            // Walk all XPath matches in document order and click the first
-            // visible, enabled one so that hidden/template duplicates with the
-            // same label don't shadow the control the user can actually see.
-            //
-            // xpathLiteral() produces a syntactically valid XPath string for any
-            // label, including those containing both ' and " (uses concat()).
+            // Compare normalized text in JS to avoid XPath string-literal
+            // quoting issues (labels with ', ", or both). Walk interactive
+            // elements in DOM order; skip hidden/disabled nodes so a visible
+            // control is always preferred over a hidden template duplicate.
             let js = format!(
                 "(function() {{ \
-                 var label = {}; \
-                 function xpathLiteral(s) {{ \
-                   if (s.indexOf(\"'\") < 0) return \"'\" + s + \"'\"; \
-                   if (s.indexOf('\"') < 0) return '\"' + s + '\"'; \
-                   return \"concat('\" + s.split(\"'\").join(\"','\\\"'\\\",' \") + \"')\"; \
-                 }} \
-                 var lit = xpathLiteral(label); \
-                 var xpath = \"//button[normalize-space(.)=\" + lit + \"] \
-                   | //a[normalize-space(.)=\" + lit + \"] \
-                   | //input[@value and normalize-space(@value)=\" + lit + \"] \
-                   | //label[normalize-space(.)=\" + lit + \"] \
-                   | //*[@role='button' and normalize-space(.)=\" + lit + \"] \
-                   | //*[@role='link' and normalize-space(.)=\" + lit + \"]\"; \
-                 var iter = document.evaluate(xpath, document, null, \
-                   XPathResult.ORDERED_NODE_ITERATOR_TYPE, null); \
-                 var node; \
-                 while ((node = iter.iterateNext())) {{ \
-                   var s = window.getComputedStyle(node); \
-                   if (s.display === 'none' || s.visibility === 'hidden' || \
-                       parseFloat(s.opacity) === 0 || node.disabled) {{ continue; }} \
-                   node.click(); return true; \
+                 var want = {}; \
+                 var normWant = want.replace(/\\s+/g, ' ').trim(); \
+                 var nodes = Array.from(document.querySelectorAll( \
+                   'button,a,input[value],label,[role=button],[role=link]')); \
+                 for (var i = 0; i < nodes.length; i++) {{ \
+                   var el = nodes[i]; \
+                   var cs = window.getComputedStyle(el); \
+                   if (cs.display === 'none' || cs.visibility === 'hidden' || \
+                       parseFloat(cs.opacity) === 0 || el.disabled) {{ continue; }} \
+                   var text = el.tagName === 'INPUT' \
+                     ? (el.value || '') \
+                     : (el.textContent || ''); \
+                   if (text.replace(/\\s+/g, ' ').trim() === normWant) {{ \
+                     el.click(); return true; \
+                   }} \
                  }} \
                  return false; \
                  }})()",

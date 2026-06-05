@@ -100,7 +100,9 @@ fn test_section_names_test(cargo_toml: &str, test_name: &str) -> bool {
         }
         if in_test {
             if trimmed.starts_with('[') {
-                in_test = false;
+                // This header ends the current [[test]] section. If it's
+                // another [[test]], re-enter immediately so we don't skip it.
+                in_test = trimmed == "[[test]]";
                 continue;
             }
             if let Some(after) = trimmed.strip_prefix("name") {
@@ -155,7 +157,14 @@ fn patch_cargo_toml(existing: &str, snake_name: &str) -> String {
         // can insert immediately after it regardless of line ending style (LF or
         // CRLF) or trailing inline comments on the header.
         if let Some(insert_pos) = find_features_header_end(&out) {
-            out.insert_str(insert_pos, &format!("{feature_line}\n"));
+            // If the header had no trailing newline (EOF case), add one before
+            // the feature line so the manifest stays valid TOML.
+            let prefix = if insert_pos > 0 && !out[..insert_pos].ends_with('\n') {
+                "\n"
+            } else {
+                ""
+            };
+            out.insert_str(insert_pos, &format!("{prefix}{feature_line}\n"));
         } else {
             let _ = write!(out, "\n[features]\n{feature_line}\n");
         }
@@ -452,6 +461,34 @@ mod tests {
         assert!(
             result.is_err(),
             "plan_system_test must propagate Cargo.toml read errors"
+        );
+    }
+
+    #[test]
+    fn patch_cargo_toml_no_trailing_newline_on_features_header() {
+        // When [features] is the last line with no newline, the feature line
+        // must be on a new line (not run together as "[features]system-tests").
+        let src = "[package]\nname = \"x\"\n\n[features]";
+        let patched = patch_cargo_toml(src, "eof_test");
+        assert!(
+            patched.contains("[features]\nsystem-tests"),
+            "feature line must follow [features] on a new line; got: {patched:?}"
+        );
+    }
+
+    #[test]
+    fn test_section_names_test_multiple_sections() {
+        // When there are multiple [[test]] sections, the scanner must check
+        // all of them and not stop after the first one.
+        let src = "[[test]]\nname = \"other_test\"\npath = \"tests/other.rs\"\n\
+                   \n[[test]]\nname = \"my_test\"\npath = \"tests/my_test.rs\"\n";
+        assert!(
+            super::test_section_names_test(src, "my_test"),
+            "should find my_test in the second [[test]] section"
+        );
+        assert!(
+            !super::test_section_names_test(src, "missing"),
+            "should return false for a name not in any section"
         );
     }
 
