@@ -3658,10 +3658,12 @@ mod tests {
 
     #[test]
     fn parse_generate_system_test() {
-        let cli =
-            Cli::try_parse_from(["autumn", "generate", "system-test", "TodoFlow"]).unwrap();
-        let Commands::Generate(GenerateCommands::SystemTest { ref name, dry_run, force }) =
-            cli.command
+        let cli = Cli::try_parse_from(["autumn", "generate", "system-test", "TodoFlow"]).unwrap();
+        let Commands::Generate(GenerateCommands::SystemTest {
+            ref name,
+            dry_run,
+            force,
+        }) = cli.command
         else {
             panic!("expected SystemTest variant");
         };
@@ -3672,14 +3674,8 @@ mod tests {
 
     #[test]
     fn parse_generate_system_test_dry_run() {
-        let cli = Cli::try_parse_from([
-            "autumn",
-            "generate",
-            "system-test",
-            "MyTest",
-            "--dry-run",
-        ])
-        .unwrap();
+        let cli = Cli::try_parse_from(["autumn", "generate", "system-test", "MyTest", "--dry-run"])
+            .unwrap();
         let Commands::Generate(GenerateCommands::SystemTest { dry_run, .. }) = cli.command else {
             panic!("expected SystemTest variant");
         };
@@ -3688,14 +3684,8 @@ mod tests {
 
     #[test]
     fn parse_generate_system_test_force() {
-        let cli = Cli::try_parse_from([
-            "autumn",
-            "generate",
-            "system-test",
-            "MyTest",
-            "--force",
-        ])
-        .unwrap();
+        let cli = Cli::try_parse_from(["autumn", "generate", "system-test", "MyTest", "--force"])
+            .unwrap();
         let Commands::Generate(GenerateCommands::SystemTest { force, .. }) = cli.command else {
             panic!("expected SystemTest variant");
         };

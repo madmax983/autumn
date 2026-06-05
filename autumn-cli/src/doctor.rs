@@ -1867,11 +1867,7 @@ pub fn browser_candidate_paths() -> Vec<std::path::PathBuf> {
         if let Ok(entries) = std::fs::read_dir(&base) {
             let mut pw_paths: Vec<_> = entries
                 .flatten()
-                .filter(|e| {
-                    e.file_name()
-                        .to_string_lossy()
-                        .starts_with("chromium-")
-                })
+                .filter(|e| e.file_name().to_string_lossy().starts_with("chromium-"))
                 .map(|e| e.path().join("chrome-linux").join("chrome"))
                 .collect();
             pw_paths.sort();
@@ -2958,9 +2954,14 @@ redirect_uri = "http://localhost/callback"
     #[test]
     fn browser_candidate_paths_includes_common_locations() {
         let paths = browser_candidate_paths();
-        let as_strs: Vec<_> = paths.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+        let as_strs: Vec<_> = paths
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
         assert!(
-            as_strs.iter().any(|s| s.contains("chromium") || s.contains("chrome")),
+            as_strs
+                .iter()
+                .any(|s| s.contains("chromium") || s.contains("chrome")),
             "candidate list must include common Chrome paths; got {as_strs:?}"
         );
     }

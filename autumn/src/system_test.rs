@@ -320,9 +320,7 @@ impl SystemTest {
         // 2. Bind the app to an ephemeral port.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
-            .map_err(|e| {
-                SystemTestError::ArtifactIo(e)
-            })?;
+            .map_err(|e| SystemTestError::ArtifactIo(e))?;
         let addr = listener.local_addr().map_err(SystemTestError::ArtifactIo)?;
         let base_url = format!("http://127.0.0.1:{}", addr.port());
 
@@ -347,9 +345,7 @@ impl SystemTest {
             .arg("--disable-gpu")
             .arg("--headless")
             .build()
-            .map_err(|msg| SystemTestError::Browser(
-                chromiumoxide::error::CdpError::msg(msg)
-            ))?;
+            .map_err(|msg| SystemTestError::Browser(chromiumoxide::error::CdpError::msg(msg)))?;
 
         let (browser, handler) = Browser::launch(config).await?;
 
@@ -551,9 +547,7 @@ impl Page {
                     .unwrap_or_else(|| "<unknown>".into());
                 let artifact = self.write_failure_artifacts("expect_url").await.ok();
                 return Err(SystemTestError::AssertionFailed {
-                    message: format!(
-                        "expected URL to contain {pattern:?}, got {current_url:?}"
-                    ),
+                    message: format!("expected URL to contain {pattern:?}, got {current_url:?}"),
                     artifact_path: artifact,
                 });
             }
@@ -595,9 +589,7 @@ impl Page {
             if tokio::time::Instant::now() >= deadline {
                 let artifact = self.write_failure_artifacts("expect_attribute").await.ok();
                 return Err(SystemTestError::AssertionFailed {
-                    message: format!(
-                        "expected [{attr}={value:?}] on {selector:?}"
-                    ),
+                    message: format!("expected [{attr}={value:?}] on {selector:?}"),
                     artifact_path: artifact,
                 });
             }
@@ -705,9 +697,7 @@ impl Page {
         loop {
             let result = self
                 .inner
-                .evaluate(
-                    "document.querySelectorAll('.htmx-request').length === 0",
-                )
+                .evaluate("document.querySelectorAll('.htmx-request').length === 0")
                 .await?;
             let settled: bool = result.into_value().unwrap_or(true);
             if settled {
@@ -734,10 +724,11 @@ impl Page {
 
         // Screenshot
         let png_path = base.with_extension("png");
-        if let Ok(bytes) = self.inner.screenshot(
-            chromiumoxide::page::ScreenshotParams::builder()
-                .build()
-        ).await {
+        if let Ok(bytes) = self
+            .inner
+            .screenshot(chromiumoxide::page::ScreenshotParams::builder().build())
+            .await
+        {
             let _ = tokio::fs::write(&png_path, bytes).await;
         }
 
@@ -754,9 +745,10 @@ impl Page {
         let dir = &self.artifact_dir;
         tokio::fs::create_dir_all(dir).await?;
         let png_path = dir.join(label).with_extension("png");
-        let bytes = self.inner.screenshot(
-            chromiumoxide::page::ScreenshotParams::builder().build()
-        ).await?;
+        let bytes = self
+            .inner
+            .screenshot(chromiumoxide::page::ScreenshotParams::builder().build())
+            .await?;
         tokio::fs::write(&png_path, bytes).await?;
         Ok(png_path)
     }
@@ -799,11 +791,7 @@ fn browser_candidates() -> Vec<PathBuf> {
         if let Ok(entries) = std::fs::read_dir(&base) {
             let mut pw_paths: Vec<PathBuf> = entries
                 .flatten()
-                .filter(|e| {
-                    e.file_name()
-                        .to_string_lossy()
-                        .starts_with("chromium-")
-                })
+                .filter(|e| e.file_name().to_string_lossy().starts_with("chromium-"))
                 .map(|e| e.path().join("chrome-linux").join("chrome"))
                 .collect();
             pw_paths.sort();
@@ -813,15 +801,18 @@ fn browser_candidates() -> Vec<PathBuf> {
     }
 
     // 3. Well-known system paths.
-    candidates.extend([
-        "/usr/bin/chromium-browser",
-        "/usr/bin/chromium",
-        "/usr/bin/google-chrome",
-        "/usr/bin/google-chrome-stable",
-        "/snap/bin/chromium",
-        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-        "/Applications/Chromium.app/Contents/MacOS/Chromium",
-    ].map(PathBuf::from));
+    candidates.extend(
+        [
+            "/usr/bin/chromium-browser",
+            "/usr/bin/chromium",
+            "/usr/bin/google-chrome",
+            "/usr/bin/google-chrome-stable",
+            "/snap/bin/chromium",
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        ]
+        .map(PathBuf::from),
+    );
 
     candidates
 }
@@ -905,7 +896,9 @@ mod tests {
             .map(|p| p.to_string_lossy().into_owned())
             .collect();
         assert!(
-            as_strings.iter().any(|s| s.contains("chromium") || s.contains("chrome")),
+            as_strings
+                .iter()
+                .any(|s| s.contains("chromium") || s.contains("chrome")),
             "should have at least one chrome path; got {as_strings:?}"
         );
     }

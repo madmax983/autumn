@@ -960,14 +960,14 @@ pub mod reexports {
 
 /// Shared application state passed to route handlers.
 pub(crate) mod state;
+#[cfg(feature = "system-tests")]
+pub mod system_test;
 #[allow(
     clippy::missing_panics_doc,
     clippy::must_use_candidate,
     clippy::field_reassign_with_default
 )]
 pub mod test;
-#[cfg(feature = "system-tests")]
-pub mod system_test;
 pub use state::AppState;
 
 #[cfg(test)]

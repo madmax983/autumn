@@ -12,7 +12,7 @@ use std::path::Path;
 
 use super::emit::Plan;
 use super::model::validate_resource_name;
-use super::naming::{snake, pascal};
+use super::naming::{pascal, snake};
 use super::{Flags, GenerateError, ensure_project_root};
 
 /// Compute the file actions for `autumn generate system-test`.
@@ -136,11 +136,7 @@ mod tests {
         let plan = plan_system_test(tmp.path(), "TodoFlow").unwrap();
         plan.execute(Flags::default()).unwrap();
 
-        let test_file = tmp
-            .path()
-            .join("tests")
-            .join("system")
-            .join("todo_flow.rs");
+        let test_file = tmp.path().join("tests").join("system").join("todo_flow.rs");
         assert!(test_file.exists(), "expected {}", test_file.display());
 
         let content = fs::read_to_string(&test_file).unwrap();
@@ -191,10 +187,7 @@ mod tests {
             .join("tests")
             .join("system")
             .join("dry_run_test.rs");
-        assert!(
-            !test_file.exists(),
-            "dry run should not write files"
-        );
+        assert!(!test_file.exists(), "dry run should not write files");
     }
 
     #[test]

@@ -108,7 +108,9 @@ async fn add_todo_htmx_swap() {
 
     // 1. Visit the todo list.
     page.visit("/").await.expect("visit /");
-    page.expect_text("My Todos").await.expect("page heading visible");
+    page.expect_text("My Todos")
+        .await
+        .expect("page heading visible");
 
     // 2. Fill the title field.
     page.fill("input[name=title]", "Buy oat milk")
@@ -116,7 +118,9 @@ async fn add_todo_htmx_swap() {
         .expect("fill title");
 
     // 3. Click submit — triggers the htmx POST.
-    page.click("button[type=submit]").await.expect("submit form");
+    page.click("button[type=submit]")
+        .await
+        .expect("submit form");
 
     // 4. Wait for htmx to settle (auto-waited by click(); explicit for clarity).
     page.expect_hx_settle().await.expect("htmx settle");
