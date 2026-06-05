@@ -1868,7 +1868,20 @@ pub fn browser_candidate_paths() -> Vec<std::path::PathBuf> {
             let mut pw_paths: Vec<_> = entries
                 .flatten()
                 .filter(|e| e.file_name().to_string_lossy().starts_with("chromium-"))
-                .map(|e| e.path().join("chrome-linux").join("chrome"))
+                .map(|e| {
+                    if cfg!(target_os = "macos") {
+                        e.path()
+                            .join("chrome-mac")
+                            .join("Chromium.app")
+                            .join("Contents")
+                            .join("MacOS")
+                            .join("Chromium")
+                    } else if cfg!(target_os = "windows") {
+                        e.path().join("chrome-win").join("chrome.exe")
+                    } else {
+                        e.path().join("chrome-linux").join("chrome")
+                    }
+                })
                 .collect();
             pw_paths.sort();
             pw_paths.reverse();

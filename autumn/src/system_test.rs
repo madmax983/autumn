@@ -347,7 +347,13 @@ impl SystemTest {
             .build()
             .map_err(|msg| SystemTestError::Browser(chromiumoxide::error::CdpError::msg(msg)))?;
 
-        let (browser, handler) = Browser::launch(config).await?;
+        let (browser, handler) =
+            tokio::time::timeout(self.browser_timeout, Browser::launch(config))
+                .await
+                .map_err(|_| SystemTestError::Timeout {
+                    message: "timed out waiting for Chromium to launch".into(),
+                    timeout: self.browser_timeout,
+                })??;
 
         // Drive the CDP event loop in a background task.
         tokio::spawn(async move {
@@ -443,9 +449,18 @@ impl Page {
     pub async fn fill(&self, selector: &str, value: &str) -> Result<&Self, SystemTestError> {
         let element = self.inner.find_element(selector).await?;
         element.click().await?;
-        // Clear the field via Ctrl+A + Delete.
-        element.press_key("a").await?; // requires Ctrl; handled by chromiumoxide
+        // Clear via JS and dispatch events so htmx/frameworks detect the change.
+        self.inner
+            .evaluate(format!(
+                "(function() {{ var el = document.querySelector({}); \
+                 if (el) {{ el.value = ''; \
+                 el.dispatchEvent(new Event('input', {{ bubbles: true }})); \
+                 el.dispatchEvent(new Event('change', {{ bubbles: true }})); }} }})()",
+                js_string_literal(selector)
+            ))
+            .await?;
         element.type_str(value).await?;
+        self.wait_for_hx_settle().await?;
         Ok(self)
     }
 
@@ -458,20 +473,29 @@ impl Page {
     /// # Errors
     /// CDP or assertion errors.
     pub async fn click(&self, selector_or_label: &str) -> Result<&Self, SystemTestError> {
-        // Try CSS selector first; fall back to text match.
-        let element = self
-            .inner
-            .find_element(selector_or_label)
-            .await
-            .or_else(|_| {
-                // Text-content match via XPath-style selector
-                let xpath = format!("//*[normalize-space(text())='{selector_or_label}']");
-                // chromiumoxide doesn't support XPath directly; use JS
-                let _ = xpath;
-                Err(chromiumoxide::error::CdpError::NotFound)
-            })?;
-
-        element.click().await?;
+        // Try CSS selector first; fall back to XPath text match via JS.
+        if let Ok(element) = self.inner.find_element(selector_or_label).await {
+            element.click().await?;
+        } else {
+            let js = format!(
+                "(function() {{ \
+                 var xpath = \"//*[normalize-space(text())='\" + {} + \"']\"; \
+                 var result = document.evaluate(xpath, document, null, \
+                   XPathResult.FIRST_ORDERED_NODE_TYPE, null); \
+                 var el = result.singleNodeValue; \
+                 if (el) {{ el.click(); return true; }} \
+                 return false; \
+                 }})()",
+                js_string_literal(selector_or_label)
+            );
+            let clicked: bool = self.inner.evaluate(js).await?.into_value().unwrap_or(false);
+            if !clicked {
+                return Err(SystemTestError::AssertionFailed {
+                    message: format!("element not found by selector or text: {selector_or_label}"),
+                    artifact_path: None,
+                });
+            }
+        }
         self.wait_for_hx_settle().await?;
         Ok(self)
     }
@@ -690,6 +714,19 @@ impl Page {
         self.write_screenshot("snapshot").await
     }
 
+    /// Evaluate a JavaScript expression on the page and return the result.
+    ///
+    /// # Errors
+    /// Propagates CDP errors.
+    pub async fn evaluate(
+        &self,
+        js: impl Into<String>,
+    ) -> Result<chromiumoxide::js::EvaluationResult, SystemTestError> {
+        let js_str: String = js.into();
+        let res = self.inner.evaluate(js_str).await?;
+        Ok(res)
+    }
+
     // ── Internal helpers ──────────────────────────────────────────────────
 
     async fn wait_for_hx_settle(&self) -> Result<(), SystemTestError> {
@@ -697,7 +734,7 @@ impl Page {
         loop {
             let result = self
                 .inner
-                .evaluate("document.querySelectorAll('.htmx-request').length === 0")
+                .evaluate("document.querySelectorAll('.htmx-request,.htmx-settling').length === 0")
                 .await?;
             let settled: bool = result.into_value().unwrap_or(true);
             if settled {
@@ -787,12 +824,24 @@ fn browser_candidates() -> Vec<PathBuf> {
     // 2. Playwright browsers directory.
     if let Ok(base) = std::env::var("PLAYWRIGHT_BROWSERS_PATH") {
         let base = PathBuf::from(base);
-        // Playwright stores Chromium under chromium-<rev>/chrome-linux/chrome
         if let Ok(entries) = std::fs::read_dir(&base) {
             let mut pw_paths: Vec<PathBuf> = entries
                 .flatten()
                 .filter(|e| e.file_name().to_string_lossy().starts_with("chromium-"))
-                .map(|e| e.path().join("chrome-linux").join("chrome"))
+                .map(|e| {
+                    if cfg!(target_os = "macos") {
+                        e.path()
+                            .join("chrome-mac")
+                            .join("Chromium.app")
+                            .join("Contents")
+                            .join("MacOS")
+                            .join("Chromium")
+                    } else if cfg!(target_os = "windows") {
+                        e.path().join("chrome-win").join("chrome.exe")
+                    } else {
+                        e.path().join("chrome-linux").join("chrome")
+                    }
+                })
                 .collect();
             pw_paths.sort();
             pw_paths.reverse(); // highest revision first

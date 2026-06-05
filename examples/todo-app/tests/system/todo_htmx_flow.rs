@@ -150,6 +150,11 @@ async fn empty_title_not_added() {
     page.expect_hx_settle().await.expect("settle");
 
     // No items should appear.
-    let result = page.expect_text("li").await;
-    assert!(result.is_err(), "empty title must not add a list item");
+    let has_li: bool = page
+        .evaluate("document.querySelector('li') !== null")
+        .await
+        .expect("evaluate")
+        .into_value()
+        .unwrap_or(false);
+    assert!(!has_li, "empty title must not add a list item");
 }
