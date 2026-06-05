@@ -73,7 +73,7 @@ system-info = []
 csv = ["dep:csv"]
 
 [dependencies]
-autumn-macros = { version = "0.4.0", path = "../autumn-macros" }
+autumn-macros = { version = "0.5.0", path = "../autumn-macros" }
 axum.workspace = true
 bytes = "1"
 http-body = "1"

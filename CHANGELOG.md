@@ -5,7 +5,7 @@ All notable changes to the Autumn framework will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] - 0.5.0
+## [0.5.0] - 2026-06-04
 
 ### Added
 
@@ -30,10 +30,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 To opt out of the generated `page` method: implement your own list handler using `repo.find_all()` or a custom Diesel query.  The `find_all` method is unchanged.
 
+- **configuration:** Add TOML config file support to generated scaffolds and a runtime configuration system for live-tunable operational knobs (#773, #931).
+- **data and repositories:** Add soft delete, high-performance bulk CRUD, Postgres full-text search, automatic version history, CSV import/export, and per-query statement timeout/slow-query telemetry support (#858, #881, #905, #922, #1075, #865).
+- **development loop:** Add the dev-mode error overlay, generator conformance CI gate, dev-loop latency budgets, and framework runtime benchmarks (#1080, #1079, #920, #756).
+- **HTTP and routing:** Add safe HTML method override handling, ETag conditional GET helpers, per-request timeout and body-size middleware, first-class response compression, and API versioning with deprecation and sunset lifecycles (#605, #853, #996, #1083, #1077).
+- **operations:** Add rolling-deploy shutdown contracts, maintenance mode middleware and CLI commands, W3C trace-context propagation across jobs/mailers, traced outbound HTTP client retries/mocks, outbound signed webhooks with retries/DLQ/actuator endpoints, and pluggable error reporting for panics and 5xx responses (#843, #917, #854, #863, #923, #1047).
+- **security:** Add encrypted credentials, at-rest attribute encryption, direct browser-to-storage uploads, trusted-host validation, CSP nonces, log parameter scrubbing, per-principal/API-token rate limits, TOTP auth scaffolding, and WebAuthn passkey scaffolding (#849, #1058, #860, #885, #915, #903, #1001, #1057, #1070).
+- **state and collaboration:** Add after-commit callbacks, HTTP idempotency-key middleware, row-level multi-tenancy, Redis-backed global rate limiting, first-class feature flags, A/B experiments, distributed presence, active search/autocomplete widgets, inline field validation, and an injectable `Clock` extractor for deterministic tests (#778, #779, #876, #764, #1000, #1016, #973, #989, #991, #1014).
+- **content and tooling:** Add Markdown rendering with frontmatter/SSG support, `autumn generate mailer`, migration safety preflight checks, and plugin hooks at framework-owned dependency boundaries (#921, #866, #762, #862).
+
 ### Fixed
 
 - **tenancy:** Normalize hostnames to lowercase in subdomain mode for DNS case-insensitivity
 - **tenancy:** Add `jwt_audience` config field; enable audience validation when configured
+- Keep the release gate from mutating the changelog during validation (#763).
+- Fix rate-limit `X-Forwarded-For` spoofing bypasses and add targeted mutant-killing coverage for proxy handling (#753, #787, #789).
+- Fix benchmark and CI lint/doc-build regressions across the 0.5.0 line (#783, #800, #801, #1041).
+
+### Changed
+
+- Move the static file layer inside the user middleware stack so custom middleware observes static responses consistently (#845).
+- Revert the OAuth2/OIDC social-login scaffold from this release line after review; the TOTP and WebAuthn scaffolds remain in scope for 0.5.0 (#1046).
+
+### Documentation
+
+- Add and refresh guides for pagination, hooks and transactions, dev inspector, runtime configuration, CSV/admin data flows, API versioning, compression, and first-run release smoke coverage.
 
 
 ## [0.4.0] - 2026-05-12

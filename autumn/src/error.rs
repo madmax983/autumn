@@ -562,6 +562,8 @@ impl AutumnError {
             details: None,
             problem_type: Some("https://autumn.dev/problems/gone"),
             cache_idempotency_response: false,
+            #[cfg(debug_assertions)]
+            backtrace_string: Some(format!("{}", std::backtrace::Backtrace::force_capture())),
         }
     }
 
@@ -1153,6 +1155,19 @@ mod tests {
         let err = AutumnError::conflict_msg("please reload and retry");
         assert_eq!(err.status(), StatusCode::CONFLICT);
         assert_eq!(err.to_string(), "please reload and retry");
+    }
+
+    #[test]
+    fn gone_is_410() {
+        let err = AutumnError::gone(TestError("sunsetted".into()));
+        assert_eq!(err.status(), StatusCode::GONE);
+    }
+
+    #[test]
+    fn gone_msg_is_410() {
+        let err = AutumnError::gone_msg("API version has been sunsetted");
+        assert_eq!(err.status(), StatusCode::GONE);
+        assert_eq!(err.to_string(), "API version has been sunsetted");
     }
 
     #[tokio::test]

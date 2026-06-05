@@ -824,7 +824,7 @@ mod tests {
             timestamp_utc: "2026-05-26T00:00:00Z".to_string(),
             runner_os: "Linux".to_string(),
             rust_version: "1.88.0".to_string(),
-            autumn_version: "0.4.0".to_string(),
+            autumn_version: "0.5.0".to_string(),
             example_name: "examples/hello".to_string(),
             all_passed: computed_all_passed,
             results,

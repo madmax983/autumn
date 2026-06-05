@@ -738,26 +738,12 @@ pub fn start_repository_commit_hook_pending_finalizer_heartbeat(
 ) -> RepositoryCommitHookPendingHeartbeat {
     let shutdown = CancellationToken::new();
     let heartbeat_shutdown = shutdown.child_token();
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                () = heartbeat_shutdown.cancelled() => break,
-                () = tokio::time::sleep(HOOK_PENDING_FINALIZER_HEARTBEAT_INTERVAL) => {
-                    match pg_extend_repository_commit_hook_pending_finalizer(&pool, &hook_id, &owner).await {
-                        Ok(true) => {}
-                        Ok(false) => break,
-                        Err(error) => {
-                            tracing::warn!(
-                                hook_id = %hook_id,
-                                error = %error,
-                                "failed to extend repository commit hook pending finalizer lease"
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    });
+    tokio::spawn(heartbeat_repository_commit_hook_pending_finalizer(
+        pool,
+        hook_id,
+        owner,
+        heartbeat_shutdown,
+    ));
     RepositoryCommitHookPendingHeartbeat::new(shutdown)
 }
 
@@ -986,6 +972,32 @@ async fn heartbeat_repository_commit_hook_claim(
                             hook_id = %hook_id,
                             error = %error,
                             "failed to extend repository commit hook claim"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn heartbeat_repository_commit_hook_pending_finalizer(
+    pool: PgPool,
+    hook_id: String,
+    owner: String,
+    shutdown: CancellationToken,
+) {
+    loop {
+        tokio::select! {
+            () = shutdown.cancelled() => break,
+            () = tokio::time::sleep(HOOK_PENDING_FINALIZER_HEARTBEAT_INTERVAL) => {
+                match pg_extend_repository_commit_hook_pending_finalizer(&pool, &hook_id, &owner).await {
+                    Ok(true) => {}
+                    Ok(false) => break,
+                    Err(error) => {
+                        tracing::warn!(
+                            hook_id = %hook_id,
+                            error = %error,
+                            "failed to extend repository commit hook pending finalizer lease"
                         );
                     }
                 }

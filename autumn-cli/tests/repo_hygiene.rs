@@ -385,6 +385,137 @@ fn publish_dry_run_script_uses_list_not_no_verify() {
 }
 
 #[test]
+fn shell_release_scripts_are_lf_normalized() {
+    let root = workspace_root();
+    let attributes_path = root.join(".gitattributes");
+    let attributes = std::fs::read_to_string(&attributes_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", attributes_path.display()));
+    assert!(
+        attributes.contains("*.sh text eol=lf"),
+        ".gitattributes must force LF checkout for shell scripts so release gates run under bash"
+    );
+
+    let scripts_dir = root.join("scripts");
+    for entry in std::fs::read_dir(&scripts_dir)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", scripts_dir.display()))
+    {
+        let entry = entry.unwrap_or_else(|err| panic!("failed to read script entry: {err}"));
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("sh") {
+            continue;
+        }
+
+        let bytes = std::fs::read(&path)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+        assert!(
+            !bytes.windows(2).any(|window| window == b"\r\n"),
+            "{} must use LF line endings; CRLF makes bash treat options and blank lines as containing carriage returns",
+            path.display()
+        );
+    }
+}
+
+#[test]
+fn semver_script_installs_tool_without_lto_hotspot() {
+    let root = workspace_root();
+    let script_path = root.join("scripts/check-semver.sh");
+    let script = std::fs::read_to_string(&script_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", script_path.display()));
+
+    assert!(
+        script.contains(r#"CARGO_PROFILE_RELEASE_LTO="${CARGO_PROFILE_RELEASE_LTO:-false}""#),
+        "{} must disable release LTO only for auto-installing cargo-semver-checks; Windows rustc has crashed in that installer profile",
+        script_path.display(),
+    );
+    assert!(
+        script.contains(
+            r#"CARGO_PROFILE_RELEASE_CODEGEN_UNITS="${CARGO_PROFILE_RELEASE_CODEGEN_UNITS:-16}""#
+        ),
+        "{} must avoid codegen-units=1 only for auto-installing cargo-semver-checks",
+        script_path.display(),
+    );
+    assert!(
+        script.contains("cargo install cargo-semver-checks --locked"),
+        "{} must still install cargo-semver-checks when the tool is missing",
+        script_path.display(),
+    );
+}
+
+#[test]
+fn semver_script_runs_checks_with_pinned_rustdoc_toolchain() {
+    let root = workspace_root();
+    let script_path = root.join("scripts/check-semver.sh");
+    let script = std::fs::read_to_string(&script_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", script_path.display()));
+
+    assert!(
+        script.contains(r#"semver_toolchain="${AUTUMN_SEMVER_RUST_VERSION:-1.92.0}""#),
+        "{} must pin the semver rustdoc toolchain to Rust 1.92.0 by default",
+        script_path.display(),
+    );
+    assert!(
+        script.contains(r#"SEMVER_CARGO=(rustup run "$semver_toolchain" cargo)"#),
+        "{} must run cargo-semver-checks through the pinned semver toolchain; \
+         latest stable rustdoc JSON has ICE'd on Diesel/diesel-async",
+        script_path.display(),
+    );
+    assert!(
+        script.contains(r#""${SEMVER_CARGO[@]}" semver-checks check-release --package "$crate""#),
+        "{} must use the pinned cargo wrapper for the semver-checks invocation",
+        script_path.display(),
+    );
+    assert!(
+        script.contains("--default-features"),
+        "{} must restrict cargo-semver-checks to default features; its default \
+         heuristic enables optional webauthn and pulls OpenSSL on Windows",
+        script_path.display(),
+    );
+
+    let workflow_path = root.join(".github/workflows/publish-gate.yml");
+    let workflow = std::fs::read_to_string(&workflow_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", workflow_path.display()));
+    let semver_job = workflow
+        .split("  semver:")
+        .nth(1)
+        .and_then(|job| job.split("\n  # ---").next())
+        .unwrap_or_else(|| panic!("{} must define a semver job", workflow_path.display()));
+    assert!(
+        semver_job.contains("dtolnay/rust-toolchain@1.92.0"),
+        "{} semver job must install the pinned Rust 1.92.0 toolchain",
+        workflow_path.display(),
+    );
+}
+
+#[test]
+fn semver_script_reports_tool_failures_separately_from_api_breaks() {
+    let root = workspace_root();
+    let script_path = root.join("scripts/check-semver.sh");
+    let script = std::fs::read_to_string(&script_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", script_path.display()));
+
+    assert!(
+        script.contains("breaking_failures=0"),
+        "{} must track SemVer API break findings separately",
+        script_path.display(),
+    );
+    assert!(
+        script.contains("tool_failures=0"),
+        "{} must track cargo-semver-checks/tool failures separately",
+        script_path.display(),
+    );
+    assert!(
+        script.contains("tool_failures=$((tool_failures + 1))"),
+        "{} must not report registry/network/compiler failures as API breaks",
+        script_path.display(),
+    );
+    assert!(
+        script.contains("SemVer check had $tool_failures tool/invocation failure(s)."),
+        "{} must end with an infrastructure/tool failure message when crates.io or rustdoc fails",
+        script_path.display(),
+    );
+}
+
+#[test]
 fn publish_gate_prepare_release_does_not_mutate_changelog() {
     let root = workspace_root();
     let workflow_path = root.join(".github/workflows/publish-gate.yml");

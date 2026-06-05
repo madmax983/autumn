@@ -167,7 +167,7 @@ autumn dev-loop-bench --fail-on-regression
 
 ```
 Autumn dev-loop latency report — 2026-05-26T12:00:00Z
-Runner: linux  Rust: 1.88.0  autumn-web: 0.4.0
+Runner: linux  Rust: 1.88.0  autumn-web: 0.5.0
 Example: examples/hello
 
 Change class                                        p50 ms   p95 ms   max ms  Status
@@ -192,7 +192,7 @@ evidence. Example structure:
   "timestamp_utc": "2026-05-26T12:00:00Z",
   "runner_os": "linux",
   "rust_version": "rustc 1.88.0 (stable)",
-  "autumn_version": "0.4.0",
+  "autumn_version": "0.5.0",
   "example_name": "examples/hello",
   "all_passed": true,
   "results": [

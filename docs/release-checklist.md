@@ -28,7 +28,7 @@ All crates share a single workspace version (`[workspace.package].version` in
 
 - Every crate's `version` field inherits from `[workspace.package].version`.
 - Crates that depend on other published Autumn crates pin the **exact workspace
-  version** (e.g. `autumn-web = { version = "0.4.0", ... }`). A workspace
+  version** (e.g. `autumn-web = { version = "X.Y.Z", ... }`). A workspace
   version bump must update these pins in lockstep.
 - The `[patch.crates-io]` override in the root `Cargo.toml` redirects
   `autumn-web` to the local workspace path during development. **Remove or
@@ -191,8 +191,8 @@ Before pushing the release tag:
    ```
 5. **Tag and push:**
    ```bash
-   git tag v0.4.0
-   git push origin v0.4.0
+   git tag v0.5.0
+   git push origin v0.5.0
    ```
    The `publish-gate` workflow runs automatically. The `release` workflow runs
    only after `publish-gate` succeeds.
