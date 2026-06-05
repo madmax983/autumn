@@ -525,7 +525,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn plan_rejects_virtual_workspace() {
         let tmp = TempDir::new().unwrap();
         fs::write(
