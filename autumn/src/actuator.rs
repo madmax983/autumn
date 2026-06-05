@@ -40,6 +40,215 @@ impl A11yPosture {
     }
 }
 
+// ── Plugin-contributed metrics ──────────────────────────────────
+
+/// Kind of a Prometheus metric family.
+///
+/// Used in [`MetricFamily`] to emit the correct `# TYPE` line in the
+/// Prometheus text format.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MetricKind {
+    /// A monotonically increasing value (e.g., request count).
+    Counter,
+    /// An arbitrary up-or-down value (e.g., queue depth, active connections).
+    Gauge,
+    /// A sampled distribution (e.g., latency buckets).
+    Histogram,
+}
+
+impl MetricKind {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Counter => "counter",
+            Self::Gauge => "gauge",
+            Self::Histogram => "histogram",
+        }
+    }
+}
+
+/// A single metric sample with optional label set and a value.
+///
+/// Labels are `(name, value)` pairs rendered as `{name="value"}` in
+/// Prometheus text format.
+#[derive(Debug, Clone)]
+pub struct MetricSample {
+    /// Label key-value pairs. Empty means no labels.
+    pub labels: Vec<(String, String)>,
+    /// The metric value.
+    pub value: f64,
+}
+
+/// A complete metric family: name, kind, help text, and current samples.
+///
+/// Each `MetricFamily` is rendered as one `# HELP` / `# TYPE` block followed
+/// by one line per sample in the Prometheus text format.
+#[derive(Debug, Clone)]
+pub struct MetricFamily {
+    /// Unique metric name (e.g., `"harvest_workflow_completions_total"`).
+    ///
+    /// Use a stable namespace prefix so names don't collide with the built-in
+    /// `autumn_*` families or other registered sources.
+    pub name: String,
+    /// One-line description emitted as `# HELP` in the Prometheus output.
+    pub help: String,
+    /// Metric type: counter, gauge, or histogram.
+    pub kind: MetricKind,
+    /// Current samples.  Each sample produces one line in the scrape output.
+    pub samples: Vec<MetricSample>,
+}
+
+/// Contract for a subsystem that contributes metrics to the unified actuator endpoints.
+///
+/// Implement this trait and register the implementation via
+/// [`AppBuilder::metrics_source`] to publish metric families that appear in
+/// `/actuator/prometheus` alongside the built-in `autumn_http_*` families, and
+/// in `/actuator/metrics` under the `sources` key.
+///
+/// # Naming rules
+///
+/// Prefix every metric name with a stable namespace (e.g. `harvest_` for
+/// autumn-harvest, `myapp_` for an application-level source).  The registry
+/// enforces that two sources cannot share the same **registration name**; metric
+/// family name uniqueness is the source's responsibility.
+///
+/// # Sync-snapshot contract
+///
+/// `collect` is called synchronously on the HTTP request goroutine.
+/// Implementations **must not block on I/O** — read from atomics,
+/// `RwLock`-protected snapshots, or channels that already have buffered data.
+/// If async work is needed, collect it into a pre-computed cache and update
+/// that cache from a background task.
+pub trait MetricsSource: Send + Sync + 'static {
+    /// Return zero or more metric families, all read from in-memory state.
+    fn collect(&self) -> Vec<MetricFamily>;
+}
+
+/// Registry of named [`MetricsSource`] implementations.
+///
+/// Maintained by [`crate::app::AppBuilder`] and stored on
+/// [`crate::AppState`]. Provides duplicate-registration detection at startup
+/// and per-source panic isolation at scrape time.
+#[derive(Clone, Default)]
+pub struct MetricsSourceRegistry {
+    inner: Arc<RwLock<MetricsSourceRegistryInner>>,
+}
+
+#[derive(Default)]
+struct MetricsSourceRegistryInner {
+    /// Registered sources in insertion order.
+    sources: Vec<(String, Arc<dyn MetricsSource>)>,
+    /// Per-source scrape-error counter incremented when a source panics.
+    error_counts: HashMap<String, u64>,
+}
+
+impl MetricsSourceRegistry {
+    /// Create a new, empty registry.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register a named source.
+    ///
+    /// Returns `Err` containing a message if a source with `name` has already
+    /// been registered (startup-time collision detection).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string when `name` is already registered.
+    pub fn register(
+        &self,
+        name: impl Into<String>,
+        source: Arc<dyn MetricsSource>,
+    ) -> Result<(), String> {
+        let name = name.into();
+        let mut inner = self
+            .inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if inner.sources.iter().any(|(n, _)| n == &name) {
+            return Err(format!(
+                "MetricsSource '{}' is already registered; skipping duplicate",
+                name
+            ));
+        }
+        inner.sources.push((name, source));
+        Ok(())
+    }
+
+    /// Collect from all registered sources, isolating panics.
+    ///
+    /// Returns one entry per registered source; panicking sources contribute an
+    /// empty `Vec<MetricFamily>` and increment their error counter.
+    pub fn collect_all(&self) -> Vec<(String, Vec<MetricFamily>)> {
+        let sources: Vec<(String, Arc<dyn MetricsSource>)> = self
+            .inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .sources
+            .clone();
+
+        let mut results = Vec::with_capacity(sources.len());
+        let mut panicked = Vec::new();
+
+        for (name, source) in &sources {
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| source.collect()));
+            match result {
+                Ok(families) => results.push((name.clone(), families)),
+                Err(_) => {
+                    panicked.push(name.clone());
+                    results.push((name.clone(), vec![]));
+                }
+            }
+        }
+
+        if !panicked.is_empty() {
+            let mut inner = self
+                .inner
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for name in panicked {
+                *inner.error_counts.entry(name).or_insert(0) += 1;
+            }
+        }
+
+        results
+    }
+
+    /// Current per-source scrape-error counts (incremented on panic isolation).
+    #[must_use]
+    pub fn error_counts(&self) -> HashMap<String, u64> {
+        self.inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .error_counts
+            .clone()
+    }
+
+    /// Names of all registered sources, in insertion order.
+    #[must_use]
+    pub fn source_names(&self) -> Vec<String> {
+        self.inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .sources
+            .iter()
+            .map(|(n, _)| n.clone())
+            .collect()
+    }
+
+    /// Returns `true` when no sources have been registered.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .sources
+            .is_empty()
+    }
+}
+
 /// Trait to abstract the state requirements for actuator handlers.
 ///
 /// Implement this trait on your application's state type to provide
@@ -97,6 +306,15 @@ pub trait ProvideActuatorState {
     /// returns all-false (no concerns addressed) — a conservative safe default.
     fn a11y_posture(&self) -> A11yPosture {
         A11yPosture::default()
+    }
+
+    /// Returns the registry of plugin-contributed [`MetricsSource`] implementations.
+    ///
+    /// The default returns `None`, meaning no plugin sources are consulted.
+    /// [`crate::AppState`] overrides this to return its registry, which is
+    /// populated by [`crate::app::AppBuilder::metrics_source`].
+    fn metrics_source_registry(&self) -> Option<&MetricsSourceRegistry> {
+        None
     }
 
     #[cfg(feature = "http-client")]
@@ -1129,30 +1347,78 @@ pub(crate) async fn metrics_endpoint<S: ProvideActuatorState + Send + Sync + 'st
     State(state): State<S>,
 ) -> Json<serde_json::Value> {
     let snapshot = state.metrics().snapshot();
-    let result = serde_json::to_value(&snapshot).unwrap_or_default();
+    let mut result = serde_json::to_value(&snapshot).unwrap_or_default();
 
     // Include DB pool stats if available
     #[cfg(feature = "db")]
-    let result = {
-        let mut result = result;
-        if let Some(pool) = state.pool() {
-            let status = pool.status();
-            let db_stats = serde_json::json!({
-                "pool_size": status.max_size,
-                "active_connections": (status.max_size as u64).saturating_sub(status.available as u64),
-                "idle_connections": status.available,
-            });
-            if let serde_json::Value::Object(ref mut map) = result {
-                map.insert("database".to_string(), db_stats);
-            }
+    if let Some(pool) = state.pool() {
+        let status = pool.status();
+        let db_stats = serde_json::json!({
+            "pool_size": status.max_size,
+            "active_connections": (status.max_size as u64).saturating_sub(status.available as u64),
+            "idle_connections": status.available,
+        });
+        if let serde_json::Value::Object(ref mut map) = result {
+            map.insert("database".to_string(), db_stats);
         }
-        result
-    };
+    }
+
+    // Include plugin-contributed sources under the "sources" key
+    if let Some(registry) = state.metrics_source_registry() {
+        let all = registry.collect_all();
+        let mut sources = serde_json::Map::new();
+        for (source_name, families) in all {
+            let families_json: Vec<serde_json::Value> = families
+                .iter()
+                .map(|f| {
+                    serde_json::json!({
+                        "name": f.name,
+                        "help": f.help,
+                        "kind": f.kind.as_str(),
+                        "samples": f.samples.iter().map(|s| serde_json::json!({
+                            "labels": s.labels.iter().map(|(k, v)| serde_json::json!({k: v})).collect::<Vec<_>>(),
+                            "value": s.value,
+                        })).collect::<Vec<_>>(),
+                    })
+                })
+                .collect();
+            sources.insert(source_name, serde_json::Value::Array(families_json));
+        }
+        if let serde_json::Value::Object(ref mut map) = result {
+            map.insert("sources".to_string(), serde_json::Value::Object(sources));
+        }
+    }
 
     Json(result)
 }
 
 // ── Prometheus ─────────────────────────────────────────────────
+
+/// Escape a Prometheus label value: backslash, newline, and double-quote need escaping.
+fn escape_label_value(v: &str) -> String {
+    let mut out = String::with_capacity(v.len());
+    for c in v.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '"' => out.push_str("\\\""),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Render label set `{k="v",...}` or empty string for no labels.
+fn render_labels(labels: &[(String, String)]) -> String {
+    if labels.is_empty() {
+        return String::new();
+    }
+    let pairs: Vec<String> = labels
+        .iter()
+        .map(|(k, v)| format!("{}=\"{}\"", k, escape_label_value(v)))
+        .collect();
+    format!("{{{}}}", pairs.join(","))
+}
 
 /// `GET <actuator-prefix>/prometheus` -- export metrics in Prometheus format.
 pub(crate) async fn prometheus_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
@@ -1161,7 +1427,7 @@ pub(crate) async fn prometheus_endpoint<S: ProvideActuatorState + Send + Sync + 
     use std::fmt::Write;
 
     let snapshot = state.metrics().snapshot();
-    let mut out = String::with_capacity(1024);
+    let mut out = String::with_capacity(2048);
 
     // requests_total
     out.push_str("# HELP autumn_http_requests_total Total number of HTTP requests\n");
@@ -1233,13 +1499,51 @@ pub(crate) async fn prometheus_endpoint<S: ProvideActuatorState + Send + Sync + 
     if !snapshot.http.by_route.is_empty() {
         out.push_str("# HELP autumn_http_route_requests_total HTTP requests by route and method\n");
         out.push_str("# TYPE autumn_http_route_requests_total counter\n");
-        for (route_key, metrics) in &snapshot.http.by_route {
+        let mut route_keys: Vec<&String> = snapshot.http.by_route.keys().collect();
+        route_keys.sort();
+        for route_key in route_keys {
+            let metrics = &snapshot.http.by_route[route_key];
             // route_key is formatted as "METHOD /path"
             if let Some((method, path)) = route_key.split_once(' ') {
                 let _ = writeln!(
                     out,
                     "autumn_http_route_requests_total{{method=\"{}\",route=\"{}\"}} {}",
                     method, path, metrics.count
+                );
+            }
+        }
+    }
+
+    // Plugin-contributed metric families
+    if let Some(registry) = state.metrics_source_registry() {
+        let all_sources = registry.collect_all();
+        for (_source_name, families) in &all_sources {
+            for family in families {
+                let _ = writeln!(out, "# HELP {} {}", family.name, family.help);
+                let _ = writeln!(out, "# TYPE {} {}", family.name, family.kind.as_str());
+                for sample in &family.samples {
+                    let labels = render_labels(&sample.labels);
+                    let _ = writeln!(out, "{}{} {}", family.name, labels, sample.value);
+                }
+            }
+        }
+
+        // Emit error counter family for any source that panicked during this scrape
+        let error_counts = registry.error_counts();
+        if !error_counts.is_empty() {
+            out.push_str(
+                "# HELP autumn_metrics_source_errors_total \
+                 Number of scrape errors (panics) per plugin metrics source\n",
+            );
+            out.push_str("# TYPE autumn_metrics_source_errors_total counter\n");
+            let mut names: Vec<&String> = error_counts.keys().collect();
+            names.sort();
+            for name in names {
+                let _ = writeln!(
+                    out,
+                    "autumn_metrics_source_errors_total{{source=\"{}\"}} {}",
+                    name,
+                    error_counts[name]
                 );
             }
         }
@@ -1960,6 +2264,7 @@ mod tests {
         task_registry: TaskRegistry,
         job_registry: JobRegistry,
         config_props: ConfigProperties,
+        metrics_source_registry: MetricsSourceRegistry,
         #[cfg(feature = "http-client")]
         webhook_outbound: Option<crate::webhook_outbound::WebhookOutboundManager>,
         #[cfg(feature = "db")]
@@ -1994,6 +2299,9 @@ mod tests {
         fn uptime_display(&self) -> String {
             "test_uptime".to_string()
         }
+        fn metrics_source_registry(&self) -> Option<&MetricsSourceRegistry> {
+            Some(&self.metrics_source_registry)
+        }
         #[cfg(feature = "http-client")]
         fn webhook_outbound(&self) -> Option<crate::webhook_outbound::WebhookOutboundManager> {
             self.webhook_outbound.clone()
@@ -2027,6 +2335,7 @@ mod tests {
             task_registry: TaskRegistry::new(),
             job_registry: JobRegistry::new(),
             config_props: ConfigProperties::from_config(config),
+            metrics_source_registry: MetricsSourceRegistry::new(),
             #[cfg(feature = "http-client")]
             webhook_outbound: None,
             #[cfg(feature = "db")]
@@ -3254,6 +3563,248 @@ mod tests {
             paths.iter().any(|p| p == "/actuator/a11y"),
             "a11y path not found in: {paths:?}"
         );
+    }
+
+    // ── MetricsSource / MetricsSourceRegistry tests ────────────
+
+    #[test]
+    fn metrics_source_registry_registers_and_collects() {
+        struct FixedSource;
+        impl MetricsSource for FixedSource {
+            fn collect(&self) -> Vec<MetricFamily> {
+                vec![MetricFamily {
+                    name: "plugin_requests_total".to_string(),
+                    help: "Plugin request count".to_string(),
+                    kind: MetricKind::Counter,
+                    samples: vec![MetricSample {
+                        labels: vec![],
+                        value: 42.0,
+                    }],
+                }]
+            }
+        }
+
+        let registry = MetricsSourceRegistry::new();
+        registry
+            .register("myplugin", Arc::new(FixedSource))
+            .unwrap();
+
+        let all = registry.collect_all();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].0, "myplugin");
+        assert_eq!(all[0].1[0].name, "plugin_requests_total");
+        assert_eq!(all[0].1[0].samples[0].value, 42.0);
+    }
+
+    #[test]
+    fn metrics_source_registry_rejects_duplicate_name() {
+        struct EmptySource;
+        impl MetricsSource for EmptySource {
+            fn collect(&self) -> Vec<MetricFamily> {
+                vec![]
+            }
+        }
+
+        let registry = MetricsSourceRegistry::new();
+        registry.register("dup", Arc::new(EmptySource)).unwrap();
+        let result = registry.register("dup", Arc::new(EmptySource));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("dup"));
+    }
+
+    #[test]
+    fn metrics_source_registry_isolates_panicking_source() {
+        struct PanickingSource;
+        impl MetricsSource for PanickingSource {
+            fn collect(&self) -> Vec<MetricFamily> {
+                panic!("source panicked!")
+            }
+        }
+
+        let registry = MetricsSourceRegistry::new();
+        registry
+            .register("panicker", Arc::new(PanickingSource))
+            .unwrap();
+
+        let all = registry.collect_all();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].1.len(), 0, "panicking source should yield no families");
+
+        let errors = registry.error_counts();
+        assert_eq!(errors.get("panicker"), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn prometheus_endpoint_includes_plugin_source_families() {
+        struct GaugeSource;
+        impl MetricsSource for GaugeSource {
+            fn collect(&self) -> Vec<MetricFamily> {
+                vec![MetricFamily {
+                    name: "plugin_queue_depth".to_string(),
+                    help: "Plugin queue depth".to_string(),
+                    kind: MetricKind::Gauge,
+                    samples: vec![MetricSample {
+                        labels: vec![("shard".to_string(), "a".to_string())],
+                        value: 7.0,
+                    }],
+                }]
+            }
+        }
+
+        let state = test_state();
+        state
+            .metrics_source_registry
+            .register("gauge_plugin", Arc::new(GaugeSource))
+            .unwrap();
+
+        let app = actuator_router(true).with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/prometheus")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(
+            text.contains("# HELP plugin_queue_depth Plugin queue depth"),
+            "missing HELP line in:\n{text}"
+        );
+        assert!(
+            text.contains("# TYPE plugin_queue_depth gauge"),
+            "missing TYPE line in:\n{text}"
+        );
+        assert!(
+            text.contains("plugin_queue_depth{shard=\"a\"} 7"),
+            "missing sample line in:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn prometheus_endpoint_emits_error_counter_for_panicking_source() {
+        struct PanickingSource;
+        impl MetricsSource for PanickingSource {
+            fn collect(&self) -> Vec<MetricFamily> {
+                panic!("oops")
+            }
+        }
+
+        let state = test_state();
+        state
+            .metrics_source_registry
+            .register("panic_src", Arc::new(PanickingSource))
+            .unwrap();
+
+        let app = actuator_router(true).with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/prometheus")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(
+            text.contains("autumn_metrics_source_errors_total{source=\"panic_src\"} 1"),
+            "missing error counter in:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_includes_sources_section() {
+        struct SampleSource;
+        impl MetricsSource for SampleSource {
+            fn collect(&self) -> Vec<MetricFamily> {
+                vec![MetricFamily {
+                    name: "custom_counter".to_string(),
+                    help: "A custom counter".to_string(),
+                    kind: MetricKind::Counter,
+                    samples: vec![MetricSample {
+                        labels: vec![],
+                        value: 5.0,
+                    }],
+                }]
+            }
+        }
+
+        let state = test_state();
+        state
+            .metrics_source_registry
+            .register("my_source", Arc::new(SampleSource))
+            .unwrap();
+
+        let app = actuator_router(true).with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert!(
+            json.get("sources").is_some(),
+            "metrics JSON missing 'sources' key"
+        );
+        assert!(
+            json["sources"].get("my_source").is_some(),
+            "sources missing 'my_source' key"
+        );
+    }
+
+    #[test]
+    fn metrics_source_registry_preserves_insertion_order() {
+        struct NamedSource(&'static str);
+        impl MetricsSource for NamedSource {
+            fn collect(&self) -> Vec<MetricFamily> {
+                vec![MetricFamily {
+                    name: self.0.to_string(),
+                    help: "".to_string(),
+                    kind: MetricKind::Counter,
+                    samples: vec![],
+                }]
+            }
+        }
+
+        let registry = MetricsSourceRegistry::new();
+        registry
+            .register("alpha", Arc::new(NamedSource("alpha_metric")))
+            .unwrap();
+        registry
+            .register("beta", Arc::new(NamedSource("beta_metric")))
+            .unwrap();
+        registry
+            .register("gamma", Arc::new(NamedSource("gamma_metric")))
+            .unwrap();
+
+        let all = registry.collect_all();
+        assert_eq!(all[0].0, "alpha");
+        assert_eq!(all[1].0, "beta");
+        assert_eq!(all[2].0, "gamma");
     }
 }
 
