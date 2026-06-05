@@ -31,7 +31,7 @@ Enable the `storage` feature on `autumn-web` (for the Local backend and the
 ```toml
 [dependencies]
 autumn-web       = { version = "0.5", features = ["storage", "multipart"] }
-autumn-storage-s3 = "0.4"   # only needed when storage.backend = "s3"
+autumn-storage-s3 = "0.5"   # only needed when storage.backend = "s3"
 ```
 
 The framework gives you a working `Local` backend in `dev` out of the
@@ -215,7 +215,7 @@ Add `autumn-storage-s3` to your `Cargo.toml` and wire it up in `main`:
 ```toml
 [dependencies]
 autumn-web        = { version = "0.5", features = ["storage", "multipart"] }
-autumn-storage-s3 = "0.4"
+autumn-storage-s3 = "0.5"
 ```
 
 ```rust,ignore
