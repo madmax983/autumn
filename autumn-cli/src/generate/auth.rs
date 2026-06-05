@@ -2324,6 +2324,7 @@ fn auth_lockout_response_identical_to_wrong_password() {{
     )
 }
 
+#[allow(clippy::too_many_lines)]
 fn render_docs_file(pascal_name: &str, totp: bool) -> String {
     let totp_docs = if totp { TOTP_DOCS_SECTION } else { "" };
     format!(
