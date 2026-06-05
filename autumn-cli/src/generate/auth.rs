@@ -1735,12 +1735,14 @@ pub async fn login(
                 // rather than an if expression inside `.eq(...)`.
                 let new_attempts: i32 = if current_attempts == {snake_name}.failed_attempts {{
                     // Normal path: DB atomically computes `failed_attempts + 1`.
+                    // Propagate write errors — silently absorbing a failure here
+                    // would let repeated bad-password attempts bypass the threshold.
                     diesel::update({table}::table.find({snake_name}.id))
                         .set({table}::failed_attempts.eq({table}::failed_attempts + 1))
                         .returning({table}::failed_attempts)
                         .get_result::<i32>(&mut *db)
                         .await
-                        .unwrap_or(current_attempts + 1)
+                        .map_err(|e| AutumnError::internal_server_error_msg(&format!("Failed to record failed login: {{e}}")))?
                 }} else {{
                     // Cool-off reset path: atomically reset counter to 1 and clear
                     // locked_at in a single UPDATE. Concurrent requests hitting this
@@ -1819,15 +1821,23 @@ pub async fn login(
 
     let {snake_name} = found_{snake_name}.ok_or_else(auth_err)?;
 
-    // Successful login: reset lockout counter so the account is unlocked.
+    // Successful login: reset lockout counter only when the account was not
+    // locked concurrently after we read it. The WHERE clause guards against
+    // a race where a concurrent bad-password request stamps locked_at between
+    // our SELECT and this UPDATE — without it a stale successful login could
+    // clear a freshly acquired lock and admit an attacker.
     if lockout_enabled {{
-        let _ = diesel::update({table}::table.find({snake_name}.id))
-            .set((
-                {table}::failed_attempts.eq(0),
-                {table}::locked_at.eq(None::<chrono::NaiveDateTime>),
-            ))
-            .execute(&mut *db)
-            .await;
+        let _ = diesel::update(
+            {table}::table
+                .find({snake_name}.id)
+                .filter({table}::locked_at.is_null()),
+        )
+        .set((
+            {table}::failed_attempts.eq(0),
+            {table}::locked_at.eq(None::<chrono::NaiveDateTime>),
+        ))
+        .execute(&mut *db)
+        .await;
     }}
 
 {totp_login_branch}
@@ -2579,7 +2589,8 @@ clears the lockout for a single account. It is protected by the
 variable. Set this variable to a strong random value in production:
 
 ```sh
-# Generate and store a secret (do this once, store in autumn credentials or .env)
+# Generate and store a secret (do this once, store in your .env or deployment
+# secrets manager — NOT in autumn credentials, which are not consulted here).
 export AUTUMN_ADMIN_SECRET="$(openssl rand -hex 32)"
 
 # Unlock an account
