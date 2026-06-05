@@ -290,20 +290,29 @@ fn consume_estring_body(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
 /// Called after the opening `$tag$` delimiter has already been consumed.
 /// Uses a simple sliding-window match — sufficient for valid SQL.
 fn consume_dollar_quoted_body(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, tag: &str) {
-    let closing: Vec<char> = format!("${tag}$").chars().collect();
-    let clen = closing.len();
-    let mut match_count = 0usize;
+    // 💡 Why: Replaces `format!("${tag}$").chars().collect::<Vec<char>>()` to eliminate
+    // 2 heap allocations (String + Vec) per dollar-quoted string in the parsing hot path.
+    let get_iter = || {
+        std::iter::once('$')
+            .chain(tag.chars())
+            .chain(std::iter::once('$'))
+    };
+    let mut expected_iter = get_iter();
+    let mut expected_char = expected_iter.next().unwrap();
+
     for sc in chars.by_ref() {
-        if sc == closing[match_count] {
-            match_count += 1;
-            if match_count == clen {
+        if sc == expected_char {
+            if let Some(next_c) = expected_iter.next() {
+                expected_char = next_c;
+            } else {
                 break; // Found the closing delimiter.
             }
         } else {
-            match_count = 0;
+            expected_iter = get_iter();
+            expected_char = expected_iter.next().unwrap();
             // The current char may start a new partial match.
-            if sc == closing[0] {
-                match_count = 1;
+            if sc == expected_char {
+                expected_char = expected_iter.next().unwrap();
             }
         }
     }
