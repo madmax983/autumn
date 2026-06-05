@@ -173,7 +173,7 @@ async fn expect_hx_settle_waits_for_htmx() {
         maud::html! {
             html {
                 head {
-                    script src="https://unpkg.com/htmx.org@1.9.10" {}
+                    script src="/static/js/htmx.min.js" {}
                 }
                 body {
                     div id="result" {}

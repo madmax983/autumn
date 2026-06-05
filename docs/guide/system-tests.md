@@ -222,6 +222,7 @@ async fn add_todo_flow() {
 
     let mut runner = SystemTest::new()
         .routes(routes![index, create_todo])
+        .state(db.app_state())
         .build()
         .await
         .unwrap();
