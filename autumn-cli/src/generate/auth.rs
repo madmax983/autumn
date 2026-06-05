@@ -1708,28 +1708,29 @@ pub async fn login(
 
             if !password_ok {{
                 // Atomically increment the failure counter so concurrent bad-password
-                // requests each count as distinct attempts rather than collapsing
-                // into a single failure. The DB computes `failed_attempts + 1` in
-                // one statement; we read back the committed value to decide whether
-                // the threshold has been crossed.
-                //
-                // When cool-off elapsed we reset to 1 directly (current_attempts == 0)
-                // so the first new failure after expiry never triggers a re-lock.
-                let new_attempts: i32 = diesel::update({table}::table.find({snake_name}.id))
-                    .set({table}::failed_attempts.eq(
-                        if current_attempts == {snake_name}.failed_attempts {{
-                            // Normal path: let the DB atomically add 1.
-                            {table}::failed_attempts + 1
-                        }} else {{
-                            // Cool-off reset path: counter was cleared locally;
-                            // set the DB value to 1 (not +1, which would re-lock).
-                            diesel::dsl::sql::<diesel::sql_types::Integer>("1")
-                        }},
-                    ))
-                    .returning({table}::failed_attempts)
-                    .get_result::<i32>(&mut *db)
-                    .await
-                    .unwrap_or(current_attempts + 1);
+                // requests each count as distinct failures rather than collapsing into
+                // one. Use two separate update paths (different Diesel expression types)
+                // rather than an if expression inside `.eq(...)`.
+                let new_attempts: i32 = if current_attempts == {snake_name}.failed_attempts {{
+                    // Normal path: DB atomically computes `failed_attempts + 1`.
+                    diesel::update({table}::table.find({snake_name}.id))
+                        .set({table}::failed_attempts.eq({table}::failed_attempts + 1))
+                        .returning({table}::failed_attempts)
+                        .get_result::<i32>(&mut *db)
+                        .await
+                        .unwrap_or(current_attempts + 1)
+                }} else {{
+                    // Cool-off reset path: set counter to 1 and clear the expired
+                    // locked_at so future failures count up from 1 correctly.
+                    let _ = diesel::update({table}::table.find({snake_name}.id))
+                        .set((
+                            {table}::failed_attempts.eq(1i32),
+                            {table}::locked_at.eq(None::<chrono::NaiveDateTime>),
+                        ))
+                        .execute(&mut *db)
+                        .await;
+                    1i32
+                }};
 
                 if new_attempts >= lockout_cfg.threshold && current_locked_at.is_none() {{
                     // Account transitions into the locked state — stamp locked_at and
@@ -1752,9 +1753,16 @@ pub async fn login(
                             format!("{{:x}}:{{:x}}:{{:x}}:{{:x}}::/64", s[0], s[1], s[2], s[3])
                         }}
                     }};
+                    // Salt the digest with the deployment secret so the
+                    // account ID cannot be recovered by hashing small integers.
                     let account_id_digest = {{
                         use sha2::{{Digest, Sha256}};
-                        let hash = Sha256::digest({snake_name}.id.to_string().as_bytes());
+                        let salt = std::env::var("SECRET_KEY_BASE")
+                            .or_else(|_| std::env::var("AUTUMN_ADMIN_SECRET"))
+                            .unwrap_or_default();
+                        let hash = Sha256::digest(
+                            format!("{{}}:{{}}", salt, {snake_name}.id).as_bytes(),
+                        );
                         hex::encode(&hash[..8])
                     }};
                     tracing::warn!(
@@ -1840,7 +1848,7 @@ pub async fn unlock_account(
     mut db: Db,
     headers: axum::http::HeaderMap,
     Form(form): Form<UnlockAccountForm>,
-) -> AutumnResult<Response> {{
+) -> AutumnResult<Markup> {{
     let admin_secret = std::env::var("AUTUMN_ADMIN_SECRET").unwrap_or_default();
     let provided = headers
         .get("x-admin-secret")
@@ -1850,13 +1858,14 @@ pub async fn unlock_account(
         return Err(AutumnError::unprocessable_msg("Invalid email or password."));
     }}
     let email = form.email.trim().to_lowercase();
-    let _ = diesel::update({table}::table.filter({table}::email.eq(&email)))
+    diesel::update({table}::table.filter({table}::email.eq(&email)))
         .set((
             {table}::failed_attempts.eq(0),
             {table}::locked_at.eq(None::<chrono::NaiveDateTime>),
         ))
         .execute(&mut *db)
-        .await;
+        .await
+        .map_err(|e| AutumnError::internal_msg(&format!("Failed to unlock account: {{e}}")))?;
     Ok(layout("Account Unlocked", html! {{
         h1 {{ "Account Unlocked" }}
         p {{ "The lockout for " (email) " has been cleared if it existed." }}
