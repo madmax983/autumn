@@ -40,7 +40,7 @@ pub fn plan_system_test(project_root: &Path, name: &str) -> Result<Plan, Generat
 
     // Patch Cargo.toml: add system-tests feature + [[test]] entry.
     let cargo_path = project_root.join("Cargo.toml");
-    let existing = std::fs::read_to_string(&cargo_path).unwrap_or_default();
+    let existing = std::fs::read_to_string(&cargo_path).map_err(GenerateError::Io)?;
     let patched = patch_cargo_toml(&existing, &snake_name);
     if patched != existing {
         plan.modify(cargo_path, patched);
@@ -107,6 +107,33 @@ fn test_section_names_test(cargo_toml: &str, test_name: &str) -> bool {
     false
 }
 
+/// Returns the byte offset immediately after the `[features]` header line
+/// (i.e. after the newline that terminates the header), handling both LF and
+/// CRLF line endings and any inline comments on the header line.
+fn find_features_header_end(cargo_toml: &str) -> Option<usize> {
+    let mut pos = 0;
+    for line in cargo_toml.lines() {
+        let trimmed = line.trim();
+        // Accept bare "[features]" or "[features] # comment".
+        let is_header = trimmed == "[features]"
+            || trimmed
+                .strip_prefix("[features]")
+                .is_some_and(|rest| rest.trim_start().starts_with('#'));
+        // Advance pos past this line (include its line ending).
+        pos += line.len();
+        // Account for \r\n vs \n.
+        if cargo_toml[pos..].starts_with("\r\n") {
+            pos += 2;
+        } else if cargo_toml[pos..].starts_with('\n') {
+            pos += 1;
+        }
+        if is_header {
+            return Some(pos);
+        }
+    }
+    None
+}
+
 /// Patch `Cargo.toml` content to add the `system-tests` feature (under
 /// `[features]` only, not in `[dependencies]`) and a `[[test]]` entry for this
 /// test file if they are not already present.
@@ -119,8 +146,11 @@ fn patch_cargo_toml(existing: &str, snake_name: &str) -> String {
     // (which is required by `--features system-tests` and `#[cfg(feature = ...)]`).
     let feature_line = "system-tests = [\"autumn-web/system-tests\"]";
     if !features_section_has_key(&out, "system-tests") {
-        if out.contains("[features]") {
-            out = out.replacen("[features]\n", &format!("[features]\n{feature_line}\n"), 1);
+        // Find the byte offset of the end of the "[features]" header line so we
+        // can insert immediately after it regardless of line ending style (LF or
+        // CRLF) or trailing inline comments on the header.
+        if let Some(insert_pos) = find_features_header_end(&out) {
+            out.insert_str(insert_pos, &format!("{feature_line}\n"));
         } else {
             let _ = write!(out, "\n[features]\n{feature_line}\n");
         }
@@ -322,6 +352,31 @@ mod tests {
         assert!(
             cargo.contains("todo_flow"),
             "[[test]] must reference the generated file"
+        );
+    }
+
+    #[test]
+    fn patch_cargo_toml_crlf_features_header() {
+        // Cargo.toml with CRLF line endings should still have the feature inserted.
+        let crlf = "[package]\r\nname = \"x\"\r\n\r\n[features]\r\nother = []\r\n";
+        let patched = patch_cargo_toml(crlf, "my_test");
+        assert!(
+            patched.contains("system-tests"),
+            "feature must be inserted even with CRLF line endings"
+        );
+        assert!(
+            patched.contains("[[test]]"),
+            "[[test]] entry must also be present"
+        );
+    }
+
+    #[test]
+    fn patch_cargo_toml_features_header_with_comment() {
+        let src = "[package]\nname = \"x\"\n\n[features] # project features\nother = []\n";
+        let patched = patch_cargo_toml(src, "my_test");
+        assert!(
+            patched.contains("system-tests"),
+            "feature must be inserted after a commented header"
         );
     }
 

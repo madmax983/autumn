@@ -493,11 +493,19 @@ impl Page {
         if let Ok(element) = self.inner.find_element(selector_or_label).await {
             element.click().await?;
         } else {
+            // Restrict to interactive/visible elements so we pick the deepest
+            // clickable node rather than an ancestor (html/body) whose aggregate
+            // normalized text happens to equal the label.
             let js = format!(
                 "(function() {{ \
                  var label = {}; \
                  var q = label.indexOf(\"'\") >= 0 ? '\"' : \"'\"; \
-                 var xpath = \"//*[normalize-space(.)=\" + q + label + q + \"]\"; \
+                 var xpath = \"//button[normalize-space(.)=\" + q + label + q + \"] \
+                   | //a[normalize-space(.)=\" + q + label + q + \"] \
+                   | //input[@value and normalize-space(@value)=\" + q + label + q + \"] \
+                   | //label[normalize-space(.)=\" + q + label + q + \"] \
+                   | //*[@role='button' and normalize-space(.)=\" + q + label + q + \"] \
+                   | //*[@role='link' and normalize-space(.)=\" + q + label + q + \"]\"; \
                  var result = document.evaluate(xpath, document, null, \
                    XPathResult.FIRST_ORDERED_NODE_TYPE, null); \
                  var el = result.singleNodeValue; \
@@ -675,26 +683,34 @@ impl Page {
         let deadline = tokio::time::Instant::now() + timeout;
 
         loop {
-            // Look up the SSE container element. Bare ids use getElementById so
-            // that metacharacters like `:` or `.` in the id don't break a CSS
-            // selector; full selectors are passed straight to querySelector.
-            let is_selector =
-                stream_id.starts_with('#') || stream_id.starts_with('.') || stream_id.contains('[');
-            let js = if is_selector {
-                format!(
-                    "(function() {{ \
-                       var el = document.querySelector({sel}); \
-                       return el ? el.innerText : null; \
-                     }})()",
-                    sel = js_string_literal(stream_id)
-                )
-            } else {
+            // A "bare id" is a plain identifier: only ASCII alphanumerics, `-`,
+            // and `_`, with no leading `#`/`.` or embedded CSS metacharacters.
+            // Everything else is treated as a full CSS selector and passed to
+            // querySelector so that inputs like "div#notifications", ".sse-target",
+            // or "ul > li" all work correctly.
+            let is_bare_id = !stream_id.is_empty()
+                && stream_id
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+            let js = if is_bare_id {
                 format!(
                     "(function() {{ \
                        var el = document.getElementById({id}); \
                        return el ? el.innerText : null; \
                      }})()",
                     id = js_string_literal(stream_id)
+                )
+            } else {
+                format!(
+                    "(function() {{ \
+                       var sel = {sel}; \
+                       var el = sel.startsWith('#') && sel.slice(1).split('').every(function(c) {{ \
+                         return /[A-Za-z0-9_-]/.test(c); }}) \
+                         ? document.getElementById(sel.slice(1)) \
+                         : document.querySelector(sel); \
+                       return el ? el.innerText : null; \
+                     }})()",
+                    sel = js_string_literal(stream_id)
                 )
             };
 
