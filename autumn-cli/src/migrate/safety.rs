@@ -360,98 +360,11 @@ fn classify_statement(normalized: &str) -> Vec<SafetyFinding> {
 
     let mut findings = Vec::new();
 
-    // DROP TABLE — check first; it subsumes DROP COLUMN detection
-    if normalized.starts_with("drop table") {
-        findings.push(SafetyFinding {
-            operation: "DROP TABLE".to_owned(),
-            risk: RiskLevel::Destructive,
-            why: "Drops the entire table and all its data. Old replicas that reference this \
-                  table will error immediately.",
-            next_action: "Use expand/contract: first deploy code that stops using the table, \
-                          then drop it in a subsequent release.",
-        });
+    if check_drop_and_rename_operations(normalized, &mut findings) {
         return findings;
     }
 
-    // DROP VIEW
-    if normalized.starts_with("drop view") {
-        findings.push(SafetyFinding {
-            operation: "DROP VIEW".to_owned(),
-            risk: RiskLevel::Destructive,
-            why: "Drops the view. Old replicas that query this view will error immediately \
-                  during a rolling deploy.",
-            next_action: "Use expand/contract: first deploy code that no longer references the \
-                          view, then drop it in a subsequent release.",
-        });
-        return findings;
-    }
-
-    // DROP SEQUENCE
-    if normalized.starts_with("drop sequence") {
-        findings.push(SafetyFinding {
-            operation: "DROP SEQUENCE".to_owned(),
-            risk: RiskLevel::Destructive,
-            why: "Dropping a sequence breaks any column that uses it as a default \
-                  (`nextval(seq)`) and any application code that calls `nextval` directly. \
-                  Old replicas will error immediately on INSERT.",
-            next_action: "Use expand/contract: first deploy code that no longer relies on this \
-                          sequence, then drop it in a subsequent release.",
-        });
-        return findings;
-    }
-
-    // DROP COLUMN
-    if normalized.contains(" drop column ") {
-        findings.push(SafetyFinding {
-            operation: "DROP COLUMN".to_owned(),
-            risk: RiskLevel::Destructive,
-            why: "Removes a column and its data. Old replicas that SELECT or INSERT this column \
-                  will error until they restart.",
-            next_action: "Use expand/contract: first deploy code that no longer reads or writes \
-                          this column, then drop it in the next release.",
-        });
-    }
-
-    // RENAME COLUMN
-    if normalized.contains(" rename column ") {
-        findings.push(SafetyFinding {
-            operation: "RENAME COLUMN".to_owned(),
-            risk: RiskLevel::Irreversible,
-            why: "Renaming a column breaks queries from old replicas that still reference the \
-                  old name, causing errors during a rolling deploy.",
-            next_action: "Use expand/contract: add the new column, dual-write, backfill existing \
-                          rows, update all code, then drop the old column.",
-        });
-    }
-
-    // RENAME TABLE
-    if normalized.contains("alter table")
-        && normalized.contains(" rename to ")
-        && !normalized.contains(" rename column ")
-    {
-        findings.push(SafetyFinding {
-            operation: "RENAME TABLE".to_owned(),
-            risk: RiskLevel::Irreversible,
-            why: "Renaming a table breaks all queries from old replicas that reference the \
-                  original name.",
-            next_action: "Create a view under the old name while the new name rolls out, or \
-                          coordinate a maintenance window.",
-        });
-    }
-
-    // ALTER COLUMN TYPE
-    if let Some(i) = normalized.find("alter column")
-        && normalized[i..].contains(" type ")
-    {
-        findings.push(SafetyFinding {
-            operation: "ALTER COLUMN TYPE".to_owned(),
-            risk: RiskLevel::Destructive,
-            why: "Changing a column's type rewrites the column data and may be incompatible \
-                  with values read by old replicas or application code.",
-            next_action: "Add a new column with the target type, migrate data, update code to \
-                          use the new column, then drop the old one.",
-        });
-    }
+    check_alter_column_type_operations(normalized, &mut findings);
 
     // ADD COLUMN NOT NULL — checked per subcommand so that a DEFAULT on one column
     // in a multi-column ALTER TABLE does not suppress the check for other columns.
@@ -560,62 +473,7 @@ fn classify_statement(normalized: &str) -> Vec<SafetyFinding> {
         }
     }
 
-    // CREATE INDEX / CREATE UNIQUE INDEX without CONCURRENTLY
-    let is_create_index =
-        normalized.starts_with("create index") || normalized.starts_with("create unique index");
-    let is_concurrent = normalized.starts_with("create index concurrently")
-        || normalized.starts_with("create unique index concurrently");
-    if is_create_index && !is_concurrent {
-        findings.push(SafetyFinding {
-            operation: "CREATE INDEX (non-concurrent)".to_owned(),
-            risk: RiskLevel::PotentiallyBlocking,
-            why: "Non-concurrent index creation holds an exclusive table lock for the entire \
-                  build, blocking all reads and writes.",
-            next_action: "Use CREATE INDEX CONCURRENTLY instead. Note: concurrent index \
-                          creation cannot run inside a transaction block.",
-        });
-    }
-
-    // Data backfill — bulk DML inside a migration requires a separate job
-    if normalized.starts_with("update ")
-        || normalized.starts_with("insert into ")
-        || normalized.starts_with("delete from ")
-        || normalized.starts_with("merge into ")
-    {
-        findings.push(SafetyFinding {
-            operation: "Bulk DML (data backfill)".to_owned(),
-            risk: RiskLevel::DataBackfill,
-            why: "Running bulk UPDATE or INSERT inside a migration locks rows for the duration \
-                  of the transaction. On large tables this can time out or block application \
-                  traffic for seconds to minutes.",
-            next_action: "Run the data backfill as a separate idempotent background job or \
-                          one-off task (`autumn task`) after the schema migration has deployed. \
-                          Add a NOT VALID constraint first if you need the constraint enforced \
-                          before the backfill completes.",
-        });
-    }
-
-    // CTE-prefixed bulk DML — WITH … UPDATE / DELETE / INSERT
-    // A CTE starts with `with` so the plain DML checks above don't fire.
-    // Check both the outer statement (`) update/delete/insert`) and CTE bodies
-    // (`(update/delete/insert`) to catch data-modifying CTEs followed by SELECT.
-    if normalized.starts_with("with ")
-        && (normalized.contains(") update ")
-            || normalized.contains(") delete ")
-            || normalized.contains(") insert into ")
-            || normalized.contains("(update ")
-            || normalized.contains("(delete ")
-            || normalized.contains("(insert into "))
-    {
-        findings.push(SafetyFinding {
-            operation: "Bulk DML (data backfill via CTE)".to_owned(),
-            risk: RiskLevel::DataBackfill,
-            why: "A CTE that writes (UPDATE, DELETE, INSERT) locks rows for the duration of the \
-                  transaction. On large tables this can time out or block application traffic.",
-            next_action: "Run the data backfill as a separate idempotent background job or \
-                          one-off task (`autumn task`) after the schema migration has deployed.",
-        });
-    }
+    check_index_and_backfill_operations(normalized, &mut findings);
 
     // DROP INDEX (non-concurrent) — holds an exclusive table lock
     // Use token-aware check: `concurrently` must be the SQL option immediately after
@@ -704,6 +562,152 @@ fn classify_statement(normalized: &str) -> Vec<SafetyFinding> {
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
+
+fn check_drop_and_rename_operations(normalized: &str, findings: &mut Vec<SafetyFinding>) -> bool {
+    if normalized.starts_with("drop table") {
+        findings.push(SafetyFinding {
+            operation: "DROP TABLE".to_owned(),
+            risk: RiskLevel::Destructive,
+            why: "Drops the entire table and all its data. Old replicas that reference this \
+                  table will error immediately.",
+            next_action: "Use expand/contract: first deploy code that stops using the table, \
+                          then drop it in a subsequent release.",
+        });
+        return true;
+    }
+
+    if normalized.starts_with("drop view") {
+        findings.push(SafetyFinding {
+            operation: "DROP VIEW".to_owned(),
+            risk: RiskLevel::Destructive,
+            why: "Drops the view. Old replicas that query this view will error immediately \
+                  during a rolling deploy.",
+            next_action: "Use expand/contract: first deploy code that no longer references the \
+                          view, then drop it in a subsequent release.",
+        });
+        return true;
+    }
+
+    if normalized.starts_with("drop sequence") {
+        findings.push(SafetyFinding {
+            operation: "DROP SEQUENCE".to_owned(),
+            risk: RiskLevel::Destructive,
+            why: "Dropping a sequence breaks any column that uses it as a default \
+                  (`nextval(seq)`) and any application code that calls `nextval` directly. \
+                  Old replicas will error immediately on INSERT.",
+            next_action: "Use expand/contract: first deploy code that no longer relies on this \
+                          sequence, then drop it in a subsequent release.",
+        });
+        return true;
+    }
+
+    if normalized.contains(" drop column ") {
+        findings.push(SafetyFinding {
+            operation: "DROP COLUMN".to_owned(),
+            risk: RiskLevel::Destructive,
+            why: "Removes a column and its data. Old replicas that SELECT or INSERT this column \
+                  will error until they restart.",
+            next_action: "Use expand/contract: first deploy code that no longer reads or writes \
+                          this column, then drop it in the next release.",
+        });
+    }
+
+    if normalized.contains(" rename column ") {
+        findings.push(SafetyFinding {
+            operation: "RENAME COLUMN".to_owned(),
+            risk: RiskLevel::Irreversible,
+            why: "Renaming a column breaks queries from old replicas that still reference the \
+                  original name.",
+            next_action: "Add a new column, migrate data to it, update code to read/write the \
+                          new column, then drop the old column.",
+        });
+    }
+
+    if normalized.contains(" rename to ")
+        && !normalized.starts_with("alter type ")
+        && !normalized.starts_with("alter index ")
+        && !normalized.contains(" rename column ")
+    {
+        findings.push(SafetyFinding {
+            operation: "RENAME TABLE".to_owned(),
+            risk: RiskLevel::Irreversible,
+            why: "Renaming a table breaks all queries from old replicas that reference the \
+                  original name.",
+            next_action: "Create a view under the old name while the new name rolls out, or \
+                          coordinate a maintenance window.",
+        });
+    }
+
+    false
+}
+
+fn check_alter_column_type_operations(normalized: &str, findings: &mut Vec<SafetyFinding>) {
+    if let Some(i) = normalized.find("alter column")
+        && normalized[i..].contains(" type ")
+    {
+        findings.push(SafetyFinding {
+            operation: "ALTER COLUMN TYPE".to_owned(),
+            risk: RiskLevel::Destructive,
+            why: "Changing a column's type rewrites the column data and may be incompatible \
+                  with values read by old replicas or application code.",
+            next_action: "Add a new column with the target type, migrate data, update code to \
+                          use the new column, then drop the old one.",
+        });
+    }
+}
+
+fn check_index_and_backfill_operations(normalized: &str, findings: &mut Vec<SafetyFinding>) {
+    let is_create_index =
+        normalized.starts_with("create index") || normalized.starts_with("create unique index");
+    let is_concurrent = normalized.starts_with("create index concurrently")
+        || normalized.starts_with("create unique index concurrently");
+    if is_create_index && !is_concurrent {
+        findings.push(SafetyFinding {
+            operation: "CREATE INDEX (non-concurrent)".to_owned(),
+            risk: RiskLevel::PotentiallyBlocking,
+            why: "Non-concurrent index creation holds an exclusive table lock for the entire \
+                  build, blocking all reads and writes.",
+            next_action: "Use CREATE INDEX CONCURRENTLY instead. Note: concurrent index \
+                          creation cannot run inside a transaction block.",
+        });
+    }
+
+    if normalized.starts_with("update ")
+        || normalized.starts_with("insert into ")
+        || normalized.starts_with("delete from ")
+        || normalized.starts_with("merge into ")
+    {
+        findings.push(SafetyFinding {
+            operation: "Bulk DML (data backfill)".to_owned(),
+            risk: RiskLevel::DataBackfill,
+            why: "Running bulk UPDATE or INSERT inside a migration locks rows for the duration \
+                  of the transaction. On large tables this can time out or block application \
+                  traffic for seconds to minutes.",
+            next_action: "Run the data backfill as a separate idempotent background job or \
+                          one-off task (`autumn task`) after the schema migration has deployed. \
+                          Add a NOT VALID constraint first if you need the constraint enforced \
+                          before the backfill completes.",
+        });
+    }
+
+    if normalized.starts_with("with ")
+        && (normalized.contains(") update ")
+            || normalized.contains(") delete ")
+            || normalized.contains(") insert into ")
+            || normalized.contains("(update ")
+            || normalized.contains("(delete ")
+            || normalized.contains("(insert into "))
+    {
+        findings.push(SafetyFinding {
+            operation: "Bulk DML (data backfill via CTE)".to_owned(),
+            risk: RiskLevel::DataBackfill,
+            why: "A CTE that writes (UPDATE, DELETE, INSERT) locks rows for the duration of the \
+                  transaction. On large tables this can time out or block application traffic.",
+            next_action: "Run the data backfill as a separate idempotent background job or \
+                          one-off task (`autumn task`) after the schema migration has deployed.",
+        });
+    }
+}
 
 #[cfg(test)]
 mod tests {

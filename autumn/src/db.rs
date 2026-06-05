@@ -335,13 +335,7 @@ pub fn scrub_sql(sql: &str) -> String {
 
     while let Some(c) = chars.next() {
         // ── E-string literal  E'...' / e'...'  (backslash-escape aware) ──
-        // Must be checked before the single-quote handler so we consume the
-        // `E` prefix and don't leave it in the fingerprint.
-        if (c == 'E' || c == 'e') && chars.peek() == Some(&'\'') {
-            chars.next(); // consume the opening '
-            out.push_str("'?'");
-            prev_is_sep = false;
-            consume_estring_body(&mut chars);
+        if scrub_estring(c, &mut chars, &mut out, &mut prev_is_sep) {
             continue;
         }
 
@@ -369,56 +363,7 @@ pub fn scrub_sql(sql: &str) -> String {
 
         // ── Dollar sign: positional parameter or dollar-quoted string ─────
         if c == '$' {
-            let next_ch = chars.peek().copied();
-
-            // Positional parameter $N — pass through verbatim.
-            if next_ch.is_some_and(|nc| nc.is_ascii_digit()) {
-                out.push('$');
-                prev_is_sep = false;
-                while chars.peek().is_some_and(char::is_ascii_digit) {
-                    if let Some(d) = chars.next() {
-                        out.push(d);
-                    }
-                }
-                continue;
-            }
-
-            // Dollar-quoted string: $$ (anonymous) or $tag$ (tagged).
-            // Collect the optional tag, looking for the second `$`.
-            let mut tag = String::new();
-            let mut found_closing_dollar = false;
-
-            if next_ch == Some('$') {
-                // Anonymous $$: consume the second `$`.
-                chars.next();
-                found_closing_dollar = true;
-            } else if next_ch.is_some_and(|nc| nc.is_alphabetic() || nc == '_') {
-                // Accumulate tag chars until we hit `$` or a non-identifier char.
-                while let Some(&tc) = chars.peek() {
-                    if tc == '$' {
-                        chars.next(); // consume the closing `$` of the opening tag
-                        found_closing_dollar = true;
-                        break;
-                    } else if tc.is_alphanumeric() || tc == '_' {
-                        tag.push(tc);
-                        chars.next();
-                    } else {
-                        // Not a valid tag character — not a dollar-quoted string.
-                        break;
-                    }
-                }
-            }
-
-            if found_closing_dollar {
-                out.push_str("'?'");
-                prev_is_sep = false;
-                consume_dollar_quoted_body(&mut chars, &tag);
-            } else {
-                // Not a recognisable dollar form — emit $ and any partial tag.
-                out.push('$');
-                out.push_str(&tag);
-                prev_is_sep = false;
-            }
+            scrub_dollar_quoted(&mut chars, &mut out, &mut prev_is_sep);
             continue;
         }
 
@@ -1116,6 +1061,82 @@ impl DatabasePoolProvider for DieselDeadpoolPoolProvider {
         config: &DatabaseConfig,
     ) -> Result<Option<Pool<AsyncPgConnection>>, PoolError> {
         create_pool(config)
+    }
+}
+
+fn scrub_estring(
+    c: char,
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    out: &mut String,
+    prev_is_sep: &mut bool,
+) -> bool {
+    // ── E-string literal  E'...' / e'...'  (backslash-escape aware) ──
+    // Must be checked before the single-quote handler so we consume the
+    // `E` prefix and don't leave it in the fingerprint.
+    if (c == 'E' || c == 'e') && chars.peek() == Some(&'\'') {
+        chars.next(); // consume the opening '
+        out.push_str("'?'");
+        *prev_is_sep = false;
+        consume_estring_body(chars);
+        return true;
+    }
+    false
+}
+
+fn scrub_dollar_quoted(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    out: &mut String,
+    prev_is_sep: &mut bool,
+) {
+    let next_ch = chars.peek().copied();
+
+    // Positional parameter $N — pass through verbatim.
+    if next_ch.is_some_and(|nc| nc.is_ascii_digit()) {
+        out.push('$');
+        *prev_is_sep = false;
+        while chars.peek().is_some_and(char::is_ascii_digit) {
+            if let Some(d) = chars.next() {
+                out.push(d);
+            }
+        }
+        return;
+    }
+
+    // Dollar-quoted string: $$ (anonymous) or $tag$ (tagged).
+    // Collect the optional tag, looking for the second `$`.
+    let mut tag = String::new();
+    let mut found_closing_dollar = false;
+
+    if next_ch == Some('$') {
+        // Anonymous $$: consume the second `$`.
+        chars.next();
+        found_closing_dollar = true;
+    } else if next_ch.is_some_and(|nc| nc.is_alphabetic() || nc == '_') {
+        // Accumulate tag chars until we hit `$` or a non-identifier char.
+        while let Some(&tc) = chars.peek() {
+            if tc == '$' {
+                chars.next(); // consume the closing `$` of the opening tag
+                found_closing_dollar = true;
+                break;
+            } else if tc.is_alphanumeric() || tc == '_' {
+                tag.push(tc);
+                chars.next();
+            } else {
+                // Not a valid tag character — not a dollar-quoted string.
+                break;
+            }
+        }
+    }
+
+    if found_closing_dollar {
+        out.push_str("'?'");
+        *prev_is_sep = false;
+        consume_dollar_quoted_body(chars, &tag);
+    } else {
+        // Not a recognisable dollar form — emit $ and any partial tag.
+        out.push('$');
+        out.push_str(&tag);
+        *prev_is_sep = false;
     }
 }
 
