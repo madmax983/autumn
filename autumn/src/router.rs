@@ -1194,6 +1194,27 @@ where
     router
 }
 
+fn apply_trusted_proxies_middleware<S>(
+    mut router: axum::Router<S>,
+    config: &AutumnConfig,
+) -> axum::Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    let tp = &config.security.trusted_proxies;
+    if tp.trust_forwarded_headers || !tp.ranges.is_empty() || tp.trusted_hops.is_some() {
+        let layer =
+            crate::security::TrustedProxiesLayer::from_config(&config.security.trusted_proxies);
+        tracing::info!(
+            ranges = ?tp.ranges,
+            trusted_hops = ?tp.trusted_hops,
+            "Centralized trusted-proxy resolution enabled"
+        );
+        router = router.layer(layer);
+    }
+    router
+}
+
 fn apply_rate_limit_middleware<S>(
     mut router: axum::Router<S>,
     config: &AutumnConfig,
@@ -1201,9 +1222,15 @@ fn apply_rate_limit_middleware<S>(
 where
     S: Clone + Send + Sync + 'static,
 {
-    // Rate limiting middleware (only applied when enabled)
     if config.security.rate_limit.enabled {
-        let layer = crate::security::RateLimitLayer::from_config(&config.security.rate_limit);
+        let tp = &config.security.trusted_proxies;
+        let has_top_level_proxy_config =
+            tp.trust_forwarded_headers || !tp.ranges.is_empty() || tp.trusted_hops.is_some();
+        let mut layer = crate::security::RateLimitLayer::from_config(&config.security.rate_limit);
+        if has_top_level_proxy_config {
+            let resolver = crate::security::ProxyResolver::from_config(tp);
+            layer = layer.with_proxy_resolver(resolver);
+        }
         tracing::info!(
             rps = config.security.rate_limit.requests_per_second,
             burst = config.security.rate_limit.burst,
@@ -1397,6 +1424,7 @@ fn apply_middleware(
     router = router.layer(axum::middleware::from_fn(move |req, next| {
         trusted_host_middleware(req, next, trusted_host_policy.clone())
     }));
+    router = apply_trusted_proxies_middleware(router, config);
     router = apply_csrf_middleware(router, config, signing_keys_opt.clone());
     // Method-override rejection filter. The outer `MethodOverrideLayer`
     // (applied at the `axum::serve` boundary so it can rewrite the

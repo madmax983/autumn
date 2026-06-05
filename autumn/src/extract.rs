@@ -763,7 +763,7 @@ pub struct ClientAddr(pub std::net::IpAddr);
 impl ClientAddr {
     /// The resolved client IP.
     #[must_use]
-    pub fn ip(&self) -> std::net::IpAddr {
+    pub const fn ip(&self) -> std::net::IpAddr {
         self.0
     }
 }
@@ -903,7 +903,7 @@ where
         parts
             .extensions
             .get::<ResolvedClientIdentity>()
-            .map(|id| ClientScheme(id.scheme.clone()))
+            .map(|id| Self(id.scheme.clone()))
             .ok_or((
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 "ClientScheme not resolved. Is the TrustedProxiesLayer installed?",
@@ -924,7 +924,7 @@ where
         Ok(parts
             .extensions
             .get::<ResolvedClientIdentity>()
-            .map(|id| ClientScheme(id.scheme.clone())))
+            .map(|id| Self(id.scheme.clone())))
     }
 }
 

@@ -368,6 +368,7 @@ fn is_form_urlencoded(headers: &http::HeaderMap) -> bool {
 ///    documented browser-form convention does not apply, so the safe
 ///    thing is to forward the request as the original `POST` and let
 ///    route matching reject it.
+///
 /// Wrapper that consults [`ResolvedClientIdentity`] extensions when available,
 /// so that the same-origin check uses the resolver-validated host and scheme
 /// rather than trusting raw `X-Forwarded-*` headers unconditionally.
@@ -375,50 +376,25 @@ fn is_same_origin_form_request(req: &Request<axum::body::Body>) -> bool {
     let identity = req.extensions().get::<ResolvedClientIdentity>();
     let headers = req.headers();
 
-    let origin = match headers.get(http::header::ORIGIN).and_then(|v| v.to_str().ok()) {
-        Some(o) => o,
-        None => {
-            if let Some(site) = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) {
-                return matches!(site, "same-origin" | "none");
-            }
-            return false;
+    let Some(origin) = headers
+        .get(http::header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+    else {
+        if let Some(site) = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) {
+            return matches!(site, "same-origin" | "none");
         }
+        return false;
     };
 
     if let Some(site) = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) {
         return match site {
             "same-origin" | "none" => true,
-            "same-site" => {
-                origin_matches_request_with_identity(origin, headers, identity)
-            }
+            "same-site" => origin_matches_request_with_identity(origin, headers, identity),
             _ => false,
         };
     }
 
     origin_matches_request_with_identity(origin, headers, identity)
-}
-
-fn is_same_origin_form(headers: &http::HeaderMap) -> bool {
-    let origin_full_match = || {
-        let origin = headers
-            .get(http::header::ORIGIN)
-            .and_then(|v| v.to_str().ok())?;
-        Some(origin_matches_request(origin, headers))
-    };
-
-    if let Some(site) = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) {
-        return match site {
-            "same-origin" | "none" => true,
-            // `same-site` is broader than same-origin; require an
-            // explicit Origin/Host (and scheme) match for the
-            // documented guarantee.
-            "same-site" => origin_full_match().unwrap_or(false),
-            // `cross-site` or any unrecognised value: reject.
-            _ => false,
-        };
-    }
-
-    origin_full_match().unwrap_or(false)
 }
 
 /// Same-origin check with optional [`ResolvedClientIdentity`] for host/scheme.
@@ -438,19 +414,20 @@ fn origin_matches_request_with_identity(
 
     // Prefer the resolver-validated host; fall back to header reads.
     let expected_host: Option<std::borrow::Cow<str>> =
-        if let Some(id) = identity.and_then(|id| id.host.as_deref()) {
-            Some(std::borrow::Cow::Borrowed(id))
-        } else {
-            headers
-                .get("x-forwarded-host")
-                .and_then(|v| v.to_str().ok())
-                .or_else(|| {
-                    headers
-                        .get(http::header::HOST)
-                        .and_then(|v| v.to_str().ok())
-                })
-                .map(std::borrow::Cow::Borrowed)
-        };
+        identity.and_then(|id| id.host.as_deref()).map_or_else(
+            || {
+                headers
+                    .get("x-forwarded-host")
+                    .and_then(|v| v.to_str().ok())
+                    .or_else(|| {
+                        headers
+                            .get(http::header::HOST)
+                            .and_then(|v| v.to_str().ok())
+                    })
+                    .map(std::borrow::Cow::Borrowed)
+            },
+            |id| Some(std::borrow::Cow::Borrowed(id)),
+        );
 
     let Some(expected_host) = expected_host else {
         return false;
@@ -460,22 +437,19 @@ fn origin_matches_request_with_identity(
     }
 
     // Prefer the resolver-validated scheme; fall back to header reads.
-    let resolved_scheme: Option<String> = if let Some(id) = identity {
-        Some(id.scheme.clone())
-    } else {
-        headers
-            .get("x-forwarded-proto")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| {
-                // Multiple `X-Forwarded-Proto` values chained by intermediaries;
-                // the leftmost (client-facing) is the one that matters.
-                s.split(',')
-                    .next()
-                    .unwrap_or(s)
-                    .trim()
-                    .to_ascii_lowercase()
-            })
-    };
+    let resolved_scheme: Option<String> = identity.map_or_else(
+        || {
+            headers
+                .get("x-forwarded-proto")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| {
+                    // Multiple `X-Forwarded-Proto` values chained by intermediaries;
+                    // the leftmost (client-facing) is the one that matters.
+                    s.split(',').next().unwrap_or(s).trim().to_ascii_lowercase()
+                })
+        },
+        |id| Some(id.scheme.clone()),
+    );
 
     if let Some(scheme) = resolved_scheme {
         return scheme.eq_ignore_ascii_case(origin_scheme);
@@ -483,30 +457,6 @@ fn origin_matches_request_with_identity(
 
     // No scheme signal: host:port match is the best we can do.
     true
-}
-
-/// Same-origin requires scheme + host + port to match. `Origin` carries
-/// all three; the request side gets host:port from `Host` (or
-/// `X-Forwarded-Host` if the deployment surfaces it) and the scheme
-/// from `X-Forwarded-Proto` when running behind a TLS-terminating
-/// reverse proxy.
-///
-/// Resolution of `X-Forwarded-Host` and `X-Forwarded-Proto` goes through
-/// the [`ResolvedClientIdentity`] extension when available (injected by
-/// the framework's [`ProxyResolver`] middleware), falling back to direct
-/// header reads for contexts where the middleware is absent (e.g. tests).
-///
-/// If we can determine the request's scheme and Origin's scheme
-/// differs, we reject — that's a true cross-origin request from a
-/// different scheme. If we cannot determine the scheme (no
-/// `X-Forwarded-Proto` set; not behind a proxy), we fall back to
-/// requiring just the host:port match. That's a deployment-specific
-/// limitation: the middleware can't observe the underlying transport
-/// from inside the request, so configurations that need strict
-/// scheme enforcement should run behind a proxy that sets
-/// `X-Forwarded-Proto`.
-fn origin_matches_request(origin: &str, req_headers: &http::HeaderMap) -> bool {
-    origin_matches_request_with_identity(origin, req_headers, None)
 }
 
 /// Split a serialized `Origin` value into `(scheme, authority)`.
@@ -1344,6 +1294,12 @@ mod tests {
         assert_eq!(parse_origin("https://"), None);
     }
 
+    fn req_from_headers(headers: http::HeaderMap) -> axum::extract::Request<Body> {
+        let mut req = axum::http::Request::builder().body(Body::empty()).unwrap();
+        *req.headers_mut() = headers;
+        req
+    }
+
     /// Helper-level cases that don't require the full router wiring.
     #[test]
     fn is_same_origin_form_decision_matrix() {
@@ -1353,7 +1309,7 @@ mod tests {
             let mut h = http::HeaderMap::new();
             h.insert("sec-fetch-site", http::HeaderValue::from_str(site).unwrap());
             assert!(
-                is_same_origin_form(&h),
+                is_same_origin_form_request(&req_from_headers(h)),
                 "sec-fetch-site={site} should be allowed"
             );
         }
@@ -1367,7 +1323,7 @@ mod tests {
             http::HeaderValue::from_static("same-site"),
         );
         assert!(
-            !is_same_origin_form(&h),
+            !is_same_origin_form_request(&req_from_headers(h)),
             "same-site alone must not be accepted"
         );
 
@@ -1385,7 +1341,7 @@ mod tests {
             http::header::HOST,
             http::HeaderValue::from_static("app.example"),
         );
-        assert!(is_same_origin_form(&h));
+        assert!(is_same_origin_form_request(&req_from_headers(h)));
 
         // `same-site` with a sibling Origin: the registrable domain is
         // the same so the browser sends `same-site`, but the Origin
@@ -1404,7 +1360,7 @@ mod tests {
             http::HeaderValue::from_static("app.example"),
         );
         assert!(
-            !is_same_origin_form(&h),
+            !is_same_origin_form_request(&req_from_headers(h)),
             "same-site with mismatched Origin/Host must be rejected"
         );
 
@@ -1413,7 +1369,7 @@ mod tests {
             "sec-fetch-site",
             http::HeaderValue::from_static("cross-site"),
         );
-        assert!(!is_same_origin_form(&h));
+        assert!(!is_same_origin_form_request(&req_from_headers(h)));
 
         // Unknown / spoofed Sec-Fetch-Site value: reject.
         let mut h = http::HeaderMap::new();
@@ -1421,7 +1377,7 @@ mod tests {
             "sec-fetch-site",
             http::HeaderValue::from_static("undefined"),
         );
-        assert!(!is_same_origin_form(&h));
+        assert!(!is_same_origin_form_request(&req_from_headers(h)));
 
         // No Sec-Fetch-Site: Origin matches Host.
         let mut h = http::HeaderMap::new();
@@ -1433,7 +1389,7 @@ mod tests {
             http::header::HOST,
             http::HeaderValue::from_static("app.example"),
         );
-        assert!(is_same_origin_form(&h));
+        assert!(is_same_origin_form_request(&req_from_headers(h)));
 
         // No Sec-Fetch-Site: Origin does not match Host.
         let mut h = http::HeaderMap::new();
@@ -1445,11 +1401,11 @@ mod tests {
             http::header::HOST,
             http::HeaderValue::from_static("app.example"),
         );
-        assert!(!is_same_origin_form(&h));
+        assert!(!is_same_origin_form_request(&req_from_headers(h)));
 
         // Neither signal present: fail closed.
         let h = http::HeaderMap::new();
-        assert!(!is_same_origin_form(&h));
+        assert!(!is_same_origin_form_request(&req_from_headers(h)));
     }
 
     /// Override rejection responses carry an `AutumnErrorInfo` extension

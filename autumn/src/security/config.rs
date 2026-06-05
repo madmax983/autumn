@@ -48,6 +48,9 @@
 //! | `AUTUMN_SECURITY__RATE_LIMIT__ON_BACKEND_FAILURE` | `security.rate_limit.on_backend_failure` | `fail_open` / `fail_closed` |
 //! | `AUTUMN_SECURITY__RATE_LIMIT__REDIS__URL` | `security.rate_limit.redis.url` | `String` |
 //! | `AUTUMN_SECURITY__RATE_LIMIT__REDIS__KEY_PREFIX` | `security.rate_limit.redis.key_prefix` | `String` |
+//! | `AUTUMN_SECURITY__TRUSTED_PROXIES__RANGES` | `security.trusted_proxies.ranges` | comma-separated `String` |
+//! | `AUTUMN_SECURITY__TRUSTED_PROXIES__TRUST_FORWARDED_HEADERS` | `security.trusted_proxies.trust_forwarded_headers` | `bool` |
+//! | `AUTUMN_SECURITY__TRUSTED_PROXIES__TRUSTED_HOPS` | `security.trusted_proxies.trusted_hops` | `u32` |
 //! | `AUTUMN_SECURITY__UPLOAD__MAX_REQUEST_SIZE_BYTES` | `security.upload.max_request_size_bytes` | `usize` |
 //! | `AUTUMN_SECURITY__UPLOAD__MAX_FILE_SIZE_BYTES` | `security.upload.max_file_size_bytes` | `usize` |
 //! | `AUTUMN_SECURITY__UPLOAD__ALLOWED_MIME_TYPES` | `security.upload.allowed_mime_types` | comma-separated `String` |
@@ -443,9 +446,14 @@ impl SecurityConfig {
                 .map(String::as_str)
                 .collect();
 
+            // The legacy rate-limit fields have no hop-count equivalent, so any
+            // trusted_hops value in the new block is always a conflict.
+            let hops_conflict = self.trusted_proxies.trusted_hops.is_some();
+
             if new_ranges != old_ranges
                 || self.trusted_proxies.trust_forwarded_headers
                     != self.rate_limit.trust_forwarded_headers
+                || hops_conflict
             {
                 return Some(
                     "[security.trusted_proxies] and \

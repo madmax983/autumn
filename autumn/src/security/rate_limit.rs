@@ -59,14 +59,12 @@
 
 use lru::LruCache;
 use std::future::Future;
-use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Instant;
 
-use axum::extract::ConnectInfo;
 use axum::http::{HeaderValue, Request, Response, StatusCode};
 use http::header::{CONTENT_TYPE, HeaderName, RETRY_AFTER};
 use tower::{Layer, Service};
@@ -422,75 +420,12 @@ struct Limiter {
     refill_per_sec: f64,
     burst: f64,
     burst_header: HeaderValue,
-    // Kept for legacy deep_clone; actual resolution goes through `resolver`.
-    trust_forwarded_headers: bool,
-    trusted_proxies_configured: bool,
-    trusted_proxies: Vec<TrustedProxy>,
     resolver: Arc<ProxyResolver>,
     key_strategy: KeyStrategy,
     tiers: Arc<std::collections::HashMap<String, RateLimitTierConfig>>,
     tier_hook: Option<TierHookFn>,
     path_overrides: Vec<(String, RateLimitOverride)>,
     backend: BucketBackend,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct TrustedProxy {
-    network: IpAddr,
-    prefix_len: u8,
-}
-
-impl TrustedProxy {
-    fn parse(value: &str) -> Option<Self> {
-        let trimmed = value.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-
-        let (addr, prefix_len) = if let Some((addr, prefix)) = trimmed.split_once('/') {
-            let addr = addr.trim().parse::<IpAddr>().ok()?;
-            let prefix_len = prefix.trim().parse::<u8>().ok()?;
-            (addr, prefix_len)
-        } else {
-            let addr = trimmed.parse::<IpAddr>().ok()?;
-            let prefix_len = match addr {
-                IpAddr::V4(_) => 32,
-                IpAddr::V6(_) => 128,
-            };
-            (addr, prefix_len)
-        };
-
-        let max_prefix = match addr {
-            IpAddr::V4(_) => 32,
-            IpAddr::V6(_) => 128,
-        };
-
-        (prefix_len <= max_prefix).then_some(Self {
-            network: addr,
-            prefix_len,
-        })
-    }
-
-    fn contains(&self, ip: IpAddr) -> bool {
-        if self.prefix_len == 0 {
-            return matches!(
-                (self.network, ip),
-                (IpAddr::V4(_), IpAddr::V4(_)) | (IpAddr::V6(_), IpAddr::V6(_))
-            );
-        }
-
-        match (self.network, ip) {
-            (IpAddr::V4(network), IpAddr::V4(candidate)) => {
-                let shift = 32_u8.saturating_sub(self.prefix_len);
-                (u32::from(network) >> shift) == (u32::from(candidate) >> shift)
-            }
-            (IpAddr::V6(network), IpAddr::V6(candidate)) => {
-                let shift = 128_u8.saturating_sub(self.prefix_len);
-                (u128::from(network) >> shift) == (u128::from(candidate) >> shift)
-            }
-            (IpAddr::V4(_), IpAddr::V6(_)) | (IpAddr::V6(_), IpAddr::V4(_)) => false,
-        }
-    }
 }
 
 impl Limiter {
@@ -505,20 +440,6 @@ impl Limiter {
         let burst = f64::from(config.burst.max(1));
         let refill_per_sec = config.requests_per_second.max(f64::MIN_POSITIVE);
         let burst_header = HeaderValue::from(config.burst.max(1));
-        let trusted_proxies_configured = !config.trusted_proxies.is_empty();
-        let trusted_proxies: Vec<TrustedProxy> = config
-            .trusted_proxies
-            .iter()
-            .filter_map(|proxy| {
-                TrustedProxy::parse(proxy).or_else(|| {
-                    tracing::warn!(
-                        trusted_proxy = %proxy,
-                        "ignoring invalid rate limit trusted proxy"
-                    );
-                    None
-                })
-            })
-            .collect();
 
         // Emit deprecation warning when the rate-limit-scoped proxy fields are
         // in use but the caller didn't supply a top-level resolver.
@@ -550,9 +471,6 @@ impl Limiter {
             refill_per_sec,
             burst,
             burst_header,
-            trust_forwarded_headers: config.trust_forwarded_headers,
-            trusted_proxies_configured,
-            trusted_proxies,
             resolver: Arc::new(resolver),
             key_strategy: config.key_strategy,
             tiers: Arc::new(config.tiers.clone()),
@@ -907,9 +825,6 @@ impl Limiter {
             refill_per_sec: self.refill_per_sec,
             burst: self.burst,
             burst_header: self.burst_header.clone(),
-            trust_forwarded_headers: self.trust_forwarded_headers,
-            trusted_proxies_configured: self.trusted_proxies_configured,
-            trusted_proxies: self.trusted_proxies.clone(),
             resolver: Arc::clone(&self.resolver),
             key_strategy: self.key_strategy,
             tiers: Arc::clone(&self.tiers),
@@ -1023,7 +938,9 @@ mod tests {
     use super::*;
     use axum::Router;
     use axum::body::Body;
+    use axum::extract::ConnectInfo;
     use axum::routing::get;
+    use std::net::{IpAddr, SocketAddr};
     use std::time::Duration;
     use tower::ServiceExt;
 
@@ -1229,17 +1146,6 @@ mod tests {
             .await
             .expect("infallible response builder");
         assert_eq!(after_refill.status(), StatusCode::OK);
-    }
-
-    #[test]
-    fn trusted_proxy_contains_ipv6() {
-        let proxy = TrustedProxy::parse("2001:db8::/32").unwrap();
-        assert!(proxy.contains("2001:db8:1234::1".parse().unwrap()));
-        assert!(!proxy.contains("2001:db9::1".parse().unwrap()));
-
-        let proxy_exact = TrustedProxy::parse("2001:db8::1").unwrap();
-        assert!(proxy_exact.contains("2001:db8::1".parse().unwrap()));
-        assert!(!proxy_exact.contains("2001:db8::2".parse().unwrap()));
     }
 
     #[test]
@@ -1883,8 +1789,8 @@ mod tests {
 
     #[test]
     fn is_trusted_proxy_returns_false_for_untrusted_ip() {
-        use crate::security::trusted_proxies::ProxyResolver;
         use crate::security::config::TrustedProxiesConfig;
+        use crate::security::trusted_proxies::ProxyResolver;
 
         let resolver = ProxyResolver::from_config(&TrustedProxiesConfig {
             ranges: vec!["10.0.0.0/8".to_string()],
@@ -1894,15 +1800,16 @@ mod tests {
 
         let untrusted_ip: IpAddr = "192.168.1.1".parse().unwrap();
         // Build a request with this peer IP and verify XFF is NOT trusted.
-        let addr: std::net::SocketAddr = format!("{untrusted_ip}:1234").parse().unwrap();
+        let peer_addr: std::net::SocketAddr = format!("{untrusted_ip}:1234").parse().unwrap();
         let mut req: axum::http::Request<()> = axum::http::Request::builder()
             .header("x-forwarded-for", "10.0.0.1")
             .body(())
             .unwrap();
-        req.extensions_mut().insert(axum::extract::ConnectInfo(addr));
+        req.extensions_mut()
+            .insert(axum::extract::ConnectInfo(peer_addr));
         // Untrusted peer: should return peer IP, not XFF value.
-        let resolved = resolver.resolve_client_addr(&req).unwrap();
-        assert_eq!(resolved, untrusted_ip);
+        let client_ip = resolver.resolve_client_addr(&req).unwrap();
+        assert_eq!(client_ip, untrusted_ip);
     }
 
     // ── Path override tests ───────────────────────────────────────────────────

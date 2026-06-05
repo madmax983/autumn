@@ -36,10 +36,15 @@
 //! are the only blessed way to obtain real client identity from request
 //! handlers and middleware.
 
+use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use axum::extract::ConnectInfo;
 use axum::http::Request;
+use tower::{Layer, Service};
 
 use crate::security::config::TrustedProxiesConfig;
 
@@ -177,7 +182,7 @@ impl ProxyResolver {
 
     /// Build a resolver that trusts no forwarding headers (prod default when unconfigured).
     #[must_use]
-    pub fn no_trust() -> Self {
+    pub const fn no_trust() -> Self {
         Self {
             ranges: Vec::new(),
             ranges_configured: false,
@@ -216,14 +221,11 @@ impl ProxyResolver {
         if let Some(xff) = Self::x_forwarded_for(req) {
             if let Some(hops) = self.trusted_hops {
                 // Peel exactly `hops` entries from the right; the next one is the client.
-                let entries: Vec<&str> = xff
-                    .rsplit(',')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .collect();
+                let mut entries = xff.rsplit(',').map(str::trim).filter(|s| !s.is_empty());
 
-                let client_idx = hops as usize;
-                if let Some(ip) = entries.get(client_idx).and_then(|s| s.parse::<IpAddr>().ok()) {
+                if let Some(entry) = entries.nth(hops as usize)
+                    && let Ok(ip) = entry.parse::<IpAddr>()
+                {
                     return Some(ip);
                 }
                 return peer_ip;
@@ -244,18 +246,18 @@ impl ProxyResolver {
             // No ranges, no hop count: use rightmost entry, but skip if it equals
             // the peer (i.e. the proxy appended itself).
             let mut entries = xff.rsplit(',').map(str::trim).filter(|s| !s.is_empty());
-            if let Some(rightmost) = entries.next() {
-                if !rightmost.is_empty() {
-                    if peer_ip.is_some_and(|p| rightmost.parse::<IpAddr>().is_ok_and(|ip| ip == p)) {
-                        if let Some(prev) = entries.next() {
-                            return prev.parse().ok().or_else(|| rightmost.parse().ok());
-                        }
-                        return rightmost.parse().ok();
+            if let Some(rightmost) = entries.next()
+                && let Ok(rightmost_ip) = rightmost.parse::<IpAddr>()
+            {
+                if peer_ip.is_some_and(|p| rightmost_ip == p) {
+                    if let Some(prev) = entries.next()
+                        && let Ok(prev_ip) = prev.parse::<IpAddr>()
+                    {
+                        return Some(prev_ip);
                     }
-                    if let Ok(ip) = rightmost.parse::<IpAddr>() {
-                        return Some(ip);
-                    }
+                    return Some(rightmost_ip);
                 }
+                return Some(rightmost_ip);
             }
         }
 
@@ -283,16 +285,16 @@ impl ProxyResolver {
         let peer_is_trusted =
             peer_ip.is_some_and(|ip| self.is_trusted_ip(ip)) || !self.ranges_configured;
 
-        if self.trust_forwarded_headers && peer_is_trusted {
-            if let Some(fwd_host) = req
+        if self.trust_forwarded_headers
+            && peer_is_trusted
+            && let Some(fwd_host) = req
                 .headers()
                 .get("x-forwarded-host")
                 .and_then(|v| v.to_str().ok())
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
-            {
-                return Some(fwd_host.to_owned());
-            }
+        {
+            return Some(fwd_host.to_owned());
         }
 
         req.headers()
@@ -311,25 +313,24 @@ impl ProxyResolver {
         let peer_is_trusted =
             peer_ip.is_some_and(|ip| self.is_trusted_ip(ip)) || !self.ranges_configured;
 
-        if self.trust_forwarded_headers && peer_is_trusted {
-            if let Some(proto) = req
+        if self.trust_forwarded_headers
+            && peer_is_trusted
+            && let Some(proto) = req
                 .headers()
                 .get("x-forwarded-proto")
                 .and_then(|v| v.to_str().ok())
-            {
-                // Multiple values are comma-separated; the leftmost is the
-                // client-facing scheme.
-                let outermost = proto.split(',').next().unwrap_or(proto).trim();
-                if !outermost.is_empty() {
-                    return outermost.to_ascii_lowercase();
-                }
+        {
+            // Multiple values are comma-separated; the leftmost is the
+            // client-facing scheme.
+            let outermost = proto.split(',').next().unwrap_or(proto).trim();
+            if !outermost.is_empty() {
+                return outermost.to_ascii_lowercase();
             }
         }
 
         req.uri()
             .scheme_str()
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| "http".to_owned())
+            .map_or_else(|| "http".to_owned(), ToOwned::to_owned)
     }
 
     fn peer_ip<B>(req: &Request<B>) -> Option<IpAddr> {
@@ -366,6 +367,75 @@ pub struct ResolvedClientIdentity {
     pub scheme: String,
 }
 
+/// Tower [`Layer`] that resolves real client identity and stamps
+/// [`ResolvedClientIdentity`] into request extensions.
+///
+/// Install this early in the middleware stack — before rate limiting, CSRF,
+/// and any middleware that reads the `ClientAddr`, `ClientHost`, or
+/// `ClientScheme` extractors.
+#[derive(Clone, Debug)]
+pub struct TrustedProxiesLayer {
+    resolver: Arc<ProxyResolver>,
+}
+
+impl TrustedProxiesLayer {
+    /// Build from the operator's `[security.trusted_proxies]` config block.
+    #[must_use]
+    pub fn from_config(config: &TrustedProxiesConfig) -> Self {
+        Self {
+            resolver: Arc::new(ProxyResolver::from_config(config)),
+        }
+    }
+}
+
+impl<S> Layer<S> for TrustedProxiesLayer {
+    type Service = TrustedProxiesService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        TrustedProxiesService {
+            inner,
+            resolver: Arc::clone(&self.resolver),
+        }
+    }
+}
+
+/// Tower [`Service`] produced by [`TrustedProxiesLayer`].
+#[derive(Clone, Debug)]
+pub struct TrustedProxiesService<S> {
+    inner: S,
+    resolver: Arc<ProxyResolver>,
+}
+
+impl<S, B> Service<Request<B>> for TrustedProxiesService<S>
+where
+    S: Service<Request<B>> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+    S::Error: Send + 'static,
+    B: Send + 'static,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, mut req: Request<B>) -> Self::Future {
+        let identity = ResolvedClientIdentity {
+            addr: self.resolver.resolve_client_addr(&req),
+            host: self.resolver.resolve_client_host(&req),
+            scheme: self.resolver.resolve_client_scheme(&req),
+        };
+        req.extensions_mut().insert(identity);
+
+        let mut inner = self.inner.clone();
+        std::mem::swap(&mut self.inner, &mut inner);
+
+        Box::pin(inner.call(req))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -384,13 +454,6 @@ mod tests {
             .header("x-forwarded-for", xff)
             .body(())
             .unwrap();
-        req.extensions_mut().insert(ConnectInfo(addr));
-        req
-    }
-
-    fn req_with_peer(peer: &str) -> Request<()> {
-        let addr: SocketAddr = format!("{peer}:1234").parse().unwrap();
-        let mut req = Request::builder().body(()).unwrap();
         req.extensions_mut().insert(ConnectInfo(addr));
         req
     }
@@ -417,6 +480,17 @@ mod tests {
         assert!(TrustedProxy::parse("not-an-ip").is_none());
         assert!(TrustedProxy::parse("").is_none());
         assert!(TrustedProxy::parse("10.0.0.0/33").is_none());
+    }
+
+    #[test]
+    fn trusted_proxy_contains_ipv6() {
+        let proxy = TrustedProxy::parse("2001:db8::/32").unwrap();
+        assert!(proxy.contains("2001:db8:1234::1".parse().unwrap()));
+        assert!(!proxy.contains("2001:db9::1".parse().unwrap()));
+
+        let proxy_exact = TrustedProxy::parse("2001:db8::1").unwrap();
+        assert!(proxy_exact.contains("2001:db8::1".parse().unwrap()));
+        assert!(!proxy_exact.contains("2001:db8::2".parse().unwrap()));
     }
 
     // ── AC (a): attacker-controlled leading value rejected with trusted_hops=1 ──

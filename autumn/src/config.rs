@@ -121,6 +121,10 @@
 //! | `AUTUMN_DEV__INSPECTOR_CAPACITY` | `dev.inspector_capacity` | `usize` |
 //! | `AUTUMN_DEV__INSPECTOR_N_PLUS_ONE_THRESHOLD` | `dev.inspector_n_plus_one_threshold` | `usize` |
 //! | `AUTUMN_COMPRESSION__ENABLED` | `compression.enabled` | `bool` |
+//! | `AUTUMN_AUTH__LOCKOUT__ENABLED` | `auth.lockout.enabled` | `bool` |
+//! | `AUTUMN_AUTH__LOCKOUT__THRESHOLD` | `auth.lockout.threshold` | `i32` |
+//! | `AUTUMN_AUTH__LOCKOUT__WINDOW_SECS` | `auth.lockout.window_secs` | `u64` |
+//! | `AUTUMN_AUTH__LOCKOUT__COOLOFF_SECS` | `auth.lockout.cooloff_secs` | `u64` |
 
 use std::path::{Path, PathBuf};
 
@@ -2333,6 +2337,28 @@ impl AutumnConfig {
             "AUTUMN_SECURITY__TRUSTED_HOSTS__HOSTS",
             &mut self.security.trusted_hosts.hosts,
         );
+
+        // Top-level trusted-proxy policy
+        parse_env_csv(
+            env,
+            "AUTUMN_SECURITY__TRUSTED_PROXIES__RANGES",
+            &mut self.security.trusted_proxies.ranges,
+        );
+        parse_env_bool(
+            env,
+            "AUTUMN_SECURITY__TRUSTED_PROXIES__TRUST_FORWARDED_HEADERS",
+            &mut self.security.trusted_proxies.trust_forwarded_headers,
+        );
+        if let Ok(val) = env.var("AUTUMN_SECURITY__TRUSTED_PROXIES__TRUSTED_HOPS") {
+            if let Ok(hops) = val.trim().parse::<u32>() {
+                self.security.trusted_proxies.trusted_hops = Some(hops);
+            } else {
+                tracing::warn!(
+                    "ignoring invalid AUTUMN_SECURITY__TRUSTED_PROXIES__TRUSTED_HOPS={val:?}: \
+                     expected a non-negative integer"
+                );
+            }
+        }
 
         self.security.webhooks.apply_env_overrides_with_env(env);
     }
