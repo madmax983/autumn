@@ -5,7 +5,7 @@
 //! `#[ignore]` and require a Chromium binary).
 //!
 //! Run:
-//!   cargo test -p autumn-web --features system-tests --test system_test_api
+//!   cargo test -p autumn-web --features system-tests --test `system_test_api`
 
 #![cfg(feature = "system-tests")]
 
