@@ -1,6 +1,10 @@
 # Normalise line endings for all text files on checkout.
 * text=auto
 
+# Shell gates must stay LF-normalized on Windows; CRLF makes bash see
+# carriage returns in options and blank lines.
+*.sh text eol=lf
+
 # Force LF for embedded Markdown content used via include_str! so that
 # git autocrlf on Windows does not corrupt the frontmatter delimiters.
 examples/wiki/content/*.md text eol=lf

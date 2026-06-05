@@ -1157,6 +1157,19 @@ mod tests {
         assert_eq!(err.to_string(), "please reload and retry");
     }
 
+    #[test]
+    fn gone_is_410() {
+        let err = AutumnError::gone(TestError("sunsetted".into()));
+        assert_eq!(err.status(), StatusCode::GONE);
+    }
+
+    #[test]
+    fn gone_msg_is_410() {
+        let err = AutumnError::gone_msg("API version has been sunsetted");
+        assert_eq!(err.status(), StatusCode::GONE);
+        assert_eq!(err.to_string(), "API version has been sunsetted");
+    }
+
     #[tokio::test]
     async fn conflict_response_is_409_json() -> Result<(), axum::Error> {
         let err = AutumnError::conflict_msg("version mismatch");

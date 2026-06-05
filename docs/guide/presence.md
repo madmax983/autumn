@@ -25,7 +25,7 @@ Presence is part of the `ws` Cargo feature (same as `Channels`):
 
 ```toml
 [dependencies]
-autumn-web = { version = "0.4", features = ["ws"] }
+autumn-web = { version = "0.5", features = ["ws"] }
 ```
 
 It is available from `autumn_web::prelude::*` automatically when `ws` is enabled.
