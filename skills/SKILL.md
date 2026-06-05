@@ -4,7 +4,7 @@ description: >
   Use when building, debugging, documenting, or upgrading Rust web applications
   with autumn-web, autumn-cli, or first-party Autumn crates; also use for
   Autumn route/model/repository/job/webhook/admin macros, AppBuilder setup,
-  Maud + htmx server-rendered UI, Diesel async Postgres, and Autumn 0.4.x
+  Maud + htmx server-rendered UI, Diesel async Postgres, and Autumn 0.5.x
   migration or release work.
 ---
 
@@ -12,7 +12,7 @@ description: >
 
 **Repository**: https://github.com/madmax983/autumn
 **Branch**: `trunk-dev`
-**Current release**: 0.4.0 (2026-05-12) | **Edition**: 2024 | **MSRV**: 1.88.0
+**Current release**: 0.5.0 (2026-06-04) | **Edition**: 2024 | **MSRV**: 1.88.0
 **Author**: madmax983
 
 autumn-web is a Spring Boot-style web framework for Rust, built on Axum. It
@@ -24,9 +24,9 @@ defaults into a convention-over-configuration stack with proc-macro ergonomics.
 This file is the quick operating guide. Load the adjacent reference files only
 when their details matter:
 
-- `references/api-reference.md` - exact 0.4.0 public exports, proc macros,
+- `references/api-reference.md` - release-line API map, proc macros,
   feature flags, AppBuilder methods, config env names, and dependency versions.
-- `references/examples.md` - official 0.4.0 example patterns for minimal apps,
+- `references/examples.md` - official 0.5.0 example patterns for minimal apps,
   CRUD, production-ish jobs, Redis channels, S3 storage plugins, and signed
   webhooks. Use this before generating full app code.
 
@@ -386,7 +386,7 @@ Clients that prefer JSON receive `application/problem+json` with `type`,
 ## CLI
 
 ```bash
-cargo install autumn-cli --version 0.4.0
+cargo install autumn-cli --version 0.5.0
 
 autumn new my-app
 autumn setup
@@ -429,7 +429,7 @@ signing secrets, and other config problems without printing credentials.
 ## Release and PR workflow
 
 - Base branch is `trunk-dev`, not `trunk`.
-- Release tag for this line is `v0.4.0`.
+- Release tag for this line is `v0.5.0`.
 - Published crates are released together at the same workspace version:
   `autumn-macros`, `autumn-web`, `autumn-cli`, `autumn-admin-plugin`,
   `autumn-storage-s3`, and `autumn-cache-redis`.

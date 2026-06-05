@@ -328,9 +328,11 @@ impl ProxyResolver {
     /// Resolve the external scheme (`"http"` or `"https"`) as seen by the client.
     ///
     /// Returns the leftmost value of `X-Forwarded-Proto` when
-    /// `trust_forwarded_headers` is `true` and the peer is trusted;
-    /// otherwise falls back to the request URI scheme, then `"http"`.
-    pub fn resolve_client_scheme<B>(&self, req: &Request<B>) -> String {
+    /// `trust_forwarded_headers` is `true` and the peer is trusted, the URI
+    /// scheme when present, or `None` when no scheme signal was observed.  A
+    /// `None` return lets callers distinguish "no signal" from "http", which
+    /// is important for the same-origin host-only fallback path.
+    pub fn resolve_client_scheme<B>(&self, req: &Request<B>) -> Option<String> {
         if self.trust_forwarded_headers {
             // Hop-count mode: trust forwarded proto without checking peer ranges.
             let peer_ip = Self::peer_ip(req);
@@ -350,14 +352,12 @@ impl ProxyResolver {
                 // client-facing scheme.
                 let outermost = proto.split(',').next().unwrap_or(proto).trim();
                 if !outermost.is_empty() {
-                    return outermost.to_ascii_lowercase();
+                    return Some(outermost.to_ascii_lowercase());
                 }
             }
         }
 
-        req.uri()
-            .scheme_str()
-            .map_or_else(|| "http".to_owned(), ToOwned::to_owned)
+        req.uri().scheme_str().map(ToOwned::to_owned)
     }
 
     fn peer_ip<B>(req: &Request<B>) -> Option<IpAddr> {
@@ -390,8 +390,11 @@ pub struct ResolvedClientIdentity {
     pub addr: Option<IpAddr>,
     /// Resolved external host.
     pub host: Option<String>,
-    /// Resolved external scheme (`"http"` or `"https"`).
-    pub scheme: String,
+    /// Resolved external scheme (`"http"` or `"https"`), or `None` when no
+    /// scheme signal was observed (no trusted `X-Forwarded-Proto` and no URI scheme).
+    /// Callers that need a concrete default should use
+    /// `scheme.as_deref().unwrap_or("http")`.
+    pub scheme: Option<String>,
 }
 
 /// Tower [`Layer`] that resolves real client identity and stamps
@@ -651,7 +654,7 @@ mod tests {
             .unwrap();
 
         let scheme = resolver.resolve_client_scheme(&req);
-        assert_eq!(scheme, "http");
+        assert_eq!(scheme.as_deref(), Some("http"));
     }
 
     // ── Host and scheme resolution ──────────────────────────────────────────
@@ -669,7 +672,10 @@ mod tests {
             .header("x-forwarded-proto", "https, http")
             .body(())
             .unwrap();
-        assert_eq!(resolver.resolve_client_scheme(&req), "https");
+        assert_eq!(
+            resolver.resolve_client_scheme(&req).as_deref(),
+            Some("https")
+        );
     }
 
     #[test]
@@ -763,7 +769,10 @@ mod tests {
         let addr: SocketAddr = "10.0.1.200:1234".parse().unwrap();
         req.extensions_mut().insert(ConnectInfo(addr));
 
-        assert_eq!(resolver.resolve_client_scheme(&req), "https");
+        assert_eq!(
+            resolver.resolve_client_scheme(&req).as_deref(),
+            Some("https")
+        );
     }
 
     // ── Untrusted peer ignores forwarding headers ───────────────────────────

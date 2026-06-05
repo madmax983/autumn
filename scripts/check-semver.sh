@@ -25,26 +25,50 @@ die() {
   exit 1
 }
 
-# Install cargo-semver-checks if it is not on PATH.
-if ! command -v cargo-semver-checks &>/dev/null; then
-  echo "cargo-semver-checks not found — installing..."
-  cargo install cargo-semver-checks --locked
-fi
-
-# Workspace version — used to locate the migration guide for intentional breaks.
-workspace_version="$(
-  awk '
+workspace_package_value() {
+  local key="$1"
+  awk -v key="$key" '
     /^\[workspace\.package\]/ { in_block = 1; next }
     /^\[/ && in_block         { in_block = 0 }
-    in_block && /^[[:space:]]*version/ {
+    in_block && $0 ~ "^[[:space:]]*" key "[[:space:]]*=" {
       match($0, /"[^"]+"/)
       print substr($0, RSTART + 1, RLENGTH - 2)
       exit
     }
   ' Cargo.toml
-)"
+}
+
+install_cargo_semver_checks() {
+  echo "cargo-semver-checks not found — installing..."
+  # This installs a local CI/helper tool, not a shipped artifact. Avoid the
+  # release-profile LTO/codegen-units=1 hotspot that has produced rustc access
+  # violations on Windows while compiling cargo-semver-checks itself.
+  CARGO_PROFILE_RELEASE_LTO="${CARGO_PROFILE_RELEASE_LTO:-false}" \
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS="${CARGO_PROFILE_RELEASE_CODEGEN_UNITS:-16}" \
+    cargo install cargo-semver-checks --locked
+}
+
+# Install cargo-semver-checks if it is not on PATH.
+if ! command -v cargo-semver-checks &>/dev/null; then
+  install_cargo_semver_checks
+fi
+
+# Workspace version — used to locate the migration guide for intentional breaks.
+workspace_version="$(workspace_package_value "version")"
 [[ -n "$workspace_version" ]] || die "could not parse workspace version from Cargo.toml"
 migration_guide="docs/migrations/${workspace_version}.md"
+
+# cargo-semver-checks 0.48 requires rustc >= 1.91.0, while rustc 1.96.0 has
+# ICE'd in the rustdoc JSON path for the Diesel/diesel-async graph. Keep this
+# pinned to a known-good toolchain instead of following latest stable.
+semver_toolchain="${AUTUMN_SEMVER_RUST_VERSION:-1.92.0}"
+
+command -v rustup &>/dev/null || die "rustup is required to run SemVer checks with Rust $semver_toolchain"
+if ! rustup toolchain list | grep -Fq "${semver_toolchain}-"; then
+  die "Rust $semver_toolchain toolchain is required for SemVer checks; run: rustup toolchain install $semver_toolchain"
+fi
+SEMVER_CARGO=(rustup run "$semver_toolchain" cargo)
+echo "semver rust toolchain = $semver_toolchain"
 
 # Parse version components (strip any pre-release suffix, e.g. -alpha.1).
 _ver="${workspace_version%%-*}"
@@ -75,7 +99,8 @@ CRATES=(
   autumn-cache-redis
 )
 
-failures=0
+breaking_failures=0
+tool_failures=0
 
 for crate in "${CRATES[@]}"; do
   echo ""
@@ -86,7 +111,7 @@ for crate in "${CRATES[@]}"; do
   # We distinguish these cases by parsing the output rather than relying on
   # exit codes alone.
   set +e
-  crate_output="$(cargo semver-checks check-release --package "$crate" 2>&1)"
+  crate_output="$("${SEMVER_CARGO[@]}" semver-checks check-release --package "$crate" 2>&1)"
   exit_code=$?
   set -e
 
@@ -114,24 +139,28 @@ for crate in "${CRATES[@]}"; do
     elif [[ -f "$migration_guide" ]]; then
       echo "  FAIL: $crate has breaking API changes but $workspace_version is a patch/minor release." >&2
       echo "        Breaking changes require a major bump (X.0.0, X≥1) or a pre-1.0 minor bump (0.Y.0)." >&2
-      failures=$((failures + 1))
+      breaking_failures=$((breaking_failures + 1))
     else
       echo "  FAIL: $crate has unacknowledged breaking API changes." >&2
       echo "        Add a migration guide at $migration_guide to acknowledge an intentional break," >&2
       echo "        or fix the API regression before releasing." >&2
-      failures=$((failures + 1))
+      breaking_failures=$((breaking_failures + 1))
     fi
   else
     # Exit 1 with unrecognised output → tool/invocation error (compilation
     # failure, registry timeout, unsupported flag, etc.).  Hard-fail so the
     # error is investigated rather than silently skipped.
     echo "  FAIL: $crate — cargo-semver-checks failed with an unexpected error (exit $exit_code)." >&2
-    failures=$((failures + 1))
+    tool_failures=$((tool_failures + 1))
   fi
 done
 
 echo ""
-if [[ "$failures" -gt 0 ]]; then
+if [[ "$tool_failures" -gt 0 ]]; then
+  die "SemVer check had $tool_failures tool/invocation failure(s)."
+fi
+
+if [[ "$breaking_failures" -gt 0 ]]; then
   # On pull requests the SemVer gate is informational: surface the findings so
   # reviewers can see them, but exit 0 so the check run shows green and does not
   # block merging.  The gate is a hard blocker only on tag-push releases, where
@@ -139,13 +168,13 @@ if [[ "$failures" -gt 0 ]]; then
   # the individual check-run conclusion (which stays "failure" even when
   # continue-on-error is set at the job level).
   if [[ "${GITHUB_EVENT_NAME:-}" == "pull_request" ]]; then
-    echo "NOTE: $failures crate(s) have breaking API changes."
+    echo "NOTE: $breaking_failures crate(s) have breaking API changes."
     echo "      These findings are informational on pull requests."
     echo "      They will block a tag-push release unless a migration guide"
     echo "      exists at $migration_guide."
     exit 0
   fi
-  die "$failures crate(s) have unacknowledged breaking public API changes."
+  die "$breaking_failures crate(s) have unacknowledged breaking public API changes."
 fi
 
 echo "SemVer check OK — no unacknowledged breaking API changes."

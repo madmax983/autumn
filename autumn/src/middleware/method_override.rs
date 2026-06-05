@@ -448,7 +448,7 @@ fn origin_matches_request_with_identity(
                     s.split(',').next().unwrap_or(s).trim().to_ascii_lowercase()
                 })
         },
-        |id| Some(id.scheme.clone()),
+        |id| id.scheme.clone(),
     );
 
     if let Some(scheme) = resolved_scheme {
@@ -1507,7 +1507,7 @@ mod tests {
         req.extensions_mut().insert(ResolvedClientIdentity {
             addr: None,
             host: Some("app.example".to_owned()),
-            scheme: "https".to_owned(),
+            scheme: Some("https".to_owned()),
         });
 
         let response = app.oneshot(req).await.unwrap();
@@ -1539,7 +1539,7 @@ mod tests {
         req.extensions_mut().insert(ResolvedClientIdentity {
             addr: None,
             host: Some("internal.cluster.local".to_owned()),
-            scheme: "http".to_owned(),
+            scheme: Some("http".to_owned()),
         });
 
         let response = app.oneshot(req).await.unwrap();

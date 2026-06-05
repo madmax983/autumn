@@ -2,7 +2,7 @@
 
 Repositories in `autumn-web` provide a clean, type-safe, and highly optimized ORM-like data access layer. By annotating a trait with `#[autumn_web::repository(Model, table = "table_name")]`, Autumn automatically generates high-performance implementations targeting PostgreSQL using `diesel-async`.
 
-In version `0.4.0`, Autumn introduces high-performance **Bulk CRUD operations** to minimize database round trips and execute massive writes transaction-safely and hook-compliantly.
+In version `0.5.0`, Autumn introduces high-performance **Bulk CRUD operations** to minimize database round trips and execute massive writes transaction-safely and hook-compliantly.
 
 ---
 

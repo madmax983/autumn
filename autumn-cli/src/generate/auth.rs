@@ -476,6 +476,8 @@ pub fn plan_auth_with_providers(
         user_field_tokens.push("totp_enabled:bool");
         user_field_tokens.push("totp_last_used_step:Option<i64>");
     }
+    user_field_tokens.push("failed_attempts:i32");
+    user_field_tokens.push("locked_at:Option<NaiveDateTime>");
     user_field_tokens.push("reset_token_digest:Option<String>");
     user_field_tokens.push("reset_token_expires_at:Option<NaiveDateTime>");
     let auth_fields: Vec<super::dsl::Field> = user_field_tokens
@@ -1320,6 +1322,8 @@ fn render_migration_up(table: &str, totp: bool) -> String {
          \x20   email TEXT NOT NULL UNIQUE,\n\
          \x20   password_digest TEXT NOT NULL,\n\
          {totp_columns}\
+         \x20   failed_attempts INT NOT NULL DEFAULT 0,\n\
+         \x20   locked_at TIMESTAMP NULL,\n\
          \x20   reset_token_digest TEXT NULL,\n\
          \x20   reset_token_expires_at TIMESTAMP NULL,\n\
          \x20   created_at TIMESTAMP NOT NULL DEFAULT NOW()\n\
@@ -1386,7 +1390,11 @@ pub struct {pascal_name} {{
     pub id: i64,
     pub email: String,
     pub password_digest: String,
-{totp_fields}    pub reset_token_digest: Option<String>,
+{totp_fields}    #[default]
+    pub failed_attempts: i32,
+    #[default]
+    pub locked_at: Option<chrono::NaiveDateTime>,
+    pub reset_token_digest: Option<String>,
     pub reset_token_expires_at: Option<chrono::NaiveDateTime>,
     #[default]
     pub created_at: chrono::NaiveDateTime,
@@ -1633,15 +1641,42 @@ pub struct LoginForm {{
     pub password: String,
 }}
 
+/// Extracts the client IP from `ConnectInfo` when present, or falls back to
+/// `UNSPECIFIED` so the handler compiles and runs correctly in both production
+/// (where `into_make_service_with_connect_info` injects the extension) and
+/// in test environments where it is absent.
+pub struct MaybeClientIp(std::net::IpAddr);
+
+impl<S: Send + Sync> axum::extract::FromRequestParts<S> for MaybeClientIp {{
+    type Rejection = std::convert::Infallible;
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {{
+        let ip = parts
+            .extensions
+            .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+            .map(|c| c.0.ip())
+            .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+        Ok(MaybeClientIp(ip))
+    }}
+}}
+
 /// `POST /login` — verify credentials and start a session.
 ///
-/// Non-enumerating: returns the same error for unknown email and wrong password
-/// so callers cannot learn which addresses are registered.
+/// Non-enumerating: returns the same error for unknown email, wrong password,
+/// and a locked account so callers cannot learn which accounts are registered
+/// or which are currently locked.
+///
+/// Account lockout policy is read from `[auth.lockout]` in `autumn.toml`.
+/// Safe defaults: threshold = 10 failures, cooloff = 900 s.
+/// Disable with `enabled = false` or `threshold = 0` to restore pre-lockout behaviour.
 #[post("/login")]
 pub async fn login(
     mut db: Db,
     State(state): State<AppState>,
     session: Session,
+    MaybeClientIp(addr_ip): MaybeClientIp,
     Form(form): Form<LoginForm>,
 ) -> AutumnResult<Response> {{
     let email = form.email.trim().to_lowercase();
@@ -1663,10 +1698,161 @@ pub async fn login(
         .map(|u| u.password_digest.as_str())
         .unwrap_or(DUMMY_HASH);
     let password_ok = verify_password(&form.password, password_hash).await.unwrap_or(false);
-    if !password_ok {{
-        return Err(auth_err());
+
+    // ── Account lockout policy ────────────────────────────────────────────────
+    // Read lockout config from the standard Autumn config surface.
+    let lockout_cfg = state.config().auth.lockout;
+    let lockout_enabled = lockout_cfg.enabled && lockout_cfg.threshold > 0;
+
+    if let Some(ref {snake_name}) = found_{snake_name} {{
+        if lockout_enabled {{
+            let now = chrono::Utc::now().naive_utc();
+            let cooloff = chrono::Duration::seconds(lockout_cfg.cooloff_secs as i64);
+
+            // Track local state; reset if cool-off has elapsed so the first new
+            // failure after expiry is counted as attempt #1, not a re-lock.
+            let mut current_attempts = {snake_name}.failed_attempts;
+            let mut current_locked_at = {snake_name}.locked_at;
+
+            // Check if the account is currently locked: locked_at is set and
+            // cool-off period has not elapsed. Non-enumerating: return the same
+            // auth_err as wrong password so the response does not reveal lock state.
+            if let Some(locked_at) = {snake_name}.locked_at {{
+                if now < locked_at + cooloff {{
+                    return Err(auth_err());
+                }}
+                // Cool-off elapsed — treat the account as unlocked. Reset local
+                // counters so the next failure starts from 1, not from threshold.
+                current_attempts = 0;
+                current_locked_at = None;
+            }}
+
+            if !password_ok {{
+                // Atomically increment the failure counter so concurrent bad-password
+                // requests each count as distinct failures rather than collapsing into
+                // one. Use two separate update paths (different Diesel expression types)
+                // rather than an if expression inside `.eq(...)`.
+                let new_attempts: i32 = if current_attempts == {snake_name}.failed_attempts {{
+                    // Normal path: DB atomically computes `failed_attempts + 1`.
+                    // Propagate write errors — silently absorbing a failure here
+                    // would let repeated bad-password attempts bypass the threshold.
+                    diesel::update({table}::table.find({snake_name}.id))
+                        .set({table}::failed_attempts.eq({table}::failed_attempts + 1))
+                        .returning({table}::failed_attempts)
+                        .get_result::<i32>(&mut *db)
+                        .await
+                        .map_err(|e| AutumnError::internal_server_error_msg(&format!("Failed to record failed login: {{e}}")))?
+                }} else {{
+                    // Cool-off reset path: atomically reset counter to 1 and clear
+                    // locked_at in a single UPDATE. Concurrent requests hitting this
+                    // branch all write the same values so races are benign (all still
+                    // count 1 failure each, not zero). Propagate write errors so that
+                    // DB permission failures don't silently bypass the lockout threshold.
+                    diesel::update({table}::table.find({snake_name}.id))
+                        .set((
+                            {table}::failed_attempts.eq(1i32),
+                            {table}::locked_at.eq(None::<chrono::NaiveDateTime>),
+                        ))
+                        .execute(&mut *db)
+                        .await
+                        .map_err(|e| AutumnError::internal_server_error_msg(&format!("Failed to reset lockout counter: {{e}}")))?;
+                    1i32
+                }};
+
+                if new_attempts >= lockout_cfg.threshold && current_locked_at.is_none() {{
+                    // Account transitions into the locked state — stamp locked_at
+                    // atomically. Propagate errors: if this write fails the account
+                    // is not locked despite the counter crossing the threshold, which
+                    // would allow a successful login to slip through.
+                    diesel::update({table}::table.find({snake_name}.id))
+                        .set({table}::locked_at.eq(Some(now)))
+                        .execute(&mut *db)
+                        .await
+                        .map_err(|e| AutumnError::internal_server_error_msg(&format!("Failed to lock account: {{e}}")))?;
+
+                    // Truncate to a coarse IP prefix (IPv4 /24, IPv6 /64) so
+                    // the telemetry event enables incident response without
+                    // logging a precise user identifier.
+                    let ip_prefix = match addr_ip {{
+                        std::net::IpAddr::V4(ip) => {{
+                            let [a, b, c, _] = ip.octets();
+                            format!("{{a}}.{{b}}.{{c}}.0/24")
+                        }}
+                        std::net::IpAddr::V6(ip) => {{
+                            let s = ip.segments();
+                            format!("{{:x}}:{{:x}}:{{:x}}:{{:x}}::/64", s[0], s[1], s[2], s[3])
+                        }}
+                    }};
+                    // Salt the digest with the deployment secret so the
+                    // account ID cannot be recovered by hashing small integers.
+                    let account_id_digest = {{
+                        use sha2::{{Digest, Sha256}};
+                        // Require a deployment secret for the digest salt. Operators
+                        // MUST set SECRET_KEY_BASE (already required for sessions) or
+                        // AUTUMN_ADMIN_SECRET. The static fallback prevents reversibility
+                        // only within this process; set the env var in production.
+                        let salt = std::env::var("SECRET_KEY_BASE")
+                            .or_else(|_| std::env::var("AUTUMN_ADMIN_SECRET"))
+                            .unwrap_or_else(|_| "autumn-lockout-fallback-salt".to_string());
+                        let hash = Sha256::digest(
+                            format!("{{}}:{{}}", salt, {snake_name}.id).as_bytes(),
+                        );
+                        hex::encode(&hash[..8])
+                    }};
+                    tracing::warn!(
+                        event = "account_locked",
+                        account_id_digest = %account_id_digest,
+                        ip_prefix = %ip_prefix,
+                        failed_attempts = new_attempts,
+                        "account locked after repeated failed login attempts"
+                    );
+                }}
+                return Err(auth_err());
+            }}
+        }} else if !password_ok {{
+            return Err(auth_err());
+        }}
+    }} else {{
+        // Unknown email — bcrypt ran on DUMMY_HASH above for timing safety.
+        if !password_ok {{
+            return Err(auth_err());
+        }}
     }}
+
     let {snake_name} = found_{snake_name}.ok_or_else(auth_err)?;
+
+    // Successful login: reset lockout counter only when the account is not
+    // currently locked. The WHERE clause accepts both:
+    //   - locked_at IS NULL (no lock ever set), and
+    //   - locked_at <= now - cooloff (lock expired via cool-off),
+    // so that a user who waited out the cool-off can log in with a correct
+    // password without requiring an operator unlock.
+    // If zero rows match after excluding active (non-expired) locks, the
+    // account was just locked concurrently — reject the login.
+    if lockout_enabled {{
+        let cooloff = chrono::Duration::seconds(lockout_cfg.cooloff_secs as i64);
+        let lock_expired_before = chrono::Utc::now().naive_utc() - cooloff;
+        let rows_cleared = diesel::update(
+            {table}::table
+                .find({snake_name}.id)
+                .filter(
+                    {table}::locked_at.is_null().or(
+                        {table}::locked_at.le(lock_expired_before)
+                    )
+                ),
+        )
+        .set((
+            {table}::failed_attempts.eq(0),
+            {table}::locked_at.eq(None::<chrono::NaiveDateTime>),
+        ))
+        .execute(&mut *db)
+        .await
+        .map_err(|e| AutumnError::internal_server_error_msg(&format!("Failed to reset lockout on login: {{e}}")))?;
+        if rows_cleared == 0 {{
+            return Err(auth_err());
+        }}
+    }}
+
 {totp_login_branch}
     session.rotate_id().await;
 {totp_clear_pending}    session.insert("{snake_name}_id", {snake_name}.id.to_string()).await;
@@ -1686,6 +1872,66 @@ pub async fn login(
 pub async fn logout(session: Session) -> AutumnResult<Response> {{
     session.destroy().await;
     Ok(redirect_to("/login"))
+}}
+
+// ── Operator unlock ───────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct UnlockAccountForm {{
+    pub email: String,
+}}
+
+/// `POST /auth/admin/unlock` — clear the lockout for a single account.
+///
+/// Requires the `X-Admin-Secret` header to match the `AUTUMN_ADMIN_SECRET`
+/// environment variable. Returns the same 422 as a wrong-password attempt on
+/// both wrong secret and unknown email so the response does not reveal which
+/// accounts exist or are locked.
+///
+/// Protect this endpoint with network-level access controls (VPN, internal
+/// load-balancer allowlist) in production in addition to the secret header.
+///
+/// **CSRF exemption required.** Autumn enables CSRF by default on all non-safe
+/// routes. Add this path to the exempt list in `autumn.toml`:
+/// ```toml
+/// [security.csrf]
+/// exempt_paths = ["/auth/admin/unlock"]
+/// ```
+///
+/// Usage:
+/// ```sh
+/// curl -s -X POST https://example.com/auth/admin/unlock \
+///   -H "Content-Type: application/x-www-form-urlencoded" \
+///   -H "X-Admin-Secret: $AUTUMN_ADMIN_SECRET" \
+///   -d "email=user%40example.com"
+/// ```
+#[post("/auth/admin/unlock")]
+pub async fn unlock_account(
+    mut db: Db,
+    headers: axum::http::HeaderMap,
+    Form(form): Form<UnlockAccountForm>,
+) -> AutumnResult<Markup> {{
+    let admin_secret = std::env::var("AUTUMN_ADMIN_SECRET").unwrap_or_default();
+    let provided = headers
+        .get("x-admin-secret")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if admin_secret.is_empty() || provided != admin_secret {{
+        return Err(AutumnError::unprocessable_msg("Invalid email or password."));
+    }}
+    let email = form.email.trim().to_lowercase();
+    diesel::update({table}::table.filter({table}::email.eq(&email)))
+        .set((
+            {table}::failed_attempts.eq(0),
+            {table}::locked_at.eq(None::<chrono::NaiveDateTime>),
+        ))
+        .execute(&mut *db)
+        .await
+        .map_err(|e| AutumnError::internal_server_error_msg(&format!("Failed to unlock account: {{e}}")))?;
+    Ok(layout("Account Unlocked", html! {{
+        h1 {{ "Account Unlocked" }}
+        p {{ "The lockout for " (email) " has been cleared if it existed." }}
+    }}))
 }}
 
 // ── Account (protected example route) ────────────────────────────────────────
@@ -2106,10 +2352,142 @@ fn auth_account_rejects_anonymous() {{
         "GET /account should reject anonymous requests (expected 401 or redirect):\n{{resp}}"
     );
 }}
+
+// ── Account lockout tests ─────────────────────────────────────────────────────
+//
+// These tests verify the lockout policy required by issue #814.
+// They run against a live server like the tests above; set AUTUMN_TEST_BASE_URL.
+//
+// Each lockout test creates its own account via POST /signup before running
+// so the tests are self-contained against a fresh database — no pre-seeding needed.
+
+/// Sign up an account, ignoring any error (account may already exist from a
+/// previous test run). Used to make lockout tests self-contained.
+fn ensure_account(base: &str, email: &str, password: &str) {{
+    let body = format!("email={{email}}&password={{password}}");
+    // The response may be a redirect (201/302 on success) or 422 if the account
+    // already exists — both are acceptable; we only care that the account exists.
+    post_form(base, "/signup", &body, "");
+}}
+
+/// AC8a — N+1 failed attempts within the window cause the next attempt with
+/// correct credentials to be rejected.
+///
+/// Scenario: sign up an account, submit threshold bad-password POSTs, then
+/// submit one more POST with the correct password. The final attempt must be
+/// rejected (same 422 body as wrong password) because the account is now locked.
+///
+/// Set `AUTUMN_AUTH__LOCKOUT__THRESHOLD=10` (the default) to run against the
+/// standard policy.
+#[test]
+fn auth_lockout_rejects_correct_credentials() {{
+    let Some(base) = base_url() else {{
+        eprintln!("skipping: AUTUMN_TEST_BASE_URL not set");
+        return;
+    }};
+    let email = "lockout-test@example.com";
+    let password = "correct-password-L0ck";
+    ensure_account(&base, email, password);
+    let bad_body = format!("email={{email}}&password=wrong-password");
+    // Exhaust the threshold (default 10) with wrong passwords.
+    for _ in 0..10 {{
+        post_form(&base, "/login", &bad_body, "");
+    }}
+    // The next attempt with the CORRECT password must still be rejected.
+    let correct_body = format!("email={{email}}&password={{password}}");
+    let resp = post_form(&base, "/login", &correct_body, "");
+    assert!(
+        resp.contains("HTTP/1.1 422") || resp.contains("HTTP/1.0 422"),
+        "locked account must reject correct credentials with 422:\n{{resp}}"
+    );
+}}
+
+/// AC8b — a successful login before the threshold resets the failure counter.
+///
+/// Scenario: sign up an account, submit (threshold-1) bad-password POSTs, then
+/// 1 correct-password POST (which succeeds and resets the counter), then
+/// (threshold-1) more bad-password POSTs. The account must remain unlocked.
+#[test]
+fn auth_successful_login_resets_lockout_counter() {{
+    let Some(base) = base_url() else {{
+        eprintln!("skipping: AUTUMN_TEST_BASE_URL not set");
+        return;
+    }};
+    let email = "lockout-reset-test@example.com";
+    let password = "correct-password-R3set";
+    ensure_account(&base, email, password);
+    let bad_body = format!("email={{email}}&password=wrong-password");
+    let good_body = format!("email={{email}}&password={{password}}");
+    // 5 failures (below default threshold of 10).
+    for _ in 0..5 {{
+        post_form(&base, "/login", &bad_body, "");
+    }}
+    // Successful login resets the counter.
+    let good_resp = post_form(&base, "/login", &good_body, "");
+    assert!(
+        good_resp.contains("HTTP/1.1 302") || good_resp.contains("HTTP/1.0 302"),
+        "correct credentials must succeed before lockout threshold:\n{{good_resp}}"
+    );
+    // 5 more failures (counter was reset, so still below threshold).
+    for _ in 0..5 {{
+        post_form(&base, "/login", &bad_body, "");
+    }}
+    // Should still be able to log in with correct credentials.
+    let after_resp = post_form(&base, "/login", &good_body, "");
+    assert!(
+        after_resp.contains("HTTP/1.1 302") || after_resp.contains("HTTP/1.0 302"),
+        "account must remain unlocked after counter was reset by successful login:\n{{after_resp}}"
+    );
+}}
+
+/// AC8c — the locked-state response is byte-identical at the response-body
+/// level to a wrong-password response (non-enumerating lockout).
+#[test]
+fn auth_lockout_response_identical_to_wrong_password() {{
+    let Some(base) = base_url() else {{
+        eprintln!("skipping: AUTUMN_TEST_BASE_URL not set");
+        return;
+    }};
+    let email_locked = "lockout-body-test@example.com";
+    let password = "correct-password-B0dy";
+    ensure_account(&base, email_locked, password);
+    // Wrong-password response body for a non-locked known account.
+    let wrong_resp = post_form(
+        &base,
+        "/login",
+        &format!("email={{email_locked}}&password=wrong"),
+        "",
+    );
+    let wrong_body = wrong_resp.splitn(2, "\r\n\r\n").nth(1).unwrap_or("");
+    // Exhaust threshold to lock the target account.
+    for _ in 0..9 {{
+        post_form(
+            &base,
+            "/login",
+            &format!("email={{email_locked}}&password=bad"),
+            "",
+        );
+    }}
+    // Locked-account response with correct password.
+    let locked_resp = post_form(
+        &base,
+        "/login",
+        &format!("email={{email_locked}}&password={{password}}"),
+        "",
+    );
+    let locked_body = locked_resp.splitn(2, "\r\n\r\n").nth(1).unwrap_or("");
+    assert_eq!(
+        wrong_body, locked_body,
+        "locked-state response body must be byte-identical to wrong-password response body\n\
+         wrong:  {{wrong_body:?}}\n\
+         locked: {{locked_body:?}}"
+    );
+}}
 "#
     )
 }
 
+#[allow(clippy::too_many_lines)]
 fn render_docs_file(pascal_name: &str, totp: bool) -> String {
     let totp_docs = if totp { TOTP_DOCS_SECTION } else { "" };
     format!(
@@ -2155,6 +2533,127 @@ password hashing, and mail primitives.
   cookie cannot be replayed.
 - **Protected routes**: The `/account` route uses `#[secured]` to reject
   unauthenticated requests before the handler runs.
+- **Account lockout**: After the configured threshold of failed login attempts,
+  the account is locked for the cool-off period. Lockout responses are
+  indistinguishable from wrong-password responses (same status, same body) so
+  the endpoint does not reveal which accounts are locked. Lockout state is
+  stored in Postgres so all app replicas agree. See [Account Lockout Policy](#account-lockout-policy) below.
+
+## Account Lockout Policy
+
+The generated login endpoint includes account-level lockout to protect against
+credential-stuffing attacks that rotate source IPs to bypass IP-rate limiting.
+
+### How It Works
+
+1. Each failed login increments `failed_attempts` on the account row.
+2. When `failed_attempts` reaches `threshold`, `locked_at` is stamped with the
+   current time and a structured telemetry event fires (see below).
+3. While the account is locked (`locked_at + cooloff_secs > now`), every login
+   attempt — correct password or not — returns the same `422 Invalid email or
+   password` response as a wrong-password attempt (non-enumerating).
+4. A successful login resets `failed_attempts` to `0` and clears `locked_at`.
+5. After `cooloff_secs` elapses without a login attempt, the account auto-unlocks
+   on the next successful login.
+
+### Configuration (`autumn.toml`)
+
+```toml
+[auth.lockout]
+enabled      = true  # false → disable lockout entirely (e.g. external policy in place)
+threshold    = 10    # consecutive failures before lockout
+window_secs  = 60    # reserved for future sliding-window counting; not yet enforced —
+                     # failures currently accumulate since the last successful login
+cooloff_secs = 900   # lock duration in seconds (default 15 minutes)
+```
+
+Override at deploy time via environment variables:
+
+| Variable | Description |
+|----------|-------------|
+| `AUTUMN_AUTH__LOCKOUT__ENABLED` | `true` / `false` |
+| `AUTUMN_AUTH__LOCKOUT__THRESHOLD` | integer (0 = disabled) |
+| `AUTUMN_AUTH__LOCKOUT__WINDOW_SECS` | integer |
+| `AUTUMN_AUTH__LOCKOUT__COOLOFF_SECS` | integer |
+
+Set `threshold = 0` or `enabled = false` to restore the pre-lockout login
+behaviour for apps that use a stronger external policy.
+
+### Telemetry
+
+When an account transitions into the locked state the handler emits a
+`tracing::warn!` event with:
+
+| Field | Value |
+|-------|-------|
+| `event` | `"account_locked"` |
+| `account_id_digest` | First 8 bytes of SHA-256(account ID) — stable but not reversible |
+| `ip_prefix` | IPv4 /24 prefix (`a.b.c.0/24`) or IPv6 /64 prefix (`x:x:x:x::/64`) |
+| `failed_attempts` | Counter value at lock time |
+
+This event flows through the standard Autumn tracing/metrics surface
+(OTLP, structured JSON, or console pretty-print depending on config).
+
+### Operator Unlock
+
+The generated auth routes include a `POST /auth/admin/unlock` endpoint that
+clears the lockout for a single account. It is protected by the
+`X-Admin-Secret` header matching the `AUTUMN_ADMIN_SECRET` environment
+variable. Set this variable to a strong random value in production:
+
+```sh
+# Generate and store a secret (do this once, store in your .env or deployment
+# secrets manager — NOT in autumn credentials, which are not consulted here).
+export AUTUMN_ADMIN_SECRET="$(openssl rand -hex 32)"
+
+# Unlock an account
+curl -s -X POST https://example.com/auth/admin/unlock \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -H "X-Admin-Secret: $AUTUMN_ADMIN_SECRET" \
+  -d "email=user%40example.com"
+```
+
+Protect this endpoint with network-level access controls (VPN, internal
+load-balancer allowlist) in production in addition to the secret header.
+If `AUTUMN_ADMIN_SECRET` is not set, the endpoint always returns 422.
+
+### Existing Apps — Adoption Path
+
+Apps that ran `autumn generate auth` before this feature was introduced need
+one additional migration to add the lockout columns. Because `generate migration`
+does not carry column defaults, write the SQL directly:
+
+```sh
+# 1. Create an empty migration
+autumn generate migration add_lockout_to_{{table}}
+
+# 2. Edit the generated up.sql to add the columns with correct defaults:
+```
+
+```sql
+-- migrations/<timestamp>_add_lockout_to_{{table}}/up.sql
+ALTER TABLE {{table}}
+  ADD COLUMN IF NOT EXISTS failed_attempts INT NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS locked_at TIMESTAMP NULL;
+```
+
+```sql
+-- migrations/<timestamp>_add_lockout_to_{{table}}/down.sql
+ALTER TABLE {{table}}
+  DROP COLUMN IF EXISTS failed_attempts,
+  DROP COLUMN IF EXISTS locked_at;
+```
+
+```sh
+# 3. Apply the migration
+autumn migrate
+
+# 4. Re-generate auth templates to pick up the lockout handler and unlock route
+autumn generate auth {pascal_name} --force
+```
+
+No behaviour changes for existing apps until the migration is applied and
+the generator re-run — the framework does not silently change behaviour.
 
 ## Mail Configuration
 
@@ -2227,6 +2726,7 @@ fn auth_route_entries(totp: bool) -> Vec<String> {
         "routes::auth::login_form".to_owned(),
         "routes::auth::login".to_owned(),
         "routes::auth::logout".to_owned(),
+        "routes::auth::unlock_account".to_owned(),
         "routes::auth::account".to_owned(),
         "routes::auth::forgot_password_form".to_owned(),
         "routes::auth::forgot_password".to_owned(),
@@ -6702,6 +7202,183 @@ mod tests {
         assert!(
             routes.contains("user_id"),
             "register begin should store user_id in passkey_reg_state envelope: {routes}"
+        );
+    }
+
+    // ── Account lockout (issue #814) ────────────────────────────────────────
+
+    #[test]
+    fn migration_up_sql_contains_lockout_columns() {
+        let tmp = project_with_main();
+        let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let up = fs::read_to_string(
+            tmp.path()
+                .join("migrations/20260508000000_create_users/up.sql"),
+        )
+        .unwrap();
+        assert!(
+            up.contains("failed_attempts"),
+            "migration must include failed_attempts column: {up}"
+        );
+        assert!(
+            up.contains("locked_at"),
+            "migration must include locked_at column: {up}"
+        );
+    }
+
+    #[test]
+    fn model_file_contains_lockout_fields() {
+        let tmp = project_with_main();
+        let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let model = fs::read_to_string(tmp.path().join("src/models/user.rs")).unwrap();
+        assert!(
+            model.contains("pub failed_attempts"),
+            "model must include failed_attempts field: {model}"
+        );
+        assert!(
+            model.contains("pub locked_at"),
+            "model must include locked_at field: {model}"
+        );
+    }
+
+    #[test]
+    fn schema_rs_contains_lockout_columns() {
+        let tmp = project_with_main();
+        let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let schema = fs::read_to_string(tmp.path().join("src/schema.rs")).unwrap();
+        assert!(
+            schema.contains("failed_attempts"),
+            "schema must include failed_attempts: {schema}"
+        );
+        assert!(
+            schema.contains("locked_at"),
+            "schema must include locked_at: {schema}"
+        );
+    }
+
+    #[test]
+    fn routes_file_checks_lockout_state_on_login() {
+        let tmp = project_with_main();
+        let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+        assert!(
+            routes.contains("locked_at"),
+            "login handler must check locked_at for lockout: {routes}"
+        );
+        assert!(
+            routes.contains("failed_attempts"),
+            "login handler must track failed_attempts: {routes}"
+        );
+    }
+
+    #[test]
+    fn routes_file_lockout_response_indistinguishable_from_wrong_password() {
+        let tmp = project_with_main();
+        let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+        // Lockout must return the same auth_err closure as wrong password (non-enumerating).
+        let auth_err_count = routes.matches("auth_err()").count();
+        assert!(
+            auth_err_count >= 2,
+            "lockout must reuse auth_err() for non-enumerating response (found {auth_err_count}): {routes}"
+        );
+    }
+
+    #[test]
+    fn routes_file_resets_failed_attempts_on_successful_login() {
+        let tmp = project_with_main();
+        let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+        assert!(
+            routes.contains("failed_attempts.eq(0)"),
+            "successful login must reset failed_attempts to 0: {routes}"
+        );
+    }
+
+    #[test]
+    fn routes_file_emits_telemetry_event_on_lockout_transition() {
+        let tmp = project_with_main();
+        let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+        assert!(
+            routes.contains("account_locked"),
+            "lockout transition must emit a structured telemetry event with account_locked: {routes}"
+        );
+    }
+
+    #[test]
+    fn routes_file_respects_lockout_enabled_config() {
+        let tmp = project_with_main();
+        let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+        // Must check enabled flag or threshold so operators can disable lockout.
+        assert!(
+            routes.contains("lockout")
+                && (routes.contains("enabled") || routes.contains("threshold")),
+            "routes must respect lockout enabled/threshold config for opt-out: {routes}"
+        );
+    }
+
+    #[test]
+    fn generated_tests_cover_lockout_scenarios() {
+        let tmp = project_with_main();
+        let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let tests = fs::read_to_string(tmp.path().join("tests/auth.rs")).unwrap();
+        // AC8a: N+1 failed attempts reject correct credentials
+        assert!(
+            tests.contains("auth_lockout_rejects_correct_credentials"),
+            "generated tests must cover: N+1 failed attempts with correct creds are rejected: {tests}"
+        );
+        // AC8b: successful login resets counter
+        assert!(
+            tests.contains("auth_successful_login_resets_lockout_counter"),
+            "generated tests must cover: successful login resets counter: {tests}"
+        );
+        // AC8c: locked-state response byte-identical to wrong-password
+        assert!(
+            tests.contains("auth_lockout_response_identical_to_wrong_password"),
+            "generated tests must verify lockout response is byte-identical to wrong-password: {tests}"
+        );
+    }
+
+    #[test]
+    fn docs_file_documents_lockout_config() {
+        let tmp = project_with_main();
+        let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let docs = fs::read_to_string(tmp.path().join("docs/guide/authentication.md")).unwrap();
+        assert!(
+            docs.contains("lockout"),
+            "docs must document the lockout policy: {docs}"
+        );
+        assert!(
+            docs.contains("threshold"),
+            "docs must document the threshold setting: {docs}"
+        );
+        assert!(
+            docs.contains("cooloff") || docs.contains("cool_off") || docs.contains("cool-off"),
+            "docs must document the cool-off period: {docs}"
+        );
+    }
+
+    #[test]
+    fn docs_file_documents_operator_unlock_path() {
+        let tmp = project_with_main();
+        let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let docs = fs::read_to_string(tmp.path().join("docs/guide/authentication.md")).unwrap();
+        assert!(
+            docs.contains("unlock"),
+            "docs must document operator unlock path: {docs}"
         );
     }
 }

@@ -74,7 +74,17 @@ pub struct ErrorPageRequestContext {
     pub path_params: Option<serde_json::Value>,
     /// SQL queries recorded during this request by `InspectorLayer` (dev only).
     pub sql_queries: Vec<crate::inspector::QueryRecord>,
+    /// Buffered request body bytes (dev mode only, capped at 64 KB).
+    pub body_bytes: Option<bytes::Bytes>,
+    /// `Content-Type` header value at the time of buffering (dev mode only).
+    pub content_type: Option<String>,
+    /// True when the body exceeded the capture limit and was truncated.
+    pub body_truncated: bool,
 }
+
+/// Max bytes captured from the request body for the dev overlay.
+/// Bodies larger than this will show a truncation notice.
+const BODY_CAPTURE_LIMIT: usize = 64 * 1024;
 
 /// Tower layer that annotates requests with Accept header preference
 /// so the error page filter knows whether to render HTML or pass through JSON.
@@ -82,28 +92,40 @@ pub struct ErrorPageRequestContext {
 /// This layer runs before the exception filter and stores [`WantsHtml`]
 /// and [`ErrorPageRequestContext`] in the response extensions.
 #[derive(Clone)]
-pub struct ErrorPageContextLayer;
+pub struct ErrorPageContextLayer {
+    pub is_dev: bool,
+}
 
 impl<S> tower::Layer<S> for ErrorPageContextLayer {
     type Service = ErrorPageContextService<S>;
 
     fn layer(&self, inner: S) -> Self::Service {
-        ErrorPageContextService { inner }
+        ErrorPageContextService {
+            inner,
+            is_dev: self.is_dev,
+        }
     }
 }
 
 #[derive(Clone)]
 pub struct ErrorPageContextService<S> {
     inner: S,
+    is_dev: bool,
 }
 
-impl<S, ReqBody> tower::Service<axum::http::Request<ReqBody>> for ErrorPageContextService<S>
+impl<S> tower::Service<axum::http::Request<axum::body::Body>> for ErrorPageContextService<S>
 where
-    S: tower::Service<axum::http::Request<ReqBody>, Response = Response>,
+    S: tower::Service<axum::http::Request<axum::body::Body>, Response = Response>
+        + Clone
+        + Send
+        + 'static,
+    S::Future: Send + 'static,
+    S::Error: Send + 'static,
 {
     type Response = Response;
     type Error = S::Error;
-    type Future = ErrorPageContextFuture<S::Future>;
+    type Future =
+        std::pin::Pin<Box<dyn std::future::Future<Output = Result<Response, S::Error>> + Send>>;
 
     fn poll_ready(
         &mut self,
@@ -112,7 +134,7 @@ where
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, req: axum::http::Request<ReqBody>) -> Self::Future {
+    fn call(&mut self, req: axum::http::Request<axum::body::Body>) -> Self::Future {
         let wants_html = accepts_html(&req);
         let uri = req.uri().clone();
         let request_id = req
@@ -123,89 +145,104 @@ where
         let query = uri.query().map(str::to_owned);
         let headers = Some(req.headers().clone());
         let method = Some(req.method().to_string());
+        let is_dev = self.is_dev;
+        let captures_body = is_dev && should_capture_body(method.as_deref());
+        let content_type = if captures_body {
+            req.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
+        } else {
+            None
+        };
 
-        ErrorPageContextFuture {
-            inner: self.inner.call(req),
-            wants_html,
-            uri,
-            request_id,
-            query,
-            headers,
-            method,
-        }
-    }
-}
+        // Use clone-and-replace so we can move inner into the async block while
+        // still having called poll_ready on the original.
+        let cloned = self.inner.clone();
+        let mut inner = std::mem::replace(&mut self.inner, cloned);
 
-pin_project_lite::pin_project! {
-    pub struct ErrorPageContextFuture<F> {
-        #[pin]
-        inner: F,
-        wants_html: bool,
-        uri: axum::http::Uri,
-        request_id: Option<String>,
-        query: Option<String>,
-        headers: Option<axum::http::HeaderMap>,
-        method: Option<String>,
-    }
-}
-
-impl<F, E> std::future::Future for ErrorPageContextFuture<F>
-where
-    F: std::future::Future<Output = Result<Response, E>>,
-{
-    type Output = Result<Response, E>;
-
-    fn poll(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
-        let this = self.project();
-        match this.inner.poll(cx) {
-            std::task::Poll::Ready(Ok(mut response)) => {
-                response
-                    .extensions_mut()
-                    .insert(WantsHtml(*this.wants_html));
-                let request_id = this.request_id.clone().or_else(|| {
-                    response
-                        .headers()
-                        .get("x-request-id")
-                        .and_then(|value| value.to_str().ok())
-                        .map(str::to_owned)
-                });
-                let matched_path = response
-                    .extensions()
-                    .get::<crate::middleware::dev::DevMatchedPath>()
-                    .map(|m| m.0.clone());
-                let path_params = matched_path
-                    .as_deref()
-                    .map(|pattern| extract_path_params(pattern, this.uri.path()));
-                let cookies = this
-                    .headers
-                    .as_ref()
-                    .and_then(|h| h.get(axum::http::header::COOKIE))
+        Box::pin(async move {
+            let (req, body_bytes, body_truncated) = if captures_body {
+                // Check Content-Length first to avoid consuming the body when it's
+                // clearly over the cap (preserving the stream for the inner service).
+                let declared_len = req
+                    .headers()
+                    .get(axum::http::header::CONTENT_LENGTH)
                     .and_then(|v| v.to_str().ok())
-                    .map(parse_cookie_header);
-                let sql_queries = response
-                    .extensions()
-                    .get::<crate::inspector::RequestQueryList>()
-                    .map(crate::inspector::RequestQueryList::snapshot)
-                    .unwrap_or_default();
-                response.extensions_mut().insert(ErrorPageRequestContext {
-                    uri: this.uri.clone(),
-                    request_id,
-                    query: this.query.clone(),
-                    headers: this.headers.clone(),
-                    method: this.method.clone(),
-                    matched_path,
-                    cookies,
-                    path_params,
-                    sql_queries,
-                });
-                std::task::Poll::Ready(Ok(response))
-            }
-            other => other,
-        }
+                    .and_then(|s| s.parse::<usize>().ok());
+
+                if declared_len.is_none_or(|len| len > BODY_CAPTURE_LIMIT) {
+                    // Body size is unknown or known to be too large — don't consume
+                    // the stream at all so the downstream handler receives it intact.
+                    (
+                        req,
+                        None,
+                        declared_len.is_some_and(|len| len > BODY_CAPTURE_LIMIT),
+                    )
+                } else {
+                    // Content-Length is present and within cap; read the full body
+                    // so we can reconstruct it exactly for the downstream handler.
+                    let (parts, body) = req.into_parts();
+                    let bytes = axum::body::to_bytes(body, BODY_CAPTURE_LIMIT + 1)
+                        .await
+                        .unwrap_or_default();
+                    let new_body = axum::body::Body::from(bytes.clone());
+                    let req = axum::http::Request::from_parts(parts, new_body);
+                    (req, Some(bytes), false)
+                }
+            } else {
+                (req, None, false)
+            };
+
+            let mut response = inner.call(req).await?;
+
+            response.extensions_mut().insert(WantsHtml(wants_html));
+            let request_id = request_id.or_else(|| {
+                response
+                    .headers()
+                    .get("x-request-id")
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned)
+            });
+            let matched_path = response
+                .extensions()
+                .get::<crate::middleware::dev::DevMatchedPath>()
+                .map(|m| m.0.clone());
+            let path_params = matched_path
+                .as_deref()
+                .map(|pattern| extract_path_params(pattern, uri.path()));
+            let cookies = headers
+                .as_ref()
+                .and_then(|h| h.get(axum::http::header::COOKIE))
+                .and_then(|v| v.to_str().ok())
+                .map(parse_cookie_header);
+            let sql_queries = response
+                .extensions()
+                .get::<crate::inspector::RequestQueryList>()
+                .map(crate::inspector::RequestQueryList::snapshot)
+                .unwrap_or_default();
+            response.extensions_mut().insert(ErrorPageRequestContext {
+                uri,
+                request_id,
+                query,
+                headers,
+                method,
+                matched_path,
+                cookies,
+                path_params,
+                sql_queries,
+                body_bytes,
+                content_type,
+                body_truncated,
+            });
+            Ok(response)
+        })
     }
+}
+
+/// Returns true for HTTP methods that typically carry a request body.
+fn should_capture_body(method: Option<&str>) -> bool {
+    matches!(method, Some("POST" | "PUT" | "PATCH"))
 }
 
 /// Check if the request's Accept header indicates a preference for HTML.
@@ -342,6 +379,100 @@ fn parse_cookie_header(raw: &str) -> serde_json::Value {
     serde_json::Value::Object(map)
 }
 
+/// Parse request body bytes into a JSON value for the dev overlay.
+///
+/// Understands `application/json` and `application/x-www-form-urlencoded`.
+/// Returns `None` for empty bodies or unrecognised content types.
+fn parse_body_preview(
+    bytes: &bytes::Bytes,
+    content_type: Option<&str>,
+) -> Option<serde_json::Value> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let ct = content_type.unwrap_or("");
+    if ct.contains("application/json") {
+        serde_json::from_slice(bytes).ok()
+    } else if ct.contains("application/x-www-form-urlencoded") {
+        // Deserialize as ordered pairs so bracket-notation keys like
+        // `user[password]` can be expanded into nested JSON before scrubbing.
+        let pairs: Vec<(String, String)> = serde_urlencoded::from_bytes(bytes).ok()?;
+        if pairs.is_empty() {
+            None
+        } else {
+            Some(form_pairs_to_nested_json(pairs))
+        }
+    } else {
+        None
+    }
+}
+
+/// Convert URL-encoded form pairs into a nested JSON object, expanding
+/// bracket notation so that `user[password]=secret` becomes
+/// `{"user": {"password": "secret"}}`.  This lets `ParameterFilter::scrub_json`
+/// match sensitive leaf keys regardless of their parent prefix.
+fn form_pairs_to_nested_json(pairs: Vec<(String, String)>) -> serde_json::Value {
+    let mut root = serde_json::Map::new();
+    for (key, value) in pairs {
+        let path = bracket_key_segments(&key);
+        form_insert_at_path(&mut root, &path, serde_json::Value::String(value));
+    }
+    serde_json::Value::Object(root)
+}
+
+/// Split a form key on bracket or dot notation into path segments.
+///
+/// `"user[password]"` → `["user", "password"]`
+/// `"user.password"` → `["user", "password"]`
+/// `"a[b][c]"` → `["a", "b", "c"]`
+/// `"simple"` → `["simple"]`
+fn bracket_key_segments(key: &str) -> Vec<String> {
+    // Dot notation: split on '.' first (only if no brackets present)
+    if key.contains('[') {
+        let pos = key.find('[').unwrap();
+        let mut parts = vec![key[..pos].to_owned()];
+        for seg in key[pos + 1..].split('[') {
+            let seg = seg.trim_end_matches(']');
+            if !seg.is_empty() {
+                parts.push(seg.to_owned());
+            }
+        }
+        parts
+    } else if key.contains('.') {
+        key.split('.')
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect()
+    } else {
+        vec![key.to_owned()]
+    }
+}
+
+fn form_insert_at_path(
+    map: &mut serde_json::Map<String, serde_json::Value>,
+    path: &[String],
+    value: serde_json::Value,
+) {
+    if path.is_empty() {
+        return;
+    }
+    if path.len() == 1 {
+        map.insert(path[0].clone(), value);
+        return;
+    }
+    let entry = map
+        .entry(path[0].clone())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if let serde_json::Value::Object(child) = entry {
+        form_insert_at_path(child, &path[1..], value);
+    } else {
+        // Key collision between a scalar value and a nested key: replace with object.
+        let mut new_map = serde_json::Map::new();
+        form_insert_at_path(&mut new_map, &path[1..], value);
+        *entry = serde_json::Value::Object(new_map);
+    }
+}
+
 fn scrub_headers(
     headers: &axum::http::HeaderMap,
     parameter_filter: &crate::log::filter::ParameterFilter,
@@ -418,6 +549,17 @@ impl ErrorPageFilter {
             .unwrap_or_else(|| serde_json::json!({}));
         let cookies = self.parameter_filter.scrub_json(&raw_cookies);
 
+        let body_preview = req_ctx.and_then(|c| {
+            if c.body_truncated {
+                return Some(serde_json::Value::String(
+                    "[body truncated: exceeds 64 KB limit]".to_owned(),
+                ));
+            }
+            let bytes = c.body_bytes.as_ref()?;
+            let parsed = parse_body_preview(bytes, c.content_type.as_deref())?;
+            Some(self.parameter_filter.scrub_json(&parsed))
+        });
+
         let badge_ctx = DevBadgeContext {
             status_code: error.status.as_u16(),
             status_reason: error
@@ -445,6 +587,7 @@ impl ErrorPageFilter {
             sql_queries: req_ctx
                 .map(|c| c.sql_queries.iter().map(query_record_to_sql_info).collect())
                 .unwrap_or_default(),
+            body_preview,
         };
         let badge = dev_badge::dev_error_badge_html(&badge_ctx).into_string();
         if let Some(pos) = html_body.rfind("</body>") {
@@ -601,7 +744,7 @@ mod tests {
                 }),
             )
             .fallback(fallback_404_handler)
-            .layer(ErrorPageContextLayer)
+            .layer(ErrorPageContextLayer { is_dev })
             .layer(ExceptionFilterLayer::new(filters))
     }
 
@@ -781,7 +924,7 @@ mod tests {
                 "/err",
                 get(|| async { Err::<String, AutumnError>(AutumnError::not_found_msg("nope")) }),
             )
-            .layer(ErrorPageContextLayer)
+            .layer(ErrorPageContextLayer { is_dev: false })
             .layer(ExceptionFilterLayer::new(filters));
 
         let resp = app
@@ -834,7 +977,7 @@ mod tests {
                 "/err",
                 get(|| async { Err::<String, AutumnError>(AutumnError::not_found_msg("nope")) }),
             )
-            .layer(ErrorPageContextLayer)
+            .layer(ErrorPageContextLayer { is_dev: false })
             .layer(ExceptionFilterLayer::new(filters));
 
         let resp = app
@@ -998,7 +1141,7 @@ mod tests {
 
         let app = Router::new()
             .fallback(fallback_404_handler)
-            .layer(ErrorPageContextLayer)
+            .layer(ErrorPageContextLayer { is_dev: true })
             .layer(ExceptionFilterLayer::new(filters));
 
         let response = tower::ServiceExt::oneshot(
@@ -1208,7 +1351,7 @@ mod tests {
             )
             .route_layer(axum::middleware::from_fn(capture_matched_path_middleware))
             .fallback(fallback_404_handler)
-            .layer(ErrorPageContextLayer)
+            .layer(ErrorPageContextLayer { is_dev })
             .layer(ExceptionFilterLayer::new(filters))
     }
 
@@ -1221,5 +1364,369 @@ mod tests {
         .await;
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ── Body capture tests (issue #1081) ────────────────────────────────────
+
+    #[tokio::test]
+    async fn dev_badge_shows_form_body_in_dev_mode() {
+        let app = test_router_with_error_pages(true);
+
+        let response = tower::ServiceExt::oneshot(
+            app,
+            Request::builder()
+                .method("POST")
+                .uri("/nope")
+                .header("accept", "text/html")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("content-length", "20")
+                .body(Body::from("username=alice&age=30"))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("bytes");
+        let body_str = String::from_utf8(body.to_vec()).expect("utf8");
+
+        assert!(
+            body_str.contains("Body"),
+            "dev overlay should show a Body section for form POST, got:\n{body_str}"
+        );
+        assert!(
+            body_str.contains("alice"),
+            "dev overlay should show form field value, got:\n{body_str}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dev_badge_shows_json_body_in_dev_mode() {
+        let app = test_router_with_error_pages(true);
+
+        let response = tower::ServiceExt::oneshot(
+            app,
+            Request::builder()
+                .method("POST")
+                .uri("/nope")
+                .header("accept", "text/html")
+                .header("content-type", "application/json")
+                .header("content-length", "24")
+                .body(Body::from(r#"{"user":"bob","score":42}"#))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("bytes");
+        let body_str = String::from_utf8(body.to_vec()).expect("utf8");
+
+        assert!(
+            body_str.contains("Body"),
+            "dev overlay should show a Body section for JSON POST"
+        );
+        assert!(
+            body_str.contains("bob"),
+            "dev overlay should show JSON field value"
+        );
+    }
+
+    #[tokio::test]
+    async fn dev_badge_scrubs_sensitive_form_body_fields() {
+        let app = test_router_with_error_pages(true);
+
+        let response = tower::ServiceExt::oneshot(
+            app,
+            Request::builder()
+                .method("POST")
+                .uri("/nope")
+                .header("accept", "text/html")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("content-length", "33")
+                .body(Body::from("username=alice&password=secret123"))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("bytes");
+        let body_str = String::from_utf8(body.to_vec()).expect("utf8");
+
+        assert!(
+            body_str.contains("password"),
+            "should show the password key"
+        );
+        assert!(
+            !body_str.contains("secret123"),
+            "raw password value must be filtered out"
+        );
+        assert!(
+            body_str.contains("[FILTERED]"),
+            "filtered field should show [FILTERED]"
+        );
+    }
+
+    #[tokio::test]
+    async fn dev_badge_scrubs_sensitive_json_body_fields() {
+        let app = test_router_with_error_pages(true);
+
+        let response = tower::ServiceExt::oneshot(
+            app,
+            Request::builder()
+                .method("POST")
+                .uri("/nope")
+                .header("accept", "text/html")
+                .header("content-type", "application/json")
+                .header("content-length", "33")
+                .body(Body::from(r#"{"user":"alice","token":"abc123"}"#))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("bytes");
+        let body_str = String::from_utf8(body.to_vec()).expect("utf8");
+
+        assert!(body_str.contains("token"), "should show the token key");
+        assert!(
+            !body_str.contains("abc123"),
+            "raw token value must be filtered out"
+        );
+        assert!(body_str.contains("[FILTERED]"), "should show [FILTERED]");
+    }
+
+    #[tokio::test]
+    async fn dev_badge_does_not_show_body_in_prod_mode() {
+        let app = test_router_with_error_pages(false);
+
+        let response = tower::ServiceExt::oneshot(
+            app,
+            Request::builder()
+                .method("POST")
+                .uri("/nope")
+                .header("accept", "text/html")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from("username=alice&age=30"))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("bytes");
+        let body_str = String::from_utf8(body.to_vec()).expect("utf8");
+
+        // In prod mode there is no dev badge at all, so no Body section
+        assert!(
+            !body_str.contains("autumn-dev-error-badge"),
+            "prod mode must not include the dev badge"
+        );
+    }
+
+    #[tokio::test]
+    async fn dev_badge_does_not_show_body_section_for_get() {
+        let app = test_router_with_error_pages(true);
+
+        let response = tower::ServiceExt::oneshot(
+            app,
+            Request::builder()
+                .method("GET")
+                .uri("/nope")
+                .header("accept", "text/html")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("bytes");
+        let body_str = String::from_utf8(body.to_vec()).expect("utf8");
+
+        // The overlay should exist but not have a Body section for GET
+        assert!(
+            body_str.contains("autumn-dev-error-badge"),
+            "dev badge should appear on GET errors"
+        );
+        // No "Body" label in the overlay for a GET request
+        assert!(
+            !body_str.contains(">Body<"),
+            "GET requests should not show a Body section"
+        );
+    }
+
+    #[tokio::test]
+    async fn dev_badge_skips_body_capture_when_no_content_length() {
+        // Without a Content-Length header the body stream is left unconsumed
+        // so that downstream handlers receive it intact. The overlay simply
+        // shows no body section rather than a potentially truncated preview.
+        let app = test_router_with_error_pages(true);
+
+        // Build a body larger than the 64 KB cap but send no Content-Length.
+        let large_body = "x=".to_owned() + &"a".repeat(70 * 1024);
+
+        let response = tower::ServiceExt::oneshot(
+            app,
+            Request::builder()
+                .method("POST")
+                .uri("/nope")
+                .header("accept", "text/html")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(large_body))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("bytes");
+        let body_str = String::from_utf8(body.to_vec()).expect("utf8");
+
+        // No body section and no truncation notice — stream was not consumed.
+        assert!(
+            !body_str.contains("truncated"),
+            "body without Content-Length should not show a truncation notice, got:\n{body_str}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dev_badge_truncates_when_content_length_header_exceeds_limit() {
+        // When Content-Length is declared over the cap the body stream is left
+        // unconsumed and the overlay shows a truncation notice immediately.
+        let app = test_router_with_error_pages(true);
+
+        let over_limit = (BODY_CAPTURE_LIMIT + 1).to_string();
+        let response = tower::ServiceExt::oneshot(
+            app,
+            Request::builder()
+                .method("POST")
+                .uri("/nope")
+                .header("accept", "text/html")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("content-length", over_limit)
+                // Actual body is small — only Content-Length matters for the early-exit path.
+                .body(Body::from("x=1"))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("bytes");
+        let body_str = String::from_utf8(body.to_vec()).expect("utf8");
+
+        assert!(
+            body_str.contains("truncated"),
+            "declared-oversized body should show truncation notice"
+        );
+    }
+
+    #[tokio::test]
+    async fn dev_badge_scrubs_bracket_notation_form_body_fields() {
+        // user[password]=secret should be treated the same as password=secret.
+        let app = test_router_with_error_pages(true);
+
+        let response = tower::ServiceExt::oneshot(
+            app,
+            Request::builder()
+                .method("POST")
+                .uri("/nope")
+                .header("accept", "text/html")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("content-length", "41")
+                .body(Body::from("user[name]=alice&user[password]=secret123"))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("bytes");
+        let body_str = String::from_utf8(body.to_vec()).expect("utf8");
+
+        assert!(
+            body_str.contains("password"),
+            "should show the password key"
+        );
+        assert!(
+            !body_str.contains("secret123"),
+            "bracket-prefixed password value must be filtered"
+        );
+        assert!(body_str.contains("[FILTERED]"), "should show [FILTERED]");
+        // The non-sensitive sibling field should still be visible.
+        assert!(
+            body_str.contains("alice"),
+            "non-sensitive field should remain"
+        );
+    }
+
+    #[tokio::test]
+    async fn dev_badge_scrubs_dotted_notation_form_body_fields() {
+        // user.password=secret uses dot notation; must be split and scrubbed.
+        let app = test_router_with_error_pages(true);
+        let body_str_literal = "user.name=alice&user.password=secret123";
+
+        let response = tower::ServiceExt::oneshot(
+            app,
+            Request::builder()
+                .method("POST")
+                .uri("/nope")
+                .header("accept", "text/html")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("content-length", body_str_literal.len().to_string())
+                .body(Body::from(body_str_literal))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("bytes");
+        let body_str = String::from_utf8(body.to_vec()).expect("utf8");
+
+        assert!(
+            body_str.contains("password"),
+            "should show the password key"
+        );
+        assert!(
+            !body_str.contains("secret123"),
+            "dot-prefixed password value must be filtered"
+        );
+        assert!(body_str.contains("[FILTERED]"), "should show [FILTERED]");
+        assert!(
+            body_str.contains("alice"),
+            "non-sensitive field should remain"
+        );
+    }
+
+    #[test]
+    fn bracket_key_segments_handles_simple_key() {
+        assert_eq!(bracket_key_segments("simple"), vec!["simple"]);
+    }
+
+    #[test]
+    fn bracket_key_segments_handles_one_level() {
+        assert_eq!(
+            bracket_key_segments("user[password]"),
+            vec!["user", "password"]
+        );
+    }
+
+    #[test]
+    fn bracket_key_segments_handles_multi_level() {
+        assert_eq!(bracket_key_segments("a[b][c]"), vec!["a", "b", "c"]);
     }
 }

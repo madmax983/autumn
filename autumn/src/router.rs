@@ -1560,7 +1560,7 @@ fn apply_middleware(
     //   SecurityHeaders -> RequestId -> [user layers, non-static build] ->
     //   Tenancy -> RateLimit -> CSRF -> CORS -> handler
     let router = router
-        .layer(crate::middleware::error_page_filter::ErrorPageContextLayer)
+        .layer(crate::middleware::error_page_filter::ErrorPageContextLayer { is_dev })
         .layer(ExceptionFilterLayer::new(all_filters))
         .layer(crate::middleware::MetricsLayer::new(state.metrics.clone()));
 
@@ -3337,7 +3337,7 @@ mod tests {
 
         let manifest = crate::static_gen::StaticManifest {
             generated_at: "2026-05-18T00:00:00Z".to_owned(),
-            autumn_version: "0.4.0".to_owned(),
+            autumn_version: "0.5.0".to_owned(),
             routes,
         };
         let json = serde_json::to_string(&manifest).expect("serialize manifest");

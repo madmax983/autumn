@@ -903,7 +903,7 @@ where
         parts
             .extensions
             .get::<ResolvedClientIdentity>()
-            .map(|id| Self(id.scheme.clone()))
+            .map(|id| Self(id.scheme.clone().unwrap_or_else(|| "http".to_owned())))
             .ok_or((
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 "ClientScheme not resolved. Is the TrustedProxiesLayer installed?",
@@ -924,7 +924,7 @@ where
         Ok(parts
             .extensions
             .get::<ResolvedClientIdentity>()
-            .map(|id| Self(id.scheme.clone())))
+            .map(|id| Self(id.scheme.clone().unwrap_or_else(|| "http".to_owned()))))
     }
 }
 
@@ -940,7 +940,7 @@ mod trusted_proxy_extractor_tests {
         ResolvedClientIdentity {
             addr: Some(addr.parse().unwrap()),
             host: Some(host.to_owned()),
-            scheme: scheme.to_owned(),
+            scheme: Some(scheme.to_owned()),
         }
     }
 

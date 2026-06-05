@@ -1,7 +1,8 @@
-# autumn-web 0.4.0 API Reference
+# autumn-web 0.5.0 API Reference
 
-Use this file when exact public names, features, dependency versions, or config
-keys matter. Source of truth is the workspace at version 0.4.0.
+Use this file as a quick map for public names, features, dependency versions,
+and config keys. Source of truth is the workspace at version 0.5.0; verify
+against current source when exact code matters.
 
 ## Published crates
 
@@ -14,7 +15,7 @@ keys matter. Source of truth is the workspace at version 0.4.0.
 | `autumn-storage-s3` | `autumn-storage-s3/` | S3-compatible `BlobStore` plugin |
 | `autumn-cache-redis` | `autumn-cache-redis/` | Redis cache plugin |
 
-All publishable crates share `[workspace.package].version = "0.4.0"`.
+All publishable crates share `[workspace.package].version = "0.5.0"`.
 
 ## Top-level exports
 
@@ -165,7 +166,7 @@ seed = ["db"]
 system-info = []
 ```
 
-`storage-s3` is not a feature in 0.4.0. Use `autumn-storage-s3 = "0.4"`.
+`storage-s3` is not a feature in 0.5.0. Use `autumn-storage-s3 = "0.5"`.
 
 ## Workspace dependency versions
 

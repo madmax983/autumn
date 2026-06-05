@@ -1,4 +1,4 @@
-# autumn-web 0.4.0 Example Reference
+# autumn-web 0.5.0 Example Reference
 
 Use these patterns when generating or reviewing Autumn apps. The official
 examples live under `examples/`; prefer current source when exact code matters.
@@ -31,7 +31,7 @@ Published-user dependency:
 
 ```toml
 [dependencies]
-autumn-web = "0.4"
+autumn-web = "0.5"
 ```
 
 Workspace examples use `autumn-web = { path = "../../autumn" }` plus the root
@@ -145,7 +145,7 @@ async fn main() {
 Feature set:
 
 ```toml
-autumn-web = { version = "0.4", features = ["mail", "ws", "storage", "multipart", "redis"] }
+autumn-web = { version = "0.5", features = ["mail", "ws", "storage", "multipart", "redis"] }
 ```
 
 Keep Harvest out of core web examples. Use built-in jobs for app-local work and
@@ -326,8 +326,8 @@ backend = "postgres"
 Install the first-party admin UI:
 
 ```toml
-autumn-web = { version = "0.4", features = ["db", "flash", "htmx", "maud"] }
-autumn-admin-plugin = "0.4"
+autumn-web = { version = "0.5", features = ["db", "flash", "htmx", "maud"] }
+autumn-admin-plugin = "0.5"
 ```
 
 ```rust
@@ -349,8 +349,8 @@ In 0.4.0 it includes `/admin/jobs` for job inspection and recovery.
 ## S3 storage plugin
 
 ```toml
-autumn-web = { version = "0.4", features = ["storage", "multipart"] }
-autumn-storage-s3 = "0.4"
+autumn-web = { version = "0.5", features = ["storage", "multipart"] }
+autumn-storage-s3 = "0.5"
 ```
 
 ```rust

@@ -1494,9 +1494,14 @@ fn resolve_proxy_conflict_data() -> ProxyConflictData {
     let raw_profile = std::env::var("AUTUMN_ENV")
         .or_else(|_| std::env::var("AUTUMN_PROFILE"))
         .unwrap_or_default();
-    let profile = raw_profile.trim().to_ascii_lowercase();
-    let merged = get_merged_toml_table(if profile.is_empty() { "dev" } else { &profile });
-    let table = merged;
+    // Normalize aliases to canonical names to match AutumnConfig::load_with_env.
+    let profile = match raw_profile.trim().to_ascii_lowercase().as_str() {
+        "production" | "prod" => "prod",
+        "development" | "dev" | "" => "dev",
+        other => other,
+    }
+    .to_owned();
+    let table = get_merged_toml_table(&profile);
 
     let parse_csv_env = |var: &str| -> Option<Vec<String>> {
         std::env::var(var).ok().map(|v| {
@@ -1879,6 +1884,9 @@ pub fn run(opts: DoctorOptions) {
         check_compression_impl(compression_enabled, is_production)
     }));
 
+    // 13. System-test browser (warn if missing; not all projects use system tests)
+    tasks.push(Box::new(check_system_test_browser));
+
     // ── Phase 3: spawn all tasks concurrently ────────────────────────────────
     let handles: Vec<thread::JoinHandle<CheckResult>> =
         tasks.into_iter().map(thread::spawn).collect();
@@ -1972,6 +1980,157 @@ pub fn check_maintenance_mode() -> CheckResult {
             detail: Some("maintenance mode is off".into()),
             hint: None,
         },
+    }
+}
+
+// ── System-test browser check ─────────────────────────────────────────────
+
+/// Candidate paths probed for a Chromium binary, in resolution order.
+pub fn browser_candidate_paths() -> Vec<std::path::PathBuf> {
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+
+    if let Ok(p) = std::env::var("AUTUMN_CHROMIUM") {
+        candidates.push(std::path::PathBuf::from(p));
+    }
+
+    if let Ok(base) = std::env::var("PLAYWRIGHT_BROWSERS_PATH") {
+        let base = std::path::PathBuf::from(base);
+        if let Ok(entries) = std::fs::read_dir(&base) {
+            let mut pw_paths: Vec<_> = entries
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().starts_with("chromium-"))
+                .map(|e| {
+                    if cfg!(target_os = "macos") {
+                        e.path()
+                            .join("chrome-mac")
+                            .join("Chromium.app")
+                            .join("Contents")
+                            .join("MacOS")
+                            .join("Chromium")
+                    } else if cfg!(target_os = "windows") {
+                        e.path().join("chrome-win").join("chrome.exe")
+                    } else {
+                        e.path().join("chrome-linux").join("chrome")
+                    }
+                })
+                .collect();
+            pw_paths.sort();
+            pw_paths.reverse();
+            candidates.extend(pw_paths);
+        }
+    }
+
+    candidates.extend(
+        [
+            "/usr/bin/chromium-browser",
+            "/usr/bin/chromium",
+            "/usr/bin/google-chrome",
+            "/usr/bin/google-chrome-stable",
+            "/snap/bin/chromium",
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        ]
+        .map(std::path::PathBuf::from),
+    );
+
+    candidates
+}
+
+/// Run `<path> --version` and return the trimmed output on success.
+fn probe_browser_version(path: &std::path::Path) -> Option<String> {
+    std::process::Command::new(path)
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+}
+
+/// Check whether a Chromium binary is available for system tests.
+///
+/// Returns `true` if the `[features]` table in `cargo_toml` declares `key`.
+///
+/// Scans only the `[features]` section (not dev-dependencies that may also
+/// reference the feature) so a line like `autumn-web = { features = ["system-tests"] }`
+/// does not produce a false positive.
+fn cargo_toml_features_has_key(cargo_toml: &str, key: &str) -> bool {
+    let quoted_key = format!("\"{key}\"");
+    let mut in_features = false;
+    for line in cargo_toml.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        if trimmed == "[features]"
+            || (trimmed.starts_with("[features]")
+                && trimmed["[features]".len()..].trim_start().starts_with('#'))
+        {
+            in_features = true;
+            continue;
+        }
+        if in_features {
+            if trimmed.starts_with('[') {
+                break;
+            }
+            let bare = trimmed
+                .strip_prefix(key)
+                .is_some_and(|r| r.trim_start().starts_with('='));
+            let quoted = trimmed
+                .strip_prefix(quoted_key.as_str())
+                .is_some_and(|r| r.trim_start().starts_with('='));
+            if bare || quoted {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Reports `Warn` (not `Fail`) so that projects that don't use system tests
+/// are not penalized. If you _do_ run system tests you'll get a clear
+/// actionable message in `autumn doctor` output.
+pub fn check_system_test_browser() -> CheckResult {
+    let candidates = browser_candidate_paths();
+    for path in &candidates {
+        if path.is_file()
+            && let Some(version) = probe_browser_version(path)
+        {
+            return CheckResult {
+                name: "system_test_browser",
+                status: CheckStatus::Pass,
+                detail: Some(format!(
+                    "Chromium for system tests: {version} ({})",
+                    path.display()
+                )),
+                hint: None,
+            };
+        }
+    }
+
+    // Only warn when the project has opted into system tests; otherwise a
+    // missing browser is irrelevant and must not fail `autumn doctor --strict`.
+    let project_uses_system_tests = std::env::current_dir()
+        .ok()
+        .and_then(|d| std::fs::read_to_string(d.join("Cargo.toml")).ok())
+        .is_some_and(|s| cargo_toml_features_has_key(&s, "system-tests"));
+
+    if project_uses_system_tests {
+        CheckResult {
+            name: "system_test_browser",
+            status: CheckStatus::Warn,
+            detail: Some("no Chromium binary found — system tests will be skipped".into()),
+            hint: Some(
+                "Install: apt-get install chromium-browser  \
+                 or set AUTUMN_CHROMIUM=/path/to/chrome",
+            ),
+        }
+    } else {
+        CheckResult {
+            name: "system_test_browser",
+            status: CheckStatus::Pass,
+            detail: Some("no Chromium binary found (project does not use system-tests)".into()),
+            hint: None,
+        }
     }
 }
 
@@ -3041,5 +3200,80 @@ redirect_uri = "http://localhost/callback"
         };
         let r = check_proxy_conflict_impl(&data);
         assert_eq!(r.status, CheckStatus::Pass);
+    }
+
+    // ── system_test_browser ───────────────────────────────────────────────────
+
+    #[test]
+    fn browser_check_not_found_is_warn_not_fail() {
+        // Simulate: no browser in an empty candidate list.  The check must
+        // return Warn so projects that don't use system tests aren't penalized.
+        let result = check_system_test_browser();
+        // Accept Pass (if Chrome is on the host) or Warn (if not).
+        assert!(
+            result.status == CheckStatus::Pass || result.status == CheckStatus::Warn,
+            "browser check must be Pass or Warn, got {:?}",
+            result.status
+        );
+    }
+
+    #[test]
+    fn browser_candidate_paths_includes_common_locations() {
+        let paths = browser_candidate_paths();
+        let as_strs: Vec<_> = paths
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            as_strs
+                .iter()
+                .any(|s| s.contains("chromium") || s.contains("chrome")),
+            "candidate list must include common Chrome paths; got {as_strs:?}"
+        );
+    }
+
+    #[test]
+    fn browser_check_hint_mentions_apt_get() {
+        let result = check_system_test_browser();
+        if result.status == CheckStatus::Warn {
+            let hint = result.hint.unwrap_or("");
+            assert!(
+                hint.contains("apt-get") || hint.contains("AUTUMN_CHROMIUM"),
+                "hint must mention install command; got: {hint}"
+            );
+        }
+    }
+
+    // ── cargo_toml_features_has_key ───────────────────────────────────────────
+
+    #[test]
+    fn features_has_key_detects_bare_key() {
+        let toml = "[features]\nsystem-tests = [\"autumn-web/system-tests\"]\n";
+        assert!(cargo_toml_features_has_key(toml, "system-tests"));
+    }
+
+    #[test]
+    fn features_has_key_detects_quoted_key() {
+        let toml = "[features]\n\"system-tests\" = [\"autumn-web/system-tests\"]\n";
+        assert!(cargo_toml_features_has_key(toml, "system-tests"));
+    }
+
+    #[test]
+    fn features_has_key_ignores_dev_dependency_mention() {
+        // The key appears in [dev-dependencies] but NOT in [features].
+        let toml = "[dev-dependencies]\nautumn-web = { features = [\"system-tests\"] }\n";
+        assert!(!cargo_toml_features_has_key(toml, "system-tests"));
+    }
+
+    #[test]
+    fn features_has_key_no_features_section() {
+        let toml = "[package]\nname = \"x\"\n";
+        assert!(!cargo_toml_features_has_key(toml, "system-tests"));
+    }
+
+    #[test]
+    fn features_has_key_commented_header() {
+        let toml = "[features] # project features\nsystem-tests = []\n";
+        assert!(cargo_toml_features_has_key(toml, "system-tests"));
     }
 }

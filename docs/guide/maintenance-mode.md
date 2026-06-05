@@ -282,7 +282,7 @@ during the migration).
 
 Confirm you have:
 
-- `autumn-cli` ≥ 0.4.0 installed on the machine that runs the CLI.
+- `autumn-cli` >= 0.5.0 installed on the machine that runs the CLI.
 - SSH or shell access to the working directory of the running app (or a shared
   volume that all replicas read from).
 - The `AUTUMN_DATABASE__PRIMARY_URL` environment variable set to the write

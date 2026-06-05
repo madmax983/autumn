@@ -26,8 +26,16 @@ cd "$root"
 # broken-link lint is required by the AC.
 export RUSTDOCFLAGS="-D rustdoc::broken_intra_doc_links -D rustdoc::private_intra_doc_links"
 
+# Cargo doc uses the dev profile while rechecking dependencies for downstream
+# crates. Keep those builds bounded like the test profile; full debug info plus
+# incremental caches has produced rustc access violations on Windows.
+export CARGO_PROFILE_DEV_DEBUG="${CARGO_PROFILE_DEV_DEBUG:-line-tables-only}"
+export CARGO_PROFILE_DEV_INCREMENTAL="${CARGO_PROFILE_DEV_INCREMENTAL:-false}"
+
 echo "Building workspace documentation (docs.rs feature posture, no deps)..."
 echo "RUSTDOCFLAGS=$RUSTDOCFLAGS"
+echo "CARGO_PROFILE_DEV_DEBUG=$CARGO_PROFILE_DEV_DEBUG"
+echo "CARGO_PROFILE_DEV_INCREMENTAL=$CARGO_PROFILE_DEV_INCREMENTAL"
 echo ""
 
 # Build each publishable crate with its declared docs.rs feature set.
