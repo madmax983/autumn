@@ -1655,7 +1655,7 @@ pub async fn login(
     mut db: Db,
     State(state): State<AppState>,
     session: Session,
-    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    connect_info: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
     Form(form): Form<LoginForm>,
 ) -> AutumnResult<Response> {{
     let email = form.email.trim().to_lowercase();
@@ -1720,30 +1720,40 @@ pub async fn login(
                         .await
                         .unwrap_or(current_attempts + 1)
                 }} else {{
-                    // Cool-off reset path: set counter to 1 and clear the expired
-                    // locked_at so future failures count up from 1 correctly.
-                    let _ = diesel::update({table}::table.find({snake_name}.id))
+                    // Cool-off reset path: atomically reset counter to 1 and clear
+                    // locked_at in a single UPDATE. Concurrent requests hitting this
+                    // branch all write the same values so races are benign (all still
+                    // count 1 failure each, not zero).
+                    diesel::update({table}::table.find({snake_name}.id))
                         .set((
                             {table}::failed_attempts.eq(1i32),
                             {table}::locked_at.eq(None::<chrono::NaiveDateTime>),
                         ))
                         .execute(&mut *db)
-                        .await;
+                        .await
+                        .unwrap_or(0);
                     1i32
                 }};
 
                 if new_attempts >= lockout_cfg.threshold && current_locked_at.is_none() {{
-                    // Account transitions into the locked state — stamp locked_at and
-                    // emit a structured telemetry event.
-                    let _ = diesel::update({table}::table.find({snake_name}.id))
+                    // Account transitions into the locked state — stamp locked_at
+                    // atomically. Propagate errors: if this write fails the account
+                    // is not locked despite the counter crossing the threshold, which
+                    // would allow a successful login to slip through.
+                    diesel::update({table}::table.find({snake_name}.id))
                         .set({table}::locked_at.eq(Some(now)))
                         .execute(&mut *db)
-                        .await;
+                        .await
+                        .map_err(|e| AutumnError::internal_server_error_msg(&format!("Failed to lock account: {{e}}")))?;
 
                     // Truncate to a coarse IP prefix (IPv4 /24, IPv6 /64) so
                     // the telemetry event enables incident response without
                     // logging a precise user identifier.
-                    let ip_prefix = match addr.ip() {{
+                    let addr_ip = connect_info.map_or(
+                        std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                        |c| c.0.ip(),
+                    );
+                    let ip_prefix = match addr_ip {{
                         std::net::IpAddr::V4(ip) => {{
                             let [a, b, c, _] = ip.octets();
                             format!("{{a}}.{{b}}.{{c}}.0/24")
@@ -1757,9 +1767,13 @@ pub async fn login(
                     // account ID cannot be recovered by hashing small integers.
                     let account_id_digest = {{
                         use sha2::{{Digest, Sha256}};
+                        // Require a deployment secret for the digest salt. Operators
+                        // MUST set SECRET_KEY_BASE (already required for sessions) or
+                        // AUTUMN_ADMIN_SECRET. The static fallback prevents reversibility
+                        // only within this process; set the env var in production.
                         let salt = std::env::var("SECRET_KEY_BASE")
                             .or_else(|_| std::env::var("AUTUMN_ADMIN_SECRET"))
-                            .unwrap_or_default();
+                            .unwrap_or_else(|_| "autumn-lockout-fallback-salt".to_string());
                         let hash = Sha256::digest(
                             format!("{{}}:{{}}", salt, {snake_name}.id).as_bytes(),
                         );
@@ -1836,6 +1850,13 @@ pub struct UnlockAccountForm {{
 /// Protect this endpoint with network-level access controls (VPN, internal
 /// load-balancer allowlist) in production in addition to the secret header.
 ///
+/// **CSRF exemption required.** Autumn enables CSRF by default on all non-safe
+/// routes. Add this path to the exempt list in `autumn.toml`:
+/// ```toml
+/// [security.csrf]
+/// exempt_paths = ["/auth/admin/unlock"]
+/// ```
+///
 /// Usage:
 /// ```sh
 /// curl -s -X POST https://example.com/auth/admin/unlock \
@@ -1865,7 +1886,7 @@ pub async fn unlock_account(
         ))
         .execute(&mut *db)
         .await
-        .map_err(|e| AutumnError::internal_msg(&format!("Failed to unlock account: {{e}}")))?;
+        .map_err(|e| AutumnError::internal_server_error_msg(&format!("Failed to unlock account: {{e}}")))?;
     Ok(layout("Account Unlocked", html! {{
         h1 {{ "Account Unlocked" }}
         p {{ "The lockout for " (email) " has been cleared if it existed." }}
