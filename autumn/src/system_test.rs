@@ -456,13 +456,14 @@ impl Page {
     pub async fn fill(&self, selector: &str, value: &str) -> Result<&Self, SystemTestError> {
         let element = self.inner.find_element(selector).await?;
         element.click().await?;
-        // Clear via JS and dispatch events so htmx/frameworks detect the change.
+        // Clear via JS: dispatch only 'input' (not 'change') so that
+        // hx-trigger="change" listeners don't fire with the empty intermediate
+        // value and race with or overwrite the intended filled-value request.
         self.inner
             .evaluate(format!(
                 "(function() {{ var el = document.querySelector({}); \
                  if (el) {{ el.value = ''; \
-                 el.dispatchEvent(new Event('input', {{ bubbles: true }})); \
-                 el.dispatchEvent(new Event('change', {{ bubbles: true }})); }} }})()",
+                 el.dispatchEvent(new Event('input', {{ bubbles: true }})); }} }})()",
                 js_string_literal(selector)
             ))
             .await?;
