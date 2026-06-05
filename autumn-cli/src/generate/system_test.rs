@@ -53,15 +53,6 @@ pub fn plan_system_test(project_root: &Path, name: &str) -> Result<Plan, Generat
     let pascal_name = pascal(name);
     let mut plan = Plan::new(project_root);
 
-    // Ensure tests/system/ directory exists by placing the file there.
-    plan.create(
-        project_root
-            .join("tests")
-            .join("system")
-            .join(format!("{snake_name}.rs")),
-        render_system_test_file(&snake_name, &pascal_name),
-    );
-
     // Patch Cargo.toml: add system-tests feature + [[test]] entry.
     let cargo_path = project_root.join("Cargo.toml");
     let existing = std::fs::read_to_string(&cargo_path).map_err(GenerateError::Io)?;
@@ -76,6 +67,22 @@ pub fn plan_system_test(project_root: &Path, name: &str) -> Result<Plan, Generat
                 .to_owned(),
         ));
     }
+
+    // Resolve the dep key before generating the file so the import uses the
+    // right crate name (e.g. `autumn::prelude::*` instead of `autumn_web::prelude::*`
+    // when the project renames the dependency).
+    let dep_key = resolve_autumn_web_dep_key(&existing);
+    let dep_crate = dep_key.replace('-', "_");
+
+    // Ensure tests/system/ directory exists by placing the file there.
+    plan.create(
+        project_root
+            .join("tests")
+            .join("system")
+            .join(format!("{snake_name}.rs")),
+        render_system_test_file(&snake_name, &pascal_name, &dep_crate),
+    );
+
     let patched = patch_cargo_toml(&existing, &snake_name);
     if patched != existing {
         plan.modify(cargo_path, patched);
@@ -182,17 +189,25 @@ fn resolve_autumn_web_dep_key(cargo_toml: &str) -> String {
             }
             continue;
         }
-        // Inline / multi-line table: `autumn = { package = "autumn-web", ... }`
+        // Continuation line inside a multi-line table value — check before
+        // attempting split_once so that `package = "autumn-web"` on its own
+        // line is matched against the saved key, not treated as a new entry.
+        if pending_key
+            .as_deref()
+            .is_some_and(|_| mentions_autumn_web(trimmed))
+        {
+            return pending_key.unwrap();
+        }
+        // Inline / single-line table: `autumn = { package = "autumn-web", ... }`
         if let Some((key, rest)) = trimmed.split_once('=') {
             let key = key.trim().trim_matches('"').to_owned();
             if mentions_autumn_web(rest) {
                 return key;
             }
-            pending_key = Some(key);
-        } else if let Some(ref key) = pending_key {
-            // Continuation line inside a multi-line table value.
-            if mentions_autumn_web(trimmed) {
-                return key.clone();
+            // Only update pending_key when we start a new entry (not a
+            // continuation key=value pair inside the open table).
+            if pending_key.is_none() {
+                pending_key = Some(key);
             }
         }
     }
@@ -345,7 +360,7 @@ fn patch_cargo_toml(existing: &str, snake_name: &str) -> String {
     out
 }
 
-fn render_system_test_file(snake_name: &str, pascal_name: &str) -> String {
+fn render_system_test_file(snake_name: &str, pascal_name: &str, dep_crate: &str) -> String {
     format!(
         r#"//! System test: {pascal_name}
 //!
@@ -361,8 +376,8 @@ fn render_system_test_file(snake_name: &str, pascal_name: &str) -> String {
 
 #![cfg(feature = "system-tests")]
 
-use autumn_web::prelude::*;
-use autumn_web::system_test::SystemTest;
+use {dep_crate}::prelude::*;
+use {dep_crate}::system_test::SystemTest;
 
 // ── Route handlers under test ──────────────────────────────────────────────
 
@@ -742,6 +757,38 @@ mod tests {
             super::resolve_autumn_web_dep_key(src),
             "autumn-web",
             "comment mention must not be treated as a package alias"
+        );
+    }
+
+    #[test]
+    fn resolve_dep_key_multiline_table() {
+        // `autumn = {` on one line, `package = "autumn-web"` on the next.
+        let src = "[dependencies]\nautumn = {\npackage = \"autumn-web\"\nversion = \"0.1\"\n}\n";
+        assert_eq!(
+            super::resolve_autumn_web_dep_key(src),
+            "autumn",
+            "should resolve key from multiline table value"
+        );
+    }
+
+    #[test]
+    fn plan_creates_system_test_file_with_renamed_dep() {
+        // When autumn-web is aliased, the generated file must import via the alias.
+        let tmp = TempDir::new().unwrap();
+        let cargo = "[package]\nname = \"x\"\nversion = \"0.1.0\"\n\n[dependencies]\nautumn = { package = \"autumn-web\", version = \"0.1\" }\n\n[features]\n";
+        fs::write(tmp.path().join("Cargo.toml"), cargo).unwrap();
+        plan_system_test(tmp.path(), "MyTest")
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+        let generated = fs::read_to_string(tmp.path().join("tests/system/my_test.rs")).unwrap();
+        assert!(
+            generated.contains("use autumn::prelude::*"),
+            "import must use the alias 'autumn', got:\n{generated}"
+        );
+        assert!(
+            !generated.contains("autumn_web::"),
+            "import must not reference 'autumn_web' when dep is aliased, got:\n{generated}"
         );
     }
 
