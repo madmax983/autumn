@@ -429,64 +429,7 @@ struct Limiter {
     backend: BucketBackend,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct TrustedProxy {
-    network: IpAddr,
-    prefix_len: u8,
-}
-
-impl TrustedProxy {
-    fn parse(value: &str) -> Option<Self> {
-        let trimmed = value.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-
-        let (addr, prefix_len) = if let Some((addr, prefix)) = trimmed.split_once('/') {
-            let addr = addr.trim().parse::<IpAddr>().ok()?;
-            let prefix_len = prefix.trim().parse::<u8>().ok()?;
-            (addr, prefix_len)
-        } else {
-            let addr = trimmed.parse::<IpAddr>().ok()?;
-            let prefix_len = match addr {
-                IpAddr::V4(_) => 32,
-                IpAddr::V6(_) => 128,
-            };
-            (addr, prefix_len)
-        };
-
-        let max_prefix = match addr {
-            IpAddr::V4(_) => 32,
-            IpAddr::V6(_) => 128,
-        };
-
-        (prefix_len <= max_prefix).then_some(Self {
-            network: addr,
-            prefix_len,
-        })
-    }
-
-    fn contains(&self, ip: IpAddr) -> bool {
-        if self.prefix_len == 0 {
-            return matches!(
-                (self.network, ip),
-                (IpAddr::V4(_), IpAddr::V4(_)) | (IpAddr::V6(_), IpAddr::V6(_))
-            );
-        }
-
-        match (self.network, ip) {
-            (IpAddr::V4(network), IpAddr::V4(candidate)) => {
-                let shift = 32_u8.saturating_sub(self.prefix_len);
-                (u32::from(network) >> shift) == (u32::from(candidate) >> shift)
-            }
-            (IpAddr::V6(network), IpAddr::V6(candidate)) => {
-                let shift = 128_u8.saturating_sub(self.prefix_len);
-                (u128::from(network) >> shift) == (u128::from(candidate) >> shift)
-            }
-            (IpAddr::V4(_), IpAddr::V6(_)) | (IpAddr::V6(_), IpAddr::V4(_)) => false,
-        }
-    }
-}
+use super::proxy::TrustedProxy;
 
 impl Limiter {
     fn from_config(config: &RateLimitConfig) -> Self {
@@ -709,88 +652,13 @@ impl Limiter {
     /// Extract the originating client IP from a request, honoring this
     /// limiter's trusted-proxy policy.
     fn client_ip<B>(&self, req: &Request<B>) -> Option<String> {
-        let peer_ip = Self::peer_ip(req);
-
-        if self.trust_forwarded_headers && self.forwarded_headers_allowed(req) {
-            let xff_ip = {
-                let all_xff: Vec<&str> = req
-                    .headers()
-                    .get_all("x-forwarded-for")
-                    .iter()
-                    .filter_map(|v| v.to_str().ok())
-                    .collect();
-
-                if all_xff.is_empty() {
-                    None
-                } else {
-                    let joined = all_xff.join(", ");
-                    self.client_ip_from_x_forwarded_for(&joined, peer_ip)
-                }
-            };
-
-            if xff_ip.is_some() {
-                return xff_ip;
-            }
-
-            let real_ip = req
-                .headers()
-                .get("x-real-ip")
-                .and_then(|v| v.to_str().ok())
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(ToOwned::to_owned);
-
-            if real_ip.is_some() {
-                return real_ip;
-            }
-        }
-
-        peer_ip.map(|ip| ip.to_string())
-    }
-
-    fn peer_ip<B>(req: &Request<B>) -> Option<IpAddr> {
-        req.extensions()
-            .get::<ConnectInfo<SocketAddr>>()
-            .map(|ConnectInfo(addr)| addr.ip())
-    }
-
-    fn forwarded_headers_allowed<B>(&self, req: &Request<B>) -> bool {
-        if !self.trusted_proxies_configured {
-            return true;
-        }
-
-        Self::peer_ip(req).is_some_and(|peer_ip| self.is_trusted_proxy(peer_ip))
-    }
-
-    fn client_ip_from_x_forwarded_for(
-        &self,
-        header: &str,
-        peer_ip: Option<IpAddr>,
-    ) -> Option<String> {
-        if !self.trusted_proxies_configured {
-            let mut entries = header.rsplit(',').map(str::trim).filter(|s| !s.is_empty());
-            let last = entries.next()?;
-
-            if peer_ip.is_some_and(|peer_ip| last.parse::<IpAddr>().is_ok_and(|ip| ip == peer_ip)) {
-                return entries
-                    .next()
-                    .map_or_else(|| Some(last.to_owned()), |entry| Some(entry.to_owned()));
-            }
-
-            return Some(last.to_owned());
-        }
-
-        for entry in header.rsplit(',').map(str::trim).filter(|s| !s.is_empty()) {
-            let Ok(ip) = entry.parse::<IpAddr>() else {
-                continue;
-            };
-
-            if !self.is_trusted_proxy(ip) {
-                return Some(ip.to_string());
-            }
-        }
-
-        None
+        super::proxy::extract_client_ip(
+            req,
+            self.trust_forwarded_headers,
+            &self.trusted_proxies,
+            self.trusted_proxies_configured,
+        )
+        .map(|ip| ip.to_string())
     }
 
     fn is_trusted_proxy(&self, ip: IpAddr) -> bool {

@@ -2021,6 +2021,34 @@ impl AppBuilder {
             #[cfg(feature = "ws")]
             channels_backend,
         );
+
+        // Instantiate MaintenanceState, insert as extension, and start background poller task
+        let maintenance_state = crate::maintenance::MaintenanceState::new();
+        state.insert_extension(maintenance_state.clone());
+
+        let poller_state = maintenance_state.clone();
+        tokio::spawn(async move {
+            let path = std::path::Path::new(crate::maintenance::MAINTENANCE_FLAG_FILE);
+            let interval = std::time::Duration::from_millis(500);
+            loop {
+                match crate::maintenance::MaintenanceState::load_from_file(path) {
+                    Ok(Some(cfg)) => {
+                        if poller_state.get() != Some(cfg.clone()) {
+                            poller_state.enable(cfg);
+                        }
+                    }
+                    Ok(None) => {
+                        if poller_state.is_active() {
+                            poller_state.disable();
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "failed to load maintenance flag file");
+                    }
+                }
+                tokio::time::sleep(interval).await;
+            }
+        });
         #[cfg(feature = "mail")]
         if let Some(interceptor) = mail_interceptor {
             state.insert_extension(interceptor);

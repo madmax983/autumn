@@ -54,6 +54,8 @@ const RETRY_AFTER_SECS: &str = "120";
 pub struct MaintenanceLayer {
     state: MaintenanceState,
     health_prefix: String,
+    trust_forwarded_headers: bool,
+    trusted_proxies: Vec<crate::security::TrustedProxy>,
 }
 
 impl MaintenanceLayer {
@@ -65,6 +67,8 @@ impl MaintenanceLayer {
         Self {
             state,
             health_prefix: DEFAULT_HEALTH_PREFIX.to_owned(),
+            trust_forwarded_headers: false,
+            trusted_proxies: Vec::new(),
         }
     }
 
@@ -78,6 +82,20 @@ impl MaintenanceLayer {
         self.health_prefix = prefix.into();
         self
     }
+
+    /// Set whether to trust forwarded headers like `X-Forwarded-For`.
+    #[must_use]
+    pub fn with_trust_forwarded_headers(mut self, trust: bool) -> Self {
+        self.trust_forwarded_headers = trust;
+        self
+    }
+
+    /// Configure the trusted proxies list.
+    #[must_use]
+    pub fn with_trusted_proxies(mut self, proxies: Vec<crate::security::TrustedProxy>) -> Self {
+        self.trusted_proxies = proxies;
+        self
+    }
 }
 
 impl<S> Layer<S> for MaintenanceLayer {
@@ -88,6 +106,8 @@ impl<S> Layer<S> for MaintenanceLayer {
             inner,
             state: self.state.clone(),
             health_prefix: self.health_prefix.clone(),
+            trust_forwarded_headers: self.trust_forwarded_headers,
+            trusted_proxies: self.trusted_proxies.clone(),
         }
     }
 }
@@ -98,6 +118,8 @@ pub struct MaintenanceService<S> {
     inner: S,
     state: MaintenanceState,
     health_prefix: String,
+    trust_forwarded_headers: bool,
+    trusted_proxies: Vec<crate::security::TrustedProxy>,
 }
 
 impl<S> MaintenanceService<S> {
@@ -125,7 +147,7 @@ impl<S> MaintenanceService<S> {
 
         // 3. IP allow-list.
         if !config.allow_ips.is_empty()
-            && let Some(client_ip) = extract_client_ip(req)
+            && let Some(client_ip) = extract_client_ip(req, self.trust_forwarded_headers, &self.trusted_proxies)
             && ip_in_allow_list(&client_ip, &config.allow_ips)
         {
             return None;
@@ -198,28 +220,18 @@ where
 }
 
 /// Extract the client IP from a request, preferring proxy-forwarded headers.
-fn extract_client_ip<B>(req: &Request<B>) -> Option<IpAddr> {
-    // X-Forwarded-For: <client>, <proxy1>, <proxy2>
-    if let Some(xff) = req.headers().get("x-forwarded-for")
-        && let Ok(s) = xff.to_str()
-        && let Some(first) = s.split(',').next()
-        && let Ok(ip) = first.trim().parse::<IpAddr>()
-    {
-        return Some(ip);
-    }
-
-    // X-Real-Ip (set by nginx)
-    if let Some(xri) = req.headers().get("x-real-ip")
-        && let Ok(s) = xri.to_str()
-        && let Ok(ip) = s.trim().parse::<IpAddr>()
-    {
-        return Some(ip);
-    }
-
-    // SocketAddr extension set by Axum's ConnectInfo
-    req.extensions()
-        .get::<std::net::SocketAddr>()
-        .map(std::net::SocketAddr::ip)
+fn extract_client_ip<B>(
+    req: &Request<B>,
+    trust_forwarded_headers: bool,
+    trusted_proxies: &[crate::security::TrustedProxy],
+) -> Option<IpAddr> {
+    let configured = !trusted_proxies.is_empty();
+    crate::security::proxy::extract_client_ip(
+        req,
+        trust_forwarded_headers,
+        trusted_proxies,
+        configured,
+    )
 }
 
 /// Build a 503 response with the appropriate content type.
@@ -283,7 +295,7 @@ mod tests {
             .route("/", get(|| async { "ok" }))
             .route("/api/data", get(|| async { "data" }))
             .route("/actuator/health", get(|| async { "healthy" }))
-            .layer(MaintenanceLayer::new(state))
+            .layer(MaintenanceLayer::new(state).with_trust_forwarded_headers(true))
     }
 
     async fn response_status(app: Router, uri: &str) -> StatusCode {

@@ -1437,6 +1437,25 @@ fn apply_middleware(
         crate::middleware::method_override_rejection_filter,
     ));
     router = apply_rate_limit_middleware(router, config, state);
+
+    // Register MaintenanceLayer automatically using rate limit proxy config
+    let maintenance_state = state
+        .extension::<crate::maintenance::MaintenanceState>()
+        .map(|s| (*s).clone())
+        .unwrap_or_default();
+    let trusted_proxies = config
+        .security
+        .rate_limit
+        .trusted_proxies
+        .iter()
+        .filter_map(|proxy| crate::security::proxy::TrustedProxy::parse(proxy))
+        .collect::<Vec<_>>();
+    router = router.layer(
+        crate::middleware::maintenance::MaintenanceLayer::new(maintenance_state)
+            .with_trust_forwarded_headers(config.security.rate_limit.trust_forwarded_headers)
+            .with_trusted_proxies(trusted_proxies),
+    );
+
     router = router.layer(axum::middleware::from_fn(crate::webhook::webhook_replay_cleanup_middleware));
     router = apply_upload_middleware(router, config);
 
