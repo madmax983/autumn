@@ -315,6 +315,23 @@ pub trait ProvideActuatorState {
         None
     }
 
+    /// Returns the registry of [`HealthIndicator`] implementations.
+    ///
+    /// The default returns `None`, meaning no custom indicators are consulted.
+    /// [`crate::AppState`] overrides this to return its registry, which is
+    /// populated by [`crate::app::AppBuilder::health_indicator`].
+    fn health_indicator_registry(&self) -> Option<&HealthIndicatorRegistry> {
+        None
+    }
+
+    /// Returns whether detailed health information should be included in responses.
+    ///
+    /// When `false`, per-component `details` maps are omitted from
+    /// `/actuator/health` output. Defaults to `true`.
+    fn health_detailed(&self) -> bool {
+        true
+    }
+
     #[cfg(feature = "http-client")]
     /// Returns the optional webhook outbound manager if enabled/registered.
     fn webhook_outbound(&self) -> Option<crate::webhook_outbound::WebhookOutboundManager> {
@@ -1165,19 +1182,322 @@ impl ConfigProperties {
     }
 }
 
+// ── Health Indicator ─────────────────────────────────────────────
+
+/// Health status reported by a [`HealthIndicator`].
+///
+/// Follows Spring Boot precedence:
+/// `Down` > `OutOfService` > `Unknown` > `Up`
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum HealthStatus {
+    /// The component is functioning normally.
+    #[serde(rename = "UP")]
+    Up,
+    /// The component is unavailable.
+    #[serde(rename = "DOWN")]
+    Down,
+    /// The component is out of service (maintenance, etc.).
+    #[serde(rename = "OUT_OF_SERVICE")]
+    OutOfService,
+    /// The component status cannot be determined.
+    #[serde(rename = "UNKNOWN")]
+    Unknown,
+}
+
+impl HealthStatus {
+    /// Human-readable string for this status.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Up => "UP",
+            Self::Down => "DOWN",
+            Self::OutOfService => "OUT_OF_SERVICE",
+            Self::Unknown => "UNKNOWN",
+        }
+    }
+
+    /// Returns `true` when this status does not indicate a failure
+    /// (`Up` and `Unknown` are healthy; `Down` and `OutOfService` are not).
+    #[must_use]
+    pub const fn is_healthy(self) -> bool {
+        matches!(self, Self::Up | Self::Unknown)
+    }
+}
+
+/// Which group a [`HealthIndicator`] belongs to.
+///
+/// `Readiness` indicators gate both `/ready` and `/actuator/health`.
+/// `HealthOnly` indicators appear only in `/actuator/health`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndicatorGroup {
+    /// Participates in `/ready` and `/actuator/health`.
+    Readiness,
+    /// Participates only in `/actuator/health`.
+    HealthOnly,
+}
+
+/// Output from a single [`HealthIndicator::check`] call.
+#[derive(Debug, Clone)]
+pub struct HealthCheckOutput {
+    /// The health status of this component.
+    pub status: HealthStatus,
+    /// Optional human-readable key-value detail map.
+    pub details: HashMap<String, serde_json::Value>,
+}
+
+impl HealthCheckOutput {
+    /// Create an `Up` output with no details.
+    #[must_use]
+    pub fn up() -> Self {
+        Self {
+            status: HealthStatus::Up,
+            details: HashMap::new(),
+        }
+    }
+
+    /// Create a `Down` output with no details.
+    #[must_use]
+    pub fn down() -> Self {
+        Self {
+            status: HealthStatus::Down,
+            details: HashMap::new(),
+        }
+    }
+
+    /// Attach a detail map to this output.
+    #[must_use]
+    pub fn with_details(mut self, details: HashMap<String, serde_json::Value>) -> Self {
+        self.details = details;
+        self
+    }
+}
+
+/// Contract for a custom health check.
+///
+/// Implement this trait and register it via [`crate::app::AppBuilder::health_indicator`]
+/// to surface the health of an external dependency in `/actuator/health` and optionally
+/// in `/ready`.
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_web::actuator::{HealthCheckOutput, HealthIndicator, HealthStatus};
+///
+/// pub struct StripeIndicator;
+///
+/// impl HealthIndicator for StripeIndicator {
+///     fn check(&self) -> futures::future::BoxFuture<'_, HealthCheckOutput> {
+///         Box::pin(async move {
+///             // TODO: ping Stripe API
+///             HealthCheckOutput::up()
+///         })
+///     }
+/// }
+/// ```
+pub trait HealthIndicator: Send + Sync + 'static {
+    /// Run the check and return the current health output.
+    ///
+    /// The future is polled inside a per-indicator timeout; if it does not
+    /// resolve within [`Self::timeout_ms`] milliseconds it is cancelled and
+    /// the indicator is reported as `Unknown` with `timed_out: true`.
+    fn check(&self) -> futures::future::BoxFuture<'_, HealthCheckOutput>;
+
+    /// Per-indicator timeout in milliseconds. Default: 2 000 ms.
+    fn timeout_ms(&self) -> u64 {
+        2000
+    }
+
+    /// Which probe group this indicator belongs to. Default: [`IndicatorGroup::Readiness`].
+    fn group(&self) -> IndicatorGroup {
+        IndicatorGroup::Readiness
+    }
+}
+
+/// A single result returned from [`HealthIndicatorRegistry::run_all`] or
+/// [`HealthIndicatorRegistry::run_readiness`].
+#[derive(Debug, Clone)]
+pub struct HealthRunResult {
+    /// The registration name of this indicator.
+    pub name: String,
+    /// Which probe group this indicator belongs to.
+    pub group: IndicatorGroup,
+    /// The output of the check (possibly timed-out).
+    pub output: HealthCheckOutput,
+}
+
+type IndicatorList = Vec<(String, IndicatorGroup, Arc<dyn HealthIndicator>)>;
+
+/// Registry of named [`HealthIndicator`] implementations.
+///
+/// Populated by [`crate::app::AppBuilder::health_indicator`] and stored on
+/// [`crate::AppState`]. Provides duplicate-registration detection at startup
+/// and per-indicator timeout enforcement at request time.
+#[derive(Clone, Default)]
+pub struct HealthIndicatorRegistry {
+    inner: Arc<RwLock<IndicatorList>>,
+}
+
+impl HealthIndicatorRegistry {
+    /// Create a new, empty registry.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register a named indicator with its group.
+    ///
+    /// Returns `Err` if a indicator with `name` was already registered.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string when `name` is already registered.
+    pub fn register(
+        &self,
+        name: impl Into<String>,
+        group: IndicatorGroup,
+        indicator: Arc<dyn HealthIndicator>,
+    ) -> Result<(), String> {
+        let name = name.into();
+        let mut inner = self
+            .inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if inner.iter().any(|(n, _, _)| n == &name) {
+            return Err(format!(
+                "HealthIndicator '{name}' is already registered; skipping duplicate"
+            ));
+        }
+        inner.push((name, group, indicator));
+        drop(inner);
+        Ok(())
+    }
+
+    /// Returns `true` when no indicators have been registered.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+    }
+
+    /// Run all registered indicators (both groups) with per-indicator timeouts.
+    ///
+    /// All indicators execute **concurrently**; total wall time is bounded by
+    /// the slowest single indicator rather than N × timeout.
+    pub async fn run_all(&self) -> Vec<HealthRunResult> {
+        let entries = self
+            .inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+
+        futures::future::join_all(
+            entries
+                .into_iter()
+                .map(|(name, group, indicator)| async move {
+                    let output = run_with_timeout(indicator.as_ref()).await;
+                    HealthRunResult {
+                        name,
+                        group,
+                        output,
+                    }
+                }),
+        )
+        .await
+    }
+
+    /// Run only `Readiness`-group indicators with per-indicator timeouts.
+    ///
+    /// All indicators execute **concurrently**; total wall time is bounded by
+    /// the slowest single indicator rather than N × timeout.
+    pub async fn run_readiness(&self) -> Vec<HealthRunResult> {
+        // Clone the full list to release the read lock before async work begins.
+        let entries = self
+            .inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+
+        futures::future::join_all(
+            entries
+                .into_iter()
+                .filter(|(_, g, _)| *g == IndicatorGroup::Readiness)
+                .map(|(name, group, indicator)| async move {
+                    let output = run_with_timeout(indicator.as_ref()).await;
+                    HealthRunResult {
+                        name,
+                        group,
+                        output,
+                    }
+                }),
+        )
+        .await
+    }
+
+    /// Compute the aggregate status following Spring Boot precedence.
+    ///
+    /// Precedence: `Down` > `OutOfService` > `Unknown` > `Up`.
+    /// An empty slice returns `Up`.
+    #[must_use]
+    pub fn aggregate_status(statuses: &[HealthStatus]) -> HealthStatus {
+        let mut overall = HealthStatus::Up;
+        for &s in statuses {
+            overall = match (overall, s) {
+                (_, HealthStatus::Down) | (HealthStatus::Down, _) => HealthStatus::Down,
+                (_, HealthStatus::OutOfService) | (HealthStatus::OutOfService, _) => {
+                    HealthStatus::OutOfService
+                }
+                (_, HealthStatus::Unknown) | (HealthStatus::Unknown, _) => HealthStatus::Unknown,
+                _ => HealthStatus::Up,
+            };
+        }
+        overall
+    }
+}
+
+/// Run a single indicator with its declared timeout. Returns `Unknown` with
+/// `timed_out: true` when the future does not resolve in time.
+async fn run_with_timeout(indicator: &dyn HealthIndicator) -> HealthCheckOutput {
+    let duration = tokio::time::Duration::from_millis(indicator.timeout_ms());
+    match tokio::time::timeout(duration, indicator.check()).await {
+        Ok(output) => output,
+        Err(_elapsed) => {
+            let mut details = HashMap::new();
+            details.insert("timed_out".to_string(), serde_json::Value::Bool(true));
+            HealthCheckOutput {
+                status: HealthStatus::Unknown,
+                details,
+            }
+        }
+    }
+}
+
 // ── Health ──────────────────────────────────────────────────────
 
 /// Enhanced health response for the actuator health endpoint.
 #[derive(Serialize)]
 struct ActuatorHealth {
+    /// Overall aggregate status following Spring Boot precedence.
     status: &'static str,
     version: &'static str,
     profile: String,
     uptime: String,
     #[cfg(feature = "db")]
     autumn_after_commit_failures_total: u64,
+    /// Per-component health, keyed by indicator name.
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    components: HashMap<String, ComponentHealth>,
+    /// Backwards-compatible checks block (populated by built-in db indicator).
     #[serde(skip_serializing_if = "Option::is_none")]
     checks: Option<HealthChecks>,
+}
+
+#[derive(Serialize, Clone)]
+struct ComponentHealth {
+    status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    details: Option<serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -1194,11 +1514,58 @@ struct DatabaseCheck {
     idle_connections: u64,
 }
 
+fn build_health_components(
+    db_status: Option<HealthStatus>,
+    db_check: Option<&DatabaseCheck>,
+    indicator_results: &[HealthRunResult],
+    detailed: bool,
+) -> HashMap<String, ComponentHealth> {
+    let mut components: HashMap<String, ComponentHealth> = HashMap::new();
+    // Custom indicators first so the built-in "db" key inserted below can never
+    // be overwritten by a user-registered indicator with the same name.
+    for result in indicator_results {
+        let details = (detailed && !result.output.details.is_empty())
+            .then(|| serde_json::to_value(&result.output.details).unwrap_or_default());
+        components.insert(
+            result.name.clone(),
+            ComponentHealth {
+                status: result.output.status.as_str(),
+                details,
+            },
+        );
+    }
+    if let Some(s) = db_status {
+        let details = detailed
+            .then(|| {
+                db_check.map(|d| {
+                    serde_json::json!({
+                        "status": d.status,
+                        "pool_size": d.pool_size,
+                        "active_connections": d.active_connections,
+                        "idle_connections": d.idle_connections,
+                    })
+                })
+            })
+            .flatten();
+        components.insert(
+            "db".to_string(),
+            ComponentHealth {
+                status: s.as_str(),
+                details,
+            },
+        );
+    }
+    components
+}
+
 /// `GET <actuator-prefix>/health`
 pub async fn health<S: ProvideActuatorState + Send + Sync + 'static>(
     State(state): State<S>,
 ) -> impl IntoResponse {
-    let (overall_healthy, db_check) = {
+    let detailed = state.health_detailed();
+
+    // ── built-in db component ────────────────────────────────────
+    let (db_component_status, db_check) = {
         #[cfg(feature = "db")]
         {
             #[allow(clippy::option_if_let_else)]
@@ -1210,39 +1577,67 @@ pub async fn health<S: ProvideActuatorState + Send + Sync + 'static>(
                 let idle = available;
                 let active = size.saturating_sub(available);
 
-                let overall_healthy = available > 0 || waiting == 0;
+                let healthy = available > 0 || waiting == 0;
+                let db_status = if healthy {
+                    HealthStatus::Up
+                } else {
+                    HealthStatus::Down
+                };
                 let db_check = Some(DatabaseCheck {
-                    status: if overall_healthy { "ok" } else { "down" },
+                    status: if healthy { "ok" } else { "down" },
                     pool_size: size,
                     active_connections: active,
                     idle_connections: idle,
                 });
-                (overall_healthy, db_check)
+                (Some(db_status), db_check)
             } else {
-                (true, None)
+                (None, None)
             }
         }
-
         #[cfg(not(feature = "db"))]
         {
-            (true, None)
+            (None::<HealthStatus>, None::<DatabaseCheck>)
         }
     };
+
+    // ── registered custom indicators ───────────────────────────
+    let indicator_results = if let Some(registry) = state.health_indicator_registry() {
+        registry.run_all().await
+    } else {
+        Vec::new()
+    };
+
+    // ── aggregate status ────────────────────────────────────────
+    let mut all_statuses: Vec<HealthStatus> =
+        indicator_results.iter().map(|r| r.output.status).collect();
+    if let Some(s) = db_component_status {
+        all_statuses.push(s);
+    }
+    let overall = HealthIndicatorRegistry::aggregate_status(&all_statuses);
+
+    // ── build components map ────────────────────────────────────
+    let components = build_health_components(
+        db_component_status,
+        db_check.as_ref(),
+        &indicator_results,
+        detailed,
+    );
 
     let checks = db_check.map(|db| HealthChecks { database: Some(db) });
 
     let body = ActuatorHealth {
-        status: if overall_healthy { "ok" } else { "degraded" },
+        status: overall.as_str(),
         version: env!("CARGO_PKG_VERSION"),
         profile: state.profile().to_owned(),
         uptime: state.uptime_display(),
         #[cfg(feature = "db")]
         autumn_after_commit_failures_total: crate::db::AFTER_COMMIT_FAILURES_TOTAL
             .load(std::sync::atomic::Ordering::Relaxed),
+        components,
         checks,
     };
 
-    let code = if overall_healthy {
+    let code = if overall.is_healthy() {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
@@ -2800,7 +3195,7 @@ mod tests {
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["status"], "ok");
+        assert_eq!(json["status"], "UP");
         assert_eq!(json["profile"], "dev");
         assert!(json["uptime"].is_string());
     }
@@ -4370,6 +4765,140 @@ mod tests {
         assert!(
             !text.contains("dup_series_metric{region=\"us\"} 20"),
             "duplicate series must be dropped:\n{text}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod health_indicator_tests {
+    use super::*;
+
+    struct AlwaysUp;
+    impl HealthIndicator for AlwaysUp {
+        fn check(&self) -> futures::future::BoxFuture<'_, HealthCheckOutput> {
+            Box::pin(async { HealthCheckOutput::up() })
+        }
+    }
+
+    struct AlwaysDown;
+    impl HealthIndicator for AlwaysDown {
+        fn check(&self) -> futures::future::BoxFuture<'_, HealthCheckOutput> {
+            Box::pin(async { HealthCheckOutput::down() })
+        }
+    }
+
+    #[test]
+    fn health_status_as_str_values() {
+        assert_eq!(HealthStatus::Up.as_str(), "UP");
+        assert_eq!(HealthStatus::Down.as_str(), "DOWN");
+        assert_eq!(HealthStatus::OutOfService.as_str(), "OUT_OF_SERVICE");
+        assert_eq!(HealthStatus::Unknown.as_str(), "UNKNOWN");
+    }
+
+    #[test]
+    fn health_status_is_healthy() {
+        assert!(HealthStatus::Up.is_healthy());
+        assert!(HealthStatus::Unknown.is_healthy());
+        assert!(!HealthStatus::Down.is_healthy());
+        assert!(!HealthStatus::OutOfService.is_healthy());
+    }
+
+    #[test]
+    fn aggregate_status_precedence() {
+        assert_eq!(
+            HealthIndicatorRegistry::aggregate_status(&[HealthStatus::Up]),
+            HealthStatus::Up
+        );
+        assert_eq!(
+            HealthIndicatorRegistry::aggregate_status(&[HealthStatus::Up, HealthStatus::Unknown]),
+            HealthStatus::Unknown
+        );
+        assert_eq!(
+            HealthIndicatorRegistry::aggregate_status(&[
+                HealthStatus::Unknown,
+                HealthStatus::OutOfService
+            ]),
+            HealthStatus::OutOfService
+        );
+        assert_eq!(
+            HealthIndicatorRegistry::aggregate_status(&[
+                HealthStatus::OutOfService,
+                HealthStatus::Down
+            ]),
+            HealthStatus::Down
+        );
+        assert_eq!(
+            HealthIndicatorRegistry::aggregate_status(&[]),
+            HealthStatus::Up
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_run_all_collects_results() {
+        let registry = HealthIndicatorRegistry::new();
+        registry
+            .register("svc_a", IndicatorGroup::Readiness, Arc::new(AlwaysUp))
+            .unwrap();
+        registry
+            .register("svc_b", IndicatorGroup::HealthOnly, Arc::new(AlwaysDown))
+            .unwrap();
+
+        let results = registry.run_all().await;
+        assert_eq!(results.len(), 2);
+        assert!(
+            results
+                .iter()
+                .any(|r| r.name == "svc_a" && r.output.status == HealthStatus::Up)
+        );
+        assert!(
+            results
+                .iter()
+                .any(|r| r.name == "svc_b" && r.output.status == HealthStatus::Down)
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_run_readiness_filters_health_only() {
+        let registry = HealthIndicatorRegistry::new();
+        registry
+            .register("probe_check", IndicatorGroup::Readiness, Arc::new(AlwaysUp))
+            .unwrap();
+        registry
+            .register(
+                "health_only",
+                IndicatorGroup::HealthOnly,
+                Arc::new(AlwaysDown),
+            )
+            .unwrap();
+
+        let results = registry.run_readiness().await;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "probe_check");
+    }
+
+    #[tokio::test]
+    async fn timed_out_indicator_reports_unknown_with_flag() {
+        struct SlowIndicator;
+        impl HealthIndicator for SlowIndicator {
+            fn check(&self) -> futures::future::BoxFuture<'_, HealthCheckOutput> {
+                Box::pin(async {
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    HealthCheckOutput::up()
+                })
+            }
+            fn timeout_ms(&self) -> u64 {
+                5
+            }
+        }
+        let registry = HealthIndicatorRegistry::new();
+        registry
+            .register("slow", IndicatorGroup::Readiness, Arc::new(SlowIndicator))
+            .unwrap();
+        let results = registry.run_all().await;
+        assert_eq!(results[0].output.status, HealthStatus::Unknown);
+        assert_eq!(
+            results[0].output.details.get("timed_out"),
+            Some(&serde_json::Value::Bool(true))
         );
     }
 }

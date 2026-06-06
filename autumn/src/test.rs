@@ -211,6 +211,12 @@ pub struct TestApp {
     api_versions: Vec<crate::app::ApiVersion>,
     /// Plugin-contributed metrics sources registered via [`AppBuilder::metrics_source`].
     metrics_sources: Vec<(String, std::sync::Arc<dyn crate::actuator::MetricsSource>)>,
+    /// Plugin-contributed health indicators registered via [`AppBuilder::health_indicator`].
+    health_indicators: Vec<(
+        String,
+        crate::actuator::IndicatorGroup,
+        std::sync::Arc<dyn crate::actuator::HealthIndicator>,
+    )>,
 }
 
 type TestPolicyRegistration = Box<dyn FnOnce(&crate::authorization::PolicyRegistry) + Send>;
@@ -263,6 +269,7 @@ impl TestApp {
             clock_as_any: None,
             api_versions: Vec::new(),
             metrics_sources: Vec::new(),
+            health_indicators: Vec::new(),
         }
     }
 
@@ -495,6 +502,7 @@ impl TestApp {
         self.jobs.extend(app_builder.jobs);
         self.exception_filters.extend(app_builder.exception_filters);
         self.metrics_sources.extend(app_builder.metrics_sources);
+        self.health_indicators.extend(app_builder.health_indicators);
 
         // Carry plugin-registered error reporters into the test app so
         // reporting-enabled plugins exercise the same behavior under `TestApp`
@@ -829,6 +837,7 @@ impl TestApp {
             job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
+            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
             #[cfg(feature = "presence")]
             presence: crate::presence::Presence::new(test_channels.clone()),
             #[cfg(feature = "ws")]
@@ -908,6 +917,14 @@ impl TestApp {
         // AppBuilder::run ordering so initializers can observe the registry.
         for (name, source) in self.metrics_sources {
             if let Err(e) = state.metrics_source_registry.register(name, source) {
+                tracing::warn!("{e}");
+            }
+        }
+        for (name, group, indicator) in self.health_indicators {
+            if let Err(e) = state
+                .health_indicator_registry
+                .register(name, group, indicator)
+            {
                 tracing::warn!("{e}");
             }
         }
