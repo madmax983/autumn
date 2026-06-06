@@ -643,12 +643,14 @@ impl ExperimentStore for InMemoryExperimentStore {
         let name = config.name.clone();
         {
             let mut inner = self.inner.write().unwrap();
+            let exists = inner.experiments.contains_key(&name);
             inner.experiments.insert(name.clone(), config);
+            let mutation = if exists { "updated" } else { "created" };
             inner
                 .changes
                 .entry(name.clone())
                 .or_default()
-                .push(ChangeRecord::now(&name, "created", None));
+                .push(ChangeRecord::now(&name, mutation, None));
         }
         Ok(())
     }
@@ -1690,11 +1692,17 @@ pub mod pg {
                      INSERT INTO autumn_experiments \
                          (name, description, state, variants, winner, exclusion_group) \
                      VALUES ($1, $2, $3::autumn_experiment_state, $4::jsonb, $5, $6) \
-                     ON CONFLICT (name) DO NOTHING \
-                     RETURNING name \
+                     ON CONFLICT (name) DO UPDATE SET \
+                         description = EXCLUDED.description, \
+                         state = EXCLUDED.state, \
+                         variants = EXCLUDED.variants, \
+                         winner = EXCLUDED.winner, \
+                         exclusion_group = EXCLUDED.exclusion_group, \
+                         updated_at = NOW() \
+                     RETURNING name, (xmax = 0) AS is_insert \
                  ) \
                  INSERT INTO autumn_experiment_changes (experiment, mutation, actor) \
-                 SELECT name, 'created', NULL FROM upserted",
+                 SELECT name, CASE WHEN is_insert THEN 'created' ELSE 'updated' END, NULL FROM upserted",
             )
             .bind::<diesel::sql_types::Text, _>(&config.name)
             .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(config.description)
@@ -2601,5 +2609,20 @@ mod tests {
     fn service_debug_does_not_panic() {
         let svc = make_svc();
         let _ = format!("{svc:?}");
+    }
+
+    #[test]
+    fn upsert_logs_created_or_updated() {
+        let svc = make_svc();
+        let exp = fifty_fifty("exp");
+        svc.create(exp.clone()).unwrap();
+        
+        // Upsert the same experiment again to trigger update
+        svc.create(exp).unwrap();
+        
+        let hist = svc.history("exp", 10).unwrap();
+        assert_eq!(hist.len(), 2);
+        assert_eq!(hist[1].mutation, "created");
+        assert_eq!(hist[0].mutation, "updated");
     }
 }
