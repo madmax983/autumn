@@ -122,6 +122,7 @@ pub fn app() -> AppBuilder {
         channels_interceptor: None,
         #[cfg(feature = "oauth2")]
         http_interceptor: None,
+        metrics_sources: Vec::new(),
     }
 }
 
@@ -320,6 +321,8 @@ pub struct AppBuilder {
     channels_interceptor: Option<Arc<dyn crate::interceptor::ChannelsInterceptor>>,
     #[cfg(feature = "oauth2")]
     http_interceptor: Option<Arc<dyn crate::interceptor::HttpInterceptor>>,
+    /// Plugin-contributed metrics sources registered via [`AppBuilder::metrics_source`].
+    pub(crate) metrics_sources: Vec<(String, Arc<dyn crate::actuator::MetricsSource>)>,
 }
 
 /// Boxed builder closure that constructs a durable
@@ -1748,6 +1751,60 @@ impl AppBuilder {
         self.registered_plugins.contains(name)
     }
 
+    /// Register a named [`MetricsSource`](crate::actuator::MetricsSource) that contributes
+    /// metric families to `/actuator/prometheus` and `/actuator/metrics`.
+    ///
+    /// The `name` is a stable identifier used for:
+    /// - Duplicate-registration detection (same behaviour as duplicate plugins: a
+    ///   `tracing::warn!` is emitted and the second registration is skipped).
+    /// - The `source` label in the `autumn_metrics_source_errors_total` counter
+    ///   that increments when a source panics during a scrape.
+    ///
+    /// `Plugin::build` implementations can call this to wire a source with no
+    /// extra application-level glue code.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use autumn_web::actuator::{MetricsSource, MetricFamily, MetricKind, MetricSample};
+    /// use autumn_web::app::AppBuilder;
+    /// use std::sync::Arc;
+    ///
+    /// struct QueueMetrics;
+    ///
+    /// impl MetricsSource for QueueMetrics {
+    ///     fn collect(&self) -> Vec<MetricFamily> {
+    ///         vec![MetricFamily {
+    ///             name: "myapp_queue_depth".to_string(),
+    ///             help: "Current queue depth".to_string(),
+    ///             kind: MetricKind::Gauge,
+    ///             samples: vec![MetricSample { labels: vec![], value: 42.0 }],
+    ///         }]
+    ///     }
+    /// }
+    ///
+    /// autumn_web::app()
+    ///     .metrics_source("myapp_queue", Arc::new(QueueMetrics));
+    /// ```
+    #[must_use]
+    pub fn metrics_source(
+        mut self,
+        name: impl Into<String>,
+        source: Arc<dyn crate::actuator::MetricsSource>,
+    ) -> Self {
+        let name = name.into();
+        if self.metrics_sources.iter().any(|(n, _)| n == &name) {
+            tracing::warn!(
+                source_name = %name,
+                "MetricsSource '{}' is already registered; skipping duplicate",
+                name
+            );
+            return self;
+        }
+        self.metrics_sources.push((name, source));
+        self
+    }
+
     /// Register embedded Diesel migrations with the application.
     ///
     /// When migrations are registered:
@@ -1887,6 +1944,7 @@ impl AppBuilder {
             channels_interceptor,
             #[cfg(feature = "oauth2")]
             http_interceptor,
+            metrics_sources,
         } = self;
 
         let all_routes = routes;
@@ -2050,6 +2108,16 @@ impl AppBuilder {
         if let Some(interceptor) = http_interceptor {
             state.insert_extension(interceptor);
         }
+
+        // Populate the metrics source registry from builder registrations.
+        // Duplicate names were already rejected in `metrics_source()`, so
+        // all entries here are unique.
+        for (name, source) in metrics_sources {
+            if let Err(e) = state.metrics_source_registry.register(name, source) {
+                tracing::warn!("{e}");
+            }
+        }
+
         #[cfg(feature = "db")]
         configure_replica_migration_check(&state, replica_migration_check);
         #[cfg(feature = "db")]
@@ -2460,9 +2528,11 @@ impl AppBuilder {
             channels_interceptor,
             #[cfg(feature = "oauth2")]
             http_interceptor,
+            metrics_sources,
         } = self;
 
         let _ = &api_versions;
+        let _ = &metrics_sources;
         let all_routes = routes;
 
         // Load config (same as normal startup)
@@ -5033,6 +5103,7 @@ fn build_state(
         task_registry: crate::actuator::TaskRegistry::new(),
         job_registry: crate::actuator::JobRegistry::new(),
         config_props: crate::actuator::ConfigProperties::from_config(config),
+        metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
         #[cfg(feature = "presence")]
         presence: crate::presence::Presence::new(channels.clone()),
         #[cfg(feature = "ws")]
@@ -5302,6 +5373,7 @@ mod tests {
             task_registry: crate::actuator::TaskRegistry::new(),
             job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
+            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "presence")]
@@ -6227,6 +6299,7 @@ mod tests {
             task_registry: crate::actuator::TaskRegistry::new(),
             job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
+            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "presence")]
@@ -6334,6 +6407,7 @@ mod tests {
             task_registry: crate::actuator::TaskRegistry::new(),
             job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
+            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "presence")]
@@ -6418,6 +6492,7 @@ mod tests {
             task_registry: crate::actuator::TaskRegistry::new(),
             job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
+            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "presence")]
@@ -6709,6 +6784,7 @@ mod tests {
             task_registry: crate::actuator::TaskRegistry::new(),
             job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
+            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "presence")]
@@ -7020,6 +7096,7 @@ mod tests {
             task_registry: crate::actuator::TaskRegistry::new(),
             job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
+            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "presence")]
@@ -7169,6 +7246,7 @@ mod tests {
             task_registry: crate::actuator::TaskRegistry::new(),
             job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
+            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "presence")]
@@ -7216,6 +7294,7 @@ mod tests {
             task_registry: crate::actuator::TaskRegistry::new(),
             job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
+            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "presence")]
@@ -7482,6 +7561,7 @@ mod tests {
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
+            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
         };
 
         let mut rx = state.channels().subscribe("sys:tasks");
@@ -7553,6 +7633,7 @@ mod tests {
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
+            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
         };
 
         let mut rx = state.channels().subscribe("sys:tasks");

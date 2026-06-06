@@ -97,6 +97,10 @@ pub struct AppState {
     /// Resolved config properties with source tracking for `/actuator/configprops`.
     pub(crate) config_props: actuator::ConfigProperties,
 
+    /// Registry of plugin-contributed metrics sources, populated by
+    /// [`crate::app::AppBuilder::metrics_source`].
+    pub(crate) metrics_source_registry: actuator::MetricsSourceRegistry,
+
     /// Named broadcast channel registry for real-time messaging.
     ///
     /// Available when the `ws` feature is enabled. Use
@@ -264,6 +268,12 @@ impl AppState {
     #[must_use]
     pub const fn config_props(&self) -> &actuator::ConfigProperties {
         &self.config_props
+    }
+
+    /// Returns the registry of plugin-contributed metrics sources.
+    #[must_use]
+    pub const fn metrics_source_registry(&self) -> &actuator::MetricsSourceRegistry {
+        &self.metrics_source_registry
     }
 
     /// Returns the resolved [`crate::config::AutumnConfig`] from the extension map.
@@ -552,6 +562,7 @@ impl AppState {
             task_registry: actuator::TaskRegistry::new(),
             job_registry: actuator::JobRegistry::new(),
             config_props: actuator::ConfigProperties::default(),
+            metrics_source_registry: actuator::MetricsSourceRegistry::new(),
             #[cfg(feature = "presence")]
             presence: Presence::new(channels.clone()),
             #[cfg(feature = "ws")]
@@ -683,6 +694,10 @@ impl crate::actuator::ProvideActuatorState for AppState {
 
     fn uptime_display(&self) -> String {
         self.uptime_display()
+    }
+
+    fn metrics_source_registry(&self) -> Option<&crate::actuator::MetricsSourceRegistry> {
+        Some(&self.metrics_source_registry)
     }
 
     #[cfg(feature = "ws")]

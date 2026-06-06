@@ -209,6 +209,8 @@ pub struct TestApp {
     /// to [`crate::time::TickingClock`] at runtime.
     clock_as_any: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
     api_versions: Vec<crate::app::ApiVersion>,
+    /// Plugin-contributed metrics sources registered via [`AppBuilder::metrics_source`].
+    metrics_sources: Vec<(String, std::sync::Arc<dyn crate::actuator::MetricsSource>)>,
 }
 
 type TestPolicyRegistration = Box<dyn FnOnce(&crate::authorization::PolicyRegistry) + Send>;
@@ -260,6 +262,7 @@ impl TestApp {
             clock: None,
             clock_as_any: None,
             api_versions: Vec::new(),
+            metrics_sources: Vec::new(),
         }
     }
 
@@ -491,6 +494,7 @@ impl TestApp {
         self.custom_layers.extend(app_builder.custom_layers);
         self.jobs.extend(app_builder.jobs);
         self.exception_filters.extend(app_builder.exception_filters);
+        self.metrics_sources.extend(app_builder.metrics_sources);
 
         // Carry plugin-registered error reporters into the test app so
         // reporting-enabled plugins exercise the same behavior under `TestApp`
@@ -824,6 +828,7 @@ impl TestApp {
             task_registry: crate::actuator::TaskRegistry::new(),
             job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
+            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
             #[cfg(feature = "presence")]
             presence: crate::presence::Presence::new(test_channels.clone()),
             #[cfg(feature = "ws")]
@@ -897,6 +902,14 @@ impl TestApp {
         #[cfg(feature = "http-client")]
         if let Some(registry) = self.http_mock_registry {
             state.insert_extension(crate::http_client::HttpMockRegistryExt(registry));
+        }
+
+        // Register metrics sources before state initializers — mirrors production
+        // AppBuilder::run ordering so initializers can observe the registry.
+        for (name, source) in self.metrics_sources {
+            if let Err(e) = state.metrics_source_registry.register(name, source) {
+                tracing::warn!("{e}");
+            }
         }
 
         for initializer in self.state_initializers {
