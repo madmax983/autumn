@@ -2022,8 +2022,12 @@ impl AppBuilder {
             channels_backend,
         );
 
-        // Instantiate MaintenanceState, insert as extension, and start background poller task
+        // Instantiate MaintenanceState, load flag synchronously at startup, insert as extension, and start background poller task
         let maintenance_state = crate::maintenance::MaintenanceState::new();
+        let flag_path = std::path::Path::new(crate::maintenance::MAINTENANCE_FLAG_FILE);
+        if let Ok(Some(cfg)) = crate::maintenance::MaintenanceState::load_from_file(flag_path) {
+            maintenance_state.enable(cfg);
+        }
         state.insert_extension(maintenance_state.clone());
 
         let poller_state = maintenance_state.clone();

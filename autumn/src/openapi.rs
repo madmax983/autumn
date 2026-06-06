@@ -116,6 +116,8 @@ pub struct ApiDoc {
     pub api_version: Option<&'static str>,
     /// Whether this route opts out of sunset 410 responses.
     pub sunset_opt_out: bool,
+    /// Whether this route uses dynamic policy authorization.
+    pub has_policy: bool,
 }
 
 /// Reference to a schema definition, produced by the route macros.

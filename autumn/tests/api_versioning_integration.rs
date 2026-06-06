@@ -166,7 +166,58 @@ async fn api_authorize_sunset(LoadedSunsetNote(sunset_note): LoadedSunsetNote) -
     "authorized sunset info"
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct SunsetPolicyDenialNote {
+    id: i64,
+}
+
+#[derive(Default, Clone)]
+struct SunsetPolicyDenialNotePolicy;
+
+impl ::autumn_web::authorization::Policy<SunsetPolicyDenialNote> for SunsetPolicyDenialNotePolicy {
+    fn can_show<'a>(
+        &'a self,
+        _ctx: &'a ::autumn_web::authorization::PolicyContext,
+        record: &'a SunsetPolicyDenialNote,
+    ) -> ::autumn_web::authorization::BoxFuture<'a, bool> {
+        let is_ok = record.id == 42;
+        Box::pin(async move { is_ok })
+    }
+}
+
+struct LoadedSunsetPolicyDenialNote(SunsetPolicyDenialNote);
+
+impl<S> ::autumn_web::reexports::axum::extract::FromRequestParts<S> for LoadedSunsetPolicyDenialNote
+where
+    S: Send + Sync,
+{
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut ::autumn_web::reexports::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let id = parts
+            .headers
+            .get("X-Note-Id")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(1);
+        Ok(Self(SunsetPolicyDenialNote { id }))
+    }
+}
+
+#[get("/api/authorize-policy-denial-sunset", api_version = "v1")]
+#[authorize("show", resource = SunsetPolicyDenialNote)]
+async fn api_authorize_policy_denial_sunset(
+    LoadedSunsetPolicyDenialNote(sunset_policy_denial_note): LoadedSunsetPolicyDenialNote,
+) -> &'static str {
+    let _ = sunset_policy_denial_note;
+    "authorized policy denial sunset info"
+}
+
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn test_api_versioning_auth_preservation() {
     use autumn_web::session::{MemoryStore, SessionConfig, SessionLayer, SessionStore};
 
@@ -192,9 +243,11 @@ async fn test_api_versioning_auth_preservation() {
         .routes(routes![
             api_secured_sunset,
             api_secured_role_sunset,
-            api_authorize_sunset
+            api_authorize_sunset,
+            api_authorize_policy_denial_sunset
         ])
         .policy::<SunsetNote, _>(SunsetNotePolicy)
+        .policy::<SunsetPolicyDenialNote, _>(SunsetPolicyDenialNotePolicy)
         .api_version(autumn_web::app::ApiVersion {
             version: "v1".to_string(),
             deprecated_at: Some(deprecated_at),
@@ -227,6 +280,23 @@ async fn test_api_versioning_auth_preservation() {
     let resp = client
         .get("/api/authorize-sunset")
         .header("Cookie", "autumn.sid=sess-user")
+        .send()
+        .await;
+    resp.assert_ok();
+
+    // Before sunset policy denial check
+    let resp = client
+        .get("/api/authorize-policy-denial-sunset")
+        .header("Cookie", "autumn.sid=sess-user")
+        .header("X-Note-Id", "1")
+        .send()
+        .await;
+    resp.assert_status(404);
+
+    let resp = client
+        .get("/api/authorize-policy-denial-sunset")
+        .header("Cookie", "autumn.sid=sess-user")
+        .header("X-Note-Id", "42")
         .send()
         .await;
     resp.assert_ok();
@@ -277,4 +347,21 @@ async fn test_api_versioning_auth_preservation() {
         .send()
         .await;
     resp.assert_status(410);
+
+    // After sunset policy denial check
+    let resp = client
+        .get("/api/authorize-policy-denial-sunset")
+        .header("Cookie", "autumn.sid=sess-user")
+        .header("X-Note-Id", "1")
+        .send()
+        .await;
+    resp.assert_status(404); // Policy denial is preserved!
+
+    let resp = client
+        .get("/api/authorize-policy-denial-sunset")
+        .header("Cookie", "autumn.sid=sess-user")
+        .header("X-Note-Id", "42")
+        .send()
+        .await;
+    resp.assert_status(410); // Authorized sunset request is 410 Gone!
 }

@@ -819,6 +819,7 @@ fn group_and_mount_routes(
                 sunset_opt_out: route.sunset_opt_out,
                 secured: route.api_doc.secured,
                 required_roles: route.api_doc.required_roles,
+                has_policy: route.api_doc.has_policy,
             }));
         }
         grouped
@@ -1077,6 +1078,7 @@ fn mount_scoped_groups(
                     sunset_opt_out: route.sunset_opt_out,
                     secured: route.api_doc.secured,
                     required_roles: route.api_doc.required_roles,
+                    has_policy: route.api_doc.has_policy,
                 }));
             }
             sub_router = sub_router.route(route.path, handler);
@@ -1452,8 +1454,17 @@ fn apply_middleware(
         .iter()
         .filter_map(|proxy| crate::security::proxy::TrustedProxy::parse(proxy))
         .collect::<Vec<_>>();
+    let bypass_paths = vec![
+        config.health.path.clone(),
+        config.health.live_path.clone(),
+        config.health.ready_path.clone(),
+        config.health.startup_path.clone(),
+        crate::actuator::actuator_route_path(&config.actuator.prefix, "/health"),
+    ];
     router = router.layer(
         crate::middleware::maintenance::MaintenanceLayer::new(maintenance_state)
+            .with_health_prefix(config.actuator.prefix.clone())
+            .with_bypass_paths(bypass_paths)
             .with_trust_forwarded_headers(config.security.rate_limit.trust_forwarded_headers)
             .with_trusted_proxies(trusted_proxies)
             .with_trusted_proxies_configured(
@@ -4123,6 +4134,7 @@ pub struct RouteVersionMetadata {
     pub sunset_opt_out: bool,
     pub secured: bool,
     pub required_roles: &'static [&'static str],
+    pub has_policy: bool,
 }
 
 /// Middleware that handles API deprecation, sunsets, and Gone responses.
@@ -4152,6 +4164,9 @@ async fn api_versioning_middleware(
     let is_sunset = version.sunset_at.is_some_and(|s| now >= s);
 
     if is_sunset && !meta.sunset_opt_out {
+        if meta.has_policy {
+            return next.run(request).await;
+        }
         if meta.secured {
             let session = request.extensions().get::<crate::session::Session>();
             let mut auth_failed = false;
@@ -4224,4 +4239,50 @@ async fn api_versioning_middleware(
     }
 
     response
+}
+
+/// Helper function to perform a sunset check during dynamic handler execution.
+/// Returns a `410 Gone` response if the route version has sunsetted.
+#[must_use]
+pub fn check_sunset(
+    state: &crate::state::AppState,
+    meta: &RouteVersionMetadata,
+) -> Option<axum::response::Response> {
+    let clock = state.clock();
+    let now = clock.now();
+
+    let versions = state.extension::<crate::app::RegisteredApiVersions>();
+    let matching_version = versions
+        .as_ref()
+        .and_then(|v| v.0.iter().find(|av| av.version == meta.version));
+
+    let version = matching_version?;
+    let is_sunset = version.sunset_at.is_some_and(|s| now >= s);
+
+    if is_sunset && !meta.sunset_opt_out {
+        let err = crate::error::AutumnError::gone_msg(format!(
+            "API version '{}' has been sunsetted.",
+            meta.version
+        ));
+        let mut response = axum::response::IntoResponse::into_response(err);
+        if let Some(sunset) = version.sunset_at {
+            let http_date = sunset.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+            if let Ok(val) = axum::http::HeaderValue::from_str(&http_date) {
+                response.headers_mut().insert("Sunset", val);
+            }
+        }
+        let deprecation_date = match (version.deprecated_at, version.sunset_at) {
+            (Some(d), Some(s)) => Some(d.min(s)),
+            (d, s) => d.or(s),
+        };
+        if let Some(date) = deprecation_date {
+            let timestamp = date.timestamp();
+            if let Ok(val) = axum::http::HeaderValue::from_str(&format!("@{timestamp}")) {
+                response.headers_mut().insert("Deprecation", val);
+            }
+        }
+        return Some(response);
+    }
+
+    None
 }

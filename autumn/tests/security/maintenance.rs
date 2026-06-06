@@ -89,3 +89,92 @@ async fn maintenance_invalid_proxies_fails_closed() {
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
+
+#[tokio::test]
+async fn maintenance_bypass_paths() {
+    let state = MaintenanceState::new();
+    state.enable(MaintenanceConfig::default());
+
+    let app = Router::new()
+        .route("/", get(|| async { "Hello" }))
+        .route("/health", get(|| async { "Hello" }))
+        .route("/health/live", get(|| async { "Hello" }))
+        .route("/health-admin", get(|| async { "Hello" }))
+        .layer(MaintenanceLayer::new(state).with_bypass_paths(vec!["/health".to_string()]));
+
+    // 1. Bypass exact path
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // 2. Bypass subtree path
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/health/live")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // 3. Do not bypass non-exact prefix path
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/health-admin")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    // 4. Do not bypass other paths
+    let resp = app
+        .clone()
+        .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn maintenance_synchronous_load_on_startup() {
+    let path = std::path::Path::new(autumn_web::maintenance::MAINTENANCE_FLAG_FILE);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+
+    let config = MaintenanceConfig {
+        message: Some("Startup Maintenance Mode Active".to_string()),
+        ..Default::default()
+    };
+    MaintenanceState::save_to_file(path, &config).unwrap();
+
+    // Verify that loading from file synchronously works and populates a new MaintenanceState
+    let state = MaintenanceState::new();
+    let loaded = MaintenanceState::load_from_file(path).unwrap();
+    assert!(loaded.is_some());
+    state.enable(loaded.unwrap());
+
+    assert!(state.is_active());
+    assert_eq!(
+        state.get().unwrap().message.unwrap(),
+        "Startup Maintenance Mode Active"
+    );
+
+    // Clean up
+    let _ = std::fs::remove_file(path);
+}

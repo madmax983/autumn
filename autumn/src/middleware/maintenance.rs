@@ -54,6 +54,7 @@ const RETRY_AFTER_SECS: &str = "120";
 pub struct MaintenanceLayer {
     state: MaintenanceState,
     health_prefix: String,
+    bypass_paths: Vec<String>,
     trust_forwarded_headers: bool,
     trusted_proxies: Vec<crate::security::TrustedProxy>,
     trusted_proxies_configured: bool,
@@ -68,6 +69,7 @@ impl MaintenanceLayer {
         Self {
             state,
             health_prefix: DEFAULT_HEALTH_PREFIX.to_owned(),
+            bypass_paths: Vec::new(),
             trust_forwarded_headers: false,
             trusted_proxies: Vec::new(),
             trusted_proxies_configured: false,
@@ -82,6 +84,15 @@ impl MaintenanceLayer {
     #[must_use]
     pub fn with_health_prefix(mut self, prefix: impl Into<String>) -> Self {
         self.health_prefix = prefix.into();
+        self
+    }
+
+    /// Configure bypass paths that escape maintenance mode.
+    ///
+    /// Requests to these paths (or starting with them as slash-delimited segments) always pass through.
+    #[must_use]
+    pub fn with_bypass_paths(mut self, paths: Vec<String>) -> Self {
+        self.bypass_paths = paths;
         self
     }
 
@@ -118,6 +129,7 @@ impl<S> Layer<S> for MaintenanceLayer {
             inner,
             state: self.state.clone(),
             health_prefix: self.health_prefix.clone(),
+            bypass_paths: self.bypass_paths.clone(),
             trust_forwarded_headers: self.trust_forwarded_headers,
             trusted_proxies: self.trusted_proxies.clone(),
             trusted_proxies_configured: self.trusted_proxies_configured,
@@ -131,6 +143,7 @@ pub struct MaintenanceService<S> {
     inner: S,
     state: MaintenanceState,
     health_prefix: String,
+    bypass_paths: Vec<String>,
     trust_forwarded_headers: bool,
     trusted_proxies: Vec<crate::security::TrustedProxy>,
     trusted_proxies_configured: bool,
@@ -146,9 +159,20 @@ impl<S> MaintenanceService<S> {
         req: &Request<B>,
         config: &MaintenanceConfig,
     ) -> Option<Response<Body>> {
-        // 1. Actuator/health routes always pass through.
-        if req.uri().path().starts_with(self.health_prefix.as_str()) {
+        // 1. Actuator/health routes and configured bypass paths always pass through.
+        let path = req.uri().path();
+        if path.starts_with(self.health_prefix.as_str()) {
             return None;
+        }
+        for bypass in &self.bypass_paths {
+            if path == bypass {
+                return None;
+            }
+            if let Some(stripped) = path.strip_prefix(bypass)
+                && (bypass.ends_with('/') || stripped.starts_with('/'))
+            {
+                return None;
+            }
         }
 
         // 2. Bypass header.

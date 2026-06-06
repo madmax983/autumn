@@ -151,6 +151,7 @@ pub fn route_macro(
         |lit| quote! { ::core::option::Option::Some(#lit) },
     );
     let sunset_opt_out_val = route_args.sunset_opt_out;
+    let has_policy_val = has_authorize_guard(&input_fn);
 
     // ── Path helper ─────────────────────────────────────────────
     let path_helper = emit_path_helper(&path_helper_name, &path, &path_params);
@@ -183,6 +184,7 @@ pub fn route_macro(
                     register_schemas: ::core::option::Option::None,
                     api_version: #api_version_expr,
                     sunset_opt_out: #sunset_opt_out_val,
+                    has_policy: #has_policy_val,
                     #api_doc_fields
                 },
                 repository: ::core::option::Option::None,
