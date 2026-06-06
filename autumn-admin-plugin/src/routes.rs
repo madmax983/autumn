@@ -134,6 +134,7 @@ pub static ADMIN_JS_PATH: LazyLock<String> =
 
 // ── Router construction ─────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 pub fn admin_router(
     registry: Arc<AdminRegistry>,
     prefix: &str,
@@ -142,6 +143,7 @@ pub fn admin_router(
     require_role: Option<String>,
     config_svc: Option<Arc<RuntimeConfigService>>,
     step_up_mutations: bool,
+    step_up_max_age_secs: u64,
 ) -> axum::Router<AppState> {
     let has_config = config_svc.is_some();
 
@@ -200,7 +202,9 @@ pub fn admin_router(
     // Apply step-up mutation guard before the role check so that a hijacked
     // admin session cannot exercise destructive admin actions.
     let router = if step_up_mutations {
-        router.layer(from_fn(crate::auth::check_step_up_mutations))
+        router.layer(from_fn(move |req, next| {
+            crate::auth::check_step_up_mutations(step_up_max_age_secs, req, next)
+        }))
     } else {
         router
     };
@@ -1429,6 +1433,7 @@ mod tests {
             None,
             None,
             false,
+            autumn_web::step_up::DEFAULT_MAX_AGE_SECS,
         )
         .layer(axum::Extension(session))
         .with_state(state);

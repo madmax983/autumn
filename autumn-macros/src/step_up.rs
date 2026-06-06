@@ -103,13 +103,22 @@ fn build_check_call(max_age_tokens: &TokenStream) -> TokenStream {
             if __wants_json {
                 return ::autumn_web::step_up::__step_up_json_response(__max_age_secs);
             } else {
-                let __return_to: ::std::string::String =
-                    ::autumn_web::step_up::encode_return_to(
+                // Prefer Referer over the current URI so that after reauth
+                // the user lands on the page that had the form (GET), not on
+                // the POST/DELETE-only endpoint that triggered this check.
+                let __return_to: ::std::string::String = {
+                    let __referer_path = __autumn_step_up_headers
+                        .get(::autumn_web::reexports::axum::http::header::REFERER)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(::autumn_web::step_up::referer_path);
+                    let __path = __referer_path.as_deref().unwrap_or_else(|| {
                         __autumn_step_up_uri
                             .path_and_query()
                             .map(|pq| pq.as_str())
-                            .unwrap_or_else(|| __autumn_step_up_uri.path()),
-                    );
+                            .unwrap_or_else(|| __autumn_step_up_uri.path())
+                    });
+                    ::autumn_web::step_up::encode_return_to(__path)
+                };
                 return ::autumn_web::reexports::axum::response::IntoResponse::into_response(
                     ::autumn_web::reexports::axum::response::Redirect::to(
                         &::std::format!("/reauth?return_to={__return_to}")

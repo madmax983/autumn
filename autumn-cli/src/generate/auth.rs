@@ -4754,6 +4754,10 @@ pub async fn login_verify(
     session.insert("__SNAKE___id", __SNAKE__.id.to_string()).await;
     session.insert("__SNAKE___email", &__SNAKE__.email).await;
     session.insert(state.auth_session_key(), __SNAKE__.id.to_string()).await;
+    // Password + TOTP proves identity at least as strongly as password-only
+    // login, so stamp the step-up claim so #[step_up] routes are immediately
+    // accessible without forcing a redundant /reauth.
+    autumn_web::step_up::set_last_strong_auth_at(&session).await;
 
     let remaining: i64 = recovery_codes::table
         .filter(recovery_codes::user_id.eq(__SNAKE__.id))
@@ -7364,6 +7368,25 @@ mod tests {
         assert!(
             verify_body.contains("reset_token_expires_at"),
             "login_verify update must filter by reset_token_expires_at: {verify_body}"
+        );
+    }
+
+    #[test]
+    fn totp_login_verify_stamps_step_up_claim_on_success() {
+        // Issue #833 / Codex P2: TOTP login (password + second factor) proves
+        // identity at least as strongly as password-only login. login_verify must
+        // call set_last_strong_auth_at so that #[step_up]-protected routes are
+        // immediately accessible without forcing a redundant /reauth.
+        let tmp = project_with_main();
+        totp_plan(tmp.path()).execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+        let verify_pos = routes
+            .find("pub async fn login_verify(")
+            .expect("login_verify fn");
+        let verify_body = &routes[verify_pos..];
+        assert!(
+            verify_body.contains("set_last_strong_auth_at"),
+            "login_verify (TOTP) must stamp set_last_strong_auth_at on success: {verify_body}"
         );
     }
 

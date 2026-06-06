@@ -80,6 +80,10 @@ pub struct AdminPlugin {
     ///
     /// Enables this with [`AdminPlugin::with_step_up_mutations`].
     step_up_mutations: bool,
+    /// Freshness window for step-up checks on admin mutations (seconds).
+    /// Defaults to [`autumn_web::step_up::DEFAULT_MAX_AGE_SECS`].
+    /// Override with [`AdminPlugin::with_step_up_max_age`].
+    step_up_max_age_secs: u64,
 }
 
 impl AdminPlugin {
@@ -99,6 +103,7 @@ impl AdminPlugin {
             require_role: Some("admin".to_owned()),
             runtime_config: None,
             step_up_mutations: false,
+            step_up_max_age_secs: autumn_web::step_up::DEFAULT_MAX_AGE_SECS,
         }
     }
 
@@ -189,6 +194,25 @@ impl AdminPlugin {
         self.step_up_mutations = true;
         self
     }
+
+    /// Override the step-up freshness window for admin mutations.
+    ///
+    /// Only meaningful when [`with_step_up_mutations`](Self::with_step_up_mutations)
+    /// is also called. Calls `with_step_up_mutations` implicitly.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// AdminPlugin::new()
+    ///     .register(UserAdmin::default())
+    ///     .with_step_up_max_age(600) // 10-minute window
+    /// ```
+    #[must_use]
+    pub const fn with_step_up_max_age(mut self, secs: u64) -> Self {
+        self.step_up_mutations = true;
+        self.step_up_max_age_secs = secs;
+        self
+    }
 }
 
 impl Default for AdminPlugin {
@@ -211,6 +235,7 @@ impl Plugin for AdminPlugin {
             require_role,
             runtime_config,
             step_up_mutations,
+            step_up_max_age_secs,
         } = self;
         let has_config = runtime_config.is_some();
         // "config" slug only conflicts when the runtime-config routes are mounted.
@@ -228,6 +253,7 @@ impl Plugin for AdminPlugin {
             require_role.clone(),
             runtime_config,
             step_up_mutations,
+            step_up_max_age_secs,
         );
 
         tracing::info!(

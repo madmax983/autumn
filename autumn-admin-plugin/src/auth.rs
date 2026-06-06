@@ -4,7 +4,6 @@
 //! request's [`Session`] and short-circuit with appropriate error responses
 //! when authentication or freshness requirements are not met.
 
-use autumn_web::AppState;
 use autumn_web::AutumnError;
 use autumn_web::session::Session;
 use autumn_web::step_up;
@@ -56,7 +55,13 @@ pub async fn check_role(
 /// - JSON/API clients receive a `401` with `WWW-Authenticate: StepUp`.
 ///
 /// GET requests are passed through unconditionally.
-pub async fn check_step_up_mutations(req: Request, next: Next) -> Response {
+///
+/// `max_age_secs` is the freshness window configured at admin plugin build
+/// time via [`AdminPlugin::with_step_up_mutations`] or
+/// [`AdminPlugin::with_step_up_max_age`]. It is captured in the closure
+/// registered in `routes::admin_router` and passed directly here so this
+/// function does not need access to `AppState` at request time.
+pub async fn check_step_up_mutations(max_age_secs: u64, req: Request, next: Next) -> Response {
     // Only guard mutating methods.
     if !matches!(
         req.method(),
@@ -72,15 +77,10 @@ pub async fn check_step_up_mutations(req: Request, next: Next) -> Response {
         .into_response();
     };
 
-    // Use the global default max-age from AppState extensions, falling back to
-    // the compiled-in constant when AppState is not present (e.g. in tests).
-    let max_age = req
-        .extensions()
-        .get::<AppState>()
-        .and_then(AppState::extension::<step_up::StepUpGlobalConfig>)
-        .map_or(step_up::DEFAULT_MAX_AGE_SECS, |c| c.default_max_age_secs);
-
-    if step_up::check_step_up(&session, max_age).await.is_err() {
+    if step_up::check_step_up(&session, max_age_secs)
+        .await
+        .is_err()
+    {
         // Detect JSON clients via Accept header.
         let wants_json = req
             .headers()
@@ -89,15 +89,23 @@ pub async fn check_step_up_mutations(req: Request, next: Next) -> Response {
             .is_some_and(|s| s.contains("application/json"));
 
         if wants_json {
-            return step_up::__step_up_json_response(max_age);
+            return step_up::__step_up_json_response(max_age_secs);
         }
 
-        // Preserve query parameters so the user returns to the exact same page.
+        // For mutating requests, prefer the Referer (the page with the action
+        // button) over the current URI so that after reauth the user lands back
+        // on a GET page — not a POST/DELETE-only endpoint with no GET handler.
         let path = req
-            .uri()
-            .path_and_query()
-            .map_or_else(|| req.uri().path(), axum::http::uri::PathAndQuery::as_str)
-            .to_owned();
+            .headers()
+            .get(header::REFERER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(step_up::referer_path)
+            .unwrap_or_else(|| {
+                req.uri()
+                    .path_and_query()
+                    .map_or_else(|| req.uri().path(), axum::http::uri::PathAndQuery::as_str)
+                    .to_owned()
+            });
         let encoded = step_up::encode_return_to(&path);
         return Redirect::to(&format!("/reauth?return_to={encoded}")).into_response();
     }
@@ -282,6 +290,10 @@ mod tests {
     // ── check_step_up_mutations ───────────────────────────────────────────────
 
     fn step_up_app(session: Session) -> Router {
+        step_up_app_with_max_age(session, autumn_web::step_up::DEFAULT_MAX_AGE_SECS)
+    }
+
+    fn step_up_app_with_max_age(session: Session, max_age_secs: u64) -> Router {
         async fn ok() -> &'static str {
             "ok"
         }
@@ -291,7 +303,7 @@ mod tests {
                 let session = session.clone();
                 async move {
                     req.extensions_mut().insert(session);
-                    check_step_up_mutations(req, next).await
+                    check_step_up_mutations(max_age_secs, req, next).await
                 }
             }))
     }
@@ -420,6 +432,59 @@ mod tests {
             res.status().is_redirection(),
             "DELETE without step-up should redirect: {}",
             res.status()
+        );
+    }
+
+    #[tokio::test]
+    async fn step_up_uses_referer_as_return_to_for_post() {
+        let session = Session::new_for_test("sid".into(), HashMap::new());
+        let app = step_up_app(session);
+        let res = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/resource")
+                    .header("Referer", "https://example.com/admin/users")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(res.status().is_redirection(), "should redirect");
+        let location = res.headers().get("location").unwrap().to_str().unwrap();
+        assert!(
+            location.contains("/admin/users"),
+            "return_to should use Referer path, not POST URI: {location}"
+        );
+    }
+
+    #[tokio::test]
+    async fn step_up_custom_max_age_is_honored() {
+        use autumn_web::step_up::STEP_UP_SESSION_KEY;
+        // Claim set 10 seconds ago — within the default 5-min window but outside
+        // a tighter 5-second window. Verifies that the captured max_age_secs is
+        // actually used rather than a hard-coded constant.
+        let stale_ts = (chrono::Utc::now() - chrono::Duration::seconds(10))
+            .timestamp()
+            .to_string();
+        let session = Session::new_for_test(
+            "sid".into(),
+            HashMap::from([(STEP_UP_SESSION_KEY.to_string(), stale_ts)]),
+        );
+        let app = step_up_app_with_max_age(session, 5);
+        let res = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/resource")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            res.status().is_redirection(),
+            "10-second-old claim should be blocked by max_age=5s"
         );
     }
 }

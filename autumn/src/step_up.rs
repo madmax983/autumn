@@ -196,6 +196,33 @@ pub fn parse_max_age_str(s: &str) -> Result<u64, String> {
 
 // ── URL encoding ─────────────────────────────────────────────────────────────
 
+/// Extract the path (and optional query) from a `Referer` header value.
+///
+/// Returns `None` when the Referer is malformed or fails the same-origin path
+/// validation performed by [`validate_return_to`].
+///
+/// # Example
+///
+/// ```
+/// use autumn_web::step_up::referer_path;
+/// assert_eq!(
+///     referer_path("https://example.com/account/settings?x=1"),
+///     Some("/account/settings?x=1".to_owned()),
+/// );
+/// assert_eq!(referer_path("//evil.com/path"), None);
+/// assert_eq!(referer_path("not-a-url"), None);
+/// ```
+#[must_use]
+pub fn referer_path(referer: &str) -> Option<String> {
+    let path = referer
+        .split_once("://")
+        .and_then(|(_, rest)| rest.find('/').map(|i| &rest[i..]))?;
+    validate_return_to(path)
+        .ok()
+        .filter(|()| !path.is_empty())?;
+    Some(path.to_owned())
+}
+
 /// Percent-encode a path for safe embedding in a `return_to` query parameter.
 ///
 /// Characters that are valid unencoded in query parameter values are left
@@ -559,6 +586,35 @@ mod tests {
         let encoded = encode_return_to("/account?tab=security");
         // '?' must be encoded so the return_to param doesn't break the outer query
         assert!(encoded.contains("%3F"), "should encode '?': {encoded}");
+    }
+
+    // ── referer_path ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn referer_path_extracts_path_from_full_url() {
+        assert_eq!(
+            referer_path("https://example.com/account/settings"),
+            Some("/account/settings".to_owned()),
+        );
+    }
+
+    #[test]
+    fn referer_path_preserves_query_string() {
+        assert_eq!(
+            referer_path("https://example.com/account/settings?tab=security"),
+            Some("/account/settings?tab=security".to_owned()),
+        );
+    }
+
+    #[test]
+    fn referer_path_rejects_protocol_relative() {
+        assert_eq!(referer_path("//evil.com/path"), None);
+    }
+
+    #[test]
+    fn referer_path_rejects_non_url() {
+        assert_eq!(referer_path("not-a-url"), None);
+        assert_eq!(referer_path(""), None);
     }
 
     // ── __check_step_up_with_config ───────────────────────────────────────────
