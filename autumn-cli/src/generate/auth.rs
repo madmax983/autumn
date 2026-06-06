@@ -2418,37 +2418,52 @@ pub async fn resend_confirmation(
     let email = form.email.trim().to_lowercase();
     let t0 = std::time::Instant::now();
 
-    let raw_confirm_token = generate_confirmation_token();
-    let confirm_digest = sha256_hex(&raw_confirm_token);
-    let confirm_expires_at = chrono::Utc::now().naive_utc() + chrono::Duration::hours(24);
     // Throttle: skip re-issue if a token was minted in the last 5 minutes
-    // (expires_at would still be > 23h55m from now).  Non-enumerating: whether
-    // the skip is due to throttling, unknown address, or already-confirmed
-    // account, the caller sees the same "check your email" page.
+    // (expires_at would still be > 23h55m from now).  Non-enumerating.
     let throttle_threshold = chrono::Utc::now().naive_utc() + chrono::Duration::minutes(23 * 60 + 55);
 
-    // Single UPDATE: no prior SELECT required.  Only fires when the account is
-    // unconfirmed and outside the throttle window.
-    let affected = diesel::update(
-        {table}::table
-            .filter({table}::email.eq(&email))
-            .filter({table}::email_confirmed_at.is_null())
-            .filter(
-                {table}::confirm_token_expires_at
-                    .is_null()
-                    .or({table}::confirm_token_expires_at.le(throttle_threshold)),
-            ),
-    )
-    .set((
-        {table}::confirm_token_digest.eq(Some(&confirm_digest)),
-        {table}::confirm_token_expires_at.eq(Some(confirm_expires_at)),
-    ))
-    .execute(&mut *db)
-    .await?;
+    // Check eligibility before generating a new token.  We send the email
+    // FIRST and only overwrite the stored token on success — so a transient
+    // mail failure leaves the previous (still-valid) token intact rather than
+    // invalidating it without delivering a replacement.
+    let eligible: bool = {table}::table
+        .filter({table}::email.eq(&email))
+        .filter({table}::email_confirmed_at.is_null())
+        .filter(
+            {table}::confirm_token_expires_at
+                .is_null()
+                .or({table}::confirm_token_expires_at.le(throttle_threshold)),
+        )
+        .count()
+        .get_result::<i64>(&mut *db)
+        .await
+        .unwrap_or(0)
+        > 0;
 
-    if affected > 0 {{
-        if let Err(e) = send_confirmation_email(&mailer, &email, &raw_confirm_token).await {{
-            tracing::error!("confirmation email failed on resend: {{e}}");
+    if eligible {{
+        let raw_confirm_token = generate_confirmation_token();
+        let confirm_digest = sha256_hex(&raw_confirm_token);
+        let confirm_expires_at = chrono::Utc::now().naive_utc() + chrono::Duration::hours(24);
+
+        match send_confirmation_email(&mailer, &email, &raw_confirm_token).await {{
+            Ok(()) => {{
+                // Email delivered — now atomically overwrite the stored token.
+                let _ = diesel::update(
+                    {table}::table
+                        .filter({table}::email.eq(&email))
+                        .filter({table}::email_confirmed_at.is_null()),
+                )
+                .set((
+                    {table}::confirm_token_digest.eq(Some(&confirm_digest)),
+                    {table}::confirm_token_expires_at.eq(Some(confirm_expires_at)),
+                ))
+                .execute(&mut *db)
+                .await;
+            }}
+            Err(e) => {{
+                // Previous token is preserved — warn but remain non-enumerating.
+                tracing::warn!("confirmation email failed on resend: {{e}}");
+            }}
         }}
     }}
 
@@ -2830,14 +2845,22 @@ fn confirm_with_valid_token_can_login() {{
         eprintln!("skipping: AUTUMN_TEST_BASE_URL not set");
         return;
     }};
-    // This test requires a real mail transport (file/log) to capture the token.
-    // In CI: configure transport = "file", read the .eml file, extract the token,
-    // then GET /auth/confirm/<token> and assert 302 → /account.
-    eprintln!(
-        "confirm_with_valid_token_can_login: \
-         requires mail transport to capture token — \
-         see docs/guide/authentication.md for the test setup guide"
-    );
+    // This test requires a real mail transport (e.g. transport = "log" or "file")
+    // that captures outgoing messages so the confirmation URL can be extracted.
+    //
+    // Suggested implementation:
+    //   1. POST /signup to create an unconfirmed account.
+    //   2. Read the confirmation URL from the mail log / .eml file.
+    //   3. GET /auth/confirm/<token> and assert HTTP 302 → /account.
+    //   4. Assert the session is authenticated (e.g. GET /account → 200).
+    //
+    // See docs/guide/authentication.md for a full walkthrough.
+    let _ = base;
+    todo!(
+        "implement confirm_with_valid_token_can_login: \
+         capture the token from the mail transport log, \
+         GET /auth/confirm/<token>, and assert 302 → /account"
+    )
 }}
 
 /// AC4 — an expired confirmation token returns a non-revealing 422 and the
@@ -5146,15 +5169,21 @@ pub async fn passkey_login_finish(
             .await
             .map_err(|_| AutumnError::unauthorized_msg("Unknown credential."))?
     };
-    let __SNAKE___email: String = {
+    let (__SNAKE___email, email_confirmed_at): (String, Option<chrono::NaiveDateTime>) = {
         use crate::schema::__TABLE__;
         __TABLE__::table
             .find(__SNAKE___id)
-            .select(__TABLE__::email)
-            .first(&mut *db)
+            .select((__TABLE__::email, __TABLE__::email_confirmed_at))
+            .first::<(String, Option<chrono::NaiveDateTime>)>(&mut *db)
             .await
             .map_err(|_| AutumnError::unauthorized_msg("User not found."))?
     };
+    // Reject unconfirmed accounts — consistent with the password-login gate.
+    if email_confirmed_at.is_none() {
+        return Err(AutumnError::unauthorized_msg(
+            "Email address not confirmed. Please check your email for a confirmation link.",
+        ));
+    }
     let now = chrono::Utc::now().naive_utc();
     if auth_result.needs_update() {
         let mut passkey: Passkey = serde_json::from_str(&cred_json)
