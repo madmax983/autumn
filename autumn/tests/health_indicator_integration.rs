@@ -1,4 +1,4 @@
-//! Integration tests for the pluggable HealthIndicator trait (issue #824).
+//! Integration tests for the pluggable `HealthIndicator` trait (issue #824).
 //!
 //! These tests verify:
 //! - The `HealthIndicator` trait can be implemented and registered
@@ -6,9 +6,8 @@
 //! - Duplicate registrations are rejected
 //! - The `HealthIndicatorRegistry` runs indicators with per-indicator timeouts
 //! - A timed-out indicator is reported as `Unknown` with `timed_out: true`
-//! - Status precedence: Down > OutOfService > Unknown > Up
+//! - Status precedence: Down > `OutOfService` > Unknown > Up
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -33,30 +32,6 @@ impl HealthIndicator for AlwaysDown {
     }
 }
 
-struct AlwaysOutOfService;
-impl HealthIndicator for AlwaysOutOfService {
-    fn check(&self) -> futures::future::BoxFuture<'_, HealthCheckOutput> {
-        Box::pin(async {
-            HealthCheckOutput {
-                status: HealthStatus::OutOfService,
-                details: HashMap::new(),
-            }
-        })
-    }
-}
-
-struct AlwaysUnknown;
-impl HealthIndicator for AlwaysUnknown {
-    fn check(&self) -> futures::future::BoxFuture<'_, HealthCheckOutput> {
-        Box::pin(async {
-            HealthCheckOutput {
-                status: HealthStatus::Unknown,
-                details: HashMap::new(),
-            }
-        })
-    }
-}
-
 struct HungIndicator;
 impl HealthIndicator for HungIndicator {
     fn check(&self) -> futures::future::BoxFuture<'_, HealthCheckOutput> {
@@ -68,21 +43,6 @@ impl HealthIndicator for HungIndicator {
 
     fn timeout_ms(&self) -> u64 {
         10
-    }
-}
-
-struct IndicatorWithDetails;
-impl HealthIndicator for IndicatorWithDetails {
-    fn check(&self) -> futures::future::BoxFuture<'_, HealthCheckOutput> {
-        Box::pin(async {
-            let mut details = HashMap::new();
-            details.insert("version".to_string(), serde_json::json!("1.2.3"));
-            details.insert("latency_ms".to_string(), serde_json::json!(42));
-            HealthCheckOutput {
-                status: HealthStatus::Up,
-                details,
-            }
-        })
     }
 }
 

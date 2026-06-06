@@ -881,7 +881,7 @@ mod tests {
 
     impl TestProbeStateWithIndicators {
         fn new(registry: crate::actuator::HealthIndicatorRegistry) -> Self {
-            let mut probes = ProbeState::pending_startup();
+            let probes = ProbeState::pending_startup();
             probes.mark_startup_complete();
             Self {
                 probes,

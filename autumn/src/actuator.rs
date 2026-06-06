@@ -1325,6 +1325,8 @@ pub struct HealthRunResult {
     pub output: HealthCheckOutput,
 }
 
+type IndicatorList = Vec<(String, IndicatorGroup, Arc<dyn HealthIndicator>)>;
+
 /// Registry of named [`HealthIndicator`] implementations.
 ///
 /// Populated by [`crate::app::AppBuilder::health_indicator`] and stored on
@@ -1332,7 +1334,7 @@ pub struct HealthRunResult {
 /// and per-indicator timeout enforcement at request time.
 #[derive(Clone, Default)]
 pub struct HealthIndicatorRegistry {
-    inner: Arc<RwLock<Vec<(String, IndicatorGroup, Arc<dyn HealthIndicator>)>>>,
+    inner: Arc<RwLock<IndicatorList>>,
 }
 
 impl HealthIndicatorRegistry {
@@ -1366,6 +1368,7 @@ impl HealthIndicatorRegistry {
             ));
         }
         inner.push((name, group, indicator));
+        drop(inner);
         Ok(())
     }
 
@@ -1380,7 +1383,7 @@ impl HealthIndicatorRegistry {
 
     /// Run all registered indicators (both groups) with per-indicator timeouts.
     pub async fn run_all(&self) -> Vec<HealthRunResult> {
-        let entries: Vec<(String, IndicatorGroup, Arc<dyn HealthIndicator>)> = self
+        let entries: IndicatorList = self
             .inner
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1400,7 +1403,7 @@ impl HealthIndicatorRegistry {
 
     /// Run only `Readiness`-group indicators with per-indicator timeouts.
     pub async fn run_readiness(&self) -> Vec<HealthRunResult> {
-        let entries: Vec<(String, IndicatorGroup, Arc<dyn HealthIndicator>)> = self
+        let entries: IndicatorList = self
             .inner
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1500,6 +1503,48 @@ struct DatabaseCheck {
     idle_connections: u64,
 }
 
+fn build_health_components(
+    db_status: Option<HealthStatus>,
+    db_check: Option<&DatabaseCheck>,
+    indicator_results: &[HealthRunResult],
+    detailed: bool,
+) -> HashMap<String, ComponentHealth> {
+    let mut components: HashMap<String, ComponentHealth> = HashMap::new();
+    if let Some(s) = db_status {
+        let details = detailed
+            .then(|| {
+                db_check.map(|d| {
+                    serde_json::json!({
+                        "status": d.status,
+                        "pool_size": d.pool_size,
+                        "active_connections": d.active_connections,
+                        "idle_connections": d.idle_connections,
+                    })
+                })
+            })
+            .flatten();
+        components.insert(
+            "db".to_string(),
+            ComponentHealth {
+                status: s.as_str(),
+                details,
+            },
+        );
+    }
+    for result in indicator_results {
+        let details = (detailed && !result.output.details.is_empty())
+            .then(|| serde_json::to_value(&result.output.details).unwrap_or_default());
+        components.insert(
+            result.name.clone(),
+            ComponentHealth {
+                status: result.output.status.as_str(),
+                details,
+            },
+        );
+    }
+    components
+}
+
 /// `GET <actuator-prefix>/health`
 pub async fn health<S: ProvideActuatorState + Send + Sync + 'static>(
     State(state): State<S>,
@@ -1558,44 +1603,12 @@ pub async fn health<S: ProvideActuatorState + Send + Sync + 'static>(
     let overall = HealthIndicatorRegistry::aggregate_status(&all_statuses);
 
     // ── build components map ────────────────────────────────────
-    let mut components: HashMap<String, ComponentHealth> = HashMap::new();
-
-    if let Some(db_status) = db_component_status {
-        let details = if detailed {
-            db_check.as_ref().map(|d| {
-                serde_json::json!({
-                    "status": d.status,
-                    "pool_size": d.pool_size,
-                    "active_connections": d.active_connections,
-                    "idle_connections": d.idle_connections,
-                })
-            })
-        } else {
-            None
-        };
-        components.insert(
-            "db".to_string(),
-            ComponentHealth {
-                status: db_status.as_str(),
-                details,
-            },
-        );
-    }
-
-    for result in &indicator_results {
-        let details = if detailed && !result.output.details.is_empty() {
-            Some(serde_json::to_value(&result.output.details).unwrap_or_default())
-        } else {
-            None
-        };
-        components.insert(
-            result.name.clone(),
-            ComponentHealth {
-                status: result.output.status.as_str(),
-                details,
-            },
-        );
-    }
+    let components = build_health_components(
+        db_component_status,
+        db_check.as_ref(),
+        &indicator_results,
+        detailed,
+    );
 
     let checks = db_check.map(|db| HealthChecks { database: Some(db) });
 
@@ -4758,30 +4771,6 @@ mod health_indicator_tests {
     impl HealthIndicator for AlwaysDown {
         fn check(&self) -> futures::future::BoxFuture<'_, HealthCheckOutput> {
             Box::pin(async { HealthCheckOutput::down() })
-        }
-    }
-
-    struct AlwaysOutOfService;
-    impl HealthIndicator for AlwaysOutOfService {
-        fn check(&self) -> futures::future::BoxFuture<'_, HealthCheckOutput> {
-            Box::pin(async {
-                HealthCheckOutput {
-                    status: HealthStatus::OutOfService,
-                    details: HashMap::new(),
-                }
-            })
-        }
-    }
-
-    struct AlwaysUnknown;
-    impl HealthIndicator for AlwaysUnknown {
-        fn check(&self) -> futures::future::BoxFuture<'_, HealthCheckOutput> {
-            Box::pin(async {
-                HealthCheckOutput {
-                    status: HealthStatus::Unknown,
-                    details: HashMap::new(),
-                }
-            })
         }
     }
 
