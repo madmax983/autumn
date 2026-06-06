@@ -26,10 +26,7 @@ fn parse_step_up_args(attr: TokenStream) -> syn::Result<Option<u64>> {
     }
 
     let meta: syn::MetaNameValue = syn::parse2(attr)?;
-    let key = meta
-        .path
-        .get_ident()
-        .map(std::string::ToString::to_string);
+    let key = meta.path.get_ident().map(std::string::ToString::to_string);
     if key.as_deref() != Some("max_age") {
         return Err(syn::Error::new_spanned(
             &meta.path,
@@ -44,14 +41,14 @@ fn parse_step_up_args(attr: TokenStream) -> syn::Result<Option<u64>> {
                 return Err(syn::Error::new_spanned(
                     &meta.value,
                     "max_age must be a string literal, e.g. \"5m\"",
-                ))
+                ));
             }
         },
         _ => {
             return Err(syn::Error::new_spanned(
                 &meta.value,
                 "max_age must be a string literal, e.g. \"5m\"",
-            ))
+            ));
         }
     };
 

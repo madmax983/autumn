@@ -38,9 +38,9 @@ mod routes_macro;
 mod scheduled;
 mod secured;
 mod service;
-mod step_up;
 mod static_route;
 mod static_routes_macro;
+mod step_up;
 mod tasks_macro;
 mod ws;
 

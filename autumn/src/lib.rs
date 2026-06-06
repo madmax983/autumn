@@ -184,12 +184,12 @@ pub mod reporting;
 pub mod scheduler;
 pub mod security;
 pub mod session;
-pub mod step_up;
 #[cfg(feature = "redis")]
 pub(crate) mod session_redis;
 pub mod sse;
 /// Static site generation support.
 pub mod static_gen;
+pub mod step_up;
 #[cfg(feature = "storage")]
 pub mod storage;
 pub mod tenancy;

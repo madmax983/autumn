@@ -112,13 +112,12 @@ pub async fn check_step_up(session: &Session, max_age_secs: u64) -> crate::Autum
         ));
     };
 
-    let ts: i64 = ts_str.parse().map_err(|_| {
-        crate::AutumnError::unauthorized_msg("step-up authentication required")
-    })?;
+    let ts: i64 = ts_str
+        .parse()
+        .map_err(|_| crate::AutumnError::unauthorized_msg("step-up authentication required"))?;
 
-    let last_auth = DateTime::from_timestamp(ts, 0).ok_or_else(|| {
-        crate::AutumnError::unauthorized_msg("step-up authentication required")
-    })?;
+    let last_auth = DateTime::from_timestamp(ts, 0)
+        .ok_or_else(|| crate::AutumnError::unauthorized_msg("step-up authentication required"))?;
 
     let age_secs = (Utc::now() - last_auth).num_seconds();
     if age_secs < 0 || age_secs as u64 > max_age_secs {
@@ -361,7 +360,10 @@ mod tests {
         data.insert(STEP_UP_SESSION_KEY.to_string(), stale_ts);
         let session = Session::new_for_test("test-id".into(), data);
         let result = check_step_up(&session, 300).await;
-        assert!(result.is_err(), "stale claim (10 min old) should fail 5-min check");
+        assert!(
+            result.is_err(),
+            "stale claim (10 min old) should fail 5-min check"
+        );
     }
 
     #[tokio::test]
@@ -408,7 +410,10 @@ mod tests {
         );
         let session = Session::new_for_test("test-id".into(), data);
         let result = check_step_up(&session, 300).await;
-        assert!(result.is_err(), "invalid timestamp should fail step-up check");
+        assert!(
+            result.is_err(),
+            "invalid timestamp should fail step-up check"
+        );
     }
 
     // ── set_last_strong_auth_at ───────────────────────────────────────────────
@@ -419,7 +424,10 @@ mod tests {
         set_last_strong_auth_at(&session).await;
         let stored = session.get(STEP_UP_SESSION_KEY).await;
         assert!(stored.is_some(), "should store a timestamp");
-        let ts: i64 = stored.unwrap().parse().expect("timestamp must be a valid i64");
+        let ts: i64 = stored
+            .unwrap()
+            .parse()
+            .expect("timestamp must be a valid i64");
         let now = Utc::now().timestamp();
         assert!(
             (now - ts).abs() < 5,
@@ -432,7 +440,10 @@ mod tests {
         let session = Session::new_for_test("test-id".into(), HashMap::new());
         set_last_strong_auth_at(&session).await;
         let result = check_step_up(&session, 300).await;
-        assert!(result.is_ok(), "freshly set claim should pass step-up check");
+        assert!(
+            result.is_ok(),
+            "freshly set claim should pass step-up check"
+        );
     }
 
     // ── validate_return_to ────────────────────────────────────────────────────
@@ -443,7 +454,10 @@ mod tests {
         assert!(validate_return_to("/account/settings").is_ok());
         assert!(validate_return_to("/admin/users/1").is_ok());
         assert!(validate_return_to("/").is_ok());
-        assert!(validate_return_to("").is_ok(), "empty string should be allowed");
+        assert!(
+            validate_return_to("").is_ok(),
+            "empty string should be allowed"
+        );
     }
 
     #[test]
@@ -541,10 +555,7 @@ mod tests {
     fn encode_return_to_encodes_query_delimiters() {
         let encoded = encode_return_to("/account?tab=security");
         // '?' must be encoded so the return_to param doesn't break the outer query
-        assert!(
-            encoded.contains("%3F"),
-            "should encode '?': {encoded}"
-        );
+        assert!(encoded.contains("%3F"), "should encode '?': {encoded}");
     }
 
     // ── __check_step_up_with_config ───────────────────────────────────────────
@@ -554,7 +565,10 @@ mod tests {
         let state = crate::AppState::for_test();
         let session = Session::new_for_test("test-id".into(), HashMap::new());
         let result = __check_step_up_with_config(&session, &state, None).await;
-        assert!(result.is_err(), "missing claim should fail with state check");
+        assert!(
+            result.is_err(),
+            "missing claim should fail with state check"
+        );
     }
 
     #[tokio::test]

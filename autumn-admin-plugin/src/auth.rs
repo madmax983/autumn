@@ -300,7 +300,11 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(res.status(), StatusCode::OK, "GET should pass without step-up");
+        assert_eq!(
+            res.status(),
+            StatusCode::OK,
+            "GET should pass without step-up"
+        );
     }
 
     #[tokio::test]
@@ -350,7 +354,12 @@ mod tests {
             StatusCode::UNAUTHORIZED,
             "JSON POST without step-up should return 401"
         );
-        let www_auth = res.headers().get("www-authenticate").unwrap().to_str().unwrap();
+        let www_auth = res
+            .headers()
+            .get("www-authenticate")
+            .unwrap()
+            .to_str()
+            .unwrap();
         assert!(
             www_auth.contains("StepUp"),
             "should include WWW-Authenticate: StepUp header: {www_auth}"
