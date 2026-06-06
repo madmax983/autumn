@@ -34,6 +34,14 @@ impl WebhookReplayStore for UnavailableReplayStore {
             ))
         })
     }
+
+    fn remove<'a>(&'a self, _key: &'a str) -> WebhookReplayFuture<'a> {
+        Box::pin(async {
+            Err(WebhookReplayStoreError::new(
+                "custom replay backend offline",
+            ))
+        })
+    }
 }
 
 #[post("/webhooks/stripe")]
@@ -948,5 +956,54 @@ async fn webhook_endpoints_exempt_from_csrf() {
         .assert_ok();
 
     assert_eq!(HANDLER_CALLS.load(Ordering::SeqCst), 1);
+}
+
+#[post("/webhooks/failing")]
+async fn failing_webhook(_webhook: SignedWebhook) -> impl IntoResponse {
+    HANDLER_CALLS.fetch_add(1, Ordering::SeqCst);
+    StatusCode::INTERNAL_SERVER_ERROR
+}
+
+#[tokio::test]
+async fn webhook_replay_key_released_on_failure() {
+    let _guard = TEST_LOCK.lock().await;
+    HANDLER_CALLS.store(0, Ordering::SeqCst);
+
+    let endpoints = vec![endpoint(WebhookProvider::Github, "/webhooks/failing", "failing")];
+    let client = TestApp::new()
+        .config(webhook_config(endpoints))
+        .routes(routes![failing_webhook])
+        .build();
+
+    let body = br#"{"action":"opened"}"#;
+    let signature = github_signature(CURRENT_SECRET, body);
+
+    // 1. Send first request. It should hit the handler and fail with 500.
+    client
+        .post("/webhooks/failing")
+        .header("x-hub-signature-256", &signature)
+        .header("x-github-delivery", "delivery-fail")
+        .header("x-github-event", "pull_request")
+        .body(body.as_slice())
+        .send()
+        .await
+        .assert_status(500);
+
+    assert_eq!(HANDLER_CALLS.load(Ordering::SeqCst), 1);
+
+    // 2. Since it failed with 500, the replay key must be released.
+    // Send the duplicate request. It should hit the handler again (returning 500)
+    // instead of being rejected as a duplicate (which would return 409).
+    client
+        .post("/webhooks/failing")
+        .header("x-hub-signature-256", &signature)
+        .header("x-github-delivery", "delivery-fail")
+        .header("x-github-event", "pull_request")
+        .body(body.as_slice())
+        .send()
+        .await
+        .assert_status(500);
+
+    assert_eq!(HANDLER_CALLS.load(Ordering::SeqCst), 2);
 }
 

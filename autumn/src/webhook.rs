@@ -678,6 +678,9 @@ pub trait WebhookReplayStore: Send + Sync + std::fmt::Debug {
         received_at: SystemTime,
         window: Duration,
     ) -> WebhookReplayFuture<'a>;
+
+    /// Remove a delivery key from the store.
+    fn remove<'a>(&'a self, key: &'a str) -> WebhookReplayFuture<'a>;
 }
 
 impl<T> WebhookReplayStore for Arc<T>
@@ -691,6 +694,10 @@ where
         window: Duration,
     ) -> WebhookReplayFuture<'a> {
         self.as_ref().check_and_insert(key, received_at, window)
+    }
+
+    fn remove<'a>(&'a self, key: &'a str) -> WebhookReplayFuture<'a> {
+        self.as_ref().remove(key)
     }
 }
 
@@ -787,6 +794,15 @@ impl WebhookReplayStore for InMemoryWebhookReplayStore {
     ) -> WebhookReplayFuture<'a> {
         Box::pin(async move { Ok(self.check_and_insert_sync(key, received_at, window)) })
     }
+
+    fn remove<'a>(&'a self, key: &'a str) -> WebhookReplayFuture<'a> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("webhook replay store lock poisoned");
+        state.seen.remove(key);
+        Box::pin(async move { Ok(true) })
+    }
 }
 
 /// Redis replay protection store.
@@ -855,6 +871,19 @@ impl WebhookReplayStore for RedisWebhookReplayStore {
                 .await
                 .map_err(|error| WebhookReplayStoreError::backend("insert", error))?;
             Ok(inserted.is_some())
+        })
+    }
+
+    fn remove<'a>(&'a self, key: &'a str) -> WebhookReplayFuture<'a> {
+        Box::pin(async move {
+            let mut connection = self.connection.clone();
+            let key = self.key_for(key);
+            let _: () = redis::cmd("DEL")
+                .arg(&key)
+                .query_async(&mut connection)
+                .await
+                .map_err(|error| WebhookReplayStoreError::backend("delete", error))?;
+            Ok(true)
         })
     }
 }
@@ -990,6 +1019,35 @@ impl WebhookVerifyError {
     }
 }
 
+tokio::task_local! {
+    pub static WEBHOOK_REPLAY_KEY: std::sync::Arc<std::sync::Mutex<Option<(std::sync::Arc<dyn WebhookReplayStore>, String)>>>;
+}
+
+pub async fn webhook_replay_cleanup_middleware(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let cell = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let cell_cloned = cell.clone();
+
+    let response = WEBHOOK_REPLAY_KEY.scope(cell, async move {
+        next.run(req).await
+    }).await;
+
+    if response.status().is_server_error() {
+        let to_remove = {
+            let mut guard = cell_cloned.lock().unwrap();
+            guard.take()
+        };
+        if let Some((store, key)) = to_remove {
+            tracing::debug!(key = %key, "Releasing webhook replay key due to 5xx server error");
+            let _ = store.remove(&key).await;
+        }
+    }
+
+    response
+}
+
 async fn verify_request(
     registry: &WebhookRegistry,
     endpoint: &ResolvedWebhookEndpoint,
@@ -1038,6 +1096,11 @@ async fn verify_request(
         {
             return Err(WebhookVerifyError::DuplicateDelivery);
         }
+        let _ = WEBHOOK_REPLAY_KEY.try_with(|cell| {
+            if let Ok(mut guard) = cell.lock() {
+                *guard = Some((std::sync::Arc::clone(&registry.replay_store), replay_key.clone()));
+            }
+        });
     }
 
     Ok(SignedWebhook {

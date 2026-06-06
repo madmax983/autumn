@@ -1437,6 +1437,7 @@ fn apply_middleware(
         crate::middleware::method_override_rejection_filter,
     ));
     router = apply_rate_limit_middleware(router, config, state);
+    router = router.layer(axum::middleware::from_fn(crate::webhook::webhook_replay_cleanup_middleware));
     router = apply_upload_middleware(router, config);
 
     // Security headers layer (always applied)
