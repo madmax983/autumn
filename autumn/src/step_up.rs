@@ -120,7 +120,8 @@ pub async fn check_step_up(session: &Session, max_age_secs: u64) -> crate::Autum
         .ok_or_else(|| crate::AutumnError::unauthorized_msg("step-up authentication required"))?;
 
     let age_secs = (Utc::now() - last_auth).num_seconds();
-    if age_secs < 0 || age_secs as u64 > max_age_secs {
+    // Negative means the timestamp is in the future (clock skew) — treat as expired.
+    if u64::try_from(age_secs).map_or(true, |age| age > max_age_secs) {
         return Err(crate::AutumnError::unauthorized_msg(
             "step-up authentication required",
         ));
@@ -258,8 +259,7 @@ pub async fn __check_step_up_with_config(
     let max_age = route_max_age_secs.unwrap_or_else(|| {
         state
             .extension::<StepUpGlobalConfig>()
-            .map(|c| c.default_max_age_secs)
-            .unwrap_or(DEFAULT_MAX_AGE_SECS)
+            .map_or(DEFAULT_MAX_AGE_SECS, |c| c.default_max_age_secs)
     });
 
     let actor_id = session
@@ -376,7 +376,7 @@ mod tests {
         data.insert(STEP_UP_SESSION_KEY.to_string(), fresh_ts);
         let session = Session::new_for_test("test-id".into(), data);
         let result = check_step_up(&session, 300).await;
-        assert!(result.is_ok(), "fresh claim should pass: {:?}", result);
+        assert!(result.is_ok(), "fresh claim should pass: {result:?}");
     }
 
     #[tokio::test]
