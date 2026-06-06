@@ -643,6 +643,28 @@ impl ExperimentStore for InMemoryExperimentStore {
         let name = config.name.clone();
         {
             let mut inner = self.inner.write().unwrap();
+            let active_variants: std::collections::HashSet<String> = inner
+                .assignments
+                .values()
+                .filter(|a| a.experiment == name)
+                .map(|a| a.variant.clone())
+                .collect();
+
+            let new_variants: std::collections::HashSet<&str> = config
+                .variants
+                .iter()
+                .map(|v| v.name.as_str())
+                .collect();
+
+            for variant in active_variants {
+                if !new_variants.contains(variant.as_str()) {
+                    return Err(ExperimentStoreError::Backend(format!(
+                        "cannot delete variant '{}' because it has active assignments",
+                        variant
+                    )));
+                }
+            }
+
             let exists = inner.experiments.contains_key(&name);
             inner.experiments.insert(name.clone(), config);
             let mutation = if exists { "updated" } else { "created" };
@@ -1683,10 +1705,33 @@ pub mod pg {
         }
 
         fn upsert(&self, config: ExperimentConfig) -> Result<(), ExperimentStoreError> {
+            let mut conn = self.connect()?;
+
+            let active_variants = diesel::sql_query(
+                "SELECT DISTINCT variant FROM autumn_experiment_assignments WHERE experiment = $1"
+            )
+            .bind::<diesel::sql_types::Text, _>(&config.name)
+            .load::<VariantNameRow>(&mut conn)
+            .map_err(|e| ExperimentStoreError::Backend(e.to_string()))?;
+
+            let new_variants: std::collections::HashSet<&str> = config
+                .variants
+                .iter()
+                .map(|v| v.name.as_str())
+                .collect();
+
+            for row in active_variants {
+                if !new_variants.contains(row.variant.as_str()) {
+                    return Err(ExperimentStoreError::Backend(format!(
+                        "cannot delete variant '{}' because it has active assignments",
+                        row.variant
+                    )));
+                }
+            }
+
             let variants_json =
                 serde_json::to_string(&config.variants).unwrap_or_else(|_| "[]".to_owned());
             let state_str = config.state.to_string();
-            let mut conn = self.connect()?;
             diesel::sql_query(
                 "WITH upserted AS ( \
                      INSERT INTO autumn_experiments \
@@ -2624,5 +2669,48 @@ mod tests {
         assert_eq!(hist.len(), 2);
         assert_eq!(hist[1].mutation, "created");
         assert_eq!(hist[0].mutation, "updated");
+    }
+
+    #[test]
+    fn upsert_rejects_deleting_variant_with_active_assignments() {
+        let store = InMemoryExperimentStore::new();
+        let name = "test_exp";
+        
+        let config = ExperimentConfig {
+            name: name.to_string(),
+            description: None,
+            state: ExperimentState::Running,
+            variants: vec![
+                VariantConfig { name: "control".to_string(), weight: 50 },
+                VariantConfig { name: "treatment".to_string(), weight: 50 },
+            ],
+            winner: None,
+            exclusion_group: None,
+            updated_at_secs: 0,
+        };
+        store.upsert(config.clone()).unwrap();
+
+        // Assign an actor to "treatment"
+        store.record_assignment(Assignment {
+            experiment: name.to_string(),
+            actor: "user1".to_string(),
+            variant: "treatment".to_string(),
+            is_override: false,
+            assigned_at_secs: 0,
+        }).unwrap();
+
+        // Attempting to upsert config without "treatment" should fail
+        let mut new_config = config.clone();
+        new_config.variants = vec![
+            VariantConfig { name: "control".to_string(), weight: 100 },
+        ];
+
+        let res = store.upsert(new_config);
+        assert!(res.is_err(), "expected upsert to fail due to deleting active variant");
+        if let Err(ExperimentStoreError::Backend(msg)) = res {
+            assert!(msg.contains("treatment"), "expected error message to mention 'treatment', got: {}", msg);
+        } else {
+            panic!("expected Backend error");
+        }
     }
 }
