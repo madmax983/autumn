@@ -2160,10 +2160,17 @@ pub async fn reauth(
         .await
         .map_err(|_| AutumnError::not_found_msg("Account not found."))?;
 
-    if !verify_password(&form.password, &{snake_name}.password_digest)
+    // In the TOTP multi-step flow, the password is verified in one request and the
+    // TOTP code in the next. Rather than echoing the password into a hidden DOM
+    // field (which would expose it to any script on the page), we store a short-
+    // lived session marker after a successful password check and rely on that marker
+    // on subsequent submissions so the password never leaves the server.
+    let pw_verified_in_session = session.get("reauth_pw_ok").await.is_some();
+    if !pw_verified_in_session && !verify_password(&form.password, &{snake_name}.password_digest)
         .await
         .unwrap_or(false)
     {{
+        session.remove("reauth_pw_ok").await;
         let return_to = form.return_to.clone();
         return Ok(layout("Confirm your identity", html! {{
             h1 {{ "Confirm your identity" }}
@@ -2180,7 +2187,14 @@ pub async fn reauth(
             }}
         }}).into_response());
     }}
+    if !pw_verified_in_session {{
+        session.insert("reauth_pw_ok", "1").await;
+    }}
     {totp_reauth_check}
+    // Rotate session ID before elevating privileges to prevent session fixation
+    // attacks where a stolen cookie is used to benefit from a legitimate reauth.
+    session.rotate_id().await;
+    session.remove("reauth_pw_ok").await;
     // Refresh the step-up claim.
     autumn_web::step_up::set_last_strong_auth_at(&session).await;
 
@@ -2520,12 +2534,15 @@ pub async fn confirm_email(
     // full session — email confirmation proves address ownership, not TOTP possession.
 {totp_confirm_branch}    // Grant an authenticated session on confirmation.
     session.rotate_id().await;
+    // Discard any step-up claim that may have carried over from a previous
+    // login in this browser — email confirmation proves inbox access, not
+    // password knowledge, so it must not inherit sudo-mode freshness.
+    session.remove(autumn_web::step_up::STEP_UP_SESSION_KEY).await;
 {totp_clear_pending}    session.insert("{snake_name}_id", {snake_name}.id.to_string()).await;
     session.insert("{snake_name}_email", &{snake_name}.email).await;
     // Use the same session key checked by `#[secured]` / `#[authorize]`.
     session.insert(state.auth_session_key(), {snake_name}.id.to_string()).await;
-    // Email confirmation proves inbox access, not password knowledge.
-    // Step-up protected routes will redirect to /reauth as expected.
+    // Step-up protected routes will redirect to /reauth as designed.
     Ok(redirect_to("/account"))
 }}
 
@@ -4067,6 +4084,10 @@ fn totp_reauth_field_src() -> String {
 /// pass through without any second-factor check.
 #[allow(clippy::too_many_lines)]
 fn totp_reauth_check_src(snake_name: &str, table: &str) -> String {
+    // This string is substituted verbatim into the outer format!() as a named argument.
+    // format!() does NOT further process the substituted value, so {{ and }} in this
+    // template appear literally in the output. Use single { } for Rust control flow,
+    // and {{ }} only inside maud html! invocations.
     const TPL: &str = r#"    // If the account uses TOTP, also require the second factor.
     if __SNAKE__.totp_enabled {
         let code = form.totp_code.trim().to_owned();
@@ -4078,7 +4099,6 @@ fn totp_reauth_check_src(snake_name: &str, table: &str) -> String {
                 form action="/reauth" method="post" {{
                     @if let Some(ref csrf) = csrf {{ input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
                     input type="hidden" name="return_to" value=(return_to);
-                    input type="hidden" name="password" value=(&form.password);
                     div {{
                         label {{ "Authenticator code" }}
                         input type="text" name="totp_code" autocomplete="one-time-code"
@@ -4089,14 +4109,14 @@ fn totp_reauth_check_src(snake_name: &str, table: &str) -> String {
                     button type="submit" {{ "Confirm" }}
                 }}
             }}).into_response());
-        }}
+        }
         let mut totp_verified = false;
-        if let Some(stored) = __SNAKE__.totp_secret_encrypted.as_deref() {{
+        if let Some(stored) = __SNAKE__.totp_secret_encrypted.as_deref() {
             if let Some(step) = decrypt_secret(stored)
                 .ok()
                 .and_then(|secret| build_totp(secret, &__SNAKE__.email).ok())
                 .and_then(|totp| verify_totp_code(&totp, &code))
-            {{
+            {
                 let affected = diesel::update(
                     __TABLE__::table.find(__SNAKE__.id).filter(
                         __TABLE__::totp_last_used_step
@@ -4107,12 +4127,12 @@ fn totp_reauth_check_src(snake_name: &str, table: &str) -> String {
                 .set(__TABLE__::totp_last_used_step.eq(Some(step)))
                 .execute(&mut *db)
                 .await?;
-                if affected == 1 {{
+                if affected == 1 {
                     totp_verified = true;
-                }}
-            }}
-        }}
-        if !totp_verified {{
+                }
+            }
+        }
+        if !totp_verified {
             let unused: Vec<RecoveryCode> = recovery_codes::table
                 .filter(recovery_codes::user_id.eq(__SNAKE__.id))
                 .filter(recovery_codes::used_at.is_null())
@@ -4120,8 +4140,8 @@ fn totp_reauth_check_src(snake_name: &str, table: &str) -> String {
                 .load(&mut *db)
                 .await
                 .unwrap_or_default();
-            for rc in &unused {{
-                if verify_password(&code, &rc.code_digest).await.unwrap_or(false) {{
+            for rc in &unused {
+                if verify_password(&code, &rc.code_digest).await.unwrap_or(false) {
                     let affected = diesel::update(
                         recovery_codes::table
                             .find(rc.id)
@@ -4130,14 +4150,14 @@ fn totp_reauth_check_src(snake_name: &str, table: &str) -> String {
                     .set(recovery_codes::used_at.eq(Some(chrono::Utc::now().naive_utc())))
                     .execute(&mut *db)
                     .await?;
-                    if affected == 1 {{
+                    if affected == 1 {
                         totp_verified = true;
                         break;
-                    }}
-                }}
-            }}
-        }}
-        if !totp_verified {{
+                    }
+                }
+            }
+        }
+        if !totp_verified {
             let return_to = form.return_to.clone();
             return Ok(layout("Confirm your identity", html! {{
                 h1 {{ "Confirm your identity" }}
@@ -4145,7 +4165,6 @@ fn totp_reauth_check_src(snake_name: &str, table: &str) -> String {
                 form action="/reauth" method="post" {{
                     @if let Some(ref csrf) = csrf {{ input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
                     input type="hidden" name="return_to" value=(return_to);
-                    input type="hidden" name="password" value=(&form.password);
                     div {{
                         label {{ "Authenticator code" }}
                         input type="text" name="totp_code" autocomplete="one-time-code"
@@ -4156,8 +4175,8 @@ fn totp_reauth_check_src(snake_name: &str, table: &str) -> String {
                     button type="submit" {{ "Confirm" }}
                 }}
             }}).into_response());
-        }}
-    }}
+        }
+    }
 "#;
     TPL.replace("__SNAKE__", snake_name)
         .replace("__TABLE__", table)
@@ -6128,6 +6147,57 @@ mod tests {
         assert!(
             !confirm_body.contains("set_last_strong_auth_at"),
             "confirm_email must NOT stamp set_last_strong_auth_at (email != password proof): {confirm_body}"
+        );
+        // confirm_email must also actively remove any inherited step-up claim so a
+        // browser session that previously held last_strong_auth_at cannot carry it
+        // into the newly confirmed account's session.
+        assert!(
+            confirm_body.contains("STEP_UP_SESSION_KEY"),
+            "confirm_email must remove STEP_UP_SESSION_KEY after rotate_id: {confirm_body}"
+        );
+    }
+
+    #[test]
+    fn reauth_rotates_session_before_stamping_step_up() {
+        // Rotating the session ID at the privilege-elevation point invalidates
+        // any attacker-held copy of the old cookie, preventing a stolen session
+        // from benefiting from the legitimate user's reauth.
+        let tmp = project_with_main();
+        let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+        let reauth_pos = routes
+            .find("pub async fn reauth(")
+            .expect("reauth handler missing");
+        let reauth_body = &routes[reauth_pos..];
+        let rotate_pos = reauth_body
+            .find("rotate_id")
+            .expect("reauth must call session.rotate_id()");
+        let stamp_pos = reauth_body
+            .find("set_last_strong_auth_at")
+            .expect("reauth must call set_last_strong_auth_at");
+        assert!(
+            rotate_pos < stamp_pos,
+            "session.rotate_id() must come before set_last_strong_auth_at to invalidate the old cookie"
+        );
+    }
+
+    #[test]
+    fn totp_reauth_does_not_embed_password_in_form() {
+        // The TOTP re-render form must not include the raw password in a hidden
+        // field — that would expose it in the DOM to any script on the page.
+        let tmp = project_with_main();
+        totp_plan(tmp.path()).execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+        let reauth_pos = routes
+            .find("pub async fn reauth(")
+            .expect("reauth handler missing");
+        let reauth_body = &routes[reauth_pos..];
+        // The only password input in reauth should be type="password" (visible field),
+        // never type="hidden" with name="password".
+        assert!(
+            !reauth_body.contains("name=\"password\" value"),
+            "TOTP reauth must not embed the raw password in a hidden field: {reauth_body}"
         );
     }
 
