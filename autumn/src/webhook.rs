@@ -1034,9 +1034,9 @@ struct ReplayKeyGuard {
 impl Drop for ReplayKeyGuard {
     fn drop(&mut self) {
         if !self.completed {
-            let to_remove = {
-                let mut guard = self.cell.lock().unwrap();
-                guard.take()
+            let to_remove = match self.cell.lock() {
+                Ok(mut guard) => guard.take(),
+                Err(poisoned) => poisoned.into_inner().take(),
             };
             if let Some((store, keys)) = to_remove {
                 tokio::spawn(async move {
@@ -1074,9 +1074,9 @@ pub async fn webhook_replay_cleanup_middleware(
     guard.completed = true;
 
     if response.status().is_server_error() {
-        let to_remove = {
-            let mut guard_cell = cell_cloned.lock().unwrap();
-            guard_cell.take()
+        let to_remove = match cell_cloned.lock() {
+            Ok(mut guard) => guard.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
         };
         if let Some((store, keys)) = to_remove {
             for key in keys {
@@ -1166,7 +1166,11 @@ async fn verify_request(
         }
 
         let _ = WEBHOOK_REPLAY_KEY.try_with(|cell| {
-            if let Ok(mut guard) = cell.lock() {
+            let guard = match cell.lock() {
+                Ok(g) => Some(g),
+                Err(poisoned) => Some(poisoned.into_inner()),
+            };
+            if let Some(mut guard) = guard {
                 *guard = Some((std::sync::Arc::clone(&registry.replay_store), inserted_keys));
             }
         });
