@@ -83,13 +83,34 @@ pub async fn extract_tenant_from_parts(
             Ok(val)
         }
         "subdomain" => {
-            let host_header = parts.headers.get(axum::http::header::HOST).ok_or_else(|| {
-                crate::AutumnError::bad_request_msg("Missing Host header for subdomain tenancy")
-            })?;
-            let host = host_header
-                .to_str()
-                .map_err(|_| crate::AutumnError::bad_request_msg("Invalid UTF-8 in Host header"))?;
+            // Prefer the proxy-resolved host (honours X-Forwarded-Host from trusted
+            // upstreams); fall back to the raw Host header when the layer has not run.
+            let host_owned: String = parts
+                .extensions
+                .get::<crate::security::ResolvedClientIdentity>()
+                .and_then(|id| id.host.clone())
+                .map(Ok)
+                .unwrap_or_else(|| {
+                    parts
+                        .headers
+                        .get(axum::http::header::HOST)
+                        .ok_or_else(|| {
+                            crate::AutumnError::bad_request_msg(
+                                "Missing Host header for subdomain tenancy",
+                            )
+                        })
+                        .and_then(|h| {
+                            h.to_str()
+                                .map(ToOwned::to_owned)
+                                .map_err(|_| {
+                                    crate::AutumnError::bad_request_msg(
+                                        "Invalid UTF-8 in Host header",
+                                    )
+                                })
+                        })
+                })?;
 
+            let host = host_owned.as_str();
             let host_only = host.split(':').next().unwrap_or(host).trim();
 
             if host_only.parse::<std::net::IpAddr>().is_ok() {
@@ -411,5 +432,110 @@ where
     fn get_values(self) -> Self::Values {
         use ::diesel::ExpressionMethods;
         (self.inner, Table::column().eq(self.tenant_id))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::security::ResolvedClientIdentity;
+
+    fn subdomain_config() -> crate::config::AutumnConfig {
+        let mut c = crate::config::AutumnConfig::default();
+        c.tenancy.enabled = true;
+        c.tenancy.source = "subdomain".to_string();
+        c
+    }
+
+    fn subdomain_config_with_base(base: &str) -> crate::config::AutumnConfig {
+        let mut c = subdomain_config();
+        c.tenancy.base_domain = Some(base.to_string());
+        c
+    }
+
+    fn make_parts(host: &str) -> axum::http::request::Parts {
+        let (parts, _) = axum::http::Request::builder()
+            .uri("http://ignored/")
+            .header(axum::http::header::HOST, host)
+            .body(())
+            .unwrap()
+            .into_parts();
+        parts
+    }
+
+    fn make_parts_with_identity(host_header: &str, resolved_host: &str) -> axum::http::request::Parts {
+        let (mut parts, _) = axum::http::Request::builder()
+            .uri("http://ignored/")
+            .header(axum::http::header::HOST, host_header)
+            .body(())
+            .unwrap()
+            .into_parts();
+        parts.extensions.insert(ResolvedClientIdentity {
+            addr: None,
+            host: Some(resolved_host.to_string()),
+            scheme: None,
+        });
+        parts
+    }
+
+    /// When no ResolvedClientIdentity extension is present, subdomain mode falls
+    /// back to the raw Host header as before.
+    #[tokio::test]
+    async fn subdomain_falls_back_to_host_header_without_extension() {
+        let config = subdomain_config();
+        let mut parts = make_parts("tenant1.example.com");
+        let result = extract_tenant_from_parts(&mut parts, &config).await;
+        assert_eq!(result.unwrap(), "tenant1");
+    }
+
+    /// When ResolvedClientIdentity.host is present, subdomain mode uses it instead
+    /// of the raw Host header so that X-Forwarded-Host from trusted proxies is honoured.
+    #[tokio::test]
+    async fn subdomain_uses_resolved_host_from_extension() {
+        let config = subdomain_config();
+        // Raw Host header is the internal address; resolved host is the public subdomain.
+        let mut parts = make_parts_with_identity("internal.cluster.local", "tenant1.example.com");
+        let result = extract_tenant_from_parts(&mut parts, &config).await;
+        assert_eq!(result.unwrap(), "tenant1");
+    }
+
+    /// With a configured base_domain, the resolved host is matched against it.
+    #[tokio::test]
+    async fn subdomain_uses_resolved_host_with_base_domain() {
+        let config = subdomain_config_with_base("example.com");
+        let mut parts =
+            make_parts_with_identity("internal.cluster.local", "acme.example.com");
+        let result = extract_tenant_from_parts(&mut parts, &config).await;
+        assert_eq!(result.unwrap(), "acme");
+    }
+
+    /// Port suffixes in the resolved host are stripped before subdomain extraction.
+    #[tokio::test]
+    async fn subdomain_strips_port_from_resolved_host() {
+        let config = subdomain_config_with_base("example.com");
+        let mut parts =
+            make_parts_with_identity("internal.cluster.local", "tenant2.example.com:8080");
+        let result = extract_tenant_from_parts(&mut parts, &config).await;
+        assert_eq!(result.unwrap(), "tenant2");
+    }
+
+    /// When ResolvedClientIdentity.host is None (layer ran but found no host),
+    /// subdomain mode falls back to the raw Host header.
+    #[tokio::test]
+    async fn subdomain_falls_back_when_resolved_host_is_none() {
+        let config = subdomain_config();
+        let (mut parts, _) = axum::http::Request::builder()
+            .uri("http://ignored/")
+            .header(axum::http::header::HOST, "tenant3.example.com")
+            .body(())
+            .unwrap()
+            .into_parts();
+        parts.extensions.insert(ResolvedClientIdentity {
+            addr: None,
+            host: None,
+            scheme: None,
+        });
+        let result = extract_tenant_from_parts(&mut parts, &config).await;
+        assert_eq!(result.unwrap(), "tenant3");
     }
 }
