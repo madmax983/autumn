@@ -82,7 +82,7 @@ pub fn route_macro(
             .is_some_and(|s| s.ident == "feature_flag")
     });
     let primitive_wrapper =
-        if should_stringify_primitive_output(&input_fn.sig.output) && !has_feature_flag_attr {
+        if should_stringify_primitive_output(&input_fn.sig.output) {
             let wrapper_name = format_ident!("__autumn_primitive_handler_{}", fn_name);
             let mut wrapper_inputs = Vec::new();
             let mut call_args = Vec::new();
@@ -126,7 +126,7 @@ pub fn route_macro(
     let response_body = api_doc::schema_option(api_doc::infer_response_body(&input_fn));
     let query_schema = api_doc::schema_option(api_doc::infer_query_params(&input_fn));
     let (secured, required_roles) = api_doc::extract_secured_info(&input_fn);
-    let body_guarded_replay = secured || has_authorize_guard(&input_fn);
+    let body_guarded_replay = secured || has_authorize_guard(&input_fn) || has_feature_flag_attr;
     let intercepted_route = !interceptors.is_empty();
     let handler_expr = build_handler_expr(
         &routing_fn,

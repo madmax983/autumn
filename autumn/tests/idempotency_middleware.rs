@@ -3133,3 +3133,45 @@ async fn test_delete_deduplication() {
     r2.assert_ok();
     assert_eq!(r2.header("x-idempotent-replayed"), Some("true"));
 }
+
+static STACKED_FLAG_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+#[tokio::test]
+async fn test_stacked_feature_flag_idempotency() {
+    use autumn_web::feature_flags::{FlagStore, InMemoryFlagStore};
+
+    #[autumn_web::feature_flag("beta")]
+    #[post("/stacked-flag")]
+    async fn stacked_flag_handler() -> u64 {
+        STACKED_FLAG_CALLS.fetch_add(1, Ordering::SeqCst);
+        42
+    }
+
+    let store = InMemoryFlagStore::new();
+    store.enable("beta", None).unwrap();
+
+    let client = TestApp::new()
+        .routes(routes![stacked_flag_handler])
+        .with_flag_store(store)
+        .idempotent()
+        .build();
+
+    let r1 = client
+        .post("/stacked-flag")
+        .header("idempotency-key", "stacked-key-1")
+        .send()
+        .await;
+    r1.assert_ok();
+    assert_eq!(r1.text(), "42");
+    assert_eq!(r1.header("x-idempotent-replayed"), None);
+
+    let r2 = client
+        .post("/stacked-flag")
+        .header("idempotency-key", "stacked-key-1")
+        .send()
+        .await;
+    r2.assert_ok();
+    assert_eq!(r2.text(), "42");
+    assert_eq!(r2.header("x-idempotent-replayed"), Some("true"));
+    assert_eq!(STACKED_FLAG_CALLS.load(Ordering::SeqCst), 1);
+}
