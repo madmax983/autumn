@@ -829,6 +829,7 @@ impl TestApp {
             job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
+            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
             #[cfg(feature = "presence")]
             presence: crate::presence::Presence::new(test_channels.clone()),
             #[cfg(feature = "ws")]
