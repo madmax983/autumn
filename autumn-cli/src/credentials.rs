@@ -107,12 +107,18 @@ fn edit_credentials(env: &str, base_dir: &Path) -> Result<(), CredentialsError> 
         let k = MasterKey::generate();
         let key_path = base_dir.join("config/master.key");
         std::fs::create_dir_all(key_path.parent().unwrap())?;
-        std::fs::write(&key_path, k.to_hex())?;
+
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))?;
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
         }
+        let mut f = options.open(&key_path)?;
+        use std::io::Write as _;
+        f.write_all(k.to_hex().as_bytes())?;
+
         println!("  Created config/master.key (keep this secret, do not commit)");
         k
     };
