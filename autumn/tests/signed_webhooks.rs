@@ -921,3 +921,32 @@ async fn replay_attack_with_modified_delivery_id_is_rejected() {
     assert_eq!(HANDLER_CALLS.load(Ordering::SeqCst), 1);
 }
 
+#[tokio::test]
+async fn webhook_endpoints_exempt_from_csrf() {
+    let _guard = TEST_LOCK.lock().await;
+    HANDLER_CALLS.store(0, Ordering::SeqCst);
+
+    let endpoints = vec![endpoint(WebhookProvider::Stripe, "/webhooks/stripe", "stripe")];
+    let mut config = webhook_config(endpoints);
+    config.security.csrf.enabled = true;
+
+    let client = TestApp::new()
+        .config(config)
+        .routes(routes![stripe_webhook])
+        .build();
+
+    let timestamp = unix_now();
+    let body = br#"{"id":"evt_123"}"#;
+    let signature = stripe_signature(CURRENT_SECRET, timestamp, body);
+
+    client
+        .post("/webhooks/stripe")
+        .header("stripe-signature", &signature)
+        .body(body.as_slice())
+        .send()
+        .await
+        .assert_ok();
+
+    assert_eq!(HANDLER_CALLS.load(Ordering::SeqCst), 1);
+}
+

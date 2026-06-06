@@ -283,6 +283,13 @@ impl CsrfLayer {
         Arc::make_mut(&mut self.settings).signing_keys = Some(keys);
         self
     }
+
+    /// Add a path prefix that is exempt from CSRF validation.
+    #[must_use]
+    pub fn with_exempt_path(mut self, path: impl Into<String>) -> Self {
+        Arc::make_mut(&mut self.settings).exempt_paths.push(path.into());
+        self
+    }
 }
 
 impl<S> Layer<S> for CsrfLayer {

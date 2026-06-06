@@ -1188,6 +1188,9 @@ where
         if let Some(keys) = signing_keys {
             csrf_layer = csrf_layer.with_signing_keys(keys);
         }
+        for endpoint in &config.security.webhooks.endpoints {
+            csrf_layer = csrf_layer.with_exempt_path(&endpoint.path);
+        }
         tracing::info!("CSRF protection enabled");
         router = router.layer(csrf_layer);
     }
