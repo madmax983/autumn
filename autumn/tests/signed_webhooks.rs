@@ -1015,6 +1015,67 @@ async fn webhook_replay_key_released_on_failure() {
     assert_eq!(HANDLER_CALLS.load(Ordering::SeqCst), 2);
 }
 
+#[post("/webhooks/panicking")]
+async fn panicking_webhook(_webhook: SignedWebhook) -> impl IntoResponse {
+    HANDLER_CALLS.fetch_add(1, Ordering::SeqCst);
+    assert!(
+        !std::convert::identity(true),
+        "intentional panic in webhook handler"
+    );
+    StatusCode::OK
+}
+
+#[tokio::test]
+async fn webhook_replay_key_released_on_panic() {
+    let _guard = TEST_LOCK.lock().await;
+    HANDLER_CALLS.store(0, Ordering::SeqCst);
+
+    let endpoints = vec![endpoint(
+        WebhookProvider::Github,
+        "/webhooks/panicking",
+        "panicking",
+    )];
+    let client = TestApp::new()
+        .config(webhook_config(endpoints))
+        .routes(routes![panicking_webhook])
+        .build();
+
+    let body = br#"{"action":"opened"}"#;
+    let signature = github_signature(CURRENT_SECRET, body);
+
+    // 1. Send first request. It should hit the handler and panic.
+    // Axum/ReportingLayer will catch the panic and return 500.
+    client
+        .post("/webhooks/panicking")
+        .header("x-hub-signature-256", &signature)
+        .header("x-github-delivery", "delivery-panic")
+        .header("x-github-event", "pull_request")
+        .body(body.as_slice())
+        .send()
+        .await
+        .assert_status(500);
+
+    assert_eq!(HANDLER_CALLS.load(Ordering::SeqCst), 1);
+
+    // Give background spawned cleanup task a chance to run
+    tokio::task::yield_now().await;
+
+    // 2. Since it panicked, the replay key must be released.
+    // Send the duplicate request. It should hit the handler again (and panic/return 500)
+    // instead of being rejected as a duplicate (which would return 409).
+    client
+        .post("/webhooks/panicking")
+        .header("x-hub-signature-256", &signature)
+        .header("x-github-delivery", "delivery-panic")
+        .header("x-github-event", "pull_request")
+        .body(body.as_slice())
+        .send()
+        .await
+        .assert_status(500);
+
+    assert_eq!(HANDLER_CALLS.load(Ordering::SeqCst), 2);
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn test_duplicate_id_replay_same_id_different_sig_rejected() {
     let _guard = TEST_LOCK.lock().await;
@@ -1095,4 +1156,3 @@ async fn test_modified_id_replay_different_id_same_sig_rejected() {
     );
     assert_eq!(HANDLER_CALLS.load(Ordering::SeqCst), 1);
 }
-
