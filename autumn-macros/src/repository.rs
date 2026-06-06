@@ -5584,7 +5584,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 records.len()
                             )
                         ));
-                    } else if !has_lock && upserted.is_empty() && !records.is_empty() {
+                    } else if !has_lock && upserted.len() != records.len() {
                         return Err(::autumn_web::AutumnError::bad_request_msg(
                             format!(
                                 "Tenant conflict: only {} of {} records were upserted (potential cross-tenant conflict)",
@@ -9192,6 +9192,20 @@ mod tests {
         assert!(
             generated.contains("records . iter () . map (| r | r . id)"),
             "versioned upsert_many lock set must be collected from all input records, not the current chunk: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_tenant_scoped_upsert_many_rejects_partial() {
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("! has_lock && upserted . len () != records . len ()"),
+            "tenant-scoped upsert_many must reject partial upserts when lock versioning is absent: {generated}"
         );
     }
 
