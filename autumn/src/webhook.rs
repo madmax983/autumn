@@ -1011,8 +1011,21 @@ async fn verify_request(
         let delivery_id = delivery_id
             .as_deref()
             .ok_or(WebhookVerifyError::MissingDeliveryId)?;
+        let mut replay_id = delivery_id.to_owned();
+        if matches!(
+            endpoint.config.provider,
+            WebhookProvider::Github | WebhookProvider::Generic
+        ) {
+            let sig_hdr = signature_header(endpoint);
+            if let Some(sig_val) = headers.get(sig_hdr).and_then(|v| v.to_str().ok()) {
+                use sha2::{Digest, Sha256};
+                let mut hasher = Sha256::new();
+                hasher.update(sig_val.as_bytes());
+                replay_id = hex::encode(hasher.finalize());
+            }
+        }
         let replay_key = format!(
-            "{}:{}:{delivery_id}",
+            "{}:{}:{replay_id}",
             endpoint.config.provider.as_str(),
             endpoint.config.name
         );

@@ -879,3 +879,45 @@ async fn toml_provider_preset_applies_signature_header_defaults() {
     response.assert_ok();
     assert_eq!(HANDLER_CALLS.load(Ordering::SeqCst), 1);
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn replay_attack_with_modified_delivery_id_is_rejected() {
+    let _guard = TEST_LOCK.lock().await;
+    HANDLER_CALLS.store(0, Ordering::SeqCst);
+    let client = client(vec![endpoint(
+        WebhookProvider::Github,
+        "/webhooks/github",
+        "github",
+    )]);
+    let body = br#"{"action":"opened"}"#;
+    let signature = github_signature(CURRENT_SECRET, body);
+
+    let first = client
+        .post("/webhooks/github")
+        .header("x-hub-signature-256", &signature)
+        .header("x-github-delivery", "delivery-1")
+        .header("x-github-event", "pull_request")
+        .body(body.as_slice())
+        .send()
+        .await;
+    first.assert_ok();
+
+    // Replay the same body & signature, but with a different delivery ID.
+    // This should still be rejected as a duplicate because the body (signature) has not changed.
+    let second = client
+        .post("/webhooks/github")
+        .header("x-hub-signature-256", &signature)
+        .header("x-github-delivery", "delivery-2")
+        .header("x-github-event", "pull_request")
+        .body(body.as_slice())
+        .send()
+        .await;
+    let json = problem_json(&second, 409);
+    assert!(
+        json["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("duplicate"))
+    );
+    assert_eq!(HANDLER_CALLS.load(Ordering::SeqCst), 1);
+}
+
