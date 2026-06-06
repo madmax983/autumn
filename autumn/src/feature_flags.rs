@@ -1266,7 +1266,7 @@ impl axum::extract::FromRequestParts<crate::AppState> for Flags {
 
         // Resolve actor_id from session if available (best-effort, non-blocking).
         let actor_id = if let Some(session) = parts.extensions.get::<crate::session::Session>() {
-            session.get("user_id").await
+            session.get(state.auth_session_key()).await
         } else {
             None
         };
@@ -1799,5 +1799,32 @@ mod tests {
         svc.enable("active", None).unwrap();
         assert!(svc.is_enabled("active", Some("any_user")));
         assert!(!svc.is_enabled("missing", Some("any_user")));
+    }
+
+    #[tokio::test]
+    async fn from_request_parts_respects_custom_auth_session_key() {
+        use std::collections::HashMap;
+        use axum::extract::FromRequestParts;
+
+        let svc = make_svc();
+        let state = crate::AppState::for_test()
+            .with_auth_session_key("custom_user_id");
+        state.insert_extension(svc);
+
+        let mut data = HashMap::new();
+        data.insert("custom_user_id".to_owned(), "user:123".to_owned());
+        data.insert("user_id".to_owned(), "user:999".to_owned()); // distracter
+        let session = crate::session::Session::new_for_test("session_id".to_owned(), data);
+
+        let mut req = axum::http::Request::builder()
+            .body(())
+            .unwrap();
+        req.extensions_mut().insert(session);
+        let mut parts = req.into_parts().0;
+
+        let flags = Flags::from_request_parts(&mut parts, &state)
+            .await
+            .unwrap();
+        assert_eq!(flags.actor_id.as_deref(), Some("user:123"));
     }
 }
