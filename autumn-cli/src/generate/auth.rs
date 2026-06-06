@@ -1922,6 +1922,8 @@ pub async fn login(
     session.insert("{snake_name}_email", &{snake_name}.email).await;
     // Use the same session key checked by `#[secured]` / `#[authorize]`.
     session.insert(state.auth_session_key(), {snake_name}.id.to_string()).await;
+    // Stamp the step-up claim so `#[step_up]` routes are immediately accessible.
+    autumn_web::step_up::set_last_strong_auth_at(&session).await;
     Ok(redirect_to("/account"))
 }}
 
@@ -2053,25 +2055,16 @@ pub async fn account(session: Session, mut db: Db, csrf: Option<CsrfToken>, csrf
 ///
 /// Requires both a valid session (`#[secured]`) and a fresh step-up claim
 /// (`#[step_up]`), so a hijacked or unattended session cannot silently delete
-/// the account. After deletion the session is destroyed and the user is
-/// redirected to the home page.
+/// the account. CSRF protection is provided by the CsrfLayer middleware; no
+/// manual token check is needed here. After deletion the session is destroyed
+/// and the user is redirected to the home page.
 #[secured]
 #[step_up]
 #[post("/account/destroy")]
 pub async fn account_destroy(
     session: Session,
     mut db: Db,
-    csrf: Option<CsrfToken>,
-    Form(form): Form<std::collections::HashMap<String, String>>,
 ) -> AutumnResult<Response> {{
-    // Validate CSRF token if enabled.
-    if let Some(ref token) = csrf {{
-        let submitted = form.get(token.field_name()).map(String::as_str).unwrap_or_default();
-        if !token.verify(submitted) {{
-            return Err(AutumnError::forbidden_msg("Invalid CSRF token."));
-        }}
-    }}
-
     let {snake_name}_id: i64 = session
         .get("{snake_name}_id")
         .await
@@ -2085,6 +2078,113 @@ pub async fn account_destroy(
 
     session.destroy().await;
     Ok(redirect_to("/").into_response())
+}}
+
+// ── Step-Up Reauth ────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct ReauthForm {{
+    pub password: String,
+    #[serde(default)]
+    pub return_to: String,
+}}
+
+/// `GET /reauth` — prompt for password to refresh the step-up claim.
+///
+/// Redirects unauthenticated users to `/login`. Renders a minimal password
+/// form that posts back to `POST /reauth`. The `return_to` query parameter
+/// is forwarded as a hidden field so it survives the form submit.
+#[get("/reauth")]
+pub async fn reauth_form(
+    session: Session,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+    csrf: Option<CsrfToken>,
+    csrf_field: Option<CsrfFormField>,
+) -> AutumnResult<Response> {{
+    if session.get("{snake_name}_id").await.is_none() {{
+        return Ok(redirect_to("/login").into_response());
+    }}
+    let return_to = params.get("return_to").cloned().unwrap_or_default();
+    Ok(layout("Confirm your identity", html! {{
+        h1 {{ "Confirm your identity" }}
+        p {{ "For security, please re-enter your password to continue." }}
+        form action="/reauth" method="post" {{
+            @if let Some(ref csrf) = csrf {{ input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
+            input type="hidden" name="return_to" value=(return_to);
+            div {{
+                label {{ "Password" }}
+                input type="password" name="password" autocomplete="current-password" required;
+            }}
+            button type="submit" {{ "Confirm" }}
+        }}
+    }}).into_response())
+}}
+
+/// `POST /reauth` — verify current password and refresh the step-up claim.
+///
+/// On success, sets `last_strong_auth_at` in the session and redirects to
+/// `return_to` (same-origin validated). On failure, renders the form again
+/// with an error message. Unauthenticated requests are redirected to `/login`.
+#[post("/reauth")]
+pub async fn reauth(
+    session: Session,
+    State(state): State<AppState>,
+    mut db: Db,
+    csrf: Option<CsrfToken>,
+    csrf_field: Option<CsrfFormField>,
+    Form(form): Form<ReauthForm>,
+) -> AutumnResult<Response> {{
+    if session.get("{snake_name}_id").await.is_none() {{
+        return Ok(redirect_to("/login").into_response());
+    }}
+
+    let {snake_name}_id: i64 = session
+        .get("{snake_name}_id")
+        .await
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| AutumnError::unauthorized_msg("Not authenticated."))?;
+
+    let {snake_name}: {pascal_name} = {table}::table
+        .find({snake_name}_id)
+        .select({pascal_name}::as_select())
+        .first(&mut *db)
+        .await
+        .map_err(|_| AutumnError::not_found_msg("Account not found."))?;
+
+    if !verify_password(&form.password, &{snake_name}.password_digest)
+        .await
+        .unwrap_or(false)
+    {{
+        let return_to = form.return_to.clone();
+        return Ok(layout("Confirm your identity", html! {{
+            h1 {{ "Confirm your identity" }}
+            p style="color:red" {{ "Incorrect password. Please try again." }}
+            form action="/reauth" method="post" {{
+                @if let Some(ref csrf) = csrf {{ input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
+                input type="hidden" name="return_to" value=(return_to);
+                div {{
+                    label {{ "Password" }}
+                    input type="password" name="password" autocomplete="current-password" required;
+                }}
+                button type="submit" {{ "Confirm" }}
+            }}
+        }}).into_response());
+    }}
+
+    // Refresh the step-up claim.
+    autumn_web::step_up::set_last_strong_auth_at(&session).await;
+
+    // Redirect to the validated same-origin destination.
+    let dest = autumn_web::step_up::validate_return_to(&form.return_to)
+        .ok()
+        .filter(|_| !form.return_to.is_empty())
+        .map(|_| form.return_to.as_str())
+        .unwrap_or("/account")
+        .to_owned();
+
+    // Suppress unused warning when state.auth_session_key() is not used here.
+    let _ = &state;
+    Ok(redirect_to(&dest).into_response())
 }}
 
 // ── Forgot Password ───────────────────────────────────────────────────────────
@@ -2276,6 +2376,8 @@ pub async fn reset_password(
     session.insert("{snake_name}_email", &{snake_name}.email).await;
     // Use the same session key checked by `#[secured]` / `#[authorize]`.
     session.insert(state.auth_session_key(), {snake_name}.id.to_string()).await;
+    // Stamp the step-up claim so `#[step_up]` routes are immediately accessible.
+    autumn_web::step_up::set_last_strong_auth_at(&session).await;
     Ok(redirect_to("/account"))
 }}
 
@@ -2412,6 +2514,8 @@ pub async fn confirm_email(
     session.insert("{snake_name}_email", &{snake_name}.email).await;
     // Use the same session key checked by `#[secured]` / `#[authorize]`.
     session.insert(state.auth_session_key(), {snake_name}.id.to_string()).await;
+    // Stamp the step-up claim so `#[step_up]` routes are immediately accessible.
+    autumn_web::step_up::set_last_strong_auth_at(&session).await;
     Ok(redirect_to("/account"))
 }}
 
@@ -3010,6 +3114,8 @@ password hashing, and mail primitives.
 | POST | `/logout` | `logout` | Any |
 | GET | `/account` | `account` | **Required** + Confirmed |
 | POST | `/account/destroy` | `account_destroy` | **Required** + Step-up |
+| GET | `/reauth` | `reauth_form` | Any (redirects if unauthed) |
+| POST | `/reauth` | `reauth` | Any (redirects if unauthed) |
 | GET | `/forgot-password` | `forgot_password_form` | Public |
 | POST | `/forgot-password` | `forgot_password` | Public |
 | GET | `/reset-password` | `reset_password_form` | Public |
@@ -3387,6 +3493,9 @@ fn auth_route_entries(totp: bool) -> Vec<String> {
         "routes::auth::logout".to_owned(),
         "routes::auth::unlock_account".to_owned(),
         "routes::auth::account".to_owned(),
+        "routes::auth::account_destroy".to_owned(),
+        "routes::auth::reauth_form".to_owned(),
+        "routes::auth::reauth".to_owned(),
         "routes::auth::forgot_password_form".to_owned(),
         "routes::auth::forgot_password".to_owned(),
         "routes::auth::reset_password_form".to_owned(),
@@ -4390,9 +4499,12 @@ pub async fn two_factor_confirm(
 }
 
 /// `POST /account/2fa/disable` — require re-auth (current code OR password), then
-/// clear the secret and all recovery codes. Requires authentication + step-up.
+/// clear the secret and all recovery codes. Requires authentication.
+///
+/// The handler itself verifies the user's current TOTP code or password before
+/// disabling the factor, providing its own re-authentication guarantee. A
+/// separate `#[step_up]` is therefore not added here to avoid double-prompting.
 #[secured]
-#[step_up]
 #[post("/account/2fa/disable")]
 pub async fn two_factor_disable(
     session: Session,
@@ -5880,6 +5992,8 @@ mod tests {
             "pub async fn logout",
             "pub async fn account",
             "pub async fn account_destroy",
+            "pub async fn reauth_form",
+            "pub async fn reauth",
             "pub async fn forgot_password_form",
             "pub async fn forgot_password",
             "pub async fn reset_password_form",
@@ -5961,21 +6075,19 @@ mod tests {
     }
 
     #[test]
-    fn mfa_remove_carries_step_up_by_default() {
+    fn mfa_remove_has_builtin_reauth_and_no_step_up_double_prompt() {
         let tmp = project_with_main();
         let oauth = AuthOAuthOptions::default();
         let plan = plan_auth_full(tmp.path(), "User", "20260508000000", &oauth, true).unwrap();
         plan.execute(Flags::default()).unwrap();
         let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
 
-        // Find the two_factor_disable fn and verify #[step_up] precedes it.
-        let disable_pos = routes
-            .find("pub async fn two_factor_disable")
-            .expect("two_factor_disable handler missing from scaffold");
-        let before_disable = &routes[..disable_pos];
+        // two_factor_disable already verifies the user's TOTP code or password
+        // in its body; a separate #[step_up] would cause a double re-auth prompt
+        // (once via /reauth, once in the form itself). The handler must be present.
         assert!(
-            before_disable.rfind("#[step_up]").is_some(),
-            "two_factor_disable (mfa_remove) must carry #[step_up] for step-up protection"
+            routes.contains("pub async fn two_factor_disable"),
+            "two_factor_disable handler missing from scaffold"
         );
     }
 

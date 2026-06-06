@@ -153,8 +153,9 @@ pub fn validate_return_to(url: &str) -> Result<(), &'static str> {
     if !url.starts_with('/') {
         return Err("return_to must be an absolute path starting with /");
     }
-    // Reject protocol-relative URLs (//host/path)
-    if url.starts_with("//") {
+    // Reject protocol-relative URLs (//host/path or /\host/path).
+    // Some browsers normalise /\ to // so we must reject both.
+    if url.starts_with("//") || url.starts_with("/\\") {
         return Err("return_to must not be a protocol-relative URL");
     }
     Ok(())
@@ -226,8 +227,10 @@ pub fn encode_return_to(path: &str) -> String {
                 encoded.push(byte as char);
             }
             _ => {
+                const HEX: &[u8; 16] = b"0123456789ABCDEF";
                 encoded.push('%');
-                encoded.push_str(&format!("{byte:02X}"));
+                encoded.push(HEX[(byte >> 4) as usize] as char);
+                encoded.push(HEX[(byte & 0xF) as usize] as char);
             }
         }
     }

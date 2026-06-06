@@ -81,38 +81,10 @@ fn parse_max_age_str_at_compile_time(lit: &LitStr) -> Result<u64, String> {
         .map_err(|_| format!("invalid max_age: '{s}' (expected seconds or e.g. \"5m\")"))
 }
 
-/// Expand the `#[step_up]` / `#[step_up(max_age = "Nm")]` attribute.
-pub fn step_up_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let max_age_opt = match parse_step_up_args(attr) {
-        Ok(v) => v,
-        Err(err) => return err.to_compile_error(),
-    };
-
-    let mut input_fn: ItemFn = match syn::parse2(item) {
-        Ok(f) => f,
-        Err(err) => return err.to_compile_error(),
-    };
-
-    if input_fn.sig.asyncness.is_none() {
-        return syn::Error::new_spanned(
-            input_fn.sig.fn_token,
-            "#[step_up] can only be applied to async functions",
-        )
-        .to_compile_error();
-    }
-
-    // Emit a `Some(N_u64)` or `None` token at the call site.
-    let max_age_tokens = match max_age_opt {
-        Some(n) => {
-            let lit = proc_macro2::Literal::u64_suffixed(n);
-            quote! { ::core::option::Option::Some(#lit) }
-        }
-        None => quote! { ::core::option::Option::None },
-    };
-
-    // The resolved max-age used in the WWW-Authenticate header. At runtime this
-    // is either the route-level value or the framework default (300).
-    let check_call = quote! {
+/// Build the runtime freshness-check token stream injected at the top of
+/// the handler body.
+fn build_check_call(max_age_tokens: &TokenStream) -> TokenStream {
+    quote! {
         const __AUTUMN_STEP_UP_MAX_AGE: ::core::option::Option<u64> = #max_age_tokens;
         if let ::core::result::Result::Err(__autumn_step_up_error) =
             ::autumn_web::step_up::__check_step_up_with_config(
@@ -123,20 +95,20 @@ pub fn step_up_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         {
             let __max_age_secs: u64 = __AUTUMN_STEP_UP_MAX_AGE
                 .unwrap_or(::autumn_web::step_up::DEFAULT_MAX_AGE_SECS);
-
-            // Detect API clients by inspecting the Accept header.
             let __wants_json: bool = __autumn_step_up_headers
                 .get(::autumn_web::reexports::axum::http::header::ACCEPT)
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.contains("application/json"))
                 .unwrap_or(false);
-
             if __wants_json {
                 return ::autumn_web::step_up::__step_up_json_response(__max_age_secs);
             } else {
                 let __return_to: ::std::string::String =
                     ::autumn_web::step_up::encode_return_to(
-                        __autumn_step_up_uri.path()
+                        __autumn_step_up_uri
+                            .path_and_query()
+                            .map(|pq| pq.as_str())
+                            .unwrap_or_else(|| __autumn_step_up_uri.path()),
                     );
                 return ::autumn_web::reexports::axum::response::IntoResponse::into_response(
                     ::autumn_web::reexports::axum::response::Redirect::to(
@@ -145,7 +117,65 @@ pub fn step_up_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 );
             }
         }
+    }
+}
+
+/// Inject the four hidden extractors required by the step-up check, guarding
+/// against duplication when `#[step_up]` is stacked with `#[secured]`.
+fn inject_step_up_params(input_fn: &mut ItemFn) {
+    if !has_input_named(input_fn, "__autumn_state") {
+        let p: syn::FnArg = parse_quote! {
+            ::autumn_web::reexports::axum::extract::State(__autumn_state):
+                ::autumn_web::reexports::axum::extract::State<::autumn_web::AppState>
+        };
+        input_fn.sig.inputs.insert(0, p);
+    }
+    if !has_input_named(input_fn, "__autumn_session") {
+        let p: syn::FnArg = parse_quote! {
+            __autumn_session: ::autumn_web::session::Session
+        };
+        input_fn.sig.inputs.insert(0, p);
+    }
+    if !has_input_named(input_fn, "__autumn_step_up_headers") {
+        let p: syn::FnArg = parse_quote! {
+            __autumn_step_up_headers: ::autumn_web::reexports::axum::http::HeaderMap
+        };
+        input_fn.sig.inputs.insert(0, p);
+    }
+    if !has_input_named(input_fn, "__autumn_step_up_uri") {
+        let p: syn::FnArg = parse_quote! {
+            __autumn_step_up_uri: ::autumn_web::reexports::axum::http::Uri
+        };
+        input_fn.sig.inputs.insert(0, p);
+    }
+}
+
+/// Expand the `#[step_up]` / `#[step_up(max_age = "Nm")]` attribute.
+pub fn step_up_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let max_age_opt = match parse_step_up_args(attr) {
+        Ok(v) => v,
+        Err(err) => return err.to_compile_error(),
     };
+    let mut input_fn: ItemFn = match syn::parse2(item) {
+        Ok(f) => f,
+        Err(err) => return err.to_compile_error(),
+    };
+    if input_fn.sig.asyncness.is_none() {
+        return syn::Error::new_spanned(
+            input_fn.sig.fn_token,
+            "#[step_up] can only be applied to async functions",
+        )
+        .to_compile_error();
+    }
+
+    let max_age_tokens = max_age_opt.map_or_else(
+        || quote! { ::core::option::Option::None },
+        |n| {
+            let lit = proc_macro2::Literal::u64_suffixed(n);
+            quote! { ::core::option::Option::Some(#lit) }
+        },
+    );
+    let check_call = build_check_call(&max_age_tokens);
 
     let original_body = &input_fn.block;
     let original_response = match &input_fn.sig.output {
@@ -164,41 +194,13 @@ pub fn step_up_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         },
     };
 
-    // Inject hidden extractors; guard against duplication when #[step_up]
-    // is stacked with #[secured] or #[authorize].
-    if !has_input_named(&input_fn, "__autumn_state") {
-        let state_param: syn::FnArg = parse_quote! {
-            ::autumn_web::reexports::axum::extract::State(__autumn_state):
-                ::autumn_web::reexports::axum::extract::State<::autumn_web::AppState>
-        };
-        input_fn.sig.inputs.insert(0, state_param);
-    }
-    if !has_input_named(&input_fn, "__autumn_session") {
-        let session_param: syn::FnArg = parse_quote! {
-            __autumn_session: ::autumn_web::session::Session
-        };
-        input_fn.sig.inputs.insert(0, session_param);
-    }
-    if !has_input_named(&input_fn, "__autumn_step_up_headers") {
-        let headers_param: syn::FnArg = parse_quote! {
-            __autumn_step_up_headers: ::autumn_web::reexports::axum::http::HeaderMap
-        };
-        input_fn.sig.inputs.insert(0, headers_param);
-    }
-    if !has_input_named(&input_fn, "__autumn_step_up_uri") {
-        let uri_param: syn::FnArg = parse_quote! {
-            __autumn_step_up_uri: ::autumn_web::reexports::axum::http::Uri
-        };
-        input_fn.sig.inputs.insert(0, uri_param);
-    }
-
+    inject_step_up_params(&mut input_fn);
     input_fn
         .attrs
         .push(parse_quote!(#[allow(clippy::too_many_arguments)]));
     input_fn.sig.output = parse_quote! {
         -> ::autumn_web::reexports::axum::response::Response
     };
-
     input_fn.block = syn::parse_quote! {
         {
             #check_call

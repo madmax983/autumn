@@ -133,10 +133,10 @@ Content-Type: application/problem+json
 
 {
   "type": "https://autumn.rs/probs/step-up-required",
-  "title": "Step-up authentication required",
+  "title": "Step-Up Authentication Required",
   "status": 401,
-  "detail": "Fresh authentication is required. Please re-authenticate and retry.",
-  "max_age_secs": 300
+  "detail": "This operation requires recent authentication. Please re-authenticate and retry.",
+  "code": "step_up_required"
 }
 ```
 

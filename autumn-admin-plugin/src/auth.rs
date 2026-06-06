@@ -4,6 +4,7 @@
 //! request's [`Session`] and short-circuit with appropriate error responses
 //! when authentication or freshness requirements are not met.
 
+use autumn_web::AppState;
 use autumn_web::AutumnError;
 use autumn_web::session::Session;
 use autumn_web::step_up;
@@ -71,8 +72,14 @@ pub async fn check_step_up_mutations(req: Request, next: Next) -> Response {
         .into_response();
     };
 
-    // Use the global default max-age (from AppState extension or hard-coded default).
-    let max_age = step_up::DEFAULT_MAX_AGE_SECS;
+    // Use the global default max-age from AppState extensions, falling back to
+    // the compiled-in constant when AppState is not present (e.g. in tests).
+    let max_age = req
+        .extensions()
+        .get::<AppState>()
+        .and_then(|state| state.extension::<step_up::StepUpGlobalConfig>())
+        .map(|c| c.default_max_age_secs)
+        .unwrap_or(step_up::DEFAULT_MAX_AGE_SECS);
 
     if step_up::check_step_up(&session, max_age).await.is_err() {
         // Detect JSON clients via Accept header.
@@ -87,7 +94,13 @@ pub async fn check_step_up_mutations(req: Request, next: Next) -> Response {
             return step_up::__step_up_json_response(max_age);
         }
 
-        let path = req.uri().path().to_owned();
+        // Preserve query parameters so the user returns to the exact same page.
+        let path = req
+            .uri()
+            .path_and_query()
+            .map(|pq| pq.as_str())
+            .unwrap_or_else(|| req.uri().path())
+            .to_owned();
         let encoded = step_up::encode_return_to(&path);
         return Redirect::to(&format!("/reauth?return_to={encoded}")).into_response();
     }
