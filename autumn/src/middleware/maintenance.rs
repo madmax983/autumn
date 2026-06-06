@@ -604,7 +604,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
-    /// When ResolvedClientIdentity is stamped by TrustedProxiesLayer, its
+    /// When `ResolvedClientIdentity` is stamped by `TrustedProxiesLayer`, its
     /// resolved addr is used for allow-list checks — a spoofed X-Forwarded-For
     /// header cannot bypass maintenance mode by claiming an allowed IP.
     #[tokio::test]
