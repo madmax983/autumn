@@ -4235,32 +4235,38 @@ pub async fn passkey_register_page(
     session: Session,
     State(state): State<AppState>,
     csrf: Option<CsrfToken>,
+    csrf_header: Option<CsrfTokenHeader>,
+    nonce: Option<CspNonce>,
 ) -> AutumnResult<Markup> {
     let _ = (session, state);
     let csrf_token = csrf.map(|t| t.token().to_owned()).unwrap_or_default();
+    let csrf_header_name = csrf_header.map(|h| h.0.clone()).unwrap_or_else(|| "X-CSRF-Token".to_owned());
+    let script_nonce = nonce.map(|n| n.0.clone());
     Ok(html! {
         html {
             head {
                 title { "Register a Passkey" }
                 meta name="csrf-token" content=(csrf_token);
+                meta name="csrf-token-header" content=(csrf_header_name);
             }
             body {
                 h1 { "Register a Passkey" }
                 button id="register-btn" { "Register passkey" }
-                script {
+                script nonce=[script_nonce] {
                     (PreEscaped(r#"
 const csrfToken = document.querySelector('meta[name="csrf-token"]')?.content ?? '';
+const csrfHeader = document.querySelector('meta[name="csrf-token-header"]')?.content ?? 'X-CSRF-Token';
 document.getElementById('register-btn').addEventListener('click', async () => {
     const beginResp = await fetch('/passkeys/register/begin', {
         method: 'POST',
-        headers: { 'X-CSRF-Token': csrfToken },
+        headers: { [csrfHeader]: csrfToken },
     });
     const optionsJSON = await beginResp.json();
     const options = PublicKeyCredential.parseCreationOptionsFromJSON(optionsJSON.publicKey);
     const credential = await navigator.credentials.create({ publicKey: options });
     const finishResp = await fetch('/passkeys/register/finish', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken },
+        headers: { 'Content-Type': 'application/json', [csrfHeader]: csrfToken },
         body: JSON.stringify({ response: credential.toJSON() }),
     });
     if (finishResp.ok) {
@@ -4400,31 +4406,39 @@ pub async fn passkey_register_finish(
 
 /// `GET /passkeys/login` — passkey login UI page.
 #[get("/passkeys/login")]
-pub async fn passkey_login_page(csrf: Option<CsrfToken>) -> AutumnResult<Markup> {
+pub async fn passkey_login_page(
+    csrf: Option<CsrfToken>,
+    csrf_header: Option<CsrfTokenHeader>,
+    nonce: Option<CspNonce>,
+) -> AutumnResult<Markup> {
     let csrf_token = csrf.map(|t| t.token().to_owned()).unwrap_or_default();
+    let csrf_header_name = csrf_header.map(|h| h.0.clone()).unwrap_or_else(|| "X-CSRF-Token".to_owned());
+    let script_nonce = nonce.map(|n| n.0.clone());
     Ok(html! {
         html {
             head {
                 title { "Sign in with Passkey" }
                 meta name="csrf-token" content=(csrf_token);
+                meta name="csrf-token-header" content=(csrf_header_name);
             }
             body {
                 h1 { "Sign in with a Passkey" }
                 button id="login-btn" { "Sign in with passkey" }
-                script {
+                script nonce=[script_nonce] {
                     (PreEscaped(r#"
 const csrfToken = document.querySelector('meta[name="csrf-token"]')?.content ?? '';
+const csrfHeader = document.querySelector('meta[name="csrf-token-header"]')?.content ?? 'X-CSRF-Token';
 document.getElementById('login-btn').addEventListener('click', async () => {
     const beginResp = await fetch('/passkeys/login/begin', {
         method: 'POST',
-        headers: { 'X-CSRF-Token': csrfToken },
+        headers: { [csrfHeader]: csrfToken },
     });
     const optionsJSON = await beginResp.json();
     const options = PublicKeyCredential.parseRequestOptionsFromJSON(optionsJSON.publicKey);
     const assertion = await navigator.credentials.get({ publicKey: options });
     const finishResp = await fetch('/passkeys/login/finish', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken },
+        headers: { 'Content-Type': 'application/json', [csrfHeader]: csrfToken },
         body: JSON.stringify({ response: assertion.toJSON() }),
     });
     if (finishResp.ok) {
@@ -7202,6 +7216,51 @@ mod tests {
         assert!(
             routes.contains("user_id"),
             "register begin should store user_id in passkey_reg_state envelope: {routes}"
+        );
+    }
+
+    #[test]
+    fn passkeys_templates_accept_csrf_header_and_nonce() {
+        let tmp = project_with_main();
+        passkey_plan(tmp.path()).execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/passkeys.rs")).unwrap();
+        
+        assert!(
+            routes.contains("pub async fn passkey_register_page("),
+            "passkey_register_page is missing"
+        );
+        assert!(
+            routes.contains("csrf_header: Option<CsrfTokenHeader>"),
+            "passkey_register_page must take csrf_header"
+        );
+        assert!(
+            routes.contains("nonce: Option<CspNonce>"),
+            "passkey_register_page must take nonce"
+        );
+        assert!(
+            routes.contains("pub async fn passkey_login_page("),
+            "passkey_login_page is missing"
+        );
+        assert!(
+            routes.contains("csrf_header: Option<CsrfTokenHeader>"),
+            "passkey_login_page must take csrf_header"
+        );
+        assert!(
+            routes.contains("nonce: Option<CspNonce>"),
+            "passkey_login_page must take nonce"
+        );
+
+        assert!(
+            routes.contains("script nonce=[script_nonce]"),
+            "templates must output script tags with nonce attribute: {routes}"
+        );
+        assert!(
+            routes.contains("const csrfHeader = document.querySelector('meta[name=\"csrf-token-header\"]')?.content ?? 'X-CSRF-Token';"),
+            "templates must dynamically resolve csrf header name: {routes}"
+        );
+        assert!(
+            routes.contains("[csrfHeader]: csrfToken"),
+            "templates must use dynamic csrf header key in fetch calls: {routes}"
         );
     }
 

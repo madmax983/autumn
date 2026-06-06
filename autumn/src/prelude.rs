@@ -174,6 +174,8 @@ pub use crate::security::CspNonce;
 pub use crate::security::CsrfFormField;
 /// CSRF token extractor for embedding in forms.
 pub use crate::security::CsrfToken;
+/// CSRF token header name extractor.
+pub use crate::security::CsrfTokenHeader;
 /// Signed webhook extractor and configuration helpers.
 pub use crate::webhook::{
     SignedWebhook, WebhookEndpointConfig, WebhookProvider, WebhookReplayBackend,
