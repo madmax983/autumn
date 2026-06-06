@@ -77,9 +77,8 @@ pub async fn check_step_up_mutations(req: Request, next: Next) -> Response {
     let max_age = req
         .extensions()
         .get::<AppState>()
-        .and_then(|state| state.extension::<step_up::StepUpGlobalConfig>())
-        .map(|c| c.default_max_age_secs)
-        .unwrap_or(step_up::DEFAULT_MAX_AGE_SECS);
+        .and_then(AppState::extension::<step_up::StepUpGlobalConfig>)
+        .map_or(step_up::DEFAULT_MAX_AGE_SECS, |c| c.default_max_age_secs);
 
     if step_up::check_step_up(&session, max_age).await.is_err() {
         // Detect JSON clients via Accept header.
@@ -87,8 +86,7 @@ pub async fn check_step_up_mutations(req: Request, next: Next) -> Response {
             .headers()
             .get(header::ACCEPT)
             .and_then(|v| v.to_str().ok())
-            .map(|s| s.contains("application/json"))
-            .unwrap_or(false);
+            .is_some_and(|s| s.contains("application/json"));
 
         if wants_json {
             return step_up::__step_up_json_response(max_age);
@@ -98,8 +96,7 @@ pub async fn check_step_up_mutations(req: Request, next: Next) -> Response {
         let path = req
             .uri()
             .path_and_query()
-            .map(|pq| pq.as_str())
-            .unwrap_or_else(|| req.uri().path())
+            .map_or_else(|| req.uri().path(), axum::http::uri::PathAndQuery::as_str)
             .to_owned();
         let encoded = step_up::encode_return_to(&path);
         return Redirect::to(&format!("/reauth?return_to={encoded}")).into_response();

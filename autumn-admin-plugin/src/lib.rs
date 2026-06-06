@@ -185,7 +185,7 @@ impl AdminPlugin {
     ///     .with_step_up_mutations()
     /// ```
     #[must_use]
-    pub fn with_step_up_mutations(mut self) -> Self {
+    pub const fn with_step_up_mutations(mut self) -> Self {
         self.step_up_mutations = true;
         self
     }
