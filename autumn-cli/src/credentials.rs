@@ -44,9 +44,8 @@ impl TempFileGuard {
 
 impl Drop for TempFileGuard {
     fn drop(&mut self) {
-        self.inner = None;
         zero_file(&self.path);
-        let _ = std::fs::remove_file(&self.path);
+        self.inner = None;
     }
 }
 

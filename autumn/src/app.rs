@@ -2031,19 +2031,27 @@ impl AppBuilder {
             let path = std::path::Path::new(crate::maintenance::MAINTENANCE_FLAG_FILE);
             let interval = std::time::Duration::from_millis(500);
             loop {
-                match crate::maintenance::MaintenanceState::load_from_file(path) {
-                    Ok(Some(cfg)) => {
+                let load_res = tokio::task::spawn_blocking(move || {
+                    crate::maintenance::MaintenanceState::load_from_file(path)
+                })
+                .await;
+
+                match load_res {
+                    Ok(Ok(Some(cfg))) => {
                         if poller_state.get() != Some(cfg.clone()) {
                             poller_state.enable(cfg);
                         }
                     }
-                    Ok(None) => {
+                    Ok(Ok(None)) => {
                         if poller_state.is_active() {
                             poller_state.disable();
                         }
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         tracing::error!(error = %e, "failed to load maintenance flag file");
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "maintenance poller task panicked");
                     }
                 }
                 tokio::time::sleep(interval).await;

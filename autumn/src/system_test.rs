@@ -84,7 +84,7 @@ use crate::route::Route;
 const DEFAULT_BROWSER_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Default timeout for htmx settle auto-wait after every mutating action.
-const DEFAULT_HX_SETTLE_TIMEOUT: Duration = Duration::from_millis(2000);
+const DEFAULT_HX_SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Default assertion polling interval.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -119,35 +119,34 @@ impl BrowserCheck {
         let candidates = browser_candidates();
         let mut searched = Vec::new();
         for path in &candidates {
-            if path.is_file() {
-                if let Some(version) = probe_version(path) {
-                    return BrowserCheck::Found {
+            if path.is_file()
+                && let Some(version) = probe_version(path) {
+                    return Self::Found {
                         path: path.clone(),
                         version,
                     };
                 }
-            }
             searched.push(path.clone());
         }
-        BrowserCheck::NotFound {
+        Self::NotFound {
             searched_paths: searched,
         }
     }
 
     /// `true` when a browser was found.
     #[must_use]
-    pub fn is_found(&self) -> bool {
-        matches!(self, BrowserCheck::Found { .. })
+    pub const fn is_found(&self) -> bool {
+        matches!(self, Self::Found { .. })
     }
 }
 
 impl fmt::Display for BrowserCheck {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            BrowserCheck::Found { path, version } => {
+            Self::Found { path, version } => {
                 write!(f, "Chromium found: {} ({})", path.display(), version)
             }
-            BrowserCheck::NotFound { searched_paths } => {
+            Self::NotFound { searched_paths } => {
                 write!(
                     f,
                     "Chromium not found. Searched:\n{}",
@@ -220,9 +219,7 @@ pub enum SystemTestError {
 #[must_use]
 pub fn artifact_dir(test_name: &str) -> PathBuf {
     // Walk up from the crate root (or use CARGO_TARGET_DIR if set).
-    let base = std::env::var("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("target"));
+    let base = std::env::var("CARGO_TARGET_DIR").map_or_else(|_| PathBuf::from("target"), PathBuf::from);
     base.join("system-tests").join(test_name)
 }
 
@@ -268,9 +265,13 @@ impl Default for SystemTest {
 impl SystemTest {
     /// Create a new builder with default configuration.
     pub fn new() -> Self {
-        let mut config = AutumnConfig::default();
-        config.profile = Some("test".into());
-        config.security.csrf.enabled = false;
+        let mut security = crate::security::SecurityConfig::default();
+        security.csrf.enabled = false;
+        let config = AutumnConfig {
+            profile: Some("test".into()),
+            security,
+            ..Default::default()
+        };
 
         Self {
             routes: Vec::new(),
@@ -312,13 +313,13 @@ impl SystemTest {
     }
 
     /// Override how long to wait for the browser to launch.
-    pub fn browser_timeout(mut self, t: Duration) -> Self {
+    pub const fn browser_timeout(mut self, t: Duration) -> Self {
         self.browser_timeout = t;
         self
     }
 
     /// Override how long to wait for htmx to finish settling after each action.
-    pub fn hx_settle_timeout(mut self, t: Duration) -> Self {
+    pub const fn hx_settle_timeout(mut self, t: Duration) -> Self {
         self.hx_settle_timeout = t;
         self
     }
@@ -338,7 +339,7 @@ impl SystemTest {
         // 2. Bind the app to an ephemeral port.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
-            .map_err(|e| SystemTestError::ArtifactIo(e))?;
+            .map_err(SystemTestError::ArtifactIo)?;
         let addr = listener.local_addr().map_err(SystemTestError::ArtifactIo)?;
         let base_url = format!("http://127.0.0.1:{}", addr.port());
 
@@ -752,11 +753,10 @@ impl Page {
             let result = self.inner.evaluate(js).await?;
 
             let text: Option<String> = result.into_value().ok();
-            if let Some(ref t) = text {
-                if predicate(t) {
+            if let Some(ref t) = text
+                && predicate(t) {
                     return Ok(self);
                 }
-            }
 
             if tokio::time::Instant::now() >= deadline {
                 let artifact = self.write_failure_artifacts("expect_sse_event").await.ok();
@@ -963,12 +963,9 @@ fn browser_candidates() -> Vec<PathBuf> {
 
 /// Return the first candidate that exists and reports a version.
 fn find_chromium() -> Option<PathBuf> {
-    for path in browser_candidates() {
-        if path.is_file() && probe_version(&path).is_some() {
-            return Some(path);
-        }
-    }
-    None
+    browser_candidates()
+        .into_iter()
+        .find(|path| path.is_file() && probe_version(path).is_some())
 }
 
 /// Run `<path> --version` and return the output if successful.
@@ -990,28 +987,29 @@ fn build_router_for_system_test(
     routes: Vec<Route>,
     state_override: Option<crate::state::AppState>,
 ) -> axum::Router {
-    match state_override {
-        Some(state) => {
-            // Use the config already embedded in the caller-supplied state so
-            // that middleware (tenancy, auth, rate-limiting, CSRF) is built
-            // from the same settings that handlers observe via AppState::config().
-            // Headless Chromium handles cookies normally, so CSRF works end-to-end:
-            // the browser receives the CSRF cookie on first visit and replays it
-            // on form submissions, exactly as a real user would.
-            let config = state
-                .extension::<AutumnConfig>()
-                .map(|arc| (*arc).clone())
-                .unwrap_or_default();
-            crate::router::build_router(routes, &config, state)
-        }
-        None => {
-            let mut config = AutumnConfig::default();
-            config.profile = Some("test".into());
-            config.security.csrf.enabled = false;
-            let state = crate::state::AppState::for_test().with_profile("test");
-            state.insert_extension(config.clone());
-            crate::router::build_router(routes, &config, state)
-        }
+    if let Some(state) = state_override {
+        // Use the config already embedded in the caller-supplied state so
+        // that middleware (tenancy, auth, rate-limiting, CSRF) is built
+        // from the same settings that handlers observe via AppState::config().
+        // Headless Chromium handles cookies normally, so CSRF works end-to-end:
+        // the browser receives the CSRF cookie on first visit and replays it
+        // on form submissions, exactly as a real user would.
+        let config = state
+            .extension::<AutumnConfig>()
+            .map(|arc| (*arc).clone())
+            .unwrap_or_default();
+        crate::router::build_router(routes, &config, state)
+    } else {
+        let mut security = crate::security::SecurityConfig::default();
+        security.csrf.enabled = false;
+        let config = AutumnConfig {
+            profile: Some("test".into()),
+            security,
+            ..Default::default()
+        };
+        let state = crate::state::AppState::for_test().with_profile("test");
+        state.insert_extension(config.clone());
+        crate::router::build_router(routes, &config, state)
     }
 }
 
@@ -1082,8 +1080,10 @@ mod tests {
     fn build_router_with_state_override_uses_embedded_config() {
         // Exercises the Some(state) branch: config is read from the supplied
         // state rather than constructed from scratch.
-        let mut config = AutumnConfig::default();
-        config.profile = Some("custom".into());
+        let config = AutumnConfig {
+            profile: Some("custom".into()),
+            ..Default::default()
+        };
         let state = crate::state::AppState::for_test();
         state.insert_extension(config);
         let _router = build_router_for_system_test(vec![], Some(state));
