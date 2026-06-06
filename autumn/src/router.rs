@@ -1194,13 +1194,26 @@ where
     router
 }
 
-fn apply_rate_limit_middleware<S>(
-    mut router: axum::Router<S>,
+async fn populate_rate_limit_principal(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    mut req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if let Some(session) = req.extensions().get::<crate::session::Session>() {
+        let auth_session_key = state.auth_session_key();
+        if let Some(user_id) = session.get(auth_session_key).await {
+            req.extensions_mut()
+                .insert(crate::security::RateLimitPrincipal(user_id));
+        }
+    }
+    next.run(req).await
+}
+
+fn apply_rate_limit_middleware(
+    mut router: axum::Router<AppState>,
     config: &AutumnConfig,
-) -> axum::Router<S>
-where
-    S: Clone + Send + Sync + 'static,
-{
+    state: &AppState,
+) -> axum::Router<AppState> {
     // Rate limiting middleware (only applied when enabled)
     if config.security.rate_limit.enabled {
         let layer = crate::security::RateLimitLayer::from_config(&config.security.rate_limit);
@@ -1210,6 +1223,13 @@ where
             "Rate limiting enabled"
         );
         router = router.layer(layer);
+
+        if config.security.rate_limit.key_strategy == crate::security::KeyStrategy::AuthenticatedPrincipal {
+            router = router.layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                populate_rate_limit_principal,
+            ));
+        }
     }
     router
 }
@@ -1413,7 +1433,7 @@ fn apply_middleware(
     router = router.layer(axum::middleware::from_fn(
         crate::middleware::method_override_rejection_filter,
     ));
-    router = apply_rate_limit_middleware(router, config);
+    router = apply_rate_limit_middleware(router, config, state);
     router = apply_upload_middleware(router, config);
 
     // Security headers layer (always applied)
@@ -2492,7 +2512,8 @@ mod tests {
 
         let base: axum::Router<AppState> =
             axum::Router::new().route("/ping", axum::routing::get(|| async { "pong" }));
-        let router = apply_rate_limit_middleware(base, &config).with_state(test_state());
+        let state = test_state();
+        let router = apply_rate_limit_middleware(base, &config, &state).with_state(state.clone());
 
         // Fire several rapid requests; none should be throttled.
         for _ in 0..5 {
@@ -2515,7 +2536,8 @@ mod tests {
 
         let base: axum::Router<AppState> =
             axum::Router::new().route("/ping", axum::routing::get(|| async { "pong" }));
-        let router = apply_rate_limit_middleware(base, &config).with_state(test_state());
+        let state = test_state();
+        let router = apply_rate_limit_middleware(base, &config, &state).with_state(state.clone());
 
         let ok = router
             .clone()
