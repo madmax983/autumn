@@ -650,11 +650,8 @@ impl ExperimentStore for InMemoryExperimentStore {
                 .map(|a| a.variant.clone())
                 .collect();
 
-            let new_variants: std::collections::HashSet<&str> = config
-                .variants
-                .iter()
-                .map(|v| v.name.as_str())
-                .collect();
+            let new_variants: std::collections::HashSet<&str> =
+                config.variants.iter().map(|v| v.name.as_str()).collect();
 
             for variant in active_variants {
                 if !new_variants.contains(variant.as_str()) {
@@ -1707,17 +1704,14 @@ pub mod pg {
             let mut conn = self.connect()?;
 
             let active_variants = diesel::sql_query(
-                "SELECT DISTINCT variant FROM autumn_experiment_assignments WHERE experiment = $1"
+                "SELECT DISTINCT variant FROM autumn_experiment_assignments WHERE experiment = $1",
             )
             .bind::<diesel::sql_types::Text, _>(&config.name)
             .load::<VariantNameRow>(&mut conn)
             .map_err(|e| ExperimentStoreError::Backend(e.to_string()))?;
 
-            let new_variants: std::collections::HashSet<&str> = config
-                .variants
-                .iter()
-                .map(|v| v.name.as_str())
-                .collect();
+            let new_variants: std::collections::HashSet<&str> =
+                config.variants.iter().map(|v| v.name.as_str()).collect();
 
             for row in active_variants {
                 if !new_variants.contains(row.variant.as_str()) {
@@ -1731,7 +1725,7 @@ pub mod pg {
             let variants_json =
                 serde_json::to_string(&config.variants).unwrap_or_else(|_| "[]".to_owned());
             let state_str = config.state.to_string();
-            diesel::sql_query(
+            let rows_affected = diesel::sql_query(
                 "WITH upserted AS ( \
                      INSERT INTO autumn_experiments \
                          (name, description, state, variants, winner, exclusion_group) \
@@ -1743,6 +1737,13 @@ pub mod pg {
                          winner = EXCLUDED.winner, \
                          exclusion_group = EXCLUDED.exclusion_group, \
                          updated_at = NOW() \
+                     WHERE NOT EXISTS ( \
+                         SELECT 1 FROM autumn_experiment_assignments a \
+                         WHERE a.experiment = EXCLUDED.name \
+                           AND a.variant NOT IN ( \
+                               SELECT x.name FROM jsonb_to_recordset(EXCLUDED.variants) AS x(name text) \
+                           ) \
+                     ) \
                      RETURNING name, (xmax = 0) AS is_insert \
                  ) \
                  INSERT INTO autumn_experiment_changes (experiment, mutation, actor) \
@@ -1756,6 +1757,13 @@ pub mod pg {
             .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(config.exclusion_group)
             .execute(&mut conn)
             .map_err(|e| ExperimentStoreError::Backend(e.to_string()))?;
+
+            if rows_affected == 0 {
+                return Err(ExperimentStoreError::Backend(
+                    "cannot delete variant because it has active assignments".to_owned(),
+                ));
+            }
+
             self.invalidate(&config.name);
             Ok(())
         }
@@ -2660,10 +2668,10 @@ mod tests {
         let svc = make_svc();
         let exp = fifty_fifty("exp");
         svc.create(exp.clone()).unwrap();
-        
+
         // Upsert the same experiment again to trigger update
         svc.create(exp).unwrap();
-        
+
         let hist = svc.history("exp", 10).unwrap();
         assert_eq!(hist.len(), 2);
         assert_eq!(hist[1].mutation, "created");
@@ -2674,14 +2682,20 @@ mod tests {
     fn upsert_rejects_deleting_variant_with_active_assignments() {
         let store = InMemoryExperimentStore::new();
         let name = "test_exp";
-        
+
         let config = ExperimentConfig {
             name: name.to_string(),
             description: None,
             state: ExperimentState::Running,
             variants: vec![
-                VariantConfig { name: "control".to_string(), weight: 50 },
-                VariantConfig { name: "treatment".to_string(), weight: 50 },
+                VariantConfig {
+                    name: "control".to_string(),
+                    weight: 50,
+                },
+                VariantConfig {
+                    name: "treatment".to_string(),
+                    weight: 50,
+                },
             ],
             winner: None,
             exclusion_group: None,
@@ -2690,24 +2704,33 @@ mod tests {
         store.upsert(config.clone()).unwrap();
 
         // Assign an actor to "treatment"
-        store.record_assignment(Assignment {
-            experiment: name.to_string(),
-            actor: "user1".to_string(),
-            variant: "treatment".to_string(),
-            is_override: false,
-            assigned_at_secs: 0,
-        }).unwrap();
+        store
+            .record_assignment(Assignment {
+                experiment: name.to_string(),
+                actor: "user1".to_string(),
+                variant: "treatment".to_string(),
+                is_override: false,
+                assigned_at_secs: 0,
+            })
+            .unwrap();
 
         // Attempting to upsert config without "treatment" should fail
         let mut new_config = config;
-        new_config.variants = vec![
-            VariantConfig { name: "control".to_string(), weight: 100 },
-        ];
+        new_config.variants = vec![VariantConfig {
+            name: "control".to_string(),
+            weight: 100,
+        }];
 
         let res = store.upsert(new_config);
-        assert!(res.is_err(), "expected upsert to fail due to deleting active variant");
+        assert!(
+            res.is_err(),
+            "expected upsert to fail due to deleting active variant"
+        );
         if let Err(ExperimentStoreError::Backend(msg)) = res {
-            assert!(msg.contains("treatment"), "expected error message to mention 'treatment', got: {msg}");
+            assert!(
+                msg.contains("treatment"),
+                "expected error message to mention 'treatment', got: {msg}"
+            );
         } else {
             panic!("expected Backend error");
         }
