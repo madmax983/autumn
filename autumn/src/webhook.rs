@@ -1020,7 +1020,7 @@ impl WebhookVerifyError {
 }
 
 tokio::task_local! {
-    pub static WEBHOOK_REPLAY_KEY: std::sync::Arc<std::sync::Mutex<Option<(std::sync::Arc<dyn WebhookReplayStore>, String)>>>;
+    pub static WEBHOOK_REPLAY_KEY: std::sync::Arc<std::sync::Mutex<Option<(std::sync::Arc<dyn WebhookReplayStore>, Vec<String>)>>>;
 }
 
 /// Middleware to clean up webhook replay keys on handler failure.
@@ -1035,18 +1035,20 @@ pub async fn webhook_replay_cleanup_middleware(
     let cell = std::sync::Arc::new(std::sync::Mutex::new(None));
     let cell_cloned = cell.clone();
 
-    let response = WEBHOOK_REPLAY_KEY.scope(cell, async move {
-        next.run(req).await
-    }).await;
+    let response = WEBHOOK_REPLAY_KEY
+        .scope(cell, async move { next.run(req).await })
+        .await;
 
     if response.status().is_server_error() {
         let to_remove = {
             let mut guard = cell_cloned.lock().unwrap();
             guard.take()
         };
-        if let Some((store, key)) = to_remove {
-            tracing::debug!(key = %key, "Releasing webhook replay key due to 5xx server error");
-            let _ = store.remove(&key).await;
+        if let Some((store, keys)) = to_remove {
+            for key in keys {
+                tracing::debug!(key = %key, "Releasing webhook replay key due to 5xx server error");
+                let _ = store.remove(&key).await;
+            }
         }
     }
 
@@ -1074,7 +1076,13 @@ async fn verify_request(
         let delivery_id = delivery_id
             .as_deref()
             .ok_or(WebhookVerifyError::MissingDeliveryId)?;
-        let mut replay_id = delivery_id.to_owned();
+
+        let mut keys_to_check = vec![format!(
+            "{}:{}:id:{delivery_id}",
+            endpoint.config.provider.as_str(),
+            endpoint.config.name
+        )];
+
         if matches!(
             endpoint.config.provider,
             WebhookProvider::Github | WebhookProvider::Generic
@@ -1084,26 +1092,49 @@ async fn verify_request(
                 use sha2::{Digest, Sha256};
                 let mut hasher = Sha256::new();
                 hasher.update(sig_val.as_bytes());
-                replay_id = hex::encode(hasher.finalize());
+                let sig_hash = hex::encode(hasher.finalize());
+                keys_to_check.push(format!(
+                    "{}:{}:sig:{sig_hash}",
+                    endpoint.config.provider.as_str(),
+                    endpoint.config.name
+                ));
             }
         }
-        let replay_key = format!(
-            "{}:{}:{replay_id}",
-            endpoint.config.provider.as_str(),
-            endpoint.config.name
-        );
+
         let window = Duration::from_secs(endpoint.config.replay_window_secs);
-        if !registry
-            .replay_store
-            .check_and_insert(&replay_key, received_at, window)
-            .await
-            .map_err(|error| WebhookVerifyError::ReplayStoreUnavailable(error.to_string()))?
-        {
-            return Err(WebhookVerifyError::DuplicateDelivery);
+        let mut inserted_keys = Vec::new();
+        for key in keys_to_check {
+            match registry
+                .replay_store
+                .check_and_insert(&key, received_at, window)
+                .await
+            {
+                Ok(true) => {
+                    inserted_keys.push(key);
+                }
+                Ok(false) => {
+                    // Rollback already inserted keys for this request
+                    for inserted in inserted_keys {
+                        let _ = registry.replay_store.remove(&inserted).await;
+                    }
+                    return Err(WebhookVerifyError::DuplicateDelivery);
+                }
+                Err(error) => {
+                    // Rollback already inserted keys for this request
+                    for inserted in inserted_keys {
+                        let _ = registry.replay_store.remove(&inserted).await;
+                    }
+                    return Err(WebhookVerifyError::ReplayStoreUnavailable(error.to_string()));
+                }
+            }
         }
+
         let _ = WEBHOOK_REPLAY_KEY.try_with(|cell| {
             if let Ok(mut guard) = cell.lock() {
-                *guard = Some((std::sync::Arc::clone(&registry.replay_store), replay_key.clone()));
+                *guard = Some((
+                    std::sync::Arc::clone(&registry.replay_store),
+                    inserted_keys,
+                ));
             }
         });
     }
