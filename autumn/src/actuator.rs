@@ -3673,7 +3673,7 @@ mod tests {
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].0, "myplugin");
         assert_eq!(all[0].1[0].name, "plugin_requests_total");
-        assert_eq!(all[0].1[0].samples[0].value, 42.0);
+        assert!((all[0].1[0].samples[0].value - 42.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -3867,7 +3867,7 @@ mod tests {
             fn collect(&self) -> Vec<MetricFamily> {
                 vec![MetricFamily {
                     name: self.0.to_string(),
-                    help: "".to_string(),
+                    help: String::new(),
                     kind: MetricKind::Counter,
                     samples: vec![],
                 }]
