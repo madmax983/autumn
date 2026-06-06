@@ -2038,7 +2038,53 @@ pub async fn account(session: Session, mut db: Db, csrf: Option<CsrfToken>, csrf
             @if let Some(ref csrf) = csrf {{ input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
             button type="submit" {{ "Log Out" }}
         }}
+        details {{
+            summary {{ "Delete account" }}
+            form action="/account/destroy" method="post" {{
+                @if let Some(ref csrf) = csrf {{ input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
+                p {{ "This is permanent and cannot be undone." }}
+                button type="submit" {{ "Delete my account" }}
+            }}
+        }}
     }}).into_response())
+}}
+
+/// `POST /account/destroy` — permanently delete the authenticated user's account.
+///
+/// Requires both a valid session (`#[secured]`) and a fresh step-up claim
+/// (`#[step_up]`), so a hijacked or unattended session cannot silently delete
+/// the account. After deletion the session is destroyed and the user is
+/// redirected to the home page.
+#[secured]
+#[step_up]
+#[post("/account/destroy")]
+pub async fn account_destroy(
+    session: Session,
+    mut db: Db,
+    csrf: Option<CsrfToken>,
+    Form(form): Form<std::collections::HashMap<String, String>>,
+) -> AutumnResult<Response> {{
+    // Validate CSRF token if enabled.
+    if let Some(ref token) = csrf {{
+        let submitted = form.get(token.field_name()).map(String::as_str).unwrap_or_default();
+        if !token.verify(submitted) {{
+            return Err(AutumnError::forbidden_msg("Invalid CSRF token."));
+        }}
+    }}
+
+    let {snake_name}_id: i64 = session
+        .get("{snake_name}_id")
+        .await
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| AutumnError::unauthorized_msg("Not authenticated."))?;
+
+    diesel::delete({table}::table.find({snake_name}_id))
+        .execute(&mut *db)
+        .await
+        .map_err(|_| AutumnError::internal_server_error_msg("Failed to delete account."))?;
+
+    session.destroy().await;
+    Ok(redirect_to("/").into_response())
 }}
 
 // ── Forgot Password ───────────────────────────────────────────────────────────
@@ -2963,6 +3009,7 @@ password hashing, and mail primitives.
 | POST | `/login` | `login` | Public |
 | POST | `/logout` | `logout` | Any |
 | GET | `/account` | `account` | **Required** + Confirmed |
+| POST | `/account/destroy` | `account_destroy` | **Required** + Step-up |
 | GET | `/forgot-password` | `forgot_password_form` | Public |
 | POST | `/forgot-password` | `forgot_password` | Public |
 | GET | `/reset-password` | `reset_password_form` | Public |
@@ -4343,8 +4390,9 @@ pub async fn two_factor_confirm(
 }
 
 /// `POST /account/2fa/disable` — require re-auth (current code OR password), then
-/// clear the secret and all recovery codes. Requires authentication.
+/// clear the secret and all recovery codes. Requires authentication + step-up.
 #[secured]
+#[step_up]
 #[post("/account/2fa/disable")]
 pub async fn two_factor_disable(
     session: Session,
@@ -5831,6 +5879,7 @@ mod tests {
             "pub async fn login",
             "pub async fn logout",
             "pub async fn account",
+            "pub async fn account_destroy",
             "pub async fn forgot_password_form",
             "pub async fn forgot_password",
             "pub async fn reset_password_form",
@@ -5890,6 +5939,43 @@ mod tests {
         assert!(
             routes.contains("#[secured]"),
             "account route must use #[secured] for protection: {routes}"
+        );
+    }
+
+    #[test]
+    fn account_destroy_carries_step_up_by_default() {
+        let tmp = project_with_main();
+        let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+
+        // Find the account_destroy fn and verify #[step_up] precedes it.
+        let destroy_pos = routes
+            .find("pub async fn account_destroy")
+            .expect("account_destroy handler missing from scaffold");
+        let before_destroy = &routes[..destroy_pos];
+        assert!(
+            before_destroy.rfind("#[step_up]").is_some(),
+            "account_destroy must carry #[step_up] for step-up protection"
+        );
+    }
+
+    #[test]
+    fn mfa_remove_carries_step_up_by_default() {
+        let tmp = project_with_main();
+        let oauth = AuthOAuthOptions::default();
+        let plan = plan_auth_full(tmp.path(), "User", "20260508000000", &oauth, true).unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+
+        // Find the two_factor_disable fn and verify #[step_up] precedes it.
+        let disable_pos = routes
+            .find("pub async fn two_factor_disable")
+            .expect("two_factor_disable handler missing from scaffold");
+        let before_disable = &routes[..disable_pos];
+        assert!(
+            before_disable.rfind("#[step_up]").is_some(),
+            "two_factor_disable (mfa_remove) must carry #[step_up] for step-up protection"
         );
     }
 

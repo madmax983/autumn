@@ -5206,6 +5206,9 @@ fn build_state(
             .configure_replica_dependency(config.database.replica_fallback);
     }
     state.insert_extension(config.clone());
+    state.insert_extension(crate::step_up::StepUpGlobalConfig {
+        default_max_age_secs: config.auth.step_up.default_max_age_secs,
+    });
     state
 }
 

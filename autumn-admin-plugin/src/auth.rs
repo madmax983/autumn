@@ -1,14 +1,16 @@
-//! Role-check middleware for the admin router.
+//! Role-check and step-up middleware for the admin router.
 //!
-//! Wraps the nested admin router with a `from_fn` layer that inspects the
-//! request's [`Session`] and short-circuits with [`AutumnError::unauthorized_msg`]
-//! or [`AutumnError::forbidden_msg`] when the required role is missing.
+//! Wraps the nested admin router with `from_fn` layers that inspect the
+//! request's [`Session`] and short-circuit with appropriate error responses
+//! when authentication or freshness requirements are not met.
 
 use autumn_web::AutumnError;
 use autumn_web::session::Session;
+use autumn_web::step_up;
 use axum::extract::Request;
+use axum::http::{Method, header};
 use axum::middleware::Next;
-use axum::response::{IntoResponse, Response};
+use axum::response::{IntoResponse, Redirect, Response};
 
 /// Produce an axum middleware that verifies the incoming request has a
 /// logged-in session with the given role.
@@ -42,6 +44,54 @@ pub async fn check_role(
     if current != role {
         return AutumnError::forbidden_msg(format!("'{role}' role required")).into_response();
     }
+    next.run(req).await
+}
+
+/// Middleware that requires step-up (fresh) authentication for mutating
+/// HTTP methods (POST, PUT, PATCH, DELETE).
+///
+/// When the session's `last_strong_auth_at` claim is missing or stale:
+/// - Browser clients are redirected to `/reauth?return_to=<path>`.
+/// - JSON/API clients receive a `401` with `WWW-Authenticate: StepUp`.
+///
+/// GET requests are passed through unconditionally.
+pub async fn check_step_up_mutations(req: Request, next: Next) -> Response {
+    // Only guard mutating methods.
+    if !matches!(
+        req.method(),
+        &Method::POST | &Method::PUT | &Method::PATCH | &Method::DELETE
+    ) {
+        return next.run(req).await;
+    }
+
+    let Some(session) = req.extensions().get::<Session>().cloned() else {
+        return AutumnError::internal_server_error_msg(
+            "SessionLayer not installed; admin step-up requires sessions",
+        )
+        .into_response();
+    };
+
+    // Use the global default max-age (from AppState extension or hard-coded default).
+    let max_age = step_up::DEFAULT_MAX_AGE_SECS;
+
+    if step_up::check_step_up(&session, max_age).await.is_err() {
+        // Detect JSON clients via Accept header.
+        let wants_json = req
+            .headers()
+            .get(header::ACCEPT)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.contains("application/json"))
+            .unwrap_or(false);
+
+        if wants_json {
+            return step_up::__step_up_json_response(max_age);
+        }
+
+        let path = req.uri().path().to_owned();
+        let encoded = step_up::encode_return_to(&path);
+        return Redirect::to(&format!("/reauth?return_to={encoded}")).into_response();
+    }
+
     next.run(req).await
 }
 
@@ -217,5 +267,140 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // ── check_step_up_mutations ───────────────────────────────────────────────
+
+    fn step_up_app(session: Session) -> Router {
+        async fn ok() -> &'static str {
+            "ok"
+        }
+        Router::new()
+            .route("/resource", get(ok).post(ok).delete(ok))
+            .layer(from_fn(move |mut req: Request, next: Next| {
+                let session = session.clone();
+                async move {
+                    req.extensions_mut().insert(session);
+                    check_step_up_mutations(req, next).await
+                }
+            }))
+    }
+
+    #[tokio::test]
+    async fn step_up_allows_get_without_claim() {
+        let session = Session::new_for_test("sid".into(), HashMap::new());
+        let app = step_up_app(session);
+        let res = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/resource")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "GET should pass without step-up");
+    }
+
+    #[tokio::test]
+    async fn step_up_blocks_post_without_claim_html_client() {
+        let session = Session::new_for_test("sid".into(), HashMap::new());
+        let app = step_up_app(session);
+        let res = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/resource")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // HTML clients get a redirect (302/303)
+        assert!(
+            res.status().is_redirection(),
+            "POST without step-up should redirect HTML client: {}",
+            res.status()
+        );
+        let location = res.headers().get("location").unwrap().to_str().unwrap();
+        assert!(
+            location.contains("/reauth"),
+            "redirect should go to /reauth: {location}"
+        );
+    }
+
+    #[tokio::test]
+    async fn step_up_blocks_post_without_claim_json_client() {
+        let session = Session::new_for_test("sid".into(), HashMap::new());
+        let app = step_up_app(session);
+        let res = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/resource")
+                    .header("Accept", "application/json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::UNAUTHORIZED,
+            "JSON POST without step-up should return 401"
+        );
+        let www_auth = res.headers().get("www-authenticate").unwrap().to_str().unwrap();
+        assert!(
+            www_auth.contains("StepUp"),
+            "should include WWW-Authenticate: StepUp header: {www_auth}"
+        );
+    }
+
+    #[tokio::test]
+    async fn step_up_allows_post_with_fresh_claim() {
+        use autumn_web::step_up::STEP_UP_SESSION_KEY;
+        let now_ts = chrono::Utc::now().timestamp().to_string();
+        let session = Session::new_for_test(
+            "sid".into(),
+            HashMap::from([(STEP_UP_SESSION_KEY.to_string(), now_ts)]),
+        );
+        let app = step_up_app(session);
+        let res = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/resource")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::OK,
+            "POST with fresh step-up claim should pass"
+        );
+    }
+
+    #[tokio::test]
+    async fn step_up_blocks_delete_without_claim() {
+        let session = Session::new_for_test("sid".into(), HashMap::new());
+        let app = step_up_app(session);
+        let res = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("DELETE")
+                    .uri("/resource")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            res.status().is_redirection(),
+            "DELETE without step-up should redirect: {}",
+            res.status()
+        );
     }
 }
