@@ -3891,6 +3891,215 @@ mod tests {
         assert_eq!(all[1].0, "beta");
         assert_eq!(all[2].0, "gamma");
     }
+
+    // ── render_plugin_sources edge-case coverage ──────────────────────────
+
+    #[test]
+    fn escape_help_text_escapes_backslash_and_newline() {
+        assert_eq!(escape_help_text("a\\b\nc"), "a\\\\b\\nc");
+        assert_eq!(escape_help_text("plain"), "plain");
+        assert_eq!(escape_help_text(""), "");
+    }
+
+    #[test]
+    fn format_sample_value_handles_special_floats() {
+        assert_eq!(format_sample_value(f64::INFINITY), "+Inf");
+        assert_eq!(format_sample_value(f64::NEG_INFINITY), "-Inf");
+        assert_eq!(format_sample_value(f64::NAN), "NaN");
+        assert_eq!(format_sample_value(0.0), "0");
+        assert_eq!(format_sample_value(1.5), "1.5");
+    }
+
+    #[test]
+    fn is_valid_metric_name_accepts_valid_and_rejects_invalid() {
+        assert!(is_valid_metric_name("http_requests_total"));
+        assert!(is_valid_metric_name("_private"));
+        assert!(is_valid_metric_name("ns:metric"));
+        assert!(!is_valid_metric_name(""));
+        assert!(!is_valid_metric_name("0starts_with_digit"));
+        assert!(!is_valid_metric_name("has-hyphen"));
+    }
+
+    #[test]
+    fn is_valid_label_name_accepts_valid_and_rejects_invalid() {
+        assert!(is_valid_label_name("shard"));
+        assert!(is_valid_label_name("_internal"));
+        assert!(is_valid_label_name("a1"));
+        assert!(!is_valid_label_name(""));
+        assert!(!is_valid_label_name("0starts_digit"));
+        assert!(!is_valid_label_name("has-hyphen"));
+        assert!(!is_valid_label_name("has.dot"));
+    }
+
+    #[tokio::test]
+    async fn prometheus_endpoint_skips_family_with_invalid_metric_name() {
+        struct BadNameSource;
+        impl MetricsSource for BadNameSource {
+            fn collect(&self) -> Vec<MetricFamily> {
+                vec![
+                    MetricFamily {
+                        name: "invalid-name".to_string(),
+                        help: "should be skipped".to_string(),
+                        kind: MetricKind::Counter,
+                        samples: vec![],
+                    },
+                    MetricFamily {
+                        name: "valid_name".to_string(),
+                        help: "should appear".to_string(),
+                        kind: MetricKind::Counter,
+                        samples: vec![MetricSample {
+                            labels: vec![],
+                            value: 1.0,
+                        }],
+                    },
+                ]
+            }
+        }
+
+        let state = test_state();
+        state
+            .metrics_source_registry
+            .register("bad_name_src", Arc::new(BadNameSource))
+            .unwrap();
+
+        let app = actuator_router(true).with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/prometheus")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(
+            !text.contains("invalid-name"),
+            "invalid family must be skipped:\n{text}"
+        );
+        assert!(
+            text.contains("valid_name"),
+            "valid family must appear:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn prometheus_endpoint_drops_invalid_and_duplicate_label_keys() {
+        struct DirtyLabelsSource;
+        impl MetricsSource for DirtyLabelsSource {
+            fn collect(&self) -> Vec<MetricFamily> {
+                vec![MetricFamily {
+                    name: "dirty_labels_metric".to_string(),
+                    help: "test".to_string(),
+                    kind: MetricKind::Counter,
+                    samples: vec![MetricSample {
+                        labels: vec![
+                            ("good".to_string(), "a".to_string()),
+                            ("bad-key".to_string(), "b".to_string()),
+                            ("good".to_string(), "dup".to_string()),
+                        ],
+                        value: 1.0,
+                    }],
+                }]
+            }
+        }
+
+        let state = test_state();
+        state
+            .metrics_source_registry
+            .register("dirty", Arc::new(DirtyLabelsSource))
+            .unwrap();
+
+        let app = actuator_router(true).with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/prometheus")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(
+            text.contains("dirty_labels_metric{good=\"a\"} 1"),
+            "expected only valid, non-duplicate label in:\n{text}"
+        );
+        assert!(
+            !text.contains("bad-key"),
+            "invalid label key must be dropped:\n{text}"
+        );
+        assert!(
+            !text.contains("dup"),
+            "duplicate label value must be dropped:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn prometheus_endpoint_escapes_help_text_and_formats_inf() {
+        struct SpecialSource;
+        impl MetricsSource for SpecialSource {
+            fn collect(&self) -> Vec<MetricFamily> {
+                vec![MetricFamily {
+                    name: "inf_gauge".to_string(),
+                    help: "has\\backslash and\nnewline".to_string(),
+                    kind: MetricKind::Gauge,
+                    samples: vec![
+                        MetricSample {
+                            labels: vec![],
+                            value: f64::INFINITY,
+                        },
+                        MetricSample {
+                            labels: vec![],
+                            value: f64::NEG_INFINITY,
+                        },
+                    ],
+                }]
+            }
+        }
+
+        let state = test_state();
+        state
+            .metrics_source_registry
+            .register("special", Arc::new(SpecialSource))
+            .unwrap();
+
+        let app = actuator_router(true).with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/prometheus")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(
+            text.contains("# HELP inf_gauge has\\\\backslash and\\nnewline"),
+            "help text must be escaped in:\n{text}"
+        );
+        assert!(
+            text.contains("inf_gauge +Inf"),
+            "must render +Inf in:\n{text}"
+        );
+        assert!(
+            text.contains("inf_gauge -Inf"),
+            "must render -Inf in:\n{text}"
+        );
+    }
 }
 
 #[cfg(test)]
