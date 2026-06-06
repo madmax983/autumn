@@ -1194,6 +1194,25 @@ where
     router
 }
 
+fn apply_trusted_proxies_middleware<S>(
+    router: axum::Router<S>,
+    config: &AutumnConfig,
+) -> axum::Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    let tp = &config.security.trusted_proxies;
+    let layer = crate::security::TrustedProxiesLayer::from_config(tp);
+    if tp.trust_forwarded_headers || !tp.ranges.is_empty() || tp.trusted_hops.is_some() {
+        tracing::info!(
+            ranges = ?tp.ranges,
+            trusted_hops = ?tp.trusted_hops,
+            "Centralized trusted-proxy resolution enabled"
+        );
+    }
+    router.layer(layer)
+}
+
 fn apply_rate_limit_middleware<S>(
     mut router: axum::Router<S>,
     config: &AutumnConfig,
@@ -1201,9 +1220,22 @@ fn apply_rate_limit_middleware<S>(
 where
     S: Clone + Send + Sync + 'static,
 {
-    // Rate limiting middleware (only applied when enabled)
     if config.security.rate_limit.enabled {
-        let layer = crate::security::RateLimitLayer::from_config(&config.security.rate_limit);
+        let tp = &config.security.trusted_proxies;
+        let rl = &config.security.rate_limit;
+        let has_top_level_proxy_config =
+            tp.trust_forwarded_headers || !tp.ranges.is_empty() || tp.trusted_hops.is_some();
+        // Preserve explicit rate-limit proxy config (legacy fields). The shared
+        // top-level resolver is only injected when the rate-limit section carries
+        // no proxy config of its own, preventing dev defaults from silently
+        // overriding an operator's explicit security.rate_limit.trusted_proxies.
+        let has_rate_limit_proxy_config =
+            rl.trust_forwarded_headers || !rl.trusted_proxies.is_empty();
+        let mut layer = crate::security::RateLimitLayer::from_config(rl);
+        if has_top_level_proxy_config && !has_rate_limit_proxy_config {
+            let resolver = crate::security::ProxyResolver::from_config(tp);
+            layer = layer.with_proxy_resolver(resolver);
+        }
         tracing::info!(
             rps = config.security.rate_limit.requests_per_second,
             burst = config.security.rate_limit.burst,
@@ -1437,6 +1469,11 @@ fn apply_middleware(
     if custom_layer_count > 0 {
         tracing::debug!(count = custom_layer_count, "Custom Tower layers applied");
     }
+
+    // TrustedProxiesLayer is applied after user layers so it is outermost in the
+    // ingress request path, stamping ResolvedClientIdentity before any user or
+    // framework middleware reads ClientAddr / ClientHost / ClientScheme.
+    router = apply_trusted_proxies_middleware(router, config);
 
     let mut router = router;
 

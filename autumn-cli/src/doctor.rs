@@ -231,6 +231,57 @@ pub fn check_rate_limit_key_strategy_impl(
     }
 }
 
+/// Input data for the proxy-conflict check, resolved from `autumn.toml` and env vars.
+#[derive(Default)]
+pub struct ProxyConflictData {
+    pub new_ranges: Vec<String>,
+    pub new_trust_fwd: bool,
+    pub new_hops: Option<u32>,
+    pub old_ranges: Vec<String>,
+    pub old_trust_fwd: bool,
+}
+
+/// Warn when both `[security.trusted_proxies]` and the deprecated
+/// `[security.rate_limit]` proxy fields are configured with conflicting values.
+pub fn check_proxy_conflict_impl(data: &ProxyConflictData) -> CheckResult {
+    let new_set = data.new_trust_fwd || !data.new_ranges.is_empty();
+    let old_set = data.old_trust_fwd || !data.old_ranges.is_empty();
+
+    if new_set && old_set {
+        let new_set: std::collections::HashSet<&str> =
+            data.new_ranges.iter().map(String::as_str).collect();
+        let old_set: std::collections::HashSet<&str> =
+            data.old_ranges.iter().map(String::as_str).collect();
+        let conflicting = new_set != old_set
+            || data.new_trust_fwd != data.old_trust_fwd
+            || data.new_hops.is_some();
+
+        if conflicting {
+            return CheckResult {
+                name: "proxy_config_conflict",
+                status: CheckStatus::Warn,
+                detail: Some(
+                    "[security.trusted_proxies] and [security.rate_limit] trusted proxy \
+                     fields are both set with conflicting values."
+                        .into(),
+                ),
+                hint: Some(
+                    "Remove the deprecated rate_limit.trusted_proxies / \
+                     rate_limit.trust_forwarded_headers fields and keep only \
+                     [security.trusted_proxies]",
+                ),
+            };
+        }
+    }
+
+    CheckResult {
+        name: "proxy_config_conflict",
+        status: CheckStatus::Pass,
+        detail: None,
+        hint: None,
+    }
+}
+
 pub fn check_trusted_hosts_impl(hosts: &[String], is_production: bool) -> CheckResult {
     let normalized: Vec<String> = hosts
         .iter()
@@ -1213,32 +1264,45 @@ fn deep_merge(target: &mut toml::Table, source: &toml::Table) {
 }
 
 fn get_merged_toml_table(profile: &str) -> toml::Table {
+    get_merged_toml_table_profiles(&[profile])
+}
+
+/// Merges config from all given profile names in order (last wins).
+///
+/// Each profile name contributes `[profile.{name}]` from `autumn.toml` and
+/// `autumn-{name}.toml`. The base `autumn.toml` top-level is applied once
+/// before the per-profile layers.
+fn get_merged_toml_table_profiles(profiles: &[&str]) -> toml::Table {
     let mut merged = toml::Table::new();
 
-    // 1. Base autumn.toml
-    if let Some(table) = std::fs::read_to_string("autumn.toml")
+    let base_toml = std::fs::read_to_string("autumn.toml")
         .ok()
-        .and_then(|contents| toml::from_str::<toml::Table>(&contents).ok())
-    {
-        deep_merge(&mut merged, &table);
+        .and_then(|c| toml::from_str::<toml::Table>(&c).ok());
 
-        // 2. Base autumn.toml [profile.{profile}]
-        if let Some(prof) = table
-            .get("profile")
+    // 1. Base autumn.toml top-level (applied once)
+    if let Some(ref table) = base_toml {
+        deep_merge(&mut merged, table);
+    }
+
+    for &profile in profiles {
+        // 2. Base autumn.toml [profile.{name}]
+        if let Some(prof) = base_toml
+            .as_ref()
+            .and_then(|t| t.get("profile"))
             .and_then(toml::Value::as_table)
             .and_then(|p| p.get(profile))
             .and_then(toml::Value::as_table)
         {
             deep_merge(&mut merged, prof);
         }
-    }
 
-    // 3. autumn-{profile}.toml
-    if let Some(table) = std::fs::read_to_string(format!("autumn-{profile}.toml"))
-        .ok()
-        .and_then(|contents| toml::from_str::<toml::Table>(&contents).ok())
-    {
-        deep_merge(&mut merged, &table);
+        // 3. autumn-{name}.toml
+        if let Some(table) = std::fs::read_to_string(format!("autumn-{profile}.toml"))
+            .ok()
+            .and_then(|c| toml::from_str::<toml::Table>(&c).ok())
+        {
+            deep_merge(&mut merged, &table);
+        }
     }
 
     merged
@@ -1434,6 +1498,89 @@ fn parse_config_bool(value: &str) -> Option<bool> {
         "1" | "true" | "yes" | "on" => Some(true),
         "0" | "false" | "no" | "off" => Some(false),
         _ => None,
+    }
+}
+
+fn resolve_proxy_conflict_data() -> ProxyConflictData {
+    // Use the profile-merged table so that [profile.prod] / autumn-prod.toml
+    // overrides are included — matching the pattern used by resolve_trusted_hosts.
+    let raw_profile = std::env::var("AUTUMN_ENV")
+        .or_else(|_| std::env::var("AUTUMN_PROFILE"))
+        .unwrap_or_default();
+    // Normalize aliases to canonical names to match AutumnConfig::load_with_env.
+    let raw_lower = raw_profile.trim().to_ascii_lowercase();
+    let canonical = match raw_lower.as_str() {
+        "production" | "prod" => "prod",
+        "development" | "dev" | "" => "dev",
+        other => other,
+    }
+    .to_owned();
+    // The runtime supports both alias spellings (e.g. "production" and "prod"),
+    // so merge both sets of profile sources to match what the app would load.
+    let alias = match raw_lower.as_str() {
+        "production" => Some("production"),
+        "development" => Some("development"),
+        _ => None,
+    };
+    let profiles: Vec<&str> = std::iter::once(canonical.as_str()).chain(alias).collect();
+    let table = get_merged_toml_table_profiles(&profiles);
+
+    let parse_csv_env = |var: &str| -> Option<Vec<String>> {
+        std::env::var(var).ok().map(|v| {
+            v.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(std::borrow::ToOwned::to_owned)
+                .collect()
+        })
+    };
+    let parse_bool_env = |var: &str| -> Option<bool> {
+        std::env::var(var)
+            .ok()
+            .map(|v| matches!(v.trim(), "true" | "1"))
+    };
+
+    let security = table.get("security");
+    let tp_section = security.and_then(|s| s.get("trusted_proxies"));
+    let rl_section = security.and_then(|s| s.get("rate_limit"));
+
+    let toml_csv = |section: Option<&toml::Value>, key: &str| -> Vec<String> {
+        section
+            .and_then(|s| s.get(key))
+            .and_then(toml::Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(toml::Value::as_str)
+                    .map(std::borrow::ToOwned::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let toml_bool = |section: Option<&toml::Value>, key: &str| -> bool {
+        section
+            .and_then(|s| s.get(key))
+            .and_then(toml::Value::as_bool)
+            .unwrap_or(false)
+    };
+
+    ProxyConflictData {
+        new_ranges: parse_csv_env("AUTUMN_SECURITY__TRUSTED_PROXIES__RANGES")
+            .unwrap_or_else(|| toml_csv(tp_section, "ranges")),
+        new_trust_fwd: parse_bool_env("AUTUMN_SECURITY__TRUSTED_PROXIES__TRUST_FORWARDED_HEADERS")
+            .unwrap_or_else(|| toml_bool(tp_section, "trust_forwarded_headers")),
+        new_hops: std::env::var("AUTUMN_SECURITY__TRUSTED_PROXIES__TRUSTED_HOPS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .or_else(|| {
+                tp_section
+                    .and_then(|s| s.get("trusted_hops"))
+                    .and_then(toml::Value::as_integer)
+                    .and_then(|v| u32::try_from(v).ok())
+            }),
+        old_ranges: parse_csv_env("AUTUMN_SECURITY__RATE_LIMIT__TRUSTED_PROXIES")
+            .unwrap_or_else(|| toml_csv(rl_section, "trusted_proxies")),
+        old_trust_fwd: parse_bool_env("AUTUMN_SECURITY__RATE_LIMIT__TRUST_FORWARDED_HEADERS")
+            .unwrap_or_else(|| toml_bool(rl_section, "trust_forwarded_headers")),
     }
 }
 
@@ -1660,6 +1807,7 @@ pub fn run(opts: DoctorOptions) {
     let rate_limit_key_strategy = resolve_rate_limit_key_strategy();
     let auth_extractor_mounted = resolve_auth_extractor_mounted();
     let compression_enabled = resolve_compression_enabled();
+    let proxy_conflict_data = resolve_proxy_conflict_data();
 
     // ── Phase 2: build tasks in display order ────────────────────────────────
     let mut tasks: Vec<Task> = Vec::new();
@@ -1732,6 +1880,11 @@ pub fn run(opts: DoctorOptions) {
     // 8b. Rate-limit key-strategy misconfiguration
     tasks.push(Box::new(move || {
         check_rate_limit_key_strategy_impl(&rate_limit_key_strategy, auth_extractor_mounted)
+    }));
+
+    // 8c. Conflicting trusted-proxy configuration (new vs. deprecated fields)
+    tasks.push(Box::new(move || {
+        check_proxy_conflict_impl(&proxy_conflict_data)
     }));
 
     // 9. OAuth2 provider checks (client_id and client_secret validation)
@@ -3001,6 +3154,74 @@ redirect_uri = "http://localhost/callback"
         assert_eq!(parse_config_bool("yes"), Some(true));
         assert_eq!(parse_config_bool("on"), Some(true));
         assert_eq!(parse_config_bool("garbage"), None);
+    }
+
+    // ── check_proxy_conflict ─────────────────────────────────────────────────
+
+    #[test]
+    fn proxy_conflict_passes_when_only_new_fields_set() {
+        let data = ProxyConflictData {
+            new_ranges: vec!["10.0.0.0/8".into()],
+            new_trust_fwd: true,
+            new_hops: None,
+            old_ranges: vec![],
+            old_trust_fwd: false,
+        };
+        let r = check_proxy_conflict_impl(&data);
+        assert_eq!(r.status, CheckStatus::Pass);
+    }
+
+    #[test]
+    fn proxy_conflict_passes_when_only_old_fields_set() {
+        let data = ProxyConflictData {
+            new_ranges: vec![],
+            new_trust_fwd: false,
+            new_hops: None,
+            old_ranges: vec!["10.0.0.0/8".into()],
+            old_trust_fwd: true,
+        };
+        let r = check_proxy_conflict_impl(&data);
+        assert_eq!(r.status, CheckStatus::Pass);
+    }
+
+    #[test]
+    fn proxy_conflict_warns_when_both_set_with_different_ranges() {
+        let data = ProxyConflictData {
+            new_ranges: vec!["10.0.0.0/8".into()],
+            new_trust_fwd: true,
+            new_hops: None,
+            old_ranges: vec!["192.168.0.0/16".into()],
+            old_trust_fwd: true,
+        };
+        let r = check_proxy_conflict_impl(&data);
+        assert_eq!(r.status, CheckStatus::Warn);
+        assert!(r.hint.is_some());
+    }
+
+    #[test]
+    fn proxy_conflict_warns_when_trusted_hops_set_alongside_old_fields() {
+        let data = ProxyConflictData {
+            new_ranges: vec![],
+            new_trust_fwd: true,
+            new_hops: Some(1),
+            old_ranges: vec![],
+            old_trust_fwd: true,
+        };
+        let r = check_proxy_conflict_impl(&data);
+        assert_eq!(r.status, CheckStatus::Warn);
+    }
+
+    #[test]
+    fn proxy_conflict_passes_when_matching_values_no_hops() {
+        let data = ProxyConflictData {
+            new_ranges: vec!["10.0.0.0/8".into()],
+            new_trust_fwd: true,
+            new_hops: None,
+            old_ranges: vec!["10.0.0.0/8".into()],
+            old_trust_fwd: true,
+        };
+        let r = check_proxy_conflict_impl(&data);
+        assert_eq!(r.status, CheckStatus::Pass);
     }
 
     // ── system_test_browser ───────────────────────────────────────────────────
