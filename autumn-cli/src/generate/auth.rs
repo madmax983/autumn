@@ -4241,7 +4241,7 @@ pub async fn passkey_register_page(
     let _ = (session, state);
     let csrf_token = csrf.map(|t| t.token().to_owned()).unwrap_or_default();
     let csrf_header_name = csrf_header.map(|h| h.0.clone()).unwrap_or_else(|| "X-CSRF-Token".to_owned());
-    let script_nonce = nonce.map(|n| n.0.clone());
+    let script_nonce = nonce.map(|n| n.value().to_owned());
     Ok(html! {
         html {
             head {
@@ -4413,7 +4413,7 @@ pub async fn passkey_login_page(
 ) -> AutumnResult<Markup> {
     let csrf_token = csrf.map(|t| t.token().to_owned()).unwrap_or_default();
     let csrf_header_name = csrf_header.map(|h| h.0.clone()).unwrap_or_else(|| "X-CSRF-Token".to_owned());
-    let script_nonce = nonce.map(|n| n.0.clone());
+    let script_nonce = nonce.map(|n| n.value().to_owned());
     Ok(html! {
         html {
             head {
@@ -7224,7 +7224,7 @@ mod tests {
         let tmp = project_with_main();
         passkey_plan(tmp.path()).execute(Flags::default()).unwrap();
         let routes = fs::read_to_string(tmp.path().join("src/routes/passkeys.rs")).unwrap();
-        
+
         assert!(
             routes.contains("pub async fn passkey_register_page("),
             "passkey_register_page is missing"
