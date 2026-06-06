@@ -89,22 +89,26 @@ pub async fn extract_tenant_from_parts(
                 .extensions
                 .get::<crate::security::ResolvedClientIdentity>()
                 .and_then(|id| id.host.clone())
-                .map(Ok)
-                .unwrap_or_else(|| {
-                    parts
-                        .headers
-                        .get(axum::http::header::HOST)
-                        .ok_or_else(|| {
-                            crate::AutumnError::bad_request_msg(
-                                "Missing Host header for subdomain tenancy",
-                            )
-                        })
-                        .and_then(|h| {
-                            h.to_str().map(ToOwned::to_owned).map_err(|_| {
-                                crate::AutumnError::bad_request_msg("Invalid UTF-8 in Host header")
+                .map_or_else(
+                    || {
+                        parts
+                            .headers
+                            .get(axum::http::header::HOST)
+                            .ok_or_else(|| {
+                                crate::AutumnError::bad_request_msg(
+                                    "Missing Host header for subdomain tenancy",
+                                )
                             })
-                        })
-                })?;
+                            .and_then(|h| {
+                                h.to_str().map(ToOwned::to_owned).map_err(|_| {
+                                    crate::AutumnError::bad_request_msg(
+                                        "Invalid UTF-8 in Host header",
+                                    )
+                                })
+                            })
+                    },
+                    Ok,
+                )?;
 
             let host = host_owned.as_str();
             let host_only = host.split(':').next().unwrap_or(host).trim();
