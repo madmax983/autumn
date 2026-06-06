@@ -197,8 +197,24 @@ where
     }
 }
 
-/// Extract the client IP from a request, preferring proxy-forwarded headers.
+/// Extract the client IP from a request.
+///
+/// When [`crate::security::ResolvedClientIdentity`] is present (stamped by
+/// `TrustedProxiesLayer`), its resolved address is used so that the configured
+/// trusted-proxy policy governs which forwarded IP is accepted. Raw
+/// `X-Forwarded-For` / `X-Real-IP` headers are only consulted as a fallback
+/// when the layer is not installed (e.g. in tests).
 fn extract_client_ip<B>(req: &Request<B>) -> Option<IpAddr> {
+    // Resolved by TrustedProxiesLayer — respects the proxy trust policy.
+    if let Some(identity) = req
+        .extensions()
+        .get::<crate::security::ResolvedClientIdentity>()
+    {
+        return identity.addr;
+    }
+
+    // Fallback: raw headers (TrustedProxiesLayer not installed).
+
     // X-Forwarded-For: <client>, <proxy1>, <proxy2>
     if let Some(xff) = req.headers().get("x-forwarded-for")
         && let Ok(s) = xff.to_str()
@@ -585,6 +601,45 @@ mod tests {
             .await
             .unwrap();
 
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// When ResolvedClientIdentity is stamped by TrustedProxiesLayer, its
+    /// resolved addr is used for allow-list checks — a spoofed X-Forwarded-For
+    /// header cannot bypass maintenance mode by claiming an allowed IP.
+    #[tokio::test]
+    async fn maintenance_resolved_identity_takes_precedence_over_raw_xff() {
+        use crate::security::ResolvedClientIdentity;
+        use std::net::IpAddr;
+
+        let state = MaintenanceState::new();
+        // Only 10.x.x.x is allowed.
+        state.enable(MaintenanceConfig {
+            allow_ips: vec!["10.0.0.0/8".into()],
+            ..Default::default()
+        });
+
+        // The resolved identity (from TrustedProxiesLayer) says the real client
+        // is 192.168.1.5 — not in the allow list.
+        let real_ip: IpAddr = "192.168.1.5".parse().unwrap();
+        let mut req = Request::builder()
+            .uri("/")
+            // Attacker forges an allowed IP in XFF.
+            .header("X-Forwarded-For", "10.0.0.1")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ResolvedClientIdentity {
+            addr: Some(real_ip),
+            host: None,
+            scheme: None,
+        });
+
+        let app = Router::new()
+            .route("/", get(|| async { "ok" }))
+            .layer(MaintenanceLayer::new(state));
+
+        let resp = app.oneshot(req).await.unwrap();
+        // Must be blocked: resolved IP (192.168.1.5) is not in the allow list.
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 

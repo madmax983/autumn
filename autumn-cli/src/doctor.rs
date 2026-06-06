@@ -1264,32 +1264,45 @@ fn deep_merge(target: &mut toml::Table, source: &toml::Table) {
 }
 
 fn get_merged_toml_table(profile: &str) -> toml::Table {
+    get_merged_toml_table_profiles(&[profile])
+}
+
+/// Merges config from all given profile names in order (last wins).
+///
+/// Each profile name contributes `[profile.{name}]` from `autumn.toml` and
+/// `autumn-{name}.toml`. The base `autumn.toml` top-level is applied once
+/// before the per-profile layers.
+fn get_merged_toml_table_profiles(profiles: &[&str]) -> toml::Table {
     let mut merged = toml::Table::new();
 
-    // 1. Base autumn.toml
-    if let Some(table) = std::fs::read_to_string("autumn.toml")
+    let base_toml = std::fs::read_to_string("autumn.toml")
         .ok()
-        .and_then(|contents| toml::from_str::<toml::Table>(&contents).ok())
-    {
-        deep_merge(&mut merged, &table);
+        .and_then(|c| toml::from_str::<toml::Table>(&c).ok());
 
-        // 2. Base autumn.toml [profile.{profile}]
-        if let Some(prof) = table
-            .get("profile")
+    // 1. Base autumn.toml top-level (applied once)
+    if let Some(ref table) = base_toml {
+        deep_merge(&mut merged, table);
+    }
+
+    for &profile in profiles {
+        // 2. Base autumn.toml [profile.{name}]
+        if let Some(prof) = base_toml
+            .as_ref()
+            .and_then(|t| t.get("profile"))
             .and_then(toml::Value::as_table)
             .and_then(|p| p.get(profile))
             .and_then(toml::Value::as_table)
         {
             deep_merge(&mut merged, prof);
         }
-    }
 
-    // 3. autumn-{profile}.toml
-    if let Some(table) = std::fs::read_to_string(format!("autumn-{profile}.toml"))
-        .ok()
-        .and_then(|contents| toml::from_str::<toml::Table>(&contents).ok())
-    {
-        deep_merge(&mut merged, &table);
+        // 3. autumn-{name}.toml
+        if let Some(table) = std::fs::read_to_string(format!("autumn-{profile}.toml"))
+            .ok()
+            .and_then(|c| toml::from_str::<toml::Table>(&c).ok())
+        {
+            deep_merge(&mut merged, &table);
+        }
     }
 
     merged
@@ -1495,13 +1508,22 @@ fn resolve_proxy_conflict_data() -> ProxyConflictData {
         .or_else(|_| std::env::var("AUTUMN_PROFILE"))
         .unwrap_or_default();
     // Normalize aliases to canonical names to match AutumnConfig::load_with_env.
-    let profile = match raw_profile.trim().to_ascii_lowercase().as_str() {
+    let raw_lower = raw_profile.trim().to_ascii_lowercase();
+    let canonical = match raw_lower.as_str() {
         "production" | "prod" => "prod",
         "development" | "dev" | "" => "dev",
         other => other,
     }
     .to_owned();
-    let table = get_merged_toml_table(&profile);
+    // The runtime supports both alias spellings (e.g. "production" and "prod"),
+    // so merge both sets of profile sources to match what the app would load.
+    let alias = match raw_lower.as_str() {
+        "production" => Some("production"),
+        "development" => Some("development"),
+        _ => None,
+    };
+    let profiles: Vec<&str> = std::iter::once(canonical.as_str()).chain(alias).collect();
+    let table = get_merged_toml_table_profiles(&profiles);
 
     let parse_csv_env = |var: &str| -> Option<Vec<String>> {
         std::env::var(var).ok().map(|v| {
