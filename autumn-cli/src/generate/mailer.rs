@@ -215,7 +215,6 @@ fn render_smoke_test(struct_name: &str, snake_name: &str) -> String {
          //! Asserts the mailer builds successfully and both template bodies render\n\
          //! without panicking. Run with `cargo test` — no running server required.\n\
          \n\
-         #[cfg(feature = \"mail\")]\n\
          mod {snake_name}_mailer_tests {{\n\
              use crate::mailers::{snake_name}::{struct_name};\n\
          \n\
@@ -587,6 +586,10 @@ async fn main() {
         assert!(
             test.contains("WelcomeMailer"),
             "smoke test body assertion must check for the mailer name"
+        );
+        assert!(
+            !test.contains("cfg(feature = \"mail\")"),
+            "smoke test must not be gated by cfg(feature = \"mail\")"
         );
     }
 
