@@ -292,6 +292,54 @@ fn render_repository_queries(pascal_name: &str, queries: &[QuerySpec]) -> String
     out
 }
 
+fn render_decoded_form(_pascal_name: &str, fields: &[Field]) -> (String, String) {
+    use std::fmt::Write;
+    let mut struct_fields = String::new();
+    let mut mapping_fields = String::new();
+
+    for f in fields {
+        if f.kind.is_attachment() {
+            let _ = writeln!(
+                struct_fields,
+                "    pub {name}: Option<String>,",
+                name = f.name
+            );
+            let _ = writeln!(
+                mapping_fields,
+                "        {name}: decoded.{name}.and_then(|s| {{\n\
+                     if s.is_empty() {{\n\
+                         None\n\
+                     }} else {{\n\
+                         serde_json::from_str(&s).ok()\n\
+                     }}\n\
+                 }}),",
+                name = f.name
+            );
+        } else {
+            let _ = writeln!(
+                struct_fields,
+                "    pub {name}: {rust_type},",
+                name = f.name,
+                rust_type = f.rust_type()
+            );
+            let _ = writeln!(
+                mapping_fields,
+                "        {name}: decoded.{name},",
+                name = f.name
+            );
+        }
+    }
+
+    let decoded_struct = format!(
+        "#[derive(serde::Deserialize)]\n\
+         struct DecodedForm {{\n\
+         {struct_fields}\
+         }}"
+    );
+
+    (decoded_struct, mapping_fields)
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "This is a single template — splitting it produces less readable output, \
@@ -308,6 +356,7 @@ fn render_routes_file(
     let update_columns = render_update_columns(plural, fields);
     let nullable_field_match = render_nullable_field_match(fields);
     let has_attachments = has_attachment_fields(fields);
+    let (decoded_form_struct, decoded_form_mapping) = render_decoded_form(pascal_name, fields);
     // Forms remain URL-encoded for compatibility with the generated handlers.
     // File uploads are handled separately via direct-upload URLs generated in
     // a CSRF-protected endpoint (see docs/guide/storage.md#direct-uploads).
@@ -321,6 +370,7 @@ fn render_routes_file(
 use autumn_web::extract::Path;
 use autumn_web::pagination::{{Page, PageRequest}};
 use autumn_web::reexports::axum::body::Bytes;
+use autumn_web::reexports::serde_json;
 use autumn_web::security::{{CsrfFormField, CsrfToken}};
 use autumn_web::{{AutumnError, AutumnResult, Db, Markup, get, html, post, secured}};
 use diesel::prelude::*;
@@ -520,6 +570,8 @@ pub async fn update(
     Ok(redirect_to(&format!("/{plural}/{{}}", *id)))
 }}
 
+{decoded_form_struct}
+
 fn decode_form(body: Bytes) -> AutumnResult<New{pascal_name}> {{
     let pairs: Vec<_> = url::form_urlencoded::parse(body.as_ref())
         .filter(|(key, value)| !(value.is_empty() && is_nullable_form_field(key)))
@@ -528,8 +580,11 @@ fn decode_form(body: Bytes) -> AutumnResult<New{pascal_name}> {{
         .extend_pairs(pairs.iter().map(|(key, value)| (key.as_ref(), value.as_ref())))
         .finish();
 
-    serde_urlencoded::from_str(&encoded)
-        .map_err(|err| AutumnError::bad_request_msg(format!("invalid form submission: {{err}}")))
+    let decoded: DecodedForm = serde_urlencoded::from_str(&encoded)
+        .map_err(|err| AutumnError::bad_request_msg(format!("invalid form submission: {{err}}")))?;
+
+    Ok(New{pascal_name} {{
+{decoded_form_mapping}    }})
 }}
 
 fn is_nullable_form_field(name: &str) -> bool {{
@@ -588,7 +643,10 @@ fn render_edit_form_inputs(fields: &[Field]) -> String {
         if f.kind.is_attachment() {
             let _ = writeln!(
                 out,
-                "            label {{ \"{name}\" }} input type=\"file\" name=\"{name}\";",
+                "            label {{ \"{name}\" }} input type=\"file\" name=\"{name}\";\n\
+                 @if let Some(ref blob) = row.{name} {{\n\
+                     input type=\"hidden\" name=\"{name}\" value=(serde_json::to_string(blob).unwrap());\n\
+                 }}",
                 name = f.name
             );
         } else {
@@ -1126,5 +1184,31 @@ async fn main() {
             !repo.contains("soft_delete"),
             "repository without soft_delete must not include soft_delete annotation: {repo}"
         );
+    }
+
+    #[test]
+    fn execute_writes_edit_form_with_attachment_hidden_input() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &[
+                "title:String".into(),
+                "avatar:Attachment".into(),
+            ],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        
+        // Assert edit form contains input type="file" AND the hidden input for existing avatar
+        assert!(routes.contains("input type=\"file\" name=\"avatar\""));
+        assert!(routes.contains("input type=\"hidden\" name=\"avatar\" value=(serde_json::to_string(blob).unwrap())"));
+
+        // Assert decode_form contains DecodedForm struct
+        assert!(routes.contains("struct DecodedForm"));
+        assert!(routes.contains("pub avatar: Option<String>"));
     }
 }
