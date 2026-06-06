@@ -293,11 +293,19 @@ impl ProxyResolver {
                 .map(|s| s.trim().to_owned());
         }
 
-        // Hop-count mode: trust forwarded host without checking peer ranges
-        // (same rationale as resolve_client_addr — dynamic peer not in ranges).
+        // Hop-count mode: only trust forwarded host when the XFF chain actually
+        // contains enough entries (i.e. the declared number of proxy hops are
+        // present). Without a valid chain a direct client could inject an
+        // X-Forwarded-Host header and have it trusted unconditionally.
         let peer_ip = Self::peer_ip(req);
-        let peer_is_trusted = if self.trusted_hops.is_some() {
-            true
+        let peer_is_trusted = if let Some(hops) = self.trusted_hops {
+            Self::x_forwarded_for(req).is_some_and(|xff| {
+                xff.rsplit(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .count()
+                    > hops as usize
+            })
         } else {
             peer_ip.is_some_and(|ip| self.is_trusted_ip(ip)) || !self.ranges_configured
         };
@@ -334,10 +342,17 @@ impl ProxyResolver {
     /// is important for the same-origin host-only fallback path.
     pub fn resolve_client_scheme<B>(&self, req: &Request<B>) -> Option<String> {
         if self.trust_forwarded_headers {
-            // Hop-count mode: trust forwarded proto without checking peer ranges.
+            // Hop-count mode: only trust forwarded proto when the XFF chain has
+            // enough entries, for the same reason as resolve_client_host.
             let peer_ip = Self::peer_ip(req);
-            let peer_is_trusted = if self.trusted_hops.is_some() {
-                true
+            let peer_is_trusted = if let Some(hops) = self.trusted_hops {
+                Self::x_forwarded_for(req).is_some_and(|xff| {
+                    xff.rsplit(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .count()
+                        > hops as usize
+                })
             } else {
                 peer_ip.is_some_and(|ip| self.is_trusted_ip(ip)) || !self.ranges_configured
             };
@@ -735,7 +750,9 @@ mod tests {
 
     #[test]
     fn trusted_hops_with_ranges_resolves_forwarded_host() {
-        // Dynamic ALB peer not in ranges; hop-count should still trust X-Forwarded-Host.
+        // Dynamic ALB peer (10.0.1.200) not in CDN ranges; hop-count should still
+        // trust X-Forwarded-Host when XFF chain has enough entries.
+        // trusted_hops=1 requires count > 1 (i.e., at least 2 XFF entries).
         let resolver = ProxyResolver::from_config(&TrustedProxiesConfig {
             ranges: vec!["203.0.113.0/24".to_owned()],
             trusted_hops: Some(1),
@@ -745,6 +762,8 @@ mod tests {
         let mut req = Request::builder()
             .header("host", "internal.cluster.local")
             .header("x-forwarded-host", "public.example.com")
+            // XFF: real-client, ALB — 2 entries satisfies count > 1
+            .header("x-forwarded-for", "192.0.2.1, 10.0.1.200")
             .body(())
             .unwrap();
         let addr: SocketAddr = "10.0.1.200:1234".parse().unwrap();
@@ -752,6 +771,28 @@ mod tests {
 
         let host = resolver.resolve_client_host(&req).unwrap();
         assert_eq!(host, "public.example.com");
+    }
+
+    #[test]
+    fn trusted_hops_with_no_xff_does_not_trust_forwarded_host() {
+        // When XFF chain is absent, a direct client could inject X-Forwarded-Host.
+        // The resolver must fall back to the Host header.
+        let resolver = ProxyResolver::from_config(&TrustedProxiesConfig {
+            ranges: vec!["203.0.113.0/24".to_owned()],
+            trusted_hops: Some(1),
+            trust_forwarded_headers: true,
+        });
+
+        let mut req = Request::builder()
+            .header("host", "real.example.com")
+            .header("x-forwarded-host", "attacker.example.com")
+            .body(())
+            .unwrap();
+        let addr: SocketAddr = "10.0.1.200:1234".parse().unwrap();
+        req.extensions_mut().insert(ConnectInfo(addr));
+
+        let host = resolver.resolve_client_host(&req).unwrap();
+        assert_eq!(host, "real.example.com");
     }
 
     #[test]
@@ -764,6 +805,8 @@ mod tests {
 
         let mut req = Request::builder()
             .header("x-forwarded-proto", "https")
+            // XFF: real-client, ALB — 2 entries satisfies count > 1
+            .header("x-forwarded-for", "192.0.2.1, 10.0.1.200")
             .body(())
             .unwrap();
         let addr: SocketAddr = "10.0.1.200:1234".parse().unwrap();
@@ -772,6 +815,27 @@ mod tests {
         assert_eq!(
             resolver.resolve_client_scheme(&req).as_deref(),
             Some("https")
+        );
+    }
+
+    #[test]
+    fn trusted_hops_with_no_xff_does_not_trust_forwarded_scheme() {
+        // Without an XFF chain, X-Forwarded-Proto must not be trusted.
+        let resolver = ProxyResolver::from_config(&TrustedProxiesConfig {
+            ranges: vec!["203.0.113.0/24".to_owned()],
+            trusted_hops: Some(1),
+            trust_forwarded_headers: true,
+        });
+
+        let req = Request::builder()
+            .header("x-forwarded-proto", "https")
+            .uri("http://example.com/")
+            .body(())
+            .unwrap();
+
+        assert_eq!(
+            resolver.resolve_client_scheme(&req).as_deref(),
+            Some("http")
         );
     }
 

@@ -1222,10 +1222,17 @@ where
 {
     if config.security.rate_limit.enabled {
         let tp = &config.security.trusted_proxies;
+        let rl = &config.security.rate_limit;
         let has_top_level_proxy_config =
             tp.trust_forwarded_headers || !tp.ranges.is_empty() || tp.trusted_hops.is_some();
-        let mut layer = crate::security::RateLimitLayer::from_config(&config.security.rate_limit);
-        if has_top_level_proxy_config {
+        // Only inject the shared top-level resolver when the rate-limit section
+        // does NOT already carry its own (legacy) proxy config. This prevents
+        // dev defaults (loopback ranges + trust_forwarded_headers=true) from
+        // silently overriding an operator's explicit rate_limit.trusted_proxies.
+        let has_rate_limit_proxy_config =
+            rl.trust_forwarded_headers || !rl.trusted_proxies.is_empty();
+        let mut layer = crate::security::RateLimitLayer::from_config(rl);
+        if has_top_level_proxy_config && !has_rate_limit_proxy_config {
             let resolver = crate::security::ProxyResolver::from_config(tp);
             layer = layer.with_proxy_resolver(resolver);
         }
