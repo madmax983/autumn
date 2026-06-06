@@ -543,15 +543,14 @@ where
     }
 
     fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
-        let method = req.method().clone();
         let route = req.extensions().get::<MatchedPath>().cloned();
 
         self.collector.increment_active();
 
         MetricsFuture {
-            inner: self.inner.call(req),
             collector: Some(self.collector.clone()),
-            method,
+            method: req.method().clone(),
+            inner: self.inner.call(req),
             route,
             start: Instant::now(),
         }

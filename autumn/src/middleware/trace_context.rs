@@ -68,8 +68,6 @@ where
             propagator.extract(&HeaderMapExtractor(req.headers()))
         });
 
-        let method = req.method().clone();
-        let uri = req.uri().clone();
         // OTel HTTP server semantic conventions want `{method} {http.route}`
         // for span names, falling back to the method alone when the matched
         // route template is unknown. Axum resolves the template inside the
@@ -79,10 +77,10 @@ where
         // attribute.
         let span = tracing::info_span!(
             "http.server.request",
-            otel.name = %method,
+            otel.name = %req.method(),
             otel.kind = "server",
-            http.request.method = %method,
-            url.path = %uri.path(),
+            http.request.method = %req.method(),
+            url.path = %req.uri().path(),
             http.response.status_code = tracing::field::Empty,
         );
         // Failure only occurs when no `tracing-opentelemetry` subscriber is
