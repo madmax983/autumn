@@ -1842,6 +1842,19 @@ impl AppBuilder {
         indicator: Arc<dyn crate::actuator::HealthIndicator>,
     ) -> Self {
         let name = name.into();
+        // "db" is a reserved built-in component name. Allowing a custom indicator
+        // under this name would produce an inconsistent response: the custom result
+        // would still gate the aggregate status while the built-in pool check owns
+        // the components.db / checks.database display.
+        #[cfg(feature = "db")]
+        if name == "db" {
+            tracing::warn!(
+                indicator_name = %name,
+                "\"db\" is a reserved built-in health indicator name; registration skipped. \
+                 Use a different name for your custom indicator."
+            );
+            return self;
+        }
         if self.health_indicators.iter().any(|(n, _, _)| n == &name) {
             tracing::warn!(
                 indicator_name = %name,
