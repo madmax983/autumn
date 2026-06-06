@@ -1482,6 +1482,8 @@ fn render_routes_file(
         totp_clear_pending,
         totp_confirm_branch,
         totp_section,
+        totp_reauth_field,
+        totp_reauth_check,
     ) = if totp {
         (
             totp_imports_src().to_owned(),
@@ -1490,9 +1492,13 @@ fn render_routes_file(
             totp_clear_pending_src().to_owned(),
             totp_confirm_branch_src(snake_name),
             totp_routes_section_src(pascal_name, snake_name, table),
+            totp_reauth_field_src(),
+            totp_reauth_check_src(snake_name, table),
         )
     } else {
         (
+            String::new(),
+            String::new(),
             String::new(),
             String::new(),
             String::new(),
@@ -2087,6 +2093,8 @@ pub struct ReauthForm {{
     pub password: String,
     #[serde(default)]
     pub return_to: String,
+    #[serde(default)]
+    pub totp_code: String,
 }}
 
 /// `GET /reauth` — prompt for password to refresh the step-up claim.
@@ -2115,6 +2123,7 @@ pub async fn reauth_form(
                 label {{ "Password" }}
                 input type="password" name="password" autocomplete="current-password" required;
             }}
+            {totp_reauth_field}
             button type="submit" {{ "Confirm" }}
         }}
     }}).into_response())
@@ -2166,11 +2175,12 @@ pub async fn reauth(
                     label {{ "Password" }}
                     input type="password" name="password" autocomplete="current-password" required;
                 }}
+                {totp_reauth_field}
                 button type="submit" {{ "Confirm" }}
             }}
         }}).into_response());
     }}
-
+    {totp_reauth_check}
     // Refresh the step-up claim.
     autumn_web::step_up::set_last_strong_auth_at(&session).await;
 
@@ -2514,8 +2524,8 @@ pub async fn confirm_email(
     session.insert("{snake_name}_email", &{snake_name}.email).await;
     // Use the same session key checked by `#[secured]` / `#[authorize]`.
     session.insert(state.auth_session_key(), {snake_name}.id.to_string()).await;
-    // Stamp the step-up claim so `#[step_up]` routes are immediately accessible.
-    autumn_web::step_up::set_last_strong_auth_at(&session).await;
+    // Email confirmation proves inbox access, not password knowledge.
+    // Step-up protected routes will redirect to /reauth as expected.
     Ok(redirect_to("/account"))
 }}
 
@@ -4035,6 +4045,122 @@ fn totp_confirm_branch_src(snake_name: &str) -> String {
     }
 "#;
     TPL.replace("__SNAKE__", snake_name)
+}
+
+/// HTML fragment injected into the reauth form for TOTP-enabled projects.
+///
+/// Shown as an optional field; the handler enforces it for accounts that have
+/// `totp_enabled = true` and ignores it for accounts that don't.
+fn totp_reauth_field_src() -> String {
+    "            div {{\n\
+     \x20               label {{ \"Authenticator code\" }}\n\
+     \x20               input type=\"text\" name=\"totp_code\" autocomplete=\"one-time-code\"\n\
+     \x20                   inputmode=\"numeric\" pattern=\"[0-9 ]*\" placeholder=\"6-digit code or recovery code\";\n\
+     \x20               small {{ \"Required if your account uses two-factor authentication.\" }}\n\
+     \x20           }}\n"
+        .to_owned()
+}
+
+/// Verification block injected into the `reauth` handler after the password
+/// check when TOTP is enabled.  For accounts with `totp_enabled = true` the
+/// user must also supply a valid TOTP code or recovery code; other accounts
+/// pass through without any second-factor check.
+#[allow(clippy::too_many_lines)]
+fn totp_reauth_check_src(snake_name: &str, table: &str) -> String {
+    const TPL: &str = r#"    // If the account uses TOTP, also require the second factor.
+    if __SNAKE__.totp_enabled {
+        let code = form.totp_code.trim().to_owned();
+        if code.is_empty() {
+            let return_to = form.return_to.clone();
+            return Ok(layout("Confirm your identity", html! {{
+                h1 {{ "Confirm your identity" }}
+                p style="color:red" {{ "Your account uses two-factor authentication. Please also enter your authenticator code." }}
+                form action="/reauth" method="post" {{
+                    @if let Some(ref csrf) = csrf {{ input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
+                    input type="hidden" name="return_to" value=(return_to);
+                    input type="hidden" name="password" value=(&form.password);
+                    div {{
+                        label {{ "Authenticator code" }}
+                        input type="text" name="totp_code" autocomplete="one-time-code"
+                            inputmode="numeric" pattern="[0-9 ]*" required
+                            placeholder="6-digit code or recovery code";
+                        small {{ "Required if your account uses two-factor authentication." }}
+                    }}
+                    button type="submit" {{ "Confirm" }}
+                }}
+            }}).into_response());
+        }}
+        let mut totp_verified = false;
+        if let Some(stored) = __SNAKE__.totp_secret_encrypted.as_deref() {{
+            if let Some(step) = decrypt_secret(stored)
+                .ok()
+                .and_then(|secret| build_totp(secret, &__SNAKE__.email).ok())
+                .and_then(|totp| verify_totp_code(&totp, &code))
+            {{
+                let affected = diesel::update(
+                    __TABLE__::table.find(__SNAKE__.id).filter(
+                        __TABLE__::totp_last_used_step
+                            .is_null()
+                            .or(__TABLE__::totp_last_used_step.lt(step)),
+                    ),
+                )
+                .set(__TABLE__::totp_last_used_step.eq(Some(step)))
+                .execute(&mut *db)
+                .await?;
+                if affected == 1 {{
+                    totp_verified = true;
+                }}
+            }}
+        }}
+        if !totp_verified {{
+            let unused: Vec<RecoveryCode> = recovery_codes::table
+                .filter(recovery_codes::user_id.eq(__SNAKE__.id))
+                .filter(recovery_codes::used_at.is_null())
+                .select(RecoveryCode::as_select())
+                .load(&mut *db)
+                .await
+                .unwrap_or_default();
+            for rc in &unused {{
+                if verify_password(&code, &rc.code_digest).await.unwrap_or(false) {{
+                    let affected = diesel::update(
+                        recovery_codes::table
+                            .find(rc.id)
+                            .filter(recovery_codes::used_at.is_null()),
+                    )
+                    .set(recovery_codes::used_at.eq(Some(chrono::Utc::now().naive_utc())))
+                    .execute(&mut *db)
+                    .await?;
+                    if affected == 1 {{
+                        totp_verified = true;
+                        break;
+                    }}
+                }}
+            }}
+        }}
+        if !totp_verified {{
+            let return_to = form.return_to.clone();
+            return Ok(layout("Confirm your identity", html! {{
+                h1 {{ "Confirm your identity" }}
+                p style="color:red" {{ "Invalid authenticator code. Please try again." }}
+                form action="/reauth" method="post" {{
+                    @if let Some(ref csrf) = csrf {{ input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
+                    input type="hidden" name="return_to" value=(return_to);
+                    input type="hidden" name="password" value=(&form.password);
+                    div {{
+                        label {{ "Authenticator code" }}
+                        input type="text" name="totp_code" autocomplete="one-time-code"
+                            inputmode="numeric" pattern="[0-9 ]*" required
+                            placeholder="6-digit code or recovery code";
+                        small {{ "Required if your account uses two-factor authentication." }}
+                    }}
+                    button type="submit" {{ "Confirm" }}
+                }}
+            }}).into_response());
+        }}
+    }}
+"#;
+    TPL.replace("__SNAKE__", snake_name)
+        .replace("__TABLE__", table)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -5977,6 +6103,73 @@ mod tests {
         assert!(
             mod_rs.contains("pub mod user;"),
             "missing pub mod user: {mod_rs}"
+        );
+    }
+
+    // ── Step-up / reauth correctness ─────────────────────────────────────────
+
+    #[test]
+    fn confirm_email_does_not_stamp_step_up_claim() {
+        // Email confirmation proves inbox access, not password knowledge.
+        // set_last_strong_auth_at must NOT be called in confirm_email so that
+        // an attacker with a stolen confirmation link cannot bypass #[step_up].
+        let tmp = project_with_main();
+        let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+        let confirm_pos = routes
+            .find("pub async fn confirm_email(")
+            .expect("confirm_email handler missing");
+        let after_confirm = &routes[confirm_pos..];
+        let next_fn = after_confirm
+            .find("\npub async fn ")
+            .unwrap_or(after_confirm.len());
+        let confirm_body = &after_confirm[..next_fn];
+        assert!(
+            !confirm_body.contains("set_last_strong_auth_at"),
+            "confirm_email must NOT stamp set_last_strong_auth_at (email != password proof): {confirm_body}"
+        );
+    }
+
+    #[test]
+    fn totp_reauth_requires_second_factor_for_enrolled_accounts() {
+        // When --totp is enabled, the reauth handler must verify the TOTP code
+        // for accounts with totp_enabled = true. Password alone is insufficient.
+        let tmp = project_with_main();
+        totp_plan(tmp.path()).execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+        let reauth_pos = routes
+            .find("pub async fn reauth(")
+            .expect("reauth handler missing");
+        let reauth_body = &routes[reauth_pos..];
+        assert!(
+            reauth_body.contains("totp_enabled"),
+            "TOTP reauth handler must check totp_enabled: {reauth_body}"
+        );
+        assert!(
+            reauth_body.contains("totp_code"),
+            "TOTP reauth handler must check totp_code from form: {reauth_body}"
+        );
+        assert!(
+            reauth_body.contains("verify_totp_code"),
+            "TOTP reauth must call verify_totp_code for enrolled accounts: {reauth_body}"
+        );
+    }
+
+    #[test]
+    fn totp_reauth_form_has_totp_field() {
+        // The reauth form must include a TOTP input when --totp is enabled so
+        // that users with two-factor authentication can provide their code.
+        let tmp = project_with_main();
+        totp_plan(tmp.path()).execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+        let reauth_pos = routes
+            .find("pub async fn reauth_form(")
+            .expect("reauth_form handler missing");
+        let reauth_body = &routes[reauth_pos..];
+        assert!(
+            reauth_body.contains("totp_code"),
+            "reauth form must include totp_code input field: {reauth_body}"
         );
     }
 

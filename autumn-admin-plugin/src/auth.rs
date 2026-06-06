@@ -61,6 +61,14 @@ pub async fn check_role(
 /// [`AdminPlugin::with_step_up_max_age`]. It is captured in the closure
 /// registered in `routes::admin_router` and passed directly here so this
 /// function does not need access to `AppState` at request time.
+///
+/// **Known limitation**: this middleware calls `check_step_up` directly and
+/// therefore does **not** emit `auth.step_up.success` / `auth.step_up.failure`
+/// audit events. `AppState` (needed to resolve the `AuditLogger`) is not
+/// available to `from_fn` middleware — that would require `from_fn_with_state`,
+/// which needs the state value at layer-registration time, before the framework
+/// finalises `AppState`. Route-level `#[step_up]` attributes do emit full audit
+/// events via `__check_step_up_with_config`.
 pub async fn check_step_up_mutations(max_age_secs: u64, req: Request, next: Next) -> Response {
     // Only guard mutating methods.
     if !matches!(

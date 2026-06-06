@@ -86,6 +86,10 @@ fn parse_max_age_str_at_compile_time(lit: &LitStr) -> Result<u64, String> {
 fn build_check_call(max_age_tokens: &TokenStream) -> TokenStream {
     quote! {
         const __AUTUMN_STEP_UP_MAX_AGE: ::core::option::Option<u64> = #max_age_tokens;
+        // Resolve max_age before the check so the response can advertise the
+        // exact value actually enforced (not the compile-time default).
+        let __max_age_secs: u64 =
+            ::autumn_web::step_up::__resolve_step_up_max_age(&__autumn_state, __AUTUMN_STEP_UP_MAX_AGE);
         if let ::core::result::Result::Err(__autumn_step_up_error) =
             ::autumn_web::step_up::__check_step_up_with_config(
                 &__autumn_session,
@@ -93,8 +97,6 @@ fn build_check_call(max_age_tokens: &TokenStream) -> TokenStream {
                 __AUTUMN_STEP_UP_MAX_AGE,
             ).await
         {
-            let __max_age_secs: u64 = __AUTUMN_STEP_UP_MAX_AGE
-                .unwrap_or(::autumn_web::step_up::DEFAULT_MAX_AGE_SECS);
             let __wants_json: bool = __autumn_step_up_headers
                 .get(::autumn_web::reexports::axum::http::header::ACCEPT)
                 .and_then(|v| v.to_str().ok())
@@ -103,10 +105,13 @@ fn build_check_call(max_age_tokens: &TokenStream) -> TokenStream {
             if __wants_json {
                 return ::autumn_web::step_up::__step_up_json_response(__max_age_secs);
             } else {
-                // Prefer Referer over the current URI so that after reauth
-                // the user lands on the page that had the form (GET), not on
-                // the POST/DELETE-only endpoint that triggered this check.
-                let __return_to: ::std::string::String = {
+                // For non-GET requests: prefer Referer so the user returns to
+                // the page with the form after reauth rather than a POST/DELETE
+                // endpoint that has no GET handler.
+                // For GET requests: use the current URI so the user is sent
+                // directly back to the page they were trying to open.
+                let __is_mutating = __autumn_step_up_method != ::autumn_web::reexports::axum::http::Method::GET;
+                let __return_to: ::std::string::String = if __is_mutating {
                     let __referer_path = __autumn_step_up_headers
                         .get(::autumn_web::reexports::axum::http::header::REFERER)
                         .and_then(|v| v.to_str().ok())
@@ -118,6 +123,13 @@ fn build_check_call(max_age_tokens: &TokenStream) -> TokenStream {
                             .unwrap_or_else(|| __autumn_step_up_uri.path())
                     });
                     ::autumn_web::step_up::encode_return_to(__path)
+                } else {
+                    ::autumn_web::step_up::encode_return_to(
+                        __autumn_step_up_uri
+                            .path_and_query()
+                            .map(|pq| pq.as_str())
+                            .unwrap_or_else(|| __autumn_step_up_uri.path()),
+                    )
                 };
                 return ::autumn_web::reexports::axum::response::IntoResponse::into_response(
                     ::autumn_web::reexports::axum::response::Redirect::to(
@@ -154,6 +166,12 @@ fn inject_step_up_params(input_fn: &mut ItemFn) {
     if !has_input_named(input_fn, "__autumn_step_up_uri") {
         let p: syn::FnArg = parse_quote! {
             __autumn_step_up_uri: ::autumn_web::reexports::axum::http::Uri
+        };
+        input_fn.sig.inputs.insert(0, p);
+    }
+    if !has_input_named(input_fn, "__autumn_step_up_method") {
+        let p: syn::FnArg = parse_quote! {
+            __autumn_step_up_method: ::autumn_web::reexports::axum::http::Method
         };
         input_fn.sig.inputs.insert(0, p);
     }
@@ -443,6 +461,37 @@ mod tests {
         assert_eq!(
             session_decl_count, 1,
             "should not duplicate __autumn_session parameter:\n{after_secured}"
+        );
+    }
+
+    #[test]
+    fn step_up_injects_method_parameter() {
+        let generated = step_up_macro(
+            quote! {},
+            quote! {
+                async fn handler() -> &'static str { "ok" }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("__autumn_step_up_method"),
+            "should inject method parameter for GET/POST distinction:\n{generated}"
+        );
+    }
+
+    #[test]
+    fn step_up_uses_resolve_max_age_for_json_response() {
+        let generated = step_up_macro(
+            quote! {},
+            quote! {
+                async fn handler() -> &'static str { "ok" }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("__resolve_step_up_max_age"),
+            "should call __resolve_step_up_max_age so WWW-Authenticate max-age \
+             reflects the actual configured value:\n{generated}"
         );
     }
 }
