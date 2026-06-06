@@ -7561,6 +7561,7 @@ mod tests {
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
+            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
         };
 
         let mut rx = state.channels().subscribe("sys:tasks");
@@ -7632,6 +7633,7 @@ mod tests {
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
+            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
         };
 
         let mut rx = state.channels().subscribe("sys:tasks");

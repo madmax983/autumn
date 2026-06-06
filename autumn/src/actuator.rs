@@ -55,7 +55,7 @@ pub enum MetricKind {
 }
 
 impl MetricKind {
-    fn as_str(&self) -> &'static str {
+    const fn as_str(&self) -> &'static str {
         match self {
             Self::Counter => "counter",
             Self::Gauge => "gauge",
@@ -159,17 +159,18 @@ impl MetricsSourceRegistry {
         source: Arc<dyn MetricsSource>,
     ) -> Result<(), String> {
         let name = name.into();
-        let mut inner = self
-            .inner
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if inner.sources.iter().any(|(n, _)| n == &name) {
-            return Err(format!(
-                "MetricsSource '{}' is already registered; skipping duplicate",
-                name
-            ));
+        {
+            let mut inner = self
+                .inner
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if inner.sources.iter().any(|(n, _)| n == &name) {
+                return Err(format!(
+                    "MetricsSource '{name}' is already registered; skipping duplicate"
+                ));
+            }
+            inner.sources.push((name, source));
         }
-        inner.sources.push((name, source));
         Ok(())
     }
 
@@ -191,13 +192,12 @@ impl MetricsSourceRegistry {
         for (name, source) in &sources {
             let result =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| source.collect()));
-            match result {
-                Ok(families) => results.push((name.clone(), families)),
-                Err(_) => {
-                    tracing::error!(source_name = %name, "MetricsSource panicked during collection");
-                    panicked.push(name.clone());
-                    results.push((name.clone(), vec![]));
-                }
+            if let Ok(families) = result {
+                results.push((name.clone(), families));
+            } else {
+                tracing::error!(source_name = %name, "MetricsSource panicked during collection");
+                panicked.push(name.clone());
+                results.push((name.clone(), vec![]));
             }
         }
 
@@ -1427,6 +1427,109 @@ fn render_labels(labels: &[(String, String)]) -> String {
     out
 }
 
+/// Returns true if `s` is a valid Prometheus metric name (`[a-zA-Z_:][a-zA-Z0-9_:]*`).
+fn is_valid_metric_name(s: &str) -> bool {
+    let mut it = s.chars();
+    matches!(it.next(), Some(c) if c.is_ascii_alphabetic() || c == '_' || c == ':')
+        && it.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+}
+
+/// Returns true if `s` is a valid Prometheus label name (`[a-zA-Z_][a-zA-Z0-9_]*`).
+fn is_valid_label_name(s: &str) -> bool {
+    let mut it = s.chars();
+    matches!(it.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && it.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Escape a Prometheus HELP string (backslash and newline only).
+fn escape_help_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Format a sample value per Prometheus text format (handles ±Inf and NaN).
+fn format_sample_value(v: f64) -> String {
+    if v == f64::INFINITY {
+        "+Inf".to_string()
+    } else if v == f64::NEG_INFINITY {
+        "-Inf".to_string()
+    } else if v.is_nan() {
+        "NaN".to_string()
+    } else {
+        v.to_string()
+    }
+}
+
+/// Append all plugin-contributed metric families (and their error counters) to `out`.
+fn render_plugin_sources(registry: &MetricsSourceRegistry, out: &mut String) {
+    use std::fmt::Write;
+
+    let all_sources = registry.collect_all();
+    for (_source_name, families) in &all_sources {
+        for family in families {
+            if !is_valid_metric_name(&family.name) {
+                tracing::warn!(name = %family.name, "MetricsSource returned invalid metric name; skipping family");
+                continue;
+            }
+            let _ = writeln!(
+                out,
+                "# HELP {} {}",
+                family.name,
+                escape_help_text(&family.help)
+            );
+            let _ = writeln!(out, "# TYPE {} {}", family.name, family.kind.as_str());
+            for sample in &family.samples {
+                let valid_labels: Vec<(String, String)> = sample
+                    .labels
+                    .iter()
+                    .filter(|(k, _)| {
+                        let ok = is_valid_label_name(k);
+                        if !ok {
+                            tracing::warn!(label_name = %k, "MetricsSource returned invalid label name; dropping label");
+                        }
+                        ok
+                    })
+                    .cloned()
+                    .collect();
+                let labels = render_labels(&valid_labels);
+                let _ = writeln!(
+                    out,
+                    "{}{} {}",
+                    family.name,
+                    labels,
+                    format_sample_value(sample.value)
+                );
+            }
+        }
+    }
+
+    let error_counts = registry.error_counts();
+    if !error_counts.is_empty() {
+        out.push_str(
+            "# HELP autumn_metrics_source_errors_total \
+             Number of scrape errors (panics) per plugin metrics source\n",
+        );
+        out.push_str("# TYPE autumn_metrics_source_errors_total counter\n");
+        let mut names: Vec<&String> = error_counts.keys().collect();
+        names.sort();
+        for name in names {
+            let label = render_labels(&[("source".to_string(), name.clone())]);
+            let _ = writeln!(
+                out,
+                "autumn_metrics_source_errors_total{} {}",
+                label, error_counts[name]
+            );
+        }
+    }
+}
+
 /// `GET <actuator-prefix>/prometheus` -- export metrics in Prometheus format.
 pub(crate) async fn prometheus_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
     State(state): State<S>,
@@ -1523,37 +1626,7 @@ pub(crate) async fn prometheus_endpoint<S: ProvideActuatorState + Send + Sync + 
 
     // Plugin-contributed metric families
     if let Some(registry) = state.metrics_source_registry() {
-        let all_sources = registry.collect_all();
-        for (_source_name, families) in &all_sources {
-            for family in families {
-                let _ = writeln!(out, "# HELP {} {}", family.name, family.help);
-                let _ = writeln!(out, "# TYPE {} {}", family.name, family.kind.as_str());
-                for sample in &family.samples {
-                    let labels = render_labels(&sample.labels);
-                    let _ = writeln!(out, "{}{} {}", family.name, labels, sample.value);
-                }
-            }
-        }
-
-        // Emit error counter family for any source that panicked during this scrape
-        let error_counts = registry.error_counts();
-        if !error_counts.is_empty() {
-            out.push_str(
-                "# HELP autumn_metrics_source_errors_total \
-                 Number of scrape errors (panics) per plugin metrics source\n",
-            );
-            out.push_str("# TYPE autumn_metrics_source_errors_total counter\n");
-            let mut names: Vec<&String> = error_counts.keys().collect();
-            names.sort();
-            for name in names {
-                let label = render_labels(&[("source".to_string(), name.to_string())]);
-                let _ = writeln!(
-                    out,
-                    "autumn_metrics_source_errors_total{} {}",
-                    label, error_counts[name]
-                );
-            }
-        }
+        render_plugin_sources(registry, &mut out);
     }
 
     (
