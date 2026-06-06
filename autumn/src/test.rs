@@ -904,14 +904,16 @@ impl TestApp {
             state.insert_extension(crate::http_client::HttpMockRegistryExt(registry));
         }
 
-        for initializer in self.state_initializers {
-            initializer(&state);
-        }
-
+        // Register metrics sources before state initializers — mirrors production
+        // AppBuilder::run ordering so initializers can observe the registry.
         for (name, source) in self.metrics_sources {
             if let Err(e) = state.metrics_source_registry.register(name, source) {
                 tracing::warn!("{e}");
             }
+        }
+
+        for initializer in self.state_initializers {
+            initializer(&state);
         }
 
         for job in &self.jobs {

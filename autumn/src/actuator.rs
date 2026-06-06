@@ -1522,6 +1522,9 @@ fn render_plugin_sources(
                 if bad_key {
                     continue;
                 }
+                // Sort by key so {a="1",b="2"} and {b="2",a="1"} produce the
+                // same canonical string and are treated as one series.
+                valid_labels.sort_by(|(a, _), (b, _)| a.cmp(b));
                 let labels = render_labels(&valid_labels);
                 if !emitted_series.insert(labels.clone()) {
                     tracing::warn!(
