@@ -869,15 +869,12 @@ mod tests {
         #[cfg(feature = "db")]
         fn pool(
             &self,
-        ) -> Option<
-            &diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
-        > {
+        ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>
+        {
             None
         }
 
-        fn health_indicator_registry(
-            &self,
-        ) -> Option<&crate::actuator::HealthIndicatorRegistry> {
+        fn health_indicator_registry(&self) -> Option<&crate::actuator::HealthIndicatorRegistry> {
             Some(&self.registry)
         }
     }

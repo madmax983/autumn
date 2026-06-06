@@ -325,8 +325,11 @@ pub struct AppBuilder {
     /// Plugin-contributed metrics sources registered via [`AppBuilder::metrics_source`].
     pub(crate) metrics_sources: Vec<(String, Arc<dyn crate::actuator::MetricsSource>)>,
     /// Custom health indicators registered via [`AppBuilder::health_indicator`].
-    pub(crate) health_indicators:
-        Vec<(String, crate::actuator::IndicatorGroup, Arc<dyn crate::actuator::HealthIndicator>)>,
+    pub(crate) health_indicators: Vec<(
+        String,
+        crate::actuator::IndicatorGroup,
+        Arc<dyn crate::actuator::HealthIndicator>,
+    )>,
 }
 
 /// Boxed builder closure that constructs a durable
@@ -2168,7 +2171,10 @@ impl AppBuilder {
 
         // Populate the health indicator registry from builder registrations.
         for (name, group, indicator) in health_indicators {
-            if let Err(e) = state.health_indicator_registry.register(name, group, indicator) {
+            if let Err(e) = state
+                .health_indicator_registry
+                .register(name, group, indicator)
+            {
                 tracing::warn!("{e}");
             }
         }

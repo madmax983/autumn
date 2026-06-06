@@ -111,7 +111,10 @@ fn health_indicator_default_group_is_readiness() {
 
 #[test]
 fn health_indicator_health_only_group_returns_health_only() {
-    assert!(matches!(HealthOnlyIndicator.group(), IndicatorGroup::HealthOnly));
+    assert!(matches!(
+        HealthOnlyIndicator.group(),
+        IndicatorGroup::HealthOnly
+    ));
 }
 
 // ── HealthCheckOutput helpers ────────────────────────────────────
@@ -137,11 +140,7 @@ fn registry_register_and_is_not_empty() {
     let registry = HealthIndicatorRegistry::new();
     assert!(registry.is_empty());
     registry
-        .register(
-            "myapp",
-            IndicatorGroup::Readiness,
-            Arc::new(AlwaysUp),
-        )
+        .register("myapp", IndicatorGroup::Readiness, Arc::new(AlwaysUp))
         .unwrap();
     assert!(!registry.is_empty());
 }
@@ -155,7 +154,10 @@ fn registry_duplicate_name_is_rejected() {
     let err = registry
         .register("svc", IndicatorGroup::Readiness, Arc::new(AlwaysUp))
         .unwrap_err();
-    assert!(err.contains("svc"), "error should mention the duplicate name");
+    assert!(
+        err.contains("svc"),
+        "error should mention the duplicate name"
+    );
 }
 
 // ── run_all ──────────────────────────────────────────────────────
@@ -178,10 +180,18 @@ async fn registry_run_all_returns_all_results() {
 async fn registry_run_readiness_skips_health_only_indicators() {
     let registry = HealthIndicatorRegistry::new();
     registry
-        .register("readiness_check", IndicatorGroup::Readiness, Arc::new(AlwaysUp))
+        .register(
+            "readiness_check",
+            IndicatorGroup::Readiness,
+            Arc::new(AlwaysUp),
+        )
         .unwrap();
     registry
-        .register("health_only_check", IndicatorGroup::HealthOnly, Arc::new(AlwaysDown))
+        .register(
+            "health_only_check",
+            IndicatorGroup::HealthOnly,
+            Arc::new(AlwaysDown),
+        )
         .unwrap();
 
     let results = registry.run_readiness().await;
@@ -210,13 +220,19 @@ async fn hung_indicator_times_out_and_reports_unknown_with_timed_out_detail() {
 
 #[test]
 fn aggregate_status_empty_is_up() {
-    assert_eq!(HealthIndicatorRegistry::aggregate_status(&[]), HealthStatus::Up);
+    assert_eq!(
+        HealthIndicatorRegistry::aggregate_status(&[]),
+        HealthStatus::Up
+    );
 }
 
 #[test]
 fn aggregate_status_all_up_is_up() {
     let statuses = [HealthStatus::Up, HealthStatus::Up];
-    assert_eq!(HealthIndicatorRegistry::aggregate_status(&statuses), HealthStatus::Up);
+    assert_eq!(
+        HealthIndicatorRegistry::aggregate_status(&statuses),
+        HealthStatus::Up
+    );
 }
 
 #[test]
@@ -287,10 +303,7 @@ fn app_builder_health_indicator_duplicate_name_does_not_panic() {
 
 #[test]
 fn health_status_serializes_to_spring_boot_values() {
-    assert_eq!(
-        serde_json::to_string(&HealthStatus::Up).unwrap(),
-        "\"UP\""
-    );
+    assert_eq!(serde_json::to_string(&HealthStatus::Up).unwrap(), "\"UP\"");
     assert_eq!(
         serde_json::to_string(&HealthStatus::Down).unwrap(),
         "\"DOWN\""

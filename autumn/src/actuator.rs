@@ -1389,7 +1389,11 @@ impl HealthIndicatorRegistry {
         let mut results = Vec::with_capacity(entries.len());
         for (name, group, indicator) in entries {
             let output = run_with_timeout(indicator.as_ref()).await;
-            results.push(HealthRunResult { name, group, output });
+            results.push(HealthRunResult {
+                name,
+                group,
+                output,
+            });
         }
         results
     }
@@ -1408,7 +1412,11 @@ impl HealthIndicatorRegistry {
         let mut results = Vec::with_capacity(entries.len());
         for (name, group, indicator) in entries {
             let output = run_with_timeout(indicator.as_ref()).await;
-            results.push(HealthRunResult { name, group, output });
+            results.push(HealthRunResult {
+                name,
+                group,
+                output,
+            });
         }
         results
     }
@@ -1512,7 +1520,11 @@ pub async fn health<S: ProvideActuatorState + Send + Sync + 'static>(
                 let active = size.saturating_sub(available);
 
                 let healthy = available > 0 || waiting == 0;
-                let db_status = if healthy { HealthStatus::Up } else { HealthStatus::Down };
+                let db_status = if healthy {
+                    HealthStatus::Up
+                } else {
+                    HealthStatus::Down
+                };
                 let db_check = Some(DatabaseCheck {
                     status: if healthy { "ok" } else { "down" },
                     pool_size: size,
@@ -1538,10 +1550,8 @@ pub async fn health<S: ProvideActuatorState + Send + Sync + 'static>(
     };
 
     // ── aggregate status ────────────────────────────────────────
-    let mut all_statuses: Vec<HealthStatus> = indicator_results
-        .iter()
-        .map(|r| r.output.status)
-        .collect();
+    let mut all_statuses: Vec<HealthStatus> =
+        indicator_results.iter().map(|r| r.output.status).collect();
     if let Some(s) = db_component_status {
         all_statuses.push(s);
     }
@@ -4798,10 +4808,7 @@ mod health_indicator_tests {
             HealthStatus::Up
         );
         assert_eq!(
-            HealthIndicatorRegistry::aggregate_status(&[
-                HealthStatus::Up,
-                HealthStatus::Unknown
-            ]),
+            HealthIndicatorRegistry::aggregate_status(&[HealthStatus::Up, HealthStatus::Unknown]),
             HealthStatus::Unknown
         );
         assert_eq!(
@@ -4836,9 +4843,15 @@ mod health_indicator_tests {
 
         let results = registry.run_all().await;
         assert_eq!(results.len(), 2);
-        assert!(results.iter().any(|r| r.name == "svc_a" && r.output.status == HealthStatus::Up));
         assert!(
-            results.iter().any(|r| r.name == "svc_b" && r.output.status == HealthStatus::Down)
+            results
+                .iter()
+                .any(|r| r.name == "svc_a" && r.output.status == HealthStatus::Up)
+        );
+        assert!(
+            results
+                .iter()
+                .any(|r| r.name == "svc_b" && r.output.status == HealthStatus::Down)
         );
     }
 
@@ -4849,7 +4862,11 @@ mod health_indicator_tests {
             .register("probe_check", IndicatorGroup::Readiness, Arc::new(AlwaysUp))
             .unwrap();
         registry
-            .register("health_only", IndicatorGroup::HealthOnly, Arc::new(AlwaysDown))
+            .register(
+                "health_only",
+                IndicatorGroup::HealthOnly,
+                Arc::new(AlwaysDown),
+            )
             .unwrap();
 
         let results = registry.run_readiness().await;
