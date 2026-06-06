@@ -1468,7 +1468,15 @@ fn format_sample_value(v: f64) -> String {
 }
 
 /// Append all plugin-contributed metric families (and their error counters) to `out`.
-fn render_plugin_sources(registry: &MetricsSourceRegistry, out: &mut String) {
+///
+/// `emitted_families` must be pre-seeded with the names of every built-in
+/// metric family already written to `out`; families whose names collide are
+/// skipped with a warning so no duplicate `# HELP`/`# TYPE` blocks are emitted.
+fn render_plugin_sources(
+    registry: &MetricsSourceRegistry,
+    out: &mut String,
+    emitted_families: &mut std::collections::HashSet<String>,
+) {
     use std::fmt::Write;
 
     let all_sources = registry.collect_all();
@@ -1478,6 +1486,10 @@ fn render_plugin_sources(registry: &MetricsSourceRegistry, out: &mut String) {
                 tracing::warn!(name = %family.name, "MetricsSource returned invalid metric name; skipping family");
                 continue;
             }
+            if !emitted_families.insert(family.name.clone()) {
+                tracing::warn!(name = %family.name, "MetricsSource returned duplicate metric family name; skipping family");
+                continue;
+            }
             let _ = writeln!(
                 out,
                 "# HELP {} {}",
@@ -1485,6 +1497,8 @@ fn render_plugin_sources(registry: &MetricsSourceRegistry, out: &mut String) {
                 escape_help_text(&family.help)
             );
             let _ = writeln!(out, "# TYPE {} {}", family.name, family.kind.as_str());
+            let mut emitted_series: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
             for sample in &family.samples {
                 let mut bad_key = false;
                 let mut seen_keys = std::collections::HashSet::new();
@@ -1509,6 +1523,14 @@ fn render_plugin_sources(registry: &MetricsSourceRegistry, out: &mut String) {
                     continue;
                 }
                 let labels = render_labels(&valid_labels);
+                if !emitted_series.insert(labels.clone()) {
+                    tracing::warn!(
+                        metric = %family.name,
+                        labels = %labels,
+                        "MetricsSource returned duplicate series; skipping sample"
+                    );
+                    continue;
+                }
                 let _ = writeln!(
                     out,
                     "{}{} {}",
@@ -1634,9 +1656,22 @@ pub(crate) async fn prometheus_endpoint<S: ProvideActuatorState + Send + Sync + 
         }
     }
 
-    // Plugin-contributed metric families
+    // Plugin-contributed metric families — seed with built-in names so
+    // plugins cannot shadow or duplicate them.
     if let Some(registry) = state.metrics_source_registry() {
-        render_plugin_sources(registry, &mut out);
+        let mut emitted_families: std::collections::HashSet<String> = [
+            "autumn_http_requests_total",
+            "autumn_http_requests_active",
+            "autumn_http_responses_total",
+            "autumn_shutdown_aborted_requests_total",
+            "autumn_request_timeouts_total",
+            "autumn_http_route_requests_total",
+            "autumn_metrics_source_errors_total",
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+        render_plugin_sources(registry, &mut out, &mut emitted_families);
     }
 
     (
@@ -4121,11 +4156,11 @@ mod tests {
                     kind: MetricKind::Gauge,
                     samples: vec![
                         MetricSample {
-                            labels: vec![],
+                            labels: vec![("dir".to_string(), "pos".to_string())],
                             value: f64::INFINITY,
                         },
                         MetricSample {
-                            labels: vec![],
+                            labels: vec![("dir".to_string(), "neg".to_string())],
                             value: f64::NEG_INFINITY,
                         },
                     ],
@@ -4159,12 +4194,179 @@ mod tests {
             "help text must be escaped in:\n{text}"
         );
         assert!(
-            text.contains("inf_gauge +Inf"),
+            text.contains("inf_gauge{dir=\"pos\"} +Inf"),
             "must render +Inf in:\n{text}"
         );
         assert!(
-            text.contains("inf_gauge -Inf"),
+            text.contains("inf_gauge{dir=\"neg\"} -Inf"),
             "must render -Inf in:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn prometheus_endpoint_skips_duplicate_family_name_across_sources() {
+        struct FirstSource;
+        impl MetricsSource for FirstSource {
+            fn collect(&self) -> Vec<MetricFamily> {
+                vec![MetricFamily {
+                    name: "shared_counter".to_string(),
+                    help: "from first".to_string(),
+                    kind: MetricKind::Counter,
+                    samples: vec![MetricSample {
+                        labels: vec![],
+                        value: 1.0,
+                    }],
+                }]
+            }
+        }
+        struct SecondSource;
+        impl MetricsSource for SecondSource {
+            fn collect(&self) -> Vec<MetricFamily> {
+                vec![MetricFamily {
+                    name: "shared_counter".to_string(),
+                    help: "from second".to_string(),
+                    kind: MetricKind::Counter,
+                    samples: vec![MetricSample {
+                        labels: vec![],
+                        value: 2.0,
+                    }],
+                }]
+            }
+        }
+
+        let state = test_state();
+        state
+            .metrics_source_registry
+            .register("first", Arc::new(FirstSource))
+            .unwrap();
+        state
+            .metrics_source_registry
+            .register("second", Arc::new(SecondSource))
+            .unwrap();
+
+        let app = actuator_router(true).with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/prometheus")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+
+        let occurrences = text.matches("# HELP shared_counter").count();
+        assert_eq!(
+            occurrences, 1,
+            "must emit exactly one HELP block for shared_counter:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn prometheus_endpoint_skips_builtin_name_collision() {
+        struct ShadowSource;
+        impl MetricsSource for ShadowSource {
+            fn collect(&self) -> Vec<MetricFamily> {
+                vec![MetricFamily {
+                    name: "autumn_http_requests_total".to_string(),
+                    help: "plugin trying to shadow built-in".to_string(),
+                    kind: MetricKind::Counter,
+                    samples: vec![MetricSample {
+                        labels: vec![],
+                        value: 999.0,
+                    }],
+                }]
+            }
+        }
+
+        let state = test_state();
+        state
+            .metrics_source_registry
+            .register("shadow", Arc::new(ShadowSource))
+            .unwrap();
+
+        let app = actuator_router(true).with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/prometheus")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+
+        let occurrences = text.matches("# HELP autumn_http_requests_total").count();
+        assert_eq!(
+            occurrences, 1,
+            "built-in must not be shadowed by plugin:\n{text}"
+        );
+        assert!(
+            !text.contains("999"),
+            "plugin shadow value must not appear:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn prometheus_endpoint_skips_duplicate_series_within_family() {
+        struct DupSeriesSource;
+        impl MetricsSource for DupSeriesSource {
+            fn collect(&self) -> Vec<MetricFamily> {
+                vec![MetricFamily {
+                    name: "dup_series_metric".to_string(),
+                    help: "test".to_string(),
+                    kind: MetricKind::Counter,
+                    samples: vec![
+                        MetricSample {
+                            labels: vec![("region".to_string(), "us".to_string())],
+                            value: 10.0,
+                        },
+                        MetricSample {
+                            labels: vec![("region".to_string(), "us".to_string())],
+                            value: 20.0,
+                        },
+                    ],
+                }]
+            }
+        }
+
+        let state = test_state();
+        state
+            .metrics_source_registry
+            .register("dup_series", Arc::new(DupSeriesSource))
+            .unwrap();
+
+        let app = actuator_router(true).with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/prometheus")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+
+        // First occurrence kept, second skipped
+        assert!(
+            text.contains("dup_series_metric{region=\"us\"} 10"),
+            "first sample must appear:\n{text}"
+        );
+        assert!(
+            !text.contains("dup_series_metric{region=\"us\"} 20"),
+            "duplicate series must be dropped:\n{text}"
         );
     }
 }
