@@ -101,26 +101,28 @@ fn edit_credentials(env: &str, base_dir: &Path) -> Result<(), CredentialsError> 
         )
     })?;
 
-    let key = if enc_path.exists() {
-        resolve_master_key(base_dir)?
-    } else {
-        let k = MasterKey::generate();
-        let key_path = base_dir.join("config/master.key");
-        std::fs::create_dir_all(key_path.parent().unwrap())?;
+    let key = match resolve_master_key(base_dir) {
+        Ok(k) => k,
+        Err(CredentialsError::NoKeyFound) => {
+            let k = MasterKey::generate();
+            let key_path = base_dir.join("config/master.key");
+            std::fs::create_dir_all(key_path.parent().unwrap())?;
 
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut f = options.open(&key_path)?;
+            use std::io::Write as _;
+            f.write_all(k.to_hex().as_bytes())?;
+
+            println!("  Created config/master.key (keep this secret, do not commit)");
+            k
         }
-        let mut f = options.open(&key_path)?;
-        use std::io::Write as _;
-        f.write_all(k.to_hex().as_bytes())?;
-
-        println!("  Created config/master.key (keep this secret, do not commit)");
-        k
+        Err(e) => return Err(e),
     };
 
     let ciphertext = encrypt(&key, &new_plaintext);
@@ -389,5 +391,41 @@ mod tests {
             assert!(path.exists());
         }
         assert!(!path.exists(), "Temp file should be removed on drop");
+    }
+
+    #[test]
+    fn edit_credentials_reuses_existing_master_key() {
+        let tmp = TempDir::new().unwrap();
+        let initial_key = MasterKey::generate();
+        let key_dir = tmp.path().join("config");
+        std::fs::create_dir_all(&key_dir).unwrap();
+        let key_path = key_dir.join("master.key");
+        std::fs::write(&key_path, initial_key.to_hex()).unwrap();
+
+        let dummy_editor = if cfg!(windows) {
+            "cmd /c type"
+        } else {
+            "cat"
+        };
+
+        temp_env::with_vars(
+            [
+                ("VISUAL", Some(dummy_editor)),
+                ("EDITOR", None::<&str>),
+            ],
+            || {
+                edit_credentials("production", tmp.path()).unwrap();
+            }
+        );
+
+        let key_content = std::fs::read_to_string(&key_path).unwrap();
+        assert_eq!(key_content, initial_key.to_hex());
+
+        let enc_path = tmp.path().join("config/credentials/production.toml.enc");
+        assert!(enc_path.exists());
+        let ciphertext = std::fs::read(&enc_path).unwrap();
+        let decrypted = decrypt(&initial_key, &ciphertext).unwrap();
+        let decrypted_str = String::from_utf8(decrypted).unwrap();
+        assert!(decrypted_str.contains("production"));
     }
 }
