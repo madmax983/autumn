@@ -1486,18 +1486,27 @@ fn render_plugin_sources(registry: &MetricsSourceRegistry, out: &mut String) {
             );
             let _ = writeln!(out, "# TYPE {} {}", family.name, family.kind.as_str());
             for sample in &family.samples {
+                let mut bad_key = false;
                 let mut seen_keys = std::collections::HashSet::new();
                 let mut valid_labels: Vec<(String, String)> = Vec::new();
                 for (k, v) in &sample.labels {
                     if !is_valid_label_name(k) {
-                        tracing::warn!(label_name = %k, "MetricsSource returned invalid label name; dropping label");
-                        continue;
+                        tracing::warn!(
+                            label_name = %k,
+                            metric = %family.name,
+                            "MetricsSource returned invalid label name; skipping sample"
+                        );
+                        bad_key = true;
+                        break;
                     }
                     if !seen_keys.insert(k.as_str()) {
                         tracing::warn!(label_name = %k, "MetricsSource returned duplicate label name; dropping duplicate");
                         continue;
                     }
                     valid_labels.push((k.clone(), v.clone()));
+                }
+                if bad_key {
+                    continue;
                 }
                 let labels = render_labels(&valid_labels);
                 let _ = writeln!(
@@ -3988,7 +3997,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prometheus_endpoint_drops_invalid_and_duplicate_label_keys() {
+    async fn prometheus_endpoint_skips_sample_with_invalid_label_key() {
+        // A sample containing an invalid label key (bad-key) must be skipped
+        // entirely — not emitted with the bad key dropped — to avoid creating
+        // a phantom duplicate series in the Prometheus scrape.
         struct DirtyLabelsSource;
         impl MetricsSource for DirtyLabelsSource {
             fn collect(&self) -> Vec<MetricFamily> {
@@ -3996,14 +4008,19 @@ mod tests {
                     name: "dirty_labels_metric".to_string(),
                     help: "test".to_string(),
                     kind: MetricKind::Counter,
-                    samples: vec![MetricSample {
-                        labels: vec![
-                            ("good".to_string(), "a".to_string()),
-                            ("bad-key".to_string(), "b".to_string()),
-                            ("good".to_string(), "dup".to_string()),
-                        ],
-                        value: 1.0,
-                    }],
+                    samples: vec![
+                        MetricSample {
+                            labels: vec![
+                                ("good".to_string(), "a".to_string()),
+                                ("bad-key".to_string(), "b".to_string()),
+                            ],
+                            value: 1.0,
+                        },
+                        MetricSample {
+                            labels: vec![("good".to_string(), "a".to_string())],
+                            value: 2.0,
+                        },
+                    ],
                 }]
             }
         }
@@ -4029,17 +4046,67 @@ mod tests {
             .unwrap();
         let text = String::from_utf8(body.to_vec()).unwrap();
 
+        // First sample (bad-key) must be absent entirely
         assert!(
-            text.contains("dirty_labels_metric{good=\"a\"} 1"),
-            "expected only valid, non-duplicate label in:\n{text}"
+            !text.contains("dirty_labels_metric{good=\"a\"} 1"),
+            "sample with invalid label key must be skipped:\n{text}"
+        );
+        // Second (clean) sample must still appear
+        assert!(
+            text.contains("dirty_labels_metric{good=\"a\"} 2"),
+            "clean sample must appear:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn prometheus_endpoint_deduplicates_label_keys() {
+        struct DupLabelSource;
+        impl MetricsSource for DupLabelSource {
+            fn collect(&self) -> Vec<MetricFamily> {
+                vec![MetricFamily {
+                    name: "dup_label_metric".to_string(),
+                    help: "test".to_string(),
+                    kind: MetricKind::Counter,
+                    samples: vec![MetricSample {
+                        labels: vec![
+                            ("env".to_string(), "prod".to_string()),
+                            ("env".to_string(), "staging".to_string()),
+                        ],
+                        value: 5.0,
+                    }],
+                }]
+            }
+        }
+
+        let state = test_state();
+        state
+            .metrics_source_registry
+            .register("dup_src", Arc::new(DupLabelSource))
+            .unwrap();
+
+        let app = actuator_router(true).with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/prometheus")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+
+        // Only the first occurrence of `env` is kept
+        assert!(
+            text.contains("dup_label_metric{env=\"prod\"} 5"),
+            "first env value must be kept:\n{text}"
         );
         assert!(
-            !text.contains("bad-key"),
-            "invalid label key must be dropped:\n{text}"
-        );
-        assert!(
-            !text.contains("dup"),
-            "duplicate label value must be dropped:\n{text}"
+            !text.contains("staging"),
+            "duplicate env key value must be dropped:\n{text}"
         );
     }
 
