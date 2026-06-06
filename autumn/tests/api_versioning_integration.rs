@@ -125,6 +125,43 @@ async fn api_secured_role_sunset() -> &'static str {
     "secured role sunset info"
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct SunsetNote {
+    id: i64,
+}
+
+#[derive(Default, Clone)]
+struct SunsetNotePolicy;
+
+impl ::autumn_web::authorization::Policy<SunsetNote> for SunsetNotePolicy {
+    fn can_show<'a>(&'a self, ctx: &'a ::autumn_web::authorization::PolicyContext, _note: &'a SunsetNote) -> ::autumn_web::authorization::BoxFuture<'a, bool> {
+        Box::pin(async move { ctx.is_authenticated() })
+    }
+}
+
+struct LoadedSunsetNote(SunsetNote);
+
+impl<S> ::autumn_web::reexports::axum::extract::FromRequestParts<S> for LoadedSunsetNote
+where
+    S: Send + Sync,
+{
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        _parts: &mut ::autumn_web::reexports::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(Self(SunsetNote { id: 1 }))
+    }
+}
+
+#[get("/api/authorize-sunset", api_version = "v1")]
+#[authorize("show", resource = SunsetNote)]
+async fn api_authorize_sunset(LoadedSunsetNote(sunset_note): LoadedSunsetNote) -> &'static str {
+    let _ = sunset_note;
+    "authorized sunset info"
+}
+
 #[tokio::test]
 async fn test_api_versioning_auth_preservation() {
     use autumn_web::session::{MemoryStore, SessionConfig, SessionLayer, SessionStore};
@@ -148,7 +185,8 @@ async fn test_api_versioning_auth_preservation() {
     store.save("sess-user", user_data).await.unwrap();
 
     let client = TestApp::new()
-        .routes(routes![api_secured_sunset, api_secured_role_sunset])
+        .routes(routes![api_secured_sunset, api_secured_role_sunset, api_authorize_sunset])
+        .policy::<SunsetNote, _>(SunsetNotePolicy)
         .api_version(autumn_web::app::ApiVersion {
             version: "v1".to_string(),
             deprecated_at: Some(deprecated_at),
@@ -166,6 +204,20 @@ async fn test_api_versioning_auth_preservation() {
     // Authenticated user -> 200
     let resp = client
         .get("/api/secured-sunset")
+        .header("Cookie", "autumn.sid=sess-user")
+        .send()
+        .await;
+    resp.assert_ok();
+
+    // Unauthenticated authorize -> 404 (due to default ForbiddenResponse / unauthenticated)
+    // Wait, let's see. For an unauthenticated request to an #[authorize]-guarded handler,
+    // authorization::authorize returns NoKeyFound/unauthorized error which becomes 404 by default.
+    let resp = client.get("/api/authorize-sunset").send().await;
+    assert!(resp.status == 404 || resp.status == 401);
+
+    // Authenticated authorize -> 200
+    let resp = client
+        .get("/api/authorize-sunset")
         .header("Cookie", "autumn.sid=sess-user")
         .send()
         .await;
@@ -202,6 +254,18 @@ async fn test_api_versioning_auth_preservation() {
     let resp = client
         .get("/api/secured-role-sunset")
         .header("Cookie", "autumn.sid=sess-admin")
+        .send()
+        .await;
+    resp.assert_status(410);
+
+    // Unauthenticated authorize request -> 404/401 Unauthorized (not 410 Gone!)
+    let resp = client.get("/api/authorize-sunset").send().await;
+    assert!(resp.status == 404 || resp.status == 401);
+
+    // Authenticated authorize request -> 410 Gone
+    let resp = client
+        .get("/api/authorize-sunset")
+        .header("Cookie", "autumn.sid=sess-user")
         .send()
         .await;
     resp.assert_status(410);
