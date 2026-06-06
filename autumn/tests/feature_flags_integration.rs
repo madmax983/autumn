@@ -380,3 +380,24 @@ async fn flags_service_accessor_returns_underlying_service() {
         "got: {body}"
     );
 }
+
+#[get("/macro-gated-primitive")]
+#[feature_flag("macro_flag")]
+async fn macro_gated_primitive_handler() -> bool {
+    true
+}
+
+#[tokio::test]
+async fn feature_flag_macro_primitive_wrapper_stacked() {
+    let store = InMemoryFlagStore::new();
+    store.enable("macro_flag", None).unwrap();
+
+    let client = TestApp::new()
+        .with_flag_store(store)
+        .routes(routes![macro_gated_primitive_handler])
+        .build();
+
+    let resp = client.get("/macro-gated-primitive").send().await;
+    resp.assert_ok();
+    assert_eq!(resp.text(), "true");
+}
