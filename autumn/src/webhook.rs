@@ -1051,10 +1051,6 @@ impl Drop for ReplayKeyGuard {
 }
 
 /// Middleware to clean up webhook replay keys on handler failure.
-///
-/// # Panics
-///
-/// Panics if the internal mutex is poisoned.
 pub async fn webhook_replay_cleanup_middleware(
     req: axum::extract::Request,
     next: axum::middleware::Next,
