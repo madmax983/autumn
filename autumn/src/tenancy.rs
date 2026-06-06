@@ -450,7 +450,7 @@ mod tests {
     }
 
     fn make_parts(host: &str) -> axum::http::request::Parts {
-        let (parts, _) = axum::http::Request::builder()
+        let (parts, ()) = axum::http::Request::builder()
             .uri("http://ignored/")
             .header(axum::http::header::HOST, host)
             .body(())
@@ -463,7 +463,7 @@ mod tests {
         host_header: &str,
         resolved_host: &str,
     ) -> axum::http::request::Parts {
-        let (mut parts, _) = axum::http::Request::builder()
+        let (mut parts, ()) = axum::http::Request::builder()
             .uri("http://ignored/")
             .header(axum::http::header::HOST, host_header)
             .body(())
@@ -477,7 +477,7 @@ mod tests {
         parts
     }
 
-    /// When no ResolvedClientIdentity extension is present, subdomain mode falls
+    /// When no `ResolvedClientIdentity` extension is present, subdomain mode falls
     /// back to the raw Host header as before.
     #[tokio::test]
     async fn subdomain_falls_back_to_host_header_without_extension() {
@@ -487,7 +487,7 @@ mod tests {
         assert_eq!(result.unwrap(), "tenant1");
     }
 
-    /// When ResolvedClientIdentity.host is present, subdomain mode uses it instead
+    /// When `ResolvedClientIdentity.host` is present, subdomain mode uses it instead
     /// of the raw Host header so that X-Forwarded-Host from trusted proxies is honoured.
     #[tokio::test]
     async fn subdomain_uses_resolved_host_from_extension() {
@@ -498,7 +498,7 @@ mod tests {
         assert_eq!(result.unwrap(), "tenant1");
     }
 
-    /// With a configured base_domain, the resolved host is matched against it.
+    /// With a configured `base_domain`, the resolved host is matched against it.
     #[tokio::test]
     async fn subdomain_uses_resolved_host_with_base_domain() {
         let config = subdomain_config_with_base("example.com");
@@ -517,12 +517,12 @@ mod tests {
         assert_eq!(result.unwrap(), "tenant2");
     }
 
-    /// When ResolvedClientIdentity.host is None (layer ran but found no host),
+    /// When `ResolvedClientIdentity.host` is `None` (layer ran but found no host),
     /// subdomain mode falls back to the raw Host header.
     #[tokio::test]
     async fn subdomain_falls_back_when_resolved_host_is_none() {
         let config = subdomain_config();
-        let (mut parts, _) = axum::http::Request::builder()
+        let (mut parts, ()) = axum::http::Request::builder()
             .uri("http://ignored/")
             .header(axum::http::header::HOST, "tenant3.example.com")
             .body(())
