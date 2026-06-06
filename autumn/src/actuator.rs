@@ -1486,18 +1486,19 @@ fn render_plugin_sources(registry: &MetricsSourceRegistry, out: &mut String) {
             );
             let _ = writeln!(out, "# TYPE {} {}", family.name, family.kind.as_str());
             for sample in &family.samples {
-                let valid_labels: Vec<(String, String)> = sample
-                    .labels
-                    .iter()
-                    .filter(|(k, _)| {
-                        let ok = is_valid_label_name(k);
-                        if !ok {
-                            tracing::warn!(label_name = %k, "MetricsSource returned invalid label name; dropping label");
-                        }
-                        ok
-                    })
-                    .cloned()
-                    .collect();
+                let mut seen_keys = std::collections::HashSet::new();
+                let mut valid_labels: Vec<(String, String)> = Vec::new();
+                for (k, v) in &sample.labels {
+                    if !is_valid_label_name(k) {
+                        tracing::warn!(label_name = %k, "MetricsSource returned invalid label name; dropping label");
+                        continue;
+                    }
+                    if !seen_keys.insert(k.as_str()) {
+                        tracing::warn!(label_name = %k, "MetricsSource returned duplicate label name; dropping duplicate");
+                        continue;
+                    }
+                    valid_labels.push((k.clone(), v.clone()));
+                }
                 let labels = render_labels(&valid_labels);
                 let _ = writeln!(
                     out,

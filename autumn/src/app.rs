@@ -322,7 +322,7 @@ pub struct AppBuilder {
     #[cfg(feature = "oauth2")]
     http_interceptor: Option<Arc<dyn crate::interceptor::HttpInterceptor>>,
     /// Plugin-contributed metrics sources registered via [`AppBuilder::metrics_source`].
-    metrics_sources: Vec<(String, Arc<dyn crate::actuator::MetricsSource>)>,
+    pub(crate) metrics_sources: Vec<(String, Arc<dyn crate::actuator::MetricsSource>)>,
 }
 
 /// Boxed builder closure that constructs a durable

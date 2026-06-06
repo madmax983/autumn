@@ -209,6 +209,8 @@ pub struct TestApp {
     /// to [`crate::time::TickingClock`] at runtime.
     clock_as_any: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
     api_versions: Vec<crate::app::ApiVersion>,
+    /// Plugin-contributed metrics sources registered via [`AppBuilder::metrics_source`].
+    metrics_sources: Vec<(String, std::sync::Arc<dyn crate::actuator::MetricsSource>)>,
 }
 
 type TestPolicyRegistration = Box<dyn FnOnce(&crate::authorization::PolicyRegistry) + Send>;
@@ -260,6 +262,7 @@ impl TestApp {
             clock: None,
             clock_as_any: None,
             api_versions: Vec::new(),
+            metrics_sources: Vec::new(),
         }
     }
 
@@ -491,6 +494,7 @@ impl TestApp {
         self.custom_layers.extend(app_builder.custom_layers);
         self.jobs.extend(app_builder.jobs);
         self.exception_filters.extend(app_builder.exception_filters);
+        self.metrics_sources.extend(app_builder.metrics_sources);
 
         // Carry plugin-registered error reporters into the test app so
         // reporting-enabled plugins exercise the same behavior under `TestApp`
@@ -902,6 +906,12 @@ impl TestApp {
 
         for initializer in self.state_initializers {
             initializer(&state);
+        }
+
+        for (name, source) in self.metrics_sources {
+            if let Err(e) = state.metrics_source_registry.register(name, source) {
+                tracing::warn!("{e}");
+            }
         }
 
         for job in &self.jobs {
