@@ -208,25 +208,29 @@ impl ProxyResolver {
             return peer_ip;
         }
 
-        // Hop-count mode: peel exactly N entries from the right regardless of peer
-        // IP ranges. The operator explicitly declared how many proxy hops to skip,
-        // so no range membership check is needed (and would break mixed topologies
-        // like a dynamic ALB peer plus CDN ranges in the XFF chain).
+        // Hop-count mode: peel exactly N entries from the right regardless of
+        // peer IP ranges.  The operator explicitly declared the number of proxy
+        // hops to skip, so no range membership check is needed (and would break
+        // mixed topologies like a dynamic ALB peer plus CDN ranges in the XFF
+        // chain).  parse_forwarded_ip normalises entries that carry a port suffix.
         if let Some(hops) = self.trusted_hops {
             if let Some(xff) = Self::x_forwarded_for(req) {
-                let mut entries = xff.rsplit(',').map(str::trim).filter(|s| !s.is_empty());
-                if let Some(entry) = entries.nth(hops as usize)
-                    && let Ok(ip) = entry.parse::<IpAddr>()
-                {
+                let mut entries = xff
+                    .rsplit(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .filter_map(Self::parse_forwarded_ip);
+
+                if let Some(ip) = entries.nth(hops as usize) {
                     return Some(ip);
                 }
             }
             return peer_ip;
         }
 
-        // Range-based resolution: honour forwarding headers only when the immediate
-        // peer is trusted. "No ranges configured" means trust all peers.
-        // "Ranges configured but all invalid" means trust no peers.
+        // Range-based resolution: honour forwarding headers only when the
+        // immediate peer is trusted.  "No ranges configured" means trust all
+        // peers.  "Ranges configured but all invalid" means trust no peers.
         let peer_is_trusted = peer_ip.is_some_and(|ip| self.is_trusted_ip(ip))
             || (!self.ranges_configured && peer_ip.is_none());
 
@@ -237,7 +241,7 @@ impl ProxyResolver {
         if let Some(xff) = Self::x_forwarded_for(req) {
             if self.ranges_configured {
                 for entry in xff.rsplit(',').map(str::trim).filter(|s| !s.is_empty()) {
-                    let Ok(ip) = entry.parse::<IpAddr>() else {
+                    let Some(ip) = Self::parse_forwarded_ip(entry) else {
                         continue;
                     };
                     if !self.ranges.iter().any(|r| r.contains(ip)) {
@@ -249,14 +253,14 @@ impl ProxyResolver {
 
             // No ranges, no hop count: use rightmost entry, but skip if it equals
             // the peer (i.e. the proxy appended itself).
-            let mut entries = xff.rsplit(',').map(str::trim).filter(|s| !s.is_empty());
-            if let Some(rightmost) = entries.next()
-                && let Ok(rightmost_ip) = rightmost.parse::<IpAddr>()
-            {
+            let mut entries = xff
+                .rsplit(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .filter_map(Self::parse_forwarded_ip);
+            if let Some(rightmost_ip) = entries.next() {
                 if peer_ip.is_some_and(|p| rightmost_ip == p) {
-                    if let Some(prev) = entries.next()
-                        && let Ok(prev_ip) = prev.parse::<IpAddr>()
-                    {
+                    if let Some(prev_ip) = entries.next() {
                         return Some(prev_ip);
                     }
                     return Some(rightmost_ip);
@@ -282,8 +286,12 @@ impl ProxyResolver {
 
     /// Resolve the external host as seen by the client.
     ///
-    /// Returns `X-Forwarded-Host` when `trust_forwarded_headers` is `true` and
-    /// the peer is trusted; falls back to the `Host` header.
+    /// Returns the leftmost `X-Forwarded-Host` value when
+    /// `trust_forwarded_headers` is `true` and the peer is trusted; falls back
+    /// to the `Host` header.  In hop-count mode the peer is considered trusted
+    /// only when the XFF chain contains enough valid-IP entries to satisfy the
+    /// declared hop count — an absent or junk-filled chain cannot be used to
+    /// spoof the host.
     pub fn resolve_client_host<B>(&self, req: &Request<B>) -> Option<String> {
         if !self.trust_forwarded_headers {
             return req
@@ -293,22 +301,23 @@ impl ProxyResolver {
                 .map(|s| s.trim().to_owned());
         }
 
-        // Hop-count mode: only trust forwarded host when the XFF chain actually
-        // contains enough entries (i.e. the declared number of proxy hops are
-        // present). Without a valid chain a direct client could inject an
-        // X-Forwarded-Host header and have it trusted unconditionally.
         let peer_ip = Self::peer_ip(req);
-        let peer_is_trusted = if let Some(hops) = self.trusted_hops {
-            Self::x_forwarded_for(req).is_some_and(|xff| {
-                xff.rsplit(',')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .count()
-                    > hops as usize
-            })
-        } else {
-            peer_ip.is_some_and(|ip| self.is_trusted_ip(ip)) || !self.ranges_configured
-        };
+        // Hop-count mode: only trust the forwarded host when the XFF chain
+        // contains enough parseable IP entries.  A direct client or a proxy
+        // that omits XFF cannot satisfy the count, preventing header spoofing.
+        let peer_is_trusted = self.trusted_hops.map_or_else(
+            || peer_ip.is_some_and(|ip| self.is_trusted_ip(ip)) || !self.ranges_configured,
+            |hops| {
+                Self::x_forwarded_for(req).is_some_and(|xff| {
+                    xff.rsplit(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .filter_map(Self::parse_forwarded_ip)
+                        .count()
+                        > hops as usize
+                })
+            },
+        );
 
         if peer_is_trusted
             && let Some(fwd_host_raw) = req
@@ -336,26 +345,28 @@ impl ProxyResolver {
     /// Resolve the external scheme (`"http"` or `"https"`) as seen by the client.
     ///
     /// Returns the leftmost value of `X-Forwarded-Proto` when
-    /// `trust_forwarded_headers` is `true` and the peer is trusted, the URI
-    /// scheme when present, or `None` when no scheme signal was observed.  A
-    /// `None` return lets callers distinguish "no signal" from "http", which
-    /// is important for the same-origin host-only fallback path.
+    /// `trust_forwarded_headers` is `true` and the peer is trusted; otherwise
+    /// the peer is considered trusted only when the XFF chain contains enough
+    /// valid-IP entries — matching the same guard used by `resolve_client_host`.
+    /// Returns `None` when no scheme signal is available, letting callers
+    /// distinguish "no signal" from `"http"` (important for the same-origin
+    /// host-only fallback in method-override).
     pub fn resolve_client_scheme<B>(&self, req: &Request<B>) -> Option<String> {
         if self.trust_forwarded_headers {
-            // Hop-count mode: only trust forwarded proto when the XFF chain has
-            // enough entries, for the same reason as resolve_client_host.
             let peer_ip = Self::peer_ip(req);
-            let peer_is_trusted = if let Some(hops) = self.trusted_hops {
-                Self::x_forwarded_for(req).is_some_and(|xff| {
-                    xff.rsplit(',')
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .count()
-                        > hops as usize
-                })
-            } else {
-                peer_ip.is_some_and(|ip| self.is_trusted_ip(ip)) || !self.ranges_configured
-            };
+            let peer_is_trusted = self.trusted_hops.map_or_else(
+                || peer_ip.is_some_and(|ip| self.is_trusted_ip(ip)) || !self.ranges_configured,
+                |hops| {
+                    Self::x_forwarded_for(req).is_some_and(|xff| {
+                        xff.rsplit(',')
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .filter_map(Self::parse_forwarded_ip)
+                            .count()
+                            > hops as usize
+                    })
+                },
+            );
 
             if peer_is_trusted
                 && let Some(proto) = req
@@ -373,6 +384,19 @@ impl ProxyResolver {
         }
 
         req.uri().scheme_str().map(ToOwned::to_owned)
+    }
+
+    /// Parse an XFF entry that may carry an optional port suffix.
+    ///
+    /// Handles the three forms proxies are known to emit:
+    /// - `"198.51.100.7"` (plain IPv4)
+    /// - `"198.51.100.7:54321"` (IPv4 with port)
+    /// - `"2001:db8::1"` (plain IPv6)
+    /// - `"[2001:db8::1]:54321"` (bracketed IPv6 with port)
+    fn parse_forwarded_ip(s: &str) -> Option<IpAddr> {
+        s.parse::<IpAddr>()
+            .ok()
+            .or_else(|| s.parse::<SocketAddr>().map(|sa| sa.ip()).ok())
     }
 
     fn peer_ip<B>(req: &Request<B>) -> Option<IpAddr> {
@@ -901,5 +925,60 @@ mod tests {
         let req = req_with_peer_and_xff("10.0.0.1", "192.0.2.1");
         let addr = resolver.resolve_client_addr(&req).unwrap();
         assert_eq!(addr, "10.0.0.1".parse::<IpAddr>().unwrap());
+    }
+
+    // ── Port-normalisation in XFF entries ──────────────────────────────────
+
+    #[test]
+    fn xff_entry_with_ipv4_port_is_parsed() {
+        let resolver = ProxyResolver::from_config(&TrustedProxiesConfig {
+            ranges: Vec::new(),
+            trusted_hops: Some(1),
+            trust_forwarded_headers: true,
+        });
+
+        // Proxy emitted "client:port, alb:port" — both carry port suffixes.
+        let req = req_with_xff("192.0.2.1:54321, 10.0.1.200:80");
+        let addr = resolver.resolve_client_addr(&req).unwrap();
+        assert_eq!(addr, "192.0.2.1".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn xff_entry_with_ipv6_port_is_parsed() {
+        let resolver = ProxyResolver::from_config(&TrustedProxiesConfig {
+            ranges: Vec::new(),
+            trusted_hops: Some(1),
+            trust_forwarded_headers: true,
+        });
+
+        // Bracketed IPv6 with port on ALB side.
+        let req = req_with_xff("2001:db8::1, [::1]:8080");
+        let addr = resolver.resolve_client_addr(&req).unwrap();
+        assert_eq!(addr, "2001:db8::1".parse::<IpAddr>().unwrap());
+    }
+
+    // ── Junk XFF entries must not satisfy hop count ─────────────────────────
+
+    #[test]
+    fn trusted_hops_with_junk_xff_does_not_trust_forwarded_host() {
+        // Non-IP XFF entries must not count toward the hop threshold.
+        let resolver = ProxyResolver::from_config(&TrustedProxiesConfig {
+            ranges: Vec::new(),
+            trusted_hops: Some(1),
+            trust_forwarded_headers: true,
+        });
+
+        let mut req = Request::builder()
+            .header("host", "real.example.com")
+            .header("x-forwarded-host", "attacker.example.com")
+            // Two entries, but both are junk — count of valid IPs is 0, not > 1.
+            .header("x-forwarded-for", "junk, more-junk")
+            .body(())
+            .unwrap();
+        let addr: SocketAddr = "10.0.1.200:1234".parse().unwrap();
+        req.extensions_mut().insert(ConnectInfo(addr));
+
+        let host = resolver.resolve_client_host(&req).unwrap();
+        assert_eq!(host, "real.example.com");
     }
 }

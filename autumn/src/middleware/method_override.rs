@@ -412,22 +412,36 @@ fn origin_matches_request_with_identity(
         return false;
     };
 
-    // Prefer the resolver-validated host; fall back to header reads.
-    let expected_host: Option<std::borrow::Cow<str>> =
-        identity.and_then(|id| id.host.as_deref()).map_or_else(
-            || {
-                headers
-                    .get("x-forwarded-host")
-                    .and_then(|v| v.to_str().ok())
-                    .or_else(|| {
-                        headers
-                            .get(http::header::HOST)
-                            .and_then(|v| v.to_str().ok())
-                    })
-                    .map(std::borrow::Cow::Borrowed)
-            },
-            |id| Some(std::borrow::Cow::Borrowed(id)),
-        );
+    // When a resolved identity is present, use it exclusively — never fall
+    // back to raw X-Forwarded-Host, because the resolver has already applied
+    // the trusted-proxy policy.  Only when no identity extension exists (e.g.,
+    // a standalone test without the proxy middleware) do we read headers
+    // directly for backwards compatibility.
+    let expected_host: Option<std::borrow::Cow<str>> = identity.map_or_else(
+        || {
+            headers
+                .get("x-forwarded-host")
+                .and_then(|v| v.to_str().ok())
+                .or_else(|| {
+                    headers
+                        .get(http::header::HOST)
+                        .and_then(|v| v.to_str().ok())
+                })
+                .map(std::borrow::Cow::Borrowed)
+        },
+        |id| {
+            // Identity stamp present: use resolver-validated host, or fall back
+            // to Host header only (never raw X-Forwarded-Host).
+            id.host
+                .as_deref()
+                .or_else(|| {
+                    headers
+                        .get(http::header::HOST)
+                        .and_then(|v| v.to_str().ok())
+                })
+                .map(std::borrow::Cow::Borrowed)
+        },
+    );
 
     let Some(expected_host) = expected_host else {
         return false;
