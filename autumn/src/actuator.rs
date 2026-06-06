@@ -1382,46 +1382,57 @@ impl HealthIndicatorRegistry {
     }
 
     /// Run all registered indicators (both groups) with per-indicator timeouts.
+    ///
+    /// All indicators execute **concurrently**; total wall time is bounded by
+    /// the slowest single indicator rather than N × timeout.
     pub async fn run_all(&self) -> Vec<HealthRunResult> {
-        let entries: IndicatorList = self
+        let entries = self
             .inner
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
 
-        let mut results = Vec::with_capacity(entries.len());
-        for (name, group, indicator) in entries {
-            let output = run_with_timeout(indicator.as_ref()).await;
-            results.push(HealthRunResult {
-                name,
-                group,
-                output,
-            });
-        }
-        results
+        futures::future::join_all(
+            entries
+                .into_iter()
+                .map(|(name, group, indicator)| async move {
+                    let output = run_with_timeout(indicator.as_ref()).await;
+                    HealthRunResult {
+                        name,
+                        group,
+                        output,
+                    }
+                }),
+        )
+        .await
     }
 
     /// Run only `Readiness`-group indicators with per-indicator timeouts.
+    ///
+    /// All indicators execute **concurrently**; total wall time is bounded by
+    /// the slowest single indicator rather than N × timeout.
     pub async fn run_readiness(&self) -> Vec<HealthRunResult> {
-        let entries: IndicatorList = self
+        // Clone the full list to release the read lock before async work begins.
+        let entries = self
             .inner
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .iter()
-            .filter(|(_, g, _)| *g == IndicatorGroup::Readiness)
-            .cloned()
-            .collect();
+            .clone();
 
-        let mut results = Vec::with_capacity(entries.len());
-        for (name, group, indicator) in entries {
-            let output = run_with_timeout(indicator.as_ref()).await;
-            results.push(HealthRunResult {
-                name,
-                group,
-                output,
-            });
-        }
-        results
+        futures::future::join_all(
+            entries
+                .into_iter()
+                .filter(|(_, g, _)| *g == IndicatorGroup::Readiness)
+                .map(|(name, group, indicator)| async move {
+                    let output = run_with_timeout(indicator.as_ref()).await;
+                    HealthRunResult {
+                        name,
+                        group,
+                        output,
+                    }
+                }),
+        )
+        .await
     }
 
     /// Compute the aggregate status following Spring Boot precedence.
@@ -1510,6 +1521,19 @@ fn build_health_components(
     detailed: bool,
 ) -> HashMap<String, ComponentHealth> {
     let mut components: HashMap<String, ComponentHealth> = HashMap::new();
+    // Custom indicators first so the built-in "db" key inserted below can never
+    // be overwritten by a user-registered indicator with the same name.
+    for result in indicator_results {
+        let details = (detailed && !result.output.details.is_empty())
+            .then(|| serde_json::to_value(&result.output.details).unwrap_or_default());
+        components.insert(
+            result.name.clone(),
+            ComponentHealth {
+                status: result.output.status.as_str(),
+                details,
+            },
+        );
+    }
     if let Some(s) = db_status {
         let details = detailed
             .then(|| {
@@ -1527,17 +1551,6 @@ fn build_health_components(
             "db".to_string(),
             ComponentHealth {
                 status: s.as_str(),
-                details,
-            },
-        );
-    }
-    for result in indicator_results {
-        let details = (detailed && !result.output.details.is_empty())
-            .then(|| serde_json::to_value(&result.output.details).unwrap_or_default());
-        components.insert(
-            result.name.clone(),
-            ComponentHealth {
-                status: result.output.status.as_str(),
                 details,
             },
         );

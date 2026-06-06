@@ -533,6 +533,13 @@ fn probe_response<S: ProvideProbeState>(
     (status_code, Json(body))
 }
 
+/// Return `true` when the `/ready` response will be 503 regardless of indicator
+/// results — avoids running potentially slow indicators unnecessarily.
+fn already_degraded<S: ProvideProbeState>(state: &S) -> bool {
+    let probes = state.probes();
+    !probes.is_startup_complete() || probes.is_shutting_down() || !dependency_readiness(state).0
+}
+
 /// Run all readiness-group [`HealthIndicator`]s and return `false` if any are
 /// `Down` or `OutOfService`.
 async fn check_readiness_indicators<S: ProvideProbeState + Sync>(state: &S) -> bool {
@@ -558,7 +565,12 @@ pub async fn ready_handler<S: ProvideProbeState + Send + Sync + 'static>(
 ) -> impl IntoResponse {
     #[cfg(feature = "db")]
     refresh_replica_readiness(&state).await;
-    let indicator_ready = check_readiness_indicators(&state).await;
+    // Skip slow indicator checks when the probe will be 503 regardless.
+    let indicator_ready = if already_degraded(&state) {
+        true
+    } else {
+        check_readiness_indicators(&state).await
+    };
     probe_response(&state, ProbeKind::Ready, indicator_ready)
 }
 
@@ -575,7 +587,11 @@ pub(crate) async fn readiness_response<S: ProvideProbeState + Sync>(
 ) -> (StatusCode, Json<ProbeResponse>) {
     #[cfg(feature = "db")]
     refresh_replica_readiness(state).await;
-    let indicator_ready = check_readiness_indicators(state).await;
+    let indicator_ready = if already_degraded(state) {
+        true
+    } else {
+        check_readiness_indicators(state).await
+    };
     probe_response(state, ProbeKind::Ready, indicator_ready)
 }
 
