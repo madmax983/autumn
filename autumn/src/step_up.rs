@@ -248,7 +248,6 @@ pub fn encode_return_to(path: &str) -> String {
             | b'('
             | b')'
             | b'*'
-            | b'+'
             | b','
             | b';'
             | b'=' => {
@@ -603,6 +602,22 @@ mod tests {
         let encoded = encode_return_to("/account?tab=security");
         // '?' must be encoded so the return_to param doesn't break the outer query
         assert!(encoded.contains("%3F"), "should encode '?': {encoded}");
+    }
+
+    #[test]
+    fn encode_return_to_encodes_plus_sign() {
+        // '+' is decoded as a space by application/x-www-form-urlencoded parsers.
+        // It must be percent-encoded so a URL like /reports?q=a+b round-trips
+        // correctly through the return_to query parameter.
+        let encoded = encode_return_to("/reports?q=a+b");
+        assert!(
+            encoded.contains("%2B"),
+            "'+' must be encoded as %2B: {encoded}"
+        );
+        assert!(
+            !encoded.contains("a+b"),
+            "literal '+' must not survive encoding: {encoded}"
+        );
     }
 
     // ── __resolve_step_up_max_age ─────────────────────────────────────────────

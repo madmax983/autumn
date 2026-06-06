@@ -2163,10 +2163,17 @@ pub async fn reauth(
     // In the TOTP multi-step flow, the password is verified in one request and the
     // TOTP code in the next. Rather than echoing the password into a hidden DOM
     // field (which would expose it to any script on the page), we store a short-
-    // lived session marker after a successful password check and rely on that marker
-    // on subsequent submissions so the password never leaves the server.
-    let pw_verified_in_session = session.get("reauth_pw_ok").await.is_some();
-    if !pw_verified_in_session && !verify_password(&form.password, &{snake_name}.password_digest)
+    // lived timestamped session marker after a successful password check and rely
+    // on that marker on subsequent submissions so the password never leaves the
+    // server. The marker expires after 10 minutes; if the user takes longer they
+    // must re-enter their password before the TOTP step is accepted.
+    const REAUTH_PW_VALID_SECS: i64 = 600;
+    let pw_verified_recently = session
+        .get("reauth_pw_ok")
+        .await
+        .and_then(|s| s.parse::<i64>().ok())
+        .is_some_and(|ts| chrono::Utc::now().timestamp() - ts < REAUTH_PW_VALID_SECS);
+    if !pw_verified_recently && !verify_password(&form.password, &{snake_name}.password_digest)
         .await
         .unwrap_or(false)
     {{
@@ -2187,8 +2194,8 @@ pub async fn reauth(
             }}
         }}).into_response());
     }}
-    if !pw_verified_in_session {{
-        session.insert("reauth_pw_ok", "1").await;
+    if !pw_verified_recently {{
+        session.insert("reauth_pw_ok", chrono::Utc::now().timestamp().to_string()).await;
     }}
     {totp_reauth_check}
     // Rotate session ID before elevating privileges to prevent session fixation
@@ -3989,7 +3996,8 @@ const fn totp_clear_pending_src() -> &'static str {
      \x20   session.remove(\"totp_pending_id\").await;\n\
      \x20   session.remove(\"totp_pending_reset_digest\").await;\n\
      \x20   session.remove(\"totp_pending_reset_token\").await;\n\
-     \x20   session.remove(\"totp_pending_secret\").await;\n"
+     \x20   session.remove(\"totp_pending_secret\").await;\n\
+     \x20   session.remove(\"totp_pending_confirmation\").await;\n"
 }
 
 /// The interstitial branch injected into `reset_password` *before* the password
@@ -4058,6 +4066,10 @@ fn totp_confirm_branch_src(snake_name: &str) -> String {
         session
             .insert("totp_pending_id", __SNAKE__.id.to_string())
             .await;
+        // Mark that this pending login originated from email confirmation (not a
+        // password login). login_verify checks this to skip the step-up stamp:
+        // email + TOTP proves address & second-factor but NOT password knowledge.
+        session.insert("totp_pending_confirmation", "1").await;
         return Ok(redirect_to("/login/verify"));
     }
 "#;
@@ -4894,15 +4906,20 @@ pub async fn login_verify(
     }
 
     // Promote the pending session to a fully authenticated one.
+    let from_confirmation = session.get("totp_pending_confirmation").await.is_some();
     session.rotate_id().await;
     session.remove("totp_pending_id").await;
+    session.remove("totp_pending_confirmation").await;
     session.insert("__SNAKE___id", __SNAKE__.id.to_string()).await;
     session.insert("__SNAKE___email", &__SNAKE__.email).await;
     session.insert(state.auth_session_key(), __SNAKE__.id.to_string()).await;
-    // Password + TOTP proves identity at least as strongly as password-only
-    // login, so stamp the step-up claim so #[step_up] routes are immediately
-    // accessible without forcing a redundant /reauth.
-    autumn_web::step_up::set_last_strong_auth_at(&session).await;
+    // Password + TOTP proves identity at least as strongly as password-only login,
+    // so stamp step-up for normal logins. Email-confirmation + TOTP proves address
+    // ownership and second-factor possession but NOT password knowledge — those
+    // sessions must still go through /reauth before accessing #[step_up] routes.
+    if !from_confirmation {
+        autumn_web::step_up::set_last_strong_auth_at(&session).await;
+    }
 
     let remaining: i64 = recovery_codes::table
         .filter(recovery_codes::user_id.eq(__SNAKE__.id))
