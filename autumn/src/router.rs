@@ -1227,7 +1227,9 @@ fn apply_rate_limit_middleware(
         );
         router = router.layer(layer);
 
-        if config.security.rate_limit.key_strategy == crate::security::KeyStrategy::AuthenticatedPrincipal {
+        if config.security.rate_limit.key_strategy
+            == crate::security::KeyStrategy::AuthenticatedPrincipal
+        {
             router = router.layer(axum::middleware::from_fn_with_state(
                 state.clone(),
                 populate_rate_limit_principal,
@@ -1453,10 +1455,15 @@ fn apply_middleware(
     router = router.layer(
         crate::middleware::maintenance::MaintenanceLayer::new(maintenance_state)
             .with_trust_forwarded_headers(config.security.rate_limit.trust_forwarded_headers)
-            .with_trusted_proxies(trusted_proxies),
+            .with_trusted_proxies(trusted_proxies)
+            .with_trusted_proxies_configured(
+                !config.security.rate_limit.trusted_proxies.is_empty(),
+            ),
     );
 
-    router = router.layer(axum::middleware::from_fn(crate::webhook::webhook_replay_cleanup_middleware));
+    router = router.layer(axum::middleware::from_fn(
+        crate::webhook::webhook_replay_cleanup_middleware,
+    ));
     router = apply_upload_middleware(router, config);
 
     // Security headers layer (always applied)

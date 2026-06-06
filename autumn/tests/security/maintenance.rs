@@ -18,13 +18,11 @@ async fn maintenance_trusted_proxy_bypass() {
 
     let trusted_proxy = TrustedProxy::parse("203.0.113.10").unwrap();
 
-    let app = Router::new()
-        .route("/", get(|| async { "Hello" }))
-        .layer(
-            MaintenanceLayer::new(state)
-                .with_trust_forwarded_headers(true)
-                .with_trusted_proxies(vec![trusted_proxy]),
-        );
+    let app = Router::new().route("/", get(|| async { "Hello" })).layer(
+        MaintenanceLayer::new(state)
+            .with_trust_forwarded_headers(true)
+            .with_trusted_proxies(vec![trusted_proxy]),
+    );
 
     let peer: SocketAddr = "203.0.113.10:4000".parse().unwrap();
 
@@ -61,4 +59,33 @@ async fn maintenance_trusted_proxy_bypass() {
 
     let resp3 = app.clone().oneshot(req3).await.unwrap();
     assert_eq!(resp3.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn maintenance_invalid_proxies_fails_closed() {
+    let state = MaintenanceState::new();
+    state.enable(MaintenanceConfig {
+        message: Some("Maintenance Mode Active".to_string()),
+        allow_ips: vec!["192.168.1.10".to_string()],
+        ..Default::default()
+    });
+
+    let app = Router::new().route("/", get(|| async { "Hello" })).layer(
+        MaintenanceLayer::new(state)
+            .with_trust_forwarded_headers(true)
+            .with_trusted_proxies_configured(true)
+            .with_trusted_proxies(vec![]),
+    );
+
+    let peer: SocketAddr = "203.0.113.11:4000".parse().unwrap();
+
+    let mut req = Request::builder()
+        .uri("/")
+        .header("X-Forwarded-For", "192.168.1.10")
+        .body(Body::empty())
+        .unwrap();
+    req.extensions_mut().insert(ConnectInfo(peer));
+
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
 }

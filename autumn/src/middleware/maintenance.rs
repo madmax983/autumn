@@ -56,6 +56,7 @@ pub struct MaintenanceLayer {
     health_prefix: String,
     trust_forwarded_headers: bool,
     trusted_proxies: Vec<crate::security::TrustedProxy>,
+    trusted_proxies_configured: bool,
 }
 
 impl MaintenanceLayer {
@@ -69,6 +70,7 @@ impl MaintenanceLayer {
             health_prefix: DEFAULT_HEALTH_PREFIX.to_owned(),
             trust_forwarded_headers: false,
             trusted_proxies: Vec::new(),
+            trusted_proxies_configured: false,
         }
     }
 
@@ -93,7 +95,17 @@ impl MaintenanceLayer {
     /// Configure the trusted proxies list.
     #[must_use]
     pub fn with_trusted_proxies(mut self, proxies: Vec<crate::security::TrustedProxy>) -> Self {
+        if !proxies.is_empty() {
+            self.trusted_proxies_configured = true;
+        }
         self.trusted_proxies = proxies;
+        self
+    }
+
+    /// Configure whether trusted proxies were originally configured.
+    #[must_use]
+    pub const fn with_trusted_proxies_configured(mut self, configured: bool) -> Self {
+        self.trusted_proxies_configured = configured;
         self
     }
 }
@@ -108,6 +120,7 @@ impl<S> Layer<S> for MaintenanceLayer {
             health_prefix: self.health_prefix.clone(),
             trust_forwarded_headers: self.trust_forwarded_headers,
             trusted_proxies: self.trusted_proxies.clone(),
+            trusted_proxies_configured: self.trusted_proxies_configured,
         }
     }
 }
@@ -120,6 +133,7 @@ pub struct MaintenanceService<S> {
     health_prefix: String,
     trust_forwarded_headers: bool,
     trusted_proxies: Vec<crate::security::TrustedProxy>,
+    trusted_proxies_configured: bool,
 }
 
 impl<S> MaintenanceService<S> {
@@ -147,7 +161,12 @@ impl<S> MaintenanceService<S> {
 
         // 3. IP allow-list.
         if !config.allow_ips.is_empty()
-            && let Some(client_ip) = extract_client_ip(req, self.trust_forwarded_headers, &self.trusted_proxies)
+            && let Some(client_ip) = extract_client_ip(
+                req,
+                self.trust_forwarded_headers,
+                &self.trusted_proxies,
+                self.trusted_proxies_configured,
+            )
             && ip_in_allow_list(&client_ip, &config.allow_ips)
         {
             return None;
@@ -224,8 +243,8 @@ fn extract_client_ip<B>(
     req: &Request<B>,
     trust_forwarded_headers: bool,
     trusted_proxies: &[crate::security::TrustedProxy],
+    configured: bool,
 ) -> Option<IpAddr> {
-    let configured = !trusted_proxies.is_empty();
     crate::security::proxy::extract_client_ip(
         req,
         trust_forwarded_headers,
