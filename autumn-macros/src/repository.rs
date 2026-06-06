@@ -3677,6 +3677,99 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 }
             };
 
+            let delete_returning_expr = if config.soft_delete {
+                if config.tenant_scoped {
+                    quote! {
+                        let query = #table_ident::table.filter(#table_ident::id.eq_any(chunk)).filter(#table_ident::deleted_at.is_null());
+                        if let ::core::option::Option::Some(t) = tenant_id {
+                            ::autumn_web::reexports::diesel::update(query.filter(#table_ident::tenant_id.eq(t)))
+                                .set(#table_ident::deleted_at.eq(::core::option::Option::Some(__now)))
+                                .returning(#table_ident::id)
+                                .get_results::<i64>(conn)
+                                .await
+                        } else {
+                            ::autumn_web::reexports::diesel::update(query)
+                                .set(#table_ident::deleted_at.eq(::core::option::Option::Some(__now)))
+                                .returning(#table_ident::id)
+                                .get_results::<i64>(conn)
+                                .await
+                        }
+                    }
+                } else {
+                    quote! {
+                        ::autumn_web::reexports::diesel::update(#table_ident::table.filter(#table_ident::id.eq_any(chunk)).filter(#table_ident::deleted_at.is_null()))
+                            .set(#table_ident::deleted_at.eq(::core::option::Option::Some(__now)))
+                            .returning(#table_ident::id)
+                            .get_results::<i64>(conn)
+                            .await
+                    }
+                }
+            } else {
+                if config.tenant_scoped {
+                    quote! {
+                        let query = #table_ident::table.filter(#table_ident::id.eq_any(chunk));
+                        if let ::core::option::Option::Some(t) = tenant_id {
+                            ::autumn_web::reexports::diesel::delete(query.filter(#table_ident::tenant_id.eq(t)))
+                                .returning(#table_ident::id)
+                                .get_results::<i64>(conn)
+                                .await
+                        } else {
+                            ::autumn_web::reexports::diesel::delete(query)
+                                .returning(#table_ident::id)
+                                .get_results::<i64>(conn)
+                                .await
+                        }
+                    }
+                } else {
+                    quote! {
+                        ::autumn_web::reexports::diesel::delete(#table_ident::table.filter(#table_ident::id.eq_any(chunk)))
+                            .returning(#table_ident::id)
+                            .get_results::<i64>(conn)
+                            .await
+                    }
+                }
+            };
+
+            let vh_delete_write = if config.versioned {
+                let vh = vh_insert_ts(
+                    table_name,
+                    "delete",
+                    false,
+                    &quote! { r },
+                    None,
+                    &quote! { conn },
+                    model_name,
+                );
+                quote! {
+                    for r in &__vh_deleted_records {
+                        #vh
+                    }
+                }
+            } else {
+                quote! {}
+            };
+
+            let delete_execution = if config.versioned {
+                quote! {
+                    let mut __vh_actually_deleted: ::std::collections::HashSet<i64> = ::std::collections::HashSet::new();
+                    for chunk in ids.chunks(1000) {
+                        let chunk_deleted_ids = #delete_returning_expr
+                            .map_err(::autumn_web::AutumnError::from)?;
+                        __vh_actually_deleted.extend(chunk_deleted_ids);
+                    }
+                    let mut __vh_deleted_records = current_rows.clone();
+                    __vh_deleted_records.retain(|r| __vh_actually_deleted.contains(&r.id));
+                    #vh_delete_write
+                }
+            } else {
+                quote! {
+                    for chunk in ids.chunks(1000) {
+                        #delete_expr
+                            .map_err(::autumn_web::AutumnError::from)?;
+                    }
+                }
+            };
+
             let idempotency_setup = if commit_hooks_enabled {
                 quote! {
                     if let ::core::option::Option::Some(__autumn_idempotency) = &self.idempotency {
@@ -3753,10 +3846,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             #delete_commit_hook_setup
                         }
 
-                        for chunk in ids.chunks(1000) {
-                            #delete_expr
-                                .map_err(::autumn_web::AutumnError::from)?;
-                        }
+                        #delete_execution
 
                         Ok(())
                     }
@@ -8362,6 +8452,34 @@ mod tests {
         assert!(
             insert_pos < history_pos && history_pos < enqueue_pos,
             "commit-hook versioned save_many must record history inside the mutation transaction before hook enqueue: {section}"
+        );
+    }
+
+    #[test]
+    fn hooked_repository_versioned_delete_many_writes_history() {
+        let generated = repository_macro(
+            quote! { Post, hooks = PostHooks, versioned = true },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        let delete_many_pos = generated
+            .find("async fn delete_many")
+            .expect("hooked repository should implement delete_many");
+        let section = &generated[delete_many_pos..];
+        
+        let history_pos = section
+            .find("INSERT INTO _autumn_version_history")
+            .expect("hooked versioned delete_many must write delete history");
+        
+        let delete_pos = section
+            .find("diesel :: delete")
+            .or_else(|| section.find("diesel :: update"))
+            .expect("hooked versioned delete_many must delete/update records");
+
+        assert!(
+            delete_pos < history_pos,
+            "hooked versioned delete_many must record history after database deletion/update: {section}"
         );
     }
 
