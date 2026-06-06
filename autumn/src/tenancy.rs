@@ -100,13 +100,9 @@ pub async fn extract_tenant_from_parts(
                             )
                         })
                         .and_then(|h| {
-                            h.to_str()
-                                .map(ToOwned::to_owned)
-                                .map_err(|_| {
-                                    crate::AutumnError::bad_request_msg(
-                                        "Invalid UTF-8 in Host header",
-                                    )
-                                })
+                            h.to_str().map(ToOwned::to_owned).map_err(|_| {
+                                crate::AutumnError::bad_request_msg("Invalid UTF-8 in Host header")
+                            })
                         })
                 })?;
 
@@ -463,7 +459,10 @@ mod tests {
         parts
     }
 
-    fn make_parts_with_identity(host_header: &str, resolved_host: &str) -> axum::http::request::Parts {
+    fn make_parts_with_identity(
+        host_header: &str,
+        resolved_host: &str,
+    ) -> axum::http::request::Parts {
         let (mut parts, _) = axum::http::Request::builder()
             .uri("http://ignored/")
             .header(axum::http::header::HOST, host_header)
@@ -503,8 +502,7 @@ mod tests {
     #[tokio::test]
     async fn subdomain_uses_resolved_host_with_base_domain() {
         let config = subdomain_config_with_base("example.com");
-        let mut parts =
-            make_parts_with_identity("internal.cluster.local", "acme.example.com");
+        let mut parts = make_parts_with_identity("internal.cluster.local", "acme.example.com");
         let result = extract_tenant_from_parts(&mut parts, &config).await;
         assert_eq!(result.unwrap(), "acme");
     }
