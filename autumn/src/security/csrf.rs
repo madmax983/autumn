@@ -287,7 +287,9 @@ impl CsrfLayer {
     /// Add a path prefix that is exempt from CSRF validation.
     #[must_use]
     pub fn with_exempt_path(mut self, path: impl Into<String>) -> Self {
-        Arc::make_mut(&mut self.settings).exempt_paths.push(path.into());
+        Arc::make_mut(&mut self.settings)
+            .exempt_paths
+            .push(path.into());
         self
     }
 }
@@ -390,11 +392,15 @@ where
 
     fn call(&mut self, mut req: Request<axum::body::Body>) -> Self::Future {
         let path = req.uri().path();
-        let is_exempt = self
-            .settings
-            .exempt_paths
-            .iter()
-            .any(|prefix| path.starts_with(prefix.as_str()));
+        let is_exempt = self.settings.exempt_paths.iter().any(|prefix| {
+            if path == prefix {
+                true
+            } else if let Some(stripped) = path.strip_prefix(prefix) {
+                prefix.ends_with('/') || stripped.starts_with('/')
+            } else {
+                false
+            }
+        });
         let is_safe = is_exempt || self.settings.safe_methods.contains(req.method());
         let raw_cookie_token = extract_cookie_token(req.headers(), &self.settings.cookie_name);
 
@@ -759,6 +765,61 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/form/submit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn exempt_path_exact_or_subtree_only() {
+        let config = CsrfConfig {
+            enabled: true,
+            exempt_paths: vec!["/webhooks/stripe".to_string()],
+            ..Default::default()
+        };
+        let app = Router::new()
+            .route("/webhooks/stripe", post(|| async { "stripe" }))
+            .route("/webhooks/stripe/events", post(|| async { "stripe events" }))
+            .route("/webhooks/stripe-admin", post(|| async { "stripe admin" }))
+            .layer(CsrfLayer::from_config(&config));
+
+        // Exact match of exempt path should skip CSRF validation
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/webhooks/stripe")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Slash-delimited subtree of exempt path should skip CSRF validation
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/webhooks/stripe/events")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Unrelated path starting with same prefix should NOT skip CSRF validation
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/webhooks/stripe-admin")
                     .body(Body::empty())
                     .unwrap(),
             )
