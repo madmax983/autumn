@@ -418,6 +418,12 @@ mod tests {
         assert!(p.join("autumn.toml").is_file());
         assert!(p.join("Dockerfile").is_file());
         assert!(p.join(".dockerignore").is_file());
+        let dockerignore = std::fs::read_to_string(p.join(".dockerignore")).unwrap();
+        assert!(
+            dockerignore.contains("/config/master.key") || dockerignore.contains("config/master.key"),
+            ".dockerignore must exclude config/master.key: {}",
+            dockerignore
+        );
         assert!(p.join("build.rs").is_file());
         assert!(p.join(".gitignore").is_file());
         assert!(p.join("static/css/input.css").is_file());
