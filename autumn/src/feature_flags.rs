@@ -1803,12 +1803,11 @@ mod tests {
 
     #[tokio::test]
     async fn from_request_parts_respects_custom_auth_session_key() {
-        use std::collections::HashMap;
         use axum::extract::FromRequestParts;
+        use std::collections::HashMap;
 
         let svc = make_svc();
-        let state = crate::AppState::for_test()
-            .with_auth_session_key("custom_user_id");
+        let state = crate::AppState::for_test().with_auth_session_key("custom_user_id");
         state.insert_extension(svc);
 
         let mut data = HashMap::new();
@@ -1816,15 +1815,11 @@ mod tests {
         data.insert("user_id".to_owned(), "user:999".to_owned()); // distracter
         let session = crate::session::Session::new_for_test("session_id".to_owned(), data);
 
-        let mut req = axum::http::Request::builder()
-            .body(())
-            .unwrap();
+        let mut req = axum::http::Request::builder().body(()).unwrap();
         req.extensions_mut().insert(session);
         let mut parts = req.into_parts().0;
 
-        let flags = Flags::from_request_parts(&mut parts, &state)
-            .await
-            .unwrap();
+        let flags = Flags::from_request_parts(&mut parts, &state).await.unwrap();
         assert_eq!(flags.actor_id.as_deref(), Some("user:123"));
     }
 }

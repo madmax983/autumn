@@ -782,7 +782,10 @@ mod tests {
         };
         let app = Router::new()
             .route("/webhooks/stripe", post(|| async { "stripe" }))
-            .route("/webhooks/stripe/events", post(|| async { "stripe events" }))
+            .route(
+                "/webhooks/stripe/events",
+                post(|| async { "stripe events" }),
+            )
             .route("/webhooks/stripe-admin", post(|| async { "stripe admin" }))
             .layer(CsrfLayer::from_config(&config));
 

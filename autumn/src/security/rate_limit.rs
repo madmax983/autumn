@@ -916,9 +916,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::extract::ConnectInfo;
     use axum::Router;
     use axum::body::Body;
+    use axum::extract::ConnectInfo;
     use axum::routing::get;
     use std::net::{IpAddr, SocketAddr};
     use std::time::Duration;

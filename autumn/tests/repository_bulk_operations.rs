@@ -318,7 +318,8 @@ async fn setup_pool() -> (
         .execute(&mut conn)
         .await
         .expect("create test_hooked_versioned_records");
-    diesel::sql_query("CREATE TABLE IF NOT EXISTS _autumn_version_history (
+    diesel::sql_query(
+        "CREATE TABLE IF NOT EXISTS _autumn_version_history (
         id          BIGSERIAL   PRIMARY KEY,
         table_name  TEXT        NOT NULL,
         tenant_id   TEXT,
@@ -328,7 +329,8 @@ async fn setup_pool() -> (
         request_id  TEXT,
         changes     JSONB       NOT NULL DEFAULT '[]',
         recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )")
+    )",
+    )
     .execute(&mut conn)
     .await
     .expect("create _autumn_version_history");
@@ -383,7 +385,9 @@ const fn build_tenant_bulk_repo(pool: Pool<AsyncPgConnection>) -> PgTenantBulkRe
     }
 }
 
-const fn build_hooked_versioned_repo(pool: Pool<AsyncPgConnection>) -> PgHookedVersionedRecordRepository {
+const fn build_hooked_versioned_repo(
+    pool: Pool<AsyncPgConnection>,
+) -> PgHookedVersionedRecordRepository {
     PgHookedVersionedRecordRepository {
         pool,
         hooks: HookedVersionedRecordHooks,
@@ -756,9 +760,15 @@ async fn test_hooked_versioned_delete_many_records_history() {
 
     // Check version history for both records
     for id in ids {
-        let history = repo.version_history(id, ::autumn_web::version_history::VersionFilter::default()).await.unwrap();
+        let history = repo
+            .version_history(id, ::autumn_web::version_history::VersionFilter::default())
+            .await
+            .unwrap();
         assert!(
-            history.entries.iter().any(|entry| entry.op == ::autumn_web::version_history::VersionOp::Delete),
+            history
+                .entries
+                .iter()
+                .any(|entry| entry.op == ::autumn_web::version_history::VersionOp::Delete),
             "expected a delete entry in version history for record {id}"
         );
     }

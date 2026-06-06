@@ -8467,11 +8467,11 @@ mod tests {
             .find("async fn delete_many")
             .expect("hooked repository should implement delete_many");
         let section = &generated[delete_many_pos..];
-        
+
         let history_pos = section
             .find("INSERT INTO _autumn_version_history")
             .expect("hooked versioned delete_many must write delete history");
-        
+
         let delete_pos = section
             .find("diesel :: delete")
             .or_else(|| section.find("diesel :: update"))

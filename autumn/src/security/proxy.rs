@@ -1,6 +1,6 @@
-use std::net::{IpAddr, SocketAddr};
 use axum::extract::ConnectInfo;
 use axum::http::Request;
+use std::net::{IpAddr, SocketAddr};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TrustedProxy {

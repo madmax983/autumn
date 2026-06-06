@@ -1192,20 +1192,19 @@ async fn main() {
         let plan = plan_scaffold(
             tmp.path(),
             "Post",
-            &[
-                "title:String".into(),
-                "avatar:Attachment".into(),
-            ],
+            &["title:String".into(), "avatar:Attachment".into()],
             "20260427000000",
         )
         .unwrap();
         plan.execute(Flags::default()).unwrap();
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
-        
+
         // Assert edit form contains input type="file" AND the hidden input for existing avatar
         assert!(routes.contains("input type=\"file\" name=\"avatar\""));
-        assert!(routes.contains("input type=\"hidden\" name=\"avatar\" value=(serde_json::to_string(blob).unwrap())"));
+        assert!(routes.contains(
+            "input type=\"hidden\" name=\"avatar\" value=(serde_json::to_string(blob).unwrap())"
+        ));
 
         // Assert decode_form contains DecodedForm struct
         assert!(routes.contains("struct DecodedForm"));

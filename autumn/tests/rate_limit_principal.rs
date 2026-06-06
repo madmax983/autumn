@@ -639,19 +639,40 @@ async fn principal_strategy_keys_on_session_user_id() {
     // 1. Log in user-A
     let resp_a = client.get("/login/user-a").send().await;
     resp_a.assert_ok();
-    let cookie_a = resp_a.header("set-cookie").expect("must set cookie").to_owned();
+    let cookie_a = resp_a
+        .header("set-cookie")
+        .expect("must set cookie")
+        .to_owned();
 
     // 2. Log in user-B
     let resp_b = client.get("/login/user-b").send().await;
     resp_b.assert_ok();
-    let cookie_b = resp_b.header("set-cookie").expect("must set cookie").to_owned();
+    let cookie_b = resp_b
+        .header("set-cookie")
+        .expect("must set cookie")
+        .to_owned();
 
     // 3. User A makes 1st request -> OK
-    client.get("/ping").header("cookie", &cookie_a).send().await.assert_ok();
+    client
+        .get("/ping")
+        .header("cookie", &cookie_a)
+        .send()
+        .await
+        .assert_ok();
 
     // 4. User A's bucket is now exhausted -> 429
-    client.get("/ping").header("cookie", &cookie_a).send().await.assert_status(429);
+    client
+        .get("/ping")
+        .header("cookie", &cookie_a)
+        .send()
+        .await
+        .assert_status(429);
 
     // 5. User B still has a fresh bucket -> OK
-    client.get("/ping").header("cookie", &cookie_b).send().await.assert_ok();
+    client
+        .get("/ping")
+        .header("cookie", &cookie_b)
+        .send()
+        .await
+        .assert_ok();
 }

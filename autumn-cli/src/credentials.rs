@@ -1,7 +1,7 @@
 //! CLI implementation for `autumn credentials edit` and `autumn credentials show`.
 
-use std::path::{Path, PathBuf};
 use std::io::Write;
+use std::path::{Path, PathBuf};
 
 use autumn_web::credentials::{
     CredentialsError, MasterKey, credentials_path, decrypt, encrypt, load_credentials,
@@ -397,20 +397,13 @@ mod tests {
         let key_path = key_dir.join("master.key");
         std::fs::write(&key_path, initial_key.to_hex()).unwrap();
 
-        let dummy_editor = if cfg!(windows) {
-            "cmd /c type"
-        } else {
-            "cat"
-        };
+        let dummy_editor = if cfg!(windows) { "cmd /c type" } else { "cat" };
 
         temp_env::with_vars(
-            [
-                ("VISUAL", Some(dummy_editor)),
-                ("EDITOR", None::<&str>),
-            ],
+            [("VISUAL", Some(dummy_editor)), ("EDITOR", None::<&str>)],
             || {
                 edit_credentials("production", tmp.path()).unwrap();
-            }
+            },
         );
 
         let key_content = std::fs::read_to_string(&key_path).unwrap();

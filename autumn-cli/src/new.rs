@@ -420,7 +420,8 @@ mod tests {
         assert!(p.join(".dockerignore").is_file());
         let dockerignore = std::fs::read_to_string(p.join(".dockerignore")).unwrap();
         assert!(
-            dockerignore.contains("/config/master.key") || dockerignore.contains("config/master.key"),
+            dockerignore.contains("/config/master.key")
+                || dockerignore.contains("config/master.key"),
             ".dockerignore must exclude config/master.key: {dockerignore}"
         );
         assert!(p.join("build.rs").is_file());
@@ -908,6 +909,9 @@ mod tests {
         use std::os::unix::fs::MetadataExt;
         let meta = fs::metadata(&p).unwrap();
         let mode = meta.mode() & 0o777;
-        assert_eq!(mode, 0o600, "master.key permissions must be 0o600, got {mode:#o}");
+        assert_eq!(
+            mode, 0o600,
+            "master.key permissions must be 0o600, got {mode:#o}"
+        );
     }
 }

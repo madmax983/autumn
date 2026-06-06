@@ -1970,7 +1970,10 @@ mod tests {
         let exp = 9_999_999_999u64;
         let sig_a = sign_upload(key, "a:b", "c", exp);
         let sig_b = sign_upload(key, "a", "b:c", exp);
-        assert_ne!(sig_a, sig_b, "Signatures for distinct fields must not collide");
+        assert_ne!(
+            sig_a, sig_b,
+            "Signatures for distinct fields must not collide"
+        );
     }
 
     #[test]

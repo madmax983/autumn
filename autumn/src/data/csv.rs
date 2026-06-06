@@ -536,10 +536,7 @@ mod tests {
             csv.as_ref(),
             &ImportOptions::default(),
             |_line, row, _mode| {
-                if row
-                    .get("email")
-                    .map_or("", String::as_str)
-                    .contains('@') {
+                if row.get("email").map_or("", String::as_str).contains('@') {
                     ImportRowResult::Inserted
                 } else {
                     ImportRowResult::FieldError {

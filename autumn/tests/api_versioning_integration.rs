@@ -134,7 +134,11 @@ struct SunsetNote {
 struct SunsetNotePolicy;
 
 impl ::autumn_web::authorization::Policy<SunsetNote> for SunsetNotePolicy {
-    fn can_show<'a>(&'a self, ctx: &'a ::autumn_web::authorization::PolicyContext, _note: &'a SunsetNote) -> ::autumn_web::authorization::BoxFuture<'a, bool> {
+    fn can_show<'a>(
+        &'a self,
+        ctx: &'a ::autumn_web::authorization::PolicyContext,
+        _note: &'a SunsetNote,
+    ) -> ::autumn_web::authorization::BoxFuture<'a, bool> {
         Box::pin(async move { ctx.is_authenticated() })
     }
 }
@@ -185,7 +189,11 @@ async fn test_api_versioning_auth_preservation() {
     store.save("sess-user", user_data).await.unwrap();
 
     let client = TestApp::new()
-        .routes(routes![api_secured_sunset, api_secured_role_sunset, api_authorize_sunset])
+        .routes(routes![
+            api_secured_sunset,
+            api_secured_role_sunset,
+            api_authorize_sunset
+        ])
         .policy::<SunsetNote, _>(SunsetNotePolicy)
         .api_version(autumn_web::app::ApiVersion {
             version: "v1".to_string(),

@@ -120,12 +120,13 @@ impl BrowserCheck {
         let mut searched = Vec::new();
         for path in &candidates {
             if path.is_file()
-                && let Some(version) = probe_version(path) {
-                    return Self::Found {
-                        path: path.clone(),
-                        version,
-                    };
-                }
+                && let Some(version) = probe_version(path)
+            {
+                return Self::Found {
+                    path: path.clone(),
+                    version,
+                };
+            }
             searched.push(path.clone());
         }
         Self::NotFound {
@@ -219,7 +220,8 @@ pub enum SystemTestError {
 #[must_use]
 pub fn artifact_dir(test_name: &str) -> PathBuf {
     // Walk up from the crate root (or use CARGO_TARGET_DIR if set).
-    let base = std::env::var("CARGO_TARGET_DIR").map_or_else(|_| PathBuf::from("target"), PathBuf::from);
+    let base =
+        std::env::var("CARGO_TARGET_DIR").map_or_else(|_| PathBuf::from("target"), PathBuf::from);
     base.join("system-tests").join(test_name)
 }
 
@@ -754,9 +756,10 @@ impl Page {
 
             let text: Option<String> = result.into_value().ok();
             if let Some(ref t) = text
-                && predicate(t) {
-                    return Ok(self);
-                }
+                && predicate(t)
+            {
+                return Ok(self);
+            }
 
             if tokio::time::Instant::now() >= deadline {
                 let artifact = self.write_failure_artifacts("expect_sse_event").await.ok();

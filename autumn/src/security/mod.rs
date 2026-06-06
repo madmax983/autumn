@@ -106,8 +106,8 @@
 pub(crate) mod config;
 pub(crate) mod csrf;
 pub(crate) mod headers;
-pub mod rate_limit;
 pub mod proxy;
+pub mod rate_limit;
 
 // Re-export commonly used types at the module level.
 pub use config::{
@@ -119,5 +119,5 @@ pub use config::{
 pub use config::{RateLimitBackendFailure, RateLimitRedisConfig};
 pub use csrf::{CsrfFormField, CsrfLayer, CsrfToken, CsrfTokenHeader};
 pub use headers::{CspNonce, SecurityHeadersLayer};
-pub use rate_limit::{RateLimitLayer, RateLimitOverride, RateLimitPrincipal};
 pub use proxy::TrustedProxy;
+pub use rate_limit::{RateLimitLayer, RateLimitOverride, RateLimitPrincipal};

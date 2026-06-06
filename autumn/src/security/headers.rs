@@ -1012,6 +1012,10 @@ mod tests {
         let nonce_val = std::str::from_utf8(&body_bytes).unwrap();
 
         assert!(!nonce_val.is_empty(), "Nonce must not be empty");
-        assert_eq!(nonce_val.len(), 22, "Nonce must be a 22-character base64 string");
+        assert_eq!(
+            nonce_val.len(),
+            22,
+            "Nonce must be a 22-character base64 string"
+        );
     }
 }
