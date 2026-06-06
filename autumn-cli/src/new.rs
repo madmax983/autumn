@@ -3,6 +3,7 @@
 //! Generates a complete Autumn project directory from embedded templates.
 
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 
 use autumn_web::credentials::{MasterKey, encrypt};
@@ -175,7 +176,6 @@ fn scaffold_credentials(project_dir: &Path, name: &str) -> Result<(), NewError> 
         options.mode(0o600);
     }
     let mut f = options.open(&key_path)?;
-    use std::io::Write as _;
     f.write_all(master_key.to_hex().as_bytes())?;
 
     let template = format!(
@@ -421,8 +421,7 @@ mod tests {
         let dockerignore = std::fs::read_to_string(p.join(".dockerignore")).unwrap();
         assert!(
             dockerignore.contains("/config/master.key") || dockerignore.contains("config/master.key"),
-            ".dockerignore must exclude config/master.key: {}",
-            dockerignore
+            ".dockerignore must exclude config/master.key: {dockerignore}"
         );
         assert!(p.join("build.rs").is_file());
         assert!(p.join(".gitignore").is_file());

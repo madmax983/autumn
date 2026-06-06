@@ -659,8 +659,7 @@ impl ExperimentStore for InMemoryExperimentStore {
             for variant in active_variants {
                 if !new_variants.contains(variant.as_str()) {
                     return Err(ExperimentStoreError::Backend(format!(
-                        "cannot delete variant '{}' because it has active assignments",
-                        variant
+                        "cannot delete variant '{variant}' because it has active assignments"
                     )));
                 }
             }
@@ -2700,7 +2699,7 @@ mod tests {
         }).unwrap();
 
         // Attempting to upsert config without "treatment" should fail
-        let mut new_config = config.clone();
+        let mut new_config = config;
         new_config.variants = vec![
             VariantConfig { name: "control".to_string(), weight: 100 },
         ];
@@ -2708,7 +2707,7 @@ mod tests {
         let res = store.upsert(new_config);
         assert!(res.is_err(), "expected upsert to fail due to deleting active variant");
         if let Err(ExperimentStoreError::Backend(msg)) = res {
-            assert!(msg.contains("treatment"), "expected error message to mention 'treatment', got: {}", msg);
+            assert!(msg.contains("treatment"), "expected error message to mention 'treatment', got: {msg}");
         } else {
             panic!("expected Backend error");
         }

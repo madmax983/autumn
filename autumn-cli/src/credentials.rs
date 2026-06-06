@@ -1,6 +1,7 @@
 //! CLI implementation for `autumn credentials edit` and `autumn credentials show`.
 
 use std::path::{Path, PathBuf};
+use std::io::Write;
 
 use autumn_web::credentials::{
     CredentialsError, MasterKey, credentials_path, decrypt, encrypt, load_credentials,
@@ -23,7 +24,6 @@ struct TempFileGuard {
 
 impl TempFileGuard {
     fn new(env: &str, plaintext: &[u8]) -> std::io::Result<Self> {
-        use std::io::Write;
         let mut file = tempfile::Builder::new()
             .prefix(&format!("autumn-credentials-{env}-"))
             .suffix(".toml")
@@ -81,14 +81,11 @@ fn edit_credentials(env: &str, base_dir: &Path) -> Result<(), CredentialsError> 
     let editor = resolve_editor();
     let status = launch_editor(&editor, tmp_path)
         .map_err(|e| std::io::Error::other(format!("cannot launch editor '{editor}': {e}")))?;
-
     if !status.success() {
-        return Err(CredentialsError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        return Err(CredentialsError::Io(std::io::Error::other(
             "editor exited with non-zero status",
         )));
     }
-
     let new_plaintext = std::fs::read(tmp_path)?;
 
     toml::from_str::<toml::Table>(std::str::from_utf8(&new_plaintext).map_err(|_| {
@@ -116,7 +113,6 @@ fn edit_credentials(env: &str, base_dir: &Path) -> Result<(), CredentialsError> 
                 options.mode(0o600);
             }
             let mut f = options.open(&key_path)?;
-            use std::io::Write as _;
             f.write_all(k.to_hex().as_bytes())?;
 
             println!("  Created config/master.key (keep this secret, do not commit)");

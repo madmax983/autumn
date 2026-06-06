@@ -796,11 +796,11 @@ impl WebhookReplayStore for InMemoryWebhookReplayStore {
     }
 
     fn remove<'a>(&'a self, key: &'a str) -> WebhookReplayFuture<'a> {
-        let mut state = self
-            .state
+        self.state
             .lock()
-            .expect("webhook replay store lock poisoned");
-        state.seen.remove(key);
+            .expect("webhook replay store lock poisoned")
+            .seen
+            .remove(key);
         Box::pin(async move { Ok(true) })
     }
 }
@@ -1023,6 +1023,11 @@ tokio::task_local! {
     pub static WEBHOOK_REPLAY_KEY: std::sync::Arc<std::sync::Mutex<Option<(std::sync::Arc<dyn WebhookReplayStore>, String)>>>;
 }
 
+/// Middleware to clean up webhook replay keys on handler failure.
+///
+/// # Panics
+///
+/// Panics if the internal mutex is poisoned.
 pub async fn webhook_replay_cleanup_middleware(
     req: axum::extract::Request,
     next: axum::middleware::Next,

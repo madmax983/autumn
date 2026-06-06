@@ -59,14 +59,12 @@
 
 use lru::LruCache;
 use std::future::Future;
-use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Instant;
 
-use axum::extract::ConnectInfo;
 use axum::http::{HeaderValue, Request, Response, StatusCode};
 use http::header::{CONTENT_TYPE, HeaderName, RETRY_AFTER};
 use tower::{Layer, Service};
@@ -661,7 +659,8 @@ impl Limiter {
         .map(|ip| ip.to_string())
     }
 
-    fn is_trusted_proxy(&self, ip: IpAddr) -> bool {
+    #[cfg(test)]
+    fn is_trusted_proxy(&self, ip: std::net::IpAddr) -> bool {
         self.trusted_proxies
             .iter()
             .any(|trusted_proxy| trusted_proxy.contains(ip))
@@ -917,9 +916,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::extract::ConnectInfo;
     use axum::Router;
     use axum::body::Body;
     use axum::routing::get;
+    use std::net::{IpAddr, SocketAddr};
     use std::time::Duration;
     use tower::ServiceExt;
 

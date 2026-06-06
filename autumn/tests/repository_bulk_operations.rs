@@ -759,8 +759,7 @@ async fn test_hooked_versioned_delete_many_records_history() {
         let history = repo.version_history(id, ::autumn_web::version_history::VersionFilter::default()).await.unwrap();
         assert!(
             history.entries.iter().any(|entry| entry.op == ::autumn_web::version_history::VersionOp::Delete),
-            "expected a delete entry in version history for record {}",
-            id
+            "expected a delete entry in version history for record {id}"
         );
     }
 }

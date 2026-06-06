@@ -85,7 +85,7 @@ impl MaintenanceLayer {
 
     /// Set whether to trust forwarded headers like `X-Forwarded-For`.
     #[must_use]
-    pub fn with_trust_forwarded_headers(mut self, trust: bool) -> Self {
+    pub const fn with_trust_forwarded_headers(mut self, trust: bool) -> Self {
         self.trust_forwarded_headers = trust;
         self
     }

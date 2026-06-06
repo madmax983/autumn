@@ -74,13 +74,13 @@ pub fn extract_client_ip<B>(
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ConnectInfo(addr)| addr.ip())
-        .or_else(|| req.extensions().get::<SocketAddr>().map(|addr| addr.ip()));
+        .or_else(|| req.extensions().get::<SocketAddr>().map(SocketAddr::ip));
 
     if trust_forwarded_headers {
-        let allowed = if !trusted_proxies_configured {
-            true
-        } else {
+        let allowed = if trusted_proxies_configured {
             peer_ip.is_some_and(|ip| is_trusted_proxy(ip, trusted_proxies))
+        } else {
+            true
         };
 
         if allowed {
@@ -130,12 +130,11 @@ fn client_ip_from_x_forwarded_for(
         let last = entries.next()?;
 
         if let Ok(last_ip) = last.parse::<IpAddr>() {
-            if peer_ip.is_some_and(|peer_ip| last_ip == peer_ip) {
-                if let Some(prev) = entries.next() {
-                    if let Ok(prev_ip) = prev.parse::<IpAddr>() {
-                        return Some(prev_ip);
-                    }
-                }
+            if peer_ip.is_some_and(|peer_ip| last_ip == peer_ip)
+                && let Some(prev) = entries.next()
+                && let Ok(prev_ip) = prev.parse::<IpAddr>()
+            {
+                return Some(prev_ip);
             }
             return Some(last_ip);
         }
@@ -143,10 +142,10 @@ fn client_ip_from_x_forwarded_for(
     }
 
     for entry in header.rsplit(',').map(str::trim).filter(|s| !s.is_empty()) {
-        if let Ok(ip) = entry.parse::<IpAddr>() {
-            if !is_trusted_proxy(ip, trusted_proxies) {
-                return Some(ip);
-            }
+        if let Ok(ip) = entry.parse::<IpAddr>()
+            && !is_trusted_proxy(ip, trusted_proxies)
+        {
+            return Some(ip);
         }
     }
 
