@@ -443,6 +443,21 @@ pub struct AuthConfig {
     /// restore pre-lockout behaviour for apps with a stronger external policy.
     #[serde(default)]
     pub lockout: LockoutConfig,
+
+    /// Step-up ("sudo mode") authentication configuration.
+    ///
+    /// Controls the global default freshness window for `#[step_up]`-protected
+    /// routes. Individual routes can override the default with
+    /// `#[step_up(max_age = "Nm")]`.
+    ///
+    /// Configure in `autumn.toml`:
+    ///
+    /// ```toml
+    /// [auth.step_up]
+    /// default_max_age_secs = 300  # 5 minutes (default)
+    /// ```
+    #[serde(default)]
+    pub step_up: StepUpConfig,
 }
 
 /// Account lockout policy configuration.
@@ -498,6 +513,33 @@ impl Default for LockoutConfig {
             threshold: default_lockout_threshold(),
             window_secs: default_lockout_window_secs(),
             cooloff_secs: default_lockout_cooloff_secs(),
+        }
+    }
+}
+
+/// Step-up authentication configuration.
+///
+/// Read from the `[auth.step_up]` section of `autumn.toml`.
+/// All fields have safe defaults.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct StepUpConfig {
+    /// Maximum age (in seconds) of the `last_strong_auth_at` session claim
+    /// before the user must re-authenticate (default: `300`, i.e. 5 minutes).
+    ///
+    /// Individual routes can override this with
+    /// `#[step_up(max_age = "Nm")]`.
+    #[serde(default = "default_step_up_max_age_secs")]
+    pub default_max_age_secs: u64,
+}
+
+const fn default_step_up_max_age_secs() -> u64 {
+    crate::step_up::DEFAULT_MAX_AGE_SECS
+}
+
+impl Default for StepUpConfig {
+    fn default() -> Self {
+        Self {
+            default_max_age_secs: crate::step_up::DEFAULT_MAX_AGE_SECS,
         }
     }
 }
@@ -1318,6 +1360,7 @@ impl Default for AuthConfig {
             #[cfg(feature = "webauthn")]
             webauthn: WebAuthnConfig::default(),
             lockout: LockoutConfig::default(),
+            step_up: StepUpConfig::default(),
         }
     }
 }

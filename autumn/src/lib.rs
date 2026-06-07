@@ -189,6 +189,7 @@ pub(crate) mod session_redis;
 pub mod sse;
 /// Static site generation support.
 pub mod static_gen;
+pub mod step_up;
 #[cfg(feature = "storage")]
 pub mod storage;
 pub mod tenancy;
@@ -732,6 +733,37 @@ pub use auth::API_TOKEN_MIGRATIONS;
 /// }
 /// ```
 pub use autumn_macros::secured;
+
+/// Require fresh ("step-up") authentication before a route handler runs.
+///
+/// The handler is guarded by a freshness check on the session's
+/// `last_strong_auth_at` claim. When the claim is missing or older than
+/// `max_age` (default: 5 minutes) the request is handled as follows:
+///
+/// - **Browser clients**: redirect to `/reauth?return_to=<current-path>`.
+/// - **API / JSON clients** (`Accept: application/json`): `401` with
+///   RFC 7807 problem-details and `WWW-Authenticate: StepUp max-age=N`.
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// use autumn_web::prelude::*;
+///
+/// // Default 5-minute window.
+/// #[delete("/account")]
+/// #[step_up]
+/// async fn destroy_account() -> AutumnResult<Redirect> {
+///     Ok(Redirect::to("/bye"))
+/// }
+///
+/// // Custom window.
+/// #[post("/auth/mfa/remove")]
+/// #[step_up(max_age = "2m")]
+/// async fn remove_mfa() -> AutumnResult<&'static str> {
+///     Ok("removed")
+/// }
+/// ```
+pub use autumn_macros::step_up;
 
 /// Gate a route handler on a named feature flag. If the flag is disabled for
 /// the current actor the handler responds with `404 Not Found` (default) or
