@@ -7,6 +7,7 @@ use autumn_web::auth::{hash_password, verify_password};
 use autumn_web::extract::Path;
 use autumn_web::extract::State;
 use autumn_web::prelude::*;
+use autumn_web::storage::{Transform, VariantBudget};
 use autumn_web::webhook_outbound::WebhookOutboundManager;
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
@@ -387,20 +388,30 @@ pub async fn profile(
         .await
         .map_err(|_| AutumnError::not_found_msg(format!("User u/{name} not found")))?;
 
-    // Mint a presigned URL for the user's avatar (if any) through the
-    // configured BlobStore. In dev that's an HMAC-signed link served by
-    // the framework's mounted `/_blobs` route; in prod it's a real S3
-    // presigned URL.
+    // Serve the avatar as a lazily-generated 64×64 thumbnail with EXIF
+    // stripped.  The variant is content-addressed and generated at most
+    // once; subsequent requests are a single head() cache hit.  In dev
+    // the URL is an HMAC-signed `/_blobs/…` link; in prod it's a real
+    // S3 presigned URL.  The expiry is long because the variant key is
+    // immutable — same source + same spec always produces the same bytes.
     let avatar_url = match (
         user.avatar.as_ref(),
         state.extension::<autumn_web::storage::BlobStoreState>(),
     ) {
-        (Some(blob), Some(blobs)) => blobs
-            .store()
-            .clone()
-            .presigned_url(&blob.key, std::time::Duration::from_secs(300))
+        (Some(blob), Some(blobs)) => {
+            let store = blobs.store();
+            let budget = VariantBudget::default();
+            blob.variant(
+                "thumb",
+                &[
+                    Transform::resize_to_limit(64, 64),
+                    Transform::strip_metadata(),
+                ],
+            )
+            .url(&**store, &budget, std::time::Duration::from_secs(3600))
             .await
-            .ok(),
+            .ok()
+        }
         _ => None,
     };
     let is_self = current_user.as_deref() == Some(user.username.as_str());
