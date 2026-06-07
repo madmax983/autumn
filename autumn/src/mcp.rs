@@ -437,7 +437,8 @@ pub fn derive_tools(
 }
 
 /// Public, transport-agnostic description of a derived tool. Returned by
-/// [`derive_tools`] and consumed by [`McpServer::new`].
+/// [`derive_tools`] and consumed by the framework when assembling the MCP
+/// endpoint router.
 #[derive(Clone, Debug)]
 pub struct McpToolInfo {
     name: String,
