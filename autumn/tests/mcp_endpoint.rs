@@ -342,7 +342,9 @@ async fn batch_of_metadata_methods_is_still_supported() {
         ]),
     )
     .await;
-    let arr = out.as_array().expect("a batch returns an array of responses");
+    let arr = out
+        .as_array()
+        .expect("a batch returns an array of responses");
     assert_eq!(arr.len(), 2);
     assert!(
         arr.iter()
