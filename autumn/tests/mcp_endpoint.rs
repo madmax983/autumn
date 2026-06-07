@@ -450,6 +450,17 @@ async fn mount_path_colliding_with_existing_route_is_rejected() {
 }
 
 #[tokio::test]
+#[should_panic(expected = "McpPathCollision")]
+async fn mount_path_colliding_with_framework_route_is_rejected() {
+    // Mounting on a framework-owned GET path (the health probe) must also be
+    // caught by the collision preflight, not just user routes.
+    let _ = TestApp::new()
+        .routes(routes![list_todos])
+        .mount_mcp("/health")
+        .build();
+}
+
+#[tokio::test]
 async fn tools_call_requires_body_for_write_tools() {
     let client = TestApp::new()
         .routes(routes![create_todo])

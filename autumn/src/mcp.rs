@@ -165,6 +165,12 @@ pub struct McpServer {
     /// Streamable-HTTP spec). Requests without an `Origin` (non-browser agents)
     /// are always allowed.
     allowed_origins: Vec<String>,
+    /// The app's trusted-Host policy. The same-origin shortcut only fires when
+    /// the request's Host is trusted by this policy, so a DNS-rebinding request
+    /// (whose `Origin` and `Host` are both the attacker's domain) cannot bypass
+    /// `Origin` validation by Host-match alone — it must still be an explicitly
+    /// trusted host, exactly as normal routes require.
+    trusted_hosts: crate::router::TrustedHostPolicy,
     /// The configured tenant header name (e.g. `x-tenant-id`) when the app uses
     /// header-based tenancy (`[tenancy] enabled = true, source = "header"`).
     /// `tools/call` forwards this header onto the dispatched request so the
@@ -180,13 +186,22 @@ impl McpServer {
     /// Whether a browser `Origin` header value is permitted.
     ///
     /// A same-origin request — one whose `Origin` matches the request's own
-    /// host (proxy/scheme-aware) — is always allowed: the CORS allowlist
-    /// governs *cross*-origin access, and a browser MCP client served by this
-    /// same Autumn app should not have to enable CORS for its own origin.
-    /// Otherwise `*` in the allowlist permits any origin; an empty allowlist
-    /// permits none (so any present cross-origin `Origin` is rejected).
+    /// host (proxy/scheme-aware) **and** whose host is trusted by the app's
+    /// trusted-Host policy — is always allowed: the CORS allowlist governs
+    /// *cross*-origin access, and a browser MCP client served by this same
+    /// Autumn app should not have to enable CORS for its own origin. The
+    /// trusted-Host gate is essential: without it, a DNS-rebinding request
+    /// (`Origin: http://attacker.example`, `Host: attacker.example`) would
+    /// match by Host alone and defeat the very protection `Origin` validation
+    /// exists to provide. Otherwise `*` in the allowlist permits any origin; an
+    /// empty allowlist permits none (so any present cross-origin `Origin` is
+    /// rejected).
     fn origin_allowed(&self, origin: &str, host: Option<&str>, scheme: Option<&str>) -> bool {
-        if is_same_origin(origin, host, scheme) {
+        if let Some(host) = host
+            && is_same_origin(origin, host, scheme)
+            && crate::router::extract_host_without_port(host)
+                .is_some_and(|h| self.trusted_hosts.allows_host(&h.to_ascii_lowercase()))
+        {
             return true;
         }
         self.allowed_origins
@@ -204,8 +219,7 @@ impl McpServer {
 /// host match is what matters for DNS-rebinding protection, and a stricter
 /// scheme check would wrongly reject same-origin clients behind a
 /// TLS-terminating proxy.
-fn is_same_origin(origin: &str, host: Option<&str>, scheme: Option<&str>) -> bool {
-    let Some(host) = host else { return false };
+fn is_same_origin(origin: &str, host: &str, scheme: Option<&str>) -> bool {
     let Some((origin_scheme, origin_authority)) = origin.split_once("://") else {
         return false;
     };
@@ -441,10 +455,11 @@ impl McpServer {
     /// Assemble the server state from derived tools, a dispatch router, and the
     /// CORS-derived `Origin` allowlist.
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         tools: Vec<McpToolInfo>,
         dispatch: axum::Router,
         allowed_origins: Vec<String>,
+        trusted_hosts: crate::router::TrustedHostPolicy,
         tenant_header: Option<String>,
     ) -> Self {
         let tools: Vec<McpTool> = tools
@@ -471,6 +486,7 @@ impl McpServer {
             by_name,
             dispatch,
             allowed_origins,
+            trusted_hosts,
             tenant_header,
             server_name: "autumn-mcp".to_owned(),
             server_version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -482,20 +498,23 @@ impl McpServer {
 ///
 /// `dispatch` must be the fully-assembled application router (state applied)
 /// so `tools/call` traverses the real handler pipeline. `allowed_origins` is
-/// the app's CORS allowlist, used for `Origin` validation. `tenant_header` is
-/// the configured tenant header name to forward on dispatch when the app uses
-/// header-based tenancy (`None` otherwise).
-pub fn build_mcp_router(
+/// the app's CORS allowlist, used for `Origin` validation; `trusted_hosts`
+/// gates the same-origin shortcut. `tenant_header` is the configured tenant
+/// header name to forward on dispatch when the app uses header-based tenancy
+/// (`None` otherwise).
+pub(crate) fn build_mcp_router(
     mount_path: &str,
     tools: Vec<McpToolInfo>,
     dispatch: axum::Router,
     allowed_origins: Vec<String>,
+    trusted_hosts: crate::router::TrustedHostPolicy,
     tenant_header: Option<String>,
 ) -> axum::Router<crate::state::AppState> {
     let server = Arc::new(McpServer::new(
         tools,
         dispatch,
         allowed_origins,
+        trusted_hosts,
         tenant_header,
     ));
     tracing::debug!(
@@ -786,10 +805,17 @@ fn build_request(
         path = replace_path_param(&path, param, &encoded);
     }
 
-    // Build the query string from the `query` object, if any.
+    // Build the query string from the `query` object, if any. The advertised
+    // `inputSchema` types `query` as an object, so a present-but-non-object
+    // value (`null`, a string, an array) is an invalid-params error rather than
+    // being silently dropped — which would otherwise replay the tool with
+    // defaulted/unfiltered query parameters.
     if tool.has_query
-        && let Some(Value::Object(map)) = arguments.get("query")
+        && let Some(query) = arguments.get("query")
     {
+        let Value::Object(map) = query else {
+            return Err("`query` must be a JSON object".to_owned());
+        };
         let mut pairs: Vec<(String, String)> = Vec::new();
         for (key, value) in map {
             match value {
@@ -1123,6 +1149,23 @@ mod tests {
     }
 
     #[test]
+    fn build_request_rejects_non_object_query() {
+        let t = tool("GET", "/api/search", false, true);
+        // `query` advertised as an object: a non-object value is invalid params,
+        // not silently dropped (which would replay with defaulted parameters).
+        for bad in [
+            json!({ "query": null }),
+            json!({ "query": "all" }),
+            json!({ "query": [1, 2] }),
+        ] {
+            let err = build_request(&t, &HeaderMap::new(), &bad, None).unwrap_err();
+            assert!(err.contains("query"), "got: {err}");
+        }
+        // An absent `query` is fine (the field is optional).
+        assert!(build_request(&t, &HeaderMap::new(), &json!({}), None).is_ok());
+    }
+
+    #[test]
     fn build_request_forwards_identity_and_idempotency_headers() {
         let t = tool("POST", "/api/todos", true, false);
         let mut headers = HeaderMap::new();
@@ -1144,8 +1187,26 @@ mod tests {
         assert_eq!(req.headers().get("idempotency-key").unwrap(), "abc-123");
     }
 
+    /// A trusted-Host policy that trusts the given hosts (plus dev loopback,
+    /// which `from_config` adds for non-production profiles).
+    fn trusted(hosts: &[&str]) -> crate::router::TrustedHostPolicy {
+        let mut config = crate::config::AutumnConfig::default();
+        config.security.trusted_hosts.hosts = hosts.iter().map(|h| (*h).to_owned()).collect();
+        crate::router::TrustedHostPolicy::from_config(&config)
+    }
+
     fn server(allowed_origins: Vec<String>) -> McpServer {
-        McpServer::new(Vec::new(), axum::Router::new(), allowed_origins, None)
+        server_with_trusted(allowed_origins, &[])
+    }
+
+    fn server_with_trusted(allowed_origins: Vec<String>, hosts: &[&str]) -> McpServer {
+        McpServer::new(
+            Vec::new(),
+            axum::Router::new(),
+            allowed_origins,
+            trusted(hosts),
+            None,
+        )
     }
 
     #[test]
@@ -1162,13 +1223,14 @@ mod tests {
     #[test]
     fn same_origin_allowed_without_cors_allowlist() {
         // An empty CORS allowlist (the default/production posture) must still
-        // permit a browser MCP client served by this same app.
-        let s = server(Vec::new());
+        // permit a browser MCP client served by this same app — provided the
+        // host is trusted by the trusted-Host policy.
+        let s = server_with_trusted(Vec::new(), &["app.example"]);
         // Host matches the Origin authority → allowed, scheme unknown.
         assert!(s.origin_allowed("https://app.example", Some("app.example"), None));
         // Scheme known and matching → allowed.
         assert!(s.origin_allowed("https://app.example", Some("app.example"), Some("https")));
-        // Host with a port matches exactly.
+        // Host with a port matches exactly (loopback is trusted in dev).
         assert!(s.origin_allowed(
             "http://localhost:8080",
             Some("localhost:8080"),
@@ -1178,6 +1240,26 @@ mod tests {
         assert!(!s.origin_allowed("https://evil.example", Some("app.example"), None));
         // Same host but a confidently-known mismatched scheme is rejected.
         assert!(!s.origin_allowed("http://app.example", Some("app.example"), Some("https")));
+    }
+
+    #[test]
+    fn same_origin_rejected_for_untrusted_host() {
+        // DNS rebinding: Origin and Host both name the attacker's domain. The
+        // authority matches, but the host is not trusted, so the same-origin
+        // shortcut must not fire — and with no CORS allowlist, it is rejected.
+        let s = server_with_trusted(Vec::new(), &["app.example"]);
+        assert!(!s.origin_allowed(
+            "http://attacker.example",
+            Some("attacker.example"),
+            Some("http")
+        ));
+        // An explicit cross-origin allowlist entry still works regardless.
+        let s = server_with_trusted(vec!["http://attacker.example".to_owned()], &["app.example"]);
+        assert!(s.origin_allowed(
+            "http://attacker.example",
+            Some("attacker.example"),
+            Some("http")
+        ));
     }
 
     #[test]

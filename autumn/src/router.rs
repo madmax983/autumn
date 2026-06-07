@@ -380,17 +380,12 @@ fn build_router_pre_state(
                 value: rt.mount_path,
             });
         }
+        // The MCP endpoint mounts GET+POST at `mount_path`. If a user or
+        // framework route already owns that exact path, the later `merge` would
+        // panic on overlapping method routes; surface it as a recoverable error
+        // first (mirroring the OpenAPI collision preflight).
+        reject_mcp_path_collisions(path, &route_list, &ctx.scoped_groups, config)?;
         let docs = collect_openapi_docs(&route_list, &ctx.scoped_groups);
-        // The MCP endpoint mounts GET+POST at `mount_path`. If an application
-        // route already owns that exact path, the later `merge` would panic on
-        // overlapping method routes; surface it as a recoverable error first
-        // (mirroring the OpenAPI collision preflight above).
-        if let Some(doc) = docs.iter().find(|d| d.path == path) {
-            return Err(RouterBuildError::McpPathCollision {
-                path: rt.mount_path,
-                method: doc.method.to_owned(),
-            });
-        }
         // Pass the app's OpenAPI config (if any) so MCP tool `inputSchema`s
         // reuse the same registered component schemas as the served spec.
         let tools = crate::mcp::derive_tools(&docs, rt.expose_all, ctx.openapi.as_ref());
@@ -519,6 +514,9 @@ fn build_router_pre_state(
             dispatch,
             // Source the Origin allowlist from the app's CORS config.
             config.cors.allowed_origins.clone(),
+            // The same-origin shortcut is gated on the app's trusted-Host
+            // policy so it can't be abused for DNS rebinding.
+            TrustedHostPolicy::from_config(config),
             tenant_header,
         );
         // Optional whole-endpoint auth gate (AppBuilder::secure_mcp), applied
@@ -736,42 +734,17 @@ fn validate_route_path(field: &'static str, value: &str) -> Result<(), RouterBui
     Ok(())
 }
 
-/// Reject `OpenAPI` mount paths that overlap with an existing `GET`
-/// handler.
-///
-/// `axum::Router::merge` panics when the merged routers have method
-/// handlers on the same path (e.g. two `GET` handlers on
-/// `/v3/api-docs`). We surface that as a recoverable
-/// [`RouterBuildError::OpenApiPathCollision`] so misconfiguration
-/// produces an actionable error instead of a crash on startup.
-///
-/// We check against:
-/// * user routes (top-level + scoped groups) that will be mounted
-///   before the `OpenAPI` sub-router merges in,
-/// * framework `GET`s: probes, actuator, htmx assets, and dev
-///   live-reload when enabled,
-/// * nest prefixes from [`AppBuilder::nest`](crate::app::AppBuilder::nest)
-///   when the `OpenAPI` path falls under one.
-///
-/// Raw routers passed to [`AppBuilder::merge`](crate::app::AppBuilder::merge)
-/// cannot be introspected — axum does not expose their route table.
-/// We emit a `tracing::warn!` so operators know the check is
-/// incomplete in that case.
+/// Gather every path that a `GET` (or `WS`, which mounts as a `GET`) handler
+/// will already own by the time a late-merged sub-router (`OpenAPI` or MCP) is
+/// added: user routes (top-level + scoped groups) plus framework-mounted `GET`s
+/// (probes, actuator, htmx assets, dev live-reload, mail previews). Shared by
+/// the `OpenAPI` and MCP mount-collision preflights so they stay in lockstep.
 #[cfg(feature = "openapi")]
-fn reject_openapi_path_collisions(
-    openapi_config: Option<&crate::openapi::OpenApiConfig>,
+fn collect_claimed_get_paths(
     route_list: &[Route],
     scoped_groups: &[ScopedGroup],
-    merge_routers: &[axum::Router<AppState>],
-    nest_routers: &[(String, axum::Router<AppState>)],
     config: &AutumnConfig,
-) -> Result<(), RouterBuildError> {
-    let Some(openapi) = openapi_config else {
-        return Ok(());
-    };
-
-    // Gather every path a GET (or WS, which mounts as GET) will already
-    // own by the time we merge.
+) -> std::collections::HashSet<String> {
     let mut claimed: std::collections::HashSet<String> = std::collections::HashSet::new();
     for route in route_list {
         if route.method == http::Method::GET || route.method.as_str() == "WS" {
@@ -817,6 +790,85 @@ fn reject_openapi_path_collisions(
         claimed.insert("/_autumn/mail/messages/{message_id}".to_owned());
         claimed.insert("/_autumn/mail/previews/{mailer}/{method}".to_owned());
     }
+    claimed
+}
+
+/// Reject an MCP mount path that overlaps with a route already owning that
+/// path. The MCP endpoint mounts `GET`+`POST` at `mount_path`; merging it would
+/// panic in axum if a `GET` (any user/framework route) or `POST` (a user route)
+/// already lives there. We surface a recoverable
+/// [`RouterBuildError::McpPathCollision`] instead, reusing the same claimed-GET
+/// gathering as the `OpenAPI` preflight so framework routes (health/probe,
+/// actuator, htmx, dev) are covered too — e.g. `mount_mcp(config.health.path)`.
+#[cfg(feature = "mcp")]
+fn reject_mcp_path_collisions(
+    mount_path: &str,
+    route_list: &[Route],
+    scoped_groups: &[ScopedGroup],
+    config: &AutumnConfig,
+) -> Result<(), RouterBuildError> {
+    if collect_claimed_get_paths(route_list, scoped_groups, config).contains(mount_path) {
+        return Err(RouterBuildError::McpPathCollision {
+            path: mount_path.to_owned(),
+            method: "GET".to_owned(),
+        });
+    }
+    // POST handlers come from user routes (framework routes are GETs).
+    let post_owns_path = route_list
+        .iter()
+        .any(|route| route.method == http::Method::POST && route.path == mount_path)
+        || scoped_groups.iter().any(|group| {
+            group.routes.iter().any(|route| {
+                route.method == http::Method::POST
+                    && join_nested_path(&group.prefix, route.path) == mount_path
+            })
+        });
+    if post_owns_path {
+        return Err(RouterBuildError::McpPathCollision {
+            path: mount_path.to_owned(),
+            method: "POST".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Reject `OpenAPI` mount paths that overlap with an existing `GET`
+/// handler.
+///
+/// `axum::Router::merge` panics when the merged routers have method
+/// handlers on the same path (e.g. two `GET` handlers on
+/// `/v3/api-docs`). We surface that as a recoverable
+/// [`RouterBuildError::OpenApiPathCollision`] so misconfiguration
+/// produces an actionable error instead of a crash on startup.
+///
+/// We check against:
+/// * user routes (top-level + scoped groups) that will be mounted
+///   before the `OpenAPI` sub-router merges in,
+/// * framework `GET`s: probes, actuator, htmx assets, and dev
+///   live-reload when enabled,
+/// * nest prefixes from [`AppBuilder::nest`](crate::app::AppBuilder::nest)
+///   when the `OpenAPI` path falls under one.
+///
+/// Raw routers passed to [`AppBuilder::merge`](crate::app::AppBuilder::merge)
+/// cannot be introspected — axum does not expose their route table.
+/// We emit a `tracing::warn!` so operators know the check is
+/// incomplete in that case.
+#[cfg(feature = "openapi")]
+fn reject_openapi_path_collisions(
+    openapi_config: Option<&crate::openapi::OpenApiConfig>,
+    route_list: &[Route],
+    scoped_groups: &[ScopedGroup],
+    merge_routers: &[axum::Router<AppState>],
+    nest_routers: &[(String, axum::Router<AppState>)],
+    config: &AutumnConfig,
+) -> Result<(), RouterBuildError> {
+    let Some(openapi) = openapi_config else {
+        return Ok(());
+    };
+
+    // Gather every path a GET (or WS, which mounts as GET) will already
+    // own by the time we merge.
+    let claimed = collect_claimed_get_paths(route_list, scoped_groups, config);
 
     check_openapi_path_against(
         "openapi_json_path",
@@ -826,7 +878,7 @@ fn reject_openapi_path_collisions(
     )?;
     if let Some(path) = &openapi.swagger_ui_path {
         check_openapi_path_against("swagger_ui_path", path, &claimed, nest_routers)?;
-        let mut claimed_with_openapi = claimed.clone();
+        let mut claimed_with_openapi = claimed;
         claimed_with_openapi.insert(openapi.openapi_json_path.clone());
         for asset_path in crate::openapi::swagger_ui_asset_paths(path) {
             check_openapi_path_against(
@@ -1739,7 +1791,7 @@ async fn trusted_host_middleware(
     }
 }
 
-fn extract_host_without_port(header: &str) -> Option<&str> {
+pub fn extract_host_without_port(header: &str) -> Option<&str> {
     let host = header.trim();
     if host.is_empty() {
         return None;
@@ -4166,7 +4218,7 @@ mod trusted_host_tests {
     }
 }
 #[derive(Clone, Debug)]
-struct TrustedHostPolicy {
+pub struct TrustedHostPolicy {
     rules: Arc<Vec<String>>,
     allow_any: bool,
     allow_missing_host: bool,
@@ -4174,7 +4226,7 @@ struct TrustedHostPolicy {
 }
 
 impl TrustedHostPolicy {
-    fn from_config(config: &AutumnConfig) -> Self {
+    pub fn from_config(config: &AutumnConfig) -> Self {
         let mut rules: Vec<String> = config
             .security
             .trusted_hosts
@@ -4208,7 +4260,7 @@ impl TrustedHostPolicy {
         }
     }
 
-    fn allows_host(&self, host: &str) -> bool {
+    pub fn allows_host(&self, host: &str) -> bool {
         if self.allow_any {
             return true;
         }
