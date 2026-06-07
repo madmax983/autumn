@@ -19,6 +19,7 @@
 use std::sync::Arc;
 
 use autumn_web::auth::{InMemoryApiTokenStore, RequireApiToken, issue_api_token};
+use autumn_web::config::AutumnConfig;
 use autumn_web::openapi::OpenApiConfig;
 use autumn_web::prelude::*;
 use autumn_web::test::{TestApp, TestClient};
@@ -473,6 +474,21 @@ async fn mount_path_colliding_with_openapi_path_is_rejected() {
 }
 
 #[tokio::test]
+#[should_panic(expected = "McpPathCollision")]
+async fn mount_path_under_nested_router_is_rejected() {
+    // A raw router nested at `/api` owns every path under it and is mounted
+    // before the MCP router, so mounting at `/api/mcp` would be shadowed by
+    // (or panic against) the nest. The preflight must catch it like the
+    // OpenAPI nest-collision check does.
+    let nested = axum::Router::new().route("/thing", axum::routing::get(|| async { "ok" }));
+    let _ = TestApp::new()
+        .routes(routes![list_todos])
+        .nest("/api", nested)
+        .mount_mcp("/api/mcp")
+        .build();
+}
+
+#[tokio::test]
 #[should_panic(expected = "InvalidMcpPath")]
 async fn dynamic_mount_path_is_rejected() {
     // A capture/catch-all mount path would shadow a whole path class; only a
@@ -597,6 +613,54 @@ async fn disallowed_origin_is_forbidden() {
         .send()
         .await;
     resp.assert_status(403);
+}
+
+#[tokio::test]
+async fn allowlisted_origin_gets_cors_grant_on_response() {
+    // The endpoint sits outside the global CORS layer, so the actual JSON-RPC
+    // response (not just the OPTIONS preflight) must carry
+    // `Access-Control-Allow-Origin` or a browser will block reading it.
+    let mut config = AutumnConfig::default();
+    config.cors.allowed_origins = vec!["https://app.example".to_owned()];
+    let client = TestApp::new()
+        .routes(routes![list_todos])
+        .config(config)
+        .mount_mcp("/mcp")
+        .build();
+
+    let resp = client
+        .post("/mcp")
+        .header("origin", "https://app.example")
+        .json(&serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))
+        .send()
+        .await;
+    resp.assert_ok();
+    assert_eq!(
+        resp.header("access-control-allow-origin"),
+        Some("https://app.example")
+    );
+}
+
+#[tokio::test]
+async fn structured_path_argument_is_rejected() {
+    // Path params are advertised as `{"type":"string"}`; a `null`/object/array
+    // must return `-32602` rather than replaying a literal `null`/JSON-text
+    // path segment against a real resource.
+    let client = TestApp::new()
+        .routes(routes![get_todo])
+        .mount_mcp("/mcp")
+        .build();
+
+    let out = rpc(
+        &client,
+        serde_json::json!({
+            "jsonrpc":"2.0","id":9,"method":"tools/call",
+            "params": {"name":"get_todo","arguments":{"id":{"nested":"object"}}}
+        }),
+    )
+    .await;
+
+    assert_eq!(out["error"]["code"], -32602);
 }
 
 #[tokio::test]

@@ -564,27 +564,17 @@ async fn serve_mcp_options(
     out.insert(header::VARY, HeaderValue::from_static("origin"));
 
     let origin = headers.get(header::ORIGIN).and_then(|o| o.to_str().ok());
-    let allow_any = cors.allowed_origins.iter().any(|a| a == "*");
-    let origin_allowed =
-        origin.is_some_and(|o| allow_any || cors.allowed_origins.iter().any(|a| a == o));
 
     // No Origin (non-CORS probe) or a non-allowlisted origin: advertise the
     // allowed methods but grant no cross-origin access.
-    if !origin_allowed {
+    let Some(allow_origin) = cors_allow_origin(cors, origin) else {
         out.insert(
             header::ALLOW,
             HeaderValue::from_static("GET, POST, OPTIONS"),
         );
         return (StatusCode::NO_CONTENT, out).into_response();
-    }
-
-    let origin = origin.unwrap_or_default();
-    // With credentials, the spec forbids `*`; echo the concrete origin instead.
-    let allow_origin = if allow_any && !cors.allow_credentials {
-        "*".to_owned()
-    } else {
-        origin.to_owned()
     };
+
     if let Ok(v) = HeaderValue::from_str(&allow_origin) {
         out.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, v);
     }
@@ -604,6 +594,50 @@ async fn serve_mcp_options(
         );
     }
     (StatusCode::NO_CONTENT, out).into_response()
+}
+
+/// Compute the `Access-Control-Allow-Origin` value to grant a request from
+/// `origin`, mirroring the preflight's allowlist logic. Returns `None` when no
+/// `Origin` is present or it is not allowlisted (a same-origin browser request
+/// needs no CORS grant). With credentials the spec forbids `*`, so the concrete
+/// origin is echoed instead.
+fn cors_allow_origin(cors: &crate::config::CorsConfig, origin: Option<&str>) -> Option<String> {
+    let origin = origin?;
+    let allow_any = cors.allowed_origins.iter().any(|a| a == "*");
+    if !(allow_any || cors.allowed_origins.iter().any(|a| a == origin)) {
+        return None;
+    }
+    Some(if allow_any && !cors.allow_credentials {
+        "*".to_owned()
+    } else {
+        origin.to_owned()
+    })
+}
+
+/// Attach the actual-request CORS grant to a response. The MCP endpoint is
+/// mounted outside the global CORS layer, so without this an allowlisted
+/// browser client's preflight would pass but the browser would still block
+/// reading the `POST`/`GET` body for lack of `Access-Control-Allow-Origin`.
+fn apply_cors_headers(
+    cors: &crate::config::CorsConfig,
+    origin: Option<&str>,
+    response: &mut Response,
+) {
+    use axum::http::HeaderValue;
+    let headers = response.headers_mut();
+    // The response varies by `Origin` whenever an origin is in play.
+    headers.insert(header::VARY, HeaderValue::from_static("origin"));
+    if let Some(allow_origin) = cors_allow_origin(cors, origin)
+        && let Ok(v) = HeaderValue::from_str(&allow_origin)
+    {
+        headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, v);
+        if cors.allow_credentials {
+            headers.insert(
+                header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
+                HeaderValue::from_static("true"),
+            );
+        }
+    }
 }
 
 /// MCP over Streamable HTTP: GET opens a server-initiated stream. This buffered
@@ -643,6 +677,13 @@ async fn serve_mcp(
 ) -> Response {
     let identity = identity.as_ref().map(|ext| &ext.0);
 
+    // Capture the request `Origin` (if any) so the actual JSON-RPC response can
+    // carry the matching CORS grant, mirroring the `OPTIONS` preflight.
+    let origin = headers
+        .get(header::ORIGIN)
+        .and_then(|o| o.to_str().ok())
+        .map(str::to_owned);
+
     // DNS-rebinding protection (MCP Streamable-HTTP spec MUST): reject a
     // browser-supplied `Origin` that is neither same-origin nor allowlisted.
     // Non-browser agents send no `Origin` and are unaffected.
@@ -672,7 +713,7 @@ async fn serve_mcp(
         peer: connect_info.map(|ext| (ext.0).0),
     };
 
-    match parsed {
+    let mut response = match parsed {
         // JSON-RPC 2.0: an empty batch is itself an Invalid Request.
         Value::Array(batch) if batch.is_empty() => {
             json_response(&error(Value::Null, -32600, "Invalid Request: empty batch"))
@@ -702,7 +743,12 @@ async fn serve_mcp(
             -32600,
             "Invalid Request: expected a JSON object or array",
         )),
-    }
+    };
+
+    // The endpoint sits outside the global CORS layer, so an allowlisted
+    // browser client needs the grant on the actual response to read the body.
+    apply_cors_headers(&server.cors, origin.as_deref(), &mut response);
+    response
 }
 
 /// Handle a single JSON-RPC message. Returns `None` only for a *valid*
@@ -876,9 +922,16 @@ fn build_request(
         let raw = arguments
             .get(arg_key)
             .ok_or_else(|| format!("missing required path parameter `{arg_key}`"))?;
+        // The tool schema advertises every path param as `{"type":"string"}`.
+        // A string passes through; a number/bool coerces to a single safe
+        // segment. `null`, an object, or an array has no valid single-segment
+        // representation — replaying its literal `null`/JSON text as a path
+        // segment could hit a real (possibly mutating) resource, so reject it
+        // as invalid params (mapped to `-32602`) instead.
         let value = match raw {
             Value::String(s) => s.clone(),
-            other => other.to_string(),
+            Value::Number(_) | Value::Bool(_) => raw.to_string(),
+            _ => return Err(format!("path parameter `{arg_key}` must be a string")),
         };
         // Use the same full segment encoder the typed path helpers use, so an
         // MCP call accepts the same values a direct HTTP caller could pass.

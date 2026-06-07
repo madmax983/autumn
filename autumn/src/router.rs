@@ -399,6 +399,8 @@ fn build_router_pre_state(
             &ctx.scoped_groups,
             config,
             ctx.openapi.as_ref(),
+            &ctx.merge_routers,
+            &ctx.nest_routers,
         )?;
         let docs = collect_openapi_docs(&route_list, &ctx.scoped_groups);
         // Pass the app's OpenAPI config (if any) so MCP tool `inputSchema`s
@@ -826,6 +828,8 @@ fn reject_mcp_path_collisions(
     scoped_groups: &[ScopedGroup],
     config: &AutumnConfig,
     openapi: Option<&crate::openapi::OpenApiConfig>,
+    merge_routers: &[axum::Router<AppState>],
+    nest_routers: &[(String, axum::Router<AppState>)],
 ) -> Result<(), RouterBuildError> {
     let mut claimed_get = collect_claimed_get_paths(route_list, scoped_groups, config);
     // The OpenAPI JSON/Swagger-UI endpoints (and UI assets) merge as GETs
@@ -858,6 +862,32 @@ fn reject_mcp_path_collisions(
             path: mount_path.to_owned(),
             method: "POST".to_owned(),
         });
+    }
+    // A nest prefix P owns every route under P (`/P/...`), and those raw routers
+    // are mounted before the MCP router. A mount path equal to P or falling
+    // under `P/` would be shadowed by (or panic against) the nested router, so
+    // reject it up front — mirroring the OpenAPI nest-collision preflight.
+    for (prefix, _) in nest_routers {
+        let prefix_slash = format!("{prefix}/");
+        if mount_path == prefix || mount_path.starts_with(&prefix_slash) {
+            return Err(RouterBuildError::McpPathCollision {
+                path: mount_path.to_owned(),
+                method: "nested router".to_owned(),
+            });
+        }
+    }
+    // Raw merged routers are opaque — axum does not expose their route table —
+    // so an overlapping handler there would still panic at merge time. Warn so
+    // operators know the check can't cover this case (mirrors the OpenAPI one).
+    if !merge_routers.is_empty() {
+        tracing::warn!(
+            mcp_mount_path = %mount_path,
+            merged_routers = merge_routers.len(),
+            "MCP mount collision check skipped for AppBuilder::merge routers: \
+             axum does not expose their route table, so an overlapping handler \
+             will still panic at startup. Choose an MCP mount path that doesn't \
+             overlap with any merged router's handlers."
+        );
     }
     Ok(())
 }
