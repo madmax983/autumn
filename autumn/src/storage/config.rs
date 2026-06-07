@@ -11,6 +11,53 @@ use std::path::PathBuf;
 use serde::Deserialize;
 use thiserror::Error;
 
+/// Configuration for the image-variant subsystem (`[storage.variants]`).
+///
+/// Used by the `variants` feature to bound variant-generation jobs so a
+/// pathologically large source image can't exhaust worker memory.
+///
+/// All limits can be overridden via environment variables under
+/// `AUTUMN_STORAGE__VARIANTS__*`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct StorageVariantsConfig {
+    /// Maximum byte size of the source blob.
+    /// Default: 20 971 520 (20 MiB).
+    #[serde(default = "default_variants_max_source_bytes")]
+    pub max_source_bytes: u64,
+
+    /// Maximum pixel width of the source image.
+    /// Default: 10 000.
+    #[serde(default = "default_variants_max_source_width")]
+    pub max_source_width: u32,
+
+    /// Maximum pixel height of the source image.
+    /// Default: 10 000.
+    #[serde(default = "default_variants_max_source_height")]
+    pub max_source_height: u32,
+}
+
+impl Default for StorageVariantsConfig {
+    fn default() -> Self {
+        Self {
+            max_source_bytes: default_variants_max_source_bytes(),
+            max_source_width: default_variants_max_source_width(),
+            max_source_height: default_variants_max_source_height(),
+        }
+    }
+}
+
+const fn default_variants_max_source_bytes() -> u64 {
+    20 * 1024 * 1024 // 20 MiB
+}
+
+const fn default_variants_max_source_width() -> u32 {
+    10_000
+}
+
+const fn default_variants_max_source_height() -> u32 {
+    10_000
+}
+
 /// Top-level `[storage]` configuration section.
 #[derive(Debug, Clone, Deserialize)]
 pub struct StorageConfig {
@@ -37,6 +84,11 @@ pub struct StorageConfig {
     /// Configuration for the S3 backend.
     #[serde(default)]
     pub s3: StorageS3Config,
+
+    /// Resource limits for the image-variant subsystem.
+    /// Only meaningful when the `variants` feature is enabled.
+    #[serde(default)]
+    pub variants: StorageVariantsConfig,
 }
 
 impl Default for StorageConfig {
@@ -47,6 +99,7 @@ impl Default for StorageConfig {
             allow_local_in_production: false,
             local: StorageLocalConfig::default(),
             s3: StorageS3Config::default(),
+            variants: StorageVariantsConfig::default(),
         }
     }
 }
