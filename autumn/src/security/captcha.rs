@@ -135,13 +135,12 @@ impl BotProtectionConfig {
     /// Returns the form field name for the CAPTCHA token.
     ///
     /// Uses the custom field name if set, otherwise the provider's canonical default.
+    #[must_use]
     pub fn effective_form_field(&self) -> &str {
-        self.form_field
-            .as_deref()
-            .unwrap_or_else(|| match self.provider {
-                CaptchaProviderKind::Turnstile => "cf-turnstile-response",
-                CaptchaProviderKind::HCaptcha => "h-captcha-response",
-            })
+        self.form_field.as_deref().unwrap_or(match self.provider {
+            CaptchaProviderKind::Turnstile => "cf-turnstile-response",
+            CaptchaProviderKind::HCaptcha => "h-captcha-response",
+        })
     }
 }
 
@@ -163,7 +162,7 @@ pub trait CaptchaProvider: Send + Sync + 'static {
     ///
     /// For example `"cf-turnstile-response"` (Turnstile) or
     /// `"h-captcha-response"` (hCaptcha).
-    fn form_field_name(&self) -> &str;
+    fn form_field_name(&self) -> &'static str;
 
     /// Emit the provider-specific widget `Markup` for embedding in Maud templates.
     ///
@@ -218,7 +217,7 @@ impl CaptchaProvider for TurnstileProvider {
         })
     }
 
-    fn form_field_name(&self) -> &str {
+    fn form_field_name(&self) -> &'static str {
         "cf-turnstile-response"
     }
 
@@ -275,7 +274,7 @@ impl CaptchaProvider for HCaptchaProvider {
         })
     }
 
-    fn form_field_name(&self) -> &str {
+    fn form_field_name(&self) -> &'static str {
         "h-captcha-response"
     }
 
@@ -309,7 +308,7 @@ impl CaptchaProvider for AlwaysFailProvider {
         Box::pin(std::future::ready(false))
     }
 
-    fn form_field_name(&self) -> &str {
+    fn form_field_name(&self) -> &'static str {
         "cf-turnstile-response"
     }
 
@@ -324,7 +323,7 @@ impl CaptchaProvider for AlwaysPassProvider {
         Box::pin(std::future::ready(true))
     }
 
-    fn form_field_name(&self) -> &str {
+    fn form_field_name(&self) -> &'static str {
         "cf-turnstile-response"
     }
 
@@ -365,7 +364,7 @@ impl CaptchaProvider for TestCaptchaProvider {
         Box::pin(std::future::ready(is_valid))
     }
 
-    fn form_field_name(&self) -> &str {
+    fn form_field_name(&self) -> &'static str {
         "cf-turnstile-response"
     }
 
@@ -499,7 +498,7 @@ pub struct BotProtectionService<S> {
 }
 
 /// Safe HTTP methods that are exempt from CAPTCHA verification.
-fn is_safe_method(method: &axum::http::Method) -> bool {
+const fn is_safe_method(method: &axum::http::Method) -> bool {
     matches!(
         *method,
         axum::http::Method::GET
@@ -683,6 +682,7 @@ where
 /// }
 /// ```
 #[cfg(feature = "maud")]
+#[must_use]
 pub fn bot_protection_widget(config: &BotProtectionConfig) -> maud::Markup {
     let site_key = config.site_key.as_deref().unwrap_or_default();
 
@@ -808,8 +808,10 @@ mod tests {
 
     #[tokio::test]
     async fn dev_bypass_skips_verification() {
-        let mut settings = BotProtectionConfig::default();
-        settings.dev_bypass = true;
+        let settings = BotProtectionConfig {
+            dev_bypass: true,
+            ..Default::default()
+        };
         let layer = BotProtectionLayer::from_config(&settings);
         let app = router_with_layer(layer);
 
