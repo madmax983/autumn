@@ -74,7 +74,6 @@ const MAX_TOOL_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
 const FORWARDED_HEADERS: &[&str] = &[
     "authorization",
     "cookie",
-    "x-csrf-token",
     "idempotency-key",
     "host",
     "forwarded",
@@ -150,6 +149,23 @@ impl McpTool {
     }
 }
 
+/// Configuration threaded from router assembly into the MCP endpoint.
+pub(crate) struct McpWiring {
+    /// The app's CORS config: `allowed_origins` is the cross-origin `Origin`
+    /// allowlist; the methods/headers/credentials/max-age fields answer this
+    /// endpoint's own `OPTIONS` preflight (it is mounted outside the global
+    /// CORS layer, so it must serve preflight for allowlisted browser clients).
+    pub cors: crate::config::CorsConfig,
+    /// The app's trusted-Host policy, gating the same-origin shortcut.
+    pub trusted_hosts: crate::router::TrustedHostPolicy,
+    /// Configured tenant header to forward (header-based tenancy), else `None`.
+    pub tenant_header: Option<String>,
+    /// Configured CSRF token header name (default `x-csrf-token`). Forwarded on
+    /// dispatch so a session-authenticated caller passes `CsrfLayer`, which
+    /// reads `CsrfConfig::token_header` — not a hard-coded name.
+    pub csrf_header: String,
+}
+
 /// The shared MCP server state attached to the endpoint handler. Holds the
 /// derived tool catalog and a clone of the fully-assembled application router
 /// to dispatch `tools/call` against.
@@ -159,12 +175,12 @@ pub struct McpServer {
     /// The real application router (state already applied) — the same path an
     /// HTTP request traverses. `tools/call` replays requests through it.
     dispatch: axum::Router,
-    /// Origins permitted to make browser (cross-origin) requests, sourced from
-    /// the app's CORS `allowed_origins`. A request carrying an `Origin` not in
-    /// this list is rejected with 403 (DNS-rebinding protection, per the MCP
-    /// Streamable-HTTP spec). Requests without an `Origin` (non-browser agents)
-    /// are always allowed.
-    allowed_origins: Vec<String>,
+    /// The app's CORS config. `cors.allowed_origins` is the cross-origin
+    /// `Origin` allowlist (DNS-rebinding protection, per the MCP
+    /// Streamable-HTTP spec); a present `Origin` that is neither same-origin
+    /// (trusted-host-gated) nor allowlisted is rejected with 403. The remaining
+    /// fields answer the endpoint's own `OPTIONS` preflight.
+    cors: crate::config::CorsConfig,
     /// The app's trusted-Host policy. The same-origin shortcut only fires when
     /// the request's Host is trusted by this policy, so a DNS-rebinding request
     /// (whose `Origin` and `Host` are both the attacker's domain) cannot bypass
@@ -178,6 +194,8 @@ pub struct McpServer {
     /// `None` for any other tenancy source (which keys off headers Autumn
     /// already forwards — `Authorization` for JWT, `Cookie`/Host otherwise).
     tenant_header: Option<String>,
+    /// The configured CSRF token header name forwarded on dispatch.
+    csrf_header: String,
     server_name: String,
     server_version: String,
 }
@@ -204,7 +222,8 @@ impl McpServer {
         {
             return true;
         }
-        self.allowed_origins
+        self.cors
+            .allowed_origins
             .iter()
             .any(|allowed| allowed == "*" || allowed == origin)
     }
@@ -286,8 +305,11 @@ fn build_input_schema(doc: &ApiDoc, components: &serde_json::Map<String, Value>)
     let mut defs = serde_json::Map::new();
 
     for param in doc.path_params {
-        properties.insert((*param).to_owned(), json!({ "type": "string" }));
-        required.push(json!(*param));
+        // axum catch-all params (`{*rest}`) surface with a leading `*`; clients
+        // address them by the bare name, so advertise the stripped name.
+        let name = param.strip_prefix('*').unwrap_or(param);
+        properties.insert(name.to_owned(), json!({ "type": "string" }));
+        required.push(json!(name));
     }
 
     if let Some(query) = &doc.query_schema {
@@ -454,15 +476,9 @@ pub struct McpToolInfo {
 
 impl McpServer {
     /// Assemble the server state from derived tools, a dispatch router, and the
-    /// CORS-derived `Origin` allowlist.
+    /// router-supplied [`McpWiring`] (CORS, trusted hosts, tenant/CSRF headers).
     #[must_use]
-    pub(crate) fn new(
-        tools: Vec<McpToolInfo>,
-        dispatch: axum::Router,
-        allowed_origins: Vec<String>,
-        trusted_hosts: crate::router::TrustedHostPolicy,
-        tenant_header: Option<String>,
-    ) -> Self {
+    pub(crate) fn new(tools: Vec<McpToolInfo>, dispatch: axum::Router, wiring: McpWiring) -> Self {
         let tools: Vec<McpTool> = tools
             .into_iter()
             .map(|t| McpTool {
@@ -486,9 +502,10 @@ impl McpServer {
             tools,
             by_name,
             dispatch,
-            allowed_origins,
-            trusted_hosts,
-            tenant_header,
+            cors: wiring.cors,
+            trusted_hosts: wiring.trusted_hosts,
+            tenant_header: wiring.tenant_header,
+            csrf_header: wiring.csrf_header,
             server_name: "autumn-mcp".to_owned(),
             server_version: env!("CARGO_PKG_VERSION").to_owned(),
         }
@@ -498,40 +515,95 @@ impl McpServer {
 /// Build an axum sub-router serving the MCP endpoint at `mount_path`.
 ///
 /// `dispatch` must be the fully-assembled application router (state applied)
-/// so `tools/call` traverses the real handler pipeline. `allowed_origins` is
-/// the app's CORS allowlist, used for `Origin` validation; `trusted_hosts`
-/// gates the same-origin shortcut. `tenant_header` is the configured tenant
-/// header name to forward on dispatch when the app uses header-based tenancy
-/// (`None` otherwise).
+/// so `tools/call` traverses the real handler pipeline. `wiring` carries the
+/// CORS config (cross-origin `Origin` allowlist + preflight settings), the
+/// trusted-Host policy gating the same-origin shortcut, and the tenant/CSRF
+/// header names forwarded on dispatch.
 pub(crate) fn build_mcp_router(
     mount_path: &str,
     tools: Vec<McpToolInfo>,
     dispatch: axum::Router,
-    allowed_origins: Vec<String>,
-    trusted_hosts: crate::router::TrustedHostPolicy,
-    tenant_header: Option<String>,
+    wiring: McpWiring,
 ) -> axum::Router<crate::state::AppState> {
-    let server = Arc::new(McpServer::new(
-        tools,
-        dispatch,
-        allowed_origins,
-        trusted_hosts,
-        tenant_header,
-    ));
+    let server = Arc::new(McpServer::new(tools, dispatch, wiring));
     tracing::debug!(
         path = mount_path,
         tools = server.tools.len(),
         "Mounted MCP endpoint"
     );
-    // Register POST and GET on the mount path as a single `MethodRouter` so the
-    // two verbs share one route entry (avoids any overlapping-route concern and
-    // mirrors how the framework mounts multi-method paths elsewhere).
+    // Register the endpoint's verbs as a single `MethodRouter` so they share one
+    // route entry (avoids any overlapping-route concern and mirrors how the
+    // framework mounts multi-method paths elsewhere). `OPTIONS` answers CORS
+    // preflight for allowlisted browser clients — the endpoint is mounted
+    // outside the global CORS layer, so it serves its own preflight.
     axum::Router::<crate::state::AppState>::new()
         .route(
             mount_path,
-            axum::routing::get(serve_mcp_get).post(serve_mcp),
+            axum::routing::get(serve_mcp_get)
+                .post(serve_mcp)
+                .options(serve_mcp_options),
         )
         .layer(axum::extract::Extension(server))
+}
+
+/// Answer a CORS preflight (`OPTIONS`) for the MCP endpoint. Because the
+/// endpoint is mounted outside the global CORS layer, an allowlisted browser
+/// MCP client's preflight would otherwise get no `Access-Control-Allow-*`
+/// headers and the browser would block the real `POST`. We reuse the app's CORS
+/// config to answer it: only an explicitly allowlisted `Origin` (or `*`) gets
+/// the allow headers; anything else gets a bare `204` with no CORS grant.
+async fn serve_mcp_options(
+    axum::extract::Extension(server): axum::extract::Extension<Arc<McpServer>>,
+    headers: HeaderMap,
+) -> Response {
+    use axum::http::HeaderValue;
+
+    let cors = &server.cors;
+    let mut out = HeaderMap::new();
+    // `Vary: Origin` since the response depends on the request Origin.
+    out.insert(header::VARY, HeaderValue::from_static("origin"));
+
+    let origin = headers.get(header::ORIGIN).and_then(|o| o.to_str().ok());
+    let allow_any = cors.allowed_origins.iter().any(|a| a == "*");
+    let origin_allowed =
+        origin.is_some_and(|o| allow_any || cors.allowed_origins.iter().any(|a| a == o));
+
+    // No Origin (non-CORS probe) or a non-allowlisted origin: advertise the
+    // allowed methods but grant no cross-origin access.
+    if !origin_allowed {
+        out.insert(
+            header::ALLOW,
+            HeaderValue::from_static("GET, POST, OPTIONS"),
+        );
+        return (StatusCode::NO_CONTENT, out).into_response();
+    }
+
+    let origin = origin.unwrap_or_default();
+    // With credentials, the spec forbids `*`; echo the concrete origin instead.
+    let allow_origin = if allow_any && !cors.allow_credentials {
+        "*".to_owned()
+    } else {
+        origin.to_owned()
+    };
+    if let Ok(v) = HeaderValue::from_str(&allow_origin) {
+        out.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, v);
+    }
+    if let Ok(v) = HeaderValue::from_str(&cors.allowed_methods.join(", ")) {
+        out.insert(header::ACCESS_CONTROL_ALLOW_METHODS, v);
+    }
+    if let Ok(v) = HeaderValue::from_str(&cors.allowed_headers.join(", ")) {
+        out.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, v);
+    }
+    if let Ok(v) = HeaderValue::from_str(&cors.max_age_secs.to_string()) {
+        out.insert(header::ACCESS_CONTROL_MAX_AGE, v);
+    }
+    if cors.allow_credentials {
+        out.insert(
+            header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
+            HeaderValue::from_static("true"),
+        );
+    }
+    (StatusCode::NO_CONTENT, out).into_response()
 }
 
 /// MCP over Streamable HTTP: GET opens a server-initiated stream. This buffered
@@ -729,6 +801,7 @@ async fn tools_call(
         tool,
         ctx.headers,
         &arguments,
+        &server.csrf_header,
         server.tenant_header.as_deref(),
     ) {
         Ok(req) => req,
@@ -788,21 +861,36 @@ fn build_request(
     tool: &McpTool,
     headers: &HeaderMap,
     arguments: &Value,
+    csrf_header: &str,
     tenant_header: Option<&str>,
 ) -> Result<axum::http::Request<Body>, String> {
     // Fill the path template from top-level string-ish arguments.
     let mut path = tool.path_template.clone();
     for param in &tool.path_params {
+        // axum catch-all params (`/files/{*rest}`) surface from `ApiDoc` with a
+        // leading `*`. Clients address them by the bare name, and their value is
+        // a multi-segment path whose `/` separators must be preserved (each
+        // segment is still percent-encoded individually).
+        let is_catch_all = param.starts_with('*');
+        let arg_key = param.strip_prefix('*').unwrap_or(param);
         let raw = arguments
-            .get(param)
-            .ok_or_else(|| format!("missing required path parameter `{param}`"))?;
+            .get(arg_key)
+            .ok_or_else(|| format!("missing required path parameter `{arg_key}`"))?;
         let value = match raw {
             Value::String(s) => s.clone(),
             other => other.to_string(),
         };
         // Use the same full segment encoder the typed path helpers use, so an
         // MCP call accepts the same values a direct HTTP caller could pass.
-        let encoded = crate::paths::encode_path_segment(&value);
+        let encoded = if is_catch_all {
+            value
+                .split('/')
+                .map(crate::paths::encode_path_segment)
+                .collect::<Vec<_>>()
+                .join("/")
+        } else {
+            crate::paths::encode_path_segment(&value)
+        };
         path = replace_path_param(&path, param, &encoded);
     }
 
@@ -846,7 +934,6 @@ fn build_request(
     // authenticates and is attributed exactly as a direct HTTP call would:
     //  * `Authorization` — bearer-token (`RequireApiToken`) auth.
     //  * `Cookie` — session-based `#[secured]` routes / session tenancy.
-    //  * `X-CSRF-Token` — `CsrfLayer` on mutating write tools.
     //  * `Idempotency-Key` — `IdempotencyLayer` dedupe on retried writes.
     //  * `Host` / `Forwarded` / `X-Forwarded-*` / `X-Real-IP` — subdomain
     //    tenancy host resolution and the rate limiter's client-IP attribution.
@@ -854,6 +941,12 @@ fn build_request(
         if let Some(value) = headers.get(*name) {
             builder = builder.header(*name, value);
         }
+    }
+    // Forward the configured CSRF token header (default `x-csrf-token`) so a
+    // session-authenticated write tool passes `CsrfLayer`, which reads
+    // `CsrfConfig::token_header` — not a hard-coded name.
+    if let Some(value) = headers.get(csrf_header) {
+        builder = builder.header(csrf_header, value);
     }
     // Header-based tenancy: forward the configured tenant header (default
     // `x-tenant-id`) so the `Tenant` extractor on the dispatched request
@@ -1087,7 +1180,8 @@ mod tests {
     #[test]
     fn build_request_rejects_missing_required_body() {
         let t = tool("POST", "/api/todos", true, false);
-        let err = build_request(&t, &HeaderMap::new(), &json!({}), None).unwrap_err();
+        let err =
+            build_request(&t, &HeaderMap::new(), &json!({}), "x-csrf-token", None).unwrap_err();
         assert!(err.contains("body"), "got: {err}");
     }
 
@@ -1098,6 +1192,7 @@ mod tests {
             &t,
             &HeaderMap::new(),
             &json!({ "query": { "tags": ["a", "b"], "q": "x" } }),
+            "x-csrf-token",
             None,
         )
         .expect("request builds");
@@ -1117,7 +1212,8 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(header::AUTHORIZATION, "Bearer tok".parse().unwrap());
         headers.insert(header::COOKIE, "autumn.sid=abc".parse().unwrap());
-        let req = build_request(&t, &headers, &json!({}), None).expect("request builds");
+        let req =
+            build_request(&t, &headers, &json!({}), "x-csrf-token", None).expect("request builds");
         assert_eq!(
             req.headers().get(header::AUTHORIZATION).unwrap(),
             "Bearer tok"
@@ -1130,9 +1226,51 @@ mod tests {
         let t = tool("POST", "/api/todos", true, false);
         let mut headers = HeaderMap::new();
         headers.insert("x-csrf-token", "csrf123".parse().unwrap());
-        let req = build_request(&t, &headers, &json!({ "body": { "x": 1 } }), None)
-            .expect("request builds");
+        let req = build_request(
+            &t,
+            &headers,
+            &json!({ "body": { "x": 1 } }),
+            "x-csrf-token",
+            None,
+        )
+        .expect("request builds");
         assert_eq!(req.headers().get("x-csrf-token").unwrap(), "csrf123");
+    }
+
+    #[test]
+    fn build_request_forwards_configured_csrf_header() {
+        // Apps that customize security.csrf.token_header must have that header
+        // forwarded, not a hard-coded `x-csrf-token`.
+        let t = tool("POST", "/api/todos", true, false);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-xsrf-token", "csrf123".parse().unwrap());
+        let req = build_request(
+            &t,
+            &headers,
+            &json!({ "body": { "x": 1 } }),
+            "x-xsrf-token",
+            None,
+        )
+        .expect("request builds");
+        assert_eq!(req.headers().get("x-xsrf-token").unwrap(), "csrf123");
+    }
+
+    #[test]
+    fn build_request_preserves_slashes_for_catch_all_param() {
+        // A catch-all route `/files/{*path}`: the argument is addressed by the
+        // bare name `path`, and its `/` separators survive into the replay URI.
+        let mut t = tool("GET", "/files/{*path}", false, false);
+        t.path_params = vec!["*path".to_owned()];
+        let req = build_request(
+            &t,
+            &HeaderMap::new(),
+            &json!({ "path": "a/b c/d.txt" }),
+            "x-csrf-token",
+            None,
+        )
+        .expect("request builds");
+        // Slashes preserved as separators; the space in a segment is encoded.
+        assert_eq!(req.uri().path(), "/files/a/b%20c/d.txt");
     }
 
     #[test]
@@ -1141,11 +1279,18 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-tenant-id", "acme".parse().unwrap());
         // With header-based tenancy configured, the tenant header is forwarded.
-        let req =
-            build_request(&t, &headers, &json!({}), Some("x-tenant-id")).expect("request builds");
+        let req = build_request(
+            &t,
+            &headers,
+            &json!({}),
+            "x-csrf-token",
+            Some("x-tenant-id"),
+        )
+        .expect("request builds");
         assert_eq!(req.headers().get("x-tenant-id").unwrap(), "acme");
         // Without a configured tenant header, it is not forwarded.
-        let req = build_request(&t, &headers, &json!({}), None).expect("request builds");
+        let req =
+            build_request(&t, &headers, &json!({}), "x-csrf-token", None).expect("request builds");
         assert!(req.headers().get("x-tenant-id").is_none());
     }
 
@@ -1159,11 +1304,11 @@ mod tests {
             json!({ "query": "all" }),
             json!({ "query": [1, 2] }),
         ] {
-            let err = build_request(&t, &HeaderMap::new(), &bad, None).unwrap_err();
+            let err = build_request(&t, &HeaderMap::new(), &bad, "x-csrf-token", None).unwrap_err();
             assert!(err.contains("query"), "got: {err}");
         }
         // An absent `query` is fine (the field is optional).
-        assert!(build_request(&t, &HeaderMap::new(), &json!({}), None).is_ok());
+        assert!(build_request(&t, &HeaderMap::new(), &json!({}), "x-csrf-token", None).is_ok());
     }
 
     #[test]
@@ -1175,8 +1320,14 @@ mod tests {
         headers.insert("x-forwarded-host", "tenant1.example.com".parse().unwrap());
         headers.insert("x-real-ip", "203.0.113.7".parse().unwrap());
         headers.insert("idempotency-key", "abc-123".parse().unwrap());
-        let req = build_request(&t, &headers, &json!({ "body": { "x": 1 } }), None)
-            .expect("request builds");
+        let req = build_request(
+            &t,
+            &headers,
+            &json!({ "body": { "x": 1 } }),
+            "x-csrf-token",
+            None,
+        )
+        .expect("request builds");
         // Host/forwarding headers carry subdomain-tenancy host + rate-limit IP.
         assert_eq!(
             req.headers().get(header::HOST).unwrap(),
@@ -1201,12 +1352,19 @@ mod tests {
     }
 
     fn server_with_trusted(allowed_origins: Vec<String>, hosts: &[&str]) -> McpServer {
+        let cors = crate::config::CorsConfig {
+            allowed_origins,
+            ..crate::config::CorsConfig::default()
+        };
         McpServer::new(
             Vec::new(),
             axum::Router::new(),
-            allowed_origins,
-            trusted(hosts),
-            None,
+            McpWiring {
+                cors,
+                trusted_hosts: trusted(hosts),
+                tenant_header: None,
+                csrf_header: "x-csrf-token".to_owned(),
+            },
         )
     }
 
@@ -1261,6 +1419,42 @@ mod tests {
             Some("attacker.example"),
             Some("http")
         ));
+    }
+
+    #[tokio::test]
+    async fn options_preflight_grants_only_allowlisted_origin() {
+        let s = Arc::new(server_with_trusted(
+            vec!["https://app.example".to_owned()],
+            &[],
+        ));
+
+        // Allowlisted origin → preflight grants the CORS headers.
+        let mut headers = HeaderMap::new();
+        headers.insert(header::ORIGIN, "https://app.example".parse().unwrap());
+        let resp = serve_mcp_options(axum::extract::Extension(s.clone()), headers).await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            resp.headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .unwrap(),
+            "https://app.example"
+        );
+        assert!(
+            resp.headers()
+                .get(header::ACCESS_CONTROL_ALLOW_METHODS)
+                .is_some()
+        );
+
+        // Non-allowlisted origin → no CORS grant (browser will block the POST).
+        let mut headers = HeaderMap::new();
+        headers.insert(header::ORIGIN, "https://evil.example".parse().unwrap());
+        let resp = serve_mcp_options(axum::extract::Extension(s), headers).await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert!(
+            resp.headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .is_none()
+        );
     }
 
     #[test]

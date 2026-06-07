@@ -461,6 +461,29 @@ async fn mount_path_colliding_with_framework_route_is_rejected() {
 }
 
 #[tokio::test]
+#[should_panic(expected = "McpPathCollision")]
+async fn mount_path_colliding_with_openapi_path_is_rejected() {
+    // The OpenAPI JSON endpoint merges as a GET before the MCP router, so a
+    // mount path that collides with it must be rejected up front.
+    let _ = TestApp::new()
+        .routes(routes![list_todos])
+        .openapi(OpenApiConfig::new("Demo", "1.0.0").openapi_json_path("/mcp"))
+        .mount_mcp("/mcp")
+        .build();
+}
+
+#[tokio::test]
+#[should_panic(expected = "InvalidMcpPath")]
+async fn dynamic_mount_path_is_rejected() {
+    // A capture/catch-all mount path would shadow a whole path class; only a
+    // single static endpoint is allowed.
+    let _ = TestApp::new()
+        .routes(routes![list_todos])
+        .mount_mcp("/{tenant}/mcp")
+        .build();
+}
+
+#[tokio::test]
 async fn tools_call_requires_body_for_write_tools() {
     let client = TestApp::new()
         .routes(routes![create_todo])

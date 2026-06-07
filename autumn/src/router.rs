@@ -375,16 +375,31 @@ fn build_router_pre_state(
     #[cfg(feature = "mcp")]
     let mcp_prepared: Option<McpPrepared> = if let Some(rt) = ctx.mcp.take() {
         let path = rt.mount_path.as_str();
-        if path.is_empty() || !path.starts_with('/') || path.contains("//") {
+        // The mount path must be a single static endpoint: reject empty,
+        // non-absolute, doubled-slash, and dynamic (`{capture}` / `{*rest}`)
+        // paths so MCP cannot shadow a whole path class and so the exact-path
+        // collision preflight reserves the concrete URL it actually matches.
+        if path.is_empty()
+            || !path.starts_with('/')
+            || path.contains("//")
+            || path.contains('{')
+            || path.contains('*')
+        {
             return Err(RouterBuildError::InvalidMcpPath {
                 value: rt.mount_path,
             });
         }
-        // The MCP endpoint mounts GET+POST at `mount_path`. If a user or
-        // framework route already owns that exact path, the later `merge` would
+        // The MCP endpoint mounts GET+POST at `mount_path`. If a user, framework,
+        // or OpenAPI route already owns that exact path, the later `merge` would
         // panic on overlapping method routes; surface it as a recoverable error
         // first (mirroring the OpenAPI collision preflight).
-        reject_mcp_path_collisions(path, &route_list, &ctx.scoped_groups, config)?;
+        reject_mcp_path_collisions(
+            path,
+            &route_list,
+            &ctx.scoped_groups,
+            config,
+            ctx.openapi.as_ref(),
+        )?;
         let docs = collect_openapi_docs(&route_list, &ctx.scoped_groups);
         // Pass the app's OpenAPI config (if any) so MCP tool `inputSchema`s
         // reuse the same registered component schemas as the served spec.
@@ -508,17 +523,19 @@ fn build_router_pre_state(
         // call would. Other sources key off already-forwarded headers/Host.
         let tenant_header = (config.tenancy.enabled && config.tenancy.source == "header")
             .then(|| config.tenancy.header_name.clone());
-        let mut mcp_router = crate::mcp::build_mcp_router(
-            &mount_path,
-            tools,
-            dispatch,
-            // Source the Origin allowlist from the app's CORS config.
-            config.cors.allowed_origins.clone(),
+        let wiring = crate::mcp::McpWiring {
+            // The CORS config drives the cross-origin Origin allowlist and the
+            // endpoint's own OPTIONS preflight responses.
+            cors: config.cors.clone(),
             // The same-origin shortcut is gated on the app's trusted-Host
             // policy so it can't be abused for DNS rebinding.
-            TrustedHostPolicy::from_config(config),
+            trusted_hosts: TrustedHostPolicy::from_config(config),
             tenant_header,
-        );
+            // Forward the configured CSRF header (default `x-csrf-token`) so
+            // customized CsrfConfig::token_header deployments work via MCP.
+            csrf_header: config.security.csrf.token_header.to_ascii_lowercase(),
+        };
+        let mut mcp_router = crate::mcp::build_mcp_router(&mount_path, tools, dispatch, wiring);
         // Optional whole-endpoint auth gate (AppBuilder::secure_mcp), applied
         // before merge so it guards the catalog as well as tool dispatch.
         if let Some(layer_fn) = endpoint_layer {
@@ -800,14 +817,27 @@ fn collect_claimed_get_paths(
 /// [`RouterBuildError::McpPathCollision`] instead, reusing the same claimed-GET
 /// gathering as the `OpenAPI` preflight so framework routes (health/probe,
 /// actuator, htmx, dev) are covered too — e.g. `mount_mcp(config.health.path)`.
+/// The configured `OpenAPI` JSON/UI/asset paths (which merge as `GET`s before
+/// the MCP router) are checked as well.
 #[cfg(feature = "mcp")]
 fn reject_mcp_path_collisions(
     mount_path: &str,
     route_list: &[Route],
     scoped_groups: &[ScopedGroup],
     config: &AutumnConfig,
+    openapi: Option<&crate::openapi::OpenApiConfig>,
 ) -> Result<(), RouterBuildError> {
-    if collect_claimed_get_paths(route_list, scoped_groups, config).contains(mount_path) {
+    let mut claimed_get = collect_claimed_get_paths(route_list, scoped_groups, config);
+    // The OpenAPI JSON/Swagger-UI endpoints (and UI assets) merge as GETs
+    // before the MCP router, so a mount path colliding with them would panic.
+    if let Some(openapi) = openapi {
+        claimed_get.insert(openapi.openapi_json_path.clone());
+        if let Some(ui_path) = &openapi.swagger_ui_path {
+            claimed_get.insert(ui_path.clone());
+            claimed_get.extend(crate::openapi::swagger_ui_asset_paths(ui_path));
+        }
+    }
+    if claimed_get.contains(mount_path) {
         return Err(RouterBuildError::McpPathCollision {
             path: mount_path.to_owned(),
             method: "GET".to_owned(),
