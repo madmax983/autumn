@@ -361,10 +361,18 @@ mod tests {
     #[test]
     fn export_archive_add_table_populates_tables_and_manifest() {
         let mut archive = ExportArchive::new("u1");
-        archive.add_table("posts", vec![serde_json::json!({"id": 1, "title": "Hello"})]);
+        archive.add_table(
+            "posts",
+            vec![serde_json::json!({"id": 1, "title": "Hello"})],
+        );
         assert_eq!(archive.tables.len(), 1);
         assert!(archive.tables.contains_key("posts"));
-        assert!(archive.manifest.tables_included.contains(&"posts".to_owned()));
+        assert!(
+            archive
+                .manifest
+                .tables_included
+                .contains(&"posts".to_owned())
+        );
     }
 
     #[test]

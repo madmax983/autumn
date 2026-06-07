@@ -551,10 +551,7 @@ pub fn plan_auth_with_providers(
         docs_dir.join("authentication.md"),
         render_docs_file(&pascal_name, totp),
     );
-    plan.create(
-        docs_dir.join("gdpr-compliance.md"),
-        render_gdpr_docs_file(),
-    );
+    plan.create(docs_dir.join("gdpr-compliance.md"), render_gdpr_docs_file());
 
     // ── src/main.rs — module declarations + route registration ────────────
     let main_path = project_root.join("src").join("main.rs");
@@ -9273,7 +9270,9 @@ mod tests {
         plan.execute(Flags::default()).unwrap();
         let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
         assert!(
-            routes.contains("export_job") || routes.contains("ExportJob") || routes.contains("enqueue"),
+            routes.contains("export_job")
+                || routes.contains("ExportJob")
+                || routes.contains("enqueue"),
             "generated code must enqueue a background export job: {routes}"
         );
     }
@@ -9297,7 +9296,9 @@ mod tests {
             })
             .collect();
         assert!(
-            paths.iter().any(|p| p.contains("gdpr") || p.contains("compliance")),
+            paths
+                .iter()
+                .any(|p| p.contains("gdpr") || p.contains("compliance")),
             "plan must include a GDPR/compliance documentation file; got: {paths:?}"
         );
     }

@@ -1913,8 +1913,7 @@ pub fn run(opts: DoctorOptions) {
     //     but #[repository] models are not registered in GdprRegistry).
     //     File-system work runs inside the task so it overlaps with other checks.
     tasks.push(Box::new(|| {
-        let has_auth_starter =
-            std::path::Path::new("src/routes/auth.rs").exists();
+        let has_auth_starter = std::path::Path::new("src/routes/auth.rs").exists();
         let unregistered = resolve_gdpr_unregistered_tables();
         check_gdpr_export_registration_impl(
             has_auth_starter,
