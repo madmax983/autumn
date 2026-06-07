@@ -523,7 +523,7 @@ pub fn infer_query_params(input_fn: &syn::ItemFn) -> Option<TokenStream> {
 /// 2. Function-local `__AUTUMN_SECURED_ROLES` marker present (secured was
 ///    above the route macro and already expanded its body).
 /// 3. Legacy fallback: `__autumn_session` param present.
-fn has_policy_check_in_stmts(stmts: &[syn::Stmt]) -> bool {
+pub fn has_policy_check_in_stmts(stmts: &[syn::Stmt]) -> bool {
     for stmt in stmts {
         let s = quote::quote!(#stmt).to_string();
         if s.contains("__check_policy") {

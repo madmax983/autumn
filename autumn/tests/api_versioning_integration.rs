@@ -216,6 +216,15 @@ async fn api_authorize_policy_denial_sunset(
     "authorized policy denial sunset info"
 }
 
+#[authorize("show", resource = SunsetPolicyDenialNote)]
+#[get("/api/authorize-policy-denial-reverse-sunset", api_version = "v1")]
+async fn api_authorize_policy_denial_reverse_sunset(
+    LoadedSunsetPolicyDenialNote(sunset_policy_denial_note): LoadedSunsetPolicyDenialNote,
+) -> &'static str {
+    let _ = sunset_policy_denial_note;
+    "authorized policy denial reverse sunset info"
+}
+
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn test_api_versioning_auth_preservation() {
@@ -244,7 +253,8 @@ async fn test_api_versioning_auth_preservation() {
             api_secured_sunset,
             api_secured_role_sunset,
             api_authorize_sunset,
-            api_authorize_policy_denial_sunset
+            api_authorize_policy_denial_sunset,
+            api_authorize_policy_denial_reverse_sunset
         ])
         .policy::<SunsetNote, _>(SunsetNotePolicy)
         .policy::<SunsetPolicyDenialNote, _>(SunsetPolicyDenialNotePolicy)
@@ -359,6 +369,23 @@ async fn test_api_versioning_auth_preservation() {
 
     let resp = client
         .get("/api/authorize-policy-denial-sunset")
+        .header("Cookie", "autumn.sid=sess-user")
+        .header("X-Note-Id", "42")
+        .send()
+        .await;
+    resp.assert_status(410); // Authorized sunset request is 410 Gone!
+
+    // After sunset policy denial check (reverse attribute macro order)
+    let resp = client
+        .get("/api/authorize-policy-denial-reverse-sunset")
+        .header("Cookie", "autumn.sid=sess-user")
+        .header("X-Note-Id", "1")
+        .send()
+        .await;
+    resp.assert_status(404); // Policy denial is preserved!
+
+    let resp = client
+        .get("/api/authorize-policy-denial-reverse-sunset")
         .header("Cookie", "autumn.sid=sess-user")
         .header("X-Note-Id", "42")
         .send()

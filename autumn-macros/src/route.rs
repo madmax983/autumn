@@ -231,6 +231,7 @@ fn has_authorize_guard(input_fn: &syn::ItemFn) -> bool {
             .last()
             .is_some_and(|segment| segment.ident == "authorize")
     }) || block_has_replay_guard(&input_fn.block)
+        || crate::api_doc::has_policy_check_in_stmts(&input_fn.block.stmts)
 }
 
 /// When a `name = "..."` override is active, emit a `pub use` alias for the

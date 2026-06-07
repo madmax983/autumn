@@ -132,7 +132,9 @@ impl<S> MaintenanceService<S> {
             if path == bypass {
                 return None;
             }
-            if let Some(stripped) = path.strip_prefix(bypass)
+            if bypass != "/"
+                && !bypass.is_empty()
+                && let Some(stripped) = path.strip_prefix(bypass)
                 && (bypass.ends_with('/') || stripped.starts_with('/'))
             {
                 return None;

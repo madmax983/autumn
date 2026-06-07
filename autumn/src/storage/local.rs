@@ -579,12 +579,40 @@ pub fn verify_upload_with_now(
         return Err(BlobStoreError::Signature("upload token expired".into()));
     }
     let expected = sign_upload(signing_key, blob_key, content_type, expires_at);
-    if !constant_time_eq(expected.as_bytes(), signature.as_bytes()) {
-        return Err(BlobStoreError::Signature(
-            "upload token signature mismatch".into(),
-        ));
+    if constant_time_eq(expected.as_bytes(), signature.as_bytes()) {
+        return Ok(());
     }
-    Ok(())
+    let expected_legacy = sign_upload_legacy(signing_key, blob_key, content_type, expires_at);
+    if constant_time_eq(expected_legacy.as_bytes(), signature.as_bytes()) {
+        return Ok(());
+    }
+    Err(BlobStoreError::Signature(
+        "upload token signature mismatch".into(),
+    ))
+}
+
+/// Compute the legacy upload signature for backwards compatibility.
+///
+/// # Panics
+///
+/// Never; `Hmac::new_from_slice` accepts any key length.
+#[must_use]
+pub fn sign_upload_legacy(
+    key_bytes: &[u8],
+    blob_key: &str,
+    content_type: &str,
+    expires_at: u64,
+) -> String {
+    use hmac::{Hmac, Mac};
+    let mut mac =
+        <Hmac<Sha256> as Mac>::new_from_slice(key_bytes).expect("HMAC accepts any key length");
+    mac.update(b"upload:");
+    mac.update(blob_key.as_bytes());
+    mac.update(b":");
+    mac.update(content_type.as_bytes());
+    mac.update(b":");
+    mac.update(expires_at.to_string().as_bytes());
+    hex(mac.finalize().into_bytes())
 }
 
 /// Verify an upload token against the current key and each previous key in a
@@ -629,9 +657,19 @@ pub(crate) fn verify_upload_rotation_with_now(
     if constant_time_eq(expected_current.as_bytes(), signature.as_bytes()) {
         return Ok(());
     }
+    let expected_current_legacy =
+        sign_upload_legacy(current.as_bytes(), blob_key, content_type, expires_at);
+    if constant_time_eq(expected_current_legacy.as_bytes(), signature.as_bytes()) {
+        return Ok(());
+    }
     for prev in previous {
         let expected = sign_upload(prev.as_bytes(), blob_key, content_type, expires_at);
         if constant_time_eq(expected.as_bytes(), signature.as_bytes()) {
+            return Ok(());
+        }
+        let expected_legacy =
+            sign_upload_legacy(prev.as_bytes(), blob_key, content_type, expires_at);
+        if constant_time_eq(expected_legacy.as_bytes(), signature.as_bytes()) {
             return Ok(());
         }
     }
@@ -1983,6 +2021,16 @@ mod tests {
         let content_type = "image/jpeg";
         let exp = u64::MAX / 2;
         let sig = sign_upload(key, blob_key, content_type, exp);
+        verify_upload(key, blob_key, content_type, exp, &sig).unwrap();
+    }
+
+    #[test]
+    fn verify_upload_accepts_legacy_token() {
+        let key = b"secret";
+        let blob_key = "img/photo.jpg";
+        let content_type = "image/jpeg";
+        let exp = u64::MAX / 2;
+        let sig = sign_upload_legacy(key, blob_key, content_type, exp);
         verify_upload(key, blob_key, content_type, exp, &sig).unwrap();
     }
 

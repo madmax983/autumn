@@ -1,5 +1,6 @@
 use autumn_web::maintenance::{MaintenanceConfig, MaintenanceState};
 use autumn_web::middleware::maintenance::MaintenanceLayer;
+use autumn_web::security::{TrustedProxiesConfig, TrustedProxiesLayer};
 use axum::extract::ConnectInfo;
 use axum::http::{Request, StatusCode};
 use axum::{Router, body::Body, routing::get};
@@ -14,9 +15,6 @@ async fn maintenance_trusted_proxy_bypass() {
         allow_ips: vec!["192.168.1.10".to_string()], // only this IP is allowed
         ..Default::default()
     });
-
-    use autumn_web::security::TrustedProxiesConfig;
-    use autumn_web::security::TrustedProxiesLayer;
 
     let app = Router::new()
         .route("/", get(|| async { "Hello" }))
@@ -150,4 +148,36 @@ async fn maintenance_synchronous_load_on_startup() {
 
     // Clean up
     let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn maintenance_root_bypass_is_exact_only() {
+    let state = MaintenanceState::new();
+    state.enable(MaintenanceConfig::default());
+
+    let app = Router::new()
+        .route("/", get(|| async { "Root" }))
+        .route("/admin", get(|| async { "Admin" }))
+        .layer(MaintenanceLayer::new(state).with_bypass_paths(vec!["/".to_string()]));
+
+    // 1. Root bypasses (exact match)
+    let resp = app
+        .clone()
+        .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // 2. /admin does NOT bypass (not treating / as a global subtree bypass)
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/admin")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
