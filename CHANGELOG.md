@@ -30,6 +30,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 To opt out of the generated `page` method: implement your own list handler using `repo.find_all()` or a custom Diesel query.  The `find_all` method is unchanged.
 
+- **security:** Centralize trusted-proxies policy across forwarded-header middleware (#812)
+  - **New `[security.trusted_proxies]` config block** at the top level of `[security]`.
+    Configure once; every framework middleware (rate limiter, method-override origin check,
+    CSRF, HSTS detection, tracing fields) honours the same trust boundary automatically.
+    Fields: `ranges` (CIDR list), `trusted_hops` (peel-N-from-right strategy), and
+    `trust_forwarded_headers` (global on/off switch). Profile-aware defaults: `dev` trusts
+    loopback only; `prod` defaults to no forwarding trust until configured.
+  - **New extractors** in `autumn_web::extract`: `ClientAddr` (resolved client IP),
+    `ClientHost` (resolved external hostname), `ClientScheme` (`"http"` / `"https"` after
+    `X-Forwarded-Proto` evaluation). These are the only blessed way to read client identity
+    from handlers and middleware — direct `X-Forwarded-*` reads are now rejected by the
+    new CI `grep` guard.
+  - **Deprecation:** `security.rate_limit.trusted_proxies` and
+    `security.rate_limit.trust_forwarded_headers` continue to work for one minor release
+    with a deprecation warning at startup pointing at the new top-level config.
+    `autumn doctor --strict` fails when both old and new are set with conflicting values.
+  - **Regression fixes:** Closes three related CVEs — PR #753 (`X-Forwarded-For`
+    rate-limit bypass), PR #785 and PR #791 (`X-Forwarded-Host` CSRF/method-override
+    spoofing bypass in `MethodOverrideLayer`). The PoC from PR #791 is now covered by
+    a regression test that validates the override is rejected when the
+    `ResolvedClientIdentity` host does not match the `Origin` header.
+  - **Plugin author guide** added to `docs/guide/middleware.md` and
+    `docs/guide/extensibility.md`: "Never read `X-Forwarded-*` directly. Use
+    `ClientAddr` / `ClientHost` / `ClientScheme` extractors."
 - **configuration:** Add TOML config file support to generated scaffolds and a runtime configuration system for live-tunable operational knobs (#773, #931).
 - **data and repositories:** Add soft delete, high-performance bulk CRUD, Postgres full-text search, automatic version history, CSV import/export, and per-query statement timeout/slow-query telemetry support (#858, #881, #905, #922, #1075, #865).
 - **development loop:** Add the dev-mode error overlay, generator conformance CI gate, dev-loop latency budgets, and framework runtime benchmarks (#1080, #1079, #920, #756).

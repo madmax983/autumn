@@ -428,6 +428,23 @@ fn profile_defaults_as_toml(profile: &str) -> toml::Value {
             let mut storage = toml::map::Map::new();
             storage.insert("backend".into(), "local".into());
             table.insert("storage".into(), toml::Value::Table(storage));
+            // Dev: trust X-Forwarded-* from loopback only so local reverse
+            // proxies (nginx, caddy, etc. on 127.0.0.1/::1) work out of the box.
+            let mut trusted_proxies = toml::map::Map::new();
+            trusted_proxies.insert("trust_forwarded_headers".into(), toml::Value::Boolean(true));
+            trusted_proxies.insert(
+                "ranges".into(),
+                toml::Value::Array(vec![
+                    toml::Value::String("127.0.0.0/8".to_owned()),
+                    toml::Value::String("::1/128".to_owned()),
+                ]),
+            );
+            let mut security = toml::map::Map::new();
+            security.insert(
+                "trusted_proxies".into(),
+                toml::Value::Table(trusted_proxies),
+            );
+            table.insert("security".into(), toml::Value::Table(security));
             // Dev: CSRF disabled (default), HSTS off (default)
         }
         "prod" => {
@@ -2357,6 +2374,28 @@ impl AutumnConfig {
             "AUTUMN_SECURITY__TRUSTED_HOSTS__HOSTS",
             &mut self.security.trusted_hosts.hosts,
         );
+
+        // Top-level trusted-proxy policy
+        parse_env_csv(
+            env,
+            "AUTUMN_SECURITY__TRUSTED_PROXIES__RANGES",
+            &mut self.security.trusted_proxies.ranges,
+        );
+        parse_env_bool(
+            env,
+            "AUTUMN_SECURITY__TRUSTED_PROXIES__TRUST_FORWARDED_HEADERS",
+            &mut self.security.trusted_proxies.trust_forwarded_headers,
+        );
+        if let Ok(val) = env.var("AUTUMN_SECURITY__TRUSTED_PROXIES__TRUSTED_HOPS") {
+            if let Ok(hops) = val.trim().parse::<u32>() {
+                self.security.trusted_proxies.trusted_hops = Some(hops);
+            } else {
+                tracing::warn!(
+                    "ignoring invalid AUTUMN_SECURITY__TRUSTED_PROXIES__TRUSTED_HOPS={val:?}: \
+                     expected a non-negative integer"
+                );
+            }
+        }
 
         self.security.webhooks.apply_env_overrides_with_env(env);
     }
@@ -4847,6 +4886,26 @@ path = "/healthz"
         assert_eq!(config.telemetry.environment, "development");
         assert!(config.health.detailed);
         assert_eq!(config.cors.allowed_origins, vec!["*"]);
+        assert!(
+            config.security.trusted_proxies.trust_forwarded_headers,
+            "dev profile must trust forwarded headers from loopback"
+        );
+        assert!(
+            config
+                .security
+                .trusted_proxies
+                .ranges
+                .contains(&"127.0.0.0/8".to_owned()),
+            "dev profile must include 127.0.0.0/8 as trusted proxy range"
+        );
+        assert!(
+            config
+                .security
+                .trusted_proxies
+                .ranges
+                .contains(&"::1/128".to_owned()),
+            "dev profile must include ::1/128 as trusted proxy range"
+        );
     }
 
     #[test]

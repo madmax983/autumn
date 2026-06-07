@@ -97,6 +97,14 @@ pub struct AppState {
     /// Resolved config properties with source tracking for `/actuator/configprops`.
     pub(crate) config_props: actuator::ConfigProperties,
 
+    /// Registry of plugin-contributed metrics sources, populated by
+    /// [`crate::app::AppBuilder::metrics_source`].
+    pub(crate) metrics_source_registry: actuator::MetricsSourceRegistry,
+
+    /// Registry of custom health indicators, populated by
+    /// [`crate::app::AppBuilder::health_indicator`].
+    pub(crate) health_indicator_registry: actuator::HealthIndicatorRegistry,
+
     /// Named broadcast channel registry for real-time messaging.
     ///
     /// Available when the `ws` feature is enabled. Use
@@ -264,6 +272,18 @@ impl AppState {
     #[must_use]
     pub const fn config_props(&self) -> &actuator::ConfigProperties {
         &self.config_props
+    }
+
+    /// Returns the registry of plugin-contributed metrics sources.
+    #[must_use]
+    pub const fn metrics_source_registry(&self) -> &actuator::MetricsSourceRegistry {
+        &self.metrics_source_registry
+    }
+
+    /// Returns the registry of custom health indicators.
+    #[must_use]
+    pub const fn health_indicator_registry(&self) -> &actuator::HealthIndicatorRegistry {
+        &self.health_indicator_registry
     }
 
     /// Returns the resolved [`crate::config::AutumnConfig`] from the extension map.
@@ -552,6 +572,8 @@ impl AppState {
             task_registry: actuator::TaskRegistry::new(),
             job_registry: actuator::JobRegistry::new(),
             config_props: actuator::ConfigProperties::default(),
+            metrics_source_registry: actuator::MetricsSourceRegistry::new(),
+            health_indicator_registry: actuator::HealthIndicatorRegistry::new(),
             #[cfg(feature = "presence")]
             presence: Presence::new(channels.clone()),
             #[cfg(feature = "ws")]
@@ -654,6 +676,10 @@ impl crate::probe::ProvideProbeState for AppState {
     {
         self.replica_pool.as_ref()
     }
+
+    fn health_indicator_registry(&self) -> Option<&crate::actuator::HealthIndicatorRegistry> {
+        Some(&self.health_indicator_registry)
+    }
 }
 
 impl crate::actuator::ProvideActuatorState for AppState {
@@ -683,6 +709,18 @@ impl crate::actuator::ProvideActuatorState for AppState {
 
     fn uptime_display(&self) -> String {
         self.uptime_display()
+    }
+
+    fn metrics_source_registry(&self) -> Option<&crate::actuator::MetricsSourceRegistry> {
+        Some(&self.metrics_source_registry)
+    }
+
+    fn health_indicator_registry(&self) -> Option<&crate::actuator::HealthIndicatorRegistry> {
+        Some(&self.health_indicator_registry)
+    }
+
+    fn health_detailed(&self) -> bool {
+        self.health_detailed
     }
 
     #[cfg(feature = "ws")]

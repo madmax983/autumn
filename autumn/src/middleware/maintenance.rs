@@ -55,9 +55,6 @@ pub struct MaintenanceLayer {
     state: MaintenanceState,
     health_prefix: String,
     bypass_paths: Vec<String>,
-    trust_forwarded_headers: bool,
-    trusted_proxies: Vec<crate::security::TrustedProxy>,
-    trusted_proxies_configured: bool,
 }
 
 impl MaintenanceLayer {
@@ -70,9 +67,6 @@ impl MaintenanceLayer {
             state,
             health_prefix: DEFAULT_HEALTH_PREFIX.to_owned(),
             bypass_paths: Vec::new(),
-            trust_forwarded_headers: false,
-            trusted_proxies: Vec::new(),
-            trusted_proxies_configured: false,
         }
     }
 
@@ -95,30 +89,6 @@ impl MaintenanceLayer {
         self.bypass_paths = paths;
         self
     }
-
-    /// Set whether to trust forwarded headers like `X-Forwarded-For`.
-    #[must_use]
-    pub const fn with_trust_forwarded_headers(mut self, trust: bool) -> Self {
-        self.trust_forwarded_headers = trust;
-        self
-    }
-
-    /// Configure the trusted proxies list.
-    #[must_use]
-    pub fn with_trusted_proxies(mut self, proxies: Vec<crate::security::TrustedProxy>) -> Self {
-        if !proxies.is_empty() {
-            self.trusted_proxies_configured = true;
-        }
-        self.trusted_proxies = proxies;
-        self
-    }
-
-    /// Configure whether trusted proxies were originally configured.
-    #[must_use]
-    pub const fn with_trusted_proxies_configured(mut self, configured: bool) -> Self {
-        self.trusted_proxies_configured = configured;
-        self
-    }
 }
 
 impl<S> Layer<S> for MaintenanceLayer {
@@ -130,9 +100,6 @@ impl<S> Layer<S> for MaintenanceLayer {
             state: self.state.clone(),
             health_prefix: self.health_prefix.clone(),
             bypass_paths: self.bypass_paths.clone(),
-            trust_forwarded_headers: self.trust_forwarded_headers,
-            trusted_proxies: self.trusted_proxies.clone(),
-            trusted_proxies_configured: self.trusted_proxies_configured,
         }
     }
 }
@@ -144,9 +111,6 @@ pub struct MaintenanceService<S> {
     state: MaintenanceState,
     health_prefix: String,
     bypass_paths: Vec<String>,
-    trust_forwarded_headers: bool,
-    trusted_proxies: Vec<crate::security::TrustedProxy>,
-    trusted_proxies_configured: bool,
 }
 
 impl<S> MaintenanceService<S> {
@@ -185,12 +149,7 @@ impl<S> MaintenanceService<S> {
 
         // 3. IP allow-list.
         if !config.allow_ips.is_empty()
-            && let Some(client_ip) = extract_client_ip(
-                req,
-                self.trust_forwarded_headers,
-                &self.trusted_proxies,
-                self.trusted_proxies_configured,
-            )
+            && let Some(client_ip) = extract_client_ip(req)
             && ip_in_allow_list(&client_ip, &config.allow_ips)
         {
             return None;
@@ -262,19 +221,45 @@ where
     }
 }
 
-/// Extract the client IP from a request, preferring proxy-forwarded headers.
-fn extract_client_ip<B>(
-    req: &Request<B>,
-    trust_forwarded_headers: bool,
-    trusted_proxies: &[crate::security::TrustedProxy],
-    configured: bool,
-) -> Option<IpAddr> {
-    crate::security::proxy::extract_client_ip(
-        req,
-        trust_forwarded_headers,
-        trusted_proxies,
-        configured,
-    )
+/// Extract the client IP from a request.
+///
+/// When [`crate::security::ResolvedClientIdentity`] is present (stamped by
+/// `TrustedProxiesLayer`), its resolved address is used so that the configured
+/// trusted-proxy policy governs which forwarded IP is accepted. Raw
+/// `X-Forwarded-For` / `X-Real-IP` headers are only consulted as a fallback
+/// when the layer is not installed (e.g. in tests).
+fn extract_client_ip<B>(req: &Request<B>) -> Option<IpAddr> {
+    // Resolved by TrustedProxiesLayer — respects the proxy trust policy.
+    if let Some(identity) = req
+        .extensions()
+        .get::<crate::security::ResolvedClientIdentity>()
+    {
+        return identity.addr;
+    }
+
+    // Fallback: raw headers (TrustedProxiesLayer not installed).
+
+    // X-Forwarded-For: <client>, <proxy1>, <proxy2>
+    if let Some(xff) = req.headers().get("x-forwarded-for")
+        && let Ok(s) = xff.to_str()
+        && let Some(first) = s.split(',').next()
+        && let Ok(ip) = first.trim().parse::<IpAddr>()
+    {
+        return Some(ip);
+    }
+
+    // X-Real-Ip (set by nginx)
+    if let Some(xri) = req.headers().get("x-real-ip")
+        && let Ok(s) = xri.to_str()
+        && let Ok(ip) = s.trim().parse::<IpAddr>()
+    {
+        return Some(ip);
+    }
+
+    // SocketAddr extension set by Axum's ConnectInfo
+    req.extensions()
+        .get::<std::net::SocketAddr>()
+        .map(std::net::SocketAddr::ip)
 }
 
 /// Build a 503 response with the appropriate content type.
@@ -338,7 +323,7 @@ mod tests {
             .route("/", get(|| async { "ok" }))
             .route("/api/data", get(|| async { "data" }))
             .route("/actuator/health", get(|| async { "healthy" }))
-            .layer(MaintenanceLayer::new(state).with_trust_forwarded_headers(true))
+            .layer(MaintenanceLayer::new(state))
     }
 
     async fn response_status(app: Router, uri: &str) -> StatusCode {
@@ -640,6 +625,45 @@ mod tests {
             .await
             .unwrap();
 
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// When `ResolvedClientIdentity` is stamped by `TrustedProxiesLayer`, its
+    /// resolved addr is used for allow-list checks — a spoofed X-Forwarded-For
+    /// header cannot bypass maintenance mode by claiming an allowed IP.
+    #[tokio::test]
+    async fn maintenance_resolved_identity_takes_precedence_over_raw_xff() {
+        use crate::security::ResolvedClientIdentity;
+        use std::net::IpAddr;
+
+        let state = MaintenanceState::new();
+        // Only 10.x.x.x is allowed.
+        state.enable(MaintenanceConfig {
+            allow_ips: vec!["10.0.0.0/8".into()],
+            ..Default::default()
+        });
+
+        // The resolved identity (from TrustedProxiesLayer) says the real client
+        // is 192.168.1.5 — not in the allow list.
+        let real_ip: IpAddr = "192.168.1.5".parse().unwrap();
+        let mut req = Request::builder()
+            .uri("/")
+            // Attacker forges an allowed IP in XFF.
+            .header("X-Forwarded-For", "10.0.0.1")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ResolvedClientIdentity {
+            addr: Some(real_ip),
+            host: None,
+            scheme: None,
+        });
+
+        let app = Router::new()
+            .route("/", get(|| async { "ok" }))
+            .layer(MaintenanceLayer::new(state));
+
+        let resp = app.oneshot(req).await.unwrap();
+        // Must be blocked: resolved IP (192.168.1.5) is not in the allow list.
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 

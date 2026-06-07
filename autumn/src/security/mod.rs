@@ -108,12 +108,13 @@ pub(crate) mod csrf;
 pub(crate) mod headers;
 pub mod proxy;
 pub mod rate_limit;
+pub(crate) mod trusted_proxies;
 
 // Re-export commonly used types at the module level.
 pub use config::{
     CspNonceConfig, CsrfConfig, HeadersConfig, KeyStrategy, RateLimitBackend, RateLimitConfig,
-    RateLimitTierConfig, SecurityConfig, UploadConfig, default_content_security_policy,
-    hmac_sha256_hex,
+    RateLimitTierConfig, SecurityConfig, TrustedProxiesConfig, UploadConfig,
+    default_content_security_policy, hmac_sha256_hex,
 };
 #[cfg(feature = "redis")]
 pub use config::{RateLimitBackendFailure, RateLimitRedisConfig};
@@ -121,3 +122,4 @@ pub use csrf::{CsrfFormField, CsrfLayer, CsrfToken, CsrfTokenHeader};
 pub use headers::{CspNonce, SecurityHeadersLayer};
 pub use proxy::TrustedProxy;
 pub use rate_limit::{RateLimitLayer, RateLimitOverride, RateLimitPrincipal};
+pub use trusted_proxies::{ProxyResolver, ResolvedClientIdentity, TrustedProxiesLayer};

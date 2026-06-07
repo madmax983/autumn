@@ -1690,3 +1690,290 @@ fn generate_mailer_preview_registry_wired_into_main() {
         "preview registry must reference the generated mailer type"
     );
 }
+
+// ── autumn generate auth email confirmation (issue #823) ──────────────────────
+//
+// RED phase: these tests capture the full acceptance criteria from #823.
+// They fail until the email-confirmation feature is implemented in auth.rs.
+
+/// AC1, AC3, AC4: Migration includes `email_confirmed_at`, `confirm_token_digest`,
+/// and `confirm_token_expires_at` columns.
+#[test]
+fn generate_auth_confirmation_migration_has_new_columns() {
+    let (_tmp, project) = fresh_project("auth-confirm-migration");
+    run_autumn(&project, &["generate", "auth", "User"]);
+
+    let migrations: Vec<_> = fs::read_dir(project.join("migrations"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().ends_with("_create_users"))
+        .collect();
+    let up = fs::read_to_string(migrations[0].path().join("up.sql")).unwrap();
+
+    assert!(
+        up.contains("email_confirmed_at"),
+        "up.sql missing email_confirmed_at column"
+    );
+    assert!(
+        up.contains("confirm_token_digest"),
+        "up.sql missing confirm_token_digest column"
+    );
+    assert!(
+        up.contains("confirm_token_expires_at"),
+        "up.sql missing confirm_token_expires_at column"
+    );
+}
+
+/// AC1, AC3: User model has confirmation fields; signup redirects to a
+/// confirmation-pending page instead of logging the user in.
+#[test]
+fn generate_auth_confirmation_model_fields_and_signup_not_logged_in() {
+    let (_tmp, project) = fresh_project("auth-confirm-signup");
+    run_autumn(&project, &["generate", "auth", "User"]);
+
+    let model = fs::read_to_string(project.join("src/models/user.rs")).unwrap();
+    assert!(
+        model.contains("pub email_confirmed_at: Option<chrono::NaiveDateTime>"),
+        "model missing email_confirmed_at field"
+    );
+    assert!(
+        model.contains("pub confirm_token_digest: Option<String>"),
+        "model missing confirm_token_digest field"
+    );
+    assert!(
+        model.contains("pub confirm_token_expires_at: Option<chrono::NaiveDateTime>"),
+        "model missing confirm_token_expires_at field"
+    );
+
+    // Signup must NOT log the user in — redirect to a confirmation-pending page.
+    let routes = fs::read_to_string(project.join("src/routes/auth.rs")).unwrap();
+    assert!(
+        routes.contains("confirm-email") || routes.contains("check-your-email"),
+        "signup handler must redirect to a confirmation-pending page, not /account"
+    );
+}
+
+/// AC2: Confirmation route `GET /auth/confirm/{token}` exists, stamps
+/// `email_confirmed_at`, and invalidates the token.
+#[test]
+fn generate_auth_confirmation_route_marks_confirmed_and_invalidates_token() {
+    let (_tmp, project) = fresh_project("auth-confirm-route");
+    run_autumn(&project, &["generate", "auth", "User"]);
+
+    let routes = fs::read_to_string(project.join("src/routes/auth.rs")).unwrap();
+    assert!(
+        routes.contains("pub async fn confirm_email"),
+        "routes/auth.rs missing confirm_email handler"
+    );
+    assert!(
+        routes.contains("/auth/confirm/"),
+        "routes/auth.rs missing /auth/confirm/:token path"
+    );
+    assert!(
+        routes.contains("email_confirmed_at"),
+        "confirm_email handler must stamp email_confirmed_at"
+    );
+    // Token must be cleared after use.
+    assert!(
+        routes.contains("confirm_token_digest.eq(None::<String>)"),
+        "confirm_email handler must invalidate token after use (set digest to NULL)"
+    );
+}
+
+/// AC3: Only the SHA-256 digest of the confirmation token is stored in the DB.
+#[test]
+fn generate_auth_confirmation_only_digest_stored_in_db() {
+    let (_tmp, project) = fresh_project("auth-confirm-digest");
+    run_autumn(&project, &["generate", "auth", "User"]);
+
+    let routes = fs::read_to_string(project.join("src/routes/auth.rs")).unwrap();
+    // Digest must be stored (not raw token).
+    let stores_digest = routes.contains("confirm_token_digest.eq(Some(&confirm_digest")
+        || routes.contains("confirm_token_digest.eq(Some(&token_digest");
+    assert!(
+        stores_digest,
+        "confirmation token digest (not raw token) must be stored"
+    );
+}
+
+/// AC4: Confirmation tokens expire after 24 hours (default).
+#[test]
+fn generate_auth_confirmation_token_expires_24h() {
+    let (_tmp, project) = fresh_project("auth-confirm-expiry");
+    run_autumn(&project, &["generate", "auth", "User"]);
+
+    let routes = fs::read_to_string(project.join("src/routes/auth.rs")).unwrap();
+    assert!(
+        routes.contains("hours(24)"),
+        "confirmation token must default to 24-hour expiry"
+    );
+    assert!(
+        routes.contains("confirm_token_expires_at.gt(now)"),
+        "confirm handler must reject tokens past confirm_token_expires_at"
+    );
+}
+
+/// AC5: Unconfirmed login is rejected; login page offers a "resend confirmation"
+/// affordance.
+#[test]
+fn generate_auth_unconfirmed_login_rejected_with_resend_affordance() {
+    let (_tmp, project) = fresh_project("auth-confirm-login-gate");
+    run_autumn(&project, &["generate", "auth", "User"]);
+
+    let routes = fs::read_to_string(project.join("src/routes/auth.rs")).unwrap();
+    assert!(
+        routes.contains("email_confirmed_at"),
+        "login handler must check email_confirmed_at before granting session"
+    );
+    assert!(
+        routes.contains("resend") || routes.contains("Resend"),
+        "login form must offer a resend confirmation email affordance"
+    );
+}
+
+/// AC6: Resend-confirmation handler exists and overwrites the old token.
+#[test]
+fn generate_auth_resend_confirmation_invalidates_old_token() {
+    let (_tmp, project) = fresh_project("auth-confirm-resend");
+    run_autumn(&project, &["generate", "auth", "User"]);
+
+    let routes = fs::read_to_string(project.join("src/routes/auth.rs")).unwrap();
+    assert!(
+        routes.contains("pub async fn resend_confirmation"),
+        "routes/auth.rs missing resend_confirmation handler"
+    );
+    assert!(
+        routes.contains("confirm_token_digest"),
+        "resend_confirmation must update confirm_token_digest"
+    );
+}
+
+/// AC7: The generated account route or a helper function demonstrates a
+/// confirmed-only gate (`email_confirmed_at` check).
+#[test]
+fn generate_auth_confirmed_gate_present() {
+    let (_tmp, project) = fresh_project("auth-confirm-gate");
+    run_autumn(&project, &["generate", "auth", "User"]);
+
+    let routes = fs::read_to_string(project.join("src/routes/auth.rs")).unwrap();
+    assert!(
+        routes.contains("email_confirmed_at.is_some()")
+            || routes.contains("email_confirmed_at.is_none()")
+            || routes.contains("require_confirmed"),
+        "routes must demonstrate an email-confirmed gate"
+    );
+}
+
+/// AC8: Password-reset completion does NOT stamp `email_confirmed_at`.
+#[test]
+fn generate_auth_password_reset_does_not_confirm_email() {
+    let (_tmp, project) = fresh_project("auth-confirm-reset-independence");
+    run_autumn(&project, &["generate", "auth", "User"]);
+
+    let routes = fs::read_to_string(project.join("src/routes/auth.rs")).unwrap();
+
+    // Locate the reset_password handler body (between its `pub async fn` and the next one).
+    let reset_start = routes
+        .find("pub async fn reset_password(")
+        .expect("reset_password handler must exist");
+    let rest = &routes[reset_start..];
+    // Everything up to the next `pub async fn` is the handler body.
+    let reset_body_end = rest[1..]
+        .find("pub async fn ")
+        .map_or(rest.len(), |p| p + 1);
+    let reset_body = &rest[..reset_body_end];
+
+    assert!(
+        !reset_body.contains("email_confirmed_at.eq("),
+        "reset_password must NOT set email_confirmed_at (confirmation and credential recovery are independent)"
+    );
+}
+
+/// AC10: The signup handler checks `mailer.is_disabled()` and returns a clear
+/// error when mail is not configured — matching the forgot-password precedent.
+#[test]
+fn generate_auth_confirmation_signup_fails_clearly_when_mail_disabled() {
+    let (_tmp, project) = fresh_project("auth-confirm-mail-check");
+    run_autumn(&project, &["generate", "auth", "User"]);
+
+    let routes = fs::read_to_string(project.join("src/routes/auth.rs")).unwrap();
+    assert!(
+        routes.contains("mailer.is_disabled()"),
+        "signup must check mailer.is_disabled() and return a clear error message"
+    );
+}
+
+/// AC11: Generated tests/auth.rs covers all confirmation-related flows.
+#[test]
+fn generate_auth_confirmation_tests_cover_required_flows() {
+    let (_tmp, project) = fresh_project("auth-confirm-tests");
+    run_autumn(&project, &["generate", "auth", "User"]);
+
+    let tests = fs::read_to_string(project.join("tests/auth.rs")).unwrap();
+    for flow in [
+        "signup_without_confirm_cannot_login",
+        "confirm_with_valid_token_can_login",
+        "confirm_with_expired_token_fails",
+        "confirm_with_replayed_token_fails",
+        "resend_confirmation_rate_limit",
+        "email_change_reenters_unconfirmed",
+    ] {
+        assert!(tests.contains(flow), "tests/auth.rs missing test: {flow}");
+    }
+}
+
+/// AC12: docs/guide/authentication.md gains a confirmation section covering
+/// the threat model, digest storage, gate usage, and email-change behavior.
+#[test]
+fn generate_auth_confirmation_docs_section_present() {
+    let (_tmp, project) = fresh_project("auth-confirm-docs");
+    run_autumn(&project, &["generate", "auth", "User"]);
+
+    let docs = fs::read_to_string(project.join("docs/guide/authentication.md")).unwrap();
+    assert!(
+        docs.contains("Email Confirmation") || docs.contains("email confirmation"),
+        "docs missing Email Confirmation section"
+    );
+    assert!(
+        docs.contains("digest") || docs.contains("SHA-256"),
+        "docs must describe digest-only token storage rule"
+    );
+    assert!(
+        docs.contains("email_confirmed_at"),
+        "docs must reference the email_confirmed_at field"
+    );
+}
+
+/// AC13: Docs include an opt-in migration path (ALTER TABLE SQL) for existing apps.
+#[test]
+fn generate_auth_confirmation_docs_migration_path_for_existing_apps() {
+    let (_tmp, project) = fresh_project("auth-confirm-migration-path");
+    run_autumn(&project, &["generate", "auth", "User"]);
+
+    let docs = fs::read_to_string(project.join("docs/guide/authentication.md")).unwrap();
+    assert!(
+        docs.contains("email_confirmed_at") && docs.contains("confirm_token_digest"),
+        "docs migration path must name both new columns"
+    );
+    assert!(
+        docs.contains("ADD COLUMN") || docs.contains("ALTER TABLE"),
+        "docs must include ALTER TABLE migration SQL for existing apps"
+    );
+}
+
+/// main.rs registers the new confirmation routes.
+#[test]
+fn generate_auth_confirmation_routes_registered_in_main() {
+    let (_tmp, project) = fresh_project("auth-confirm-main-rs");
+    run_autumn(&project, &["generate", "auth", "User"]);
+
+    let main = fs::read_to_string(project.join("src/main.rs")).unwrap();
+    assert!(
+        main.contains("routes::auth::confirm_email"),
+        "main.rs must register confirm_email route"
+    );
+    assert!(
+        main.contains("routes::auth::resend_confirmation"),
+        "main.rs must register resend_confirmation route"
+    );
+}

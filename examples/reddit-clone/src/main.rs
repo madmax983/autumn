@@ -32,6 +32,7 @@
 // API test:   curl http://localhost:3000/api/posts
 //             curl http://localhost:3000/api/subreddits
 
+use autumn_web::actuator::{HealthCheckOutput, HealthIndicator, HealthStatus};
 use autumn_web::config::AutumnConfig;
 use autumn_web::migrate::{EmbeddedMigrations, embed_migrations};
 use autumn_web::prelude::*;
@@ -39,7 +40,29 @@ use autumn_web::webhook_outbound::{InMemoryOutboundWebhookStore, OutboundWebhook
 use reddit_clone::models::Post;
 use reddit_clone::policies::PostPolicy;
 use reddit_clone::{live_events, repositories, routes, tasks};
+use std::collections::HashMap;
 use std::sync::Arc;
+
+/// Example custom health indicator: verifies the live-feed relay is reachable.
+///
+/// In a real app this would ping Redis, an SMTP server, or a payment gateway.
+/// This demo always returns `UP` — swap in real connectivity logic as needed.
+struct LiveFeedRelayIndicator;
+
+impl HealthIndicator for LiveFeedRelayIndicator {
+    fn check(&self) -> futures::future::BoxFuture<'_, HealthCheckOutput> {
+        Box::pin(async move {
+            // In production: attempt a lightweight ping to the Redis pub/sub
+            // channel used by the live-feed relay and return Down on failure.
+            let mut details = HashMap::new();
+            details.insert("backend".to_string(), serde_json::json!("in_process"));
+            HealthCheckOutput {
+                status: HealthStatus::Up,
+                details,
+            }
+        })
+    }
+}
 
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
 
@@ -109,6 +132,10 @@ async fn main() {
         .jobs(reddit_clone::jobs::registered_jobs())
         .plugin(webhook_plugin)
         .plugin(live_events::LiveFeedPlugin::new())
+        // Custom health indicator — visible at GET /actuator/health under "live_feed_relay".
+        // Gates /ready (IndicatorGroup::Readiness by default), so a degraded relay
+        // will block rolling deploys until it recovers.
+        .health_indicator("live_feed_relay", Arc::new(LiveFeedRelayIndicator))
         .idempotent()
         .run()
         .await;

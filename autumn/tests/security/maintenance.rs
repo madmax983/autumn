@@ -1,6 +1,5 @@
 use autumn_web::maintenance::{MaintenanceConfig, MaintenanceState};
 use autumn_web::middleware::maintenance::MaintenanceLayer;
-use autumn_web::security::TrustedProxy;
 use axum::extract::ConnectInfo;
 use axum::http::{Request, StatusCode};
 use axum::{Router, body::Body, routing::get};
@@ -16,13 +15,17 @@ async fn maintenance_trusted_proxy_bypass() {
         ..Default::default()
     });
 
-    let trusted_proxy = TrustedProxy::parse("203.0.113.10").unwrap();
+    use autumn_web::security::TrustedProxiesConfig;
+    use autumn_web::security::TrustedProxiesLayer;
 
-    let app = Router::new().route("/", get(|| async { "Hello" })).layer(
-        MaintenanceLayer::new(state)
-            .with_trust_forwarded_headers(true)
-            .with_trusted_proxies(vec![trusted_proxy]),
-    );
+    let app = Router::new()
+        .route("/", get(|| async { "Hello" }))
+        .layer(MaintenanceLayer::new(state))
+        .layer(TrustedProxiesLayer::from_config(&TrustedProxiesConfig {
+            ranges: vec!["203.0.113.10".to_owned()],
+            trusted_hops: None,
+            trust_forwarded_headers: true,
+        }));
 
     let peer: SocketAddr = "203.0.113.10:4000".parse().unwrap();
 
@@ -60,36 +63,6 @@ async fn maintenance_trusted_proxy_bypass() {
     let resp3 = app.clone().oneshot(req3).await.unwrap();
     assert_eq!(resp3.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
-
-#[tokio::test]
-async fn maintenance_invalid_proxies_fails_closed() {
-    let state = MaintenanceState::new();
-    state.enable(MaintenanceConfig {
-        message: Some("Maintenance Mode Active".to_string()),
-        allow_ips: vec!["192.168.1.10".to_string()],
-        ..Default::default()
-    });
-
-    let app = Router::new().route("/", get(|| async { "Hello" })).layer(
-        MaintenanceLayer::new(state)
-            .with_trust_forwarded_headers(true)
-            .with_trusted_proxies_configured(true)
-            .with_trusted_proxies(vec![]),
-    );
-
-    let peer: SocketAddr = "203.0.113.11:4000".parse().unwrap();
-
-    let mut req = Request::builder()
-        .uri("/")
-        .header("X-Forwarded-For", "192.168.1.10")
-        .body(Body::empty())
-        .unwrap();
-    req.extensions_mut().insert(ConnectInfo(peer));
-
-    let resp = app.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
-}
-
 #[tokio::test]
 async fn maintenance_bypass_paths() {
     let state = MaintenanceState::new();

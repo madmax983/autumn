@@ -122,6 +122,8 @@ pub fn app() -> AppBuilder {
         channels_interceptor: None,
         #[cfg(feature = "oauth2")]
         http_interceptor: None,
+        metrics_sources: Vec::new(),
+        health_indicators: Vec::new(),
     }
 }
 
@@ -320,6 +322,14 @@ pub struct AppBuilder {
     channels_interceptor: Option<Arc<dyn crate::interceptor::ChannelsInterceptor>>,
     #[cfg(feature = "oauth2")]
     http_interceptor: Option<Arc<dyn crate::interceptor::HttpInterceptor>>,
+    /// Plugin-contributed metrics sources registered via [`AppBuilder::metrics_source`].
+    pub(crate) metrics_sources: Vec<(String, Arc<dyn crate::actuator::MetricsSource>)>,
+    /// Custom health indicators registered via [`AppBuilder::health_indicator`].
+    pub(crate) health_indicators: Vec<(
+        String,
+        crate::actuator::IndicatorGroup,
+        Arc<dyn crate::actuator::HealthIndicator>,
+    )>,
 }
 
 /// Boxed builder closure that constructs a durable
@@ -1748,6 +1758,116 @@ impl AppBuilder {
         self.registered_plugins.contains(name)
     }
 
+    /// Register a named [`MetricsSource`](crate::actuator::MetricsSource) that contributes
+    /// metric families to `/actuator/prometheus` and `/actuator/metrics`.
+    ///
+    /// The `name` is a stable identifier used for:
+    /// - Duplicate-registration detection (same behaviour as duplicate plugins: a
+    ///   `tracing::warn!` is emitted and the second registration is skipped).
+    /// - The `source` label in the `autumn_metrics_source_errors_total` counter
+    ///   that increments when a source panics during a scrape.
+    ///
+    /// `Plugin::build` implementations can call this to wire a source with no
+    /// extra application-level glue code.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use autumn_web::actuator::{MetricsSource, MetricFamily, MetricKind, MetricSample};
+    /// use autumn_web::app::AppBuilder;
+    /// use std::sync::Arc;
+    ///
+    /// struct QueueMetrics;
+    ///
+    /// impl MetricsSource for QueueMetrics {
+    ///     fn collect(&self) -> Vec<MetricFamily> {
+    ///         vec![MetricFamily {
+    ///             name: "myapp_queue_depth".to_string(),
+    ///             help: "Current queue depth".to_string(),
+    ///             kind: MetricKind::Gauge,
+    ///             samples: vec![MetricSample { labels: vec![], value: 42.0 }],
+    ///         }]
+    ///     }
+    /// }
+    ///
+    /// autumn_web::app()
+    ///     .metrics_source("myapp_queue", Arc::new(QueueMetrics));
+    /// ```
+    #[must_use]
+    pub fn metrics_source(
+        mut self,
+        name: impl Into<String>,
+        source: Arc<dyn crate::actuator::MetricsSource>,
+    ) -> Self {
+        let name = name.into();
+        if self.metrics_sources.iter().any(|(n, _)| n == &name) {
+            tracing::warn!(
+                source_name = %name,
+                "MetricsSource '{}' is already registered; skipping duplicate",
+                name
+            );
+            return self;
+        }
+        self.metrics_sources.push((name, source));
+        self
+    }
+
+    /// Register a custom [`HealthIndicator`](crate::actuator::HealthIndicator) with the application.
+    ///
+    /// The indicator's [`check`](crate::actuator::HealthIndicator::check) method is called on every
+    /// `/actuator/health` request (and on `/ready` for `Readiness`-group indicators).
+    ///
+    /// Duplicate registration names are silently ignored (a warning is logged).
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use std::sync::Arc;
+    /// use autumn_web::actuator::{HealthCheckOutput, HealthIndicator};
+    ///
+    /// struct StripeIndicator;
+    /// impl HealthIndicator for StripeIndicator {
+    ///     fn check(&self) -> futures::future::BoxFuture<'_, HealthCheckOutput> {
+    ///         Box::pin(async move { HealthCheckOutput::up() })
+    ///     }
+    /// }
+    ///
+    /// autumn_web::app()
+    ///     .health_indicator("stripe", Arc::new(StripeIndicator));
+    /// ```
+    #[must_use]
+    pub fn health_indicator(
+        mut self,
+        name: impl Into<String>,
+        indicator: Arc<dyn crate::actuator::HealthIndicator>,
+    ) -> Self {
+        let name = name.into();
+        // "db" is a reserved built-in component name. Allowing a custom indicator
+        // under this name would produce an inconsistent response: the custom result
+        // would still gate the aggregate status while the built-in pool check owns
+        // the components.db / checks.database display.
+        #[cfg(feature = "db")]
+        if name == "db" {
+            tracing::warn!(
+                indicator_name = %name,
+                "\"db\" is a reserved built-in health indicator name; registration skipped. \
+                 Use a different name for your custom indicator."
+            );
+            return self;
+        }
+        if self.health_indicators.iter().any(|(n, _, _)| n == &name) {
+            tracing::warn!(
+                indicator_name = %name,
+                "HealthIndicator '{}' is already registered; skipping duplicate",
+                name
+            );
+            return self;
+        }
+        let group = indicator.group();
+        self.health_indicators.push((name, group, indicator));
+        self
+    }
+
     /// Register embedded Diesel migrations with the application.
     ///
     /// When migrations are registered:
@@ -1887,6 +2007,8 @@ impl AppBuilder {
             channels_interceptor,
             #[cfg(feature = "oauth2")]
             http_interceptor,
+            metrics_sources,
+            health_indicators,
         } = self;
 
         let all_routes = routes;
@@ -2090,6 +2212,26 @@ impl AppBuilder {
         if let Some(interceptor) = http_interceptor {
             state.insert_extension(interceptor);
         }
+
+        // Populate the metrics source registry from builder registrations.
+        // Duplicate names were already rejected in `metrics_source()`, so
+        // all entries here are unique.
+        for (name, source) in metrics_sources {
+            if let Err(e) = state.metrics_source_registry.register(name, source) {
+                tracing::warn!("{e}");
+            }
+        }
+
+        // Populate the health indicator registry from builder registrations.
+        for (name, group, indicator) in health_indicators {
+            if let Err(e) = state
+                .health_indicator_registry
+                .register(name, group, indicator)
+            {
+                tracing::warn!("{e}");
+            }
+        }
+
         #[cfg(feature = "db")]
         configure_replica_migration_check(&state, replica_migration_check);
         #[cfg(feature = "db")]
@@ -2247,10 +2389,16 @@ impl AppBuilder {
         // a layered service ever runs. Wrapping the whole router as a
         // tower::Service is the documented way to run middleware before
         // route matching.
-        let service = tower::Layer::layer(
+        // TrustedProxiesLayer must be outermost (stamped before MethodOverrideLayer
+        // reads ResolvedClientIdentity for its same-origin form check).
+        let after_method = tower::Layer::layer(
             &crate::middleware::MethodOverrideLayer::new()
                 .with_max_scan_bytes(config.security.upload.max_request_size_bytes),
             router,
+        );
+        let service = tower::Layer::layer(
+            &crate::security::TrustedProxiesLayer::from_config(&config.security.trusted_proxies),
+            after_method,
         );
         let make_service =
             axum::ServiceExt::<axum::extract::Request>::into_make_service_with_connect_info::<
@@ -2500,9 +2648,13 @@ impl AppBuilder {
             channels_interceptor,
             #[cfg(feature = "oauth2")]
             http_interceptor,
+            metrics_sources,
+            health_indicators,
         } = self;
 
         let _ = &api_versions;
+        let _ = &metrics_sources;
+        let _ = &health_indicators;
         let all_routes = routes;
 
         // Load config (same as normal startup)
@@ -5073,6 +5225,8 @@ fn build_state(
         task_registry: crate::actuator::TaskRegistry::new(),
         job_registry: crate::actuator::JobRegistry::new(),
         config_props: crate::actuator::ConfigProperties::from_config(config),
+        metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
+        health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
         #[cfg(feature = "presence")]
         presence: crate::presence::Presence::new(channels.clone()),
         #[cfg(feature = "ws")]
@@ -5342,6 +5496,8 @@ mod tests {
             task_registry: crate::actuator::TaskRegistry::new(),
             job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
+            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
+            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "presence")]
@@ -6267,6 +6423,8 @@ mod tests {
             task_registry: crate::actuator::TaskRegistry::new(),
             job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
+            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
+            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "presence")]
@@ -6374,6 +6532,8 @@ mod tests {
             task_registry: crate::actuator::TaskRegistry::new(),
             job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
+            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
+            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "presence")]
@@ -6458,6 +6618,8 @@ mod tests {
             task_registry: crate::actuator::TaskRegistry::new(),
             job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
+            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
+            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "presence")]
@@ -6749,6 +6911,8 @@ mod tests {
             task_registry: crate::actuator::TaskRegistry::new(),
             job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
+            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
+            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "presence")]
@@ -7060,6 +7224,8 @@ mod tests {
             task_registry: crate::actuator::TaskRegistry::new(),
             job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
+            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
+            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "presence")]
@@ -7209,6 +7375,8 @@ mod tests {
             task_registry: crate::actuator::TaskRegistry::new(),
             job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
+            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
+            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "presence")]
@@ -7256,6 +7424,8 @@ mod tests {
             task_registry: crate::actuator::TaskRegistry::new(),
             job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
+            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
+            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "presence")]
@@ -7522,6 +7692,8 @@ mod tests {
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
+            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
+            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
         };
 
         let mut rx = state.channels().subscribe("sys:tasks");
@@ -7593,6 +7765,8 @@ mod tests {
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
+            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
+            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
         };
 
         let mut rx = state.channels().subscribe("sys:tasks");
