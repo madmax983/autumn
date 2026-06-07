@@ -119,5 +119,5 @@ pub use config::{
 pub use config::{RateLimitBackendFailure, RateLimitRedisConfig};
 pub use csrf::{CsrfFormField, CsrfLayer, CsrfToken, CsrfTokenHeader};
 pub use headers::{CspNonce, SecurityHeadersLayer};
-pub use rate_limit::{RateLimitLayer, RateLimitOverride, RateLimitPrincipal};
+pub use rate_limit::{RateLimitExempt, RateLimitLayer, RateLimitOverride, RateLimitPrincipal};
 pub use trusted_proxies::{ProxyResolver, ResolvedClientIdentity, TrustedProxiesLayer};

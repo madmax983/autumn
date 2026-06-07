@@ -536,6 +536,10 @@ fn build_router_pre_state(
             // Forward the configured CSRF header (default `x-csrf-token`) so
             // customized CsrfConfig::token_header deployments work via MCP.
             csrf_header: config.security.csrf.token_header.to_ascii_lowercase(),
+            // The envelope is rate-limited below iff rate limiting is enabled;
+            // when so, a tools/call is counted there and its replay is exempted
+            // from the dispatch pipeline's limiter (avoiding double-counting).
+            envelope_rate_limited: config.security.rate_limit.enabled,
         };
         let mut mcp_router =
             crate::mcp::build_mcp_router(&mount_path, tools, dispatch, wiring, endpoint_layer);
@@ -555,6 +559,18 @@ fn build_router_pre_state(
         mcp_router = mcp_router.layer(axum::extract::DefaultBodyLimit::max(
             config.security.upload.max_request_size_bytes,
         ));
+        // Rate-limit the envelope so `secure_mcp` auth rejections — which never
+        // reach the dispatch clone's limiter — are throttled (credential
+        // guessing otherwise consumes no per-client bucket). A successful
+        // tools/call is counted once here and replayed with `RateLimitExempt`,
+        // so it isn't double-counted by the dispatch pipeline's own limiter.
+        // No-op when rate limiting is disabled (matching `envelope_rate_limited`).
+        mcp_router = apply_rate_limit_middleware(mcp_router, config);
+        // CORS grant outermost so every response — including auth 401/403, the
+        // 413 body-limit rejection, and a 429 from the limiter above, all
+        // produced before `serve_mcp` runs — is readable by an allowlisted
+        // browser client instead of being masked as a CORS failure.
+        mcp_router = crate::mcp::apply_mcp_cors_layer(mcp_router, &config.cors);
         router.merge(mcp_router)
     } else {
         router

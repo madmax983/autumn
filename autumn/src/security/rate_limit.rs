@@ -731,6 +731,18 @@ fn key_class_label(key: &str) -> &'static str {
 /// let layer = RateLimitLayer::from_config(&config.security.rate_limit)
 ///     .with_path_override("/api/free/", RateLimitOverride { burst: Some(5), requests_per_second: Some(1.0) });
 /// ```
+/// Request-extension marker that exempts a request from rate limiting.
+///
+/// Set on requests that have already been counted by an upstream limiter so the
+/// pipeline's limiter doesn't double-count them. The MCP endpoint uses this:
+/// it counts a `tools/call` once at its `/mcp` envelope, then replays the
+/// request through the full dispatch pipeline (which carries its own
+/// [`RateLimitLayer`]); the marker keeps that replay from consuming a second
+/// token. It is only ever set internally — external requests cannot carry it,
+/// since extensions are not derived from headers.
+#[derive(Clone, Copy, Debug)]
+pub struct RateLimitExempt;
+
 #[derive(Clone, Debug)]
 pub struct RateLimitLayer {
     limiter: Arc<Limiter>,
@@ -870,6 +882,14 @@ where
     }
 
     fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
+        // A request already counted upstream (e.g. an MCP `tools/call` charged
+        // at the `/mcp` envelope and replayed through this pipeline) bypasses
+        // the limiter so it isn't double-counted.
+        if req.extensions().get::<RateLimitExempt>().is_some() {
+            let mut inner = self.inner.clone();
+            std::mem::swap(&mut self.inner, &mut inner);
+            return Box::pin(async move { inner.call(req).await });
+        }
         // Resolve key and effective params synchronously (no I/O).
         let resolved = self.limiter.resolve_key_and_params(&req);
 

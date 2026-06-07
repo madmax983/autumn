@@ -88,6 +88,10 @@ const FORWARDED_HEADERS: &[&str] = &[
     "x-forwarded-host",
     "x-forwarded-proto",
     "x-real-ip",
+    // Locale negotiation: the `Locale` extractor falls back to `Accept-Language`
+    // when no locale query/cookie is present, so forward it for the tool result
+    // to match the localized data a direct HTTP call would return.
+    "accept-language",
 ];
 
 /// Layer applier for the optional whole-endpoint auth gate (e.g.
@@ -171,6 +175,12 @@ pub(crate) struct McpWiring {
     /// dispatch so a session-authenticated caller passes `CsrfLayer`, which
     /// reads `CsrfConfig::token_header` — not a hard-coded name.
     pub csrf_header: String,
+    /// Whether a [`RateLimitLayer`](crate::security::RateLimitLayer) wraps the
+    /// `/mcp` envelope (true iff rate limiting is enabled). When set, a
+    /// `tools/call` is counted once at the envelope, so its replayed dispatch is
+    /// marked [`RateLimitExempt`](crate::security::RateLimitExempt) to avoid
+    /// double-counting against the dispatch pipeline's own limiter.
+    pub envelope_rate_limited: bool,
 }
 
 /// The shared MCP server state attached to the endpoint handler. Holds the
@@ -203,6 +213,9 @@ pub struct McpServer {
     tenant_header: Option<String>,
     /// The configured CSRF token header name forwarded on dispatch.
     csrf_header: String,
+    /// Whether the `/mcp` envelope is rate-limited; gates exempting the
+    /// replayed `tools/call` dispatch from the pipeline limiter.
+    envelope_rate_limited: bool,
     server_name: String,
     server_version: String,
 }
@@ -569,6 +582,7 @@ impl McpServer {
             trusted_hosts: wiring.trusted_hosts,
             tenant_header: wiring.tenant_header,
             csrf_header: wiring.csrf_header,
+            envelope_rate_limited: wiring.envelope_rate_limited,
             server_name: "autumn-mcp".to_owned(),
             server_version: env!("CARGO_PKG_VERSION").to_owned(),
         }
@@ -610,16 +624,28 @@ pub(crate) fn build_mcp_router(
     if let Some(layer_fn) = endpoint_layer {
         rpc = layer_fn(rpc);
     }
-    // Apply the CORS grant *outside* the optional `secure_mcp` auth layer so an
-    // auth rejection (401/403) — produced before `serve_mcp` runs — still
-    // carries `Access-Control-Allow-Origin`. Without this, an allowlisted
-    // browser client's preflight succeeds but the rejected POST is hidden by
-    // the browser as a CORS failure rather than surfacing the real status. On
-    // the success path this just re-affirms the headers `serve_mcp` already set.
-    let cors_server = Arc::clone(&server);
-    rpc = rpc.layer(axum::middleware::from_fn(
+    let preflight = axum::Router::<crate::state::AppState>::new()
+        .route(mount_path, axum::routing::options(serve_mcp_options))
+        .layer(axum::extract::Extension(server));
+    rpc.merge(preflight)
+}
+
+/// Wrap a fully-assembled MCP envelope so **every** response carries the CORS
+/// grant — including ones produced by outer layers *before* `serve_mcp` runs:
+/// `secure_mcp` auth rejections (401/403), the request-body limit (413), and
+/// rate limiting (429). Applied as the outermost layer so it sees the final
+/// response regardless of which inner layer produced it; without it an
+/// allowlisted browser client's preflight succeeds but the rejection is masked
+/// as an opaque CORS failure instead of surfacing the real status. The grant is
+/// only added for allowlisted origins (see [`apply_cors_headers`]).
+pub(crate) fn apply_mcp_cors_layer(
+    router: axum::Router<crate::state::AppState>,
+    cors: &crate::config::CorsConfig,
+) -> axum::Router<crate::state::AppState> {
+    let cors = cors.clone();
+    router.layer(axum::middleware::from_fn(
         move |req: axum::extract::Request, next: axum::middleware::Next| {
-            let server = Arc::clone(&cors_server);
+            let cors = cors.clone();
             async move {
                 let origin = req
                     .headers()
@@ -627,15 +653,11 @@ pub(crate) fn build_mcp_router(
                     .and_then(|v| v.to_str().ok())
                     .map(str::to_owned);
                 let mut response = next.run(req).await;
-                apply_cors_headers(&server.cors, origin.as_deref(), &mut response);
+                apply_cors_headers(&cors, origin.as_deref(), &mut response);
                 response
             }
         },
-    ));
-    let preflight = axum::Router::<crate::state::AppState>::new()
-        .route(mount_path, axum::routing::options(serve_mcp_options))
-        .layer(axum::extract::Extension(server));
-    rpc.merge(preflight)
+    ))
 }
 
 /// Answer a CORS preflight (`OPTIONS`) for the MCP endpoint. Because the
@@ -996,6 +1018,14 @@ async fn tools_call(
             .extensions_mut()
             .insert(axum::extract::ConnectInfo(peer));
     }
+    // When the `/mcp` envelope is itself rate-limited, this call was already
+    // counted there; mark the replay exempt so the dispatch pipeline's own
+    // limiter doesn't charge a second token for the same tool call.
+    if server.envelope_rate_limited {
+        request
+            .extensions_mut()
+            .insert(crate::security::RateLimitExempt);
+    }
 
     let response = match server.dispatch.clone().oneshot(request).await {
         Ok(resp) => resp,
@@ -1130,7 +1160,11 @@ fn build_request(
     //  * `Host` / `Forwarded` / `X-Forwarded-*` / `X-Real-IP` — subdomain
     //    tenancy host resolution and the rate limiter's client-IP attribution.
     for name in FORWARDED_HEADERS {
-        if let Some(value) = headers.get(*name) {
+        // Forward *every* value, not just the first: a header like `Cookie` can
+        // appear multiple times, and `CsrfLayer` inspects all `Cookie` headers
+        // to detect cookie-tossing (duplicate CSRF cookies). Collapsing them to
+        // one value here would let a replayed write slip past that check.
+        for value in headers.get_all(*name) {
             builder = builder.header(*name, value);
         }
     }
@@ -1531,6 +1565,48 @@ mod tests {
         assert_eq!(req.headers().get("idempotency-key").unwrap(), "abc-123");
     }
 
+    #[test]
+    fn build_request_forwards_accept_language() {
+        // The `Locale` extractor falls back to `Accept-Language`; forwarding it
+        // keeps an MCP tool's localized result matching a direct HTTP call.
+        let t = tool("GET", "/api/todos", false, false);
+        let mut headers = HeaderMap::new();
+        headers.insert("accept-language", "fr-CA,fr;q=0.9".parse().unwrap());
+        let req =
+            build_request(&t, &headers, &json!({}), "x-csrf-token", None).expect("request builds");
+        assert_eq!(
+            req.headers().get("accept-language").unwrap(),
+            "fr-CA,fr;q=0.9"
+        );
+    }
+
+    #[test]
+    fn build_request_preserves_repeated_cookie_headers() {
+        // `CsrfLayer` inspects *all* Cookie headers to detect cookie-tossing
+        // (duplicate CSRF cookies); forwarding only the first would let a
+        // replayed write slip past that check. Every value must be carried.
+        let t = tool("POST", "/api/todos", true, false);
+        let mut headers = HeaderMap::new();
+        headers.append("cookie", "session=abc".parse().unwrap());
+        headers.append("cookie", "csrf=dup1".parse().unwrap());
+        headers.append("cookie", "csrf=dup2".parse().unwrap());
+        let req = build_request(
+            &t,
+            &headers,
+            &json!({ "body": { "x": 1 } }),
+            "x-csrf-token",
+            None,
+        )
+        .expect("request builds");
+        let cookies: Vec<_> = req
+            .headers()
+            .get_all("cookie")
+            .iter()
+            .map(|v| v.to_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(cookies, ["session=abc", "csrf=dup1", "csrf=dup2"]);
+    }
+
     /// A trusted-Host policy that trusts the given hosts (plus dev loopback,
     /// which `from_config` adds for non-production profiles).
     fn trusted(hosts: &[&str]) -> crate::router::TrustedHostPolicy {
@@ -1556,6 +1632,7 @@ mod tests {
                 trusted_hosts: trusted(hosts),
                 tenant_header: None,
                 csrf_header: "x-csrf-token".to_owned(),
+                envelope_rate_limited: false,
             },
         )
     }

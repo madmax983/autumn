@@ -608,6 +608,51 @@ async fn secure_mcp_rejection_carries_cors_headers() {
 }
 
 #[tokio::test]
+async fn secure_mcp_rejections_are_rate_limited() {
+    // Credential-guessing against secure_mcp must be throttled: auth rejections
+    // never reach the dispatch clone's limiter, so the /mcp envelope is itself
+    // rate-limited. The 429 must also carry CORS (outermost grant).
+    let store = Arc::new(InMemoryApiTokenStore::default());
+    let mut config = AutumnConfig::default();
+    config.cors.allowed_origins = vec!["https://app.example".to_owned()];
+    config.security.rate_limit.enabled = true;
+    config.security.rate_limit.burst = 1;
+    config.security.rate_limit.requests_per_second = 0.1;
+    config.security.rate_limit.trust_forwarded_headers = true;
+    let client = TestApp::new()
+        .routes(routes![list_todos])
+        .config(config)
+        .mount_mcp("/mcp")
+        .secure_mcp(RequireApiToken::new(store.clone()))
+        .build();
+
+    // First unauthenticated POST: within the burst, so auth rejects it (401).
+    let first = client
+        .post("/mcp")
+        .header("origin", "https://app.example")
+        .header("x-forwarded-for", "203.0.113.9")
+        .json(&serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))
+        .send()
+        .await;
+    first.assert_status(401);
+
+    // Second from the same client: the envelope limiter denies it before auth
+    // even runs (429), and the rejection still carries the CORS grant.
+    let second = client
+        .post("/mcp")
+        .header("origin", "https://app.example")
+        .header("x-forwarded-for", "203.0.113.9")
+        .json(&serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}))
+        .send()
+        .await;
+    second.assert_status(429);
+    assert_eq!(
+        second.header("access-control-allow-origin"),
+        Some("https://app.example")
+    );
+}
+
+#[tokio::test]
 async fn tools_call_accepts_body_above_axum_default_limit() {
     // The MCP route is merged after the upload-limit middleware, so without an
     // explicit limit axum's built-in 2 MiB cap would reject a `tools/call`
