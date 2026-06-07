@@ -547,6 +547,14 @@ fn build_router_pre_state(
         // same-origin browser client behind a TLS-terminating proxy. The
         // dispatch clone already carries its own copy of this layer.
         mcp_router = apply_trusted_proxies_middleware(mcp_router, config);
+        // The MCP route is merged after `apply_upload_middleware`, so axum's
+        // built-in 2 MiB `DefaultBodyLimit` — not the app's configured limit —
+        // would otherwise govern the `tools/call` envelope's `Bytes` body. Apply
+        // the same cap a direct JSON endpoint gets so larger-but-valid tool
+        // payloads aren't rejected before dispatch.
+        mcp_router = mcp_router.layer(axum::extract::DefaultBodyLimit::max(
+            config.security.upload.max_request_size_bytes,
+        ));
         router.merge(mcp_router)
     } else {
         router
@@ -803,6 +811,13 @@ fn collect_claimed_get_paths(
     if dev::is_enabled_with_env(&crate::config::OsEnv) {
         claimed.insert(dev::LIVE_RELOAD_PATH.to_owned());
         claimed.insert(dev::LIVE_RELOAD_SCRIPT_PATH.to_owned());
+    }
+    // The dev request inspector merges a GET at `config.dev.inspector_path`
+    // (only under the dev profile), before the late-merged OpenAPI/MCP routers.
+    // Reserve it so a mount path colliding with the inspector surfaces a
+    // recoverable error instead of panicking in `router.merge`.
+    if matches!(config.profile.as_deref(), Some("dev" | "development")) {
+        claimed.insert(config.dev.inspector_path.clone());
     }
     #[cfg(feature = "mail")]
     if config

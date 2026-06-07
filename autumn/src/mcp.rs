@@ -318,6 +318,13 @@ fn should_expose(doc: &ApiDoc, expose_all: bool) -> bool {
     }
     // JSON-out only: a response schema is the structural signal that this is a
     // JSON endpoint rather than an HTML/Maud route.
+    //
+    // Note this gates on the *response* shape only. The macro infers a request
+    // body solely from `Json<T>`, so a route returning `Json<T>` but reading a
+    // non-JSON body (`Form<T>`/multipart/`Bytes`/`String`) is indistinguishable
+    // here from a legitimately body-less route — both leave `request_body`
+    // unset. Such routes are a documented non-target for MCP exposure (see
+    // `AppBuilder::mount_mcp`): opting one in yields a tool with no body input.
     if doc.response.is_none() {
         return false;
     }
@@ -603,6 +610,28 @@ pub(crate) fn build_mcp_router(
     if let Some(layer_fn) = endpoint_layer {
         rpc = layer_fn(rpc);
     }
+    // Apply the CORS grant *outside* the optional `secure_mcp` auth layer so an
+    // auth rejection (401/403) — produced before `serve_mcp` runs — still
+    // carries `Access-Control-Allow-Origin`. Without this, an allowlisted
+    // browser client's preflight succeeds but the rejected POST is hidden by
+    // the browser as a CORS failure rather than surfacing the real status. On
+    // the success path this just re-affirms the headers `serve_mcp` already set.
+    let cors_server = Arc::clone(&server);
+    rpc = rpc.layer(axum::middleware::from_fn(
+        move |req: axum::extract::Request, next: axum::middleware::Next| {
+            let server = Arc::clone(&cors_server);
+            async move {
+                let origin = req
+                    .headers()
+                    .get(header::ORIGIN)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned);
+                let mut response = next.run(req).await;
+                apply_cors_headers(&server.cors, origin.as_deref(), &mut response);
+                response
+            }
+        },
+    ));
     let preflight = axum::Router::<crate::state::AppState>::new()
         .route(mount_path, axum::routing::options(serve_mcp_options))
         .layer(axum::extract::Extension(server));

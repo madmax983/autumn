@@ -584,6 +584,14 @@ impl AppBuilder {
     /// Opt-in is per-endpoint; nothing is exposed implicitly. Use
     /// [`expose_all_as_mcp`](Self::expose_all_as_mcp) for the whole-API hatch.
     ///
+    /// Only **JSON** endpoints are projected: a route is eligible when it
+    /// returns `Json<T>` (the structural signal for a JSON response). The
+    /// generated tool's `body` input is derived solely from a `Json<T>`
+    /// request extractor, so a handler that returns `Json<T>` but reads its
+    /// body via `Form<T>`, `Multipart`, `Bytes`, or `String` should **not** be
+    /// opted in — the tool would carry no body input and replay an empty
+    /// request. Use JSON request bodies for endpoints exposed as MCP tools.
+    ///
     /// Requires the `mcp` Cargo feature.
     ///
     /// ```rust,ignore

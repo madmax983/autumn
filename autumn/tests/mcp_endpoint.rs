@@ -561,6 +561,78 @@ async fn mount_path_under_static_prefix_is_rejected() {
 }
 
 #[tokio::test]
+#[should_panic(expected = "McpPathCollision")]
+async fn mount_path_colliding_with_dev_inspector_is_rejected() {
+    // Under the dev profile, the request inspector merges a GET at
+    // `dev.inspector_path` before the MCP router, so mounting there would panic
+    // at merge time. The preflight must reserve the active inspector path.
+    let config = AutumnConfig {
+        profile: Some("dev".to_owned()),
+        ..AutumnConfig::default()
+    };
+    let inspector_path = config.dev.inspector_path.clone();
+    let _ = TestApp::new()
+        .routes(routes![list_todos])
+        .config(config)
+        .mount_mcp(inspector_path)
+        .build();
+}
+
+#[tokio::test]
+async fn secure_mcp_rejection_carries_cors_headers() {
+    // An allowlisted browser client's preflight succeeds, but an unauthenticated
+    // POST is rejected by `secure_mcp` before `serve_mcp` runs. The rejection
+    // must still carry `Access-Control-Allow-Origin`, or the browser masks the
+    // 401 as an opaque CORS failure instead of surfacing the real status.
+    let store = Arc::new(InMemoryApiTokenStore::default());
+    let mut config = AutumnConfig::default();
+    config.cors.allowed_origins = vec!["https://app.example".to_owned()];
+    let client = TestApp::new()
+        .routes(routes![list_todos])
+        .config(config)
+        .mount_mcp("/mcp")
+        .secure_mcp(RequireApiToken::new(store.clone()))
+        .build();
+
+    let resp = client
+        .post("/mcp")
+        .header("origin", "https://app.example")
+        .json(&serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))
+        .send()
+        .await;
+    resp.assert_status(401);
+    assert_eq!(
+        resp.header("access-control-allow-origin"),
+        Some("https://app.example")
+    );
+}
+
+#[tokio::test]
+async fn tools_call_accepts_body_above_axum_default_limit() {
+    // The MCP route is merged after the upload-limit middleware, so without an
+    // explicit limit axum's built-in 2 MiB cap would reject a `tools/call`
+    // envelope that the app's configured 32 MiB JSON limit would accept. A ~3
+    // MiB payload (above 2 MiB, below the default) must dispatch successfully.
+    let client = TestApp::new()
+        .routes(routes![create_todo])
+        .mount_mcp("/mcp")
+        .build();
+
+    let big_title = "x".repeat(3 * 1024 * 1024);
+    let resp = client
+        .post("/mcp")
+        .json(&serde_json::json!({
+            "jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params": {"name":"create_todo","arguments":{"body":{"title": big_title}}}
+        }))
+        .send()
+        .await;
+    resp.assert_ok();
+    let out = resp.json::<serde_json::Value>();
+    assert_ne!(out["result"]["isError"], true);
+}
+
+#[tokio::test]
 #[should_panic(expected = "InvalidMcpPath")]
 async fn dynamic_mount_path_is_rejected() {
     // A capture/catch-all mount path would shadow a whole path class; only a
