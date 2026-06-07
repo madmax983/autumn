@@ -18,11 +18,12 @@
 //!
 //! ## Content addressing
 //!
-//! The variant key is `SHA-256(source_key + NUL + etag + NUL + JSON(transforms))`
+//! The variant key is
+//! `SHA-256(source_key + NUL + etag + NUL + content_type + NUL + JSON(transforms))`
 //! encoded under `_variants/{h0}{h1}/{h2}{h3}/{hash}`.  The same
-//! `(source content, transforms)` pair always produces the same key regardless
-//! of the `name` label; re-uploading to the same key (new `ETag`) produces a
-//! fresh variant key so stale thumbnails are never served.
+//! `(source content, transforms)` pair always maps to the same key; re-uploading
+//! to the same storage key (new `ETag`) or correcting a mis-tagged MIME type
+//! both produce a fresh variant key so stale thumbnails are never served.
 //!
 //! ## Budget
 //!
@@ -167,6 +168,46 @@ pub enum VariantError {
     /// A storage operation failed while checking for or writing the variant.
     #[error(transparent)]
     Storage(#[from] BlobStoreError),
+}
+
+impl VariantError {
+    /// HTTP status code that best represents this error.
+    ///
+    /// Routes using `?` on [`VariantHandle::url`] or
+    /// [`VariantHandle::ensure_generated`] get 500 by default via the blanket
+    /// `impl From<E: Error> for AutumnError`; call
+    /// [`VariantError::into_autumn_error`] instead to preserve the precise
+    /// status.
+    #[must_use]
+    pub const fn status(&self) -> http::StatusCode {
+        match self {
+            Self::UnsupportedMimeType(_) | Self::DecodeError(_) => {
+                http::StatusCode::UNPROCESSABLE_ENTITY
+            }
+            Self::SourceTooLarge { .. } | Self::SourceDimensionsTooLarge { .. } => {
+                http::StatusCode::PAYLOAD_TOO_LARGE
+            }
+            Self::Storage(e) => e.status(),
+        }
+    }
+
+    /// Promote into an [`AutumnError`](crate::AutumnError) carrying the
+    /// status from [`VariantError::status`].
+    ///
+    /// Use this instead of `?` when the route needs accurate HTTP status codes
+    /// for variant failures (e.g. 422 for a corrupt image, 413 for an
+    /// oversized source):
+    ///
+    /// ```rust,ignore
+    /// let url = handle.url(&*store, &budget, expires)
+    ///     .await
+    ///     .map_err(VariantError::into_autumn_error)?;
+    /// ```
+    #[must_use]
+    pub fn into_autumn_error(self) -> crate::AutumnError {
+        let status = self.status();
+        crate::AutumnError::internal_server_error(self).with_status(status)
+    }
 }
 
 /// Handle for a named, lazily-generated image variant.
@@ -398,12 +439,14 @@ pub(crate) fn check_image_mime_type(content_type: &str) -> Result<(), VariantErr
 /// transform spec.
 ///
 /// Format: `_variants/{h[0..2]}/{h[2..4]}/{h}` where `h` is the lowercase
-/// hex SHA-256 of `source_key + NUL + etag + NUL + JSON(transforms)`.
+/// hex SHA-256 of
+/// `source_key + NUL + etag + NUL + content_type + NUL + JSON(transforms)`.
 ///
-/// The `etag` component means that re-uploading to the same key (producing a
-/// new `ETag`) invalidates any previously cached variant — preventing stale
-/// thumbnails when avatars or other mutable blobs are replaced in-place.
-/// When the source blob has no `etag`, the hash falls back to key + transforms.
+/// Including `etag` ensures re-uploading to the same key invalidates cached
+/// variants.  Including `content_type` ensures that correcting a mis-tagged
+/// MIME type (PNG stored as `image/webp`) also produces a fresh variant key
+/// — the two produce different output formats, so the same bytes should not
+/// share a cached result.
 pub(crate) fn content_addressed_key(source_blob: &Blob, transforms: &[Transform]) -> String {
     let spec = serde_json::to_string(transforms).expect("Transform is always serialisable");
     let mut hasher = Sha256::new();
@@ -412,6 +455,8 @@ pub(crate) fn content_addressed_key(source_blob: &Blob, transforms: &[Transform]
     if let Some(etag) = &source_blob.etag {
         hasher.update(etag.as_bytes());
     }
+    hasher.update(b"\0");
+    hasher.update(source_blob.content_type.as_bytes());
     hasher.update(b"\0");
     hasher.update(spec.as_bytes());
     let hash = hasher.finalize();
