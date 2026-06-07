@@ -77,9 +77,9 @@ use serde::{Deserialize, Serialize};
 /// any [`#[api_doc(...)]`](crate::api_doc) overrides.
 #[derive(Clone, Debug, Default)]
 // A flat, generated metadata descriptor; the independent boolean flags
-// (hidden, secured, sunset_opt_out, mcp_tool, mcp_exclude) each model a
-// distinct, orthogonal route property, so grouping them into a sub-struct
-// would obscure rather than clarify.
+// (hidden, secured, sunset_opt_out, has_policy, mcp_tool, mcp_exclude) each
+// model a distinct, orthogonal route property, so grouping them into a
+// sub-struct would obscure rather than clarify.
 #[allow(clippy::struct_excessive_bools)]
 pub struct ApiDoc {
     /// HTTP method as an uppercase string (e.g. `"GET"`).
@@ -121,6 +121,8 @@ pub struct ApiDoc {
     pub api_version: Option<&'static str>,
     /// Whether this route opts out of sunset 410 responses.
     pub sunset_opt_out: bool,
+    /// Whether this route uses dynamic policy authorization.
+    pub has_policy: bool,
     /// True when the endpoint opts in to MCP tool exposure via
     /// `#[api_doc(mcp)]`. Opt-in is per-endpoint and never implicit.
     pub mcp_tool: bool,

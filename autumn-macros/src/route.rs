@@ -70,50 +70,55 @@ pub fn route_macro(
     let method_const = format_ident!("{}", http_method); // e.g., GET
     let routing_fn = format_ident!("{}", axum_fn); // e.g., get
 
-    // When #[feature_flag] is stacked, it will change the return type to
-    // `Response` after this macro runs.  Generating a primitive wrapper here
-    // (which calls `.to_string()` on the handler result) would then try to
-    // stringify a `Response` value and fail to compile.  Skip it so that
-    // #[feature_flag] can rewrite the signature without breaking the route.
+    // When #[feature_flag] is stacked, it prepends a gate parameter of type
+    // `__AutumnFlagGate_{handler_name}` to the handler inputs. Since route macros
+    // run before attribute macros lower down the chain, we must detect this attribute
+    // and manually propagate the gate parameter to the primitive wrapper so that
+    // the wrapper's call to the handler compiles.
     let has_feature_flag_attr = input_fn.attrs.iter().any(|a| {
         a.path()
             .segments
             .last()
             .is_some_and(|s| s.ident == "feature_flag")
     });
-    let primitive_wrapper =
-        if should_stringify_primitive_output(&input_fn.sig.output) && !has_feature_flag_attr {
-            let wrapper_name = format_ident!("__autumn_primitive_handler_{}", fn_name);
-            let mut wrapper_inputs = Vec::new();
-            let mut call_args = Vec::new();
+    let primitive_wrapper = if should_stringify_primitive_output(&input_fn.sig.output) {
+        let wrapper_name = format_ident!("__autumn_primitive_handler_{}", fn_name);
+        let mut wrapper_inputs = Vec::new();
+        let mut call_args = Vec::new();
 
-            for (idx, arg) in input_fn.sig.inputs.iter().enumerate() {
-                match arg {
-                    FnArg::Typed(pat_type) => {
-                        let arg_name = format_ident!("__autumn_arg_{idx}");
-                        let ty = &pat_type.ty;
-                        wrapper_inputs.push(quote! { #arg_name: #ty });
-                        call_args.push(quote! { #arg_name });
-                    }
-                    FnArg::Receiver(receiver) => {
-                        return syn::Error::new_spanned(
-                            receiver,
-                            "Autumn route handlers cannot take a self receiver",
-                        )
-                        .to_compile_error();
-                    }
+        if has_feature_flag_attr {
+            let gate_ident = format_ident!("__AutumnFlagGate_{}", fn_name);
+            wrapper_inputs.push(quote! { __autumn_gate: #gate_ident });
+            call_args.push(quote! { __autumn_gate });
+        }
+
+        for (idx, arg) in input_fn.sig.inputs.iter().enumerate() {
+            match arg {
+                FnArg::Typed(pat_type) => {
+                    let arg_name = format_ident!("__autumn_arg_{idx}");
+                    let ty = &pat_type.ty;
+                    wrapper_inputs.push(quote! { #arg_name: #ty });
+                    call_args.push(quote! { #arg_name });
+                }
+                FnArg::Receiver(receiver) => {
+                    return syn::Error::new_spanned(
+                        receiver,
+                        "Autumn route handlers cannot take a self receiver",
+                    )
+                    .to_compile_error();
                 }
             }
+        }
 
-            Some(quote! {
-                #[doc(hidden)]
-                async fn #wrapper_name(#(#wrapper_inputs),*) -> ::std::string::String {
-                    #fn_name(#(#call_args),*).await.to_string()
-                }
-            })
-        } else {
-            None
-        };
+        Some(quote! {
+            #[doc(hidden)]
+            async fn #wrapper_name(#(#wrapper_inputs),*) -> ::std::string::String {
+                #fn_name(#(#call_args),*).await.to_string()
+            }
+        })
+    } else {
+        None
+    };
 
     let handler_name = primitive_wrapper.as_ref().map_or_else(
         || fn_name.clone(),
@@ -126,7 +131,8 @@ pub fn route_macro(
     let response_body = api_doc::schema_option(api_doc::infer_response_body(&input_fn));
     let query_schema = api_doc::schema_option(api_doc::infer_query_params(&input_fn));
     let (secured, required_roles) = api_doc::extract_secured_info(&input_fn);
-    let body_guarded_replay = secured || has_authorize_guard(&input_fn);
+    let has_feature_flag = has_feature_flag_attr || has_expanded_feature_flag_gate(&input_fn);
+    let body_guarded_replay = secured || has_authorize_guard(&input_fn) || has_feature_flag;
     let intercepted_route = !interceptors.is_empty();
     let handler_expr = build_handler_expr(
         &routing_fn,
@@ -146,6 +152,7 @@ pub fn route_macro(
         |lit| quote! { ::core::option::Option::Some(#lit) },
     );
     let sunset_opt_out_val = route_args.sunset_opt_out;
+    let has_policy_val = has_policy_only(&input_fn);
 
     // ── Path helper ─────────────────────────────────────────────
     let path_helper = emit_path_helper(&path_helper_name, &path, &path_params);
@@ -178,6 +185,7 @@ pub fn route_macro(
                     register_schemas: ::core::option::Option::None,
                     api_version: #api_version_expr,
                     sunset_opt_out: #sunset_opt_out_val,
+                    has_policy: #has_policy_val,
                     #api_doc_fields
                 },
                 repository: ::core::option::Option::None,
@@ -224,6 +232,34 @@ fn has_authorize_guard(input_fn: &syn::ItemFn) -> bool {
             .last()
             .is_some_and(|segment| segment.ident == "authorize")
     }) || block_has_replay_guard(&input_fn.block)
+        || crate::api_doc::has_policy_check_in_stmts(&input_fn.block.stmts)
+}
+
+fn has_policy_only(input_fn: &syn::ItemFn) -> bool {
+    input_fn.attrs.iter().any(|attr| {
+        attr.path()
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == "authorize")
+    }) || crate::api_doc::has_policy_check_in_stmts(&input_fn.block.stmts)
+}
+
+fn has_expanded_feature_flag_gate(input_fn: &syn::ItemFn) -> bool {
+    input_fn.sig.inputs.iter().any(|arg| {
+        let FnArg::Typed(pat_type) = arg else {
+            return false;
+        };
+        let Type::Path(type_path) = pat_type.ty.as_ref() else {
+            return false;
+        };
+        let Some(last_segment) = type_path.path.segments.last() else {
+            return false;
+        };
+        last_segment
+            .ident
+            .to_string()
+            .starts_with("__AutumnFlagGate_")
+    })
 }
 
 /// When a `name = "..."` override is active, emit a `pub use` alias for the
@@ -281,9 +317,16 @@ fn emit_path_helper(
     // Rust keywords (you cannot write `format!("{type}")` in generated code).
     let format_str = positional_format_string(&path.value());
     let format_lit = LitStr::new(&format_str, path.span());
-    let encoded_params: Vec<TokenStream> = param_idents
+    let encoded_params: Vec<TokenStream> = params
         .iter()
-        .map(|ident| quote! { ::autumn_web::paths::encode_path_segment(#ident) })
+        .zip(param_idents.iter())
+        .map(|(param, ident)| {
+            if param.starts_with('*') {
+                quote! { ::autumn_web::paths::encode_catch_all_param(#ident) }
+            } else {
+                quote! { ::autumn_web::paths::encode_path_segment(#ident) }
+            }
+        })
         .collect();
 
     quote! {

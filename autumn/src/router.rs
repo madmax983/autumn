@@ -578,7 +578,7 @@ fn build_router_pre_state(
         // tools/call is counted once here and replayed with `RateLimitExempt`,
         // so it isn't double-counted by the dispatch pipeline's own limiter.
         // No-op when rate limiting is disabled (matching `envelope_rate_limited`).
-        mcp_router = apply_rate_limit_middleware(mcp_router, config);
+        mcp_router = apply_rate_limit_middleware(mcp_router, config, state);
         // CORS grant outermost so every response — including auth 401/403, the
         // 413 body-limit rejection, and a 429 from the limiter above, all
         // produced before `serve_mcp` runs — is readable by an allowlisted
@@ -1092,6 +1092,7 @@ fn group_and_mount_routes(
                 sunset_opt_out: route.sunset_opt_out,
                 secured: route.api_doc.secured,
                 required_roles: route.api_doc.required_roles,
+                has_policy: route.api_doc.has_policy,
             }));
         }
         grouped
@@ -1350,6 +1351,7 @@ fn mount_scoped_groups(
                     sunset_opt_out: route.sunset_opt_out,
                     secured: route.api_doc.secured,
                     required_roles: route.api_doc.required_roles,
+                    has_policy: route.api_doc.has_policy,
                 }));
             }
             sub_router = sub_router.route(route.path, handler);
@@ -1461,10 +1463,28 @@ where
         if let Some(keys) = signing_keys {
             csrf_layer = csrf_layer.with_signing_keys(keys);
         }
+        for endpoint in &config.security.webhooks.endpoints {
+            csrf_layer = csrf_layer.with_exempt_path(&endpoint.path);
+        }
         tracing::info!("CSRF protection enabled");
         router = router.layer(csrf_layer);
     }
     router
+}
+
+async fn populate_rate_limit_principal(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    mut req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if let Some(session) = req.extensions().get::<crate::session::Session>() {
+        let auth_session_key = state.auth_session_key();
+        if let Some(user_id) = session.get(auth_session_key).await {
+            req.extensions_mut()
+                .insert(crate::security::RateLimitPrincipal(user_id));
+        }
+    }
+    next.run(req).await
 }
 
 fn apply_trusted_proxies_middleware<S>(
@@ -1486,13 +1506,11 @@ where
     router.layer(layer)
 }
 
-fn apply_rate_limit_middleware<S>(
-    mut router: axum::Router<S>,
+fn apply_rate_limit_middleware(
+    mut router: axum::Router<AppState>,
     config: &AutumnConfig,
-) -> axum::Router<S>
-where
-    S: Clone + Send + Sync + 'static,
-{
+    state: &AppState,
+) -> axum::Router<AppState> {
     if config.security.rate_limit.enabled {
         let tp = &config.security.trusted_proxies;
         let rl = &config.security.rate_limit;
@@ -1515,6 +1533,15 @@ where
             "Rate limiting enabled"
         );
         router = router.layer(layer);
+
+        if config.security.rate_limit.key_strategy
+            == crate::security::KeyStrategy::AuthenticatedPrincipal
+        {
+            router = router.layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                populate_rate_limit_principal,
+            ));
+        }
     }
     router
 }
@@ -1668,7 +1695,7 @@ fn build_idempotency_layers(
     }))
 }
 
-#[allow(clippy::cognitive_complexity)]
+#[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
 fn apply_middleware(
     mut router: axum::Router<AppState>,
     config: &AutumnConfig,
@@ -1718,7 +1745,29 @@ fn apply_middleware(
     router = router.layer(axum::middleware::from_fn(
         crate::middleware::method_override_rejection_filter,
     ));
-    router = apply_rate_limit_middleware(router, config);
+    router = apply_rate_limit_middleware(router, config, state);
+
+    // Register MaintenanceLayer automatically
+    let maintenance_state = state
+        .extension::<crate::maintenance::MaintenanceState>()
+        .map(|s| (*s).clone())
+        .unwrap_or_default();
+    let bypass_paths = vec![
+        config.health.path.clone(),
+        config.health.live_path.clone(),
+        config.health.ready_path.clone(),
+        config.health.startup_path.clone(),
+        crate::actuator::actuator_route_path(&config.actuator.prefix, "/health"),
+    ];
+    router = router.layer(
+        crate::middleware::maintenance::MaintenanceLayer::new(maintenance_state)
+            .with_health_prefix(config.actuator.prefix.clone())
+            .with_probe_paths(bypass_paths),
+    );
+
+    router = router.layer(axum::middleware::from_fn(
+        crate::webhook::webhook_replay_cleanup_middleware,
+    ));
     router = apply_upload_middleware(router, config);
 
     // Security headers layer (always applied)
@@ -2806,7 +2855,8 @@ mod tests {
 
         let base: axum::Router<AppState> =
             axum::Router::new().route("/ping", axum::routing::get(|| async { "pong" }));
-        let router = apply_rate_limit_middleware(base, &config).with_state(test_state());
+        let state = test_state();
+        let router = apply_rate_limit_middleware(base, &config, &state).with_state(state.clone());
 
         // Fire several rapid requests; none should be throttled.
         for _ in 0..5 {
@@ -2829,7 +2879,8 @@ mod tests {
 
         let base: axum::Router<AppState> =
             axum::Router::new().route("/ping", axum::routing::get(|| async { "pong" }));
-        let router = apply_rate_limit_middleware(base, &config).with_state(test_state());
+        let state = test_state();
+        let router = apply_rate_limit_middleware(base, &config, &state).with_state(state.clone());
 
         let ok = router
             .clone()
@@ -4406,6 +4457,7 @@ pub struct RouteVersionMetadata {
     pub sunset_opt_out: bool,
     pub secured: bool,
     pub required_roles: &'static [&'static str],
+    pub has_policy: bool,
 }
 
 /// Middleware that handles API deprecation, sunsets, and Gone responses.
@@ -4435,6 +4487,9 @@ async fn api_versioning_middleware(
     let is_sunset = version.sunset_at.is_some_and(|s| now >= s);
 
     if is_sunset && !meta.sunset_opt_out {
+        if meta.has_policy {
+            return next.run(request).await;
+        }
         if meta.secured {
             let session = request.extensions().get::<crate::session::Session>();
             let mut auth_failed = false;
@@ -4507,4 +4562,50 @@ async fn api_versioning_middleware(
     }
 
     response
+}
+
+/// Helper function to perform a sunset check during dynamic handler execution.
+/// Returns a `410 Gone` response if the route version has sunsetted.
+#[must_use]
+pub fn check_sunset(
+    state: &crate::state::AppState,
+    meta: &RouteVersionMetadata,
+) -> Option<axum::response::Response> {
+    let clock = state.clock();
+    let now = clock.now();
+
+    let versions = state.extension::<crate::app::RegisteredApiVersions>();
+    let matching_version = versions
+        .as_ref()
+        .and_then(|v| v.0.iter().find(|av| av.version == meta.version));
+
+    let version = matching_version?;
+    let is_sunset = version.sunset_at.is_some_and(|s| now >= s);
+
+    if is_sunset && !meta.sunset_opt_out {
+        let err = crate::error::AutumnError::gone_msg(format!(
+            "API version '{}' has been sunsetted.",
+            meta.version
+        ));
+        let mut response = axum::response::IntoResponse::into_response(err);
+        if let Some(sunset) = version.sunset_at {
+            let http_date = sunset.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+            if let Ok(val) = axum::http::HeaderValue::from_str(&http_date) {
+                response.headers_mut().insert("Sunset", val);
+            }
+        }
+        let deprecation_date = match (version.deprecated_at, version.sunset_at) {
+            (Some(d), Some(s)) => Some(d.min(s)),
+            (d, s) => d.or(s),
+        };
+        if let Some(date) = deprecation_date {
+            let timestamp = date.timestamp();
+            if let Ok(val) = axum::http::HeaderValue::from_str(&format!("@{timestamp}")) {
+                response.headers_mut().insert("Deprecation", val);
+            }
+        }
+        return Some(response);
+    }
+
+    None
 }

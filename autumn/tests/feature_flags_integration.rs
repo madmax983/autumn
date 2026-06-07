@@ -380,3 +380,98 @@ async fn flags_service_accessor_returns_underlying_service() {
         "got: {body}"
     );
 }
+
+#[get("/macro-gated-primitive")]
+#[feature_flag("macro_flag")]
+async fn macro_gated_primitive_handler() -> bool {
+    true
+}
+
+#[tokio::test]
+async fn feature_flag_macro_primitive_wrapper_stacked() {
+    let store = InMemoryFlagStore::new();
+    store.enable("macro_flag", None).unwrap();
+
+    let client = TestApp::new()
+        .with_flag_store(store)
+        .routes(routes![macro_gated_primitive_handler])
+        .build();
+
+    let resp = client.get("/macro-gated-primitive").send().await;
+    resp.assert_ok();
+    assert_eq!(resp.text(), "true");
+}
+
+#[post("/macro-gated-idempotent")]
+#[feature_flag("replay_flag")]
+async fn macro_gated_idempotent_handler() -> &'static str {
+    "handler ran"
+}
+
+#[tokio::test]
+async fn feature_flag_checked_before_idempotency_replay() {
+    let store = Arc::new(InMemoryFlagStore::new());
+    let shared = SharedStore(store.clone());
+
+    store.enable("replay_flag", None).unwrap();
+
+    let client = TestApp::new()
+        .with_flag_store(shared)
+        .routes(routes![macro_gated_idempotent_handler])
+        .idempotent()
+        .build();
+
+    let r1 = client
+        .post("/macro-gated-idempotent")
+        .header("idempotency-key", "replay-test-key")
+        .send()
+        .await;
+    r1.assert_ok();
+    assert_eq!(r1.text(), "handler ran");
+
+    store.disable("replay_flag", None).unwrap();
+
+    client
+        .post("/macro-gated-idempotent")
+        .header("idempotency-key", "replay-test-key")
+        .send()
+        .await
+        .assert_status(StatusCode::NOT_FOUND.as_u16());
+}
+
+#[feature_flag("replay_flag_outer")]
+#[post("/macro-gated-idempotent-outer")]
+async fn macro_gated_idempotent_outer_handler() -> &'static str {
+    "handler ran outer"
+}
+
+#[tokio::test]
+async fn feature_flag_checked_before_idempotency_replay_outer() {
+    let store = Arc::new(InMemoryFlagStore::new());
+    let shared = SharedStore(store.clone());
+
+    store.enable("replay_flag_outer", None).unwrap();
+
+    let client = TestApp::new()
+        .with_flag_store(shared)
+        .routes(routes![macro_gated_idempotent_outer_handler])
+        .idempotent()
+        .build();
+
+    let r1 = client
+        .post("/macro-gated-idempotent-outer")
+        .header("idempotency-key", "replay-test-key-outer")
+        .send()
+        .await;
+    r1.assert_ok();
+    assert_eq!(r1.text(), "handler ran outer");
+
+    store.disable("replay_flag_outer", None).unwrap();
+
+    client
+        .post("/macro-gated-idempotent-outer")
+        .header("idempotency-key", "replay-test-key-outer")
+        .send()
+        .await
+        .assert_status(StatusCode::NOT_FOUND.as_u16());
+}

@@ -3,6 +3,7 @@
 //! Generates a complete Autumn project directory from embedded templates.
 
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 
 use autumn_web::credentials::{MasterKey, encrypt};
@@ -162,12 +163,20 @@ pub fn generate_with(name: &str, parent_dir: &Path, opts: GenerateOptions) -> Re
 fn scaffold_credentials(project_dir: &Path, name: &str) -> Result<(), NewError> {
     let master_key = MasterKey::generate();
     let key_path = project_dir.join("config/master.key");
-    fs::write(&key_path, master_key.to_hex())?;
+
+    if let Some(parent) = key_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600))?;
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
+    let mut f = options.open(&key_path)?;
+    f.write_all(master_key.to_hex().as_bytes())?;
 
     let template = format!(
         "# Encrypted credentials for '{name}'\n\
@@ -409,6 +418,12 @@ mod tests {
         assert!(p.join("autumn.toml").is_file());
         assert!(p.join("Dockerfile").is_file());
         assert!(p.join(".dockerignore").is_file());
+        let dockerignore = std::fs::read_to_string(p.join(".dockerignore")).unwrap();
+        assert!(
+            dockerignore.contains("/config/master.key")
+                || dockerignore.contains("config/master.key"),
+            ".dockerignore must exclude config/master.key: {dockerignore}"
+        );
         assert!(p.join("build.rs").is_file());
         assert!(p.join(".gitignore").is_file());
         assert!(p.join("static/css/input.css").is_file());
@@ -882,6 +897,21 @@ mod tests {
             k1.trim(),
             k2.trim(),
             "each project must get a unique master key"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn master_key_file_has_secure_permissions() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = TempDir::new().unwrap();
+        generate("secure-key-app", tmp.path()).unwrap();
+        let p = tmp.path().join("secure-key-app/config/master.key");
+        let meta = fs::metadata(&p).unwrap();
+        let mode = meta.mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "master.key permissions must be 0o600, got {mode:#o}"
         );
     }
 }

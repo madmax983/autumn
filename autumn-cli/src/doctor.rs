@@ -1909,6 +1909,18 @@ pub fn run(opts: DoctorOptions) {
     // 13. System-test browser (warn if missing; not all projects use system tests)
     tasks.push(Box::new(check_system_test_browser));
 
+    // 14. GDPR export/erasure registration (warn when auth starter is present
+    //     but #[repository] models are not registered in GdprRegistry).
+    //     File-system work runs inside the task so it overlaps with other checks.
+    tasks.push(Box::new(|| {
+        let has_auth_starter = std::path::Path::new("src/routes/auth.rs").exists();
+        let unregistered = resolve_gdpr_unregistered_tables();
+        check_gdpr_export_registration_impl(
+            has_auth_starter,
+            &unregistered.iter().map(String::as_str).collect::<Vec<_>>(),
+        )
+    }));
+
     // ── Phase 3: spawn all tasks concurrently ────────────────────────────────
     let handles: Vec<thread::JoinHandle<CheckResult>> =
         tasks.into_iter().map(thread::spawn).collect();
@@ -2153,6 +2165,177 @@ pub fn check_system_test_browser() -> CheckResult {
             detail: Some("no Chromium binary found (project does not use system-tests)".into()),
             hint: None,
         }
+    }
+}
+
+/// Resolve the list of `#[repository]`-annotated table names that are not yet
+/// registered in a `GdprRegistry` in the project source.
+///
+/// Currently uses a lightweight heuristic: scans `src/schema.rs` for `diesel::table!`
+/// declarations and returns those that have no matching `GdprRegistry::register` call
+/// in any `*.rs` source file. Returns an empty list when the project has no schema or
+/// when all tables appear to be registered.
+fn resolve_gdpr_unregistered_tables() -> Vec<String> {
+    let schema_path = std::path::Path::new("src/schema.rs");
+    let Ok(schema) = std::fs::read_to_string(schema_path) else {
+        return Vec::new();
+    };
+
+    // Collect table names declared as `diesel::table! { <name> (id) { ... } }`.
+    let mut declared_tables: Vec<String> = Vec::new();
+    for line in schema.lines() {
+        let trimmed = line.trim();
+        // Match lines like `diesel::table! {` followed by the table name on the next line,
+        // or inline `pub table_name (id) {` patterns.  Use a simple prefix scan.
+        if let Some(rest) = trimmed
+            .strip_prefix("diesel::table!")
+            .map(str::trim)
+            .filter(|r| r.starts_with('{'))
+        {
+            // table name is on the same line or will appear shortly; skip for now
+            let _ = rest;
+        }
+        // Diesel schema emits bare identifiers like `    table_name (pk) {`
+        // where `pk` can be any column name (id, uuid, code, or composite).
+        if let Some(open_paren) = trimmed.find('(')
+            && (trimmed.ends_with('{') || trimmed.ends_with("{ "))
+        {
+            let name = trimmed[..open_paren].trim();
+            if !name.is_empty() && !name.starts_with("//") && !name.starts_with("diesel") {
+                declared_tables.push(name.to_owned());
+            }
+        }
+    }
+
+    if declared_tables.is_empty() {
+        return Vec::new();
+    }
+
+    // Check which tables appear to be registered via GdprRegistry in the project.
+    let registered_tables = collect_gdpr_registered_tables_from_source();
+
+    declared_tables
+        .into_iter()
+        .filter(|t| !registered_tables.contains(t))
+        .collect()
+}
+
+/// Scan all `*.rs` files under `src/` for `GdprRegistry` register calls and
+/// return the set of table names found. Handles both single-line and
+/// rustfmt-formatted multi-line `ModelRegistration::` calls.
+fn collect_gdpr_registered_tables_from_source() -> std::collections::HashSet<String> {
+    let mut found = std::collections::HashSet::new();
+    for path in glob_rs_files(std::path::Path::new("src")) {
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        scan_source_for_gdpr_registrations(&content, &mut found);
+    }
+    found
+}
+
+/// Extract `ModelRegistration::` table names from source text, handling both
+/// single-line calls and multi-line rustfmt-formatted calls.
+fn scan_source_for_gdpr_registrations(
+    content: &str,
+    found: &mut std::collections::HashSet<String>,
+) {
+    let lines: Vec<&str> = content.lines().collect();
+    for (i, line) in lines.iter().enumerate() {
+        if let Some(idx) = line.find("ModelRegistration::") {
+            let rest = &line[idx..];
+            // Try the same line first, then the next 3 lines for multi-line calls.
+            if extract_quoted_table_name(rest, found) {
+                continue;
+            }
+            for j in 1..=3 {
+                if let Some(next) = lines.get(i + j)
+                    && extract_quoted_table_name(next.trim(), found)
+                {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Extract the first double-quoted string from `s` as a table name.
+/// Returns `true` if a non-empty, non-whitespace name was found and inserted.
+fn extract_quoted_table_name(s: &str, found: &mut std::collections::HashSet<String>) -> bool {
+    if let Some(start) = s.find('"')
+        && let Some(end) = s[start + 1..].find('"')
+    {
+        let name = &s[start + 1..start + 1 + end];
+        if !name.is_empty() && !name.contains(' ') {
+            found.insert(name.to_owned());
+            return true;
+        }
+    }
+    false
+}
+
+/// Recursively collect all `*.rs` file paths under `dir`.
+fn glob_rs_files(dir: impl AsRef<std::path::Path>) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            out.append(&mut glob_rs_files(&path));
+        } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+            out.push(path);
+        }
+    }
+    out
+}
+
+/// Warn when the auth starter is present but one or more `#[repository]`-annotated
+/// tables have not been registered in the GDPR export/erasure registry.
+///
+/// This check implements GDPR issue #820 AC #8:
+/// > `autumn doctor` warns when repositories exist whose models are not registered
+/// > for export/erasure once the auth starter is present.
+///
+/// `has_auth_starter` should be `true` when the project's `src/routes/auth.rs` exists
+/// (indicating `autumn generate auth` was run).
+/// `unregistered_tables` is the list of `#[repository]`-annotated table names that
+/// have not been registered via `GdprRegistry`.
+pub fn check_gdpr_export_registration_impl(
+    has_auth_starter: bool,
+    unregistered_tables: &[&str],
+) -> CheckResult {
+    if !has_auth_starter {
+        return CheckResult {
+            name: "gdpr_export_registration",
+            status: CheckStatus::Pass,
+            detail: Some("auth starter not present; GDPR registration not required".into()),
+            hint: None,
+        };
+    }
+
+    if unregistered_tables.is_empty() {
+        return CheckResult {
+            name: "gdpr_export_registration",
+            status: CheckStatus::Pass,
+            detail: Some("all repositories are registered for GDPR export/erasure".into()),
+            hint: None,
+        };
+    }
+
+    let tables = unregistered_tables.join(", ");
+    CheckResult {
+        name: "gdpr_export_registration",
+        status: CheckStatus::Warn,
+        detail: Some(format!(
+            "{} repository model(s) not registered for GDPR export/erasure: {tables}",
+            unregistered_tables.len()
+        )),
+        hint: Some(
+            "Register each model via GdprRegistry in your application state. \
+             See docs/guide/gdpr-compliance.md for the export/erasure API.",
+        ),
     }
 }
 
@@ -3297,5 +3480,137 @@ redirect_uri = "http://localhost/callback"
     fn features_has_key_commented_header() {
         let toml = "[features] # project features\nsystem-tests = []\n";
         assert!(cargo_toml_features_has_key(toml, "system-tests"));
+    }
+
+    // ── check_gdpr_export_registration ───────────────────────────────────────
+
+    #[test]
+    fn gdpr_check_passes_when_no_auth_starter() {
+        let r = check_gdpr_export_registration_impl(false, &[]);
+        assert_eq!(
+            r.status,
+            CheckStatus::Pass,
+            "no auth starter → should always pass: {r:?}"
+        );
+    }
+
+    #[test]
+    fn gdpr_check_passes_when_no_auth_starter_even_with_unregistered_tables() {
+        let r = check_gdpr_export_registration_impl(false, &["posts", "comments"]);
+        assert_eq!(
+            r.status,
+            CheckStatus::Pass,
+            "no auth starter → must not warn about unregistered tables: {r:?}"
+        );
+    }
+
+    #[test]
+    fn gdpr_check_passes_when_all_tables_registered() {
+        let r = check_gdpr_export_registration_impl(true, &[]);
+        assert_eq!(
+            r.status,
+            CheckStatus::Pass,
+            "auth starter present + all tables registered → should pass: {r:?}"
+        );
+    }
+
+    #[test]
+    fn gdpr_check_warns_when_unregistered_tables_present() {
+        let r = check_gdpr_export_registration_impl(true, &["posts", "comments"]);
+        assert_eq!(
+            r.status,
+            CheckStatus::Warn,
+            "unregistered tables with auth starter must warn: {r:?}"
+        );
+    }
+
+    #[test]
+    fn gdpr_check_name_is_stable() {
+        let r = check_gdpr_export_registration_impl(false, &[]);
+        assert_eq!(r.name, "gdpr_export_registration");
+    }
+
+    #[test]
+    fn gdpr_check_detail_lists_unregistered_table_names() {
+        let r = check_gdpr_export_registration_impl(true, &["posts", "comments"]);
+        let detail = r.detail.as_deref().unwrap_or("");
+        assert!(
+            detail.contains("posts"),
+            "detail must mention unregistered table 'posts': {detail}"
+        );
+        assert!(
+            detail.contains("comments"),
+            "detail must mention unregistered table 'comments': {detail}"
+        );
+    }
+
+    #[test]
+    fn gdpr_check_hint_references_registry_api() {
+        let r = check_gdpr_export_registration_impl(true, &["orders"]);
+        let hint = r.hint.unwrap_or("");
+        assert!(
+            hint.contains("GdprRegistry") || hint.contains("gdpr"),
+            "hint must reference the GdprRegistry API: {hint}"
+        );
+    }
+
+    #[test]
+    fn gdpr_check_detail_mentions_count_of_unregistered_tables() {
+        let r = check_gdpr_export_registration_impl(true, &["t1", "t2", "t3"]);
+        let detail = r.detail.as_deref().unwrap_or("");
+        assert!(
+            detail.contains('3') || detail.contains("3 "),
+            "detail must mention the count of unregistered tables: {detail}"
+        );
+    }
+
+    // ── scan_source_for_gdpr_registrations / extract_quoted_table_name ─────────
+
+    #[test]
+    fn scanner_detects_single_line_hard_delete() {
+        let src = r#"registry.register(ModelRegistration::hard_delete("posts"));"#;
+        let mut found = std::collections::HashSet::new();
+        scan_source_for_gdpr_registrations(src, &mut found);
+        assert!(
+            found.contains("posts"),
+            "should detect single-line hard_delete: {found:?}"
+        );
+    }
+
+    #[test]
+    fn scanner_detects_multiline_retain_call() {
+        let src = "registry.register(ModelRegistration::retain(\n    \"invoices\",\n    \"7-year financial hold\",\n));";
+        let mut found = std::collections::HashSet::new();
+        scan_source_for_gdpr_registrations(src, &mut found);
+        assert!(
+            found.contains("invoices"),
+            "should detect multi-line retain registration: {found:?}"
+        );
+    }
+
+    #[test]
+    fn scanner_detects_multiline_anonymize_call() {
+        let src = "registry.register(ModelRegistration::anonymize(\n    \"comments\",\n));";
+        let mut found = std::collections::HashSet::new();
+        scan_source_for_gdpr_registrations(src, &mut found);
+        assert!(
+            found.contains("comments"),
+            "should detect multi-line anonymize registration: {found:?}"
+        );
+    }
+
+    #[test]
+    fn scanner_ignores_string_before_token() {
+        let src = r#"let _x = "not_a_table"; ModelRegistration::hard_delete("real_table");"#;
+        let mut found = std::collections::HashSet::new();
+        scan_source_for_gdpr_registrations(src, &mut found);
+        assert!(
+            found.contains("real_table"),
+            "should contain real_table: {found:?}"
+        );
+        assert!(
+            !found.contains("not_a_table"),
+            "should not contain string before token: {found:?}"
+        );
     }
 }

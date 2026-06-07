@@ -217,6 +217,16 @@ pub fn authorize_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         };
         input_fn.sig.inputs.insert(0, idempotency_param);
     }
+    if !has_input_named(&input_fn, "__autumn_route_version") {
+        let route_version_param: syn::FnArg = parse_quote! {
+            __autumn_route_version: ::core::option::Option<
+                ::autumn_web::reexports::axum::extract::Extension<
+                    ::autumn_web::RouteVersionMetadata
+                >
+            >
+        };
+        input_fn.sig.inputs.insert(0, route_version_param);
+    }
 
     let action_lit = syn::LitStr::new(&action_str, proc_macro2::Span::call_site());
     let original_body = &input_fn.block;
@@ -273,6 +283,14 @@ pub fn authorize_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     return __autumn_response;
                 }
                 return ::autumn_web::reexports::axum::response::IntoResponse::into_response(__autumn_error);
+            }
+            if let ::core::option::Option::Some(::autumn_web::reexports::axum::extract::Extension(__autumn_meta)) = &__autumn_route_version {
+                if let ::core::option::Option::Some(__autumn_response) = ::autumn_web::__private::check_sunset(
+                    &__autumn_state,
+                    __autumn_meta,
+                ) {
+                    return __autumn_response;
+                }
             }
             #replay_stop
             #original_response

@@ -143,6 +143,12 @@ pub fn feature_flag_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         ::autumn_web::reexports::axum::response::IntoResponse::into_response(e)
                     })?;
                 if flags.enabled(#flag_key) {
+                    if let ::core::option::Option::Some(replay) = parts.extensions.get::<::autumn_web::idempotency::IdempotencyReplayResponse>() {
+                        let opt_ext = ::core::option::Option::Some(::autumn_web::reexports::axum::extract::Extension(replay.clone()));
+                        if let ::core::option::Option::Some(resp) = ::autumn_web::idempotency::__replay_response(&opt_ext) {
+                            return ::std::result::Result::Err(resp);
+                        }
+                    }
                     ::std::result::Result::Ok(#gate_ident)
                 } else {
                     #disabled_rejection

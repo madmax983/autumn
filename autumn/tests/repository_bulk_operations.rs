@@ -244,6 +244,37 @@ impl MutationHooks for HookedRecordHooks {
 #[autumn_web::repository(HookedRecord, table = "test_hooked_records", hooks = HookedRecordHooks)]
 pub trait HookedRecordRepository {}
 
+// ── Schema & models with hooks and version history (Task 20) ──────────────────
+
+diesel::table! {
+    test_hooked_versioned_records (id) {
+        id -> Int8,
+        name -> Text,
+        value -> Int4,
+    }
+}
+
+#[autumn_web::model(table = "test_hooked_versioned_records")]
+#[derive(PartialEq, Eq)]
+pub struct HookedVersionedRecord {
+    #[id]
+    pub id: i64,
+    pub name: String,
+    pub value: i32,
+}
+
+#[derive(Clone, Default)]
+pub struct HookedVersionedRecordHooks;
+
+impl MutationHooks for HookedVersionedRecordHooks {
+    type Model = HookedVersionedRecord;
+    type NewModel = NewHookedVersionedRecord;
+    type UpdateModel = UpdateHookedVersionedRecord;
+}
+
+#[autumn_web::repository(HookedVersionedRecord, table = "test_hooked_versioned_records", hooks = HookedVersionedRecordHooks, versioned = true)]
+pub trait HookedVersionedRecordRepository {}
+
 // ── Setup & helpers ─────────────────────────────────────────────────────────
 
 async fn setup_pool() -> (
@@ -283,6 +314,26 @@ async fn setup_pool() -> (
         .execute(&mut conn)
         .await
         .expect("create test_tenant_bulk_records");
+    diesel::sql_query("CREATE TABLE IF NOT EXISTS test_hooked_versioned_records (id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL, value INT NOT NULL)")
+        .execute(&mut conn)
+        .await
+        .expect("create test_hooked_versioned_records");
+    diesel::sql_query(
+        "CREATE TABLE IF NOT EXISTS _autumn_version_history (
+        id          BIGSERIAL   PRIMARY KEY,
+        table_name  TEXT        NOT NULL,
+        tenant_id   TEXT,
+        record_id   BIGINT      NOT NULL,
+        op          TEXT        NOT NULL CHECK (op IN ('insert', 'update', 'delete')),
+        actor       TEXT        NOT NULL DEFAULT 'system',
+        request_id  TEXT,
+        changes     JSONB       NOT NULL DEFAULT '[]',
+        recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("create _autumn_version_history");
 
     (pool, container)
 }
@@ -328,6 +379,18 @@ const fn build_tenant_bulk_repo(pool: Pool<AsyncPgConnection>) -> PgTenantBulkRe
     PgTenantBulkRecordRepository {
         pool,
         across_tenants: false,
+        __autumn_statement_timeout_ms: 0,
+        __autumn_slow_threshold: std::time::Duration::from_millis(500),
+        __autumn_route: None,
+    }
+}
+
+const fn build_hooked_versioned_repo(
+    pool: Pool<AsyncPgConnection>,
+) -> PgHookedVersionedRecordRepository {
+    PgHookedVersionedRecordRepository {
+        pool,
+        hooks: HookedVersionedRecordHooks,
         __autumn_statement_timeout_ms: 0,
         __autumn_slow_threshold: std::time::Duration::from_millis(500),
         __autumn_route: None,
@@ -669,4 +732,44 @@ async fn test_lock_version_upsert_many_conflict() {
         err_str.contains("conflict") || err_str.contains("Conflict"),
         "Expected conflict error, got: {err_str}"
     );
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn test_hooked_versioned_delete_many_records_history() {
+    let (pool, _container) = setup_pool().await;
+    let repo = build_hooked_versioned_repo(pool);
+
+    // Save initial records
+    let new_records = vec![
+        NewHookedVersionedRecord {
+            name: "H1".to_string(),
+            value: 10,
+        },
+        NewHookedVersionedRecord {
+            name: "H2".to_string(),
+            value: 20,
+        },
+    ];
+    let inserted = repo.save_many(&new_records).await.unwrap();
+    assert_eq!(inserted.len(), 2);
+    let ids: Vec<i64> = inserted.iter().map(|r| r.id).collect();
+
+    // Delete them
+    repo.delete_many(&ids).await.unwrap();
+
+    // Check version history for both records
+    for id in ids {
+        let history = repo
+            .version_history(id, ::autumn_web::version_history::VersionFilter::default())
+            .await
+            .unwrap();
+        assert!(
+            history
+                .entries
+                .iter()
+                .any(|entry| entry.op == ::autumn_web::version_history::VersionOp::Delete),
+            "expected a delete entry in version history for record {id}"
+        );
+    }
 }

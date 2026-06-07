@@ -678,6 +678,9 @@ pub trait WebhookReplayStore: Send + Sync + std::fmt::Debug {
         received_at: SystemTime,
         window: Duration,
     ) -> WebhookReplayFuture<'a>;
+
+    /// Remove a delivery key from the store.
+    fn remove<'a>(&'a self, key: &'a str) -> WebhookReplayFuture<'a>;
 }
 
 impl<T> WebhookReplayStore for Arc<T>
@@ -691,6 +694,10 @@ where
         window: Duration,
     ) -> WebhookReplayFuture<'a> {
         self.as_ref().check_and_insert(key, received_at, window)
+    }
+
+    fn remove<'a>(&'a self, key: &'a str) -> WebhookReplayFuture<'a> {
+        self.as_ref().remove(key)
     }
 }
 
@@ -787,6 +794,15 @@ impl WebhookReplayStore for InMemoryWebhookReplayStore {
     ) -> WebhookReplayFuture<'a> {
         Box::pin(async move { Ok(self.check_and_insert_sync(key, received_at, window)) })
     }
+
+    fn remove<'a>(&'a self, key: &'a str) -> WebhookReplayFuture<'a> {
+        self.state
+            .lock()
+            .expect("webhook replay store lock poisoned")
+            .seen
+            .remove(key);
+        Box::pin(async move { Ok(true) })
+    }
 }
 
 /// Redis replay protection store.
@@ -855,6 +871,19 @@ impl WebhookReplayStore for RedisWebhookReplayStore {
                 .await
                 .map_err(|error| WebhookReplayStoreError::backend("insert", error))?;
             Ok(inserted.is_some())
+        })
+    }
+
+    fn remove<'a>(&'a self, key: &'a str) -> WebhookReplayFuture<'a> {
+        Box::pin(async move {
+            let mut connection = self.connection.clone();
+            let key = self.key_for(key);
+            let _: () = redis::cmd("DEL")
+                .arg(&key)
+                .query_async(&mut connection)
+                .await
+                .map_err(|error| WebhookReplayStoreError::backend("delete", error))?;
+            Ok(true)
         })
     }
 }
@@ -990,6 +1019,72 @@ impl WebhookVerifyError {
     }
 }
 
+type ReplayStoreCell =
+    std::sync::Arc<std::sync::Mutex<Option<(std::sync::Arc<dyn WebhookReplayStore>, Vec<String>)>>>;
+
+tokio::task_local! {
+    pub static WEBHOOK_REPLAY_KEY: ReplayStoreCell;
+}
+
+struct ReplayKeyGuard {
+    cell: ReplayStoreCell,
+    completed: bool,
+}
+
+impl Drop for ReplayKeyGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            let to_remove = match self.cell.lock() {
+                Ok(mut guard) => guard.take(),
+                Err(poisoned) => poisoned.into_inner().take(),
+            };
+            if let Some((store, keys)) = to_remove {
+                tokio::spawn(async move {
+                    for key in keys {
+                        tracing::debug!(key = %key, "Releasing webhook replay key due to panic in handler");
+                        let _ = store.remove(&key).await;
+                    }
+                });
+            }
+        }
+    }
+}
+
+/// Middleware to clean up webhook replay keys on handler failure.
+pub async fn webhook_replay_cleanup_middleware(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let cell = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let cell_cloned = cell.clone();
+
+    let mut guard = ReplayKeyGuard {
+        cell: cell_cloned.clone(),
+        completed: false,
+    };
+
+    let response = WEBHOOK_REPLAY_KEY
+        .scope(cell, async move { next.run(req).await })
+        .await;
+
+    guard.completed = true;
+
+    if response.status().is_server_error() {
+        let to_remove = match cell_cloned.lock() {
+            Ok(mut guard) => guard.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        };
+        if let Some((store, keys)) = to_remove {
+            for key in keys {
+                tracing::debug!(key = %key, "Releasing webhook replay key due to 5xx server error");
+                let _ = store.remove(&key).await;
+            }
+        }
+    }
+
+    response
+}
+
 async fn verify_request(
     registry: &WebhookRegistry,
     endpoint: &ResolvedWebhookEndpoint,
@@ -1011,20 +1106,70 @@ async fn verify_request(
         let delivery_id = delivery_id
             .as_deref()
             .ok_or(WebhookVerifyError::MissingDeliveryId)?;
-        let replay_key = format!(
-            "{}:{}:{delivery_id}",
+
+        let mut keys_to_check = vec![format!(
+            "{}:{}:id:{delivery_id}",
             endpoint.config.provider.as_str(),
             endpoint.config.name
-        );
-        let window = Duration::from_secs(endpoint.config.replay_window_secs);
-        if !registry
-            .replay_store
-            .check_and_insert(&replay_key, received_at, window)
-            .await
-            .map_err(|error| WebhookVerifyError::ReplayStoreUnavailable(error.to_string()))?
-        {
-            return Err(WebhookVerifyError::DuplicateDelivery);
+        )];
+
+        if matches!(
+            endpoint.config.provider,
+            WebhookProvider::Github | WebhookProvider::Generic
+        ) {
+            let sig_hdr = signature_header(endpoint);
+            if let Some(sig_val) = headers.get(sig_hdr).and_then(|v| v.to_str().ok()) {
+                use sha2::{Digest, Sha256};
+                let mut hasher = Sha256::new();
+                hasher.update(sig_val.as_bytes());
+                let sig_hash = hex::encode(hasher.finalize());
+                keys_to_check.push(format!(
+                    "{}:{}:sig:{sig_hash}",
+                    endpoint.config.provider.as_str(),
+                    endpoint.config.name
+                ));
+            }
         }
+
+        let window = Duration::from_secs(endpoint.config.replay_window_secs);
+        let mut inserted_keys = Vec::new();
+        for key in keys_to_check {
+            match registry
+                .replay_store
+                .check_and_insert(&key, received_at, window)
+                .await
+            {
+                Ok(true) => {
+                    inserted_keys.push(key);
+                }
+                Ok(false) => {
+                    // Rollback already inserted keys for this request
+                    for inserted in inserted_keys {
+                        let _ = registry.replay_store.remove(&inserted).await;
+                    }
+                    return Err(WebhookVerifyError::DuplicateDelivery);
+                }
+                Err(error) => {
+                    // Rollback already inserted keys for this request
+                    for inserted in inserted_keys {
+                        let _ = registry.replay_store.remove(&inserted).await;
+                    }
+                    return Err(WebhookVerifyError::ReplayStoreUnavailable(
+                        error.to_string(),
+                    ));
+                }
+            }
+        }
+
+        let _ = WEBHOOK_REPLAY_KEY.try_with(|cell| {
+            let guard = match cell.lock() {
+                Ok(g) => Some(g),
+                Err(poisoned) => Some(poisoned.into_inner()),
+            };
+            if let Some(mut guard) = guard {
+                *guard = Some((std::sync::Arc::clone(&registry.replay_store), inserted_keys));
+            }
+        });
     }
 
     Ok(SignedWebhook {

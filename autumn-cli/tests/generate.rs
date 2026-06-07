@@ -1071,6 +1071,95 @@ fn generate_auth_without_totp_has_no_totp_artifacts() {
     assert!(!project.join("tests/auth_2fa.rs").exists());
 }
 
+#[test]
+fn generate_auth_passkeys_creates_expected_files() {
+    let (_tmp, project) = fresh_project("auth-passkeys-app");
+    run_autumn(&project, &["generate", "auth", "User", "--passkeys"]);
+
+    // Migration: Webauthn credentials table exists.
+    let migrations: Vec<_> = fs::read_dir(project.join("migrations"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .ends_with("_create_webauthn_credentials")
+        })
+        .collect();
+    assert_eq!(
+        migrations.len(),
+        1,
+        "expected one create_webauthn_credentials migration"
+    );
+    let up = fs::read_to_string(migrations[0].path().join("up.sql")).unwrap();
+    assert!(
+        up.contains("CREATE TABLE webauthn_credentials"),
+        "up.sql missing webauthn_credentials table"
+    );
+
+    // Model: webauthn_credential model exists.
+    assert!(
+        project.join("src/models/webauthn_credential.rs").exists(),
+        "webauthn_credential model missing"
+    );
+
+    // Routes: passkey routes.
+    let routes = fs::read_to_string(project.join("src/routes/passkeys.rs")).unwrap();
+    for needle in [
+        "pub async fn passkey_register_page",
+        "pub async fn passkey_login_page",
+        "let script_nonce = nonce.map(|n| n.value().to_owned());",
+    ] {
+        assert!(
+            routes.contains(needle),
+            "routes/passkeys.rs missing or incorrect: {needle}"
+        );
+    }
+
+    // Ensure it does not contain the old private field access.
+    assert!(
+        !routes.contains("nonce.map(|n| n.0.clone())"),
+        "routes/passkeys.rs must not access private field n.0"
+    );
+}
+
+#[test]
+fn generate_auth_without_passkeys_has_no_passkeys_artifacts() {
+    let (_tmp, project) = fresh_project("auth-no-passkeys-app");
+    run_autumn(&project, &["generate", "auth", "User"]);
+    assert!(!project.join("src/models/webauthn_credential.rs").exists());
+    assert!(!project.join("src/routes/passkeys.rs").exists());
+}
+
+#[test]
+#[ignore = "slow: cargo-checks a fresh project — run with `cargo test -p autumn-cli -- --ignored`"]
+fn generated_auth_passkeys_cargo_checks() {
+    let (_tmp, project) = fresh_project("auth-passkeys-build");
+    patch_generated_cargo_toml(&project);
+
+    run_autumn(&project, &["generate", "auth", "User", "--passkeys"]);
+
+    let cargo_after = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+    for dep in ["webauthn-rs", "uuid", "serde", "diesel", "maud", "chrono"] {
+        assert!(
+            cargo_after.contains(&format!("{dep} =")),
+            "Cargo.toml missing '{dep}' after `generate auth --passkeys`"
+        );
+    }
+
+    let check = Command::new("cargo")
+        .args(["check", "--tests"])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "cargo check on generated --passkeys auth failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr),
+    );
+}
+
 /// Slow: scaffold `generate auth --totp` and `cargo check --tests` the result
 /// against the local `autumn-web` crate, proving the generated 2FA app and its
 /// test suite type-check with zero edits (issue #799 success metric).
@@ -1484,13 +1573,10 @@ fn generate_mailer_creates_all_expected_files() {
     assert!(mod_rs.contains("pub mod welcome;"));
     assert!(mod_rs.contains("pub mod previews;"));
 
-    // Smoke test.
-    assert!(project.join("tests/welcome_mailer.rs").is_file());
-    let test = fs::read_to_string(project.join("tests/welcome_mailer.rs")).unwrap();
-    assert!(test.contains("WelcomeMailer"));
-    assert!(test.contains("renders_both_bodies"));
-    assert!(test.contains("html.contains") || test.contains("html body"));
-    assert!(test.contains("text.contains") || test.contains("text body"));
+    // Smoke test is inline in the mailer file.
+    assert!(!project.join("tests/welcome_mailer.rs").exists());
+    assert!(mailer.contains("mod welcome_mailer_tests"));
+    assert!(mailer.contains("welcome_mailer_renders_both_bodies"));
 }
 
 #[test]

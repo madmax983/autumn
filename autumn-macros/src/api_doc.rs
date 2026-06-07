@@ -553,6 +553,16 @@ pub fn infer_query_params(input_fn: &syn::ItemFn) -> Option<TokenStream> {
 /// 2. Function-local `__AUTUMN_SECURED_ROLES` marker present (secured was
 ///    above the route macro and already expanded its body).
 /// 3. Legacy fallback: `__autumn_session` param present.
+pub fn has_policy_check_in_stmts(stmts: &[syn::Stmt]) -> bool {
+    for stmt in stmts {
+        let s = quote::quote!(#stmt).to_string();
+        if s.contains("__check_policy") {
+            return true;
+        }
+    }
+    false
+}
+
 pub fn extract_secured_info(input_fn: &syn::ItemFn) -> (bool, TokenStream) {
     // Case 1 — #[secured] or #[autumn_web::secured] visible as a remaining attribute.
     for attr in &input_fn.attrs {
@@ -569,11 +579,30 @@ pub fn extract_secured_info(input_fn: &syn::ItemFn) -> (bool, TokenStream) {
         }
     }
 
+    // Case 1b — #[authorize] or #[autumn_web::authorize] visible as a remaining attribute.
+    for attr in &input_fn.attrs {
+        if attr.path().is_ident("authorize")
+            || attr
+                .path()
+                .segments
+                .last()
+                .is_some_and(|s| s.ident == "authorize")
+        {
+            return (true, quote! { &[] });
+        }
+    }
+
     // Case 2 — #[secured] was above the route macro and already expanded;
     // read the marker emitted into the guarded function body.
     if let Some(roles) = extract_secured_roles_marker(input_fn) {
         let roles_tokens = emit_static_str_slice(&roles);
         return (true, roles_tokens);
+    }
+
+    // Case 2b — #[authorize] was above the route macro and already expanded;
+    // check if a policy check statement is present.
+    if has_policy_check_in_stmts(&input_fn.block.stmts) {
+        return (true, quote! { &[] });
     }
 
     // Case 3 — compatibility fallback for expansions produced before the

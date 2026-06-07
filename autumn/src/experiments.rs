@@ -643,12 +643,32 @@ impl ExperimentStore for InMemoryExperimentStore {
         let name = config.name.clone();
         {
             let mut inner = self.inner.write().unwrap();
+            let active_variants: std::collections::HashSet<String> = inner
+                .assignments
+                .values()
+                .filter(|a| a.experiment == name)
+                .map(|a| a.variant.clone())
+                .collect();
+
+            let new_variants: std::collections::HashSet<&str> =
+                config.variants.iter().map(|v| v.name.as_str()).collect();
+
+            for variant in active_variants {
+                if !new_variants.contains(variant.as_str()) {
+                    return Err(ExperimentStoreError::Backend(format!(
+                        "cannot delete variant '{variant}' because it has active assignments"
+                    )));
+                }
+            }
+
+            let exists = inner.experiments.contains_key(&name);
             inner.experiments.insert(name.clone(), config);
+            let mutation = if exists { "updated" } else { "created" };
             inner
                 .changes
                 .entry(name.clone())
                 .or_default()
-                .push(ChangeRecord::now(&name, "created", None));
+                .push(ChangeRecord::now(&name, mutation, None));
         }
         Ok(())
     }
@@ -689,6 +709,24 @@ impl ExperimentStore for InMemoryExperimentStore {
     ) -> Result<(), ExperimentStoreError> {
         {
             let mut inner = self.inner.write().unwrap();
+            let active_variants: std::collections::HashSet<String> = inner
+                .assignments
+                .values()
+                .filter(|a| a.experiment == name)
+                .map(|a| a.variant.clone())
+                .collect();
+
+            let new_variants: std::collections::HashSet<&str> =
+                variants.iter().map(|v| v.name.as_str()).collect();
+
+            for variant in active_variants {
+                if !new_variants.contains(variant.as_str()) {
+                    return Err(ExperimentStoreError::Backend(format!(
+                        "cannot delete variant '{variant}' because it has active assignments"
+                    )));
+                }
+            }
+
             if let Some(exp) = inner.experiments.get_mut(name) {
                 exp.variants = variants;
                 exp.updated_at_secs = now_secs();
@@ -1681,20 +1719,53 @@ pub mod pg {
         }
 
         fn upsert(&self, config: ExperimentConfig) -> Result<(), ExperimentStoreError> {
+            let mut conn = self.connect()?;
+
+            let active_variants = diesel::sql_query(
+                "SELECT DISTINCT variant FROM autumn_experiment_assignments WHERE experiment = $1",
+            )
+            .bind::<diesel::sql_types::Text, _>(&config.name)
+            .load::<VariantNameRow>(&mut conn)
+            .map_err(|e| ExperimentStoreError::Backend(e.to_string()))?;
+
+            let new_variants: std::collections::HashSet<&str> =
+                config.variants.iter().map(|v| v.name.as_str()).collect();
+
+            for row in active_variants {
+                if !new_variants.contains(row.variant.as_str()) {
+                    return Err(ExperimentStoreError::Backend(format!(
+                        "cannot delete variant '{}' because it has active assignments",
+                        row.variant
+                    )));
+                }
+            }
+
             let variants_json =
                 serde_json::to_string(&config.variants).unwrap_or_else(|_| "[]".to_owned());
             let state_str = config.state.to_string();
-            let mut conn = self.connect()?;
-            diesel::sql_query(
+            let rows_affected = diesel::sql_query(
                 "WITH upserted AS ( \
                      INSERT INTO autumn_experiments \
                          (name, description, state, variants, winner, exclusion_group) \
                      VALUES ($1, $2, $3::autumn_experiment_state, $4::jsonb, $5, $6) \
-                     ON CONFLICT (name) DO NOTHING \
-                     RETURNING name \
+                     ON CONFLICT (name) DO UPDATE SET \
+                         description = EXCLUDED.description, \
+                         state = EXCLUDED.state, \
+                         variants = EXCLUDED.variants, \
+                         winner = EXCLUDED.winner, \
+                         exclusion_group = EXCLUDED.exclusion_group, \
+                         updated_at = NOW() \
+                     WHERE NOT EXISTS ( \
+                         SELECT 1 FROM autumn_experiment_assignments a \
+                         WHERE a.experiment = EXCLUDED.name \
+                           AND a.variant NOT IN ( \
+                               SELECT x.name FROM jsonb_to_recordset(EXCLUDED.variants) AS x(name text) \
+                           ) \
+                     ) \
+                     RETURNING name, (xmax = 0) AS is_insert \
                  ) \
                  INSERT INTO autumn_experiment_changes (experiment, mutation, actor) \
-                 SELECT name, 'created', NULL FROM upserted",
+                 SELECT name, CASE WHEN is_insert THEN 'created' ELSE 'updated' END, NULL FROM upserted",
             )
             .bind::<diesel::sql_types::Text, _>(&config.name)
             .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(config.description)
@@ -1704,6 +1775,13 @@ pub mod pg {
             .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(config.exclusion_group)
             .execute(&mut conn)
             .map_err(|e| ExperimentStoreError::Backend(e.to_string()))?;
+
+            if rows_affected == 0 {
+                return Err(ExperimentStoreError::Backend(
+                    "cannot delete variant because it has active assignments".to_owned(),
+                ));
+            }
+
             self.invalidate(&config.name);
             Ok(())
         }
@@ -1748,14 +1826,41 @@ pub mod pg {
             variants: Vec<VariantConfig>,
             actor: Option<&str>,
         ) -> Result<(), ExperimentStoreError> {
+            let mut conn = self.connect()?;
+
+            let active_variants = diesel::sql_query(
+                "SELECT DISTINCT variant FROM autumn_experiment_assignments WHERE experiment = $1",
+            )
+            .bind::<diesel::sql_types::Text, _>(name)
+            .load::<VariantNameRow>(&mut conn)
+            .map_err(|e| ExperimentStoreError::Backend(e.to_string()))?;
+
+            let new_variants: std::collections::HashSet<&str> =
+                variants.iter().map(|v| v.name.as_str()).collect();
+
+            for row in active_variants {
+                if !new_variants.contains(row.variant.as_str()) {
+                    return Err(ExperimentStoreError::Backend(format!(
+                        "cannot delete variant '{}' because it has active assignments",
+                        row.variant
+                    )));
+                }
+            }
+
             let variants_json =
                 serde_json::to_string(&variants).unwrap_or_else(|_| "[]".to_owned());
-            let mut conn = self.connect()?;
-            diesel::sql_query(
+            let rows_affected = diesel::sql_query(
                 "WITH updated AS ( \
                      UPDATE autumn_experiments \
                      SET variants = $2::jsonb, updated_at = NOW() \
                      WHERE name = $1 \
+                       AND NOT EXISTS ( \
+                           SELECT 1 FROM autumn_experiment_assignments a \
+                           WHERE a.experiment = name \
+                             AND a.variant NOT IN ( \
+                                 SELECT x.name FROM jsonb_to_recordset($2::jsonb) AS x(name text) \
+                             ) \
+                       ) \
                      RETURNING name \
                  ) \
                  INSERT INTO autumn_experiment_changes (experiment, mutation, actor) \
@@ -1768,6 +1873,22 @@ pub mod pg {
             )
             .execute(&mut conn)
             .map_err(|e| ExperimentStoreError::Backend(e.to_string()))?;
+
+            if rows_affected == 0 {
+                let exists_row = diesel::sql_query(
+                    "SELECT EXISTS(SELECT 1 FROM autumn_experiments WHERE name = $1) AS result",
+                )
+                .bind::<diesel::sql_types::Text, _>(name)
+                .get_result::<BoolRow>(&mut conn)
+                .map_err(|e| ExperimentStoreError::Backend(e.to_string()))?;
+
+                if exists_row.result {
+                    return Err(ExperimentStoreError::Backend(
+                        "cannot delete variant because it has active assignments".to_owned(),
+                    ));
+                }
+            }
+
             self.invalidate(name);
             Ok(())
         }
@@ -2242,6 +2363,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn set_weights_rejects_deleting_assigned_variant() {
+        let svc = make_svc();
+        running(&svc, "exp");
+        let original = svc.assign("exp", "user:1").unwrap();
+
+        let remaining_variant = if original == "control" {
+            "treatment"
+        } else {
+            "control"
+        };
+        let err = svc
+            .set_weights(
+                "exp",
+                vec![VariantConfig::new(remaining_variant, 100)],
+                None,
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("cannot delete variant"),
+            "expected active assignment delete guard error, got {err}"
+        );
+    }
+
     // ── AC: exposure emitted exactly once per assign() call ───────────────────
 
     #[test]
@@ -2601,5 +2746,78 @@ mod tests {
     fn service_debug_does_not_panic() {
         let svc = make_svc();
         let _ = format!("{svc:?}");
+    }
+
+    #[test]
+    fn upsert_logs_created_or_updated() {
+        let svc = make_svc();
+        let exp = fifty_fifty("exp");
+        svc.create(exp.clone()).unwrap();
+
+        // Upsert the same experiment again to trigger update
+        svc.create(exp).unwrap();
+
+        let hist = svc.history("exp", 10).unwrap();
+        assert_eq!(hist.len(), 2);
+        assert_eq!(hist[1].mutation, "created");
+        assert_eq!(hist[0].mutation, "updated");
+    }
+
+    #[test]
+    fn upsert_rejects_deleting_variant_with_active_assignments() {
+        let store = InMemoryExperimentStore::new();
+        let name = "test_exp";
+
+        let config = ExperimentConfig {
+            name: name.to_string(),
+            description: None,
+            state: ExperimentState::Running,
+            variants: vec![
+                VariantConfig {
+                    name: "control".to_string(),
+                    weight: 50,
+                },
+                VariantConfig {
+                    name: "treatment".to_string(),
+                    weight: 50,
+                },
+            ],
+            winner: None,
+            exclusion_group: None,
+            updated_at_secs: 0,
+        };
+        store.upsert(config.clone()).unwrap();
+
+        // Assign an actor to "treatment"
+        store
+            .record_assignment(Assignment {
+                experiment: name.to_string(),
+                actor: "user1".to_string(),
+                variant: "treatment".to_string(),
+                is_override: false,
+                assigned_at_secs: 0,
+            })
+            .unwrap();
+
+        // Attempting to upsert config without "treatment" should fail
+        let mut new_config = config;
+        new_config.variants = vec![VariantConfig {
+            name: "control".to_string(),
+            weight: 100,
+        }];
+
+        let res = store.upsert(new_config);
+        assert!(
+            res.is_err(),
+            "expected upsert to fail due to deleting active variant"
+        );
+        if let Err(ExperimentStoreError::Backend(msg)) = res {
+            assert!(
+                msg.contains("treatment"),
+                "expected error message to mention 'treatment', got: {msg}"
+            );
+        } else {
+            panic!("expected Backend error");
+        }
     }
 }

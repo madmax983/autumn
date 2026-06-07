@@ -1335,7 +1335,10 @@ fn run_command(command: Commands) {
         Commands::Generate(cmd) => run_generate_command(cmd),
         Commands::Credentials(cmd) => match cmd {
             CredentialsCommands::Edit { env } => {
-                credentials::run_edit(&credentials::EditOptions { env });
+                if let Err(e) = credentials::run_edit(&credentials::EditOptions { env }) {
+                    eprintln!("autumn credentials edit: {e}");
+                    std::process::exit(1);
+                }
             }
             CredentialsCommands::Show { env, reveal } => {
                 credentials::run_show(&credentials::ShowOptions { env, reveal });
