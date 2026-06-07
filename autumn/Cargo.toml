@@ -176,7 +176,7 @@ rusty-fork = "0.3.1"
 features = [
   "maud", "htmx", "tailwind", "db", "cache-moka",
   "ws", "flash", "multipart", "http-client", "oauth2", "openapi",
-  "redis", "i18n", "storage", "mail", "seed", "system-info", "markdown",
+  "redis", "i18n", "storage", "variants", "mail", "seed", "system-info", "markdown",
   "reporting", "csv",
 ]
 rustdoc-args = ["--cfg", "docsrs"]

@@ -283,12 +283,13 @@ impl VariantHandle {
     ) -> Result<Blob, VariantError> {
         // Fast path: variant already in store.
         if let Some(meta) = store.head(&self.variant_key).await? {
-            return Ok(Blob::new(
-                store.provider_id(),
-                &self.variant_key,
-                &meta.content_type,
-                meta.byte_size,
-            ));
+            return Ok(Blob {
+                provider_id: store.provider_id().to_owned(),
+                key: self.variant_key.clone(),
+                content_type: meta.content_type,
+                byte_size: meta.byte_size,
+                etag: meta.etag,
+            });
         }
         self.generate(store, budget).await
     }

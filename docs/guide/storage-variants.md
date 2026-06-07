@@ -68,7 +68,7 @@ async fn upload_avatar(
 ```rust,ignore
 use std::time::Duration;
 use autumn_web::prelude::*;
-use autumn_web::storage::{BlobStoreState, variant::{Transform, VariantBudget}};
+use autumn_web::storage::{BlobStoreState, variant::{Transform, VariantBudget, VariantError}};
 
 #[get("/users/:id/avatar/thumb")]
 async fn avatar_thumb(
@@ -98,7 +98,7 @@ async fn avatar_thumb(
     let url = handle
         .url(&**store, &budget, Duration::from_secs(3600))
         .await
-        .map_err(|e| AutumnError::internal_server_error(e))?;
+        .map_err(VariantError::into_autumn_error)?;
 
     Ok(Redirect::to(url))
 }
