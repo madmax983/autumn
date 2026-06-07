@@ -484,12 +484,18 @@ fn build_router_pre_state(
     #[cfg(feature = "mcp")]
     let router = if let Some((mount_path, tools, endpoint_layer)) = mcp_prepared {
         let dispatch = router.clone().with_state(state.clone());
+        // For header-based tenancy, forward the configured tenant header on
+        // dispatch so tenant-scoped tools resolve the same tenant a direct HTTP
+        // call would. Other sources key off already-forwarded headers/Host.
+        let tenant_header = (config.tenancy.enabled && config.tenancy.source == "header")
+            .then(|| config.tenancy.header_name.clone());
         let mut mcp_router = crate::mcp::build_mcp_router(
             &mount_path,
             tools,
             dispatch,
             // Source the Origin allowlist from the app's CORS config.
             config.cors.allowed_origins.clone(),
+            tenant_header,
         );
         // Optional whole-endpoint auth gate (AppBuilder::secure_mcp), applied
         // before merge so it guards the catalog as well as tool dispatch.

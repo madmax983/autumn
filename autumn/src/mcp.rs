@@ -147,19 +147,54 @@ pub struct McpServer {
     /// Streamable-HTTP spec). Requests without an `Origin` (non-browser agents)
     /// are always allowed.
     allowed_origins: Vec<String>,
+    /// The configured tenant header name (e.g. `x-tenant-id`) when the app uses
+    /// header-based tenancy (`[tenancy] enabled = true, source = "header"`).
+    /// `tools/call` forwards this header onto the dispatched request so the
+    /// `Tenant` extractor resolves the same tenant a direct HTTP call would.
+    /// `None` for any other tenancy source (which keys off headers Autumn
+    /// already forwards — `Authorization` for JWT, `Cookie`/Host otherwise).
+    tenant_header: Option<String>,
     server_name: String,
     server_version: String,
 }
 
 impl McpServer {
-    /// Whether a browser `Origin` header value is permitted. `*` in the
-    /// allowlist permits any origin; an empty allowlist permits none (so any
-    /// present `Origin` is rejected).
-    fn origin_allowed(&self, origin: &str) -> bool {
+    /// Whether a browser `Origin` header value is permitted.
+    ///
+    /// A same-origin request — one whose `Origin` matches the request's own
+    /// host (proxy/scheme-aware) — is always allowed: the CORS allowlist
+    /// governs *cross*-origin access, and a browser MCP client served by this
+    /// same Autumn app should not have to enable CORS for its own origin.
+    /// Otherwise `*` in the allowlist permits any origin; an empty allowlist
+    /// permits none (so any present cross-origin `Origin` is rejected).
+    fn origin_allowed(&self, origin: &str, host: Option<&str>, scheme: Option<&str>) -> bool {
+        if is_same_origin(origin, host, scheme) {
+            return true;
+        }
         self.allowed_origins
             .iter()
             .any(|allowed| allowed == "*" || allowed == origin)
     }
+}
+
+/// Whether `origin` (an `Origin` header value like `https://app.example:8443`)
+/// is the same origin as the request's own host.
+///
+/// The authority (`host[:port]`) must match exactly; when the request's own
+/// scheme is known (resolved proxy-aware from `X-Forwarded-Proto`/URI), it must
+/// match too. If the scheme is unknown we accept on the authority alone — the
+/// host match is what matters for DNS-rebinding protection, and a stricter
+/// scheme check would wrongly reject same-origin clients behind a
+/// TLS-terminating proxy.
+fn is_same_origin(origin: &str, host: Option<&str>, scheme: Option<&str>) -> bool {
+    let Some(host) = host else { return false };
+    let Some((origin_scheme, origin_authority)) = origin.split_once("://") else {
+        return false;
+    };
+    if !origin_authority.eq_ignore_ascii_case(host) {
+        return false;
+    }
+    scheme.is_none_or(|s| s.eq_ignore_ascii_case(origin_scheme))
 }
 
 /// Decide whether a route's `ApiDoc` should be projected as a tool.
@@ -392,6 +427,7 @@ impl McpServer {
         tools: Vec<McpToolInfo>,
         dispatch: axum::Router,
         allowed_origins: Vec<String>,
+        tenant_header: Option<String>,
     ) -> Self {
         let tools: Vec<McpTool> = tools
             .into_iter()
@@ -417,6 +453,7 @@ impl McpServer {
             by_name,
             dispatch,
             allowed_origins,
+            tenant_header,
             server_name: "autumn-mcp".to_owned(),
             server_version: env!("CARGO_PKG_VERSION").to_owned(),
         }
@@ -427,14 +464,22 @@ impl McpServer {
 ///
 /// `dispatch` must be the fully-assembled application router (state applied)
 /// so `tools/call` traverses the real handler pipeline. `allowed_origins` is
-/// the app's CORS allowlist, used for `Origin` validation.
+/// the app's CORS allowlist, used for `Origin` validation. `tenant_header` is
+/// the configured tenant header name to forward on dispatch when the app uses
+/// header-based tenancy (`None` otherwise).
 pub fn build_mcp_router(
     mount_path: &str,
     tools: Vec<McpToolInfo>,
     dispatch: axum::Router,
     allowed_origins: Vec<String>,
+    tenant_header: Option<String>,
 ) -> axum::Router<crate::state::AppState> {
-    let server = Arc::new(McpServer::new(tools, dispatch, allowed_origins));
+    let server = Arc::new(McpServer::new(
+        tools,
+        dispatch,
+        allowed_origins,
+        tenant_header,
+    ));
     tracing::debug!(
         path = mount_path,
         tools = server.tools.len(),
@@ -461,15 +506,23 @@ async fn serve_mcp_get() -> Response {
 /// and responds with `application/json`.
 async fn serve_mcp(
     axum::extract::Extension(server): axum::extract::Extension<Arc<McpServer>>,
+    identity: Option<axum::extract::Extension<crate::security::ResolvedClientIdentity>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     // DNS-rebinding protection (MCP Streamable-HTTP spec MUST): reject a
-    // browser-supplied `Origin` that isn't allowlisted. Non-browser agents send
-    // no `Origin` and are unaffected.
+    // browser-supplied `Origin` that is neither same-origin nor allowlisted.
+    // Non-browser agents send no `Origin` and are unaffected.
     if let Some(origin) = headers.get(header::ORIGIN) {
         let origin = origin.to_str().unwrap_or("");
-        if !server.origin_allowed(origin) {
+        // Prefer the proxy-resolved host/scheme (honours X-Forwarded-Host/-Proto
+        // from trusted upstreams); fall back to the raw Host header.
+        let identity = identity.as_ref().map(|ext| &ext.0);
+        let host = identity
+            .and_then(|id| id.host.as_deref())
+            .or_else(|| headers.get(header::HOST).and_then(|h| h.to_str().ok()));
+        let scheme = identity.and_then(|id| id.scheme.as_deref());
+        if !server.origin_allowed(origin, host, scheme) {
             return (StatusCode::FORBIDDEN, "origin not allowed").into_response();
         }
     }
@@ -588,7 +641,7 @@ async fn tools_call(server: &McpServer, headers: &HeaderMap, id: Value, params: 
     };
     let tool = &server.tools[idx];
 
-    let request = match build_request(tool, headers, &arguments) {
+    let request = match build_request(tool, headers, &arguments, server.tenant_header.as_deref()) {
         Ok(req) => req,
         Err(message) => return error(id, -32602, &message),
     };
@@ -634,6 +687,7 @@ fn build_request(
     tool: &McpTool,
     headers: &HeaderMap,
     arguments: &Value,
+    tenant_header: Option<&str>,
 ) -> Result<axum::http::Request<Body>, String> {
     // Fill the path template from top-level string-ish arguments.
     let mut path = tool.path_template.clone();
@@ -694,6 +748,15 @@ fn build_request(
     }
     if let Some(csrf) = headers.get("x-csrf-token") {
         builder = builder.header("x-csrf-token", csrf);
+    }
+    // Header-based tenancy: forward the configured tenant header (default
+    // `x-tenant-id`) so the `Tenant` extractor on the dispatched request
+    // resolves the same tenant a direct HTTP caller would. Other tenancy
+    // sources key off headers already forwarded above (or the Host).
+    if let Some(name) = tenant_header
+        && let Some(value) = headers.get(name)
+    {
+        builder = builder.header(name, value);
     }
 
     let body = if tool.has_body {
@@ -919,7 +982,7 @@ mod tests {
     #[test]
     fn build_request_rejects_missing_required_body() {
         let t = tool("POST", "/api/todos", true, false);
-        let err = build_request(&t, &HeaderMap::new(), &json!({})).unwrap_err();
+        let err = build_request(&t, &HeaderMap::new(), &json!({}), None).unwrap_err();
         assert!(err.contains("body"), "got: {err}");
     }
 
@@ -930,6 +993,7 @@ mod tests {
             &t,
             &HeaderMap::new(),
             &json!({ "query": { "tags": ["a", "b"], "q": "x" } }),
+            None,
         )
         .expect("request builds");
         let query = req.uri().query().unwrap_or_default();
@@ -948,7 +1012,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(header::AUTHORIZATION, "Bearer tok".parse().unwrap());
         headers.insert(header::COOKIE, "autumn.sid=abc".parse().unwrap());
-        let req = build_request(&t, &headers, &json!({})).expect("request builds");
+        let req = build_request(&t, &headers, &json!({}), None).expect("request builds");
         assert_eq!(
             req.headers().get(header::AUTHORIZATION).unwrap(),
             "Bearer tok"
@@ -961,24 +1025,59 @@ mod tests {
         let t = tool("POST", "/api/todos", true, false);
         let mut headers = HeaderMap::new();
         headers.insert("x-csrf-token", "csrf123".parse().unwrap());
-        let req =
-            build_request(&t, &headers, &json!({ "body": { "x": 1 } })).expect("request builds");
+        let req = build_request(&t, &headers, &json!({ "body": { "x": 1 } }), None)
+            .expect("request builds");
         assert_eq!(req.headers().get("x-csrf-token").unwrap(), "csrf123");
     }
 
+    #[test]
+    fn build_request_forwards_configured_tenant_header() {
+        let t = tool("GET", "/api/todos", false, false);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-tenant-id", "acme".parse().unwrap());
+        // With header-based tenancy configured, the tenant header is forwarded.
+        let req =
+            build_request(&t, &headers, &json!({}), Some("x-tenant-id")).expect("request builds");
+        assert_eq!(req.headers().get("x-tenant-id").unwrap(), "acme");
+        // Without a configured tenant header, it is not forwarded.
+        let req = build_request(&t, &headers, &json!({}), None).expect("request builds");
+        assert!(req.headers().get("x-tenant-id").is_none());
+    }
+
     fn server(allowed_origins: Vec<String>) -> McpServer {
-        McpServer::new(Vec::new(), axum::Router::new(), allowed_origins)
+        McpServer::new(Vec::new(), axum::Router::new(), allowed_origins, None)
     }
 
     #[test]
     fn origin_allowlist_enforced() {
         let s = server(vec!["https://ok.example".to_owned()]);
-        assert!(s.origin_allowed("https://ok.example"));
-        assert!(!s.origin_allowed("https://evil.example"));
-        // Empty allowlist permits no browser origin.
-        assert!(!server(Vec::new()).origin_allowed("https://any.example"));
+        assert!(s.origin_allowed("https://ok.example", None, None));
+        assert!(!s.origin_allowed("https://evil.example", None, None));
+        // Empty allowlist permits no cross-origin browser request.
+        assert!(!server(Vec::new()).origin_allowed("https://any.example", None, None));
         // Wildcard permits any.
-        assert!(server(vec!["*".to_owned()]).origin_allowed("https://any.example"));
+        assert!(server(vec!["*".to_owned()]).origin_allowed("https://any.example", None, None));
+    }
+
+    #[test]
+    fn same_origin_allowed_without_cors_allowlist() {
+        // An empty CORS allowlist (the default/production posture) must still
+        // permit a browser MCP client served by this same app.
+        let s = server(Vec::new());
+        // Host matches the Origin authority → allowed, scheme unknown.
+        assert!(s.origin_allowed("https://app.example", Some("app.example"), None));
+        // Scheme known and matching → allowed.
+        assert!(s.origin_allowed("https://app.example", Some("app.example"), Some("https")));
+        // Host with a port matches exactly.
+        assert!(s.origin_allowed(
+            "http://localhost:8080",
+            Some("localhost:8080"),
+            Some("http")
+        ));
+        // A different host is still rejected (DNS-rebinding protection holds).
+        assert!(!s.origin_allowed("https://evil.example", Some("app.example"), None));
+        // Same host but a confidently-known mismatched scheme is rejected.
+        assert!(!s.origin_allowed("http://app.example", Some("app.example"), Some("https")));
     }
 
     #[test]
