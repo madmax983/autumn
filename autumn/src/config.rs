@@ -4410,7 +4410,7 @@ path = "/healthz"
     }
 
     #[test]
-    pub(crate) fn parse_env_string_works() {
+    fn parse_env_string_works() {
         let env = MockEnv::new().with("SOME_STR", "val");
         let mut target = "old".to_string();
         parse_env_string(&env, "SOME_STR", &mut target);
@@ -4418,7 +4418,7 @@ path = "/healthz"
     }
 
     #[test]
-    pub(crate) fn parse_env_bool_works() {
+    fn parse_env_bool_works() {
         let env = MockEnv::new().with("SOME_BOOL", "true");
         let mut target = false;
         parse_env_bool(&env, "SOME_BOOL", &mut target);
@@ -4441,7 +4441,7 @@ path = "/healthz"
     }
 
     #[test]
-    pub(crate) fn parse_env_csv_works() {
+    fn parse_env_csv_works() {
         let env = MockEnv::new().with("SOME_CSV", "a, b,c");
         let mut target = vec![];
         parse_env_csv(&env, "SOME_CSV", &mut target);
