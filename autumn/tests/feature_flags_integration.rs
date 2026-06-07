@@ -438,3 +438,40 @@ async fn feature_flag_checked_before_idempotency_replay() {
         .await
         .assert_status(StatusCode::NOT_FOUND.as_u16());
 }
+
+#[feature_flag("replay_flag_outer")]
+#[post("/macro-gated-idempotent-outer")]
+async fn macro_gated_idempotent_outer_handler() -> &'static str {
+    "handler ran outer"
+}
+
+#[tokio::test]
+async fn feature_flag_checked_before_idempotency_replay_outer() {
+    let store = Arc::new(InMemoryFlagStore::new());
+    let shared = SharedStore(store.clone());
+
+    store.enable("replay_flag_outer", None).unwrap();
+
+    let client = TestApp::new()
+        .with_flag_store(shared)
+        .routes(routes![macro_gated_idempotent_outer_handler])
+        .idempotent()
+        .build();
+
+    let r1 = client
+        .post("/macro-gated-idempotent-outer")
+        .header("idempotency-key", "replay-test-key-outer")
+        .send()
+        .await;
+    r1.assert_ok();
+    assert_eq!(r1.text(), "handler ran outer");
+
+    store.disable("replay_flag_outer", None).unwrap();
+
+    client
+        .post("/macro-gated-idempotent-outer")
+        .header("idempotency-key", "replay-test-key-outer")
+        .send()
+        .await
+        .assert_status(StatusCode::NOT_FOUND.as_u16());
+}

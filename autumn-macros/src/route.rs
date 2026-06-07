@@ -131,7 +131,8 @@ pub fn route_macro(
     let response_body = api_doc::schema_option(api_doc::infer_response_body(&input_fn));
     let query_schema = api_doc::schema_option(api_doc::infer_query_params(&input_fn));
     let (secured, required_roles) = api_doc::extract_secured_info(&input_fn);
-    let body_guarded_replay = secured || has_authorize_guard(&input_fn) || has_feature_flag_attr;
+    let has_feature_flag = has_feature_flag_attr || has_expanded_feature_flag_gate(&input_fn);
+    let body_guarded_replay = secured || has_authorize_guard(&input_fn) || has_feature_flag;
     let intercepted_route = !interceptors.is_empty();
     let handler_expr = build_handler_expr(
         &routing_fn,
@@ -241,6 +242,24 @@ fn has_policy_only(input_fn: &syn::ItemFn) -> bool {
             .last()
             .is_some_and(|segment| segment.ident == "authorize")
     }) || crate::api_doc::has_policy_check_in_stmts(&input_fn.block.stmts)
+}
+
+fn has_expanded_feature_flag_gate(input_fn: &syn::ItemFn) -> bool {
+    input_fn.sig.inputs.iter().any(|arg| {
+        let FnArg::Typed(pat_type) = arg else {
+            return false;
+        };
+        let Type::Path(type_path) = pat_type.ty.as_ref() else {
+            return false;
+        };
+        let Some(last_segment) = type_path.path.segments.last() else {
+            return false;
+        };
+        last_segment
+            .ident
+            .to_string()
+            .starts_with("__AutumnFlagGate_")
+    })
 }
 
 /// When a `name = "..."` override is active, emit a `pub use` alias for the

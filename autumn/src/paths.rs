@@ -59,7 +59,15 @@ pub fn encode_path_segment(value: impl std::fmt::Display) -> String {
 pub fn encode_catch_all_param(value: impl std::fmt::Display) -> String {
     let s = value.to_string();
     s.split('/')
-        .map(percent_encode)
+        .map(|segment| {
+            if segment == "." {
+                "%2E".to_string()
+            } else if segment == ".." {
+                "%2E%2E".to_string()
+            } else {
+                percent_encode(segment)
+            }
+        })
         .collect::<Vec<String>>()
         .join("/")
 }
@@ -142,5 +150,13 @@ mod tests {
     fn test_encode_catch_all_param() {
         assert_eq!(encode_catch_all_param("a/b/c d"), "a/b/c%20d");
         assert_eq!(encode_catch_all_param("foo bar/baz"), "foo%20bar/baz");
+    }
+
+    #[test]
+    fn test_encode_catch_all_param_dot_segments() {
+        assert_eq!(encode_catch_all_param("a/../b"), "a/%2E%2E/b");
+        assert_eq!(encode_catch_all_param("a/./b"), "a/%2E/b");
+        assert_eq!(encode_catch_all_param(".."), "%2E%2E");
+        assert_eq!(encode_catch_all_param("."), "%2E");
     }
 }
