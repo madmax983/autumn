@@ -258,7 +258,7 @@ impl CaptchaProvider for HCaptchaProvider {
             let params = [("secret", self.secret_key.as_str()), ("response", token)];
             match self
                 .client
-                .post("https://hcaptcha.com/siteverify")
+                .post("https://api.hcaptcha.com/siteverify")
                 .form(&params)
                 .send()
                 .await
@@ -295,6 +295,29 @@ impl CaptchaProvider for HCaptchaProvider {
 /// Use this in dev environments and tests where you want requests to flow
 /// through without any CAPTCHA challenge.
 pub struct AlwaysPassProvider;
+
+/// A CAPTCHA provider that always fails verification.
+///
+/// Used internally when bot protection is enabled but the `http-client`
+/// feature is not compiled in — fail closed rather than silently bypass.
+#[cfg(not(feature = "http-client"))]
+pub(crate) struct AlwaysFailProvider;
+
+#[cfg(not(feature = "http-client"))]
+impl CaptchaProvider for AlwaysFailProvider {
+    fn verify<'a>(&'a self, _token: &'a str) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
+        Box::pin(std::future::ready(false))
+    }
+
+    fn form_field_name(&self) -> &str {
+        "cf-turnstile-response"
+    }
+
+    #[cfg(feature = "maud")]
+    fn widget_markup(&self, _site_key: &str) -> maud::Markup {
+        maud::html! {}
+    }
+}
 
 impl CaptchaProvider for AlwaysPassProvider {
     fn verify<'a>(&'a self, _token: &'a str) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
@@ -361,6 +384,8 @@ impl CaptchaProvider for TestCaptchaProvider {
 struct BotProtectionSettings {
     provider: Arc<dyn CaptchaProvider>,
     dev_bypass: bool,
+    /// Effective form field name (may override provider default via config).
+    form_field: String,
     /// Maximum body bytes scanned when searching for the CAPTCHA token field.
     max_scan_bytes: usize,
 }
@@ -391,10 +416,12 @@ impl BotProtectionLayer {
     /// let layer = BotProtectionLayer::new(Arc::new(TestCaptchaProvider::new("my-token")));
     /// ```
     pub fn new(provider: Arc<dyn CaptchaProvider>) -> Self {
+        let form_field = provider.form_field_name().to_owned();
         Self {
             settings: Arc::new(BotProtectionSettings {
                 provider,
                 dev_bypass: false,
+                form_field,
                 max_scan_bytes: 2 * 1024 * 1024,
             }),
         }
@@ -431,17 +458,20 @@ impl BotProtectionLayer {
                 _ => {
                     tracing::warn!(
                         "bot_protection: http-client feature is disabled; \
-                         falling back to AlwaysPassProvider"
+                         CAPTCHA verification is unavailable — all protected form \
+                         submissions will be rejected (fail closed)"
                     );
-                    Arc::new(AlwaysPassProvider)
+                    Arc::new(AlwaysFailProvider)
                 }
             }
         };
 
+        let form_field = config.effective_form_field().to_owned();
         Self {
             settings: Arc::new(BotProtectionSettings {
                 provider,
                 dev_bypass: config.dev_bypass,
+                form_field,
                 max_scan_bytes: 2 * 1024 * 1024,
             }),
         }
@@ -589,9 +619,9 @@ where
         std::mem::swap(&mut self.inner, &mut inner);
 
         Box::pin(async move {
-            let field_name = settings.provider.form_field_name().to_owned();
             let token =
-                extract_token_from_form(&mut req, &field_name, settings.max_scan_bytes).await;
+                extract_token_from_form(&mut req, &settings.form_field, settings.max_scan_bytes)
+                    .await;
 
             let token_str = match &token {
                 Some(t) if !t.is_empty() => t.as_str(),

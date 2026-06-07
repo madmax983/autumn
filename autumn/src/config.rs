@@ -1825,6 +1825,7 @@ impl AutumnConfig {
         self.apply_scheduler_env_overrides_with_env(env);
         self.apply_auth_env_overrides_with_env(env);
         self.apply_security_env_overrides_with_env(env);
+        self.apply_bot_protection_env_overrides_with_env(env);
         self.apply_idempotency_env_overrides_with_env(env);
         self.apply_dev_env_overrides_with_env(env);
         self.apply_compression_env_overrides_with_env(env);
@@ -2416,6 +2417,34 @@ impl AutumnConfig {
         }
 
         self.security.webhooks.apply_env_overrides_with_env(env);
+    }
+
+    fn apply_bot_protection_env_overrides_with_env(&mut self, env: &dyn Env) {
+        parse_env_bool(
+            env,
+            "AUTUMN_BOT_PROTECTION__ENABLED",
+            &mut self.bot_protection.enabled,
+        );
+        parse_env_bool(
+            env,
+            "AUTUMN_BOT_PROTECTION__DEV_BYPASS",
+            &mut self.bot_protection.dev_bypass,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_BOT_PROTECTION__SITE_KEY",
+            &mut self.bot_protection.site_key,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_BOT_PROTECTION__SECRET_KEY",
+            &mut self.bot_protection.secret_key,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_BOT_PROTECTION__FORM_FIELD",
+            &mut self.bot_protection.form_field,
+        );
     }
 
     fn apply_rate_limit_env_overrides_with_env(&mut self, env: &dyn Env) {
