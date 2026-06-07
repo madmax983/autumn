@@ -2274,79 +2274,11 @@ impl AutumnConfig {
     }
 
     /// Apply `AUTUMN_SECURITY__*` environment variable overrides.
-    #[allow(clippy::too_many_lines)]
     fn apply_security_env_overrides_with_env(&mut self, env: &dyn Env) {
-        parse_env_string(
-            env,
-            "AUTUMN_SECURITY__HEADERS__X_FRAME_OPTIONS",
-            &mut self.security.headers.x_frame_options,
-        );
-        parse_env_bool(
-            env,
-            "AUTUMN_SECURITY__HEADERS__X_CONTENT_TYPE_OPTIONS",
-            &mut self.security.headers.x_content_type_options,
-        );
-        parse_env_bool(
-            env,
-            "AUTUMN_SECURITY__HEADERS__STRICT_TRANSPORT_SECURITY",
-            &mut self.security.headers.strict_transport_security,
-        );
-        parse_env(
-            env,
-            "AUTUMN_SECURITY__HEADERS__HSTS_MAX_AGE_SECS",
-            &mut self.security.headers.hsts_max_age_secs,
-        );
-        parse_env_string(
-            env,
-            "AUTUMN_SECURITY__HEADERS__CONTENT_SECURITY_POLICY",
-            &mut self.security.headers.content_security_policy,
-        );
-        parse_env_string(
-            env,
-            "AUTUMN_SECURITY__HEADERS__REFERRER_POLICY",
-            &mut self.security.headers.referrer_policy,
-        );
-        parse_env_string(
-            env,
-            "AUTUMN_SECURITY__HEADERS__PERMISSIONS_POLICY",
-            &mut self.security.headers.permissions_policy,
-        );
-
-        // CSRF
-        parse_env_bool(
-            env,
-            "AUTUMN_SECURITY__CSRF__ENABLED",
-            &mut self.security.csrf.enabled,
-        );
-        parse_env_string(
-            env,
-            "AUTUMN_SECURITY__CSRF__TOKEN_HEADER",
-            &mut self.security.csrf.token_header,
-        );
-        parse_env_string(
-            env,
-            "AUTUMN_SECURITY__CSRF__COOKIE_NAME",
-            &mut self.security.csrf.cookie_name,
-        );
-
+        self.security.headers.apply_env_overrides_with_env(env);
+        self.security.csrf.apply_env_overrides_with_env(env);
         self.apply_rate_limit_env_overrides_with_env(env);
-
-        // Multipart uploads
-        parse_env(
-            env,
-            "AUTUMN_SECURITY__UPLOAD__MAX_REQUEST_SIZE_BYTES",
-            &mut self.security.upload.max_request_size_bytes,
-        );
-        parse_env(
-            env,
-            "AUTUMN_SECURITY__UPLOAD__MAX_FILE_SIZE_BYTES",
-            &mut self.security.upload.max_file_size_bytes,
-        );
-        parse_env_csv(
-            env,
-            "AUTUMN_SECURITY__UPLOAD__ALLOWED_MIME_TYPES",
-            &mut self.security.upload.allowed_mime_types,
-        );
+        self.security.upload.apply_env_overrides_with_env(env);
 
         // Authorization deny shape + repository-API escape hatch.
         if let Ok(value) = env.var("AUTUMN_SECURITY__FORBIDDEN_RESPONSE") {
@@ -2369,34 +2301,13 @@ impl AutumnConfig {
             "AUTUMN_SECURITY__SIGNING_SECRET",
             &mut self.security.signing_secret.secret,
         );
-        parse_env_csv(
-            env,
-            "AUTUMN_SECURITY__TRUSTED_HOSTS__HOSTS",
-            &mut self.security.trusted_hosts.hosts,
-        );
 
-        // Top-level trusted-proxy policy
-        parse_env_csv(
-            env,
-            "AUTUMN_SECURITY__TRUSTED_PROXIES__RANGES",
-            &mut self.security.trusted_proxies.ranges,
-        );
-        parse_env_bool(
-            env,
-            "AUTUMN_SECURITY__TRUSTED_PROXIES__TRUST_FORWARDED_HEADERS",
-            &mut self.security.trusted_proxies.trust_forwarded_headers,
-        );
-        if let Ok(val) = env.var("AUTUMN_SECURITY__TRUSTED_PROXIES__TRUSTED_HOPS") {
-            if let Ok(hops) = val.trim().parse::<u32>() {
-                self.security.trusted_proxies.trusted_hops = Some(hops);
-            } else {
-                tracing::warn!(
-                    "ignoring invalid AUTUMN_SECURITY__TRUSTED_PROXIES__TRUSTED_HOPS={val:?}: \
-                     expected a non-negative integer"
-                );
-            }
-        }
-
+        self.security
+            .trusted_hosts
+            .apply_env_overrides_with_env(env);
+        self.security
+            .trusted_proxies
+            .apply_env_overrides_with_env(env);
         self.security.webhooks.apply_env_overrides_with_env(env);
     }
 
@@ -3279,7 +3190,7 @@ pub struct CompressionConfig {
 }
 
 /// Parse an environment variable into a typed target, logging a warning on failure.
-fn parse_env<T: std::str::FromStr>(env: &dyn Env, key: &str, target: &mut T) {
+pub(crate) fn parse_env<T: std::str::FromStr>(env: &dyn Env, key: &str, target: &mut T) {
     if let Ok(val) = env.var(key) {
         match val.parse::<T>() {
             Ok(v) => *target = v,
@@ -3307,13 +3218,13 @@ fn parse_env_option<T: std::str::FromStr>(env: &dyn Env, key: &str, target: &mut
     }
 }
 
-fn parse_env_string(env: &dyn Env, key: &str, target: &mut String) {
+pub(crate) fn parse_env_string(env: &dyn Env, key: &str, target: &mut String) {
     if let Ok(val) = env.var(key) {
         *target = val;
     }
 }
 
-fn parse_env_bool(env: &dyn Env, key: &str, target: &mut bool) {
+pub(crate) fn parse_env_bool(env: &dyn Env, key: &str, target: &mut bool) {
     if let Ok(val) = env.var(key) {
         match val.as_str() {
             "true" | "1" => *target = true,
@@ -3333,7 +3244,7 @@ fn parse_env_option_bool(env: &dyn Env, key: &str, target: &mut Option<bool>) {
     }
 }
 
-fn parse_env_csv(env: &dyn Env, key: &str, target: &mut Vec<String>) {
+pub(crate) fn parse_env_csv(env: &dyn Env, key: &str, target: &mut Vec<String>) {
     if let Ok(val) = env.var(key) {
         *target = val.split(',').map(|s| s.trim().to_owned()).collect();
     }
@@ -4499,7 +4410,7 @@ path = "/healthz"
     }
 
     #[test]
-    fn parse_env_string_works() {
+    pub(crate) fn parse_env_string_works() {
         let env = MockEnv::new().with("SOME_STR", "val");
         let mut target = "old".to_string();
         parse_env_string(&env, "SOME_STR", &mut target);
@@ -4507,7 +4418,7 @@ path = "/healthz"
     }
 
     #[test]
-    fn parse_env_bool_works() {
+    pub(crate) fn parse_env_bool_works() {
         let env = MockEnv::new().with("SOME_BOOL", "true");
         let mut target = false;
         parse_env_bool(&env, "SOME_BOOL", &mut target);
@@ -4530,7 +4441,7 @@ path = "/healthz"
     }
 
     #[test]
-    fn parse_env_csv_works() {
+    pub(crate) fn parse_env_csv_works() {
         let env = MockEnv::new().with("SOME_CSV", "a, b,c");
         let mut target = vec![];
         parse_env_csv(&env, "SOME_CSV", &mut target);
