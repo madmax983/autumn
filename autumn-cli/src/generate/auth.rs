@@ -2891,7 +2891,6 @@ pub async fn data_export(
     session: Session,
     mut db: Db,
     State(state): State<AppState>,
-    mailer: Option<Mailer>,
 ) -> AutumnResult<Response> {{
     let {snake_name}_id: i64 = session
         .get("{snake_name}_id")
@@ -2899,6 +2898,7 @@ pub async fn data_export(
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| AutumnError::unauthorized_msg("Not authenticated."))?;
 
+    let mailer = state.extension::<Mailer>().cloned();
     let now = chrono::Utc::now().naive_utc();
     let one_hour_ago = now - chrono::Duration::hours(1);
 
@@ -3163,7 +3163,6 @@ pub async fn admin_data_export(
     session: Session,
     mut db: Db,
     State(state): State<AppState>,
-    mailer: Option<Mailer>,
     axum::Form(form): axum::Form<AdminGdprActionForm>,
 ) -> AutumnResult<Response> {{
     let operator_id: String = session
@@ -3171,12 +3170,22 @@ pub async fn admin_data_export(
         .await
         .ok_or_else(|| AutumnError::unauthorized_msg("Admin access required."))?;
 
+    if form.reason.trim().is_empty() {{
+        return Err(AutumnError::unprocessable_msg("Reason is required for admin GDPR actions."));
+    }}
+
+    let mailer = state.extension::<Mailer>().cloned();
+
     let now = chrono::Utc::now().naive_utc();
-    diesel::update({table}::table.find(user_id))
+    let updated = diesel::update({table}::table.find(user_id))
         .set({table}::export_requested_at.eq(Some(now)))
         .execute(&mut *db)
         .await
         .map_err(|_| AutumnError::internal_server_error_msg("Failed to record export request."))?;
+
+    if updated == 0 {{
+        return Err(AutumnError::not_found_msg("User not found."));
+    }}
 
     enqueue_data_export_job(&state, user_id, mailer.as_ref()).await;
 
@@ -3214,10 +3223,14 @@ pub async fn admin_delete_account(
         .await
         .ok_or_else(|| AutumnError::unauthorized_msg("Admin access required."))?;
 
+    if form.reason.trim().is_empty() {{
+        return Err(AutumnError::unprocessable_msg("Reason is required for admin GDPR actions."));
+    }}
+
     let now = chrono::Utc::now().naive_utc();
     let grace_until = now + chrono::Duration::days(30);
 
-    diesel::update({table}::table.find(user_id))
+    let updated = diesel::update({table}::table.find(user_id))
         .set((
             {table}::delete_requested_at.eq(Some(now)),
             {table}::delete_scheduled_at.eq(Some(grace_until)),
@@ -3225,6 +3238,10 @@ pub async fn admin_delete_account(
         .execute(&mut *db)
         .await
         .map_err(|_| AutumnError::internal_server_error_msg("Failed to schedule deletion."))?;
+
+    if updated == 0 {{
+        return Err(AutumnError::not_found_msg("User not found."));
+    }}
 
     autumn_web::audit::write_from_state(
         &state,
