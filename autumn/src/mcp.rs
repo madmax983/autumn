@@ -61,6 +61,13 @@ const DEFAULT_PROTOCOL_VERSION: &str = "2025-06-18";
 /// client decides whether it can proceed.
 const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 
+/// MCP Streamable-HTTP transport headers a browser client attaches to its
+/// JSON-RPC requests. They are always added to the `OPTIONS` preflight's
+/// `Access-Control-Allow-Headers` (on top of the app's configured list) so a
+/// default CORS config doesn't block the follow-up `POST`. See
+/// <https://modelcontextprotocol.io/specification/2025-06-18/basic/transports#protocol-version-header>.
+const MCP_REQUEST_HEADERS: &[&str] = &["mcp-protocol-version", "mcp-session-id"];
+
 /// Upper bound on a tool's buffered response body (10 MiB). MCP tool results
 /// are structured JSON; this guards the in-process dispatch path against a
 /// handler that would otherwise buffer an unbounded body into memory.
@@ -242,10 +249,59 @@ fn is_same_origin(origin: &str, host: &str, scheme: Option<&str>) -> bool {
     let Some((origin_scheme, origin_authority)) = origin.split_once("://") else {
         return false;
     };
-    if !origin_authority.eq_ignore_ascii_case(host) {
+    // When the request's own scheme is known, it must match the Origin's.
+    if scheme.is_some_and(|s| !s.eq_ignore_ascii_case(origin_scheme)) {
         return false;
     }
-    scheme.is_none_or(|s| s.eq_ignore_ascii_case(origin_scheme))
+    // Compare host + port with default-port normalization, so e.g.
+    // `Host: app.example:443` (https) is the same origin as
+    // `Origin: https://app.example`. When the request scheme is unknown we
+    // assume the Origin's for the host's default-port resolution.
+    let host_scheme = scheme.unwrap_or(origin_scheme);
+    authority_matches(origin_authority, origin_scheme, host, host_scheme)
+}
+
+/// Compare two `host[:port]` authorities for origin equality, treating an
+/// omitted port as the scheme's default (443 for https, 80 for http). The host
+/// comparison is case-insensitive; IPv6 literals (`[::1]`) are handled.
+fn authority_matches(a: &str, a_scheme: &str, b: &str, b_scheme: &str) -> bool {
+    let (a_host, a_port) = split_host_port(a);
+    let (b_host, b_port) = split_host_port(b);
+    if !a_host.eq_ignore_ascii_case(b_host) {
+        return false;
+    }
+    a_port.or_else(|| default_port(a_scheme)) == b_port.or_else(|| default_port(b_scheme))
+}
+
+/// Split an authority into its host and optional port. Bracketed IPv6 literals
+/// keep their brackets in the host part; a trailing `:digits` is the port.
+fn split_host_port(authority: &str) -> (&str, Option<&str>) {
+    if authority.starts_with('[') {
+        // IPv6: `[::1]` or `[::1]:8080`. The host is everything through `]`.
+        if let Some(close) = authority.find(']') {
+            let host = &authority[..=close];
+            let port = authority[close + 1..]
+                .strip_prefix(':')
+                .filter(|p| !p.is_empty());
+            return (host, port);
+        }
+        return (authority, None);
+    }
+    match authority.rsplit_once(':') {
+        Some((host, port)) if !port.is_empty() && port.bytes().all(|c| c.is_ascii_digit()) => {
+            (host, Some(port))
+        }
+        _ => (authority, None),
+    }
+}
+
+/// The default TCP port for a URL scheme, used to normalize authorities.
+fn default_port(scheme: &str) -> Option<&'static str> {
+    match scheme.to_ascii_lowercase().as_str() {
+        "https" => Some("443"),
+        "http" => Some("80"),
+        _ => None,
+    }
 }
 
 /// Decide whether a route's `ApiDoc` should be projected as a tool.
@@ -588,7 +644,18 @@ async fn serve_mcp_options(
     if let Ok(v) = HeaderValue::from_str(&cors.allowed_methods.join(", ")) {
         out.insert(header::ACCESS_CONTROL_ALLOW_METHODS, v);
     }
-    if let Ok(v) = HeaderValue::from_str(&cors.allowed_headers.join(", ")) {
+    // Mirror the app's configured allow-headers, but always include the MCP
+    // Streamable-HTTP transport headers a browser client sends on follow-up
+    // requests (`MCP-Protocol-Version`, and `Mcp-Session-Id` for stateful
+    // clients). The default `allowed_headers` (`Content-Type, Authorization`)
+    // omits them, which would otherwise make the browser block the POST.
+    let mut allow_headers = cors.allowed_headers.clone();
+    for extra in MCP_REQUEST_HEADERS {
+        if !allow_headers.iter().any(|h| h.eq_ignore_ascii_case(extra)) {
+            allow_headers.push((*extra).to_owned());
+        }
+    }
+    if let Ok(v) = HeaderValue::from_str(&allow_headers.join(", ")) {
         out.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, v);
     }
     if let Ok(v) = HeaderValue::from_str(&cors.max_age_secs.to_string()) {
@@ -728,7 +795,12 @@ async fn serve_mcp(
         Value::Array(batch) => {
             let mut out = Vec::new();
             for msg in batch {
-                if let Some(resp) = handle_message(&server, &ctx, msg).await {
+                // Cookie propagation is intentionally limited to single calls:
+                // a batch could carry conflicting `Set-Cookie`s from several
+                // tool calls with no well-defined precedence, so they are
+                // collected but discarded here.
+                let mut discard = Vec::new();
+                if let Some(resp) = handle_message(&server, &ctx, msg, &mut discard).await {
                     out.push(resp);
                 }
             }
@@ -740,10 +812,23 @@ async fn serve_mcp(
             }
         }
         // A single request object. A notification (no `id`) yields `None` → 202.
-        msg @ Value::Object(_) => handle_message(&server, &ctx, msg).await.map_or_else(
-            || StatusCode::ACCEPTED.into_response(),
-            |v| json_response(&v),
-        ),
+        msg @ Value::Object(_) => {
+            let mut cookies = Vec::new();
+            handle_message(&server, &ctx, msg, &mut cookies)
+                .await
+                .map_or_else(
+                    || StatusCode::ACCEPTED.into_response(),
+                    |v| {
+                        let mut resp = json_response(&v);
+                        // Replay the inner handler's `Set-Cookie`s so a session- or
+                        // CSRF-cookie-mutating tool behaves like a direct call.
+                        for cookie in cookies {
+                            resp.headers_mut().append(header::SET_COOKIE, cookie);
+                        }
+                        resp
+                    },
+                )
+        }
         // Anything else (scalar, null) is not a valid JSON-RPC message.
         _ => json_response(&error(
             Value::Null,
@@ -760,7 +845,16 @@ async fn serve_mcp(
 
 /// Handle a single JSON-RPC message. Returns `None` only for a *valid*
 /// notification (a `2.0` message with a `method` and no `id`).
-async fn handle_message(server: &McpServer, ctx: &ReplayContext<'_>, msg: Value) -> Option<Value> {
+///
+/// `cookies` collects any `Set-Cookie` headers a replayed `tools/call`
+/// response carried, so a single (non-batch) call can propagate session/CSRF
+/// cookie updates to the outer HTTP response.
+async fn handle_message(
+    server: &McpServer,
+    ctx: &ReplayContext<'_>,
+    msg: Value,
+    cookies: &mut Vec<axum::http::HeaderValue>,
+) -> Option<Value> {
     let id = msg.get("id").cloned();
 
     // A JSON-RPC 2.0 `id`, when present, must be a string, number, or null;
@@ -796,7 +890,7 @@ async fn handle_message(server: &McpServer, ctx: &ReplayContext<'_>, msg: Value)
         "initialize" => Ok(initialize_result(server, &params)),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(tools_list_result(server)),
-        "tools/call" => return Some(tools_call(server, ctx, id, &params).await),
+        "tools/call" => return Some(tools_call(server, ctx, id, &params, cookies).await),
         other => Err((-32601, format!("method not found: {other}"))),
     };
 
@@ -835,6 +929,7 @@ async fn tools_call(
     ctx: &ReplayContext<'_>,
     id: Value,
     params: &Value,
+    cookies: &mut Vec<axum::http::HeaderValue>,
 ) -> Value {
     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
     // `inputSchema` is always an object; reject a non-object `arguments`
@@ -881,6 +976,14 @@ async fn tools_call(
     };
 
     let status = response.status();
+    // Capture any `Set-Cookie` the inner handler/middleware set (session
+    // renewal, CSRF-cookie refresh, login) before the body is consumed, so a
+    // single (non-batch) call can replay them onto the outer HTTP response —
+    // matching what the equivalent direct call would have sent. The caller only
+    // applies these for a single request; a batch leaves them unused.
+    for value in response.headers().get_all(header::SET_COOKIE) {
+        cookies.push(value.clone());
+    }
     // Unlike a normal HTTP response (streamed straight to the socket), the MCP
     // path buffers the whole body to repackage it as a tool result. Cap that
     // buffer so a runaway handler can't OOM the process; report an overflow as
@@ -1462,6 +1565,33 @@ mod tests {
     }
 
     #[test]
+    fn same_origin_normalizes_default_ports() {
+        let s = server_with_trusted(Vec::new(), &["app.example"]);
+        // Host carries the explicit default https port; Origin omits it.
+        assert!(s.origin_allowed(
+            "https://app.example",
+            Some("app.example:443"),
+            Some("https")
+        ));
+        // ...and the reverse: Origin carries the default port, Host omits it.
+        assert!(s.origin_allowed(
+            "https://app.example:443",
+            Some("app.example"),
+            Some("https")
+        ));
+        // Explicit default http port likewise normalizes.
+        assert!(s.origin_allowed("http://app.example", Some("app.example:80"), Some("http")));
+        // A non-default explicit port is NOT the same origin.
+        assert!(!s.origin_allowed(
+            "https://app.example",
+            Some("app.example:8443"),
+            Some("https")
+        ));
+        // The https default (443) must not be conflated with the http default.
+        assert!(!s.origin_allowed("http://app.example:443", Some("app.example"), Some("http")));
+    }
+
+    #[test]
     fn same_origin_rejected_for_untrusted_host() {
         // DNS rebinding: Origin and Host both name the attacker's domain. The
         // authority matches, but the host is not trusted, so the same-origin
@@ -1503,6 +1633,18 @@ mod tests {
             resp.headers()
                 .get(header::ACCESS_CONTROL_ALLOW_METHODS)
                 .is_some()
+        );
+        // The MCP transport headers must be allowed even though the default
+        // CORS `allowed_headers` omits them, or the browser blocks the POST.
+        let allow_headers = resp
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_HEADERS)
+            .and_then(|v| v.to_str().ok())
+            .unwrap()
+            .to_ascii_lowercase();
+        assert!(
+            allow_headers.contains("mcp-protocol-version"),
+            "allow-headers missing MCP-Protocol-Version: {allow_headers}"
         );
 
         // Non-allowlisted origin → no CORS grant (browser will block the POST).

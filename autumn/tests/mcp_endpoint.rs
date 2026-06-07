@@ -108,6 +108,21 @@ async fn html_page() -> &'static str {
     "<h1>hi</h1>"
 }
 
+// Appends a `Set-Cookie` to every response in the pipeline; used to verify a
+// single `tools/call` propagates the replayed handler's cookie updates while a
+// batch does not.
+async fn add_test_cookie(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let mut resp = next.run(req).await;
+    resp.headers_mut().append(
+        axum::http::header::SET_COOKIE,
+        axum::http::HeaderValue::from_static("mcp_session=abc; Path=/"),
+    );
+    resp
+}
+
 async fn rpc(client: &TestClient, body: serde_json::Value) -> serde_json::Value {
     let resp = client.post("/mcp").json(&body).send().await;
     resp.assert_ok();
@@ -254,6 +269,51 @@ async fn tools_call_dispatches_write_tool_with_body() {
     let payload: serde_json::Value = serde_json::from_str(text).unwrap();
     assert_eq!(payload["id"], 42);
     assert_eq!(payload["title"], "new one");
+}
+
+#[tokio::test]
+async fn single_tools_call_propagates_set_cookie() {
+    // A session-renewal / CSRF-refresh handler sets Set-Cookie; a single
+    // tools/call must replay it onto the outer HTTP response so cookie-based
+    // MCP flows behave like the equivalent direct call.
+    let client = TestApp::new()
+        .routes(routes![get_todo])
+        .layer(axum::middleware::from_fn(add_test_cookie))
+        .mount_mcp("/mcp")
+        .build();
+
+    let resp = client
+        .post("/mcp")
+        .json(&serde_json::json!({
+            "jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params": {"name":"get_todo","arguments":{"id":"7"}}
+        }))
+        .send()
+        .await;
+    resp.assert_ok();
+    assert_eq!(resp.header("set-cookie"), Some("mcp_session=abc; Path=/"));
+}
+
+#[tokio::test]
+async fn batch_tools_call_does_not_propagate_set_cookie() {
+    // Batches can carry conflicting Set-Cookies from several calls with no
+    // defined precedence, so cookie propagation is intentionally single-only.
+    let client = TestApp::new()
+        .routes(routes![get_todo])
+        .layer(axum::middleware::from_fn(add_test_cookie))
+        .mount_mcp("/mcp")
+        .build();
+
+    let resp = client
+        .post("/mcp")
+        .json(&serde_json::json!([{
+            "jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params": {"name":"get_todo","arguments":{"id":"7"}}
+        }]))
+        .send()
+        .await;
+    resp.assert_ok();
+    assert_eq!(resp.header("set-cookie"), None);
 }
 
 #[tokio::test]
