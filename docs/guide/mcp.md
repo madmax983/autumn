@@ -234,6 +234,25 @@ autumn_web::app()
     .await;
 ```
 
+### Why the `/mcp` endpoint sits outside the global middleware stack
+
+The `/mcp` envelope (`initialize`/`tools/list`) is mounted **outside** the
+app's global middleware — your `AppBuilder::layer(...)` layers and the
+framework's CSRF/session middleware do not wrap it. This is deliberate and
+matches how the MCP SDKs work:
+
+- Forcing **CSRF/session** middleware onto a JSON-RPC `POST` would reject
+  legitimate agent calls — MCP authenticates with bearer tokens/OAuth, not
+  browser form tokens. No MCP SDK wraps the endpoint in browser middleware.
+- The protections that *do* matter are provided the MCP-native way: **`Origin`
+  validation** lives in the MCP layer (below), every **`tools/call`** runs the
+  full per-route pipeline (so per-route auth/validation always applies), and
+  **`secure_mcp(...)`** is the explicit opt-in to gate the whole endpoint —
+  the analogue of `fastapi-mcp`'s `AuthConfig`.
+
+If you want a global concern (auth, logging) to cover the envelope too, pass it
+to `secure_mcp(layer)` rather than relying on `AppBuilder::layer`.
+
 ### Origin validation (DNS-rebinding protection)
 
 The MCP Streamable-HTTP transport **requires** servers to validate the
