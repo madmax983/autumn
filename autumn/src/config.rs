@@ -2550,6 +2550,21 @@ impl AutumnConfig {
             "AUTUMN_STORAGE__S3__DEFAULT_URL_EXPIRY_SECS",
             &mut self.storage.s3.default_url_expiry_secs,
         );
+        parse_env(
+            env,
+            "AUTUMN_STORAGE__VARIANTS__MAX_SOURCE_BYTES",
+            &mut self.storage.variants.max_source_bytes,
+        );
+        parse_env(
+            env,
+            "AUTUMN_STORAGE__VARIANTS__MAX_SOURCE_WIDTH",
+            &mut self.storage.variants.max_source_width,
+        );
+        parse_env(
+            env,
+            "AUTUMN_STORAGE__VARIANTS__MAX_SOURCE_HEIGHT",
+            &mut self.storage.variants.max_source_height,
+        );
     }
 
     #[cfg(feature = "mail")]
@@ -4282,7 +4297,10 @@ path = "/healthz"
                 "AWS_SECRET_ACCESS_KEY",
             )
             .with("AUTUMN_STORAGE__S3__FORCE_PATH_STYLE", "true")
-            .with("AUTUMN_STORAGE__S3__DEFAULT_URL_EXPIRY_SECS", "99");
+            .with("AUTUMN_STORAGE__S3__DEFAULT_URL_EXPIRY_SECS", "99")
+            .with("AUTUMN_STORAGE__VARIANTS__MAX_SOURCE_BYTES", "5242880")
+            .with("AUTUMN_STORAGE__VARIANTS__MAX_SOURCE_WIDTH", "2000")
+            .with("AUTUMN_STORAGE__VARIANTS__MAX_SOURCE_HEIGHT", "1500");
         let mut config = AutumnConfig::default();
 
         config.apply_env_overrides_with_env(&env);
@@ -4314,6 +4332,9 @@ path = "/healthz"
         );
         assert!(config.storage.s3.force_path_style);
         assert_eq!(config.storage.s3.default_url_expiry_secs, 99);
+        assert_eq!(config.storage.variants.max_source_bytes, 5_242_880);
+        assert_eq!(config.storage.variants.max_source_width, 2_000);
+        assert_eq!(config.storage.variants.max_source_height, 1_500);
     }
 
     #[test]

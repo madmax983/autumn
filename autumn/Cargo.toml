@@ -55,6 +55,11 @@ i18n = []
 # When combined with `db`, opts diesel into `serde_json` so the `Blob`
 # value type can round-trip through a Postgres `JSONB` column.
 storage = ["diesel?/serde_json"]
+# On-demand image variants (resize, rotate, strip metadata) with
+# content-addressed caching on top of the storage layer.
+# Pulls in the `image` crate (JPEG + PNG + WebP codecs) behind this flag
+# to keep the `storage`-only build lean.
+variants = ["storage", "dep:image"]
 # Pluggable error reporting: catch handler panics at the HTTP layer and route
 # panics + 5xx responses to configured `ErrorReporter`s. Ships a `tracing`-based
 # `LogReporter` as the default. On by default; disable to drop the panic-catch
@@ -141,6 +146,7 @@ hex = "0.4"
 csv = { workspace = true, optional = true }
 lettre = { version = "0.11.21", default-features = false, features = ["builder", "smtp-transport", "tokio1-rustls-tls"], optional = true }
 chromiumoxide = { workspace = true, optional = true, features = ["tokio-runtime"] }
+image = { workspace = true, optional = true }
 
 [dev-dependencies]
 diesel = { version = "2", features = ["chrono", "postgres"] }
@@ -170,7 +176,7 @@ rusty-fork = "0.3.1"
 features = [
   "maud", "htmx", "tailwind", "db", "cache-moka",
   "ws", "flash", "multipart", "http-client", "oauth2", "openapi",
-  "redis", "i18n", "storage", "mail", "seed", "system-info", "markdown",
+  "redis", "i18n", "storage", "variants", "mail", "seed", "system-info", "markdown",
   "reporting", "csv",
 ]
 rustdoc-args = ["--cfg", "docsrs"]

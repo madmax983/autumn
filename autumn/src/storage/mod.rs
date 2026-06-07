@@ -69,13 +69,19 @@ pub mod migrations;
 #[cfg(feature = "maud")]
 pub mod form_helper;
 
+#[cfg(feature = "variants")]
+pub mod variant;
+
 pub use blob::{Blob, BlobMeta};
 pub use config::{
     StorageBackend, StorageBackendConfigError, StorageBackendPlan, StorageConfig,
-    StorageLocalConfig, StorageS3Config,
+    StorageLocalConfig, StorageS3Config, StorageVariantsConfig,
 };
 pub use direct_upload::{PresignPutResult, complete_direct_upload};
 pub use local::LocalBlobStore;
+
+#[cfg(feature = "variants")]
+pub use variant::{Transform, VariantBudget, VariantError, VariantHandle};
 
 /// Boxed future returned by [`BlobStore`] methods.
 ///

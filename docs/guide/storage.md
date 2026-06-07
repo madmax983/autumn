@@ -412,10 +412,13 @@ Recommended: set a bucket lifecycle rule (S3) or a cron sweeper (local) to
 delete objects with a well-known "orphan" prefix after a short window (e.g.,
 `tmp/` prefix, 24 h expiry).
 
-## What's out of scope (for now)
+## Image variants
 
-- **Image processing / resizing.** Track separately. `image` and
-  `imageproc` have their own dependency surfaces.
+Resize, rotate, and strip metadata from stored images — lazily, with
+content-addressed caching — via the `variants` feature.  See the
+[Image Variants guide](storage-variants.md) for the full walkthrough.
+
+## What's out of scope (for now)
 - **Native non-S3 backends (GCS, Azure Blob, B2 native).** Anyone
   whose object store speaks S3 is covered by `autumn-storage-s3`. Native
   backends are a future plugin-crate extension.
