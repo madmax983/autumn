@@ -136,7 +136,19 @@ impl<S> MaintenanceService<S> {
     ) -> Option<Response<Body>> {
         // 1. Actuator/health routes and configured bypass paths always pass through.
         let path = req.uri().path();
-        if path.starts_with(self.health_prefix.as_str()) {
+        let health_matched = if self.health_prefix.is_empty() || self.health_prefix == "/" {
+            path == "/"
+        } else {
+            path == self.health_prefix
+                || if self.health_prefix.ends_with('/') {
+                    path.starts_with(&self.health_prefix)
+                } else {
+                    let mut prefix_slash = self.health_prefix.clone();
+                    prefix_slash.push('/');
+                    path.starts_with(&prefix_slash)
+                }
+        };
+        if health_matched {
             return None;
         }
         for probe in &self.probe_paths {
@@ -769,6 +781,43 @@ mod tests {
         state.enable(MaintenanceConfig::default());
         assert_eq!(
             response_status(app, "/").await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[tokio::test]
+    async fn maintenance_on_root_health_prefix_passes_only_root() {
+        let state = MaintenanceState::new();
+        state.enable(MaintenanceConfig::default());
+
+        let app = Router::new()
+            .route("/", get(|| async { "root" }))
+            .route("/api/data", get(|| async { "data" }))
+            .layer(MaintenanceLayer::new(state).with_health_prefix("/"));
+
+        assert_eq!(response_status(app.clone(), "/").await, StatusCode::OK);
+        assert_eq!(
+            response_status(app, "/api/data").await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[tokio::test]
+    async fn maintenance_on_custom_health_prefix_segment_aware() {
+        let state = MaintenanceState::new();
+        state.enable(MaintenanceConfig::default());
+
+        let app = Router::new()
+            .route("/actuator/health", get(|| async { "healthy" }))
+            .route("/actuator-dashboard", get(|| async { "dashboard" }))
+            .layer(MaintenanceLayer::new(state).with_health_prefix("/actuator"));
+
+        assert_eq!(
+            response_status(app.clone(), "/actuator/health").await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            response_status(app, "/actuator-dashboard").await,
             StatusCode::SERVICE_UNAVAILABLE
         );
     }
