@@ -1,15 +1,18 @@
 //! Profile-picture (avatar) upload routes.
 //!
-//! Demonstrates the autumn-web `[storage]` feature end-to-end: a
-//! `Blob` column on a `#[model]`, a multipart upload that streams
-//! straight into the configured `BlobStore`, and a presigned URL
-//! rendered in the user profile page. With `storage.backend = "local"`
-//! (the dev default) bytes land under `target/blobs/`; with `s3`
-//! they land in your bucket. The route is identical either way.
+//! Demonstrates the autumn-web `[storage]` and `[variants]` features
+//! end-to-end: a `Blob` column on a `#[model]`, a multipart upload that
+//! streams straight into the configured `BlobStore`, and on-demand
+//! thumbnail generation via `blob.variant(…)`.  With
+//! `storage.backend = "local"` (the dev default) bytes land under
+//! `target/blobs/`; with `s3` they land in your bucket.  The routes
+//! are identical either way.
+
+use std::time::Duration;
 
 use autumn_web::extract::{Multipart, State};
 use autumn_web::prelude::*;
-use autumn_web::storage::{Blob, BlobStoreState};
+use autumn_web::storage::{Blob, BlobStoreState, Transform, VariantBudget};
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 
@@ -35,7 +38,12 @@ const AVATAR_ALLOWED_MIME_TYPES: &[&str] = &["image/png", "image/jpeg", "image/w
 
 #[get("/settings/avatar")]
 #[secured]
-pub async fn avatar_form(session: Session, csrf: CsrfToken, mut db: Db) -> AutumnResult<Markup> {
+pub async fn avatar_form(
+    State(state): State<AppState>,
+    session: Session,
+    csrf: CsrfToken,
+    mut db: Db,
+) -> AutumnResult<Markup> {
     let username = session
         .get("username")
         .await
@@ -47,6 +55,30 @@ pub async fn avatar_form(session: Session, csrf: CsrfToken, mut db: Db) -> Autum
         .await
         .map_err(|_| AutumnError::not_found_msg("user record missing"))?;
 
+    // Lazily generate a 100×100 preview thumbnail for the settings form.
+    // First visit generates it (and caches it content-addressably in the
+    // same BlobStore as the source); subsequent visits are a single head()
+    // cache hit.  EXIF/GPS metadata is stripped for privacy.
+    let preview_url = match (
+        user.avatar.as_ref(),
+        state.extension::<BlobStoreState>(),
+    ) {
+        (Some(blob), Some(blobs)) => {
+            let store = blobs.store();
+            blob.variant(
+                "preview",
+                &[
+                    Transform::resize_to_limit(100, 100),
+                    Transform::strip_metadata(),
+                ],
+            )
+            .url(&**store, &VariantBudget::default(), Duration::from_secs(3600))
+            .await
+            .ok()
+        }
+        _ => None,
+    };
+
     Ok(layout(
         "Profile picture",
         Some(&username),
@@ -54,13 +86,11 @@ pub async fn avatar_form(session: Session, csrf: CsrfToken, mut db: Db) -> Autum
         html! {
             div class="max-w-md mx-auto bg-white rounded-lg shadow p-6" {
                 h1 class="text-2xl font-bold mb-4" { "Profile picture" }
-                @if let Some(blob) = &user.avatar {
-                    p class="text-sm text-gray-500 mb-3" {
-                        "Current: " (blob.byte_size) " bytes"
-                        @if let Some(etag) = &blob.etag {
-                            " · etag " span class="font-mono" { (&etag[..etag.len().min(8)]) }
-                        }
-                    }
+                @if let Some(url) = &preview_url {
+                    img src=(url) alt="current avatar"
+                        class="w-24 h-24 rounded-full object-cover mb-4";
+                } @else if user.avatar.is_some() {
+                    p class="text-sm text-gray-500 mb-3" { "Current avatar (preview unavailable)" }
                 }
                 form action="/settings/avatar" method="post" enctype="multipart/form-data"
                      class="space-y-3" {
@@ -74,8 +104,8 @@ pub async fn avatar_form(session: Session, csrf: CsrfToken, mut db: Db) -> Autum
                     }
                 }
                 p class="text-xs text-gray-400 mt-4" {
-                    "Max " (AVATAR_MAX_BYTES / 1024) " KiB. The bytes flow through the configured \
-                     BlobStore (local in dev, S3 in prod)."
+                    "Max " (AVATAR_MAX_BYTES / 1024) " KiB · JPEG, PNG, or WebP · "
+                    "EXIF metadata is stripped on save."
                 }
             }
         },
