@@ -856,6 +856,10 @@ async fn serve_mcp(
         }
     };
 
+    if let Some(rejection) = reject_unsupported_protocol_version(&headers, &parsed) {
+        return rejection;
+    }
+
     let ctx = ReplayContext {
         headers: &headers,
         identity,
@@ -940,6 +944,36 @@ async fn serve_mcp(
     // browser client needs the grant on the actual response to read the body.
     apply_cors_headers(&server.cors, origin.as_deref(), &mut response);
     response
+}
+
+/// Enforce the Streamable-HTTP `MCP-Protocol-Version` header. Returns a 400
+/// response when a non-`initialize` request carries an unsupported version —
+/// otherwise a future client (e.g. a `2025-11-25` one) could run `tools/call`
+/// under semantics this server never negotiated. A missing header means "assume
+/// the pre-header default" (2025-03-26), which this server supports, so absence
+/// is allowed. The `initialize` handshake is exempt: that is where the version
+/// is negotiated (in the body), so pre-validating its header would make
+/// negotiating a newer client down to a supported version impossible.
+fn reject_unsupported_protocol_version(headers: &HeaderMap, parsed: &Value) -> Option<Response> {
+    let is_initialize = parsed
+        .as_object()
+        .and_then(|o| o.get("method"))
+        .and_then(Value::as_str)
+        == Some("initialize");
+    if is_initialize {
+        return None;
+    }
+    let version = headers.get("mcp-protocol-version")?.to_str().unwrap_or("");
+    if SUPPORTED_PROTOCOL_VERSIONS.contains(&version) {
+        return None;
+    }
+    Some(
+        (
+            StatusCode::BAD_REQUEST,
+            format!("unsupported MCP-Protocol-Version: {version}"),
+        )
+            .into_response(),
+    )
 }
 
 /// Handle a single JSON-RPC message. Returns `None` only for a *valid*

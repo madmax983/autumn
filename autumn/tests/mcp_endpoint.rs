@@ -514,6 +514,76 @@ async fn empty_batch_returns_invalid_request() {
 }
 
 #[tokio::test]
+async fn unsupported_protocol_version_header_is_rejected() {
+    // MCP Streamable-HTTP requires a 400 for an unsupported `MCP-Protocol-Version`
+    // on a non-initialize request, so an incompatible client can't run tools
+    // under semantics the server never negotiated.
+    let client = TestApp::new()
+        .routes(routes![get_todo])
+        .mount_mcp("/mcp")
+        .build();
+
+    let resp = client
+        .post("/mcp")
+        .header("mcp-protocol-version", "2025-11-25")
+        .json(&serde_json::json!({
+            "jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params": {"name":"get_todo","arguments":{"id":"7"}}
+        }))
+        .send()
+        .await;
+    resp.assert_status(400);
+}
+
+#[tokio::test]
+async fn initialize_is_exempt_from_protocol_version_header_check() {
+    // The handshake negotiates the version in-body; pre-validating its header
+    // would make negotiating a newer client down to a supported version
+    // impossible, so an unsupported header on `initialize` must still proceed.
+    let client = TestApp::new()
+        .routes(routes![list_todos])
+        .mount_mcp("/mcp")
+        .build();
+
+    let resp = client
+        .post("/mcp")
+        .header("mcp-protocol-version", "2025-11-25")
+        .json(&serde_json::json!({
+            "jsonrpc":"2.0","id":1,"method":"initialize",
+            "params": {"protocolVersion":"2025-11-25","capabilities":{}}
+        }))
+        .send()
+        .await;
+    resp.assert_ok();
+    let out = resp.json::<serde_json::Value>();
+    // Negotiated down to the server's newest supported version.
+    assert_eq!(out["result"]["protocolVersion"], "2025-06-18");
+}
+
+#[tokio::test]
+async fn supported_protocol_version_header_is_accepted() {
+    // A negotiated, supported version header passes; a missing header is also
+    // allowed (the spec's pre-header default is supported).
+    let client = TestApp::new()
+        .routes(routes![get_todo])
+        .mount_mcp("/mcp")
+        .build();
+
+    let resp = client
+        .post("/mcp")
+        .header("mcp-protocol-version", "2025-06-18")
+        .json(&serde_json::json!({
+            "jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params": {"name":"get_todo","arguments":{"id":"7"}}
+        }))
+        .send()
+        .await;
+    resp.assert_ok();
+    let out = resp.json::<serde_json::Value>();
+    assert_ne!(out["result"]["isError"], true);
+}
+
+#[tokio::test]
 async fn malformed_request_returns_invalid_request() {
     let client = TestApp::new()
         .routes(routes![list_todos])
