@@ -51,17 +51,30 @@ use tower::ServiceExt as _;
 
 use crate::openapi::{ApiDoc, schema_entry_to_value};
 
-/// Protocol version advertised when a client does not request one.
+/// Protocol version advertised when a client requests an unsupported one (or
+/// none). Also the newest version this server implements.
 const DEFAULT_PROTOCOL_VERSION: &str = "2025-06-18";
+
+/// MCP protocol revisions whose semantics this buffered, tools-only server
+/// honors. A client's requested version is echoed only if it appears here;
+/// otherwise the server replies with [`DEFAULT_PROTOCOL_VERSION`] and the
+/// client decides whether it can proceed.
+const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 
 /// Upper bound on a tool's buffered response body (10 MiB). MCP tool results
 /// are structured JSON; this guards the in-process dispatch path against a
 /// handler that would otherwise buffer an unbounded body into memory.
 const MAX_TOOL_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
 
+/// Layer applier for the optional whole-endpoint auth gate (e.g.
+/// `RequireApiToken`). Boxed so any `tower::Layer` can be erased; applied to
+/// the `/mcp` router before it is merged.
+pub(crate) type McpEndpointLayer = Box<
+    dyn FnOnce(axum::Router<crate::state::AppState>) -> axum::Router<crate::state::AppState> + Send,
+>;
+
 /// Runtime MCP configuration carried from the [`AppBuilder`](crate::app::AppBuilder)
 /// through router assembly.
-#[derive(Clone, Debug)]
 pub struct McpRuntime {
     /// Path the Streamable-HTTP endpoint is mounted at (e.g. `/mcp`).
     pub mount_path: String,
@@ -70,6 +83,10 @@ pub struct McpRuntime {
     /// an explicit `#[api_doc(mcp)]` opt-in, and `#[api_doc(mcp = false)]`
     /// exclusions are always honored.
     pub expose_all: bool,
+    /// Optional layer applied to the *entire* `/mcp` endpoint — gating the
+    /// catalog (`initialize`/`tools/list`) as well as tool dispatch. Set via
+    /// [`AppBuilder::secure_mcp`](crate::app::AppBuilder::secure_mcp).
+    pub(crate) endpoint_layer: Option<McpEndpointLayer>,
 }
 
 impl McpRuntime {
@@ -79,6 +96,7 @@ impl McpRuntime {
         Self {
             mount_path: mount_path.into(),
             expose_all: false,
+            endpoint_layer: None,
         }
     }
 }
@@ -123,8 +141,25 @@ pub struct McpServer {
     /// The real application router (state already applied) — the same path an
     /// HTTP request traverses. `tools/call` replays requests through it.
     dispatch: axum::Router,
+    /// Origins permitted to make browser (cross-origin) requests, sourced from
+    /// the app's CORS `allowed_origins`. A request carrying an `Origin` not in
+    /// this list is rejected with 403 (DNS-rebinding protection, per the MCP
+    /// Streamable-HTTP spec). Requests without an `Origin` (non-browser agents)
+    /// are always allowed.
+    allowed_origins: Vec<String>,
     server_name: String,
     server_version: String,
+}
+
+impl McpServer {
+    /// Whether a browser `Origin` header value is permitted. `*` in the
+    /// allowlist permits any origin; an empty allowlist permits none (so any
+    /// present `Origin` is rejected).
+    fn origin_allowed(&self, origin: &str) -> bool {
+        self.allowed_origins
+            .iter()
+            .any(|allowed| allowed == "*" || allowed == origin)
+    }
 }
 
 /// Decide whether a route's `ApiDoc` should be projected as a tool.
@@ -284,6 +319,7 @@ pub fn derive_tools(
         .unwrap_or_default();
 
     let mut tools = Vec::new();
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for doc in docs {
         // Surface the "opted in but ineligible" case as a build-time note.
         if (doc.mcp_tool || (expose_all && is_read_only(doc.method)))
@@ -301,6 +337,20 @@ pub fn derive_tools(
             continue;
         }
         if !should_expose(doc, expose_all) {
+            continue;
+        }
+        // Tool names (operation ids) must be unique: the same handler mounted
+        // under two scoped prefixes, or a reused explicit operation_id, would
+        // otherwise advertise a duplicate that dispatch can't disambiguate.
+        // Keep the first registration deterministically and warn on the rest.
+        if !seen.insert(doc.operation_id) {
+            tracing::warn!(
+                operation_id = doc.operation_id,
+                method = doc.method,
+                path = doc.path,
+                "duplicate MCP tool name; keeping the first registration and \
+                 skipping this duplicate (set a distinct operation_id to expose both)"
+            );
             continue;
         }
         let title = doc.summary.unwrap_or(doc.operation_id);
@@ -335,9 +385,14 @@ pub struct McpToolInfo {
 }
 
 impl McpServer {
-    /// Assemble the server state from derived tools and a dispatch router.
+    /// Assemble the server state from derived tools, a dispatch router, and the
+    /// CORS-derived `Origin` allowlist.
     #[must_use]
-    pub fn new(tools: Vec<McpToolInfo>, dispatch: axum::Router) -> Self {
+    pub fn new(
+        tools: Vec<McpToolInfo>,
+        dispatch: axum::Router,
+        allowed_origins: Vec<String>,
+    ) -> Self {
         let tools: Vec<McpTool> = tools
             .into_iter()
             .map(|t| McpTool {
@@ -361,6 +416,7 @@ impl McpServer {
             tools,
             by_name,
             dispatch,
+            allowed_origins,
             server_name: "autumn-mcp".to_owned(),
             server_version: env!("CARGO_PKG_VERSION").to_owned(),
         }
@@ -370,13 +426,15 @@ impl McpServer {
 /// Build an axum sub-router serving the MCP endpoint at `mount_path`.
 ///
 /// `dispatch` must be the fully-assembled application router (state applied)
-/// so `tools/call` traverses the real handler pipeline.
+/// so `tools/call` traverses the real handler pipeline. `allowed_origins` is
+/// the app's CORS allowlist, used for `Origin` validation.
 pub fn build_mcp_router(
     mount_path: &str,
     tools: Vec<McpToolInfo>,
     dispatch: axum::Router,
+    allowed_origins: Vec<String>,
 ) -> axum::Router<crate::state::AppState> {
-    let server = Arc::new(McpServer::new(tools, dispatch));
+    let server = Arc::new(McpServer::new(tools, dispatch, allowed_origins));
     tracing::debug!(
         path = mount_path,
         tools = server.tools.len(),
@@ -406,6 +464,16 @@ async fn serve_mcp(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    // DNS-rebinding protection (MCP Streamable-HTTP spec MUST): reject a
+    // browser-supplied `Origin` that isn't allowlisted. Non-browser agents send
+    // no `Origin` and are unaffected.
+    if let Some(origin) = headers.get(header::ORIGIN) {
+        let origin = origin.to_str().unwrap_or("");
+        if !server.origin_allowed(origin) {
+            return (StatusCode::FORBIDDEN, "origin not allowed").into_response();
+        }
+    }
+
     let parsed: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
@@ -446,10 +514,24 @@ async fn serve_mcp(
     }
 }
 
-/// Handle a single JSON-RPC message. Returns `None` for notifications.
+/// Handle a single JSON-RPC message. Returns `None` only for a *valid*
+/// notification (a `2.0` message with a `method` and no `id`).
 async fn handle_message(server: &McpServer, headers: &HeaderMap, msg: Value) -> Option<Value> {
-    // Notifications have no `id` member and never get a response.
-    let id = msg.get("id").cloned()?;
+    let id = msg.get("id").cloned();
+
+    // Reject anything that isn't a well-formed JSON-RPC 2.0 request/notification
+    // object (e.g. `5`, `{}`, or a message missing `jsonrpc`/`method`). A bare
+    // notification-shaped-but-invalid item must still produce an error with
+    // `id: null` rather than being silently swallowed.
+    let is_valid = msg.is_object()
+        && msg.get("jsonrpc").and_then(Value::as_str) == Some("2.0")
+        && msg.get("method").and_then(Value::as_str).is_some();
+    if !is_valid {
+        return Some(error(id.unwrap_or(Value::Null), -32600, "Invalid Request"));
+    }
+
+    // A valid notification (method present, no `id`) gets no response.
+    let id = id?;
     let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
     let params = msg.get("params").cloned().unwrap_or(Value::Null);
 
@@ -468,10 +550,12 @@ async fn handle_message(server: &McpServer, headers: &HeaderMap, msg: Value) -> 
 }
 
 fn initialize_result(server: &McpServer, params: &Value) -> Value {
-    let protocol = params
-        .get("protocolVersion")
-        .and_then(Value::as_str)
-        .unwrap_or(DEFAULT_PROTOCOL_VERSION);
+    // Echo the client's requested version only if we actually implement it;
+    // otherwise advertise our newest supported version (MCP negotiation).
+    let protocol = match params.get("protocolVersion").and_then(Value::as_str) {
+        Some(requested) if SUPPORTED_PROTOCOL_VERSIONS.contains(&requested) => requested,
+        _ => DEFAULT_PROTOCOL_VERSION,
+    };
     json!({
         "protocolVersion": protocol,
         "capabilities": { "tools": { "listChanged": false } },
@@ -491,10 +575,13 @@ fn tools_list_result(server: &McpServer) -> Value {
 /// an MCP tool result.
 async fn tools_call(server: &McpServer, headers: &HeaderMap, id: Value, params: &Value) -> Value {
     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
-    let arguments = params
-        .get("arguments")
-        .cloned()
-        .unwrap_or_else(|| json!({}));
+    // `inputSchema` is always an object; reject a non-object `arguments`
+    // (null/string/array) rather than coercing it to `{}` and dispatching.
+    let arguments = match params.get("arguments") {
+        None => json!({}),
+        Some(value) if value.is_object() => value.clone(),
+        Some(_) => return error(id, -32602, "`arguments` must be a JSON object"),
+    };
 
     let Some(&idx) = server.by_name.get(name) else {
         return error(id, -32602, &format!("unknown tool: {name}"));
@@ -558,7 +645,9 @@ fn build_request(
             Value::String(s) => s.clone(),
             other => other.to_string(),
         };
-        let encoded = percent_encode_segment(&value);
+        // Use the same full segment encoder the typed path helpers use, so an
+        // MCP call accepts the same values a direct HTTP caller could pass.
+        let encoded = crate::paths::encode_path_segment(&value);
         path = replace_path_param(&path, param, &encoded);
     }
 
@@ -593,13 +682,18 @@ fn build_request(
 
     // Forward the caller's credentials so the dispatched request authenticates
     // exactly as a direct HTTP call would: `Authorization` for bearer-token
-    // (`RequireApiToken`) auth, and `Cookie` for session-based `#[secured]`
-    // routes (the session layer needs the cookie to load the principal).
+    // (`RequireApiToken`) auth, `Cookie` for session-based `#[secured]` routes
+    // (the session layer needs the cookie to load the principal), and the
+    // CSRF token (default header `X-CSRF-Token`) so CSRF-protected write tools
+    // pass the `CsrfLayer` they would on a direct request.
     if let Some(auth) = headers.get(header::AUTHORIZATION) {
         builder = builder.header(header::AUTHORIZATION, auth);
     }
     if let Some(cookie) = headers.get(header::COOKIE) {
         builder = builder.header(header::COOKIE, cookie);
+    }
+    if let Some(csrf) = headers.get("x-csrf-token") {
+        builder = builder.header("x-csrf-token", csrf);
     }
 
     let body = if tool.has_body {
@@ -654,20 +748,6 @@ fn replace_path_param(path: &str, name: &str, value: &str) -> String {
     }
     out.push_str(rest);
     out
-}
-
-/// Percent-encode a single path segment value.
-fn percent_encode_segment(value: &str) -> String {
-    use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
-    // Encode characters that are unsafe inside a path segment.
-    const SEGMENT: &AsciiSet = &CONTROLS
-        .add(b' ')
-        .add(b'/')
-        .add(b'?')
-        .add(b'#')
-        .add(b'%')
-        .add(b'&');
-    utf8_percent_encode(value, SEGMENT).to_string()
 }
 
 // ── MCP tool-result helpers ───────────────────────────────────────
@@ -874,5 +954,41 @@ mod tests {
             "Bearer tok"
         );
         assert_eq!(req.headers().get(header::COOKIE).unwrap(), "autumn.sid=abc");
+    }
+
+    #[test]
+    fn build_request_forwards_csrf_token() {
+        let t = tool("POST", "/api/todos", true, false);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-csrf-token", "csrf123".parse().unwrap());
+        let req =
+            build_request(&t, &headers, &json!({ "body": { "x": 1 } })).expect("request builds");
+        assert_eq!(req.headers().get("x-csrf-token").unwrap(), "csrf123");
+    }
+
+    fn server(allowed_origins: Vec<String>) -> McpServer {
+        McpServer::new(Vec::new(), axum::Router::new(), allowed_origins)
+    }
+
+    #[test]
+    fn origin_allowlist_enforced() {
+        let s = server(vec!["https://ok.example".to_owned()]);
+        assert!(s.origin_allowed("https://ok.example"));
+        assert!(!s.origin_allowed("https://evil.example"));
+        // Empty allowlist permits no browser origin.
+        assert!(!server(Vec::new()).origin_allowed("https://any.example"));
+        // Wildcard permits any.
+        assert!(server(vec!["*".to_owned()]).origin_allowed("https://any.example"));
+    }
+
+    #[test]
+    fn initialize_negotiates_supported_protocol_version() {
+        let s = server(Vec::new());
+        // A supported version is echoed back.
+        let echoed = initialize_result(&s, &json!({ "protocolVersion": "2024-11-05" }));
+        assert_eq!(echoed["protocolVersion"], "2024-11-05");
+        // An unsupported version falls back to the server's newest.
+        let fallback = initialize_result(&s, &json!({ "protocolVersion": "3999-01-01" }));
+        assert_eq!(fallback["protocolVersion"], DEFAULT_PROTOCOL_VERSION);
     }
 }

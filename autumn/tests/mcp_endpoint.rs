@@ -479,3 +479,97 @@ async fn input_schema_reuses_registered_openapi_component() {
         "string"
     );
 }
+
+#[tokio::test]
+async fn non_object_arguments_are_rejected() {
+    let client = TestApp::new()
+        .routes(routes![get_todo])
+        .mount_mcp("/mcp")
+        .build();
+
+    let out = rpc(
+        &client,
+        serde_json::json!({
+            "jsonrpc":"2.0","id":13,"method":"tools/call",
+            "params": {"name":"get_todo","arguments":"not-an-object"}
+        }),
+    )
+    .await;
+    assert_eq!(out["error"]["code"], -32602);
+}
+
+#[tokio::test]
+async fn missing_jsonrpc_version_is_invalid_request() {
+    let client = TestApp::new()
+        .routes(routes![list_todos])
+        .mount_mcp("/mcp")
+        .build();
+
+    // No `jsonrpc` member → not a valid JSON-RPC 2.0 request.
+    let out = rpc(
+        &client,
+        serde_json::json!({ "id": 1, "method": "tools/list" }),
+    )
+    .await;
+    assert_eq!(out["error"]["code"], -32600);
+}
+
+#[tokio::test]
+async fn malformed_batch_item_returns_error_not_silent_accept() {
+    let client = TestApp::new()
+        .routes(routes![list_todos])
+        .mount_mcp("/mcp")
+        .build();
+
+    // `[5]` is not a valid notification; it must produce an error response.
+    let out = rpc(&client, serde_json::json!([5])).await;
+    assert_eq!(out[0]["error"]["code"], -32600);
+}
+
+#[tokio::test]
+async fn disallowed_origin_is_forbidden() {
+    let client = TestApp::new()
+        .routes(routes![list_todos])
+        .mount_mcp("/mcp")
+        .build();
+
+    // Test config has no CORS allowed_origins, so any browser Origin is rejected
+    // (DNS-rebinding protection). Non-browser agents (no Origin) are unaffected.
+    let resp = client
+        .post("/mcp")
+        .header("origin", "https://evil.example")
+        .json(&serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))
+        .send()
+        .await;
+    resp.assert_status(403);
+}
+
+#[tokio::test]
+async fn secure_mcp_gates_the_whole_endpoint() {
+    let store = Arc::new(InMemoryApiTokenStore::default());
+    let token = issue_api_token(store.as_ref(), "agent:bot").await.unwrap();
+
+    let client = TestApp::new()
+        .routes(routes![list_todos])
+        .mount_mcp("/mcp")
+        .secure_mcp(RequireApiToken::new(store.clone()))
+        .build();
+
+    // Even the catalog requires the token now.
+    client
+        .post("/mcp")
+        .json(&serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))
+        .send()
+        .await
+        .assert_status(401);
+
+    let ok = client
+        .post("/mcp")
+        .header("authorization", &format!("Bearer {token}"))
+        .json(&serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}))
+        .send()
+        .await;
+    ok.assert_ok();
+    let out = ok.json::<serde_json::Value>();
+    assert!(out["result"]["tools"].is_array());
+}

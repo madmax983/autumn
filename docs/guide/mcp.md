@@ -188,7 +188,9 @@ an agent call and an ordinary HTTP call. There is no separate auth subsystem.
 Agents authenticate exactly like any other API client: with a bearer token
 verified by [`RequireApiToken`](../../autumn/src/auth.rs). The `Authorization`
 header an agent sends to `/mcp` is **forwarded** into the dispatched request,
-so the call runs as that verified principal.
+so the call runs as that verified principal. The `Cookie` and `X-CSRF-Token`
+headers are forwarded too, so session-based `#[secured]` routes and
+CSRF-protected writes behave identically to a direct call.
 
 To put a tool behind token auth, register the route inside a `scoped` group
 carrying the `RequireApiToken` layer. The scope keeps the route in the
@@ -214,7 +216,38 @@ autumn_web::app()
 
 A `tools/call` with no token is rejected by `RequireApiToken` and surfaces as
 `isError: true`; the same call with a valid `Authorization: Bearer <token>`
-header on the `/mcp` request succeeds.
+header on the `/mcp` request succeeds. This protects the **tools** — but
+`initialize`/`tools/list` (the catalog) are still reachable, since the
+per-route layer only wraps the dispatched call, not the `/mcp` envelope.
+
+### Gating the whole endpoint
+
+To require a credential for the *entire* endpoint — catalog included — wrap it
+with `secure_mcp`, passing any tower layer (e.g. `RequireApiToken`):
+
+```rust
+autumn_web::app()
+    .routes(routes![list_todos, create_todo])
+    .mount_mcp("/mcp")
+    .secure_mcp(RequireApiToken::new(store.clone())) // gates initialize/tools/list too
+    .run()
+    .await;
+```
+
+### Origin validation (DNS-rebinding protection)
+
+The MCP Streamable-HTTP transport **requires** servers to validate the
+`Origin` header so a malicious web page can't use a browser to reach a local
+MCP server via DNS rebinding. Autumn enforces this automatically against your
+CORS `allowed_origins`:
+
+- A request with **no `Origin`** header (curl, SDKs, server-side agents) is
+  allowed — non-browser callers aren't subject to DNS rebinding.
+- A request whose `Origin` **isn't** in `cors.allowed_origins` (or `*`) gets
+  **403 Forbidden** before any parsing or dispatch.
+
+So to allow a browser-based MCP client from `https://app.example.com`, add that
+origin to your CORS config; agent clients need no configuration.
 
 ---
 

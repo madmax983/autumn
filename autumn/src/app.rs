@@ -631,6 +631,45 @@ impl AppBuilder {
         self
     }
 
+    /// Gate the **entire** MCP endpoint — the catalog (`initialize`/
+    /// `tools/list`) as well as tool dispatch — behind a tower `layer`.
+    ///
+    /// The `/mcp` envelope is otherwise reachable without the app's global
+    /// middleware. Pass an auth layer (e.g.
+    /// [`RequireApiToken`](crate::auth::RequireApiToken)) here to require a
+    /// credential for the whole endpoint, the way you'd protect a normal
+    /// route group. Combine with [`mount_mcp`](Self::mount_mcp); the MCP
+    /// transport's spec-required `Origin` validation (sourced from your CORS
+    /// `allowed_origins`) always applies regardless of this layer.
+    ///
+    /// Requires the `mcp` Cargo feature.
+    #[cfg(feature = "mcp")]
+    #[must_use]
+    pub fn secure_mcp<L>(mut self, layer: L) -> Self
+    where
+        L: tower::Layer<axum::routing::Route> + Clone + Send + Sync + 'static,
+        L::Service: tower::Service<
+                axum::http::Request<axum::body::Body>,
+                Response = axum::http::Response<axum::body::Body>,
+                Error = std::convert::Infallible,
+            > + Clone
+            + Send
+            + Sync
+            + 'static,
+        <L::Service as tower::Service<axum::http::Request<axum::body::Body>>>::Future:
+            Send + 'static,
+    {
+        let applier: crate::mcp::McpEndpointLayer = Box::new(move |router| router.layer(layer));
+        if let Some(rt) = self.mcp.as_mut() {
+            rt.endpoint_layer = Some(applier);
+        } else {
+            let mut rt = crate::mcp::McpRuntime::new("/mcp");
+            rt.endpoint_layer = Some(applier);
+            self.mcp = Some(rt);
+        }
+        self
+    }
+
     /// Register a global exception filter.
     ///
     /// Exception filters intercept error responses produced by

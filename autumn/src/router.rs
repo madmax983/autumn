@@ -276,6 +276,15 @@ pub fn try_build_router_inner(
     Ok(router.with_state(state))
 }
 
+/// Prepared MCP exposure carried through `build_router_pre_state`: the mount
+/// path, the derived tool catalog, and the optional whole-endpoint auth layer.
+#[cfg(feature = "mcp")]
+type McpPrepared = (
+    String,
+    Vec<crate::mcp::McpToolInfo>,
+    Option<crate::mcp::McpEndpointLayer>,
+);
+
 /// Like [`try_build_router_inner`] but returns `Router<AppState>` before
 /// [`with_state`](axum::Router::with_state) is called.  Used by
 /// [`try_build_router_with_static_inner`] so that user layers and the static
@@ -285,7 +294,7 @@ fn build_router_pre_state(
     route_list: Vec<Route>,
     config: &AutumnConfig,
     state: &AppState,
-    ctx: RouterContext,
+    #[cfg_attr(not(feature = "mcp"), allow(unused_mut))] mut ctx: RouterContext,
     // When custom_layers are extracted from ctx before this call (SSG path),
     // the caller pre-computes the flag so the idempotency selector still sees
     // the real layer list even though ctx.custom_layers is empty.
@@ -344,30 +353,27 @@ fn build_router_pre_state(
         versions.as_ref().map_or(&[], |v| v.0.as_slice()),
     )?;
 
-    // Validate the MCP mount path up front so a typo like `"mcp"` (missing the
-    // leading slash) surfaces as a recoverable error instead of an axum panic
-    // at `Router::route` time — mirroring the OpenAPI path validation above.
+    // Prepare MCP exposure *before* `route_list` is moved into axum below.
+    // Validate the mount path up front (a typo like `"mcp"` surfaces as a
+    // recoverable error, mirroring the OpenAPI path validation, instead of an
+    // axum panic), derive the tool catalog, and carry the optional endpoint
+    // auth layer to be applied once the router is assembled.
     #[cfg(feature = "mcp")]
-    if let Some(rt) = ctx.mcp.as_ref() {
+    let mcp_prepared: Option<McpPrepared> = if let Some(rt) = ctx.mcp.take() {
         let path = rt.mount_path.as_str();
         if path.is_empty() || !path.starts_with('/') || path.contains("//") {
             return Err(RouterBuildError::InvalidMcpPath {
-                value: rt.mount_path.clone(),
+                value: rt.mount_path,
             });
         }
-    }
-
-    // Derive MCP tools from the route registry *before* `route_list` is moved
-    // into axum below. The dispatch router is captured later, once the full
-    // pipeline (routes + middleware) is assembled.
-    #[cfg(feature = "mcp")]
-    let mcp_assembly: Option<(String, Vec<crate::mcp::McpToolInfo>)> = ctx.mcp.as_ref().map(|rt| {
         let docs = collect_openapi_docs(&route_list, &ctx.scoped_groups);
         // Pass the app's OpenAPI config (if any) so MCP tool `inputSchema`s
         // reuse the same registered component schemas as the served spec.
         let tools = crate::mcp::derive_tools(&docs, rt.expose_all, ctx.openapi.as_ref());
-        (rt.mount_path.clone(), tools)
-    });
+        Some((rt.mount_path, tools, rt.endpoint_layer))
+    } else {
+        None
+    };
 
     let idempotency_layers = build_idempotency_layers(config, state)?;
     let opaque_app_layers_present = opaque_app_layers_override
@@ -476,9 +482,20 @@ fn build_router_pre_state(
     // taken *before* the MCP route is added, so `tools/call` never recurses
     // into the MCP endpoint itself.
     #[cfg(feature = "mcp")]
-    let router = if let Some((mount_path, tools)) = mcp_assembly {
+    let router = if let Some((mount_path, tools, endpoint_layer)) = mcp_prepared {
         let dispatch = router.clone().with_state(state.clone());
-        let mcp_router = crate::mcp::build_mcp_router(&mount_path, tools, dispatch);
+        let mut mcp_router = crate::mcp::build_mcp_router(
+            &mount_path,
+            tools,
+            dispatch,
+            // Source the Origin allowlist from the app's CORS config.
+            config.cors.allowed_origins.clone(),
+        );
+        // Optional whole-endpoint auth gate (AppBuilder::secure_mcp), applied
+        // before merge so it guards the catalog as well as tool dispatch.
+        if let Some(layer_fn) = endpoint_layer {
+            mcp_router = layer_fn(mcp_router);
+        }
         router.merge(mcp_router)
     } else {
         router
