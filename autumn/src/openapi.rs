@@ -76,6 +76,7 @@ use serde::{Deserialize, Serialize};
 /// [`post`](crate::post), etc.) from the handler's path, signature, and
 /// any [`#[api_doc(...)]`](crate::api_doc) overrides.
 #[derive(Clone, Debug, Default)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct ApiDoc {
     /// HTTP method as an uppercase string (e.g. `"GET"`).
     pub method: &'static str,
@@ -116,6 +117,8 @@ pub struct ApiDoc {
     pub api_version: Option<&'static str>,
     /// Whether this route opts out of sunset 410 responses.
     pub sunset_opt_out: bool,
+    /// Whether this route uses dynamic policy authorization.
+    pub has_policy: bool,
 }
 
 /// Reference to a schema definition, produced by the route macros.

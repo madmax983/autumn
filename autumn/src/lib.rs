@@ -244,6 +244,8 @@ pub mod __private {
     #[cfg(feature = "db")]
     pub use crate::version_history::VersionedRepositoryDescriptor;
 
+    pub use crate::router::check_sunset;
+
     // Shared factory creation depth — bounds cyclic `#[factory_assoc]` chains
     // across all models in a single create() chain.
     //
@@ -254,6 +256,8 @@ pub mod __private {
         pub static FACTORY_DEPTH: u32;
     }
 }
+
+pub use crate::router::RouteVersionMetadata;
 
 /// Create a new [`app::AppBuilder`] for configuring and launching an Autumn server.
 ///

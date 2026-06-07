@@ -661,8 +661,6 @@ fn extract_bearer_token<B>(req: &Request<B>) -> Option<String> {
 }
 
 impl Limiter {
-    /// Extract the originating client IP from a request, honoring the
-    /// centralized trusted-proxy policy.
     fn client_ip<B>(&self, req: &Request<B>) -> Option<String> {
         self.resolver
             .resolve_client_addr(req)
