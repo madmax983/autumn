@@ -93,9 +93,7 @@ async fn dev_bypass_passes_without_token() {
 
 #[tokio::test]
 async fn disabled_bot_protection_is_passthrough() {
-    let client = TestApp::new()
-        .routes(routes![submit])
-        .build(); // default config has bot_protection.enabled = false
+    let client = TestApp::new().routes(routes![submit]).build(); // default config has bot_protection.enabled = false
 
     client
         .post("/submit")
@@ -122,15 +120,12 @@ async fn get_request_exempt_from_bot_protection() {
 
 #[tokio::test]
 async fn valid_token_with_bypass_provider_passes() {
-    use std::sync::Arc;
     use autumn_web::security::captcha::AlwaysPassProvider;
+    use std::sync::Arc;
 
     let layer = BotProtectionLayer::new(Arc::new(AlwaysPassProvider));
 
-    let client = TestApp::new()
-        .routes(routes![submit])
-        .layer(layer)
-        .build();
+    let client = TestApp::new().routes(routes![submit]).layer(layer).build();
 
     client
         .post("/submit")
@@ -145,15 +140,12 @@ async fn valid_token_with_bypass_provider_passes() {
 
 #[tokio::test]
 async fn invalid_token_yields_400() {
-    use std::sync::Arc;
     use autumn_web::security::captcha::TestCaptchaProvider;
+    use std::sync::Arc;
 
     let layer = BotProtectionLayer::new(Arc::new(TestCaptchaProvider::new("correct-token")));
 
-    let client = TestApp::new()
-        .routes(routes![submit])
-        .layer(layer)
-        .build();
+    let client = TestApp::new().routes(routes![submit]).layer(layer).build();
 
     // Send wrong token
     client
@@ -169,15 +161,12 @@ async fn invalid_token_yields_400() {
 
 #[tokio::test]
 async fn correct_token_passes() {
-    use std::sync::Arc;
     use autumn_web::security::captcha::TestCaptchaProvider;
+    use std::sync::Arc;
 
     let layer = BotProtectionLayer::new(Arc::new(TestCaptchaProvider::new("correct-token")));
 
-    let client = TestApp::new()
-        .routes(routes![submit])
-        .layer(layer)
-        .build();
+    let client = TestApp::new().routes(routes![submit]).layer(layer).build();
 
     client
         .post("/submit")
@@ -193,7 +182,9 @@ async fn correct_token_passes() {
 #[cfg(feature = "maud")]
 #[test]
 fn bot_protection_widget_turnstile_emits_markup() {
-    use autumn_web::security::captcha::{BotProtectionConfig, CaptchaProviderKind, bot_protection_widget};
+    use autumn_web::security::captcha::{
+        BotProtectionConfig, CaptchaProviderKind, bot_protection_widget,
+    };
 
     let config = BotProtectionConfig {
         enabled: true,
@@ -206,15 +197,23 @@ fn bot_protection_widget_turnstile_emits_markup() {
 
     let markup = bot_protection_widget(&config);
     let html = markup.into_string();
-    assert!(html.contains("cf-turnstile"), "Should contain Turnstile widget class");
+    assert!(
+        html.contains("cf-turnstile"),
+        "Should contain Turnstile widget class"
+    );
     assert!(html.contains("test-site-key"), "Should contain site key");
-    assert!(html.contains("challenges.cloudflare.com"), "Should contain Turnstile script src");
+    assert!(
+        html.contains("challenges.cloudflare.com"),
+        "Should contain Turnstile script src"
+    );
 }
 
 #[cfg(feature = "maud")]
 #[test]
 fn bot_protection_widget_hcaptcha_emits_markup() {
-    use autumn_web::security::captcha::{BotProtectionConfig, CaptchaProviderKind, bot_protection_widget};
+    use autumn_web::security::captcha::{
+        BotProtectionConfig, CaptchaProviderKind, bot_protection_widget,
+    };
 
     let config = BotProtectionConfig {
         enabled: true,
@@ -227,9 +226,18 @@ fn bot_protection_widget_hcaptcha_emits_markup() {
 
     let markup = bot_protection_widget(&config);
     let html = markup.into_string();
-    assert!(html.contains("h-captcha"), "Should contain hCaptcha widget class");
-    assert!(html.contains("hcaptcha-site-key"), "Should contain site key");
-    assert!(html.contains("js.hcaptcha.com"), "Should contain hCaptcha script src");
+    assert!(
+        html.contains("h-captcha"),
+        "Should contain hCaptcha widget class"
+    );
+    assert!(
+        html.contains("hcaptcha-site-key"),
+        "Should contain site key"
+    );
+    assert!(
+        html.contains("js.hcaptcha.com"),
+        "Should contain hCaptcha script src"
+    );
 }
 
 // ── Config deserialization ─────────────────────────────────────────────────
@@ -247,7 +255,10 @@ dev_bypass = false
     let config: AutumnConfig = toml::from_str(toml).expect("should parse");
     assert!(config.bot_protection.enabled);
     assert_eq!(config.bot_protection.site_key.as_deref(), Some("site-abc"));
-    assert_eq!(config.bot_protection.secret_key.as_deref(), Some("secret-xyz"));
+    assert_eq!(
+        config.bot_protection.secret_key.as_deref(),
+        Some("secret-xyz")
+    );
     assert!(!config.bot_protection.dev_bypass);
 }
 

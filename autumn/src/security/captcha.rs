@@ -198,10 +198,7 @@ impl TurnstileProvider {
 impl CaptchaProvider for TurnstileProvider {
     fn verify<'a>(&'a self, token: &'a str) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
         Box::pin(async move {
-            let params = [
-                ("secret", self.secret_key.as_str()),
-                ("response", token),
-            ];
+            let params = [("secret", self.secret_key.as_str()), ("response", token)];
             match self
                 .client
                 .post("https://challenges.cloudflare.com/turnstile/v0/siteverify")
@@ -258,10 +255,7 @@ impl HCaptchaProvider {
 impl CaptchaProvider for HCaptchaProvider {
     fn verify<'a>(&'a self, token: &'a str) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
         Box::pin(async move {
-            let params = [
-                ("secret", self.secret_key.as_str()),
-                ("response", token),
-            ];
+            let params = [("secret", self.secret_key.as_str()), ("response", token)];
             match self
                 .client
                 .post("https://hcaptcha.com/siteverify")
@@ -422,6 +416,12 @@ impl BotProtectionLayer {
             Arc::new(AlwaysPassProvider)
         } else {
             let secret = config.secret_key.clone().unwrap_or_default();
+            if secret.is_empty() {
+                tracing::warn!(
+                    "bot_protection: enabled is true and dev_bypass is false, but secret_key is \
+                     missing or empty — all CAPTCHA verifications will fail!"
+                );
+            }
             match config.provider {
                 #[cfg(feature = "http-client")]
                 CaptchaProviderKind::Turnstile => Arc::new(TurnstileProvider::new(secret)),
@@ -536,10 +536,7 @@ fn bot_protection_problem_response<ResBody: From<String> + Default>(
 
     Response::builder()
         .status(StatusCode::BAD_REQUEST)
-        .header(
-            axum::http::header::CONTENT_TYPE,
-            "application/problem+json",
-        )
+        .header(axum::http::header::CONTENT_TYPE, "application/problem+json")
         .body(ResBody::from(body))
         .unwrap_or_default()
 }
@@ -569,6 +566,19 @@ where
 
         // Dev bypass: skip verification entirely.
         if self.settings.dev_bypass {
+            let mut inner = self.inner.clone();
+            std::mem::swap(&mut self.inner, &mut inner);
+            return Box::pin(async move { inner.call(req).await });
+        }
+
+        // Only enforce CAPTCHA on application/x-www-form-urlencoded requests.
+        // JSON APIs, multipart uploads, and external webhooks pass through unchallenged.
+        let content_type = req
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        if !content_type.starts_with("application/x-www-form-urlencoded") {
             let mut inner = self.inner.clone();
             std::mem::swap(&mut self.inner, &mut inner);
             return Box::pin(async move { inner.call(req).await });
@@ -792,10 +802,7 @@ mod tests {
     async fn get_request_passes_without_token() {
         let layer = BotProtectionLayer::new(Arc::new(TestCaptchaProvider::new("required")));
         let app = Router::new()
-            .route(
-                "/page",
-                axum::routing::get(ok_handler),
-            )
+            .route("/page", axum::routing::get(ok_handler))
             .layer(layer);
 
         let resp = app
@@ -853,6 +860,46 @@ mod tests {
         let html = bot_protection_widget(&config).into_string();
         assert!(html.contains("type=\"hidden\""));
         assert!(html.contains("dev-bypass"));
+    }
+
+    #[tokio::test]
+    async fn json_post_passes_without_captcha_token() {
+        let layer = BotProtectionLayer::new(Arc::new(TestCaptchaProvider::new("required")));
+        let app = router_with_layer(layer);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/submit")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(r#"{"key":"value"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn multipart_post_passes_without_captcha_token() {
+        let layer = BotProtectionLayer::new(Arc::new(TestCaptchaProvider::new("required")));
+        let app = router_with_layer(layer);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/submit")
+                    .header("Content-Type", "multipart/form-data; boundary=----boundary")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[test]
