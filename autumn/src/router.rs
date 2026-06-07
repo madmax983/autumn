@@ -517,6 +517,19 @@ fn build_router_pre_state(
     // routes, layers, and middleware an HTTP request would. The clone is
     // taken *before* the MCP route is added, so `tools/call` never recurses
     // into the MCP endpoint itself.
+    //
+    // KNOWN LIMITATION (static/ISR mode): when an app has a `dist` manifest,
+    // `try_build_router_with_static_inner` drains the global custom layers
+    // (`AppBuilder::layer`) and applies them *outside* the static-first
+    // middleware — i.e. after this builder returns. This dispatch clone is
+    // built here, before that, so a `tools/call` replay does not pass through
+    // those outer custom layers (it would in the non-static path, where they
+    // are applied via `apply_middleware` before the clone is taken). Route-level
+    // guards and `#[secured]` dispatch through this clone and so still apply;
+    // only hand-rolled global `.layer(...)` middleware is skipped for MCP calls
+    // in static mode. Restoring full parity would require making custom-layer
+    // appliers re-usable (they are `FnOnce` today), so this is left documented
+    // rather than fixed for that narrow combination.
     #[cfg(feature = "mcp")]
     let router = if let Some((mount_path, tools, endpoint_layer)) = mcp_prepared {
         let dispatch = router.clone().with_state(state.clone());

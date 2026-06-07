@@ -592,6 +592,14 @@ impl AppBuilder {
     /// opted in — the tool would carry no body input and replay an empty
     /// request. Use JSON request bodies for endpoints exposed as MCP tools.
     ///
+    /// `tools/call` replays through the same pipeline as a direct HTTP request,
+    /// so `#[secured]`, route guards, rate limits, and validation apply
+    /// identically. One caveat applies only in **static/ISR mode** (an app with
+    /// a `dist` manifest): a global [`layer`](Self::layer) is applied outside
+    /// the static-first middleware and is therefore *not* traversed by MCP
+    /// `tools/call` replays. Prefer `#[secured]` or route-level guards (which do
+    /// apply) for MCP-exposed handlers in that mode.
+    ///
     /// Requires the `mcp` Cargo feature.
     ///
     /// ```rust,ignore
