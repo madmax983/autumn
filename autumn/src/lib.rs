@@ -198,6 +198,7 @@ pub mod time;
 pub mod experiments;
 pub mod feature_flags;
 pub mod form;
+pub mod gdpr;
 pub mod job;
 pub mod runtime_config;
 #[cfg(feature = "seed")]

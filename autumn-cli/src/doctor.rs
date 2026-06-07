@@ -2156,6 +2156,54 @@ pub fn check_system_test_browser() -> CheckResult {
     }
 }
 
+/// Warn when the auth starter is present but one or more `#[repository]`-annotated
+/// tables have not been registered in the GDPR export/erasure registry.
+///
+/// This check implements GDPR issue #820 AC #8:
+/// > `autumn doctor` warns when repositories exist whose models are not registered
+/// > for export/erasure once the auth starter is present.
+///
+/// `has_auth_starter` should be `true` when the project's `src/routes/auth.rs` exists
+/// (indicating `autumn generate auth` was run).
+/// `unregistered_tables` is the list of `#[repository]`-annotated table names that
+/// have not been registered via `GdprRegistry`.
+pub fn check_gdpr_export_registration_impl(
+    has_auth_starter: bool,
+    unregistered_tables: &[&str],
+) -> CheckResult {
+    if !has_auth_starter {
+        return CheckResult {
+            name: "gdpr_export_registration",
+            status: CheckStatus::Pass,
+            detail: Some("auth starter not present; GDPR registration not required".into()),
+            hint: None,
+        };
+    }
+
+    if unregistered_tables.is_empty() {
+        return CheckResult {
+            name: "gdpr_export_registration",
+            status: CheckStatus::Pass,
+            detail: Some("all repositories are registered for GDPR export/erasure".into()),
+            hint: None,
+        };
+    }
+
+    let tables = unregistered_tables.join(", ");
+    CheckResult {
+        name: "gdpr_export_registration",
+        status: CheckStatus::Warn,
+        detail: Some(format!(
+            "{} repository model(s) not registered for GDPR export/erasure: {tables}",
+            unregistered_tables.len()
+        )),
+        hint: Some(
+            "Register each model via GdprRegistry in your application state. \
+             See docs/guide/gdpr-compliance.md for the export/erasure API.",
+        ),
+    }
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -3297,5 +3345,87 @@ redirect_uri = "http://localhost/callback"
     fn features_has_key_commented_header() {
         let toml = "[features] # project features\nsystem-tests = []\n";
         assert!(cargo_toml_features_has_key(toml, "system-tests"));
+    }
+
+    // ── check_gdpr_export_registration ───────────────────────────────────────
+
+    #[test]
+    fn gdpr_check_passes_when_no_auth_starter() {
+        let r = check_gdpr_export_registration_impl(false, &[]);
+        assert_eq!(
+            r.status,
+            CheckStatus::Pass,
+            "no auth starter → should always pass: {r:?}"
+        );
+    }
+
+    #[test]
+    fn gdpr_check_passes_when_no_auth_starter_even_with_unregistered_tables() {
+        let r = check_gdpr_export_registration_impl(false, &["posts", "comments"]);
+        assert_eq!(
+            r.status,
+            CheckStatus::Pass,
+            "no auth starter → must not warn about unregistered tables: {r:?}"
+        );
+    }
+
+    #[test]
+    fn gdpr_check_passes_when_all_tables_registered() {
+        let r = check_gdpr_export_registration_impl(true, &[]);
+        assert_eq!(
+            r.status,
+            CheckStatus::Pass,
+            "auth starter present + all tables registered → should pass: {r:?}"
+        );
+    }
+
+    #[test]
+    fn gdpr_check_warns_when_unregistered_tables_present() {
+        let r = check_gdpr_export_registration_impl(true, &["posts", "comments"]);
+        assert_eq!(
+            r.status,
+            CheckStatus::Warn,
+            "unregistered tables with auth starter must warn: {r:?}"
+        );
+    }
+
+    #[test]
+    fn gdpr_check_name_is_stable() {
+        let r = check_gdpr_export_registration_impl(false, &[]);
+        assert_eq!(r.name, "gdpr_export_registration");
+    }
+
+    #[test]
+    fn gdpr_check_detail_lists_unregistered_table_names() {
+        let r = check_gdpr_export_registration_impl(true, &["posts", "comments"]);
+        let detail = r.detail.as_deref().unwrap_or("");
+        assert!(
+            detail.contains("posts"),
+            "detail must mention unregistered table 'posts': {detail}"
+        );
+        assert!(
+            detail.contains("comments"),
+            "detail must mention unregistered table 'comments': {detail}"
+        );
+    }
+
+    #[test]
+    fn gdpr_check_hint_references_registry_api() {
+        let r = check_gdpr_export_registration_impl(true, &["orders"]);
+        let hint = r.hint.unwrap_or("");
+        assert!(
+            hint.contains("GdprRegistry") || hint.contains("gdpr"),
+            "hint must reference the GdprRegistry API: {hint}"
+        );
+    }
+
+    #[test]
+    fn gdpr_check_detail_mentions_count_of_unregistered_tables() {
+        let r = check_gdpr_export_registration_impl(true, &["t1", "t2", "t3"]);
+        let detail = r.detail.as_deref().unwrap_or("");
+        assert!(
+            detail.contains('3') || detail.contains("3 "),
+            "detail must mention the count of unregistered tables: {detail}"
+        );
     }
 }

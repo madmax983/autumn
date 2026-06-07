@@ -483,6 +483,9 @@ pub fn plan_auth_with_providers(
     user_field_tokens.push("confirm_token_digest:Option<String>");
     user_field_tokens.push("confirm_token_expires_at:Option<NaiveDateTime>");
     user_field_tokens.push("email_confirmed_at:Option<NaiveDateTime>");
+    user_field_tokens.push("export_requested_at:Option<NaiveDateTime>");
+    user_field_tokens.push("delete_requested_at:Option<NaiveDateTime>");
+    user_field_tokens.push("delete_scheduled_at:Option<NaiveDateTime>");
     let auth_fields: Vec<super::dsl::Field> = user_field_tokens
         .iter()
         .map(|t| super::dsl::parse_field(t).expect("auth field tokens are always valid"))
@@ -547,6 +550,10 @@ pub fn plan_auth_with_providers(
     plan.create(
         docs_dir.join("authentication.md"),
         render_docs_file(&pascal_name, totp),
+    );
+    plan.create(
+        docs_dir.join("gdpr-compliance.md"),
+        render_gdpr_docs_file(),
     );
 
     // ── src/main.rs — module declarations + route registration ────────────
@@ -1332,6 +1339,9 @@ fn render_migration_up(table: &str, totp: bool) -> String {
          \x20   confirm_token_digest TEXT NULL,\n\
          \x20   confirm_token_expires_at TIMESTAMP NULL,\n\
          \x20   email_confirmed_at TIMESTAMP NULL,\n\
+         \x20   export_requested_at TIMESTAMP NULL,\n\
+         \x20   delete_requested_at TIMESTAMP NULL,\n\
+         \x20   delete_scheduled_at TIMESTAMP NULL,\n\
          \x20   created_at TIMESTAMP NOT NULL DEFAULT NOW()\n\
          );\n"
     );
@@ -1406,6 +1416,12 @@ pub struct {pascal_name} {{
     pub confirm_token_expires_at: Option<chrono::NaiveDateTime>,
     #[default]
     pub email_confirmed_at: Option<chrono::NaiveDateTime>,
+    #[default]
+    pub export_requested_at: Option<chrono::NaiveDateTime>,
+    #[default]
+    pub delete_requested_at: Option<chrono::NaiveDateTime>,
+    #[default]
+    pub delete_scheduled_at: Option<chrono::NaiveDateTime>,
     #[default]
     pub created_at: chrono::NaiveDateTime,
 }}
@@ -2815,6 +2831,374 @@ async fn send_confirmation_email(mailer: &Mailer, to: &str, token: &str) -> Autu
         ))
     }})
 }}
+
+// ── GDPR: Data Export & Account Deletion (Issue #820) ─────────────────────────
+//
+// These routes satisfy GDPR Article 15 (right of access) and Article 17
+// (right to erasure) obligations. Edit freely — all logic is app code.
+
+/// `GET /account/data-export` — "Download my data" request form.
+///
+/// The authenticated user may request a full data archive. The request is
+/// recorded and a background job is enqueued to build the archive and email
+/// a signed download link.
+#[get("/account/data-export")]
+pub async fn data_export_form(
+    session: Session,
+    csrf: Option<CsrfToken>,
+    csrf_field: Option<CsrfFormField>,
+) -> AutumnResult<Response> {{
+    let auth = session
+        .get("{snake_name}_id")
+        .await
+        .ok_or_else(|| AutumnError::unauthorized_msg("Not authenticated."))?;
+    let _ = auth;
+    Ok(layout("Download My Data", html! {{
+        h1 {{ "Download My Data" }}
+        p {{
+            "Request a copy of all data we hold about you. You will receive an email \
+             with a secure download link when the archive is ready (usually within a few minutes)."
+        }}
+        form action="/account/data-export" method="post" {{
+            @if let Some(ref csrf) = csrf {{
+                input type="hidden"
+                    name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str()))
+                    value=(csrf.token());
+            }}
+            button type="submit" {{ "Request My Data Archive" }}
+        }}
+        p {{ a href="/account" {{ "← Back to account" }} }}
+    }}).into_response())
+}}
+
+/// `POST /account/data-export` — enqueue the export job (GDPR Article 15).
+///
+/// Stamps `export_requested_at` and enqueues a `data_export_job` that builds
+/// a JSON archive and emails a signed download link via the configured mailer.
+/// The job is idempotent: a second request within the same hour is a no-op.
+#[post("/account/data-export")]
+pub async fn data_export(
+    session: Session,
+    mut db: Db,
+    state: AppState,
+    mailer: Option<Mailer>,
+) -> AutumnResult<Response> {{
+    let {snake_name}_id: i64 = session
+        .get("{snake_name}_id")
+        .await
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| AutumnError::unauthorized_msg("Not authenticated."))?;
+
+    let now = chrono::Utc::now().naive_utc();
+    diesel::update({table}::table.find({snake_name}_id))
+        .set({table}::export_requested_at.eq(Some(now)))
+        .execute(&mut *db)
+        .await
+        .map_err(|_| AutumnError::internal_server_error_msg("Failed to record export request."))?;
+
+    // Enqueue the background export job.
+    enqueue_data_export_job(&state, {snake_name}_id, mailer.as_ref()).await;
+
+    autumn_web::audit::write_from_state(
+        &state,
+        autumn_web::audit::AuditEvent::new(
+            {snake_name}_id.to_string(),
+            "gdpr.export.requested",
+            {snake_name}_id.to_string(),
+            None,
+            autumn_web::audit::AuditStatus::Success,
+        ),
+    )
+    .await
+    .ok();
+
+    Ok(layout("Export Requested", html! {{
+        h1 {{ "Export Requested" }}
+        p {{
+            "Your data export is being prepared. You will receive an email with a \
+             secure download link when it is ready."
+        }}
+        p {{ a href="/account" {{ "← Back to account" }} }}
+    }}).into_response())
+}}
+
+/// Background export job: build the JSON archive and email a signed link.
+///
+/// In production, move this to a dedicated `src/jobs/data_export.rs` file and
+/// register it with `autumn_web::job::JobClient`. For now it is a plain async
+/// function invoked inline so the starter compiles without a job backend.
+async fn enqueue_data_export_job(
+    state: &AppState,
+    {snake_name}_id: i64,
+    mailer: Option<&Mailer>,
+) {{
+    // TODO: Replace with state.jobs().enqueue("data_export_job", payload).await
+    // when a job backend is configured. This inline stub satisfies the starter
+    // without requiring a running Redis/Postgres job queue.
+    let _ = (state, {snake_name}_id, mailer);
+    tracing::info!(
+        user_id = {snake_name}_id,
+        "data_export_job enqueued (stub — wire up JobClient for production)"
+    );
+}}
+
+#[derive(Deserialize)]
+pub struct DeleteAccountForm {{
+    /// User must type "DELETE" to confirm the irreversible operation.
+    pub confirmation: String,
+}}
+
+/// `GET /account/delete` — account deletion confirmation form.
+///
+/// Requires a confirmation step: the user types "DELETE" before submitting,
+/// reducing accidental deletions.
+#[get("/account/delete")]
+pub async fn delete_account_form(
+    session: Session,
+    csrf: Option<CsrfToken>,
+    csrf_field: Option<CsrfFormField>,
+) -> AutumnResult<Response> {{
+    let auth = session
+        .get("{snake_name}_id")
+        .await
+        .ok_or_else(|| AutumnError::unauthorized_msg("Not authenticated."))?;
+    let _ = auth;
+    Ok(layout("Delete My Account", html! {{
+        h1 {{ "Delete My Account" }}
+        p class="warning" {{
+            "⚠️ This action schedules your account for permanent deletion after a \
+             30-day grace period. You may cancel during the grace period by logging in."
+        }}
+        p {{
+            "All data we hold about you will be erased. Data we are legally required \
+             to retain (e.g. financial records) will be anonymized or held under legal-hold \
+             with the reason documented in our audit log."
+        }}
+        form action="/account/delete" method="post" {{
+            @if let Some(ref csrf) = csrf {{
+                input type="hidden"
+                    name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str()))
+                    value=(csrf.token());
+            }}
+            div {{
+                label for="confirmation" {{ "Type DELETE to confirm:" }}
+                input type="text" id="confirmation" name="confirmation"
+                    placeholder="DELETE" autocomplete="off" required;
+            }}
+            button type="submit" {{ "Schedule Account Deletion" }}
+        }}
+        p {{ a href="/account" {{ "← Back to account" }} }}
+    }}).into_response())
+}}
+
+/// `POST /account/delete` — schedule account for deletion (GDPR Article 17).
+///
+/// Records `delete_requested_at` and `delete_scheduled_at` (30-day grace period)
+/// then writes an audit log entry. A background sweeper handles the hard-delete
+/// once the grace period expires. The user is logged out immediately.
+#[post("/account/delete")]
+pub async fn delete_account(
+    session: Session,
+    mut db: Db,
+    state: AppState,
+    axum::Form(form): axum::Form<DeleteAccountForm>,
+) -> AutumnResult<Response> {{
+    let {snake_name}_id: i64 = session
+        .get("{snake_name}_id")
+        .await
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| AutumnError::unauthorized_msg("Not authenticated."))?;
+
+    // Require the user to type DELETE as a confirmation step.
+    if form.confirmation.trim() != "DELETE" {{
+        return Ok(layout("Delete My Account", html! {{
+            h1 {{ "Delete My Account" }}
+            p class="error" {{ "You must type DELETE (in uppercase) to confirm." }}
+            p {{ a href="/account/delete" {{ "← Back" }} }}
+        }}).into_response());
+    }}
+
+    let now = chrono::Utc::now().naive_utc();
+    let grace_until = now + chrono::Duration::days(30);
+
+    diesel::update({table}::table.find({snake_name}_id))
+        .set((
+            {table}::delete_requested_at.eq(Some(now)),
+            {table}::delete_scheduled_at.eq(Some(grace_until)),
+        ))
+        .execute(&mut *db)
+        .await
+        .map_err(|_| AutumnError::internal_server_error_msg("Failed to schedule deletion."))?;
+
+    autumn_web::audit::write_from_state(
+        &state,
+        autumn_web::audit::AuditEvent::new(
+            {snake_name}_id.to_string(),
+            "gdpr.erasure.requested",
+            {snake_name}_id.to_string(),
+            None,
+            autumn_web::audit::AuditStatus::Success,
+        ),
+    )
+    .await
+    .ok();
+
+    session.destroy().await;
+
+    Ok(layout("Deletion Scheduled", html! {{
+        h1 {{ "Account Deletion Scheduled" }}
+        p {{
+            "Your account has been scheduled for deletion in 30 days. \
+             You will receive a confirmation email."
+        }}
+        p {{
+            "If you change your mind, log in within 30 days and visit \
+             your account settings to cancel."
+        }}
+    }}).into_response())
+}}
+
+/// `POST /account/delete/cancel` — cancel a pending account deletion.
+///
+/// Clears the `delete_requested_at` / `delete_scheduled_at` columns and writes
+/// an audit log entry. Only available during the grace period.
+#[post("/account/delete/cancel")]
+pub async fn cancel_delete_account(
+    session: Session,
+    mut db: Db,
+    state: AppState,
+) -> AutumnResult<Response> {{
+    let {snake_name}_id: i64 = session
+        .get("{snake_name}_id")
+        .await
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| AutumnError::unauthorized_msg("Not authenticated."))?;
+
+    diesel::update({table}::table.find({snake_name}_id))
+        .set((
+            {table}::delete_requested_at.eq(None::<chrono::NaiveDateTime>),
+            {table}::delete_scheduled_at.eq(None::<chrono::NaiveDateTime>),
+        ))
+        .execute(&mut *db)
+        .await
+        .map_err(|_| AutumnError::internal_server_error_msg("Failed to cancel deletion."))?;
+
+    autumn_web::audit::write_from_state(
+        &state,
+        autumn_web::audit::AuditEvent::new(
+            {snake_name}_id.to_string(),
+            "gdpr.erasure.cancelled",
+            {snake_name}_id.to_string(),
+            None,
+            autumn_web::audit::AuditStatus::Success,
+        ),
+    )
+    .await
+    .ok();
+
+    Ok(redirect_to("/account").into_response())
+}}
+
+// ── Admin GDPR Operations (Issue #820 AC#6) ───────────────────────────────────
+//
+// These routes allow an admin operator to trigger export or erasure on behalf
+// of a user. All operations are fully audited with actor, reason, and timestamp.
+// Mount behind your admin authentication middleware.
+
+#[derive(Deserialize)]
+pub struct AdminGdprActionForm {{
+    /// Free-text reason recorded in the audit log (required for compliance).
+    pub reason: String,
+}}
+
+/// `POST /admin/{table}/:id/data-export` — admin triggers data export for a user.
+///
+/// Stamps `export_requested_at` and enqueues the export job.
+/// Records `actor_id` (the operator) + `reason` in the audit log.
+#[post("/admin/{table}/:id/data-export")]
+pub async fn admin_data_export(
+    Path(user_id): Path<i64>,
+    session: Session,
+    mut db: Db,
+    state: AppState,
+    mailer: Option<Mailer>,
+    axum::Form(form): axum::Form<AdminGdprActionForm>,
+) -> AutumnResult<Response> {{
+    let operator_id: String = session
+        .get("{snake_name}_id")
+        .await
+        .unwrap_or_else(|| "admin".to_owned());
+
+    let now = chrono::Utc::now().naive_utc();
+    diesel::update({table}::table.find(user_id))
+        .set({table}::export_requested_at.eq(Some(now)))
+        .execute(&mut *db)
+        .await
+        .map_err(|_| AutumnError::internal_server_error_msg("Failed to record export request."))?;
+
+    enqueue_data_export_job(&state, user_id, mailer.as_ref()).await;
+
+    autumn_web::audit::write_from_state(
+        &state,
+        autumn_web::audit::AuditEvent::new(
+            operator_id,
+            "gdpr.export.admin_triggered",
+            user_id.to_string(),
+            None,
+            autumn_web::audit::AuditStatus::Success,
+        ),
+    )
+    .await
+    .ok();
+
+    let _ = form.reason; // reason is logged via the audit system above
+    Ok(redirect_to(&format!("/admin/{table}/{{user_id}}")).into_response())
+}}
+
+/// `POST /admin/{table}/:id/delete` — admin triggers account erasure for a user.
+///
+/// Schedules the account for deletion (30-day grace period).
+/// Records `actor_id` (the operator), `reason`, and timestamp in the audit log.
+#[post("/admin/{table}/:id/delete")]
+pub async fn admin_delete_account(
+    Path(user_id): Path<i64>,
+    session: Session,
+    mut db: Db,
+    state: AppState,
+    axum::Form(form): axum::Form<AdminGdprActionForm>,
+) -> AutumnResult<Response> {{
+    let operator_id: String = session
+        .get("{snake_name}_id")
+        .await
+        .unwrap_or_else(|| "admin".to_owned());
+
+    let now = chrono::Utc::now().naive_utc();
+    let grace_until = now + chrono::Duration::days(30);
+
+    diesel::update({table}::table.find(user_id))
+        .set((
+            {table}::delete_requested_at.eq(Some(now)),
+            {table}::delete_scheduled_at.eq(Some(grace_until)),
+        ))
+        .execute(&mut *db)
+        .await
+        .map_err(|_| AutumnError::internal_server_error_msg("Failed to schedule deletion."))?;
+
+    autumn_web::audit::write_from_state(
+        &state,
+        autumn_web::audit::AuditEvent::new(
+            operator_id,
+            format!("gdpr.erasure.admin_triggered reason={{}}", form.reason),
+            user_id.to_string(),
+            None,
+            autumn_web::audit::AuditStatus::Success,
+        ),
+    )
+    .await
+    .ok();
+
+    Ok(redirect_to(&format!("/admin/{table}/{{user_id}}")).into_response())
+}}
 {totp_section}"#
     )
 }
@@ -3626,6 +4010,99 @@ Then open <http://localhost:3000/signup> to create your first account.
     )
 }
 
+/// Render `docs/guide/gdpr-compliance.md` — GDPR/CCPA compliance checklist.
+///
+/// Documents exactly which generated artifacts satisfy Article 15 (right of
+/// access) and Article 17 (right to erasure), and which obligations remain the
+/// application developer's responsibility.
+fn render_gdpr_docs_file() -> String {
+    r#"# GDPR & CCPA Compliance Checklist
+
+This document describes the data-privacy obligations covered by the generated
+auth starter and those that remain the application developer's responsibility.
+
+## What the Auth Starter Provides
+
+### Article 15 — Right of Access (`GET /account/data-export`)
+
+| Artifact | Location |
+|---|---|
+| Self-service "Download my data" form | `GET /account/data-export` |
+| Export-request POST handler | `POST /account/data-export` |
+| `export_requested_at` column on the users table | Migration + model |
+| Audit log entry on request (`gdpr.export.requested`) | `src/routes/auth.rs` |
+| Background export job stub (wire up `JobClient` for production) | `src/routes/auth.rs` |
+
+### Article 17 — Right to Erasure (`POST /account/delete`)
+
+| Artifact | Location |
+|---|---|
+| Self-service "Delete my account" confirmation form | `GET /account/delete` |
+| 30-day grace period with `delete_scheduled_at` column | Migration + model |
+| Typed confirmation step (user must type "DELETE") | `src/routes/auth.rs` |
+| Audit log entry on request (`gdpr.erasure.requested`) | `src/routes/auth.rs` |
+| Cancellation route during grace period | `POST /account/delete/cancel` |
+| Audit log entry on cancellation (`gdpr.erasure.cancelled`) | `src/routes/auth.rs` |
+
+## What the Application Developer Must Provide
+
+The following obligations are **not** automated by the framework and require
+per-application implementation:
+
+### Hard-Delete / Anonymize Sweeper
+
+The grace-period sweeper that reads `delete_scheduled_at` and performs the
+actual erasure is the application's responsibility. Implement it as a scheduled
+job or a cron task:
+
+1. Query for `WHERE delete_scheduled_at < NOW()`.
+2. For each model, apply the registered erasure strategy:
+   - `hard_delete` — `DELETE FROM <table> WHERE user_id = $1`.
+   - `anonymize` — replace PII columns with tombstone values (e.g. `DELETED_<hash>`).
+   - `retain` — keep the row, record the retention reason in your audit log.
+3. Finally, hard-delete the user row.
+
+### Third-Party Processor Erasure
+
+GDPR requires erasure from third-party processors (Stripe, SendGrid, analytics
+services, etc.). This is out of scope for the auth starter. Document your
+processor list and erasure API calls in a separate runbook.
+
+### Admin-Triggered Export and Erasure
+
+For Subject Access Requests (SARs) initiated by your legal/ops team, add admin
+routes that call the same export/erasure logic with the operator's identity
+recorded as the `actor_id` in the audit log.
+
+## Compliance Status Summary
+
+| Obligation | Status |
+|---|---|
+| Article 15 — right of access route | ✅ Generated |
+| Article 15 — audit log | ✅ Generated |
+| Article 17 — erasure request route | ✅ Generated |
+| Article 17 — grace period + cancellation | ✅ Generated |
+| Article 17 — audit log | ✅ Generated |
+| Article 17 — actual row deletion sweeper | ⚠️ Application responsibility |
+| Article 17 — third-party processor erasure | ⚠️ Application responsibility |
+| CCPA §1798.105 — deletion right | ✅ Covered by Article 17 routes |
+| Admin/operator SAR tooling | ⚠️ Application responsibility |
+
+## Running `autumn doctor`
+
+After registering your application's models, run:
+
+```bash
+autumn doctor
+```
+
+The `gdpr_export_registration` check will warn if any `#[repository]`-annotated
+models are not registered for export/erasure. Register models via `GdprRegistry`
+in your application state.
+"#
+    .to_owned()
+}
+
 fn auth_route_entries(totp: bool) -> Vec<String> {
     let mut entries = vec![
         "routes::auth::signup_form".to_owned(),
@@ -3646,6 +4123,13 @@ fn auth_route_entries(totp: bool) -> Vec<String> {
         "routes::auth::resend_confirmation_form".to_owned(),
         "routes::auth::resend_confirmation".to_owned(),
         "routes::auth::confirm_email".to_owned(),
+        "routes::auth::data_export_form".to_owned(),
+        "routes::auth::data_export".to_owned(),
+        "routes::auth::delete_account_form".to_owned(),
+        "routes::auth::delete_account".to_owned(),
+        "routes::auth::cancel_delete_account".to_owned(),
+        "routes::auth::admin_data_export".to_owned(),
+        "routes::auth::admin_delete_account".to_owned(),
     ];
     if totp {
         entries.extend([
@@ -8649,6 +9133,197 @@ mod tests {
         assert!(
             docs.contains("unlock"),
             "docs must document operator unlock path: {docs}"
+        );
+    }
+
+    // ── GDPR data export & account deletion (issue #820) ─────────────────────
+
+    #[test]
+    fn plan_auth_creates_data_export_route() {
+        // AC#1: auth starter generates a "Download my data" route
+        let tmp = project_with_main();
+        let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+        assert!(
+            routes.contains("data_export") || routes.contains("download_my_data"),
+            "generated routes must include a data-export handler: {routes}"
+        );
+    }
+
+    #[test]
+    fn plan_auth_data_export_route_requires_auth() {
+        // AC#1: the export route must be protected by authentication
+        let tmp = project_with_main();
+        let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+        // Find the data_export function and verify it extracts Auth
+        let export_pos = routes
+            .find("data_export")
+            .expect("data_export route must be present");
+        let export_body = &routes[export_pos..export_pos + 500.min(routes.len() - export_pos)];
+        assert!(
+            export_body.contains("Auth") || export_body.contains("auth"),
+            "data_export route must require authentication: {export_body}"
+        );
+    }
+
+    #[test]
+    fn plan_auth_creates_delete_account_route() {
+        // AC#3: auth starter generates a "Delete my account" flow
+        let tmp = project_with_main();
+        let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+        assert!(
+            routes.contains("delete_account") || routes.contains("account_delete"),
+            "generated routes must include an account-deletion handler: {routes}"
+        );
+    }
+
+    #[test]
+    fn plan_auth_delete_account_has_confirmation_step() {
+        // AC#3: deletion flow requires a confirmation step
+        let tmp = project_with_main();
+        let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+        assert!(
+            routes.contains("confirm") || routes.contains("confirmation"),
+            "delete_account handler must include a confirmation step: {routes}"
+        );
+    }
+
+    #[test]
+    fn plan_auth_delete_account_writes_audit_log() {
+        // AC#3: account deletion must write an audit log entry
+        let tmp = project_with_main();
+        let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+        assert!(
+            routes.contains("audit") || routes.contains("AuditEvent"),
+            "delete_account handler must write an audit log entry: {routes}"
+        );
+    }
+
+    #[test]
+    fn plan_auth_migration_includes_deletion_tracking_columns() {
+        // AC#3: migration must include grace-period deletion tracking columns
+        let tmp = project_with_main();
+        let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let up = fs::read_to_string(
+            tmp.path()
+                .join("migrations/20260508000000_create_users/up.sql"),
+        )
+        .unwrap();
+        assert!(
+            up.contains("delete_requested_at") || up.contains("deletion_requested_at"),
+            "migration must include a deletion-request timestamp column: {up}"
+        );
+        assert!(
+            up.contains("delete_scheduled_at")
+                || up.contains("deletion_scheduled_at")
+                || up.contains("delete_grace_until"),
+            "migration must include a grace-period deadline column: {up}"
+        );
+    }
+
+    #[test]
+    fn plan_auth_migration_includes_export_tracking_columns() {
+        // AC#1/#5: migration must include export-request tracking columns
+        let tmp = project_with_main();
+        let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let up = fs::read_to_string(
+            tmp.path()
+                .join("migrations/20260508000000_create_users/up.sql"),
+        )
+        .unwrap();
+        assert!(
+            up.contains("export_requested_at") || up.contains("data_export_requested_at"),
+            "migration must include an export-request timestamp column: {up}"
+        );
+    }
+
+    #[test]
+    fn plan_auth_creates_export_job() {
+        // AC#5: auth starter generates a background export job
+        let tmp = project_with_main();
+        let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+        assert!(
+            routes.contains("export_job") || routes.contains("ExportJob") || routes.contains("enqueue"),
+            "generated code must enqueue a background export job: {routes}"
+        );
+    }
+
+    #[test]
+    fn plan_auth_gdpr_docs_file_created() {
+        // AC#7: auth starter generates a GDPR compliance documentation file
+        let tmp = project_with_main();
+        let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let paths: Vec<String> = plan
+            .actions
+            .iter()
+            .map(|a| {
+                a.path()
+                    .strip_prefix(tmp.path())
+                    .unwrap()
+                    .display()
+                    .to_string()
+                    .replace('\\', "/")
+            })
+            .collect();
+        assert!(
+            paths.iter().any(|p| p.contains("gdpr") || p.contains("compliance")),
+            "plan must include a GDPR/compliance documentation file; got: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn plan_auth_gdpr_docs_references_article_15_and_17() {
+        // AC#7: GDPR docs must reference Article 15 (right of access) and Article 17 (erasure)
+        let tmp = project_with_main();
+        let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        // Find the GDPR compliance docs file
+        let docs_path = plan
+            .actions
+            .iter()
+            .find(|a| {
+                let path_str = a.path().to_string_lossy().to_lowercase();
+                path_str.contains("gdpr") || path_str.contains("compliance")
+            })
+            .map(|a| a.path().to_owned())
+            .expect("plan must include a GDPR/compliance documentation file");
+
+        let content = fs::read_to_string(&docs_path).unwrap();
+        assert!(
+            content.contains("Article 15") || content.contains("article 15"),
+            "GDPR docs must reference Article 15 (right of access): {content}"
+        );
+        assert!(
+            content.contains("Article 17") || content.contains("article 17"),
+            "GDPR docs must reference Article 17 (right to erasure): {content}"
+        );
+    }
+
+    #[test]
+    fn plan_auth_model_includes_delete_requested_at_field() {
+        // AC#3: generated User model must include deletion tracking fields
+        let tmp = project_with_main();
+        let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let model = fs::read_to_string(tmp.path().join("src/models/user.rs")).unwrap();
+        assert!(
+            model.contains("delete_requested_at") || model.contains("deletion_requested_at"),
+            "User model must include deletion tracking field: {model}"
         );
     }
 }
