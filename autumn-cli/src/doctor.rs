@@ -1909,6 +1909,18 @@ pub fn run(opts: DoctorOptions) {
     // 13. System-test browser (warn if missing; not all projects use system tests)
     tasks.push(Box::new(check_system_test_browser));
 
+    // 14. GDPR export/erasure registration (warn when auth starter is present
+    //     but #[repository] models are not registered in GdprRegistry)
+    let has_auth_starter =
+        std::path::Path::new("src/routes/auth.rs").exists();
+    let unregistered = resolve_gdpr_unregistered_tables();
+    tasks.push(Box::new(move || {
+        check_gdpr_export_registration_impl(
+            has_auth_starter,
+            &unregistered.iter().map(String::as_str).collect::<Vec<_>>(),
+        )
+    }));
+
     // ── Phase 3: spawn all tasks concurrently ────────────────────────────────
     let handles: Vec<thread::JoinHandle<CheckResult>> =
         tasks.into_iter().map(thread::spawn).collect();
@@ -2154,6 +2166,106 @@ pub fn check_system_test_browser() -> CheckResult {
             hint: None,
         }
     }
+}
+
+/// Resolve the list of `#[repository]`-annotated table names that are not yet
+/// registered in a `GdprRegistry` in the project source.
+///
+/// Currently uses a lightweight heuristic: scans `src/schema.rs` for `diesel::table!`
+/// declarations and returns those that have no matching `GdprRegistry::register` call
+/// in any `*.rs` source file. Returns an empty list when the project has no schema or
+/// when all tables appear to be registered.
+fn resolve_gdpr_unregistered_tables() -> Vec<String> {
+    let schema_path = std::path::Path::new("src/schema.rs");
+    let schema = match std::fs::read_to_string(schema_path) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+
+    // Collect table names declared as `diesel::table! { <name> (id) { ... } }`.
+    let mut declared_tables: Vec<String> = Vec::new();
+    for line in schema.lines() {
+        let trimmed = line.trim();
+        // Match lines like `diesel::table! {` followed by the table name on the next line,
+        // or inline `pub table_name (id) {` patterns.  Use a simple prefix scan.
+        if let Some(rest) = trimmed
+            .strip_prefix("diesel::table!")
+            .map(str::trim)
+            .filter(|r| r.starts_with('{'))
+        {
+            // table name is on the same line or will appear shortly; skip for now
+            let _ = rest;
+        }
+        // Diesel schema emits bare identifiers like `    table_name (id) {`
+        if trimmed.ends_with("(id) {") || trimmed.ends_with("(id) { ") {
+            if let Some(name) = trimmed.split_whitespace().next() {
+                if !name.starts_with("//") && !name.starts_with("diesel") {
+                    declared_tables.push(name.to_owned());
+                }
+            }
+        }
+    }
+
+    if declared_tables.is_empty() {
+        return Vec::new();
+    }
+
+    // Check which tables appear to be registered via GdprRegistry in the project.
+    let registered_tables = collect_gdpr_registered_tables_from_source();
+
+    declared_tables
+        .into_iter()
+        .filter(|t| !registered_tables.contains(t))
+        .collect()
+}
+
+/// Scan all `*.rs` files under `src/` for `GdprRegistry` register calls and
+/// return the set of table names found.
+fn collect_gdpr_registered_tables_from_source() -> std::collections::HashSet<String> {
+    let mut found = std::collections::HashSet::new();
+    let Ok(entries) = glob_rs_files("src") else {
+        return found;
+    };
+    for path in entries {
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        // Look for patterns like `.register(ModelRegistration::hard_delete("posts"))`
+        // or `.register(ModelRegistration::anonymize("posts"))`.
+        for line in content.lines() {
+            if line.contains("ModelRegistration::") {
+                // Extract the quoted table name from the argument list.
+                if let Some(start) = line.find('"') {
+                    if let Some(end) = line[start + 1..].find('"') {
+                        let name = &line[start + 1..start + 1 + end];
+                        if !name.is_empty() && !name.contains(' ') {
+                            found.insert(name.to_owned());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    found
+}
+
+/// Recursively collect all `*.rs` file paths under `dir`.
+fn glob_rs_files(dir: &str) -> std::io::Result<Vec<std::path::PathBuf>> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Ok(out);
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if let Ok(mut sub) = glob_rs_files(&path.to_string_lossy()) {
+                out.append(&mut sub);
+            }
+        } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+            out.push(path);
+        }
+    }
+    Ok(out)
 }
 
 /// Warn when the auth starter is present but one or more `#[repository]`-annotated
