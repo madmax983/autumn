@@ -126,7 +126,9 @@ pub struct ApiDoc {
     pub mcp_tool: bool,
     /// True when the endpoint explicitly opts *out* of MCP exposure via
     /// `#[api_doc(mcp = false)]`. Honored even under the whole-API hatch
-    /// ([`AppBuilder::expose_all_as_mcp`](crate::app::AppBuilder::expose_all_as_mcp)).
+    /// (`AppBuilder::expose_all_as_mcp`). Not an intra-doc link: this field is
+    /// always compiled, but the builder method is gated behind the `mcp`
+    /// feature, so a hard link would break docs built without it.
     pub mcp_exclude: bool,
 }
 

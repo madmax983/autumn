@@ -54,6 +54,11 @@ use crate::openapi::{ApiDoc, schema_entry_to_value};
 /// Protocol version advertised when a client does not request one.
 const DEFAULT_PROTOCOL_VERSION: &str = "2025-06-18";
 
+/// Upper bound on a tool's buffered response body (10 MiB). MCP tool results
+/// are structured JSON; this guards the in-process dispatch path against a
+/// handler that would otherwise buffer an unbounded body into memory.
+const MAX_TOOL_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
+
 /// Runtime MCP configuration carried from the [`AppBuilder`](crate::app::AppBuilder)
 /// through router assembly.
 #[derive(Clone, Debug)]
@@ -400,6 +405,10 @@ async fn serve_mcp(
     };
 
     match parsed {
+        // JSON-RPC 2.0: an empty batch is itself an Invalid Request.
+        Value::Array(batch) if batch.is_empty() => {
+            json_response(&error(Value::Null, -32600, "Invalid Request: empty batch"))
+        }
         Value::Array(batch) => {
             let mut out = Vec::new();
             for msg in batch {
@@ -407,17 +416,24 @@ async fn serve_mcp(
                     out.push(resp);
                 }
             }
+            // An all-notification batch produces no responses → empty 202.
             if out.is_empty() {
                 StatusCode::ACCEPTED.into_response()
             } else {
                 json_response(&Value::Array(out))
             }
         }
-        // A notification (no `id`) yields `None` → an empty 202 per the spec.
-        msg => handle_message(&server, &headers, msg).await.map_or_else(
+        // A single request object. A notification (no `id`) yields `None` → 202.
+        msg @ Value::Object(_) => handle_message(&server, &headers, msg).await.map_or_else(
             || StatusCode::ACCEPTED.into_response(),
             |v| json_response(&v),
         ),
+        // Anything else (scalar, null) is not a valid JSON-RPC message.
+        _ => json_response(&error(
+            Value::Null,
+            -32600,
+            "Invalid Request: expected a JSON object or array",
+        )),
     }
 }
 
@@ -489,9 +505,19 @@ async fn tools_call(server: &McpServer, headers: &HeaderMap, id: Value, params: 
     };
 
     let status = response.status();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap_or_default();
+    // Unlike a normal HTTP response (streamed straight to the socket), the MCP
+    // path buffers the whole body to repackage it as a tool result. Cap that
+    // buffer so a runaway handler can't OOM the process; report an overflow as
+    // an explicit tool error rather than silently truncating to an empty body.
+    let Ok(bytes) = axum::body::to_bytes(response.into_body(), MAX_TOOL_RESPONSE_BYTES).await
+    else {
+        return success(
+            id,
+            tool_error(&format!(
+                "handler response exceeded the {MAX_TOOL_RESPONSE_BYTES}-byte MCP tool-result limit"
+            )),
+        );
+    };
     let text = String::from_utf8_lossy(&bytes).into_owned();
 
     if status.is_success() {

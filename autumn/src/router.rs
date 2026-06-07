@@ -87,6 +87,15 @@ pub enum RouterBuildError {
     /// A route is annotated with an API version that is not registered.
     #[error("route '{route_name}' uses unregistered API version '{version}'")]
     UnregisteredApiVersion { route_name: String, version: String },
+    /// The MCP mount path (from [`AppBuilder::mount_mcp`](crate::app::AppBuilder::mount_mcp))
+    /// is not a valid route path. axum requires paths to start with `/`, so an
+    /// invalid path is surfaced here rather than panicking at mount time.
+    #[cfg(feature = "mcp")]
+    #[error("invalid MCP mount path: {value:?} (must start with '/' and be non-empty)")]
+    InvalidMcpPath {
+        /// The offending mount path.
+        value: String,
+    },
 }
 
 /// Build the fully-configured Axum router from routes, config, and state.
@@ -334,6 +343,19 @@ fn build_router_pre_state(
         &config.session.cookie_name,
         versions.as_ref().map_or(&[], |v| v.0.as_slice()),
     )?;
+
+    // Validate the MCP mount path up front so a typo like `"mcp"` (missing the
+    // leading slash) surfaces as a recoverable error instead of an axum panic
+    // at `Router::route` time — mirroring the OpenAPI path validation above.
+    #[cfg(feature = "mcp")]
+    if let Some(rt) = ctx.mcp.as_ref() {
+        let path = rt.mount_path.as_str();
+        if path.is_empty() || !path.starts_with('/') || path.contains("//") {
+            return Err(RouterBuildError::InvalidMcpPath {
+                value: rt.mount_path.clone(),
+            });
+        }
+    }
 
     // Derive MCP tools from the route registry *before* `route_list` is moved
     // into axum below. The dispatch router is captured later, once the full

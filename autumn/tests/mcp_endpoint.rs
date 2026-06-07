@@ -389,3 +389,40 @@ async fn expose_all_excludes_unopted_mutating_verbs() {
         "mutating verb without opt-in is excluded even under the hatch"
     );
 }
+
+// ── JSON-RPC robustness + path validation ─────────────────────────
+
+#[tokio::test]
+async fn empty_batch_returns_invalid_request() {
+    let client = TestApp::new()
+        .routes(routes![list_todos])
+        .mount_mcp("/mcp")
+        .build();
+
+    // An empty JSON-RPC batch is itself an Invalid Request (-32600).
+    let out = rpc(&client, serde_json::json!([])).await;
+    assert_eq!(out["error"]["code"], -32600);
+}
+
+#[tokio::test]
+async fn malformed_request_returns_invalid_request() {
+    let client = TestApp::new()
+        .routes(routes![list_todos])
+        .mount_mcp("/mcp")
+        .build();
+
+    // A bare scalar is not a valid JSON-RPC message.
+    let out = rpc(&client, serde_json::json!(5)).await;
+    assert_eq!(out["error"]["code"], -32600);
+}
+
+#[tokio::test]
+#[should_panic(expected = "InvalidMcpPath")]
+async fn mount_path_without_leading_slash_is_rejected() {
+    // axum would otherwise panic at route time; we surface it as a
+    // recoverable RouterBuildError instead.
+    let _ = TestApp::new()
+        .routes(routes![list_todos])
+        .mount_mcp("mcp")
+        .build();
+}
