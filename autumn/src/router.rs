@@ -363,7 +363,9 @@ fn build_router_pre_state(
     #[cfg(feature = "mcp")]
     let mcp_assembly: Option<(String, Vec<crate::mcp::McpToolInfo>)> = ctx.mcp.as_ref().map(|rt| {
         let docs = collect_openapi_docs(&route_list, &ctx.scoped_groups);
-        let tools = crate::mcp::derive_tools(&docs, rt.expose_all);
+        // Pass the app's OpenAPI config (if any) so MCP tool `inputSchema`s
+        // reuse the same registered component schemas as the served spec.
+        let tools = crate::mcp::derive_tools(&docs, rt.expose_all, ctx.openapi.as_ref());
         (rt.mount_path.clone(), tools)
     });
 

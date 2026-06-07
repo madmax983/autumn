@@ -19,6 +19,7 @@
 use std::sync::Arc;
 
 use autumn_web::auth::{InMemoryApiTokenStore, RequireApiToken, issue_api_token};
+use autumn_web::openapi::OpenApiConfig;
 use autumn_web::prelude::*;
 use autumn_web::test::{TestApp, TestClient};
 use serde::{Deserialize, Serialize};
@@ -425,4 +426,56 @@ async fn mount_path_without_leading_slash_is_rejected() {
         .routes(routes![list_todos])
         .mount_mcp("mcp")
         .build();
+}
+
+#[tokio::test]
+async fn tools_call_requires_body_for_write_tools() {
+    let client = TestApp::new()
+        .routes(routes![create_todo])
+        .mount_mcp("/mcp")
+        .build();
+
+    // `body` is advertised as required; omitting it is an invalid-params error
+    // rather than a silently-dispatched empty body.
+    let out = rpc(
+        &client,
+        serde_json::json!({
+            "jsonrpc":"2.0","id":11,"method":"tools/call",
+            "params": {"name":"create_todo","arguments":{}}
+        }),
+    )
+    .await;
+    assert_eq!(out["error"]["code"], -32602);
+}
+
+#[tokio::test]
+async fn input_schema_reuses_registered_openapi_component() {
+    // A schema registered on the app's OpenApiConfig must flow into the tool's
+    // inputSchema, identical to the served OpenAPI doc — not a placeholder.
+    let client = TestApp::new()
+        .routes(routes![create_todo])
+        .openapi(OpenApiConfig::new("Demo", "1.0.0").register_schema(
+            "NewTodo",
+            serde_json::json!({
+                "type": "object",
+                "properties": { "title": { "type": "string" } },
+                "required": ["title"],
+            }),
+        ))
+        .mount_mcp("/mcp")
+        .build();
+
+    let out = rpc(
+        &client,
+        serde_json::json!({"jsonrpc":"2.0","id":12,"method":"tools/list"}),
+    )
+    .await;
+    let tools = out["result"]["tools"].as_array().unwrap();
+    let create = tools.iter().find(|t| t["name"] == "create_todo").unwrap();
+    // The registered component (with its `title` property) is inlined into
+    // `$defs`, rather than the `{type:object,title:NewTodo}` placeholder.
+    assert_eq!(
+        create["inputSchema"]["$defs"]["NewTodo"]["properties"]["title"]["type"],
+        "string"
+    );
 }

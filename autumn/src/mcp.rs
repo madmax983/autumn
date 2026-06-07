@@ -261,11 +261,20 @@ fn rewrite_refs(
 /// is ineligible (e.g. an HTML/Maud route with no JSON response schema), so it
 /// is a logged note rather than a runtime surprise.
 #[must_use]
-pub fn derive_tools(docs: &[ApiDoc], expose_all: bool) -> Vec<McpToolInfo> {
+pub fn derive_tools(
+    docs: &[ApiDoc],
+    expose_all: bool,
+    openapi: Option<&crate::openapi::OpenApiConfig>,
+) -> Vec<McpToolInfo> {
     // Reuse the OpenAPI generator to resolve component schemas exactly once,
-    // so tool input schemas share the handler's typed contract.
+    // so tool input schemas share the handler's typed contract. Crucially,
+    // reuse the *app's* OpenApiConfig when present so component schemas the
+    // user registered via `OpenApiConfig::register_schema` resolve identically
+    // to the served OpenAPI document, instead of drifting to placeholders.
     let refs: Vec<&ApiDoc> = docs.iter().collect();
-    let config = crate::openapi::OpenApiConfig::new("autumn-mcp", env!("CARGO_PKG_VERSION"));
+    let config = openapi.cloned().unwrap_or_else(|| {
+        crate::openapi::OpenApiConfig::new("autumn-mcp", env!("CARGO_PKG_VERSION"))
+    });
     let spec = crate::openapi::generate_spec(&config, &refs);
     let components = spec
         .components
@@ -557,16 +566,20 @@ fn build_request(
     if tool.has_query
         && let Some(Value::Object(map)) = arguments.get("query")
     {
-        let pairs: Vec<(String, String)> = map
-            .iter()
-            .map(|(k, v)| {
-                let value = match v {
-                    Value::String(s) => s.clone(),
-                    other => other.to_string(),
-                };
-                (k.clone(), value)
-            })
-            .collect();
+        let mut pairs: Vec<(String, String)> = Vec::new();
+        for (key, value) in map {
+            match value {
+                // Form/explode semantics: an array field expands to repeated
+                // keys (`tags=a&tags=b`), matching the OpenAPI query model the
+                // tool schema advertises — not a single `tags=["a","b"]`.
+                Value::Array(items) => {
+                    for item in items {
+                        pairs.push((key.clone(), query_scalar(item)));
+                    }
+                }
+                other => pairs.push((key.clone(), query_scalar(other))),
+            }
+        }
         if !pairs.is_empty() {
             let qs = serde_urlencoded::to_string(&pairs)
                 .map_err(|e| format!("invalid query arguments: {e}"))?;
@@ -578,16 +591,26 @@ fn build_request(
         .method(tool.method.as_str())
         .uri(&path);
 
-    // Forward the agent's bearer credential so RequireApiToken / #[secured]
-    // and friends see the same principal an HTTP caller would present.
+    // Forward the caller's credentials so the dispatched request authenticates
+    // exactly as a direct HTTP call would: `Authorization` for bearer-token
+    // (`RequireApiToken`) auth, and `Cookie` for session-based `#[secured]`
+    // routes (the session layer needs the cookie to load the principal).
     if let Some(auth) = headers.get(header::AUTHORIZATION) {
         builder = builder.header(header::AUTHORIZATION, auth);
     }
+    if let Some(cookie) = headers.get(header::COOKIE) {
+        builder = builder.header(header::COOKIE, cookie);
+    }
 
     let body = if tool.has_body {
+        // The tool schema marks `body` required; reject a call that omits it
+        // rather than dispatching an empty `{}` that a defaults-only DTO would
+        // silently accept (violating the advertised contract).
+        let payload = arguments
+            .get("body")
+            .ok_or_else(|| "missing required `body` argument".to_owned())?;
         builder = builder.header(header::CONTENT_TYPE, "application/json");
-        let payload = arguments.get("body").cloned().unwrap_or_else(|| json!({}));
-        Body::from(serde_json::to_vec(&payload).unwrap_or_default())
+        Body::from(serde_json::to_vec(payload).unwrap_or_default())
     } else {
         Body::empty()
     };
@@ -595,6 +618,15 @@ fn build_request(
     builder
         .body(body)
         .map_err(|e| format!("invalid request: {e}"))
+}
+
+/// Render a single query-argument value as a string for the query string.
+/// Strings pass through unquoted; other scalars use their JSON text.
+fn query_scalar(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
 }
 
 /// Replace a single `{name}` / `{name:regex}` capture in a path template.
@@ -788,5 +820,59 @@ mod tests {
             replace_path_param("/u/{id}/p/{pid}", "pid", "9"),
             "/u/{id}/p/9"
         );
+    }
+
+    fn tool(method: &str, path: &str, has_body: bool, has_query: bool) -> McpTool {
+        McpTool {
+            name: "t".to_owned(),
+            description: None,
+            input_schema: json!({}),
+            annotations: json!({}),
+            method: method.to_owned(),
+            path_template: path.to_owned(),
+            path_params: Vec::new(),
+            has_body,
+            has_query,
+        }
+    }
+
+    #[test]
+    fn build_request_rejects_missing_required_body() {
+        let t = tool("POST", "/api/todos", true, false);
+        let err = build_request(&t, &HeaderMap::new(), &json!({})).unwrap_err();
+        assert!(err.contains("body"), "got: {err}");
+    }
+
+    #[test]
+    fn build_request_explodes_array_query_into_repeated_keys() {
+        let t = tool("GET", "/api/search", false, true);
+        let req = build_request(
+            &t,
+            &HeaderMap::new(),
+            &json!({ "query": { "tags": ["a", "b"], "q": "x" } }),
+        )
+        .expect("request builds");
+        let query = req.uri().query().unwrap_or_default();
+        assert!(query.contains("tags=a"), "got: {query}");
+        assert!(query.contains("tags=b"), "got: {query}");
+        assert!(query.contains("q=x"), "got: {query}");
+        assert!(
+            !query.contains("%5B"), // no JSON `[` — i.e. not `tags=["a","b"]`
+            "array must explode, not serialize as JSON: {query}"
+        );
+    }
+
+    #[test]
+    fn build_request_forwards_authorization_and_cookie() {
+        let t = tool("GET", "/secure", false, false);
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, "Bearer tok".parse().unwrap());
+        headers.insert(header::COOKIE, "autumn.sid=abc".parse().unwrap());
+        let req = build_request(&t, &headers, &json!({})).expect("request builds");
+        assert_eq!(
+            req.headers().get(header::AUTHORIZATION).unwrap(),
+            "Bearer tok"
+        );
+        assert_eq!(req.headers().get(header::COOKIE).unwrap(), "autumn.sid=abc");
     }
 }
