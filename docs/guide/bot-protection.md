@@ -221,6 +221,41 @@ need it and the webhook endpoints are left untouched.
 
 ---
 
+## Content Security Policy
+
+Autumn's default CSP (`default-src 'self'; script-src 'self'; ...`) blocks the
+provider scripts and iframes loaded by `bot_protection_widget`.  When bot
+protection is enabled you must extend the CSP to allow the provider's origins.
+
+Add the following to your `autumn.toml` security headers config:
+
+**Turnstile:**
+
+```toml
+[security.headers]
+content_security_policy = """
+  default-src 'self';
+  script-src 'self' https://challenges.cloudflare.com;
+  frame-src https://challenges.cloudflare.com;
+"""
+```
+
+**hCaptcha:**
+
+```toml
+[security.headers]
+content_security_policy = """
+  default-src 'self';
+  script-src 'self' https://js.hcaptcha.com https://newassets.hcaptcha.com;
+  frame-src https://newassets.hcaptcha.com;
+"""
+```
+
+Or extend the default CSP programmatically by calling
+`default_content_security_policy()` and appending the required sources.
+
+---
+
 ## Edge cases
 
 ### No-JS clients

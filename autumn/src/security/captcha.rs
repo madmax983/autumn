@@ -164,6 +164,18 @@ pub trait CaptchaProvider: Send + Sync + 'static {
     /// `"h-captcha-response"` (hCaptcha).
     fn form_field_name(&self) -> &'static str;
 
+    /// Whether a non-empty token must be present for verification to proceed.
+    ///
+    /// When `true` (the default), the middleware rejects requests with a missing
+    /// or empty CAPTCHA field locally — without making an outbound verification
+    /// call — so bots that simply omit the field are rejected cheaply.
+    ///
+    /// Override to return `false` for bypass providers like [`AlwaysPassProvider`]
+    /// that should let requests through regardless of whether a token is present.
+    fn requires_token(&self) -> bool {
+        true
+    }
+
     /// Emit the provider-specific widget `Markup` for embedding in Maud templates.
     ///
     /// Includes both the placeholder `<div>` and the provider `<script>` tag.
@@ -339,6 +351,10 @@ impl CaptchaProvider for AlwaysPassProvider {
 
     fn form_field_name(&self) -> &'static str {
         "cf-turnstile-response"
+    }
+
+    fn requires_token(&self) -> bool {
+        false
     }
 
     #[cfg(feature = "maud")]
@@ -636,11 +652,16 @@ where
                 extract_token_from_form(&mut req, &settings.form_field, settings.max_scan_bytes)
                     .await;
 
-            // Pass the token (or empty string for a missing field) to the provider.
-            // This lets AlwaysPassProvider bypass the check even when no field is present,
-            // while real providers (Turnstile, hCaptcha) will reject the empty string.
             let token_str = token.as_deref().unwrap_or("");
-            let valid = settings.provider.verify(token_str).await;
+
+            // Reject missing/empty tokens locally before any outbound call, unless
+            // the provider explicitly allows missing tokens (e.g. AlwaysPassProvider).
+            let valid = if token_str.is_empty() && settings.provider.requires_token() {
+                false
+            } else {
+                settings.provider.verify(token_str).await
+            };
+
             if !valid {
                 let request_id = req
                     .extensions()
@@ -687,6 +708,10 @@ where
 #[cfg(feature = "maud")]
 #[must_use]
 pub fn bot_protection_widget(config: &BotProtectionConfig) -> maud::Markup {
+    if !config.enabled {
+        return maud::html! {};
+    }
+
     let site_key = config.site_key.as_deref().unwrap_or_default();
 
     if config.dev_bypass {
