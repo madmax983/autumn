@@ -2177,9 +2177,8 @@ pub fn check_system_test_browser() -> CheckResult {
 /// when all tables appear to be registered.
 fn resolve_gdpr_unregistered_tables() -> Vec<String> {
     let schema_path = std::path::Path::new("src/schema.rs");
-    let schema = match std::fs::read_to_string(schema_path) {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
+    let Ok(schema) = std::fs::read_to_string(schema_path) else {
+        return Vec::new();
     };
 
     // Collect table names declared as `diesel::table! { <name> (id) { ... } }`.
@@ -2198,12 +2197,12 @@ fn resolve_gdpr_unregistered_tables() -> Vec<String> {
         }
         // Diesel schema emits bare identifiers like `    table_name (pk) {`
         // where `pk` can be any column name (id, uuid, code, or composite).
-        if let Some(open_paren) = trimmed.find('(') {
-            if trimmed.ends_with('{') || trimmed.ends_with("{ ") {
-                let name = trimmed[..open_paren].trim();
-                if !name.is_empty() && !name.starts_with("//") && !name.starts_with("diesel") {
-                    declared_tables.push(name.to_owned());
-                }
+        if let Some(open_paren) = trimmed.find('(')
+            && (trimmed.ends_with('{') || trimmed.ends_with("{ "))
+        {
+            let name = trimmed[..open_paren].trim();
+            if !name.is_empty() && !name.starts_with("//") && !name.starts_with("diesel") {
+                declared_tables.push(name.to_owned());
             }
         }
     }
