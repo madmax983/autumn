@@ -2226,10 +2226,7 @@ fn resolve_gdpr_unregistered_tables() -> Vec<String> {
 /// rustfmt-formatted multi-line `ModelRegistration::` calls.
 fn collect_gdpr_registered_tables_from_source() -> std::collections::HashSet<String> {
     let mut found = std::collections::HashSet::new();
-    let Ok(entries) = glob_rs_files(std::path::Path::new("src")) else {
-        return found;
-    };
-    for path in entries {
+    for path in glob_rs_files(std::path::Path::new("src")) {
         let Ok(content) = std::fs::read_to_string(&path) else {
             continue;
         };
@@ -2253,10 +2250,10 @@ fn scan_source_for_gdpr_registrations(
                 continue;
             }
             for j in 1..=3 {
-                if let Some(next) = lines.get(i + j) {
-                    if extract_quoted_table_name(next.trim(), found) {
-                        break;
-                    }
+                if let Some(next) = lines.get(i + j)
+                    && extract_quoted_table_name(next.trim(), found)
+                {
+                    break;
                 }
             }
         }
@@ -2266,35 +2263,33 @@ fn scan_source_for_gdpr_registrations(
 /// Extract the first double-quoted string from `s` as a table name.
 /// Returns `true` if a non-empty, non-whitespace name was found and inserted.
 fn extract_quoted_table_name(s: &str, found: &mut std::collections::HashSet<String>) -> bool {
-    if let Some(start) = s.find('"') {
-        if let Some(end) = s[start + 1..].find('"') {
-            let name = &s[start + 1..start + 1 + end];
-            if !name.is_empty() && !name.contains(' ') {
-                found.insert(name.to_owned());
-                return true;
-            }
+    if let Some(start) = s.find('"')
+        && let Some(end) = s[start + 1..].find('"')
+    {
+        let name = &s[start + 1..start + 1 + end];
+        if !name.is_empty() && !name.contains(' ') {
+            found.insert(name.to_owned());
+            return true;
         }
     }
     false
 }
 
 /// Recursively collect all `*.rs` file paths under `dir`.
-fn glob_rs_files(dir: impl AsRef<std::path::Path>) -> std::io::Result<Vec<std::path::PathBuf>> {
+fn glob_rs_files(dir: impl AsRef<std::path::Path>) -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return Ok(out);
+        return out;
     };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            if let Ok(mut sub) = glob_rs_files(&path) {
-                out.append(&mut sub);
-            }
+            out.append(&mut glob_rs_files(&path));
         } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
             out.push(path);
         }
     }
-    Ok(out)
+    out
 }
 
 /// Warn when the auth starter is present but one or more `#[repository]`-annotated
