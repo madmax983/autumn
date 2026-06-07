@@ -2898,7 +2898,7 @@ pub async fn data_export(
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| AutumnError::unauthorized_msg("Not authenticated."))?;
 
-    let mailer = state.extension::<Mailer>().cloned();
+    let mailer = state.extension::<Mailer>();
     let now = chrono::Utc::now().naive_utc();
     let one_hour_ago = now - chrono::Duration::hours(1);
 
@@ -2926,7 +2926,7 @@ pub async fn data_export(
     }}
 
     // Enqueue the background export job.
-    enqueue_data_export_job(&state, {snake_name}_id, mailer.as_ref()).await;
+    enqueue_data_export_job(&state, {snake_name}_id, mailer.as_deref()).await;
 
     autumn_web::audit::write_from_state(
         &state,
@@ -3174,7 +3174,7 @@ pub async fn admin_data_export(
         return Err(AutumnError::unprocessable_msg("Reason is required for admin GDPR actions."));
     }}
 
-    let mailer = state.extension::<Mailer>().cloned();
+    let mailer = state.extension::<Mailer>();
 
     let now = chrono::Utc::now().naive_utc();
     let updated = diesel::update({table}::table.find(user_id))
@@ -3187,7 +3187,7 @@ pub async fn admin_data_export(
         return Err(AutumnError::not_found_msg("User not found."));
     }}
 
-    enqueue_data_export_job(&state, user_id, mailer.as_ref()).await;
+    enqueue_data_export_job(&state, user_id, mailer.as_deref()).await;
 
     autumn_web::audit::write_from_state(
         &state,
