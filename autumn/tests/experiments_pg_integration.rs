@@ -219,3 +219,57 @@ async fn pg_store_query_level_variant_deletion_check_atomic() {
         "Expected 0 rows affected because the UPDATE check should have failed"
     );
 }
+
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn pg_store_set_variants_rejects_deleting_variant_with_active_assignments() {
+    let (store, _url, _c) = setup_pg_store().await;
+    let config = ExperimentConfig {
+        name: "test_exp".to_string(),
+        description: None,
+        state: ExperimentState::Running,
+        variants: vec![
+            VariantConfig {
+                name: "control".to_string(),
+                weight: 50,
+            },
+            VariantConfig {
+                name: "treatment".to_string(),
+                weight: 50,
+            },
+        ],
+        winner: None,
+        exclusion_group: None,
+        updated_at_secs: 0,
+    };
+
+    store.upsert(config).unwrap();
+
+    // Record an assignment for "treatment"
+    let assignment = Assignment {
+        experiment: "test_exp".to_string(),
+        actor: "user_1".to_string(),
+        variant: "treatment".to_string(),
+        is_override: false,
+        assigned_at_secs: 0,
+    };
+    store.record_assignment(assignment).unwrap();
+
+    // Now attempt to set_variants, deleting "treatment"
+    let new_variants = vec![VariantConfig {
+        name: "control".to_string(),
+        weight: 100,
+    }];
+
+    let res = store.set_variants("test_exp", new_variants, None);
+    assert!(
+        res.is_err(),
+        "expected set_variants to fail because 'treatment' has active assignments"
+    );
+    let err_msg = res.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("treatment") || err_msg.contains("active assignments"),
+        "expected error to mention treatment, got: {err_msg}"
+    );
+}
+

@@ -709,6 +709,24 @@ impl ExperimentStore for InMemoryExperimentStore {
     ) -> Result<(), ExperimentStoreError> {
         {
             let mut inner = self.inner.write().unwrap();
+            let active_variants: std::collections::HashSet<String> = inner
+                .assignments
+                .values()
+                .filter(|a| a.experiment == name)
+                .map(|a| a.variant.clone())
+                .collect();
+
+            let new_variants: std::collections::HashSet<&str> =
+                variants.iter().map(|v| v.name.as_str()).collect();
+
+            for variant in active_variants {
+                if !new_variants.contains(variant.as_str()) {
+                    return Err(ExperimentStoreError::Backend(format!(
+                        "cannot delete variant '{variant}' because it has active assignments"
+                    )));
+                }
+            }
+
             if let Some(exp) = inner.experiments.get_mut(name) {
                 exp.variants = variants;
                 exp.updated_at_secs = now_secs();
@@ -1808,14 +1826,41 @@ pub mod pg {
             variants: Vec<VariantConfig>,
             actor: Option<&str>,
         ) -> Result<(), ExperimentStoreError> {
+            let mut conn = self.connect()?;
+
+            let active_variants = diesel::sql_query(
+                "SELECT DISTINCT variant FROM autumn_experiment_assignments WHERE experiment = $1",
+            )
+            .bind::<diesel::sql_types::Text, _>(name)
+            .load::<VariantNameRow>(&mut conn)
+            .map_err(|e| ExperimentStoreError::Backend(e.to_string()))?;
+
+            let new_variants: std::collections::HashSet<&str> =
+                variants.iter().map(|v| v.name.as_str()).collect();
+
+            for row in active_variants {
+                if !new_variants.contains(row.variant.as_str()) {
+                    return Err(ExperimentStoreError::Backend(format!(
+                        "cannot delete variant '{}' because it has active assignments",
+                        row.variant
+                    )));
+                }
+            }
+
             let variants_json =
                 serde_json::to_string(&variants).unwrap_or_else(|_| "[]".to_owned());
-            let mut conn = self.connect()?;
-            diesel::sql_query(
+            let rows_affected = diesel::sql_query(
                 "WITH updated AS ( \
                      UPDATE autumn_experiments \
                      SET variants = $2::jsonb, updated_at = NOW() \
                      WHERE name = $1 \
+                       AND NOT EXISTS ( \
+                           SELECT 1 FROM autumn_experiment_assignments a \
+                           WHERE a.experiment = name \
+                             AND a.variant NOT IN ( \
+                                 SELECT x.name FROM jsonb_to_recordset($2::jsonb) AS x(name text) \
+                             ) \
+                       ) \
                      RETURNING name \
                  ) \
                  INSERT INTO autumn_experiment_changes (experiment, mutation, actor) \
@@ -1828,6 +1873,22 @@ pub mod pg {
             )
             .execute(&mut conn)
             .map_err(|e| ExperimentStoreError::Backend(e.to_string()))?;
+
+            if rows_affected == 0 {
+                let exists_row = diesel::sql_query(
+                    "SELECT EXISTS(SELECT 1 FROM autumn_experiments WHERE name = $1) AS result",
+                )
+                .bind::<diesel::sql_types::Text, _>(name)
+                .get_result::<BoolRow>(&mut conn)
+                .map_err(|e| ExperimentStoreError::Backend(e.to_string()))?;
+
+                if exists_row.result {
+                    return Err(ExperimentStoreError::Backend(
+                        "cannot delete variant because it has active assignments".to_owned(),
+                    ));
+                }
+            }
+
             self.invalidate(name);
             Ok(())
         }
@@ -2301,6 +2362,31 @@ mod tests {
             "existing sticky assignment must not be re-bucketed after weight change"
         );
     }
+
+    #[test]
+    fn set_weights_rejects_deleting_assigned_variant() {
+        let svc = make_svc();
+        running(&svc, "exp");
+        let original = svc.assign("exp", "user:1").unwrap();
+
+        let remaining_variant = if original == "control" {
+            "treatment"
+        } else {
+            "control"
+        };
+        let err = svc
+            .set_weights(
+                "exp",
+                vec![VariantConfig::new(remaining_variant, 100)],
+                None,
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("cannot delete variant"),
+            "expected active assignment delete guard error, got {err}"
+        );
+    }
+
 
     // ── AC: exposure emitted exactly once per assign() call ───────────────────
 
