@@ -174,6 +174,10 @@ pub use crate::security::CspNonce;
 pub use crate::security::CsrfFormField;
 /// CSRF token extractor for embedding in forms.
 pub use crate::security::CsrfToken;
+/// CAPTCHA widget helper — emits provider-specific markup (Turnstile or hCaptcha).
+/// Requires `bot_protection.enabled = true` in `autumn.toml`.
+#[cfg(feature = "maud")]
+pub use crate::security::bot_protection_widget;
 /// Signed webhook extractor and configuration helpers.
 pub use crate::webhook::{
     SignedWebhook, WebhookEndpointConfig, WebhookProvider, WebhookReplayBackend,

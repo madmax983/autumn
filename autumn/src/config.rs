@@ -789,6 +789,24 @@ pub struct AutumnConfig {
     /// or via `AUTUMN_COMPRESSION__ENABLED=true`.
     #[serde(default)]
     pub compression: CompressionConfig,
+
+    /// Bot protection / CAPTCHA settings (`[bot_protection]` section in `autumn.toml`).
+    ///
+    /// Requires a CAPTCHA token on mutating requests (POST/PUT/PATCH/DELETE) to
+    /// protect public-facing forms against automated abuse.
+    ///
+    /// # Example
+    ///
+    /// ```toml
+    /// [bot_protection]
+    /// enabled    = true
+    /// provider   = "turnstile"      # "turnstile" (default) or "hcaptcha"
+    /// site_key   = "0x4AAAA..."     # public key — safe to commit
+    /// secret_key = "..."            # private key — use env var!
+    /// dev_bypass = false
+    /// ```
+    #[serde(default)]
+    pub bot_protection: crate::security::captcha::BotProtectionConfig,
 }
 
 /// Error-reporting settings (`[reporting]` section in `autumn.toml`).
