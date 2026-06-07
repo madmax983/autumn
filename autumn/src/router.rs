@@ -1203,7 +1203,8 @@ where
 {
     if config.bot_protection.enabled {
         let layer =
-            crate::security::captcha::BotProtectionLayer::from_config(&config.bot_protection);
+            crate::security::captcha::BotProtectionLayer::from_config(&config.bot_protection)
+                .with_max_scan_bytes(config.security.upload.max_request_size_bytes);
         tracing::info!(
             provider = ?config.bot_protection.provider,
             dev_bypass = config.bot_protection.dev_bypass,

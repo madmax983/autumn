@@ -505,6 +505,16 @@ impl BotProtectionLayer {
             }),
         }
     }
+
+    /// Override the maximum number of body bytes scanned when looking for the
+    /// CAPTCHA token field.  Wired to `security.upload.max_request_size_bytes`
+    /// by the framework so the limit matches the configured request size.
+    #[must_use]
+    pub fn with_max_scan_bytes(mut self, bytes: usize) -> Self {
+        let settings = Arc::make_mut(&mut self.settings);
+        settings.max_scan_bytes = bytes;
+        self
+    }
 }
 
 impl<S> Layer<S> for BotProtectionLayer {
@@ -551,6 +561,7 @@ async fn extract_token_from_form(
         .headers()
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
+        .map(str::to_ascii_lowercase)
         .unwrap_or_default();
 
     if !content_type.starts_with("application/x-www-form-urlencoded") {
@@ -632,10 +643,12 @@ where
 
         // Only enforce CAPTCHA on application/x-www-form-urlencoded requests.
         // JSON APIs, multipart uploads, and external webhooks pass through unchallenged.
+        // Use ASCII lowercase comparison — HTTP media types are case-insensitive.
         let content_type = req
             .headers()
             .get(axum::http::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
+            .map(str::to_ascii_lowercase)
             .unwrap_or_default();
         if !content_type.starts_with("application/x-www-form-urlencoded") {
             let mut inner = self.inner.clone();
