@@ -2387,7 +2387,6 @@ mod tests {
         );
     }
 
-
     // ── AC: exposure emitted exactly once per assign() call ───────────────────
 
     #[test]

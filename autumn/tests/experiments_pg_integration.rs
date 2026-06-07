@@ -272,4 +272,3 @@ async fn pg_store_set_variants_rejects_deleting_variant_with_active_assignments(
         "expected error to mention treatment, got: {err_msg}"
     );
 }
-
