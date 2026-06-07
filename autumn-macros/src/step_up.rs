@@ -100,7 +100,7 @@ fn build_check_call(max_age_tokens: &TokenStream) -> TokenStream {
             let __wants_json: bool = __autumn_step_up_headers
                 .get(::autumn_web::reexports::axum::http::header::ACCEPT)
                 .and_then(|v| v.to_str().ok())
-                .map(|s| s.contains("application/json"))
+                .map(|s| s.contains("application/json") || s.contains("+json"))
                 .unwrap_or(false);
             if __wants_json {
                 return ::autumn_web::step_up::__step_up_json_response(__max_age_secs);

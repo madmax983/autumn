@@ -2090,6 +2090,9 @@ pub async fn account_destroy(
 
 #[derive(Deserialize)]
 pub struct ReauthForm {{
+    // The TOTP retry form omits the password field and relies on the
+    // `reauth_pw_ok` session marker, so `password` must be optional here.
+    #[serde(default)]
     pub password: String,
     #[serde(default)]
     pub return_to: String,
@@ -4195,7 +4198,7 @@ fn totp_reauth_field_src() -> String {
     "            div {{\n\
      \x20               label {{ \"Authenticator code\" }}\n\
      \x20               input type=\"text\" name=\"totp_code\" autocomplete=\"one-time-code\"\n\
-     \x20                   inputmode=\"numeric\" pattern=\"[0-9 ]*\" placeholder=\"6-digit code or recovery code\";\n\
+     \x20                   inputmode=\"text\" pattern=\"[0-9a-fA-F \\\\-]*\" placeholder=\"6-digit code or recovery code\";\n\
      \x20               small {{ \"Required if your account uses two-factor authentication.\" }}\n\
      \x20           }}\n"
         .to_owned()
