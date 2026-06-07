@@ -809,16 +809,40 @@ async fn serve_mcp(
         .and_then(|o| o.to_str().ok())
         .map(str::to_owned);
 
+    // The request's own host, proxy-resolved (honours X-Forwarded-Host from
+    // trusted upstreams) with a fallback to the raw `Host` header. Drives both
+    // the trusted-Host gate and the same-origin `Origin` shortcut below.
+    let host = identity
+        .and_then(|id| id.host.as_deref())
+        .or_else(|| headers.get(header::HOST).and_then(|h| h.to_str().ok()));
+
+    // Trusted-Host enforcement, mirroring the `trusted_host_middleware` every
+    // normal route runs. The `/mcp` envelope is merged after that layer, so it
+    // would otherwise be exempt: because the DNS-rebinding `Origin` check below
+    // only fires for browsers, a no-`Origin` agent could call
+    // `initialize`/`tools/list` with an arbitrary `Host` and enumerate the tool
+    // catalog — even though the same request to a direct route, and the inner
+    // `tools/call` replay (which dispatches through the clone that *does* carry
+    // the layer), would be rejected. Judged on the proxy-resolved host so a
+    // request behind a trusted TLS-terminating proxy (raw `Host` rewritten to an
+    // internal authority) isn't wrongly 400'd, exactly as the `Origin` check is.
+    let host_trusted = host
+        .and_then(crate::router::extract_host_without_port)
+        .map(|h| h.trim_end_matches('.').to_ascii_lowercase())
+        .filter(|h| !h.is_empty())
+        .map_or_else(
+            || server.trusted_hosts.allows_missing_host(),
+            |h| server.trusted_hosts.allows_host(&h),
+        );
+    if !host_trusted {
+        return (StatusCode::BAD_REQUEST, "Invalid Host header").into_response();
+    }
+
     // DNS-rebinding protection (MCP Streamable-HTTP spec MUST): reject a
     // browser-supplied `Origin` that is neither same-origin nor allowlisted.
     // Non-browser agents send no `Origin` and are unaffected.
     if let Some(origin) = headers.get(header::ORIGIN) {
         let origin = origin.to_str().unwrap_or("");
-        // Prefer the proxy-resolved host/scheme (honours X-Forwarded-Host/-Proto
-        // from trusted upstreams); fall back to the raw Host header.
-        let host = identity
-            .and_then(|id| id.host.as_deref())
-            .or_else(|| headers.get(header::HOST).and_then(|h| h.to_str().ok()));
         let scheme = identity.and_then(|id| id.scheme.as_deref());
         if !server.origin_allowed(origin, host, scheme) {
             return (StatusCode::FORBIDDEN, "origin not allowed").into_response();
@@ -843,13 +867,37 @@ async fn serve_mcp(
         Value::Array(batch) if batch.is_empty() => {
             json_response(&error(Value::Null, -32600, "Invalid Request: empty batch"))
         }
+        // A batch carrying a `tools/call` is refused outright. Batching would
+        // let one envelope amplify two budgets a sequence of direct HTTP calls
+        // can't: memory (each replayed call buffers up to
+        // `MAX_TOOL_RESPONSE_BYTES`, and every response object is retained in
+        // `out` until the whole batch serializes) and rate limiting (the
+        // envelope is counted once, so each replayed call below would carry
+        // `RateLimitExempt` and skip the per-route limiter). The newest protocol
+        // revision dropped JSON-RPC batching entirely, so no conformant client
+        // batches calls; rejecting here keeps `tools/call` a single-message
+        // request — where the per-call limiter and the 10 MiB cap both still
+        // apply. Harmless metadata methods (initialize/tools/list/ping) may
+        // still be batched.
+        Value::Array(batch)
+            if batch
+                .iter()
+                .any(|msg| msg.get("method").and_then(Value::as_str) == Some("tools/call")) =>
+        {
+            json_response(&error(
+                Value::Null,
+                -32600,
+                "Invalid Request: batched tools/call is not supported; \
+                 send each tools/call as a single JSON-RPC request",
+            ))
+        }
         Value::Array(batch) => {
             let mut out = Vec::new();
             for msg in batch {
-                // Cookie propagation is intentionally limited to single calls:
-                // a batch could carry conflicting `Set-Cookie`s from several
-                // tool calls with no well-defined precedence, so they are
-                // collected but discarded here.
+                // No cookies are propagated from a batch: the only cookie-setting
+                // path is `tools/call`, which is rejected above before reaching a
+                // batch, so the remaining metadata methods never set one. The sink
+                // is kept to satisfy `handle_message`'s signature and is discarded.
                 let mut discard = Vec::new();
                 if let Some(resp) = handle_message(&server, &ctx, msg, &mut discard).await {
                     out.push(resp);

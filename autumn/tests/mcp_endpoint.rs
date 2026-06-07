@@ -295,9 +295,14 @@ async fn single_tools_call_propagates_set_cookie() {
 }
 
 #[tokio::test]
-async fn batch_tools_call_does_not_propagate_set_cookie() {
-    // Batches can carry conflicting Set-Cookies from several calls with no
-    // defined precedence, so cookie propagation is intentionally single-only.
+async fn batch_containing_tools_call_is_rejected() {
+    // A batch carrying a `tools/call` is refused outright (-32600). Batching
+    // would let one envelope amplify memory (each call buffers up to the 10 MiB
+    // cap, all retained until the batch serializes) and rate-limit budget (the
+    // envelope is counted once, so each replay would skip the per-route
+    // limiter). The newest protocol revision dropped JSON-RPC batching, so no
+    // conformant client batches calls; keeping `tools/call` single-message means
+    // the per-call limiter and the response cap both still apply.
     let client = TestApp::new()
         .routes(routes![get_todo])
         .layer(axum::middleware::from_fn(add_test_cookie))
@@ -313,7 +318,37 @@ async fn batch_tools_call_does_not_propagate_set_cookie() {
         .send()
         .await;
     resp.assert_ok();
+    let out = resp.json::<serde_json::Value>();
+    assert_eq!(out["error"]["code"], -32600);
+    // The call never dispatched, so the pipeline's `Set-Cookie` never ran.
     assert_eq!(resp.header("set-cookie"), None);
+}
+
+#[tokio::test]
+async fn batch_of_metadata_methods_is_still_supported() {
+    // Only `tools/call` batches are refused; harmless metadata methods that
+    // older protocol revisions may batch (initialize/tools/list/ping) still
+    // return one correlated response per entry.
+    let client = TestApp::new()
+        .routes(routes![list_todos])
+        .mount_mcp("/mcp")
+        .build();
+
+    let out = rpc(
+        &client,
+        serde_json::json!([
+            {"jsonrpc":"2.0","id":1,"method":"tools/list"},
+            {"jsonrpc":"2.0","id":2,"method":"ping"}
+        ]),
+    )
+    .await;
+    let arr = out.as_array().expect("a batch returns an array of responses");
+    assert_eq!(arr.len(), 2);
+    assert!(
+        arr.iter()
+            .any(|r| r["id"] == 1 && r["result"]["tools"].is_array())
+    );
+    assert!(arr.iter().any(|r| r["id"] == 2 && r["result"].is_object()));
 }
 
 #[tokio::test]
@@ -859,6 +894,30 @@ async fn proxy_resolved_same_origin_is_allowed() {
         .await;
     // Resolved as same-origin → allowed (not the 403 a raw-Host fallback gives).
     resp.assert_ok();
+}
+
+#[tokio::test]
+async fn untrusted_host_is_rejected_even_without_origin() {
+    // Parity with normal routes' `trusted_host_middleware`: a request whose Host
+    // isn't trusted is refused (400) even when it carries no `Origin` (so the
+    // DNS-rebinding Origin check is skipped). Without this gate a no-`Origin`
+    // agent could call `initialize`/`tools/list` with an arbitrary Host and
+    // enumerate the tool catalog.
+    let mut config = AutumnConfig::default();
+    config.security.trusted_hosts.hosts = vec!["app.example".to_owned()];
+    let client = TestApp::new()
+        .routes(routes![list_todos])
+        .config(config)
+        .mount_mcp("/mcp")
+        .build();
+
+    let resp = client
+        .post("/mcp")
+        .header("host", "evil.example")
+        .json(&serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))
+        .send()
+        .await;
+    resp.assert_status(400);
 }
 
 #[tokio::test]
