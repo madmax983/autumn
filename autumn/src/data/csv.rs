@@ -32,6 +32,29 @@
 //! export_csv(posts, &mut out).unwrap();
 //! ```
 //!
+//! # Example — response wrapper
+//!
+//! To return CSV data directly from an Axum route, wrap any iterable of `CsvSchema`
+//! items in the [`Csv`] struct:
+//!
+//! ```rust,no_run
+//! use autumn_web::prelude::*;
+//! use autumn_web::data::csv::{Csv, CsvSchema};
+//!
+//! # struct Post { id: i64, title: String, published: bool }
+//! # impl CsvSchema for Post {
+//! #     fn csv_columns() -> &'static [&'static str] { &["id", "title", "published"] }
+//! #     fn to_csv_record(&self) -> Vec<String> {
+//! #         vec![self.id.to_string(), self.title.clone(), self.published.to_string()]
+//! #     }
+//! # }
+//! #[get("/posts.csv")]
+//! async fn export_posts() -> Csv<Vec<Post>> {
+//!     let posts = vec![Post { id: 1, title: "Hello".into(), published: true }];
+//!     Csv(posts)
+//! }
+//! ```
+//!
 //! # Example — import
 //!
 //! ```rust,no_run
@@ -110,13 +133,13 @@ pub struct ImportReport {
 impl ImportReport {
     /// Total data rows processed (inserted + updated + skipped + errors).
     #[must_use]
-    pub fn total_rows(&self) -> u64 {
+    pub const fn total_rows(&self) -> u64 {
         self.inserted + self.updated + self.skipped + self.errors.len() as u64
     }
 
     /// `true` if no errors were recorded.
     #[must_use]
-    pub fn is_ok(&self) -> bool {
+    pub const fn is_ok(&self) -> bool {
         self.errors.is_empty()
     }
 }
@@ -272,6 +295,76 @@ where
 ///
 /// # Errors
 ///
+/// A response wrapper that serializes records as an RFC 4180 CSV stream.
+///
+/// Implements [`axum::response::IntoResponse`], setting the `Content-Type`
+/// header to `text/csv; charset=utf-8` and streaming the CSV data as the body.
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// use autumn_web::prelude::*;
+/// use autumn_web::data::csv::{Csv, CsvSchema};
+///
+/// #[derive(CsvSchema)]
+/// struct User {
+///     id: i64,
+///     name: String,
+/// }
+///
+/// #[get("/users.csv")]
+/// async fn export_users() -> Csv<Vec<User>> {
+///     let users = vec![User { id: 1, name: "Alice".to_string() }];
+///     Csv(users)
+/// }
+/// ```
+pub struct Csv<T>(pub T);
+
+impl<T, I> axum::response::IntoResponse for Csv<T>
+where
+    T: IntoIterator<Item = I>,
+    I: CsvSchema,
+{
+    fn into_response(self) -> axum::response::Response {
+        let mut buf = Vec::new();
+        match export_csv(self.0, &mut buf) {
+            Ok(()) => {
+                let body = http_body_util::Full::new(bytes::Bytes::from(buf));
+                axum::response::Response::builder()
+                    .status(axum::http::StatusCode::OK)
+                    .header(
+                        axum::http::header::CONTENT_TYPE,
+                        axum::http::HeaderValue::from_static("text/csv; charset=utf-8"),
+                    )
+                    .body(axum::body::Body::new(body))
+                    .unwrap()
+            }
+            Err(err) => crate::AutumnError::internal_server_error(err).into_response(),
+        }
+    }
+}
+
+// ── import_csv ────────────────────────────────────────────────────────────────
+
+/// Parse CSV from `reader`, validate rows, and drive import via `handler`.
+///
+/// The `handler` closure receives the **1-based CSV line number** and a
+/// `HashMap<String, String>` mapping column name → value for every data row.
+/// It returns an [`ImportRowResult`] that is folded into the returned
+/// [`ImportReport`].
+///
+/// In [`ImportMode::DryRun`], the handler is invoked but any
+/// `Inserted` / `Updated` results are counted but **not written**.
+/// The returned report reflects what *would* happen in a real run.
+///
+/// # Column ordering
+///
+/// Column names come from the CSV header row (the first row).  Field names
+/// must match the schema (or a `#[serde(rename)]` mapping) for the handler to
+/// find them by name.
+///
+/// # Errors
+///
 /// CSV parse errors (malformed quoting, wrong number of fields) are captured
 /// as [`CsvRowError`] entries rather than bubbling as a `Result` so that a
 /// single bad row does not abort the entire import.
@@ -299,11 +392,11 @@ where
     for result in rdr.records() {
         let (line, record) = match result {
             Ok(r) => {
-                let pos = r.position().map_or(0, |p| p.line());
+                let pos = r.position().map_or(0, csv::Position::line);
                 (pos, r)
             }
             Err(e) => {
-                let pos = e.position().map_or(0, |p| p.line());
+                let pos = e.position().map_or(0, csv::Position::line);
                 report
                     .errors
                     .push(CsvRowError::row(pos, format!("CSV parse error: {e}")));
@@ -420,6 +513,29 @@ mod tests {
         };
         assert_eq!(r.total_rows(), 7);
         assert!(!r.is_ok());
+    }
+
+    // ── IntoResponse tests ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn csv_into_response() {
+        use axum::response::IntoResponse;
+        use http_body_util::BodyExt;
+
+        let posts = sample_posts();
+        let response = Csv(posts).into_response();
+
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "text/csv; charset=utf-8"
+        );
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body_str = std::str::from_utf8(&body).unwrap();
+
+        assert!(body_str.starts_with("id,title,published\n"));
+        assert!(body_str.contains("1,\"Hello, World\",true\n"));
     }
 
     // ── export_csv tests ──────────────────────────────────────────────────────

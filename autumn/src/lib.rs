@@ -914,6 +914,10 @@ pub use crate::extract::Form;
 /// Query extractor.
 pub use crate::extract::Query;
 
+/// CSV response wrapper.
+#[cfg(feature = "csv")]
+pub use crate::data::csv::Csv;
+
 /// Resolved client IP address after trusted-proxy evaluation.
 pub use crate::extract::ClientAddr;
 
