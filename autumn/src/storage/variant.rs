@@ -1,7 +1,7 @@
 //! On-demand image variants for stored blobs.
 //!
 //! Variants are lazily generated on first request, stored content-addressably
-//! in the same [`BlobStore`] as the source, and served with a strong ETag and
+//! in the same [`BlobStore`] as the source, and served with a strong `ETag` and
 //! far-future `Cache-Control: immutable` header from that point on.
 //!
 //! ## Quick start
@@ -18,10 +18,11 @@
 //!
 //! ## Content addressing
 //!
-//! The variant key is `SHA-256(source_key + NUL + JSON(transforms))` encoded
-//! under `_variants/{h0}{h1}/{h2}{h3}/{hash}`.  The same `(source, transforms)`
-//! pair always produces the same key regardless of the `name` label; two
-//! different transform specs always produce different keys.
+//! The variant key is `SHA-256(source_key + NUL + etag + NUL + JSON(transforms))`
+//! encoded under `_variants/{h0}{h1}/{h2}{h3}/{hash}`.  The same
+//! `(source content, transforms)` pair always produces the same key regardless
+//! of the `name` label; re-uploading to the same key (new `ETag`) produces a
+//! fresh variant key so stale thumbnails are never served.
 //!
 //! ## Budget
 //!
@@ -280,27 +281,55 @@ impl VariantHandle {
             });
         }
 
-        // Auto-detect format from bytes; the image crate's magic-byte
-        // detection is more reliable than trusting the stored content_type
-        // while still letting `check_image_mime_type` enforce the supported-
-        // format contract above.
-        let img = image::load_from_memory(&source_bytes)
-            .map_err(|e| VariantError::DecodeError(e.to_string()))?;
+        // Offload CPU-bound decode/transform/encode to a blocking thread so
+        // Tokio worker threads are not stalled during image processing.
+        let transforms = self.transforms.clone();
+        let content_type = self.source.content_type.clone();
+        let max_width = budget.max_source_width;
+        let max_height = budget.max_source_height;
 
-        // Guard pixel dimensions after decode.
-        if img.width() > budget.max_source_width || img.height() > budget.max_source_height {
-            return Err(VariantError::SourceDimensionsTooLarge {
-                width: img.width(),
-                height: img.height(),
-                max_width: budget.max_source_width,
-                max_height: budget.max_source_height,
-            });
-        }
+        let (output_bytes, output_content_type) = tokio::task::spawn_blocking(
+            move || -> Result<(Vec<u8>, &'static str), VariantError> {
+                // Use decoder limits to guard against image bombs: a compressed
+                // file under `max_source_bytes` can still expand to gigabytes of
+                // pixel data without this guard.
+                let mut reader = image::ImageReader::new(Cursor::new(&source_bytes[..]))
+                    .with_guessed_format()
+                    .map_err(|e| VariantError::DecodeError(e.to_string()))?;
+                // image::Limits is #[non_exhaustive]; build via Default + field mutation.
+                let mut limits = image::Limits::default();
+                limits.max_image_width = Some(max_width);
+                limits.max_image_height = Some(max_height);
+                reader.limits(limits);
+                let img = reader.decode().map_err(|e| match &e {
+                    image::ImageError::Limits(_) => VariantError::SourceDimensionsTooLarge {
+                        width: 0,
+                        height: 0,
+                        max_width,
+                        max_height,
+                    },
+                    _ => VariantError::DecodeError(e.to_string()),
+                })?;
 
-        let transformed = apply_transforms(img, &self.transforms);
-        let (output_format, output_content_type) =
-            output_format_and_mime(&self.source.content_type);
-        let output_bytes = encode_image(&transformed, output_format)?;
+                // Belt-and-suspenders: if the decoder didn't enforce limits,
+                // catch oversized images here where we know the actual size.
+                if img.width() > max_width || img.height() > max_height {
+                    return Err(VariantError::SourceDimensionsTooLarge {
+                        width: img.width(),
+                        height: img.height(),
+                        max_width,
+                        max_height,
+                    });
+                }
+
+                let transformed = apply_transforms(img, &transforms);
+                let (output_format, output_content_type) = output_format_and_mime(&content_type);
+                let output_bytes = encode_image(&transformed, output_format)?;
+                Ok((output_bytes, output_content_type))
+            },
+        )
+        .await
+        .map_err(|e| VariantError::DecodeError(format!("variant worker panicked: {e}")))??;
 
         let blob = store
             .put(
@@ -335,7 +364,7 @@ impl Blob {
     /// ```
     #[must_use]
     pub fn variant(&self, name: &str, transforms: &[Transform]) -> VariantHandle {
-        let key = content_addressed_key(&self.key, transforms);
+        let key = content_addressed_key(self, transforms);
         VariantHandle {
             source: self.clone(),
             name: name.to_owned(),
@@ -365,15 +394,24 @@ pub(crate) fn check_image_mime_type(content_type: &str) -> Result<(), VariantErr
     }
 }
 
-/// Derive the content-addressed storage key for a given source key and
+/// Derive the content-addressed storage key for a given source blob and
 /// transform spec.
 ///
 /// Format: `_variants/{h[0..2]}/{h[2..4]}/{h}` where `h` is the lowercase
-/// hex SHA-256 of `source_key + NUL + JSON(transforms)`.
-pub(crate) fn content_addressed_key(source_key: &str, transforms: &[Transform]) -> String {
+/// hex SHA-256 of `source_key + NUL + etag + NUL + JSON(transforms)`.
+///
+/// The `etag` component means that re-uploading to the same key (producing a
+/// new `ETag`) invalidates any previously cached variant — preventing stale
+/// thumbnails when avatars or other mutable blobs are replaced in-place.
+/// When the source blob has no `etag`, the hash falls back to key + transforms.
+pub(crate) fn content_addressed_key(source_blob: &Blob, transforms: &[Transform]) -> String {
     let spec = serde_json::to_string(transforms).expect("Transform is always serialisable");
     let mut hasher = Sha256::new();
-    hasher.update(source_key.as_bytes());
+    hasher.update(source_blob.key.as_bytes());
+    hasher.update(b"\0");
+    if let Some(etag) = &source_blob.etag {
+        hasher.update(etag.as_bytes());
+    }
     hasher.update(b"\0");
     hasher.update(spec.as_bytes());
     let hash = hasher.finalize();
@@ -519,6 +557,23 @@ mod tests {
         let b2 = Blob::new("local", "a/2.png", "image/png", 1024);
         let spec = [Transform::resize_to_limit(200, 200)];
         assert_ne!(b1.variant("t", &spec).key(), b2.variant("t", &spec).key());
+    }
+
+    #[test]
+    fn same_source_key_different_etag_produces_different_keys() {
+        // Simulates a re-upload to the same key (e.g. avatars/{id}.bin):
+        // the new ETag must produce a different variant key so the old
+        // cached thumbnail is not served for the new content.
+        let mut b1 = Blob::new("local", "avatars/1.png", "image/png", 1024);
+        b1.etag = Some("sha256-aabbcc".to_owned());
+        let mut b2 = Blob::new("local", "avatars/1.png", "image/png", 2048);
+        b2.etag = Some("sha256-ddeeff".to_owned());
+        let spec = [Transform::resize_to_limit(100, 100)];
+        assert_ne!(
+            b1.variant("thumb", &spec).key(),
+            b2.variant("thumb", &spec).key(),
+            "different ETags on the same source key must yield different variant keys"
+        );
     }
 
     #[test]
@@ -992,7 +1047,8 @@ mod tests {
 
     #[test]
     fn content_addressed_key_hex_is_64_chars() {
-        let key = content_addressed_key("avatars/1.png", &[Transform::resize_to_limit(200, 200)]);
+        let blob = Blob::new("local", "avatars/1.png", "image/png", 1024);
+        let key = content_addressed_key(&blob, &[Transform::resize_to_limit(200, 200)]);
         // format: _variants/xx/xx/<64-hex-chars>
         let hash_part = key.rsplit('/').next().unwrap();
         assert_eq!(hash_part.len(), 64, "hash part must be 64 hex chars");

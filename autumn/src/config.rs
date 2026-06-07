@@ -2550,6 +2550,21 @@ impl AutumnConfig {
             "AUTUMN_STORAGE__S3__DEFAULT_URL_EXPIRY_SECS",
             &mut self.storage.s3.default_url_expiry_secs,
         );
+        parse_env(
+            env,
+            "AUTUMN_STORAGE__VARIANTS__MAX_SOURCE_BYTES",
+            &mut self.storage.variants.max_source_bytes,
+        );
+        parse_env(
+            env,
+            "AUTUMN_STORAGE__VARIANTS__MAX_SOURCE_WIDTH",
+            &mut self.storage.variants.max_source_width,
+        );
+        parse_env(
+            env,
+            "AUTUMN_STORAGE__VARIANTS__MAX_SOURCE_HEIGHT",
+            &mut self.storage.variants.max_source_height,
+        );
     }
 
     #[cfg(feature = "mail")]
