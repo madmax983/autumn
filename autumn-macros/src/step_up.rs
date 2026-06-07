@@ -177,6 +177,37 @@ fn inject_step_up_params(input_fn: &mut ItemFn) {
     }
 }
 
+/// Returns `true` if `ty` contains an `impl Trait` anywhere in its tree.
+///
+/// Rust forbids `impl Trait` in local variable type annotations, so the
+/// macro must skip the explicit annotation for return types like
+/// `AutumnResult<impl IntoResponse>` even though the top-level type is not
+/// `impl Trait` itself.
+fn type_contains_impl_trait(ty: &syn::Type) -> bool {
+    match ty {
+        syn::Type::ImplTrait(_) => true,
+        syn::Type::Path(tp) => tp.path.segments.iter().any(|seg| {
+            match &seg.arguments {
+                syn::PathArguments::AngleBracketed(args) => {
+                    args.args.iter().any(|arg| match arg {
+                        syn::GenericArgument::Type(t) => type_contains_impl_trait(t),
+                        _ => false,
+                    })
+                }
+                syn::PathArguments::Parenthesized(args) => {
+                    args.inputs.iter().any(type_contains_impl_trait)
+                        || matches!(&args.output,
+                            syn::ReturnType::Type(_, t) if type_contains_impl_trait(t))
+                }
+                syn::PathArguments::None => false,
+            }
+        }),
+        syn::Type::Reference(r) => type_contains_impl_trait(&r.elem),
+        syn::Type::Tuple(t) => t.elems.iter().any(type_contains_impl_trait),
+        _ => false,
+    }
+}
+
 /// Expand the `#[step_up]` / `#[step_up(max_age = "Nm")]` attribute.
 pub fn step_up_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let max_age_opt = match parse_step_up_args(attr) {
@@ -210,7 +241,10 @@ pub fn step_up_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             let __autumn_inner: () = (async move #original_body).await;
             ::autumn_web::reexports::axum::response::IntoResponse::into_response(__autumn_inner)
         },
-        syn::ReturnType::Type(_, ty) if matches!(ty.as_ref(), syn::Type::ImplTrait(_)) => quote! {
+        // Avoid `let x: T = …` when T contains `impl Trait` at any depth.
+        // Rust rejects `impl Trait` in local variable type annotations; drop
+        // the annotation and let type inference handle it instead.
+        syn::ReturnType::Type(_, ty) if type_contains_impl_trait(ty) => quote! {
             ::autumn_web::reexports::axum::response::IntoResponse::into_response(
                 (async move #original_body).await
             )
@@ -492,6 +526,29 @@ mod tests {
             generated.contains("__resolve_step_up_max_age"),
             "should call __resolve_step_up_max_age so WWW-Authenticate max-age \
              reflects the actual configured value:\n{generated}"
+        );
+    }
+
+    #[test]
+    fn step_up_handles_nested_impl_trait_return_type() {
+        // Rust rejects `impl Trait` in local variable type annotations.
+        // A handler returning `Result<impl IntoResponse, _>` or
+        // `AutumnResult<impl IntoResponse>` must not produce
+        // `let __autumn_inner: Result<impl IntoResponse, _> = …`.
+        let generated = step_up_macro(
+            quote! {},
+            quote! {
+                async fn handler() -> Result<impl IntoResponse, String> {
+                    Ok("ok")
+                }
+            },
+        )
+        .to_string();
+        // The generated code must NOT contain the explicit local-type annotation
+        // when the return type contains impl Trait.
+        assert!(
+            !generated.contains("__autumn_inner :"),
+            "should not emit an explicit local annotation for nested impl Trait: {generated}"
         );
     }
 }

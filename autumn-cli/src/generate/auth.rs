@@ -2163,16 +2163,26 @@ pub async fn reauth(
     // In the TOTP multi-step flow, the password is verified in one request and the
     // TOTP code in the next. Rather than echoing the password into a hidden DOM
     // field (which would expose it to any script on the page), we store a short-
-    // lived timestamped session marker after a successful password check and rely
-    // on that marker on subsequent submissions so the password never leaves the
-    // server. The marker expires after 10 minutes; if the user takes longer they
-    // must re-enter their password before the TOTP step is accepted.
+    // lived session marker after a successful password check and rely on that marker
+    // on subsequent submissions so the password never leaves the server.
+    // The marker stores "<timestamp>:<account_id>" so it is both time-limited
+    // (10-minute window) and bound to the specific account — if the session is
+    // reused by a different account the stored id will not match and the marker
+    // is ignored, requiring the new account's password to be re-entered.
     const REAUTH_PW_VALID_SECS: i64 = 600;
     let pw_verified_recently = session
         .get("reauth_pw_ok")
         .await
-        .and_then(|s| s.parse::<i64>().ok())
-        .is_some_and(|ts| chrono::Utc::now().timestamp() - ts < REAUTH_PW_VALID_SECS);
+        .and_then(|s| {{
+            let mut parts = s.splitn(2, ':');
+            let ts = parts.next()?.parse::<i64>().ok()?;
+            let id = parts.next()?.parse::<i64>().ok()?;
+            Some((ts, id))
+        }})
+        .is_some_and(|(ts, id)| {{
+            id == {snake_name}.id
+                && chrono::Utc::now().timestamp() - ts < REAUTH_PW_VALID_SECS
+        }});
     if !pw_verified_recently && !verify_password(&form.password, &{snake_name}.password_digest)
         .await
         .unwrap_or(false)
@@ -2195,7 +2205,12 @@ pub async fn reauth(
         }}).into_response());
     }}
     if !pw_verified_recently {{
-        session.insert("reauth_pw_ok", chrono::Utc::now().timestamp().to_string()).await;
+        session
+            .insert(
+                "reauth_pw_ok",
+                format!("{{}}:{{}}", chrono::Utc::now().timestamp(), {snake_name}.id),
+            )
+            .await;
     }}
     {totp_reauth_check}
     // Rotate session ID before elevating privileges to prevent session fixation
@@ -4224,6 +4239,7 @@ const RESERVED_TOTP_PENDING_KEYS: &[&str] = &[
     "totp_pending_reset_digest",
     "totp_pending_reset_token",
     "totp_pending_secret",
+    "totp_pending_confirmation",
 ];
 
 /// Whether `key` (typically the configured `[auth].session_key`) collides with a
