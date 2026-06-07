@@ -1111,4 +1111,67 @@ mod tests {
             "transform order must affect the content-addressed key"
         );
     }
+
+    // ── status() and into_autumn_error() ────────────────────────────────────
+
+    #[test]
+    fn variant_error_status_unsupported_mime_is_422() {
+        assert_eq!(
+            VariantError::UnsupportedMimeType("image/bmp".into()).status(),
+            http::StatusCode::UNPROCESSABLE_ENTITY
+        );
+    }
+
+    #[test]
+    fn variant_error_status_decode_error_is_422() {
+        assert_eq!(
+            VariantError::DecodeError("bad pixels".into()).status(),
+            http::StatusCode::UNPROCESSABLE_ENTITY
+        );
+    }
+
+    #[test]
+    fn variant_error_status_source_too_large_is_413() {
+        assert_eq!(
+            VariantError::SourceTooLarge {
+                byte_size: 999,
+                max_bytes: 100
+            }
+            .status(),
+            http::StatusCode::PAYLOAD_TOO_LARGE
+        );
+    }
+
+    #[test]
+    fn variant_error_status_dimensions_too_large_is_413() {
+        assert_eq!(
+            VariantError::SourceDimensionsTooLarge {
+                width: 200,
+                height: 200,
+                max_width: 100,
+                max_height: 100
+            }
+            .status(),
+            http::StatusCode::PAYLOAD_TOO_LARGE
+        );
+    }
+
+    #[test]
+    fn variant_error_status_storage_delegates_to_blob_store_error() {
+        use crate::storage::BlobStoreError;
+        assert_eq!(
+            VariantError::Storage(BlobStoreError::NotFound("k".into())).status(),
+            http::StatusCode::NOT_FOUND
+        );
+    }
+
+    #[test]
+    fn variant_error_into_autumn_error_carries_correct_status() {
+        let err = VariantError::SourceTooLarge {
+            byte_size: 999,
+            max_bytes: 100,
+        }
+        .into_autumn_error();
+        assert_eq!(err.status(), http::StatusCode::PAYLOAD_TOO_LARGE);
+    }
 }
