@@ -636,22 +636,10 @@ where
                 extract_token_from_form(&mut req, &settings.form_field, settings.max_scan_bytes)
                     .await;
 
-            let token_str = match &token {
-                Some(t) if !t.is_empty() => t.as_str(),
-                _ => {
-                    let request_id = req
-                        .extensions()
-                        .get::<crate::middleware::RequestId>()
-                        .map(std::string::ToString::to_string);
-                    let instance = Some(req.uri().path().to_owned());
-                    tracing::debug!(
-                        path = %req.uri().path(),
-                        "bot_protection: CAPTCHA token missing"
-                    );
-                    return Ok(bot_protection_problem_response(request_id, instance));
-                }
-            };
-
+            // Pass the token (or empty string for a missing field) to the provider.
+            // This lets AlwaysPassProvider bypass the check even when no field is present,
+            // while real providers (Turnstile, hCaptcha) will reject the empty string.
+            let token_str = token.as_deref().unwrap_or("");
             let valid = settings.provider.verify(token_str).await;
             if !valid {
                 let request_id = req
@@ -661,7 +649,8 @@ where
                 let instance = Some(req.uri().path().to_owned());
                 tracing::debug!(
                     path = %req.uri().path(),
-                    "bot_protection: CAPTCHA token failed verification"
+                    token_present = token.is_some(),
+                    "bot_protection: CAPTCHA token missing or invalid"
                 );
                 return Ok(bot_protection_problem_response(request_id, instance));
             }

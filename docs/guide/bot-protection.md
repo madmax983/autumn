@@ -151,6 +151,7 @@ let client = TestApp::new()
 // Correct token → 200
 client
     .post("/submit")
+    .header("Content-Type", "application/x-www-form-urlencoded")
     .body("cf-turnstile-response=correct-token")
     .send()
     .await
@@ -159,6 +160,7 @@ client
 // Wrong token → 400
 client
     .post("/submit")
+    .header("Content-Type", "application/x-www-form-urlencoded")
     .body("cf-turnstile-response=bad-token")
     .send()
     .await
