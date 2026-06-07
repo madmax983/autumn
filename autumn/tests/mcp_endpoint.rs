@@ -489,6 +489,18 @@ async fn mount_path_under_nested_router_is_rejected() {
 }
 
 #[tokio::test]
+#[should_panic(expected = "McpPathCollision")]
+async fn mount_path_under_static_prefix_is_rejected() {
+    // The framework unconditionally nests the static-file service at `/static`
+    // before the MCP router merges, so mounting there would be shadowed by (or
+    // panic against) that service. The preflight must reserve `/static`.
+    let _ = TestApp::new()
+        .routes(routes![list_todos])
+        .mount_mcp("/static/mcp")
+        .build();
+}
+
+#[tokio::test]
 #[should_panic(expected = "InvalidMcpPath")]
 async fn dynamic_mount_path_is_rejected() {
     // A capture/catch-all mount path would shadow a whole path class; only a
@@ -642,6 +654,37 @@ async fn allowlisted_origin_gets_cors_grant_on_response() {
 }
 
 #[tokio::test]
+async fn proxy_resolved_same_origin_is_allowed() {
+    // Behind a TLS-terminating proxy that rewrites `Host` to an internal
+    // authority and supplies the public origin via `X-Forwarded-*`, a
+    // same-origin browser MCP client must not be 403'd. The MCP route is merged
+    // after the centralized proxy layer, so the endpoint applies its own
+    // `TrustedProxiesLayer` to resolve the outer request's host/scheme.
+    let mut config = AutumnConfig::default();
+    config.security.trusted_proxies.trust_forwarded_headers = true;
+    config.security.trusted_hosts.hosts = vec!["app.example".to_owned()];
+    // CORS allowlist stays empty: this must pass via the same-origin shortcut,
+    // not a cross-origin grant.
+    let client = TestApp::new()
+        .routes(routes![list_todos])
+        .config(config)
+        .mount_mcp("/mcp")
+        .build();
+
+    let resp = client
+        .post("/mcp")
+        .header("host", "internal.svc.cluster.local")
+        .header("x-forwarded-host", "app.example")
+        .header("x-forwarded-proto", "https")
+        .header("origin", "https://app.example")
+        .json(&serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))
+        .send()
+        .await;
+    // Resolved as same-origin → allowed (not the 403 a raw-Host fallback gives).
+    resp.assert_ok();
+}
+
+#[tokio::test]
 async fn structured_path_argument_is_rejected() {
     // Path params are advertised as `{"type":"string"}`; a `null`/object/array
     // must return `-32602` rather than replaying a literal `null`/JSON-text
@@ -661,6 +704,43 @@ async fn structured_path_argument_is_rejected() {
     .await;
 
     assert_eq!(out["error"]["code"], -32602);
+}
+
+#[tokio::test]
+async fn secure_mcp_still_answers_unauthenticated_cors_preflight() {
+    // A browser sends the CORS preflight unauthenticated; gating OPTIONS behind
+    // `secure_mcp` would 401 it and the real POST would never fire. The
+    // preflight route must stay outside the auth layer.
+    let store = Arc::new(InMemoryApiTokenStore::default());
+    let mut config = AutumnConfig::default();
+    config.cors.allowed_origins = vec!["https://app.example".to_owned()];
+    let client = TestApp::new()
+        .routes(routes![list_todos])
+        .config(config)
+        .mount_mcp("/mcp")
+        .secure_mcp(RequireApiToken::new(store.clone()))
+        .build();
+
+    let resp = client
+        .options("/mcp")
+        .header("origin", "https://app.example")
+        .header("access-control-request-method", "POST")
+        .send()
+        .await;
+    // Not 401: the preflight is answered and grants the allowlisted origin.
+    resp.assert_status(204);
+    assert_eq!(
+        resp.header("access-control-allow-origin"),
+        Some("https://app.example")
+    );
+
+    // The JSON-RPC surface is still gated.
+    client
+        .post("/mcp")
+        .json(&serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))
+        .send()
+        .await
+        .assert_status(401);
 }
 
 #[tokio::test]

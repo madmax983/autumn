@@ -537,12 +537,16 @@ fn build_router_pre_state(
             // customized CsrfConfig::token_header deployments work via MCP.
             csrf_header: config.security.csrf.token_header.to_ascii_lowercase(),
         };
-        let mut mcp_router = crate::mcp::build_mcp_router(&mount_path, tools, dispatch, wiring);
-        // Optional whole-endpoint auth gate (AppBuilder::secure_mcp), applied
-        // before merge so it guards the catalog as well as tool dispatch.
-        if let Some(layer_fn) = endpoint_layer {
-            mcp_router = layer_fn(mcp_router);
-        }
+        let mut mcp_router =
+            crate::mcp::build_mcp_router(&mount_path, tools, dispatch, wiring, endpoint_layer);
+        // Stamp `ResolvedClientIdentity` on the *outer* `/mcp` request too. The
+        // MCP route is merged after `apply_middleware`, so the centralized
+        // `TrustedProxiesLayer` above does not wrap it; without this, the
+        // endpoint's own DNS-rebinding / same-origin check would fall back to
+        // the raw (possibly proxy-rewritten) `Host` and wrongly 403 a
+        // same-origin browser client behind a TLS-terminating proxy. The
+        // dispatch clone already carries its own copy of this layer.
+        mcp_router = apply_trusted_proxies_middleware(mcp_router, config);
         router.merge(mcp_router)
     } else {
         router
@@ -866,8 +870,14 @@ fn reject_mcp_path_collisions(
     // A nest prefix P owns every route under P (`/P/...`), and those raw routers
     // are mounted before the MCP router. A mount path equal to P or falling
     // under `P/` would be shadowed by (or panic against) the nested router, so
-    // reject it up front — mirroring the OpenAPI nest-collision preflight.
-    for (prefix, _) in nest_routers {
+    // reject it up front — mirroring the OpenAPI nest-collision preflight. The
+    // framework unconditionally nests the static-file service at `/static`, so
+    // reserve that prefix too.
+    let nest_prefixes = nest_routers
+        .iter()
+        .map(|(prefix, _)| prefix.as_str())
+        .chain(std::iter::once("/static"));
+    for prefix in nest_prefixes {
         let prefix_slash = format!("{prefix}/");
         if mount_path == prefix || mount_path.starts_with(&prefix_slash) {
             return Err(RouterBuildError::McpPathCollision {

@@ -1187,6 +1187,12 @@ impl TestClient {
     pub fn patch(&self, uri: &str) -> RequestBuilder {
         RequestBuilder::new(self.router.clone(), Method::PATCH, uri)
     }
+
+    /// Start building an OPTIONS request (e.g. a CORS preflight).
+    #[must_use]
+    pub fn options(&self, uri: &str) -> RequestBuilder {
+        RequestBuilder::new(self.router.clone(), Method::OPTIONS, uri)
+    }
 }
 
 // ── RequestBuilder ─────────────────────────────────────────────

@@ -524,6 +524,7 @@ pub(crate) fn build_mcp_router(
     tools: Vec<McpToolInfo>,
     dispatch: axum::Router,
     wiring: McpWiring,
+    endpoint_layer: Option<McpEndpointLayer>,
 ) -> axum::Router<crate::state::AppState> {
     let server = Arc::new(McpServer::new(tools, dispatch, wiring));
     tracing::debug!(
@@ -531,19 +532,25 @@ pub(crate) fn build_mcp_router(
         tools = server.tools.len(),
         "Mounted MCP endpoint"
     );
-    // Register the endpoint's verbs as a single `MethodRouter` so they share one
-    // route entry (avoids any overlapping-route concern and mirrors how the
-    // framework mounts multi-method paths elsewhere). `OPTIONS` answers CORS
-    // preflight for allowlisted browser clients — the endpoint is mounted
-    // outside the global CORS layer, so it serves its own preflight.
-    axum::Router::<crate::state::AppState>::new()
+    // The JSON-RPC surface (GET probe + POST) carries the optional whole-endpoint
+    // auth gate (`secure_mcp`). `OPTIONS` is deliberately mounted on a *separate*
+    // sub-router so the auth layer never wraps it: a CORS preflight is sent
+    // unauthenticated by the browser, so gating it would 401 the preflight and
+    // the real POST would never fire. Disjoint methods on the same path merge
+    // into one `MethodRouter` without overlap.
+    let mut rpc = axum::Router::<crate::state::AppState>::new()
         .route(
             mount_path,
-            axum::routing::get(serve_mcp_get)
-                .post(serve_mcp)
-                .options(serve_mcp_options),
+            axum::routing::get(serve_mcp_get).post(serve_mcp),
         )
-        .layer(axum::extract::Extension(server))
+        .layer(axum::extract::Extension(Arc::clone(&server)));
+    if let Some(layer_fn) = endpoint_layer {
+        rpc = layer_fn(rpc);
+    }
+    let preflight = axum::Router::<crate::state::AppState>::new()
+        .route(mount_path, axum::routing::options(serve_mcp_options))
+        .layer(axum::extract::Extension(server));
+    rpc.merge(preflight)
 }
 
 /// Answer a CORS preflight (`OPTIONS`) for the MCP endpoint. Because the
