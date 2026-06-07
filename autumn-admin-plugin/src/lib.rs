@@ -75,6 +75,15 @@ pub struct AdminPlugin {
     auth_session_key: String,
     require_role: Option<String>,
     runtime_config: Option<Arc<RuntimeConfigService>>,
+    /// When `true`, every mutating action (create, update, destroy) on any
+    /// registered model requires step-up authentication before proceeding.
+    ///
+    /// Enables this with [`AdminPlugin::with_step_up_mutations`].
+    step_up_mutations: bool,
+    /// Freshness window for step-up checks on admin mutations (seconds).
+    /// Defaults to [`autumn_web::step_up::DEFAULT_MAX_AGE_SECS`].
+    /// Override with [`AdminPlugin::with_step_up_max_age`].
+    step_up_max_age_secs: u64,
 }
 
 impl AdminPlugin {
@@ -93,6 +102,8 @@ impl AdminPlugin {
             auth_session_key: "user_id".to_owned(),
             require_role: Some("admin".to_owned()),
             runtime_config: None,
+            step_up_mutations: false,
+            step_up_max_age_secs: autumn_web::step_up::DEFAULT_MAX_AGE_SECS,
         }
     }
 
@@ -158,6 +169,50 @@ impl AdminPlugin {
         self.runtime_config = Some(svc);
         self
     }
+
+    /// Require step-up (fresh) authentication before any mutating admin action.
+    ///
+    /// When enabled, every `POST` (create/update) and `DELETE` (destroy) request
+    /// to the admin panel is checked against the session's `last_strong_auth_at`
+    /// claim using the global step-up max-age configured in `[auth.step_up]`
+    /// (default: 5 minutes). Requests without a valid fresh-auth claim are
+    /// redirected to `/reauth?return_to=…` (HTML clients) or receive a
+    /// `401 step_up_required` problem-details response (JSON clients).
+    ///
+    /// Highly recommended for production admin panels to reduce the blast radius
+    /// of a hijacked admin session.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// AdminPlugin::new()
+    ///     .register(UserAdmin::default())
+    ///     .with_step_up_mutations()
+    /// ```
+    #[must_use]
+    pub const fn with_step_up_mutations(mut self) -> Self {
+        self.step_up_mutations = true;
+        self
+    }
+
+    /// Override the step-up freshness window for admin mutations.
+    ///
+    /// Only meaningful when [`with_step_up_mutations`](Self::with_step_up_mutations)
+    /// is also called. Calls `with_step_up_mutations` implicitly.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// AdminPlugin::new()
+    ///     .register(UserAdmin::default())
+    ///     .with_step_up_max_age(600) // 10-minute window
+    /// ```
+    #[must_use]
+    pub const fn with_step_up_max_age(mut self, secs: u64) -> Self {
+        self.step_up_mutations = true;
+        self.step_up_max_age_secs = secs;
+        self
+    }
 }
 
 impl Default for AdminPlugin {
@@ -179,6 +234,8 @@ impl Plugin for AdminPlugin {
             auth_session_key,
             require_role,
             runtime_config,
+            step_up_mutations,
+            step_up_max_age_secs,
         } = self;
         let has_config = runtime_config.is_some();
         // "config" slug only conflicts when the runtime-config routes are mounted.
@@ -195,6 +252,8 @@ impl Plugin for AdminPlugin {
             auth_session_key.clone(),
             require_role.clone(),
             runtime_config,
+            step_up_mutations,
+            step_up_max_age_secs,
         );
 
         tracing::info!(
@@ -203,6 +262,7 @@ impl Plugin for AdminPlugin {
             auth_session_key = %auth_session_key,
             models = registry.model_count(),
             role = require_role.as_deref().unwrap_or("<none>"),
+            step_up_mutations = %step_up_mutations,
             "🍂 Autumn Admin mounted"
         );
 

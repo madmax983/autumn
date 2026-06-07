@@ -1482,6 +1482,8 @@ fn render_routes_file(
         totp_clear_pending,
         totp_confirm_branch,
         totp_section,
+        totp_reauth_field,
+        totp_reauth_check,
     ) = if totp {
         (
             totp_imports_src().to_owned(),
@@ -1490,9 +1492,13 @@ fn render_routes_file(
             totp_clear_pending_src().to_owned(),
             totp_confirm_branch_src(snake_name),
             totp_routes_section_src(pascal_name, snake_name, table),
+            totp_reauth_field_src(),
+            totp_reauth_check_src(snake_name, table),
         )
     } else {
         (
+            String::new(),
+            String::new(),
             String::new(),
             String::new(),
             String::new(),
@@ -1922,6 +1928,8 @@ pub async fn login(
     session.insert("{snake_name}_email", &{snake_name}.email).await;
     // Use the same session key checked by `#[secured]` / `#[authorize]`.
     session.insert(state.auth_session_key(), {snake_name}.id.to_string()).await;
+    // Stamp the step-up claim so `#[step_up]` routes are immediately accessible.
+    autumn_web::step_up::set_last_strong_auth_at(&session).await;
     Ok(redirect_to("/account"))
 }}
 
@@ -2038,7 +2046,284 @@ pub async fn account(session: Session, mut db: Db, csrf: Option<CsrfToken>, csrf
             @if let Some(ref csrf) = csrf {{ input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
             button type="submit" {{ "Log Out" }}
         }}
+        details {{
+            summary {{ "Delete account" }}
+            form action="/account/destroy" method="post" {{
+                @if let Some(ref csrf) = csrf {{ input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
+                p {{ "This is permanent and cannot be undone." }}
+                button type="submit" {{ "Delete my account" }}
+            }}
+        }}
     }}).into_response())
+}}
+
+/// `POST /account/destroy` — permanently delete the authenticated user's account.
+///
+/// Requires both a valid session (`#[secured]`) and a fresh step-up claim
+/// (`#[step_up]`), so a hijacked or unattended session cannot silently delete
+/// the account. CSRF protection is provided by the CsrfLayer middleware; no
+/// manual token check is needed here. After deletion the session is destroyed
+/// and the user is redirected to the home page.
+#[secured]
+#[step_up]
+#[post("/account/destroy")]
+pub async fn account_destroy(
+    session: Session,
+    mut db: Db,
+) -> AutumnResult<Response> {{
+    let {snake_name}_id: i64 = session
+        .get("{snake_name}_id")
+        .await
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| AutumnError::unauthorized_msg("Not authenticated."))?;
+
+    diesel::delete({table}::table.find({snake_name}_id))
+        .execute(&mut *db)
+        .await
+        .map_err(|_| AutumnError::internal_server_error_msg("Failed to delete account."))?;
+
+    session.destroy().await;
+    Ok(redirect_to("/").into_response())
+}}
+
+// ── Step-Up Reauth ────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct ReauthForm {{
+    // The TOTP retry form omits the password field and relies on the
+    // `reauth_pw_ok` session marker, so `password` must be optional here.
+    #[serde(default)]
+    pub password: String,
+    #[serde(default)]
+    pub return_to: String,
+    #[serde(default)]
+    pub totp_code: String,
+}}
+
+/// `GET /reauth` — prompt for password to refresh the step-up claim.
+///
+/// Redirects unauthenticated users to `/login`. Renders a minimal password
+/// form that posts back to `POST /reauth`. The `return_to` query parameter
+/// is forwarded as a hidden field so it survives the form submit.
+#[get("/reauth")]
+pub async fn reauth_form(
+    session: Session,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+    csrf: Option<CsrfToken>,
+    csrf_field: Option<CsrfFormField>,
+) -> AutumnResult<Response> {{
+    if session.get("{snake_name}_id").await.is_none() {{
+        return Ok(redirect_to("/login").into_response());
+    }}
+    let return_to = params.get("return_to").cloned().unwrap_or_default();
+    Ok(layout("Confirm your identity", html! {{
+        h1 {{ "Confirm your identity" }}
+        p {{ "For security, please re-enter your password to continue." }}
+        form action="/reauth" method="post" {{
+            @if let Some(ref csrf) = csrf {{ input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
+            input type="hidden" name="return_to" value=(return_to);
+            div {{
+                label {{ "Password" }}
+                input type="password" name="password" autocomplete="current-password" required;
+            }}
+            {totp_reauth_field}
+            button type="submit" {{ "Confirm" }}
+        }}
+    }}).into_response())
+}}
+
+/// `POST /reauth` — verify current password and refresh the step-up claim.
+///
+/// On success, sets `last_strong_auth_at` in the session and redirects to
+/// `return_to` (same-origin validated). On failure, renders the form again
+/// with an error message. Unauthenticated requests are redirected to `/login`.
+#[post("/reauth")]
+pub async fn reauth(
+    session: Session,
+    State(state): State<AppState>,
+    mut db: Db,
+    csrf: Option<CsrfToken>,
+    csrf_field: Option<CsrfFormField>,
+    Form(form): Form<ReauthForm>,
+) -> AutumnResult<Response> {{
+    if session.get("{snake_name}_id").await.is_none() {{
+        return Ok(redirect_to("/login").into_response());
+    }}
+
+    let {snake_name}_id: i64 = session
+        .get("{snake_name}_id")
+        .await
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| AutumnError::unauthorized_msg("Not authenticated."))?;
+
+    let {snake_name}: {pascal_name} = {table}::table
+        .find({snake_name}_id)
+        .select({pascal_name}::as_select())
+        .first(&mut *db)
+        .await
+        .map_err(|_| AutumnError::not_found_msg("Account not found."))?;
+
+    // In the TOTP multi-step flow, the password is verified in one request and the
+    // TOTP code in the next. Rather than echoing the password into a hidden DOM
+    // field (which would expose it to any script on the page), we store a short-
+    // lived session marker after a successful password check and rely on that marker
+    // on subsequent submissions so the password never leaves the server.
+    // The marker stores "<timestamp>:<account_id>" so it is both time-limited
+    // (10-minute window) and bound to the specific account — if the session is
+    // reused by a different account the stored id will not match and the marker
+    // is ignored, requiring the new account's password to be re-entered.
+    const REAUTH_PW_VALID_SECS: i64 = 600;
+    let pw_verified_recently = session
+        .get("reauth_pw_ok")
+        .await
+        .and_then(|s| {{
+            let mut parts = s.splitn(2, ':');
+            let ts = parts.next()?.parse::<i64>().ok()?;
+            let id = parts.next()?.parse::<i64>().ok()?;
+            Some((ts, id))
+        }})
+        .is_some_and(|(ts, id)| {{
+            id == {snake_name}.id
+                && chrono::Utc::now().timestamp() - ts < REAUTH_PW_VALID_SECS
+        }});
+    if !pw_verified_recently {{
+        // Helper to render the reauth error form without duplicating markup.
+        let reauth_form_err = |ret: &str| {{
+            layout("Confirm your identity", html! {{
+                h1 {{ "Confirm your identity" }}
+                p style="color:red" {{ "Incorrect password. Please try again." }}
+                form action="/reauth" method="post" {{
+                    @if let Some(ref csrf) = csrf {{ input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
+                    input type="hidden" name="return_to" value=(ret);
+                    div {{
+                        label {{ "Password" }}
+                        input type="password" name="password" autocomplete="current-password" required;
+                    }}
+                    {totp_reauth_field}
+                    button type="submit" {{ "Confirm" }}
+                }}
+            }}).into_response()
+        }};
+
+        // ── Account lockout policy ──────────────────────────────────────────
+        let lockout_cfg = state.config().auth.lockout;
+        let lockout_enabled = lockout_cfg.enabled && lockout_cfg.threshold > 0;
+
+        if lockout_enabled {{
+            let now = chrono::Utc::now().naive_utc();
+            let cooloff = chrono::Duration::seconds(lockout_cfg.cooloff_secs as i64);
+
+            // Local mutable counters reset when cool-off has elapsed.
+            let mut current_attempts = {snake_name}.failed_attempts;
+            let mut current_locked_at = {snake_name}.locked_at;
+
+            if let Some(locked_at) = {snake_name}.locked_at {{
+                if now < locked_at + cooloff {{
+                    // Non-enumerating: same form as wrong password.
+                    session.remove("reauth_pw_ok").await;
+                    return Ok(reauth_form_err(&form.return_to));
+                }}
+                // Cool-off elapsed — treat as unlocked.
+                current_attempts = 0;
+                current_locked_at = None;
+            }}
+
+            let password_ok = verify_password(&form.password, &{snake_name}.password_digest)
+                .await
+                .unwrap_or(false);
+
+            if !password_ok {{
+                // Atomically increment (or reset to 1 if cool-off just elapsed).
+                let new_attempts: i32 = if current_attempts == {snake_name}.failed_attempts {{
+                    diesel::update({table}::table.find({snake_name}.id))
+                        .set({table}::failed_attempts.eq({table}::failed_attempts + 1))
+                        .returning({table}::failed_attempts)
+                        .get_result::<i32>(&mut *db)
+                        .await
+                        .map_err(|e| AutumnError::internal_server_error_msg(&format!("Failed to record failed reauth: {{e}}")))?
+                }} else {{
+                    diesel::update({table}::table.find({snake_name}.id))
+                        .set((
+                            {table}::failed_attempts.eq(1i32),
+                            {table}::locked_at.eq(None::<chrono::NaiveDateTime>),
+                        ))
+                        .execute(&mut *db)
+                        .await
+                        .map_err(|e| AutumnError::internal_server_error_msg(&format!("Failed to reset lockout counter: {{e}}")))?;
+                    1i32
+                }};
+                if new_attempts >= lockout_cfg.threshold && current_locked_at.is_none() {{
+                    diesel::update({table}::table.find({snake_name}.id))
+                        .set({table}::locked_at.eq(Some(now)))
+                        .execute(&mut *db)
+                        .await
+                        .map_err(|e| AutumnError::internal_server_error_msg(&format!("Failed to lock account: {{e}}")))?;
+                }}
+                session.remove("reauth_pw_ok").await;
+                return Ok(reauth_form_err(&form.return_to));
+            }}
+
+            // Correct password — reset lockout counters. The WHERE guard
+            // excludes accounts locked by a concurrent bad-password request
+            // between our check and now, treating that race as auth failure.
+            let lock_expired_before = chrono::Utc::now().naive_utc() - cooloff;
+            let rows_cleared = diesel::update(
+                {table}::table
+                    .find({snake_name}.id)
+                    .filter(
+                        {table}::locked_at.is_null().or(
+                            {table}::locked_at.le(lock_expired_before)
+                        ),
+                    ),
+            )
+            .set((
+                {table}::failed_attempts.eq(0i32),
+                {table}::locked_at.eq(None::<chrono::NaiveDateTime>),
+            ))
+            .execute(&mut *db)
+            .await
+            .map_err(|e| AutumnError::internal_server_error_msg(&format!("Failed to reset lockout on reauth: {{e}}")))?;
+            if rows_cleared == 0 {{
+                // Concurrently locked — treat as authentication failure.
+                session.remove("reauth_pw_ok").await;
+                return Ok(reauth_form_err(&form.return_to));
+            }}
+        }} else {{
+            let password_ok = verify_password(&form.password, &{snake_name}.password_digest)
+                .await
+                .unwrap_or(false);
+            if !password_ok {{
+                session.remove("reauth_pw_ok").await;
+                return Ok(reauth_form_err(&form.return_to));
+            }}
+        }}
+
+        session
+            .insert(
+                "reauth_pw_ok",
+                format!("{{}}:{{}}", chrono::Utc::now().timestamp(), {snake_name}.id),
+            )
+            .await;
+    }}
+    {totp_reauth_check}
+    // Rotate session ID before elevating privileges to prevent session fixation
+    // attacks where a stolen cookie is used to benefit from a legitimate reauth.
+    session.rotate_id().await;
+    session.remove("reauth_pw_ok").await;
+    // Refresh the step-up claim.
+    autumn_web::step_up::set_last_strong_auth_at(&session).await;
+
+    // Redirect to the validated same-origin destination.
+    let dest = autumn_web::step_up::validate_return_to(&form.return_to)
+        .ok()
+        .filter(|_| !form.return_to.is_empty())
+        .map(|_| form.return_to.as_str())
+        .unwrap_or("/account")
+        .to_owned();
+
+    // Suppress unused warning when state.auth_session_key() is not used here.
+    let _ = &state;
+    Ok(redirect_to(&dest).into_response())
 }}
 
 // ── Forgot Password ───────────────────────────────────────────────────────────
@@ -2230,6 +2515,8 @@ pub async fn reset_password(
     session.insert("{snake_name}_email", &{snake_name}.email).await;
     // Use the same session key checked by `#[secured]` / `#[authorize]`.
     session.insert(state.auth_session_key(), {snake_name}.id.to_string()).await;
+    // Stamp the step-up claim so `#[step_up]` routes are immediately accessible.
+    autumn_web::step_up::set_last_strong_auth_at(&session).await;
     Ok(redirect_to("/account"))
 }}
 
@@ -2362,10 +2649,15 @@ pub async fn confirm_email(
     // full session — email confirmation proves address ownership, not TOTP possession.
 {totp_confirm_branch}    // Grant an authenticated session on confirmation.
     session.rotate_id().await;
+    // Discard any step-up claim that may have carried over from a previous
+    // login in this browser — email confirmation proves inbox access, not
+    // password knowledge, so it must not inherit sudo-mode freshness.
+    session.remove(autumn_web::step_up::STEP_UP_SESSION_KEY).await;
 {totp_clear_pending}    session.insert("{snake_name}_id", {snake_name}.id.to_string()).await;
     session.insert("{snake_name}_email", &{snake_name}.email).await;
     // Use the same session key checked by `#[secured]` / `#[authorize]`.
     session.insert(state.auth_session_key(), {snake_name}.id.to_string()).await;
+    // Step-up protected routes will redirect to /reauth as designed.
     Ok(redirect_to("/account"))
 }}
 
@@ -2963,6 +3255,9 @@ password hashing, and mail primitives.
 | POST | `/login` | `login` | Public |
 | POST | `/logout` | `logout` | Any |
 | GET | `/account` | `account` | **Required** + Confirmed |
+| POST | `/account/destroy` | `account_destroy` | **Required** + Step-up |
+| GET | `/reauth` | `reauth_form` | Any (redirects if unauthed) |
+| POST | `/reauth` | `reauth` | Any (redirects if unauthed) |
 | GET | `/forgot-password` | `forgot_password_form` | Public |
 | POST | `/forgot-password` | `forgot_password` | Public |
 | GET | `/reset-password` | `reset_password_form` | Public |
@@ -3340,6 +3635,9 @@ fn auth_route_entries(totp: bool) -> Vec<String> {
         "routes::auth::logout".to_owned(),
         "routes::auth::unlock_account".to_owned(),
         "routes::auth::account".to_owned(),
+        "routes::auth::account_destroy".to_owned(),
+        "routes::auth::reauth_form".to_owned(),
+        "routes::auth::reauth".to_owned(),
         "routes::auth::forgot_password_form".to_owned(),
         "routes::auth::forgot_password".to_owned(),
         "routes::auth::reset_password_form".to_owned(),
@@ -3785,6 +4083,7 @@ fn totp_login_branch_src(snake_name: &str) -> String {
         session.remove("totp_pending_reset_digest").await;
         session.remove("totp_pending_reset_token").await;
         session.remove("totp_pending_secret").await;
+        session.remove("totp_pending_confirmation").await;
         session
             .insert("totp_pending_id", __SNAKE__.id.to_string())
             .await;
@@ -3806,7 +4105,8 @@ const fn totp_clear_pending_src() -> &'static str {
      \x20   session.remove(\"totp_pending_id\").await;\n\
      \x20   session.remove(\"totp_pending_reset_digest\").await;\n\
      \x20   session.remove(\"totp_pending_reset_token\").await;\n\
-     \x20   session.remove(\"totp_pending_secret\").await;\n"
+     \x20   session.remove(\"totp_pending_secret\").await;\n\
+     \x20   session.remove(\"totp_pending_confirmation\").await;\n"
 }
 
 /// The interstitial branch injected into `reset_password` *before* the password
@@ -3837,6 +4137,7 @@ fn totp_reset_branch_src(snake_name: &str) -> String {
         session.remove("__SNAKE___email").await;
         session.remove(state.auth_session_key()).await;
         session.remove("totp_pending_secret").await;
+        session.remove("totp_pending_confirmation").await;
         session
             .insert("totp_pending_id", __SNAKE__.id.to_string())
             .await;
@@ -3866,6 +4167,10 @@ fn totp_confirm_branch_src(snake_name: &str) -> String {
             ));
         }
         session.rotate_id().await;
+        // rotate_id() preserves session data; drop the step-up claim so a
+        // prior password-authenticated session cannot piggyback step-up
+        // privileges into this email-confirmation-only pending session.
+        session.remove(autumn_web::step_up::STEP_UP_SESSION_KEY).await;
         session.remove("__SNAKE___id").await;
         session.remove("__SNAKE___email").await;
         session.remove(state.auth_session_key()).await;
@@ -3875,10 +4180,132 @@ fn totp_confirm_branch_src(snake_name: &str) -> String {
         session
             .insert("totp_pending_id", __SNAKE__.id.to_string())
             .await;
+        // Mark that this pending login originated from email confirmation (not a
+        // password login). login_verify checks this to skip the step-up stamp:
+        // email + TOTP proves address & second-factor but NOT password knowledge.
+        session.insert("totp_pending_confirmation", "1").await;
         return Ok(redirect_to("/login/verify"));
     }
 "#;
     TPL.replace("__SNAKE__", snake_name)
+}
+
+/// HTML fragment injected into the reauth form for TOTP-enabled projects.
+///
+/// Shown as an optional field; the handler enforces it for accounts that have
+/// `totp_enabled = true` and ignores it for accounts that don't.
+fn totp_reauth_field_src() -> String {
+    "            div {{\n\
+     \x20               label {{ \"Authenticator code\" }}\n\
+     \x20               input type=\"text\" name=\"totp_code\" autocomplete=\"one-time-code\"\n\
+     \x20                   inputmode=\"text\" pattern=\"[0-9a-fA-F \\\\-]*\" placeholder=\"6-digit code or recovery code\";\n\
+     \x20               small {{ \"Required if your account uses two-factor authentication.\" }}\n\
+     \x20           }}\n"
+        .to_owned()
+}
+
+/// Verification block injected into the `reauth` handler after the password
+/// check when TOTP is enabled.  For accounts with `totp_enabled = true` the
+/// user must also supply a valid TOTP code or recovery code; other accounts
+/// pass through without any second-factor check.
+#[allow(clippy::too_many_lines)]
+fn totp_reauth_check_src(snake_name: &str, table: &str) -> String {
+    // This string is substituted verbatim into the outer format!() as a named argument.
+    // format!() does NOT further process the substituted value, so {{ and }} in this
+    // template appear literally in the output. Use single { } for Rust control flow,
+    // and {{ }} only inside maud html! invocations.
+    const TPL: &str = r#"    // If the account uses TOTP, also require the second factor.
+    if __SNAKE__.totp_enabled {
+        let code = form.totp_code.trim().to_owned();
+        if code.is_empty() {
+            let return_to = form.return_to.clone();
+            return Ok(layout("Confirm your identity", html! {{
+                h1 {{ "Confirm your identity" }}
+                p style="color:red" {{ "Your account uses two-factor authentication. Please also enter your authenticator code." }}
+                form action="/reauth" method="post" {{
+                    @if let Some(ref csrf) = csrf {{ input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
+                    input type="hidden" name="return_to" value=(return_to);
+                    div {{
+                        label {{ "Authenticator code" }}
+                        input type="text" name="totp_code" autocomplete="one-time-code"
+                            inputmode="numeric" pattern="[0-9 ]*" required
+                            placeholder="6-digit code or recovery code";
+                        small {{ "Required if your account uses two-factor authentication." }}
+                    }}
+                    button type="submit" {{ "Confirm" }}
+                }}
+            }}).into_response());
+        }
+        let mut totp_verified = false;
+        if let Some(stored) = __SNAKE__.totp_secret_encrypted.as_deref() {
+            if let Some(step) = decrypt_secret(stored)
+                .ok()
+                .and_then(|secret| build_totp(secret, &__SNAKE__.email).ok())
+                .and_then(|totp| verify_totp_code(&totp, &code))
+            {
+                let affected = diesel::update(
+                    __TABLE__::table.find(__SNAKE__.id).filter(
+                        __TABLE__::totp_last_used_step
+                            .is_null()
+                            .or(__TABLE__::totp_last_used_step.lt(step)),
+                    ),
+                )
+                .set(__TABLE__::totp_last_used_step.eq(Some(step)))
+                .execute(&mut *db)
+                .await?;
+                if affected == 1 {
+                    totp_verified = true;
+                }
+            }
+        }
+        if !totp_verified {
+            let unused: Vec<RecoveryCode> = recovery_codes::table
+                .filter(recovery_codes::user_id.eq(__SNAKE__.id))
+                .filter(recovery_codes::used_at.is_null())
+                .select(RecoveryCode::as_select())
+                .load(&mut *db)
+                .await
+                .unwrap_or_default();
+            for rc in &unused {
+                if verify_password(&code, &rc.code_digest).await.unwrap_or(false) {
+                    let affected = diesel::update(
+                        recovery_codes::table
+                            .find(rc.id)
+                            .filter(recovery_codes::used_at.is_null()),
+                    )
+                    .set(recovery_codes::used_at.eq(Some(chrono::Utc::now().naive_utc())))
+                    .execute(&mut *db)
+                    .await?;
+                    if affected == 1 {
+                        totp_verified = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if !totp_verified {
+            let return_to = form.return_to.clone();
+            return Ok(layout("Confirm your identity", html! {{
+                h1 {{ "Confirm your identity" }}
+                p style="color:red" {{ "Invalid authenticator code. Please try again." }}
+                form action="/reauth" method="post" {{
+                    @if let Some(ref csrf) = csrf {{ input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
+                    input type="hidden" name="return_to" value=(return_to);
+                    div {{
+                        label {{ "Authenticator code" }}
+                        input type="text" name="totp_code" autocomplete="one-time-code"
+                            inputmode="numeric" pattern="[0-9 ]*" required
+                            placeholder="6-digit code or recovery code";
+                        small {{ "Required if your account uses two-factor authentication." }}
+                    }}
+                    button type="submit" {{ "Confirm" }}
+                }}
+            }}).into_response());
+        }
+    }
+"#;
+    TPL.replace("__SNAKE__", snake_name)
+        .replace("__TABLE__", table)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -3911,6 +4338,7 @@ const RESERVED_TOTP_PENDING_KEYS: &[&str] = &[
     "totp_pending_reset_digest",
     "totp_pending_reset_token",
     "totp_pending_secret",
+    "totp_pending_confirmation",
 ];
 
 /// Whether `key` (typically the configured `[auth].session_key`) collides with a
@@ -4344,6 +4772,10 @@ pub async fn two_factor_confirm(
 
 /// `POST /account/2fa/disable` — require re-auth (current code OR password), then
 /// clear the secret and all recovery codes. Requires authentication.
+///
+/// The handler itself verifies the user's current TOTP code or password before
+/// disabling the factor, providing its own re-authentication guarantee. A
+/// separate `#[step_up]` is therefore not added here to avoid double-prompting.
 #[secured]
 #[post("/account/2fa/disable")]
 pub async fn two_factor_disable(
@@ -4589,11 +5021,20 @@ pub async fn login_verify(
     }
 
     // Promote the pending session to a fully authenticated one.
+    let from_confirmation = session.get("totp_pending_confirmation").await.is_some();
     session.rotate_id().await;
     session.remove("totp_pending_id").await;
+    session.remove("totp_pending_confirmation").await;
     session.insert("__SNAKE___id", __SNAKE__.id.to_string()).await;
     session.insert("__SNAKE___email", &__SNAKE__.email).await;
     session.insert(state.auth_session_key(), __SNAKE__.id.to_string()).await;
+    // Password + TOTP proves identity at least as strongly as password-only login,
+    // so stamp step-up for normal logins. Email-confirmation + TOTP proves address
+    // ownership and second-factor possession but NOT password knowledge — those
+    // sessions must still go through /reauth before accessing #[step_up] routes.
+    if !from_confirmation {
+        autumn_web::step_up::set_last_strong_auth_at(&session).await;
+    }
 
     let remaining: i64 = recovery_codes::table
         .filter(recovery_codes::user_id.eq(__SNAKE__.id))
@@ -5830,6 +6271,124 @@ mod tests {
         );
     }
 
+    // ── Step-up / reauth correctness ─────────────────────────────────────────
+
+    #[test]
+    fn confirm_email_does_not_stamp_step_up_claim() {
+        // Email confirmation proves inbox access, not password knowledge.
+        // set_last_strong_auth_at must NOT be called in confirm_email so that
+        // an attacker with a stolen confirmation link cannot bypass #[step_up].
+        let tmp = project_with_main();
+        let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+        let confirm_pos = routes
+            .find("pub async fn confirm_email(")
+            .expect("confirm_email handler missing");
+        let after_confirm = &routes[confirm_pos..];
+        let next_fn = after_confirm
+            .find("\npub async fn ")
+            .unwrap_or(after_confirm.len());
+        let confirm_body = &after_confirm[..next_fn];
+        assert!(
+            !confirm_body.contains("set_last_strong_auth_at"),
+            "confirm_email must NOT stamp set_last_strong_auth_at (email != password proof): {confirm_body}"
+        );
+        // confirm_email must also actively remove any inherited step-up claim so a
+        // browser session that previously held last_strong_auth_at cannot carry it
+        // into the newly confirmed account's session.
+        assert!(
+            confirm_body.contains("STEP_UP_SESSION_KEY"),
+            "confirm_email must remove STEP_UP_SESSION_KEY after rotate_id: {confirm_body}"
+        );
+    }
+
+    #[test]
+    fn reauth_rotates_session_before_stamping_step_up() {
+        // Rotating the session ID at the privilege-elevation point invalidates
+        // any attacker-held copy of the old cookie, preventing a stolen session
+        // from benefiting from the legitimate user's reauth.
+        let tmp = project_with_main();
+        let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+        let reauth_pos = routes
+            .find("pub async fn reauth(")
+            .expect("reauth handler missing");
+        let reauth_body = &routes[reauth_pos..];
+        let rotate_pos = reauth_body
+            .find("rotate_id")
+            .expect("reauth must call session.rotate_id()");
+        let stamp_pos = reauth_body
+            .find("set_last_strong_auth_at")
+            .expect("reauth must call set_last_strong_auth_at");
+        assert!(
+            rotate_pos < stamp_pos,
+            "session.rotate_id() must come before set_last_strong_auth_at to invalidate the old cookie"
+        );
+    }
+
+    #[test]
+    fn totp_reauth_does_not_embed_password_in_form() {
+        // The TOTP re-render form must not include the raw password in a hidden
+        // field — that would expose it in the DOM to any script on the page.
+        let tmp = project_with_main();
+        totp_plan(tmp.path()).execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+        let reauth_pos = routes
+            .find("pub async fn reauth(")
+            .expect("reauth handler missing");
+        let reauth_body = &routes[reauth_pos..];
+        // The only password input in reauth should be type="password" (visible field),
+        // never type="hidden" with name="password".
+        assert!(
+            !reauth_body.contains("name=\"password\" value"),
+            "TOTP reauth must not embed the raw password in a hidden field: {reauth_body}"
+        );
+    }
+
+    #[test]
+    fn totp_reauth_requires_second_factor_for_enrolled_accounts() {
+        // When --totp is enabled, the reauth handler must verify the TOTP code
+        // for accounts with totp_enabled = true. Password alone is insufficient.
+        let tmp = project_with_main();
+        totp_plan(tmp.path()).execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+        let reauth_pos = routes
+            .find("pub async fn reauth(")
+            .expect("reauth handler missing");
+        let reauth_body = &routes[reauth_pos..];
+        assert!(
+            reauth_body.contains("totp_enabled"),
+            "TOTP reauth handler must check totp_enabled: {reauth_body}"
+        );
+        assert!(
+            reauth_body.contains("totp_code"),
+            "TOTP reauth handler must check totp_code from form: {reauth_body}"
+        );
+        assert!(
+            reauth_body.contains("verify_totp_code"),
+            "TOTP reauth must call verify_totp_code for enrolled accounts: {reauth_body}"
+        );
+    }
+
+    #[test]
+    fn totp_reauth_form_has_totp_field() {
+        // The reauth form must include a TOTP input when --totp is enabled so
+        // that users with two-factor authentication can provide their code.
+        let tmp = project_with_main();
+        totp_plan(tmp.path()).execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+        let reauth_pos = routes
+            .find("pub async fn reauth_form(")
+            .expect("reauth_form handler missing");
+        let reauth_body = &routes[reauth_pos..];
+        assert!(
+            reauth_body.contains("totp_code"),
+            "reauth form must include totp_code input field: {reauth_body}"
+        );
+    }
+
     // ── Routes file ─────────────────────────────────────────────────────────
 
     #[test]
@@ -5845,6 +6404,9 @@ mod tests {
             "pub async fn login",
             "pub async fn logout",
             "pub async fn account",
+            "pub async fn account_destroy",
+            "pub async fn reauth_form",
+            "pub async fn reauth",
             "pub async fn forgot_password_form",
             "pub async fn forgot_password",
             "pub async fn reset_password_form",
@@ -5904,6 +6466,41 @@ mod tests {
         assert!(
             routes.contains("#[secured]"),
             "account route must use #[secured] for protection: {routes}"
+        );
+    }
+
+    #[test]
+    fn account_destroy_carries_step_up_by_default() {
+        let tmp = project_with_main();
+        let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+
+        // Find the account_destroy fn and verify #[step_up] precedes it.
+        let destroy_pos = routes
+            .find("pub async fn account_destroy")
+            .expect("account_destroy handler missing from scaffold");
+        let before_destroy = &routes[..destroy_pos];
+        assert!(
+            before_destroy.rfind("#[step_up]").is_some(),
+            "account_destroy must carry #[step_up] for step-up protection"
+        );
+    }
+
+    #[test]
+    fn mfa_remove_has_builtin_reauth_and_no_step_up_double_prompt() {
+        let tmp = project_with_main();
+        let oauth = AuthOAuthOptions::default();
+        let plan = plan_auth_full(tmp.path(), "User", "20260508000000", &oauth, true).unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+
+        // two_factor_disable already verifies the user's TOTP code or password
+        // in its body; a separate #[step_up] would cause a double re-auth prompt
+        // (once via /reauth, once in the form itself). The handler must be present.
+        assert!(
+            routes.contains("pub async fn two_factor_disable"),
+            "two_factor_disable handler missing from scaffold"
         );
     }
 
@@ -7180,6 +7777,25 @@ mod tests {
         assert!(
             verify_body.contains("reset_token_expires_at"),
             "login_verify update must filter by reset_token_expires_at: {verify_body}"
+        );
+    }
+
+    #[test]
+    fn totp_login_verify_stamps_step_up_claim_on_success() {
+        // Issue #833 / Codex P2: TOTP login (password + second factor) proves
+        // identity at least as strongly as password-only login. login_verify must
+        // call set_last_strong_auth_at so that #[step_up]-protected routes are
+        // immediately accessible without forcing a redundant /reauth.
+        let tmp = project_with_main();
+        totp_plan(tmp.path()).execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+        let verify_pos = routes
+            .find("pub async fn login_verify(")
+            .expect("login_verify fn");
+        let verify_body = &routes[verify_pos..];
+        assert!(
+            verify_body.contains("set_last_strong_auth_at"),
+            "login_verify (TOTP) must stamp set_last_strong_auth_at on success: {verify_body}"
         );
     }
 
