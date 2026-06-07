@@ -1910,11 +1910,12 @@ pub fn run(opts: DoctorOptions) {
     tasks.push(Box::new(check_system_test_browser));
 
     // 14. GDPR export/erasure registration (warn when auth starter is present
-    //     but #[repository] models are not registered in GdprRegistry)
-    let has_auth_starter =
-        std::path::Path::new("src/routes/auth.rs").exists();
-    let unregistered = resolve_gdpr_unregistered_tables();
-    tasks.push(Box::new(move || {
+    //     but #[repository] models are not registered in GdprRegistry).
+    //     File-system work runs inside the task so it overlaps with other checks.
+    tasks.push(Box::new(|| {
+        let has_auth_starter =
+            std::path::Path::new("src/routes/auth.rs").exists();
+        let unregistered = resolve_gdpr_unregistered_tables();
         check_gdpr_export_registration_impl(
             has_auth_starter,
             &unregistered.iter().map(String::as_str).collect::<Vec<_>>(),
@@ -2196,10 +2197,12 @@ fn resolve_gdpr_unregistered_tables() -> Vec<String> {
             // table name is on the same line or will appear shortly; skip for now
             let _ = rest;
         }
-        // Diesel schema emits bare identifiers like `    table_name (id) {`
-        if trimmed.ends_with("(id) {") || trimmed.ends_with("(id) { ") {
-            if let Some(name) = trimmed.split_whitespace().next() {
-                if !name.starts_with("//") && !name.starts_with("diesel") {
+        // Diesel schema emits bare identifiers like `    table_name (pk) {`
+        // where `pk` can be any column name (id, uuid, code, or composite).
+        if let Some(open_paren) = trimmed.find('(') {
+            if trimmed.ends_with('{') || trimmed.ends_with("{ ") {
+                let name = trimmed[..open_paren].trim();
+                if !name.is_empty() && !name.starts_with("//") && !name.starts_with("diesel") {
                     declared_tables.push(name.to_owned());
                 }
             }
@@ -2223,7 +2226,7 @@ fn resolve_gdpr_unregistered_tables() -> Vec<String> {
 /// return the set of table names found.
 fn collect_gdpr_registered_tables_from_source() -> std::collections::HashSet<String> {
     let mut found = std::collections::HashSet::new();
-    let Ok(entries) = glob_rs_files("src") else {
+    let Ok(entries) = glob_rs_files(std::path::Path::new("src")) else {
         return found;
     };
     for path in entries {
@@ -2232,12 +2235,14 @@ fn collect_gdpr_registered_tables_from_source() -> std::collections::HashSet<Str
         };
         // Look for patterns like `.register(ModelRegistration::hard_delete("posts"))`
         // or `.register(ModelRegistration::anonymize("posts"))`.
+        // Start the quote search *after* the `ModelRegistration::` token so that
+        // any earlier string literals on the same line are not mistakenly extracted.
         for line in content.lines() {
-            if line.contains("ModelRegistration::") {
-                // Extract the quoted table name from the argument list.
-                if let Some(start) = line.find('"') {
-                    if let Some(end) = line[start + 1..].find('"') {
-                        let name = &line[start + 1..start + 1 + end];
+            if let Some(idx) = line.find("ModelRegistration::") {
+                let rest = &line[idx..];
+                if let Some(start) = rest.find('"') {
+                    if let Some(end) = rest[start + 1..].find('"') {
+                        let name = &rest[start + 1..start + 1 + end];
                         if !name.is_empty() && !name.contains(' ') {
                             found.insert(name.to_owned());
                         }
@@ -2250,7 +2255,7 @@ fn collect_gdpr_registered_tables_from_source() -> std::collections::HashSet<Str
 }
 
 /// Recursively collect all `*.rs` file paths under `dir`.
-fn glob_rs_files(dir: &str) -> std::io::Result<Vec<std::path::PathBuf>> {
+fn glob_rs_files(dir: impl AsRef<std::path::Path>) -> std::io::Result<Vec<std::path::PathBuf>> {
     let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Ok(out);
@@ -2258,7 +2263,7 @@ fn glob_rs_files(dir: &str) -> std::io::Result<Vec<std::path::PathBuf>> {
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            if let Ok(mut sub) = glob_rs_files(&path.to_string_lossy()) {
+            if let Ok(mut sub) = glob_rs_files(&path) {
                 out.append(&mut sub);
             }
         } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {

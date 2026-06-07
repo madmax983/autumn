@@ -2053,6 +2053,23 @@ pub async fn account(session: Session, mut db: Db, csrf: Option<CsrfToken>, csrf
 
     Ok(layout("Your Account", html! {{
         h1 {{ "Your Account" }}
+        @if let Some(scheduled) = {snake_name}.delete_scheduled_at {{
+            div style="border:1px solid #c00;padding:0.75rem;margin-bottom:1rem;" {{
+                p {{
+                    "⚠️ Your account is scheduled for deletion on "
+                    (scheduled.format("%Y-%m-%d").to_string())
+                    ". Log in before then to cancel."
+                }}
+                form action="/account/delete/cancel" method="post" {{
+                    @if let Some(ref csrf) = csrf {{
+                        input type="hidden"
+                            name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str()))
+                            value=(csrf.token());
+                    }}
+                    button type="submit" {{ "Cancel Deletion" }}
+                }}
+            }}
+        }}
         p {{ "Email: " ({snake_name}.email) }}
         p {{
             "Email confirmed: "
@@ -2064,10 +2081,11 @@ pub async fn account(session: Session, mut db: Db, csrf: Option<CsrfToken>, csrf
         }}
         details {{
             summary {{ "Delete account" }}
+            p {{ "For GDPR-compliant deletion with a 30-day grace period, use " a href="/account/delete" {{ "Delete My Account" }} "." }}
             form action="/account/destroy" method="post" {{
                 @if let Some(ref csrf) = csrf {{ input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
-                p {{ "This is permanent and cannot be undone." }}
-                button type="submit" {{ "Delete my account" }}
+                p {{ "Or use the legacy immediate hard-delete (no grace period):" }}
+                button type="submit" {{ "Delete my account (immediate)" }}
             }}
         }}
     }}).into_response())
@@ -3142,7 +3160,7 @@ pub async fn admin_data_export(
         &state,
         autumn_web::audit::AuditEvent::new(
             operator_id,
-            "gdpr.export.admin_triggered",
+            format!("gdpr.export.admin_triggered reason={{}}", form.reason),
             user_id.to_string(),
             None,
             autumn_web::audit::AuditStatus::Success,
@@ -3151,7 +3169,6 @@ pub async fn admin_data_export(
     .await
     .ok();
 
-    let _ = form.reason; // reason is logged via the audit system above
     Ok(redirect_to(&format!("/admin/{table}/{{user_id}}")).into_response())
 }}
 
