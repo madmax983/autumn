@@ -2183,28 +2183,118 @@ pub async fn reauth(
             id == {snake_name}.id
                 && chrono::Utc::now().timestamp() - ts < REAUTH_PW_VALID_SECS
         }});
-    if !pw_verified_recently && !verify_password(&form.password, &{snake_name}.password_digest)
-        .await
-        .unwrap_or(false)
-    {{
-        session.remove("reauth_pw_ok").await;
-        let return_to = form.return_to.clone();
-        return Ok(layout("Confirm your identity", html! {{
-            h1 {{ "Confirm your identity" }}
-            p style="color:red" {{ "Incorrect password. Please try again." }}
-            form action="/reauth" method="post" {{
-                @if let Some(ref csrf) = csrf {{ input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
-                input type="hidden" name="return_to" value=(return_to);
-                div {{
-                    label {{ "Password" }}
-                    input type="password" name="password" autocomplete="current-password" required;
-                }}
-                {totp_reauth_field}
-                button type="submit" {{ "Confirm" }}
-            }}
-        }}).into_response());
-    }}
     if !pw_verified_recently {{
+        // Helper to render the reauth error form without duplicating markup.
+        let reauth_form_err = |ret: &str| {{
+            layout("Confirm your identity", html! {{
+                h1 {{ "Confirm your identity" }}
+                p style="color:red" {{ "Incorrect password. Please try again." }}
+                form action="/reauth" method="post" {{
+                    @if let Some(ref csrf) = csrf {{ input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
+                    input type="hidden" name="return_to" value=(ret);
+                    div {{
+                        label {{ "Password" }}
+                        input type="password" name="password" autocomplete="current-password" required;
+                    }}
+                    {totp_reauth_field}
+                    button type="submit" {{ "Confirm" }}
+                }}
+            }}).into_response()
+        }};
+
+        // ── Account lockout policy ──────────────────────────────────────────
+        let lockout_cfg = state.config().auth.lockout;
+        let lockout_enabled = lockout_cfg.enabled && lockout_cfg.threshold > 0;
+
+        if lockout_enabled {{
+            let now = chrono::Utc::now().naive_utc();
+            let cooloff = chrono::Duration::seconds(lockout_cfg.cooloff_secs as i64);
+
+            // Local mutable counters reset when cool-off has elapsed.
+            let mut current_attempts = {snake_name}.failed_attempts;
+            let mut current_locked_at = {snake_name}.locked_at;
+
+            if let Some(locked_at) = {snake_name}.locked_at {{
+                if now < locked_at + cooloff {{
+                    // Non-enumerating: same form as wrong password.
+                    session.remove("reauth_pw_ok").await;
+                    return Ok(reauth_form_err(&form.return_to));
+                }}
+                // Cool-off elapsed — treat as unlocked.
+                current_attempts = 0;
+                current_locked_at = None;
+            }}
+
+            let password_ok = verify_password(&form.password, &{snake_name}.password_digest)
+                .await
+                .unwrap_or(false);
+
+            if !password_ok {{
+                // Atomically increment (or reset to 1 if cool-off just elapsed).
+                let new_attempts: i32 = if current_attempts == {snake_name}.failed_attempts {{
+                    diesel::update({table}::table.find({snake_name}.id))
+                        .set({table}::failed_attempts.eq({table}::failed_attempts + 1))
+                        .returning({table}::failed_attempts)
+                        .get_result::<i32>(&mut *db)
+                        .await
+                        .map_err(|e| AutumnError::internal_server_error_msg(&format!("Failed to record failed reauth: {{e}}")))?
+                }} else {{
+                    diesel::update({table}::table.find({snake_name}.id))
+                        .set((
+                            {table}::failed_attempts.eq(1i32),
+                            {table}::locked_at.eq(None::<chrono::NaiveDateTime>),
+                        ))
+                        .execute(&mut *db)
+                        .await
+                        .map_err(|e| AutumnError::internal_server_error_msg(&format!("Failed to reset lockout counter: {{e}}")))?;
+                    1i32
+                }};
+                if new_attempts >= lockout_cfg.threshold && current_locked_at.is_none() {{
+                    diesel::update({table}::table.find({snake_name}.id))
+                        .set({table}::locked_at.eq(Some(now)))
+                        .execute(&mut *db)
+                        .await
+                        .map_err(|e| AutumnError::internal_server_error_msg(&format!("Failed to lock account: {{e}}")))?;
+                }}
+                session.remove("reauth_pw_ok").await;
+                return Ok(reauth_form_err(&form.return_to));
+            }}
+
+            // Correct password — reset lockout counters. The WHERE guard
+            // excludes accounts locked by a concurrent bad-password request
+            // between our check and now, treating that race as auth failure.
+            let lock_expired_before = chrono::Utc::now().naive_utc() - cooloff;
+            let rows_cleared = diesel::update(
+                {table}::table
+                    .find({snake_name}.id)
+                    .filter(
+                        {table}::locked_at.is_null().or(
+                            {table}::locked_at.le(lock_expired_before)
+                        ),
+                    ),
+            )
+            .set((
+                {table}::failed_attempts.eq(0i32),
+                {table}::locked_at.eq(None::<chrono::NaiveDateTime>),
+            ))
+            .execute(&mut *db)
+            .await
+            .map_err(|e| AutumnError::internal_server_error_msg(&format!("Failed to reset lockout on reauth: {{e}}")))?;
+            if rows_cleared == 0 {{
+                // Concurrently locked — treat as authentication failure.
+                session.remove("reauth_pw_ok").await;
+                return Ok(reauth_form_err(&form.return_to));
+            }}
+        }} else {{
+            let password_ok = verify_password(&form.password, &{snake_name}.password_digest)
+                .await
+                .unwrap_or(false);
+            if !password_ok {{
+                session.remove("reauth_pw_ok").await;
+                return Ok(reauth_form_err(&form.return_to));
+            }}
+        }}
+
         session
             .insert(
                 "reauth_pw_ok",
@@ -3990,6 +4080,7 @@ fn totp_login_branch_src(snake_name: &str) -> String {
         session.remove("totp_pending_reset_digest").await;
         session.remove("totp_pending_reset_token").await;
         session.remove("totp_pending_secret").await;
+        session.remove("totp_pending_confirmation").await;
         session
             .insert("totp_pending_id", __SNAKE__.id.to_string())
             .await;
@@ -4043,6 +4134,7 @@ fn totp_reset_branch_src(snake_name: &str) -> String {
         session.remove("__SNAKE___email").await;
         session.remove(state.auth_session_key()).await;
         session.remove("totp_pending_secret").await;
+        session.remove("totp_pending_confirmation").await;
         session
             .insert("totp_pending_id", __SNAKE__.id.to_string())
             .await;
@@ -4072,6 +4164,10 @@ fn totp_confirm_branch_src(snake_name: &str) -> String {
             ));
         }
         session.rotate_id().await;
+        // rotate_id() preserves session data; drop the step-up claim so a
+        // prior password-authenticated session cannot piggyback step-up
+        // privileges into this email-confirmation-only pending session.
+        session.remove(autumn_web::step_up::STEP_UP_SESSION_KEY).await;
         session.remove("__SNAKE___id").await;
         session.remove("__SNAKE___email").await;
         session.remove(state.auth_session_key()).await;
