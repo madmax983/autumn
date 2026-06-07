@@ -482,7 +482,16 @@ impl BotProtectionLayer {
                 #[cfg(feature = "http-client")]
                 CaptchaProviderKind::Turnstile => Arc::new(TurnstileProvider::new(secret)),
                 #[cfg(feature = "http-client")]
-                CaptchaProviderKind::HCaptcha => Arc::new(HCaptchaProvider::new(secret)),
+                CaptchaProviderKind::HCaptcha => {
+                    if config.form_field.is_some() {
+                        tracing::warn!(
+                            "bot_protection: hCaptcha does not support the form_field override — \
+                             the widget always submits as \"h-captcha-response\"; \
+                             set form_field only when using Turnstile"
+                        );
+                    }
+                    Arc::new(HCaptchaProvider::new(secret))
+                }
                 #[cfg(not(feature = "http-client"))]
                 _ => {
                     tracing::warn!(
@@ -725,8 +734,6 @@ pub fn bot_protection_widget(config: &BotProtectionConfig) -> maud::Markup {
         return maud::html! {};
     }
 
-    let site_key = config.site_key.as_deref().unwrap_or_default();
-
     if config.dev_bypass {
         // Dev mode: render an invisible placeholder so the form submits cleanly.
         return maud::html! {
@@ -734,8 +741,21 @@ pub fn bot_protection_widget(config: &BotProtectionConfig) -> maud::Markup {
         };
     }
 
-    // Pass data-response-field-name when a custom form field is configured so
-    // the provider JS submits the token under the same name the middleware scans.
+    let site_key = match config.site_key.as_deref() {
+        Some(k) if !k.is_empty() => k,
+        _ => {
+            tracing::warn!(
+                "bot_protection: site_key is not configured; \
+                 rendering no widget — CAPTCHA tokens cannot be generated \
+                 and every form submission will be rejected"
+            );
+            return maud::html! {};
+        }
+    };
+
+    // Turnstile supports data-response-field-name to customise the submitted
+    // field name; hCaptcha does not — the token is always submitted as
+    // "h-captcha-response" regardless of any attribute.
     let custom_field = config.form_field.as_deref();
 
     match config.provider {
@@ -749,7 +769,6 @@ pub fn bot_protection_widget(config: &BotProtectionConfig) -> maud::Markup {
         CaptchaProviderKind::HCaptcha => maud::html! {
             div .h-captcha
                 data-sitekey=(site_key)
-                data-response-field-name=[custom_field]
                 {}
             script src="https://js.hcaptcha.com/1/api.js" async="true" defer="true" {}
         },
