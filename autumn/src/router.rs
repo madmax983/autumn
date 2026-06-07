@@ -96,6 +96,20 @@ pub enum RouterBuildError {
         /// The offending mount path.
         value: String,
     },
+    /// The MCP mount path collides with an existing application route at the
+    /// same path. Mounting the MCP endpoint there would panic at
+    /// `axum::Router::merge` time on overlapping method routes, so this is
+    /// surfaced as a recoverable error instead.
+    #[cfg(feature = "mcp")]
+    #[error(
+        "MCP mount path {path:?} collides with an existing {method} route; choose a different `mount_mcp` path"
+    )]
+    McpPathCollision {
+        /// The colliding mount path.
+        path: String,
+        /// The HTTP method of the existing route at that path.
+        method: String,
+    },
 }
 
 /// Build the fully-configured Axum router from routes, config, and state.
@@ -367,6 +381,16 @@ fn build_router_pre_state(
             });
         }
         let docs = collect_openapi_docs(&route_list, &ctx.scoped_groups);
+        // The MCP endpoint mounts GET+POST at `mount_path`. If an application
+        // route already owns that exact path, the later `merge` would panic on
+        // overlapping method routes; surface it as a recoverable error first
+        // (mirroring the OpenAPI collision preflight above).
+        if let Some(doc) = docs.iter().find(|d| d.path == path) {
+            return Err(RouterBuildError::McpPathCollision {
+                path: rt.mount_path,
+                method: doc.method.to_owned(),
+            });
+        }
         // Pass the app's OpenAPI config (if any) so MCP tool `inputSchema`s
         // reuse the same registered component schemas as the served spec.
         let tools = crate::mcp::derive_tools(&docs, rt.expose_all, ctx.openapi.as_ref());

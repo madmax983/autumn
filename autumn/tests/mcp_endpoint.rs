@@ -71,6 +71,16 @@ async fn delete_todo(Path(id): Path<u32>) -> AutumnResult<Json<Todo>> {
     }))
 }
 
+// A user route that already owns the `/mcp` path, used to exercise the
+// mount-path collision preflight.
+#[get("/mcp")]
+async fn mcp_named_route() -> AutumnResult<Json<Todo>> {
+    Ok(Json(Todo {
+        id: 0,
+        title: "preexisting".into(),
+    }))
+}
+
 // Opted-out JSON endpoint: eligible but explicitly excluded.
 #[get("/api/secret")]
 #[api_doc(mcp = false)]
@@ -425,6 +435,17 @@ async fn mount_path_without_leading_slash_is_rejected() {
     let _ = TestApp::new()
         .routes(routes![list_todos])
         .mount_mcp("mcp")
+        .build();
+}
+
+#[tokio::test]
+#[should_panic(expected = "McpPathCollision")]
+async fn mount_path_colliding_with_existing_route_is_rejected() {
+    // An app route already owns `/mcp`; mounting the MCP endpoint there would
+    // panic at merge time, so we surface a recoverable RouterBuildError.
+    let _ = TestApp::new()
+        .routes(routes![mcp_named_route])
+        .mount_mcp("/mcp")
         .build();
 }
 

@@ -66,6 +66,24 @@ const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024
 /// handler that would otherwise buffer an unbounded body into memory.
 const MAX_TOOL_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
 
+/// Request headers copied verbatim from the `POST /mcp` envelope onto the
+/// in-process request a `tools/call` replays, so the dispatched call
+/// authenticates, resolves its tenant, and is rate-limited/deduped exactly as
+/// the equivalent direct HTTP request would. (The configured header-based
+/// tenant header, whose name is dynamic, is forwarded separately.)
+const FORWARDED_HEADERS: &[&str] = &[
+    "authorization",
+    "cookie",
+    "x-csrf-token",
+    "idempotency-key",
+    "host",
+    "forwarded",
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "x-real-ip",
+];
+
 /// Layer applier for the optional whole-endpoint auth gate (e.g.
 /// `RequireApiToken`). Boxed so any `tower::Layer` can be erased; applied to
 /// the `/mcp` router before it is merged.
@@ -485,9 +503,14 @@ pub fn build_mcp_router(
         tools = server.tools.len(),
         "Mounted MCP endpoint"
     );
+    // Register POST and GET on the mount path as a single `MethodRouter` so the
+    // two verbs share one route entry (avoids any overlapping-route concern and
+    // mirrors how the framework mounts multi-method paths elsewhere).
     axum::Router::<crate::state::AppState>::new()
-        .route(mount_path, axum::routing::post(serve_mcp))
-        .route(mount_path, axum::routing::get(serve_mcp_get))
+        .route(
+            mount_path,
+            axum::routing::get(serve_mcp_get).post(serve_mcp),
+        )
         .layer(axum::extract::Extension(server))
 }
 
@@ -502,14 +525,32 @@ async fn serve_mcp_get() -> Response {
         .into_response()
 }
 
+/// Per-request context threaded into a replayed `tools/call` so the in-process
+/// dispatch sees the same client identity a direct HTTP request would: the
+/// caller's headers, the proxy-resolved client identity, and the connection
+/// peer address (for the IP-keyed rate limiter).
+struct ReplayContext<'a> {
+    headers: &'a HeaderMap,
+    identity: Option<&'a crate::security::ResolvedClientIdentity>,
+    peer: Option<std::net::SocketAddr>,
+}
+
 /// The Streamable-HTTP POST handler: parses one JSON-RPC message (or a batch)
 /// and responds with `application/json`.
 async fn serve_mcp(
     axum::extract::Extension(server): axum::extract::Extension<Arc<McpServer>>,
     identity: Option<axum::extract::Extension<crate::security::ResolvedClientIdentity>>,
+    // The connection peer is stored as a `ConnectInfo<SocketAddr>` request
+    // extension by axum's connect-info make-service; read it via `Extension`
+    // (which is optional-friendly) rather than the `ConnectInfo` extractor.
+    connect_info: Option<
+        axum::extract::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>,
+    >,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let identity = identity.as_ref().map(|ext| &ext.0);
+
     // DNS-rebinding protection (MCP Streamable-HTTP spec MUST): reject a
     // browser-supplied `Origin` that is neither same-origin nor allowlisted.
     // Non-browser agents send no `Origin` and are unaffected.
@@ -517,7 +558,6 @@ async fn serve_mcp(
         let origin = origin.to_str().unwrap_or("");
         // Prefer the proxy-resolved host/scheme (honours X-Forwarded-Host/-Proto
         // from trusted upstreams); fall back to the raw Host header.
-        let identity = identity.as_ref().map(|ext| &ext.0);
         let host = identity
             .and_then(|id| id.host.as_deref())
             .or_else(|| headers.get(header::HOST).and_then(|h| h.to_str().ok()));
@@ -534,6 +574,12 @@ async fn serve_mcp(
         }
     };
 
+    let ctx = ReplayContext {
+        headers: &headers,
+        identity,
+        peer: connect_info.map(|ext| (ext.0).0),
+    };
+
     match parsed {
         // JSON-RPC 2.0: an empty batch is itself an Invalid Request.
         Value::Array(batch) if batch.is_empty() => {
@@ -542,7 +588,7 @@ async fn serve_mcp(
         Value::Array(batch) => {
             let mut out = Vec::new();
             for msg in batch {
-                if let Some(resp) = handle_message(&server, &headers, msg).await {
+                if let Some(resp) = handle_message(&server, &ctx, msg).await {
                     out.push(resp);
                 }
             }
@@ -554,7 +600,7 @@ async fn serve_mcp(
             }
         }
         // A single request object. A notification (no `id`) yields `None` → 202.
-        msg @ Value::Object(_) => handle_message(&server, &headers, msg).await.map_or_else(
+        msg @ Value::Object(_) => handle_message(&server, &ctx, msg).await.map_or_else(
             || StatusCode::ACCEPTED.into_response(),
             |v| json_response(&v),
         ),
@@ -569,18 +615,31 @@ async fn serve_mcp(
 
 /// Handle a single JSON-RPC message. Returns `None` only for a *valid*
 /// notification (a `2.0` message with a `method` and no `id`).
-async fn handle_message(server: &McpServer, headers: &HeaderMap, msg: Value) -> Option<Value> {
+async fn handle_message(server: &McpServer, ctx: &ReplayContext<'_>, msg: Value) -> Option<Value> {
     let id = msg.get("id").cloned();
 
+    // A JSON-RPC 2.0 `id`, when present, must be a string, number, or null;
+    // an object/array id is invalid and must not reach dispatch.
+    let id_ok = id
+        .as_ref()
+        .is_none_or(|v| v.is_string() || v.is_number() || v.is_null());
+
     // Reject anything that isn't a well-formed JSON-RPC 2.0 request/notification
-    // object (e.g. `5`, `{}`, or a message missing `jsonrpc`/`method`). A bare
-    // notification-shaped-but-invalid item must still produce an error with
-    // `id: null` rather than being silently swallowed.
+    // object (e.g. `5`, `{}`, a message missing `jsonrpc`/`method`, or one with
+    // a structured `id`). A bare notification-shaped-but-invalid item must still
+    // produce an error rather than being silently swallowed.
     let is_valid = msg.is_object()
         && msg.get("jsonrpc").and_then(Value::as_str) == Some("2.0")
-        && msg.get("method").and_then(Value::as_str).is_some();
+        && msg.get("method").and_then(Value::as_str).is_some()
+        && id_ok;
     if !is_valid {
-        return Some(error(id.unwrap_or(Value::Null), -32600, "Invalid Request"));
+        // Echo the id only when it is a usable string/number; otherwise (missing
+        // or structurally invalid) the spec requires `id: null`.
+        let err_id = match &id {
+            Some(v) if v.is_string() || v.is_number() => v.clone(),
+            _ => Value::Null,
+        };
+        return Some(error(err_id, -32600, "Invalid Request"));
     }
 
     // A valid notification (method present, no `id`) gets no response.
@@ -592,7 +651,7 @@ async fn handle_message(server: &McpServer, headers: &HeaderMap, msg: Value) -> 
         "initialize" => Ok(initialize_result(server, &params)),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(tools_list_result(server)),
-        "tools/call" => return Some(tools_call(server, headers, id, &params).await),
+        "tools/call" => return Some(tools_call(server, ctx, id, &params).await),
         other => Err((-32601, format!("method not found: {other}"))),
     };
 
@@ -626,7 +685,12 @@ fn tools_list_result(server: &McpServer) -> Value {
 
 /// Dispatch a `tools/call` through the real router and shape the response as
 /// an MCP tool result.
-async fn tools_call(server: &McpServer, headers: &HeaderMap, id: Value, params: &Value) -> Value {
+async fn tools_call(
+    server: &McpServer,
+    ctx: &ReplayContext<'_>,
+    id: Value,
+    params: &Value,
+) -> Value {
     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
     // `inputSchema` is always an object; reject a non-object `arguments`
     // (null/string/array) rather than coercing it to `{}` and dispatching.
@@ -641,10 +705,27 @@ async fn tools_call(server: &McpServer, headers: &HeaderMap, id: Value, params: 
     };
     let tool = &server.tools[idx];
 
-    let request = match build_request(tool, headers, &arguments, server.tenant_header.as_deref()) {
+    let mut request = match build_request(
+        tool,
+        ctx.headers,
+        &arguments,
+        server.tenant_header.as_deref(),
+    ) {
         Ok(req) => req,
         Err(message) => return error(id, -32602, &message),
     };
+
+    // Carry the caller's resolved identity and connection peer into the replay
+    // so the dispatch pipeline attributes it like a direct request would — the
+    // proxy-aware tenancy host and the IP-keyed rate limiter both read these.
+    if let Some(identity) = ctx.identity {
+        request.extensions_mut().insert(identity.clone());
+    }
+    if let Some(peer) = ctx.peer {
+        request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo(peer));
+    }
 
     let response = match server.dispatch.clone().oneshot(request).await {
         Ok(resp) => resp,
@@ -734,25 +815,22 @@ fn build_request(
         .method(tool.method.as_str())
         .uri(&path);
 
-    // Forward the caller's credentials so the dispatched request authenticates
-    // exactly as a direct HTTP call would: `Authorization` for bearer-token
-    // (`RequireApiToken`) auth, `Cookie` for session-based `#[secured]` routes
-    // (the session layer needs the cookie to load the principal), and the
-    // CSRF token (default header `X-CSRF-Token`) so CSRF-protected write tools
-    // pass the `CsrfLayer` they would on a direct request.
-    if let Some(auth) = headers.get(header::AUTHORIZATION) {
-        builder = builder.header(header::AUTHORIZATION, auth);
-    }
-    if let Some(cookie) = headers.get(header::COOKIE) {
-        builder = builder.header(header::COOKIE, cookie);
-    }
-    if let Some(csrf) = headers.get("x-csrf-token") {
-        builder = builder.header("x-csrf-token", csrf);
+    // Replay the caller's headers verbatim so the dispatched request
+    // authenticates and is attributed exactly as a direct HTTP call would:
+    //  * `Authorization` — bearer-token (`RequireApiToken`) auth.
+    //  * `Cookie` — session-based `#[secured]` routes / session tenancy.
+    //  * `X-CSRF-Token` — `CsrfLayer` on mutating write tools.
+    //  * `Idempotency-Key` — `IdempotencyLayer` dedupe on retried writes.
+    //  * `Host` / `Forwarded` / `X-Forwarded-*` / `X-Real-IP` — subdomain
+    //    tenancy host resolution and the rate limiter's client-IP attribution.
+    for name in FORWARDED_HEADERS {
+        if let Some(value) = headers.get(*name) {
+            builder = builder.header(*name, value);
+        }
     }
     // Header-based tenancy: forward the configured tenant header (default
     // `x-tenant-id`) so the `Tenant` extractor on the dispatched request
-    // resolves the same tenant a direct HTTP caller would. Other tenancy
-    // sources key off headers already forwarded above (or the Host).
+    // resolves the same tenant a direct HTTP caller would.
     if let Some(name) = tenant_header
         && let Some(value) = headers.get(name)
     {
@@ -1042,6 +1120,28 @@ mod tests {
         // Without a configured tenant header, it is not forwarded.
         let req = build_request(&t, &headers, &json!({}), None).expect("request builds");
         assert!(req.headers().get("x-tenant-id").is_none());
+    }
+
+    #[test]
+    fn build_request_forwards_identity_and_idempotency_headers() {
+        let t = tool("POST", "/api/todos", true, false);
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "tenant1.example.com".parse().unwrap());
+        headers.insert("x-forwarded-for", "203.0.113.7".parse().unwrap());
+        headers.insert("x-forwarded-host", "tenant1.example.com".parse().unwrap());
+        headers.insert("x-real-ip", "203.0.113.7".parse().unwrap());
+        headers.insert("idempotency-key", "abc-123".parse().unwrap());
+        let req = build_request(&t, &headers, &json!({ "body": { "x": 1 } }), None)
+            .expect("request builds");
+        // Host/forwarding headers carry subdomain-tenancy host + rate-limit IP.
+        assert_eq!(
+            req.headers().get(header::HOST).unwrap(),
+            "tenant1.example.com"
+        );
+        assert_eq!(req.headers().get("x-forwarded-for").unwrap(), "203.0.113.7");
+        assert_eq!(req.headers().get("x-real-ip").unwrap(), "203.0.113.7");
+        // Idempotency-Key is preserved for safe retries of mutating tools.
+        assert_eq!(req.headers().get("idempotency-key").unwrap(), "abc-123");
     }
 
     fn server(allowed_origins: Vec<String>) -> McpServer {
