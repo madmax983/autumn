@@ -401,3 +401,41 @@ async fn feature_flag_macro_primitive_wrapper_stacked() {
     resp.assert_ok();
     assert_eq!(resp.text(), "true");
 }
+
+#[post("/macro-gated-idempotent")]
+#[feature_flag("replay_flag")]
+async fn macro_gated_idempotent_handler() -> &'static str {
+    "handler ran"
+}
+
+#[tokio::test]
+async fn feature_flag_checked_before_idempotency_replay() {
+    let store = Arc::new(InMemoryFlagStore::new());
+    let shared = SharedStore(store.clone());
+
+    store.enable("replay_flag", None).unwrap();
+
+    let client = TestApp::new()
+        .with_flag_store(shared)
+        .routes(routes![macro_gated_idempotent_handler])
+        .idempotent()
+        .build();
+
+    let r1 = client
+        .post("/macro-gated-idempotent")
+        .header("idempotency-key", "replay-test-key")
+        .send()
+        .await;
+    r1.assert_ok();
+    assert_eq!(r1.text(), "handler ran");
+
+    store.disable("replay_flag", None).unwrap();
+
+    client
+        .post("/macro-gated-idempotent")
+        .header("idempotency-key", "replay-test-key")
+        .send()
+        .await
+        .assert_status(StatusCode::NOT_FOUND.as_u16());
+}
+
