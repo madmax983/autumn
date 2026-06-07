@@ -121,7 +121,7 @@ impl BrowserCheck {
         for path in &candidates {
             if path.is_file() {
                 if let Some(version) = probe_version(path) {
-                    return BrowserCheck::Found {
+                    return Self::Found {
                         path: path.clone(),
                         version,
                     };
@@ -129,7 +129,7 @@ impl BrowserCheck {
             }
             searched.push(path.clone());
         }
-        BrowserCheck::NotFound {
+        Self::NotFound {
             searched_paths: searched,
         }
     }
@@ -137,17 +137,17 @@ impl BrowserCheck {
     /// `true` when a browser was found.
     #[must_use]
     pub fn is_found(&self) -> bool {
-        matches!(self, BrowserCheck::Found { .. })
+        matches!(self, Self::Found { .. })
     }
 }
 
 impl fmt::Display for BrowserCheck {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            BrowserCheck::Found { path, version } => {
+            Self::Found { path, version } => {
                 write!(f, "Chromium found: {} ({})", path.display(), version)
             }
-            BrowserCheck::NotFound { searched_paths } => {
+            Self::NotFound { searched_paths } => {
                 write!(
                     f,
                     "Chromium not found. Searched:\n{}",
@@ -1050,7 +1050,7 @@ mod tests {
 
     #[test]
     fn browser_check_not_found_message_has_hints() {
-        let check = BrowserCheck::NotFound {
+        let check = Self::NotFound {
             searched_paths: vec![PathBuf::from("/no/such/path")],
         };
         let msg = check.to_string();

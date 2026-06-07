@@ -66,6 +66,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::config::{Env, parse_env, parse_env_bool, parse_env_csv, parse_env_string};
 use serde::Deserialize;
 
 // ── Signing secret contract ────────────────────────────────────────────────
@@ -475,6 +476,16 @@ pub struct TrustedHostsConfig {
     pub hosts: Vec<String>,
 }
 
+impl TrustedHostsConfig {
+    pub fn apply_env_overrides_with_env(&mut self, env: &dyn Env) {
+        parse_env_csv(
+            env,
+            "AUTUMN_SECURITY__TRUSTED_HOSTS__HOSTS",
+            &mut self.hosts,
+        );
+    }
+}
+
 /// Top-level trusted-proxy policy applied by every forwarding-aware middleware.
 ///
 /// Declare this once under `[security.trusted_proxies]` and every framework
@@ -519,6 +530,31 @@ pub struct TrustedProxiesConfig {
     /// reverse proxy that sets these headers.
     #[serde(default)]
     pub trust_forwarded_headers: bool,
+}
+
+impl TrustedProxiesConfig {
+    pub fn apply_env_overrides_with_env(&mut self, env: &dyn Env) {
+        parse_env_csv(
+            env,
+            "AUTUMN_SECURITY__TRUSTED_PROXIES__RANGES",
+            &mut self.ranges,
+        );
+        parse_env_bool(
+            env,
+            "AUTUMN_SECURITY__TRUSTED_PROXIES__TRUST_FORWARDED_HEADERS",
+            &mut self.trust_forwarded_headers,
+        );
+        if let Ok(val) = env.var("AUTUMN_SECURITY__TRUSTED_PROXIES__TRUSTED_HOPS") {
+            if let Ok(hops) = val.trim().parse::<u32>() {
+                self.trusted_hops = Some(hops);
+            } else {
+                tracing::warn!(
+                    "ignoring invalid AUTUMN_SECURITY__TRUSTED_PROXIES__TRUSTED_HOPS={val:?}: \
+                     expected a non-negative integer"
+                );
+            }
+        }
+    }
 }
 
 /// Security response headers configuration.
@@ -629,6 +665,46 @@ pub struct HeadersConfig {
     pub csp_nonce: CspNonceConfig,
 }
 
+impl HeadersConfig {
+    pub fn apply_env_overrides_with_env(&mut self, env: &dyn Env) {
+        parse_env_string(
+            env,
+            "AUTUMN_SECURITY__HEADERS__X_FRAME_OPTIONS",
+            &mut self.x_frame_options,
+        );
+        parse_env_bool(
+            env,
+            "AUTUMN_SECURITY__HEADERS__X_CONTENT_TYPE_OPTIONS",
+            &mut self.x_content_type_options,
+        );
+        parse_env_bool(
+            env,
+            "AUTUMN_SECURITY__HEADERS__STRICT_TRANSPORT_SECURITY",
+            &mut self.strict_transport_security,
+        );
+        parse_env(
+            env,
+            "AUTUMN_SECURITY__HEADERS__HSTS_MAX_AGE_SECS",
+            &mut self.hsts_max_age_secs,
+        );
+        parse_env_string(
+            env,
+            "AUTUMN_SECURITY__HEADERS__CONTENT_SECURITY_POLICY",
+            &mut self.content_security_policy,
+        );
+        parse_env_string(
+            env,
+            "AUTUMN_SECURITY__HEADERS__REFERRER_POLICY",
+            &mut self.referrer_policy,
+        );
+        parse_env_string(
+            env,
+            "AUTUMN_SECURITY__HEADERS__PERMISSIONS_POLICY",
+            &mut self.permissions_policy,
+        );
+    }
+}
+
 impl Default for HeadersConfig {
     fn default() -> Self {
         Self {
@@ -710,6 +786,22 @@ pub struct CsrfConfig {
     /// under `/api/`.
     #[serde(default)]
     pub exempt_paths: Vec<String>,
+}
+
+impl CsrfConfig {
+    pub fn apply_env_overrides_with_env(&mut self, env: &dyn Env) {
+        parse_env_bool(env, "AUTUMN_SECURITY__CSRF__ENABLED", &mut self.enabled);
+        parse_env_string(
+            env,
+            "AUTUMN_SECURITY__CSRF__TOKEN_HEADER",
+            &mut self.token_header,
+        );
+        parse_env_string(
+            env,
+            "AUTUMN_SECURITY__CSRF__COOKIE_NAME",
+            &mut self.cookie_name,
+        );
+    }
 }
 
 impl Default for CsrfConfig {
@@ -1097,6 +1189,26 @@ pub struct UploadConfig {
     /// Optional allowed MIME types (e.g. `["image/png", "image/jpeg"]`).
     #[serde(default)]
     pub allowed_mime_types: Vec<String>,
+}
+
+impl UploadConfig {
+    pub fn apply_env_overrides_with_env(&mut self, env: &dyn Env) {
+        parse_env(
+            env,
+            "AUTUMN_SECURITY__UPLOAD__MAX_REQUEST_SIZE_BYTES",
+            &mut self.max_request_size_bytes,
+        );
+        parse_env(
+            env,
+            "AUTUMN_SECURITY__UPLOAD__MAX_FILE_SIZE_BYTES",
+            &mut self.max_file_size_bytes,
+        );
+        parse_env_csv(
+            env,
+            "AUTUMN_SECURITY__UPLOAD__ALLOWED_MIME_TYPES",
+            &mut self.allowed_mime_types,
+        );
+    }
 }
 
 impl Default for UploadConfig {
