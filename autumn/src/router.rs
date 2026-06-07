@@ -146,6 +146,14 @@ pub struct RouterContext {
     /// Gated behind the `openapi` feature.
     #[cfg(feature = "openapi")]
     pub openapi: Option<crate::openapi::OpenApiConfig>,
+    /// MCP (Model Context Protocol) runtime config. When `Some`, the router
+    /// mounts a Streamable-HTTP MCP endpoint that projects opted-in routes as
+    /// agent-callable tools and dispatches `tools/call` through the real
+    /// handler pipeline.
+    ///
+    /// Gated behind the `mcp` feature.
+    #[cfg(feature = "mcp")]
+    pub mcp: Option<crate::mcp::McpRuntime>,
 }
 
 /// Checked variant of [`build_router`] that returns configuration errors
@@ -175,6 +183,8 @@ pub fn try_build_router(
             session_store: None,
             #[cfg(feature = "openapi")]
             openapi: None,
+            #[cfg(feature = "mcp")]
+            mcp: None,
         },
     )?;
     Ok(apply_startup_barrier(
@@ -236,6 +246,8 @@ pub fn try_build_router_merged(
             session_store: None,
             #[cfg(feature = "openapi")]
             openapi: None,
+            #[cfg(feature = "mcp")]
+            mcp: None,
         },
     )?;
     Ok(apply_startup_barrier(
@@ -322,6 +334,16 @@ fn build_router_pre_state(
         &config.session.cookie_name,
         versions.as_ref().map_or(&[], |v| v.0.as_slice()),
     )?;
+
+    // Derive MCP tools from the route registry *before* `route_list` is moved
+    // into axum below. The dispatch router is captured later, once the full
+    // pipeline (routes + middleware) is assembled.
+    #[cfg(feature = "mcp")]
+    let mcp_assembly: Option<(String, Vec<crate::mcp::McpToolInfo>)> = ctx.mcp.as_ref().map(|rt| {
+        let docs = collect_openapi_docs(&route_list, &ctx.scoped_groups);
+        let tools = crate::mcp::derive_tools(&docs, rt.expose_all);
+        (rt.mount_path.clone(), tools)
+    });
 
     let idempotency_layers = build_idempotency_layers(config, state)?;
     let opaque_app_layers_present = opaque_app_layers_override
@@ -423,6 +445,20 @@ fn build_router_pre_state(
         state.clone(),
         http_interceptor_middleware,
     ));
+
+    // Mount the MCP endpoint last so its dispatch target — a clone of the
+    // fully-assembled router with state applied — traverses the exact same
+    // routes, layers, and middleware an HTTP request would. The clone is
+    // taken *before* the MCP route is added, so `tools/call` never recurses
+    // into the MCP endpoint itself.
+    #[cfg(feature = "mcp")]
+    let router = if let Some((mount_path, tools)) = mcp_assembly {
+        let dispatch = router.clone().with_state(state.clone());
+        let mcp_router = crate::mcp::build_mcp_router(&mount_path, tools, dispatch);
+        router.merge(mcp_router)
+    } else {
+        router
+    };
 
     Ok(router)
 }
@@ -1734,6 +1770,8 @@ pub fn try_build_router_with_static(
             session_store: None,
             #[cfg(feature = "openapi")]
             openapi: None,
+            #[cfg(feature = "mcp")]
+            mcp: None,
         },
     )
 }
@@ -2839,6 +2877,8 @@ mod tests {
             error_page_renderer: None,
             session_store: None,
             openapi: Some(openapi),
+            #[cfg(feature = "mcp")]
+            mcp: None,
         };
         let err = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx)
             .expect_err("scope '/api' + child '/' should collide with openapi path '/api'");
@@ -3143,6 +3183,8 @@ mod tests {
             error_page_renderer: None,
             session_store: None,
             openapi: Some(openapi),
+            #[cfg(feature = "mcp")]
+            mcp: None,
         };
         let err = super::try_build_router_inner(vec![user_route], &config, test_state(), ctx)
             .expect_err("user-owned path should prevent OpenAPI mount");
@@ -3167,6 +3209,8 @@ mod tests {
             error_page_renderer: None,
             session_store: None,
             openapi: Some(openapi),
+            #[cfg(feature = "mcp")]
+            mcp: None,
         };
         let err = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx)
             .expect_err("framework-owned path should prevent OpenAPI mount");
@@ -3212,6 +3256,8 @@ mod tests {
             error_page_renderer: None,
             session_store: None,
             openapi: Some(openapi),
+            #[cfg(feature = "mcp")]
+            mcp: None,
         };
         let err = super::try_build_router_inner(vec![user_route], &config, test_state(), ctx)
             .expect_err("swagger ui asset path should be reserved");
@@ -3239,6 +3285,8 @@ mod tests {
             error_page_renderer: None,
             session_store: None,
             openapi: Some(openapi),
+            #[cfg(feature = "mcp")]
+            mcp: None,
         };
         let err = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx)
             .expect_err("htmx csrf helper path should be reserved");
@@ -3272,6 +3320,8 @@ mod tests {
             error_page_renderer: None,
             session_store: None,
             openapi: Some(openapi),
+            #[cfg(feature = "mcp")]
+            mcp: None,
         };
         let err = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx)
             .expect_err("OpenAPI path under a nest prefix should collide");
@@ -3305,6 +3355,8 @@ mod tests {
                     error_page_renderer: None,
                     session_store: None,
                     openapi: Some(openapi),
+                    #[cfg(feature = "mcp")]
+                    mcp: None,
                 };
                 let err = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx)
                     .expect_err("dev reload path should be reserved");

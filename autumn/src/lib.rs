@@ -158,6 +158,12 @@ pub mod flash;
 pub(crate) mod htmx;
 pub mod log;
 pub(crate) mod logging;
+/// Project typed JSON endpoints as Model Context Protocol (MCP) tools so AI
+/// agents can call the real, authenticated handler pipeline.
+///
+/// Enable with the Cargo feature `mcp` (which implies `openapi`).
+#[cfg(feature = "mcp")]
+pub mod mcp;
 pub mod middleware;
 pub mod openapi;
 pub mod pagination;

@@ -49,7 +49,13 @@ pub async fn issue_token(
 // them — the middleware rejects them with `401 Unauthorized` first.
 
 /// Return all todos as a JSON array.
-#[get("/api/todos")]
+///
+/// Tagged `#[api_doc(mcp)]` so it is projected as a read-only MCP tool: an AI
+/// agent can call `list_json` through the same bearer-token-protected pipeline
+/// a mobile or CLI client uses. The route is scoped under `/api` in
+/// `main.rs`, so the served URL stays `/api/todos`.
+#[get("/todos")]
+#[api_doc(mcp, summary = "List all todos")]
 pub async fn list_json(ApiToken(caller): ApiToken, mut db: Db) -> AutumnResult<Json<Vec<Todo>>> {
     let _ = caller; // available for per-user filtering; unused in this demo
     let all_todos = Todo::all(&mut db).await?;
@@ -57,7 +63,12 @@ pub async fn list_json(ApiToken(caller): ApiToken, mut db: Db) -> AutumnResult<J
 }
 
 /// Create a new todo from a JSON body, return the created todo as JSON.
-#[post("/api/todos")]
+///
+/// Tagged `#[api_doc(mcp)]` to expose it as a write tool. Mutating verbs are
+/// never exposed implicitly — this explicit opt-in is what allows an agent to
+/// call it, even under the whole-API hatch.
+#[post("/todos")]
+#[api_doc(mcp, summary = "Create a new todo")]
 pub async fn create_json(
     ApiToken(caller): ApiToken,
     mut db: Db,

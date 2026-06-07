@@ -5,6 +5,21 @@ All notable changes to the Autumn framework will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **mcp:** Expose typed endpoints as Model Context Protocol (MCP) tools so AI agents can call your API (#1117)
+  - New `mcp` Cargo feature (implies `openapi`). `AppBuilder::mount_mcp("/mcp")` serves a spec-compliant MCP endpoint over Streamable HTTP, handling `initialize`, `tools/list`, and `tools/call`.
+  - Endpoints opt in per-route via `#[api_doc(mcp)]`; nothing is exposed implicitly. `#[api_doc(mcp = false)]` force-excludes a route.
+  - A whole-API hatch, `AppBuilder::expose_all_as_mcp()`, auto-includes every eligible `GET`, but mutating verbs (`POST`/`PUT`/`PATCH`/`DELETE`) still require an explicit `#[api_doc(mcp)]` opt-in, and per-endpoint exclusions are always honored.
+  - Each tool's `name`, `description`, and `inputSchema` are derived from the existing `ApiDoc` (operation id, summary/description, merged request-body + `Query` + path-param schemas) — there is no second, hand-maintained schema, so the tool catalog cannot drift from the handler's typed contract.
+  - `tools/call` dispatches through the **real handler pipeline** (the same in-process path the test client uses), so `#[secured]`, authorization, tenancy, rate limits, and validation apply identically to an agent call and an HTTP call.
+  - Agent authentication reuses the existing bearer-token surface (`RequireApiToken` / `ApiTokenStore`): the `Authorization` header presented to `/mcp` is forwarded into the dispatched call.
+  - HTTP method maps to MCP safety annotations: `GET` → `readOnlyHint`; `DELETE` → `destructiveHint`.
+  - Only JSON-in/JSON-out endpoints are eligible; HTML/Maud routes (no response schema) are auto-excluded with a build-time log note.
+  - `examples/todo-app` gains an `/mcp` endpoint exposing `list_json` (read) and `create_json` (explicitly-opted-in write) behind `RequireApiToken`.
+
 ## [0.5.0] - 2026-06-04
 
 ### Added

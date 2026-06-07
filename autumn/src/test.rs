@@ -169,6 +169,8 @@ pub struct TestApp {
     config: AutumnConfig,
     #[cfg(feature = "openapi")]
     openapi: Option<crate::openapi::OpenApiConfig>,
+    #[cfg(feature = "mcp")]
+    mcp: Option<crate::mcp::McpRuntime>,
     #[cfg(feature = "db")]
     pool: Option<Pool<AsyncPgConnection>>,
     #[cfg(feature = "db")]
@@ -239,6 +241,8 @@ impl TestApp {
             config,
             #[cfg(feature = "openapi")]
             openapi: None,
+            #[cfg(feature = "mcp")]
+            mcp: None,
             #[cfg(feature = "db")]
             pool: None,
             #[cfg(feature = "db")]
@@ -325,6 +329,41 @@ impl TestApp {
     #[must_use]
     pub fn openapi(mut self, config: crate::openapi::OpenApiConfig) -> Self {
         self.openapi = Some(config);
+        self
+    }
+
+    /// Mount an MCP endpoint at `path`, mirroring
+    /// [`AppBuilder::mount_mcp`](crate::app::AppBuilder::mount_mcp) so
+    /// integration tests can drive `initialize`/`tools/list`/`tools/call`
+    /// through the in-process pipeline.
+    ///
+    /// Gated behind the `mcp` Cargo feature.
+    #[cfg(feature = "mcp")]
+    #[must_use]
+    pub fn mount_mcp(mut self, path: impl Into<String>) -> Self {
+        let path = path.into();
+        if let Some(rt) = self.mcp.as_mut() {
+            rt.mount_path = path;
+        } else {
+            self.mcp = Some(crate::mcp::McpRuntime::new(path));
+        }
+        self
+    }
+
+    /// Enable the whole-API MCP hatch, mirroring
+    /// [`AppBuilder::expose_all_as_mcp`](crate::app::AppBuilder::expose_all_as_mcp).
+    ///
+    /// Gated behind the `mcp` Cargo feature.
+    #[cfg(feature = "mcp")]
+    #[must_use]
+    pub fn expose_all_as_mcp(mut self) -> Self {
+        if let Some(rt) = self.mcp.as_mut() {
+            rt.expose_all = true;
+        } else {
+            let mut rt = crate::mcp::McpRuntime::new("/mcp");
+            rt.expose_all = true;
+            self.mcp = Some(rt);
+        }
         self
     }
 
@@ -960,6 +999,8 @@ impl TestApp {
                 session_store: None,
                 #[cfg(feature = "openapi")]
                 openapi: self.openapi,
+                #[cfg(feature = "mcp")]
+                mcp: self.mcp,
             },
         )
         .expect("failed to build test router");
