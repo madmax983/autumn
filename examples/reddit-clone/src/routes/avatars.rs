@@ -59,10 +59,7 @@ pub async fn avatar_form(
     // First visit generates it (and caches it content-addressably in the
     // same BlobStore as the source); subsequent visits are a single head()
     // cache hit.  EXIF/GPS metadata is stripped for privacy.
-    let preview_url = match (
-        user.avatar.as_ref(),
-        state.extension::<BlobStoreState>(),
-    ) {
+    let preview_url = match (user.avatar.as_ref(), state.extension::<BlobStoreState>()) {
         (Some(blob), Some(blobs)) => {
             let store = blobs.store();
             blob.variant(
@@ -72,7 +69,11 @@ pub async fn avatar_form(
                     Transform::strip_metadata(),
                 ],
             )
-            .url(&**store, &VariantBudget::default(), Duration::from_secs(3600))
+            .url(
+                &**store,
+                &VariantBudget::default(),
+                Duration::from_secs(3600),
+            )
             .await
             .ok()
         }

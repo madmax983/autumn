@@ -223,9 +223,7 @@ impl VariantHandle {
         expires_in: Duration,
     ) -> Result<String, VariantError> {
         self.ensure_generated(store, budget).await?;
-        Ok(store
-            .presigned_url(&self.variant_key, expires_in)
-            .await?)
+        Ok(store.presigned_url(&self.variant_key, expires_in).await?)
     }
 
     /// Ensure the variant blob exists in the store, returning its handle.
@@ -272,6 +270,15 @@ impl VariantHandle {
         check_image_mime_type(&self.source.content_type)?;
 
         let source_bytes = store.get(&self.source.key).await?;
+
+        // Secondary guard on the real byte count — the Blob metadata could be
+        // stale or crafted; check the actual payload length too.
+        if source_bytes.len() as u64 > budget.max_source_bytes {
+            return Err(VariantError::SourceTooLarge {
+                byte_size: source_bytes.len() as u64,
+                max_bytes: budget.max_source_bytes,
+            });
+        }
 
         // Auto-detect format from bytes; the image crate's magic-byte
         // detection is more reliable than trusting the stored content_type
@@ -347,9 +354,14 @@ pub(crate) fn check_image_mime_type(content_type: &str) -> Result<(), VariantErr
         .next()
         .unwrap_or(content_type)
         .trim();
-    match base {
-        "image/jpeg" | "image/jpg" | "image/png" | "image/webp" => Ok(()),
-        other => Err(VariantError::UnsupportedMimeType(other.to_owned())),
+    if base.eq_ignore_ascii_case("image/jpeg")
+        || base.eq_ignore_ascii_case("image/jpg")
+        || base.eq_ignore_ascii_case("image/png")
+        || base.eq_ignore_ascii_case("image/webp")
+    {
+        Ok(())
+    } else {
+        Err(VariantError::UnsupportedMimeType(base.to_owned()))
     }
 }
 
@@ -365,15 +377,7 @@ pub(crate) fn content_addressed_key(source_key: &str, transforms: &[Transform]) 
     hasher.update(b"\0");
     hasher.update(spec.as_bytes());
     let hash = hasher.finalize();
-    let hash_hex: String = hash
-        .iter()
-        .flat_map(|b| {
-            let hi = (b >> 4) as usize;
-            let lo = (b & 0xf) as usize;
-            const HEX: &[u8] = b"0123456789abcdef";
-            [HEX[hi] as char, HEX[lo] as char]
-        })
-        .collect();
+    let hash_hex = hex::encode(hash);
     format!(
         "_variants/{}/{}/{}",
         &hash_hex[..2],
@@ -394,17 +398,15 @@ fn output_format_and_mime(content_type: &str) -> (image::ImageFormat, &'static s
         .next()
         .unwrap_or(content_type)
         .trim();
-    match base {
-        "image/png" => (image::ImageFormat::Png, "image/png"),
-        _ => (image::ImageFormat::Jpeg, "image/jpeg"),
+    if base.eq_ignore_ascii_case("image/png") {
+        (image::ImageFormat::Png, "image/png")
+    } else {
+        (image::ImageFormat::Jpeg, "image/jpeg")
     }
 }
 
 /// Apply each transform in order to the image.
-fn apply_transforms(
-    mut img: image::DynamicImage,
-    transforms: &[Transform],
-) -> image::DynamicImage {
+fn apply_transforms(mut img: image::DynamicImage, transforms: &[Transform]) -> image::DynamicImage {
     use image::imageops::FilterType;
 
     for transform in transforms {
@@ -523,15 +525,20 @@ mod tests {
     fn variant_key_passes_blob_validation() {
         use crate::storage::validate_key;
         let blob = Blob::new("local", "avatars/1.png", "image/png", 1024);
-        let key = blob.variant("t", &[Transform::resize_to_limit(200, 200)]).key().to_owned();
-        validate_key(&key)
-            .unwrap_or_else(|e| panic!("variant key {key:?} failed validation: {e}"));
+        let key = blob
+            .variant("t", &[Transform::resize_to_limit(200, 200)])
+            .key()
+            .to_owned();
+        validate_key(&key).unwrap_or_else(|e| panic!("variant key {key:?} failed validation: {e}"));
     }
 
     #[test]
     fn variant_key_starts_with_variants_prefix() {
         let blob = Blob::new("local", "avatars/1.png", "image/png", 1024);
-        let key = blob.variant("t", &[Transform::resize_to_limit(200, 200)]).key().to_owned();
+        let key = blob
+            .variant("t", &[Transform::resize_to_limit(200, 200)])
+            .key()
+            .to_owned();
         assert!(key.starts_with("_variants/"), "key: {key}");
     }
 
@@ -585,7 +592,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = test_store(dir.path());
         store
-            .put("doc.pdf", "application/pdf", Bytes::from_static(b"%PDF-1.4"))
+            .put(
+                "doc.pdf",
+                "application/pdf",
+                Bytes::from_static(b"%PDF-1.4"),
+            )
             .await
             .unwrap();
         let blob = Blob::new("test", "doc.pdf", "application/pdf", 8);
@@ -639,7 +650,7 @@ mod tests {
             .await
             .unwrap();
         let budget = VariantBudget {
-            max_source_width: 3,  // less than 4
+            max_source_width: 3, // less than 4
             max_source_height: 3,
             max_source_bytes: jpeg.len() as u64 * 10, // byte budget is fine
         };
@@ -748,7 +759,10 @@ mod tests {
             .unwrap();
 
         let out_bytes = store
-            .get(blob.variant("large", &[Transform::resize_to_limit(200, 200)]).key())
+            .get(
+                blob.variant("large", &[Transform::resize_to_limit(200, 200)])
+                    .key(),
+            )
             .await
             .unwrap();
         let out_img = image::load_from_memory(&out_bytes).unwrap();
@@ -776,7 +790,10 @@ mod tests {
             .unwrap();
 
         let out_bytes = store
-            .get(blob.variant("square", &[Transform::resize_to_fill(50, 50)]).key())
+            .get(
+                blob.variant("square", &[Transform::resize_to_fill(50, 50)])
+                    .key(),
+            )
             .await
             .unwrap();
         let out_img = image::load_from_memory(&out_bytes).unwrap();
@@ -858,7 +875,10 @@ mod tests {
             .unwrap();
 
         let out_bytes = store
-            .get(blob.variant("stripped", &[Transform::strip_metadata()]).key())
+            .get(
+                blob.variant("stripped", &[Transform::strip_metadata()])
+                    .key(),
+            )
             .await
             .unwrap();
         assert!(
@@ -940,7 +960,10 @@ mod tests {
             .url(&store, &VariantBudget::default(), Duration::from_secs(300))
             .await
             .unwrap();
-        assert!(url.contains("_variants/"), "URL must contain variant key: {url}");
+        assert!(
+            url.contains("_variants/"),
+            "URL must contain variant key: {url}"
+        );
         assert!(url.contains("exp="), "URL must contain expiry param: {url}");
         assert!(url.contains("sig="), "URL must contain signature: {url}");
     }
@@ -956,7 +979,10 @@ mod tests {
 
     #[test]
     fn handle_transforms_accessor() {
-        let transforms = vec![Transform::resize_to_limit(200, 200), Transform::strip_metadata()];
+        let transforms = vec![
+            Transform::resize_to_limit(200, 200),
+            Transform::strip_metadata(),
+        ];
         let blob = Blob::new("local", "a.png", "image/png", 1);
         let h = blob.variant("t", &transforms);
         assert_eq!(h.transforms(), &transforms);
