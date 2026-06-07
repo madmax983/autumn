@@ -76,6 +76,7 @@ use serde::{Deserialize, Serialize};
 /// [`post`](crate::post), etc.) from the handler's path, signature, and
 /// any [`#[api_doc(...)]`](crate::api_doc) overrides.
 #[derive(Clone, Debug, Default)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct ApiDoc {
     /// HTTP method as an uppercase string (e.g. `"GET"`).
     pub method: &'static str,
