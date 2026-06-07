@@ -133,7 +133,7 @@ impl GdprRegistry {
 
     /// Returns `true` when at least one model is registered.
     #[must_use]
-    pub fn is_populated(&self) -> bool {
+    pub const fn is_populated(&self) -> bool {
         !self.registrations.is_empty()
     }
 

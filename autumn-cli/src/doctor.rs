@@ -2222,7 +2222,8 @@ fn resolve_gdpr_unregistered_tables() -> Vec<String> {
 }
 
 /// Scan all `*.rs` files under `src/` for `GdprRegistry` register calls and
-/// return the set of table names found.
+/// return the set of table names found. Handles both single-line and
+/// rustfmt-formatted multi-line `ModelRegistration::` calls.
 fn collect_gdpr_registered_tables_from_source() -> std::collections::HashSet<String> {
     let mut found = std::collections::HashSet::new();
     let Ok(entries) = glob_rs_files(std::path::Path::new("src")) else {
@@ -2232,25 +2233,49 @@ fn collect_gdpr_registered_tables_from_source() -> std::collections::HashSet<Str
         let Ok(content) = std::fs::read_to_string(&path) else {
             continue;
         };
-        // Look for patterns like `.register(ModelRegistration::hard_delete("posts"))`
-        // or `.register(ModelRegistration::anonymize("posts"))`.
-        // Start the quote search *after* the `ModelRegistration::` token so that
-        // any earlier string literals on the same line are not mistakenly extracted.
-        for line in content.lines() {
-            if let Some(idx) = line.find("ModelRegistration::") {
-                let rest = &line[idx..];
-                if let Some(start) = rest.find('"') {
-                    if let Some(end) = rest[start + 1..].find('"') {
-                        let name = &rest[start + 1..start + 1 + end];
-                        if !name.is_empty() && !name.contains(' ') {
-                            found.insert(name.to_owned());
-                        }
+        scan_source_for_gdpr_registrations(&content, &mut found);
+    }
+    found
+}
+
+/// Extract `ModelRegistration::` table names from source text, handling both
+/// single-line calls and multi-line rustfmt-formatted calls.
+fn scan_source_for_gdpr_registrations(
+    content: &str,
+    found: &mut std::collections::HashSet<String>,
+) {
+    let lines: Vec<&str> = content.lines().collect();
+    for (i, line) in lines.iter().enumerate() {
+        if let Some(idx) = line.find("ModelRegistration::") {
+            let rest = &line[idx..];
+            // Try the same line first, then the next 3 lines for multi-line calls.
+            if extract_quoted_table_name(rest, found) {
+                continue;
+            }
+            for j in 1..=3 {
+                if let Some(next) = lines.get(i + j) {
+                    if extract_quoted_table_name(next.trim(), found) {
+                        break;
                     }
                 }
             }
         }
     }
-    found
+}
+
+/// Extract the first double-quoted string from `s` as a table name.
+/// Returns `true` if a non-empty, non-whitespace name was found and inserted.
+fn extract_quoted_table_name(s: &str, found: &mut std::collections::HashSet<String>) -> bool {
+    if let Some(start) = s.find('"') {
+        if let Some(end) = s[start + 1..].find('"') {
+            let name = &s[start + 1..start + 1 + end];
+            if !name.is_empty() && !name.contains(' ') {
+                found.insert(name.to_owned());
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Recursively collect all `*.rs` file paths under `dir`.
@@ -3542,6 +3567,56 @@ redirect_uri = "http://localhost/callback"
         assert!(
             detail.contains('3') || detail.contains("3 "),
             "detail must mention the count of unregistered tables: {detail}"
+        );
+    }
+
+    // ── scan_source_for_gdpr_registrations / extract_quoted_table_name ─────────
+
+    #[test]
+    fn scanner_detects_single_line_hard_delete() {
+        let src = r#"registry.register(ModelRegistration::hard_delete("posts"));"#;
+        let mut found = std::collections::HashSet::new();
+        scan_source_for_gdpr_registrations(src, &mut found);
+        assert!(
+            found.contains("posts"),
+            "should detect single-line hard_delete: {found:?}"
+        );
+    }
+
+    #[test]
+    fn scanner_detects_multiline_retain_call() {
+        let src = "registry.register(ModelRegistration::retain(\n    \"invoices\",\n    \"7-year financial hold\",\n));";
+        let mut found = std::collections::HashSet::new();
+        scan_source_for_gdpr_registrations(src, &mut found);
+        assert!(
+            found.contains("invoices"),
+            "should detect multi-line retain registration: {found:?}"
+        );
+    }
+
+    #[test]
+    fn scanner_detects_multiline_anonymize_call() {
+        let src = "registry.register(ModelRegistration::anonymize(\n    \"comments\",\n));";
+        let mut found = std::collections::HashSet::new();
+        scan_source_for_gdpr_registrations(src, &mut found);
+        assert!(
+            found.contains("comments"),
+            "should detect multi-line anonymize registration: {found:?}"
+        );
+    }
+
+    #[test]
+    fn scanner_ignores_string_before_token() {
+        let src = r#"let _x = "not_a_table"; ModelRegistration::hard_delete("real_table");"#;
+        let mut found = std::collections::HashSet::new();
+        scan_source_for_gdpr_registrations(src, &mut found);
+        assert!(
+            found.contains("real_table"),
+            "should contain real_table: {found:?}"
+        );
+        assert!(
+            !found.contains("not_a_table"),
+            "should not contain string before token: {found:?}"
         );
     }
 }

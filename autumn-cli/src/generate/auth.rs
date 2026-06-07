@@ -2076,14 +2076,9 @@ pub async fn account(session: Session, mut db: Db, csrf: Option<CsrfToken>, csrf
             @if let Some(ref csrf) = csrf {{ input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
             button type="submit" {{ "Log Out" }}
         }}
-        details {{
-            summary {{ "Delete account" }}
-            p {{ "For GDPR-compliant deletion with a 30-day grace period, use " a href="/account/delete" {{ "Delete My Account" }} "." }}
-            form action="/account/destroy" method="post" {{
-                @if let Some(ref csrf) = csrf {{ input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
-                p {{ "Or use the legacy immediate hard-delete (no grace period):" }}
-                button type="submit" {{ "Delete my account (immediate)" }}
-            }}
+        p {{
+            a href="/account/delete" {{ "Delete my account" }}
+            " (30-day grace period — GDPR Article 17)"
         }}
     }}).into_response())
 }}
@@ -2895,7 +2890,7 @@ pub async fn data_export_form(
 pub async fn data_export(
     session: Session,
     mut db: Db,
-    state: AppState,
+    State(state): State<AppState>,
     mailer: Option<Mailer>,
 ) -> AutumnResult<Response> {{
     let {snake_name}_id: i64 = session
@@ -2905,11 +2900,30 @@ pub async fn data_export(
         .ok_or_else(|| AutumnError::unauthorized_msg("Not authenticated."))?;
 
     let now = chrono::Utc::now().naive_utc();
-    diesel::update({table}::table.find({snake_name}_id))
+    let one_hour_ago = now - chrono::Duration::hours(1);
+
+    // Idempotency: only update (and enqueue) if no export was requested in the last hour.
+    let updated = diesel::update({table}::table.find({snake_name}_id))
+        .filter(
+            {table}::export_requested_at
+                .is_null()
+                .or({table}::export_requested_at.lt(Some(one_hour_ago))),
+        )
         .set({table}::export_requested_at.eq(Some(now)))
         .execute(&mut *db)
         .await
         .map_err(|_| AutumnError::internal_server_error_msg("Failed to record export request."))?;
+
+    if updated == 0 {{
+        return Ok(layout("Export Already Pending", html! {{
+            h1 {{ "Export Already Pending" }}
+            p {{
+                "A data export was already requested within the last hour. \
+                 Please check your email or try again later."
+            }}
+            p {{ a href="/account" {{ "← Back to account" }} }}
+        }}).into_response());
+    }}
 
     // Enqueue the background export job.
     enqueue_data_export_job(&state, {snake_name}_id, mailer.as_ref()).await;
@@ -3011,11 +3025,13 @@ pub async fn delete_account_form(
 /// Records `delete_requested_at` and `delete_scheduled_at` (30-day grace period)
 /// then writes an audit log entry. A background sweeper handles the hard-delete
 /// once the grace period expires. The user is logged out immediately.
+#[secured]
+#[step_up]
 #[post("/account/delete")]
 pub async fn delete_account(
     session: Session,
     mut db: Db,
-    state: AppState,
+    State(state): State<AppState>,
     axum::Form(form): axum::Form<DeleteAccountForm>,
 ) -> AutumnResult<Response> {{
     let {snake_name}_id: i64 = session
@@ -3076,12 +3092,14 @@ pub async fn delete_account(
 /// `POST /account/delete/cancel` — cancel a pending account deletion.
 ///
 /// Clears the `delete_requested_at` / `delete_scheduled_at` columns and writes
-/// an audit log entry. Only available during the grace period.
+/// an audit log entry. Returns an error if no deletion is pending or the grace
+/// period has already elapsed.
+#[secured]
 #[post("/account/delete/cancel")]
 pub async fn cancel_delete_account(
     session: Session,
     mut db: Db,
-    state: AppState,
+    State(state): State<AppState>,
 ) -> AutumnResult<Response> {{
     let {snake_name}_id: i64 = session
         .get("{snake_name}_id")
@@ -3089,7 +3107,9 @@ pub async fn cancel_delete_account(
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| AutumnError::unauthorized_msg("Not authenticated."))?;
 
-    diesel::update({table}::table.find({snake_name}_id))
+    // Only cancel if a future deletion is scheduled; reject once the deadline has passed.
+    let rows = diesel::update({table}::table.find({snake_name}_id))
+        .filter({table}::delete_scheduled_at.gt(Some(chrono::Utc::now().naive_utc())))
         .set((
             {table}::delete_requested_at.eq(None::<chrono::NaiveDateTime>),
             {table}::delete_scheduled_at.eq(None::<chrono::NaiveDateTime>),
@@ -3097,6 +3117,12 @@ pub async fn cancel_delete_account(
         .execute(&mut *db)
         .await
         .map_err(|_| AutumnError::internal_server_error_msg("Failed to cancel deletion."))?;
+
+    if rows == 0 {{
+        return Err(AutumnError::unprocessable_msg(
+            "No pending deletion found, or the grace period has already elapsed.",
+        ));
+    }}
 
     autumn_web::audit::write_from_state(
         &state,
@@ -3126,23 +3152,24 @@ pub struct AdminGdprActionForm {{
     pub reason: String,
 }}
 
-/// `POST /admin/{table}/:id/data-export` — admin triggers data export for a user.
+/// `POST /admin/{table}/{{id}}/data-export` — admin triggers data export for a user.
 ///
 /// Stamps `export_requested_at` and enqueues the export job.
 /// Records `actor_id` (the operator) + `reason` in the audit log.
-#[post("/admin/{table}/:id/data-export")]
+/// Mount behind your admin authentication middleware.
+#[post("/admin/{table}/{{id}}/data-export")]
 pub async fn admin_data_export(
     Path(user_id): Path<i64>,
     session: Session,
     mut db: Db,
-    state: AppState,
+    State(state): State<AppState>,
     mailer: Option<Mailer>,
     axum::Form(form): axum::Form<AdminGdprActionForm>,
 ) -> AutumnResult<Response> {{
     let operator_id: String = session
         .get("{snake_name}_id")
         .await
-        .unwrap_or_else(|| "admin".to_owned());
+        .ok_or_else(|| AutumnError::unauthorized_msg("Admin access required."))?;
 
     let now = chrono::Utc::now().naive_utc();
     diesel::update({table}::table.find(user_id))
@@ -3169,22 +3196,23 @@ pub async fn admin_data_export(
     Ok(redirect_to(&format!("/admin/{table}/{{user_id}}")).into_response())
 }}
 
-/// `POST /admin/{table}/:id/delete` — admin triggers account erasure for a user.
+/// `POST /admin/{table}/{{id}}/delete` — admin triggers account erasure for a user.
 ///
 /// Schedules the account for deletion (30-day grace period).
 /// Records `actor_id` (the operator), `reason`, and timestamp in the audit log.
-#[post("/admin/{table}/:id/delete")]
+/// Mount behind your admin authentication middleware.
+#[post("/admin/{table}/{{id}}/delete")]
 pub async fn admin_delete_account(
     Path(user_id): Path<i64>,
     session: Session,
     mut db: Db,
-    state: AppState,
+    State(state): State<AppState>,
     axum::Form(form): axum::Form<AdminGdprActionForm>,
 ) -> AutumnResult<Response> {{
     let operator_id: String = session
         .get("{snake_name}_id")
         .await
-        .unwrap_or_else(|| "admin".to_owned());
+        .ok_or_else(|| AutumnError::unauthorized_msg("Admin access required."))?;
 
     let now = chrono::Utc::now().naive_utc();
     let grace_until = now + chrono::Duration::days(30);
