@@ -186,21 +186,17 @@ fn inject_step_up_params(input_fn: &mut ItemFn) {
 fn type_contains_impl_trait(ty: &syn::Type) -> bool {
     match ty {
         syn::Type::ImplTrait(_) => true,
-        syn::Type::Path(tp) => tp.path.segments.iter().any(|seg| {
-            match &seg.arguments {
-                syn::PathArguments::AngleBracketed(args) => {
-                    args.args.iter().any(|arg| match arg {
-                        syn::GenericArgument::Type(t) => type_contains_impl_trait(t),
-                        _ => false,
-                    })
-                }
-                syn::PathArguments::Parenthesized(args) => {
-                    args.inputs.iter().any(type_contains_impl_trait)
-                        || matches!(&args.output,
+        syn::Type::Path(tp) => tp.path.segments.iter().any(|seg| match &seg.arguments {
+            syn::PathArguments::AngleBracketed(args) => args.args.iter().any(|arg| match arg {
+                syn::GenericArgument::Type(t) => type_contains_impl_trait(t),
+                _ => false,
+            }),
+            syn::PathArguments::Parenthesized(args) => {
+                args.inputs.iter().any(type_contains_impl_trait)
+                    || matches!(&args.output,
                             syn::ReturnType::Type(_, t) if type_contains_impl_trait(t))
-                }
-                syn::PathArguments::None => false,
             }
+            syn::PathArguments::None => false,
         }),
         syn::Type::Reference(r) => type_contains_impl_trait(&r.elem),
         syn::Type::Tuple(t) => t.elems.iter().any(type_contains_impl_trait),
