@@ -55,6 +55,7 @@ pub struct MaintenanceLayer {
     state: MaintenanceState,
     health_prefix: String,
     bypass_paths: Vec<String>,
+    probe_paths: Vec<String>,
 }
 
 impl MaintenanceLayer {
@@ -67,6 +68,7 @@ impl MaintenanceLayer {
             state,
             health_prefix: DEFAULT_HEALTH_PREFIX.to_owned(),
             bypass_paths: Vec::new(),
+            probe_paths: Vec::new(),
         }
     }
 
@@ -89,6 +91,13 @@ impl MaintenanceLayer {
         self.bypass_paths = paths;
         self
     }
+
+    /// Configure exact-match health probe paths that escape maintenance mode.
+    #[must_use]
+    pub fn with_probe_paths(mut self, paths: Vec<String>) -> Self {
+        self.probe_paths = paths;
+        self
+    }
 }
 
 impl<S> Layer<S> for MaintenanceLayer {
@@ -100,6 +109,7 @@ impl<S> Layer<S> for MaintenanceLayer {
             state: self.state.clone(),
             health_prefix: self.health_prefix.clone(),
             bypass_paths: self.bypass_paths.clone(),
+            probe_paths: self.probe_paths.clone(),
         }
     }
 }
@@ -111,6 +121,7 @@ pub struct MaintenanceService<S> {
     state: MaintenanceState,
     health_prefix: String,
     bypass_paths: Vec<String>,
+    probe_paths: Vec<String>,
 }
 
 impl<S> MaintenanceService<S> {
@@ -127,6 +138,11 @@ impl<S> MaintenanceService<S> {
         let path = req.uri().path();
         if path.starts_with(self.health_prefix.as_str()) {
             return None;
+        }
+        for probe in &self.probe_paths {
+            if path == probe {
+                return None;
+            }
         }
         for bypass in &self.bypass_paths {
             if path == bypass {

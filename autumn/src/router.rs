@@ -1489,7 +1489,7 @@ fn apply_middleware(
     router = router.layer(
         crate::middleware::maintenance::MaintenanceLayer::new(maintenance_state)
             .with_health_prefix(config.actuator.prefix.clone())
-            .with_bypass_paths(bypass_paths),
+            .with_probe_paths(bypass_paths),
     );
 
     router = router.layer(axum::middleware::from_fn(

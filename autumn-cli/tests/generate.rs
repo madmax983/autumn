@@ -1573,13 +1573,10 @@ fn generate_mailer_creates_all_expected_files() {
     assert!(mod_rs.contains("pub mod welcome;"));
     assert!(mod_rs.contains("pub mod previews;"));
 
-    // Smoke test.
-    assert!(project.join("tests/welcome_mailer.rs").is_file());
-    let test = fs::read_to_string(project.join("tests/welcome_mailer.rs")).unwrap();
-    assert!(test.contains("WelcomeMailer"));
-    assert!(test.contains("renders_both_bodies"));
-    assert!(test.contains("html.contains") || test.contains("html body"));
-    assert!(test.contains("text.contains") || test.contains("text body"));
+    // Smoke test is inline in the mailer file.
+    assert!(!project.join("tests/welcome_mailer.rs").exists());
+    assert!(mailer.contains("mod welcome_mailer_tests"));
+    assert!(mailer.contains("welcome_mailer_renders_both_bodies"));
 }
 
 #[test]

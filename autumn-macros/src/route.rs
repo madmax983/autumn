@@ -151,7 +151,7 @@ pub fn route_macro(
         |lit| quote! { ::core::option::Option::Some(#lit) },
     );
     let sunset_opt_out_val = route_args.sunset_opt_out;
-    let has_policy_val = has_authorize_guard(&input_fn);
+    let has_policy_val = has_policy_only(&input_fn);
 
     // ── Path helper ─────────────────────────────────────────────
     let path_helper = emit_path_helper(&path_helper_name, &path, &path_params);
@@ -232,6 +232,15 @@ fn has_authorize_guard(input_fn: &syn::ItemFn) -> bool {
             .is_some_and(|segment| segment.ident == "authorize")
     }) || block_has_replay_guard(&input_fn.block)
         || crate::api_doc::has_policy_check_in_stmts(&input_fn.block.stmts)
+}
+
+fn has_policy_only(input_fn: &syn::ItemFn) -> bool {
+    input_fn.attrs.iter().any(|attr| {
+        attr.path()
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == "authorize")
+    }) || crate::api_doc::has_policy_check_in_stmts(&input_fn.block.stmts)
 }
 
 /// When a `name = "..."` override is active, emit a `pub use` alias for the

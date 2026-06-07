@@ -181,3 +181,30 @@ async fn maintenance_root_bypass_is_exact_only() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
+
+#[tokio::test]
+async fn maintenance_probe_paths_are_exact_only() {
+    let state = MaintenanceState::new();
+    state.enable(MaintenanceConfig::default());
+
+    let app = Router::new()
+        .route("/health", get(|| async { "Health" }))
+        .route("/health/live", get(|| async { "Live" }))
+        .layer(MaintenanceLayer::new(state).with_probe_paths(vec!["/health".to_string()]));
+
+    // 1. Exact match /health bypasses
+    let resp = app
+        .clone()
+        .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // 2. /health/live does NOT bypass (subpath/prefix is blocked)
+    let resp = app
+        .clone()
+        .oneshot(Request::builder().uri("/health/live").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+}

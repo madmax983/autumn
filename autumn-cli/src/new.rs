@@ -903,10 +903,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn master_key_file_has_secure_permissions() {
+        use std::os::unix::fs::MetadataExt;
         let tmp = TempDir::new().unwrap();
         generate("secure-key-app", tmp.path()).unwrap();
         let p = tmp.path().join("secure-key-app/config/master.key");
-        use std::os::unix::fs::MetadataExt;
         let meta = fs::metadata(&p).unwrap();
         let mode = meta.mode() & 0o777;
         assert_eq!(
