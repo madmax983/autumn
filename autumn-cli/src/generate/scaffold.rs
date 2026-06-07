@@ -369,7 +369,13 @@ fn render_routes_file(
     // a CSRF-protected endpoint (see docs/guide/storage.md#direct-uploads).
     let form_enctype = "";
 
-    let (create_signature, decode_create_call, update_signature, decode_update_call, decode_form_sig) = if has_attachments {
+    let (
+        create_signature,
+        decode_create_call,
+        update_signature,
+        decode_update_call,
+        decode_form_sig,
+    ) = if has_attachments {
         (
             "state: autumn_web::extract::State<autumn_web::AppState>, mut db: Db, body: Bytes".to_owned(),
             "decode_form(&state, body).await?".to_owned(),
@@ -1225,9 +1231,7 @@ async fn main() {
 
         // Assert edit form contains input type="file" AND the hidden input for existing avatar
         assert!(routes.contains("input type=\"file\" name=\"avatar\""));
-        assert!(routes.contains(
-            "input type=\"hidden\" name=\"avatar\" value=(blob.key)"
-        ));
+        assert!(routes.contains("input type=\"hidden\" name=\"avatar\" value=(blob.key)"));
 
         // Assert decode_form contains DecodedForm struct
         assert!(routes.contains("struct DecodedForm"));

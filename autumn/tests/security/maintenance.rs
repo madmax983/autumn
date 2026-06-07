@@ -195,7 +195,12 @@ async fn maintenance_probe_paths_are_exact_only() {
     // 1. Exact match /health bypasses
     let resp = app
         .clone()
-        .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -203,7 +208,12 @@ async fn maintenance_probe_paths_are_exact_only() {
     // 2. /health/live does NOT bypass (subpath/prefix is blocked)
     let resp = app
         .clone()
-        .oneshot(Request::builder().uri("/health/live").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/health/live")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);

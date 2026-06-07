@@ -97,7 +97,6 @@ pub fn plan_mailer(project_root: &Path, name: &str) -> Result<Plan, GenerateErro
     let with_both_mods = add_mod_declaration(&with_mailer_mod, "previews");
     plan.modify(mod_path, with_both_mods);
 
-
     // ── src/main.rs: add mod mailers; and .mail_previews(…) ────────────────
     let main_path = project_root.join("src").join("main.rs");
     let main_existing = std::fs::read_to_string(&main_path).map_err(|_| {
@@ -359,9 +358,10 @@ async fn main() {
         let tmp = project_with_main(default_main());
         let plan = plan_mailer(tmp.path(), "Welcome").unwrap();
         assert!(
-            !plan.actions
-                .iter()
-                .any(|a| a.path().to_string_lossy().contains("tests/welcome_mailer.rs")),
+            !plan.actions.iter().any(|a| a
+                .path()
+                .to_string_lossy()
+                .contains("tests/welcome_mailer.rs")),
             "plan must not include tests/welcome_mailer.rs"
         );
     }
