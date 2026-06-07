@@ -185,10 +185,17 @@ pub struct TurnstileProvider {
 #[cfg(feature = "http-client")]
 impl TurnstileProvider {
     /// Create a new Turnstile provider with the given secret key.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the underlying TLS backend cannot be initialised (extremely rare).
     pub fn new(secret_key: impl Into<String>) -> Self {
         Self {
             secret_key: secret_key.into(),
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .expect("failed to build reqwest client"),
         }
     }
 }
@@ -242,10 +249,17 @@ pub struct HCaptchaProvider {
 #[cfg(feature = "http-client")]
 impl HCaptchaProvider {
     /// Create a new hCaptcha provider with the given secret key.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the underlying TLS backend cannot be initialised (extremely rare).
     pub fn new(secret_key: impl Into<String>) -> Self {
         Self {
             secret_key: secret_key.into(),
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .expect("failed to build reqwest client"),
         }
     }
 }
@@ -693,13 +707,23 @@ pub fn bot_protection_widget(config: &BotProtectionConfig) -> maud::Markup {
         };
     }
 
+    // Pass data-response-field-name when a custom form field is configured so
+    // the provider JS submits the token under the same name the middleware scans.
+    let custom_field = config.form_field.as_deref();
+
     match config.provider {
         CaptchaProviderKind::Turnstile => maud::html! {
-            div .cf-turnstile data-sitekey=(site_key) {}
+            div .cf-turnstile
+                data-sitekey=(site_key)
+                data-response-field-name=[custom_field]
+                {}
             script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async="true" defer="true" {}
         },
         CaptchaProviderKind::HCaptcha => maud::html! {
-            div .h-captcha data-sitekey=(site_key) {}
+            div .h-captcha
+                data-sitekey=(site_key)
+                data-response-field-name=[custom_field]
+                {}
             script src="https://js.hcaptcha.com/1/api.js" async="true" defer="true" {}
         },
     }

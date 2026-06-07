@@ -176,14 +176,46 @@ let layer = BotProtectionLayer::new(Arc::new(AlwaysPassProvider));
 ## Scope: only HTML forms are challenged
 
 The middleware inspects only `application/x-www-form-urlencoded` requests.
-Other content types — JSON API calls, multipart file uploads, external
+Other content types — JSON API calls, multipart file uploads, and most external
 webhooks — pass through without any CAPTCHA check.  This means:
 
 - REST JSON endpoints are unaffected.
 - File upload endpoints (`multipart/form-data`) are unaffected.
-- Incoming webhooks (Stripe, GitHub, etc.) are unaffected.
+- Webhooks delivered as JSON (Stripe, GitHub, etc.) are unaffected.
 
 Only classic HTML form submissions — the intended target — are verified.
+
+### URL-encoded webhook payloads (Slack slash commands, etc.)
+
+Some webhook senders — most notably Slack slash commands — deliver payloads as
+`application/x-www-form-urlencoded`.  Those requests will be challenged by the
+middleware and will fail because they cannot include a CAPTCHA token.
+
+The recommended solution is to **not apply bot protection globally** when your
+application handles url-encoded webhooks.  Instead, scope the middleware to only
+the router that serves your public forms:
+
+```rust,no_run
+use autumn_web::prelude::*;
+use autumn_web::security::captcha::{BotProtectionLayer, AlwaysPassProvider};
+use std::sync::Arc;
+
+// Public form routes — protected by CAPTCHA.
+let forms_router = Router::new()
+    .route("/signup", post(signup_submit))
+    .layer(BotProtectionLayer::from_config(&config.bot_protection));
+
+// Webhook routes — no CAPTCHA (signature verification happens inside the handler).
+let webhook_router = Router::new()
+    .route("/webhooks/slack", post(slack_handler));
+
+let app = Router::new()
+    .merge(forms_router)
+    .merge(webhook_router);
+```
+
+With this layout the bot protection middleware is only applied to the routes that
+need it and the webhook endpoints are left untouched.
 
 ---
 

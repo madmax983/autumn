@@ -2430,6 +2430,22 @@ impl AutumnConfig {
             "AUTUMN_BOT_PROTECTION__DEV_BYPASS",
             &mut self.bot_protection.dev_bypass,
         );
+        if let Ok(val) = env.var("AUTUMN_BOT_PROTECTION__PROVIDER") {
+            match val.to_lowercase().as_str() {
+                "turnstile" => {
+                    self.bot_protection.provider =
+                        crate::security::captcha::CaptchaProviderKind::Turnstile;
+                }
+                "hcaptcha" => {
+                    self.bot_protection.provider =
+                        crate::security::captcha::CaptchaProviderKind::HCaptcha;
+                }
+                _ => tracing::warn!(
+                    "ignoring unrecognised AUTUMN_BOT_PROTECTION__PROVIDER={val:?}: \
+                     expected \"turnstile\" or \"hcaptcha\""
+                ),
+            }
+        }
         parse_env_option_string(
             env,
             "AUTUMN_BOT_PROTECTION__SITE_KEY",
