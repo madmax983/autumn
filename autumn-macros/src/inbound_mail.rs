@@ -179,10 +179,18 @@ pub fn inbound_mail_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     // Build processing mode.
-    let processing_ts = if attrs.processing.as_deref() == Some("sync") {
-        quote! { ::autumn_web::inbound_mail::ProcessingMode::Sync }
-    } else {
-        quote! { ::autumn_web::inbound_mail::ProcessingMode::Background }
+    let processing_ts = match attrs.processing.as_deref() {
+        None | Some("background") => {
+            quote! { ::autumn_web::inbound_mail::ProcessingMode::Background }
+        }
+        Some("sync") => quote! { ::autumn_web::inbound_mail::ProcessingMode::Sync },
+        Some(other) => {
+            return syn::Error::new(
+                proc_macro2::Span::call_site(),
+                format!("unknown processing mode `{other}`; expected `sync` or `background`"),
+            )
+            .to_compile_error();
+        }
     };
 
     // Generate the wrapper function that adapts `async fn(InboundEmail) -> AutumnResult<()>`

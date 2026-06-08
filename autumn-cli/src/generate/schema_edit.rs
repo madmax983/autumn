@@ -717,11 +717,12 @@ fn insert_mail_previews_call(existing: &str, mailer_type: &str) -> String {
 
 /// Ensure the `autumn-web` dependency in `Cargo.toml` includes `feature`.
 ///
-/// Handles the three most common forms of the dependency declaration:
+/// Handles four common forms of the dependency declaration:
 ///
 ///   1. `autumn-web = "x.y.z"` → `autumn-web = { version = "x.y.z", features = ["mail"] }`
 ///   2. `autumn-web = { version = "x.y.z" }` → adds `features = ["mail"]`
 ///   3. `autumn-web = { ..., features = ["other"] }` → appends `"mail"` to the list
+///   4. `[dependencies.autumn-web]` section with a separate `features` key (multiline form)
 ///
 /// Idempotent: a second call with the same feature is a no-op.
 /// Returns `existing` unchanged when the `autumn-web` dep cannot be found.
@@ -731,6 +732,7 @@ pub fn ensure_autumn_web_feature(existing: &str, feature: &str) -> String {
     let lines: Vec<&str> = existing.lines().collect();
     let mut in_deps = false;
 
+    // Pass 1: inline form under [dependencies].
     for (i, &line) in lines.iter().enumerate() {
         let trimmed = line.trim();
         if is_dependencies_header(trimmed) {
@@ -764,7 +766,90 @@ pub fn ensure_autumn_web_feature(existing: &str, feature: &str) -> String {
         }
         return out;
     }
+
+    // Pass 2: multiline section form `[dependencies.autumn-web]`.
+    for (i, &line) in lines.iter().enumerate() {
+        if line.trim() != "[dependencies.autumn-web]" {
+            continue;
+        }
+        let section_start = i + 1;
+        // Section ends at the next TOML table header.
+        let section_end = lines[section_start..]
+            .iter()
+            .position(|l| {
+                let t = l.trim();
+                t.starts_with('[') && !t.is_empty()
+            })
+            .map_or(lines.len(), |p| section_start + p);
+
+        // Idempotency check across the whole section.
+        if lines[section_start..section_end]
+            .iter()
+            .any(|l| l.contains(&feature_quoted))
+        {
+            return existing.to_owned();
+        }
+
+        // Look for an existing `features = [...]` line in the section.
+        for (j, &sect_line) in lines[section_start..section_end].iter().enumerate() {
+            let abs_j = section_start + j;
+            if sect_line.trim_start().starts_with("features") {
+                let new_feat_line = rewrite_features_line(sect_line, feature);
+                let mut out = String::with_capacity(existing.len() + 32);
+                for (k, &l) in lines.iter().enumerate() {
+                    out.push_str(if k == abs_j { &new_feat_line } else { l });
+                    out.push('\n');
+                }
+                if !existing.ends_with('\n') {
+                    out.pop();
+                }
+                return out;
+            }
+        }
+
+        // No features key found — append one before the section end.
+        let feat_line = format!("features = [{feature_quoted}]");
+        let insert_before = section_end;
+        let mut out = String::with_capacity(existing.len() + feat_line.len() + 2);
+        for (k, &l) in lines.iter().enumerate() {
+            if k == insert_before {
+                out.push_str(&feat_line);
+                out.push('\n');
+            }
+            out.push_str(l);
+            out.push('\n');
+        }
+        if insert_before == lines.len() {
+            out.push_str(&feat_line);
+            out.push('\n');
+        }
+        if !existing.ends_with('\n') && out.ends_with('\n') {
+            out.pop();
+        }
+        return out;
+    }
+
     existing.to_owned()
+}
+
+/// Append `feature` to a standalone `features = [...]` TOML line.
+fn rewrite_features_line(line: &str, feature: &str) -> String {
+    let feature_quoted = format!("\"{feature}\"");
+    if let Some(open) = line.find('[') {
+        if let Some(close_rel) = line[open..].find(']') {
+            let abs_end = open + close_rel;
+            let body = &line[open + 1..abs_end];
+            let separator = if body.trim().is_empty() { "" } else { ", " };
+            return format!(
+                "{}{}{}{}",
+                &line[..abs_end],
+                separator,
+                feature_quoted,
+                &line[abs_end..]
+            );
+        }
+    }
+    line.to_owned()
 }
 
 /// Rewrite a single `autumn-web = …` TOML line to include `feature`.
@@ -2257,6 +2342,37 @@ async fn main() {\n\
         let updated = ensure_autumn_web_feature(cargo, "mail");
         // The function should not panic; it falls back to the existing line.
         assert!(updated.contains("autumn-web = malformed"));
+    }
+
+    #[test]
+    fn ensure_feature_multiline_section_adds_to_existing_features() {
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies.autumn-web]\nversion = \"0.6\"\nfeatures = [\"db\"]\n";
+        let updated = ensure_autumn_web_feature(cargo, "inbound-mailgun");
+        assert!(
+            updated.contains("\"inbound-mailgun\""),
+            "must add feature to section: {updated}"
+        );
+        assert!(updated.contains("\"db\""), "must preserve existing feature");
+    }
+
+    #[test]
+    fn ensure_feature_multiline_section_inserts_features_when_absent() {
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies.autumn-web]\nversion = \"0.6\"\n";
+        let updated = ensure_autumn_web_feature(cargo, "inbound-mailgun");
+        assert!(
+            updated.contains("\"inbound-mailgun\""),
+            "must insert features line: {updated}"
+        );
+    }
+
+    #[test]
+    fn ensure_feature_multiline_section_idempotent() {
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies.autumn-web]\nversion = \"0.6\"\nfeatures = [\"inbound-mailgun\"]\n";
+        let updated = ensure_autumn_web_feature(cargo, "inbound-mailgun");
+        assert_eq!(
+            cargo, updated,
+            "already-present feature in section must be a no-op"
+        );
     }
 
     #[test]

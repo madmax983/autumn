@@ -856,6 +856,59 @@ fn parse_rfc5322(raw: Bytes) -> InboundEmail {
     }
 }
 
+/// Decode a MIME part body according to its `Content-Transfer-Encoding` header.
+///
+/// Handles `base64` and `quoted-printable`; passes everything else through unchanged.
+fn decode_transfer_encoding(body: &str, cte: &str) -> String {
+    match cte.trim() {
+        "base64" => {
+            let stripped: String = body.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+            base64::engine::general_purpose::STANDARD
+                .decode(stripped.as_bytes())
+                .ok()
+                .and_then(|b| String::from_utf8(b).ok())
+                .unwrap_or_else(|| body.to_string())
+        }
+        "quoted-printable" => decode_quoted_printable(body),
+        _ => body.to_string(),
+    }
+}
+
+/// Decode a quoted-printable encoded string per RFC 2045.
+fn decode_quoted_printable(input: &str) -> String {
+    let mut out = Vec::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'=' {
+            if i + 1 < bytes.len() && (bytes[i + 1] == b'\n' || bytes[i + 1] == b'\r') {
+                // Soft line break: `=\n` or `=\r\n`
+                i += 1;
+                if i + 1 < bytes.len() && bytes[i] == b'\r' && bytes[i + 1] == b'\n' {
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            } else if i + 2 < bytes.len()
+                && bytes[i + 1].is_ascii_hexdigit()
+                && bytes[i + 2].is_ascii_hexdigit()
+            {
+                let hi = (bytes[i + 1] as char).to_digit(16).unwrap_or(0) as u8;
+                let lo = (bytes[i + 2] as char).to_digit(16).unwrap_or(0) as u8;
+                out.push((hi << 4) | lo);
+                i += 3;
+            } else {
+                out.push(b'=');
+                i += 1;
+            }
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+}
+
 /// Extract the MIME boundary parameter from a `Content-Type` header value.
 fn extract_boundary(content_type: &str) -> Option<String> {
     content_type.split(';').skip(1).find_map(|part| {
@@ -890,6 +943,14 @@ fn extract_multipart_bodies(body: &str, content_type: &str) -> (Option<String>, 
             .find(|l| l.to_ascii_lowercase().starts_with("content-type:"))
             .map(|l| l[13..].trim().to_ascii_lowercase())
             .unwrap_or_default();
+        let part_cte = part_headers
+            .lines()
+            .find(|l| {
+                l.to_ascii_lowercase()
+                    .starts_with("content-transfer-encoding:")
+            })
+            .map(|l| l[26..].trim().to_ascii_lowercase())
+            .unwrap_or_default();
         // Strip trailing boundary marker (e.g. "\r\n--boundary--").
         let text = part_body
             .find(&format!("\r\n--{boundary}"))
@@ -897,9 +958,9 @@ fn extract_multipart_bodies(body: &str, content_type: &str) -> (Option<String>, 
             .map_or(part_body, |end| &part_body[..end])
             .trim();
         if part_ct.starts_with("text/plain") && text_body.is_none() {
-            text_body = Some(text.to_string());
+            text_body = Some(decode_transfer_encoding(text, &part_cte));
         } else if part_ct.starts_with("text/html") && html_body.is_none() {
-            html_body = Some(text.to_string());
+            html_body = Some(decode_transfer_encoding(text, &part_cte));
         }
     }
     (text_body, html_body)
@@ -1441,6 +1502,78 @@ mod tests {
         )]);
         let result = parse_ses(&Bytes::from("{}"), &headers);
         assert_eq!(result.unwrap_err(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn decode_transfer_encoding_passthrough_for_7bit() {
+        assert_eq!(
+            decode_transfer_encoding("Hello world", "7bit"),
+            "Hello world"
+        );
+    }
+
+    #[test]
+    fn decode_transfer_encoding_base64_decodes() {
+        use base64::Engine as _;
+        let plain = "Hello, MIME world!";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(plain);
+        assert_eq!(decode_transfer_encoding(&encoded, "base64"), plain);
+    }
+
+    #[test]
+    fn decode_transfer_encoding_base64_with_whitespace() {
+        // Base64 encoded across lines (as email clients produce).
+        use base64::Engine as _;
+        let plain = "Hello";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(plain);
+        let with_ws = format!("{encoded}\r\n");
+        assert_eq!(decode_transfer_encoding(&with_ws, "base64"), plain);
+    }
+
+    #[test]
+    fn decode_transfer_encoding_quoted_printable() {
+        let qp = "Subject=3A Hello=20World";
+        assert_eq!(
+            decode_transfer_encoding(qp, "quoted-printable"),
+            "Subject: Hello World"
+        );
+    }
+
+    #[test]
+    fn decode_quoted_printable_soft_line_break() {
+        let qp = "long line=\r\ncontinued";
+        assert_eq!(decode_quoted_printable(qp), "long linecontinued");
+    }
+
+    #[test]
+    fn decode_quoted_printable_literal_equals() {
+        let qp = "price=3D10";
+        assert_eq!(decode_quoted_printable(qp), "price=10");
+    }
+
+    #[test]
+    fn extract_multipart_bodies_base64_decoded() {
+        use base64::Engine as _;
+        let b = "boundary99";
+        let plain = "Decoded body text";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(plain);
+        let body = format!(
+            "--{b}\r\nContent-Type: text/plain\r\nContent-Transfer-Encoding: base64\r\n\r\n{encoded}\r\n--{b}--\r\n"
+        );
+        let ct = format!("multipart/mixed; boundary={b}");
+        let (text, _html) = extract_multipart_bodies(&body, &ct);
+        assert_eq!(text.unwrap(), plain);
+    }
+
+    #[test]
+    fn extract_multipart_bodies_quoted_printable_decoded() {
+        let b = "bnd";
+        let body = format!(
+            "--{b}\r\nContent-Type: text/plain\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\nHello=20World\r\n--{b}--\r\n"
+        );
+        let ct = format!("multipart/mixed; boundary={b}");
+        let (text, _html) = extract_multipart_bodies(&body, &ct);
+        assert_eq!(text.unwrap(), "Hello World");
     }
 
     #[test]
