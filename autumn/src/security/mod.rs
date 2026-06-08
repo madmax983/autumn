@@ -11,6 +11,7 @@
 //! | Security headers | `headers` | X-Frame-Options, X-Content-Type-Options, HSTS, CSP, etc. |
 //! | CSRF protection | `csrf` | Token-based CSRF validation for mutating requests |
 //! | Rate limiting | `rate_limit` | Per-client-IP token-bucket; memory (default) or Redis backend for multi-replica global enforcement |
+//! | Bot protection | `captcha` | Pluggable CAPTCHA verification (Turnstile, hCaptcha); dev-mode bypass (`[bot_protection]` in `autumn.toml`) |
 //! | Configuration | `config` | `[security]` section in `autumn.toml` |
 //!
 //! Authentication, session management, and password hashing live in
@@ -31,6 +32,14 @@
 //! ## Configuration
 //!
 //! ```toml
+//! # Bot protection / CAPTCHA (top-level section, not under [security])
+//! [bot_protection]
+//! enabled    = true
+//! provider   = "turnstile"    # "turnstile" (default) or "hcaptcha"
+//! site_key   = "0x4AAAA..."  # client-side widget key
+//! secret_key = "..."          # server-side secret — use env var!
+//! dev_bypass = false
+//!
 //! [security.headers]
 //! x_frame_options = "DENY"            # or "SAMEORIGIN", "" to disable
 //! x_content_type_options = true        # X-Content-Type-Options: nosniff
@@ -102,7 +111,33 @@
 //!     }
 //! }
 //! ```
+//!
+//! For bot protection on public forms (requires `bot_protection.enabled = true`):
+//!
+//! ```rust,ignore
+//! use autumn_web::prelude::*;
+//! use autumn_web::config::AutumnConfig;
+//! use autumn_web::security::captcha::bot_protection_widget;
+//!
+//! #[get("/signup")]
+//! async fn signup_form(config: AutumnConfig) -> Markup {
+//!     html! {
+//!         form method="POST" action="/signup" {
+//!             input type="email" name="email";
+//!             (bot_protection_widget(&config.bot_protection))
+//!             button { "Sign up" }
+//!         }
+//!     }
+//! }
+//!
+//! #[post("/signup")]
+//! async fn signup_submit() -> &'static str {
+//!     // Only reached if CAPTCHA passes — bot protection verified automatically
+//!     "Welcome!"
+//! }
+//! ```
 
+pub mod captcha;
 pub(crate) mod config;
 pub(crate) mod csrf;
 pub(crate) mod headers;
@@ -111,6 +146,12 @@ pub mod rate_limit;
 pub(crate) mod trusted_proxies;
 
 // Re-export commonly used types at the module level.
+#[cfg(feature = "maud")]
+pub use captcha::bot_protection_widget;
+pub use captcha::{
+    AlwaysPassProvider, BotProtectionConfig, BotProtectionLayer, CaptchaProvider,
+    CaptchaProviderKind, TestCaptchaProvider,
+};
 pub use config::{
     CspNonceConfig, CsrfConfig, HeadersConfig, KeyStrategy, RateLimitBackend, RateLimitConfig,
     RateLimitTierConfig, SecurityConfig, TrustedProxiesConfig, UploadConfig,
