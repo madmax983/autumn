@@ -566,6 +566,18 @@ mod tests {
         assert!(content.contains("dist"), ".dockerignore must exclude dist/");
     }
 
+    #[test]
+    fn dockerignore_excludes_master_key() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::Default).unwrap();
+        let content = fs::read_to_string(dir.join(".dockerignore")).unwrap();
+        assert!(
+            content.contains("/config/master.key") || content.contains("config/master.key"),
+            ".dockerignore must exclude config/master.key"
+        );
+    }
+
     // ── signing-secret smoke gate ─────────────────────────────────────────────
 
     #[test]

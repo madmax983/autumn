@@ -1,5 +1,6 @@
 //! CLI implementation for `autumn credentials edit` and `autumn credentials show`.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use autumn_web::credentials::{
@@ -16,27 +17,49 @@ pub struct ShowOptions {
     pub reveal: bool,
 }
 
+struct TempFileGuard {
+    path: PathBuf,
+    inner: Option<tempfile::NamedTempFile>,
+}
+
+impl TempFileGuard {
+    fn new(env: &str, plaintext: &[u8]) -> std::io::Result<Self> {
+        let mut file = tempfile::Builder::new()
+            .prefix(&format!("autumn-credentials-{env}-"))
+            .suffix(".toml")
+            .tempfile()?;
+        file.write_all(plaintext)?;
+        file.flush()?;
+        let path = file.path().to_path_buf();
+        Ok(Self {
+            path,
+            inner: Some(file),
+        })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        zero_file(&self.path);
+        self.inner = None;
+    }
+}
+
 /// Run `autumn credentials edit [--env <env>]`.
 ///
 /// Resolves the master key, decrypts the credentials file into a temp file,
 /// opens `$VISUAL` / `$EDITOR` (falling back to `vi` on Unix, `notepad` on
 /// Windows), re-encrypts on save, then zeroes and removes the temp file.
-pub fn run_edit(opts: &EditOptions) {
-    let base_dir = std::env::current_dir().unwrap_or_else(|e| {
-        eprintln!("autumn credentials: cannot determine current directory: {e}");
-        std::process::exit(1);
-    });
-
-    let result = edit_credentials(&opts.env, &base_dir);
-    if let Err(e) = result {
-        eprintln!("autumn credentials edit: {e}");
-        std::process::exit(1);
-    }
+pub fn run_edit(opts: &EditOptions) -> Result<(), CredentialsError> {
+    let base_dir = std::env::current_dir()?;
+    edit_credentials(&opts.env, &base_dir)
 }
 
 fn edit_credentials(env: &str, base_dir: &Path) -> Result<(), CredentialsError> {
-    use std::io::Write;
-
     let enc_path = credentials_path(env, base_dir);
 
     let plaintext = if enc_path.exists() {
@@ -51,32 +74,18 @@ fn edit_credentials(env: &str, base_dir: &Path) -> Result<(), CredentialsError> 
         default_credentials_template(env).into_bytes()
     };
 
-    let tmp_dir = std::env::temp_dir();
-    let tmp_path = tmp_dir.join(format!("autumn-credentials-{env}.toml"));
-
-    {
-        #[cfg(unix)]
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        options.mode(0o600);
-        let mut f = options.open(&tmp_path)?;
-        f.write_all(&plaintext)?;
-    }
+    let tmp_guard = TempFileGuard::new(env, &plaintext)?;
+    let tmp_path = tmp_guard.path();
 
     let editor = resolve_editor();
-    let status = launch_editor(&editor, &tmp_path)
+    let status = launch_editor(&editor, tmp_path)
         .map_err(|e| std::io::Error::other(format!("cannot launch editor '{editor}': {e}")))?;
-
     if !status.success() {
-        zero_file(&tmp_path);
-        let _ = std::fs::remove_file(&tmp_path);
-        eprintln!("autumn credentials edit: editor exited with non-zero status");
-        std::process::exit(1);
+        return Err(CredentialsError::Io(std::io::Error::other(
+            "editor exited with non-zero status",
+        )));
     }
-
-    let new_plaintext = std::fs::read(&tmp_path)?;
+    let new_plaintext = std::fs::read(tmp_path)?;
 
     toml::from_str::<toml::Table>(std::str::from_utf8(&new_plaintext).map_err(|_| {
         std::io::Error::new(std::io::ErrorKind::InvalidData, "file is not valid UTF-8")
@@ -88,20 +97,27 @@ fn edit_credentials(env: &str, base_dir: &Path) -> Result<(), CredentialsError> 
         )
     })?;
 
-    let key = if enc_path.exists() {
-        resolve_master_key(base_dir)?
-    } else {
-        let k = MasterKey::generate();
-        let key_path = base_dir.join("config/master.key");
-        std::fs::create_dir_all(key_path.parent().unwrap())?;
-        std::fs::write(&key_path, k.to_hex())?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))?;
+    let key = match resolve_master_key(base_dir) {
+        Ok(k) => k,
+        Err(CredentialsError::NoKeyFound) => {
+            let k = MasterKey::generate();
+            let key_path = base_dir.join("config/master.key");
+            std::fs::create_dir_all(key_path.parent().unwrap())?;
+
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut f = options.open(&key_path)?;
+            f.write_all(k.to_hex().as_bytes())?;
+
+            println!("  Created config/master.key (keep this secret, do not commit)");
+            k
         }
-        println!("  Created config/master.key (keep this secret, do not commit)");
-        k
+        Err(e) => return Err(e),
     };
 
     let ciphertext = encrypt(&key, &new_plaintext);
@@ -109,9 +125,6 @@ fn edit_credentials(env: &str, base_dir: &Path) -> Result<(), CredentialsError> 
     let tmp_enc = enc_path.with_extension("enc.tmp");
     std::fs::write(&tmp_enc, &ciphertext)?;
     std::fs::rename(&tmp_enc, &enc_path)?;
-
-    zero_file(&tmp_path);
-    let _ = std::fs::remove_file(&tmp_path);
 
     println!("  Saved {}", enc_path.display());
     Ok(())
@@ -362,5 +375,45 @@ mod tests {
         // then appends file as $0 → runs `true` and exits 0.
         let status = launch_editor("sh -c true", &path).unwrap();
         assert!(status.success());
+    }
+
+    #[test]
+    fn test_temp_file_guard_zeroes_and_removes() {
+        let path;
+        {
+            let guard = TempFileGuard::new("test-env", b"highly sensitive token data").unwrap();
+            path = guard.path().to_path_buf();
+            assert!(path.exists());
+        }
+        assert!(!path.exists(), "Temp file should be removed on drop");
+    }
+
+    #[test]
+    fn edit_credentials_reuses_existing_master_key() {
+        let tmp = TempDir::new().unwrap();
+        let initial_key = MasterKey::generate();
+        let key_dir = tmp.path().join("config");
+        std::fs::create_dir_all(&key_dir).unwrap();
+        let key_path = key_dir.join("master.key");
+        std::fs::write(&key_path, initial_key.to_hex()).unwrap();
+
+        let dummy_editor = if cfg!(windows) { "cmd /c type" } else { "cat" };
+
+        temp_env::with_vars(
+            [("VISUAL", Some(dummy_editor)), ("EDITOR", None::<&str>)],
+            || {
+                edit_credentials("production", tmp.path()).unwrap();
+            },
+        );
+
+        let key_content = std::fs::read_to_string(&key_path).unwrap();
+        assert_eq!(key_content, initial_key.to_hex());
+
+        let enc_path = tmp.path().join("config/credentials/production.toml.enc");
+        assert!(enc_path.exists());
+        let ciphertext = std::fs::read(&enc_path).unwrap();
+        let decrypted = decrypt(&initial_key, &ciphertext).unwrap();
+        let decrypted_str = String::from_utf8(decrypted).unwrap();
+        assert!(decrypted_str.contains("production"));
     }
 }

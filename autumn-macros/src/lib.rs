@@ -634,6 +634,7 @@ pub fn cached(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// | `operation_id` | string | Override the default operation id |
 /// | `status` | integer | Success HTTP status code (defaults to `200`) |
 /// | `hidden` | flag / bool | Exclude the route from the generated spec |
+/// | `mcp` | flag / bool | Expose this endpoint as an MCP tool (`mcp = false` force-excludes it). Requires the `mcp` feature and a `mount_mcp` call. |
 ///
 /// # Examples
 ///

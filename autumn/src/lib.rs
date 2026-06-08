@@ -158,6 +158,12 @@ pub mod flash;
 pub(crate) mod htmx;
 pub mod log;
 pub(crate) mod logging;
+/// Project typed JSON endpoints as Model Context Protocol (MCP) tools so AI
+/// agents can call the real, authenticated handler pipeline.
+///
+/// Enable with the Cargo feature `mcp` (which implies `openapi`).
+#[cfg(feature = "mcp")]
+pub mod mcp;
 pub mod middleware;
 pub mod openapi;
 pub mod pagination;
@@ -244,6 +250,8 @@ pub mod __private {
     #[cfg(feature = "db")]
     pub use crate::version_history::VersionedRepositoryDescriptor;
 
+    pub use crate::router::check_sunset;
+
     // Shared factory creation depth — bounds cyclic `#[factory_assoc]` chains
     // across all models in a single create() chain.
     //
@@ -254,6 +262,8 @@ pub mod __private {
         pub static FACTORY_DEPTH: u32;
     }
 }
+
+pub use crate::router::RouteVersionMetadata;
 
 /// Create a new [`app::AppBuilder`] for configuring and launching an Autumn server.
 ///

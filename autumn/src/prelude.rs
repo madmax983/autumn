@@ -174,6 +174,8 @@ pub use crate::security::CspNonce;
 pub use crate::security::CsrfFormField;
 /// CSRF token extractor for embedding in forms.
 pub use crate::security::CsrfToken;
+/// CSRF token header name extractor.
+pub use crate::security::CsrfTokenHeader;
 /// CAPTCHA widget helper — emits provider-specific markup (Turnstile or hCaptcha).
 /// Requires `bot_protection.enabled = true` in `autumn.toml`.
 #[cfg(feature = "maud")]

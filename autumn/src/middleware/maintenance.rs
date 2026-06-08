@@ -54,6 +54,8 @@ const RETRY_AFTER_SECS: &str = "120";
 pub struct MaintenanceLayer {
     state: MaintenanceState,
     health_prefix: String,
+    bypass_paths: Vec<String>,
+    probe_paths: Vec<String>,
 }
 
 impl MaintenanceLayer {
@@ -65,6 +67,8 @@ impl MaintenanceLayer {
         Self {
             state,
             health_prefix: DEFAULT_HEALTH_PREFIX.to_owned(),
+            bypass_paths: Vec::new(),
+            probe_paths: Vec::new(),
         }
     }
 
@@ -78,6 +82,22 @@ impl MaintenanceLayer {
         self.health_prefix = prefix.into();
         self
     }
+
+    /// Configure bypass paths that escape maintenance mode.
+    ///
+    /// Requests to these paths (or starting with them as slash-delimited segments) always pass through.
+    #[must_use]
+    pub fn with_bypass_paths(mut self, paths: Vec<String>) -> Self {
+        self.bypass_paths = paths;
+        self
+    }
+
+    /// Configure exact-match health probe paths that escape maintenance mode.
+    #[must_use]
+    pub fn with_probe_paths(mut self, paths: Vec<String>) -> Self {
+        self.probe_paths = paths;
+        self
+    }
 }
 
 impl<S> Layer<S> for MaintenanceLayer {
@@ -88,6 +108,8 @@ impl<S> Layer<S> for MaintenanceLayer {
             inner,
             state: self.state.clone(),
             health_prefix: self.health_prefix.clone(),
+            bypass_paths: self.bypass_paths.clone(),
+            probe_paths: self.probe_paths.clone(),
         }
     }
 }
@@ -98,6 +120,8 @@ pub struct MaintenanceService<S> {
     inner: S,
     state: MaintenanceState,
     health_prefix: String,
+    bypass_paths: Vec<String>,
+    probe_paths: Vec<String>,
 }
 
 impl<S> MaintenanceService<S> {
@@ -110,9 +134,39 @@ impl<S> MaintenanceService<S> {
         req: &Request<B>,
         config: &MaintenanceConfig,
     ) -> Option<Response<Body>> {
-        // 1. Actuator/health routes always pass through.
-        if req.uri().path().starts_with(self.health_prefix.as_str()) {
+        // 1. Actuator/health routes and configured bypass paths always pass through.
+        let path = req.uri().path();
+        let health_matched = if self.health_prefix.is_empty() || self.health_prefix == "/" {
+            path == "/"
+        } else {
+            path == self.health_prefix
+                || if self.health_prefix.ends_with('/') {
+                    path.starts_with(&self.health_prefix)
+                } else {
+                    let mut prefix_slash = self.health_prefix.clone();
+                    prefix_slash.push('/');
+                    path.starts_with(&prefix_slash)
+                }
+        };
+        if health_matched {
             return None;
+        }
+        for probe in &self.probe_paths {
+            if path == probe {
+                return None;
+            }
+        }
+        for bypass in &self.bypass_paths {
+            if path == bypass {
+                return None;
+            }
+            if bypass != "/"
+                && !bypass.is_empty()
+                && let Some(stripped) = path.strip_prefix(bypass)
+                && (bypass.ends_with('/') || stripped.starts_with('/'))
+            {
+                return None;
+            }
         }
 
         // 2. Bypass header.
@@ -727,6 +781,43 @@ mod tests {
         state.enable(MaintenanceConfig::default());
         assert_eq!(
             response_status(app, "/").await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[tokio::test]
+    async fn maintenance_on_root_health_prefix_passes_only_root() {
+        let state = MaintenanceState::new();
+        state.enable(MaintenanceConfig::default());
+
+        let app = Router::new()
+            .route("/", get(|| async { "root" }))
+            .route("/api/data", get(|| async { "data" }))
+            .layer(MaintenanceLayer::new(state).with_health_prefix("/"));
+
+        assert_eq!(response_status(app.clone(), "/").await, StatusCode::OK);
+        assert_eq!(
+            response_status(app, "/api/data").await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[tokio::test]
+    async fn maintenance_on_custom_health_prefix_segment_aware() {
+        let state = MaintenanceState::new();
+        state.enable(MaintenanceConfig::default());
+
+        let app = Router::new()
+            .route("/actuator/health", get(|| async { "healthy" }))
+            .route("/actuator-dashboard", get(|| async { "dashboard" }))
+            .layer(MaintenanceLayer::new(state).with_health_prefix("/actuator"));
+
+        assert_eq!(
+            response_status(app.clone(), "/actuator/health").await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            response_status(app, "/actuator-dashboard").await,
             StatusCode::SERVICE_UNAVAILABLE
         );
     }

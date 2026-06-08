@@ -34,6 +34,14 @@ impl WebhookReplayStore for UnavailableReplayStore {
             ))
         })
     }
+
+    fn remove<'a>(&'a self, _key: &'a str) -> WebhookReplayFuture<'a> {
+        Box::pin(async {
+            Err(WebhookReplayStoreError::new(
+                "custom replay backend offline",
+            ))
+        })
+    }
 }
 
 #[post("/webhooks/stripe")]
@@ -877,5 +885,274 @@ async fn toml_provider_preset_applies_signature_header_defaults() {
         .await;
 
     response.assert_ok();
+    assert_eq!(HANDLER_CALLS.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn replay_attack_with_modified_delivery_id_is_rejected() {
+    let _guard = TEST_LOCK.lock().await;
+    HANDLER_CALLS.store(0, Ordering::SeqCst);
+    let client = client(vec![endpoint(
+        WebhookProvider::Github,
+        "/webhooks/github",
+        "github",
+    )]);
+    let body = br#"{"action":"opened"}"#;
+    let signature = github_signature(CURRENT_SECRET, body);
+
+    let first = client
+        .post("/webhooks/github")
+        .header("x-hub-signature-256", &signature)
+        .header("x-github-delivery", "delivery-1")
+        .header("x-github-event", "pull_request")
+        .body(body.as_slice())
+        .send()
+        .await;
+    first.assert_ok();
+
+    // Replay the same body & signature, but with a different delivery ID.
+    // This should still be rejected as a duplicate because the body (signature) has not changed.
+    let second = client
+        .post("/webhooks/github")
+        .header("x-hub-signature-256", &signature)
+        .header("x-github-delivery", "delivery-2")
+        .header("x-github-event", "pull_request")
+        .body(body.as_slice())
+        .send()
+        .await;
+    let json = problem_json(&second, 409);
+    assert!(
+        json["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("duplicate"))
+    );
+    assert_eq!(HANDLER_CALLS.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn webhook_endpoints_exempt_from_csrf() {
+    let _guard = TEST_LOCK.lock().await;
+    HANDLER_CALLS.store(0, Ordering::SeqCst);
+
+    let endpoints = vec![endpoint(
+        WebhookProvider::Stripe,
+        "/webhooks/stripe",
+        "stripe",
+    )];
+    let mut config = webhook_config(endpoints);
+    config.security.csrf.enabled = true;
+
+    let client = TestApp::new()
+        .config(config)
+        .routes(routes![stripe_webhook])
+        .build();
+
+    let timestamp = unix_now();
+    let body = br#"{"id":"evt_123"}"#;
+    let signature = stripe_signature(CURRENT_SECRET, timestamp, body);
+
+    client
+        .post("/webhooks/stripe")
+        .header("stripe-signature", &signature)
+        .body(body.as_slice())
+        .send()
+        .await
+        .assert_ok();
+
+    assert_eq!(HANDLER_CALLS.load(Ordering::SeqCst), 1);
+}
+
+#[post("/webhooks/failing")]
+async fn failing_webhook(_webhook: SignedWebhook) -> impl IntoResponse {
+    HANDLER_CALLS.fetch_add(1, Ordering::SeqCst);
+    StatusCode::INTERNAL_SERVER_ERROR
+}
+
+#[tokio::test]
+async fn webhook_replay_key_released_on_failure() {
+    let _guard = TEST_LOCK.lock().await;
+    HANDLER_CALLS.store(0, Ordering::SeqCst);
+
+    let endpoints = vec![endpoint(
+        WebhookProvider::Github,
+        "/webhooks/failing",
+        "failing",
+    )];
+    let client = TestApp::new()
+        .config(webhook_config(endpoints))
+        .routes(routes![failing_webhook])
+        .build();
+
+    let body = br#"{"action":"opened"}"#;
+    let signature = github_signature(CURRENT_SECRET, body);
+
+    // 1. Send first request. It should hit the handler and fail with 500.
+    client
+        .post("/webhooks/failing")
+        .header("x-hub-signature-256", &signature)
+        .header("x-github-delivery", "delivery-fail")
+        .header("x-github-event", "pull_request")
+        .body(body.as_slice())
+        .send()
+        .await
+        .assert_status(500);
+
+    assert_eq!(HANDLER_CALLS.load(Ordering::SeqCst), 1);
+
+    // 2. Since it failed with 500, the replay key must be released.
+    // Send the duplicate request. It should hit the handler again (returning 500)
+    // instead of being rejected as a duplicate (which would return 409).
+    client
+        .post("/webhooks/failing")
+        .header("x-hub-signature-256", &signature)
+        .header("x-github-delivery", "delivery-fail")
+        .header("x-github-event", "pull_request")
+        .body(body.as_slice())
+        .send()
+        .await
+        .assert_status(500);
+
+    assert_eq!(HANDLER_CALLS.load(Ordering::SeqCst), 2);
+}
+
+#[post("/webhooks/panicking")]
+async fn panicking_webhook(_webhook: SignedWebhook) -> impl IntoResponse {
+    HANDLER_CALLS.fetch_add(1, Ordering::SeqCst);
+    assert!(
+        !std::convert::identity(true),
+        "intentional panic in webhook handler"
+    );
+    StatusCode::OK
+}
+
+#[tokio::test]
+async fn webhook_replay_key_released_on_panic() {
+    let _guard = TEST_LOCK.lock().await;
+    HANDLER_CALLS.store(0, Ordering::SeqCst);
+
+    let endpoints = vec![endpoint(
+        WebhookProvider::Github,
+        "/webhooks/panicking",
+        "panicking",
+    )];
+    let client = TestApp::new()
+        .config(webhook_config(endpoints))
+        .routes(routes![panicking_webhook])
+        .build();
+
+    let body = br#"{"action":"opened"}"#;
+    let signature = github_signature(CURRENT_SECRET, body);
+
+    // 1. Send first request. It should hit the handler and panic.
+    // Axum/ReportingLayer will catch the panic and return 500.
+    client
+        .post("/webhooks/panicking")
+        .header("x-hub-signature-256", &signature)
+        .header("x-github-delivery", "delivery-panic")
+        .header("x-github-event", "pull_request")
+        .body(body.as_slice())
+        .send()
+        .await
+        .assert_status(500);
+
+    assert_eq!(HANDLER_CALLS.load(Ordering::SeqCst), 1);
+
+    // Give background spawned cleanup task a chance to run
+    tokio::task::yield_now().await;
+
+    // 2. Since it panicked, the replay key must be released.
+    // Send the duplicate request. It should hit the handler again (and panic/return 500)
+    // instead of being rejected as a duplicate (which would return 409).
+    client
+        .post("/webhooks/panicking")
+        .header("x-hub-signature-256", &signature)
+        .header("x-github-delivery", "delivery-panic")
+        .header("x-github-event", "pull_request")
+        .body(body.as_slice())
+        .send()
+        .await
+        .assert_status(500);
+
+    assert_eq!(HANDLER_CALLS.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_duplicate_id_replay_same_id_different_sig_rejected() {
+    let _guard = TEST_LOCK.lock().await;
+    HANDLER_CALLS.store(0, Ordering::SeqCst);
+    let client = client(vec![endpoint(
+        WebhookProvider::Github,
+        "/webhooks/github",
+        "github",
+    )]);
+    let body1 = br#"{"action":"opened"}"#;
+    let signature1 = github_signature(CURRENT_SECRET, body1);
+
+    let first = client
+        .post("/webhooks/github")
+        .header("x-hub-signature-256", &signature1)
+        .header("x-github-delivery", "same-id")
+        .header("x-github-event", "pull_request")
+        .body(body1.as_slice())
+        .send()
+        .await;
+    first.assert_ok();
+
+    let body2 = br#"{"action":"synchronize"}"#;
+    let signature2 = github_signature(CURRENT_SECRET, body2);
+
+    let second = client
+        .post("/webhooks/github")
+        .header("x-hub-signature-256", &signature2)
+        .header("x-github-delivery", "same-id")
+        .header("x-github-event", "pull_request")
+        .body(body2.as_slice())
+        .send()
+        .await;
+    let json = problem_json(&second, 409);
+    assert!(
+        json["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("duplicate"))
+    );
+    assert_eq!(HANDLER_CALLS.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_modified_id_replay_different_id_same_sig_rejected() {
+    let _guard = TEST_LOCK.lock().await;
+    HANDLER_CALLS.store(0, Ordering::SeqCst);
+    let client = client(vec![endpoint(
+        WebhookProvider::Github,
+        "/webhooks/github",
+        "github",
+    )]);
+    let body = br#"{"action":"opened"}"#;
+    let signature = github_signature(CURRENT_SECRET, body);
+
+    let first = client
+        .post("/webhooks/github")
+        .header("x-hub-signature-256", &signature)
+        .header("x-github-delivery", "id-1")
+        .header("x-github-event", "pull_request")
+        .body(body.as_slice())
+        .send()
+        .await;
+    first.assert_ok();
+
+    let second = client
+        .post("/webhooks/github")
+        .header("x-hub-signature-256", &signature)
+        .header("x-github-delivery", "id-2")
+        .header("x-github-event", "pull_request")
+        .body(body.as_slice())
+        .send()
+        .await;
+    let json = problem_json(&second, 409);
+    assert!(
+        json["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("duplicate"))
+    );
     assert_eq!(HANDLER_CALLS.load(Ordering::SeqCst), 1);
 }

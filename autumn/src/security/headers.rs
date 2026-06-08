@@ -163,6 +163,7 @@ struct ComputedHeaders {
     /// CSP template containing `AUTUMN_CSP_NONCE` placeholder tokens.
     /// `None` when nonce injection is disabled or the user has set a custom CSP.
     nonce_csp_template: Option<Arc<str>>,
+    csp_nonce_enabled: bool,
 }
 
 impl ComputedHeaders {
@@ -236,6 +237,7 @@ impl ComputedHeaders {
         Self {
             static_pairs,
             nonce_csp_template,
+            csp_nonce_enabled: config.csp_nonce.enabled,
         }
     }
 }
@@ -295,7 +297,7 @@ where
         // When nonce injection is active: generate a nonce, insert it into
         // request extensions (so handlers can extract it), and pass it along
         // to the response future where it will be substituted into the CSP.
-        let nonce = if self.headers.nonce_csp_template.is_some() {
+        let nonce = if self.headers.csp_nonce_enabled {
             let n = generate_nonce();
             req.extensions_mut().insert(CspNonce(n.clone()));
             Some(n)
@@ -969,6 +971,51 @@ mod tests {
         assert!(
             !csp.contains("'nonce-"),
             "Default CSP without nonce must not contain nonce directive: {csp}"
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_csp_with_nonce_enabled_generates_nonce_for_extractor() {
+        use super::super::config::CspNonceConfig;
+
+        async fn handler(nonce: CspNonce) -> String {
+            nonce.value().to_owned()
+        }
+
+        let config = HeadersConfig {
+            content_security_policy: "default-src 'self'; script-src 'self'".to_string(),
+            csp_nonce: CspNonceConfig { enabled: true },
+            ..Default::default()
+        };
+
+        let app = Router::new()
+            .route("/", get(handler))
+            .layer(SecurityHeadersLayer::from_config(&config));
+
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        // 1. Verify custom CSP header is sent unmodified
+        let csp = response
+            .headers()
+            .get("content-security-policy")
+            .expect("CSP header must be present")
+            .to_str()
+            .unwrap();
+        assert_eq!(csp, "default-src 'self'; script-src 'self'");
+
+        // 2. Verify CspNonce extractor gets a valid nonce
+        let (_, body) = response.into_parts();
+        let body_bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let nonce_val = std::str::from_utf8(&body_bytes).unwrap();
+
+        assert!(!nonce_val.is_empty(), "Nonce must not be empty");
+        assert_eq!(
+            nonce_val.len(),
+            22,
+            "Nonce must be a 22-character base64 string"
         );
     }
 }
