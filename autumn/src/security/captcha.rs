@@ -459,8 +459,9 @@ impl BotProtectionLayer {
     /// Create a layer from [`BotProtectionConfig`].
     ///
     /// Selects the built-in provider based on `config.provider`.
-    /// When `config.dev_bypass` is `true`, an [`AlwaysPassProvider`] is used
-    /// regardless of the configured provider.
+    /// When `config.enabled` is `false` or `config.dev_bypass` is `true`,
+    /// an [`AlwaysPassProvider`] is used so that manually-scoped layers respect
+    /// the same flag that controls the global auto-wired middleware.
     ///
     /// # Panics
     ///
@@ -468,7 +469,7 @@ impl BotProtectionLayer {
     /// the real provider is still constructed (requests will always fail
     /// verification because the secret is empty).
     pub fn from_config(config: &BotProtectionConfig) -> Self {
-        let provider: Arc<dyn CaptchaProvider> = if config.dev_bypass {
+        let provider: Arc<dyn CaptchaProvider> = if !config.enabled || config.dev_bypass {
             Arc::new(AlwaysPassProvider)
         } else {
             let secret = config.secret_key.clone().unwrap_or_default();
@@ -670,9 +671,16 @@ where
         std::mem::swap(&mut self.inner, &mut inner);
 
         Box::pin(async move {
-            let token =
+            // Skip body scanning entirely for providers that don't require a token
+            // (e.g. AlwaysPassProvider). Scanning would consume the body and, if
+            // the form exceeds max_scan_bytes, restore an empty body to downstream
+            // handlers — corrupting the request silently.
+            let token = if settings.provider.requires_token() {
                 extract_token_from_form(&mut req, &settings.form_field, settings.max_scan_bytes)
-                    .await;
+                    .await
+            } else {
+                None
+            };
 
             let token_str = token.as_deref().unwrap_or("");
 
