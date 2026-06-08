@@ -238,12 +238,17 @@ mod sns_verify {
         }
     }
 
-    /// Verify the SNS notification signature.
+    /// Verify the SNS notification signature and optional TopicArn binding.
+    ///
+    /// `expected_topic_arn` — when `Some`, the notification's `TopicArn` must
+    /// match exactly; this prevents any other AWS account's SNS topic from
+    /// posting forged (but validly-signed) messages to this endpoint.
     ///
     /// Set `AUTUMN_SES_SKIP_SNS_VERIFICATION=1` to disable in tests/local dev.
     pub(super) async fn verify(
         json: &serde_json::Value,
         http_client: &reqwest::Client,
+        expected_topic_arn: Option<&str>,
     ) -> Result<(), StatusCode> {
         if std::env::var("AUTUMN_SES_SKIP_SNS_VERIFICATION").is_ok() {
             return Ok(());
@@ -288,10 +293,27 @@ mod sns_verify {
             tracing::error!("inbound_mail.ses: could not extract public key from SNS cert");
             StatusCode::UNAUTHORIZED
         })?;
-        verify_rsa_signature(&spki, canonical.as_bytes(), &sig_bytes, sig_version).map_err(|_| {
-            tracing::warn!("inbound_mail.ses: SNS signature verification failed");
-            StatusCode::UNAUTHORIZED
-        })
+        verify_rsa_signature(&spki, canonical.as_bytes(), &sig_bytes, sig_version).map_err(
+            |_| {
+                tracing::warn!("inbound_mail.ses: SNS signature verification failed");
+                StatusCode::UNAUTHORIZED
+            },
+        )?;
+
+        // Bind to the expected SNS topic so that signed messages from any other
+        // topic are also rejected (prevents cross-account/cross-topic forgery).
+        if let Some(expected) = expected_topic_arn {
+            let actual = json.get("TopicArn").and_then(|v| v.as_str()).unwrap_or("");
+            if actual != expected {
+                tracing::warn!(
+                    expected_topic_arn = expected,
+                    actual_topic_arn = actual,
+                    "inbound_mail.ses: TopicArn mismatch — request rejected"
+                );
+                return Err(StatusCode::UNAUTHORIZED);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -434,6 +456,13 @@ pub struct InboundMailEndpointConfig {
     /// honours each [`InboundMailHandlerInfo::processing`] value directly;
     /// the endpoint-level default is not yet applied automatically.
     pub processing: ProcessingMode,
+    /// Expected SNS `TopicArn` for SES endpoints (recommended).
+    ///
+    /// When set, the SNS signature verifier rejects any notification whose
+    /// `TopicArn` field does not match this value.  This prevents a validly-
+    /// signed message from a *different* SNS topic (possibly owned by another
+    /// AWS account) from being accepted.  Leave `None` to skip the topic check.
+    pub topic_arn: Option<String>,
 }
 
 impl Default for InboundMailEndpointConfig {
@@ -444,6 +473,7 @@ impl Default for InboundMailEndpointConfig {
             signing_key: None,
             signing_key_env: None,
             processing: ProcessingMode::Background,
+            topic_arn: None,
         }
     }
 }
@@ -458,6 +488,7 @@ impl InboundMailEndpointConfig {
             signing_key: Some(signing_key.into()),
             signing_key_env: None,
             processing: ProcessingMode::Background,
+            topic_arn: None,
         }
     }
 
@@ -466,6 +497,9 @@ impl InboundMailEndpointConfig {
     /// No signing key is configured here: SNS subscription confirmation is
     /// handled automatically, and SNS message authenticity is verified via
     /// the `X-Amz-Sns-Message-Type` header.
+    ///
+    /// For production use, call [`.with_topic_arn`](Self::with_topic_arn) to
+    /// restrict accepted notifications to your application's SNS topic.
     #[must_use]
     pub fn ses(path: impl Into<String>) -> Self {
         Self {
@@ -474,7 +508,19 @@ impl InboundMailEndpointConfig {
             signing_key: None,
             signing_key_env: None,
             processing: ProcessingMode::Background,
+            topic_arn: None,
         }
+    }
+
+    /// Restrict this SES endpoint to notifications from a specific SNS topic.
+    ///
+    /// The `TopicArn` in each notification is checked against `arn` after
+    /// signature verification.  Notifications from any other topic are
+    /// rejected with 401.
+    #[must_use]
+    pub fn with_topic_arn(mut self, arn: impl Into<String>) -> Self {
+        self.topic_arn = Some(arn.into());
+        self
     }
 
     /// Generic RFC 5322 raw-body endpoint with optional HMAC signing.
@@ -489,6 +535,7 @@ impl InboundMailEndpointConfig {
             signing_key: None,
             signing_key_env: None,
             processing: ProcessingMode::Background,
+            topic_arn: None,
         }
     }
 
@@ -1072,11 +1119,15 @@ fn parse_rfc5322(raw: Bytes) -> InboundEmail {
         .map(|s| s.to_ascii_lowercase())
         .unwrap_or_default();
     let body_str = body_block.trim().to_string();
+    // Normalise the MIME type/subtype for matching (RFC 2045 §5 — case-insensitive),
+    // but pass the original `content_type` value to boundary extraction so that
+    // case-sensitive boundary parameter values are preserved.
+    let ct_lower = content_type.to_ascii_lowercase();
     let (text_body, html_body) = if body_str.is_empty() {
         (None, None)
-    } else if content_type.starts_with("multipart/") {
+    } else if ct_lower.starts_with("multipart/") {
         extract_multipart_bodies(&body_str, &content_type)
-    } else if content_type.contains("text/html") {
+    } else if ct_lower.contains("text/html") {
         (None, Some(decode_transfer_encoding(&body_str, &cte)))
     } else {
         (Some(decode_transfer_encoding(&body_str, &cte)), None)
@@ -1358,7 +1409,9 @@ pub(crate) fn build_routes(
                 endpoint.signing_key.is_some() || endpoint.signing_key_env.is_some();
             let axum_router = match provider {
                 InboundMailProvider::Mailgun => build_mailgun_route(&path, signing_key, router_arc),
-                InboundMailProvider::Ses => build_ses_route(&path, router_arc),
+                InboundMailProvider::Ses => {
+                    build_ses_route(&path, endpoint.topic_arn.clone(), router_arc)
+                }
                 InboundMailProvider::Generic => {
                     build_generic_route(&path, signing_key, key_configured, router_arc)
                 }
@@ -1402,6 +1455,7 @@ fn build_mailgun_route(
 
 fn build_ses_route(
     path: &str,
+    topic_arn: Option<String>,
     router: Arc<InboundMailRouter>,
 ) -> axum::Router<crate::state::AppState> {
     use axum::extract::DefaultBodyLimit;
@@ -1415,11 +1469,27 @@ fn build_ses_route(
         let router = Arc::clone(&router);
         #[cfg(feature = "inbound-ses")]
         let http_client = http_client.clone();
+        let topic_arn = topic_arn.clone();
         async move {
-            // Verify SNS signature before parsing.
+            // Reject SES notifications when the `inbound-ses` feature is off: the
+            // signature verifier is not compiled in, so accepting requests would
+            // bypass SNS authentication entirely.
+            #[cfg(not(feature = "inbound-ses"))]
+            {
+                tracing::error!(
+                    "inbound_mail.ses: SES endpoint configured but the `inbound-ses` \
+                     Cargo feature is not enabled; all requests are rejected. \
+                     Add `inbound-ses` to your feature list."
+                );
+                return StatusCode::SERVICE_UNAVAILABLE;
+            }
+
+            // Verify SNS signature (and optional TopicArn binding) before parsing.
             #[cfg(feature = "inbound-ses")]
             if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body) {
-                if let Err(status) = sns_verify::verify(&json, &http_client).await {
+                if let Err(status) =
+                    sns_verify::verify(&json, &http_client, topic_arn.as_deref()).await
+                {
                     return status;
                 }
             }
