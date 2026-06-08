@@ -148,6 +148,18 @@ pub fn plan_scaffold_with_options(
     let updated = update_main_rs(&main_existing, &mods, &route_entries);
     plan.modify(main_path, updated);
 
+    // Modify `autumn.toml` if it exists and --api is set to avoid prod boot block
+    if options.api {
+        let toml_path = project_root.join("autumn.toml");
+        if toml_path.exists() {
+            let toml_existing = std::fs::read_to_string(&toml_path).unwrap_or_default();
+            let updated_toml = ensure_allow_unauthorized_repository_api(&toml_existing);
+            if updated_toml != toml_existing {
+                plan.modify(toml_path, updated_toml);
+            }
+        }
+    }
+
     // The Maud `html!` macro pulls in a direct `maud` dep on top of the
     // model's deps. Both modify actions target Cargo.toml, so we combine
     // them into a single deduplicated call — otherwise the second write
@@ -772,8 +784,10 @@ fn render_smoke_test(pascal_name: &str, plural: &str, api: bool, fields: &[Field
                 FieldKind::I32 | FieldKind::I64 => "1",
                 FieldKind::F32 | FieldKind::F64 => "1.0",
                 FieldKind::Uuid => "\\\"00000000-0000-0000-0000-000000000000\\\"",
-                FieldKind::NaiveDateTime | FieldKind::DateTime => "\\\"2026-06-08T00:00:00Z\\\"",
-                FieldKind::Bytea | FieldKind::Attachment => "[]",
+                FieldKind::NaiveDateTime => "\\\"2026-06-08T00:00:00\\\"",
+                FieldKind::DateTime => "\\\"2026-06-08T00:00:00Z\\\"",
+                FieldKind::Bytea => "[]",
+                FieldKind::Attachment => "null",
             };
             sample_parts.push(format!("\\\"{}\\\": {}", f.name, val));
         }
@@ -948,11 +962,50 @@ fn main_route_entries(plural: &str, snake_name: &str, api: bool) -> Vec<String> 
     }
 }
 
+fn ensure_allow_unauthorized_repository_api(toml: &str) -> String {
+    if toml.contains("allow_unauthorized_repository_api") {
+        return toml.to_owned();
+    }
+
+    let mut out = toml.trim_end().to_owned();
+    if out.contains("[security]") {
+        if let Some(pos) = out.find("[security]") {
+            let insert_pos = pos + "[security]".len();
+            out.insert_str(insert_pos, "\nallow_unauthorized_repository_api = true");
+        }
+    } else {
+        out.push_str("\n\n[security]\nallow_unauthorized_repository_api = true");
+    }
+    out.push('\n');
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn test_ensure_allow_unauthorized_repository_api_empty() {
+        let input = "";
+        let expected = "\n\n[security]\nallow_unauthorized_repository_api = true\n";
+        assert_eq!(ensure_allow_unauthorized_repository_api(input), expected);
+    }
+
+    #[test]
+    fn test_ensure_allow_unauthorized_repository_api_existing_security() {
+        let input = "[server]\nport = 3000\n\n[security]\nforbidden_response = \"403\"";
+        let expected = "[server]\nport = 3000\n\n[security]\nallow_unauthorized_repository_api = true\nforbidden_response = \"403\"\n";
+        assert_eq!(ensure_allow_unauthorized_repository_api(input), expected);
+    }
+
+    #[test]
+    fn test_ensure_allow_unauthorized_repository_api_already_present() {
+        let input =
+            "[security]\nallow_unauthorized_repository_api = true\nforbidden_response = \"403\"";
+        assert_eq!(ensure_allow_unauthorized_repository_api(input), input);
+    }
 
     fn project_with_main(template: &str) -> TempDir {
         let tmp = TempDir::new().unwrap();

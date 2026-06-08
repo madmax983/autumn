@@ -477,6 +477,13 @@ fn generate_scaffold_api_only() {
             "main.rs should not mount HTML route: {entry}\n{main}"
         );
     }
+
+    // autumn.toml updates.
+    let config_toml = fs::read_to_string(project.join("autumn.toml")).unwrap();
+    assert!(
+        config_toml.contains("allow_unauthorized_repository_api = true"),
+        "autumn.toml missing allow_unauthorized_repository_api override:\n{config_toml}"
+    );
 }
 
 #[test]
