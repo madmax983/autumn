@@ -1810,6 +1810,7 @@ impl AutumnConfig {
         self.apply_idempotency_env_overrides_with_env(env);
         self.apply_dev_env_overrides_with_env(env);
         self.apply_compression_env_overrides_with_env(env);
+        self.apply_actuator_env_overrides_with_env(env);
         #[cfg(feature = "reporting")]
         self.apply_reporting_env_overrides_with_env(env);
         #[cfg(feature = "storage")]
@@ -1855,6 +1856,23 @@ impl AutumnConfig {
             env,
             "AUTUMN_COMPRESSION__ENABLED",
             &mut self.compression.enabled,
+        );
+    }
+
+    fn apply_actuator_env_overrides_with_env(&mut self, env: &dyn Env) {
+        parse_env_string(env, "AUTUMN_ACTUATOR__PREFIX", &mut self.actuator.prefix);
+        parse_env_bool(
+            env,
+            "AUTUMN_ACTUATOR__SENSITIVE",
+            &mut self.actuator.sensitive,
+        );
+        // Security-sensitive: operators disable the Prometheus scrape endpoint
+        // with AUTUMN_ACTUATOR__PROMETHEUS=false; the override must be honored
+        // so the endpoint is not left exposed against the operator's intent.
+        parse_env_bool(
+            env,
+            "AUTUMN_ACTUATOR__PROMETHEUS",
+            &mut self.actuator.prometheus,
         );
     }
 
@@ -4213,6 +4231,37 @@ path = "/healthz"
             config.database.url.as_deref(),
             Some("postgres://override:5432/test")
         );
+    }
+
+    #[test]
+    fn env_override_actuator_prometheus_disables() {
+        // Operators must be able to remove the scrape endpoint via the
+        // documented AUTUMN_SECTION__FIELD convention, not just TOML.
+        let env = MockEnv::new().with("AUTUMN_ACTUATOR__PROMETHEUS", "false");
+        let mut config = AutumnConfig::default();
+        assert!(config.actuator.prometheus, "default should be enabled");
+        config.apply_env_overrides_with_env(&env);
+        assert!(
+            !config.actuator.prometheus,
+            "AUTUMN_ACTUATOR__PROMETHEUS=false must disable the scrape endpoint"
+        );
+    }
+
+    #[test]
+    fn env_override_actuator_sensitive() {
+        let env = MockEnv::new().with("AUTUMN_ACTUATOR__SENSITIVE", "true");
+        let mut config = AutumnConfig::default();
+        assert!(!config.actuator.sensitive);
+        config.apply_env_overrides_with_env(&env);
+        assert!(config.actuator.sensitive);
+    }
+
+    #[test]
+    fn env_override_actuator_prefix() {
+        let env = MockEnv::new().with("AUTUMN_ACTUATOR__PREFIX", "/ops");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.actuator.prefix, "/ops");
     }
 
     #[test]

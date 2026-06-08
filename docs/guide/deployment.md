@@ -280,8 +280,11 @@ prometheus = true    # /actuator/prometheus still scrapeable
 ```
 
 To remove the scrape endpoint entirely (it then returns `404`), set
-`prometheus = false`. Regression tests assert both directions — the endpoint is
-present under the non-sensitive config and absent when export is disabled.
+`prometheus = false` — either in `autumn.toml` or via the environment override
+`AUTUMN_ACTUATOR__PROMETHEUS=false` (the whole `[actuator]` section follows the
+standard `AUTUMN_SECTION__FIELD` convention). Regression tests assert both
+directions — the endpoint is present under the non-sensitive config and absent
+when export is disabled.
 
 The generated `fly.toml` wires Fly's `[metrics]` block to this endpoint:
 

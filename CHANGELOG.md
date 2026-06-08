@@ -30,8 +30,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `[metrics]`) while keeping `sensitive = false`, so `/actuator/env`,
     `/actuator/configprops`, `/actuator/loggers`, `/actuator/tasks`,
     `/actuator/jobs`, and the actuator task UI stay off the public surface.
-  - Set `actuator.prometheus = false` to remove the scrape endpoint entirely
-    (it then returns `404`). The flag is surfaced in `/actuator/configprops`.
+  - Set `actuator.prometheus = false` (or `AUTUMN_ACTUATOR__PROMETHEUS=false`)
+    to remove the scrape endpoint entirely (it then returns `404`). The flag is
+    surfaced in `/actuator/configprops`.
+  - The `[actuator]` section now honors environment overrides
+    (`AUTUMN_ACTUATOR__PREFIX`, `AUTUMN_ACTUATOR__SENSITIVE`,
+    `AUTUMN_ACTUATOR__PROMETHEUS`), matching the documented
+    `AUTUMN_SECTION__FIELD` convention. Previously the actuator section was only
+    configurable via TOML.
   - Docs: `docs/guide/deployment.md` now describes the safe Fly.io deployment
     shape, including scraping a private/non-public metrics port, and clarifies
     that OTLP tracing and the Prometheus scrape endpoint are separate telemetry
