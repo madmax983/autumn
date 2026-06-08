@@ -347,11 +347,13 @@ impl SystemTest {
 
         // 3. Build the axum router from the registered routes.
         let router = build_router_for_system_test(self.routes, self.state_override);
+        let service = tower::Layer::layer(&crate::middleware::MethodOverrideLayer::new(), router);
+        let make_service = axum::ServiceExt::<axum::extract::Request>::into_make_service(service);
 
         // 4. Spawn the server in a background task.
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let server_handle = tokio::spawn(async move {
-            let _ = axum::serve(listener, router)
+            let _ = axum::serve(listener, make_service)
                 .with_graceful_shutdown(async move {
                     let _ = shutdown_rx.await;
                 })
@@ -990,7 +992,7 @@ fn build_router_for_system_test(
     routes: Vec<Route>,
     state_override: Option<crate::state::AppState>,
 ) -> axum::Router {
-    let router = if let Some(state) = state_override {
+    if let Some(state) = state_override {
         // Use the config already embedded in the caller-supplied state so
         // that middleware (tenancy, auth, rate-limiting, CSRF) is built
         // from the same settings that handlers observe via AppState::config().
@@ -1013,9 +1015,7 @@ fn build_router_for_system_test(
         let state = crate::state::AppState::for_test().with_profile("test");
         state.insert_extension(config.clone());
         crate::router::build_router(routes, &config, state)
-    };
-
-    tower::Layer::layer(&crate::middleware::MethodOverrideLayer::new(), router)
+    }
 }
 
 /// Escape a string as a JSON-safe JavaScript string literal.
