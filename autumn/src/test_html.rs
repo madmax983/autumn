@@ -354,23 +354,39 @@ impl<'a> Parser<'a> {
     fn read_raw_text(&mut self, tag: &str) -> String {
         let start = self.pos;
         let needle = format!("</{tag}");
-        let rest = &self.input[self.pos..];
-        let lowered = rest.to_ascii_lowercase();
-        if let Some(rel) = lowered.find(&needle) {
-            let text = self.input[start..start + rel].to_string();
-            self.pos += rel;
-            // Consume the closing tag through '>'.
-            while self.pos < self.bytes.len() && self.bytes[self.pos] != b'>' {
-                self.pos += 1;
+        let mut search_from = self.pos;
+        loop {
+            let lowered = self.input[search_from..].to_ascii_lowercase();
+            let Some(rel) = lowered.find(&needle) else {
+                // No closing tag: the rest of the input is raw content.
+                let text = self.input[start..].to_string();
+                self.pos = self.bytes.len();
+                return text;
+            };
+            let match_pos = search_from + rel;
+            // `</script` is only a real close tag when the matched name ends
+            // here — i.e. the next char is `>`, `/`, whitespace, or EOF. This
+            // prevents `</scripture>` inside a JS string from terminating a
+            // `<script>` block early.
+            let after = self.input[match_pos + needle.len()..].chars().next();
+            let is_close = match after {
+                None | Some('>' | '/') => true,
+                Some(c) => c.is_whitespace(),
+            };
+            if is_close {
+                let text = self.input[start..match_pos].to_string();
+                self.pos = match_pos;
+                // Consume the closing tag through '>'.
+                while self.pos < self.bytes.len() && self.bytes[self.pos] != b'>' {
+                    self.pos += 1;
+                }
+                if self.pos < self.bytes.len() {
+                    self.pos += 1;
+                }
+                return text;
             }
-            if self.pos < self.bytes.len() {
-                self.pos += 1;
-            }
-            text
-        } else {
-            let text = self.input[start..].to_string();
-            self.pos = self.bytes.len();
-            text
+            // False match (e.g. `</scripture`): keep scanning past it.
+            search_from = match_pos + needle.len();
         }
     }
 }
@@ -537,39 +553,36 @@ impl Complex {
         if !self.parts[n - 1].1.matches(el) {
             return false;
         }
-        // Walk the remaining compounds right-to-left up the ancestor chain.
-        let mut anc = ancestors.len();
-        let mut idx = n - 1;
-        while idx > 0 {
-            let combinator = self.parts[idx].0.unwrap_or(Combinator::Descendant);
-            let target = &self.parts[idx - 1].1;
-            match combinator {
-                Combinator::Child => {
-                    if anc == 0 {
-                        return false;
-                    }
-                    anc -= 1;
-                    if !target.matches(ancestors[anc]) {
-                        return false;
-                    }
-                }
-                Combinator::Descendant => {
-                    let mut found = false;
-                    while anc > 0 {
-                        anc -= 1;
-                        if target.matches(ancestors[anc]) {
-                            found = true;
-                            break;
-                        }
-                    }
-                    if !found {
-                        return false;
-                    }
-                }
-            }
-            idx -= 1;
+        // Match the remaining compounds against the ancestor chain.
+        self.match_prefix(n - 1, ancestors)
+    }
+
+    /// Match `parts[0..idx]` against `ancestors`, where `parts[idx]` has already
+    /// matched the element whose ancestor chain is `ancestors`. Descendant steps
+    /// backtrack across every candidate ancestor rather than greedily committing
+    /// to the nearest one, so selectors like `.foo > .bar span` still match when
+    /// a `.bar` is nested inside another `.bar`.
+    fn match_prefix(&self, idx: usize, ancestors: &[&Element]) -> bool {
+        if idx == 0 {
+            return true; // all compounds matched
         }
-        true
+        // `parts[idx].0` is the combinator linking `parts[idx - 1]` to `parts[idx]`.
+        let combinator = self.parts[idx].0.unwrap_or(Combinator::Descendant);
+        let target = &self.parts[idx - 1].1;
+        match combinator {
+            Combinator::Child => {
+                let Some((parent, rest)) = ancestors.split_last() else {
+                    return false;
+                };
+                target.matches(parent) && self.match_prefix(idx - 1, rest)
+            }
+            Combinator::Descendant => {
+                // Try each ancestor from nearest to farthest, backtracking.
+                (0..ancestors.len()).rev().any(|k| {
+                    target.matches(ancestors[k]) && self.match_prefix(idx - 1, &ancestors[..k])
+                })
+            }
+        }
     }
 }
 
@@ -650,38 +663,49 @@ fn split_top_level_commas(input: &str) -> Vec<String> {
 fn parse_complex(input: &str) -> Result<Complex, String> {
     let tokens = tokenize_complex(input);
     let mut parts: Vec<(Option<Combinator>, Compound)> = Vec::new();
-    let mut pending: Option<Combinator> = None;
-    let mut expect_compound = true;
+    // Number of `>` combinators accumulated in the current gap between
+    // compounds. More than one (e.g. `div >> span`) is malformed.
+    let mut child_combinators = 0usize;
+    let mut seen_compound = false;
 
     for token in tokens {
         match token {
             ComplexToken::Child => {
-                if parts.is_empty() {
+                if !seen_compound {
                     return Err(format!("selector `{input}` may not start with `>`"));
                 }
-                pending = Some(Combinator::Child);
-                expect_compound = true;
+                child_combinators += 1;
             }
-            ComplexToken::Whitespace => {
-                if !parts.is_empty() && pending.is_none() {
-                    pending = Some(Combinator::Descendant);
-                    expect_compound = true;
-                }
-            }
+            ComplexToken::Whitespace => {}
             ComplexToken::Compound(text) => {
                 let compound = parse_compound(&text, input)?;
-                let combinator = if parts.is_empty() { None } else { pending };
+                let combinator = if seen_compound {
+                    match child_combinators {
+                        0 => Some(Combinator::Descendant),
+                        1 => Some(Combinator::Child),
+                        _ => {
+                            return Err(format!(
+                                "selector `{input}` has consecutive `>` combinators"
+                            ));
+                        }
+                    }
+                } else {
+                    None
+                };
                 parts.push((combinator, compound));
-                pending = None;
-                expect_compound = false;
+                seen_compound = true;
+                child_combinators = 0;
             }
         }
     }
 
-    if parts.is_empty() || expect_compound {
+    if child_combinators > 0 {
         return Err(format!(
             "selector `{input}` ends with a dangling combinator"
         ));
+    }
+    if parts.is_empty() {
+        return Err(format!("selector `{input}` has no compound selectors"));
     }
     Ok(Complex { parts })
 }
@@ -1070,5 +1094,44 @@ mod tests {
         assert!(SelectorList::parse("div >").is_err());
         assert!(SelectorList::parse("a,").is_err());
         assert!(SelectorList::parse("[href").is_err());
+        // Repeated child combinators are a typo, not `div > span`.
+        assert!(SelectorList::parse("div >> span").is_err());
+        assert!(SelectorList::parse("div > > span").is_err());
+    }
+
+    #[test]
+    fn descendant_match_backtracks_over_ancestors() {
+        // `.bar` nested inside another `.bar` that is a direct child of `.foo`.
+        // Greedy nearest-ancestor matching would commit to the inner `.bar`,
+        // fail the `.foo > .bar` child step, and wrongly report no match.
+        let html = r#"
+            <div class="foo">
+              <div class="bar">
+                <div class="bar">
+                  <span>target</span>
+                </div>
+              </div>
+            </div>
+        "#;
+        assert_eq!(count(html, ".foo > .bar span"), 1);
+        // Sanity: the child combinator itself still rejects a too-deep parent.
+        assert_eq!(count(html, ".foo > span"), 0);
+    }
+
+    #[test]
+    fn raw_text_close_tag_requires_name_boundary() {
+        // A `</scripture>` substring inside a JS string must not terminate the
+        // `<script>` block early and resume markup parsing.
+        let html = r#"<div><script>var s = "</scripture><b>x</b>";</script><p>after</p></div>"#;
+        // The `<b>` lives inside the script string, so it is not an element.
+        assert_eq!(count(html, "b"), 0);
+        // Only the real `<p>` after the (correctly closed) script is seen.
+        assert_eq!(count(html, "div > p"), 1);
+        let roots = parse(html);
+        let scripts = SelectorList::parse("script").unwrap();
+        assert_eq!(
+            scripts.matches(&roots)[0].text(),
+            r#"var s = "</scripture><b>x</b>";"#
+        );
     }
 }
