@@ -191,21 +191,33 @@ Only classic HTML form submissions — the intended target — are verified.
 
 Some webhook senders — most notably Slack slash commands — deliver payloads as
 `application/x-www-form-urlencoded`.  Those requests will be challenged by the
-middleware and will fail because they cannot include a CAPTCHA token.
+global middleware and will fail because they cannot include a CAPTCHA token.
 
-The recommended solution is to **not apply bot protection globally** when your
-application handles url-encoded webhooks.  Instead, scope the middleware to only
-the router that serves your public forms:
+The solution is to **disable the global middleware** (`bot_protection.enabled = false`
+in `autumn.toml`) and apply the layer manually only to the router that serves
+your public forms.  Use `BotProtectionLayer::new()` with an explicitly
+constructed provider so the scoped layer is enforcing:
+
+```toml
+# autumn.toml — disable global auto-wiring; we apply the layer manually below
+[bot_protection]
+enabled  = false
+site_key = "0x4AAAA..."
+# Use AUTUMN_BOT_PROTECTION__SECRET_KEY env var for the secret in production
+```
 
 ```rust,no_run
 use autumn_web::prelude::*;
-use autumn_web::security::captcha::{BotProtectionLayer, AlwaysPassProvider};
+use autumn_web::security::captcha::{BotProtectionLayer, TurnstileProvider};
 use std::sync::Arc;
 
-// Public form routes — protected by CAPTCHA.
+// Read the secret from the loaded config (populated from the env var).
+let secret = config.bot_protection.secret_key.clone().unwrap_or_default();
+
+// Public form routes — CAPTCHA enforced via an explicit layer.
 let forms_router = Router::new()
     .route("/signup", post(signup_submit))
-    .layer(BotProtectionLayer::from_config(&config.bot_protection));
+    .layer(BotProtectionLayer::new(Arc::new(TurnstileProvider::new(secret))));
 
 // Webhook routes — no CAPTCHA (signature verification happens inside the handler).
 let webhook_router = Router::new()
@@ -216,8 +228,9 @@ let app = Router::new()
     .merge(webhook_router);
 ```
 
-With this layout the bot protection middleware is only applied to the routes that
-need it and the webhook endpoints are left untouched.
+With this layout the CAPTCHA middleware is only applied to the routes that need
+it and the webhook endpoints are left untouched.  The `bot_protection.site_key`
+is still read and passed to `bot_protection_widget` in templates as normal.
 
 ---
 
@@ -246,10 +259,16 @@ content_security_policy = """
 [security.headers]
 content_security_policy = """
   default-src 'self';
-  script-src 'self' https://js.hcaptcha.com https://newassets.hcaptcha.com;
-  frame-src https://newassets.hcaptcha.com;
+  script-src 'self' https://hcaptcha.com https://*.hcaptcha.com;
+  frame-src https://hcaptcha.com https://*.hcaptcha.com;
+  style-src 'self' https://hcaptcha.com https://*.hcaptcha.com;
+  connect-src https://hcaptcha.com https://*.hcaptcha.com;
 """
 ```
+
+The wildcard `*.hcaptcha.com` covers all asset subdomains used by the widget;
+hCaptcha's official CSP guidance recommends this over hard-coding specific
+subdomains which may change.
 
 Or extend the default CSP programmatically by calling
 `default_content_security_policy()` and appending the required sources.
