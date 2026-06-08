@@ -593,7 +593,28 @@ fn build_router_pre_state(
         // tools/call is counted once here and replayed with `RateLimitExempt`,
         // so it isn't double-counted by the dispatch pipeline's own limiter.
         // No-op when rate limiting is disabled (matching `envelope_rate_limited`).
+        //
+        // KNOWN LIMITATION (key_strategy = AuthenticatedPrincipal + session
+        // auth): the envelope keys on the IP fallback because the session layer
+        // — which `populate_rate_limit_principal` reads the principal from — is
+        // applied inside `apply_middleware` and does not wrap this late-merged
+        // router, so no `RateLimitPrincipal` is resolved here. Because the
+        // tools/call replay is then exempted, the dispatch clone's
+        // principal-aware limiter is skipped too, so a session-authenticated MCP
+        // call does not consume the same per-user bucket a direct request would
+        // (the framework only derives `RateLimitPrincipal` from the session).
         mcp_router = apply_rate_limit_middleware(mcp_router, config, state);
+        // Security headers (HSTS/CSP/etc.), mirroring the `SecurityHeadersLayer`
+        // `apply_middleware` installs for direct routes. The `/mcp` router is
+        // merged after that layer, so without this the envelope's responses —
+        // `initialize`/`tools/list`, auth 401/403, and rate-limit 429 — would
+        // ship without the configured `security.headers` every direct route
+        // carries. (The `tools/call` replay's headers are produced on the
+        // dispatch clone and discarded when `serve_mcp` rebuilds the JSON-RPC
+        // response, so the envelope needs its own copy.)
+        mcp_router = mcp_router.layer(crate::security::SecurityHeadersLayer::from_config(
+            &config.security.headers,
+        ));
         // CORS grant outermost so every response — including auth 401/403, the
         // 413 body-limit rejection, and a 429 from the limiter above, all
         // produced before `serve_mcp` runs — is readable by an allowlisted

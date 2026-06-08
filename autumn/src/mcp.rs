@@ -380,6 +380,17 @@ fn build_input_schema(doc: &ApiDoc, components: &serde_json::Map<String, Value>)
     let mut required: Vec<Value> = Vec::new();
     let mut defs = serde_json::Map::new();
 
+    // Path params, the `Query<T>` extractor, and the JSON body share one flat
+    // argument object, keyed by the param name for path params and by the
+    // reserved keys `query`/`body` for the other two.
+    //
+    // KNOWN LIMITATION: a path param literally named `query` or `body` collides
+    // with those reserved keys — the inserts below overwrite the path-param
+    // property, and `build_request` then feeds the `query`/`body` value to the
+    // path slot. Such routes (e.g. `/search/{query}` with a `Query<T>`) are
+    // vanishingly rare; the tool they generate is unusable, but the collision is
+    // left undisambiguated rather than reshaping the argument contract for every
+    // path-param tool.
     for param in doc.path_params {
         // axum catch-all params (`{*rest}`) surface with a leading `*`; clients
         // address them by the bare name, so advertise the stripped name.
