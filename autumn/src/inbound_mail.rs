@@ -315,20 +315,27 @@ impl RecipientPattern {
 
     /// Extract the plus-address token from `address` if this is a
     /// [`PlusAddress`](Self::PlusAddress) pattern and the address matches.
+    ///
+    /// The returned token preserves its original casing.
     #[must_use]
     pub fn extract_token(&self, address: &str) -> Option<String> {
         let Self::PlusAddress { local, domain } = self else {
             return None;
         };
         let lower = address.to_ascii_lowercase();
-        let (addr_local, addr_domain) = split_address(&lower)?;
+        let (addr_local_lower, addr_domain) = split_address(&lower)?;
         if let Some(dom) = domain {
             if addr_domain != dom.to_ascii_lowercase() {
                 return None;
             }
         }
         let prefix = format!("{}+", local.to_ascii_lowercase());
-        addr_local.strip_prefix(prefix.as_str()).map(str::to_string)
+        if !addr_local_lower.starts_with(&prefix) {
+            return None;
+        }
+        // Extract from the original address so the token's casing is preserved.
+        let (orig_local, _) = split_address(address)?;
+        orig_local.get(prefix.len()..).map(str::to_string)
     }
 }
 
@@ -445,10 +452,9 @@ impl InboundMailRouter {
             }
         }
 
-        let recipient = email.to.first().cloned().unwrap_or_default();
-
         for info in &self.handlers {
-            if info.pattern.matches(&recipient) {
+            let matched = email.to.iter().find(|r| info.pattern.matches(r)).cloned();
+            if let Some(recipient) = matched {
                 if let Some(token) = info.pattern.extract_token(&recipient) {
                     email.plus_token = Some(token);
                 }
@@ -488,6 +494,20 @@ fn subtle_eq(a: &[u8], b: &[u8]) -> bool {
     a.ct_eq(b).into()
 }
 
+/// Strip a display-name from an RFC 5322 address, returning only the addr-spec.
+///
+/// `"Support <support@company.com>"` → `"support@company.com"`
+/// `"<support@company.com>"` → `"support@company.com"`
+/// `"support@company.com"` → `"support@company.com"` (unchanged)
+fn extract_addr_spec(addr: &str) -> String {
+    if let Some(start) = addr.find('<') {
+        if let Some(rel_end) = addr[start + 1..].find('>') {
+            return addr[start + 1..start + 1 + rel_end].trim().to_string();
+        }
+    }
+    addr.trim().to_string()
+}
+
 fn parse_address_list(s: &str) -> Vec<String> {
     if s.is_empty() {
         return Vec::new();
@@ -495,7 +515,7 @@ fn parse_address_list(s: &str) -> Vec<String> {
     s.split(',')
         .map(str::trim)
         .filter(|a| !a.is_empty())
-        .map(str::to_string)
+        .map(|a| extract_addr_spec(a))
         .collect()
 }
 
@@ -506,9 +526,28 @@ pub(crate) fn parse_mailgun(
     form: &HashMap<String, String>,
     signing_key: &str,
 ) -> Result<InboundEmail, StatusCode> {
+    // Refuse all requests when no signing key is configured to prevent trivial forgery.
+    if signing_key.is_empty() {
+        tracing::error!("inbound_mail.mailgun: signing key is empty; rejecting request");
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
     let timestamp = form.get("timestamp").map_or("", String::as_str);
     let token = form.get("token").map_or("", String::as_str);
     let signature = form.get("signature").map_or("", String::as_str);
+
+    // Reject stale or future timestamps (5-minute window) to block replay attacks.
+    let ts: i64 = timestamp.parse().map_err(|_| {
+        tracing::warn!("inbound_mail.mailgun: missing or non-numeric timestamp");
+        StatusCode::UNAUTHORIZED
+    })?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs()) as i64;
+    if (now - ts).abs() > 300 {
+        tracing::warn!("inbound_mail.mailgun: timestamp outside 5-minute window");
+        return Err(StatusCode::UNAUTHORIZED);
+    }
 
     let expected = compute_mailgun_signature(timestamp, token, signing_key);
     if !subtle_eq(expected.as_bytes(), signature.as_bytes()) {
@@ -559,7 +598,8 @@ pub(crate) fn parse_mailgun(
     let attachment_count: usize = form
         .get("attachment-count")
         .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
+        .unwrap_or(0)
+        .min(100);
     let mut attachments = Vec::new();
     for i in 1..=attachment_count {
         if let Some(name) = form.get(&format!("attachment-{i}")) {
@@ -636,10 +676,22 @@ pub(crate) fn parse_ses(body: Bytes, headers: &HeaderMap) -> Result<SnsParseResu
             let json: serde_json::Value =
                 serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
             let message = json.get("Message").and_then(|m| m.as_str()).unwrap_or("");
-            // SES can base64-encode the raw email in the SNS message.
-            let raw = base64::engine::general_purpose::STANDARD
-                .decode(message)
-                .unwrap_or_else(|_| message.as_bytes().to_vec());
+            // The SNS Message may be (a) a plain base64-encoded RFC 5322 email,
+            // (b) a raw RFC 5322 string, or (c) a JSON object with a "content"
+            // field containing the base64-encoded email (SES default action format).
+            let raw = if let Ok(msg_json) = serde_json::from_str::<serde_json::Value>(message) {
+                if let Some(content) = msg_json.get("content").and_then(|c| c.as_str()) {
+                    base64::engine::general_purpose::STANDARD
+                        .decode(content)
+                        .unwrap_or_else(|_| content.as_bytes().to_vec())
+                } else {
+                    message.as_bytes().to_vec()
+                }
+            } else {
+                base64::engine::general_purpose::STANDARD
+                    .decode(message)
+                    .unwrap_or_else(|_| message.as_bytes().to_vec())
+            };
             let email = parse_rfc5322(Bytes::from(raw))?;
             Ok(SnsParseResult::Email(email))
         }
@@ -836,12 +888,13 @@ fn build_mailgun_route(
             let form = url_decode_form(&body);
             let effective_key = key.as_deref().unwrap_or("");
             match parse_mailgun(&form, effective_key) {
-                Ok(email) => {
-                    if let Err(e) = router.dispatch(email).await {
-                        tracing::error!(error = %e, "inbound_mail.mailgun: dispatch error");
+                Ok(email) => match router.dispatch(email).await {
+                    Ok(()) => StatusCode::OK,
+                    Err(e) => {
+                        tracing::error!(error = %e, "inbound_mail.mailgun: sync dispatch error");
+                        StatusCode::INTERNAL_SERVER_ERROR
                     }
-                    StatusCode::OK
-                }
+                },
                 Err(status) => status,
             }
         }
@@ -861,12 +914,13 @@ fn build_ses_route(
         async move {
             match parse_ses(body, &headers) {
                 Ok(SnsParseResult::SubscriptionConfirmation { .. }) => StatusCode::OK,
-                Ok(SnsParseResult::Email(email)) => {
-                    if let Err(e) = router.dispatch(email).await {
-                        tracing::error!(error = %e, "inbound_mail.ses: dispatch error");
+                Ok(SnsParseResult::Email(email)) => match router.dispatch(email).await {
+                    Ok(()) => StatusCode::OK,
+                    Err(e) => {
+                        tracing::error!(error = %e, "inbound_mail.ses: sync dispatch error");
+                        StatusCode::INTERNAL_SERVER_ERROR
                     }
-                    StatusCode::OK
-                }
+                },
                 Err(status) => status,
             }
         }
@@ -887,12 +941,13 @@ fn build_generic_route(
         let key = signing_key.clone();
         async move {
             match parse_generic(body, key.as_deref(), &headers) {
-                Ok(email) => {
-                    if let Err(e) = router.dispatch(email).await {
-                        tracing::error!(error = %e, "inbound_mail.generic: dispatch error");
+                Ok(email) => match router.dispatch(email).await {
+                    Ok(()) => StatusCode::OK,
+                    Err(e) => {
+                        tracing::error!(error = %e, "inbound_mail.generic: sync dispatch error");
+                        StatusCode::INTERNAL_SERVER_ERROR
                     }
-                    StatusCode::OK
-                }
+                },
                 Err(status) => status,
             }
         }
@@ -1036,13 +1091,21 @@ mod tests {
         });
     }
 
+    fn now_ts() -> String {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs())
+            .to_string()
+    }
+
     #[test]
     fn mailgun_parse_rejects_invalid_signature() {
+        let ts = now_ts();
         let form: HashMap<String, String> = [
             ("from".to_string(), "user@example.com".to_string()),
             ("to".to_string(), "support@company.com".to_string()),
             ("subject".to_string(), "Test".to_string()),
-            ("timestamp".to_string(), "1234567890".to_string()),
+            ("timestamp".to_string(), ts),
             ("token".to_string(), "some-token".to_string()),
             ("signature".to_string(), "deadbeef".repeat(8)),
         ]
@@ -1056,17 +1119,17 @@ mod tests {
 
     #[test]
     fn mailgun_parse_accepts_valid_signature() {
-        let ts = "1700000000";
+        let ts = now_ts();
         let tok = "mytoken";
         let key = "my-signing-key";
-        let sig = compute_mailgun_signature(ts, tok, key);
+        let sig = compute_mailgun_signature(&ts, tok, key);
 
         let form: HashMap<String, String> = [
             ("from".to_string(), "user@example.com".to_string()),
             ("to".to_string(), "support@company.com".to_string()),
             ("subject".to_string(), "Hello".to_string()),
             ("body-plain".to_string(), "Test body".to_string()),
-            ("timestamp".to_string(), ts.to_string()),
+            ("timestamp".to_string(), ts),
             ("token".to_string(), tok.to_string()),
             ("signature".to_string(), sig),
         ]
@@ -1084,16 +1147,16 @@ mod tests {
 
     #[test]
     fn mailgun_parse_detects_bounce_header() {
-        let ts = "1700000001";
+        let ts = now_ts();
         let tok = "bouncetoken";
         let key = "bounce-key";
-        let sig = compute_mailgun_signature(ts, tok, key);
+        let sig = compute_mailgun_signature(&ts, tok, key);
 
         let form: HashMap<String, String> = [
             ("from".to_string(), "MAILER-DAEMON@mailgun.net".to_string()),
             ("to".to_string(), "bounced@company.com".to_string()),
             ("subject".to_string(), "Delivery failed".to_string()),
-            ("timestamp".to_string(), ts.to_string()),
+            ("timestamp".to_string(), ts),
             ("token".to_string(), tok.to_string()),
             ("signature".to_string(), sig),
             (
