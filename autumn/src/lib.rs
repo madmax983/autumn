@@ -1020,6 +1020,9 @@ pub mod system_test;
     clippy::field_reassign_with_default
 )]
 pub mod test;
+/// Dependency-free HTML parser + CSS-selector matcher backing the structural
+/// HTML assertions on [`test::TestResponse`].
+mod test_html;
 pub use state::AppState;
 
 #[cfg(test)]

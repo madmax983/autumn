@@ -1516,6 +1516,27 @@ where
     router
 }
 
+fn apply_bot_protection_middleware<S>(
+    mut router: axum::Router<S>,
+    config: &AutumnConfig,
+) -> axum::Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    if config.bot_protection.enabled {
+        let layer =
+            crate::security::captcha::BotProtectionLayer::from_config(&config.bot_protection)
+                .with_max_scan_bytes(config.security.upload.max_request_size_bytes);
+        tracing::info!(
+            provider = ?config.bot_protection.provider,
+            dev_bypass = config.bot_protection.dev_bypass,
+            "Bot protection (CAPTCHA) enabled"
+        );
+        router = router.layer(layer);
+    }
+    router
+}
+
 async fn populate_rate_limit_principal(
     axum::extract::State(state): axum::extract::State<AppState>,
     mut req: axum::extract::Request,
@@ -1806,6 +1827,7 @@ fn apply_middleware(
         trusted_host_middleware(req, next, trusted_host_policy.clone())
     }));
     router = apply_csrf_middleware(router, config, signing_keys_opt.clone());
+    router = apply_bot_protection_middleware(router, config);
     // Method-override rejection filter. The outer `MethodOverrideLayer`
     // (applied at the `axum::serve` boundary so it can rewrite the
     // request method before route matching) stamps a
@@ -4546,6 +4568,10 @@ impl TrustedHostPolicy {
     /// Whether a request carrying no usable `Host` is allowed through. Mirrors
     /// `trusted_host_middleware`'s missing-host branch for callers (e.g. the MCP
     /// envelope) that enforce the policy outside that middleware.
+    ///
+    /// Only the `mcp` feature consumes this today; gated so default-feature
+    /// builds don't flag it as dead code.
+    #[cfg(feature = "mcp")]
     pub const fn allows_missing_host(&self) -> bool {
         self.allow_missing_host
     }

@@ -34,20 +34,32 @@
 //!   [`RequireApiToken`](crate::auth::RequireApiToken) surface; the
 //!   `Authorization` header is forwarded into the dispatched call.
 //!
+//! Results are buffered by default. A tool tagged `#[api_doc(mcp, stream)]`
+//! (issue #1118) returns an Autumn [`Sse`](crate::sse::Sse) stream that this
+//! module projects onto the Streamable-HTTP SSE channel as
+//! `notifications/progress` messages terminated by the final `tools/call`
+//! result — see `serve_tools_call` / `stream_tool_result`. Streaming is
+//! strictly opt-in per tool; the buffered path is unchanged.
+//!
 //! [`AppBuilder::expose_all_as_mcp`]: crate::app::AppBuilder::expose_all_as_mcp
 //!
 //! [mcp]: https://modelcontextprotocol.io
 
 #![cfg(feature = "mcp")]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::convert::Infallible;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use axum::body::{Body, Bytes};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
+use futures::{Stream, StreamExt as _};
 use serde_json::{Value, json};
 use tower::ServiceExt as _;
+
+use crate::sse::{Event, Sse};
 
 use crate::openapi::{ApiDoc, schema_entry_to_value};
 
@@ -55,8 +67,10 @@ use crate::openapi::{ApiDoc, schema_entry_to_value};
 /// none). Also the newest version this server implements.
 const DEFAULT_PROTOCOL_VERSION: &str = "2025-06-18";
 
-/// MCP protocol revisions whose semantics this buffered, tools-only server
-/// honors. A client's requested version is echoed only if it appears here;
+/// MCP protocol revisions whose semantics this tools-only server honors
+/// (results are buffered by default, with opt-in SSE streaming per tool — see
+/// [`serve_tools_call`]). A client's requested version is echoed only if it
+/// appears here;
 /// otherwise the server replies with [`DEFAULT_PROTOCOL_VERSION`] and the
 /// client decides whether it can proceed.
 const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
@@ -144,6 +158,9 @@ struct McpTool {
     path_params: Vec<String>,
     has_body: bool,
     has_query: bool,
+    /// True for a `#[api_doc(mcp, stream)]` tool whose handler returns an
+    /// Autumn `Sse` stream, projected onto the Streamable-HTTP SSE channel.
+    streams: bool,
 }
 
 impl McpTool {
@@ -329,6 +346,16 @@ fn should_expose(doc: &ApiDoc, expose_all: bool) -> bool {
     if doc.hidden || doc.mcp_exclude {
         return false;
     }
+    // A streaming tool (`#[api_doc(mcp, stream)]`) returns an `Sse` body, so it
+    // has no JSON response schema by nature. It is eligible purely on its
+    // explicit opt-in (or the hatch, for a read-only verb), bypassing the
+    // JSON-out gate below that would otherwise exclude every schema-less route.
+    if doc.mcp_stream {
+        if doc.mcp_tool {
+            return true;
+        }
+        return expose_all && is_read_only(doc.method);
+    }
     // JSON-out only: a response schema is the structural signal that this is a
     // JSON endpoint rather than an HTML/Maud route.
     //
@@ -498,8 +525,11 @@ pub fn derive_tools(
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for doc in docs {
         // Surface the "opted in but ineligible" case as a build-time note.
+        // Streaming tools legitimately have no JSON response schema, so they
+        // are exempt from this "missing response" warning/skip.
         if (doc.mcp_tool || (expose_all && is_read_only(doc.method)))
             && doc.response.is_none()
+            && !doc.mcp_stream
             && !doc.mcp_exclude
             && !doc.hidden
         {
@@ -540,6 +570,7 @@ pub fn derive_tools(
             path_params: doc.path_params.iter().map(|p| (*p).to_owned()).collect(),
             has_body: doc.request_body.is_some(),
             has_query: doc.query_schema.is_some(),
+            streams: doc.mcp_stream,
         });
     }
     tools
@@ -559,6 +590,7 @@ pub struct McpToolInfo {
     path_params: Vec<String>,
     has_body: bool,
     has_query: bool,
+    streams: bool,
 }
 
 impl McpServer {
@@ -578,6 +610,7 @@ impl McpServer {
                 path_params: t.path_params,
                 has_body: t.has_body,
                 has_query: t.has_query,
+                streams: t.streams,
             })
             .collect();
         let by_name = tools
@@ -785,8 +818,11 @@ fn apply_cors_headers(
     }
 }
 
-/// MCP over Streamable HTTP: GET opens a server-initiated stream. This buffered
-/// v1 has nothing to stream, so we politely decline (SSE is tracked in #1118).
+/// MCP over Streamable HTTP: a `GET` opens a *server-initiated* stream (for
+/// unsolicited server→client messages). Autumn only streams *in response to a
+/// `tools/call`* — a streaming tool's SSE rides the POST response (see
+/// [`serve_tools_call`]) — so there is nothing to serve on a bare `GET`, and we
+/// decline it per spec.
 async fn serve_mcp_get() -> Response {
     (
         StatusCode::METHOD_NOT_ALLOWED,
@@ -949,12 +985,9 @@ async fn serve_mcp(
         Value::Array(batch) => {
             let mut out = Vec::new();
             for msg in batch {
-                // No cookies are propagated from a batch: the only cookie-setting
-                // path is `tools/call`, which is rejected above before reaching a
-                // batch, so the remaining metadata methods never set one. The sink
-                // is kept to satisfy `handle_message`'s signature and is discarded.
-                let mut discard = Vec::new();
-                if let Some(resp) = handle_message(&server, &ctx, msg, &mut discard).await {
+                // Only metadata methods reach here (a batched `tools/call` is
+                // rejected above), so none set a `Set-Cookie`.
+                if let Some(resp) = handle_message(&server, &msg) {
                     out.push(resp);
                 }
             }
@@ -965,23 +998,19 @@ async fn serve_mcp(
                 json_response(&Value::Array(out))
             }
         }
-        // A single request object. A notification (no `id`) yields `None` → 202.
+        // A single request object. A `tools/call` is dispatched through a path
+        // that can answer with the Streamable-HTTP SSE channel (a streaming
+        // tool) or buffered JSON; everything else (initialize/tools/list/ping)
+        // is buffered. A notification (no `id`) yields `None` → 202.
         msg @ Value::Object(_) => {
-            let mut cookies = Vec::new();
-            handle_message(&server, &ctx, msg, &mut cookies)
-                .await
-                .map_or_else(
+            if let Some((id, params)) = single_tools_call(&msg) {
+                serve_tools_call(&server, &ctx, id, params).await
+            } else {
+                handle_message(&server, &msg).map_or_else(
                     || StatusCode::ACCEPTED.into_response(),
-                    |v| {
-                        let mut resp = json_response(&v);
-                        // Replay the inner handler's `Set-Cookie`s so a session- or
-                        // CSRF-cookie-mutating tool behaves like a direct call.
-                        for cookie in cookies {
-                            resp.headers_mut().append(header::SET_COOKIE, cookie);
-                        }
-                        resp
-                    },
+                    |v| json_response(&v),
                 )
+            }
         }
         // Anything else (scalar, null) is not a valid JSON-RPC message.
         _ => json_response(&error(
@@ -1027,18 +1056,10 @@ fn reject_unsupported_protocol_version(headers: &HeaderMap, parsed: &Value) -> O
     )
 }
 
-/// Handle a single JSON-RPC message. Returns `None` only for a *valid*
-/// notification (a `2.0` message with a `method` and no `id`).
-///
-/// `cookies` collects any `Set-Cookie` headers a replayed `tools/call`
-/// response carried, so a single (non-batch) call can propagate session/CSRF
-/// cookie updates to the outer HTTP response.
-async fn handle_message(
-    server: &McpServer,
-    ctx: &ReplayContext<'_>,
-    msg: Value,
-    cookies: &mut Vec<axum::http::HeaderValue>,
-) -> Option<Value> {
+/// Handle a single buffered JSON-RPC message (everything except `tools/call`,
+/// which [`serve_tools_call`] handles so it can stream). Returns `None` only
+/// for a *valid* notification (a `2.0` message with a `method` and no `id`).
+fn handle_message(server: &McpServer, msg: &Value) -> Option<Value> {
     let id = msg.get("id").cloned();
 
     // A JSON-RPC 2.0 `id`, when present, must be a string, number, or null;
@@ -1074,7 +1095,12 @@ async fn handle_message(
         "initialize" => Ok(initialize_result(server, &params)),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(tools_list_result(server)),
-        "tools/call" => return Some(tools_call(server, ctx, id, &params, cookies).await),
+        // A single `tools/call` is diverted to `serve_tools_call` before reaching
+        // here, and a batched one is rejected upstream; this arm is defensive.
+        "tools/call" => Err((
+            -32600,
+            "tools/call must be sent as a single JSON-RPC request".to_owned(),
+        )),
         other => Err((-32601, format!("method not found: {other}"))),
     };
 
@@ -1106,26 +1132,51 @@ fn tools_list_result(server: &McpServer) -> Value {
     json!({ "tools": tools })
 }
 
-/// Dispatch a `tools/call` through the real router and shape the response as
-/// an MCP tool result.
-async fn tools_call(
+/// Whether `msg` is a well-formed single `tools/call` request (JSON-RPC 2.0
+/// object, `method == "tools/call"`, with a usable `id`). Returns the cloned
+/// `id` and `params`. A `tools/call` is handled apart from [`handle_message`]
+/// so its (possibly streaming) result can ride the Streamable-HTTP SSE channel.
+///
+/// A malformed one (bad `jsonrpc`/`id`) returns `None` and falls through to
+/// [`handle_message`], which produces the standard `-32600` error; a
+/// `tools/call` *notification* (no `id`) likewise falls through and is treated
+/// as a no-op notification (`202`), matching the pre-streaming behavior.
+fn single_tools_call(msg: &Value) -> Option<(Value, Value)> {
+    let obj = msg.as_object()?;
+    if obj.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+        return None;
+    }
+    if obj.get("method").and_then(Value::as_str) != Some("tools/call") {
+        return None;
+    }
+    let id = obj.get("id")?;
+    if !(id.is_string() || id.is_number() || id.is_null()) {
+        return None;
+    }
+    let params = obj.get("params").cloned().unwrap_or(Value::Null);
+    Some((id.clone(), params))
+}
+
+/// Dispatch a `tools/call` through the real router and shape the response as an
+/// MCP tool result — buffered JSON for an ordinary tool, or a progressive SSE
+/// stream for a `#[api_doc(mcp, stream)]` tool whose handler returns `Sse`.
+async fn serve_tools_call(
     server: &McpServer,
     ctx: &ReplayContext<'_>,
     id: Value,
-    params: &Value,
-    cookies: &mut Vec<axum::http::HeaderValue>,
-) -> Value {
+    params: Value,
+) -> Response {
     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
     // `inputSchema` is always an object; reject a non-object `arguments`
     // (null/string/array) rather than coercing it to `{}` and dispatching.
     let arguments = match params.get("arguments") {
         None => json!({}),
         Some(value) if value.is_object() => value.clone(),
-        Some(_) => return error(id, -32602, "`arguments` must be a JSON object"),
+        Some(_) => return json_response(&error(id, -32602, "`arguments` must be a JSON object")),
     };
 
     let Some(&idx) = server.by_name.get(name) else {
-        return error(id, -32602, &format!("unknown tool: {name}"));
+        return json_response(&error(id, -32602, &format!("unknown tool: {name}")));
     };
     let tool = &server.tools[idx];
 
@@ -1137,7 +1188,7 @@ async fn tools_call(
         server.tenant_header.as_deref(),
     ) {
         Ok(req) => req,
-        Err(message) => return error(id, -32602, &message),
+        Err(message) => return json_response(&error(id, -32602, &message)),
     };
 
     // Carry the caller's resolved identity and connection peer into the replay
@@ -1163,35 +1214,68 @@ async fn tools_call(
     let response = match server.dispatch.clone().oneshot(request).await {
         Ok(resp) => resp,
         Err(e) => {
-            return success(id, tool_error(&format!("dispatch failed: {e}")));
+            return json_response(&success(id, tool_error(&format!("dispatch failed: {e}"))));
         }
     };
 
     let status = response.status();
+    let is_event_stream = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|c| {
+            c.trim_start()
+                .to_ascii_lowercase()
+                .starts_with("text/event-stream")
+        });
+    let client_accepts_sse = ctx
+        .headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(accept_includes_event_stream);
+
     // Capture any `Set-Cookie` the inner handler/middleware set (session
     // renewal, CSRF-cookie refresh, login) before the body is consumed, so a
-    // single (non-batch) call can replay them onto the outer HTTP response —
-    // matching what the equivalent direct call would have sent. The caller only
-    // applies these for a single request; a batch leaves them unused.
+    // single call replays them onto the outer HTTP response — matching what the
+    // equivalent direct call would have sent.
+    let mut cookies: Vec<HeaderValue> = Vec::new();
     for value in response.headers().get_all(header::SET_COOKIE) {
         cookies.push(value.clone());
     }
+
+    // A streaming tool whose handler streamed (text/event-stream) and whose
+    // client can read SSE: project the stream onto the MCP SSE channel. This is
+    // the only path that escapes buffering; every other case (a buffered tool, a
+    // streaming handler that errored before streaming, or a client that can't
+    // read SSE) falls through to the buffered branch below — so the base #1117
+    // path and non-SSE clients are entirely unaffected.
+    if tool.streams && status.is_success() && is_event_stream && client_accepts_sse {
+        return stream_tool_result(id, &params, response, cookies);
+    }
+
     // Unlike a normal HTTP response (streamed straight to the socket), the MCP
     // path buffers the whole body to repackage it as a tool result. Cap that
     // buffer so a runaway handler can't OOM the process; report an overflow as
     // an explicit tool error rather than silently truncating to an empty body.
     let Ok(bytes) = axum::body::to_bytes(response.into_body(), MAX_TOOL_RESPONSE_BYTES).await
     else {
-        return success(
+        return json_response(&success(
             id,
             tool_error(&format!(
                 "handler response exceeded the {MAX_TOOL_RESPONSE_BYTES}-byte MCP tool-result limit"
             )),
-        );
+        ));
     };
-    let text = String::from_utf8_lossy(&bytes).into_owned();
+    // A streaming handler buffered for a non-SSE client: collapse the SSE wire
+    // frames into their concatenated data payload so the client still receives a
+    // usable single result instead of raw `data:`-framed text.
+    let text = if is_event_stream {
+        collapse_sse_body(&bytes)
+    } else {
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
 
-    if status.is_success() {
+    let value = if status.is_success() {
         success(id, tool_ok(&text))
     } else {
         success(
@@ -1201,6 +1285,322 @@ async fn tools_call(
                 status.as_u16()
             )),
         )
+    };
+    let mut resp = json_response(&value);
+    for cookie in cookies {
+        resp.headers_mut().append(header::SET_COOKIE, cookie);
+    }
+    resp
+}
+
+// ── Progressive (SSE) tool-result projection ──────────────────────
+//
+// A streaming tool is a normal Autumn route returning `Sse` (issue #1118). Its
+// dispatched response is already SSE wire bytes (`event:`/`data:` frames). The
+// MCP endpoint *re-projects* those frames onto the Streamable-HTTP SSE channel:
+// each handler event becomes a `notifications/progress` message (when the
+// client supplied `_meta.progressToken`), and the stream is terminated by the
+// final id-correlated `tools/call` result. The developer writes a plain Autumn
+// stream — zero hand-written JSON-RPC/SSE framing — and time-to-first-signal is
+// decoupled from total tool duration because frames are forwarded as they
+// arrive rather than buffered.
+
+/// Whether an `Accept` header opts the client in to an SSE response. The MCP
+/// Streamable-HTTP transport has a streaming client advertise
+/// `Accept: ..., text/event-stream`; a client that does not is served a
+/// buffered JSON result instead (see [`serve_tools_call`]). `*/*` is treated as
+/// "does not explicitly accept SSE" so a plain JSON client isn't handed a body
+/// it can't parse.
+fn accept_includes_event_stream(accept: &str) -> bool {
+    accept.split(',').any(|part| {
+        let media = part
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        media == "text/event-stream" || media == "text/*"
+    })
+}
+
+/// Build the JSON-RPC `notifications/progress` message for one streamed event.
+///
+/// When the event's data is a JSON object carrying a numeric `progress`, its
+/// `progress`/`total`/`message` fields are forwarded verbatim (structured
+/// progress). Otherwise the event text is the human-readable `message` and
+/// `progress` is the running per-event counter.
+fn progress_notification(token: &Value, progress: f64, message: &str) -> Value {
+    if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(message)
+        && map.get("progress").is_some_and(Value::is_number)
+    {
+        let mut params = serde_json::Map::new();
+        params.insert("progressToken".into(), token.clone());
+        for key in ["progress", "total", "message"] {
+            if let Some(v) = map.get(key) {
+                params.insert((*key).to_owned(), v.clone());
+            }
+        }
+        return json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/progress",
+            "params": Value::Object(params),
+        });
+    }
+    json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/progress",
+        "params": { "progressToken": token, "progress": progress, "message": message },
+    })
+}
+
+/// Phase of the SSE projection state machine.
+enum ProjectionPhase {
+    /// Reading frames from the handler's stream.
+    Streaming,
+    /// Handler stream ended; the final `tools/call` result is pending.
+    Final,
+    /// Final result emitted; the stream is complete.
+    Done,
+}
+
+/// State threaded through the projection `unfold` (see [`stream_tool_result`]).
+struct StreamProjection {
+    /// The handler's SSE response body, as a byte stream of wire frames.
+    body: Pin<Box<dyn Stream<Item = Result<Bytes, axum::Error>> + Send>>,
+    parser: SseWireParser,
+    /// MCP messages parsed but not yet emitted (one inner chunk may yield many).
+    ready: VecDeque<Event>,
+    /// The client's `_meta.progressToken`, if any; absent ⇒ no progress notes.
+    progress_token: Option<Value>,
+    /// The original request id, echoed on the terminating result.
+    id: Value,
+    /// Running per-event progress counter (used when the handler doesn't supply
+    /// its own structured `progress`).
+    progress: f64,
+    /// Accumulated text of progress (default/`progress`-typed) events.
+    progress_parts: Vec<String>,
+    /// Accumulated text of explicit `event: result` frames, if the handler uses
+    /// them to distinguish the final payload from incremental progress.
+    result_parts: Vec<String>,
+    phase: ProjectionPhase,
+}
+
+/// Project a streaming handler's `Sse` response onto the MCP SSE channel.
+///
+/// Back-pressure / disconnect: the returned [`Sse`] writes frames to the socket
+/// as the agent consumes them; if the agent disconnects, axum drops the
+/// response future, which drops this `unfold` state — and with it the boxed
+/// handler body stream — so the handler's task unwinds with no leak and no panic
+/// on a closed stream, exactly as `sse.rs` handles a dropped subscriber.
+fn stream_tool_result(
+    id: Value,
+    params: &Value,
+    response: Response,
+    cookies: Vec<HeaderValue>,
+) -> Response {
+    let progress_token = params
+        .get("_meta")
+        .and_then(|m| m.get("progressToken"))
+        .cloned();
+
+    let state = StreamProjection {
+        body: Box::pin(response.into_body().into_data_stream()),
+        parser: SseWireParser::new(),
+        ready: VecDeque::new(),
+        progress_token,
+        id,
+        progress: 0.0,
+        progress_parts: Vec::new(),
+        result_parts: Vec::new(),
+        phase: ProjectionPhase::Streaming,
+    };
+
+    let stream = futures::stream::unfold(state, project_next);
+    let mut resp = Sse::new(stream)
+        .keep_alive(crate::sse::keep_alive())
+        .into_response();
+    for cookie in cookies {
+        resp.headers_mut().append(header::SET_COOKIE, cookie);
+    }
+    resp
+}
+
+/// Yield the next MCP message (as an SSE [`Event`]) for the projection.
+async fn project_next(
+    mut st: StreamProjection,
+) -> Option<(Result<Event, Infallible>, StreamProjection)> {
+    loop {
+        if let Some(event) = st.ready.pop_front() {
+            return Some((Ok(event), st));
+        }
+        match st.phase {
+            ProjectionPhase::Done => return None,
+            ProjectionPhase::Final => {
+                // Prefer explicit `event: result` payloads; otherwise the joined
+                // progress text is the complete result.
+                let content = if st.result_parts.is_empty() {
+                    st.progress_parts.join("\n")
+                } else {
+                    st.result_parts.concat()
+                };
+                let value = success(st.id.clone(), tool_ok(&content));
+                st.phase = ProjectionPhase::Done;
+                return Some((Ok(Event::default().data(value.to_string())), st));
+            }
+            ProjectionPhase::Streaming => {
+                if let Some(Ok(bytes)) = st.body.next().await {
+                    let events = st.parser.push(&bytes);
+                    enqueue_projected(&mut st, events);
+                } else {
+                    // End of stream (or a body error): flush any trailing frame
+                    // and move on to the terminating result.
+                    let trailing = st.parser.finish();
+                    enqueue_projected(&mut st, trailing);
+                    st.phase = ProjectionPhase::Final;
+                }
+            }
+        }
+    }
+}
+
+/// Fold parsed handler frames into the projection: accumulate their text for the
+/// final result and, when a `progressToken` is present, enqueue a
+/// `notifications/progress` message per incremental frame.
+fn enqueue_projected(st: &mut StreamProjection, events: Vec<ParsedSseEvent>) {
+    for ev in events {
+        if ev.event.as_deref() == Some("result") {
+            // Explicit final-result content — not surfaced as progress.
+            st.result_parts.push(ev.data);
+            continue;
+        }
+        st.progress_parts.push(ev.data.clone());
+        if let Some(token) = &st.progress_token {
+            st.progress += 1.0;
+            let note = progress_notification(token, st.progress, &ev.data);
+            st.ready.push_back(Event::default().data(note.to_string()));
+        }
+    }
+}
+
+/// One logical SSE frame parsed off the wire.
+struct ParsedSseEvent {
+    /// The `event:` field, if any (`None` ⇒ the default unnamed event).
+    event: Option<String>,
+    /// The `data:` payload (multiple `data:` lines joined by `\n`).
+    data: String,
+}
+
+/// Incremental parser for the SSE wire format (`event:`/`data:` lines, blank
+/// line dispatches, `:`-comment keep-alives ignored). Fed arbitrary byte chunks;
+/// emits one [`ParsedSseEvent`] per completed frame.
+struct SseWireParser {
+    /// Bytes received but not yet split into a complete line.
+    buffer: String,
+    event_type: Option<String>,
+    data_lines: Vec<String>,
+    /// Whether any field line has been seen since the last dispatch (so a lone
+    /// blank line or a comment doesn't emit an empty frame).
+    has_fields: bool,
+}
+
+impl SseWireParser {
+    const fn new() -> Self {
+        Self {
+            buffer: String::new(),
+            event_type: None,
+            data_lines: Vec::new(),
+            has_fields: false,
+        }
+    }
+
+    /// Feed a chunk; return any frames completed by it.
+    fn push(&mut self, bytes: &[u8]) -> Vec<ParsedSseEvent> {
+        self.buffer.push_str(&String::from_utf8_lossy(bytes));
+        let mut out = Vec::new();
+        while let Some(pos) = self.buffer.find('\n') {
+            let line: String = self.buffer.drain(..=pos).collect();
+            if let Some(event) = self.process_line(line.trim_end_matches(['\n', '\r'])) {
+                out.push(event);
+            }
+        }
+        out
+    }
+
+    /// Flush the trailing partial line and any pending (unterminated) frame.
+    fn finish(&mut self) -> Vec<ParsedSseEvent> {
+        let mut out = Vec::new();
+        if !self.buffer.is_empty() {
+            let line = std::mem::take(&mut self.buffer);
+            if let Some(event) = self.process_line(line.trim_end_matches(['\n', '\r'])) {
+                out.push(event);
+            }
+        }
+        if let Some(event) = self.dispatch() {
+            out.push(event);
+        }
+        out
+    }
+
+    fn process_line(&mut self, line: &str) -> Option<ParsedSseEvent> {
+        if line.is_empty() {
+            return self.dispatch();
+        }
+        // A leading colon marks a comment line (SSE keep-alive); ignore it.
+        if line.starts_with(':') {
+            return None;
+        }
+        let (field, value) = match line.split_once(':') {
+            // One optional leading space after the colon is stripped per spec.
+            Some((f, v)) => (f, v.strip_prefix(' ').unwrap_or(v)),
+            None => (line, ""),
+        };
+        match field {
+            "event" => {
+                self.event_type = Some(value.to_owned());
+                self.has_fields = true;
+            }
+            "data" => {
+                self.data_lines.push(value.to_owned());
+                self.has_fields = true;
+            }
+            // `id:`/`retry:` and any unknown field are irrelevant to projection.
+            _ => {}
+        }
+        None
+    }
+
+    fn dispatch(&mut self) -> Option<ParsedSseEvent> {
+        if !self.has_fields {
+            return None;
+        }
+        let event = ParsedSseEvent {
+            event: self.event_type.take(),
+            data: self.data_lines.join("\n"),
+        };
+        self.data_lines.clear();
+        self.has_fields = false;
+        Some(event)
+    }
+}
+
+/// Collapse a fully-buffered SSE body into a single result string — the
+/// non-SSE-client fallback for a streaming tool. Mirrors the streaming final
+/// content: explicit `event: result` frames win, else the joined frame data.
+fn collapse_sse_body(bytes: &[u8]) -> String {
+    let mut parser = SseWireParser::new();
+    let mut events = parser.push(bytes);
+    events.extend(parser.finish());
+    let (results, progress): (Vec<_>, Vec<_>) = events
+        .into_iter()
+        .partition(|e| e.event.as_deref() == Some("result"));
+    if results.is_empty() {
+        progress
+            .into_iter()
+            .map(|e| e.data)
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        results.into_iter().map(|e| e.data).collect()
     }
 }
 
@@ -1481,6 +1881,109 @@ mod tests {
     }
 
     #[test]
+    fn streaming_tool_is_eligible_without_response_schema() {
+        // A streaming tool returns `Sse` (no JSON response schema); the `stream`
+        // flag exempts it from the JSON-out gate that excludes HTML routes.
+        let mut d = doc("GET", "/api/search", "search");
+        d.response = None;
+        d.mcp_stream = true;
+        // Still requires opt-in: `stream` alone (no `mcp`) is not exposed.
+        assert!(
+            !should_expose(&d, false),
+            "stream without opt-in stays hidden"
+        );
+        d.mcp_tool = true;
+        assert!(
+            should_expose(&d, false),
+            "opted-in streaming tool is exposed"
+        );
+        // Exclusion still wins.
+        d.mcp_exclude = true;
+        assert!(!should_expose(&d, false));
+    }
+
+    #[test]
+    fn streaming_get_is_included_under_the_hatch() {
+        // Under `expose_all`, a read-only streaming GET is auto-included even
+        // without an explicit `mcp` tag (and despite having no response schema).
+        let mut d = doc("GET", "/api/search", "search");
+        d.response = None;
+        d.mcp_stream = true;
+        assert!(should_expose(&d, true));
+        // A mutating streaming verb still needs an explicit opt-in.
+        let mut w = doc("POST", "/api/search", "search2");
+        w.response = None;
+        w.mcp_stream = true;
+        assert!(!should_expose(&w, true));
+    }
+
+    #[test]
+    fn accept_header_gates_sse() {
+        assert!(accept_includes_event_stream(
+            "application/json, text/event-stream"
+        ));
+        assert!(accept_includes_event_stream("text/event-stream;q=1.0"));
+        assert!(accept_includes_event_stream("text/*"));
+        // A plain JSON client (or a generic `*/*`) does not opt in to SSE.
+        assert!(!accept_includes_event_stream("application/json"));
+        assert!(!accept_includes_event_stream("*/*"));
+    }
+
+    #[test]
+    fn sse_parser_splits_frames_and_joins_data() {
+        let mut p = SseWireParser::new();
+        // A multi-data frame, an `event:`-typed frame, and a comment keep-alive.
+        let mut events = p.push(b"data: line1\ndata: line2\n\n");
+        events.extend(p.push(b": keep-alive\n\nevent: result\ndata: final\n\n"));
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event, None);
+        assert_eq!(events[0].data, "line1\nline2");
+        assert_eq!(events[1].event.as_deref(), Some("result"));
+        assert_eq!(events[1].data, "final");
+    }
+
+    #[test]
+    fn sse_parser_handles_chunk_boundaries_mid_frame() {
+        // A frame split across chunk boundaries must still parse once complete.
+        let mut p = SseWireParser::new();
+        assert!(p.push(b"data: hel").is_empty());
+        assert!(p.push(b"lo\n").is_empty());
+        let events = p.push(b"\n");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].data, "hello");
+    }
+
+    #[test]
+    fn progress_notification_plain_and_structured() {
+        let token = json!("tok");
+        // Plain text → message + running counter.
+        let plain = progress_notification(&token, 2.0, "working");
+        assert_eq!(plain["method"], "notifications/progress");
+        assert_eq!(plain["params"]["progressToken"], "tok");
+        assert_eq!(plain["params"]["progress"], 2.0);
+        assert_eq!(plain["params"]["message"], "working");
+        // Structured JSON with a numeric `progress` → forwarded verbatim.
+        let structured = progress_notification(
+            &token,
+            99.0,
+            r#"{"progress":50,"total":100,"message":"half"}"#,
+        );
+        assert_eq!(structured["params"]["progress"], 50);
+        assert_eq!(structured["params"]["total"], 100);
+        assert_eq!(structured["params"]["message"], "half");
+    }
+
+    #[test]
+    fn collapse_sse_body_prefers_result_frames() {
+        // No `result` frame: data joined.
+        let joined = collapse_sse_body(b"data: a\n\ndata: b\n\n");
+        assert_eq!(joined, "a\nb");
+        // With a `result` frame: only the result content is kept.
+        let result = collapse_sse_body(b"data: progress\n\nevent: result\ndata: done\n\n");
+        assert_eq!(result, "done");
+    }
+
+    #[test]
     fn annotations_track_method() {
         assert_eq!(annotations_for("GET", "t")["readOnlyHint"], json!(true));
         assert_eq!(annotations_for("POST", "t")["readOnlyHint"], json!(false));
@@ -1533,6 +2036,7 @@ mod tests {
             path_params: Vec::new(),
             has_body,
             has_query,
+            streams: false,
         }
     }
 

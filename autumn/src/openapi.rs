@@ -132,6 +132,14 @@ pub struct ApiDoc {
     /// always compiled, but the builder method is gated behind the `mcp`
     /// feature, so a hard link would break docs built without it.
     pub mcp_exclude: bool,
+    /// True when the endpoint opts in to *streaming* MCP exposure via
+    /// `#[api_doc(mcp, stream)]`. A streaming tool returns an Autumn `Sse`
+    /// stream that the MCP endpoint projects onto the Streamable-HTTP SSE
+    /// channel as `notifications/progress` messages terminated by the final
+    /// `tools/call` result. Because an `Sse` handler has no JSON response
+    /// schema, this flag also exempts the tool from the JSON-out eligibility
+    /// gate that otherwise excludes schema-less routes.
+    pub mcp_stream: bool,
 }
 
 /// Reference to a schema definition, produced by the route macros.

@@ -178,7 +178,114 @@ curl -s http://127.0.0.1:3000/mcp \
 
 ---
 
-## 5. Authentication: reuse your bearer tokens
+## 5. Streaming progressive results over SSE
+
+A long-running tool — a code search over a large graph, a multi-step report, a
+slow scan — feels broken if the agent waits in silence for the whole result.
+The MCP Streamable-HTTP transport lets a `tools/call` emit
+`notifications/progress` messages (and partial content) over the response's SSE
+channel *before* the final result lands. Autumn already ships a first-class SSE
+primitive (`sse.rs`: `Sse`/`Event`/`keep_alive`) — the exact transport MCP
+streaming rides — so a streaming tool is just **a normal Autumn `Sse` stream
+wearing an MCP hat**. You write zero JSON-RPC or SSE framing.
+
+### Opt in with `stream`
+
+Add the `stream` flag to `#[api_doc(mcp, stream)]` and return an `Sse` stream
+of `Event`s. Because an `Sse` handler has no JSON response schema, `stream` also
+exempts the tool from the JSON-out eligibility gate (see §8):
+
+```rust
+use std::convert::Infallible;
+use autumn_web::prelude::*;
+use autumn_web::sse::{Event, Sse};
+use futures::stream::{self, Stream};
+
+#[get("/api/search")]
+#[api_doc(mcp, stream, summary = "Streaming code search")]
+async fn search() -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    // A plain Autumn stream — each event is one incremental chunk of work.
+    let stream = stream::iter(vec![
+        Ok(Event::default().data("match src/a.rs:12")),
+        Ok(Event::default().data("match src/b.rs:48")),
+    ]);
+    Sse::new(stream)
+}
+```
+
+### What rides the wire
+
+When a client calls a streaming tool **and** advertises it can read SSE
+(`Accept: application/json, text/event-stream`), Autumn answers the `POST /mcp`
+with `Content-Type: text/event-stream` and projects your stream onto it:
+
+- **Each `Event` you yield** becomes a `notifications/progress` message — *but
+  only when the client supplied a progress token* in `params._meta.progressToken`
+  (per spec, progress requires a token). The event's text is the progress
+  `message`; `progress` auto-increments per event.
+- **The stream is terminated** by the final id-correlated `tools/call` result,
+  whose content is the joined text of the streamed events.
+
+```jsonc
+// client → server
+{
+  "jsonrpc": "2.0", "id": 7, "method": "tools/call",
+  "params": {
+    "name": "search", "arguments": {},
+    "_meta": { "progressToken": "tok-1" }
+  }
+}
+
+// server → client, as SSE frames (one JSON-RPC message per `data:` frame)
+data: {"jsonrpc":"2.0","method":"notifications/progress",
+       "params":{"progressToken":"tok-1","progress":1,"message":"match src/a.rs:12"}}
+
+data: {"jsonrpc":"2.0","method":"notifications/progress",
+       "params":{"progressToken":"tok-1","progress":2,"message":"match src/b.rs:48"}}
+
+data: {"jsonrpc":"2.0","id":7,"result":{"content":[{"type":"text",
+       "text":"match src/a.rs:12\nmatch src/b.rs:48"}],"isError":false}}
+```
+
+The **time-to-first-signal is decoupled from total duration**: frames are
+forwarded as your stream produces them, so the first progress notification
+reaches the agent immediately even when the whole tool takes seconds.
+
+### Structured progress and an explicit final payload
+
+Two optional conventions, still framing-free:
+
+- **Structured progress** — yield an `Event` whose data is a JSON object with a
+  numeric `progress` (and optional `total`/`message`); those fields are
+  forwarded verbatim into the notification's params instead of the
+  auto-incrementing counter.
+- **An explicit final result** — yield `Event::default().event("result").data(…)`
+  to set the terminating result's content directly. Frames typed `result` are
+  *not* surfaced as progress; everything else is.
+
+### Buffered tools and non-SSE clients are unaffected
+
+Streaming is **strictly opt-in per tool**. A tool without `stream` follows the
+exact buffered path from §4 — nothing about it changes. And a streaming tool
+called by a client that does *not* accept `text/event-stream` is served a
+buffered JSON result (its streamed events collapsed into one tool result), so a
+plain JSON client is never handed a body it can't read.
+
+### Back-pressure and disconnect
+
+The projection reuses the same lifecycle `sse.rs` uses for a dropped subscriber:
+if the agent disconnects mid-stream, axum drops the response and Autumn drops
+the underlying handler stream — the handler's task unwinds with no leaked task
+and no panic on the closed stream. A `keep_alive` comment is sent on idle so
+proxies don't drop a slow stream.
+
+> **Server-initiated `GET` streams are not supported.** Streaming rides the
+> `tools/call` `POST` response; a bare `GET /mcp` (for unsolicited server→client
+> messages) returns `405`.
+
+---
+
+## 6. Authentication: reuse your bearer tokens
 
 `tools/call` runs through the **real handler pipeline** — the same in-process
 path Autumn's [test client](testing.md) uses. That means `#[secured]`,
@@ -270,7 +377,7 @@ origin to your CORS config; agent clients need no configuration.
 
 ---
 
-## 6. The whole-API hatch
+## 7. The whole-API hatch
 
 For internal tools or trusted agents you can expose every eligible **read**
 endpoint at once, without tagging each one, via `expose_all_as_mcp()`:
@@ -294,7 +401,7 @@ conservative:
 
 ---
 
-## 7. Eligibility: JSON in, JSON out
+## 8. Eligibility: JSON in, JSON out
 
 Only JSON endpoints are eligible. Autumn detects this structurally: a route is
 eligible when its handler has a JSON **response schema** (it returns
@@ -311,28 +418,35 @@ WARN skipping MCP exposure: endpoint has no JSON response schema
 
 ---
 
-## 8. End-to-end example
+## 9. End-to-end example
 
-`examples/todo-app` ships an `/mcp` endpoint. Its bearer-token JSON API
-(`list_json`, `create_json`) is mounted in a `scoped("/api", RequireApiToken,
-…)` group and tagged `#[api_doc(mcp)]`, exposing one read tool and one
-explicitly-opted-in write tool behind the same token auth a mobile client uses:
+`examples/todo-app` ships an `/mcp` endpoint. Its bearer-token JSON API is
+mounted in a `scoped("/api", RequireApiToken, …)` group and tagged
+`#[api_doc(mcp)]`, exposing a read tool (`list_json`), an explicitly-opted-in
+write tool (`create_json`), and a **streaming** tool (`scan_json`, tagged
+`#[api_doc(mcp, stream)]`) — all behind the same token auth a mobile client uses:
 
 ```rust
 .scoped(
     "/api",
     RequireApiToken::new(Arc::new(deferred.clone())),
-    routes![routes::api::list_json, routes::api::create_json],
+    routes![
+        routes::api::list_json,
+        routes::api::create_json,
+        routes::api::scan_json, // streaming: Sse → notifications/progress
+    ],
 )
 .mount_mcp("/mcp")
 ```
 
 Run it, issue a token via `POST /api/tokens`, then `tools/list` and
-`tools/call` against `/mcp` with that token in the `Authorization` header.
+`tools/call` against `/mcp` with that token in the `Authorization` header. Call
+`scan_json` with a `_meta.progressToken` and an `Accept: text/event-stream`
+header to watch progress frames arrive as the scan runs.
 
 ---
 
-## 9. How a tool call is dispatched (and why it can't loop)
+## 10. How a tool call is dispatched (and why it can't loop)
 
 When a `tools/call` arrives, the MCP handler reconstructs an ordinary HTTP
 request — filling the path template, building the query string, and attaching
@@ -362,15 +476,12 @@ that from convention to a structural guarantee.)
 
 ---
 
-## 10. Scope and roadmap
+## 11. Scope and roadmap
 
-This slice is intentionally **tools-only and buffered**. The following are
-**out of scope for v1** and tracked as follow-ups:
+This slice is **tools-only**. Tool results are buffered by default, with
+**opt-in progressive streaming over SSE** (§5). The following remain **out of
+scope** and are tracked as follow-ups:
 
-- **Streaming / partial tool results** (SSE-style progressive output) — rides
-  the existing `sse.rs` transport. Tracked in
-  [#1118](https://github.com/madmax983/autumn/issues/1118). Base tool exposure
-  stays buffered happy-path; streaming layers on top.
 - **Daemon lifetime** for long-running, session-surviving work —
   [#1119](https://github.com/madmax983/autumn/issues/1119).
 - **Durable workflow tools** — exposing Harvest `#[workflow]`s as
