@@ -344,7 +344,7 @@ pub struct AppBuilder {
     /// HTTP webhook routes are derived from the router's endpoint configs and
     /// merged into the Axum router at startup.
     #[cfg(feature = "inbound-mail")]
-    inbound_mail_router: Option<Arc<crate::inbound_mail::InboundMailRouter>>,
+    pub(crate) inbound_mail_router: Option<Arc<crate::inbound_mail::InboundMailRouter>>,
 }
 
 /// Boxed builder closure that constructs a durable
@@ -2480,7 +2480,10 @@ impl AppBuilder {
         }
         #[cfg(feature = "inbound-mail")]
         if let Some(ref im_router) = inbound_mail_router {
-            for (_path, axum_router) in crate::inbound_mail::build_routes(im_router) {
+            for (path, axum_router) in crate::inbound_mail::build_routes(im_router) {
+                // Exempt each inbound webhook path from CSRF: these routes receive
+                // provider-signed POST requests that never carry a CSRF token.
+                config.security.csrf.exempt_paths.push(path);
                 merge_routers.push(axum_router);
             }
         }

@@ -463,7 +463,12 @@ impl InboundMailRouter {
         }
 
         for info in &self.handlers {
-            let matched = email.to.iter().find(|r| info.pattern.matches(r)).cloned();
+            // Any pattern must fire even when email.to is empty (e.g. Bcc-only delivery).
+            let matched = if matches!(info.pattern, RecipientPattern::Any) {
+                Some(email.to.first().cloned().unwrap_or_default())
+            } else {
+                email.to.iter().find(|r| info.pattern.matches(r)).cloned()
+            };
             if let Some(recipient) = matched {
                 if let Some(token) = info.pattern.extract_token(&recipient) {
                     email.plus_token = Some(token);

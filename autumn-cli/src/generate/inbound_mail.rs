@@ -264,8 +264,20 @@ fn add_inbound_mail_router_to_app(src: &str, handler_module_path: &str) -> Strin
                 b')' => {
                     depth -= 1;
                     if depth == 0 {
+                        // Insert before the closing `)`, but skip over any
+                        // trailing comma + whitespace that rustfmt may have
+                        // added after the router expression. Without this,
+                        // `handler(old),)` becomes `handler(old),.handler(new))`
+                        // which is invalid Rust.
+                        let mut insert_pos = i;
+                        while insert_pos > start && bytes[insert_pos - 1].is_ascii_whitespace() {
+                            insert_pos -= 1;
+                        }
+                        if insert_pos > start && bytes[insert_pos - 1] == b',' {
+                            insert_pos -= 1;
+                        }
                         let mut out = src.to_owned();
-                        out.insert_str(i, &format!(".handler({handler_module_path}())"));
+                        out.insert_str(insert_pos, &format!(".handler({handler_module_path}())"));
                         return out;
                     }
                 }

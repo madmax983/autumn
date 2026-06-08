@@ -639,6 +639,12 @@ impl TestApp {
         self.exception_filters.extend(app_builder.exception_filters);
         self.metrics_sources.extend(app_builder.metrics_sources);
         self.health_indicators.extend(app_builder.health_indicators);
+        // Carry plugin-registered inbound mail router into the test app so
+        // webhook plugins behave identically under TestApp.
+        #[cfg(feature = "inbound-mail")]
+        if let Some(router) = app_builder.inbound_mail_router {
+            self.inbound_mail_router = Some(router);
+        }
 
         // Carry plugin-registered error reporters into the test app so
         // reporting-enabled plugins exercise the same behavior under `TestApp`
