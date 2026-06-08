@@ -144,7 +144,7 @@ pub fn inbound_mail_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     if input_fn.sig.asyncness.is_none() {
         return syn::Error::new_spanned(
-            &input_fn.sig.fn_token,
+            input_fn.sig.fn_token,
             "#[inbound_mail] functions must be async",
         )
         .to_compile_error();
@@ -155,16 +155,16 @@ pub fn inbound_mail_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let handler_name = fn_name.to_string();
 
     // Build the pattern token stream.
-    let pattern_ts = if let Some(to) = &attrs.to {
-        detect_pattern(to)
-    } else {
-        quote! { ::autumn_web::inbound_mail::RecipientPattern::Any }
-    };
+    let pattern_ts = attrs.to.as_ref().map_or_else(
+        || quote! { ::autumn_web::inbound_mail::RecipientPattern::Any },
+        |to| detect_pattern(to),
+    );
 
     // Build processing mode.
-    let processing_ts = match attrs.processing.as_deref() {
-        Some("sync") => quote! { ::autumn_web::inbound_mail::ProcessingMode::Sync },
-        _ => quote! { ::autumn_web::inbound_mail::ProcessingMode::Background },
+    let processing_ts = if let Some("sync") = attrs.processing.as_deref() {
+        quote! { ::autumn_web::inbound_mail::ProcessingMode::Sync }
+    } else {
+        quote! { ::autumn_web::inbound_mail::ProcessingMode::Background }
     };
 
     // Generate the wrapper function that adapts `async fn(InboundEmail) -> AutumnResult<()>`
