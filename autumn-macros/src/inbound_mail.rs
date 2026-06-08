@@ -84,11 +84,9 @@ fn detect_pattern(to: &str) -> TokenStream {
 
     // Plus-address: `"{local}+{token}@{domain}"` or `"{local}+{token}"` (no domain).
     // The domain part is optional; `{token}` must be a literal `{...}` placeholder.
-    let (local_part, domain_part) = if let Some(at_pos) = to.rfind('@') {
+    let (local_part, domain_part) = to.rfind('@').map_or((to, None), |at_pos| {
         (&to[..at_pos], Some(&to[at_pos + 1..]))
-    } else {
-        (to, None)
-    };
+    });
 
     if let Some(plus_pos) = local_part.find('+') {
         let tag = &local_part[plus_pos + 1..];
@@ -161,7 +159,7 @@ pub fn inbound_mail_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     );
 
     // Build processing mode.
-    let processing_ts = if let Some("sync") = attrs.processing.as_deref() {
+    let processing_ts = if attrs.processing.as_deref() == Some("sync") {
         quote! { ::autumn_web::inbound_mail::ProcessingMode::Sync }
     } else {
         quote! { ::autumn_web::inbound_mail::ProcessingMode::Background }
