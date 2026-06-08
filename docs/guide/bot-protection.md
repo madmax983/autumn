@@ -223,9 +223,14 @@ use std::sync::Arc;
 let secret = config.bot_protection.secret_key.clone().unwrap_or_default();
 
 // Public form routes — CAPTCHA enforced via an explicit layer.
+// .with_form_field ensures the layer scans the same field name that
+// bot_protection_widget emits (important when bot_protection.form_field is set).
 let forms_router = Router::new()
     .route("/signup", post(signup_submit))
-    .layer(BotProtectionLayer::new(Arc::new(TurnstileProvider::new(secret))));
+    .layer(
+        BotProtectionLayer::new(Arc::new(TurnstileProvider::new(secret)))
+            .with_form_field(config.bot_protection.effective_form_field()),
+    );
 
 // Webhook routes — no CAPTCHA (signature verification happens inside the handler).
 let webhook_router = Router::new()

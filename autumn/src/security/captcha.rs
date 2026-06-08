@@ -521,6 +521,24 @@ impl BotProtectionLayer {
         }
     }
 
+    /// Override the form field name scanned for the CAPTCHA token.
+    ///
+    /// Use this when applying a scoped layer with [`BotProtectionLayer::new`]
+    /// and `bot_protection.form_field` is set in `autumn.toml` — otherwise the
+    /// widget submits under the configured field name while the layer scans the
+    /// provider default, causing every submission to be rejected.
+    ///
+    /// ```rust,ignore
+    /// BotProtectionLayer::new(Arc::new(TurnstileProvider::new(secret)))
+    ///     .with_form_field(config.bot_protection.effective_form_field())
+    /// ```
+    #[must_use]
+    pub fn with_form_field(mut self, field: impl Into<String>) -> Self {
+        let settings = Arc::make_mut(&mut self.settings);
+        settings.form_field = field.into();
+        self
+    }
+
     /// Override the maximum number of body bytes scanned when looking for the
     /// CAPTCHA token field.  Wired to `security.upload.max_request_size_bytes`
     /// by the framework so the limit matches the configured request size.
@@ -1069,5 +1087,43 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(config.effective_form_field(), "h-captcha-response");
+    }
+
+    #[tokio::test]
+    async fn with_form_field_overrides_provider_default() {
+        // Scoped layer using a custom form field: widget submits "my-captcha",
+        // so the layer must also scan "my-captcha", not "cf-turnstile-response".
+        let layer = BotProtectionLayer::new(Arc::new(TestCaptchaProvider::new("tok")))
+            .with_form_field("my-captcha");
+        let app = router_with_layer(layer);
+
+        // Correct token in the custom field → 200
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/submit")
+                    .header("Content-Type", "application/x-www-form-urlencoded")
+                    .body(Body::from("my-captcha=tok"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Token in the provider default field (wrong field) → 400
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/submit")
+                    .header("Content-Type", "application/x-www-form-urlencoded")
+                    .body(Body::from("cf-turnstile-response=tok"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 }
