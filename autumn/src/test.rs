@@ -892,7 +892,7 @@ impl TestApp {
     /// per-function Moka stores and do not accidentally inherit a Redis or
     /// other shared backend installed by a previous test.
     #[must_use]
-    pub fn build(self) -> TestClient {
+    pub fn build(mut self) -> TestClient {
         // Reset the global cache to prevent cross-test contamination.
         crate::cache::clear_global_cache();
 
@@ -1092,7 +1092,8 @@ impl TestApp {
         let mut merge_routers = self.merge_routers;
         #[cfg(feature = "inbound-mail")]
         if let Some(ref im_router) = self.inbound_mail_router {
-            for (_path, axum_router) in crate::inbound_mail::build_routes(im_router) {
+            for (path, axum_router) in crate::inbound_mail::build_routes(im_router) {
+                self.config.security.csrf.exempt_paths.push(path);
                 merge_routers.push(axum_router);
             }
         }

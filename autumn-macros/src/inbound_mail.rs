@@ -172,10 +172,17 @@ pub fn inbound_mail_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             quote! { ::autumn_web::inbound_mail::RecipientPattern::Any }
         }
         // No explicit pattern — auto-detect from `to`.
-        _ => attrs.to.as_ref().map_or_else(
+        None => attrs.to.as_ref().map_or_else(
             || quote! { ::autumn_web::inbound_mail::RecipientPattern::Any },
             |to| detect_pattern(to),
         ),
+        Some(other) => {
+            return syn::Error::new(
+                proc_macro2::Span::call_site(),
+                format!("unknown pattern `{other}`; expected `exact`, `prefix`, or `any`"),
+            )
+            .to_compile_error();
+        }
     };
 
     // Build processing mode.

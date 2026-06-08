@@ -830,15 +830,19 @@ fn parse_rfc5322(raw: Bytes) -> InboundEmail {
         .get("content-type")
         .cloned()
         .unwrap_or_default();
+    let cte = parsed_headers
+        .get("content-transfer-encoding")
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default();
     let body_str = body_block.trim().to_string();
     let (text_body, html_body) = if body_str.is_empty() {
         (None, None)
     } else if content_type.starts_with("multipart/") {
         extract_multipart_bodies(&body_str, &content_type)
     } else if content_type.contains("text/html") {
-        (None, Some(body_str))
+        (None, Some(decode_transfer_encoding(&body_str, &cte)))
     } else {
-        (Some(body_str), None)
+        (Some(decode_transfer_encoding(&body_str, &cte)), None)
     };
 
     InboundEmail {
@@ -966,6 +970,110 @@ fn extract_multipart_bodies(body: &str, content_type: &str) -> (Option<String>, 
     (text_body, html_body)
 }
 
+/// Decode RFC 2047 encoded words (`=?charset?B/Q?text?=`) in a header value.
+///
+/// Adjacent encoded words separated only by whitespace are joined without the whitespace
+/// per RFC 2047 §6.2.
+fn decode_rfc2047(value: &str) -> String {
+    if !value.contains("=?") {
+        return value.to_string();
+    }
+    let mut result = String::with_capacity(value.len());
+    let mut rest = value;
+    let mut last_was_encoded = false;
+    while let Some(start) = rest.find("=?") {
+        let before = &rest[..start];
+        // If the gap between encoded words is only whitespace, skip it.
+        if last_was_encoded && before.chars().all(|c| c == ' ' || c == '\t') {
+            // swallow inter-word whitespace
+        } else {
+            result.push_str(before);
+        }
+        rest = &rest[start + 2..];
+        let Some(charset_end) = rest.find('?') else {
+            result.push_str("=?");
+            result.push_str(rest);
+            return result;
+        };
+        let charset = &rest[..charset_end];
+        rest = &rest[charset_end + 1..];
+        let Some(enc_end) = rest.find('?') else {
+            result.push_str("=?");
+            result.push_str(charset);
+            result.push('?');
+            result.push_str(rest);
+            return result;
+        };
+        let encoding = &rest[..enc_end];
+        rest = &rest[enc_end + 1..];
+        let Some(text_end) = rest.find("?=") else {
+            result.push_str("=?");
+            result.push_str(charset);
+            result.push('?');
+            result.push_str(encoding);
+            result.push('?');
+            result.push_str(rest);
+            return result;
+        };
+        let encoded_text = &rest[..text_end];
+        rest = &rest[text_end + 2..];
+        let decoded_bytes: Option<Vec<u8>> = match encoding.to_ascii_uppercase().as_str() {
+            "B" => {
+                let stripped: String = encoded_text
+                    .chars()
+                    .filter(|c| !c.is_ascii_whitespace())
+                    .collect();
+                base64::engine::general_purpose::STANDARD
+                    .decode(stripped.as_bytes())
+                    .ok()
+            }
+            "Q" => Some(decode_rfc2047_q(encoded_text.as_bytes())),
+            _ => None,
+        };
+        let decoded = decoded_bytes
+            .and_then(|b| rfc2047_bytes_to_string(b, charset))
+            .unwrap_or_else(|| encoded_text.to_string());
+        result.push_str(&decoded);
+        last_was_encoded = true;
+    }
+    result.push_str(rest);
+    result
+}
+
+/// Decode RFC 2047 Q-encoding (header variant): `_` → space, `=XX` → byte.
+fn decode_rfc2047_q(input: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(input.len());
+    let mut i = 0;
+    while i < input.len() {
+        if input[i] == b'_' {
+            out.push(b' ');
+            i += 1;
+        } else if input[i] == b'='
+            && i + 2 < input.len()
+            && input[i + 1].is_ascii_hexdigit()
+            && input[i + 2].is_ascii_hexdigit()
+        {
+            let hi = (input[i + 1] as char).to_digit(16).unwrap_or(0) as u8;
+            let lo = (input[i + 2] as char).to_digit(16).unwrap_or(0) as u8;
+            out.push((hi << 4) | lo);
+            i += 3;
+        } else {
+            out.push(input[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Convert a decoded byte sequence to a String given its RFC 2047 charset label.
+fn rfc2047_bytes_to_string(bytes: Vec<u8>, charset: &str) -> Option<String> {
+    match charset.to_ascii_lowercase().as_str() {
+        "utf-8" | "utf8" | "us-ascii" | "ascii" => String::from_utf8(bytes).ok(),
+        "iso-8859-1" | "latin-1" | "iso8859-1" => Some(bytes.iter().map(|&b| b as char).collect()),
+        _ => String::from_utf8(bytes).ok(),
+    }
+}
+
 fn apply_header(
     headers: &mut HashMap<String, String>,
     from: &mut String,
@@ -980,7 +1088,7 @@ fn apply_header(
         "from" => *from = value.to_string(),
         "to" => *to = parse_address_list(value),
         "cc" => *cc = parse_address_list(value),
-        "subject" => *subject = value.to_string(),
+        "subject" => *subject = decode_rfc2047(value),
         _ => {}
     }
 }
@@ -1502,6 +1610,52 @@ mod tests {
         )]);
         let result = parse_ses(&Bytes::from("{}"), &headers);
         assert_eq!(result.unwrap_err(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn decode_rfc2047_plain_subject_unchanged() {
+        assert_eq!(decode_rfc2047("Hello world"), "Hello world");
+    }
+
+    #[test]
+    fn decode_rfc2047_base64_utf8() {
+        use base64::Engine as _;
+        let text = "Héllo";
+        let b64 = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+        let encoded = format!("=?UTF-8?B?{b64}?=");
+        assert_eq!(decode_rfc2047(&encoded), text);
+    }
+
+    #[test]
+    fn decode_rfc2047_q_encoding() {
+        // =?UTF-8?Q?Hello_World?= → "Hello World"
+        let encoded = "=?UTF-8?Q?Hello_World?=";
+        assert_eq!(decode_rfc2047(encoded), "Hello World");
+    }
+
+    #[test]
+    fn decode_rfc2047_q_hex_sequence() {
+        // =?UTF-8?Q?caf=C3=A9?= → "café"
+        let encoded = "=?UTF-8?Q?caf=C3=A9?=";
+        assert_eq!(decode_rfc2047(encoded), "café");
+    }
+
+    #[test]
+    fn decode_rfc2047_adjacent_words_no_space() {
+        // Two adjacent encoded words should be joined without whitespace.
+        use base64::Engine as _;
+        let w1 = base64::engine::general_purpose::STANDARD.encode("Hello");
+        let w2 = base64::engine::general_purpose::STANDARD.encode(" World");
+        let encoded = format!("=?UTF-8?B?{w1}?= =?UTF-8?B?{w2}?=");
+        assert_eq!(decode_rfc2047(&encoded), "Hello World");
+    }
+
+    #[test]
+    fn decode_rfc2047_mixed_literal_and_encoded() {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD.encode("World");
+        let encoded = format!("Hello =?UTF-8?B?{b64}?=");
+        assert_eq!(decode_rfc2047(&encoded), "Hello World");
     }
 
     #[test]
