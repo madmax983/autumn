@@ -480,7 +480,10 @@ enum Combinator {
 #[derive(Debug, Default)]
 struct Compound {
     tag: Option<String>,
-    id: Option<String>,
+    /// All id selectors in the compound. A compound with two distinct ids
+    /// (`#a#b`) matches nothing, mirroring CSS, rather than silently using the
+    /// last one.
+    ids: Vec<String>,
     classes: Vec<String>,
     attrs: Vec<AttrPred>,
 }
@@ -593,9 +596,11 @@ impl Compound {
         {
             return false;
         }
-        if let Some(id) = &self.id
-            && el.attr("id") != Some(id.as_str())
-        {
+        if let Some(el_id) = el.attr("id") {
+            if !self.ids.iter().all(|id| id == el_id) {
+                return false;
+            }
+        } else if !self.ids.is_empty() {
             return false;
         }
         if !self.classes.iter().all(|c| el.has_class(c)) {
@@ -789,12 +794,20 @@ fn parse_compound(input: &str, full: &str) -> Result<Compound, String> {
                 if name.is_empty() {
                     return Err(format!("empty id in selector `{full}`"));
                 }
-                compound.id = Some(name);
+                compound.ids.push(name);
             }
             '[' => {
                 i += 1;
                 let pred = parse_attr_pred(&chars, &mut i, full)?;
                 compound.attrs.push(pred);
+            }
+            ':' => {
+                // Pseudo-classes/elements are out of scope; reject rather than
+                // folding `:` into a tag/class identifier (which would let a
+                // typo like `.flash:first-child` silently match `.flash`).
+                return Err(format!(
+                    "pseudo-classes/elements are not supported in selector `{full}`"
+                ));
             }
             c if is_ident_char(c) => {
                 let name = read_ident(&chars, &mut i).to_ascii_lowercase();
@@ -888,7 +901,9 @@ fn read_ident(chars: &[char], i: &mut usize) -> String {
 }
 
 const fn is_ident_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ':')
+    // Note: `:` is intentionally excluded so pseudo-classes (`tr:first-child`)
+    // are rejected rather than folded into a tag/class/id name.
+    c.is_ascii_alphanumeric() || matches!(c, '-' | '_')
 }
 
 fn skip_ws(chars: &[char], i: &mut usize) {
@@ -1097,6 +1112,30 @@ mod tests {
         // Repeated child combinators are a typo, not `div > span`.
         assert!(SelectorList::parse("div >> span").is_err());
         assert!(SelectorList::parse("div > > span").is_err());
+        // Unsupported pseudo-classes must be rejected, not folded into idents.
+        assert!(SelectorList::parse("tr:first-child").is_err());
+        assert!(SelectorList::parse(".flash:first-child").is_err());
+        assert!(SelectorList::parse("a:hover").is_err());
+    }
+
+    #[test]
+    fn repeated_ids_must_match_all() {
+        // A compound with two distinct ids matches nothing (it must satisfy
+        // both), rather than silently using the last id.
+        let html = r#"<div id="go">x</div>"#;
+        assert_eq!(count(html, "#go"), 1);
+        assert_eq!(count(html, "#missing#go"), 0);
+        assert_eq!(count(html, "#go#go"), 1); // same id twice is satisfiable
+    }
+
+    #[test]
+    fn pseudo_class_does_not_false_pass_negative_assertions() {
+        // `.flash:first-child` must not silently parse as a literal class and
+        // make `assert_no_selector`-style checks pass when a `.flash` exists.
+        let html = r#"<div class="flash">oops</div>"#;
+        assert!(SelectorList::parse(".flash:first-child").is_err());
+        // The plain class selector still matches as expected.
+        assert_eq!(count(html, ".flash"), 1);
     }
 
     #[test]
