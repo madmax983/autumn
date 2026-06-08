@@ -824,7 +824,11 @@ async fn mcp_host_origin_guard(
     let host = identity
         .and_then(|id| id.host.as_deref())
         .or_else(|| req.uri().authority().map(http::uri::Authority::as_str))
-        .or_else(|| req.headers().get(header::HOST).and_then(|h| h.to_str().ok()));
+        .or_else(|| {
+            req.headers()
+                .get(header::HOST)
+                .and_then(|h| h.to_str().ok())
+        });
 
     // Trusted-Host enforcement. Without it, because the DNS-rebinding `Origin`
     // check below only fires for browsers, a no-`Origin` agent could call
