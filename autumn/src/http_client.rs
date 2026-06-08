@@ -136,6 +136,10 @@ pub struct RetryPolicy {
     /// When `true` (the default), only GET / HEAD / PUT / DELETE / OPTIONS /
     /// TRACE are retried; POST and PATCH are not.
     pub retry_idempotent_only: bool,
+    /// Maximum Retry-After sleep duration to accept before clamping.
+    pub max_retry_after: Duration,
+    /// Per-request timeout.
+    pub request_timeout: Option<Duration>,
 }
 
 impl Default for RetryPolicy {
@@ -143,6 +147,8 @@ impl Default for RetryPolicy {
         Self {
             max_retries: 3,
             retry_idempotent_only: true,
+            max_retry_after: Duration::from_secs(10),
+            request_timeout: Some(Duration::from_secs(30)),
         }
     }
 }
@@ -468,7 +474,12 @@ impl Client {
             alias: None,
             base_url: None,
             base_urls: HashMap::new(),
-            retry_policy: RetryPolicy::default(),
+            retry_policy: RetryPolicy {
+                max_retries: 3,
+                retry_idempotent_only: true,
+                max_retry_after: Duration::from_secs(10),
+                request_timeout: Some(timeout),
+            },
             mock: None,
         }
     }
@@ -481,8 +492,9 @@ impl Client {
     /// happen with the default `rustls-tls` feature).
     #[must_use]
     pub fn from_config(config: &crate::config::HttpClientConfig) -> Self {
+        let timeout = Duration::from_secs(config.timeout_secs);
         let inner = reqwest::ClientBuilder::new()
-            .timeout(Duration::from_secs(config.timeout_secs))
+            .timeout(timeout)
             .build()
             .expect("failed to build reqwest client");
         Self {
@@ -493,6 +505,8 @@ impl Client {
             retry_policy: RetryPolicy {
                 max_retries: config.max_retries,
                 retry_idempotent_only: true,
+                max_retry_after: Duration::from_secs(config.max_retry_after_secs),
+                request_timeout: Some(timeout),
             },
             mock: None,
         }
@@ -707,6 +721,13 @@ impl RequestBuilder {
         self
     }
 
+    /// Override the maximum `Retry-After` sleep duration for this request.
+    #[must_use]
+    pub const fn max_retry_after(mut self, max: Duration) -> Self {
+        self.retry_policy.max_retry_after = max;
+        self
+    }
+
     /// Disable retries for this request.
     #[must_use]
     pub const fn no_retry(mut self) -> Self {
@@ -809,11 +830,13 @@ impl RequestBuilder {
 
                     // 429 → honour Retry-After and retry if attempts remain.
                     if status.as_u16() == 429 && attempt + 1 < max_attempts {
-                        if let Some(delay) = parse_retry_after(&headers) {
-                            tokio::time::sleep(delay).await;
-                        } else {
-                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        let mut sleep_delay =
+                            parse_retry_after(&headers).unwrap_or(Duration::from_secs(1));
+                        sleep_delay = sleep_delay.min(self.retry_policy.max_retry_after);
+                        if let Some(req_timeout) = self.retry_policy.request_timeout {
+                            sleep_delay = sleep_delay.min(req_timeout);
                         }
+                        tokio::time::sleep(sleep_delay).await;
                         continue;
                     }
 
@@ -1257,6 +1280,7 @@ mod tests {
         let config = HttpClientConfig {
             timeout_secs: 10,
             max_retries: 1,
+            max_retry_after_secs: 10,
             base_urls: std::collections::HashMap::new(),
         };
         let client = Client::from_config(&config);
@@ -1336,6 +1360,7 @@ mod tests {
         let config = HttpClientConfig {
             timeout_secs: 30,
             max_retries: 3,
+            max_retry_after_secs: 10,
             base_urls,
         };
         let client = Client::from_config(&config);

@@ -193,6 +193,14 @@ pub enum PresenceEvent {
 ///   so every replica sees them. Each replica maintains its own local membership
 ///   view; replicas converge as heartbeats and events propagate.
 ///
+/// # Multi-Replica / Clustering Warnings
+///
+/// > [!IMPORTANT]
+/// > In multi-replica deployments, the membership store is process-local. Calls to
+/// > [`Presence::list`] only return presence entries tracked on the local process instance,
+/// > not cluster-wide. Replicas synchronize membership states by listening to event broadcasts
+/// > over the message bus (e.g. Redis), but there is no distributed query mechanism for `list()`.
+///
 /// # Stale entry eviction
 ///
 /// Entries are evicted by a periodic background sweep (default 30 s) if the
@@ -267,6 +275,11 @@ impl Presence {
     /// Connections with the same `key` are collapsed into one [`PresenceEntry`]
     /// with a list of `metas` — one per active connection (Phoenix
     /// `Presence.list/1` semantics).
+    ///
+    /// > [!IMPORTANT]
+    /// > **Process-Local Only:** In clustered/multi-replica environments (e.g., using Redis
+    /// > pub/sub backend), this function returns only the active connections tracked on the
+    /// > current local server instance. It does not perform a cluster-wide query.
     ///
     /// # Panics
     ///

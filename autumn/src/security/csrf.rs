@@ -551,6 +551,26 @@ async fn verify_csrf_token(
         return true;
     }
 
+    // 1b. Check query parameter (e.g. `_csrf`) before falling back to body
+    let query_token = req.uri().query().and_then(|q| {
+        url::form_urlencoded::parse(q.as_bytes())
+            .find(|(key, _)| key == "_csrf" || key == settings.form_field.as_str())
+            .map(|(_, val)| val.into_owned())
+    });
+
+    if let (Some(c), Some(q)) = (cookie_token, &query_token)
+        && !c.is_empty()
+        && !q.is_empty()
+        && validate_cookie_token_hmac(c, settings)
+        && constant_time_eq(c, q)
+    {
+        token_found = true;
+    }
+
+    if token_found {
+        return true;
+    }
+
     // 2. Check form field (if not found in header)
     let content_type = req
         .headers()
@@ -608,6 +628,29 @@ mod tests {
                     .header("Cookie", format!("autumn-csrf={raw_token}"))
                     .header("Content-Type", "application/x-www-form-urlencoded")
                     .body(Body::from(format!("_csrf={encoded_token}")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn post_with_query_param_token_passes() {
+        let raw_token = "abc+123/xyz=456";
+        let encoded_token = "abc%2B123%2Fxyz%3D456";
+        let app = Router::new()
+            .route("/submit", post(|| async { "created" }))
+            .layer(CsrfLayer::from_config(&default_csrf_config()));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/submit?_csrf={encoded_token}"))
+                    .header("Cookie", format!("autumn-csrf={raw_token}"))
+                    .body(Body::empty())
                     .unwrap(),
             )
             .await

@@ -14,6 +14,7 @@ use proc_macro2::TokenStream;
 use quote::quote;
 use syn::{ItemFn, LitStr, parse_quote};
 
+use crate::idempotency_guard::block_has_replay_guard;
 use crate::param_helpers::has_input_named;
 
 /// Parse the `#[step_up(max_age = "…")]` attribute arguments.
@@ -97,6 +98,16 @@ fn build_check_call(max_age_tokens: &TokenStream) -> TokenStream {
                 __AUTUMN_STEP_UP_MAX_AGE,
             ).await
         {
+            if let ::core::option::Option::Some(__autumn_response) =
+                ::autumn_web::idempotency::__replay_finalized_session_response_for_anonymous(
+                    &__autumn_session,
+                    __autumn_state.auth_session_key(),
+                    &__autumn_idempotency_replay,
+                )
+                .await
+            {
+                return __autumn_response;
+            }
             let __wants_json: bool = __autumn_step_up_headers
                 .get(::autumn_web::reexports::axum::http::header::ACCEPT)
                 .and_then(|v| v.to_str().ok())
@@ -175,6 +186,16 @@ fn inject_step_up_params(input_fn: &mut ItemFn) {
         };
         input_fn.sig.inputs.insert(0, p);
     }
+    if !has_input_named(input_fn, "__autumn_idempotency_replay") {
+        let p: syn::FnArg = parse_quote! {
+            __autumn_idempotency_replay: ::core::option::Option<
+                ::autumn_web::reexports::axum::extract::Extension<
+                    ::autumn_web::idempotency::IdempotencyReplayResponse
+                >
+            >
+        };
+        input_fn.sig.inputs.insert(0, p);
+    }
 }
 
 /// Returns `true` if `ty` contains an `impl Trait` anywhere in its tree.
@@ -231,7 +252,7 @@ pub fn step_up_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     );
     let check_call = build_check_call(&max_age_tokens);
 
-    let original_body = &input_fn.block;
+    let original_body = input_fn.block.clone();
     let original_response = match &input_fn.sig.output {
         syn::ReturnType::Default => quote! {
             let __autumn_inner: () = (async move #original_body).await;
@@ -258,8 +279,22 @@ pub fn step_up_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     input_fn.sig.output = parse_quote! {
         -> ::autumn_web::reexports::axum::response::Response
     };
+    let body_already_has_replay_guard = block_has_replay_guard(&original_body);
+    let replay_stop = if body_already_has_replay_guard {
+        quote! {}
+    } else {
+        quote! {
+            const __AUTUMN_IDEMPOTENCY_REPLAY_GUARD: () = ();
+            if let ::core::option::Option::Some(__autumn_response) =
+                ::autumn_web::idempotency::__replay_response(&__autumn_idempotency_replay)
+            {
+                return __autumn_response;
+            }
+        }
+    };
     input_fn.block = syn::parse_quote! {
         {
+            #replay_stop
             #check_call
             #original_response
         }

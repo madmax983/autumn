@@ -990,7 +990,7 @@ fn build_router_for_system_test(
     routes: Vec<Route>,
     state_override: Option<crate::state::AppState>,
 ) -> axum::Router {
-    if let Some(state) = state_override {
+    let router = if let Some(state) = state_override {
         // Use the config already embedded in the caller-supplied state so
         // that middleware (tenancy, auth, rate-limiting, CSRF) is built
         // from the same settings that handlers observe via AppState::config().
@@ -1013,7 +1013,9 @@ fn build_router_for_system_test(
         let state = crate::state::AppState::for_test().with_profile("test");
         state.insert_extension(config.clone());
         crate::router::build_router(routes, &config, state)
-    }
+    };
+
+    tower::Layer::layer(&crate::middleware::MethodOverrideLayer::new(), router)
 }
 
 /// Escape a string as a JSON-safe JavaScript string literal.

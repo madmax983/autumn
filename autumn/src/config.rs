@@ -952,6 +952,11 @@ pub struct HttpClientConfig {
     #[serde(default = "default_http_max_retries")]
     pub max_retries: u32,
 
+    /// Maximum Retry-After sleep duration in seconds to accept before clamping.
+    /// Default: 10.
+    #[serde(default = "default_http_max_retry_after_secs")]
+    pub max_retry_after_secs: u64,
+
     /// Named base URL aliases, e.g. `stripe = "https://api.stripe.com"`.
     ///
     /// A [`Client`](crate::http_client::Client) configured with `.named("stripe")` will
@@ -973,11 +978,17 @@ const fn default_http_max_retries() -> u32 {
 }
 
 #[cfg(feature = "http-client")]
+const fn default_http_max_retry_after_secs() -> u64 {
+    10
+}
+
+#[cfg(feature = "http-client")]
 impl Default for HttpClientConfig {
     fn default() -> Self {
         Self {
             timeout_secs: default_http_timeout_secs(),
             max_retries: default_http_max_retries(),
+            max_retry_after_secs: default_http_max_retry_after_secs(),
             base_urls: std::collections::HashMap::new(),
         }
     }
