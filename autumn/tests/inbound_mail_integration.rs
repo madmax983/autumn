@@ -959,3 +959,180 @@ async fn generic_multipart_email_parsed() {
 
     assert_eq!(*MULTIPART_SUBJECT.lock().unwrap(), "Multipart-Test");
 }
+
+// ── SES / SNS HTTP endpoint ───────────────────────────────────────────────────
+
+static SES_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+fn ses_dispatch_handler(
+    email: InboundEmail,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = autumn_web::AutumnResult<()>> + Send + 'static>,
+> {
+    SES_HANDLER_CALLS.fetch_add(1, Ordering::SeqCst);
+    let _ = email;
+    Box::pin(async { Ok(()) })
+}
+
+#[tokio::test]
+async fn ses_subscription_confirmation_returns_200() {
+    let router = InboundMailRouter::new()
+        .endpoint(InboundMailEndpointConfig::ses("/inbound/ses"))
+        .handler(InboundMailHandlerInfo {
+            name: "ses",
+            pattern: RecipientPattern::Any,
+            processing: ProcessingMode::Sync,
+            handler: ses_dispatch_handler,
+        });
+
+    let client = TestApp::new()
+        .inbound_mail_router(router)
+        .routes(routes![ping])
+        .build();
+
+    let body = serde_json::json!({
+        "Type": "SubscriptionConfirmation",
+        "SubscribeURL": "https://sns.example.com/confirm?token=abc123"
+    })
+    .to_string();
+
+    client
+        .post("/inbound/ses")
+        .header("x-amz-sns-message-type", "SubscriptionConfirmation")
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .assert_status(200);
+}
+
+#[tokio::test]
+async fn ses_notification_dispatches_to_handler() {
+    SES_HANDLER_CALLS.store(0, Ordering::SeqCst);
+
+    let raw = "From: sender@example.com\r\n\
+               To: support@company.com\r\n\
+               Subject: SES-Integration\r\n\
+               \r\n\
+               Hello from SES.";
+    let encoded = {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(raw)
+    };
+
+    let body = serde_json::json!({
+        "Type": "Notification",
+        "Message": encoded
+    })
+    .to_string();
+
+    let router = InboundMailRouter::new()
+        .endpoint(InboundMailEndpointConfig::ses("/inbound/ses"))
+        .handler(InboundMailHandlerInfo {
+            name: "ses_notify",
+            pattern: RecipientPattern::Any,
+            processing: ProcessingMode::Sync,
+            handler: ses_dispatch_handler,
+        });
+
+    let client = TestApp::new()
+        .inbound_mail_router(router)
+        .routes(routes![ping])
+        .build();
+
+    client
+        .post("/inbound/ses")
+        .header("x-amz-sns-message-type", "Notification")
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .assert_status(200);
+
+    assert_eq!(SES_HANDLER_CALLS.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn ses_bad_json_returns_400() {
+    let router = InboundMailRouter::new()
+        .endpoint(InboundMailEndpointConfig::ses("/inbound/ses"))
+        .handler(InboundMailHandlerInfo {
+            name: "ses_bad",
+            pattern: RecipientPattern::Any,
+            processing: ProcessingMode::Sync,
+            handler: ses_dispatch_handler,
+        });
+
+    let client = TestApp::new()
+        .inbound_mail_router(router)
+        .routes(routes![ping])
+        .build();
+
+    client
+        .post("/inbound/ses")
+        .header("x-amz-sns-message-type", "Notification")
+        .header("content-type", "application/json")
+        .body("not-json")
+        .send()
+        .await
+        .assert_status(400);
+}
+
+// ── Mailgun empty signing key ─────────────────────────────────────────────────
+
+#[tokio::test]
+async fn mailgun_empty_signing_key_returns_500() {
+    // Mailgun endpoint with no key at all → parse_mailgun rejects with 500.
+    let router = InboundMailRouter::new()
+        .endpoint(InboundMailEndpointConfig {
+            path: "/inbound/mailgun".to_string(),
+            provider: InboundMailProvider::Mailgun,
+            signing_key: None,
+            signing_key_env: None,
+            processing: ProcessingMode::Background,
+        })
+        .handler(InboundMailHandlerInfo {
+            name: "nokey",
+            pattern: RecipientPattern::Any,
+            processing: ProcessingMode::Sync,
+            handler: noop_handler,
+        });
+
+    let client = TestApp::new()
+        .inbound_mail_router(router)
+        .routes(routes![ping])
+        .build();
+
+    client
+        .post("/inbound/mailgun")
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body("from=a%40b.com&to=c%40d.com&timestamp=1&token=t&signature=s")
+        .send()
+        .await
+        .assert_status(500);
+}
+
+// ── on_complaint API ──────────────────────────────────────────────────────────
+
+static COMPLAINT_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+fn complaint_fn(
+    email: InboundEmail,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = autumn_web::AutumnResult<()>> + Send + 'static>,
+> {
+    COMPLAINT_CALLS.fetch_add(1, Ordering::SeqCst);
+    let _ = email;
+    Box::pin(async { Ok(()) })
+}
+
+#[test]
+fn on_complaint_registers_handler() {
+    // Verify the builder API compiles and stores the handler without panicking.
+    let router = InboundMailRouter::new()
+        .endpoint(InboundMailEndpointConfig::generic("/inbound"))
+        .on_complaint(complaint_fn);
+    // complaint_handler is pub(crate) so we can't assert on it, but registration
+    // must not panic.
+    drop(router);
+}
