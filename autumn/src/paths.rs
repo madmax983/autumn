@@ -32,11 +32,21 @@ pub trait PathExt {
 }
 
 impl PathExt for String {
-    fn with_query(self, key: impl std::fmt::Display, value: impl std::fmt::Display) -> String {
-        let encoded_key = percent_encode(&key.to_string());
-        let encoded_value = percent_encode(&value.to_string());
+    fn with_query(mut self, key: impl std::fmt::Display, value: impl std::fmt::Display) -> String {
+        let key_str = key.to_string();
+        let value_str = value.to_string();
+
+        let encoded_key = percent_encode(&key_str);
+        let encoded_value = percent_encode(&value_str);
+
         let sep = if self.contains('?') { '&' } else { '?' };
-        format!("{self}{sep}{encoded_key}={encoded_value}")
+
+        self.reserve(1 + encoded_key.len() + 1 + encoded_value.len());
+        self.push(sep);
+        self.push_str(&encoded_key);
+        self.push('=');
+        self.push_str(&encoded_value);
+        self
     }
 }
 
@@ -47,7 +57,7 @@ impl PathExt for String {
 #[doc(hidden)]
 #[must_use]
 pub fn encode_path_segment(value: impl std::fmt::Display) -> String {
-    percent_encode(&value.to_string())
+    percent_encode(&value.to_string()).into_owned()
 }
 
 /// Percent-encode a catch-all path parameter (starts with `*`).
@@ -58,26 +68,35 @@ pub fn encode_path_segment(value: impl std::fmt::Display) -> String {
 #[must_use]
 pub fn encode_catch_all_param(value: impl std::fmt::Display) -> String {
     let s = value.to_string();
-    s.split('/')
-        .map(|segment| {
-            if segment == "." {
-                "%2E".to_string()
-            } else if segment == ".." {
-                "%2E%2E".to_string()
-            } else {
-                percent_encode(segment)
-            }
-        })
-        .collect::<Vec<String>>()
-        .join("/")
+    let mut out = String::with_capacity(s.len());
+    for (i, segment) in s.split('/').enumerate() {
+        if i > 0 {
+            out.push('/');
+        }
+        if segment == "." {
+            out.push_str("%2E");
+        } else if segment == ".." {
+            out.push_str("%2E%2E");
+        } else {
+            out.push_str(&percent_encode(segment));
+        }
+    }
+    out
 }
 
 /// Percent-encode a query component per RFC 3986.
 ///
 /// Unreserved characters (ALPHA / DIGIT / `-` / `_` / `.` / `~`) are left
 /// unchanged; everything else is `%XX`-encoded.
-fn percent_encode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
+fn percent_encode(s: &str) -> std::borrow::Cow<'_, str> {
+    let needs_encoding = s
+        .bytes()
+        .any(|b| !matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~'));
+    if !needs_encoding {
+        return std::borrow::Cow::Borrowed(s);
+    }
+
+    let mut out = String::with_capacity(s.len() + 4);
     for byte in s.bytes() {
         match byte {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
@@ -100,7 +119,7 @@ fn percent_encode(s: &str) -> String {
             }
         }
     }
-    out
+    std::borrow::Cow::Owned(out)
 }
 
 #[cfg(test)]
