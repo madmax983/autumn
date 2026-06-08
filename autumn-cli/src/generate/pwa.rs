@@ -33,9 +33,7 @@ pub fn plan_pwa(project_root: &Path) -> Result<Plan, GenerateError> {
 
     // Static assets (served via generated route handlers + participate in fingerprinting)
     plan.create(
-        project_root
-            .join("static")
-            .join("manifest.webmanifest"),
+        project_root.join("static").join("manifest.webmanifest"),
         render_manifest(),
     );
     plan.create(
@@ -43,10 +41,7 @@ pub fn plan_pwa(project_root: &Path) -> Result<Plan, GenerateError> {
         render_service_worker(),
     );
     plan.create(
-        project_root
-            .join("static")
-            .join("icons")
-            .join("icon.svg"),
+        project_root.join("static").join("icons").join("icon.svg"),
         render_icon_svg(),
     );
     plan.create(
@@ -161,6 +156,9 @@ self.addEventListener('activate', (event) => {
 });
 
 self.addEventListener('fetch', (event) => {
+  if (event.request.method !== 'GET') {
+    return;
+  }
   if (event.request.mode === 'navigate') {
     event.respondWith(
       fetch(event.request).catch(() =>
@@ -174,7 +172,10 @@ self.addEventListener('fetch', (event) => {
       caches.match(event.request).then((cached) => {
         if (cached) return cached;
         return fetch(event.request).then((response) => {
-          caches.open(CACHE_NAME).then((cache) => cache.put(event.request, response.clone()));
+          if (response.ok) {
+            const copy = response.clone();
+            caches.open(CACHE_NAME).then((cache) => cache.put(event.request, copy));
+          }
           return response;
         });
       })
@@ -230,19 +231,27 @@ fn render_pwa_system_test() -> String {
              let base_url = runner.base_url();\n\
              let page = runner.page();\n\
              \n\
-             // Verify HTTP content-type via reqwest (no browser needed for this check)\n\
-             let resp = reqwest::get(format!(\"{{base_url}}/manifest.webmanifest\"))\n\
-                 .await\n\
-                 .expect(\"manifest request\");\n\
-             assert_eq!(resp.status(), 200, \"manifest must return 200\");\n\
-             let ct = resp.headers()\n\
-                 .get(\"content-type\")\n\
-                 .and_then(|v| v.to_str().ok())\n\
-                 .unwrap_or(\"\");\n\
-             assert!(\n\
-                 ct.contains(\"application/manifest+json\"),\n\
-                 \"manifest content-type must be application/manifest+json, got: {{ct}}\"\n\
-             );\n\
+             // Verify HTTP content-type via raw TCP to avoid a reqwest dev-dependency.\n\
+             {{\n\
+                 use std::io::{{Read, Write}};\n\
+                 let host_port = base_url\n\
+                     .trim_start_matches(\"http://\")\n\
+                     .trim_start_matches(\"https://\");\n\
+                 let mut stream = std::net::TcpStream::connect(host_port)\n\
+                     .expect(\"connect to test server\");\n\
+                 let req = \"GET /manifest.webmanifest HTTP/1.1\\r\\nHost: {{host_port}}\\r\\nConnection: close\\r\\n\\r\\n\";\n\
+                 stream.write_all(req.as_bytes()).expect(\"write request\");\n\
+                 let mut response = String::new();\n\
+                 stream.read_to_string(&mut response).expect(\"read response\");\n\
+                 assert!(\n\
+                     response.starts_with(\"HTTP/1.1 200\") || response.starts_with(\"HTTP/1.0 200\"),\n\
+                     \"manifest must return 200, got: {{response}}\"\n\
+                 );\n\
+                 assert!(\n\
+                     response.contains(\"application/manifest+json\"),\n\
+                     \"manifest content-type must be application/manifest+json\"\n\
+                 );\n\
+             }}\n\
              \n\
              // Browser check: <link rel=\"manifest\"> is in <head>\n\
              page.visit(\"/\").await.expect(\"root page loaded\");\n\
@@ -296,8 +305,12 @@ fn inject_pwa_meta_into_head(source: &str) -> String {
 
     let lines: Vec<&str> = source.lines().collect();
 
-    // Find the first `head {` line (Maud DSL — no leading keyword)
-    let Some(head_idx) = lines.iter().position(|l| l.trim() == "head {") else {
+    // Find the first `head {` line (Maud DSL — no leading keyword).
+    // Support both `head {` and `head{` (both are valid Maud syntax).
+    let Some(head_idx) = lines.iter().position(|l| {
+        let t = l.trim();
+        t == "head {" || t == "head{"
+    }) else {
         return source.to_owned();
     };
 
@@ -305,9 +318,10 @@ fn inject_pwa_meta_into_head(source: &str) -> String {
 
     // Find the closing `}` of the head block (first `}` at the same indent
     // level as `head {`, after `head {`).
-    let Some(close_rel) = lines[head_idx + 1..].iter().position(|l| {
-        indent_count(l) == head_indent && l.trim() == "}"
-    }) else {
+    let Some(close_rel) = lines[head_idx + 1..]
+        .iter()
+        .position(|l| indent_count(l) == head_indent && l.trim() == "}")
+    else {
         return source.to_owned();
     };
     let close_idx = head_idx + 1 + close_rel;
@@ -315,8 +329,7 @@ fn inject_pwa_meta_into_head(source: &str) -> String {
     let inner_indent = " ".repeat(head_indent + 4);
     // SW registration script uses dataset to signal completion — the system
     // test polls for `data-sw-registered="true"` on `<html>`.
-    let sw_register_js =
-        "if('serviceWorker'in navigator)navigator.serviceWorker\
+    let sw_register_js = "if('serviceWorker'in navigator)navigator.serviceWorker\
          .register('/service-worker.js',{scope:'/'})\
          .then(()=>document.documentElement.dataset.swRegistered='true')\
          .catch(console.error);";
@@ -550,8 +563,8 @@ async fn main() {
     #[test]
     fn manifest_is_valid_json() {
         let content = render_manifest();
-        let parsed: serde_json::Value = serde_json::from_str(&content)
-            .expect("manifest.webmanifest must be valid JSON");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&content).expect("manifest.webmanifest must be valid JSON");
         assert!(parsed["name"].is_string(), "manifest must have a name");
         assert!(parsed["icons"].is_array(), "manifest must have icons array");
     }
@@ -561,9 +574,10 @@ async fn main() {
         let content = render_manifest();
         let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert!(parsed["start_url"].is_string());
-        assert!(["fullscreen", "standalone", "minimal-ui"].contains(
-            &parsed["display"].as_str().unwrap_or("")
-        ));
+        assert!(
+            ["fullscreen", "standalone", "minimal-ui"]
+                .contains(&parsed["display"].as_str().unwrap_or(""))
+        );
         let icons = parsed["icons"].as_array().unwrap();
         assert!(!icons.is_empty(), "at least one icon required");
     }
@@ -573,12 +587,11 @@ async fn main() {
         let content = render_manifest();
         let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
         let icons = parsed["icons"].as_array().unwrap();
-        let purposes: Vec<&str> = icons
-            .iter()
-            .filter_map(|i| i["purpose"].as_str())
-            .collect();
+        let purposes: Vec<&str> = icons.iter().filter_map(|i| i["purpose"].as_str()).collect();
         assert!(
-            purposes.iter().any(|p| p.contains("any") || p.contains("monochrome")),
+            purposes
+                .iter()
+                .any(|p| p.contains("any") || p.contains("monochrome")),
             "must have a general-purpose icon"
         );
         assert!(
@@ -592,15 +605,24 @@ async fn main() {
     #[test]
     fn service_worker_has_offline_fallback_for_navigation() {
         let sw = render_service_worker();
-        assert!(sw.contains("navigate"), "SW must handle navigation requests");
+        assert!(
+            sw.contains("navigate"),
+            "SW must handle navigation requests"
+        );
         assert!(sw.contains("offline"), "SW must have offline fallback");
     }
 
     #[test]
     fn service_worker_precaches_offline_url() {
         let sw = render_service_worker();
-        assert!(sw.contains("PRECACHE_URLS"), "SW must declare precache list");
-        assert!(sw.contains("/offline"), "SW must precache the offline shell");
+        assert!(
+            sw.contains("PRECACHE_URLS"),
+            "SW must declare precache list"
+        );
+        assert!(
+            sw.contains("/offline"),
+            "SW must precache the offline shell"
+        );
     }
 
     #[test]
@@ -796,7 +818,10 @@ async fn main() {
             .execute(Flags::default())
             .unwrap();
         let manifest_path = tmp.path().join("static/manifest.webmanifest");
-        assert!(manifest_path.exists(), "static/manifest.webmanifest must exist");
+        assert!(
+            manifest_path.exists(),
+            "static/manifest.webmanifest must exist"
+        );
         let content = fs::read_to_string(&manifest_path).unwrap();
         let _: serde_json::Value = serde_json::from_str(&content)
             .expect("manifest.webmanifest must be valid JSON after execution");
@@ -904,5 +929,4 @@ async fn main() {
         let after = fs::read_to_string(tmp.path().join("src/main.rs")).unwrap();
         assert_eq!(original_main, after, "dry-run must not modify main.rs");
     }
-
 }
