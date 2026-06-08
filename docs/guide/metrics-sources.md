@@ -215,7 +215,31 @@ current scrapers are not affected.
 
 ## Actuator exposure config
 
-Sources respect the same actuator exposure settings as the built-in families.
-If `/actuator/prometheus` is only reachable in sensitive mode (see
-`actuator.sensitive` in `autumn.toml`), plugin-contributed families are also
-behind that gate — no per-source exposure config is needed.
+Sources respect the same actuator exposure settings as the built-in families —
+no per-source exposure config is needed. Two independent toggles in
+`autumn.toml` govern the scrape endpoint:
+
+```toml
+[actuator]
+sensitive  = false   # env/configprops/loggers/tasks/jobs — off by default in prod
+prometheus = true    # /actuator/prometheus scrape endpoint — on by default
+```
+
+`actuator.prometheus` controls `/actuator/prometheus` **independently of**
+`actuator.sensitive`. The safe production shape is `sensitive = false` +
+`prometheus = true`: platform scrapers (e.g. Fly.io `[metrics]`) collect metrics
+while sensitive actuator surfaces stay unmounted. Set `prometheus = false` to
+remove the scrape endpoint entirely (`404`). See the
+[deployment guide](deployment.md#prometheus-metrics-for-platform-scraping) for
+the Fly.io shape, including scraping a private/non-public metrics port.
+
+## Relationship to OTLP tracing
+
+The Prometheus scrape endpoint and OTLP tracing are **separate telemetry
+paths**. Enabling OTLP (`telemetry.enabled = true` + `telemetry.otlp_endpoint`)
+initializes span export to an OTLP collector; it does **not** add OpenTelemetry
+metrics to `/actuator/prometheus`. The Prometheus endpoint is backed by Autumn's
+in-process request `MetricsCollector` snapshot plus any registered
+`MetricsSource` families — a distinct pipeline from the OTLP trace exporter.
+Bridging OTLP metrics into the scrape would require an explicit metrics
+exporter/bridge, which Autumn does not add implicitly.

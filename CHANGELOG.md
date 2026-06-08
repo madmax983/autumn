@@ -5,6 +5,25 @@ All notable changes to the Autumn framework will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **actuator:** Decouple the Prometheus scrape endpoint from sensitive mode (#857)
+  - New `actuator.prometheus` config flag (default `true`) controls
+    `/actuator/prometheus` **independently of** `actuator.sensitive`. Production
+    apps can expose Prometheus metrics for platform scraping (e.g. Fly.io
+    `[metrics]`) while keeping `sensitive = false`, so `/actuator/env`,
+    `/actuator/configprops`, `/actuator/loggers`, `/actuator/tasks`,
+    `/actuator/jobs`, and the actuator task UI stay off the public surface.
+  - Set `actuator.prometheus = false` to remove the scrape endpoint entirely
+    (it then returns `404`). The flag is surfaced in `/actuator/configprops`.
+  - Docs: `docs/guide/deployment.md` now describes the safe Fly.io deployment
+    shape, including scraping a private/non-public metrics port, and clarifies
+    that OTLP tracing and the Prometheus scrape endpoint are separate telemetry
+    paths — enabling OTLP does not add OpenTelemetry metrics to
+    `/actuator/prometheus` without an explicit bridge/exporter.
+
 ## [0.5.0] - 2026-06-04
 
 ### Added

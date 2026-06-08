@@ -1022,6 +1022,13 @@ impl ConfigProperties {
             &defaults.actuator.sensitive.to_string(),
             profile_str,
         );
+        Self::track_property(
+            props,
+            "actuator.prometheus",
+            &config.actuator.prometheus.to_string(),
+            &defaults.actuator.prometheus.to_string(),
+            profile_str,
+        );
     }
 
     fn track_session_props(
@@ -2514,7 +2521,11 @@ pub(crate) fn actuator_route_path(prefix: &str, suffix: &str) -> String {
     }
 }
 
-pub(crate) fn actuator_endpoint_paths(prefix: &str, sensitive: bool) -> Vec<String> {
+pub(crate) fn actuator_endpoint_paths(
+    prefix: &str,
+    sensitive: bool,
+    prometheus_enabled: bool,
+) -> Vec<String> {
     let mut paths = vec![
         actuator_route_path(prefix, "/health"),
         actuator_route_path(prefix, "/info"),
@@ -2524,7 +2535,9 @@ pub(crate) fn actuator_endpoint_paths(prefix: &str, sensitive: bool) -> Vec<Stri
         actuator_route_path(prefix, "/ui/metrics"),
     ];
 
-    paths.push(actuator_route_path(prefix, "/prometheus"));
+    if prometheus_enabled {
+        paths.push(actuator_route_path(prefix, "/prometheus"));
+    }
 
     if sensitive {
         paths.push(actuator_route_path(prefix, "/env"));
@@ -2552,20 +2565,28 @@ pub(crate) fn actuator_endpoint_paths(prefix: &str, sensitive: bool) -> Vec<Stri
 ///
 /// In dev mode (or when `actuator.sensitive = true`), all endpoints are
 /// exposed. In prod mode, only health, info, and metrics are available.
+///
+/// The Prometheus scrape endpoint is mounted (independent of `sensitive`); use
+/// [`actuator_router_with_prefix`] to control it explicitly.
 pub fn actuator_router<S: ProvideActuatorState + Send + Sync + Clone + 'static>(
     sensitive: bool,
 ) -> axum::Router<S> {
-    actuator_router_with_prefix("/actuator", sensitive)
+    actuator_router_with_prefix("/actuator", sensitive, true)
 }
 
 /// Build the actuator router at a configured prefix.
 ///
 /// This is the prefix-aware variant used by the framework router.
+///
+/// `prometheus_enabled` controls the `/actuator/prometheus` scrape endpoint
+/// independently of `sensitive`, so platform metrics scraping can be exposed
+/// without also exposing sensitive actuator surfaces.
 pub(crate) fn actuator_router_with_prefix<
     S: ProvideActuatorState + Send + Sync + Clone + 'static,
 >(
     prefix: &str,
     sensitive: bool,
+    prometheus_enabled: bool,
 ) -> axum::Router<S> {
     let mut router = axum::Router::new()
         .route(
@@ -2583,11 +2604,14 @@ pub(crate) fn actuator_router_with_prefix<
         .route(
             &actuator_route_path(prefix, "/a11y"),
             axum::routing::get(a11y_endpoint::<S>),
-        )
-        .route(
+        );
+
+    if prometheus_enabled {
+        router = router.route(
             &actuator_route_path(prefix, "/prometheus"),
             axum::routing::get(prometheus_endpoint::<S>),
         );
+    }
 
     if sensitive {
         router = router
@@ -3228,7 +3252,7 @@ mod tests {
 
     #[tokio::test]
     async fn actuator_routes_respect_custom_prefix() {
-        let app = actuator_router_with_prefix("/ops", true).with_state(test_state());
+        let app = actuator_router_with_prefix("/ops", true, true).with_state(test_state());
 
         let prefixed = app
             .clone()
@@ -3672,6 +3696,97 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    #[tokio::test]
+    async fn actuator_prometheus_available_when_export_enabled_and_nonsensitive() {
+        // Metrics export decoupled from sensitive: prometheus is reachable even
+        // though sensitive endpoints (env/configprops/loggers/tasks) are not.
+        let app = actuator_router_with_prefix("/actuator", false, true).with_state(test_state());
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/prometheus")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Sensitive surfaces stay closed under the non-sensitive metrics config.
+        for sensitive_path in [
+            "/actuator/env",
+            "/actuator/configprops",
+            "/actuator/loggers",
+            "/actuator/tasks",
+            "/actuator/jobs",
+            "/actuator/ui/tasks",
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(sensitive_path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::NOT_FOUND,
+                "{sensitive_path} should be unavailable when actuator is non-sensitive"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn actuator_prometheus_unavailable_when_export_disabled() {
+        // Regression: with metrics export disabled, the scrape endpoint is gone.
+        let app = actuator_router_with_prefix("/actuator", false, false).with_state(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/prometheus")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn actuator_prometheus_unavailable_when_export_disabled_even_if_sensitive() {
+        // Disabling export wins even when sensitive endpoints are enabled.
+        let app = actuator_router_with_prefix("/actuator", true, false).with_state(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/prometheus")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn actuator_endpoint_paths_respects_prometheus_toggle() {
+        let enabled = actuator_endpoint_paths("/actuator", false, true);
+        assert!(
+            enabled.iter().any(|p| p == "/actuator/prometheus"),
+            "prometheus path should be listed when export is enabled: {enabled:?}"
+        );
+
+        let disabled = actuator_endpoint_paths("/actuator", false, false);
+        assert!(
+            !disabled.iter().any(|p| p == "/actuator/prometheus"),
+            "prometheus path should be absent when export is disabled: {disabled:?}"
+        );
+    }
+
     // ── Tasks endpoint tests ───────────────────────────────────
 
     #[tokio::test]
@@ -4081,7 +4196,7 @@ mod tests {
 
     #[tokio::test]
     async fn actuator_a11y_endpoint_paths_includes_a11y() {
-        let paths = actuator_endpoint_paths("/actuator", false);
+        let paths = actuator_endpoint_paths("/actuator", false, true);
         assert!(
             paths.iter().any(|p| p == "/actuator/a11y"),
             "a11y path not found in: {paths:?}"

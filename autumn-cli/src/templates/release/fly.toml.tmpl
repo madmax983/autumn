@@ -51,7 +51,12 @@ kill_timeout = 45
   cpus     = 1
 
 # Fly scrapes this Prometheus text endpoint and surfaces it in the dashboard.
-# /actuator/prometheus is always available (not gated by actuator.sensitive).
+# /actuator/prometheus is controlled by `actuator.prometheus` (default true) and
+# is independent of `actuator.sensitive`: metrics stay scrapeable while
+# env/configprops/loggers/tasks/jobs remain off the public surface.
+# To keep metrics off public traffic, bind a separate internal listener and set
+# `port` here to that non-public port (no [http_service] mapping) — Fly scrapes
+# it over the private network. See docs/guide/deployment.md.
 [metrics]
   port = 3000
   path = "/actuator/prometheus"

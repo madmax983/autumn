@@ -3089,6 +3089,16 @@ pub struct ActuatorConfig {
     /// Defaults vary by profile: `true` for dev, `false` for prod.
     #[serde(default)]
     pub sensitive: bool,
+
+    /// When `true`, mount the `/actuator/prometheus` scrape endpoint.
+    ///
+    /// This is **independent of [`Self::sensitive`]**: a production app can
+    /// expose Prometheus metrics for platform scraping (e.g. Fly.io `[metrics]`)
+    /// while keeping `sensitive = false` so env/configprops/loggers/tasks/jobs
+    /// stay off the public surface. Set to `false` to remove the scrape
+    /// endpoint entirely (it then returns `404`). Default: `true`.
+    #[serde(default = "default_actuator_prometheus")]
+    pub prometheus: bool,
 }
 
 impl Default for ActuatorConfig {
@@ -3096,12 +3106,17 @@ impl Default for ActuatorConfig {
         Self {
             prefix: default_actuator_prefix(),
             sensitive: false,
+            prometheus: default_actuator_prometheus(),
         }
     }
 }
 
 fn default_actuator_prefix() -> String {
     "/actuator".to_owned()
+}
+
+const fn default_actuator_prometheus() -> bool {
+    true
 }
 
 /// CORS (Cross-Origin Resource Sharing) configuration.
@@ -5546,6 +5561,20 @@ path = "/healthz"
         let config = ActuatorConfig::default();
         assert_eq!(config.prefix, "/actuator");
         assert!(!config.sensitive);
+        // Prometheus metrics export is on by default and independent of
+        // `sensitive`, so platform scraping works without exposing env/loggers.
+        assert!(config.prometheus);
+    }
+
+    #[test]
+    fn actuator_prometheus_can_be_disabled_via_toml() {
+        let toml = r#"
+            sensitive = false
+            prometheus = false
+        "#;
+        let config: ActuatorConfig = toml::from_str(toml).unwrap();
+        assert!(!config.sensitive);
+        assert!(!config.prometheus);
     }
 
     #[test]

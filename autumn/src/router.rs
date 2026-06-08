@@ -683,9 +683,11 @@ fn reject_openapi_path_collisions(
     claimed.insert(config.health.live_path.clone());
     claimed.insert(config.health.ready_path.clone());
     claimed.insert(config.health.startup_path.clone());
-    for path in
-        crate::actuator::actuator_endpoint_paths(&config.actuator.prefix, config.actuator.sensitive)
-    {
+    for path in crate::actuator::actuator_endpoint_paths(
+        &config.actuator.prefix,
+        config.actuator.sensitive,
+        config.actuator.prometheus,
+    ) {
         claimed.insert(path);
     }
     #[cfg(feature = "htmx")]
@@ -1016,8 +1018,12 @@ fn mount_actuator_endpoints(
 ) -> Result<axum::Router<AppState>, RouterBuildError> {
     // Actuator endpoints
     let actuator_sensitive = config.actuator.sensitive;
-    let actuator_paths =
-        crate::actuator::actuator_endpoint_paths(&config.actuator.prefix, actuator_sensitive);
+    let actuator_prometheus = config.actuator.prometheus;
+    let actuator_paths = crate::actuator::actuator_endpoint_paths(
+        &config.actuator.prefix,
+        actuator_sensitive,
+        actuator_prometheus,
+    );
     if let Some(path) = actuator_paths
         .iter()
         .find(|path| mounted_probe_paths.contains(path.as_str()))
@@ -1031,9 +1037,11 @@ fn mount_actuator_endpoints(
     router = router.merge(crate::actuator::actuator_router_with_prefix(
         &config.actuator.prefix,
         actuator_sensitive,
+        actuator_prometheus,
     ));
     tracing::debug!(
         sensitive = actuator_sensitive,
+        prometheus = actuator_prometheus,
         prefix = %config.actuator.prefix,
         "Mounted actuator endpoints"
     );
@@ -1970,6 +1978,7 @@ impl StartupBarrierState {
             actuator_paths: crate::actuator::actuator_endpoint_paths(
                 &config.actuator.prefix,
                 config.actuator.sensitive,
+                config.actuator.prometheus,
             ),
             actuator_subtree_paths,
         }

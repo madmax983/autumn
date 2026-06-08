@@ -202,9 +202,11 @@ pub(crate) fn append_framework_routes(
         }
     }
 
-    for path in
-        crate::actuator::actuator_endpoint_paths(&config.actuator.prefix, config.actuator.sensitive)
-    {
+    for path in crate::actuator::actuator_endpoint_paths(
+        &config.actuator.prefix,
+        config.actuator.sensitive,
+        config.actuator.prometheus,
+    ) {
         infos.push(RouteInfo {
             method: "GET".to_owned(),
             path,
