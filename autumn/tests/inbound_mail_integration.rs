@@ -968,6 +968,17 @@ async fn generic_multipart_email_parsed() {
 
 static SES_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 
+/// Disable SNS signature verification for the remainder of this test process.
+///
+/// Uses the `SKIP_SNS_VERIFICATION` atomic flag exported by `autumn_web::inbound_mail`
+/// rather than `std::env::set_var` (which is `unsafe` in edition 2024) or
+/// `temp_env::async_with_vars` (which races when two tests run concurrently).
+fn set_skip_sns_verification() {
+    #[cfg(feature = "inbound-ses")]
+    autumn_web::inbound_mail::SKIP_SNS_VERIFICATION
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn ses_dispatch_handler(
     email: InboundEmail,
 ) -> std::pin::Pin<
@@ -980,86 +991,83 @@ fn ses_dispatch_handler(
 
 #[tokio::test]
 async fn ses_subscription_confirmation_returns_200() {
-    temp_env::async_with_vars([("AUTUMN_SES_SKIP_SNS_VERIFICATION", Some("1"))], async {
-        let router = InboundMailRouter::new()
-            .endpoint(InboundMailEndpointConfig::ses("/inbound/ses"))
-            .handler(InboundMailHandlerInfo {
-                name: "ses",
-                pattern: RecipientPattern::Any,
-                processing: ProcessingMode::Sync,
-                handler: ses_dispatch_handler,
-            });
+    set_skip_sns_verification();
 
-        let client = TestApp::new()
-            .inbound_mail_router(router)
-            .routes(routes![ping])
-            .build();
+    let router = InboundMailRouter::new()
+        .endpoint(InboundMailEndpointConfig::ses("/inbound/ses"))
+        .handler(InboundMailHandlerInfo {
+            name: "ses",
+            pattern: RecipientPattern::Any,
+            processing: ProcessingMode::Sync,
+            handler: ses_dispatch_handler,
+        });
 
-        let body = serde_json::json!({
-            "Type": "SubscriptionConfirmation",
-            "SubscribeURL": "https://sns.example.com/confirm?token=abc123"
-        })
-        .to_string();
+    let client = TestApp::new()
+        .inbound_mail_router(router)
+        .routes(routes![ping])
+        .build();
 
-        client
-            .post("/inbound/ses")
-            .header("x-amz-sns-message-type", "SubscriptionConfirmation")
-            .header("content-type", "application/json")
-            .body(body)
-            .send()
-            .await
-            .assert_status(200);
+    let body = serde_json::json!({
+        "Type": "SubscriptionConfirmation",
+        "SubscribeURL": "https://sns.example.com/confirm?token=abc123"
     })
-    .await;
+    .to_string();
+
+    client
+        .post("/inbound/ses")
+        .header("x-amz-sns-message-type", "SubscriptionConfirmation")
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .assert_status(200);
 }
 
 #[tokio::test]
 async fn ses_notification_dispatches_to_handler() {
+    set_skip_sns_verification();
     SES_HANDLER_CALLS.store(0, Ordering::SeqCst);
 
-    temp_env::async_with_vars([("AUTUMN_SES_SKIP_SNS_VERIFICATION", Some("1"))], async {
-        let raw = "From: sender@example.com\r\n\
-                       To: support@company.com\r\n\
-                       Subject: SES-Integration\r\n\
-                       \r\n\
-                       Hello from SES.";
-        let encoded = {
-            use base64::Engine as _;
-            base64::engine::general_purpose::STANDARD.encode(raw)
-        };
+    let raw = "From: sender@example.com\r\n\
+                   To: support@company.com\r\n\
+                   Subject: SES-Integration\r\n\
+                   \r\n\
+                   Hello from SES.";
+    let encoded = {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(raw)
+    };
 
-        let body = serde_json::json!({
-            "Type": "Notification",
-            "Message": encoded
-        })
-        .to_string();
-
-        let router = InboundMailRouter::new()
-            .endpoint(InboundMailEndpointConfig::ses("/inbound/ses"))
-            .handler(InboundMailHandlerInfo {
-                name: "ses_notify",
-                pattern: RecipientPattern::Any,
-                processing: ProcessingMode::Sync,
-                handler: ses_dispatch_handler,
-            });
-
-        let client = TestApp::new()
-            .inbound_mail_router(router)
-            .routes(routes![ping])
-            .build();
-
-        client
-            .post("/inbound/ses")
-            .header("x-amz-sns-message-type", "Notification")
-            .header("content-type", "application/json")
-            .body(body)
-            .send()
-            .await
-            .assert_status(200);
-
-        assert_eq!(SES_HANDLER_CALLS.load(Ordering::SeqCst), 1);
+    let body = serde_json::json!({
+        "Type": "Notification",
+        "Message": encoded
     })
-    .await;
+    .to_string();
+
+    let router = InboundMailRouter::new()
+        .endpoint(InboundMailEndpointConfig::ses("/inbound/ses"))
+        .handler(InboundMailHandlerInfo {
+            name: "ses_notify",
+            pattern: RecipientPattern::Any,
+            processing: ProcessingMode::Sync,
+            handler: ses_dispatch_handler,
+        });
+
+    let client = TestApp::new()
+        .inbound_mail_router(router)
+        .routes(routes![ping])
+        .build();
+
+    client
+        .post("/inbound/ses")
+        .header("x-amz-sns-message-type", "Notification")
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .assert_status(200);
+
+    assert_eq!(SES_HANDLER_CALLS.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

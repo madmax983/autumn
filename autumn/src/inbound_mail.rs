@@ -250,7 +250,12 @@ mod sns_verify {
         http_client: &reqwest::Client,
         expected_topic_arn: Option<&str>,
     ) -> Result<(), StatusCode> {
-        if std::env::var("AUTUMN_SES_SKIP_SNS_VERIFICATION").is_ok() {
+        if super::SKIP_SNS_VERIFICATION.load(std::sync::atomic::Ordering::Relaxed)
+            || std::env::var("AUTUMN_SES_SKIP_SNS_VERIFICATION")
+                .ok()
+                .as_deref()
+                == Some("1")
+        {
             return Ok(());
         }
         let msg_type = json.get("Type").and_then(|v| v.as_str()).unwrap_or("");
@@ -316,6 +321,17 @@ mod sns_verify {
         Ok(())
     }
 }
+
+// ── Test-bypass flag ─────────────────────────────────────────────────────────
+
+/// When set to `true`, SNS signature verification is skipped entirely.
+///
+/// **Never set this in production.** It exists solely so integration tests can
+/// call `SKIP_SNS_VERIFICATION.store(true, Ordering::Relaxed)` without needing
+/// `unsafe` (which edition-2024 requires for `std::env::set_var`).
+#[cfg(feature = "inbound-ses")]
+pub static SKIP_SNS_VERIFICATION: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 // ── Signature helpers ─────────────────────────────────────────────────────────
 
@@ -985,26 +1001,20 @@ pub(crate) fn parse_ses(body: &Bytes, headers: &HeaderMap) -> Result<SnsParseRes
             // The SNS Message may be (a) a plain base64-encoded RFC 5322 email,
             // (b) a raw RFC 5322 string, or (c) a JSON object with a "content"
             // field containing the base64-encoded email (SES default action format).
-            let raw = serde_json::from_str::<serde_json::Value>(message).map_or_else(
-                |_| {
-                    base64::engine::general_purpose::STANDARD
-                        .decode(message)
-                        .unwrap_or_else(|_| message.as_bytes().to_vec())
-                },
-                |msg_json| {
-                    msg_json
+            let raw: Vec<u8> = match serde_json::from_str::<serde_json::Value>(message) {
+                Err(_) => base64::engine::general_purpose::STANDARD
+                    .decode(message)
+                    .unwrap_or_else(|_| message.as_bytes().to_vec()),
+                Ok(msg_json) => {
+                    let content = msg_json
                         .get("content")
                         .and_then(|c| c.as_str())
-                        .map_or_else(
-                            || message.as_bytes().to_vec(),
-                            |content| {
-                                base64::engine::general_purpose::STANDARD
-                                    .decode(content)
-                                    .unwrap_or_else(|_| content.as_bytes().to_vec())
-                            },
-                        )
-                },
-            );
+                        .ok_or(StatusCode::UNPROCESSABLE_ENTITY)?;
+                    base64::engine::general_purpose::STANDARD
+                        .decode(content)
+                        .unwrap_or_else(|_| content.as_bytes().to_vec())
+                }
+            };
             let email = parse_rfc5322(Bytes::from(raw));
             Ok(SnsParseResult::Email(Box::new(email)))
         }
@@ -1205,8 +1215,12 @@ fn decode_quoted_printable(input: &str) -> String {
 fn extract_boundary(content_type: &str) -> Option<String> {
     content_type.split(';').skip(1).find_map(|part| {
         let part = part.trim();
-        part.strip_prefix("boundary=")
-            .map(|b| b.trim_matches('"').to_string())
+        let (key, val) = part.split_once('=')?;
+        if key.trim().eq_ignore_ascii_case("boundary") {
+            Some(val.trim().trim_matches('"').to_string())
+        } else {
+            None
+        }
     })
 }
 
