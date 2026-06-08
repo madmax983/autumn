@@ -7,9 +7,8 @@
 //!   - `static/icons/icon.svg`         — Placeholder app icon (replace with real PNG)
 //!   - `static/icons/maskable-icon.svg` — Maskable variant (safe-zone compliant)
 //!   - `src/main.rs`                   — Route handlers for `/manifest.webmanifest`,
-//!                                       `/service-worker.js`, `/pwa-register.js`, and
-//!                                       `/offline`; PWA `<link>` / `<meta>` tags
-//!                                       injected into the shared `layout` head block.
+//!     `/service-worker.js`, `/pwa-register.js`, and `/offline`; PWA `<link>` /
+//!     `<meta>` tags injected into the shared `layout` head block.
 //!   - `tests/system/pwa_smoke.rs`     — Smoke test (manifest content-type + SW registration)
 //!   - `Cargo.toml`                    — `system-tests` feature added if absent
 
@@ -138,9 +137,9 @@ fn render_manifest() -> String {
 }
 
 fn render_service_worker() -> String {
-    r#"const CACHE_NAME = 'autumn-pwa-v1';
+    r"const CACHE_NAME = 'autumn-pwa-v1';
 const OFFLINE_URL = '/offline';
-const PRECACHE_URLS = ['/', OFFLINE_URL];
+const PRECACHE_URLS = [OFFLINE_URL];
 
 self.addEventListener('install', (event) => {
   event.waitUntil(
@@ -187,7 +186,7 @@ self.addEventListener('fetch', (event) => {
     );
   }
 });
-"#
+"
     .to_owned()
 }
 
@@ -432,23 +431,25 @@ async fn pwa_offline() -> maud::Markup {\n\
 }\n\
 \n";
 
-    // Insert before `#[autumn_web::main]`
-    if let Some(pos) = source.find("#[autumn_web::main]") {
-        let mut result = String::with_capacity(source.len() + handlers.len());
-        result.push_str(&source[..pos]);
-        result.push_str(handlers);
-        result.push_str(&source[pos..]);
-        result
-    } else {
-        // Fallback: append at end
-        let mut result = source.to_owned();
-        if !result.ends_with('\n') {
+    // Insert before `#[autumn_web::main]`, or append at end as fallback.
+    source.find("#[autumn_web::main]").map_or_else(
+        || {
+            let mut result = source.to_owned();
+            if !result.ends_with('\n') {
+                result.push('\n');
+            }
             result.push('\n');
-        }
-        result.push('\n');
-        result.push_str(handlers);
-        result
-    }
+            result.push_str(handlers);
+            result
+        },
+        |pos| {
+            let mut result = String::with_capacity(source.len() + handlers.len());
+            result.push_str(&source[..pos]);
+            result.push_str(handlers);
+            result.push_str(&source[pos..]);
+            result
+        },
+    )
 }
 
 fn indent_count(line: &str) -> usize {
@@ -581,13 +582,14 @@ async fn main() {
     fn plan_creates_icons() {
         let tmp = project_with_main(DEFAULT_MAIN);
         let plan = plan_pwa(tmp.path()).unwrap();
-        let paths: Vec<_> = plan.actions.iter().map(|a| a.path()).collect();
         assert!(
-            paths.iter().any(|p| p.ends_with("icon.svg")),
+            plan.actions.iter().any(|a| a.path().ends_with("icon.svg")),
             "plan must include icon.svg"
         );
         assert!(
-            paths.iter().any(|p| p.ends_with("maskable-icon.svg")),
+            plan.actions
+                .iter()
+                .any(|a| a.path().ends_with("maskable-icon.svg")),
             "plan must include maskable-icon.svg"
         );
     }
