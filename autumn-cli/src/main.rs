@@ -1130,6 +1130,9 @@ enum GenerateCommands {
         /// Add a `deleted_at` column and use soft-delete in the repository.
         #[arg(long)]
         soft_delete: bool,
+        /// Scaffold a JSON-only API resource (no HTML/Maud views, mount CRUD endpoints).
+        #[arg(long)]
+        api: bool,
         /// Print the file plan and exit without writing anything.
         #[arg(long)]
         dry_run: bool,
@@ -1725,6 +1728,7 @@ fn run_generate_command(cmd: GenerateCommands) {
             query,
             config,
             soft_delete,
+            api,
             dry_run,
             force,
         } => {
@@ -1754,6 +1758,7 @@ fn run_generate_command(cmd: GenerateCommands) {
                 &default,
                 &query,
                 soft_delete,
+                api,
             );
             generate::scaffold::run(&name, &fields, generate::Flags { dry_run, force }, &options);
         }

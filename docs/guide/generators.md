@@ -232,16 +232,18 @@ Everything `model` produces, plus:
   block that auto-generates CRUD methods plus JSON REST handlers.
 - `src/repositories/mod.rs` — module aggregator.
 - `src/routes/<plural>.rs` — Maud HTML handlers for `index`, `show`, `new_form`,
-  `create`, `edit_form`, and `update`.
-- `src/routes/mod.rs` — module aggregator.
+  `create`, `edit_form`, and `update`. (Skipped if `--api` is set).
+- `src/routes/mod.rs` — module aggregator. (Skipped if `--api` is set).
 - `tests/<snake>.rs` — a smoke test that hits `GET /<plural>` against
   a running server and asserts a 2xx response (skipped unless
-  `AUTUMN_TEST_BASE_URL` is set).
+  `AUTUMN_TEST_BASE_URL` is set). For `--api` scaffolds, this performs a JSON-based
+  CRUD round-trip.
 - `src/main.rs` — the `mod` declarations plus `routes![…]` entries get
   added in place. Existing entries are preserved; rerunning the generator
-  with the same arguments is a no-op. The scaffold registers only read-only
-  API routes (`GET /api/<plural>` and `GET /api/<plural>/{id}`) by default;
-  mount `POST`/`PUT`/`DELETE` handlers only after adding a repository policy.
+  with the same arguments is a no-op. By default, the scaffold registers only
+  read-only API routes (`GET /api/<plural>` and `GET /api/<plural>/{id}`); mount
+  `POST`/`PUT`/`DELETE` handlers only after adding a repository policy. For `--api`
+  scaffolds, all 5 JSON endpoints (GET index/show, POST, PUT, DELETE) are automatically registered.
 
 ### No-JavaScript edit and delete flows
 
@@ -302,6 +304,7 @@ autumn generate scaffold Bookmark url:String title:String tag:String alive:bool 
 | `--validate FIELD=RULE` | Adds `#[validate(...)]` and the `validator` dependency. Supported rules: `url`, `email`, and `length:min=N,max=N` on `String` / `Text` fields. |
 | `--default FIELD=VALUE` | Adds `#[default]` and a SQL `DEFAULT` for bool, string/text, integer, and float fields. `i32` defaults must fit PostgreSQL's `INTEGER` range. Defaulted fields are omitted from generated HTML forms and update columns because the model macro keeps them out of `NewX`. |
 | `--query METHOD:FIELD` | Adds a derived repository method such as `find_by_tag(tag: String) -> Vec<Model>`. The `find_by_` suffix must match `FIELD`. |
+| `--api` | Generates a JSON API-only scaffold (skips HTML routes/templates, registers 5 REST JSON routes, and generates a JSON-based smoke test). |
 
 | Generated file                        | Existing concept it maps to                                                                |
 | ------------------------------------- | ------------------------------------------------------------------------------------------ |
@@ -356,6 +359,7 @@ indexes     = ["url", "tag"]
 validations = ["url=url", "title=length:min=1,max=200"]
 defaults    = ["alive=true"]
 queries     = ["find_by_tag:tag", "find_by_alive:alive"]
+api         = true # Optional: JSON API-only scaffold
 ```
 
 Pass the file with `--config`:
