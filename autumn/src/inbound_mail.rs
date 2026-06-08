@@ -840,6 +840,7 @@ fn parse_address_list(s: &str) -> Vec<String> {
 pub(crate) fn parse_mailgun(
     form: &HashMap<String, String>,
     signing_key: &str,
+    file_parts: Vec<Attachment>,
 ) -> Result<InboundEmail, StatusCode> {
     // Refuse all requests when no signing key is configured to prevent trivial forgery.
     if signing_key.is_empty() {
@@ -916,22 +917,29 @@ pub(crate) fn parse_mailgun(
         None
     };
 
-    // Compact attachment metadata (Mailgun form-field format).
-    let attachment_count: usize = form
-        .get("attachment-count")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0)
-        .min(100);
-    let mut attachments = Vec::new();
-    for i in 1..=attachment_count {
-        if let Some(name) = form.get(&format!("attachment-{i}")) {
-            attachments.push(Attachment {
-                filename: Some(name.clone()),
-                content_type: "application/octet-stream".to_string(),
-                data: Bytes::new(),
-            });
+    // Use actual file parts when available (multipart/form-data delivery); fall back
+    // to metadata-only attachment stubs for URL-encoded deliveries where Mailgun
+    // includes only attachment-count / attachment-{n} fields.
+    let attachments = if !file_parts.is_empty() {
+        file_parts
+    } else {
+        let attachment_count: usize = form
+            .get("attachment-count")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0)
+            .min(100);
+        let mut metadata = Vec::new();
+        for i in 1..=attachment_count {
+            if let Some(name) = form.get(&format!("attachment-{i}")) {
+                metadata.push(Attachment {
+                    filename: Some(name.clone()),
+                    content_type: "application/octet-stream".to_string(),
+                    data: Bytes::new(),
+                });
+            }
         }
-    }
+        metadata
+    };
 
     Ok(InboundEmail {
         from,
@@ -943,7 +951,10 @@ pub(crate) fn parse_mailgun(
         headers: final_headers,
         attachments,
         spam_report,
-        raw: Bytes::new(),
+        raw: form
+            .get("body-mime")
+            .map(|s| Bytes::from(s.as_bytes().to_vec()))
+            .unwrap_or_default(),
         plus_token: None,
     })
 }
@@ -1133,14 +1144,22 @@ fn parse_rfc5322(raw: Bytes) -> InboundEmail {
     // but pass the original `content_type` value to boundary extraction so that
     // case-sensitive boundary parameter values are preserved.
     let ct_lower = content_type.to_ascii_lowercase();
-    let (text_body, html_body) = if body_str.is_empty() {
-        (None, None)
+    let (text_body, html_body, attachments) = if body_str.is_empty() {
+        (None, None, Vec::new())
     } else if ct_lower.starts_with("multipart/") {
         extract_multipart_bodies(&body_str, &content_type)
     } else if ct_lower.contains("text/html") {
-        (None, Some(decode_transfer_encoding(&body_str, &cte)))
+        (
+            None,
+            Some(decode_transfer_encoding(&body_str, &cte)),
+            Vec::new(),
+        )
     } else {
-        (Some(decode_transfer_encoding(&body_str, &cte)), None)
+        (
+            Some(decode_transfer_encoding(&body_str, &cte)),
+            None,
+            Vec::new(),
+        )
     };
 
     InboundEmail {
@@ -1151,7 +1170,7 @@ fn parse_rfc5322(raw: Bytes) -> InboundEmail {
         text_body,
         html_body,
         headers: parsed_headers,
-        attachments: Vec::new(),
+        attachments,
         spam_report: None,
         raw,
         plus_token: None,
@@ -1224,14 +1243,22 @@ fn extract_boundary(content_type: &str) -> Option<String> {
     })
 }
 
-/// Split a MIME multipart body and return `(text/plain, text/html)` parts.
-fn extract_multipart_bodies(body: &str, content_type: &str) -> (Option<String>, Option<String>) {
+/// Split a MIME multipart body and return `(text/plain, text/html, attachments)`.
+///
+/// Recurses into nested `multipart/*` parts (e.g. `multipart/alternative`
+/// inside `multipart/mixed`) so that both text and HTML bodies are extracted
+/// even when the outer type is `multipart/mixed`.
+fn extract_multipart_bodies(
+    body: &str,
+    content_type: &str,
+) -> (Option<String>, Option<String>, Vec<Attachment>) {
     let Some(boundary) = extract_boundary(content_type) else {
-        return (Some(body.to_string()), None);
+        return (Some(body.to_string()), None, Vec::new());
     };
     let delimiter = format!("--{boundary}");
     let mut text_body: Option<String> = None;
     let mut html_body: Option<String> = None;
+    let mut attachments: Vec<Attachment> = Vec::new();
 
     for part in body.split(&delimiter).skip(1) {
         if part.trim_start_matches('-').trim().is_empty() {
@@ -1244,10 +1271,16 @@ fn extract_multipart_bodies(body: &str, content_type: &str) -> (Option<String>, 
         } else {
             continue;
         };
-        let part_ct = part_headers
+        // Lowercased content-type for matching; original-case for boundary extraction.
+        let part_ct_lower = part_headers
             .lines()
             .find(|l| l.to_ascii_lowercase().starts_with("content-type:"))
             .map(|l| l[13..].trim().to_ascii_lowercase())
+            .unwrap_or_default();
+        let part_ct_orig = part_headers
+            .lines()
+            .find(|l| l.to_ascii_lowercase().starts_with("content-type:"))
+            .map(|l| l[13..].trim().to_string())
             .unwrap_or_default();
         let part_cte = part_headers
             .lines()
@@ -1257,19 +1290,70 @@ fn extract_multipart_bodies(body: &str, content_type: &str) -> (Option<String>, 
             })
             .map(|l| l[26..].trim().to_ascii_lowercase())
             .unwrap_or_default();
+        let disposition = part_headers
+            .lines()
+            .find(|l| l.to_ascii_lowercase().starts_with("content-disposition:"))
+            .map(|l| {
+                l[l.find(':').map_or(0, |p| p + 1)..]
+                    .trim()
+                    .to_ascii_lowercase()
+            })
+            .unwrap_or_default();
         // Strip trailing boundary marker (e.g. "\r\n--boundary--").
         let text = part_body
             .find(&format!("\r\n--{boundary}"))
             .or_else(|| part_body.find(&format!("\n--{boundary}")))
             .map_or(part_body, |end| &part_body[..end])
             .trim();
-        if part_ct.starts_with("text/plain") && text_body.is_none() {
+        let is_attachment = disposition.starts_with("attachment")
+            || disposition
+                .split(';')
+                .any(|s| s.trim().starts_with("filename="));
+        if part_ct_lower.starts_with("multipart/") {
+            // Recurse into nested multipart parts (e.g. multipart/alternative).
+            let (nested_text, nested_html, nested_atts) =
+                extract_multipart_bodies(text, &part_ct_orig);
+            if text_body.is_none() {
+                text_body = nested_text;
+            }
+            if html_body.is_none() {
+                html_body = nested_html;
+            }
+            attachments.extend(nested_atts);
+        } else if !is_attachment && part_ct_lower.starts_with("text/plain") && text_body.is_none() {
             text_body = Some(decode_transfer_encoding(text, &part_cte));
-        } else if part_ct.starts_with("text/html") && html_body.is_none() {
+        } else if !is_attachment && part_ct_lower.starts_with("text/html") && html_body.is_none() {
             html_body = Some(decode_transfer_encoding(text, &part_cte));
+        } else if is_attachment || !part_ct_lower.starts_with("text/") {
+            // Collect attachment parts (binary or explicitly marked as attachment).
+            let filename = disposition.split(';').find_map(|seg| {
+                let seg = seg.trim();
+                seg.strip_prefix("filename=")
+                    .map(|v| v.trim_matches('"').to_string())
+            });
+            let ct_only = part_ct_lower
+                .split(';')
+                .next()
+                .map(str::trim)
+                .unwrap_or("application/octet-stream")
+                .to_string();
+            let data = if part_cte == "base64" {
+                let stripped: String = text.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+                base64::engine::general_purpose::STANDARD
+                    .decode(stripped.as_bytes())
+                    .map(Bytes::from)
+                    .unwrap_or_else(|_| Bytes::from(text.as_bytes().to_vec()))
+            } else {
+                Bytes::from(text.as_bytes().to_vec())
+            };
+            attachments.push(Attachment {
+                filename,
+                content_type: ct_only,
+                data,
+            });
         }
     }
-    (text_body, html_body)
+    (text_body, html_body, attachments)
 }
 
 /// Decode RFC 2047 encoded words (`=?charset?B/Q?text?=`) in a header value.
@@ -1403,22 +1487,20 @@ fn url_decode_form(body: &[u8]) -> HashMap<String, String> {
     serde_urlencoded::from_str(&s).unwrap_or_default()
 }
 
-/// Parse a `multipart/form-data` Mailgun webhook body into a field map.
-///
-/// Text fields (those without a `filename` parameter in `Content-Disposition`)
-/// are captured as UTF-8 strings.  Binary file parts are skipped for field
-/// extraction — attachment metadata arrives via the `attachment-count` /
-/// `attachment-{n}` fields that Mailgun still includes as plain text parts.
-fn parse_mailgun_form_data(body: &[u8], content_type: &str) -> HashMap<String, String> {
+/// Parse a `multipart/form-data` Mailgun webhook body into a field map and attachment list.
+fn parse_mailgun_form_data(
+    body: &[u8],
+    content_type: &str,
+) -> (HashMap<String, String>, Vec<Attachment>) {
     let Some(boundary) = extract_boundary(content_type) else {
-        return HashMap::new();
+        return (HashMap::new(), Vec::new());
     };
     let delimiter = format!("--{boundary}");
     let body_str = String::from_utf8_lossy(body);
     let mut map = HashMap::new();
+    let mut file_parts: Vec<Attachment> = Vec::new();
 
     for part in body_str.split(delimiter.as_str()).skip(1) {
-        // Final boundary marker is `--{boundary}--`; its content is just "--\r\n".
         if part.trim_start_matches('-').trim().is_empty() {
             continue;
         }
@@ -1430,7 +1512,6 @@ fn parse_mailgun_form_data(body: &[u8], content_type: &str) -> HashMap<String, S
             continue;
         };
 
-        // Extract `name="..."` from Content-Disposition header.
         let disposition = part_headers_str
             .lines()
             .find(|l| l.to_ascii_lowercase().starts_with("content-disposition:"))
@@ -1449,35 +1530,82 @@ fn parse_mailgun_form_data(body: &[u8], content_type: &str) -> HashMap<String, S
 
         let Some(name) = name else { continue };
 
-        // Skip binary file parts (they have a `filename=` parameter).
-        let has_filename = disposition
-            .split(';')
-            .any(|s| s.trim().starts_with("filename="));
-        if has_filename {
-            continue;
-        }
+        let filename = disposition.split(';').find_map(|seg| {
+            let seg = seg.trim();
+            seg.strip_prefix("filename=")
+                .map(|v| v.trim_matches('"').to_string())
+        });
 
-        // Strip the trailing boundary delimiter that may appear inside the body slice.
-        let value = part_body
+        // Strip the trailing boundary delimiter.
+        let raw_value = part_body
             .find(&format!("\r\n--{boundary}"))
             .or_else(|| part_body.find(&format!("\n--{boundary}")))
             .map_or(part_body, |end| &part_body[..end]);
 
-        map.insert(name, value.trim_end_matches(['\r', '\n']).to_string());
+        if let Some(filename) = filename {
+            // File part: capture as Attachment with raw bytes.
+            let part_ct = part_headers_str
+                .lines()
+                .find(|l| l.to_ascii_lowercase().starts_with("content-type:"))
+                .map(|l| {
+                    l[13..]
+                        .trim()
+                        .split(';')
+                        .next()
+                        .map(str::trim)
+                        .unwrap_or("application/octet-stream")
+                        .to_ascii_lowercase()
+                })
+                .unwrap_or_else(|| "application/octet-stream".to_string());
+            let part_cte = part_headers_str
+                .lines()
+                .find(|l| {
+                    l.to_ascii_lowercase()
+                        .starts_with("content-transfer-encoding:")
+                })
+                .map(|l| l[26..].trim().to_ascii_lowercase())
+                .unwrap_or_default();
+            let data: Bytes = if part_cte == "base64" {
+                let stripped: String = raw_value
+                    .chars()
+                    .filter(|c| !c.is_ascii_whitespace())
+                    .collect();
+                base64::engine::general_purpose::STANDARD
+                    .decode(stripped.as_bytes())
+                    .map(Bytes::from)
+                    .unwrap_or_else(|_| Bytes::from(raw_value.as_bytes().to_vec()))
+            } else {
+                Bytes::from(raw_value.as_bytes().to_vec())
+            };
+            // Use the field name (e.g. "attachment-1") to associate with Mailgun's
+            // attachment-{n} numbering, but keep the human-readable filename.
+            let _ = name;
+            file_parts.push(Attachment {
+                filename: Some(filename),
+                content_type: part_ct,
+                data,
+            });
+        } else {
+            // Text field.
+            map.insert(name, raw_value.trim_end_matches(['\r', '\n']).to_string());
+        }
     }
-    map
+    (map, file_parts)
 }
 
 /// Decode a Mailgun webhook body, supporting both `application/x-www-form-urlencoded`
 /// and `multipart/form-data` content types.
-fn decode_mailgun_body(body: &[u8], content_type: &str) -> HashMap<String, String> {
+fn decode_mailgun_body(
+    body: &[u8],
+    content_type: &str,
+) -> (HashMap<String, String>, Vec<Attachment>) {
     if content_type
         .to_ascii_lowercase()
         .starts_with("multipart/form-data")
     {
         parse_mailgun_form_data(body, content_type)
     } else {
-        url_decode_form(body)
+        (url_decode_form(body), Vec::new())
     }
 }
 
@@ -1529,9 +1657,9 @@ fn build_mailgun_route(
                 .get(http::header::CONTENT_TYPE)
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("");
-            let form = decode_mailgun_body(&body, content_type);
+            let (form, file_parts) = decode_mailgun_body(&body, content_type);
             let effective_key = key.as_deref().unwrap_or("");
-            match parse_mailgun(&form, effective_key) {
+            match parse_mailgun(&form, effective_key, file_parts) {
                 Ok(email) => match router.dispatch(email).await {
                     Ok(()) => StatusCode::OK,
                     Err(e) => {
@@ -1804,7 +1932,7 @@ mod tests {
         .into_iter()
         .collect();
 
-        let result = parse_mailgun(&form, "correct-key");
+        let result = parse_mailgun(&form, "correct-key", Vec::new());
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), StatusCode::UNAUTHORIZED);
     }
@@ -1828,7 +1956,7 @@ mod tests {
         .into_iter()
         .collect();
 
-        let result = parse_mailgun(&form, key);
+        let result = parse_mailgun(&form, key, Vec::new());
         assert!(result.is_ok());
         let email = result.unwrap();
         assert_eq!(email.from, "user@example.com");
@@ -1859,13 +1987,13 @@ mod tests {
         .into_iter()
         .collect();
 
-        let email = parse_mailgun(&form, key).unwrap();
+        let email = parse_mailgun(&form, key, Vec::new()).unwrap();
         assert!(email.headers.contains_key("x-mailgun-bounced-address"));
     }
 
     #[test]
     fn mailgun_empty_key_returns_500() {
-        let result = parse_mailgun(&HashMap::new(), "");
+        let result = parse_mailgun(&HashMap::new(), "", Vec::new());
         assert_eq!(result.unwrap_err(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
@@ -1885,7 +2013,7 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let email = parse_mailgun(&form, key).unwrap();
+        let email = parse_mailgun(&form, key, Vec::new()).unwrap();
         assert!(email.to.contains(&"a@example.com".to_string()));
         assert!(email.to.contains(&"b@example.com".to_string()));
     }
@@ -1908,7 +2036,7 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let email = parse_mailgun(&form, key).unwrap();
+        let email = parse_mailgun(&form, key, Vec::new()).unwrap();
         assert!(email.to.contains(&"support@company.com".to_string()));
     }
 
@@ -1929,7 +2057,7 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let email = parse_mailgun(&form, key).unwrap();
+        let email = parse_mailgun(&form, key, Vec::new()).unwrap();
         let report = email.spam_report.unwrap();
         assert!((report.score.unwrap() - 5.7_f64).abs() < 0.01);
         assert_eq!(report.verdict.as_deref(), Some("Yes"));
@@ -2132,7 +2260,7 @@ mod tests {
             "--{b}\r\nContent-Type: text/plain\r\nContent-Transfer-Encoding: base64\r\n\r\n{encoded}\r\n--{b}--\r\n"
         );
         let ct = format!("multipart/mixed; boundary={b}");
-        let (text, _html) = extract_multipart_bodies(&body, &ct);
+        let (text, _html, _) = extract_multipart_bodies(&body, &ct);
         assert_eq!(text.unwrap(), plain);
     }
 
@@ -2143,7 +2271,7 @@ mod tests {
             "--{b}\r\nContent-Type: text/plain\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\nHello=20World\r\n--{b}--\r\n"
         );
         let ct = format!("multipart/mixed; boundary={b}");
-        let (text, _html) = extract_multipart_bodies(&body, &ct);
+        let (text, _html, _) = extract_multipart_bodies(&body, &ct);
         assert_eq!(text.unwrap(), "Hello World");
     }
 
@@ -2177,14 +2305,14 @@ mod tests {
              --{b}--\r\n"
         );
         let ct = format!("multipart/alternative; boundary={b}");
-        let (text, html) = extract_multipart_bodies(&body, &ct);
+        let (text, html, _) = extract_multipart_bodies(&body, &ct);
         assert_eq!(text.as_deref(), Some("Hello text"));
         assert_eq!(html.as_deref(), Some("<b>Hello</b>"));
     }
 
     #[test]
     fn extract_multipart_bodies_no_boundary_returns_body_as_text() {
-        let (text, html) = extract_multipart_bodies("plain text", "text/plain");
+        let (text, html, _) = extract_multipart_bodies("plain text", "text/plain");
         assert_eq!(text.as_deref(), Some("plain text"));
         assert!(html.is_none());
     }
