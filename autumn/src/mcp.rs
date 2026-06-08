@@ -1006,8 +1006,10 @@ async fn serve_mcp(
             if let Some((id, params)) = single_tools_call(&msg) {
                 serve_tools_call(&server, &ctx, id, params).await
             } else {
-                handle_message(&server, &msg)
-                    .map_or_else(|| StatusCode::ACCEPTED.into_response(), |v| json_response(&v))
+                handle_message(&server, &msg).map_or_else(
+                    || StatusCode::ACCEPTED.into_response(),
+                    |v| json_response(&v),
+                )
             }
         }
         // Anything else (scalar, null) is not a valid JSON-RPC message.
@@ -1221,7 +1223,11 @@ async fn serve_tools_call(
         .headers()
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|c| c.trim_start().to_ascii_lowercase().starts_with("text/event-stream"));
+        .is_some_and(|c| {
+            c.trim_start()
+                .to_ascii_lowercase()
+                .starts_with("text/event-stream")
+        });
     let client_accepts_sse = ctx
         .headers
         .get(header::ACCEPT)
@@ -1274,7 +1280,10 @@ async fn serve_tools_call(
     } else {
         success(
             id,
-            tool_error(&format!("handler returned HTTP {}: {text}", status.as_u16())),
+            tool_error(&format!(
+                "handler returned HTTP {}: {text}",
+                status.as_u16()
+            )),
         )
     };
     let mut resp = json_response(&value);
@@ -1879,9 +1888,15 @@ mod tests {
         d.response = None;
         d.mcp_stream = true;
         // Still requires opt-in: `stream` alone (no `mcp`) is not exposed.
-        assert!(!should_expose(&d, false), "stream without opt-in stays hidden");
+        assert!(
+            !should_expose(&d, false),
+            "stream without opt-in stays hidden"
+        );
         d.mcp_tool = true;
-        assert!(should_expose(&d, false), "opted-in streaming tool is exposed");
+        assert!(
+            should_expose(&d, false),
+            "opted-in streaming tool is exposed"
+        );
         // Exclusion still wins.
         d.mcp_exclude = true;
         assert!(!should_expose(&d, false));
@@ -1948,8 +1963,11 @@ mod tests {
         assert_eq!(plain["params"]["progress"], 2.0);
         assert_eq!(plain["params"]["message"], "working");
         // Structured JSON with a numeric `progress` → forwarded verbatim.
-        let structured =
-            progress_notification(&token, 99.0, r#"{"progress":50,"total":100,"message":"half"}"#);
+        let structured = progress_notification(
+            &token,
+            99.0,
+            r#"{"progress":50,"total":100,"message":"half"}"#,
+        );
         assert_eq!(structured["params"]["progress"], 50);
         assert_eq!(structured["params"]["total"], 100);
         assert_eq!(structured["params"]["message"], "half");

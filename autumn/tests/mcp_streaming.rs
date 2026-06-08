@@ -118,7 +118,8 @@ async fn streaming_tool_emits_progress_then_final_result() {
     resp.assert_ok();
     // The response rides the Streamable-HTTP SSE channel.
     assert_eq!(
-        resp.header("content-type").map(|c| c.starts_with("text/event-stream")),
+        resp.header("content-type")
+            .map(|c| c.starts_with("text/event-stream")),
         Some(true),
         "streaming tool must answer with text/event-stream, got {:?}",
         resp.header("content-type")
@@ -132,7 +133,11 @@ async fn streaming_tool_emits_progress_then_final_result() {
         .iter()
         .filter(|m| m["method"] == "notifications/progress")
         .collect();
-    assert_eq!(progress.len(), 3, "one progress per streamed event: {messages:?}");
+    assert_eq!(
+        progress.len(),
+        3,
+        "one progress per streamed event: {messages:?}"
+    );
     for p in &progress {
         assert_eq!(p["params"]["progressToken"], "tok-1");
     }
@@ -146,7 +151,10 @@ async fn streaming_tool_emits_progress_then_final_result() {
         .expect("a final id-correlated result terminates the stream");
     assert_ne!(final_msg["result"]["isError"], true);
     let text = final_msg["result"]["content"][0]["text"].as_str().unwrap();
-    assert!(text.contains("match 1") && text.contains("match 3"), "got: {text}");
+    assert!(
+        text.contains("match 1") && text.contains("match 3"),
+        "got: {text}"
+    );
 }
 
 #[tokio::test]
@@ -169,10 +177,15 @@ async fn streaming_without_progress_token_still_terminates_with_result() {
     resp.assert_ok();
     let messages = sse_messages(&resp.text());
     assert!(
-        messages.iter().all(|m| m["method"] != "notifications/progress"),
+        messages
+            .iter()
+            .all(|m| m["method"] != "notifications/progress"),
         "no progressToken => no progress notifications: {messages:?}"
     );
-    let final_msg = messages.iter().find(|m| m["id"] == 7).expect("final result");
+    let final_msg = messages
+        .iter()
+        .find(|m| m["id"] == 7)
+        .expect("final result");
     assert_ne!(final_msg["result"]["isError"], true);
 }
 
@@ -196,7 +209,8 @@ async fn client_without_sse_accept_gets_buffered_result() {
         .await;
     resp.assert_ok();
     assert_eq!(
-        resp.header("content-type").map(|c| c.starts_with("application/json")),
+        resp.header("content-type")
+            .map(|c| c.starts_with("application/json")),
         Some(true),
         "non-SSE client gets buffered JSON, got {:?}",
         resp.header("content-type")
@@ -204,7 +218,10 @@ async fn client_without_sse_accept_gets_buffered_result() {
     let out = resp.json::<serde_json::Value>();
     assert_eq!(out["id"], 9);
     let text = out["result"]["content"][0]["text"].as_str().unwrap();
-    assert!(text.contains("match 1"), "buffered content joins the stream: {text}");
+    assert!(
+        text.contains("match 1"),
+        "buffered content joins the stream: {text}"
+    );
 }
 
 #[tokio::test]
@@ -225,7 +242,8 @@ async fn buffered_tool_is_unchanged_by_streaming_support() {
         .await;
     resp.assert_ok();
     assert_eq!(
-        resp.header("content-type").map(|c| c.starts_with("application/json")),
+        resp.header("content-type")
+            .map(|c| c.starts_with("application/json")),
         Some(true),
         "buffered tool still answers application/json"
     );
@@ -243,12 +261,12 @@ async fn first_progress_arrives_before_the_slow_tool_completes() {
     #[get("/api/slow")]
     #[api_doc(mcp, stream, summary = "Slow streaming tool")]
     async fn slow_stream() -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-        let s = stream::once(async { Ok(Event::default().data("started")) }).chain(
-            stream::once(async {
+        let s = stream::once(async { Ok(Event::default().data("started")) }).chain(stream::once(
+            async {
                 tokio::time::sleep(Duration::from_millis(300)).await;
                 Ok(Event::default().data("done"))
-            }),
-        );
+            },
+        ));
         Sse::new(s)
     }
 
