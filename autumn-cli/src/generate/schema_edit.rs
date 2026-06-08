@@ -835,19 +835,19 @@ pub fn ensure_autumn_web_feature(existing: &str, feature: &str) -> String {
 /// Append `feature` to a standalone `features = [...]` TOML line.
 fn rewrite_features_line(line: &str, feature: &str) -> String {
     let feature_quoted = format!("\"{feature}\"");
-    if let Some(open) = line.find('[') {
-        if let Some(close_rel) = line[open..].find(']') {
-            let abs_end = open + close_rel;
-            let body = &line[open + 1..abs_end];
-            let separator = if body.trim().is_empty() { "" } else { ", " };
-            return format!(
-                "{}{}{}{}",
-                &line[..abs_end],
-                separator,
-                feature_quoted,
-                &line[abs_end..]
-            );
-        }
+    if let Some(open) = line.find('[')
+        && let Some(close_rel) = line[open..].find(']')
+    {
+        let abs_end = open + close_rel;
+        let body = &line[open + 1..abs_end];
+        let separator = if body.trim().is_empty() { "" } else { ", " };
+        return format!(
+            "{}{}{}{}",
+            &line[..abs_end],
+            separator,
+            feature_quoted,
+            &line[abs_end..]
+        );
     }
     line.to_owned()
 }
