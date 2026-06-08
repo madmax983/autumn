@@ -561,6 +561,16 @@ fn build_router_pre_state(
         };
         let mut mcp_router =
             crate::mcp::build_mcp_router(&mount_path, tools, dispatch, wiring, endpoint_layer);
+        // Gate the envelope under maintenance mode, mirroring the layer
+        // `apply_middleware` installs for direct routes. The `/mcp` router is
+        // merged after that layer, so without this `initialize`/`tools/list`
+        // would keep serving the tool catalog during maintenance (the
+        // `tools/call` replay is already gated — the dispatch clone carries the
+        // layer). Applied before the `TrustedProxiesLayer` below so it is inner
+        // to it: the maintenance IP allow-list then reads the proxy-resolved
+        // identity, exactly as the direct-route layer does, instead of a
+        // spoofable raw `X-Forwarded-For`.
+        mcp_router = mcp_router.layer(build_maintenance_layer(config, state));
         // Stamp `ResolvedClientIdentity` on the *outer* `/mcp` request too. The
         // MCP route is merged after `apply_middleware`, so the centralized
         // `TrustedProxiesLayer` above does not wrap it; without this, the
@@ -1585,6 +1595,34 @@ where
     ))
 }
 
+/// Build the [`MaintenanceLayer`](crate::middleware::maintenance::MaintenanceLayer)
+/// from config + state, with the health/probe paths that always bypass the gate.
+///
+/// Shared by [`apply_middleware`] (direct routes) and the late-mounted `/mcp`
+/// envelope so both return the documented `503` identically when maintenance
+/// mode is active — the `/mcp` router is merged after `apply_middleware`, so
+/// without an explicit layer its `initialize`/`tools/list` would keep serving
+/// the catalog during maintenance.
+fn build_maintenance_layer(
+    config: &AutumnConfig,
+    state: &AppState,
+) -> crate::middleware::maintenance::MaintenanceLayer {
+    let maintenance_state = state
+        .extension::<crate::maintenance::MaintenanceState>()
+        .map(|s| (*s).clone())
+        .unwrap_or_default();
+    let bypass_paths = vec![
+        config.health.path.clone(),
+        config.health.live_path.clone(),
+        config.health.ready_path.clone(),
+        config.health.startup_path.clone(),
+        crate::actuator::actuator_route_path(&config.actuator.prefix, "/health"),
+    ];
+    crate::middleware::maintenance::MaintenanceLayer::new(maintenance_state)
+        .with_health_prefix(config.actuator.prefix.clone())
+        .with_probe_paths(bypass_paths)
+}
+
 /// Apply a per-request-cycle timeout when `config.server.timeouts.request_timeout_ms`
 /// is set and non-zero.
 ///
@@ -1756,23 +1794,9 @@ fn apply_middleware(
     ));
     router = apply_rate_limit_middleware(router, config, state);
 
-    // Register MaintenanceLayer automatically
-    let maintenance_state = state
-        .extension::<crate::maintenance::MaintenanceState>()
-        .map(|s| (*s).clone())
-        .unwrap_or_default();
-    let bypass_paths = vec![
-        config.health.path.clone(),
-        config.health.live_path.clone(),
-        config.health.ready_path.clone(),
-        config.health.startup_path.clone(),
-        crate::actuator::actuator_route_path(&config.actuator.prefix, "/health"),
-    ];
-    router = router.layer(
-        crate::middleware::maintenance::MaintenanceLayer::new(maintenance_state)
-            .with_health_prefix(config.actuator.prefix.clone())
-            .with_probe_paths(bypass_paths),
-    );
+    // Register MaintenanceLayer automatically (shared construction with the
+    // late-mounted `/mcp` envelope — see `build_maintenance_layer`).
+    router = router.layer(build_maintenance_layer(config, state));
 
     router = router.layer(axum::middleware::from_fn(
         crate::webhook::webhook_replay_cleanup_middleware,
@@ -2916,6 +2940,61 @@ mod tests {
             .unwrap();
         assert_eq!(blocked.status(), StatusCode::TOO_MANY_REQUESTS);
         assert!(blocked.headers().get("retry-after").is_some());
+    }
+
+    #[cfg(feature = "mcp")]
+    #[tokio::test]
+    async fn mcp_envelope_is_gated_during_maintenance() {
+        use crate::maintenance::{MaintenanceConfig, MaintenanceState};
+
+        // Trust the host the control request sends so that, with maintenance
+        // off, the envelope's host guard lets `initialize` through.
+        let mut config = AutumnConfig::default();
+        config.security.trusted_hosts.hosts = vec!["app.example".to_owned()];
+
+        let wiring = crate::mcp::McpWiring {
+            cors: crate::config::CorsConfig::default(),
+            trusted_hosts: TrustedHostPolicy::from_config(&config),
+            tenant_header: None,
+            csrf_header: "x-csrf-token".to_owned(),
+            envelope_rate_limited: false,
+        };
+        let mcp_router =
+            crate::mcp::build_mcp_router("/mcp", Vec::new(), axum::Router::new(), wiring, None);
+
+        let initialize = || {
+            Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header("host", "app.example")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize"}).to_string(),
+                ))
+                .unwrap()
+        };
+
+        // Maintenance ON: the late-mounted envelope returns the documented 503
+        // instead of serving the catalog — the gap this layer closes.
+        let state = test_state();
+        let maintenance = MaintenanceState::new();
+        maintenance.enable(MaintenanceConfig::default());
+        state.insert_extension(maintenance);
+        let gated = mcp_router
+            .clone()
+            .layer(build_maintenance_layer(&config, &state))
+            .with_state(state);
+        let resp = gated.oneshot(initialize()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // Maintenance OFF (no enabled state): the same envelope serves
+        // `initialize` normally, confirming the gate is the only difference.
+        let state = test_state();
+        let open = mcp_router
+            .layer(build_maintenance_layer(&config, &state))
+            .with_state(state);
+        let resp = open.oneshot(initialize()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[cfg(feature = "mail")]

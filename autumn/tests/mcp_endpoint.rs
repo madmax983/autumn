@@ -1004,6 +1004,53 @@ async fn untrusted_host_is_rejected_even_without_origin() {
 }
 
 #[tokio::test]
+async fn http2_authority_without_host_header_is_honored() {
+    // An HTTP/2 client carries the target host in the request URI `:authority`
+    // and may omit the `Host` header. The endpoint must resolve the host from
+    // the URI authority — exactly as `trusted_host_middleware` does for direct
+    // routes — instead of treating it as a missing host and 400'ing a trusted
+    // authority. (`resolve_client_host` only consults the `Host` header, so
+    // `ResolvedClientIdentity.host` is `None` here and the authority fallback is
+    // what permits the request.)
+    let mut config = AutumnConfig::default();
+    config.security.trusted_hosts.hosts = vec!["app.example".to_owned()];
+    let client = TestApp::new()
+        .routes(routes![list_todos])
+        .config(config)
+        .mount_mcp("/mcp")
+        .build();
+
+    // An absolute-form request target populates `uri().authority()`; no `Host`
+    // header is sent, mirroring an HTTP/2 `:authority`-only request.
+    let resp = client
+        .post("http://app.example/mcp")
+        .json(&serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))
+        .send()
+        .await;
+    resp.assert_ok();
+}
+
+#[tokio::test]
+async fn http2_untrusted_authority_without_host_header_is_rejected() {
+    // The flip side: an untrusted `:authority` (no `Host` header) is still
+    // rejected, so the authority fallback can't be used to dodge the gate.
+    let mut config = AutumnConfig::default();
+    config.security.trusted_hosts.hosts = vec!["app.example".to_owned()];
+    let client = TestApp::new()
+        .routes(routes![list_todos])
+        .config(config)
+        .mount_mcp("/mcp")
+        .build();
+
+    let resp = client
+        .post("http://evil.example/mcp")
+        .json(&serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))
+        .send()
+        .await;
+    resp.assert_status(400);
+}
+
+#[tokio::test]
 async fn structured_path_argument_is_rejected() {
     // Path params are advertised as `{"type":"string"}`; a `null`/object/array
     // must return `-32602` rather than replaying a literal `null`/JSON-text

@@ -624,6 +624,15 @@ pub(crate) fn build_mcp_router(
     if let Some(layer_fn) = endpoint_layer {
         rpc = layer_fn(rpc);
     }
+    // Host/Origin gate, applied outermost on the JSON-RPC surface so an
+    // untrusted Host or disallowed Origin is rejected before the optional auth
+    // gate runs and before `serve_mcp` buffers the body (see
+    // `mcp_host_origin_guard`). Mounted only on `rpc`, not the `OPTIONS`
+    // preflight below, which a browser sends unauthenticated and host-agnostic.
+    let guard_server = Arc::clone(&server);
+    rpc = rpc.layer(axum::middleware::from_fn(move |req, next| {
+        mcp_host_origin_guard(Arc::clone(&guard_server), req, next)
+    }));
     let preflight = axum::Router::<crate::state::AppState>::new()
         .route(mount_path, axum::routing::options(serve_mcp_options))
         .layer(axum::extract::Extension(server));
@@ -786,6 +795,67 @@ struct ReplayContext<'a> {
     peer: Option<std::net::SocketAddr>,
 }
 
+/// Reject an untrusted `Host`/`:authority` or a disallowed browser `Origin`
+/// before the request body is buffered.
+///
+/// The `/mcp` envelope is merged after `apply_middleware`, so it does not pass
+/// through the global [`trusted_host_middleware`](crate::router) every direct
+/// route runs; this layer restores that gate for the endpoint. Running as a
+/// layer (rather than inside `serve_mcp`) means a bad-`Host` request is rejected
+/// before the handler's `Bytes` extractor reads up to the configured
+/// `max_request_size_bytes`, exactly as a direct route rejects in middleware
+/// before handler extraction.
+///
+/// Host resolution mirrors `trusted_host_middleware`: the proxy-resolved
+/// identity first (honouring `X-Forwarded-Host` from trusted upstreams), then
+/// the HTTP/2 `:authority` carried in the request URI, then the `Host` header —
+/// so an HTTP/2 client that sends `:authority` without a `Host` header is not
+/// wrongly rejected as missing-host. The same proxy-resolved host drives the
+/// same-origin `Origin` shortcut, so a same-origin client behind a
+/// TLS-terminating proxy isn't 403'd.
+async fn mcp_host_origin_guard(
+    server: Arc<McpServer>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let identity = req
+        .extensions()
+        .get::<crate::security::ResolvedClientIdentity>();
+    let host = identity
+        .and_then(|id| id.host.as_deref())
+        .or_else(|| req.uri().authority().map(http::uri::Authority::as_str))
+        .or_else(|| req.headers().get(header::HOST).and_then(|h| h.to_str().ok()));
+
+    // Trusted-Host enforcement. Without it, because the DNS-rebinding `Origin`
+    // check below only fires for browsers, a no-`Origin` agent could call
+    // `initialize`/`tools/list` with an arbitrary `Host` and enumerate the tool
+    // catalog — even though the same request to a direct route would be rejected.
+    let host_trusted = host
+        .and_then(crate::router::extract_host_without_port)
+        .map(|h| h.trim_end_matches('.').to_ascii_lowercase())
+        .filter(|h| !h.is_empty())
+        .map_or_else(
+            || server.trusted_hosts.allows_missing_host(),
+            |h| server.trusted_hosts.allows_host(&h),
+        );
+    if !host_trusted {
+        return (StatusCode::BAD_REQUEST, "Invalid Host header").into_response();
+    }
+
+    // DNS-rebinding protection (MCP Streamable-HTTP spec MUST): reject a
+    // browser-supplied `Origin` that is neither same-origin nor allowlisted.
+    // Non-browser agents send no `Origin` and are unaffected.
+    if let Some(origin) = req.headers().get(header::ORIGIN) {
+        let origin = origin.to_str().unwrap_or("");
+        let scheme = identity.and_then(|id| id.scheme.as_deref());
+        if !server.origin_allowed(origin, host, scheme) {
+            return (StatusCode::FORBIDDEN, "origin not allowed").into_response();
+        }
+    }
+
+    next.run(req).await
+}
+
 /// The Streamable-HTTP POST handler: parses one JSON-RPC message (or a batch)
 /// and responds with `application/json`.
 async fn serve_mcp(
@@ -809,46 +879,12 @@ async fn serve_mcp(
         .and_then(|o| o.to_str().ok())
         .map(str::to_owned);
 
-    // The request's own host, proxy-resolved (honours X-Forwarded-Host from
-    // trusted upstreams) with a fallback to the raw `Host` header. Drives both
-    // the trusted-Host gate and the same-origin `Origin` shortcut below.
-    let host = identity
-        .and_then(|id| id.host.as_deref())
-        .or_else(|| headers.get(header::HOST).and_then(|h| h.to_str().ok()));
-
-    // Trusted-Host enforcement, mirroring the `trusted_host_middleware` every
-    // normal route runs. The `/mcp` envelope is merged after that layer, so it
-    // would otherwise be exempt: because the DNS-rebinding `Origin` check below
-    // only fires for browsers, a no-`Origin` agent could call
-    // `initialize`/`tools/list` with an arbitrary `Host` and enumerate the tool
-    // catalog — even though the same request to a direct route, and the inner
-    // `tools/call` replay (which dispatches through the clone that *does* carry
-    // the layer), would be rejected. Judged on the proxy-resolved host so a
-    // request behind a trusted TLS-terminating proxy (raw `Host` rewritten to an
-    // internal authority) isn't wrongly 400'd, exactly as the `Origin` check is.
-    let host_trusted = host
-        .and_then(crate::router::extract_host_without_port)
-        .map(|h| h.trim_end_matches('.').to_ascii_lowercase())
-        .filter(|h| !h.is_empty())
-        .map_or_else(
-            || server.trusted_hosts.allows_missing_host(),
-            |h| server.trusted_hosts.allows_host(&h),
-        );
-    if !host_trusted {
-        return (StatusCode::BAD_REQUEST, "Invalid Host header").into_response();
-    }
-
-    // DNS-rebinding protection (MCP Streamable-HTTP spec MUST): reject a
-    // browser-supplied `Origin` that is neither same-origin nor allowlisted.
-    // Non-browser agents send no `Origin` and are unaffected.
-    if let Some(origin) = headers.get(header::ORIGIN) {
-        let origin = origin.to_str().unwrap_or("");
-        let scheme = identity.and_then(|id| id.scheme.as_deref());
-        if !server.origin_allowed(origin, host, scheme) {
-            return (StatusCode::FORBIDDEN, "origin not allowed").into_response();
-        }
-    }
-
+    // Trusted-Host enforcement and DNS-rebinding `Origin` validation run in the
+    // `mcp_host_origin_guard` layer (applied in `build_mcp_router`) rather than
+    // here, so an untrusted Host or disallowed Origin is rejected *before* this
+    // handler buffers `body` up to the configured `max_request_size_bytes` —
+    // mirroring how direct routes reject in `trusted_host_middleware` before
+    // handler extraction.
     let parsed: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
