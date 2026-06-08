@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **mcp:** Expose typed endpoints as Model Context Protocol (MCP) tools so AI agents can call your API (#1117)
+  - New `mcp` Cargo feature (implies `openapi`). `AppBuilder::mount_mcp("/mcp")` serves a spec-compliant MCP endpoint over Streamable HTTP, handling `initialize`, `tools/list`, and `tools/call`.
+  - Endpoints opt in per-route via `#[api_doc(mcp)]`; nothing is exposed implicitly. `#[api_doc(mcp = false)]` force-excludes a route.
+  - A whole-API hatch, `AppBuilder::expose_all_as_mcp()`, auto-includes every eligible `GET`, but mutating verbs (`POST`/`PUT`/`PATCH`/`DELETE`) still require an explicit `#[api_doc(mcp)]` opt-in, and per-endpoint exclusions are always honored.
+  - Each tool's `name`, `description`, and `inputSchema` are derived from the existing `ApiDoc` (operation id, summary/description, merged request-body + `Query` + path-param schemas) — there is no second, hand-maintained schema, so the tool catalog cannot drift from the handler's typed contract.
+  - `tools/call` dispatches through the **real handler pipeline** (the same in-process path the test client uses), so `#[secured]`, authorization, tenancy, rate limits, and validation apply identically to an agent call and an HTTP call.
+  - Agent authentication reuses the existing bearer-token surface (`RequireApiToken` / `ApiTokenStore`): the `Authorization`, `Cookie`, and `X-CSRF-Token` headers presented to `/mcp` are forwarded into the dispatched call, so bearer, session (`#[secured]`), and CSRF-protected routes behave identically to a direct request.
+  - `Origin` validation (MCP Streamable-HTTP spec requirement) is enforced against the app's CORS `allowed_origins`: a browser `Origin` not in the allowlist gets `403`, while requests without an `Origin` (non-browser agents) pass — defending against DNS-rebinding without breaking agent clients.
+  - `AppBuilder::secure_mcp(layer)` gates the entire `/mcp` endpoint (catalog included) behind any tower layer, e.g. `RequireApiToken`.
+  - JSON-RPC robustness: rejects requests missing `jsonrpc: "2.0"`, empty/malformed batches, and non-object `arguments` with `-32600`/`-32602`; negotiates only supported protocol versions; enforces required `body` arguments; serializes array query fields with form/explode semantics; and reuses the framework path-segment encoder. Tool-result bodies are capped at 10 MiB. Duplicate tool names (same `operation_id`) keep the first registration with a build-time warning.
+  - HTTP method maps to MCP safety annotations: `GET` → `readOnlyHint`; `DELETE` → `destructiveHint`.
+  - Only JSON-in/JSON-out endpoints are eligible; HTML/Maud routes (no response schema) are auto-excluded with a build-time log note.
+  - `examples/todo-app` gains an `/mcp` endpoint exposing `list_json` (read) and `create_json` (explicitly-opted-in write) behind `RequireApiToken`.
+
 - **actuator:** Decouple the Prometheus scrape endpoint from sensitive mode (#857)
   - New `actuator.prometheus` config flag (default `true`) controls
     `/actuator/prometheus` **independently of** `actuator.sensitive`. Production

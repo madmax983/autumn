@@ -87,6 +87,29 @@ pub enum RouterBuildError {
     /// A route is annotated with an API version that is not registered.
     #[error("route '{route_name}' uses unregistered API version '{version}'")]
     UnregisteredApiVersion { route_name: String, version: String },
+    /// The MCP mount path (from [`AppBuilder::mount_mcp`](crate::app::AppBuilder::mount_mcp))
+    /// is not a valid route path. axum requires paths to start with `/`, so an
+    /// invalid path is surfaced here rather than panicking at mount time.
+    #[cfg(feature = "mcp")]
+    #[error("invalid MCP mount path: {value:?} (must start with '/' and be non-empty)")]
+    InvalidMcpPath {
+        /// The offending mount path.
+        value: String,
+    },
+    /// The MCP mount path collides with an existing application route at the
+    /// same path. Mounting the MCP endpoint there would panic at
+    /// `axum::Router::merge` time on overlapping method routes, so this is
+    /// surfaced as a recoverable error instead.
+    #[cfg(feature = "mcp")]
+    #[error(
+        "MCP mount path {path:?} collides with an existing {method} route; choose a different `mount_mcp` path"
+    )]
+    McpPathCollision {
+        /// The colliding mount path.
+        path: String,
+        /// The HTTP method of the existing route at that path.
+        method: String,
+    },
 }
 
 /// Build the fully-configured Axum router from routes, config, and state.
@@ -146,6 +169,14 @@ pub struct RouterContext {
     /// Gated behind the `openapi` feature.
     #[cfg(feature = "openapi")]
     pub openapi: Option<crate::openapi::OpenApiConfig>,
+    /// MCP (Model Context Protocol) runtime config. When `Some`, the router
+    /// mounts a Streamable-HTTP MCP endpoint that projects opted-in routes as
+    /// agent-callable tools and dispatches `tools/call` through the real
+    /// handler pipeline.
+    ///
+    /// Gated behind the `mcp` feature.
+    #[cfg(feature = "mcp")]
+    pub mcp: Option<crate::mcp::McpRuntime>,
 }
 
 /// Checked variant of [`build_router`] that returns configuration errors
@@ -175,6 +206,8 @@ pub fn try_build_router(
             session_store: None,
             #[cfg(feature = "openapi")]
             openapi: None,
+            #[cfg(feature = "mcp")]
+            mcp: None,
         },
     )?;
     Ok(apply_startup_barrier(
@@ -236,6 +269,8 @@ pub fn try_build_router_merged(
             session_store: None,
             #[cfg(feature = "openapi")]
             openapi: None,
+            #[cfg(feature = "mcp")]
+            mcp: None,
         },
     )?;
     Ok(apply_startup_barrier(
@@ -255,6 +290,15 @@ pub fn try_build_router_inner(
     Ok(router.with_state(state))
 }
 
+/// Prepared MCP exposure carried through `build_router_pre_state`: the mount
+/// path, the derived tool catalog, and the optional whole-endpoint auth layer.
+#[cfg(feature = "mcp")]
+type McpPrepared = (
+    String,
+    Vec<crate::mcp::McpToolInfo>,
+    Option<crate::mcp::McpEndpointLayer>,
+);
+
 /// Like [`try_build_router_inner`] but returns `Router<AppState>` before
 /// [`with_state`](axum::Router::with_state) is called.  Used by
 /// [`try_build_router_with_static_inner`] so that user layers and the static
@@ -264,7 +308,7 @@ fn build_router_pre_state(
     route_list: Vec<Route>,
     config: &AutumnConfig,
     state: &AppState,
-    ctx: RouterContext,
+    #[cfg_attr(not(feature = "mcp"), allow(unused_mut))] mut ctx: RouterContext,
     // When custom_layers are extracted from ctx before this call (SSG path),
     // the caller pre-computes the flag so the idempotency selector still sees
     // the real layer list even though ctx.custom_layers is empty.
@@ -322,6 +366,55 @@ fn build_router_pre_state(
         &config.session.cookie_name,
         versions.as_ref().map_or(&[], |v| v.0.as_slice()),
     )?;
+
+    // Prepare MCP exposure *before* `route_list` is moved into axum below.
+    // Validate the mount path up front (a typo like `"mcp"` surfaces as a
+    // recoverable error, mirroring the OpenAPI path validation, instead of an
+    // axum panic), derive the tool catalog, and carry the optional endpoint
+    // auth layer to be applied once the router is assembled.
+    #[cfg(feature = "mcp")]
+    let mcp_prepared: Option<McpPrepared> = if let Some(rt) = ctx.mcp.take() {
+        let path = rt.mount_path.as_str();
+        // The mount path must be a single static endpoint: reject empty,
+        // non-absolute, doubled-slash, and dynamic (`{capture}` / `{*rest}`)
+        // paths so MCP cannot shadow a whole path class and so the exact-path
+        // collision preflight reserves the concrete URL it actually matches.
+        // Colon-prefixed segments (`/:mcp`, axum 0.7 capture syntax) are also
+        // rejected: axum 0.8's `Router::route` panics on them during assembly
+        // (`validate_v07_paths`), so catching them here yields the recoverable
+        // `InvalidMcpPath` error instead of a startup crash.
+        if path.is_empty()
+            || !path.starts_with('/')
+            || path.contains("//")
+            || path.contains('{')
+            || path.contains('*')
+            || path.split('/').any(|segment| segment.starts_with(':'))
+        {
+            return Err(RouterBuildError::InvalidMcpPath {
+                value: rt.mount_path,
+            });
+        }
+        // The MCP endpoint mounts GET+POST at `mount_path`. If a user, framework,
+        // or OpenAPI route already owns that exact path, the later `merge` would
+        // panic on overlapping method routes; surface it as a recoverable error
+        // first (mirroring the OpenAPI collision preflight).
+        reject_mcp_path_collisions(
+            path,
+            &route_list,
+            &ctx.scoped_groups,
+            config,
+            ctx.openapi.as_ref(),
+            &ctx.merge_routers,
+            &ctx.nest_routers,
+        )?;
+        let docs = collect_openapi_docs(&route_list, &ctx.scoped_groups);
+        // Pass the app's OpenAPI config (if any) so MCP tool `inputSchema`s
+        // reuse the same registered component schemas as the served spec.
+        let tools = crate::mcp::derive_tools(&docs, rt.expose_all, ctx.openapi.as_ref());
+        Some((rt.mount_path, tools, rt.endpoint_layer))
+    } else {
+        None
+    };
 
     let idempotency_layers = build_idempotency_layers(config, state)?;
     let opaque_app_layers_present = opaque_app_layers_override
@@ -423,6 +516,114 @@ fn build_router_pre_state(
         state.clone(),
         http_interceptor_middleware,
     ));
+
+    // Mount the MCP endpoint last so its dispatch target — a clone of the
+    // fully-assembled router with state applied — traverses the exact same
+    // routes, layers, and middleware an HTTP request would. The clone is
+    // taken *before* the MCP route is added, so `tools/call` never recurses
+    // into the MCP endpoint itself.
+    //
+    // KNOWN LIMITATION (static/ISR mode): when an app has a `dist` manifest,
+    // `try_build_router_with_static_inner` drains the global custom layers
+    // (`AppBuilder::layer`) and applies them *outside* the static-first
+    // middleware — i.e. after this builder returns. This dispatch clone is
+    // built here, before that, so a `tools/call` replay does not pass through
+    // those outer custom layers (it would in the non-static path, where they
+    // are applied via `apply_middleware` before the clone is taken). Route-level
+    // guards and `#[secured]` dispatch through this clone and so still apply;
+    // only hand-rolled global `.layer(...)` middleware is skipped for MCP calls
+    // in static mode. Restoring full parity would require making custom-layer
+    // appliers re-usable (they are `FnOnce` today), so this is left documented
+    // rather than fixed for that narrow combination.
+    #[cfg(feature = "mcp")]
+    let router = if let Some((mount_path, tools, endpoint_layer)) = mcp_prepared {
+        let dispatch = router.clone().with_state(state.clone());
+        // For header-based tenancy, forward the configured tenant header on
+        // dispatch so tenant-scoped tools resolve the same tenant a direct HTTP
+        // call would. Other sources key off already-forwarded headers/Host.
+        let tenant_header = (config.tenancy.enabled && config.tenancy.source == "header")
+            .then(|| config.tenancy.header_name.clone());
+        let wiring = crate::mcp::McpWiring {
+            // The CORS config drives the cross-origin Origin allowlist and the
+            // endpoint's own OPTIONS preflight responses.
+            cors: config.cors.clone(),
+            // The same-origin shortcut is gated on the app's trusted-Host
+            // policy so it can't be abused for DNS rebinding.
+            trusted_hosts: TrustedHostPolicy::from_config(config),
+            tenant_header,
+            // Forward the configured CSRF header (default `x-csrf-token`) so
+            // customized CsrfConfig::token_header deployments work via MCP.
+            csrf_header: config.security.csrf.token_header.to_ascii_lowercase(),
+            // The envelope is rate-limited below iff rate limiting is enabled;
+            // when so, a tools/call is counted there and its replay is exempted
+            // from the dispatch pipeline's limiter (avoiding double-counting).
+            envelope_rate_limited: config.security.rate_limit.enabled,
+        };
+        let mut mcp_router =
+            crate::mcp::build_mcp_router(&mount_path, tools, dispatch, wiring, endpoint_layer);
+        // Gate the envelope under maintenance mode, mirroring the layer
+        // `apply_middleware` installs for direct routes. The `/mcp` router is
+        // merged after that layer, so without this `initialize`/`tools/list`
+        // would keep serving the tool catalog during maintenance (the
+        // `tools/call` replay is already gated — the dispatch clone carries the
+        // layer). Applied before the `TrustedProxiesLayer` below so it is inner
+        // to it: the maintenance IP allow-list then reads the proxy-resolved
+        // identity, exactly as the direct-route layer does, instead of a
+        // spoofable raw `X-Forwarded-For`.
+        mcp_router = mcp_router.layer(build_maintenance_layer(config, state));
+        // Stamp `ResolvedClientIdentity` on the *outer* `/mcp` request too. The
+        // MCP route is merged after `apply_middleware`, so the centralized
+        // `TrustedProxiesLayer` above does not wrap it; without this, the
+        // endpoint's own DNS-rebinding / same-origin check would fall back to
+        // the raw (possibly proxy-rewritten) `Host` and wrongly 403 a
+        // same-origin browser client behind a TLS-terminating proxy. The
+        // dispatch clone already carries its own copy of this layer.
+        mcp_router = apply_trusted_proxies_middleware(mcp_router, config);
+        // The MCP route is merged after `apply_upload_middleware`, so axum's
+        // built-in 2 MiB `DefaultBodyLimit` — not the app's configured limit —
+        // would otherwise govern the `tools/call` envelope's `Bytes` body. Apply
+        // the same cap a direct JSON endpoint gets so larger-but-valid tool
+        // payloads aren't rejected before dispatch.
+        mcp_router = mcp_router.layer(axum::extract::DefaultBodyLimit::max(
+            config.security.upload.max_request_size_bytes,
+        ));
+        // Rate-limit the envelope so `secure_mcp` auth rejections — which never
+        // reach the dispatch clone's limiter — are throttled (credential
+        // guessing otherwise consumes no per-client bucket). A successful
+        // tools/call is counted once here and replayed with `RateLimitExempt`,
+        // so it isn't double-counted by the dispatch pipeline's own limiter.
+        // No-op when rate limiting is disabled (matching `envelope_rate_limited`).
+        //
+        // KNOWN LIMITATION (key_strategy = AuthenticatedPrincipal + session
+        // auth): the envelope keys on the IP fallback because the session layer
+        // — which `populate_rate_limit_principal` reads the principal from — is
+        // applied inside `apply_middleware` and does not wrap this late-merged
+        // router, so no `RateLimitPrincipal` is resolved here. Because the
+        // tools/call replay is then exempted, the dispatch clone's
+        // principal-aware limiter is skipped too, so a session-authenticated MCP
+        // call does not consume the same per-user bucket a direct request would
+        // (the framework only derives `RateLimitPrincipal` from the session).
+        mcp_router = apply_rate_limit_middleware(mcp_router, config, state);
+        // Security headers (HSTS/CSP/etc.), mirroring the `SecurityHeadersLayer`
+        // `apply_middleware` installs for direct routes. The `/mcp` router is
+        // merged after that layer, so without this the envelope's responses —
+        // `initialize`/`tools/list`, auth 401/403, and rate-limit 429 — would
+        // ship without the configured `security.headers` every direct route
+        // carries. (The `tools/call` replay's headers are produced on the
+        // dispatch clone and discarded when `serve_mcp` rebuilds the JSON-RPC
+        // response, so the envelope needs its own copy.)
+        mcp_router = mcp_router.layer(crate::security::SecurityHeadersLayer::from_config(
+            &config.security.headers,
+        ));
+        // CORS grant outermost so every response — including auth 401/403, the
+        // 413 body-limit rejection, and a 429 from the limiter above, all
+        // produced before `serve_mcp` runs — is readable by an allowlisted
+        // browser client instead of being masked as a CORS failure.
+        mcp_router = crate::mcp::apply_mcp_cors_layer(mcp_router, &config.cors);
+        router.merge(mcp_router)
+    } else {
+        router
+    };
 
     Ok(router)
 }
@@ -629,42 +830,17 @@ fn validate_route_path(field: &'static str, value: &str) -> Result<(), RouterBui
     Ok(())
 }
 
-/// Reject `OpenAPI` mount paths that overlap with an existing `GET`
-/// handler.
-///
-/// `axum::Router::merge` panics when the merged routers have method
-/// handlers on the same path (e.g. two `GET` handlers on
-/// `/v3/api-docs`). We surface that as a recoverable
-/// [`RouterBuildError::OpenApiPathCollision`] so misconfiguration
-/// produces an actionable error instead of a crash on startup.
-///
-/// We check against:
-/// * user routes (top-level + scoped groups) that will be mounted
-///   before the `OpenAPI` sub-router merges in,
-/// * framework `GET`s: probes, actuator, htmx assets, and dev
-///   live-reload when enabled,
-/// * nest prefixes from [`AppBuilder::nest`](crate::app::AppBuilder::nest)
-///   when the `OpenAPI` path falls under one.
-///
-/// Raw routers passed to [`AppBuilder::merge`](crate::app::AppBuilder::merge)
-/// cannot be introspected — axum does not expose their route table.
-/// We emit a `tracing::warn!` so operators know the check is
-/// incomplete in that case.
+/// Gather every path that a `GET` (or `WS`, which mounts as a `GET`) handler
+/// will already own by the time a late-merged sub-router (`OpenAPI` or MCP) is
+/// added: user routes (top-level + scoped groups) plus framework-mounted `GET`s
+/// (probes, actuator, htmx assets, dev live-reload, mail previews). Shared by
+/// the `OpenAPI` and MCP mount-collision preflights so they stay in lockstep.
 #[cfg(feature = "openapi")]
-fn reject_openapi_path_collisions(
-    openapi_config: Option<&crate::openapi::OpenApiConfig>,
+fn collect_claimed_get_paths(
     route_list: &[Route],
     scoped_groups: &[ScopedGroup],
-    merge_routers: &[axum::Router<AppState>],
-    nest_routers: &[(String, axum::Router<AppState>)],
     config: &AutumnConfig,
-) -> Result<(), RouterBuildError> {
-    let Some(openapi) = openapi_config else {
-        return Ok(());
-    };
-
-    // Gather every path a GET (or WS, which mounts as GET) will already
-    // own by the time we merge.
+) -> std::collections::HashSet<String> {
     let mut claimed: std::collections::HashSet<String> = std::collections::HashSet::new();
     for route in route_list {
         if route.method == http::Method::GET || route.method.as_str() == "WS" {
@@ -703,6 +879,13 @@ fn reject_openapi_path_collisions(
         claimed.insert(dev::LIVE_RELOAD_PATH.to_owned());
         claimed.insert(dev::LIVE_RELOAD_SCRIPT_PATH.to_owned());
     }
+    // The dev request inspector merges a GET at `config.dev.inspector_path`
+    // (only under the dev profile), before the late-merged OpenAPI/MCP routers.
+    // Reserve it so a mount path colliding with the inspector surfaces a
+    // recoverable error instead of panicking in `router.merge`.
+    if matches!(config.profile.as_deref(), Some("dev" | "development")) {
+        claimed.insert(config.dev.inspector_path.clone());
+    }
     #[cfg(feature = "mail")]
     if config
         .mail
@@ -712,6 +895,132 @@ fn reject_openapi_path_collisions(
         claimed.insert("/_autumn/mail/messages/{message_id}".to_owned());
         claimed.insert("/_autumn/mail/previews/{mailer}/{method}".to_owned());
     }
+    claimed
+}
+
+/// Reject an MCP mount path that overlaps with a route already owning that
+/// path. The MCP endpoint mounts `GET`+`POST` at `mount_path`; merging it would
+/// panic in axum if a `GET` (any user/framework route) or `POST` (a user route)
+/// already lives there. We surface a recoverable
+/// [`RouterBuildError::McpPathCollision`] instead, reusing the same claimed-GET
+/// gathering as the `OpenAPI` preflight so framework routes (health/probe,
+/// actuator, htmx, dev) are covered too — e.g. `mount_mcp(config.health.path)`.
+/// The configured `OpenAPI` JSON/UI/asset paths (which merge as `GET`s before
+/// the MCP router) are checked as well.
+#[cfg(feature = "mcp")]
+fn reject_mcp_path_collisions(
+    mount_path: &str,
+    route_list: &[Route],
+    scoped_groups: &[ScopedGroup],
+    config: &AutumnConfig,
+    openapi: Option<&crate::openapi::OpenApiConfig>,
+    merge_routers: &[axum::Router<AppState>],
+    nest_routers: &[(String, axum::Router<AppState>)],
+) -> Result<(), RouterBuildError> {
+    let mut claimed_get = collect_claimed_get_paths(route_list, scoped_groups, config);
+    // The OpenAPI JSON/Swagger-UI endpoints (and UI assets) merge as GETs
+    // before the MCP router, so a mount path colliding with them would panic.
+    if let Some(openapi) = openapi {
+        claimed_get.insert(openapi.openapi_json_path.clone());
+        if let Some(ui_path) = &openapi.swagger_ui_path {
+            claimed_get.insert(ui_path.clone());
+            claimed_get.extend(crate::openapi::swagger_ui_asset_paths(ui_path));
+        }
+    }
+    if claimed_get.contains(mount_path) {
+        return Err(RouterBuildError::McpPathCollision {
+            path: mount_path.to_owned(),
+            method: "GET".to_owned(),
+        });
+    }
+    // POST handlers come from user routes (framework routes are GETs).
+    let post_owns_path = route_list
+        .iter()
+        .any(|route| route.method == http::Method::POST && route.path == mount_path)
+        || scoped_groups.iter().any(|group| {
+            group.routes.iter().any(|route| {
+                route.method == http::Method::POST
+                    && join_nested_path(&group.prefix, route.path) == mount_path
+            })
+        });
+    if post_owns_path {
+        return Err(RouterBuildError::McpPathCollision {
+            path: mount_path.to_owned(),
+            method: "POST".to_owned(),
+        });
+    }
+    // A nest prefix P owns every route under P (`/P/...`), and those raw routers
+    // are mounted before the MCP router. A mount path equal to P or falling
+    // under `P/` would be shadowed by (or panic against) the nested router, so
+    // reject it up front — mirroring the OpenAPI nest-collision preflight. The
+    // framework unconditionally nests the static-file service at `/static`, so
+    // reserve that prefix too.
+    let nest_prefixes = nest_routers
+        .iter()
+        .map(|(prefix, _)| prefix.as_str())
+        .chain(std::iter::once("/static"));
+    for prefix in nest_prefixes {
+        let prefix_slash = format!("{prefix}/");
+        if mount_path == prefix || mount_path.starts_with(&prefix_slash) {
+            return Err(RouterBuildError::McpPathCollision {
+                path: mount_path.to_owned(),
+                method: "nested router".to_owned(),
+            });
+        }
+    }
+    // Raw merged routers are opaque — axum does not expose their route table —
+    // so an overlapping handler there would still panic at merge time. Warn so
+    // operators know the check can't cover this case (mirrors the OpenAPI one).
+    if !merge_routers.is_empty() {
+        tracing::warn!(
+            mcp_mount_path = %mount_path,
+            merged_routers = merge_routers.len(),
+            "MCP mount collision check skipped for AppBuilder::merge routers: \
+             axum does not expose their route table, so an overlapping handler \
+             will still panic at startup. Choose an MCP mount path that doesn't \
+             overlap with any merged router's handlers."
+        );
+    }
+    Ok(())
+}
+
+/// Reject `OpenAPI` mount paths that overlap with an existing `GET`
+/// handler.
+///
+/// `axum::Router::merge` panics when the merged routers have method
+/// handlers on the same path (e.g. two `GET` handlers on
+/// `/v3/api-docs`). We surface that as a recoverable
+/// [`RouterBuildError::OpenApiPathCollision`] so misconfiguration
+/// produces an actionable error instead of a crash on startup.
+///
+/// We check against:
+/// * user routes (top-level + scoped groups) that will be mounted
+///   before the `OpenAPI` sub-router merges in,
+/// * framework `GET`s: probes, actuator, htmx assets, and dev
+///   live-reload when enabled,
+/// * nest prefixes from [`AppBuilder::nest`](crate::app::AppBuilder::nest)
+///   when the `OpenAPI` path falls under one.
+///
+/// Raw routers passed to [`AppBuilder::merge`](crate::app::AppBuilder::merge)
+/// cannot be introspected — axum does not expose their route table.
+/// We emit a `tracing::warn!` so operators know the check is
+/// incomplete in that case.
+#[cfg(feature = "openapi")]
+fn reject_openapi_path_collisions(
+    openapi_config: Option<&crate::openapi::OpenApiConfig>,
+    route_list: &[Route],
+    scoped_groups: &[ScopedGroup],
+    merge_routers: &[axum::Router<AppState>],
+    nest_routers: &[(String, axum::Router<AppState>)],
+    config: &AutumnConfig,
+) -> Result<(), RouterBuildError> {
+    let Some(openapi) = openapi_config else {
+        return Ok(());
+    };
+
+    // Gather every path a GET (or WS, which mounts as GET) will already
+    // own by the time we merge.
+    let claimed = collect_claimed_get_paths(route_list, scoped_groups, config);
 
     check_openapi_path_against(
         "openapi_json_path",
@@ -721,7 +1030,7 @@ fn reject_openapi_path_collisions(
     )?;
     if let Some(path) = &openapi.swagger_ui_path {
         check_openapi_path_against("swagger_ui_path", path, &claimed, nest_routers)?;
-        let mut claimed_with_openapi = claimed.clone();
+        let mut claimed_with_openapi = claimed;
         claimed_with_openapi.insert(openapi.openapi_json_path.clone());
         for asset_path in crate::openapi::swagger_ui_asset_paths(path) {
             check_openapi_path_against(
@@ -1257,7 +1566,11 @@ fn apply_rate_limit_middleware(
         // overriding an operator's explicit security.rate_limit.trusted_proxies.
         let has_rate_limit_proxy_config =
             rl.trust_forwarded_headers || !rl.trusted_proxies.is_empty();
-        let mut layer = crate::security::RateLimitLayer::from_config(rl);
+        // The framework default limiter shares its bucket with the MCP `/mcp`
+        // envelope limiter (both built here), so it honors `RateLimitExempt` to
+        // avoid double-counting an already-charged `tools/call`. User-installed
+        // limiters don't, so MCP replays still consume their per-route buckets.
+        let mut layer = crate::security::RateLimitLayer::from_config(rl).honoring_mcp_exempt();
         if has_top_level_proxy_config && !has_rate_limit_proxy_config {
             let resolver = crate::security::ProxyResolver::from_config(tp);
             layer = layer.with_proxy_resolver(resolver);
@@ -1309,6 +1622,34 @@ where
             }
         },
     ))
+}
+
+/// Build the [`MaintenanceLayer`](crate::middleware::maintenance::MaintenanceLayer)
+/// from config + state, with the health/probe paths that always bypass the gate.
+///
+/// Shared by [`apply_middleware`] (direct routes) and the late-mounted `/mcp`
+/// envelope so both return the documented `503` identically when maintenance
+/// mode is active — the `/mcp` router is merged after `apply_middleware`, so
+/// without an explicit layer its `initialize`/`tools/list` would keep serving
+/// the catalog during maintenance.
+fn build_maintenance_layer(
+    config: &AutumnConfig,
+    state: &AppState,
+) -> crate::middleware::maintenance::MaintenanceLayer {
+    let maintenance_state = state
+        .extension::<crate::maintenance::MaintenanceState>()
+        .map(|s| (*s).clone())
+        .unwrap_or_default();
+    let bypass_paths = vec![
+        config.health.path.clone(),
+        config.health.live_path.clone(),
+        config.health.ready_path.clone(),
+        config.health.startup_path.clone(),
+        crate::actuator::actuator_route_path(&config.actuator.prefix, "/health"),
+    ];
+    crate::middleware::maintenance::MaintenanceLayer::new(maintenance_state)
+        .with_health_prefix(config.actuator.prefix.clone())
+        .with_probe_paths(bypass_paths)
 }
 
 /// Apply a per-request-cycle timeout when `config.server.timeouts.request_timeout_ms`
@@ -1482,23 +1823,9 @@ fn apply_middleware(
     ));
     router = apply_rate_limit_middleware(router, config, state);
 
-    // Register MaintenanceLayer automatically
-    let maintenance_state = state
-        .extension::<crate::maintenance::MaintenanceState>()
-        .map(|s| (*s).clone())
-        .unwrap_or_default();
-    let bypass_paths = vec![
-        config.health.path.clone(),
-        config.health.live_path.clone(),
-        config.health.ready_path.clone(),
-        config.health.startup_path.clone(),
-        crate::actuator::actuator_route_path(&config.actuator.prefix, "/health"),
-    ];
-    router = router.layer(
-        crate::middleware::maintenance::MaintenanceLayer::new(maintenance_state)
-            .with_health_prefix(config.actuator.prefix.clone())
-            .with_probe_paths(bypass_paths),
-    );
+    // Register MaintenanceLayer automatically (shared construction with the
+    // late-mounted `/mcp` envelope — see `build_maintenance_layer`).
+    router = router.layer(build_maintenance_layer(config, state));
 
     router = router.layer(axum::middleware::from_fn(
         crate::webhook::webhook_replay_cleanup_middleware,
@@ -1689,7 +2016,7 @@ async fn trusted_host_middleware(
     }
 }
 
-fn extract_host_without_port(header: &str) -> Option<&str> {
+pub fn extract_host_without_port(header: &str) -> Option<&str> {
     let host = header.trim();
     if host.is_empty() {
         return None;
@@ -1791,6 +2118,8 @@ pub fn try_build_router_with_static(
             session_store: None,
             #[cfg(feature = "openapi")]
             openapi: None,
+            #[cfg(feature = "mcp")]
+            mcp: None,
         },
     )
 }
@@ -2643,6 +2972,61 @@ mod tests {
         assert!(blocked.headers().get("retry-after").is_some());
     }
 
+    #[cfg(feature = "mcp")]
+    #[tokio::test]
+    async fn mcp_envelope_is_gated_during_maintenance() {
+        use crate::maintenance::{MaintenanceConfig, MaintenanceState};
+
+        // Trust the host the control request sends so that, with maintenance
+        // off, the envelope's host guard lets `initialize` through.
+        let mut config = AutumnConfig::default();
+        config.security.trusted_hosts.hosts = vec!["app.example".to_owned()];
+
+        let wiring = crate::mcp::McpWiring {
+            cors: crate::config::CorsConfig::default(),
+            trusted_hosts: TrustedHostPolicy::from_config(&config),
+            tenant_header: None,
+            csrf_header: "x-csrf-token".to_owned(),
+            envelope_rate_limited: false,
+        };
+        let mcp_router =
+            crate::mcp::build_mcp_router("/mcp", Vec::new(), axum::Router::new(), wiring, None);
+
+        let initialize = || {
+            Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header("host", "app.example")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize"}).to_string(),
+                ))
+                .unwrap()
+        };
+
+        // Maintenance ON: the late-mounted envelope returns the documented 503
+        // instead of serving the catalog — the gap this layer closes.
+        let state = test_state();
+        let maintenance = MaintenanceState::new();
+        maintenance.enable(MaintenanceConfig::default());
+        state.insert_extension(maintenance);
+        let gated = mcp_router
+            .clone()
+            .layer(build_maintenance_layer(&config, &state))
+            .with_state(state);
+        let resp = gated.oneshot(initialize()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // Maintenance OFF (no enabled state): the same envelope serves
+        // `initialize` normally, confirming the gate is the only difference.
+        let state = test_state();
+        let open = mcp_router
+            .layer(build_maintenance_layer(&config, &state))
+            .with_state(state);
+        let resp = open.oneshot(initialize()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
     #[cfg(feature = "mail")]
     fn dev_mail_preview_config(dir: &std::path::Path) -> AutumnConfig {
         let mut config = AutumnConfig {
@@ -2899,6 +3283,8 @@ mod tests {
             error_page_renderer: None,
             session_store: None,
             openapi: Some(openapi),
+            #[cfg(feature = "mcp")]
+            mcp: None,
         };
         let err = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx)
             .expect_err("scope '/api' + child '/' should collide with openapi path '/api'");
@@ -3203,6 +3589,8 @@ mod tests {
             error_page_renderer: None,
             session_store: None,
             openapi: Some(openapi),
+            #[cfg(feature = "mcp")]
+            mcp: None,
         };
         let err = super::try_build_router_inner(vec![user_route], &config, test_state(), ctx)
             .expect_err("user-owned path should prevent OpenAPI mount");
@@ -3227,6 +3615,8 @@ mod tests {
             error_page_renderer: None,
             session_store: None,
             openapi: Some(openapi),
+            #[cfg(feature = "mcp")]
+            mcp: None,
         };
         let err = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx)
             .expect_err("framework-owned path should prevent OpenAPI mount");
@@ -3272,6 +3662,8 @@ mod tests {
             error_page_renderer: None,
             session_store: None,
             openapi: Some(openapi),
+            #[cfg(feature = "mcp")]
+            mcp: None,
         };
         let err = super::try_build_router_inner(vec![user_route], &config, test_state(), ctx)
             .expect_err("swagger ui asset path should be reserved");
@@ -3299,6 +3691,8 @@ mod tests {
             error_page_renderer: None,
             session_store: None,
             openapi: Some(openapi),
+            #[cfg(feature = "mcp")]
+            mcp: None,
         };
         let err = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx)
             .expect_err("htmx csrf helper path should be reserved");
@@ -3332,6 +3726,8 @@ mod tests {
             error_page_renderer: None,
             session_store: None,
             openapi: Some(openapi),
+            #[cfg(feature = "mcp")]
+            mcp: None,
         };
         let err = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx)
             .expect_err("OpenAPI path under a nest prefix should collide");
@@ -3365,6 +3761,8 @@ mod tests {
                     error_page_renderer: None,
                     session_store: None,
                     openapi: Some(openapi),
+                    #[cfg(feature = "mcp")]
+                    mcp: None,
                 };
                 let err = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx)
                     .expect_err("dev reload path should be reserved");
@@ -4103,7 +4501,7 @@ mod trusted_host_tests {
     }
 }
 #[derive(Clone, Debug)]
-struct TrustedHostPolicy {
+pub struct TrustedHostPolicy {
     rules: Arc<Vec<String>>,
     allow_any: bool,
     allow_missing_host: bool,
@@ -4111,7 +4509,7 @@ struct TrustedHostPolicy {
 }
 
 impl TrustedHostPolicy {
-    fn from_config(config: &AutumnConfig) -> Self {
+    pub fn from_config(config: &AutumnConfig) -> Self {
         let mut rules: Vec<String> = config
             .security
             .trusted_hosts
@@ -4145,7 +4543,14 @@ impl TrustedHostPolicy {
         }
     }
 
-    fn allows_host(&self, host: &str) -> bool {
+    /// Whether a request carrying no usable `Host` is allowed through. Mirrors
+    /// `trusted_host_middleware`'s missing-host branch for callers (e.g. the MCP
+    /// envelope) that enforce the policy outside that middleware.
+    pub const fn allows_missing_host(&self) -> bool {
+        self.allow_missing_host
+    }
+
+    pub fn allows_host(&self, host: &str) -> bool {
         if self.allow_any {
             return true;
         }

@@ -25,6 +25,10 @@ http-client = ["dep:reqwest"]
 oauth2 = ["http-client"]
 webauthn = ["dep:webauthn-rs"]
 openapi = ["dep:serde_yaml"]
+# Project typed JSON endpoints as MCP (Model Context Protocol) tools so AI
+# agents can call the real, authenticated handler pipeline. Builds on the
+# same `ApiDoc` registry that drives `openapi`, so it implies that feature.
+mcp = ["openapi"]
 # Optional Markdown rendering with frontmatter parsing and SSG integration.
 markdown = ["dep:pulldown-cmark"]
 db = [
@@ -175,7 +179,7 @@ rusty-fork = "0.3.1"
 [package.metadata.docs.rs]
 features = [
   "maud", "htmx", "tailwind", "db", "cache-moka",
-  "ws", "flash", "multipart", "http-client", "oauth2", "openapi",
+  "ws", "flash", "multipart", "http-client", "oauth2", "openapi", "mcp",
   "redis", "i18n", "storage", "variants", "mail", "seed", "system-info", "markdown",
   "reporting", "csv",
 ]

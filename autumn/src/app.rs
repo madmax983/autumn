@@ -101,6 +101,8 @@ pub fn app() -> AppBuilder {
         error_reporters: Vec::new(),
         #[cfg(feature = "openapi")]
         openapi: None,
+        #[cfg(feature = "mcp")]
+        mcp: None,
         audit_logger: None,
         #[cfg(feature = "i18n")]
         i18n_bundle: None,
@@ -279,6 +281,12 @@ pub struct AppBuilder {
     /// runtime collision-check machinery.
     #[cfg(feature = "openapi")]
     openapi: Option<crate::openapi::OpenApiConfig>,
+    /// MCP (Model Context Protocol) runtime config. `Some` once
+    /// [`AppBuilder::mount_mcp`] is called; the contained `expose_all` flag is
+    /// flipped by [`AppBuilder::expose_all_as_mcp`]. Gated behind the `mcp`
+    /// feature (which implies `openapi`).
+    #[cfg(feature = "mcp")]
+    mcp: Option<crate::mcp::McpRuntime>,
     /// Shared audit logger used for append-only compliance events.
     audit_logger: Option<Arc<crate::audit::AuditLogger>>,
     /// Loaded i18n translation bundle. When `Some`, an `axum::Extension`
@@ -559,6 +567,122 @@ impl AppBuilder {
     #[must_use]
     pub fn openapi(mut self, config: crate::openapi::OpenApiConfig) -> Self {
         self.openapi = Some(config);
+        self
+    }
+
+    /// Mount a Model Context Protocol (MCP) endpoint at `path` (e.g. `/mcp`).
+    ///
+    /// Projects opted-in routes — those tagged `#[api_doc(mcp)]` — as
+    /// agent-callable MCP tools over Streamable HTTP, handling `initialize`,
+    /// `tools/list`, and `tools/call`. A tool's `name`, `description`, and
+    /// `inputSchema` are derived from the handler's existing
+    /// [`ApiDoc`](crate::openapi::ApiDoc), so the tool catalog cannot drift
+    /// from the handler's typed contract. `tools/call` dispatches through the
+    /// real handler pipeline, so `#[secured]`, authorization, rate limits, and
+    /// validation apply identically to agent and HTTP calls.
+    ///
+    /// Opt-in is per-endpoint; nothing is exposed implicitly. Use
+    /// [`expose_all_as_mcp`](Self::expose_all_as_mcp) for the whole-API hatch.
+    ///
+    /// Only **JSON** endpoints are projected: a route is eligible when it
+    /// returns `Json<T>` (the structural signal for a JSON response). The
+    /// generated tool's `body` input is derived solely from a `Json<T>`
+    /// request extractor, so a handler that returns `Json<T>` but reads its
+    /// body via `Form<T>`, `Multipart`, `Bytes`, or `String` should **not** be
+    /// opted in — the tool would carry no body input and replay an empty
+    /// request. Use JSON request bodies for endpoints exposed as MCP tools.
+    ///
+    /// `tools/call` replays through the same pipeline as a direct HTTP request,
+    /// so `#[secured]`, route guards, rate limits, and validation apply
+    /// identically. One caveat applies only in **static/ISR mode** (an app with
+    /// a `dist` manifest): a global [`layer`](Self::layer) is applied outside
+    /// the static-first middleware and is therefore *not* traversed by MCP
+    /// `tools/call` replays. Prefer `#[secured]` or route-level guards (which do
+    /// apply) for MCP-exposed handlers in that mode.
+    ///
+    /// Requires the `mcp` Cargo feature.
+    ///
+    /// ```rust,ignore
+    /// autumn_web::app()
+    ///     .routes(routes![list_todos, create_todo])
+    ///     .mount_mcp("/mcp")
+    ///     .run()
+    ///     .await;
+    /// ```
+    #[cfg(feature = "mcp")]
+    #[must_use]
+    pub fn mount_mcp(mut self, path: impl Into<String>) -> Self {
+        let path = path.into();
+        if let Some(rt) = self.mcp.as_mut() {
+            rt.mount_path = path;
+        } else {
+            self.mcp = Some(crate::mcp::McpRuntime::new(path));
+        }
+        self
+    }
+
+    /// Whole-API escape hatch: expose **every** eligible read (`GET`) endpoint
+    /// as an MCP tool without per-endpoint tags.
+    ///
+    /// This is an explicit, separate opt-in — never the default. It still
+    /// honors per-endpoint exclusions (`#[api_doc(mcp = false)]`) and the
+    /// JSON-only rule, and **mutating verbs (`POST`/`PUT`/`PATCH`/`DELETE`)
+    /// still require an explicit `#[api_doc(mcp)]` opt-in** even under the
+    /// hatch.
+    ///
+    /// On its own this mounts the endpoint at the default `/mcp`; chain
+    /// [`mount_mcp`](Self::mount_mcp) to serve it at a different path.
+    ///
+    /// Requires the `mcp` Cargo feature.
+    #[cfg(feature = "mcp")]
+    #[must_use]
+    pub fn expose_all_as_mcp(mut self) -> Self {
+        if let Some(rt) = self.mcp.as_mut() {
+            rt.expose_all = true;
+        } else {
+            let mut rt = crate::mcp::McpRuntime::new("/mcp");
+            rt.expose_all = true;
+            self.mcp = Some(rt);
+        }
+        self
+    }
+
+    /// Gate the **entire** MCP endpoint — the catalog (`initialize`/
+    /// `tools/list`) as well as tool dispatch — behind a tower `layer`.
+    ///
+    /// The `/mcp` envelope is otherwise reachable without the app's global
+    /// middleware. Pass an auth layer (e.g.
+    /// [`RequireApiToken`](crate::auth::RequireApiToken)) here to require a
+    /// credential for the whole endpoint, the way you'd protect a normal
+    /// route group. Combine with [`mount_mcp`](Self::mount_mcp); the MCP
+    /// transport's spec-required `Origin` validation (sourced from your CORS
+    /// `allowed_origins`) always applies regardless of this layer.
+    ///
+    /// Requires the `mcp` Cargo feature.
+    #[cfg(feature = "mcp")]
+    #[must_use]
+    pub fn secure_mcp<L>(mut self, layer: L) -> Self
+    where
+        L: tower::Layer<axum::routing::Route> + Clone + Send + Sync + 'static,
+        L::Service: tower::Service<
+                axum::http::Request<axum::body::Body>,
+                Response = axum::http::Response<axum::body::Body>,
+                Error = std::convert::Infallible,
+            > + Clone
+            + Send
+            + Sync
+            + 'static,
+        <L::Service as tower::Service<axum::http::Request<axum::body::Body>>>::Future:
+            Send + 'static,
+    {
+        let applier: crate::mcp::McpEndpointLayer = Box::new(move |router| router.layer(layer));
+        if let Some(rt) = self.mcp.as_mut() {
+            rt.endpoint_layer = Some(applier);
+        } else {
+            let mut rt = crate::mcp::McpRuntime::new("/mcp");
+            rt.endpoint_layer = Some(applier);
+            self.mcp = Some(rt);
+        }
         self
     }
 
@@ -1986,6 +2110,8 @@ impl AppBuilder {
             error_reporters,
             #[cfg(feature = "openapi")]
             openapi,
+            #[cfg(feature = "mcp")]
+            mcp,
             audit_logger,
             #[cfg(feature = "i18n")]
             i18n_bundle,
@@ -2325,6 +2451,8 @@ impl AppBuilder {
                 } else {
                     None
                 },
+                #[cfg(feature = "mcp")]
+                mcp,
             },
         )
         .unwrap_or_else(|error| {
@@ -2627,6 +2755,8 @@ impl AppBuilder {
             error_reporters,
             #[cfg(feature = "openapi")]
             openapi,
+            #[cfg(feature = "mcp")]
+                mcp: _,
             audit_logger: _,
             #[cfg(feature = "i18n")]
             i18n_bundle,
@@ -2888,6 +3018,8 @@ impl AppBuilder {
                 session_store,
                 #[cfg(feature = "openapi")]
                 openapi: None,
+                #[cfg(feature = "mcp")]
+                mcp: None,
             },
         )
         .unwrap_or_else(|error| {
@@ -6094,6 +6226,8 @@ mod tests {
                 session_store: None,
                 #[cfg(feature = "openapi")]
                 openapi: None,
+                #[cfg(feature = "mcp")]
+                mcp: None,
             },
         )
         .expect("router builds");

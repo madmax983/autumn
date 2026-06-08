@@ -8,7 +8,6 @@ use std::sync::{Arc, OnceLock};
 
 use autumn_web::auth::{API_TOKEN_MIGRATIONS, ApiTokenStore, DbApiTokenStore, RequireApiToken};
 use autumn_web::migrate::{EmbeddedMigrations, embed_migrations};
-use autumn_web::reexports::axum::{Router, routing};
 use autumn_web::{AutumnResult, routes};
 
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
@@ -73,12 +72,6 @@ async fn main() {
     let deferred = DeferredStore::new();
     let deferred_for_startup = deferred.clone();
 
-    // `/api/todos` requires a valid Bearer token; `/api/tokens` is open.
-    let protected_api = Router::new()
-        .route("/api/todos", routing::get(routes::api::list_json))
-        .route("/api/todos", routing::post(routes::api::create_json))
-        .layer(RequireApiToken::new(Arc::new(deferred.clone())));
-
     autumn_web::app()
         // App migrations (todos table) + framework migrations (api_tokens table).
         .migrations(MIGRATIONS)
@@ -94,8 +87,19 @@ async fn main() {
             routes::todos::delete_todo,
             routes::api::issue_token,
         ])
-        // Bearer-token-protected JSON API.
-        .merge(protected_api)
+        // Bearer-token-protected JSON API under `/api`. Using `.scoped(...)`
+        // (rather than a merged raw router) keeps these routes in the route
+        // registry, so their `#[api_doc(mcp)]` tags project them as MCP tools
+        // while `RequireApiToken` still guards every call — agent or HTTP.
+        .scoped(
+            "/api",
+            RequireApiToken::new(Arc::new(deferred.clone())),
+            routes![routes::api::list_json, routes::api::create_json],
+        )
+        // Expose the tagged endpoints as agent-callable MCP tools. `tools/call`
+        // dispatches through the real pipeline above, so the bearer token an
+        // agent presents to `/mcp` is enforced by `RequireApiToken`.
+        .mount_mcp("/mcp")
         // Wire the real DbApiTokenStore once the pool is ready.
         .on_startup(move |state| {
             let deferred = deferred_for_startup.clone();
