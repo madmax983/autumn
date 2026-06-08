@@ -95,7 +95,12 @@ pub enum CaptchaProviderKind {
 /// ```
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct BotProtectionConfig {
-    /// Enable bot protection middleware. Default: `false`.
+    /// Wire the bot-protection middleware globally. Default: `false`.
+    ///
+    /// When `false`, the global auto-wired layer is not applied but you can
+    /// still apply [`BotProtectionLayer::new`] manually to a scoped router.
+    /// [`bot_protection_widget`] renders the widget whenever `site_key` is set,
+    /// regardless of this flag — so forms work correctly in the scoped pattern.
     #[serde(default)]
     pub enabled: bool,
 
@@ -718,6 +723,12 @@ where
 /// Renders the placeholder `<div>` and the provider `<script>` tag required to
 /// load the widget JavaScript.  No manual `<script>` tags needed.
 ///
+/// The widget renders whenever `site_key` is set, regardless of
+/// `config.enabled`.  This allows the scoped-layer pattern (where `enabled =
+/// false` disables global auto-wiring but a manually-applied
+/// [`BotProtectionLayer`] protects specific routes) to still render the widget
+/// in forms.
+///
 /// # Example
 ///
 /// ```rust,ignore
@@ -738,10 +749,6 @@ where
 #[cfg(feature = "maud")]
 #[must_use]
 pub fn bot_protection_widget(config: &BotProtectionConfig) -> maud::Markup {
-    if !config.enabled {
-        return maud::html! {};
-    }
-
     if config.dev_bypass {
         // Dev mode: render an invisible placeholder so the form submits cleanly.
         return maud::html! {
@@ -970,6 +977,34 @@ mod tests {
         let html = bot_protection_widget(&config).into_string();
         assert!(html.contains("type=\"hidden\""));
         assert!(html.contains("dev-bypass"));
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn widget_renders_when_enabled_false_but_site_key_set() {
+        // Scoped-layer pattern: enabled=false disables global auto-wiring but
+        // the widget must still render so the manually-layered router can verify tokens.
+        let config = BotProtectionConfig {
+            enabled: false,
+            provider: CaptchaProviderKind::Turnstile,
+            site_key: Some("0x4AAAA".to_string()),
+            ..Default::default()
+        };
+        let html = bot_protection_widget(&config).into_string();
+        assert!(html.contains("cf-turnstile"));
+        assert!(html.contains("0x4AAAA"));
+        assert!(html.contains("challenges.cloudflare.com"));
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn widget_empty_when_no_site_key() {
+        let config = BotProtectionConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        let html = bot_protection_widget(&config).into_string();
+        assert!(html.is_empty());
     }
 
     #[tokio::test]

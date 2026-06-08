@@ -206,6 +206,14 @@ site_key = "0x4AAAA..."
 # Use AUTUMN_BOT_PROTECTION__SECRET_KEY env var for the secret in production
 ```
 
+> **Widget rendering with `enabled = false`**
+>
+> `bot_protection_widget` renders the CAPTCHA widget whenever `site_key` is
+> configured, regardless of the `enabled` flag.  Setting `enabled = false`
+> only disables the global auto-wired middleware — it does **not** suppress
+> the widget.  Forms in the manually-layered router will correctly render and
+> submit the CAPTCHA token.
+
 ```rust,no_run
 use autumn_web::prelude::*;
 use autumn_web::security::captcha::{BotProtectionLayer, TurnstileProvider};
@@ -230,7 +238,8 @@ let app = Router::new()
 
 With this layout the CAPTCHA middleware is only applied to the routes that need
 it and the webhook endpoints are left untouched.  The `bot_protection.site_key`
-is still read and passed to `bot_protection_widget` in templates as normal.
+is read by `bot_protection_widget` in templates as normal — the widget renders
+the full Turnstile `<div>` and `<script>` regardless of `enabled`.
 
 ---
 
