@@ -1,0 +1,5 @@
+error: Route path must not contain traversal sequences like `..` or `.`
+ --> tests/security/compile_fail/route_traversal.rs:3:7
+  |
+3 | #[get("/../../../etc/passwd")]
+  |       ^^^^^^^^^^^^^^^^^^^^^^
