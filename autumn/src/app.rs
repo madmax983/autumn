@@ -126,6 +126,8 @@ pub fn app() -> AppBuilder {
         http_interceptor: None,
         metrics_sources: Vec::new(),
         health_indicators: Vec::new(),
+        #[cfg(feature = "inbound-mail")]
+        inbound_mail_router: None,
     }
 }
 
@@ -338,6 +340,11 @@ pub struct AppBuilder {
         crate::actuator::IndicatorGroup,
         Arc<dyn crate::actuator::HealthIndicator>,
     )>,
+    /// Inbound mail router registered via [`AppBuilder::inbound_mail_router`].
+    /// HTTP webhook routes are derived from the router's endpoint configs and
+    /// merged into the Axum router at startup.
+    #[cfg(feature = "inbound-mail")]
+    inbound_mail_router: Option<Arc<crate::inbound_mail::InboundMailRouter>>,
 }
 
 /// Boxed builder closure that constructs a durable
@@ -1750,6 +1757,42 @@ impl AppBuilder {
         self
     }
 
+    /// Register an inbound mail router that creates webhook HTTP endpoints and
+    /// dispatches parsed [`InboundEmail`](crate::inbound_mail::InboundEmail)
+    /// values to registered handlers.
+    ///
+    /// Calling this method twice replaces the previously registered router.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use autumn_web::inbound_mail::{
+    ///     InboundMailRouter, InboundMailEndpointConfig,
+    ///     InboundMailHandlerInfo, ProcessingMode, RecipientPattern,
+    /// };
+    ///
+    /// autumn_web::app()
+    ///     .inbound_mail_router(
+    ///         InboundMailRouter::new()
+    ///             .endpoint(InboundMailEndpointConfig::mailgun("/inbound/mailgun", "key"))
+    ///             .handler(InboundMailHandlerInfo {
+    ///                 name: "support",
+    ///                 pattern: RecipientPattern::Exact("support@company.com".to_string()),
+    ///                 processing: ProcessingMode::Background,
+    ///                 handler: handle_support,
+    ///             })
+    ///     )
+    ///     .routes(routes![...])
+    ///     .run()
+    ///     .await;
+    /// ```
+    #[cfg(feature = "inbound-mail")]
+    #[must_use]
+    pub fn inbound_mail_router(mut self, router: crate::inbound_mail::InboundMailRouter) -> Self {
+        self.inbound_mail_router = Some(Arc::new(router));
+        self
+    }
+
     /// Register mail template previews for the dev mail preview UI.
     ///
     /// Pair this with `#[mailer_preview]` and `mail_previews![...]`.
@@ -2135,6 +2178,8 @@ impl AppBuilder {
             http_interceptor,
             metrics_sources,
             health_indicators,
+            #[cfg(feature = "inbound-mail")]
+            inbound_mail_router,
         } = self;
 
         let all_routes = routes;
@@ -2424,11 +2469,17 @@ impl AppBuilder {
         } else {
             None
         };
-        #[cfg_attr(not(feature = "storage"), allow(unused_mut))]
+        #[cfg_attr(not(any(feature = "storage", feature = "inbound-mail")), allow(unused_mut))]
         let mut merge_routers = merge_routers;
         #[cfg(feature = "storage")]
         if let Some(router) = storage_router {
             merge_routers.push(router);
+        }
+        #[cfg(feature = "inbound-mail")]
+        if let Some(ref im_router) = inbound_mail_router {
+            for (_path, axum_router) in crate::inbound_mail::build_routes(im_router) {
+                merge_routers.push(axum_router);
+            }
         }
         let router = crate::router::try_build_router_with_static_inner(
             all_routes,
@@ -2780,6 +2831,8 @@ impl AppBuilder {
             http_interceptor,
             metrics_sources,
             health_indicators,
+            #[cfg(feature = "inbound-mail")]
+                inbound_mail_router: _,
         } = self;
 
         let _ = &api_versions;

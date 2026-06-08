@@ -19,6 +19,7 @@ mod collect;
 mod feature_flag;
 mod i18n;
 mod idempotency_guard;
+mod inbound_mail;
 mod job;
 mod jobs_macro;
 mod mail_previews_macro;
@@ -233,6 +234,39 @@ pub fn paths(input: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
     main_macro::main_macro(item.into()).into()
+}
+
+/// Annotate an async inbound mail handler function.
+///
+/// Generates a companion `{name}_handler_info()` function that returns an
+/// [`InboundMailHandlerInfo`](autumn_web::inbound_mail::InboundMailHandlerInfo)
+/// ready to be passed to
+/// [`InboundMailRouter::handler`](autumn_web::inbound_mail::InboundMailRouter::handler).
+///
+/// # Attributes
+///
+/// - `to = "address@example.com"` — exact recipient match.
+/// - `to = "replies+{token}@app.example"` — plus-address routing; the captured
+///   token is available via [`InboundEmail::plus_token()`].
+/// - `to = "prefix+*"` — local-part prefix match.
+/// - `processing = "sync"` | `"background"` (default: `"background"`).
+///
+/// # Example
+///
+/// ```rust,ignore
+/// #[inbound_mail(to = "support@company.com")]
+/// async fn handle_support(email: InboundEmail) -> AutumnResult<()> {
+///     tracing::info!(from = %email.from, "support email received");
+///     Ok(())
+/// }
+///
+/// // Registration:
+/// InboundMailRouter::new()
+///     .handler(handle_support_handler_info())
+/// ```
+#[proc_macro_attribute]
+pub fn inbound_mail(attr: TokenStream, item: TokenStream) -> TokenStream {
+    inbound_mail::inbound_mail_macro(attr.into(), item.into()).into()
 }
 
 /// Generate `send_*` and `deliver_later_*` helpers for a mailer impl block.

@@ -270,6 +270,9 @@ pub struct TestApp {
         crate::actuator::IndicatorGroup,
         std::sync::Arc<dyn crate::actuator::HealthIndicator>,
     )>,
+    /// Inbound mail router registered via [`TestApp::inbound_mail_router`].
+    #[cfg(feature = "inbound-mail")]
+    inbound_mail_router: Option<std::sync::Arc<crate::inbound_mail::InboundMailRouter>>,
 }
 
 type TestPolicyRegistration = Box<dyn FnOnce(&crate::authorization::PolicyRegistry) + Send>;
@@ -325,6 +328,8 @@ impl TestApp {
             api_versions: Vec::new(),
             metrics_sources: Vec::new(),
             health_indicators: Vec::new(),
+            #[cfg(feature = "inbound-mail")]
+            inbound_mail_router: None,
         }
     }
 
@@ -355,6 +360,19 @@ impl TestApp {
         self.policy_registrations.push(Box::new(move |registry| {
             registry.register_scope::<R, _>(scope);
         }));
+        self
+    }
+
+    /// Register an inbound mail router for this test app.
+    ///
+    /// Mirrors [`crate::app::AppBuilder::inbound_mail_router`].
+    #[cfg(feature = "inbound-mail")]
+    #[must_use]
+    pub fn inbound_mail_router(
+        mut self,
+        router: crate::inbound_mail::InboundMailRouter,
+    ) -> Self {
+        self.inbound_mail_router = Some(std::sync::Arc::new(router));
         self
     }
 
@@ -1067,6 +1085,15 @@ impl TestApp {
             Some(TestJobRuntime { shutdown })
         };
 
+        #[cfg_attr(not(feature = "inbound-mail"), allow(unused_mut))]
+        let mut merge_routers = self.merge_routers;
+        #[cfg(feature = "inbound-mail")]
+        if let Some(ref im_router) = self.inbound_mail_router {
+            for (_path, axum_router) in crate::inbound_mail::build_routes(im_router) {
+                merge_routers.push(axum_router);
+            }
+        }
+
         let router = crate::router::try_build_router_inner(
             self.routes,
             &self.config,
@@ -1074,7 +1101,7 @@ impl TestApp {
             crate::router::RouterContext {
                 exception_filters: self.exception_filters,
                 scoped_groups: self.scoped_groups,
-                merge_routers: self.merge_routers,
+                merge_routers,
                 nest_routers: self.nest_routers,
                 custom_layers: self.custom_layers,
                 error_page_renderer: None,

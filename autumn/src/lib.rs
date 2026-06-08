@@ -104,6 +104,8 @@ pub mod inspector;
 pub mod interceptor;
 #[cfg(feature = "mail")]
 pub mod mail;
+#[cfg(feature = "inbound-mail")]
+pub mod inbound_mail;
 pub mod maintenance;
 #[cfg(feature = "db")]
 pub mod migrate;
@@ -405,6 +407,11 @@ pub use autumn_macros::api_doc;
 /// }
 /// ```
 pub use autumn_macros::get;
+/// Annotate an async function as a first-class inbound mail handler.
+///
+/// See [`inbound_mail`] for usage documentation.
+#[cfg(feature = "inbound-mail")]
+pub use autumn_macros::inbound_mail;
 /// Collect mailer preview registrations into an `AppBuilder`.
 #[cfg(feature = "mail")]
 pub use autumn_macros::mail_previews;

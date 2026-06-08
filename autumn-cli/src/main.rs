@@ -1080,6 +1080,31 @@ enum GenerateCommands {
         #[arg(long)]
         force: bool,
     },
+    /// Generate an `#[inbound_mail]` handler skeleton for receiving email via
+    /// provider webhooks (Mailgun, SES, or generic RFC 5322).
+    ///
+    /// Creates:
+    ///   - `src/inbound_mailers/<snake>.rs`  — handler with `#[inbound_mail]` macro
+    ///   - `src/inbound_mailers/mod.rs`      — created/updated with `pub mod`
+    ///   - `tests/<snake>_inbound_mail.rs`   — integration smoke test
+    ///   - `src/main.rs`                    — wired into `InboundMailRouter`
+    ///   - `Cargo.toml`                     — `inbound-mail` feature added
+    ///
+    /// Example:
+    ///
+    ///   autumn generate inbound-mail Support
+    ///   autumn generate inbound-mail Support --dry-run
+    #[command(name = "inbound-mail", verbatim_doc_comment)]
+    InboundMail {
+        /// Handler name (`PascalCase` or `snake_case`, e.g. `Support`).
+        name: String,
+        /// Print the file plan and exit without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Overwrite existing files instead of erroring on collision.
+        #[arg(long)]
+        force: bool,
+    },
     /// Generate a system-test skeleton under `tests/system/`.
     ///
     /// The generated test is gated behind `#[cfg(feature = "system-tests")]` and
@@ -1668,6 +1693,11 @@ fn run_generate_command(cmd: GenerateCommands) {
             dry_run,
             force,
         } => generate::mailer::run(&name, generate::Flags { dry_run, force }),
+        GenerateCommands::InboundMail {
+            name,
+            dry_run,
+            force,
+        } => generate::inbound_mail::run(&name, generate::Flags { dry_run, force }),
         GenerateCommands::SystemTest {
             name,
             dry_run,

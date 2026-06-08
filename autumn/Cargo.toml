@@ -70,6 +70,15 @@ variants = ["storage", "dep:image"]
 # layer and the reporting machinery.
 reporting = []
 mail = ["dep:lettre", "maud"]
+# First-class inbound email handling with provider webhooks and routing DSL.
+# Adds `autumn_web::inbound_mail` with the generic RFC 5322 adapter.
+inbound-mail = []
+# Mailgun HTTP-webhook adapter: HMAC-SHA256 signature verification and form
+# field parsing. Implies `inbound-mail`.
+inbound-mailgun = ["inbound-mail"]
+# AWS SES via SNS notification adapter: subscription confirmation + RFC 5322
+# parsing from the SNS notification body. Implies `inbound-mail`.
+inbound-ses = ["inbound-mail"]
 # Enables `autumn_web::seed::SeedContext` for use in `src/bin/seed.rs`.
 # Depends on `db`; off by default so apps that don't seed pay zero compile cost.
 seed = ["db"]
