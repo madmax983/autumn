@@ -31,7 +31,7 @@
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
-use syn::{parse::Parser as _, ItemFn, LitStr};
+use syn::{ItemFn, LitStr, parse::Parser as _};
 
 /// Parsed attributes from `#[inbound_mail(...)]`.
 struct InboundMailAttrs {
@@ -111,7 +111,10 @@ fn detect_pattern(to: &str) -> TokenStream {
 
     // LocalPrefix: ends with `*` or `.*`.
     if to.ends_with('*') {
-        let prefix = to.trim_end_matches('*').trim_end_matches('.').trim_end_matches('+');
+        let prefix = to
+            .trim_end_matches('*')
+            .trim_end_matches('.')
+            .trim_end_matches('+');
         let p = prefix.to_string();
         return quote! {
             ::autumn_web::inbound_mail::RecipientPattern::LocalPrefix(#p.to_string())
@@ -288,7 +291,10 @@ mod tests {
         };
         let expanded = inbound_mail_macro(attr, item);
         let s = expanded.to_string();
-        assert!(s.contains("compile_error"), "expected compile_error, got: {s}");
+        assert!(
+            s.contains("compile_error"),
+            "expected compile_error, got: {s}"
+        );
     }
 
     #[test]

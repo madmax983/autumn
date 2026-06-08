@@ -2469,7 +2469,10 @@ impl AppBuilder {
         } else {
             None
         };
-        #[cfg_attr(not(any(feature = "storage", feature = "inbound-mail")), allow(unused_mut))]
+        #[cfg_attr(
+            not(any(feature = "storage", feature = "inbound-mail")),
+            allow(unused_mut)
+        )]
         let mut merge_routers = merge_routers;
         #[cfg(feature = "storage")]
         if let Some(router) = storage_router {

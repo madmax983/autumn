@@ -368,10 +368,7 @@ impl TestApp {
     /// Mirrors [`crate::app::AppBuilder::inbound_mail_router`].
     #[cfg(feature = "inbound-mail")]
     #[must_use]
-    pub fn inbound_mail_router(
-        mut self,
-        router: crate::inbound_mail::InboundMailRouter,
-    ) -> Self {
+    pub fn inbound_mail_router(mut self, router: crate::inbound_mail::InboundMailRouter) -> Self {
         self.inbound_mail_router = Some(std::sync::Arc::new(router));
         self
     }

@@ -216,7 +216,10 @@ async fn mailgun_invalid_signature_returns_401() {
         ("body-plain", "Hello"),
         ("timestamp", "1234567890"),
         ("token", "some-token"),
-        ("signature", "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"),
+        (
+            "signature",
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+        ),
     ]);
 
     client
@@ -409,7 +412,12 @@ async fn routing_dispatches_to_matching_handler() {
             ("body-plain", "I-need-help"),
         ],
     );
-    client.post("/inbound/mailgun").form(&body).send().await.assert_status(200);
+    client
+        .post("/inbound/mailgun")
+        .form(&body)
+        .send()
+        .await
+        .assert_status(200);
 
     assert_eq!(SUPPORT_HANDLER_CALLS.load(Ordering::SeqCst), 1);
     assert_eq!(REPLY_HANDLER_CALLS.load(Ordering::SeqCst), 0);
@@ -464,7 +472,12 @@ async fn routing_plus_address_captures_token() {
             ("body-plain", "Following-up"),
         ],
     );
-    client.post("/inbound/mailgun").form(&body).send().await.assert_status(200);
+    client
+        .post("/inbound/mailgun")
+        .form(&body)
+        .send()
+        .await
+        .assert_status(200);
 
     assert_eq!(
         PLUS_TOKEN_RECEIVED.lock().unwrap().as_deref(),
@@ -520,7 +533,12 @@ async fn background_mode_returns_200_before_handler_completes() {
     );
 
     let start = std::time::Instant::now();
-    client.post("/inbound/mailgun").form(&body).send().await.assert_status(200);
+    client
+        .post("/inbound/mailgun")
+        .form(&body)
+        .send()
+        .await
+        .assert_status(200);
     let elapsed = start.elapsed();
 
     assert!(
@@ -587,7 +605,12 @@ async fn unmatched_email_goes_to_fallback() {
             ("body-plain", "No-handler"),
         ],
     );
-    client.post("/inbound/mailgun").form(&body).send().await.assert_status(200);
+    client
+        .post("/inbound/mailgun")
+        .form(&body)
+        .send()
+        .await
+        .assert_status(200);
 
     assert_eq!(FALLBACK_CALLS.load(Ordering::SeqCst), 1);
 }
@@ -636,7 +659,12 @@ async fn bounce_event_routes_to_bounce_handler() {
             ("X-Mailgun-Bounced-Address", "user@bad-domain.com"),
         ],
     );
-    client.post("/inbound/mailgun").form(&body).send().await.assert_status(200);
+    client
+        .post("/inbound/mailgun")
+        .form(&body)
+        .send()
+        .await
+        .assert_status(200);
 
     assert_eq!(BOUNCE_CALLS.load(Ordering::SeqCst), 1);
 }

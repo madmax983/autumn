@@ -70,8 +70,8 @@ pub fn compute_mailgun_signature(timestamp: &str, token: &str, signing_key: &str
     use sha2::Sha256;
 
     type HmacSha256 = Hmac<Sha256>;
-    let mut mac = HmacSha256::new_from_slice(signing_key.as_bytes())
-        .expect("HMAC can accept any key size");
+    let mut mac =
+        HmacSha256::new_from_slice(signing_key.as_bytes()).expect("HMAC can accept any key size");
     mac.update(timestamp.as_bytes());
     mac.update(token.as_bytes());
     hex::encode(mac.finalize().into_bytes())
@@ -305,7 +305,9 @@ impl RecipientPattern {
                 if !addr_local.starts_with(&prefix) {
                     return false;
                 }
-                domain.as_ref().is_none_or(|dom| addr_domain == dom.to_ascii_lowercase())
+                domain
+                    .as_ref()
+                    .is_none_or(|dom| addr_domain == dom.to_ascii_lowercase())
             }
             Self::Any => true,
         }
@@ -525,9 +527,7 @@ pub(crate) fn parse_mailgun(
     let text_body = form.get("body-plain").cloned().filter(|s| !s.is_empty());
     let html_body = form.get("body-html").cloned().filter(|s| !s.is_empty());
 
-    let headers = parse_mailgun_headers(
-        form.get("message-headers").map_or("", String::as_str),
-    );
+    let headers = parse_mailgun_headers(form.get("message-headers").map_or("", String::as_str));
 
     // Bounce signalling via form field.
     let mut final_headers = headers;
@@ -609,10 +609,7 @@ fn parse_mailgun_headers(json: &str) -> HashMap<String, String> {
 ///
 /// Handles `SubscriptionConfirmation` (logs the subscribe URL) and
 /// `Notification` (extracts the raw email from the `Message` field).
-pub(crate) fn parse_ses(
-    body: Bytes,
-    headers: &HeaderMap,
-) -> Result<SnsParseResult, StatusCode> {
+pub(crate) fn parse_ses(body: Bytes, headers: &HeaderMap) -> Result<SnsParseResult, StatusCode> {
     let msg_type = headers
         .get("x-amz-sns-message-type")
         .and_then(|v| v.to_str().ok())
@@ -638,10 +635,7 @@ pub(crate) fn parse_ses(
         "Notification" => {
             let json: serde_json::Value =
                 serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
-            let message = json
-                .get("Message")
-                .and_then(|m| m.as_str())
-                .unwrap_or("");
+            let message = json.get("Message").and_then(|m| m.as_str()).unwrap_or("");
             // SES can base64-encode the raw email in the SNS message.
             let raw = base64::engine::general_purpose::STANDARD
                 .decode(message)
@@ -818,9 +812,7 @@ pub(crate) fn build_routes(
                 InboundMailProvider::Mailgun => {
                     build_mailgun_route(path.clone(), signing_key, router_arc)
                 }
-                InboundMailProvider::Ses => {
-                    build_ses_route(path.clone(), router_arc)
-                }
+                InboundMailProvider::Ses => build_ses_route(path.clone(), router_arc),
                 InboundMailProvider::Generic => {
                     build_generic_route(path.clone(), signing_key, router_arc)
                 }

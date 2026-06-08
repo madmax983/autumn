@@ -214,9 +214,8 @@ async fn {snake_name}_handler_processes_valid_mailgun_webhook() {{
 /// Insert `.inbound_mail_router(InboundMailRouter::new().handler({module_path}()))` into
 /// the app builder chain in `src/main.rs`. Idempotent.
 fn add_inbound_mail_router_to_app(src: &str, handler_module_path: &str) -> String {
-    let snippet = format!(
-        ".inbound_mail_router(InboundMailRouter::new().handler({handler_module_path}()))"
-    );
+    let snippet =
+        format!(".inbound_mail_router(InboundMailRouter::new().handler({handler_module_path}()))");
 
     // Idempotency check: if any inbound_mail_router call is already present, leave unchanged.
     if src.contains(".inbound_mail_router(") {
@@ -243,9 +242,7 @@ fn add_inbound_mail_router_to_app(src: &str, handler_module_path: &str) -> Strin
             out
         } else {
             // Cannot find insertion point — append a comment.
-            format!(
-                "{src}\n// TODO: add to app builder: {snippet}"
-            )
+            format!("{src}\n// TODO: add to app builder: {snippet}")
         }
     })
 }
@@ -366,9 +363,7 @@ async fn main() {
         let tmp = project_with_main(default_main());
         let plan = plan_inbound_mail(tmp.path(), "Replies").unwrap();
         assert!(
-            plan.actions
-                .iter()
-                .any(|a| a.path().ends_with("main.rs")),
+            plan.actions.iter().any(|a| a.path().ends_with("main.rs")),
             "plan must update main.rs"
         );
     }
@@ -443,7 +438,8 @@ async fn main() {
         .routes(routes![index])
         .run()
         .await;"#;
-        let updated = add_inbound_mail_router_to_app(src, "inbound_mailers::replies::replies_handler_info");
+        let updated =
+            add_inbound_mail_router_to_app(src, "inbound_mailers::replies::replies_handler_info");
         assert!(
             updated.contains(".inbound_mail_router("),
             "must insert .inbound_mail_router(…), got:\n{updated}"
@@ -457,12 +453,13 @@ async fn main() {
         .inbound_mail_router(InboundMailRouter::new().handler(replies_handler_info()))
         .run()
         .await;"#;
-        let updated = add_inbound_mail_router_to_app(
-            src,
-            "inbound_mailers::replies::replies_handler_info",
-        );
+        let updated =
+            add_inbound_mail_router_to_app(src, "inbound_mailers::replies::replies_handler_info");
         let count = updated.matches(".inbound_mail_router(").count();
-        assert_eq!(count, 1, "idempotent: must not insert twice, got:\n{updated}");
+        assert_eq!(
+            count, 1,
+            "idempotent: must not insert twice, got:\n{updated}"
+        );
     }
 
     #[test]

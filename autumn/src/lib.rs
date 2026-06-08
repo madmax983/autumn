@@ -100,12 +100,12 @@ pub mod idempotency;
 /// `autumn_web::t!(locale, "key")` usage.
 #[cfg(feature = "i18n")]
 pub use crate::i18n::t;
+#[cfg(feature = "inbound-mail")]
+pub mod inbound_mail;
 pub mod inspector;
 pub mod interceptor;
 #[cfg(feature = "mail")]
 pub mod mail;
-#[cfg(feature = "inbound-mail")]
-pub mod inbound_mail;
 pub mod maintenance;
 #[cfg(feature = "db")]
 pub mod migrate;
