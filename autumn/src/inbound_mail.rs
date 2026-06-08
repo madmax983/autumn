@@ -1389,6 +1389,84 @@ fn url_decode_form(body: &[u8]) -> HashMap<String, String> {
     serde_urlencoded::from_str(&s).unwrap_or_default()
 }
 
+/// Parse a `multipart/form-data` Mailgun webhook body into a field map.
+///
+/// Text fields (those without a `filename` parameter in `Content-Disposition`)
+/// are captured as UTF-8 strings.  Binary file parts are skipped for field
+/// extraction — attachment metadata arrives via the `attachment-count` /
+/// `attachment-{n}` fields that Mailgun still includes as plain text parts.
+fn parse_mailgun_form_data(body: &[u8], content_type: &str) -> HashMap<String, String> {
+    let Some(boundary) = extract_boundary(content_type) else {
+        return HashMap::new();
+    };
+    let delimiter = format!("--{boundary}");
+    let body_str = String::from_utf8_lossy(body);
+    let mut map = HashMap::new();
+
+    for part in body_str.split(delimiter.as_str()).skip(1) {
+        // Final boundary marker is `--{boundary}--`; its content is just "--\r\n".
+        if part.trim_start_matches('-').trim().is_empty() {
+            continue;
+        }
+        let (part_headers_str, part_body) = if let Some(pos) = part.find("\r\n\r\n") {
+            (&part[..pos], &part[pos + 4..])
+        } else if let Some(pos) = part.find("\n\n") {
+            (&part[..pos], &part[pos + 2..])
+        } else {
+            continue;
+        };
+
+        // Extract `name="..."` from Content-Disposition header.
+        let disposition = part_headers_str
+            .lines()
+            .find(|l| l.to_ascii_lowercase().starts_with("content-disposition:"))
+            .map(|l| {
+                l[l.find(':').map_or(0, |p| p + 1)..]
+                    .trim()
+                    .to_ascii_lowercase()
+            })
+            .unwrap_or_default();
+
+        let name = disposition.split(';').find_map(|seg| {
+            let seg = seg.trim();
+            seg.strip_prefix("name=")
+                .map(|v| v.trim_matches('"').to_string())
+        });
+
+        let Some(name) = name else { continue };
+
+        // Skip binary file parts (they have a `filename=` parameter).
+        let has_filename = disposition
+            .split(';')
+            .any(|s| s.trim().starts_with("filename="));
+        if has_filename {
+            continue;
+        }
+
+        // Strip the trailing boundary delimiter that may appear inside the body slice.
+        let value = part_body
+            .find(&format!("\r\n--{boundary}"))
+            .or_else(|| part_body.find(&format!("\n--{boundary}")))
+            .map_or(part_body, |end| &part_body[..end]);
+
+        map.insert(name, value.trim_end_matches(['\r', '\n']).to_string());
+    }
+    map
+}
+
+/// Decode a Mailgun webhook body, supporting both `application/x-www-form-urlencoded`
+/// and `multipart/form-data` content types.
+fn decode_mailgun_body(body: &[u8], content_type: &str) -> HashMap<String, String> {
+    if content_type
+        .to_ascii_lowercase()
+        .starts_with("multipart/form-data")
+    {
+        parse_mailgun_form_data(body, content_type)
+    } else {
+        url_decode_form(body)
+    }
+}
+
 /// Build all Axum routes for the router's configured endpoints.
 ///
 /// Called by `AppBuilder::run()` and `TestApp::build()`.
@@ -1429,11 +1507,15 @@ fn build_mailgun_route(
     use axum::extract::DefaultBodyLimit;
     use axum::routing::post;
 
-    let handler = move |_headers: HeaderMap, body: Bytes| {
+    let handler = move |headers: HeaderMap, body: Bytes| {
         let router = Arc::clone(&router);
         let key = signing_key.clone();
         async move {
-            let form = url_decode_form(&body);
+            let content_type = headers
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            let form = decode_mailgun_body(&body, content_type);
             let effective_key = key.as_deref().unwrap_or("");
             match parse_mailgun(&form, effective_key) {
                 Ok(email) => match router.dispatch(email).await {

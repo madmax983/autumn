@@ -756,6 +756,7 @@ fn endpoint_config_signing_key_from_env() {
         signing_key: None,
         signing_key_env: Some("MY_MAILGUN_KEY".to_string()),
         processing: ProcessingMode::Background,
+        topic_arn: None,
     };
     assert_eq!(c.signing_key_env.as_deref(), Some("MY_MAILGUN_KEY"));
 }
@@ -809,6 +810,7 @@ async fn generic_valid_hmac_signature_accepts_request() {
             signing_key: Some(key.to_string()),
             signing_key_env: None,
             processing: ProcessingMode::Background,
+            topic_arn: None,
         })
         .handler(InboundMailHandlerInfo {
             name: "signed",
@@ -846,6 +848,7 @@ async fn generic_invalid_hmac_signature_returns_401() {
             signing_key: Some(key.to_string()),
             signing_key_env: None,
             processing: ProcessingMode::Background,
+            topic_arn: None,
         })
         .handler(InboundMailHandlerInfo {
             name: "signed2",
@@ -879,6 +882,7 @@ async fn generic_missing_env_var_returns_500() {
             signing_key: None,
             signing_key_env: Some("AUTUMN_TEST_MISSING_KEY_XYZ".to_string()),
             processing: ProcessingMode::Background,
+            topic_arn: None,
         })
         .handler(InboundMailHandlerInfo {
             name: "failclosed",
@@ -1096,6 +1100,7 @@ async fn mailgun_empty_signing_key_returns_500() {
             signing_key: None,
             signing_key_env: None,
             processing: ProcessingMode::Background,
+            topic_arn: None,
         })
         .handler(InboundMailHandlerInfo {
             name: "nokey",
