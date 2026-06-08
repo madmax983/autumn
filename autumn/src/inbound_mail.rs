@@ -64,6 +64,11 @@ use serde::Deserialize;
 ///
 /// Mailgun signs webhooks as `HMAC-SHA256(timestamp || token, signing_key)`.
 /// Returns a lowercase hex string (64 characters).
+///
+/// # Panics
+///
+/// Panics if `signing_key` cannot be used to initialize the HMAC (which the
+/// underlying library guarantees never happens for any key size).
 #[must_use]
 pub fn compute_mailgun_signature(timestamp: &str, token: &str, signing_key: &str) -> String {
     use hmac::{Hmac, Mac};
@@ -324,10 +329,10 @@ impl RecipientPattern {
         };
         let lower = address.to_ascii_lowercase();
         let (addr_local_lower, addr_domain) = split_address(&lower)?;
-        if let Some(dom) = domain {
-            if addr_domain != dom.to_ascii_lowercase() {
-                return None;
-            }
+        if let Some(dom) = domain
+            && addr_domain != dom.to_ascii_lowercase()
+        {
+            return None;
         }
         let prefix = format!("{}+", local.to_ascii_lowercase());
         if !addr_local_lower.starts_with(&prefix) {
@@ -441,15 +446,25 @@ impl InboundMailRouter {
     ///
     /// Evaluation order:
     /// 1. Bounce handler (when `x-mailgun-bounced-address` header present).
-    /// 2. Registered handlers, in order.
-    /// 3. Fallback handler, if registered.
-    /// 4. Log + drop with a `WARN` trace.
+    /// 2. Complaint handler (when `x-mailgun-spam-flag: YES` header present).
+    /// 3. Registered handlers, in order.
+    /// 4. Fallback handler, if registered.
+    /// 5. Log + drop with a `WARN` trace.
     pub(crate) async fn dispatch(&self, mut email: InboundEmail) -> crate::AutumnResult<()> {
         // Bounce detection via Mailgun header.
-        if email.headers.contains_key("x-mailgun-bounced-address") {
-            if let Some(handler) = self.bounce_handler {
-                return handler(email).await;
-            }
+        if email.headers.contains_key("x-mailgun-bounced-address")
+            && let Some(handler) = self.bounce_handler
+        {
+            return handler(email).await;
+        }
+
+        // Complaint detection: Mailgun sets X-Mailgun-Sflag=YES for spam-flagged mail.
+        let spam_flagged = email
+            .headers
+            .get("x-mailgun-sflag")
+            .is_some_and(|v| v.eq_ignore_ascii_case("YES"));
+        if spam_flagged && let Some(handler) = self.complaint_handler {
+            return handler(email).await;
         }
 
         for info in &self.handlers {
@@ -500,10 +515,10 @@ fn subtle_eq(a: &[u8], b: &[u8]) -> bool {
 /// `"<support@company.com>"` → `"support@company.com"`
 /// `"support@company.com"` → `"support@company.com"` (unchanged)
 fn extract_addr_spec(addr: &str) -> String {
-    if let Some(start) = addr.find('<') {
-        if let Some(rel_end) = addr[start + 1..].find('>') {
-            return addr[start + 1..start + 1 + rel_end].trim().to_string();
-        }
+    if let Some(start) = addr.find('<')
+        && let Some(rel_end) = addr[start + 1..].find('>')
+    {
+        return addr[start + 1..start + 1 + rel_end].trim().to_string();
     }
     addr.trim().to_string()
 }
@@ -515,7 +530,7 @@ fn parse_address_list(s: &str) -> Vec<String> {
     s.split(',')
         .map(str::trim)
         .filter(|a| !a.is_empty())
-        .map(|a| extract_addr_spec(a))
+        .map(extract_addr_spec)
         .collect()
 }
 
@@ -543,7 +558,8 @@ pub(crate) fn parse_mailgun(
     })?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs()) as i64;
+        .map_or(0, |d| d.as_secs())
+        .cast_signed();
     if (now - ts).abs() > 300 {
         tracing::warn!("inbound_mail.mailgun: timestamp outside 5-minute window");
         return Err(StatusCode::UNAUTHORIZED);
@@ -556,7 +572,13 @@ pub(crate) fn parse_mailgun(
     }
 
     let from = form.get("from").cloned().unwrap_or_default();
-    let to = parse_address_list(form.get("to").map_or("", String::as_str));
+    // Collect all recipients: RFC `To` header + Mailgun's envelope `recipient` field.
+    let mut to = parse_address_list(form.get("to").map_or("", String::as_str));
+    for addr in parse_address_list(form.get("recipient").map_or("", String::as_str)) {
+        if !to.contains(&addr) {
+            to.push(addr);
+        }
+    }
     let cc = parse_address_list(
         form.get("Cc")
             .or_else(|| form.get("cc"))
@@ -633,12 +655,11 @@ fn parse_mailgun_headers(json: &str) -> HashMap<String, String> {
     }
     if let Ok(serde_json::Value::Array(arr)) = serde_json::from_str(json) {
         for item in arr {
-            if let serde_json::Value::Array(pair) = item {
-                if pair.len() == 2 {
-                    if let (Some(name), Some(value)) = (pair[0].as_str(), pair[1].as_str()) {
-                        map.insert(name.to_ascii_lowercase(), value.to_string());
-                    }
-                }
+            if let serde_json::Value::Array(pair) = item
+                && pair.len() == 2
+                && let (Some(name), Some(value)) = (pair[0].as_str(), pair[1].as_str())
+            {
+                map.insert(name.to_ascii_lowercase(), value.to_string());
             }
         }
     }
@@ -649,7 +670,7 @@ fn parse_mailgun_headers(json: &str) -> HashMap<String, String> {
 ///
 /// Handles `SubscriptionConfirmation` (logs the subscribe URL) and
 /// `Notification` (extracts the raw email from the `Message` field).
-pub(crate) fn parse_ses(body: Bytes, headers: &HeaderMap) -> Result<SnsParseResult, StatusCode> {
+pub(crate) fn parse_ses(body: &Bytes, headers: &HeaderMap) -> Result<SnsParseResult, StatusCode> {
     let msg_type = headers
         .get("x-amz-sns-message-type")
         .and_then(|v| v.to_str().ok())
@@ -658,7 +679,7 @@ pub(crate) fn parse_ses(body: Bytes, headers: &HeaderMap) -> Result<SnsParseResu
     match msg_type {
         "SubscriptionConfirmation" => {
             let json: serde_json::Value =
-                serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
+                serde_json::from_slice(body).map_err(|_| StatusCode::BAD_REQUEST)?;
             let url = json
                 .get("SubscribeURL")
                 .and_then(|u| u.as_str())
@@ -674,26 +695,33 @@ pub(crate) fn parse_ses(body: Bytes, headers: &HeaderMap) -> Result<SnsParseResu
         }
         "Notification" => {
             let json: serde_json::Value =
-                serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
+                serde_json::from_slice(body).map_err(|_| StatusCode::BAD_REQUEST)?;
             let message = json.get("Message").and_then(|m| m.as_str()).unwrap_or("");
             // The SNS Message may be (a) a plain base64-encoded RFC 5322 email,
             // (b) a raw RFC 5322 string, or (c) a JSON object with a "content"
             // field containing the base64-encoded email (SES default action format).
-            let raw = if let Ok(msg_json) = serde_json::from_str::<serde_json::Value>(message) {
-                if let Some(content) = msg_json.get("content").and_then(|c| c.as_str()) {
+            let raw = serde_json::from_str::<serde_json::Value>(message).map_or_else(
+                |_| {
                     base64::engine::general_purpose::STANDARD
-                        .decode(content)
-                        .unwrap_or_else(|_| content.as_bytes().to_vec())
-                } else {
-                    message.as_bytes().to_vec()
-                }
-            } else {
-                base64::engine::general_purpose::STANDARD
-                    .decode(message)
-                    .unwrap_or_else(|_| message.as_bytes().to_vec())
-            };
-            let email = parse_rfc5322(Bytes::from(raw))?;
-            Ok(SnsParseResult::Email(email))
+                        .decode(message)
+                        .unwrap_or_else(|_| message.as_bytes().to_vec())
+                },
+                |msg_json| {
+                    msg_json
+                        .get("content")
+                        .and_then(|c| c.as_str())
+                        .map_or_else(
+                            || message.as_bytes().to_vec(),
+                            |content| {
+                                base64::engine::general_purpose::STANDARD
+                                    .decode(content)
+                                    .unwrap_or_else(|_| content.as_bytes().to_vec())
+                            },
+                        )
+                },
+            );
+            let email = parse_rfc5322(Bytes::from(raw));
+            Ok(SnsParseResult::Email(Box::new(email)))
         }
         _ => {
             tracing::warn!(msg_type, "inbound_mail.ses: unknown SNS message type");
@@ -708,7 +736,7 @@ pub(crate) enum SnsParseResult {
         #[allow(dead_code)]
         url: String,
     },
-    Email(InboundEmail),
+    Email(Box<InboundEmail>),
 }
 
 /// Parse and optionally authenticate a generic RFC 5322 raw-body POST.
@@ -731,23 +759,25 @@ pub(crate) fn parse_generic(
             return Err(StatusCode::UNAUTHORIZED);
         }
     }
-    parse_rfc5322(raw_body)
+    Ok(parse_rfc5322(raw_body))
 }
 
 /// Minimal RFC 5322 parser.
 ///
 /// Handles folded headers, plain-text and HTML bodies (single-part only).
 /// Multi-part MIME bodies are accepted but only the first part is extracted.
-fn parse_rfc5322(raw: Bytes) -> Result<InboundEmail, StatusCode> {
+fn parse_rfc5322(raw: Bytes) -> InboundEmail {
     let text = String::from_utf8_lossy(&raw);
 
-    let (header_block, body_block) = if let Some(pos) = text.find("\r\n\r\n") {
-        (&text[..pos], &text[pos + 4..])
-    } else if let Some(pos) = text.find("\n\n") {
-        (&text[..pos], &text[pos + 2..])
-    } else {
-        (text.as_ref(), "")
-    };
+    let (header_block, body_block) = text.find("\r\n\r\n").map_or_else(
+        || {
+            text.find("\n\n").map_or_else(
+                || (text.as_ref(), ""),
+                |pos| (&text[..pos], &text[pos + 2..]),
+            )
+        },
+        |pos| (&text[..pos], &text[pos + 4..]),
+    );
 
     let mut from = String::new();
     let mut to = Vec::new();
@@ -797,13 +827,15 @@ fn parse_rfc5322(raw: Bytes) -> Result<InboundEmail, StatusCode> {
     let body_str = body_block.trim().to_string();
     let (text_body, html_body) = if body_str.is_empty() {
         (None, None)
+    } else if content_type.starts_with("multipart/") {
+        extract_multipart_bodies(&body_str, &content_type)
     } else if content_type.contains("text/html") {
         (None, Some(body_str))
     } else {
         (Some(body_str), None)
     };
 
-    Ok(InboundEmail {
+    InboundEmail {
         from,
         to,
         cc,
@@ -815,7 +847,56 @@ fn parse_rfc5322(raw: Bytes) -> Result<InboundEmail, StatusCode> {
         spam_report: None,
         raw,
         plus_token: None,
+    }
+}
+
+/// Extract the MIME boundary parameter from a `Content-Type` header value.
+fn extract_boundary(content_type: &str) -> Option<String> {
+    content_type.split(';').skip(1).find_map(|part| {
+        let part = part.trim();
+        part.strip_prefix("boundary=")
+            .map(|b| b.trim_matches('"').to_string())
     })
+}
+
+/// Split a MIME multipart body and return `(text/plain, text/html)` parts.
+fn extract_multipart_bodies(body: &str, content_type: &str) -> (Option<String>, Option<String>) {
+    let Some(boundary) = extract_boundary(content_type) else {
+        return (Some(body.to_string()), None);
+    };
+    let delimiter = format!("--{boundary}");
+    let mut text_body: Option<String> = None;
+    let mut html_body: Option<String> = None;
+
+    for part in body.split(&delimiter).skip(1) {
+        if part.trim_start_matches('-').trim().is_empty() {
+            continue;
+        }
+        let (part_headers, part_body) = if let Some(pos) = part.find("\r\n\r\n") {
+            (&part[..pos], &part[pos + 4..])
+        } else if let Some(pos) = part.find("\n\n") {
+            (&part[..pos], &part[pos + 2..])
+        } else {
+            continue;
+        };
+        let part_ct = part_headers
+            .lines()
+            .find(|l| l.to_ascii_lowercase().starts_with("content-type:"))
+            .map(|l| l[13..].trim().to_ascii_lowercase())
+            .unwrap_or_default();
+        // Strip trailing boundary marker (e.g. "\r\n--boundary--").
+        let text = part_body
+            .find(&format!("\r\n--{boundary}"))
+            .or_else(|| part_body.find(&format!("\n--{boundary}")))
+            .map_or(part_body, |end| &part_body[..end])
+            .trim();
+        if part_ct.starts_with("text/plain") && text_body.is_none() {
+            text_body = Some(text.to_string());
+        } else if part_ct.starts_with("text/html") && html_body.is_none() {
+            html_body = Some(text.to_string());
+        }
+    }
+    (text_body, html_body)
 }
 
 fn apply_header(
@@ -860,13 +941,14 @@ pub(crate) fn build_routes(
             let signing_key = endpoint.resolve_signing_key();
             let router_arc = Arc::clone(router);
 
+            // Whether a signing key was *configured* (even if the env var is absent).
+            let key_configured =
+                endpoint.signing_key.is_some() || endpoint.signing_key_env.is_some();
             let axum_router = match provider {
-                InboundMailProvider::Mailgun => {
-                    build_mailgun_route(path.clone(), signing_key, router_arc)
-                }
-                InboundMailProvider::Ses => build_ses_route(path.clone(), router_arc),
+                InboundMailProvider::Mailgun => build_mailgun_route(&path, signing_key, router_arc),
+                InboundMailProvider::Ses => build_ses_route(&path, router_arc),
                 InboundMailProvider::Generic => {
-                    build_generic_route(path.clone(), signing_key, router_arc)
+                    build_generic_route(&path, signing_key, key_configured, router_arc)
                 }
             };
             (path, axum_router)
@@ -875,10 +957,11 @@ pub(crate) fn build_routes(
 }
 
 fn build_mailgun_route(
-    path: String,
+    path: &str,
     signing_key: Option<String>,
     router: Arc<InboundMailRouter>,
 ) -> axum::Router<crate::state::AppState> {
+    use axum::extract::DefaultBodyLimit;
     use axum::routing::post;
 
     let handler = move |_headers: HeaderMap, body: Bytes| {
@@ -900,21 +983,24 @@ fn build_mailgun_route(
         }
     };
 
-    axum::Router::new().route(&path, post(handler))
+    axum::Router::new()
+        .route(path, post(handler))
+        .layer(DefaultBodyLimit::max(50 * 1024 * 1024))
 }
 
 fn build_ses_route(
-    path: String,
+    path: &str,
     router: Arc<InboundMailRouter>,
 ) -> axum::Router<crate::state::AppState> {
+    use axum::extract::DefaultBodyLimit;
     use axum::routing::post;
 
     let handler = move |headers: HeaderMap, body: Bytes| {
         let router = Arc::clone(&router);
         async move {
-            match parse_ses(body, &headers) {
+            match parse_ses(&body, &headers) {
                 Ok(SnsParseResult::SubscriptionConfirmation { .. }) => StatusCode::OK,
-                Ok(SnsParseResult::Email(email)) => match router.dispatch(email).await {
+                Ok(SnsParseResult::Email(email)) => match router.dispatch(*email).await {
                     Ok(()) => StatusCode::OK,
                     Err(e) => {
                         tracing::error!(error = %e, "inbound_mail.ses: sync dispatch error");
@@ -926,20 +1012,32 @@ fn build_ses_route(
         }
     };
 
-    axum::Router::new().route(&path, post(handler))
+    axum::Router::new()
+        .route(path, post(handler))
+        .layer(DefaultBodyLimit::max(50 * 1024 * 1024))
 }
 
 fn build_generic_route(
-    path: String,
+    path: &str,
     signing_key: Option<String>,
+    key_configured: bool,
     router: Arc<InboundMailRouter>,
 ) -> axum::Router<crate::state::AppState> {
+    use axum::extract::DefaultBodyLimit;
     use axum::routing::post;
 
     let handler = move |headers: HeaderMap, body: Bytes| {
         let router = Arc::clone(&router);
         let key = signing_key.clone();
         async move {
+            // Fail closed: if a signing key was configured but could not be resolved
+            // (e.g. missing env var), reject instead of silently skipping verification.
+            if key_configured && key.is_none() {
+                tracing::error!(
+                    "inbound_mail.generic: signing key env var not resolved; rejecting request"
+                );
+                return StatusCode::INTERNAL_SERVER_ERROR;
+            }
             match parse_generic(body, key.as_deref(), &headers) {
                 Ok(email) => match router.dispatch(email).await {
                     Ok(()) => StatusCode::OK,
@@ -953,7 +1051,9 @@ fn build_generic_route(
         }
     };
 
-    axum::Router::new().route(&path, post(handler))
+    axum::Router::new()
+        .route(path, post(handler))
+        .layer(DefaultBodyLimit::max(50 * 1024 * 1024))
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
@@ -1043,7 +1143,7 @@ mod tests {
                    Subject: Hello\r\n\
                    \r\n\
                    Body text here.";
-        let email = parse_rfc5322(Bytes::from_static(raw.as_bytes())).unwrap();
+        let email = parse_rfc5322(Bytes::from_static(raw.as_bytes()));
         assert_eq!(email.from, "alice@example.com");
         assert_eq!(email.to, vec!["bob@example.com"]);
         assert_eq!(email.subject, "Hello");
@@ -1056,7 +1156,7 @@ mod tests {
                    To: bob@example.com, carol@example.com\r\n\
                    Subject: Multi\r\n\
                    \r\n";
-        let email = parse_rfc5322(Bytes::from_static(raw.as_bytes())).unwrap();
+        let email = parse_rfc5322(Bytes::from_static(raw.as_bytes()));
         assert_eq!(email.to.len(), 2);
         assert!(email.to.contains(&"bob@example.com".to_string()));
         assert!(email.to.contains(&"carol@example.com".to_string()));

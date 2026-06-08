@@ -153,10 +153,30 @@ pub fn inbound_mail_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let handler_name = fn_name.to_string();
 
     // Build the pattern token stream.
-    let pattern_ts = attrs.to.as_ref().map_or_else(
-        || quote! { ::autumn_web::inbound_mail::RecipientPattern::Any },
-        |to| detect_pattern(to),
-    );
+    // When `pattern = "..."` is set explicitly it overrides auto-detection from `to`.
+    let pattern_ts = match attrs.pattern_kind.as_deref() {
+        Some("exact") => {
+            let addr = attrs.to.as_deref().unwrap_or("").to_string();
+            quote! { ::autumn_web::inbound_mail::RecipientPattern::Exact(#addr.to_string()) }
+        }
+        Some("prefix") => {
+            let prefix = attrs
+                .to
+                .as_deref()
+                .unwrap_or("")
+                .trim_end_matches(['*', '.', '+'])
+                .to_string();
+            quote! { ::autumn_web::inbound_mail::RecipientPattern::LocalPrefix(#prefix.to_string()) }
+        }
+        Some("any") => {
+            quote! { ::autumn_web::inbound_mail::RecipientPattern::Any }
+        }
+        // No explicit pattern — auto-detect from `to`.
+        _ => attrs.to.as_ref().map_or_else(
+            || quote! { ::autumn_web::inbound_mail::RecipientPattern::Any },
+            |to| detect_pattern(to),
+        ),
+    };
 
     // Build processing mode.
     let processing_ts = if attrs.processing.as_deref() == Some("sync") {
