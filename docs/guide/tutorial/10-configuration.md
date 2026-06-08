@@ -91,7 +91,10 @@ Recommended use:
 
 Actuator endpoints live under `/actuator` by default and expose health, info,
 metrics, config properties, loggers, and task visibility based on the
-`actuator.sensitive` setting.
+`actuator.sensitive` setting. The Prometheus scrape endpoint
+(`/actuator/prometheus`) is governed separately by `actuator.prometheus`
+(default `true`), so platform scraping works with `sensitive = false` — see the
+[deployment guide](../deployment.md#prometheus-metrics-for-platform-scraping).
 
 ## Telemetry
 

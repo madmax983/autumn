@@ -23,6 +23,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Only JSON-in/JSON-out endpoints are eligible; HTML/Maud routes (no response schema) are auto-excluded with a build-time log note.
   - `examples/todo-app` gains an `/mcp` endpoint exposing `list_json` (read) and `create_json` (explicitly-opted-in write) behind `RequireApiToken`.
 
+- **actuator:** Decouple the Prometheus scrape endpoint from sensitive mode (#857)
+  - New `actuator.prometheus` config flag (default `true`) controls
+    `/actuator/prometheus` **independently of** `actuator.sensitive`. Production
+    apps can expose Prometheus metrics for platform scraping (e.g. Fly.io
+    `[metrics]`) while keeping `sensitive = false`, so `/actuator/env`,
+    `/actuator/configprops`, `/actuator/loggers`, `/actuator/tasks`,
+    `/actuator/jobs`, and the actuator task UI stay off the public surface.
+  - Set `actuator.prometheus = false` (or `AUTUMN_ACTUATOR__PROMETHEUS=false`)
+    to remove the scrape endpoint entirely (it then returns `404`). The flag is
+    surfaced in `/actuator/configprops`.
+  - The `[actuator]` section now honors environment overrides
+    (`AUTUMN_ACTUATOR__PREFIX`, `AUTUMN_ACTUATOR__SENSITIVE`,
+    `AUTUMN_ACTUATOR__PROMETHEUS`), matching the documented
+    `AUTUMN_SECTION__FIELD` convention. Previously the actuator section was only
+    configurable via TOML.
+  - Docs: `docs/guide/deployment.md` now describes the safe Fly.io deployment
+    shape, including scraping a private/non-public metrics port, and clarifies
+    that OTLP tracing and the Prometheus scrape endpoint are separate telemetry
+    paths — enabling OTLP does not add OpenTelemetry metrics to
+    `/actuator/prometheus` without an explicit bridge/exporter.
 - **testing:** CSS-selector HTML assertions on `TestResponse` (#1147)
   - Autumn renders server-side HTML (Maud + htmx), so the in-process test client can now assert on page *structure* by CSS selector instead of brittle substrings. New chainable methods on `TestResponse`: `assert_selector(css)`, `assert_no_selector(css)`, `assert_selector_count(css, n)`, `assert_text(css, expected)`, `assert_text_contains(css, sub)`, and `assert_attr(css, attr, expected)`.
   - Non-asserting accessors for custom assertions: `selector_count(css) -> usize`, `selector_text(css) -> Vec<String>`, and `selector_attr(css, attr) -> Vec<Option<String>>` — each returns matches in document order.

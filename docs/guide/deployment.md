@@ -231,7 +231,7 @@ The generated `fly.toml` includes four first-class integrations:
 |---|---|
 | `/live` + `/ready` checks | Fly uses `/live` to decide machine restarts; `/ready` to gate traffic routing. Autumn flips `/ready` to 503 at drain start so Fly deregisters before the listener closes. |
 | `kill_timeout = 45` | Fly waits 45 s after SIGTERM before SIGKILL — `prestop_grace_secs (5) + shutdown_timeout_secs (30) + 10 s buffer` for the process to log and exit cleanly. Value is an integer (seconds); Fly does not accept a string like `"45s"`. |
-| `[metrics]` → `/actuator/prometheus` | Fly scrapes Autumn's Prometheus text endpoint and surfaces it in the dashboard. No extra agent needed. |
+| `[metrics]` → `/actuator/prometheus` | Fly scrapes Autumn's Prometheus text endpoint and surfaces it in the dashboard. No extra agent needed. Controlled by `actuator.prometheus` (default on) and independent of `actuator.sensitive` — see [Prometheus metrics for platform scraping](#prometheus-metrics-for-platform-scraping). |
 | `[deploy]` `release_command` (opt-in) | When uncommented, migrations run in a one-shot machine before new app machines start; a failed migration aborts the deploy before any traffic-serving machine is replaced. |
 
 Deploy:
@@ -259,6 +259,76 @@ which would fail the first deploy of a database-free app.
 
 If you add a read replica, set `AUTUMN_DATABASE__REPLICA_URL` as a secret and
 Autumn gates `/ready` until the replica has replayed the latest migration.
+
+---
+
+## Prometheus metrics for platform scraping
+
+Autumn exposes a Prometheus text endpoint at `/actuator/prometheus`. It is
+controlled by `actuator.prometheus` (default **`true`**) and is **independent of
+`actuator.sensitive`**. That separation is the whole point: a production app can
+let Fly.io (or any scraper) collect metrics while keeping `actuator.sensitive =
+false`, so `/actuator/env`, `/actuator/configprops`, `/actuator/loggers`,
+`/actuator/tasks`, `/actuator/jobs`, and the actuator task UI stay off the
+public surface.
+
+```toml
+# autumn.toml — metrics on, sensitive surfaces off (the safe production shape)
+[actuator]
+sensitive  = false   # env/configprops/loggers/tasks/jobs NOT mounted
+prometheus = true    # /actuator/prometheus still scrapeable
+```
+
+To remove the scrape endpoint entirely (it then returns `404`), set
+`prometheus = false` — either in `autumn.toml` or via the environment override
+`AUTUMN_ACTUATOR__PROMETHEUS=false` (the whole `[actuator]` section follows the
+standard `AUTUMN_SECTION__FIELD` convention). Regression tests assert both
+directions — the endpoint is present under the non-sensitive config and absent
+when export is disabled.
+
+The generated `fly.toml` wires Fly's `[metrics]` block to this endpoint:
+
+```toml
+[metrics]
+  port = 3000
+  path = "/actuator/prometheus"
+```
+
+### Keeping metrics off the public HTTP service
+
+`/actuator/prometheus` carries operational counters, not secrets, but you may
+still want it unreachable from public traffic. The Fly-native way is to scrape a
+**separate, non-public port** rather than the port behind `[http_service]`.
+Bind a second internal listener and point `[metrics]` at it:
+
+```toml
+[metrics]
+  port = 9091                       # internal-only; no [http_service] on it
+  path = "/actuator/prometheus"
+```
+
+Fly scrapes `[metrics]` over the private 6PN network, so a port that has no
+`[http_service]` / `force_https` mapping is reachable by the Fly metrics
+collector but not by the public internet. Front the public app on its own port
+and reserve the metrics port for scraping. (If you only run a single listener,
+gate access at the edge or accept that the counters are publicly readable —
+they contain no credentials.)
+
+### OTLP tracing and Prometheus are separate telemetry paths
+
+Enabling OTLP tracing (`telemetry.enabled = true` + `telemetry.otlp_endpoint`)
+initializes **span export to an OTLP collector**. It does **not** feed
+OpenTelemetry metrics into `/actuator/prometheus`. The Prometheus endpoint is
+backed by Autumn's in-process request `MetricsCollector` snapshot plus any
+registered [`MetricsSource`](metrics-sources.md) families — it is a distinct
+pipeline from the OTLP trace exporter. Treat them as two independent channels:
+
+- **Tracing** → OTLP collector (Jaeger, Tempo, Honeycomb, …) via the OTLP path.
+- **Metrics** → `/actuator/prometheus` scraped by Fly `[metrics]` or Prometheus.
+
+Turning on one does not populate the other. Bridging OTLP metrics into the
+Prometheus scrape would require an explicit metrics exporter/bridge, which
+Autumn does not add implicitly.
 
 ---
 

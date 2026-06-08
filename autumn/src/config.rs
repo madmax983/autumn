@@ -1829,6 +1829,7 @@ impl AutumnConfig {
         self.apply_idempotency_env_overrides_with_env(env);
         self.apply_dev_env_overrides_with_env(env);
         self.apply_compression_env_overrides_with_env(env);
+        self.apply_actuator_env_overrides_with_env(env);
         #[cfg(feature = "reporting")]
         self.apply_reporting_env_overrides_with_env(env);
         #[cfg(feature = "storage")]
@@ -1874,6 +1875,23 @@ impl AutumnConfig {
             env,
             "AUTUMN_COMPRESSION__ENABLED",
             &mut self.compression.enabled,
+        );
+    }
+
+    fn apply_actuator_env_overrides_with_env(&mut self, env: &dyn Env) {
+        parse_env_string(env, "AUTUMN_ACTUATOR__PREFIX", &mut self.actuator.prefix);
+        parse_env_bool(
+            env,
+            "AUTUMN_ACTUATOR__SENSITIVE",
+            &mut self.actuator.sensitive,
+        );
+        // Security-sensitive: operators disable the Prometheus scrape endpoint
+        // with AUTUMN_ACTUATOR__PROMETHEUS=false; the override must be honored
+        // so the endpoint is not left exposed against the operator's intent.
+        parse_env_bool(
+            env,
+            "AUTUMN_ACTUATOR__PROMETHEUS",
+            &mut self.actuator.prometheus,
         );
     }
 
@@ -3152,6 +3170,16 @@ pub struct ActuatorConfig {
     /// Defaults vary by profile: `true` for dev, `false` for prod.
     #[serde(default)]
     pub sensitive: bool,
+
+    /// When `true`, mount the `/actuator/prometheus` scrape endpoint.
+    ///
+    /// This is **independent of [`Self::sensitive`]**: a production app can
+    /// expose Prometheus metrics for platform scraping (e.g. Fly.io `[metrics]`)
+    /// while keeping `sensitive = false` so env/configprops/loggers/tasks/jobs
+    /// stay off the public surface. Set to `false` to remove the scrape
+    /// endpoint entirely (it then returns `404`). Default: `true`.
+    #[serde(default = "default_actuator_prometheus")]
+    pub prometheus: bool,
 }
 
 impl Default for ActuatorConfig {
@@ -3159,12 +3187,17 @@ impl Default for ActuatorConfig {
         Self {
             prefix: default_actuator_prefix(),
             sensitive: false,
+            prometheus: default_actuator_prometheus(),
         }
     }
 }
 
 fn default_actuator_prefix() -> String {
     "/actuator".to_owned()
+}
+
+const fn default_actuator_prometheus() -> bool {
+    true
 }
 
 /// CORS (Cross-Origin Resource Sharing) configuration.
@@ -4261,6 +4294,37 @@ path = "/healthz"
             config.database.url.as_deref(),
             Some("postgres://override:5432/test")
         );
+    }
+
+    #[test]
+    fn env_override_actuator_prometheus_disables() {
+        // Operators must be able to remove the scrape endpoint via the
+        // documented AUTUMN_SECTION__FIELD convention, not just TOML.
+        let env = MockEnv::new().with("AUTUMN_ACTUATOR__PROMETHEUS", "false");
+        let mut config = AutumnConfig::default();
+        assert!(config.actuator.prometheus, "default should be enabled");
+        config.apply_env_overrides_with_env(&env);
+        assert!(
+            !config.actuator.prometheus,
+            "AUTUMN_ACTUATOR__PROMETHEUS=false must disable the scrape endpoint"
+        );
+    }
+
+    #[test]
+    fn env_override_actuator_sensitive() {
+        let env = MockEnv::new().with("AUTUMN_ACTUATOR__SENSITIVE", "true");
+        let mut config = AutumnConfig::default();
+        assert!(!config.actuator.sensitive);
+        config.apply_env_overrides_with_env(&env);
+        assert!(config.actuator.sensitive);
+    }
+
+    #[test]
+    fn env_override_actuator_prefix() {
+        let env = MockEnv::new().with("AUTUMN_ACTUATOR__PREFIX", "/ops");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.actuator.prefix, "/ops");
     }
 
     #[test]
@@ -5609,6 +5673,20 @@ path = "/healthz"
         let config = ActuatorConfig::default();
         assert_eq!(config.prefix, "/actuator");
         assert!(!config.sensitive);
+        // Prometheus metrics export is on by default and independent of
+        // `sensitive`, so platform scraping works without exposing env/loggers.
+        assert!(config.prometheus);
+    }
+
+    #[test]
+    fn actuator_prometheus_can_be_disabled_via_toml() {
+        let toml = r"
+            sensitive = false
+            prometheus = false
+        ";
+        let config: ActuatorConfig = toml::from_str(toml).unwrap();
+        assert!(!config.sensitive);
+        assert!(!config.prometheus);
     }
 
     #[test]
