@@ -39,6 +39,57 @@
 //! | [`TestResponse`] | `MvcResult` | Response with assertion helpers |
 //! | `TestDb` | `@DataJpaTest` | Shared Postgres testcontainer with pool |
 //!
+//! # Structural HTML assertions
+//!
+//! Autumn renders server-side HTML (Maud + htmx), so tests should assert on a
+//! page's *structure* — "the table has exactly N rows", "this link points at
+//! `/notes/1`" — rather than brittle substrings. [`TestResponse`] parses the
+//! body with a real HTML parser and matches against a CSS-selector subset
+//! (tag, `.class`, `#id`, `[attr=…]`, plus descendant/child combinators), so
+//! assertions survive cosmetic template changes (whitespace, attribute order,
+//! wrapping markup) that would break [`TestResponse::assert_body_contains`].
+//! They work for full documents and for partial/fragment responses (htmx
+//! swaps) alike.
+//!
+//! The worked example below asserts a scaffolded notes-index page's row count
+//! and the link target of each row. Every assertion returns `&Self`, so they
+//! chain with the status/header/body matchers:
+//!
+//! ```rust
+//! use autumn_web::test::TestResponse;
+//! use axum::http::StatusCode;
+//!
+//! // The HTML a scaffolded `notes#index` view renders: a table with one
+//! // `<tr>` per note, each linking to `/notes/{id}`.
+//! let resp = TestResponse {
+//!     status: StatusCode::OK,
+//!     headers: vec![("content-type".into(), "text/html; charset=utf-8".into())],
+//!     body: br#"
+//!         <table class="notes">
+//!           <tbody>
+//!             <tr class="note-row"><td><a href="/notes/1">First note</a></td></tr>
+//!             <tr class="note-row"><td><a href="/notes/2">Second note</a></td></tr>
+//!             <tr class="note-row"><td><a href="/notes/3">Third note</a></td></tr>
+//!           </tbody>
+//!         </table>
+//!     "#.to_vec(),
+//! };
+//!
+//! resp.assert_ok()
+//!     .assert_selector("table.notes")               // the table is present
+//!     .assert_selector_count("tbody tr.note-row", 3) // exactly three rows
+//!     .assert_attr("tr.note-row a", "href", "/notes/1") // first row's link target
+//!     .assert_text("tr.note-row a", "First note")    // …and its visible text
+//!     .assert_no_selector(".flash--error");          // no error flash rendered
+//!
+//! // Non-asserting accessors compose for custom checks:
+//! assert_eq!(
+//!     resp.selector_attr("tbody tr.note-row a", "href"),
+//!     vec![Some("/notes/1".into()), Some("/notes/2".into()), Some("/notes/3".into())],
+//! );
+//! assert_eq!(resp.selector_count("tr.note-row"), 3);
+//! ```
+//!
 //! # Test-data factories
 //!
 //! `#[model]` generates a `{Model}Factory` builder so tests only declare the
@@ -1425,6 +1476,207 @@ impl TestResponse {
         );
         self
     }
+
+    // ── CSS-selector HTML assertions ────────────────────────────
+    //
+    // Autumn renders server-side HTML (Maud + htmx), so tests want to assert on
+    // page *structure* — "the table has exactly 3 rows", "there is a `<form>`
+    // posting to `/notes`" — rather than brittle substrings. These helpers parse
+    // the body with a real HTML parser and match against a CSS-selector subset
+    // (tag, `.class`, `#id`, `[attr=…]`, plus descendant/child combinators), so
+    // assertions survive cosmetic template changes (whitespace, attribute order,
+    // wrapping markup) that would break [`assert_body_contains`].
+    //
+    // They work for full documents and for partial/fragment responses (htmx
+    // swaps) alike, and compose with the other matchers — every method returns
+    // `&Self` for chaining.
+    //
+    // ```rust,ignore
+    // client.get("/notes").send().await
+    //     .assert_ok()
+    //     .assert_selector_count("tbody tr.note-row", 3)   // exactly 3 rows
+    //     .assert_attr("tr.note-row:first-child a", "href", "/notes/1")
+    //     .assert_text("h1", "Notes");
+    // ```
+
+    /// Parse the response body as HTML once for a selector assertion.
+    fn parse_html(&self) -> Vec<crate::test_html::Node> {
+        crate::test_html::parse(&self.text())
+    }
+
+    /// Compile a CSS selector, panicking with an actionable message on a
+    /// malformed selector.
+    #[track_caller]
+    fn compile_selector(css: &str) -> crate::test_html::SelectorList {
+        crate::test_html::SelectorList::parse(css)
+            .unwrap_or_else(|e| panic!("invalid CSS selector `{css}`: {e}"))
+    }
+
+    /// A truncated, indented outline of the parsed HTML for failure messages.
+    fn html_outline(nodes: &[crate::test_html::Node]) -> String {
+        crate::test_html::outline(nodes, 1200)
+    }
+
+    /// Return the normalized text content of every element matching `css`, in
+    /// document order. Non-asserting accessor for custom assertions.
+    ///
+    /// Whitespace within each element's text is collapsed and trimmed so values
+    /// are stable across indentation and line-wrapping changes.
+    #[must_use]
+    #[track_caller]
+    pub fn selector_text(&self, css: &str) -> Vec<String> {
+        let selector = Self::compile_selector(css);
+        let nodes = self.parse_html();
+        selector
+            .matches(&nodes)
+            .iter()
+            .map(|el| crate::test_html::normalize_ws(&el.text()))
+            .collect()
+    }
+
+    /// Return the value of attribute `attr` for every element matching `css`,
+    /// in document order (`None` for matches lacking the attribute).
+    /// Non-asserting accessor for custom assertions.
+    #[must_use]
+    #[track_caller]
+    pub fn selector_attr(&self, css: &str, attr: &str) -> Vec<Option<String>> {
+        let selector = Self::compile_selector(css);
+        let nodes = self.parse_html();
+        selector
+            .matches(&nodes)
+            .iter()
+            .map(|el| el.attr(attr).map(str::to_string))
+            .collect()
+    }
+
+    /// Return the number of elements matching `css`. Non-asserting accessor.
+    #[must_use]
+    #[track_caller]
+    pub fn selector_count(&self, css: &str) -> usize {
+        let selector = Self::compile_selector(css);
+        let nodes = self.parse_html();
+        selector.matches(&nodes).len()
+    }
+
+    /// Assert at least one element matches the CSS selector.
+    #[track_caller]
+    pub fn assert_selector(&self, css: &str) -> &Self {
+        let selector = Self::compile_selector(css);
+        let nodes = self.parse_html();
+        let count = selector.matches(&nodes).len();
+        assert!(
+            count > 0,
+            "no elements matched selector `{css}`.\nParsed HTML:\n{}",
+            Self::html_outline(&nodes)
+        );
+        self
+    }
+
+    /// Assert that *no* element matches the CSS selector.
+    #[track_caller]
+    pub fn assert_no_selector(&self, css: &str) -> &Self {
+        let selector = Self::compile_selector(css);
+        let nodes = self.parse_html();
+        let count = selector.matches(&nodes).len();
+        assert!(
+            count == 0,
+            "expected no elements matching selector `{css}`, but found {count}.\nParsed HTML:\n{}",
+            Self::html_outline(&nodes)
+        );
+        self
+    }
+
+    /// Assert exactly `expected` elements match the CSS selector.
+    #[track_caller]
+    pub fn assert_selector_count(&self, css: &str, expected: usize) -> &Self {
+        let selector = Self::compile_selector(css);
+        let nodes = self.parse_html();
+        let actual = selector.matches(&nodes).len();
+        assert!(
+            actual == expected,
+            "expected {expected} element(s) matching selector `{css}`, found {actual}.\n\
+             Parsed HTML:\n{}",
+            Self::html_outline(&nodes)
+        );
+        self
+    }
+
+    /// Assert the first element matching `css` has text content equal to
+    /// `expected` (whitespace-normalized on both sides).
+    #[track_caller]
+    pub fn assert_text(&self, css: &str, expected: &str) -> &Self {
+        let selector = Self::compile_selector(css);
+        let nodes = self.parse_html();
+        let matched = selector.matches(&nodes);
+        let Some(first) = matched.into_iter().next() else {
+            panic!(
+                "no elements matched selector `{css}`.\nParsed HTML:\n{}",
+                Self::html_outline(&nodes)
+            );
+        };
+        let actual = crate::test_html::normalize_ws(&first.text());
+        let expected_norm = crate::test_html::normalize_ws(expected);
+        assert!(
+            actual == expected_norm,
+            "text mismatch for selector `{css}`:\n  expected: {expected_norm:?}\n  \
+             actual:   {actual:?}\nParsed HTML:\n{}",
+            Self::html_outline(&nodes)
+        );
+        self
+    }
+
+    /// Assert the first element matching `css` has text content containing
+    /// `substring` (whitespace-normalized on both sides).
+    #[track_caller]
+    pub fn assert_text_contains(&self, css: &str, substring: &str) -> &Self {
+        let selector = Self::compile_selector(css);
+        let nodes = self.parse_html();
+        let matched = selector.matches(&nodes);
+        let Some(first) = matched.into_iter().next() else {
+            panic!(
+                "no elements matched selector `{css}`.\nParsed HTML:\n{}",
+                Self::html_outline(&nodes)
+            );
+        };
+        let actual = crate::test_html::normalize_ws(&first.text());
+        let needle = crate::test_html::normalize_ws(substring);
+        assert!(
+            actual.contains(&needle),
+            "text for selector `{css}` did not contain {needle:?}.\n  actual: {actual:?}\n\
+             Parsed HTML:\n{}",
+            Self::html_outline(&nodes)
+        );
+        self
+    }
+
+    /// Assert the first element matching `css` has attribute `attr` equal to
+    /// `expected`.
+    #[track_caller]
+    pub fn assert_attr(&self, css: &str, attr: &str, expected: &str) -> &Self {
+        let selector = Self::compile_selector(css);
+        let nodes = self.parse_html();
+        let matched = selector.matches(&nodes);
+        let Some(first) = matched.into_iter().next() else {
+            panic!(
+                "no elements matched selector `{css}`.\nParsed HTML:\n{}",
+                Self::html_outline(&nodes)
+            );
+        };
+        match first.attr(attr) {
+            Some(actual) => assert!(
+                actual == expected,
+                "attribute `{attr}` mismatch for selector `{css}`:\n  expected: {expected:?}\n  \
+                 actual:   {actual:?}\nParsed HTML:\n{}",
+                Self::html_outline(&nodes)
+            ),
+            None => panic!(
+                "element matching selector `{css}` has no `{attr}` attribute.\n\
+                 Parsed HTML:\n{}",
+                Self::html_outline(&nodes)
+            ),
+        }
+        self
+    }
 }
 
 #[cfg(feature = "db")]
@@ -1916,6 +2168,184 @@ mod tests {
             .await
             .assert_ok()
             .assert_body_eq("deleted");
+    }
+
+    // ── CSS-selector HTML assertions (issue #1147) ─────────────────────────
+    //
+    // These tests are the executable specification for the selector-aware
+    // assertions on [`TestResponse`]. They exercise the success metric:
+    // a structural assertion against a notes index survives a cosmetic
+    // template refactor (indentation, attribute order, wrapping markup)
+    // that would break the equivalent `assert_body_contains` substring test.
+    #[cfg(feature = "maud")]
+    mod html_assertions {
+        use super::*;
+        use axum::routing::get;
+
+        /// The "original" notes index: a 3-row table where each `<tr>` links
+        /// to `/notes/{id}`.
+        async fn notes_index_v1() -> maud::Markup {
+            maud::html! {
+                table.notes {
+                    tbody {
+                        @for id in 1..=3u32 {
+                            tr.note-row {
+                                td.title { a href=(format!("/notes/{id}")) { "Note " (id) } }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        /// The same index after a cosmetic refactor: attribute order changed,
+        /// extra wrapping markup and classes, different nesting — but the same
+        /// structural facts (3 rows, each linking to `/notes/{id}`).
+        async fn notes_index_v2() -> maud::Markup {
+            maud::html! {
+                div.card {
+                    table.notes.striped {
+                        thead { tr { th { "Title" } } }
+                        tbody.rows {
+                            @for id in 1..=3u32 {
+                                tr.note-row.is-clickable data-id=(id) {
+                                    td.title {
+                                        span.wrap {
+                                            a.link href=(format!("/notes/{id}")) data-turbo="true" {
+                                                "Note " (id)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        /// An htmx swap fragment: a bare `<tr>` with no enclosing `<table>`.
+        async fn note_row_fragment() -> maud::Markup {
+            maud::html! {
+                tr.note-row #note-7 {
+                    td.title { a.link href="/notes/7" { "Note 7" } }
+                }
+            }
+        }
+
+        fn client(
+            path: &str,
+            handler: axum::routing::MethodRouter<crate::state::AppState>,
+        ) -> TestClient {
+            let router = axum::Router::<crate::state::AppState>::new().route(path, handler);
+            TestApp::new().merge(router).build()
+        }
+
+        #[tokio::test]
+        async fn counts_rows_by_tag_and_class() {
+            let resp = client("/notes", get(notes_index_v1))
+                .get("/notes")
+                .send()
+                .await;
+            resp.assert_ok()
+                .assert_selector("table.notes")
+                .assert_selector_count("tbody tr", 3)
+                .assert_selector_count("tr.note-row", 3)
+                .assert_no_selector("form");
+        }
+
+        #[tokio::test]
+        async fn reads_text_and_attributes() {
+            let resp = client("/notes", get(notes_index_v1))
+                .get("/notes")
+                .send()
+                .await;
+            resp.assert_text("tr.note-row td.title a", "Note 1")
+                .assert_text_contains("tr.note-row", "Note 1")
+                .assert_attr("tr.note-row td a", "href", "/notes/1");
+
+            // Non-asserting accessors compose for custom assertions.
+            let links = resp.selector_text("tr.note-row a");
+            assert_eq!(links, vec!["Note 1", "Note 2", "Note 3"]);
+            let hrefs = resp.selector_attr("tr.note-row a", "href");
+            assert_eq!(
+                hrefs,
+                vec![
+                    Some("/notes/1".to_string()),
+                    Some("/notes/2".to_string()),
+                    Some("/notes/3".to_string()),
+                ]
+            );
+            assert_eq!(resp.selector_count("tr.note-row"), 3);
+        }
+
+        /// The success metric: identical structural assertions pass against
+        /// both the original and the refactored template.
+        #[tokio::test]
+        async fn survives_cosmetic_refactor() {
+            for handler in [get(notes_index_v1), get(notes_index_v2)] {
+                let resp = client("/notes", handler).get("/notes").send().await;
+                resp.assert_ok()
+                    // Exactly three data rows, each linking to /notes/{id}.
+                    .assert_selector_count("tbody tr.note-row", 3);
+                let hrefs = resp.selector_attr("tbody tr.note-row a", "href");
+                assert_eq!(
+                    hrefs,
+                    vec![
+                        Some("/notes/1".to_string()),
+                        Some("/notes/2".to_string()),
+                        Some("/notes/3".to_string()),
+                    ],
+                    "row links must survive the refactor"
+                );
+            }
+        }
+
+        /// AC: works for partial/fragment responses (htmx swaps) — a bare
+        /// `<tr>` with no enclosing table must still be selectable.
+        #[tokio::test]
+        async fn works_for_htmx_fragment() {
+            let resp = client("/rows/7", get(note_row_fragment))
+                .get("/rows/7")
+                .send()
+                .await;
+            resp.assert_selector("tr.note-row")
+                .assert_selector("tr#note-7")
+                .assert_attr("tr#note-7 a", "href", "/notes/7")
+                .assert_text("tr#note-7 a.link", "Note 7");
+        }
+
+        #[tokio::test]
+        async fn id_and_attribute_selectors() {
+            let resp = client("/rows/7", get(note_row_fragment))
+                .get("/rows/7")
+                .send()
+                .await;
+            resp.assert_selector("#note-7")
+                .assert_selector("a[href=\"/notes/7\"]")
+                .assert_selector("a[href^=\"/notes/\"]")
+                .assert_no_selector("a[href=\"/other\"]");
+        }
+
+        #[tokio::test]
+        #[should_panic(expected = "expected 5 element(s) matching selector")]
+        async fn count_mismatch_panics_with_actionable_message() {
+            let resp = client("/notes", get(notes_index_v1))
+                .get("/notes")
+                .send()
+                .await;
+            resp.assert_selector_count("tr.note-row", 5);
+        }
+
+        #[tokio::test]
+        #[should_panic(expected = "no elements matched selector `table.missing`")]
+        async fn missing_selector_panics() {
+            let resp = client("/notes", get(notes_index_v1))
+                .get("/notes")
+                .send()
+                .await;
+            resp.assert_selector("table.missing");
+        }
     }
 
     /// Companion to the override test: an invalid `_method` value rejects
