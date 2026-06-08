@@ -23,6 +23,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Only JSON-in/JSON-out endpoints are eligible; HTML/Maud routes (no response schema) are auto-excluded with a build-time log note.
   - `examples/todo-app` gains an `/mcp` endpoint exposing `list_json` (read) and `create_json` (explicitly-opted-in write) behind `RequireApiToken`.
 
+- **testing:** CSS-selector HTML assertions on `TestResponse` (#1147)
+  - Autumn renders server-side HTML (Maud + htmx), so the in-process test client can now assert on page *structure* by CSS selector instead of brittle substrings. New chainable methods on `TestResponse`: `assert_selector(css)`, `assert_no_selector(css)`, `assert_selector_count(css, n)`, `assert_text(css, expected)`, `assert_text_contains(css, sub)`, and `assert_attr(css, attr, expected)`.
+  - Non-asserting accessors for custom assertions: `selector_count(css) -> usize`, `selector_text(css) -> Vec<String>`, and `selector_attr(css, attr) -> Vec<Option<String>>` — each returns matches in document order.
+  - Backed by a dependency-free HTML parser and CSS-selector matcher (`tag`, `.class`, `#id`, `[attr]`/`[attr=v]`/`[attr^=v]`/`[attr$=v]`/`[attr*=v]`, compound selectors, selector lists, and descendant/child combinators). Parses fragments literally, so bare `<tr>` htmx swaps are selectable — a spec HTML5 tree builder would foster-parent and drop them.
+  - Assertions survive cosmetic template changes (whitespace, attribute order, wrapping markup) that break the equivalent `assert_body_contains` test. Failure messages print the selector, expected-vs-actual value, and a truncated outline of the parsed HTML.
+  - Purely additive: no breaking change to existing assertions; no new published dependency. See the `autumn::test` module docs and `docs/guide/testing.md` for a worked example.
+
 ## [0.5.0] - 2026-06-04
 
 ### Added

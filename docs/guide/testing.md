@@ -102,6 +102,59 @@ resp
 
 ---
 
+## Structural HTML assertions
+
+Autumn renders server-side HTML (Maud + htmx), so tests should assert on a
+page's *structure* rather than brittle substrings. `TestResponse` parses the
+body with a real HTML parser and matches against a CSS-selector subset, so
+assertions survive cosmetic template changes — whitespace, attribute order, or
+extra wrapping markup — that would break an `assert_body_contains` check. They
+work for full documents and for partial/fragment responses (htmx swaps) alike.
+
+Supported selectors: tag (`tr`), `.class`, `#id`, `[attr]` / `[attr=v]` /
+`[attr^=v]` / `[attr$=v]` / `[attr*=v]`, compound selectors (`a.link[href]`),
+selector lists (`a, button`), and descendant (`table tr`) / child
+(`tbody > tr`) combinators.
+
+```rust
+#[tokio::test]
+async fn notes_index_renders_one_row_per_note() {
+    let client = TestApp::new().routes(routes![notes_index]).build();
+
+    client.get("/notes").send().await
+        .assert_ok()
+        .assert_selector("table.notes")                  // the table is present
+        .assert_selector_count("tbody tr.note-row", 3)   // exactly three rows
+        .assert_attr("tr.note-row a", "href", "/notes/1") // first row's link target
+        .assert_text("tr.note-row a", "First note")      // …and its visible text
+        .assert_no_selector(".flash--error");            // no error flash rendered
+}
+```
+
+| Method | Checks |
+|--------|--------|
+| `assert_selector(css)` | at least one element matches |
+| `assert_no_selector(css)` | no element matches |
+| `assert_selector_count(css, n)` | exactly `n` elements match |
+| `assert_text(css, expected)` | first match's text equals `expected` (whitespace-normalized) |
+| `assert_text_contains(css, sub)` | first match's text contains `sub` |
+| `assert_attr(css, attr, expected)` | first match's `attr` equals `expected` |
+
+For custom assertions, the non-asserting accessors return owned data:
+`selector_count(css) -> usize`, `selector_text(css) -> Vec<String>`, and
+`selector_attr(css, attr) -> Vec<Option<String>>` — each in document order.
+
+```rust
+let hrefs = resp.selector_attr("tbody tr.note-row a", "href");
+assert_eq!(hrefs, vec![Some("/notes/1".into()), Some("/notes/2".into())]);
+```
+
+On failure these print the selector, the expected-vs-actual value, and a
+truncated outline of the parsed HTML — so a red test points straight at the
+mismatch instead of dumping raw markup.
+
+---
+
 ## Database integration tests
 
 For tests that need a real database, `TestDb` wraps a Postgres testcontainer.

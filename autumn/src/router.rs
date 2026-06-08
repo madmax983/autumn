@@ -4537,6 +4537,10 @@ impl TrustedHostPolicy {
     /// Whether a request carrying no usable `Host` is allowed through. Mirrors
     /// `trusted_host_middleware`'s missing-host branch for callers (e.g. the MCP
     /// envelope) that enforce the policy outside that middleware.
+    ///
+    /// Only the `mcp` feature consumes this today; gated so default-feature
+    /// builds don't flag it as dead code.
+    #[cfg(feature = "mcp")]
     pub const fn allows_missing_host(&self) -> bool {
         self.allow_missing_host
     }
