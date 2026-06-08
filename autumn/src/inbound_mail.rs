@@ -762,6 +762,17 @@ impl InboundMailRouter {
             return handler(email).await;
         }
 
+        // Complaint detection: Mailgun sets X-Mailgun-Sflag to "Yes" for spam complaints.
+        if email
+            .spam_report
+            .as_ref()
+            .and_then(|r| r.verdict.as_deref())
+            .map_or(false, |v| v.eq_ignore_ascii_case("yes"))
+            && let Some(handler) = self.complaint_handler
+        {
+            return handler(email).await;
+        }
+
         for info in &self.handlers {
             // Any pattern must fire even when email.to is empty (e.g. Bcc-only delivery).
             let matched = if matches!(info.pattern, RecipientPattern::Any) {
@@ -1487,7 +1498,17 @@ fn url_decode_form(body: &[u8]) -> HashMap<String, String> {
     serde_urlencoded::from_str(&s).unwrap_or_default()
 }
 
+/// Find the first occurrence of `needle` in `haystack`, returning the start offset.
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
 /// Parse a `multipart/form-data` Mailgun webhook body into a field map and attachment list.
+///
+/// Operates at the byte level so binary file parts are not corrupted by lossy UTF-8 conversion.
 fn parse_mailgun_form_data(
     body: &[u8],
     content_type: &str,
@@ -1495,24 +1516,60 @@ fn parse_mailgun_form_data(
     let Some(boundary) = extract_boundary(content_type) else {
         return (HashMap::new(), Vec::new());
     };
-    let delimiter = format!("--{boundary}");
-    let body_str = String::from_utf8_lossy(body);
+    let delim = format!("--{boundary}");
+    let delim_bytes = delim.as_bytes();
+    let crlf_delim = format!("\r\n--{boundary}");
+    let lf_delim = format!("\n--{boundary}");
+    let crlf_delim_bytes = crlf_delim.as_bytes();
+    let lf_delim_bytes = lf_delim.as_bytes();
+
     let mut map = HashMap::new();
     let mut file_parts: Vec<Attachment> = Vec::new();
+    let mut search_from = 0_usize;
 
-    for part in body_str.split(delimiter.as_str()).skip(1) {
-        if part.trim_start_matches('-').trim().is_empty() {
-            continue;
+    loop {
+        // Locate the next "--{boundary}" in the raw byte buffer.
+        let Some(rel) = find_subslice(&body[search_from..], delim_bytes) else {
+            break;
+        };
+        let after_delim = search_from + rel + delim_bytes.len();
+
+        // "--{boundary}--" is the final delimiter — stop.
+        if body[after_delim..].starts_with(b"--") {
+            break;
         }
-        let (part_headers_str, part_body) = if let Some(pos) = part.find("\r\n\r\n") {
-            (&part[..pos], &part[pos + 4..])
-        } else if let Some(pos) = part.find("\n\n") {
-            (&part[..pos], &part[pos + 2..])
+
+        // Skip the CRLF/LF that follows the opening boundary line.
+        let part_start = if body[after_delim..].starts_with(b"\r\n") {
+            after_delim + 2
+        } else if body[after_delim..].starts_with(b"\n") {
+            after_delim + 1
+        } else {
+            after_delim
+        };
+
+        // The part body ends just before the next "\r\n--{boundary}" or "\n--{boundary}".
+        let part_end = find_subslice(&body[part_start..], crlf_delim_bytes)
+            .map(|p| part_start + p)
+            .or_else(|| find_subslice(&body[part_start..], lf_delim_bytes).map(|p| part_start + p))
+            .unwrap_or(body.len());
+
+        search_from = part_end;
+        let part = &body[part_start..part_end];
+
+        // Split part headers from body on the blank line.
+        let (headers_bytes, body_bytes) = if let Some(sep) = find_subslice(part, b"\r\n\r\n") {
+            (&part[..sep], &part[sep + 4..])
+        } else if let Some(sep) = find_subslice(part, b"\n\n") {
+            (&part[..sep], &part[sep + 2..])
         } else {
             continue;
         };
 
-        let disposition = part_headers_str
+        // Headers are ASCII; lossy conversion is safe here.
+        let headers_str = String::from_utf8_lossy(headers_bytes);
+
+        let disposition = headers_str
             .lines()
             .find(|l| l.to_ascii_lowercase().starts_with("content-disposition:"))
             .map(|l| {
@@ -1527,7 +1584,6 @@ fn parse_mailgun_form_data(
             seg.strip_prefix("name=")
                 .map(|v| v.trim_matches('"').to_string())
         });
-
         let Some(name) = name else { continue };
 
         let filename = disposition.split(';').find_map(|seg| {
@@ -1536,15 +1592,9 @@ fn parse_mailgun_form_data(
                 .map(|v| v.trim_matches('"').to_string())
         });
 
-        // Strip the trailing boundary delimiter.
-        let raw_value = part_body
-            .find(&format!("\r\n--{boundary}"))
-            .or_else(|| part_body.find(&format!("\n--{boundary}")))
-            .map_or(part_body, |end| &part_body[..end]);
-
         if let Some(filename) = filename {
-            // File part: capture as Attachment with raw bytes.
-            let part_ct = part_headers_str
+            // File part: use raw bytes from the original buffer to avoid lossy UTF-8 corruption.
+            let part_ct = headers_str
                 .lines()
                 .find(|l| l.to_ascii_lowercase().starts_with("content-type:"))
                 .map(|l| {
@@ -1557,7 +1607,7 @@ fn parse_mailgun_form_data(
                         .to_ascii_lowercase()
                 })
                 .unwrap_or_else(|| "application/octet-stream".to_string());
-            let part_cte = part_headers_str
+            let part_cte = headers_str
                 .lines()
                 .find(|l| {
                     l.to_ascii_lowercase()
@@ -1566,28 +1616,28 @@ fn parse_mailgun_form_data(
                 .map(|l| l[26..].trim().to_ascii_lowercase())
                 .unwrap_or_default();
             let data: Bytes = if part_cte == "base64" {
-                let stripped: String = raw_value
+                // base64 is ASCII; string round-trip is safe.
+                let stripped: String = String::from_utf8_lossy(body_bytes)
                     .chars()
                     .filter(|c| !c.is_ascii_whitespace())
                     .collect();
                 base64::engine::general_purpose::STANDARD
                     .decode(stripped.as_bytes())
                     .map(Bytes::from)
-                    .unwrap_or_else(|_| Bytes::from(raw_value.as_bytes().to_vec()))
+                    .unwrap_or_else(|_| Bytes::copy_from_slice(body_bytes))
             } else {
-                Bytes::from(raw_value.as_bytes().to_vec())
+                // Binary (8-bit): copy raw bytes without any string conversion.
+                Bytes::copy_from_slice(body_bytes)
             };
-            // Use the field name (e.g. "attachment-1") to associate with Mailgun's
-            // attachment-{n} numbering, but keep the human-readable filename.
-            let _ = name;
             file_parts.push(Attachment {
                 filename: Some(filename),
                 content_type: part_ct,
                 data,
             });
         } else {
-            // Text field.
-            map.insert(name, raw_value.trim_end_matches(['\r', '\n']).to_string());
+            // Text field: lossy conversion is acceptable.
+            let value = String::from_utf8_lossy(body_bytes).into_owned();
+            map.insert(name, value.trim_end_matches(['\r', '\n']).to_string());
         }
     }
     (map, file_parts)
