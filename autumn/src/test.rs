@@ -220,6 +220,8 @@ pub struct TestApp {
     config: AutumnConfig,
     #[cfg(feature = "openapi")]
     openapi: Option<crate::openapi::OpenApiConfig>,
+    #[cfg(feature = "mcp")]
+    mcp: Option<crate::mcp::McpRuntime>,
     #[cfg(feature = "db")]
     pool: Option<Pool<AsyncPgConnection>>,
     #[cfg(feature = "db")]
@@ -290,6 +292,8 @@ impl TestApp {
             config,
             #[cfg(feature = "openapi")]
             openapi: None,
+            #[cfg(feature = "mcp")]
+            mcp: None,
             #[cfg(feature = "db")]
             pool: None,
             #[cfg(feature = "db")]
@@ -376,6 +380,72 @@ impl TestApp {
     #[must_use]
     pub fn openapi(mut self, config: crate::openapi::OpenApiConfig) -> Self {
         self.openapi = Some(config);
+        self
+    }
+
+    /// Mount an MCP endpoint at `path`, mirroring
+    /// [`AppBuilder::mount_mcp`](crate::app::AppBuilder::mount_mcp) so
+    /// integration tests can drive `initialize`/`tools/list`/`tools/call`
+    /// through the in-process pipeline.
+    ///
+    /// Gated behind the `mcp` Cargo feature.
+    #[cfg(feature = "mcp")]
+    #[must_use]
+    pub fn mount_mcp(mut self, path: impl Into<String>) -> Self {
+        let path = path.into();
+        if let Some(rt) = self.mcp.as_mut() {
+            rt.mount_path = path;
+        } else {
+            self.mcp = Some(crate::mcp::McpRuntime::new(path));
+        }
+        self
+    }
+
+    /// Enable the whole-API MCP hatch, mirroring
+    /// [`AppBuilder::expose_all_as_mcp`](crate::app::AppBuilder::expose_all_as_mcp).
+    ///
+    /// Gated behind the `mcp` Cargo feature.
+    #[cfg(feature = "mcp")]
+    #[must_use]
+    pub fn expose_all_as_mcp(mut self) -> Self {
+        if let Some(rt) = self.mcp.as_mut() {
+            rt.expose_all = true;
+        } else {
+            let mut rt = crate::mcp::McpRuntime::new("/mcp");
+            rt.expose_all = true;
+            self.mcp = Some(rt);
+        }
+        self
+    }
+
+    /// Gate the entire MCP endpoint behind a tower `layer`, mirroring
+    /// [`AppBuilder::secure_mcp`](crate::app::AppBuilder::secure_mcp).
+    ///
+    /// Gated behind the `mcp` Cargo feature.
+    #[cfg(feature = "mcp")]
+    #[must_use]
+    pub fn secure_mcp<L>(mut self, layer: L) -> Self
+    where
+        L: tower::Layer<axum::routing::Route> + Clone + Send + Sync + 'static,
+        L::Service: tower::Service<
+                axum::http::Request<axum::body::Body>,
+                Response = axum::http::Response<axum::body::Body>,
+                Error = std::convert::Infallible,
+            > + Clone
+            + Send
+            + Sync
+            + 'static,
+        <L::Service as tower::Service<axum::http::Request<axum::body::Body>>>::Future:
+            Send + 'static,
+    {
+        let applier: crate::mcp::McpEndpointLayer = Box::new(move |router| router.layer(layer));
+        if let Some(rt) = self.mcp.as_mut() {
+            rt.endpoint_layer = Some(applier);
+        } else {
+            let mut rt = crate::mcp::McpRuntime::new("/mcp");
+            rt.endpoint_layer = Some(applier);
+            self.mcp = Some(rt);
+        }
         self
     }
 
@@ -1011,6 +1081,8 @@ impl TestApp {
                 session_store: None,
                 #[cfg(feature = "openapi")]
                 openapi: self.openapi,
+                #[cfg(feature = "mcp")]
+                mcp: self.mcp,
             },
         )
         .expect("failed to build test router");
@@ -1165,6 +1237,12 @@ impl TestClient {
     #[must_use]
     pub fn patch(&self, uri: &str) -> RequestBuilder {
         RequestBuilder::new(self.router.clone(), Method::PATCH, uri)
+    }
+
+    /// Start building an OPTIONS request (e.g. a CORS preflight).
+    #[must_use]
+    pub fn options(&self, uri: &str) -> RequestBuilder {
+        RequestBuilder::new(self.router.clone(), Method::OPTIONS, uri)
     }
 }
 
