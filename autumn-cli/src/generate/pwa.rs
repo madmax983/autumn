@@ -1,16 +1,17 @@
 //! `autumn generate pwa` — scaffold an installable Progressive Web App.
 //!
 //! Creates:
-//!   - `static/manifest.webmanifest` — Web App Manifest (application/manifest+json)
-//!   - `static/service-worker.js`    — Service Worker with offline-shell caching
-//!   - `static/icons/icon.svg`       — Placeholder app icon (replace with real PNG)
+//!   - `static/manifest.webmanifest`   — Web App Manifest (application/manifest+json)
+//!   - `static/service-worker.js`      — Service Worker with offline-shell caching
+//!   - `static/pwa-register.js`        — SW registration script (avoids CSP inline-script issues)
+//!   - `static/icons/icon.svg`         — Placeholder app icon (replace with real PNG)
 //!   - `static/icons/maskable-icon.svg` — Maskable variant (safe-zone compliant)
-//!   - `src/main.rs`                 — Route handlers for `/manifest.webmanifest`,
-//!                                     `/service-worker.js`, and `/offline`; PWA
-//!                                     `<link>` / `<meta>` tags injected into the
-//!                                     shared `layout` head block.
-//!   - `tests/system/pwa_smoke.rs`   — Smoke test (manifest content-type + SW registration)
-//!   - `Cargo.toml`                  — `system-tests` feature added if absent
+//!   - `src/main.rs`                   — Route handlers for `/manifest.webmanifest`,
+//!                                       `/service-worker.js`, `/pwa-register.js`, and
+//!                                       `/offline`; PWA `<link>` / `<meta>` tags
+//!                                       injected into the shared `layout` head block.
+//!   - `tests/system/pwa_smoke.rs`     — Smoke test (manifest content-type + SW registration)
+//!   - `Cargo.toml`                    — `system-tests` feature added if absent
 
 use std::path::Path;
 
@@ -39,6 +40,10 @@ pub fn plan_pwa(project_root: &Path) -> Result<Plan, GenerateError> {
     plan.create(
         project_root.join("static").join("service-worker.js"),
         render_service_worker(),
+    );
+    plan.create(
+        project_root.join("static").join("pwa-register.js"),
+        render_pwa_register_js(),
     );
     plan.create(
         project_root.join("static").join("icons").join("icon.svg"),
@@ -210,6 +215,17 @@ fn render_maskable_icon_svg() -> String {
     .to_owned()
 }
 
+fn render_pwa_register_js() -> String {
+    // Served as a same-origin script to avoid CSP `script-src 'self'` blocking
+    // inline scripts that the default SecurityHeadersLayer enforces.
+    "if('serviceWorker'in navigator)\
+     navigator.serviceWorker\
+     .register('/service-worker.js',{scope:'/'})\
+     .then(()=>document.documentElement.dataset.swRegistered='true')\
+     .catch(console.error);\n"
+        .to_owned()
+}
+
 fn render_pwa_system_test() -> String {
     let manifest_selector = r#"link[rel="manifest"]"#;
     format!(
@@ -223,13 +239,17 @@ fn render_pwa_system_test() -> String {
          use autumn_web::system_test::SystemTest;\n\
          \n\
          /// Checks that `GET /manifest.webmanifest` returns `application/manifest+json`\n\
-         /// and that the `<link rel=\"manifest\">` tag is present in the root page DOM.\n\
+         /// and that the `<link rel=\"manifest\">` tag is present in the page DOM.\n\
          #[tokio::test]\n\
          #[ignore = \"requires Chromium; run with --include-ignored\"]\n\
          async fn pwa_manifest_loads_with_correct_content_type() {{\n\
-             let runner = SystemTest::new().build().await.expect(\"test runner\");\n\
+             let runner = SystemTest::new()\n\
+                 .routes(routes![pwa_manifest, pwa_service_worker, pwa_register_js, pwa_offline])\n\
+                 .build()\n\
+                 .await\n\
+                 .expect(\"test runner\");\n\
              let base_url = runner.base_url();\n\
-             let page = runner.page();\n\
+             let page = runner.page().await.expect(\"page\");\n\
              \n\
              // Verify HTTP content-type via raw TCP to avoid a reqwest dev-dependency.\n\
              {{\n\
@@ -239,7 +259,7 @@ fn render_pwa_system_test() -> String {
                      .trim_start_matches(\"https://\");\n\
                  let mut stream = std::net::TcpStream::connect(host_port)\n\
                      .expect(\"connect to test server\");\n\
-                 let req = \"GET /manifest.webmanifest HTTP/1.1\\r\\nHost: {{host_port}}\\r\\nConnection: close\\r\\n\\r\\n\";\n\
+                 let req = format!(\"GET /manifest.webmanifest HTTP/1.1\\r\\nHost: {{host_port}}\\r\\nConnection: close\\r\\n\\r\\n\");\n\
                  stream.write_all(req.as_bytes()).expect(\"write request\");\n\
                  let mut response = String::new();\n\
                  stream.read_to_string(&mut response).expect(\"read response\");\n\
@@ -254,23 +274,28 @@ fn render_pwa_system_test() -> String {
              }}\n\
              \n\
              // Browser check: <link rel=\"manifest\"> is in <head>\n\
-             page.visit(\"/\").await.expect(\"root page loaded\");\n\
+             page.visit(\"/offline\").await.expect(\"offline page loaded\");\n\
              page.expect_attribute({manifest_selector:?}, \"href\", \"/manifest.webmanifest\")\n\
                  .await\n\
                  .expect(\"manifest link present in DOM\");\n\
          }}\n\
          \n\
-         /// Verifies that the service worker registers successfully (scope covers the whole app)\n\
-         /// and that the offline shell renders when navigating offline.\n\
+         /// Verifies that the service worker registers successfully (scope covers the whole app).\n\
+         /// The `/offline` page is used as the test shell since it is always available.\n\
          #[tokio::test]\n\
          #[ignore = \"requires Chromium; run with --include-ignored\"]\n\
          async fn service_worker_registers_successfully() {{\n\
-             let runner = SystemTest::new().build().await.expect(\"test runner\");\n\
-             let page = runner.page();\n\
+             let runner = SystemTest::new()\n\
+                 .routes(routes![pwa_manifest, pwa_service_worker, pwa_register_js, pwa_offline])\n\
+                 .build()\n\
+                 .await\n\
+                 .expect(\"test runner\");\n\
+             let page = runner.page().await.expect(\"page\");\n\
              \n\
-             // The layout injects an inline SW registration script that sets\n\
-             // `data-sw-registered=\"true\"` on `<html>` upon successful registration.\n\
-             page.visit(\"/\").await.expect(\"root page loaded\");\n\
+             // `/pwa-register.js` sets `data-sw-registered=\"true\"` on `<html>`\n\
+             // after the SW registers.  Visiting `/offline` (which uses layout)\n\
+             // loads the script without needing the user's root route.\n\
+             page.visit(\"/offline\").await.expect(\"offline page loaded\");\n\
              page.expect_attribute(\"html\", \"data-sw-registered\", \"true\")\n\
                  .await\n\
                  .expect(\"service worker registered and controlling page\");\n\
@@ -281,8 +306,8 @@ fn render_pwa_system_test() -> String {
 // ── src/main.rs patching ──────────────────────────────────────────────────────
 
 /// Inject all PWA additions into `src/main.rs` in a single idempotent pass:
-/// 1. Add PWA `<meta>` / `<link>` tags to the `head {}` block in `layout`.
-/// 2. Add `pwa_manifest`, `pwa_service_worker`, and `pwa_offline` handlers.
+/// 1. Add PWA `<meta>` / `<link>` tags + external register script to the `head {}` block.
+/// 2. Add `pwa_manifest`, `pwa_service_worker`, `pwa_register_js`, and `pwa_offline` handlers.
 /// 3. Register those handlers in `routes![…]`.
 pub fn inject_pwa_into_main(source: &str) -> String {
     let with_meta = inject_pwa_meta_into_head(source);
@@ -290,6 +315,7 @@ pub fn inject_pwa_into_main(source: &str) -> String {
     let route_entries = vec![
         "pwa_manifest".to_owned(),
         "pwa_service_worker".to_owned(),
+        "pwa_register_js".to_owned(),
         "pwa_offline".to_owned(),
     ];
     update_main_rs(&with_handlers, &[], &route_entries)
@@ -299,7 +325,7 @@ pub fn inject_pwa_into_main(source: &str) -> String {
 /// `layout` function.  Idempotent — skipped if `rel="manifest"` is already
 /// present.
 fn inject_pwa_meta_into_head(source: &str) -> String {
-    if source.contains(r#"rel="manifest""#) {
+    if source.contains("/pwa-register.js") {
         return source.to_owned();
     }
 
@@ -327,17 +353,14 @@ fn inject_pwa_meta_into_head(source: &str) -> String {
     let close_idx = head_idx + 1 + close_rel;
 
     let inner_indent = " ".repeat(head_indent + 4);
-    // SW registration script uses dataset to signal completion — the system
-    // test polls for `data-sw-registered="true"` on `<html>`.
-    let sw_register_js = "if('serviceWorker'in navigator)navigator.serviceWorker\
-         .register('/service-worker.js',{scope:'/'})\
-         .then(()=>document.documentElement.dataset.swRegistered='true')\
-         .catch(console.error);";
+    // Use an external script to stay compliant with `script-src 'self'` CSP.
+    // The script sets `data-sw-registered="true"` on `<html>` after registration;
+    // the system test polls for that attribute.
     let meta_block = format!(
         "{inner_indent}link rel=\"manifest\" href=\"/manifest.webmanifest\";\n\
          {inner_indent}meta name=\"theme-color\" content=\"#ffffff\";\n\
          {inner_indent}link rel=\"apple-touch-icon\" href=\"/static/icons/icon.svg\";\n\
-         {inner_indent}script {{ (maud::PreEscaped(\"{sw_register_js}\")) }}\n"
+         {inner_indent}script src=\"/pwa-register.js\" {{}}\n"
     );
 
     let mut result = lines[..close_idx].join("\n");
@@ -354,8 +377,8 @@ fn inject_pwa_meta_into_head(source: &str) -> String {
     result
 }
 
-/// Append `pwa_manifest`, `pwa_service_worker`, and `pwa_offline` handler
-/// functions just before `#[autumn_web::main]`.  Idempotent — skipped when
+/// Append `pwa_manifest`, `pwa_service_worker`, `pwa_register_js`, and `pwa_offline`
+/// handler functions just before `#[autumn_web::main]`.  Idempotent — skipped when
 /// `pwa_manifest` is already defined.
 fn inject_pwa_handlers(source: &str) -> String {
     if source.contains("async fn pwa_manifest()") {
@@ -383,6 +406,17 @@ async fn pwa_service_worker() -> impl IntoResponse {\n\
             (\"cache-control\", \"no-cache\"),\n\
         ],\n\
         include_str!(\"../static/service-worker.js\"),\n\
+    )\n\
+}\n\
+\n\
+#[get(\"/pwa-register.js\")]\n\
+async fn pwa_register_js() -> impl IntoResponse {\n\
+    (\n\
+        [\n\
+            (\"content-type\", \"text/javascript; charset=utf-8\"),\n\
+            (\"cache-control\", \"public, max-age=3600\"),\n\
+        ],\n\
+        include_str!(\"../static/pwa-register.js\"),\n\
     )\n\
 }\n\
 \n\
@@ -532,6 +566,18 @@ async fn main() {
     }
 
     #[test]
+    fn plan_creates_pwa_register_js() {
+        let tmp = project_with_main(DEFAULT_MAIN);
+        let plan = plan_pwa(tmp.path()).unwrap();
+        assert!(
+            plan.actions
+                .iter()
+                .any(|a| a.path().ends_with("pwa-register.js")),
+            "plan must include pwa-register.js"
+        );
+    }
+
+    #[test]
     fn plan_creates_icons() {
         let tmp = project_with_main(DEFAULT_MAIN);
         let plan = plan_pwa(tmp.path()).unwrap();
@@ -654,6 +700,19 @@ async fn main() {
     }
 
     #[test]
+    fn inject_adds_external_register_script() {
+        let updated = inject_pwa_meta_into_head(DEFAULT_MAIN);
+        assert!(
+            updated.contains("src=\"/pwa-register.js\""),
+            "must add external SW registration script (avoids CSP inline-script issues)"
+        );
+        assert!(
+            !updated.contains("serviceWorker"),
+            "must not embed inline serviceWorker JS"
+        );
+    }
+
+    #[test]
     fn inject_adds_theme_color_meta() {
         let updated = inject_pwa_meta_into_head(DEFAULT_MAIN);
         assert!(
@@ -722,6 +781,19 @@ async fn main() {
     }
 
     #[test]
+    fn inject_handlers_adds_register_js_route() {
+        let updated = inject_pwa_handlers(DEFAULT_MAIN);
+        assert!(
+            updated.contains("async fn pwa_register_js()"),
+            "must add pwa_register_js handler"
+        );
+        assert!(
+            updated.contains("include_str!(\"../static/pwa-register.js\")"),
+            "pwa_register_js must embed file at compile time via include_str!"
+        );
+    }
+
+    #[test]
     fn inject_handlers_adds_offline_route() {
         let updated = inject_pwa_handlers(DEFAULT_MAIN);
         assert!(
@@ -778,6 +850,10 @@ async fn main() {
         assert!(
             updated.contains("pwa_service_worker"),
             "routes![] must include pwa_service_worker"
+        );
+        assert!(
+            updated.contains("pwa_register_js"),
+            "routes![] must include pwa_register_js"
         );
         assert!(
             updated.contains("pwa_offline"),
@@ -841,6 +917,24 @@ async fn main() {
     }
 
     #[test]
+    fn plan_execute_creates_pwa_register_js_file() {
+        let tmp = project_with_main(DEFAULT_MAIN);
+        plan_pwa(tmp.path())
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+        assert!(
+            tmp.path().join("static/pwa-register.js").exists(),
+            "static/pwa-register.js must exist"
+        );
+        let content = fs::read_to_string(tmp.path().join("static/pwa-register.js")).unwrap();
+        assert!(
+            content.contains("serviceWorker"),
+            "pwa-register.js must contain SW registration code"
+        );
+    }
+
+    #[test]
     fn plan_execute_creates_icon_files() {
         let tmp = project_with_main(DEFAULT_MAIN);
         plan_pwa(tmp.path())
@@ -879,8 +973,10 @@ async fn main() {
             .unwrap();
         let main_rs = fs::read_to_string(tmp.path().join("src/main.rs")).unwrap();
         assert!(main_rs.contains(r#"rel="manifest""#));
+        assert!(main_rs.contains("src=\"/pwa-register.js\""));
         assert!(main_rs.contains("async fn pwa_manifest()"));
         assert!(main_rs.contains("async fn pwa_service_worker()"));
+        assert!(main_rs.contains("async fn pwa_register_js()"));
         assert!(main_rs.contains("async fn pwa_offline()"));
     }
 
