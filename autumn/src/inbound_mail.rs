@@ -58,6 +58,243 @@ use bytes::Bytes;
 use http::{HeaderMap, StatusCode};
 use serde::Deserialize;
 
+// ── SNS signature verification ────────────────────────────────────────────────
+
+#[cfg(feature = "inbound-ses")]
+mod sns_verify {
+    use super::*;
+
+    /// Validate that a `SigningCertURL` comes from the AWS SNS service.
+    ///
+    /// Accepted form: `https://sns.<region>.amazonaws.com/…` (or `.cn`).
+    pub(super) fn is_valid_sns_cert_url(url: &str) -> bool {
+        let Some(host) = url.strip_prefix("https://") else {
+            return false;
+        };
+        let host = host.split('/').next().unwrap_or("");
+        // Must be sns.<anything>.amazonaws.com or sns.<anything>.amazonaws.com.cn
+        let base = host.strip_suffix(".cn").unwrap_or(host);
+        base.ends_with(".amazonaws.com") && base.starts_with("sns.") && !host.contains("..")
+    }
+
+    /// Build the canonical string SNS uses for signing.
+    pub(super) fn canonical_string(json: &serde_json::Value, msg_type: &str) -> Option<String> {
+        let mut s = String::new();
+        let fields: &[&str] = match msg_type {
+            "Notification" => &[
+                "Message",
+                "MessageId",
+                "Subject",
+                "Timestamp",
+                "TopicArn",
+                "Type",
+            ],
+            "SubscriptionConfirmation" | "UnsubscribeConfirmation" => &[
+                "Message",
+                "MessageId",
+                "SubscribeURL",
+                "Timestamp",
+                "Token",
+                "TopicArn",
+                "Type",
+            ],
+            _ => return None,
+        };
+        for field in fields {
+            if let Some(v) = json.get(field).and_then(|v| v.as_str()) {
+                s.push_str(field);
+                s.push('\n');
+                s.push_str(v);
+                s.push('\n');
+            }
+        }
+        Some(s)
+    }
+
+    // ── Minimal DER parser (X.509 SubjectPublicKeyInfo extraction) ────────────
+
+    fn read_der_length(data: &[u8], pos: &mut usize) -> Option<usize> {
+        let first = *data.get(*pos)?;
+        *pos += 1;
+        if first & 0x80 == 0 {
+            return Some(first as usize);
+        }
+        let n = (first & 0x7f) as usize;
+        if n == 0 || n > 4 {
+            return None;
+        }
+        let mut len = 0usize;
+        for _ in 0..n {
+            len = (len << 8) | (*data.get(*pos)? as usize);
+            *pos += 1;
+        }
+        Some(len)
+    }
+
+    fn skip_tlv(data: &[u8], pos: &mut usize) -> Option<()> {
+        *pos += 1; // tag
+        let len = read_der_length(data, pos)?;
+        *pos = pos.checked_add(len).filter(|&e| e <= data.len())?;
+        Some(())
+    }
+
+    fn enter_sequence(data: &[u8], pos: &mut usize) -> Option<(usize, usize)> {
+        if *data.get(*pos)? != 0x30 {
+            return None;
+        }
+        *pos += 1;
+        let len = read_der_length(data, pos)?;
+        let content_start = *pos;
+        *pos = content_start
+            .checked_add(len)
+            .filter(|&e| e <= data.len())?;
+        Some((content_start, len))
+    }
+
+    /// Extract the DER-encoded SubjectPublicKeyInfo from a DER X.509 certificate.
+    pub(super) fn extract_spki_from_der(cert_der: &[u8]) -> Option<Vec<u8>> {
+        let mut pos = 0;
+        // Certificate SEQUENCE
+        let (_, _) = enter_sequence(cert_der, &mut pos)?;
+        // Restart pos at TBSCertificate
+        let mut pos = 0;
+        skip_tlv(cert_der, &mut pos)?; // skip outer tag+len, get to TBS content
+        // Re-enter properly: outer Certificate SEQUENCE → TBSCertificate SEQUENCE
+        let mut outer = 0usize;
+        let (cert_start, cert_len) = enter_sequence(cert_der, &mut outer)?;
+        let tbs_data = &cert_der[cert_start..cert_start + cert_len];
+
+        let mut tbs = 0usize;
+        let (tbs_start, tbs_len) = enter_sequence(tbs_data, &mut tbs)?;
+        let tbs_content = &tbs_data[tbs_start..tbs_start + tbs_len];
+
+        let mut p = 0usize;
+        // Skip version [0] EXPLICIT (tag 0xa0) if present.
+        if tbs_content.get(p) == Some(&0xa0) {
+            skip_tlv(tbs_content, &mut p)?;
+        }
+        skip_tlv(tbs_content, &mut p)?; // serialNumber
+        skip_tlv(tbs_content, &mut p)?; // signature AlgorithmIdentifier
+        skip_tlv(tbs_content, &mut p)?; // issuer
+        skip_tlv(tbs_content, &mut p)?; // validity
+        skip_tlv(tbs_content, &mut p)?; // subject
+
+        // subjectPublicKeyInfo starts here; capture the full TLV.
+        let spki_start = p;
+        skip_tlv(tbs_content, &mut p)?;
+        Some(tbs_content[spki_start..p].to_vec())
+    }
+
+    /// Decode a PEM certificate (first CERTIFICATE block) to DER bytes.
+    pub(super) fn pem_to_der(pem: &str) -> Option<Vec<u8>> {
+        let start = pem.find("-----BEGIN CERTIFICATE-----")?;
+        let after = &pem[start + "-----BEGIN CERTIFICATE-----".len()..];
+        let end = after.find("-----END CERTIFICATE-----")?;
+        let b64: String = after[..end]
+            .chars()
+            .filter(|c| !c.is_ascii_whitespace())
+            .collect();
+        base64::engine::general_purpose::STANDARD.decode(b64).ok()
+    }
+
+    /// Verify an RSA PKCS#1 v1.5 signature with SHA-1 or SHA-256.
+    pub(super) fn verify_rsa_signature(
+        spki_der: &[u8],
+        message: &[u8],
+        sig: &[u8],
+        sig_version: &str,
+    ) -> Result<(), ()> {
+        use rsa::pkcs1v15::Pkcs1v15Sign;
+        use rsa::pkcs8::DecodePublicKey as _;
+        use sha2::Digest as _;
+
+        let public_key = rsa::RsaPublicKey::from_public_key_der(spki_der).map_err(|_| ())?;
+        match sig_version {
+            "2" => {
+                let hash = sha2::Sha256::digest(message);
+                public_key
+                    .verify(Pkcs1v15Sign::new::<sha2::Sha256>(), &hash, sig)
+                    .map_err(|_| ())
+            }
+            _ => {
+                // SignatureVersion 1 uses SHA-1.
+                // sha1 0.10 uses const-oid 0.10.x while rsa 0.9 uses const-oid 0.9.x,
+                // so Pkcs1v15Sign::new::<sha1::Sha1>() fails to compile.  Work around
+                // the version split by using new_unprefixed() and prepending the
+                // DigestInfo DER structure (RFC 3447 §9.2) manually.
+                use sha1::Digest as _;
+                let hash = sha1::Sha1::digest(message);
+                // SHA-1 DigestInfo prefix: SEQUENCE { SEQUENCE { OID sha1, NULL }, OCTET STRING }
+                const SHA1_DI_PREFIX: &[u8] = &[
+                    0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x0e, 0x03, 0x02, 0x1a, 0x05, 0x00,
+                    0x04, 0x14,
+                ];
+                let mut digest_info = SHA1_DI_PREFIX.to_vec();
+                digest_info.extend_from_slice(&hash);
+                public_key
+                    .verify(Pkcs1v15Sign::new_unprefixed(), &digest_info, sig)
+                    .map_err(|_| ())
+            }
+        }
+    }
+
+    /// Verify the SNS notification signature.
+    ///
+    /// Set `AUTUMN_SES_SKIP_SNS_VERIFICATION=1` to disable in tests/local dev.
+    pub(super) async fn verify(
+        json: &serde_json::Value,
+        http_client: &reqwest::Client,
+    ) -> Result<(), StatusCode> {
+        if std::env::var("AUTUMN_SES_SKIP_SNS_VERIFICATION").is_ok() {
+            return Ok(());
+        }
+        let msg_type = json.get("Type").and_then(|v| v.as_str()).unwrap_or("");
+        let cert_url = json
+            .get("SigningCertURL")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let sig_b64 = json.get("Signature").and_then(|v| v.as_str()).unwrap_or("");
+        let sig_version = json
+            .get("SignatureVersion")
+            .and_then(|v| v.as_str())
+            .unwrap_or("1");
+
+        if !is_valid_sns_cert_url(cert_url) {
+            tracing::warn!(cert_url, "inbound_mail.ses: invalid SNS SigningCertURL");
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+        let sig_bytes = base64::engine::general_purpose::STANDARD
+            .decode(sig_b64)
+            .map_err(|_| StatusCode::UNAUTHORIZED)?;
+        let canonical = canonical_string(json, msg_type).ok_or(StatusCode::BAD_REQUEST)?;
+
+        let cert_pem = http_client
+            .get(cert_url)
+            .send()
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "inbound_mail.ses: failed to fetch SNS cert");
+                StatusCode::BAD_GATEWAY
+            })?
+            .text()
+            .await
+            .map_err(|_| StatusCode::BAD_GATEWAY)?;
+
+        let cert_der = pem_to_der(&cert_pem).ok_or_else(|| {
+            tracing::error!("inbound_mail.ses: could not parse SNS signing cert PEM");
+            StatusCode::UNAUTHORIZED
+        })?;
+        let spki = extract_spki_from_der(&cert_der).ok_or_else(|| {
+            tracing::error!("inbound_mail.ses: could not extract public key from SNS cert");
+            StatusCode::UNAUTHORIZED
+        })?;
+        verify_rsa_signature(&spki, canonical.as_bytes(), &sig_bytes, sig_version).map_err(|_| {
+            tracing::warn!("inbound_mail.ses: SNS signature verification failed");
+            StatusCode::UNAUTHORIZED
+        })
+    }
+}
+
 // ── Signature helpers ─────────────────────────────────────────────────────────
 
 /// Compute the Mailgun HMAC-SHA256 webhook signature.
@@ -1170,9 +1407,23 @@ fn build_ses_route(
     use axum::extract::DefaultBodyLimit;
     use axum::routing::post;
 
+    // One shared client per route for SNS cert fetching.
+    #[cfg(feature = "inbound-ses")]
+    let http_client = reqwest::Client::new();
+
     let handler = move |headers: HeaderMap, body: Bytes| {
         let router = Arc::clone(&router);
+        #[cfg(feature = "inbound-ses")]
+        let http_client = http_client.clone();
         async move {
+            // Verify SNS signature before parsing.
+            #[cfg(feature = "inbound-ses")]
+            if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body) {
+                if let Err(status) = sns_verify::verify(&json, &http_client).await {
+                    return status;
+                }
+            }
+
             match parse_ses(&body, &headers) {
                 Ok(SnsParseResult::SubscriptionConfirmation { .. }) => StatusCode::OK,
                 Ok(SnsParseResult::Email(email)) => match router.dispatch(*email).await {
