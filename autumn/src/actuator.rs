@@ -2566,8 +2566,9 @@ pub(crate) fn actuator_endpoint_paths(
 /// In dev mode (or when `actuator.sensitive = true`), all endpoints are
 /// exposed. In prod mode, only health, info, and metrics are available.
 ///
-/// The Prometheus scrape endpoint is mounted (independent of `sensitive`); use
-/// [`actuator_router_with_prefix`] to control it explicitly.
+/// The Prometheus scrape endpoint is mounted unconditionally here (independent
+/// of `sensitive`). The framework router mounts the actuator from configuration
+/// and gates `/actuator/prometheus` on the `actuator.prometheus` flag.
 pub fn actuator_router<S: ProvideActuatorState + Send + Sync + Clone + 'static>(
     sensitive: bool,
 ) -> axum::Router<S> {
