@@ -38,7 +38,7 @@
 //! (issue #1118) returns an Autumn [`Sse`](crate::sse::Sse) stream that this
 //! module projects onto the Streamable-HTTP SSE channel as
 //! `notifications/progress` messages terminated by the final `tools/call`
-//! result — see [`serve_tools_call`] / [`stream_tool_result`]. Streaming is
+//! result — see `serve_tools_call` / `stream_tool_result`. Streaming is
 //! strictly opt-in per tool; the buffered path is unchanged.
 //!
 //! [`AppBuilder::expose_all_as_mcp`]: crate::app::AppBuilder::expose_all_as_mcp
