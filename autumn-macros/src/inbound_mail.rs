@@ -82,30 +82,32 @@ fn detect_pattern(to: &str) -> TokenStream {
         return quote! { ::autumn_web::inbound_mail::RecipientPattern::Any };
     }
 
-    // Plus-address: `"{local}+{token}@{domain}"` where `{token}` is a literal `{...}`.
-    // We look for the pattern `local+{...}@domain`.
-    if let Some(at_pos) = to.rfind('@') {
-        let local_part = &to[..at_pos];
-        let domain_part = &to[at_pos + 1..];
+    // Plus-address: `"{local}+{token}@{domain}"` or `"{local}+{token}"` (no domain).
+    // The domain part is optional; `{token}` must be a literal `{...}` placeholder.
+    let (local_part, domain_part) = if let Some(at_pos) = to.rfind('@') {
+        (&to[..at_pos], Some(&to[at_pos + 1..]))
+    } else {
+        (to, None)
+    };
 
-        if let Some(plus_pos) = local_part.find('+') {
-            let tag = &local_part[plus_pos + 1..];
-            if tag.starts_with('{') && tag.ends_with('}') {
-                let local = &local_part[..plus_pos];
-                let domain = if domain_part.is_empty() {
-                    quote! { None }
-                } else {
-                    let d = domain_part.to_string();
+    if let Some(plus_pos) = local_part.find('+') {
+        let tag = &local_part[plus_pos + 1..];
+        if tag.starts_with('{') && tag.ends_with('}') {
+            let local = &local_part[..plus_pos];
+            let domain = match domain_part {
+                Some(d) if !d.is_empty() => {
+                    let d = d.to_string();
                     quote! { Some(#d.to_string()) }
-                };
-                let l = local.to_string();
-                return quote! {
-                    ::autumn_web::inbound_mail::RecipientPattern::PlusAddress {
-                        local: #l.to_string(),
-                        domain: #domain,
-                    }
-                };
-            }
+                }
+                _ => quote! { None },
+            };
+            let l = local.to_string();
+            return quote! {
+                ::autumn_web::inbound_mail::RecipientPattern::PlusAddress {
+                    local: #l.to_string(),
+                    domain: #domain,
+                }
+            };
         }
     }
 

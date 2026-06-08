@@ -255,7 +255,11 @@ async fn mailgun_valid_signature_reaches_handler() {
     VALID_SIG_CALLS.store(0, Ordering::SeqCst);
 
     let key = "test-signing-key";
-    let ts = "1700000000";
+    let ts = &std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        .to_string();
     let token = "unique-token-abc";
 
     let router = InboundMailRouter::new()
@@ -378,7 +382,11 @@ async fn routing_dispatches_to_matching_handler() {
     REPLY_HANDLER_CALLS.store(0, Ordering::SeqCst);
 
     let key = "routing-key";
-    let ts = "1700000001";
+    let ts = &std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        .to_string();
     let token = "routing-token";
 
     let router = InboundMailRouter::new()
@@ -441,7 +449,11 @@ async fn routing_plus_address_captures_token() {
     *PLUS_TOKEN_RECEIVED.lock().unwrap() = None;
 
     let key = "plus-key";
-    let ts = "1700000002";
+    let ts = &std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        .to_string();
     let token = "plus-token";
 
     let router = InboundMailRouter::new()
@@ -503,7 +515,11 @@ async fn background_mode_returns_200_before_handler_completes() {
     }
 
     let key = "bg-key";
-    let ts = "1700000003";
+    let ts = &std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        .to_string();
     let token = "bg-token";
 
     let router = InboundMailRouter::new()
@@ -576,7 +592,11 @@ async fn unmatched_email_goes_to_fallback() {
     FALLBACK_CALLS.store(0, Ordering::SeqCst);
 
     let key = "fallback-key";
-    let ts = "1700000004";
+    let ts = &std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        .to_string();
     let token = "fallback-token";
 
     let router = InboundMailRouter::new()
@@ -634,7 +654,11 @@ async fn bounce_event_routes_to_bounce_handler() {
     BOUNCE_CALLS.store(0, Ordering::SeqCst);
 
     let key = "bounce-key";
-    let ts = "1700000005";
+    let ts = &std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        .to_string();
     let token = "bounce-token";
 
     let router = InboundMailRouter::new()
