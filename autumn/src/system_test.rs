@@ -347,11 +347,13 @@ impl SystemTest {
 
         // 3. Build the axum router from the registered routes.
         let router = build_router_for_system_test(self.routes, self.state_override);
+        let service = tower::Layer::layer(&crate::middleware::MethodOverrideLayer::new(), router);
+        let make_service = axum::ServiceExt::<axum::extract::Request>::into_make_service(service);
 
         // 4. Spawn the server in a background task.
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let server_handle = tokio::spawn(async move {
-            let _ = axum::serve(listener, router)
+            let _ = axum::serve(listener, make_service)
                 .with_graceful_shutdown(async move {
                     let _ = shutdown_rx.await;
                 })

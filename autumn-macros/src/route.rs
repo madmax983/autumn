@@ -132,7 +132,10 @@ pub fn route_macro(
     let query_schema = api_doc::schema_option(api_doc::infer_query_params(&input_fn));
     let (secured, required_roles) = api_doc::extract_secured_info(&input_fn);
     let has_feature_flag = has_feature_flag_attr || has_expanded_feature_flag_gate(&input_fn);
-    let body_guarded_replay = secured || has_authorize_guard(&input_fn) || has_feature_flag;
+    let body_guarded_replay = secured
+        || has_authorize_guard(&input_fn)
+        || has_feature_flag
+        || has_step_up_guard(&input_fn);
     let intercepted_route = !interceptors.is_empty();
     let handler_expr = build_handler_expr(
         &routing_fn,
@@ -233,6 +236,15 @@ fn has_authorize_guard(input_fn: &syn::ItemFn) -> bool {
             .is_some_and(|segment| segment.ident == "authorize")
     }) || block_has_replay_guard(&input_fn.block)
         || crate::api_doc::has_policy_check_in_stmts(&input_fn.block.stmts)
+}
+
+fn has_step_up_guard(input_fn: &syn::ItemFn) -> bool {
+    input_fn.attrs.iter().any(|attr| {
+        attr.path()
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == "step_up")
+    })
 }
 
 fn has_policy_only(input_fn: &syn::ItemFn) -> bool {

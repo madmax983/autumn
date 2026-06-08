@@ -497,7 +497,7 @@ where
     S: Service<Request<axum::body::Body>, Response = Response<ResBody>> + Clone + Send + 'static,
     S::Future: Send + 'static,
     S::Error: Send + 'static,
-    ResBody: Send + 'static,
+    ResBody: From<&'static str> + Send + 'static,
 {
     type Response = S::Response;
     type Error = S::Error;
@@ -555,7 +555,31 @@ where
                 // `413` before any handler is called.
                 req.extensions_mut()
                     .insert(MethodOverrideRejection::BodyTooLarge);
-                return inner.call(req).await;
+                let res = inner.call(req).await?;
+                if res.status() == StatusCode::METHOD_NOT_ALLOWED
+                    || res.status() == StatusCode::NOT_FOUND
+                {
+                    use crate::middleware::exception_filter::AutumnErrorInfo;
+                    let (parts, _body) = res.into_parts();
+                    let mut res = Response::from_parts(
+                        parts,
+                        ResBody::from("Form body too large for method-override scanning."),
+                    );
+                    *res.status_mut() = StatusCode::PAYLOAD_TOO_LARGE;
+                    res.headers_mut().insert(
+                        http::header::CONTENT_TYPE,
+                        http::HeaderValue::from_static("text/plain; charset=utf-8"),
+                    );
+                    res.extensions_mut().insert(AutumnErrorInfo {
+                        status: StatusCode::PAYLOAD_TOO_LARGE,
+                        message: "Form body too large for method-override scanning.".to_owned(),
+                        details: None,
+                        problem_type: None,
+                        backtrace_string: None,
+                    });
+                    return Ok(res);
+                }
+                return Ok(res);
             };
 
             let outcome = scan_form_for_override(&bytes, &config.field_name);
@@ -580,9 +604,40 @@ where
                     // from inside the framework's response middleware
                     // stack, so security headers, request IDs, metrics,
                     // and error-page rendering all apply.
+                    // If route matching fails and returns 404 or 405, we
+                    // intercept and rewrite to 400 Bad Request, keeping
+                    // headers/extensions (like RequestId and security headers).
                     req.extensions_mut()
                         .insert(MethodOverrideRejection::InvalidValue);
-                    inner.call(req).await
+                    let res = inner.call(req).await?;
+                    if res.status() == StatusCode::METHOD_NOT_ALLOWED
+                        || res.status() == StatusCode::NOT_FOUND
+                    {
+                        use crate::middleware::exception_filter::AutumnErrorInfo;
+                        let (parts, _body) = res.into_parts();
+                        let mut res = Response::from_parts(
+                            parts,
+                            ResBody::from(
+                                "Invalid method override value: must be PUT, PATCH, or DELETE.",
+                            ),
+                        );
+                        *res.status_mut() = StatusCode::BAD_REQUEST;
+                        res.headers_mut().insert(
+                            http::header::CONTENT_TYPE,
+                            http::HeaderValue::from_static("text/plain; charset=utf-8"),
+                        );
+                        res.extensions_mut().insert(AutumnErrorInfo {
+                            status: StatusCode::BAD_REQUEST,
+                            message:
+                                "Invalid method override value: must be PUT, PATCH, or DELETE."
+                                    .to_owned(),
+                            details: None,
+                            problem_type: None,
+                            backtrace_string: None,
+                        });
+                        return Ok(res);
+                    }
+                    Ok(res)
                 }
             }
         })

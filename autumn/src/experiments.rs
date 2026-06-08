@@ -753,13 +753,37 @@ impl ExperimentStore for InMemoryExperimentStore {
     }
 
     fn record_assignment(&self, assignment: Assignment) -> Result<String, ExperimentStoreError> {
+        let mut inner = self.inner.write().unwrap();
+
+        if !assignment.is_override {
+            // Find the exclusion group for this experiment.
+            if let Some(group) = inner
+                .experiments
+                .get(&assignment.experiment)
+                .and_then(|c| c.exclusion_group.as_ref())
+            {
+                // Check if there is a sibling assignment in the same group.
+                for (exp_name, exp_config) in &inner.experiments {
+                    if exp_name == &assignment.experiment {
+                        continue;
+                    }
+                    if exp_config.exclusion_group.as_ref() == Some(group)
+                        && inner
+                            .assignments
+                            .contains_key(&(exp_name.clone(), assignment.actor.clone()))
+                    {
+                        return Err(ExperimentStoreError::Backend(format!(
+                            "ExcludedByGroup:{group}"
+                        )));
+                    }
+                }
+            }
+        }
+
         let variant = assignment.variant.clone();
         let key = (assignment.experiment.clone(), assignment.actor.clone());
-        self.inner
-            .write()
-            .unwrap()
-            .assignments
-            .insert(key, assignment);
+        inner.assignments.insert(key, assignment);
+        drop(inner);
         Ok(variant)
     }
 
@@ -1082,7 +1106,24 @@ impl ExperimentService {
             && config.variants.iter().any(|v| v.name == override_variant)
         {
             let sticky = Assignment::new(experiment, actor, &override_variant, true);
-            self.store.record_assignment(sticky)?;
+            if let Err(e) = self.store.record_assignment(sticky) {
+                match e {
+                    ExperimentStoreError::Backend(msg) if msg.starts_with("ExcludedByGroup:") => {
+                        let group = msg
+                            .strip_prefix("ExcludedByGroup:")
+                            .unwrap_or("")
+                            .trim()
+                            .to_owned();
+                        return Err(ExperimentError::ExcludedByGroup(
+                            experiment.to_owned(),
+                            group,
+                        ));
+                    }
+                    other @ ExperimentStoreError::Backend(_) => {
+                        return Err(ExperimentError::Store(other));
+                    }
+                }
+            }
             self.emit_exposure(experiment, &override_variant, actor, request_id, true);
             return Ok(override_variant);
         }
@@ -1120,7 +1161,23 @@ impl ExperimentService {
         // Store sticky assignment. Use the persisted variant (the winner of any
         // concurrent first-write race), not the locally-computed one.
         let assignment = Assignment::new(experiment, actor, &variant_name, false);
-        let persisted_variant = self.store.record_assignment(assignment)?;
+        let persisted_variant = match self.store.record_assignment(assignment) {
+            Ok(v) => v,
+            Err(ExperimentStoreError::Backend(msg)) if msg.starts_with("ExcludedByGroup:") => {
+                let group = msg
+                    .strip_prefix("ExcludedByGroup:")
+                    .unwrap_or("")
+                    .trim()
+                    .to_owned();
+                return Err(ExperimentError::ExcludedByGroup(
+                    experiment.to_owned(),
+                    group,
+                ));
+            }
+            Err(other @ ExperimentStoreError::Backend(_)) => {
+                return Err(ExperimentError::Store(other));
+            }
+        };
         self.emit_exposure(experiment, &persisted_variant, actor, request_id, false);
 
         Ok(persisted_variant)
@@ -1541,6 +1598,12 @@ pub mod pg {
     }
 
     #[derive(diesel::QueryableByName)]
+    struct ExclusionGroupRow {
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        exclusion_group: Option<String>,
+    }
+
+    #[derive(diesel::QueryableByName)]
     struct ChangeRow {
         #[diesel(sql_type = diesel::sql_types::Text)]
         experiment: String,
@@ -1925,26 +1988,87 @@ pub mod pg {
             &self,
             assignment: Assignment,
         ) -> Result<String, ExperimentStoreError> {
+            use diesel::connection::Connection as _;
+
+            #[derive(Debug)]
+            enum TxError {
+                Database(diesel::result::Error),
+                Excluded(String),
+            }
+            impl From<diesel::result::Error> for TxError {
+                fn from(e: diesel::result::Error) -> Self {
+                    Self::Database(e)
+                }
+            }
+
             let mut conn = self.connect()?;
-            // The no-op DO UPDATE (setting each column to its existing value) forces
-            // Postgres to return a row even on conflict, giving us the first-writer's
-            // variant so concurrent replicas agree on the same sticky bucket.
-            diesel::sql_query(
-                "INSERT INTO autumn_experiment_assignments \
-                     (experiment, actor, variant, is_override) \
-                 VALUES ($1, $2, $3, $4) \
-                 ON CONFLICT (experiment, actor) DO UPDATE \
-                     SET variant = autumn_experiment_assignments.variant, \
-                         is_override = autumn_experiment_assignments.is_override \
-                 RETURNING variant",
-            )
-            .bind::<diesel::sql_types::Text, _>(&assignment.experiment)
-            .bind::<diesel::sql_types::Text, _>(&assignment.actor)
-            .bind::<diesel::sql_types::Text, _>(&assignment.variant)
-            .bind::<diesel::sql_types::Bool, _>(assignment.is_override)
-            .get_result::<VariantNameRow>(&mut conn)
-            .map(|r| r.variant)
-            .map_err(|e| ExperimentStoreError::Backend(e.to_string()))
+            let result = conn.transaction::<String, TxError, _>(|conn| {
+                // 1. Acquire advisory lock on actor to serialize concurrent assignments for this actor.
+                diesel::sql_query("SELECT pg_advisory_xact_lock(hashtext($1))")
+                    .bind::<diesel::sql_types::Text, _>(&assignment.actor)
+                    .execute(conn)?;
+
+                // 2. Check exclusion group if this is NOT an override.
+                if !assignment.is_override {
+                    // Fetch the exclusion group for this experiment.
+                    let group_row = diesel::sql_query(
+                        "SELECT exclusion_group FROM autumn_experiments WHERE name = $1"
+                    )
+                    .bind::<diesel::sql_types::Text, _>(&assignment.experiment)
+                    .get_result::<ExclusionGroupRow>(conn)
+                    .optional()?;
+
+                    if let Some(ExclusionGroupRow { exclusion_group: Some(group) }) = group_row {
+                        // Check if there are other assignments in the same group.
+                        let exists = diesel::sql_query(
+                            "SELECT EXISTS ( \
+                                 SELECT 1 \
+                                 FROM autumn_experiment_assignments a \
+                                 JOIN autumn_experiments e ON e.name = a.experiment \
+                                 WHERE a.actor = $1 \
+                                   AND e.exclusion_group = $2 \
+                                   AND a.experiment <> $3 \
+                             ) AS result",
+                        )
+                        .bind::<diesel::sql_types::Text, _>(&assignment.actor)
+                        .bind::<diesel::sql_types::Text, _>(&group)
+                        .bind::<diesel::sql_types::Text, _>(&assignment.experiment)
+                        .get_result::<BoolRow>(conn)
+                        .map(|r| r.result)?;
+
+                        if exists {
+                            return Err(TxError::Excluded(group));
+                        }
+                    }
+                }
+
+                // 3. Insert or update on conflict.
+                let variant_name = diesel::sql_query(
+                    "INSERT INTO autumn_experiment_assignments \
+                         (experiment, actor, variant, is_override) \
+                     VALUES ($1, $2, $3, $4) \
+                     ON CONFLICT (experiment, actor) DO UPDATE \
+                         SET variant = CASE WHEN EXCLUDED.is_override THEN EXCLUDED.variant ELSE autumn_experiment_assignments.variant END, \
+                             is_override = CASE WHEN EXCLUDED.is_override THEN EXCLUDED.is_override ELSE autumn_experiment_assignments.is_override END \
+                     RETURNING variant",
+                )
+                .bind::<diesel::sql_types::Text, _>(&assignment.experiment)
+                .bind::<diesel::sql_types::Text, _>(&assignment.actor)
+                .bind::<diesel::sql_types::Text, _>(&assignment.variant)
+                .bind::<diesel::sql_types::Bool, _>(assignment.is_override)
+                .get_result::<VariantNameRow>(conn)
+                .map(|r| r.variant)?;
+
+                Ok(variant_name)
+            });
+
+            match result {
+                Ok(v) => Ok(v),
+                Err(TxError::Database(e)) => Err(ExperimentStoreError::Backend(e.to_string())),
+                Err(TxError::Excluded(group)) => Err(ExperimentStoreError::Backend(format!(
+                    "ExcludedByGroup:{group}"
+                ))),
+            }
         }
 
         fn get_override(

@@ -85,7 +85,14 @@ pub fn render(body: &str, options: RenderOptions) -> RenderedMarkdown {
                 i += 1;
             }
             _ => {
-                output.push(raw[i].clone());
+                match &raw[i] {
+                    Event::Html(s) | Event::InlineHtml(s) => {
+                        output.push(Event::Text(s.clone()));
+                    }
+                    other => {
+                        output.push(other.clone());
+                    }
+                }
                 i += 1;
             }
         }
@@ -309,5 +316,15 @@ mod tests {
         assert!(result.toc.is_empty());
         // The heading tag itself must still be present.
         assert!(result.html.contains("<h1>"));
+    }
+
+    #[test]
+    fn escapes_raw_html() {
+        let md = "<script>alert('xss')</script>\n\nAn <img src=x onerror=alert(1)> image.";
+        let result = render(md, RenderOptions::default());
+        assert!(!result.html.contains("<script>"));
+        assert!(!result.html.contains("<img"));
+        assert!(result.html.contains("&lt;script&gt;"));
+        assert!(result.html.contains("&lt;img"));
     }
 }

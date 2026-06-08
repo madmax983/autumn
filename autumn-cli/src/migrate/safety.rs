@@ -129,10 +129,13 @@ pub fn has_unsafe_findings(findings: &[SafetyFinding]) -> bool {
 
 // ── internals ────────────────────────────────────────────────────────────────
 
-/// Extract the table name from a normalized `CREATE TABLE [IF NOT EXISTS] name …` statement.
+/// Extract the table name from a normalized `CREATE TABLE name …` statement.
+/// Only unconditional creates that are known to create a fresh table are matched.
 fn extract_created_table_name(normalized: &str) -> Option<String> {
     let rest = normalized.strip_prefix("create table ")?;
-    let rest = rest.strip_prefix("if not exists ").unwrap_or(rest);
+    if rest.starts_with("if not exists ") {
+        return None;
+    }
     let name = rest.split([' ', '(']).next()?;
     if name.is_empty() {
         None
@@ -396,6 +399,19 @@ fn classify_statement(normalized: &str) -> Vec<SafetyFinding> {
                   Old replicas will error immediately on INSERT.",
             next_action: "Use expand/contract: first deploy code that no longer relies on this \
                           sequence, then drop it in a subsequent release.",
+        });
+        return findings;
+    }
+
+    // TRUNCATE TABLE
+    if normalized.starts_with("truncate ") {
+        findings.push(SafetyFinding {
+            operation: "TRUNCATE".to_owned(),
+            risk: RiskLevel::Destructive,
+            why: "Truncating a table deletes all data and acquires an AccessExclusiveLock, \
+                  blocking all concurrent reads and writes.",
+            next_action: "If you need to empty the table, delete rows in small batches, or perform \
+                          the truncate during a coordinated maintenance window.",
         });
         return findings;
     }
@@ -669,6 +685,7 @@ fn classify_statement(normalized: &str) -> Vec<SafetyFinding> {
         || normalized.starts_with("insert into ")
         || normalized.starts_with("delete from ")
         || normalized.starts_with("merge into ")
+        || normalized.starts_with("truncate ")
         || normalized.starts_with("comment on")
         || normalized.starts_with("create sequence")
         || normalized.starts_with("alter sequence")
@@ -1128,6 +1145,27 @@ mod tests {
         assert_eq!(findings[0].risk, RiskLevel::PotentiallyBlocking);
     }
 
+    #[test]
+    fn if_not_exists_table_not_treated_as_newly_created() {
+        let sql = "CREATE TABLE IF NOT EXISTS posts (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL);\n\
+                   CREATE INDEX idx_posts_title ON posts (title);";
+        let findings = classify_sql(sql);
+        assert_eq!(
+            findings.len(),
+            1,
+            "non-concurrent index on IF NOT EXISTS table must still be flagged"
+        );
+        assert_eq!(findings[0].risk, RiskLevel::PotentiallyBlocking);
+    }
+
+    #[test]
+    fn truncate_table_is_destructive() {
+        let findings = classify_sql("TRUNCATE TABLE posts;");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].risk, RiskLevel::Destructive);
+        assert_eq!(findings[0].operation, "TRUNCATE");
+    }
+
     // ── multi-statement SQL ───────────────────────────────────────────────────
 
     #[test]
@@ -1402,10 +1440,10 @@ mod tests {
     }
 
     #[test]
-    fn truncate_requires_manual_review() {
+    fn truncate_is_destructive() {
         let findings = classify_sql("TRUNCATE TABLE staging_data;");
         assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].risk, RiskLevel::ManualReview);
+        assert_eq!(findings[0].risk, RiskLevel::Destructive);
     }
 
     #[test]

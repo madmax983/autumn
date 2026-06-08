@@ -1146,7 +1146,7 @@ pub fn model_import_form_page(
 
                 form id="autumn-csv-import-form"
                     method="post"
-                    action={ (prefix) "/" (model_slug) "/import" }
+                    action={ (prefix) "/" (model_slug) "/import?" (csrf_form_field) "=" (csrf_token) }
                     enctype="multipart/form-data" {
 
                     (csrf_hidden_input(csrf_token, csrf_form_field))

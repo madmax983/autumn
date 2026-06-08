@@ -1134,39 +1134,53 @@ pub fn serve_router(store: &LocalBlobStore) -> axum::Router<crate::AppState> {
     };
 
     let store_for_upload = store.clone();
-    let upload_handler =
-        move |axum::extract::State(state): axum::extract::State<crate::AppState>,
-              Path(blob_key): Path<String>,
-              Query(q): Query<UploadQuery>,
-              body: axum::body::Body| {
-            use futures::StreamExt as _;
-            let store = store_for_upload.clone();
-            async move {
-                let now = crate::time::clock_unix_secs(state.clock());
-                if let Err(err) = verify_upload_rotation_with_now(
-                    &store.inner.signing_key,
-                    &store.inner.previous_signing_keys,
-                    &blob_key,
-                    &q.ct,
-                    q.exp,
-                    &q.sig,
-                    now,
-                ) {
-                    return (StatusCode::FORBIDDEN, err.to_string()).into_response();
-                }
-
-                let stream = body.into_data_stream();
-                let byte_stream = Box::pin(stream.map(|item| match item {
-                    Ok(bytes) => Ok(bytes),
-                    Err(e) => Err(crate::storage::BlobStoreError::Io(e.to_string())),
-                }));
-
-                match store.put_stream(&blob_key, &q.ct, byte_stream).await {
-                    Ok(_blob) => StatusCode::OK.into_response(),
-                    Err(err) => err.into_autumn_error().into_response(),
-                }
+    let upload_handler = move |axum::extract::State(state): axum::extract::State<
+        crate::AppState,
+    >,
+                               Path(blob_key): Path<String>,
+                               Query(q): Query<UploadQuery>,
+                               body: axum::body::Body| {
+        use futures::StreamExt as _;
+        let store = store_for_upload.clone();
+        async move {
+            let now = crate::time::clock_unix_secs(state.clock());
+            if let Err(err) = verify_upload_rotation_with_now(
+                &store.inner.signing_key,
+                &store.inner.previous_signing_keys,
+                &blob_key,
+                &q.ct,
+                q.exp,
+                &q.sig,
+                now,
+            ) {
+                return (StatusCode::FORBIDDEN, err.to_string()).into_response();
             }
-        };
+
+            let limit = state.config().security.upload.max_request_size_bytes;
+            let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+            let stream = body.into_data_stream();
+            let byte_stream = Box::pin(stream.map(move |item| match item {
+                Ok(bytes) => {
+                    let total = counter.fetch_add(bytes.len(), std::sync::atomic::Ordering::SeqCst)
+                        + bytes.len();
+                    if total > limit {
+                        Err(crate::storage::BlobStoreError::PayloadTooLarge(format!(
+                            "Upload size limit of {limit} bytes exceeded"
+                        )))
+                    } else {
+                        Ok(bytes)
+                    }
+                }
+                Err(e) => Err(crate::storage::BlobStoreError::Io(e.to_string())),
+            }));
+
+            match store.put_stream(&blob_key, &q.ct, byte_stream).await {
+                Ok(_blob) => StatusCode::OK.into_response(),
+                Err(err) => err.into_autumn_error().into_response(),
+            }
+        }
+    };
 
     axum::Router::new()
         .route(&mount, axum::routing::get(handler))
@@ -2223,6 +2237,41 @@ mod tests {
             .unwrap();
         let response = router.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn direct_put_enforces_size_limits() {
+        use autumn_web::reexports::axum::body::Body;
+        use http::{Method, Request, StatusCode};
+        use tower::ServiceExt as _;
+
+        let dir = temp_root();
+        let s = store(dir.path());
+        let result = s
+            .presign_put(
+                "limit/file.bin",
+                "application/octet-stream",
+                Duration::from_secs(60),
+            )
+            .await
+            .unwrap();
+
+        let arc: std::sync::Arc<dyn crate::storage::BlobStore> = std::sync::Arc::new(s.clone());
+        let mut config = crate::config::AutumnConfig::default();
+        config.security.upload.max_request_size_bytes = 10;
+        let state = crate::AppState::for_test()
+            .with_extension(crate::storage::BlobStoreState::new(arc))
+            .with_extension(config);
+        let router = serve_router(&s).with_state(state);
+
+        // Put 15 bytes, which exceeds the limit of 10
+        let request = Request::builder()
+            .method(Method::PUT)
+            .uri(&result.url)
+            .body(Body::from(b"1234567890abcde".as_ref()))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[test]

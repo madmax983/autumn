@@ -288,6 +288,7 @@ impl AdminModel for ExperimentAdminModel {
         })
     }
 
+    #[allow(clippy::too_many_lines)]
     fn update(
         &self,
         pool: &diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
@@ -304,18 +305,24 @@ impl AdminModel for ExperimentAdminModel {
                 .await
                 .map_err(|e| AdminError::Database(e.to_string()))?;
 
-            // Archived is a terminal state — reject any edit that tries to leave it.
-            let current_state: Option<String> = diesel::sql_query(
-                "SELECT state::text AS state FROM autumn_experiments WHERE id = $1",
+            let current = diesel::sql_query(
+                "SELECT name, state::text AS state FROM autumn_experiments WHERE id = $1",
             )
             .bind::<diesel::sql_types::BigInt, _>(id)
-            .get_result::<StateRow>(&mut conn)
+            .get_result::<NameStateRow>(&mut conn)
             .await
             .optional()
-            .map_err(|e| AdminError::Database(e.to_string()))?
-            .map(|r| r.state);
+            .map_err(|e| AdminError::Database(e.to_string()))?;
 
-            if current_state.as_deref() == Some("archived") {
+            let Some(NameStateRow {
+                name,
+                state: state_str,
+            }) = current
+            else {
+                return Err(AdminError::Validation("experiment not found".into()));
+            };
+
+            if state_str == "archived" {
                 return Err(AdminError::Validation(
                     "archived experiments cannot be edited".into(),
                 ));
@@ -327,6 +334,30 @@ impl AdminModel for ExperimentAdminModel {
             let state = data.get("state").and_then(Value::as_str).unwrap_or("draft");
             let variants = validate_variants_json(&extract_variants_str(&data))?;
             let winner = data.get("winner").and_then(Value::as_str);
+
+            let parsed_new_variants: Vec<serde_json::Value> = serde_json::from_str(&variants)
+                .map_err(|e| AdminError::Validation(format!("invalid variants JSON: {e}")))?;
+            let new_variant_names: std::collections::HashSet<&str> = parsed_new_variants
+                .iter()
+                .filter_map(|v| v.get("name").and_then(Value::as_str))
+                .collect();
+
+            let active_variants = diesel::sql_query(
+                "SELECT DISTINCT variant FROM autumn_experiment_assignments WHERE experiment = $1",
+            )
+            .bind::<diesel::sql_types::Text, _>(&name)
+            .load::<VariantNameRow>(&mut conn)
+            .await
+            .map_err(|e| AdminError::Database(e.to_string()))?;
+
+            for row in active_variants {
+                if !new_variant_names.contains(row.variant.as_str()) {
+                    return Err(AdminError::Validation(format!(
+                        "cannot delete variant '{}' because it has active assignments",
+                        row.variant
+                    )));
+                }
+            }
 
             // Concluding requires a non-empty winner that is a configured variant.
             if state == "concluded" {
@@ -586,9 +617,17 @@ struct NameRow {
 }
 
 #[derive(diesel::QueryableByName)]
-struct StateRow {
+struct NameStateRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    name: String,
     #[diesel(sql_type = diesel::sql_types::Text)]
     state: String,
+}
+
+#[derive(diesel::QueryableByName)]
+struct VariantNameRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    variant: String,
 }
 
 /// Row returned from list queries (no `exclusion_group` for brevity in list view).
