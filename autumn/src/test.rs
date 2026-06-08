@@ -892,6 +892,7 @@ impl TestApp {
     /// per-function Moka stores and do not accidentally inherit a Redis or
     /// other shared backend installed by a previous test.
     #[must_use]
+    #[cfg_attr(not(feature = "inbound-mail"), allow(unused_mut))]
     pub fn build(mut self) -> TestClient {
         // Reset the global cache to prevent cross-test contamination.
         crate::cache::clear_global_cache();
