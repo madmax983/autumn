@@ -5568,10 +5568,10 @@ path = "/healthz"
 
     #[test]
     fn actuator_prometheus_can_be_disabled_via_toml() {
-        let toml = r#"
+        let toml = r"
             sensitive = false
             prometheus = false
-        "#;
+        ";
         let config: ActuatorConfig = toml::from_str(toml).unwrap();
         assert!(!config.sensitive);
         assert!(!config.prometheus);
