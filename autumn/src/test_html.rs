@@ -92,8 +92,15 @@ const VOID_ELEMENTS: &[&str] = &[
     "track", "wbr",
 ];
 
-/// Elements whose content is raw text (no nested markup parsed).
+/// Elements whose content is parsed as raw text (no nested markup). This
+/// covers both true raw-text elements (`script`, `style`) and *escapable*
+/// raw-text / RCDATA elements (`textarea`, `title`).
 const RAW_TEXT_ELEMENTS: &[&str] = &["script", "style", "textarea", "title"];
+
+/// Escapable raw-text (RCDATA) elements: their content is not parsed as markup
+/// but character references *are* decoded, exactly like ordinary element text.
+/// `script`/`style` are true raw text and kept verbatim.
+const ESCAPABLE_RAW_TEXT_ELEMENTS: &[&str] = &["textarea", "title"];
 
 /// Parse an HTML fragment or document into a forest of root nodes.
 pub fn parse(input: &str) -> Vec<Node> {
@@ -208,10 +215,17 @@ impl<'a> Parser<'a> {
             let mut el = element;
             let raw = self.read_raw_text(&tag);
             if !raw.is_empty() {
-                // `<script>`/`<style>` content is not entity-decoded; text
-                // elements like `<title>` are, but treating all raw-text
-                // content verbatim is sufficient for structural assertions.
-                el.children.push(Node::Text(raw));
+                // `<title>`/`<textarea>` are escapable raw text (RCDATA): their
+                // character references are decoded just like ordinary element
+                // text, so `assert_text("title", "Tom & Jerry")` works against
+                // Maud's escaped `<title>Tom &amp; Jerry</title>`. `<script>`/
+                // `<style>` are true raw text and kept verbatim.
+                let text = if ESCAPABLE_RAW_TEXT_ELEMENTS.contains(&tag.as_str()) {
+                    decode_entities(&raw)
+                } else {
+                    raw
+                };
+                el.children.push(Node::Text(text));
             }
             attach(roots, stack, Node::Element(el));
             return;
@@ -1010,6 +1024,30 @@ mod tests {
         let html = "<div><script>if (a < b) { x(); }</script><p>after</p></div>";
         assert_eq!(count(html, "p"), 1);
         assert_eq!(count(html, "div p"), 1);
+    }
+
+    #[test]
+    fn escapable_raw_text_decodes_entities_but_script_stays_verbatim() {
+        // `<title>`/`<textarea>` are RCDATA: their entities are decoded, like
+        // ordinary element text — matching Maud's escaped output.
+        let title = parse("<title>Tom &amp; Jerry</title>");
+        let Node::Element(el) = &title[0] else {
+            panic!("expected element");
+        };
+        assert_eq!(el.text(), "Tom & Jerry");
+
+        let textarea = parse("<textarea>1 &lt; 2 &amp;&amp; 3 &gt; 2</textarea>");
+        let Node::Element(el) = &textarea[0] else {
+            panic!("expected element");
+        };
+        assert_eq!(el.text(), "1 < 2 && 3 > 2");
+
+        // `<script>` is true raw text: entities are *not* decoded.
+        let script = parse("<script>var s = \"a &amp; b\";</script>");
+        let Node::Element(el) = &script[0] else {
+            panic!("expected element");
+        };
+        assert_eq!(el.text(), "var s = \"a &amp; b\";");
     }
 
     #[test]
