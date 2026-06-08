@@ -796,6 +796,17 @@ async fn dynamic_mount_path_is_rejected() {
 }
 
 #[tokio::test]
+#[should_panic(expected = "InvalidMcpPath")]
+async fn colon_capture_mount_path_is_rejected() {
+    // A v0.7-style `:capture` segment makes axum 0.8's `Router::route` panic
+    // during assembly; surface the recoverable error instead.
+    let _ = TestApp::new()
+        .routes(routes![list_todos])
+        .mount_mcp("/api/:mcp")
+        .build();
+}
+
+#[tokio::test]
 async fn tools_call_requires_body_for_write_tools() {
     let client = TestApp::new()
         .routes(routes![create_todo])

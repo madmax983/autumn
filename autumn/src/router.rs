@@ -379,11 +379,16 @@ fn build_router_pre_state(
         // non-absolute, doubled-slash, and dynamic (`{capture}` / `{*rest}`)
         // paths so MCP cannot shadow a whole path class and so the exact-path
         // collision preflight reserves the concrete URL it actually matches.
+        // Colon-prefixed segments (`/:mcp`, axum 0.7 capture syntax) are also
+        // rejected: axum 0.8's `Router::route` panics on them during assembly
+        // (`validate_v07_paths`), so catching them here yields the recoverable
+        // `InvalidMcpPath` error instead of a startup crash.
         if path.is_empty()
             || !path.starts_with('/')
             || path.contains("//")
             || path.contains('{')
             || path.contains('*')
+            || path.split('/').any(|segment| segment.starts_with(':'))
         {
             return Err(RouterBuildError::InvalidMcpPath {
                 value: rt.mount_path,
@@ -1522,7 +1527,11 @@ fn apply_rate_limit_middleware(
         // overriding an operator's explicit security.rate_limit.trusted_proxies.
         let has_rate_limit_proxy_config =
             rl.trust_forwarded_headers || !rl.trusted_proxies.is_empty();
-        let mut layer = crate::security::RateLimitLayer::from_config(rl);
+        // The framework default limiter shares its bucket with the MCP `/mcp`
+        // envelope limiter (both built here), so it honors `RateLimitExempt` to
+        // avoid double-counting an already-charged `tools/call`. User-installed
+        // limiters don't, so MCP replays still consume their per-route buckets.
+        let mut layer = crate::security::RateLimitLayer::from_config(rl).honoring_mcp_exempt();
         if has_top_level_proxy_config && !has_rate_limit_proxy_config {
             let resolver = crate::security::ProxyResolver::from_config(tp);
             layer = layer.with_proxy_resolver(resolver);
