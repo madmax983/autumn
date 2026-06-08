@@ -292,14 +292,14 @@ fn add_inbound_mail_router_to_app(src: &str, handler_module_path: &str) -> Strin
 
     target.unwrap_or_else(|| {
         // Fallback: insert before `.run()`.
-        if let Some(run_pos) = src.find(".run()") {
-            let mut out = src.to_owned();
-            out.insert_str(run_pos, &format!("{snippet}\n        "));
-            out
-        } else {
-            // Cannot find insertion point — append a comment.
-            format!("{src}\n// TODO: add to app builder: {snippet}")
-        }
+        src.find(".run()").map_or_else(
+            || format!("{src}\n// TODO: add to app builder: {snippet}"),
+            |run_pos| {
+                let mut out = src.to_owned();
+                out.insert_str(run_pos, &format!("{snippet}\n        "));
+                out
+            },
+        )
     })
 }
 
@@ -460,8 +460,8 @@ async fn main() {
             .find(|a| a.path().ends_with("support.rs"))
             .expect("handler file must be in plan");
         let contents = match handler_action {
-            super::super::emit::Action::Create { contents, .. } => contents,
-            super::super::emit::Action::Modify { contents, .. } => contents,
+            super::super::emit::Action::Create { contents, .. }
+            | super::super::emit::Action::Modify { contents, .. } => contents,
         };
         assert!(
             contents.contains("#[inbound_mail"),
@@ -479,8 +479,8 @@ async fn main() {
             .find(|a| a.path().ends_with("support_inbound_mail.rs"))
             .expect("integration test must be in plan");
         let contents = match test_action {
-            super::super::emit::Action::Create { contents, .. } => contents,
-            super::super::emit::Action::Modify { contents, .. } => contents,
+            super::super::emit::Action::Create { contents, .. }
+            | super::super::emit::Action::Modify { contents, .. } => contents,
         };
         assert!(
             contents.contains("compute_mailgun_signature"),
@@ -490,10 +490,10 @@ async fn main() {
 
     #[test]
     fn add_inbound_mail_router_inserts_after_routes() {
-        let src = r#"autumn_web::app()
+        let src = r"autumn_web::app()
         .routes(routes![index])
         .run()
-        .await;"#;
+        .await;";
         let updated =
             add_inbound_mail_router_to_app(src, "inbound_mailers::replies::replies_handler_info");
         assert!(
@@ -505,11 +505,11 @@ async fn main() {
     #[test]
     fn add_inbound_mail_router_is_idempotent_when_handler_already_present() {
         // Handler already fully registered — no change expected.
-        let src = r#"autumn_web::app()
+        let src = r"autumn_web::app()
         .routes(routes![index])
         .inbound_mail_router(InboundMailRouter::new().handler(inbound_mailers::replies::replies_handler_info()))
         .run()
-        .await;"#;
+        .await;";
         let updated =
             add_inbound_mail_router_to_app(src, "inbound_mailers::replies::replies_handler_info");
         assert_eq!(
@@ -520,11 +520,11 @@ async fn main() {
 
     #[test]
     fn add_inbound_mail_router_chains_new_handler_onto_existing_router() {
-        let src = r#"autumn_web::app()
+        let src = r"autumn_web::app()
         .routes(routes![index])
         .inbound_mail_router(InboundMailRouter::new().handler(replies_handler_info()))
         .run()
-        .await;"#;
+        .await;";
         let updated =
             add_inbound_mail_router_to_app(src, "inbound_mailers::support::support_handler_info");
         let count = updated.matches(".inbound_mail_router(").count();
@@ -548,8 +548,8 @@ async fn main() {
             .find(|a| a.path().ends_with("reply_thread.rs"))
             .expect("handler file must be in plan");
         let contents = match handler_action {
-            super::super::emit::Action::Create { contents, .. } => contents,
-            super::super::emit::Action::Modify { contents, .. } => contents,
+            super::super::emit::Action::Create { contents, .. }
+            | super::super::emit::Action::Modify { contents, .. } => contents,
         };
         assert!(
             contents.contains("ReplyThreadMailHandler"),
