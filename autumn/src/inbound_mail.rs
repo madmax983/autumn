@@ -192,6 +192,10 @@ pub struct InboundMailEndpointConfig {
     /// Environment variable that holds the signing key at startup.
     pub signing_key_env: Option<String>,
     /// Default processing mode for all handlers on this endpoint.
+    ///
+    /// Note: this field is reserved for future use. Dispatch currently
+    /// honours each [`InboundMailHandlerInfo::processing`] value directly;
+    /// the endpoint-level default is not yet applied automatically.
     pub processing: ProcessingMode,
 }
 
@@ -458,15 +462,6 @@ impl InboundMailRouter {
             return handler(email).await;
         }
 
-        // Complaint detection: Mailgun sets X-Mailgun-Sflag=YES for spam-flagged mail.
-        let spam_flagged = email
-            .headers
-            .get("x-mailgun-sflag")
-            .is_some_and(|v| v.eq_ignore_ascii_case("YES"));
-        if spam_flagged && let Some(handler) = self.complaint_handler {
-            return handler(email).await;
-        }
-
         for info in &self.handlers {
             let matched = email.to.iter().find(|r| info.pattern.matches(r)).cloned();
             if let Some(recipient) = matched {
@@ -684,10 +679,11 @@ pub(crate) fn parse_ses(body: &Bytes, headers: &HeaderMap) -> Result<SnsParseRes
                 .get("SubscribeURL")
                 .and_then(|u| u.as_str())
                 .unwrap_or("");
-            tracing::info!(
+            tracing::warn!(
                 subscribe_url = %url,
-                "inbound_mail.ses: SNS SubscriptionConfirmation received; \
-                 visit SubscribeURL to confirm or configure auto-confirm"
+                "inbound_mail.ses: SNS SubscriptionConfirmation received — \
+                 SES notifications will NOT be delivered until you visit the \
+                 SubscribeURL above to confirm the subscription"
             );
             Ok(SnsParseResult::SubscriptionConfirmation {
                 url: url.to_string(),
@@ -731,6 +727,7 @@ pub(crate) fn parse_ses(body: &Bytes, headers: &HeaderMap) -> Result<SnsParseRes
 }
 
 /// Possible outcomes of parsing an SNS notification body.
+#[derive(Debug)]
 pub(crate) enum SnsParseResult {
     SubscriptionConfirmation {
         #[allow(dead_code)]
@@ -749,6 +746,10 @@ pub(crate) fn parse_generic(
     headers: &HeaderMap,
 ) -> Result<InboundEmail, StatusCode> {
     if let Some(key) = signing_key {
+        if key.is_empty() {
+            tracing::error!("inbound_mail.generic: signing key is empty; rejecting request");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
         let provided = headers
             .get("x-inbound-signature")
             .and_then(|v| v.to_str().ok())
@@ -1269,5 +1270,272 @@ mod tests {
 
         let email = parse_mailgun(&form, key).unwrap();
         assert!(email.headers.contains_key("x-mailgun-bounced-address"));
+    }
+
+    #[test]
+    fn mailgun_empty_key_returns_500() {
+        let result = parse_mailgun(&HashMap::new(), "");
+        assert_eq!(result.unwrap_err(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn mailgun_merges_recipient_into_to() {
+        let ts = now_ts();
+        let tok = "tok";
+        let key = "k";
+        let sig = compute_mailgun_signature(&ts, tok, key);
+        let form: HashMap<String, String> = [
+            ("from".to_string(), "u@example.com".to_string()),
+            ("to".to_string(), "a@example.com".to_string()),
+            ("recipient".to_string(), "b@example.com".to_string()),
+            ("timestamp".to_string(), ts),
+            ("token".to_string(), tok.to_string()),
+            ("signature".to_string(), sig),
+        ]
+        .into_iter()
+        .collect();
+        let email = parse_mailgun(&form, key).unwrap();
+        assert!(email.to.contains(&"a@example.com".to_string()));
+        assert!(email.to.contains(&"b@example.com".to_string()));
+    }
+
+    #[test]
+    fn mailgun_display_name_stripped_from_to() {
+        let ts = now_ts();
+        let tok = "tok2";
+        let key = "k2";
+        let sig = compute_mailgun_signature(&ts, tok, key);
+        let form: HashMap<String, String> = [
+            ("from".to_string(), "u@example.com".to_string()),
+            (
+                "to".to_string(),
+                "Support <support@company.com>".to_string(),
+            ),
+            ("timestamp".to_string(), ts),
+            ("token".to_string(), tok.to_string()),
+            ("signature".to_string(), sig),
+        ]
+        .into_iter()
+        .collect();
+        let email = parse_mailgun(&form, key).unwrap();
+        assert!(email.to.contains(&"support@company.com".to_string()));
+    }
+
+    #[test]
+    fn mailgun_spam_report_populated() {
+        let ts = now_ts();
+        let tok = "spam-tok";
+        let key = "spam-key";
+        let sig = compute_mailgun_signature(&ts, tok, key);
+        let form: HashMap<String, String> = [
+            ("from".to_string(), "u@example.com".to_string()),
+            ("to".to_string(), "r@example.com".to_string()),
+            ("timestamp".to_string(), ts),
+            ("token".to_string(), tok.to_string()),
+            ("signature".to_string(), sig),
+            ("X-Mailgun-Spam-Score".to_string(), "5.7".to_string()),
+            ("X-Mailgun-Sflag".to_string(), "Yes".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let email = parse_mailgun(&form, key).unwrap();
+        let report = email.spam_report.unwrap();
+        assert!((report.score.unwrap() - 5.7_f64).abs() < 0.01);
+        assert_eq!(report.verdict.as_deref(), Some("Yes"));
+    }
+
+    #[test]
+    fn generic_empty_key_returns_500() {
+        let headers = HeaderMap::new();
+        let result = parse_generic(Bytes::from("test"), Some(""), &headers);
+        assert_eq!(result.unwrap_err(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn generic_invalid_signature_returns_401() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::HeaderName::from_static("x-inbound-signature"),
+            "badhex".parse().unwrap(),
+        );
+        let result = parse_generic(Bytes::from("body"), Some("key"), &headers);
+        assert_eq!(result.unwrap_err(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn generic_no_key_passes_through() {
+        let headers = HeaderMap::new();
+        let raw = "From: a@b.com\r\nTo: c@d.com\r\nSubject: S\r\n\r\nB";
+        let result = parse_generic(Bytes::from(raw), None, &headers);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().subject, "S");
+    }
+
+    #[test]
+    fn parse_ses_subscription_confirmation() {
+        let headers = HeaderMap::from_iter([(
+            http::header::HeaderName::from_static("x-amz-sns-message-type"),
+            "SubscriptionConfirmation".parse().unwrap(),
+        )]);
+        let payload = serde_json::json!({
+            "Type": "SubscriptionConfirmation",
+            "SubscribeURL": "https://sns.example.com/confirm?token=abc"
+        });
+        let body = Bytes::from(payload.to_string());
+        let result = parse_ses(&body, &headers);
+        assert!(
+            matches!(result, Ok(SnsParseResult::SubscriptionConfirmation { .. })),
+            "expected SubscriptionConfirmation"
+        );
+    }
+
+    #[test]
+    fn parse_ses_notification_base64_email() {
+        use base64::Engine as _;
+        let raw =
+            "From: sender@example.com\r\nTo: recv@example.com\r\nSubject: SES-Base64\r\n\r\nHi";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(raw);
+        let headers = HeaderMap::from_iter([(
+            http::header::HeaderName::from_static("x-amz-sns-message-type"),
+            "Notification".parse().unwrap(),
+        )]);
+        let sns = serde_json::json!({ "Type": "Notification", "Message": encoded });
+        let result = parse_ses(&Bytes::from(sns.to_string()), &headers);
+        let Ok(SnsParseResult::Email(email)) = result else {
+            panic!("expected Email result, got: {result:?}");
+        };
+        assert_eq!(email.subject, "SES-Base64");
+    }
+
+    #[test]
+    fn parse_ses_notification_nested_content_field() {
+        use base64::Engine as _;
+        let raw = "From: sender@example.com\r\nTo: dest@example.com\r\nSubject: Nested\r\n\r\nBody";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(raw);
+        let msg_json = serde_json::json!({ "content": encoded });
+        let headers = HeaderMap::from_iter([(
+            http::header::HeaderName::from_static("x-amz-sns-message-type"),
+            "Notification".parse().unwrap(),
+        )]);
+        let sns = serde_json::json!({
+            "Type": "Notification",
+            "Message": msg_json.to_string()
+        });
+        let result = parse_ses(&Bytes::from(sns.to_string()), &headers);
+        let Ok(SnsParseResult::Email(email)) = result else {
+            panic!("expected Email, got: {result:?}");
+        };
+        assert_eq!(email.subject, "Nested");
+    }
+
+    #[test]
+    fn parse_ses_unknown_type_returns_400() {
+        let headers = HeaderMap::from_iter([(
+            http::header::HeaderName::from_static("x-amz-sns-message-type"),
+            "UnknownType".parse().unwrap(),
+        )]);
+        let result = parse_ses(&Bytes::from("{}"), &headers);
+        assert_eq!(result.unwrap_err(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn extract_boundary_parses_unquoted() {
+        assert_eq!(
+            extract_boundary("multipart/mixed; boundary=abc123"),
+            Some("abc123".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_boundary_parses_quoted() {
+        assert_eq!(
+            extract_boundary("multipart/mixed; boundary=\"abc=123\""),
+            Some("abc=123".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_boundary_returns_none_for_plain_content_type() {
+        assert!(extract_boundary("text/plain").is_none());
+    }
+
+    #[test]
+    fn extract_multipart_bodies_text_and_html() {
+        let b = "boundary42";
+        let body = format!(
+            "--{b}\r\nContent-Type: text/plain\r\n\r\nHello text\r\n\
+             --{b}\r\nContent-Type: text/html\r\n\r\n<b>Hello</b>\r\n\
+             --{b}--\r\n"
+        );
+        let ct = format!("multipart/alternative; boundary={b}");
+        let (text, html) = extract_multipart_bodies(&body, &ct);
+        assert_eq!(text.as_deref(), Some("Hello text"));
+        assert_eq!(html.as_deref(), Some("<b>Hello</b>"));
+    }
+
+    #[test]
+    fn extract_multipart_bodies_no_boundary_returns_body_as_text() {
+        let (text, html) = extract_multipart_bodies("plain text", "text/plain");
+        assert_eq!(text.as_deref(), Some("plain text"));
+        assert!(html.is_none());
+    }
+
+    #[test]
+    fn rfc5322_parses_multipart_body() {
+        let b = "TESTBOUNDARY";
+        let raw = format!(
+            "From: a@b.com\r\nTo: c@d.com\r\nSubject: Multi\r\n\
+             Content-Type: multipart/alternative; boundary={b}\r\n\r\n\
+             --{b}\r\nContent-Type: text/plain\r\n\r\nText part\r\n\
+             --{b}\r\nContent-Type: text/html\r\n\r\n<p>HTML</p>\r\n\
+             --{b}--\r\n"
+        );
+        let email = parse_rfc5322(Bytes::from(raw));
+        assert_eq!(email.text_body.as_deref(), Some("Text part"));
+        assert_eq!(email.html_body.as_deref(), Some("<p>HTML</p>"));
+    }
+
+    #[test]
+    fn rfc5322_html_only_body() {
+        let raw = "From: a@b.com\r\nTo: c@d.com\r\nContent-Type: text/html\r\n\r\n<p>Hello</p>";
+        let email = parse_rfc5322(Bytes::from_static(raw.as_bytes()));
+        assert!(email.text_body.is_none());
+        assert_eq!(email.html_body.as_deref(), Some("<p>Hello</p>"));
+    }
+
+    #[test]
+    fn primary_recipient_returns_first_to() {
+        let email = InboundEmail {
+            from: "a@b.com".to_string(),
+            to: vec!["first@x.com".to_string(), "second@x.com".to_string()],
+            cc: vec![],
+            subject: String::new(),
+            text_body: None,
+            html_body: None,
+            headers: HashMap::new(),
+            attachments: vec![],
+            spam_report: None,
+            raw: Bytes::new(),
+            plus_token: None,
+        };
+        assert_eq!(email.primary_recipient(), Some("first@x.com"));
+    }
+
+    #[test]
+    fn primary_recipient_returns_none_for_empty_to() {
+        let email = InboundEmail {
+            from: "a@b.com".to_string(),
+            to: vec![],
+            cc: vec![],
+            subject: String::new(),
+            text_body: None,
+            html_body: None,
+            headers: HashMap::new(),
+            attachments: vec![],
+            spam_report: None,
+            raw: Bytes::new(),
+            plus_token: None,
+        };
+        assert!(email.primary_recipient().is_none());
     }
 }

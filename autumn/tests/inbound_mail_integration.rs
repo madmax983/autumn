@@ -766,3 +766,196 @@ fn endpoint_config_signing_key_from_env() {
 fn default_processing_mode_is_background() {
     assert_eq!(ProcessingMode::default(), ProcessingMode::Background);
 }
+
+// ── AC3: Generic endpoint signing key ─────────────────────────────────────────
+
+fn hmac_sha256_hex(key: &[u8], msg: &[u8]) -> String {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    type HmacSha256 = Hmac<Sha256>;
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key size");
+    mac.update(msg);
+    hex::encode(mac.finalize().into_bytes())
+}
+
+static GENERIC_SIGNED_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+fn generic_signed_handler(
+    email: InboundEmail,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = autumn_web::AutumnResult<()>> + Send + 'static>,
+> {
+    GENERIC_SIGNED_CALLS.fetch_add(1, Ordering::SeqCst);
+    let _ = email;
+    Box::pin(async { Ok(()) })
+}
+
+#[tokio::test]
+async fn generic_valid_hmac_signature_accepts_request() {
+    GENERIC_SIGNED_CALLS.store(0, Ordering::SeqCst);
+
+    let key = "generic-secret";
+    let raw_email = "From: sender@example.com\r\n\
+                     To: support@company.com\r\n\
+                     Subject: Signed-Generic\r\n\
+                     \r\n\
+                     Signed body.";
+    let sig = hmac_sha256_hex(key.as_bytes(), raw_email.as_bytes());
+
+    let router = InboundMailRouter::new()
+        .endpoint(InboundMailEndpointConfig {
+            path: "/inbound/generic".to_string(),
+            provider: InboundMailProvider::Generic,
+            signing_key: Some(key.to_string()),
+            signing_key_env: None,
+            processing: ProcessingMode::Background,
+        })
+        .handler(InboundMailHandlerInfo {
+            name: "signed",
+            pattern: RecipientPattern::Any,
+            processing: ProcessingMode::Sync,
+            handler: generic_signed_handler,
+        });
+
+    let client = TestApp::new()
+        .inbound_mail_router(router)
+        .routes(routes![ping])
+        .build();
+
+    client
+        .post("/inbound/generic")
+        .header("x-inbound-signature", sig.as_str())
+        .header("content-type", "message/rfc822")
+        .body(raw_email)
+        .send()
+        .await
+        .assert_status(200);
+
+    assert_eq!(GENERIC_SIGNED_CALLS.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn generic_invalid_hmac_signature_returns_401() {
+    let key = "generic-secret2";
+    let raw_email = "From: s@example.com\r\nTo: r@example.com\r\nSubject: Bad\r\n\r\nBody";
+
+    let router = InboundMailRouter::new()
+        .endpoint(InboundMailEndpointConfig {
+            path: "/inbound/generic".to_string(),
+            provider: InboundMailProvider::Generic,
+            signing_key: Some(key.to_string()),
+            signing_key_env: None,
+            processing: ProcessingMode::Background,
+        })
+        .handler(InboundMailHandlerInfo {
+            name: "signed2",
+            pattern: RecipientPattern::Any,
+            processing: ProcessingMode::Sync,
+            handler: generic_signed_handler,
+        });
+
+    let client = TestApp::new()
+        .inbound_mail_router(router)
+        .routes(routes![ping])
+        .build();
+
+    client
+        .post("/inbound/generic")
+        .header("x-inbound-signature", "wrongsignature")
+        .header("content-type", "message/rfc822")
+        .body(raw_email)
+        .send()
+        .await
+        .assert_status(401);
+}
+
+#[tokio::test]
+async fn generic_missing_env_var_returns_500() {
+    // Endpoint configured with env var, but the var is not set → fail closed.
+    let router = InboundMailRouter::new()
+        .endpoint(InboundMailEndpointConfig {
+            path: "/inbound/generic".to_string(),
+            provider: InboundMailProvider::Generic,
+            signing_key: None,
+            signing_key_env: Some("AUTUMN_TEST_MISSING_KEY_XYZ".to_string()),
+            processing: ProcessingMode::Background,
+        })
+        .handler(InboundMailHandlerInfo {
+            name: "failclosed",
+            pattern: RecipientPattern::Any,
+            processing: ProcessingMode::Sync,
+            handler: generic_signed_handler,
+        });
+
+    let client = TestApp::new()
+        .inbound_mail_router(router)
+        .routes(routes![ping])
+        .build();
+
+    client
+        .post("/inbound/generic")
+        .header("content-type", "message/rfc822")
+        .body("From: a@b.com\r\nTo: c@d.com\r\nSubject: S\r\n\r\nB")
+        .send()
+        .await
+        .assert_status(500);
+}
+
+static MULTIPART_SUBJECT: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+fn multipart_fn(
+    email: InboundEmail,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = autumn_web::AutumnResult<()>> + Send + 'static>,
+> {
+    *MULTIPART_SUBJECT.lock().unwrap() = email.subject.clone();
+    Box::pin(async { Ok(()) })
+}
+
+#[tokio::test]
+async fn generic_multipart_email_parsed() {
+    *MULTIPART_SUBJECT.lock().unwrap() = String::new();
+
+    let boundary = "TESTBOUNDARY";
+    let raw_email = format!(
+        "From: sender@example.com\r\n\
+         To: support@company.com\r\n\
+         Subject: Multipart-Test\r\n\
+         MIME-Version: 1.0\r\n\
+         Content-Type: multipart/alternative; boundary={boundary}\r\n\
+         \r\n\
+         --{boundary}\r\n\
+         Content-Type: text/plain\r\n\
+         \r\n\
+         Plain text part\r\n\
+         --{boundary}\r\n\
+         Content-Type: text/html\r\n\
+         \r\n\
+         <p>HTML part</p>\r\n\
+         --{boundary}--\r\n"
+    );
+
+    let router = InboundMailRouter::new()
+        .endpoint(InboundMailEndpointConfig::generic("/inbound/raw2"))
+        .handler(InboundMailHandlerInfo {
+            name: "multipart",
+            pattern: RecipientPattern::Any,
+            processing: ProcessingMode::Sync,
+            handler: multipart_fn,
+        });
+
+    let client = TestApp::new()
+        .inbound_mail_router(router)
+        .routes(routes![ping])
+        .build();
+
+    client
+        .post("/inbound/raw2")
+        .header("content-type", "message/rfc822")
+        .body(raw_email.into_bytes())
+        .send()
+        .await
+        .assert_status(200);
+
+    assert_eq!(*MULTIPART_SUBJECT.lock().unwrap(), "Multipart-Test");
+}
