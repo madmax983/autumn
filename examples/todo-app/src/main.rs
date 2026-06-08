@@ -94,7 +94,13 @@ async fn main() {
         .scoped(
             "/api",
             RequireApiToken::new(Arc::new(deferred.clone())),
-            routes![routes::api::list_json, routes::api::create_json],
+            routes![
+                routes::api::list_json,
+                routes::api::create_json,
+                // A streaming MCP tool (#1118): its `Sse` stream is projected
+                // onto the MCP SSE channel as progressive `notifications/progress`.
+                routes::api::scan_json,
+            ],
         )
         // Expose the tagged endpoints as agent-callable MCP tools. `tools/call`
         // dispatches through the real pipeline above, so the bearer token an

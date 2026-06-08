@@ -7,10 +7,15 @@
 //!
 //! The HTML routes at `/todos` are unaffected — they use session auth as usual.
 
+use std::convert::Infallible;
+use std::time::Duration;
+
 use autumn_web::auth::{DbApiTokenStore, issue_api_token};
 use autumn_web::prelude::*;
+use autumn_web::sse::{Event, Sse};
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
+use futures::stream::{self, Stream, StreamExt};
 use serde::Deserialize;
 
 use crate::models::{NewTodo, Todo};
@@ -82,4 +87,49 @@ pub async fn create_json(
         .get_result(&mut db)
         .await?;
     Ok(Json(created))
+}
+
+// ── Streaming MCP tool (issue #1118) ────────────────────────────────────────────
+//
+// A slow tool — imagine scanning a large codebase rather than a todo list —
+// feels broken if the agent waits in silence for the whole result. `stream`
+// projects this handler's *normal Autumn `Sse` stream* onto the MCP
+// Streamable-HTTP SSE channel: each yielded `Event` becomes a
+// `notifications/progress` message (when the client sends `_meta.progressToken`),
+// and the stream is terminated by the final `tools/call` result. The developer
+// writes zero JSON-RPC/SSE framing — just a stream of events.
+
+/// Scan all todos, emitting incremental progress per item, then a final summary.
+///
+/// Tagged `#[api_doc(mcp, stream)]`: the `stream` flag opts this tool into
+/// progressive output and exempts it from the JSON-response eligibility gate
+/// (an `Sse` handler has no JSON response schema). It dispatches through the
+/// same `RequireApiToken` pipeline as the buffered tools above, so an agent's
+/// bearer token is still enforced.
+#[get("/todos/scan")]
+#[api_doc(mcp, stream, summary = "Scan todos, streaming progress")]
+pub async fn scan_json(
+    ApiToken(caller): ApiToken,
+    mut db: Db,
+) -> AutumnResult<Sse<impl Stream<Item = Result<Event, Infallible>>>> {
+    let _ = caller; // available for per-user filtering; unused in this demo
+    let all = Todo::all(&mut db).await?;
+    let total = all.len();
+
+    // A normal Autumn stream. `.then` simulates incremental work so the first
+    // progress frame reaches the agent long before the scan completes — the
+    // success metric for #1118 (time-to-first-signal decoupled from duration).
+    let stream = stream::iter(all.into_iter().enumerate()).then(move |(index, todo)| async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Structured progress: a numeric `progress`/`total` plus a human
+        // message are forwarded into the `notifications/progress` params.
+        let frame = serde_json::json!({
+            "progress": index + 1,
+            "total": total,
+            "message": format!("scanned todo #{}: {}", todo.id, todo.title),
+        });
+        Ok(Event::default().data(frame.to_string()))
+    });
+
+    Ok(Sse::new(stream))
 }

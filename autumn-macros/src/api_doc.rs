@@ -39,6 +39,9 @@ use syn::parse::{Parse, ParseStream, Parser as _};
 use syn::{Attribute, Expr, ExprLit, Ident, Lit, LitBool, LitStr, Token};
 
 /// Parsed `#[api_doc(...)]` attribute arguments.
+// Each bool models a distinct, orthogonal attribute flag (`hidden`, `mcp`,
+// `mcp = false`, `stream`); grouping them would obscure rather than clarify.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Default)]
 pub struct ApiDocAttr {
     pub summary: Option<LitStr>,
@@ -53,6 +56,13 @@ pub struct ApiDocAttr {
     /// `#[api_doc(mcp = false)]` — explicitly exclude from MCP, honored
     /// even under the whole-API hatch.
     pub mcp_exclude: bool,
+    /// `#[api_doc(mcp, stream)]` — this MCP tool returns an Autumn `Sse`
+    /// stream, projected onto the MCP Streamable-HTTP SSE channel as
+    /// `notifications/progress` messages terminated by the final result.
+    /// Only meaningful together with `mcp`; it also exempts the tool from
+    /// the JSON-response eligibility gate (an `Sse` handler has no JSON
+    /// response schema).
+    pub mcp_stream: bool,
 }
 
 enum KeyValue {
@@ -65,6 +75,8 @@ enum KeyValue {
     Hidden,
     /// `true` => opt in as a tool, `false` => explicit exclusion.
     Mcp(bool),
+    /// `stream` flag — this MCP tool streams over SSE.
+    Stream,
 }
 
 impl Parse for KeyValue {
@@ -99,6 +111,21 @@ impl Parse for KeyValue {
             return Ok(KeyValue::Mcp(true));
         }
 
+        if key_str == "stream" {
+            if input.peek(Token![=]) {
+                let _eq: Token![=] = input.parse()?;
+                let value: LitBool = input.parse()?;
+                return Ok(if value.value {
+                    KeyValue::Stream
+                } else {
+                    // `stream = false` is the default; emit a no-op marker.
+                    KeyValue::Tags(Vec::new())
+                });
+            }
+            // Bare `stream` flag opts in.
+            return Ok(KeyValue::Stream);
+        }
+
         let _eq: Token![=] = input.parse()?;
         match key_str.as_str() {
             "summary" => Ok(KeyValue::Summary(input.parse()?)),
@@ -122,7 +149,7 @@ impl Parse for KeyValue {
                 key.span(),
                 format!(
                     "unknown key `{other}` in `#[api_doc(...)]`. \
-                     Supported keys: summary, description, tag, tags, operation_id, status, hidden, mcp."
+                     Supported keys: summary, description, tag, tags, operation_id, status, hidden, mcp, stream."
                 ),
             )),
         }
@@ -156,6 +183,7 @@ impl ApiDocAttr {
             KeyValue::Hidden => self.hidden = true,
             KeyValue::Mcp(true) => self.mcp_tool = true,
             KeyValue::Mcp(false) => self.mcp_exclude = true,
+            KeyValue::Stream => self.mcp_stream = true,
         }
     }
 }
@@ -238,6 +266,9 @@ impl ApiDocAttr {
         if other.mcp_exclude {
             self.mcp_exclude = true;
         }
+        if other.mcp_stream {
+            self.mcp_stream = true;
+        }
     }
 
     /// Emit field initializers `summary: ..., description: ..., tags: ..., hidden: ...`
@@ -258,6 +289,7 @@ impl ApiDocAttr {
         let hidden = self.hidden;
         let mcp_tool = self.mcp_tool;
         let mcp_exclude = self.mcp_exclude;
+        let mcp_stream = self.mcp_stream;
         quote! {
             operation_id: #op_id,
             summary: #summary,
@@ -267,6 +299,7 @@ impl ApiDocAttr {
             hidden: #hidden,
             mcp_tool: #mcp_tool,
             mcp_exclude: #mcp_exclude,
+            mcp_stream: #mcp_stream,
         }
     }
 }

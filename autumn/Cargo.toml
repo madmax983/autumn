@@ -155,6 +155,7 @@ image = { workspace = true, optional = true }
 [dev-dependencies]
 diesel = { version = "2", features = ["chrono", "postgres"] }
 filetime = "0.2"
+futures.workspace = true
 http.workspace = true
 serde_json = "1"
 tempfile = "3"
