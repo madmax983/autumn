@@ -239,15 +239,13 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
 /// Annotate an async inbound mail handler function.
 ///
 /// Generates a companion `{name}_handler_info()` function that returns an
-/// [`InboundMailHandlerInfo`](autumn_web::inbound_mail::InboundMailHandlerInfo)
-/// ready to be passed to
-/// [`InboundMailRouter::handler`](autumn_web::inbound_mail::InboundMailRouter::handler).
+/// `InboundMailHandlerInfo` ready to be passed to `InboundMailRouter::handler`.
 ///
 /// # Attributes
 ///
 /// - `to = "address@example.com"` — exact recipient match.
 /// - `to = "replies+{token}@app.example"` — plus-address routing; the captured
-///   token is available via [`InboundEmail::plus_token()`].
+///   token is available via `InboundEmail::plus_token()`.
 /// - `to = "prefix+*"` — local-part prefix match.
 /// - `processing = "sync"` | `"background"` (default: `"background"`).
 ///
