@@ -19,6 +19,7 @@ pub mod mailer;
 pub mod migration;
 pub mod model;
 pub mod naming;
+pub mod pwa;
 pub mod scaffold;
 pub mod schema_edit;
 pub mod system_test;

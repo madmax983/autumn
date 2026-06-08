@@ -1104,6 +1104,30 @@ enum GenerateCommands {
         #[arg(long)]
         force: bool,
     },
+    /// Scaffold an installable Progressive Web App (manifest, service worker,
+    /// icons, and layout meta tags).
+    ///
+    /// Creates:
+    ///   - `static/manifest.webmanifest` — Web App Manifest (served as application/manifest+json)
+    ///   - `static/service-worker.js`    — Offline-shell service worker
+    ///   - `static/icons/icon.svg`       — Placeholder icon (replace with real PNG for full compat)
+    ///   - `static/icons/maskable-icon.svg` — Maskable icon variant
+    ///   - `src/main.rs`                 — Route handlers + PWA `<link>`/`<meta>` tags in layout
+    ///   - `tests/system/pwa_smoke.rs`   — Smoke test for manifest content-type + SW registration
+    ///
+    /// Example:
+    ///
+    ///   autumn generate pwa
+    ///   autumn generate pwa --dry-run
+    #[command(verbatim_doc_comment)]
+    Pwa {
+        /// Print the file plan and exit without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Overwrite existing files instead of erroring on collision.
+        #[arg(long)]
+        force: bool,
+    },
     /// Generate model, migration, repository, HTML routes, smoke test, and
     /// register the new routes in `src/main.rs`.
     Scaffold {
@@ -1673,6 +1697,9 @@ fn run_generate_command(cmd: GenerateCommands) {
             dry_run,
             force,
         } => generate::system_test::run(&name, generate::Flags { dry_run, force }),
+        GenerateCommands::Pwa { dry_run, force } => {
+            generate::pwa::run(generate::Flags { dry_run, force });
+        }
         GenerateCommands::Auth {
             name,
             oauth,
@@ -3692,6 +3719,40 @@ mod tests {
         let Commands::Generate(GenerateCommands::SystemTest { force, .. }) = cli.command else {
             panic!("expected SystemTest variant");
         };
+        assert!(force);
+    }
+
+    // ── autumn generate pwa ────────────────────────────────────────────────
+
+    #[test]
+    fn parse_generate_pwa() {
+        let cli = Cli::try_parse_from(["autumn", "generate", "pwa"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Generate(GenerateCommands::Pwa {
+                dry_run: false,
+                force: false
+            })
+        ));
+    }
+
+    #[test]
+    fn parse_generate_pwa_dry_run() {
+        let cli = Cli::try_parse_from(["autumn", "generate", "pwa", "--dry-run"]).unwrap();
+        let Commands::Generate(GenerateCommands::Pwa { dry_run, force }) = cli.command else {
+            panic!("expected Pwa variant");
+        };
+        assert!(dry_run);
+        assert!(!force);
+    }
+
+    #[test]
+    fn parse_generate_pwa_force() {
+        let cli = Cli::try_parse_from(["autumn", "generate", "pwa", "--force"]).unwrap();
+        let Commands::Generate(GenerateCommands::Pwa { dry_run, force }) = cli.command else {
+            panic!("expected Pwa variant");
+        };
+        assert!(!dry_run);
         assert!(force);
     }
 }
