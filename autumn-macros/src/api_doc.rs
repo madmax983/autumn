@@ -47,6 +47,12 @@ pub struct ApiDocAttr {
     pub operation_id: Option<LitStr>,
     pub status: Option<u16>,
     pub hidden: bool,
+    /// `#[api_doc(mcp)]` / `#[api_doc(mcp = true)]` — opt this endpoint in
+    /// as an MCP tool.
+    pub mcp_tool: bool,
+    /// `#[api_doc(mcp = false)]` — explicitly exclude from MCP, honored
+    /// even under the whole-API hatch.
+    pub mcp_exclude: bool,
 }
 
 enum KeyValue {
@@ -57,6 +63,8 @@ enum KeyValue {
     OperationId(LitStr),
     Status(u16),
     Hidden,
+    /// `true` => opt in as a tool, `false` => explicit exclusion.
+    Mcp(bool),
 }
 
 impl Parse for KeyValue {
@@ -79,6 +87,16 @@ impl Parse for KeyValue {
                 });
             }
             return Ok(KeyValue::Hidden);
+        }
+
+        if key_str == "mcp" {
+            if input.peek(Token![=]) {
+                let _eq: Token![=] = input.parse()?;
+                let value: LitBool = input.parse()?;
+                return Ok(KeyValue::Mcp(value.value));
+            }
+            // Bare `mcp` flag opts in.
+            return Ok(KeyValue::Mcp(true));
         }
 
         let _eq: Token![=] = input.parse()?;
@@ -104,7 +122,7 @@ impl Parse for KeyValue {
                 key.span(),
                 format!(
                     "unknown key `{other}` in `#[api_doc(...)]`. \
-                     Supported keys: summary, description, tag, tags, operation_id, status, hidden."
+                     Supported keys: summary, description, tag, tags, operation_id, status, hidden, mcp."
                 ),
             )),
         }
@@ -136,6 +154,8 @@ impl ApiDocAttr {
             KeyValue::OperationId(v) => self.operation_id = Some(v),
             KeyValue::Status(n) => self.status = Some(n),
             KeyValue::Hidden => self.hidden = true,
+            KeyValue::Mcp(true) => self.mcp_tool = true,
+            KeyValue::Mcp(false) => self.mcp_exclude = true,
         }
     }
 }
@@ -212,6 +232,12 @@ impl ApiDocAttr {
         if other.hidden {
             self.hidden = true;
         }
+        if other.mcp_tool {
+            self.mcp_tool = true;
+        }
+        if other.mcp_exclude {
+            self.mcp_exclude = true;
+        }
     }
 
     /// Emit field initializers `summary: ..., description: ..., tags: ..., hidden: ...`
@@ -230,6 +256,8 @@ impl ApiDocAttr {
         };
         let status = self.status.unwrap_or(200);
         let hidden = self.hidden;
+        let mcp_tool = self.mcp_tool;
+        let mcp_exclude = self.mcp_exclude;
         quote! {
             operation_id: #op_id,
             summary: #summary,
@@ -237,6 +265,8 @@ impl ApiDocAttr {
             tags: #tags,
             success_status: #status,
             hidden: #hidden,
+            mcp_tool: #mcp_tool,
+            mcp_exclude: #mcp_exclude,
         }
     }
 }

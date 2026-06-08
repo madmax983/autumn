@@ -426,6 +426,14 @@ struct Limiter {
     tier_hook: Option<TierHookFn>,
     path_overrides: Vec<(String, RateLimitOverride)>,
     backend: BucketBackend,
+    /// Whether this limiter honors the [`RateLimitExempt`] request marker. Only
+    /// the framework's own default limiter sets this: it shares a bucket with the
+    /// MCP `/mcp` envelope limiter, so a `tools/call` it already counted there
+    /// must not be charged twice in the dispatch pipeline. User-installed
+    /// limiters (e.g. an `AppBuilder::layer(RateLimitLayer::with_path_override(..))`)
+    /// leave it `false` so an MCP replay still consumes their route-specific
+    /// bucket, exactly as the equivalent direct HTTP call would.
+    honors_mcp_exempt: bool,
 }
 
 impl Limiter {
@@ -477,6 +485,7 @@ impl Limiter {
             tier_hook: None,
             path_overrides: Vec::new(),
             backend,
+            honors_mcp_exempt: false,
         }
     }
 
@@ -729,6 +738,18 @@ fn key_class_label(key: &str) -> &'static str {
 /// let layer = RateLimitLayer::from_config(&config.security.rate_limit)
 ///     .with_path_override("/api/free/", RateLimitOverride { burst: Some(5), requests_per_second: Some(1.0) });
 /// ```
+/// Request-extension marker that exempts a request from rate limiting.
+///
+/// Set on requests that have already been counted by an upstream limiter so the
+/// pipeline's limiter doesn't double-count them. The MCP endpoint uses this:
+/// it counts a `tools/call` once at its `/mcp` envelope, then replays the
+/// request through the full dispatch pipeline (which carries its own
+/// [`RateLimitLayer`]); the marker keeps that replay from consuming a second
+/// token. It is only ever set internally — external requests cannot carry it,
+/// since extensions are not derived from headers.
+#[derive(Clone, Copy, Debug)]
+pub struct RateLimitExempt;
+
 #[derive(Clone, Debug)]
 pub struct RateLimitLayer {
     limiter: Arc<Limiter>,
@@ -814,6 +835,20 @@ impl RateLimitLayer {
             limiter: Arc::new(limiter),
         }
     }
+
+    /// Mark this as the framework's default limiter, which shares a bucket with
+    /// the MCP `/mcp` envelope limiter and therefore honors the
+    /// [`RateLimitExempt`] marker (so an envelope-counted `tools/call` isn't
+    /// charged a second time on replay). Framework-internal: user-built limiters
+    /// must not set this, or MCP replays would skip their per-route buckets.
+    #[must_use]
+    pub(crate) fn honoring_mcp_exempt(self) -> Self {
+        let mut limiter = Arc::try_unwrap(self.limiter).unwrap_or_else(|arc| (*arc).deep_clone());
+        limiter.honors_mcp_exempt = true;
+        Self {
+            limiter: Arc::new(limiter),
+        }
+    }
 }
 
 impl Limiter {
@@ -829,6 +864,7 @@ impl Limiter {
             tier_hook: self.tier_hook.clone(),
             path_overrides: self.path_overrides.clone(),
             backend: self.backend.clone(),
+            honors_mcp_exempt: self.honors_mcp_exempt,
         }
     }
 }
@@ -868,6 +904,18 @@ where
     }
 
     fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
+        // A request already counted upstream (e.g. an MCP `tools/call` charged
+        // at the `/mcp` envelope and replayed through this pipeline) bypasses
+        // the limiter so it isn't double-counted — but only this framework
+        // default limiter, which shares the envelope's bucket, honors the
+        // marker. A user-installed limiter (e.g. a per-path override added via
+        // `AppBuilder::layer`) leaves `honors_mcp_exempt` false so the replay
+        // still consumes its route-specific bucket, exactly as a direct call.
+        if self.limiter.honors_mcp_exempt && req.extensions().get::<RateLimitExempt>().is_some() {
+            let mut inner = self.inner.clone();
+            std::mem::swap(&mut self.inner, &mut inner);
+            return Box::pin(async move { inner.call(req).await });
+        }
         // Resolve key and effective params synchronously (no I/O).
         let resolved = self.limiter.resolve_key_and_params(&req);
 
@@ -1863,6 +1911,85 @@ mod tests {
             let r = app.clone().oneshot(normal_req()).await.unwrap();
             assert_eq!(r.status(), StatusCode::OK);
         }
+    }
+
+    // ── RateLimitExempt scoping (MCP replay) tests ─────────────────────────────
+
+    fn exempt_req(uri: &str) -> Request<Body> {
+        let mut req = Request::builder()
+            .method("GET")
+            .uri(uri)
+            .header("X-Forwarded-For", "2.2.2.2")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(RateLimitExempt);
+        req
+    }
+
+    #[tokio::test]
+    async fn exempt_marker_honored_only_by_framework_default_limiter() {
+        // The framework's default limiter shares the MCP envelope's bucket, so a
+        // `RateLimitExempt` replay must bypass it (no double-count).
+        let config = RateLimitConfig {
+            enabled: true,
+            requests_per_second: 0.1,
+            burst: 1,
+            trust_forwarded_headers: true,
+            ..Default::default()
+        };
+        let layer = RateLimitLayer::from_config(&config).honoring_mcp_exempt();
+        let app = Router::new()
+            .route("/api/strict", get(|| async { "ok" }))
+            .layer(layer);
+
+        // Even past the burst of 1, every exempt request passes.
+        for _ in 0..3 {
+            let r = app
+                .clone()
+                .oneshot(exempt_req("/api/strict"))
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::OK);
+        }
+    }
+
+    #[tokio::test]
+    async fn exempt_marker_ignored_by_user_path_override_limiter() {
+        // A user-installed per-path override limiter does NOT share the envelope's
+        // bucket, so an MCP `tools/call` replay must still consume its
+        // route-specific bucket — the marker is ignored.
+        let config = RateLimitConfig {
+            enabled: true,
+            requests_per_second: 0.1,
+            burst: 5,
+            trust_forwarded_headers: true,
+            ..Default::default()
+        };
+        let layer = RateLimitLayer::from_config(&config).with_path_override(
+            "/api/strict",
+            RateLimitOverride {
+                burst: Some(1),
+                requests_per_second: None,
+            },
+        );
+        let app = Router::new()
+            .route("/api/strict", get(|| async { "ok" }))
+            .layer(layer);
+
+        // Override burst is 1: the first exempt replay passes, the second is
+        // denied despite carrying `RateLimitExempt`.
+        let r = app
+            .clone()
+            .oneshot(exempt_req("/api/strict"))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let r = app
+            .clone()
+            .oneshot(exempt_req("/api/strict"))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 
     // ── Tier hook tests ───────────────────────────────────────────────────────

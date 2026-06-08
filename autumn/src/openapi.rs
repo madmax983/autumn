@@ -76,6 +76,10 @@ use serde::{Deserialize, Serialize};
 /// [`post`](crate::post), etc.) from the handler's path, signature, and
 /// any [`#[api_doc(...)]`](crate::api_doc) overrides.
 #[derive(Clone, Debug, Default)]
+// A flat, generated metadata descriptor; the independent boolean flags
+// (hidden, secured, sunset_opt_out, has_policy, mcp_tool, mcp_exclude) each
+// model a distinct, orthogonal route property, so grouping them into a
+// sub-struct would obscure rather than clarify.
 #[allow(clippy::struct_excessive_bools)]
 pub struct ApiDoc {
     /// HTTP method as an uppercase string (e.g. `"GET"`).
@@ -119,6 +123,15 @@ pub struct ApiDoc {
     pub sunset_opt_out: bool,
     /// Whether this route uses dynamic policy authorization.
     pub has_policy: bool,
+    /// True when the endpoint opts in to MCP tool exposure via
+    /// `#[api_doc(mcp)]`. Opt-in is per-endpoint and never implicit.
+    pub mcp_tool: bool,
+    /// True when the endpoint explicitly opts *out* of MCP exposure via
+    /// `#[api_doc(mcp = false)]`. Honored even under the whole-API hatch
+    /// (`AppBuilder::expose_all_as_mcp`). Not an intra-doc link: this field is
+    /// always compiled, but the builder method is gated behind the `mcp`
+    /// feature, so a hard link would break docs built without it.
+    pub mcp_exclude: bool,
 }
 
 /// Reference to a schema definition, produced by the route macros.
@@ -775,6 +788,17 @@ fn operation_for(
         security,
         deprecated,
     }
+}
+
+/// Render a [`SchemaEntry`] into its JSON Schema value.
+///
+/// Produces the same shape the OpenAPI generator emits. Exposed so the MCP
+/// projection can derive a tool's `inputSchema` from the exact same typed
+/// contract — guaranteeing the tool schema cannot drift from the handler.
+#[cfg(feature = "openapi")]
+#[must_use]
+pub fn schema_entry_to_value(entry: &SchemaEntry) -> serde_json::Value {
+    schema_value_for(entry)
 }
 
 #[cfg(feature = "openapi")]
