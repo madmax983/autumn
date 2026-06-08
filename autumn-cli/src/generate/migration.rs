@@ -11,10 +11,28 @@ use super::dsl::parse_fields;
 use super::emit::Plan;
 use super::naming::pascal_to_snake;
 use super::schema_edit::{
-    MigrationShape, add_columns_down_sql, add_columns_up_sql, detect_migration_shape,
-    remove_columns_down_sql, remove_columns_up_sql,
+    MigrationShape, add_columns_down_sql, add_columns_up_sql, add_search_down_sql,
+    add_search_up_sql, detect_migration_shape, encrypt_columns_down_sql, encrypt_columns_up_sql,
+    parse_model_search_config_for_table, remove_columns_down_sql, remove_columns_up_sql,
+    singularize,
 };
 use super::{Flags, GenerateError, ensure_project_root, timestamp_now};
+
+fn collect_rs_files_recursive(dir: &Path, candidates: &mut Vec<std::path::PathBuf>) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_rs_files_recursive(&path, candidates);
+            } else if path.is_file()
+                && path.extension().is_some_and(|ext| ext == "rs")
+                && !candidates.contains(&path)
+            {
+                candidates.push(path);
+            }
+        }
+    }
+}
 
 /// Compute the file actions for `autumn generate migration`.
 ///
@@ -47,6 +65,78 @@ pub fn plan_migration(
             remove_columns_up_sql(table, &fields),
             remove_columns_down_sql(table, &fields),
         ),
+        MigrationShape::EncryptColumns {
+            ref table,
+            ref columns,
+        } => (
+            encrypt_columns_up_sql(table, columns),
+            encrypt_columns_down_sql(table, columns),
+        ),
+        MigrationShape::AddSearch { ref table } => {
+            let singular = singularize(table);
+
+            // Collect all potential model file candidates in order of preference
+            let mut candidates = Vec::new();
+
+            let first_cand = project_root
+                .join("src/models")
+                .join(format!("{singular}.rs"));
+            if first_cand.exists() {
+                candidates.push(first_cand);
+            }
+
+            let second_cand = project_root.join("src/models.rs");
+            if second_cand.exists() {
+                candidates.push(second_cand);
+            }
+
+            let models_dir = project_root.join("src/models");
+            let mut other_candidates = Vec::new();
+            collect_rs_files_recursive(&models_dir, &mut other_candidates);
+            other_candidates.sort();
+
+            for path in other_candidates {
+                if !candidates.contains(&path) {
+                    candidates.push(path);
+                }
+            }
+
+            let mut found_config = None;
+            let mut tried_files = Vec::new();
+
+            for path in candidates {
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    if let Some((language, fts_fields)) =
+                        parse_model_search_config_for_table(&content, table)
+                    {
+                        found_config = Some((path, language, fts_fields));
+                        break;
+                    }
+                    tried_files.push(path);
+                }
+            }
+
+            let Some((_path, language, fts_fields)) = found_config else {
+                if tried_files.is_empty() {
+                    return Err(GenerateError::Config(format!(
+                        "Missing model files for table '{table}'. Expected src/models/{singular}.rs or src/models.rs."
+                    )));
+                }
+                let files_str = tried_files
+                    .iter()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(GenerateError::Config(format!(
+                    "No #[searchable] fields configured for table '{table}' in any of the checked files: [{files_str}]"
+                )));
+            };
+
+            (
+                add_search_up_sql(table, &language, &fts_fields),
+                add_search_down_sql(table),
+            )
+        }
         _ => (String::new(), String::new()),
     };
 
@@ -195,5 +285,46 @@ mod tests {
         )
         .unwrap();
         assert!(up.contains("ALTER TABLE posts ADD COLUMN title TEXT NOT NULL"));
+    }
+
+    #[test]
+    fn add_search_migration_emits_fts_columns_and_indices() {
+        let tmp = project();
+        let models_dir = tmp.path().join("src/models");
+        fs::create_dir_all(&models_dir).unwrap();
+        let model_src = r#"
+#[autumn_web::model(table = "posts")]
+#[searchable(language = "english")]
+pub struct Post {
+    #[id]
+    pub id: i64,
+    #[searchable(weight = "A")]
+    pub title: String,
+    #[searchable(weight = "B")]
+    pub body: String,
+}
+"#;
+        fs::write(models_dir.join("post.rs"), model_src).unwrap();
+
+        let plan = plan_migration(tmp.path(), "AddSearchToPosts", &[], "20260427000000").unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let up = fs::read_to_string(
+            tmp.path()
+                .join("migrations/20260427000000_add_search_to_posts/up.sql"),
+        )
+        .unwrap();
+        let down = fs::read_to_string(
+            tmp.path()
+                .join("migrations/20260427000000_add_search_to_posts/down.sql"),
+        )
+        .unwrap();
+
+        assert!(up.contains("ALTER TABLE posts ADD COLUMN search_vector tsvector GENERATED ALWAYS AS (setweight(to_tsvector('english'::regconfig, coalesce(\"title\"::text, '')), 'A') || setweight(to_tsvector('english'::regconfig, coalesce(\"body\"::text, '')), 'B')) STORED;"));
+        assert!(
+            up.contains("CREATE INDEX idx_posts_search_vector ON posts USING gin(search_vector);")
+        );
+        assert!(down.contains("DROP INDEX IF EXISTS idx_posts_search_vector;"));
+        assert!(down.contains("ALTER TABLE posts DROP COLUMN IF EXISTS search_vector;"));
     }
 }

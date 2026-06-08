@@ -39,6 +39,9 @@ use syn::parse::{Parse, ParseStream, Parser as _};
 use syn::{Attribute, Expr, ExprLit, Ident, Lit, LitBool, LitStr, Token};
 
 /// Parsed `#[api_doc(...)]` attribute arguments.
+// Each bool models a distinct, orthogonal attribute flag (`hidden`, `mcp`,
+// `mcp = false`, `stream`); grouping them would obscure rather than clarify.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Default)]
 pub struct ApiDocAttr {
     pub summary: Option<LitStr>,
@@ -47,6 +50,19 @@ pub struct ApiDocAttr {
     pub operation_id: Option<LitStr>,
     pub status: Option<u16>,
     pub hidden: bool,
+    /// `#[api_doc(mcp)]` / `#[api_doc(mcp = true)]` — opt this endpoint in
+    /// as an MCP tool.
+    pub mcp_tool: bool,
+    /// `#[api_doc(mcp = false)]` — explicitly exclude from MCP, honored
+    /// even under the whole-API hatch.
+    pub mcp_exclude: bool,
+    /// `#[api_doc(mcp, stream)]` — this MCP tool returns an Autumn `Sse`
+    /// stream, projected onto the MCP Streamable-HTTP SSE channel as
+    /// `notifications/progress` messages terminated by the final result.
+    /// Only meaningful together with `mcp`; it also exempts the tool from
+    /// the JSON-response eligibility gate (an `Sse` handler has no JSON
+    /// response schema).
+    pub mcp_stream: bool,
 }
 
 enum KeyValue {
@@ -57,6 +73,10 @@ enum KeyValue {
     OperationId(LitStr),
     Status(u16),
     Hidden,
+    /// `true` => opt in as a tool, `false` => explicit exclusion.
+    Mcp(bool),
+    /// `stream` flag — this MCP tool streams over SSE.
+    Stream,
 }
 
 impl Parse for KeyValue {
@@ -79,6 +99,31 @@ impl Parse for KeyValue {
                 });
             }
             return Ok(KeyValue::Hidden);
+        }
+
+        if key_str == "mcp" {
+            if input.peek(Token![=]) {
+                let _eq: Token![=] = input.parse()?;
+                let value: LitBool = input.parse()?;
+                return Ok(KeyValue::Mcp(value.value));
+            }
+            // Bare `mcp` flag opts in.
+            return Ok(KeyValue::Mcp(true));
+        }
+
+        if key_str == "stream" {
+            if input.peek(Token![=]) {
+                let _eq: Token![=] = input.parse()?;
+                let value: LitBool = input.parse()?;
+                return Ok(if value.value {
+                    KeyValue::Stream
+                } else {
+                    // `stream = false` is the default; emit a no-op marker.
+                    KeyValue::Tags(Vec::new())
+                });
+            }
+            // Bare `stream` flag opts in.
+            return Ok(KeyValue::Stream);
         }
 
         let _eq: Token![=] = input.parse()?;
@@ -104,7 +149,7 @@ impl Parse for KeyValue {
                 key.span(),
                 format!(
                     "unknown key `{other}` in `#[api_doc(...)]`. \
-                     Supported keys: summary, description, tag, tags, operation_id, status, hidden."
+                     Supported keys: summary, description, tag, tags, operation_id, status, hidden, mcp, stream."
                 ),
             )),
         }
@@ -136,6 +181,9 @@ impl ApiDocAttr {
             KeyValue::OperationId(v) => self.operation_id = Some(v),
             KeyValue::Status(n) => self.status = Some(n),
             KeyValue::Hidden => self.hidden = true,
+            KeyValue::Mcp(true) => self.mcp_tool = true,
+            KeyValue::Mcp(false) => self.mcp_exclude = true,
+            KeyValue::Stream => self.mcp_stream = true,
         }
     }
 }
@@ -212,6 +260,15 @@ impl ApiDocAttr {
         if other.hidden {
             self.hidden = true;
         }
+        if other.mcp_tool {
+            self.mcp_tool = true;
+        }
+        if other.mcp_exclude {
+            self.mcp_exclude = true;
+        }
+        if other.mcp_stream {
+            self.mcp_stream = true;
+        }
     }
 
     /// Emit field initializers `summary: ..., description: ..., tags: ..., hidden: ...`
@@ -230,6 +287,9 @@ impl ApiDocAttr {
         };
         let status = self.status.unwrap_or(200);
         let hidden = self.hidden;
+        let mcp_tool = self.mcp_tool;
+        let mcp_exclude = self.mcp_exclude;
+        let mcp_stream = self.mcp_stream;
         quote! {
             operation_id: #op_id,
             summary: #summary,
@@ -237,6 +297,9 @@ impl ApiDocAttr {
             tags: #tags,
             success_status: #status,
             hidden: #hidden,
+            mcp_tool: #mcp_tool,
+            mcp_exclude: #mcp_exclude,
+            mcp_stream: #mcp_stream,
         }
     }
 }
@@ -523,6 +586,16 @@ pub fn infer_query_params(input_fn: &syn::ItemFn) -> Option<TokenStream> {
 /// 2. Function-local `__AUTUMN_SECURED_ROLES` marker present (secured was
 ///    above the route macro and already expanded its body).
 /// 3. Legacy fallback: `__autumn_session` param present.
+pub fn has_policy_check_in_stmts(stmts: &[syn::Stmt]) -> bool {
+    for stmt in stmts {
+        let s = quote::quote!(#stmt).to_string();
+        if s.contains("__check_policy") {
+            return true;
+        }
+    }
+    false
+}
+
 pub fn extract_secured_info(input_fn: &syn::ItemFn) -> (bool, TokenStream) {
     // Case 1 — #[secured] or #[autumn_web::secured] visible as a remaining attribute.
     for attr in &input_fn.attrs {
@@ -539,11 +612,30 @@ pub fn extract_secured_info(input_fn: &syn::ItemFn) -> (bool, TokenStream) {
         }
     }
 
+    // Case 1b — #[authorize] or #[autumn_web::authorize] visible as a remaining attribute.
+    for attr in &input_fn.attrs {
+        if attr.path().is_ident("authorize")
+            || attr
+                .path()
+                .segments
+                .last()
+                .is_some_and(|s| s.ident == "authorize")
+        {
+            return (true, quote! { &[] });
+        }
+    }
+
     // Case 2 — #[secured] was above the route macro and already expanded;
     // read the marker emitted into the guarded function body.
     if let Some(roles) = extract_secured_roles_marker(input_fn) {
         let roles_tokens = emit_static_str_slice(&roles);
         return (true, roles_tokens);
+    }
+
+    // Case 2b — #[authorize] was above the route macro and already expanded;
+    // check if a policy check statement is present.
+    if has_policy_check_in_stmts(&input_fn.block.stmts) {
+        return (true, quote! { &[] });
     }
 
     // Case 3 — compatibility fallback for expansions produced before the

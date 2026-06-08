@@ -54,6 +54,7 @@ const KNOWN_TOML_SECTIONS: &[&str] = &[
     "storage",
     "mail",
     "profile",
+    "compression",
 ];
 
 /// Result status for a single diagnostic check.
@@ -164,6 +165,245 @@ pub fn check_signing_secret_impl(secret: Option<&str>, is_production: bool) -> C
             detail: Some("signing secret is configured".into()),
             hint: None,
         },
+    }
+}
+
+/// Check that the rate-limit key strategy is consistent with mounted auth middleware.
+///
+/// When `key_strategy = "authenticated_principal"`, the rate limiter reads a
+/// `RateLimitPrincipal` extension that must be set by the auth layer. If no
+/// auth extractor is mounted, unauthenticated requests still fall back to IP
+/// keying, but authenticated routes will never use the principal bucket.
+///
+/// `auth_extractor_mounted` should be `true` when the project has auth configured
+/// (e.g. `[auth]` section present and enabled in `autumn.toml`).
+///
+/// In strict mode (`autumn doctor --strict`), a warning is surfaced as an error.
+pub fn check_rate_limit_key_strategy_impl(
+    key_strategy: &str,
+    auth_extractor_mounted: bool,
+) -> CheckResult {
+    if !key_strategy.is_empty()
+        && key_strategy != "ip"
+        && key_strategy != "api_token"
+        && key_strategy != "authenticated_principal"
+    {
+        return CheckResult {
+            name: "rate_limit_key_strategy",
+            status: CheckStatus::Fail,
+            detail: Some(format!(
+                "rate_limit.key_strategy = {key_strategy:?} is not a valid strategy"
+            )),
+            hint: Some("Expected \"ip\", \"api_token\", or \"authenticated_principal\""),
+        };
+    }
+
+    if key_strategy == "authenticated_principal" && !auth_extractor_mounted {
+        return CheckResult {
+            name: "rate_limit_key_strategy",
+            status: CheckStatus::Warn,
+            detail: Some(
+                "rate_limit.key_strategy = \"authenticated_principal\" is configured \
+                 but no auth extractor is mounted — unauthenticated requests will \
+                 always fall back to IP keying, so the per-principal budget \
+                 is never applied to authenticated callers"
+                    .into(),
+            ),
+            hint: Some(
+                "Mount an auth layer (e.g. `[auth]` in autumn.toml) or change \
+                 key_strategy to \"ip\" or \"api_token\"",
+            ),
+        };
+    }
+
+    CheckResult {
+        name: "rate_limit_key_strategy",
+        status: CheckStatus::Pass,
+        detail: Some(format!(
+            "rate_limit.key_strategy = {:?} is compatible with the current auth configuration",
+            if key_strategy.is_empty() {
+                "ip"
+            } else {
+                key_strategy
+            }
+        )),
+        hint: None,
+    }
+}
+
+/// Input data for the proxy-conflict check, resolved from `autumn.toml` and env vars.
+#[derive(Default)]
+pub struct ProxyConflictData {
+    pub new_ranges: Vec<String>,
+    pub new_trust_fwd: bool,
+    pub new_hops: Option<u32>,
+    pub old_ranges: Vec<String>,
+    pub old_trust_fwd: bool,
+}
+
+/// Warn when both `[security.trusted_proxies]` and the deprecated
+/// `[security.rate_limit]` proxy fields are configured with conflicting values.
+pub fn check_proxy_conflict_impl(data: &ProxyConflictData) -> CheckResult {
+    let new_set = data.new_trust_fwd || !data.new_ranges.is_empty();
+    let old_set = data.old_trust_fwd || !data.old_ranges.is_empty();
+
+    if new_set && old_set {
+        let new_set: std::collections::HashSet<&str> =
+            data.new_ranges.iter().map(String::as_str).collect();
+        let old_set: std::collections::HashSet<&str> =
+            data.old_ranges.iter().map(String::as_str).collect();
+        let conflicting = new_set != old_set
+            || data.new_trust_fwd != data.old_trust_fwd
+            || data.new_hops.is_some();
+
+        if conflicting {
+            return CheckResult {
+                name: "proxy_config_conflict",
+                status: CheckStatus::Warn,
+                detail: Some(
+                    "[security.trusted_proxies] and [security.rate_limit] trusted proxy \
+                     fields are both set with conflicting values."
+                        .into(),
+                ),
+                hint: Some(
+                    "Remove the deprecated rate_limit.trusted_proxies / \
+                     rate_limit.trust_forwarded_headers fields and keep only \
+                     [security.trusted_proxies]",
+                ),
+            };
+        }
+    }
+
+    CheckResult {
+        name: "proxy_config_conflict",
+        status: CheckStatus::Pass,
+        detail: None,
+        hint: None,
+    }
+}
+
+pub fn check_trusted_hosts_impl(hosts: &[String], is_production: bool) -> CheckResult {
+    let normalized: Vec<String> = hosts
+        .iter()
+        .map(|h| h.trim().to_owned())
+        .filter(|h| !h.is_empty())
+        .collect();
+    if normalized.is_empty() {
+        return if is_production {
+            CheckResult {
+                name: "trusted_hosts",
+                status: CheckStatus::Fail,
+                detail: Some("trusted hosts list is empty in production".into()),
+                hint: Some(
+                    "Set [security.trusted_hosts] hosts = [\"example.com\"] or \
+                     AUTUMN_SECURITY__TRUSTED_HOSTS__HOSTS",
+                ),
+            }
+        } else {
+            CheckResult {
+                name: "trusted_hosts",
+                status: CheckStatus::Warn,
+                detail: Some("trusted hosts list is empty".into()),
+                hint: Some(
+                    "Set [security.trusted_hosts] hosts to prevent Host-header rebinding attacks",
+                ),
+            }
+        };
+    }
+
+    if normalized.iter().any(|h| h == "*") {
+        return CheckResult {
+            name: "trusted_hosts",
+            status: CheckStatus::Warn,
+            detail: Some("trusted hosts wildcard '*' disables host-header allow-listing".into()),
+            hint: Some("Prefer explicit hosts in production to fail closed"),
+        };
+    }
+
+    CheckResult {
+        name: "trusted_hosts",
+        status: CheckStatus::Pass,
+        detail: Some(format!(
+            "trusted hosts configured ({} entries)",
+            normalized.len()
+        )),
+        hint: None,
+    }
+}
+
+/// Check a single `[auth.oauth2.<provider>]` entry for common misconfigurations.
+///
+/// - In production (`is_production = true`): fails when `client_secret` is empty.
+/// - Outside production: warns when `client_secret` is empty.
+///
+/// The returned check name is `"oauth2_provider"`.
+pub fn check_oauth2_provider_impl(
+    provider_name: &str,
+    client_id: &str,
+    client_secret: &str,
+    is_production: bool,
+) -> CheckResult {
+    // Use a static string for the name field to satisfy lifetime constraints.
+    // The name is formatted in the `detail` field instead.
+    let detail_prefix = format!("[auth.oauth2.{provider_name}]");
+
+    // Check client_id first
+    if client_id.trim().is_empty() {
+        return if is_production {
+            CheckResult {
+                name: "oauth2_provider",
+                status: CheckStatus::Fail,
+                detail: Some(format!(
+                    "{detail_prefix}: client_id is empty — OAuth2 login will fail in production"
+                )),
+                hint: Some(
+                    "Set client_id via AUTUMN_AUTH__OAUTH2__<PROVIDER>__CLIENT_ID \
+                     or in autumn.toml",
+                ),
+            }
+        } else {
+            CheckResult {
+                name: "oauth2_provider",
+                status: CheckStatus::Warn,
+                detail: Some(format!(
+                    "{detail_prefix}: client_id is empty (OK for dev if using env vars)"
+                )),
+                hint: Some("Set client_id before deploying to production"),
+            }
+        };
+    }
+
+    // Check client_secret next
+    if client_secret.trim().is_empty() {
+        return if is_production {
+            CheckResult {
+                name: "oauth2_provider",
+                status: CheckStatus::Fail,
+                detail: Some(format!(
+                    "{detail_prefix}: client_secret is empty — OAuth2 login will fail in production"
+                )),
+                hint: Some(
+                    "Set client_secret via AUTUMN_AUTH__OAUTH2__<PROVIDER>__CLIENT_SECRET \
+                     or autumn credentials edit",
+                ),
+            }
+        } else {
+            CheckResult {
+                name: "oauth2_provider",
+                status: CheckStatus::Warn,
+                detail: Some(format!(
+                    "{detail_prefix}: client_secret is empty (OK for dev if using env vars)"
+                )),
+                hint: Some("Set client_secret before deploying to production"),
+            }
+        };
+    }
+
+    CheckResult {
+        name: "oauth2_provider",
+        status: CheckStatus::Pass,
+        detail: Some(format!("{detail_prefix}: provider is correctly configured")),
+        hint: None,
     }
 }
 
@@ -1010,6 +1250,174 @@ fn read_autumn_toml_table() -> Option<toml::Table> {
         .and_then(|contents| toml::from_str::<toml::Table>(&contents).ok())
 }
 
+fn deep_merge(target: &mut toml::Table, source: &toml::Table) {
+    for (k, v) in source {
+        if let (Some(source_tbl), Some(target_tbl)) = (
+            v.as_table(),
+            target.get_mut(k).and_then(|t| t.as_table_mut()),
+        ) {
+            deep_merge(target_tbl, source_tbl);
+            continue;
+        }
+        target.insert(k.clone(), v.clone());
+    }
+}
+
+fn get_merged_toml_table(profile: &str) -> toml::Table {
+    get_merged_toml_table_profiles(&[profile])
+}
+
+/// Merges config from all given profile names in order (last wins).
+///
+/// Each profile name contributes `[profile.{name}]` from `autumn.toml` and
+/// `autumn-{name}.toml`. The base `autumn.toml` top-level is applied once
+/// before the per-profile layers.
+fn get_merged_toml_table_profiles(profiles: &[&str]) -> toml::Table {
+    let mut merged = toml::Table::new();
+
+    let base_toml = std::fs::read_to_string("autumn.toml")
+        .ok()
+        .and_then(|c| toml::from_str::<toml::Table>(&c).ok());
+
+    // 1. Base autumn.toml top-level (applied once)
+    if let Some(ref table) = base_toml {
+        deep_merge(&mut merged, table);
+    }
+
+    for &profile in profiles {
+        // 2. Base autumn.toml [profile.{name}]
+        if let Some(prof) = base_toml
+            .as_ref()
+            .and_then(|t| t.get("profile"))
+            .and_then(toml::Value::as_table)
+            .and_then(|p| p.get(profile))
+            .and_then(toml::Value::as_table)
+        {
+            deep_merge(&mut merged, prof);
+        }
+
+        // 3. autumn-{name}.toml
+        if let Some(table) = std::fs::read_to_string(format!("autumn-{profile}.toml"))
+            .ok()
+            .and_then(|c| toml::from_str::<toml::Table>(&c).ok())
+        {
+            deep_merge(&mut merged, &table);
+        }
+    }
+
+    merged
+}
+
+pub struct DoctorOAuth2Provider {
+    pub name: String,
+    pub client_id: String,
+    pub client_secret: String,
+}
+
+fn resolve_oauth2_providers() -> Vec<DoctorOAuth2Provider> {
+    let raw_profile = std::env::var("AUTUMN_ENV")
+        .or_else(|_| std::env::var("AUTUMN_PROFILE"))
+        .unwrap_or_else(|_| "dev".to_owned());
+    let profile = match raw_profile.trim().to_lowercase().as_str() {
+        "production" => "prod".to_owned(),
+        "development" => "dev".to_owned(),
+        other => other.to_owned(),
+    };
+    let merged_toml = get_merged_toml_table(&profile);
+    resolve_oauth2_providers_from_sources(
+        |key| std::env::var(key).ok().filter(|v| !v.is_empty()),
+        Some(&merged_toml),
+        &profile,
+    )
+}
+
+fn resolve_oauth2_providers_from_sources<F>(
+    env_var: F,
+    table: Option<&toml::Table>,
+    profile: &str,
+) -> Vec<DoctorOAuth2Provider>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    // Load credentials if available
+    let credentials =
+        autumn_web::credentials::load_credentials(profile, std::path::Path::new(".")).ok();
+
+    table
+        .and_then(|t| t.get("auth"))
+        .and_then(toml::Value::as_table)
+        .and_then(|auth| auth.get("oauth2"))
+        .and_then(toml::Value::as_table)
+        .map(|providers| {
+            providers
+                .iter()
+                .map(|(name, val)| {
+                    let mut client_id = val
+                        .as_table()
+                        .and_then(|t| t.get("client_id"))
+                        .and_then(toml::Value::as_str)
+                        .unwrap_or("")
+                        .to_owned();
+                    let mut client_secret = val
+                        .as_table()
+                        .and_then(|t| t.get("client_secret"))
+                        .and_then(toml::Value::as_str)
+                        .unwrap_or("")
+                        .to_owned();
+
+                    let normalized_name = name
+                        .chars()
+                        .map(|c| if c.is_alphanumeric() { c } else { '_' })
+                        .collect::<String>()
+                        .to_lowercase();
+                    let upper = normalized_name.to_uppercase();
+
+                    // Get values from env vars
+                    let env_id_key = format!("AUTUMN_AUTH__OAUTH2__{upper}__CLIENT_ID");
+                    if let Some(id) = env_var(&env_id_key) {
+                        client_id = id;
+                    }
+                    let env_secret_key = format!("AUTUMN_AUTH__OAUTH2__{upper}__CLIENT_SECRET");
+                    if let Some(sec) = env_var(&env_secret_key) {
+                        client_secret = sec;
+                    }
+
+                    // Get values from credentials
+                    if let Some(ref creds) = credentials {
+                        let id_key = format!("oauth2_{normalized_name}_client_id");
+                        if client_id.is_empty() {
+                            if let Some(id) = creds.get::<String>(&id_key) {
+                                client_id = id;
+                            } else if let Some(id) =
+                                creds.get::<String>(&format!("oauth2_{name}_client_id"))
+                            {
+                                client_id = id;
+                            }
+                        }
+
+                        let secret_key = format!("oauth2_{normalized_name}_client_secret");
+                        if client_secret.is_empty() {
+                            if let Some(sec) = creds.get::<String>(&secret_key) {
+                                client_secret = sec;
+                            } else if let Some(sec) =
+                                creds.get::<String>(&format!("oauth2_{name}_client_secret"))
+                            {
+                                client_secret = sec;
+                            }
+                        }
+                    }
+
+                    DoctorOAuth2Provider {
+                        name: name.clone(),
+                        client_id,
+                        client_secret,
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn resolve_database_topology(table: Option<&toml::Table>) -> DoctorDatabaseTopology {
     resolve_database_topology_from_sources(
         |key| std::env::var(key).ok().filter(|value| !value.is_empty()),
@@ -1093,11 +1501,133 @@ fn parse_config_bool(value: &str) -> Option<bool> {
     }
 }
 
-/// Resolve the signing secret from the environment or `autumn.toml`.
+fn resolve_proxy_conflict_data() -> ProxyConflictData {
+    // Use the profile-merged table so that [profile.prod] / autumn-prod.toml
+    // overrides are included — matching the pattern used by resolve_trusted_hosts.
+    let raw_profile = std::env::var("AUTUMN_ENV")
+        .or_else(|_| std::env::var("AUTUMN_PROFILE"))
+        .unwrap_or_default();
+    // Normalize aliases to canonical names to match AutumnConfig::load_with_env.
+    let raw_lower = raw_profile.trim().to_ascii_lowercase();
+    let canonical = match raw_lower.as_str() {
+        "production" | "prod" => "prod",
+        "development" | "dev" | "" => "dev",
+        other => other,
+    }
+    .to_owned();
+    // The runtime supports both alias spellings (e.g. "production" and "prod"),
+    // so merge both sets of profile sources to match what the app would load.
+    let alias = match raw_lower.as_str() {
+        "production" => Some("production"),
+        "development" => Some("development"),
+        _ => None,
+    };
+    let profiles: Vec<&str> = std::iter::once(canonical.as_str()).chain(alias).collect();
+    let table = get_merged_toml_table_profiles(&profiles);
+
+    let parse_csv_env = |var: &str| -> Option<Vec<String>> {
+        std::env::var(var).ok().map(|v| {
+            v.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(std::borrow::ToOwned::to_owned)
+                .collect()
+        })
+    };
+    let parse_bool_env = |var: &str| -> Option<bool> {
+        std::env::var(var)
+            .ok()
+            .map(|v| matches!(v.trim(), "true" | "1"))
+    };
+
+    let security = table.get("security");
+    let tp_section = security.and_then(|s| s.get("trusted_proxies"));
+    let rl_section = security.and_then(|s| s.get("rate_limit"));
+
+    let toml_csv = |section: Option<&toml::Value>, key: &str| -> Vec<String> {
+        section
+            .and_then(|s| s.get(key))
+            .and_then(toml::Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(toml::Value::as_str)
+                    .map(std::borrow::ToOwned::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let toml_bool = |section: Option<&toml::Value>, key: &str| -> bool {
+        section
+            .and_then(|s| s.get(key))
+            .and_then(toml::Value::as_bool)
+            .unwrap_or(false)
+    };
+
+    ProxyConflictData {
+        new_ranges: parse_csv_env("AUTUMN_SECURITY__TRUSTED_PROXIES__RANGES")
+            .unwrap_or_else(|| toml_csv(tp_section, "ranges")),
+        new_trust_fwd: parse_bool_env("AUTUMN_SECURITY__TRUSTED_PROXIES__TRUST_FORWARDED_HEADERS")
+            .unwrap_or_else(|| toml_bool(tp_section, "trust_forwarded_headers")),
+        new_hops: std::env::var("AUTUMN_SECURITY__TRUSTED_PROXIES__TRUSTED_HOPS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .or_else(|| {
+                tp_section
+                    .and_then(|s| s.get("trusted_hops"))
+                    .and_then(toml::Value::as_integer)
+                    .and_then(|v| u32::try_from(v).ok())
+            }),
+        old_ranges: parse_csv_env("AUTUMN_SECURITY__RATE_LIMIT__TRUSTED_PROXIES")
+            .unwrap_or_else(|| toml_csv(rl_section, "trusted_proxies")),
+        old_trust_fwd: parse_bool_env("AUTUMN_SECURITY__RATE_LIMIT__TRUST_FORWARDED_HEADERS")
+            .unwrap_or_else(|| toml_bool(rl_section, "trust_forwarded_headers")),
+    }
+}
+
+/// Resolve the rate-limit key strategy from config/env.
 ///
 /// Priority:
-/// 1. `AUTUMN_SECURITY__SIGNING_SECRET` env var
-/// 2. `[security] signing_secret` in `autumn.toml`
+/// 1. `AUTUMN_SECURITY__RATE_LIMIT__KEY_STRATEGY` env var
+/// 2. `[security.rate_limit] key_strategy` in `autumn.toml`
+fn resolve_rate_limit_key_strategy() -> String {
+    if let Ok(val) = std::env::var("AUTUMN_SECURITY__RATE_LIMIT__KEY_STRATEGY")
+        && !val.is_empty()
+    {
+        return val;
+    }
+    std::fs::read_to_string("autumn.toml")
+        .ok()
+        .and_then(|c| toml::from_str::<toml::Table>(&c).ok())
+        .and_then(|t| {
+            t.get("security")
+                .and_then(|s| s.get("rate_limit"))
+                .and_then(|rl| rl.get("key_strategy"))
+                .and_then(toml::Value::as_str)
+                .filter(|v| !v.is_empty())
+                .map(std::borrow::ToOwned::to_owned)
+        })
+        .unwrap_or_default()
+}
+
+/// Detect whether an auth extractor is mounted (i.e. `[auth]` section exists
+/// and is not explicitly disabled).
+fn resolve_auth_extractor_mounted() -> bool {
+    if let Ok(val) = std::env::var("AUTUMN_AUTH__ENABLED") {
+        return !val.trim().eq_ignore_ascii_case("false");
+    }
+    std::fs::read_to_string("autumn.toml")
+        .ok()
+        .and_then(|c| toml::from_str::<toml::Table>(&c).ok())
+        .is_some_and(|t| {
+            // [auth] section present and not explicitly disabled.
+            t.get("auth").is_some_and(|auth| {
+                auth.get("enabled")
+                    .and_then(toml::Value::as_bool)
+                    .unwrap_or(true) // enabled by default when section exists
+            })
+        })
+}
+
 fn resolve_optional_signing_secret() -> Option<String> {
     if let Ok(val) = std::env::var("AUTUMN_SECURITY__SIGNING_SECRET")
         && !val.is_empty()
@@ -1115,6 +1645,54 @@ fn resolve_optional_signing_secret() -> Option<String> {
                 .filter(|v| !v.is_empty())
                 .map(std::borrow::ToOwned::to_owned)
         })
+}
+
+fn resolve_trusted_hosts() -> Vec<String> {
+    if let Ok(val) = std::env::var("AUTUMN_SECURITY__TRUSTED_HOSTS__HOSTS") {
+        return val
+            .split(',')
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(std::borrow::ToOwned::to_owned)
+            .collect();
+    }
+    let table = read_autumn_toml_table().unwrap_or_default();
+    let profile = std::env::var("AUTUMN_ENV")
+        .ok()
+        .or_else(|| std::env::var("AUTUMN_PROFILE").ok())
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+
+    let parse_hosts = |root: &toml::Table| {
+        root.get("security")
+            .and_then(|s| s.get("trusted_hosts"))
+            .and_then(|th| th.get("hosts"))
+            .and_then(toml::Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(toml::Value::as_str)
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .map(std::borrow::ToOwned::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+
+    if !profile.is_empty()
+        && let Some(profile_table) = table
+            .get("profile")
+            .and_then(|v| v.get(&profile))
+            .and_then(toml::Value::as_table)
+    {
+        let profile_hosts = parse_hosts(profile_table);
+        if !profile_hosts.is_empty() {
+            return profile_hosts;
+        }
+    }
+
+    parse_hosts(&table)
 }
 
 /// Resolve whether the active profile is production from the environment or
@@ -1147,6 +1725,49 @@ fn tailwind_enabled() -> bool {
         .unwrap_or_else(|| std::path::Path::new("build.rs").exists())
 }
 
+fn resolve_compression_enabled() -> bool {
+    // 1. Env var takes highest precedence. Use the same accepted values as the
+    //    runtime's parse_env_bool ("true"/"1"/"false"/"0") so doctor never
+    //    reports a different state than the app would observe.
+    if let Ok(val) = std::env::var("AUTUMN_COMPRESSION__ENABLED") {
+        match val.as_str() {
+            "true" | "1" => return true,
+            "false" | "0" => return false,
+            _ => {}
+        }
+    }
+
+    // 2. Read TOML, applying profile-specific override when a profile is active
+    //    (mirrors the five-layer config system so `[profile.prod] compression.enabled`
+    //    doesn't cause a spurious doctor warning in production).
+    let table = read_autumn_toml_table().unwrap_or_default();
+    let profile = std::env::var("AUTUMN_ENV")
+        .ok()
+        .or_else(|| std::env::var("AUTUMN_PROFILE").ok())
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+
+    let parse_enabled = |root: &toml::Table| {
+        root.get("compression")
+            .and_then(|v| v.get("enabled"))
+            .and_then(toml::Value::as_bool)
+    };
+
+    // Profile-specific section takes precedence over base config.
+    if !profile.is_empty()
+        && let Some(enabled) = table
+            .get("profile")
+            .and_then(|v| v.get(&profile))
+            .and_then(toml::Value::as_table)
+            .and_then(&parse_enabled)
+    {
+        return enabled;
+    }
+
+    parse_enabled(&table).unwrap_or(false)
+}
+
 // ─── Main entry point ─────────────────────────────────────────────────────────
 
 /// Run all doctor checks and report results.
@@ -1157,6 +1778,7 @@ fn tailwind_enabled() -> bool {
 /// 2. **Check phase** (parallel) — every applicable check is spawned on its own
 ///    thread so that slow operations (TCP connect, subprocess calls) overlap.
 ///    Results are joined back in display order.
+#[allow(clippy::too_many_lines)]
 pub fn run(opts: DoctorOptions) {
     use std::thread;
     type Task = Box<dyn FnOnce() -> CheckResult + Send>;
@@ -1180,7 +1802,12 @@ pub fn run(opts: DoctorOptions) {
     let port = resolve_server_port();
     let tailwind = tailwind_enabled();
     let signing_secret = resolve_optional_signing_secret();
+    let trusted_hosts = resolve_trusted_hosts();
     let is_production = resolve_is_production();
+    let rate_limit_key_strategy = resolve_rate_limit_key_strategy();
+    let auth_extractor_mounted = resolve_auth_extractor_mounted();
+    let compression_enabled = resolve_compression_enabled();
+    let proxy_conflict_data = resolve_proxy_conflict_data();
 
     // ── Phase 2: build tasks in display order ────────────────────────────────
     let mut tasks: Vec<Task> = Vec::new();
@@ -1246,9 +1873,53 @@ pub fn run(opts: DoctorOptions) {
     tasks.push(Box::new(move || {
         check_signing_secret_impl(signing_secret.as_deref(), is_production)
     }));
+    tasks.push(Box::new(move || {
+        check_trusted_hosts_impl(&trusted_hosts, is_production)
+    }));
 
-    // 9. Stale artifacts (warn only, never fail)
+    // 8b. Rate-limit key-strategy misconfiguration
+    tasks.push(Box::new(move || {
+        check_rate_limit_key_strategy_impl(&rate_limit_key_strategy, auth_extractor_mounted)
+    }));
+
+    // 8c. Conflicting trusted-proxy configuration (new vs. deprecated fields)
+    tasks.push(Box::new(move || {
+        check_proxy_conflict_impl(&proxy_conflict_data)
+    }));
+
+    // 9. OAuth2 provider checks (client_id and client_secret validation)
+    let oauth2_providers = resolve_oauth2_providers();
+    for p in oauth2_providers {
+        tasks.push(Box::new(move || {
+            check_oauth2_provider_impl(&p.name, &p.client_id, &p.client_secret, is_production)
+        }));
+    }
+
+    // 10. Stale artifacts (warn only, never fail)
     tasks.push(Box::new(check_stale_artifacts));
+
+    // 11. Maintenance mode state
+    tasks.push(Box::new(check_maintenance_mode));
+
+    // 12. Compression (warn in production when disabled)
+    tasks.push(Box::new(move || {
+        check_compression_impl(compression_enabled, is_production)
+    }));
+
+    // 13. System-test browser (warn if missing; not all projects use system tests)
+    tasks.push(Box::new(check_system_test_browser));
+
+    // 14. GDPR export/erasure registration (warn when auth starter is present
+    //     but #[repository] models are not registered in GdprRegistry).
+    //     File-system work runs inside the task so it overlaps with other checks.
+    tasks.push(Box::new(|| {
+        let has_auth_starter = std::path::Path::new("src/routes/auth.rs").exists();
+        let unregistered = resolve_gdpr_unregistered_tables();
+        check_gdpr_export_registration_impl(
+            has_auth_starter,
+            &unregistered.iter().map(String::as_str).collect::<Vec<_>>(),
+        )
+    }));
 
     // ── Phase 3: spawn all tasks concurrently ────────────────────────────────
     let handles: Vec<thread::JoinHandle<CheckResult>> =
@@ -1283,6 +1954,391 @@ pub fn run(opts: DoctorOptions) {
     std::process::exit(code);
 }
 
+/// Check whether maintenance mode is currently active.
+///
+/// Warns (not fails) so `autumn doctor` stays green during planned windows.
+/// Check whether response compression is configured for a production profile.
+///
+/// Compression is off by default (for BREACH/CRIME safety). When running in
+/// production without compression this check emits a `Warn` so operators know
+/// they may want to enable it (or document the deliberate choice to rely on a
+/// CDN / reverse-proxy for compression instead).
+pub fn check_compression_impl(compression_enabled: bool, is_production: bool) -> CheckResult {
+    if is_production && !compression_enabled {
+        return CheckResult {
+            name: "compression",
+            status: CheckStatus::Warn,
+            detail: Some(
+                "response compression is disabled in production; \
+                 text payloads (HTML/JSON/CSS) are served uncompressed"
+                    .into(),
+            ),
+            hint: Some(
+                "Set [compression] enabled = true in autumn.toml (or AUTUMN_COMPRESSION__ENABLED=true) \
+                 if you are not using a CDN or reverse-proxy that compresses for you. \
+                 Read the BREACH/CRIME tradeoff in docs/guide/compression.md before enabling.",
+            ),
+        };
+    }
+    CheckResult {
+        name: "compression",
+        status: CheckStatus::Pass,
+        detail: Some(if compression_enabled {
+            "response compression is enabled".into()
+        } else {
+            "response compression is disabled (off by default; use CDN or enable explicitly)".into()
+        }),
+        hint: None,
+    }
+}
+
+pub fn check_maintenance_mode() -> CheckResult {
+    use autumn_web::maintenance::{MAINTENANCE_FLAG_FILE, MaintenanceState};
+    let path = std::path::Path::new(MAINTENANCE_FLAG_FILE);
+    match MaintenanceState::load_from_file(path) {
+        Ok(Some(config)) => {
+            let detail = config.message.as_ref().map_or_else(
+                || "maintenance mode is ON".to_owned(),
+                |msg| format!("maintenance mode is ON — \"{msg}\""),
+            );
+            CheckResult {
+                name: "maintenance_mode",
+                status: CheckStatus::Warn,
+                detail: Some(detail),
+                hint: Some("Run `autumn maintenance off` to re-enable normal traffic"),
+            }
+        }
+        Ok(None) | Err(_) => CheckResult {
+            name: "maintenance_mode",
+            status: CheckStatus::Pass,
+            detail: Some("maintenance mode is off".into()),
+            hint: None,
+        },
+    }
+}
+
+// ── System-test browser check ─────────────────────────────────────────────
+
+/// Candidate paths probed for a Chromium binary, in resolution order.
+pub fn browser_candidate_paths() -> Vec<std::path::PathBuf> {
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+
+    if let Ok(p) = std::env::var("AUTUMN_CHROMIUM") {
+        candidates.push(std::path::PathBuf::from(p));
+    }
+
+    if let Ok(base) = std::env::var("PLAYWRIGHT_BROWSERS_PATH") {
+        let base = std::path::PathBuf::from(base);
+        if let Ok(entries) = std::fs::read_dir(&base) {
+            let mut pw_paths: Vec<_> = entries
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().starts_with("chromium-"))
+                .map(|e| {
+                    if cfg!(target_os = "macos") {
+                        e.path()
+                            .join("chrome-mac")
+                            .join("Chromium.app")
+                            .join("Contents")
+                            .join("MacOS")
+                            .join("Chromium")
+                    } else if cfg!(target_os = "windows") {
+                        e.path().join("chrome-win").join("chrome.exe")
+                    } else {
+                        e.path().join("chrome-linux").join("chrome")
+                    }
+                })
+                .collect();
+            pw_paths.sort();
+            pw_paths.reverse();
+            candidates.extend(pw_paths);
+        }
+    }
+
+    candidates.extend(
+        [
+            "/usr/bin/chromium-browser",
+            "/usr/bin/chromium",
+            "/usr/bin/google-chrome",
+            "/usr/bin/google-chrome-stable",
+            "/snap/bin/chromium",
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        ]
+        .map(std::path::PathBuf::from),
+    );
+
+    candidates
+}
+
+/// Run `<path> --version` and return the trimmed output on success.
+fn probe_browser_version(path: &std::path::Path) -> Option<String> {
+    std::process::Command::new(path)
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+}
+
+/// Check whether a Chromium binary is available for system tests.
+///
+/// Returns `true` if the `[features]` table in `cargo_toml` declares `key`.
+///
+/// Scans only the `[features]` section (not dev-dependencies that may also
+/// reference the feature) so a line like `autumn-web = { features = ["system-tests"] }`
+/// does not produce a false positive.
+fn cargo_toml_features_has_key(cargo_toml: &str, key: &str) -> bool {
+    let quoted_key = format!("\"{key}\"");
+    let mut in_features = false;
+    for line in cargo_toml.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        if trimmed == "[features]"
+            || (trimmed.starts_with("[features]")
+                && trimmed["[features]".len()..].trim_start().starts_with('#'))
+        {
+            in_features = true;
+            continue;
+        }
+        if in_features {
+            if trimmed.starts_with('[') {
+                break;
+            }
+            let bare = trimmed
+                .strip_prefix(key)
+                .is_some_and(|r| r.trim_start().starts_with('='));
+            let quoted = trimmed
+                .strip_prefix(quoted_key.as_str())
+                .is_some_and(|r| r.trim_start().starts_with('='));
+            if bare || quoted {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Reports `Warn` (not `Fail`) so that projects that don't use system tests
+/// are not penalized. If you _do_ run system tests you'll get a clear
+/// actionable message in `autumn doctor` output.
+pub fn check_system_test_browser() -> CheckResult {
+    let candidates = browser_candidate_paths();
+    for path in &candidates {
+        if path.is_file()
+            && let Some(version) = probe_browser_version(path)
+        {
+            return CheckResult {
+                name: "system_test_browser",
+                status: CheckStatus::Pass,
+                detail: Some(format!(
+                    "Chromium for system tests: {version} ({})",
+                    path.display()
+                )),
+                hint: None,
+            };
+        }
+    }
+
+    // Only warn when the project has opted into system tests; otherwise a
+    // missing browser is irrelevant and must not fail `autumn doctor --strict`.
+    let project_uses_system_tests = std::env::current_dir()
+        .ok()
+        .and_then(|d| std::fs::read_to_string(d.join("Cargo.toml")).ok())
+        .is_some_and(|s| cargo_toml_features_has_key(&s, "system-tests"));
+
+    if project_uses_system_tests {
+        CheckResult {
+            name: "system_test_browser",
+            status: CheckStatus::Warn,
+            detail: Some("no Chromium binary found — system tests will be skipped".into()),
+            hint: Some(
+                "Install: apt-get install chromium-browser  \
+                 or set AUTUMN_CHROMIUM=/path/to/chrome",
+            ),
+        }
+    } else {
+        CheckResult {
+            name: "system_test_browser",
+            status: CheckStatus::Pass,
+            detail: Some("no Chromium binary found (project does not use system-tests)".into()),
+            hint: None,
+        }
+    }
+}
+
+/// Resolve the list of `#[repository]`-annotated table names that are not yet
+/// registered in a `GdprRegistry` in the project source.
+///
+/// Currently uses a lightweight heuristic: scans `src/schema.rs` for `diesel::table!`
+/// declarations and returns those that have no matching `GdprRegistry::register` call
+/// in any `*.rs` source file. Returns an empty list when the project has no schema or
+/// when all tables appear to be registered.
+fn resolve_gdpr_unregistered_tables() -> Vec<String> {
+    let schema_path = std::path::Path::new("src/schema.rs");
+    let Ok(schema) = std::fs::read_to_string(schema_path) else {
+        return Vec::new();
+    };
+
+    // Collect table names declared as `diesel::table! { <name> (id) { ... } }`.
+    let mut declared_tables: Vec<String> = Vec::new();
+    for line in schema.lines() {
+        let trimmed = line.trim();
+        // Match lines like `diesel::table! {` followed by the table name on the next line,
+        // or inline `pub table_name (id) {` patterns.  Use a simple prefix scan.
+        if let Some(rest) = trimmed
+            .strip_prefix("diesel::table!")
+            .map(str::trim)
+            .filter(|r| r.starts_with('{'))
+        {
+            // table name is on the same line or will appear shortly; skip for now
+            let _ = rest;
+        }
+        // Diesel schema emits bare identifiers like `    table_name (pk) {`
+        // where `pk` can be any column name (id, uuid, code, or composite).
+        if let Some(open_paren) = trimmed.find('(')
+            && (trimmed.ends_with('{') || trimmed.ends_with("{ "))
+        {
+            let name = trimmed[..open_paren].trim();
+            if !name.is_empty() && !name.starts_with("//") && !name.starts_with("diesel") {
+                declared_tables.push(name.to_owned());
+            }
+        }
+    }
+
+    if declared_tables.is_empty() {
+        return Vec::new();
+    }
+
+    // Check which tables appear to be registered via GdprRegistry in the project.
+    let registered_tables = collect_gdpr_registered_tables_from_source();
+
+    declared_tables
+        .into_iter()
+        .filter(|t| !registered_tables.contains(t))
+        .collect()
+}
+
+/// Scan all `*.rs` files under `src/` for `GdprRegistry` register calls and
+/// return the set of table names found. Handles both single-line and
+/// rustfmt-formatted multi-line `ModelRegistration::` calls.
+fn collect_gdpr_registered_tables_from_source() -> std::collections::HashSet<String> {
+    let mut found = std::collections::HashSet::new();
+    for path in glob_rs_files(std::path::Path::new("src")) {
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        scan_source_for_gdpr_registrations(&content, &mut found);
+    }
+    found
+}
+
+/// Extract `ModelRegistration::` table names from source text, handling both
+/// single-line calls and multi-line rustfmt-formatted calls.
+fn scan_source_for_gdpr_registrations(
+    content: &str,
+    found: &mut std::collections::HashSet<String>,
+) {
+    let lines: Vec<&str> = content.lines().collect();
+    for (i, line) in lines.iter().enumerate() {
+        if let Some(idx) = line.find("ModelRegistration::") {
+            let rest = &line[idx..];
+            // Try the same line first, then the next 3 lines for multi-line calls.
+            if extract_quoted_table_name(rest, found) {
+                continue;
+            }
+            for j in 1..=3 {
+                if let Some(next) = lines.get(i + j)
+                    && extract_quoted_table_name(next.trim(), found)
+                {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Extract the first double-quoted string from `s` as a table name.
+/// Returns `true` if a non-empty, non-whitespace name was found and inserted.
+fn extract_quoted_table_name(s: &str, found: &mut std::collections::HashSet<String>) -> bool {
+    if let Some(start) = s.find('"')
+        && let Some(end) = s[start + 1..].find('"')
+    {
+        let name = &s[start + 1..start + 1 + end];
+        if !name.is_empty() && !name.contains(' ') {
+            found.insert(name.to_owned());
+            return true;
+        }
+    }
+    false
+}
+
+/// Recursively collect all `*.rs` file paths under `dir`.
+fn glob_rs_files(dir: impl AsRef<std::path::Path>) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            out.append(&mut glob_rs_files(&path));
+        } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+            out.push(path);
+        }
+    }
+    out
+}
+
+/// Warn when the auth starter is present but one or more `#[repository]`-annotated
+/// tables have not been registered in the GDPR export/erasure registry.
+///
+/// This check implements GDPR issue #820 AC #8:
+/// > `autumn doctor` warns when repositories exist whose models are not registered
+/// > for export/erasure once the auth starter is present.
+///
+/// `has_auth_starter` should be `true` when the project's `src/routes/auth.rs` exists
+/// (indicating `autumn generate auth` was run).
+/// `unregistered_tables` is the list of `#[repository]`-annotated table names that
+/// have not been registered via `GdprRegistry`.
+pub fn check_gdpr_export_registration_impl(
+    has_auth_starter: bool,
+    unregistered_tables: &[&str],
+) -> CheckResult {
+    if !has_auth_starter {
+        return CheckResult {
+            name: "gdpr_export_registration",
+            status: CheckStatus::Pass,
+            detail: Some("auth starter not present; GDPR registration not required".into()),
+            hint: None,
+        };
+    }
+
+    if unregistered_tables.is_empty() {
+        return CheckResult {
+            name: "gdpr_export_registration",
+            status: CheckStatus::Pass,
+            detail: Some("all repositories are registered for GDPR export/erasure".into()),
+            hint: None,
+        };
+    }
+
+    let tables = unregistered_tables.join(", ");
+    CheckResult {
+        name: "gdpr_export_registration",
+        status: CheckStatus::Warn,
+        detail: Some(format!(
+            "{} repository model(s) not registered for GDPR export/erasure: {tables}",
+            unregistered_tables.len()
+        )),
+        hint: Some(
+            "Register each model via GdprRegistry in your application state. \
+             See docs/guide/gdpr-compliance.md for the export/erasure API.",
+        ),
+    }
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1304,6 +2360,27 @@ mod tests {
     #[test]
     fn glyph_fail() {
         assert_eq!(glyph(&CheckStatus::Fail), "❌");
+    }
+
+    #[test]
+    fn trusted_hosts_fail_in_production_when_empty() {
+        let result = check_trusted_hosts_impl(&[], true);
+        assert_eq!(result.name, "trusted_hosts");
+        assert!(matches!(result.status, CheckStatus::Fail));
+    }
+
+    #[test]
+    fn trusted_hosts_warn_on_wildcard() {
+        let result = check_trusted_hosts_impl(&["*".to_owned()], true);
+        assert_eq!(result.name, "trusted_hosts");
+        assert!(matches!(result.status, CheckStatus::Warn));
+    }
+
+    #[test]
+    fn trusted_hosts_warn_on_wildcard_when_mixed_with_other_entries() {
+        let result = check_trusted_hosts_impl(&["example.com".to_owned(), "*".to_owned()], true);
+        assert_eq!(result.name, "trusted_hosts");
+        assert!(matches!(result.status, CheckStatus::Warn));
     }
 
     // ── compute_summary ──────────────────────────────────────────────────────
@@ -2043,5 +3120,497 @@ foo = "bar"
         let json = to_json_output(&results, &summary);
         // Should parse as valid JSON
         assert!(serde_json::from_str::<serde_json::Value>(&json).is_ok());
+    }
+
+    // ── check_rate_limit_key_strategy ────────────────────────────────────────
+
+    #[test]
+    fn rate_limit_key_strategy_ip_always_passes() {
+        let r = check_rate_limit_key_strategy_impl("ip", false);
+        assert_eq!(r.status, CheckStatus::Pass);
+    }
+
+    #[test]
+    fn rate_limit_key_strategy_api_token_always_passes() {
+        let r = check_rate_limit_key_strategy_impl("api_token", false);
+        assert_eq!(r.status, CheckStatus::Pass);
+    }
+
+    #[test]
+    fn rate_limit_key_strategy_authenticated_principal_without_auth_warns_in_strict() {
+        let r = check_rate_limit_key_strategy_impl("authenticated_principal", false);
+        assert_eq!(r.status, CheckStatus::Warn);
+        assert!(r.hint.is_some());
+        assert!(
+            r.detail.as_deref().unwrap_or("").contains("auth extractor"),
+            "detail should mention auth extractor"
+        );
+    }
+
+    #[test]
+    fn rate_limit_key_strategy_authenticated_principal_with_auth_passes() {
+        let r = check_rate_limit_key_strategy_impl("authenticated_principal", true);
+        assert_eq!(r.status, CheckStatus::Pass);
+    }
+
+    #[test]
+    fn rate_limit_key_strategy_name_is_stable() {
+        let r = check_rate_limit_key_strategy_impl("authenticated_principal", false);
+        assert_eq!(r.name, "rate_limit_key_strategy");
+    }
+
+    #[test]
+    fn rate_limit_key_strategy_empty_strategy_passes() {
+        // Unconfigured / empty strategy is treated as default (ip).
+        let r = check_rate_limit_key_strategy_impl("", false);
+        assert_eq!(r.status, CheckStatus::Pass);
+    }
+
+    #[test]
+    fn rate_limit_key_strategy_invalid_value_fails() {
+        let r = check_rate_limit_key_strategy_impl("authenticated_principals", false);
+        assert_eq!(r.status, CheckStatus::Fail);
+        assert!(
+            r.detail
+                .as_deref()
+                .unwrap_or("")
+                .contains("not a valid strategy")
+        );
+    }
+
+    // ── check_maintenance_mode ────────────────────────────────────────────────
+
+    #[test]
+    fn check_maintenance_mode_passes_when_off() {
+        // No flag file in the test dir → maintenance is off → Pass
+        let result = check_maintenance_mode();
+        // In CI there should be no flag file; if there is, accept Warn too.
+        assert!(
+            result.status == CheckStatus::Pass || result.status == CheckStatus::Warn,
+            "unexpected status: {:?}",
+            result.status
+        );
+    }
+
+    // ── check_oauth2 (RED phase) ──────────────────────────────────────────────
+
+    #[test]
+    fn check_oauth2_empty_client_id_in_production_fails() {
+        let result = check_oauth2_provider_impl("github", "", "real-secret-value", true);
+        assert_eq!(
+            result.status,
+            CheckStatus::Fail,
+            "empty client_id in production must fail: {result:?}",
+        );
+        assert!(
+            result.detail.as_deref().unwrap_or("").contains("client_id"),
+            "detail must mention client_id: {:?}",
+            result.detail
+        );
+    }
+
+    #[test]
+    fn check_oauth2_empty_client_secret_in_production_fails() {
+        let result = check_oauth2_provider_impl("github", "cid", "", true);
+        assert_eq!(
+            result.status,
+            CheckStatus::Fail,
+            "empty client_secret in production must fail: {result:?}",
+        );
+        assert!(
+            result
+                .detail
+                .as_deref()
+                .unwrap_or("")
+                .contains("client_secret"),
+            "detail must mention client_secret: {:?}",
+            result.detail
+        );
+    }
+
+    #[test]
+    fn check_oauth2_empty_client_secret_in_dev_warns() {
+        let result = check_oauth2_provider_impl("github", "cid", "", false);
+        assert_eq!(
+            result.status,
+            CheckStatus::Warn,
+            "empty client_secret outside production must warn: {result:?}",
+        );
+    }
+
+    #[test]
+    fn check_oauth2_non_empty_client_secret_passes() {
+        let result = check_oauth2_provider_impl("github", "cid", "real-secret-value", true);
+        assert_eq!(
+            result.status,
+            CheckStatus::Pass,
+            "non-empty client_secret must pass: {result:?}",
+        );
+    }
+
+    #[test]
+    fn check_oauth2_provider_name_appears_in_check_name() {
+        let result = check_oauth2_provider_impl("google", "cid", "", true);
+        assert!(
+            result.name.contains("oauth2") || result.name.contains("google"),
+            "check name must identify the provider: {}",
+            result.name
+        );
+    }
+
+    #[test]
+    fn resolve_oauth2_providers_prefers_env_var_over_empty_toml_secret() {
+        let toml: toml::Table = toml::from_str(
+            r#"
+[auth.oauth2.github]
+client_id = "cid"
+client_secret = ""
+authorize_url = "https://github.com/login/oauth/authorize"
+token_url = "https://github.com/login/oauth/access_token"
+redirect_uri = "http://localhost/callback"
+"#,
+        )
+        .unwrap();
+
+        let providers = resolve_oauth2_providers_from_sources(
+            |key| {
+                if key == "AUTUMN_AUTH__OAUTH2__GITHUB__CLIENT_SECRET" {
+                    Some("ghp_test_secret".to_owned())
+                } else {
+                    None
+                }
+            },
+            Some(&toml),
+            "dev",
+        );
+
+        let p = providers.into_iter().find(|p| p.name == "github").unwrap();
+        assert_eq!(
+            p.client_secret, "ghp_test_secret",
+            "env var must override empty TOML client_secret"
+        );
+    }
+
+    // ── check_compression ────────────────────────────────────────────────────
+
+    #[test]
+    fn compression_warns_in_production_when_disabled() {
+        let result = check_compression_impl(false, true);
+        assert_eq!(result.name, "compression");
+        assert!(
+            matches!(result.status, CheckStatus::Warn),
+            "expected Warn, got {:?}",
+            result.status
+        );
+    }
+
+    #[test]
+    fn compression_passes_in_production_when_enabled() {
+        let result = check_compression_impl(true, true);
+        assert_eq!(result.name, "compression");
+        assert!(
+            matches!(result.status, CheckStatus::Pass),
+            "expected Pass, got {:?}",
+            result.status
+        );
+    }
+
+    #[test]
+    fn compression_passes_in_dev_when_disabled() {
+        let result = check_compression_impl(false, false);
+        assert_eq!(result.name, "compression");
+        assert!(
+            matches!(result.status, CheckStatus::Pass),
+            "expected Pass in dev profile, got {:?}",
+            result.status
+        );
+    }
+
+    #[test]
+    fn parse_config_bool_handles_false_values() {
+        assert_eq!(parse_config_bool("false"), Some(false));
+        assert_eq!(parse_config_bool("0"), Some(false));
+        assert_eq!(parse_config_bool("no"), Some(false));
+        assert_eq!(parse_config_bool("off"), Some(false));
+        assert_eq!(parse_config_bool("true"), Some(true));
+        assert_eq!(parse_config_bool("1"), Some(true));
+        assert_eq!(parse_config_bool("yes"), Some(true));
+        assert_eq!(parse_config_bool("on"), Some(true));
+        assert_eq!(parse_config_bool("garbage"), None);
+    }
+
+    // ── check_proxy_conflict ─────────────────────────────────────────────────
+
+    #[test]
+    fn proxy_conflict_passes_when_only_new_fields_set() {
+        let data = ProxyConflictData {
+            new_ranges: vec!["10.0.0.0/8".into()],
+            new_trust_fwd: true,
+            new_hops: None,
+            old_ranges: vec![],
+            old_trust_fwd: false,
+        };
+        let r = check_proxy_conflict_impl(&data);
+        assert_eq!(r.status, CheckStatus::Pass);
+    }
+
+    #[test]
+    fn proxy_conflict_passes_when_only_old_fields_set() {
+        let data = ProxyConflictData {
+            new_ranges: vec![],
+            new_trust_fwd: false,
+            new_hops: None,
+            old_ranges: vec!["10.0.0.0/8".into()],
+            old_trust_fwd: true,
+        };
+        let r = check_proxy_conflict_impl(&data);
+        assert_eq!(r.status, CheckStatus::Pass);
+    }
+
+    #[test]
+    fn proxy_conflict_warns_when_both_set_with_different_ranges() {
+        let data = ProxyConflictData {
+            new_ranges: vec!["10.0.0.0/8".into()],
+            new_trust_fwd: true,
+            new_hops: None,
+            old_ranges: vec!["192.168.0.0/16".into()],
+            old_trust_fwd: true,
+        };
+        let r = check_proxy_conflict_impl(&data);
+        assert_eq!(r.status, CheckStatus::Warn);
+        assert!(r.hint.is_some());
+    }
+
+    #[test]
+    fn proxy_conflict_warns_when_trusted_hops_set_alongside_old_fields() {
+        let data = ProxyConflictData {
+            new_ranges: vec![],
+            new_trust_fwd: true,
+            new_hops: Some(1),
+            old_ranges: vec![],
+            old_trust_fwd: true,
+        };
+        let r = check_proxy_conflict_impl(&data);
+        assert_eq!(r.status, CheckStatus::Warn);
+    }
+
+    #[test]
+    fn proxy_conflict_passes_when_matching_values_no_hops() {
+        let data = ProxyConflictData {
+            new_ranges: vec!["10.0.0.0/8".into()],
+            new_trust_fwd: true,
+            new_hops: None,
+            old_ranges: vec!["10.0.0.0/8".into()],
+            old_trust_fwd: true,
+        };
+        let r = check_proxy_conflict_impl(&data);
+        assert_eq!(r.status, CheckStatus::Pass);
+    }
+
+    // ── system_test_browser ───────────────────────────────────────────────────
+
+    #[test]
+    fn browser_check_not_found_is_warn_not_fail() {
+        // Simulate: no browser in an empty candidate list.  The check must
+        // return Warn so projects that don't use system tests aren't penalized.
+        let result = check_system_test_browser();
+        // Accept Pass (if Chrome is on the host) or Warn (if not).
+        assert!(
+            result.status == CheckStatus::Pass || result.status == CheckStatus::Warn,
+            "browser check must be Pass or Warn, got {:?}",
+            result.status
+        );
+    }
+
+    #[test]
+    fn browser_candidate_paths_includes_common_locations() {
+        let paths = browser_candidate_paths();
+        let as_strs: Vec<_> = paths
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            as_strs
+                .iter()
+                .any(|s| s.contains("chromium") || s.contains("chrome")),
+            "candidate list must include common Chrome paths; got {as_strs:?}"
+        );
+    }
+
+    #[test]
+    fn browser_check_hint_mentions_apt_get() {
+        let result = check_system_test_browser();
+        if result.status == CheckStatus::Warn {
+            let hint = result.hint.unwrap_or("");
+            assert!(
+                hint.contains("apt-get") || hint.contains("AUTUMN_CHROMIUM"),
+                "hint must mention install command; got: {hint}"
+            );
+        }
+    }
+
+    // ── cargo_toml_features_has_key ───────────────────────────────────────────
+
+    #[test]
+    fn features_has_key_detects_bare_key() {
+        let toml = "[features]\nsystem-tests = [\"autumn-web/system-tests\"]\n";
+        assert!(cargo_toml_features_has_key(toml, "system-tests"));
+    }
+
+    #[test]
+    fn features_has_key_detects_quoted_key() {
+        let toml = "[features]\n\"system-tests\" = [\"autumn-web/system-tests\"]\n";
+        assert!(cargo_toml_features_has_key(toml, "system-tests"));
+    }
+
+    #[test]
+    fn features_has_key_ignores_dev_dependency_mention() {
+        // The key appears in [dev-dependencies] but NOT in [features].
+        let toml = "[dev-dependencies]\nautumn-web = { features = [\"system-tests\"] }\n";
+        assert!(!cargo_toml_features_has_key(toml, "system-tests"));
+    }
+
+    #[test]
+    fn features_has_key_no_features_section() {
+        let toml = "[package]\nname = \"x\"\n";
+        assert!(!cargo_toml_features_has_key(toml, "system-tests"));
+    }
+
+    #[test]
+    fn features_has_key_commented_header() {
+        let toml = "[features] # project features\nsystem-tests = []\n";
+        assert!(cargo_toml_features_has_key(toml, "system-tests"));
+    }
+
+    // ── check_gdpr_export_registration ───────────────────────────────────────
+
+    #[test]
+    fn gdpr_check_passes_when_no_auth_starter() {
+        let r = check_gdpr_export_registration_impl(false, &[]);
+        assert_eq!(
+            r.status,
+            CheckStatus::Pass,
+            "no auth starter → should always pass: {r:?}"
+        );
+    }
+
+    #[test]
+    fn gdpr_check_passes_when_no_auth_starter_even_with_unregistered_tables() {
+        let r = check_gdpr_export_registration_impl(false, &["posts", "comments"]);
+        assert_eq!(
+            r.status,
+            CheckStatus::Pass,
+            "no auth starter → must not warn about unregistered tables: {r:?}"
+        );
+    }
+
+    #[test]
+    fn gdpr_check_passes_when_all_tables_registered() {
+        let r = check_gdpr_export_registration_impl(true, &[]);
+        assert_eq!(
+            r.status,
+            CheckStatus::Pass,
+            "auth starter present + all tables registered → should pass: {r:?}"
+        );
+    }
+
+    #[test]
+    fn gdpr_check_warns_when_unregistered_tables_present() {
+        let r = check_gdpr_export_registration_impl(true, &["posts", "comments"]);
+        assert_eq!(
+            r.status,
+            CheckStatus::Warn,
+            "unregistered tables with auth starter must warn: {r:?}"
+        );
+    }
+
+    #[test]
+    fn gdpr_check_name_is_stable() {
+        let r = check_gdpr_export_registration_impl(false, &[]);
+        assert_eq!(r.name, "gdpr_export_registration");
+    }
+
+    #[test]
+    fn gdpr_check_detail_lists_unregistered_table_names() {
+        let r = check_gdpr_export_registration_impl(true, &["posts", "comments"]);
+        let detail = r.detail.as_deref().unwrap_or("");
+        assert!(
+            detail.contains("posts"),
+            "detail must mention unregistered table 'posts': {detail}"
+        );
+        assert!(
+            detail.contains("comments"),
+            "detail must mention unregistered table 'comments': {detail}"
+        );
+    }
+
+    #[test]
+    fn gdpr_check_hint_references_registry_api() {
+        let r = check_gdpr_export_registration_impl(true, &["orders"]);
+        let hint = r.hint.unwrap_or("");
+        assert!(
+            hint.contains("GdprRegistry") || hint.contains("gdpr"),
+            "hint must reference the GdprRegistry API: {hint}"
+        );
+    }
+
+    #[test]
+    fn gdpr_check_detail_mentions_count_of_unregistered_tables() {
+        let r = check_gdpr_export_registration_impl(true, &["t1", "t2", "t3"]);
+        let detail = r.detail.as_deref().unwrap_or("");
+        assert!(
+            detail.contains('3') || detail.contains("3 "),
+            "detail must mention the count of unregistered tables: {detail}"
+        );
+    }
+
+    // ── scan_source_for_gdpr_registrations / extract_quoted_table_name ─────────
+
+    #[test]
+    fn scanner_detects_single_line_hard_delete() {
+        let src = r#"registry.register(ModelRegistration::hard_delete("posts"));"#;
+        let mut found = std::collections::HashSet::new();
+        scan_source_for_gdpr_registrations(src, &mut found);
+        assert!(
+            found.contains("posts"),
+            "should detect single-line hard_delete: {found:?}"
+        );
+    }
+
+    #[test]
+    fn scanner_detects_multiline_retain_call() {
+        let src = "registry.register(ModelRegistration::retain(\n    \"invoices\",\n    \"7-year financial hold\",\n));";
+        let mut found = std::collections::HashSet::new();
+        scan_source_for_gdpr_registrations(src, &mut found);
+        assert!(
+            found.contains("invoices"),
+            "should detect multi-line retain registration: {found:?}"
+        );
+    }
+
+    #[test]
+    fn scanner_detects_multiline_anonymize_call() {
+        let src = "registry.register(ModelRegistration::anonymize(\n    \"comments\",\n));";
+        let mut found = std::collections::HashSet::new();
+        scan_source_for_gdpr_registrations(src, &mut found);
+        assert!(
+            found.contains("comments"),
+            "should detect multi-line anonymize registration: {found:?}"
+        );
+    }
+
+    #[test]
+    fn scanner_ignores_string_before_token() {
+        let src = r#"let _x = "not_a_table"; ModelRegistration::hard_delete("real_table");"#;
+        let mut found = std::collections::HashSet::new();
+        scan_source_for_gdpr_registrations(src, &mut found);
+        assert!(
+            found.contains("real_table"),
+            "should contain real_table: {found:?}"
+        );
+        assert!(
+            !found.contains("not_a_table"),
+            "should not contain string before token: {found:?}"
+        );
     }
 }

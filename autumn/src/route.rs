@@ -63,6 +63,26 @@ pub struct RepositoryApiMeta {
     pub scope_check: Option<fn(&crate::authorization::PolicyRegistry) -> bool>,
 }
 
+/// Declares how the app-level idempotency layer should replay cached responses
+/// for this route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RouteIdempotency {
+    /// Unknown/manual routes have no guaranteed generated replay consumer.
+    /// Autumn stores the first successful mutation but fails closed on cache
+    /// hits instead of directly replaying a stale success around any
+    /// route-local authorization, tenant, audit, or similar layers.
+    #[default]
+    Direct,
+    /// Autumn-generated routes install a replay consumer inside the route
+    /// stack or generated guard body, allowing route-local middleware and
+    /// guards to run before the cached response is returned.
+    ///
+    /// Manual layered routes can use this too, but they must place
+    /// [`crate::idempotency::IdempotencyReplayLayer`] after those checks and
+    /// before the mutating handler.
+    ReplayThroughInner,
+}
+
 /// A single route binding an HTTP method + path to an Axum handler.
 ///
 /// Created by the `__autumn_route_info_{name}()` companion functions
@@ -102,8 +122,17 @@ pub struct Route {
     /// generating `/v3/api-docs`.
     pub api_doc: ApiDoc,
 
+    /// API version of the route (e.g. "v1")
+    pub api_version: Option<&'static str>,
+
+    /// Whether this route opts out of sunset 410 response
+    pub sunset_opt_out: bool,
+
     /// Repository auto-API metadata, populated by the
     /// `#[repository(api = ...)]` macro. `None` for hand-written
     /// route handlers.
     pub repository: Option<RepositoryApiMeta>,
+
+    /// Idempotency replay behavior for this route.
+    pub idempotency: RouteIdempotency,
 }

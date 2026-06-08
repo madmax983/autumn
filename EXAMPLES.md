@@ -119,8 +119,8 @@ blocks publishing `autumn-web` or `autumn-cli`.
 | Field | Value |
 |-------|-------|
 | **Persona** | Developer building a production-shaped Autumn application with auth and real-time features |
-| **Journey** | Full-stack Reddit clone: registration, sessions, posts, voting, live feeds, background jobs, transactional email |
-| **Key capabilities** | `#[secured]`, CSRF, sessions, `#[job]`, `#[ws]` channels, Redis fan-out, `#[scheduled]`, `#[static_get]`, transactional email, htmx voting |
+| **Journey** | Full-stack Reddit clone: registration, sessions, posts, voting, live feeds, background jobs, transactional email, live-tunable runtime config |
+| **Key capabilities** | `#[secured]`, CSRF, sessions, `#[job]`, `#[ws]` channels, Redis fan-out, `#[scheduled]`, `#[static_get]`, transactional email, htmx voting, `RuntimeConfigService` |
 | **Prerequisites** | Rust 1.88.0+, PostgreSQL, Redis (optional for local run; required for multi-replica fan-out) |
 | **Run command** | `cargo run -p reddit-clone` |
 | **Success proof** | `curl http://localhost:3000/` returns the front-page HTML |
@@ -157,6 +157,21 @@ blocks publishing `autumn-web` or `autumn-cli`.
 
 ---
 
+### `examples/outbound-http` - Traced Outbound HTTP Client
+
+<!-- catalog:example name=outbound-http tier=supported -->
+
+| Field | Value |
+|-------|-------|
+| **Persona** | Developer integrating third-party APIs (Stripe, SendGrid, etc.) |
+| **Journey** | Call an external HTTP API from a handler with automatic retries and trace propagation; assert call counts in integration tests using `TestApp::http_mock` |
+| **Key capabilities** | `Client` extractor, `[http.client]` config, `TestApp::http_mock`, `MockHandle::expect_called`, W3C trace propagation |
+| **Prerequisites** | Rust 1.88.0+ |
+| **Run command** | `cargo run -p outbound-http` |
+| **Success proof** | `cargo test -p outbound-http` passes all four mock-harness integration tests |
+
+---
+
 ### `examples/signed-webhooks` - Signed Webhook Intake
 
 <!-- catalog:example name=signed-webhooks tier=supported -->
@@ -169,6 +184,36 @@ blocks publishing `autumn-web` or `autumn-cli`.
 | **Prerequisites** | Rust 1.88.0+ |
 | **Run command** | `cargo run -p signed-webhooks-example` |
 | **Success proof** | `cargo test -p signed-webhooks-example` passes valid, tampered-body, stale-timestamp, bad-signature, and duplicate-delivery fixtures |
+
+---
+
+### `examples/experiments` - A/B Experiments
+
+<!-- catalog:example name=experiments tier=supported -->
+
+| Field | Value |
+|-------|-------|
+| **Persona** | Engineer adding feature experimentation to a production app |
+| **Journey** | Declare a 50/50 experiment, assign actors deterministically, emit exposure events, pin a QA override, and conclude with a winner |
+| **Key capabilities** | `ExperimentService`, `InMemoryExperimentStore`, `TracingExposureSink`, `Experiments` extractor, QA overrides, lifecycle transitions |
+| **Prerequisites** | Rust 1.88.0+ |
+| **Run command** | `cargo run -p experiments` |
+| **Success proof** | `cargo test -p experiments` passes; `curl http://localhost:3000/checkout/user:1` returns a variant; `qa:alice` always returns `treatment` |
+
+---
+
+### `examples/error-reporting` - Pluggable Error Reporting
+
+<!-- catalog:example name=error-reporting tier=supported -->
+
+| Field | Value |
+|-------|-------|
+| **Persona** | Operator who needs unhandled panics and 5xx errors routed to a sink (Sentry/Slack/custom) |
+| **Journey** | Implement a custom `ErrorReporter`, wire it with one builder call, watch panics and server errors deliver structured events while clients still get a clean 500 |
+| **Key capabilities** | `ErrorReporter`, `ErrorEvent`, `.with_error_reporter(..)`, HTTP-layer panic capture, `[reporting]` sampling/enable config |
+| **Prerequisites** | Rust 1.88.0+ |
+| **Run command** | `cargo run -p error-reporting` |
+| **Success proof** | `curl -i localhost:3000/boom` returns a clean 500 and the server logs one `[report]` line; `/ok` returns 200 with no report |
 
 ---
 
@@ -189,6 +234,7 @@ can pick the closest starting point without overlap.
 | Custom config loading | `custom_config_loader` | Replace the default config loader with a custom `ConfigLoader` |
 | WebSocket / SSE | `ws-echo` | Echo, fan-out channels, SSE, Redis multi-replica pub/sub |
 | Signed intake | `signed-webhooks` | Provider-shaped webhook HMAC verification and replay rejection |
+| A/B experiments | `experiments` | Deterministic bucketing, sticky assignments, exposure telemetry, QA overrides |
 
 ---
 

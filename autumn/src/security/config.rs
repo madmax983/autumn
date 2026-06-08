@@ -16,6 +16,11 @@
 //! x_frame_options = "DENY"
 //! content_security_policy = "default-src 'self'"
 //!
+//! # Enable per-request CSP nonces — removes 'unsafe-inline' from the default
+//! # style-src and makes the nonce available via the CspNonce extractor.
+//! [security.headers.csp_nonce]
+//! enabled = true
+//!
 //! [security.csrf]
 //! enabled = true
 //!
@@ -32,12 +37,20 @@
 //! | `AUTUMN_SECURITY__HEADERS__X_FRAME_OPTIONS` | `security.headers.x_frame_options` | `String` |
 //! | `AUTUMN_SECURITY__HEADERS__HSTS_MAX_AGE_SECS` | `security.headers.hsts_max_age_secs` | `u64` |
 //! | `AUTUMN_SECURITY__HEADERS__CONTENT_SECURITY_POLICY` | `security.headers.content_security_policy` | `String` |
+//! | `AUTUMN_SECURITY__HEADERS__CSP_NONCE__ENABLED` | `security.headers.csp_nonce.enabled` | `bool` |
 //! | `AUTUMN_SECURITY__CSRF__ENABLED` | `security.csrf.enabled` | `bool` |
 //! | `AUTUMN_SECURITY__RATE_LIMIT__ENABLED` | `security.rate_limit.enabled` | `bool` |
 //! | `AUTUMN_SECURITY__RATE_LIMIT__REQUESTS_PER_SECOND` | `security.rate_limit.requests_per_second` | `f64` |
 //! | `AUTUMN_SECURITY__RATE_LIMIT__BURST` | `security.rate_limit.burst` | `u32` |
 //! | `AUTUMN_SECURITY__RATE_LIMIT__TRUST_FORWARDED_HEADERS` | `security.rate_limit.trust_forwarded_headers` | `bool` |
 //! | `AUTUMN_SECURITY__RATE_LIMIT__TRUSTED_PROXIES` | `security.rate_limit.trusted_proxies` | comma-separated `String` |
+//! | `AUTUMN_SECURITY__RATE_LIMIT__BACKEND` | `security.rate_limit.backend` | `memory` / `redis` |
+//! | `AUTUMN_SECURITY__RATE_LIMIT__ON_BACKEND_FAILURE` | `security.rate_limit.on_backend_failure` | `fail_open` / `fail_closed` |
+//! | `AUTUMN_SECURITY__RATE_LIMIT__REDIS__URL` | `security.rate_limit.redis.url` | `String` |
+//! | `AUTUMN_SECURITY__RATE_LIMIT__REDIS__KEY_PREFIX` | `security.rate_limit.redis.key_prefix` | `String` |
+//! | `AUTUMN_SECURITY__TRUSTED_PROXIES__RANGES` | `security.trusted_proxies.ranges` | comma-separated `String` |
+//! | `AUTUMN_SECURITY__TRUSTED_PROXIES__TRUST_FORWARDED_HEADERS` | `security.trusted_proxies.trust_forwarded_headers` | `bool` |
+//! | `AUTUMN_SECURITY__TRUSTED_PROXIES__TRUSTED_HOPS` | `security.trusted_proxies.trusted_hops` | `u32` |
 //! | `AUTUMN_SECURITY__UPLOAD__MAX_REQUEST_SIZE_BYTES` | `security.upload.max_request_size_bytes` | `usize` |
 //! | `AUTUMN_SECURITY__UPLOAD__MAX_FILE_SIZE_BYTES` | `security.upload.max_file_size_bytes` | `usize` |
 //! | `AUTUMN_SECURITY__UPLOAD__ALLOWED_MIME_TYPES` | `security.upload.allowed_mime_types` | comma-separated `String` |
@@ -50,6 +63,7 @@
 //! Setting any header value to an empty string disables it (the header is
 //! not emitted). This is the escape hatch for opting out of a default.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde::Deserialize;
@@ -388,6 +402,123 @@ pub struct SecurityConfig {
     /// secret via `AUTUMN_SECURITY__SIGNING_SECRET`.
     #[serde(default)]
     pub signing_secret: SigningSecretConfig,
+
+    /// Trusted Host header allow-list.
+    #[serde(default)]
+    pub trusted_hosts: TrustedHostsConfig,
+
+    /// Top-level trusted-proxy policy for `X-Forwarded-*` headers.
+    ///
+    /// When configured, every forwarding-aware middleware (rate limiter, CSRF
+    /// origin check, method-override, HSTS detection, tracing fields) honours
+    /// this policy.  The old per-subsystem `security.rate_limit.trusted_proxies`
+    /// and `security.rate_limit.trust_forwarded_headers` fields continue to work
+    /// for one minor release but are deprecated; configure this block instead.
+    #[serde(default)]
+    pub trusted_proxies: TrustedProxiesConfig,
+}
+
+impl SecurityConfig {
+    /// Check for conflicting configuration between the new top-level
+    /// `[security.trusted_proxies]` and the deprecated rate-limit-scoped fields.
+    ///
+    /// Returns `Some(message)` when both are set with values that differ; the
+    /// caller (e.g. `autumn doctor --strict`) should treat this as a failure.
+    #[must_use]
+    pub fn trusted_proxies_conflict(&self) -> Option<String> {
+        let new_set =
+            self.trusted_proxies.trust_forwarded_headers || !self.trusted_proxies.ranges.is_empty();
+        let old_set =
+            self.rate_limit.trust_forwarded_headers || !self.rate_limit.trusted_proxies.is_empty();
+
+        if new_set && old_set {
+            // Check for value-level conflicts.
+            let new_ranges: std::collections::HashSet<&str> = self
+                .trusted_proxies
+                .ranges
+                .iter()
+                .map(String::as_str)
+                .collect();
+            let old_ranges: std::collections::HashSet<&str> = self
+                .rate_limit
+                .trusted_proxies
+                .iter()
+                .map(String::as_str)
+                .collect();
+
+            // The legacy rate-limit fields have no hop-count equivalent, so any
+            // trusted_hops value in the new block is always a conflict.
+            let hops_conflict = self.trusted_proxies.trusted_hops.is_some();
+
+            if new_ranges != old_ranges
+                || self.trusted_proxies.trust_forwarded_headers
+                    != self.rate_limit.trust_forwarded_headers
+                || hops_conflict
+            {
+                return Some(
+                    "[security.trusted_proxies] and \
+                     [security.rate_limit] trusted_proxies/trust_forwarded_headers \
+                     are both set with conflicting values. Remove the deprecated \
+                     rate_limit fields and keep only [security.trusted_proxies]."
+                        .to_owned(),
+                );
+            }
+        }
+
+        None
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TrustedHostsConfig {
+    #[serde(default)]
+    pub hosts: Vec<String>,
+}
+
+/// Top-level trusted-proxy policy applied by every forwarding-aware middleware.
+///
+/// Declare this once under `[security.trusted_proxies]` and every framework
+/// middleware that reads `X-Forwarded-*` headers (rate limiter, CSRF origin
+/// check, method-override, HSTS detection, tracing fields) will honour it
+/// automatically.
+///
+/// # Examples
+///
+/// ```toml
+/// # Behind Cloudflare (known IP ranges) + an ALB in 10.0.0.0/8
+/// [security.trusted_proxies]
+/// ranges = ["173.245.48.0/20", "103.21.244.0/22", "10.0.0.0/8"]
+/// trust_forwarded_headers = true
+///
+/// # Behind exactly one ALB with dynamic IPs — trust the rightmost 1 hop
+/// [security.trusted_proxies]
+/// trusted_hops = 1
+/// trust_forwarded_headers = true
+/// ```
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TrustedProxiesConfig {
+    /// Trusted proxy IP addresses or CIDR ranges.
+    ///
+    /// Walk the `X-Forwarded-For` chain from the right, skipping IPs in these
+    /// ranges.  The first IP that falls outside the ranges is the real client.
+    #[serde(default)]
+    pub ranges: Vec<String>,
+
+    /// Trust exactly this many proxy hops from the right of the
+    /// `X-Forwarded-For` chain, regardless of their IPs.
+    ///
+    /// Use when proxy IPs are dynamic (e.g., AWS ALB).  Takes precedence over
+    /// `ranges` when set.
+    #[serde(default)]
+    pub trusted_hops: Option<u32>,
+
+    /// Whether to consult `X-Forwarded-*` headers at all.
+    ///
+    /// Defaults to `false` in `prod` (safe default — no forwarding trust until
+    /// explicitly configured).  Set `true` when the application is behind a
+    /// reverse proxy that sets these headers.
+    #[serde(default)]
+    pub trust_forwarded_headers: bool,
 }
 
 /// Security response headers configuration.
@@ -480,6 +611,22 @@ pub struct HeadersConfig {
     /// Example: `"camera=(), microphone=(), geolocation=()"`.
     #[serde(default)]
     pub permissions_policy: String,
+
+    /// Per-request CSP nonce configuration.
+    ///
+    /// When enabled, a fresh cryptographically-random nonce is generated for
+    /// every request and injected into `script-src` and `style-src` of the
+    /// default `Content-Security-Policy`. The nonce is also available via the
+    /// [`CspNonce`] extractor for use in templates.
+    ///
+    /// Apps that set an explicit `content_security_policy` string opt out of
+    /// automatic nonce injection automatically — their custom CSP is used
+    /// verbatim, but the nonce is still generated and available via the
+    /// extractor.
+    ///
+    /// [`CspNonce`]: crate::security::CspNonce
+    #[serde(default)]
+    pub csp_nonce: CspNonceConfig,
 }
 
 impl Default for HeadersConfig {
@@ -494,6 +641,7 @@ impl Default for HeadersConfig {
             content_security_policy: default_content_security_policy(),
             referrer_policy: default_referrer_policy(),
             permissions_policy: String::new(),
+            csp_nonce: CspNonceConfig::default(),
         }
     }
 }
@@ -577,11 +725,83 @@ impl Default for CsrfConfig {
     }
 }
 
+/// Strategy for identifying which client a rate-limit bucket belongs to.
+///
+/// Controls what value is used as the bucket key for incoming requests.
+///
+/// # `autumn.toml` example
+///
+/// ```toml
+/// [security.rate_limit]
+/// enabled = true
+/// key_strategy = "authenticated_principal"
+/// ```
+///
+/// | Value | Description |
+/// |-------|-------------|
+/// | `"ip"` | Connection peer address (default). Safe against header spoofing. |
+/// | `"api_token"` | `Authorization: Bearer <token>` value. Falls back to IP when no token. |
+/// | `"authenticated_principal"` | Principal ID set by auth middleware via `RateLimitPrincipal` extension. Falls back to IP for unauthenticated requests. |
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyStrategy {
+    /// Key on client IP address (connection peer or trusted-proxy-resolved). **Default.**
+    #[default]
+    Ip,
+    /// Key on the `Authorization: Bearer` token value. Falls back to IP when absent.
+    ApiToken,
+    /// Key on the authenticated principal ID from the `RateLimitPrincipal` request
+    /// extension (set by the auth middleware). Falls back to IP for unauthenticated requests.
+    AuthenticatedPrincipal,
+}
+
+impl KeyStrategy {
+    pub(crate) fn from_env_value(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "ip" => Some(Self::Ip),
+            "api_token" => Some(Self::ApiToken),
+            "authenticated_principal" => Some(Self::AuthenticatedPrincipal),
+            _ => None,
+        }
+    }
+}
+
+/// Per-tier rate limit parameters for tiered quota configuration.
+///
+/// Declare named tiers under `[security.rate_limit.tiers.<name>]` in `autumn.toml`.
+/// Each tier gets its own token bucket with independent `requests_per_second` and
+/// `burst` values. The app maps callers to a tier via a tier-assignment hook
+/// (see [`crate::security::rate_limit::RateLimitLayer::with_tier_hook`]).
+///
+/// # `autumn.toml` example
+///
+/// ```toml
+/// [security.rate_limit.tiers.free]
+/// requests_per_second = 1.0
+/// burst = 10
+///
+/// [security.rate_limit.tiers.pro]
+/// requests_per_second = 10.0
+/// burst = 100
+///
+/// [security.rate_limit.tiers.enterprise]
+/// requests_per_second = 100.0
+/// burst = 1000
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct RateLimitTierConfig {
+    /// Steady-state refill rate for this tier in requests per second.
+    pub requests_per_second: f64,
+    /// Maximum burst capacity (token bucket size) for this tier.
+    pub burst: u32,
+}
+
 /// Rate limiting configuration.
 ///
-/// Applies a per-client-IP token bucket to every request. When a client
-/// exceeds their bucket, the middleware returns `429 Too Many Requests`
-/// with a `Retry-After` header indicating when to retry.
+/// Applies a token bucket to every request, keyed by client IP (default)
+/// or by authenticated principal / API token. When a client exhausts their
+/// bucket, the middleware returns `429 Too Many Requests` with `Retry-After`
+/// and Problem Details (RFC 9457).
 ///
 /// # Defaults
 ///
@@ -592,6 +812,8 @@ impl Default for CsrfConfig {
 /// | `burst` | `20` |
 /// | `trust_forwarded_headers` | `false` |
 /// | `trusted_proxies` | `[]` |
+/// | `key_strategy` | `"ip"` |
+/// | `tiers` | `{}` (no tiers; all callers share the default config) |
 ///
 /// # Client IP resolution
 ///
@@ -606,6 +828,34 @@ impl Default for CsrfConfig {
 /// then walks the header from right to left, skips those trusted proxy
 /// hops, and keys the bucket on the nearest untrusted client IP.
 ///
+/// # Per-principal / API-token keying
+///
+/// Set `key_strategy = "authenticated_principal"` to key on the authenticated
+/// user identity instead of IP. Auth middleware must insert a
+/// `RateLimitPrincipal` extension on the request before the rate limiter runs.
+/// Unauthenticated requests fall through to IP-based keying — never silently
+/// unbounded.
+///
+/// Set `key_strategy = "api_token"` to key on the `Authorization: Bearer`
+/// token value. Falls back to IP when no `Authorization` header is present.
+///
+/// # Tiered quotas
+///
+/// Declare named tiers and register a tier-assignment hook at startup:
+///
+/// ```toml
+/// [security.rate_limit]
+/// key_strategy = "authenticated_principal"
+///
+/// [security.rate_limit.tiers.free]
+/// requests_per_second = 1.0
+/// burst = 10
+///
+/// [security.rate_limit.tiers.pro]
+/// requests_per_second = 10.0
+/// burst = 100
+/// ```
+///
 /// # Examples
 ///
 /// ```toml
@@ -615,6 +865,15 @@ impl Default for CsrfConfig {
 /// burst = 10
 /// trust_forwarded_headers = false
 /// trusted_proxies = ["10.0.0.10", "203.0.113.0/24"]
+/// key_strategy = "authenticated_principal"
+///
+/// # Multi-replica: share the budget across all pods
+/// backend = "redis"
+/// on_backend_failure = "fail_open"
+///
+/// [security.rate_limit.redis]
+/// url = "redis://redis:6379"
+/// key_prefix = "myapp:rate_limit"
 /// ```
 #[derive(Debug, Clone, Deserialize)]
 pub struct RateLimitConfig {
@@ -623,33 +882,81 @@ pub struct RateLimitConfig {
     pub enabled: bool,
 
     /// Steady-state refill rate in requests per second. Default: `10.0`.
+    ///
+    /// Used as the default when no tier matches. Configure per-tier values
+    /// under `[security.rate_limit.tiers.<name>]`.
     #[serde(default = "default_rps")]
     pub requests_per_second: f64,
 
     /// Maximum burst capacity (number of tokens the bucket can hold).
     /// Default: `20`.
+    ///
+    /// Used as the default when no tier matches.
     #[serde(default = "default_burst")]
     pub burst: u32,
 
+    /// **Deprecated** — use `[security.trusted_proxies]` instead.
+    ///
     /// Consult `X-Forwarded-For` / `X-Real-IP` before the connection peer
     /// when identifying the client. Default: `false`.
     ///
-    /// Enable ONLY when the server is behind a trusted reverse proxy that
-    /// fully overrides these headers on every request. Otherwise a client
-    /// can rotate header values to bypass throttling.
+    /// This field is honoured for one minor release and emits a startup
+    /// warning.  Configure [`SecurityConfig::trusted_proxies`] to silence
+    /// the warning and share the policy with all middleware.
     #[serde(default)]
     pub trust_forwarded_headers: bool,
 
+    /// **Deprecated** — use `[security.trusted_proxies]` instead.
+    ///
     /// Trusted proxy IP addresses or CIDR ranges to skip at the right
     /// side of an appended `X-Forwarded-For` chain.
     ///
-    /// This is only used when `trust_forwarded_headers = true`. Include
-    /// the immediate peer proxy when `ConnectInfo` is available; forwarded
-    /// headers from non-trusted peers, or requests without peer metadata,
-    /// are ignored. Invalid entries are ignored; if every configured
-    /// entry is invalid, forwarded headers are ignored rather than trusted.
+    /// This field is honoured for one minor release and emits a startup
+    /// warning.  Configure [`SecurityConfig::trusted_proxies`] to silence
+    /// the warning and share the policy with all middleware.
     #[serde(default)]
     pub trusted_proxies: Vec<String>,
+
+    /// Key extraction strategy. Default: `"ip"`.
+    ///
+    /// Determines what value is used as the rate-limit bucket key.
+    /// See [`KeyStrategy`] for the available options.
+    #[serde(default)]
+    pub key_strategy: KeyStrategy,
+
+    /// Named tiers with per-tier `requests_per_second` and `burst` values.
+    ///
+    /// When a tier-assignment hook is registered and returns a tier name that
+    /// matches a key here, that tier's config is used for the caller's bucket
+    /// instead of the top-level defaults.
+    #[serde(default)]
+    pub tiers: HashMap<String, RateLimitTierConfig>,
+
+    /// Bucket store backend. Default: `"memory"` (in-process, single-replica).
+    ///
+    /// Set to `"redis"` in multi-replica deployments so the configured
+    /// rate cap is enforced globally rather than per pod. Requires the
+    /// `redis` cargo feature to take effect; without it, a startup warning
+    /// is emitted and the memory backend is used.
+    #[serde(default)]
+    pub backend: RateLimitBackend,
+
+    /// Redis backend options. Used when `backend = "redis"`.
+    ///
+    /// Requires the `redis` cargo feature.
+    #[cfg(feature = "redis")]
+    #[serde(default)]
+    pub redis: RateLimitRedisConfig,
+
+    /// Behavior when the backend is unavailable. Default: `"fail_open"`.
+    ///
+    /// `"fail_open"` lets requests through (matches single-replica posture).
+    /// `"fail_closed"` returns `429` until the backend recovers.
+    ///
+    /// Requires the `redis` cargo feature.
+    #[cfg(feature = "redis")]
+    #[serde(default)]
+    pub on_backend_failure: RateLimitBackendFailure,
 }
 
 impl Default for RateLimitConfig {
@@ -660,8 +967,114 @@ impl Default for RateLimitConfig {
             burst: default_burst(),
             trust_forwarded_headers: false,
             trusted_proxies: Vec::new(),
+            key_strategy: KeyStrategy::default(),
+            tiers: HashMap::new(),
+            backend: RateLimitBackend::default(),
+            #[cfg(feature = "redis")]
+            redis: RateLimitRedisConfig::default(),
+            #[cfg(feature = "redis")]
+            on_backend_failure: RateLimitBackendFailure::default(),
         }
     }
+}
+
+/// Storage backend for per-IP token buckets.
+///
+/// Matches the pattern established by [`CacheBackend`](crate::config::CacheBackend)
+/// (issue #535) and `SchedulerBackend` (issue #531): one `backend = "redis"` flip
+/// per subsystem, identical failure semantics.
+///
+/// The enum is always available so misconfiguration is detectable even when the
+/// `redis` cargo feature is disabled. Without the feature, selecting `Redis`
+/// emits a startup warning and falls back to `Memory`.
+///
+/// [`CacheBackend`]: crate::config::CacheBackend
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RateLimitBackend {
+    /// In-process LRU of token buckets (default). Each replica maintains its own
+    /// store; a 3-replica deployment permits up to 3× the configured rate.
+    #[default]
+    Memory,
+    /// Shared Redis store coordinated via an atomic Lua script. The configured
+    /// rate is enforced globally across all replicas.
+    ///
+    /// Requires the `redis` cargo feature.
+    Redis,
+}
+
+impl RateLimitBackend {
+    pub(crate) fn from_env_value(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "memory" => Some(Self::Memory),
+            "redis" => Some(Self::Redis),
+            _ => None,
+        }
+    }
+}
+
+/// Behavior when the rate-limit backend becomes unreachable.
+///
+/// Configures the limiter's posture when the storage backend (Redis) is
+/// unavailable. Matches the pattern used by the webhook replay store.
+///
+/// Requires the `redis` cargo feature.
+#[cfg(feature = "redis")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RateLimitBackendFailure {
+    /// Allow the request through. Matches the existing single-replica posture:
+    /// a lost limiter is invisible to clients. **Default.**
+    #[default]
+    #[serde(alias = "open")]
+    FailOpen,
+    /// Deny the request with `429 Too Many Requests` until the backend recovers.
+    #[serde(alias = "closed")]
+    FailClosed,
+}
+
+#[cfg(feature = "redis")]
+impl RateLimitBackendFailure {
+    pub(crate) fn from_env_value(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "fail_open" | "open" => Some(Self::FailOpen),
+            "fail_closed" | "closed" => Some(Self::FailClosed),
+            _ => None,
+        }
+    }
+}
+
+/// Redis-specific options for the rate-limit backend.
+///
+/// Used when `security.rate_limit.backend = "redis"`.
+///
+/// Requires the `redis` cargo feature.
+#[cfg(feature = "redis")]
+#[derive(Debug, Clone, Deserialize)]
+pub struct RateLimitRedisConfig {
+    /// Redis connection URL (e.g. `redis://127.0.0.1:6379`).
+    /// Reuses the same Redis instance as sessions, cache, and the scheduler.
+    #[serde(default)]
+    pub url: Option<String>,
+
+    /// Key prefix for all token-bucket hashes stored in Redis.
+    #[serde(default = "default_rate_limit_redis_key_prefix")]
+    pub key_prefix: String,
+}
+
+#[cfg(feature = "redis")]
+impl Default for RateLimitRedisConfig {
+    fn default() -> Self {
+        Self {
+            url: None,
+            key_prefix: default_rate_limit_redis_key_prefix(),
+        }
+    }
+}
+
+#[cfg(feature = "redis")]
+fn default_rate_limit_redis_key_prefix() -> String {
+    "autumn:rate_limit".to_owned()
 }
 
 /// Multipart upload configuration.
@@ -694,6 +1107,35 @@ impl Default for UploadConfig {
             allowed_mime_types: Vec::new(),
         }
     }
+}
+
+/// Per-request Content Security Policy nonce configuration.
+///
+/// When `enabled = true`, the security-headers middleware generates a fresh
+/// cryptographically-random nonce (≥128 bits, URL-safe base64) for every
+/// request. The nonce is:
+///
+/// 1. Injected into `script-src` and `style-src` of the **default** CSP as
+///    `'nonce-<value>'`, replacing `'unsafe-inline'`.
+/// 2. Inserted into request extensions so handlers can extract it via
+///    [`CspNonce`](crate::security::CspNonce).
+///
+/// Apps that override `content_security_policy` with an explicit string
+/// automatically opt out of nonce injection for the header — the custom CSP
+/// is used verbatim — but the nonce is still generated and available via the
+/// extractor for template use.
+///
+/// # `autumn.toml` example
+///
+/// ```toml
+/// [security.headers.csp_nonce]
+/// enabled = true
+/// ```
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct CspNonceConfig {
+    /// Enable per-request CSP nonce generation. Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 // ── Default value functions ────────────────────────────────────────
@@ -1017,6 +1459,112 @@ mod tests {
         assert_eq!(config.burst, 20);
         assert!(!config.trust_forwarded_headers);
         assert!(config.trusted_proxies.is_empty());
+        #[cfg(feature = "redis")]
+        {
+            assert_eq!(config.backend, RateLimitBackend::Memory);
+            assert_eq!(config.on_backend_failure, RateLimitBackendFailure::FailOpen);
+            assert_eq!(config.redis.key_prefix, "autumn:rate_limit");
+        }
+    }
+
+    #[cfg(feature = "redis")]
+    #[test]
+    fn rate_limit_backend_deserializes_memory() {
+        let config: RateLimitConfig = toml::from_str("backend = \"memory\"").unwrap();
+        assert_eq!(config.backend, RateLimitBackend::Memory);
+    }
+
+    #[cfg(feature = "redis")]
+    #[test]
+    fn rate_limit_backend_deserializes_redis() {
+        let config: RateLimitConfig = toml::from_str("backend = \"redis\"").unwrap();
+        assert_eq!(config.backend, RateLimitBackend::Redis);
+    }
+
+    #[cfg(feature = "redis")]
+    #[test]
+    fn rate_limit_on_backend_failure_deserializes_fail_open() {
+        let config: RateLimitConfig = toml::from_str("on_backend_failure = \"fail_open\"").unwrap();
+        assert_eq!(config.on_backend_failure, RateLimitBackendFailure::FailOpen);
+    }
+
+    #[cfg(feature = "redis")]
+    #[test]
+    fn rate_limit_on_backend_failure_deserializes_fail_closed() {
+        let config: RateLimitConfig =
+            toml::from_str("on_backend_failure = \"fail_closed\"").unwrap();
+        assert_eq!(
+            config.on_backend_failure,
+            RateLimitBackendFailure::FailClosed
+        );
+    }
+
+    #[cfg(feature = "redis")]
+    #[test]
+    fn rate_limit_redis_config_deserializes() {
+        let toml_str = r#"
+            backend = "redis"
+            [redis]
+            url = "redis://localhost:6379"
+            key_prefix = "myapp:rl"
+        "#;
+        let config: RateLimitConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.backend, RateLimitBackend::Redis);
+        assert_eq!(config.redis.url.as_deref(), Some("redis://localhost:6379"));
+        assert_eq!(config.redis.key_prefix, "myapp:rl");
+    }
+
+    #[cfg(feature = "redis")]
+    #[test]
+    fn rate_limit_redis_config_defaults_key_prefix() {
+        let config: RateLimitConfig = toml::from_str("backend = \"redis\"").unwrap();
+        assert_eq!(config.redis.key_prefix, "autumn:rate_limit");
+        assert!(config.redis.url.is_none());
+    }
+
+    #[test]
+    fn rate_limit_backend_from_env_value() {
+        assert_eq!(
+            RateLimitBackend::from_env_value("memory"),
+            Some(RateLimitBackend::Memory)
+        );
+        assert_eq!(
+            RateLimitBackend::from_env_value("redis"),
+            Some(RateLimitBackend::Redis)
+        );
+        assert_eq!(
+            RateLimitBackend::from_env_value("REDIS"),
+            Some(RateLimitBackend::Redis)
+        );
+        assert_eq!(RateLimitBackend::from_env_value("postgres"), None);
+        assert_eq!(RateLimitBackend::from_env_value(""), None);
+    }
+
+    #[cfg(feature = "redis")] // RateLimitBackendFailure is redis-gated
+    #[test]
+    fn rate_limit_backend_failure_from_env_value() {
+        assert_eq!(
+            RateLimitBackendFailure::from_env_value("fail_open"),
+            Some(RateLimitBackendFailure::FailOpen)
+        );
+        assert_eq!(
+            RateLimitBackendFailure::from_env_value("open"),
+            Some(RateLimitBackendFailure::FailOpen)
+        );
+        assert_eq!(
+            RateLimitBackendFailure::from_env_value("FAIL_OPEN"),
+            Some(RateLimitBackendFailure::FailOpen)
+        );
+        assert_eq!(
+            RateLimitBackendFailure::from_env_value("fail_closed"),
+            Some(RateLimitBackendFailure::FailClosed)
+        );
+        assert_eq!(
+            RateLimitBackendFailure::from_env_value("closed"),
+            Some(RateLimitBackendFailure::FailClosed)
+        );
+        assert_eq!(RateLimitBackendFailure::from_env_value("panic"), None);
+        assert_eq!(RateLimitBackendFailure::from_env_value(""), None);
     }
 
     #[test]
@@ -1172,5 +1720,121 @@ mod tests {
         let sig = keys.sign(b"msg");
         assert_eq!(sig.len(), 64, "HMAC-SHA256 hex is 64 chars");
         assert!(sig.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    // ── CspNonceConfig (RED phase) ────────────────────────────────────────────
+
+    #[test]
+    fn csp_nonce_config_defaults_to_disabled() {
+        let config = CspNonceConfig::default();
+        assert!(!config.enabled);
+    }
+
+    #[test]
+    fn headers_config_csp_nonce_defaults_to_disabled() {
+        let config = HeadersConfig::default();
+        assert!(!config.csp_nonce.enabled);
+    }
+
+    #[test]
+    fn csp_nonce_config_can_be_enabled_via_toml() {
+        let toml_str = r"
+            [csp_nonce]
+            enabled = true
+        ";
+        let config: HeadersConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.csp_nonce.enabled);
+    }
+
+    #[test]
+    fn csp_nonce_config_deserialize_standalone() {
+        let config: CspNonceConfig = toml::from_str("enabled = true").unwrap();
+        assert!(config.enabled);
+    }
+
+    #[test]
+    fn csp_nonce_config_disabled_by_default_in_standalone() {
+        let config: CspNonceConfig = toml::from_str("").unwrap();
+        assert!(!config.enabled);
+    }
+
+    // ── TrustedProxiesConfig & conflict detection ─────────────────────────────
+
+    #[test]
+    fn trusted_proxies_config_parses_from_toml() {
+        let toml = r#"
+[trusted_proxies]
+ranges = ["10.0.0.0/8", "203.0.113.0/24"]
+trusted_hops = 2
+trust_forwarded_headers = true
+"#;
+        let config: SecurityConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.trusted_proxies.ranges.len(), 2);
+        assert_eq!(config.trusted_proxies.trusted_hops, Some(2));
+        assert!(config.trusted_proxies.trust_forwarded_headers);
+    }
+
+    #[test]
+    fn trusted_proxies_config_defaults_to_no_trust() {
+        let config: SecurityConfig = toml::from_str("").unwrap();
+        assert!(config.trusted_proxies.ranges.is_empty());
+        assert!(config.trusted_proxies.trusted_hops.is_none());
+        assert!(!config.trusted_proxies.trust_forwarded_headers);
+    }
+
+    #[test]
+    fn trusted_proxies_conflict_detected_when_both_set_with_different_values() {
+        let toml = r#"
+[trusted_proxies]
+ranges = ["10.0.0.0/8"]
+trust_forwarded_headers = true
+
+[rate_limit]
+trusted_proxies = ["192.168.0.0/16"]
+trust_forwarded_headers = true
+"#;
+        let config: SecurityConfig = toml::from_str(toml).unwrap();
+        assert!(
+            config.trusted_proxies_conflict().is_some(),
+            "conflicting proxy configs must be detected"
+        );
+    }
+
+    #[test]
+    fn trusted_proxies_no_conflict_when_only_new_set() {
+        let toml = r#"
+[trusted_proxies]
+ranges = ["10.0.0.0/8"]
+trust_forwarded_headers = true
+"#;
+        let config: SecurityConfig = toml::from_str(toml).unwrap();
+        assert!(config.trusted_proxies_conflict().is_none());
+    }
+
+    #[test]
+    fn trusted_proxies_no_conflict_when_only_old_set() {
+        let toml = r#"
+[rate_limit]
+trusted_proxies = ["10.0.0.0/8"]
+trust_forwarded_headers = true
+"#;
+        let config: SecurityConfig = toml::from_str(toml).unwrap();
+        assert!(config.trusted_proxies_conflict().is_none());
+    }
+
+    #[test]
+    fn trusted_proxies_no_conflict_when_same_values_in_both() {
+        let toml = r#"
+[trusted_proxies]
+ranges = ["10.0.0.0/8"]
+trust_forwarded_headers = true
+
+[rate_limit]
+trusted_proxies = ["10.0.0.0/8"]
+trust_forwarded_headers = true
+"#;
+        let config: SecurityConfig = toml::from_str(toml).unwrap();
+        // Same values — no conflict (though old fields still warn at startup).
+        assert!(config.trusted_proxies_conflict().is_none());
     }
 }

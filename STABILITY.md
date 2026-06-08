@@ -231,6 +231,93 @@ Draft migration guides are opened alongside the first breaking change that
 targets the next major; they are merged and polished across the prerelease
 cycle so that the `x.0.0` release ships with a complete guide on day one.
 
+## CSV import/export (issue #808)
+
+### SemVer impact
+
+The CSV import/export surface introduced by issue #808 is **gated behind the
+`csv` Cargo feature** (`autumn-web = { features = ["csv"] }`) for the first
+minor release cycle.  Enabling an opt-in feature is non-breaking per the
+feature-flag policy above; callers who do not enable `csv` are unaffected.
+
+Once the feature graduates out of its initial cycle the `csv` feature will
+remain (removing it would be a breaking change), but its content may be
+stabilised into the `default` feature set.
+
+### New public items (all `#[cfg(feature = "csv")]`)
+
+| Item | Location | Notes |
+|------|----------|-------|
+| `autumn_web::data::csv::CsvSchema` | trait | Stable input API; generated expansion is not |
+| `autumn_web::data::csv::ImportReport` | struct | `#[non_exhaustive]` for forward compat |
+| `autumn_web::data::csv::ImportMode` | enum | `#[non_exhaustive]` |
+| `autumn_web::data::csv::ImportOptions` | struct | |
+| `autumn_web::data::csv::CsvRowError` | struct | |
+| `autumn_web::data::csv::ImportRowResult` | enum | |
+| `autumn_web::data::csv::export_csv` | free fn | |
+| `autumn_web::data::csv::import_csv` | free fn | |
+
+### Admin plugin additions (`autumn-admin-plugin`)
+
+Two new **provided methods** on `AdminModel` (non-breaking per the trait
+evolution policy):
+
+- `fn supports_csv_export(&self) -> bool` — defaults to `true`
+- `fn csv_export_columns(&self) -> Vec<&'static str>` — defaults to non-hidden, non-password fields
+- `fn csv_export_row(&self, columns: &[&str], record: &Value) -> Vec<String>`
+- `fn supports_csv_import(&self) -> bool` — defaults to `false`
+- `fn import_csv_row(…) -> AdminFuture<AdminImportRowResult>` — defaults to `Skipped`
+
+Two new HTTP routes (non-breaking; additive):
+
+- `GET /admin/{slug}/export.csv`
+- `GET /admin/{slug}/import` (import form)
+- `POST /admin/{slug}/import` (multipart upload)
+
+### CLI additions (`autumn-cli`)
+
+New `autumn data` subcommand (non-breaking; additive):
+
+- `autumn data export <model> [--out <file>] [--where <expr>]`
+- `autumn data import <model> --in <file> [--dry-run] [--upsert-by <col>]`
+
+### PII redaction strategy
+
+Override `csv_export_columns` to omit sensitive column names from the header
+row, or override `csv_export_row` to return `"[REDACTED]"` for a column's
+value while keeping the column in the header.  Fields declared with
+`AdminFieldKind::Password` are **always excluded** from the default column
+list; fields declared `AdminFieldKind::Hidden` are also excluded.
+
+### Transactional batching strategy
+
+`import_csv` processes rows one at a time via the caller-supplied `handler`
+closure.  To batch within a database transaction, wrap the handler in a
+transaction opened before the call and committed (or rolled back) after.
+The `batch_size` knob in `ImportOptions` signals the intended chunk size to
+the caller but does not enforce it — the framework does not hold a connection
+open across the call.
+
+### Custom column override
+
+To add a computed column (e.g. a joined display value from a related table):
+
+```rust
+fn csv_export_columns(&self) -> Vec<&'static str> {
+    vec!["id", "title", "author_name"]   // "author_name" is not a real DB column
+}
+
+fn csv_export_row(&self, columns: &[&str], record: &Value) -> Vec<String> {
+    columns.iter().map(|col| match *col {
+        "author_name" => lookup_author_display(record),
+        _ => record.get(*col).map(|v| match v {
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
+        }).unwrap_or_default(),
+    }).collect()
+}
+```
+
 ## Pre-1.0 notes
 
 Until Autumn reaches `1.0.0`:

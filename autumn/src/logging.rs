@@ -68,6 +68,7 @@ mod tests {
             let config = LogConfig {
                 level: "debug".to_owned(),
                 format: LogFormat::Pretty,
+                ..LogConfig::default()
             };
             init(&config);
         }
@@ -77,6 +78,7 @@ mod tests {
             let config = LogConfig {
                 level: "debug".to_owned(),
                 format: LogFormat::Pretty,
+                ..LogConfig::default()
             };
             init(&config); // Sets it successfully
 
@@ -96,6 +98,7 @@ mod tests {
             let config = LogConfig {
                 level: "debug".to_owned(),
                 format: LogFormat::Json,
+                ..LogConfig::default()
             };
             init(&config);
         }
@@ -105,6 +108,7 @@ mod tests {
             let config = LogConfig {
                 level: "debug".to_owned(),
                 format: LogFormat::Auto,
+                ..LogConfig::default()
             };
             init(&config);
         }
@@ -114,6 +118,7 @@ mod tests {
             let config = LogConfig {
                 level: "invalid_level_format_[without_equal]".to_owned(),
                 format: LogFormat::Pretty,
+                ..LogConfig::default()
             };
             init(&config);
         }
@@ -171,6 +176,7 @@ mod tests {
         let config = LogConfig {
             level: "debug".to_owned(),
             format: LogFormat::Auto,
+            ..LogConfig::default()
         };
         let filter = tracing_subscriber::EnvFilter::try_new(&config.level);
         assert!(filter.is_ok());
@@ -194,6 +200,7 @@ mod tests {
         let log_config = LogConfig {
             level: "debug".to_owned(),
             format: LogFormat::Pretty,
+            ..LogConfig::default()
         };
         let telemetry_config = TelemetryConfig {
             enabled: true,

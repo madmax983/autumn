@@ -7,6 +7,8 @@ use autumn_web::auth::{hash_password, verify_password};
 use autumn_web::extract::Path;
 use autumn_web::extract::State;
 use autumn_web::prelude::*;
+use autumn_web::storage::{Transform, VariantBudget};
+use autumn_web::webhook_outbound::WebhookOutboundManager;
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 use scoped_futures::ScopedFutureExt;
@@ -118,11 +120,23 @@ pub struct RegisterForm {
 
 #[post("/register")]
 pub async fn register(
+    State(state): State<AppState>,
     mut db: Db,
     mailer: Mailer,
     session: Session,
     form: Form<RegisterForm>,
 ) -> AutumnResult<Redirect> {
+    let open = crate::config_svc()
+        .get("registration_open")
+        .ok()
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if !open {
+        return Err(AutumnError::unprocessable_msg(
+            "Registrations are currently closed",
+        ));
+    }
+
     let username = form.0.username.trim().to_lowercase();
     let email = form.0.email.trim().to_owned();
     let password = form.0.password;
@@ -176,7 +190,16 @@ pub async fn register(
                     .await
                     .map_err(|_| AutumnError::unprocessable_msg("Username already taken"))?;
 
-                enqueue_user_onboarding(&user).await?;
+                // The default profile uses the Postgres job backend, so the
+                // job row is inserted on this transaction connection.
+                autumn_web::job::enqueue_on_conn(
+                    UserOnboardingJob::NAME,
+                    UserOnboardingArgs::from_user(&user),
+                    conn,
+                )
+                .await?;
+
+                AccountMailer.deliver_later_welcome(&mailer, email, user.username.clone());
 
                 Ok::<_, AutumnError>(user)
             }
@@ -184,19 +207,21 @@ pub async fn register(
         })
         .await?;
 
+    // Dispatch the outbound webhook event on "user.created"
+    if let Some(manager) = state.extension::<WebhookOutboundManager>() {
+        let dispatch_result = manager.dispatch(&state, "user.created", &user).await;
+        if let Err(e) = dispatch_result {
+            tracing::error!(error = %e, "Failed to dispatch user.created webhook event");
+        }
+    }
+
     // Log in immediately after registration
     session.rotate_id().await;
     session.insert("user_id", user.id.to_string()).await;
     session.insert("username", &user.username).await;
     session.insert("role", &user.role).await;
 
-    AccountMailer.deliver_later_welcome(&mailer, email, user.username.clone());
-
     Ok(Redirect::to("/"))
-}
-
-async fn enqueue_user_onboarding(user: &User) -> AutumnResult<()> {
-    UserOnboardingJob::enqueue(UserOnboardingArgs::from_user(user)).await
 }
 
 // ── Login ──────────────────────────────────────────────────────
@@ -251,7 +276,7 @@ mod tests {
             avatar: None,
         };
 
-        let error = enqueue_user_onboarding(&user)
+        let error = UserOnboardingJob::enqueue(UserOnboardingArgs::from_user(&user))
             .await
             .expect_err("missing job runtime should fail registration");
 
@@ -363,20 +388,30 @@ pub async fn profile(
         .await
         .map_err(|_| AutumnError::not_found_msg(format!("User u/{name} not found")))?;
 
-    // Mint a presigned URL for the user's avatar (if any) through the
-    // configured BlobStore. In dev that's an HMAC-signed link served by
-    // the framework's mounted `/_blobs` route; in prod it's a real S3
-    // presigned URL.
+    // Serve the avatar as a lazily-generated 64×64 thumbnail with EXIF
+    // stripped.  The variant is content-addressed and generated at most
+    // once; subsequent requests are a single head() cache hit.  In dev
+    // the URL is an HMAC-signed `/_blobs/…` link; in prod it's a real
+    // S3 presigned URL.  The expiry is long because the variant key is
+    // immutable — same source + same spec always produces the same bytes.
     let avatar_url = match (
         user.avatar.as_ref(),
         state.extension::<autumn_web::storage::BlobStoreState>(),
     ) {
-        (Some(blob), Some(blobs)) => blobs
-            .store()
-            .clone()
-            .presigned_url(&blob.key, std::time::Duration::from_secs(300))
+        (Some(blob), Some(blobs)) => {
+            let store = blobs.store();
+            let budget = VariantBudget::default();
+            blob.variant(
+                "thumb",
+                &[
+                    Transform::resize_to_limit(64, 64),
+                    Transform::strip_metadata(),
+                ],
+            )
+            .url(&**store, &budget, std::time::Duration::from_secs(3600))
             .await
-            .ok(),
+            .ok()
+        }
         _ => None,
     };
     let is_self = current_user.as_deref() == Some(user.username.as_str());

@@ -4,32 +4,72 @@
 app = "{{project_name}}"
 primary_region = "iad"
 
+# Fly sends SIGKILL when kill_timeout expires.  Set this above Autumn's total
+# graceful-shutdown budget: prestop_grace_secs (5) + shutdown_timeout_secs (30)
+# = 35 s, plus 10 s buffer for the process to log and exit cleanly.
+# Value is in seconds (integer); Fly does not accept a string like "45s".
+kill_signal  = "SIGTERM"
+kill_timeout = 45
+
 [build]
   dockerfile = "Dockerfile"
 
+[deploy]
+  # Uncomment to run `autumn migrate` in a one-shot machine before new app
+  # machines start.  If the migration fails the deploy stops before any
+  # traffic-serving machine is replaced.  Leave commented for apps without
+  # a database — autumn migrate exits non-zero when no DB URL is configured.
+  # release_command = "autumn migrate"
+
 [http_service]
-  internal_port = 3000
-  force_https = true
-  auto_stop_machines = true
-  auto_start_machines = true
+  internal_port        = 3000
+  force_https          = true
+  auto_stop_machines   = true
+  auto_start_machines  = true
   min_machines_running = 0
 
   [http_service.concurrency]
-    type = "connections"
+    type       = "connections"
     hard_limit = 25
     soft_limit = 20
 
+  # Readiness: the Fly proxy uses service-level checks to gate traffic routing.
+  # Top-level [checks] affect machine lifecycle (restarts) but NOT proxy routing.
+  # /ready must be here so the proxy stops sending traffic when Autumn flips
+  # /ready to 503 during the prestop grace window.
+  [[http_service.checks]]
+    grace_period = "5s"
+    interval     = "5s"
+    method       = "GET"
+    path         = "/ready"
+    timeout      = "2s"
+    type         = "http"
+
 [[vm]]
-  memory = "1gb"
+  memory   = "1gb"
   cpu_kind = "shared"
-  cpus = 1
+  cpus     = 1
+
+# Fly scrapes this Prometheus text endpoint and surfaces it in the dashboard.
+# /actuator/prometheus is controlled by `actuator.prometheus` (default true) and
+# is independent of `actuator.sensitive`: metrics stay scrapeable while
+# env/configprops/loggers/tasks/jobs remain off the public surface.
+# To keep metrics off public traffic, bind a separate internal listener and set
+# `port` here to that non-public port (no [http_service] mapping) — Fly scrapes
+# it over the private network. See docs/guide/deployment.md.
+[metrics]
+  port = 3000
+  path = "/actuator/prometheus"
 
 [checks]
-  [checks.health]
-    port = 3000
-    type = "http"
-    interval = "15s"
-    timeout = "2s"
+  # Liveness: restart the machine if the process is deadlocked or broken.
+  # /live never fails due to a missing dependency.  Use [[http_service.checks]]
+  # above (not this section) to control proxy traffic routing via /ready.
+  [checks.live]
+    port         = 3000
+    type         = "http"
+    interval     = "15s"
+    timeout      = "2s"
     grace_period = "5s"
-    method = "get"
-    path = "/health"
+    method       = "get"
+    path         = "/live"

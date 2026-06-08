@@ -118,6 +118,7 @@ pub fn static_get_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         .to_compile_error();
     }
 
+    // Parse the async handler function
     let input_fn = match crate::parse::parse_async_handler(item) {
         Ok(f) => f,
         Err(err) => return err,
@@ -181,8 +182,13 @@ pub fn static_get_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     secured: false,
                     required_roles: &[],
                     register_schemas: ::core::option::Option::None,
+                    api_version: ::core::option::Option::None,
+                    ..::core::default::Default::default()
                 },
                 repository: ::core::option::Option::None,
+                idempotency: ::autumn_web::RouteIdempotency::Direct,
+                api_version: ::core::option::Option::None,
+                sunset_opt_out: false,
             }
         }
 

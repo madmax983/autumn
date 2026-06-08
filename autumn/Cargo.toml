@@ -12,16 +12,25 @@ keywords = ["web", "composable", "axum", "htmx", "fullstack"]
 categories = ["web-programming", "web-programming::http-server"]
 
 [features]
-default = ["maud", "htmx", "tailwind", "db", "cache-moka"]
+default = ["maud", "htmx", "tailwind", "db", "cache-moka", "http-client", "reporting"]
 ws = ["dep:tokio-stream"]
+presence = ["ws"]
 flash = []
 cache-moka = ["dep:moka"]
 maud = ["dep:maud"]
 htmx = []
 multipart = ["axum/multipart"]
 tailwind = []
-oauth2 = ["dep:reqwest", "dep:jsonwebtoken"]
+http-client = ["dep:reqwest"]
+oauth2 = ["http-client"]
+webauthn = ["dep:webauthn-rs"]
 openapi = ["dep:serde_yaml"]
+# Project typed JSON endpoints as MCP (Model Context Protocol) tools so AI
+# agents can call the real, authenticated handler pipeline. Builds on the
+# same `ApiDoc` registry that drives `openapi`, so it implies that feature.
+mcp = ["openapi"]
+# Optional Markdown rendering with frontmatter parsing and SSG integration.
+markdown = ["dep:pulldown-cmark"]
 db = [
     "dep:deadpool",
     "dep:diesel",
@@ -30,7 +39,9 @@ db = [
     "dep:libsqlite3-sys",
     "dep:pq-sys",
     "dep:scoped-futures",
+    "dep:tokio-postgres",
     "diesel/postgres",
+    "diesel/chrono",
 ]
 test-support = ["dep:testcontainers", "dep:testcontainers-modules"]
 telemetry-otlp = [
@@ -48,16 +59,37 @@ i18n = []
 # When combined with `db`, opts diesel into `serde_json` so the `Blob`
 # value type can round-trip through a Postgres `JSONB` column.
 storage = ["diesel?/serde_json"]
+# On-demand image variants (resize, rotate, strip metadata) with
+# content-addressed caching on top of the storage layer.
+# Pulls in the `image` crate (JPEG + PNG + WebP codecs) behind this flag
+# to keep the `storage`-only build lean.
+variants = ["storage", "dep:image"]
+# Pluggable error reporting: catch handler panics at the HTTP layer and route
+# panics + 5xx responses to configured `ErrorReporter`s. Ships a `tracing`-based
+# `LogReporter` as the default. On by default; disable to drop the panic-catch
+# layer and the reporting machinery.
+reporting = []
 mail = ["dep:lettre", "maud"]
 # Enables `autumn_web::seed::SeedContext` for use in `src/bin/seed.rs`.
 # Depends on `db`; off by default so apps that don't seed pay zero compile cost.
 seed = ["db"]
 system-info = []
+# First-class CSV import and export for `#[repository]` models.
+# Adds `autumn_web::data::csv` (streaming export, row-by-row import with
+# structured error reporting) and the matching admin-panel routes and
+# `autumn data` CLI subcommand.  Off by default so the `csv` crate is
+# opt-in.
+csv = ["dep:csv"]
+# First-class system tests driving a headless Chromium browser against a
+# live Autumn server. Off by default — intended as a dev-dependency only.
+# Adds `autumn_web::system_test::{SystemTest, Page, BrowserCheck}`.
+system-tests = ["dep:chromiumoxide"]
 
 [dependencies]
-autumn-macros = { version = "0.4.0", path = "../autumn-macros" }
+autumn-macros = { version = "0.5.0", path = "../autumn-macros" }
 axum.workspace = true
 bytes = "1"
+http-body = "1"
 http-body-util = "0.1"
 bcrypt.workspace = true
 deadpool = { version = "0.13", default-features = false, features = ["managed", "rt_tokio_1"], optional = true }
@@ -66,9 +98,11 @@ pq-sys = { workspace = true, optional = true }
 diesel-async = { workspace = true, optional = true }
 diesel_migrations = { workspace = true, optional = true }
 scoped-futures = { version = "0.1.4", optional = true }
+tokio-postgres = { version = "0.7", optional = true }
 futures.workspace = true
 http.workspace = true
 indexmap.workspace = true
+inventory.workspace = true
 libsqlite3-sys = { workspace = true, optional = true }
 maud = { workspace = true, optional = true }
 moka = { workspace = true, optional = true }
@@ -99,23 +133,33 @@ testcontainers = { workspace = true, optional = true }
 testcontainers-modules = { workspace = true, optional = true }
 serde_urlencoded = "0.7"
 serde_yaml = { version = "0.9", optional = true }
+pulldown-cmark = { workspace = true, optional = true }
 subtle = "2.6.1"
+base64 = "0.22"
 url = "2.5.8"
 percent-encoding = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
-jsonwebtoken = { version = "10.1.0", optional = true }
+webauthn-rs = { version = "0.5", features = ["danger-allow-state-serialisation"], optional = true }
+jsonwebtoken = { version = "10.1.0", default-features = false, features = ["rust_crypto"] }
 lru = "0.18.0"
 hmac = "0.12"
 sha2 = "0.10"
+aes-gcm = "0.10"
+getrandom = "0.2"
+hex = "0.4"
+csv = { workspace = true, optional = true }
 lettre = { version = "0.11.21", default-features = false, features = ["builder", "smtp-transport", "tokio1-rustls-tls"], optional = true }
+chromiumoxide = { workspace = true, optional = true, features = ["tokio-runtime"] }
+image = { workspace = true, optional = true }
 
 [dev-dependencies]
-diesel = { version = "2", features = ["chrono"] }
+diesel = { version = "2", features = ["chrono", "postgres"] }
 filetime = "0.2"
+futures.workspace = true
 http.workspace = true
 serde_json = "1"
 tempfile = "3"
-tokio.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 tower = { workspace = true, features = ["timeout", "util"] }
 trybuild = "1"
 testcontainers = { workspace = true }
@@ -136,10 +180,23 @@ rusty-fork = "0.3.1"
 [package.metadata.docs.rs]
 features = [
   "maud", "htmx", "tailwind", "db", "cache-moka",
-  "ws", "flash", "multipart", "oauth2", "openapi",
-  "redis", "i18n", "storage", "mail", "seed", "system-info",
+  "ws", "flash", "multipart", "http-client", "oauth2", "openapi", "mcp",
+  "redis", "i18n", "storage", "variants", "mail", "seed", "system-info", "markdown",
+  "reporting", "csv",
 ]
 rustdoc-args = ["--cfg", "docsrs"]
+
+[[bench]]
+name = "version_history"
+harness = false
+
+[[bench]]
+name = "attribute_encryption"
+harness = false
+
+[[bench]]
+name = "inspector"
+harness = false
 
 [lints]
 workspace = true

@@ -1,0 +1,8 @@
+error[E0599]: no method named `upsert_many` found for struct `PgItemRepository` in the current scope
+  --> tests/compile-fail/repository_bulk_upsert_many_hooks.rs:42:18
+   |
+31 | #[autumn_web::repository(Item, table = "items", hooks = DummyHooks)]
+   | -------------------------------------------------------------------- method `upsert_many` not found for this struct
+...
+42 |     let _ = repo.upsert_many(&records).await;
+   |                  ^^^^^^^^^^^ method not found in `PgItemRepository`

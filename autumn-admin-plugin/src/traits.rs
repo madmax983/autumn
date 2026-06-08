@@ -3,6 +3,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -64,6 +65,19 @@ pub struct AdminField {
     pub editable: bool,
     /// Sort priority in list view (None = not sortable).
     pub sortable: bool,
+    /// Whether this column is encrypted at rest (#805). When set, the field is
+    /// rendered as a disabled, redacted, unsubmitted control in forms (so its
+    /// plaintext is never placed into the HTML and a save never overwrites the
+    /// stored ciphertext), and — unless [`Self::encrypted_visible`] is also set —
+    /// redacted (`••••••••`) in list and detail views.
+    ///
+    /// This is a per-field flag rather than a global column-name lookup so that an
+    /// unrelated resource with a same-named plaintext field stays fully editable.
+    pub encrypted: bool,
+    /// For an [`Self::encrypted`] column, show its decrypted plaintext in list and
+    /// detail (read) views — the `#[encrypted(admin_visible)]` opt-in. Edit forms
+    /// still never pre-fill the plaintext. Has no effect unless `encrypted` is set.
+    pub encrypted_visible: bool,
 }
 
 impl AdminField {
@@ -87,7 +101,27 @@ impl AdminField {
             required: true,
             editable,
             sortable: true,
+            encrypted: false,
+            encrypted_visible: false,
         }
+    }
+
+    /// Mark this column as encrypted at rest (#805): redacted in read views and
+    /// rendered as a disabled, unsubmitted control in forms.
+    #[must_use]
+    pub const fn encrypted(mut self) -> Self {
+        self.encrypted = true;
+        self
+    }
+
+    /// Mark this column as encrypted at rest but show its decrypted plaintext in
+    /// read views (the `#[encrypted(admin_visible)]` opt-in). Implies
+    /// [`Self::encrypted`]; edit forms still never pre-fill the plaintext.
+    #[must_use]
+    pub const fn encrypted_visible(mut self) -> Self {
+        self.encrypted = true;
+        self.encrypted_visible = true;
+        self
     }
 
     /// Set the human-readable label.
@@ -158,6 +192,54 @@ pub enum ActionStyle {
     Danger,
 }
 
+// ── Version history ──────────────────────────────────────────────────
+
+/// A single entry in the admin History pane for an opted-in model.
+///
+/// Mirrors [`autumn_web::VersionEntry`] but is decoupled from the runtime
+/// type so the admin plugin has no compile-time dependency on the DB feature.
+#[derive(Debug, Clone)]
+pub struct AdminHistoryEntry {
+    /// Auto-incrementing PK in the history table.
+    pub id: i64,
+    /// Actor identifier (`user_id` or `"system"`).
+    pub actor: String,
+    /// Operation: `"insert"`, `"update"`, or `"delete"`.
+    pub op: String,
+    /// Request / trace correlation ID.
+    pub request_id: Option<String>,
+    /// Column-level changes, serialized as JSON for template rendering.
+    pub changes: Vec<Value>,
+    /// When this entry was recorded.
+    pub recorded_at: DateTime<Utc>,
+}
+
+/// Paginated history result for the admin History pane.
+#[derive(Debug, Clone)]
+pub struct AdminHistoryPage {
+    pub entries: Vec<AdminHistoryEntry>,
+    pub total: u64,
+    pub page: u64,
+    pub per_page: u64,
+}
+
+impl AdminHistoryPage {
+    /// Total number of pages.
+    #[must_use]
+    pub const fn total_pages(&self) -> u64 {
+        if self.per_page == 0 {
+            return 0;
+        }
+        self.total.div_ceil(self.per_page)
+    }
+
+    /// Whether there is a next page.
+    #[must_use]
+    pub const fn has_next_page(&self) -> bool {
+        self.page < self.total_pages()
+    }
+}
+
 // ── The core trait ──────────────────────────────────────────────────
 
 /// Type alias for the boxed future returned by async `AdminModel` methods.
@@ -177,6 +259,69 @@ pub enum AdminError {
 
     #[error("{0}")]
     Other(String),
+}
+
+// ── CSV import types ────────────────────────────────────────────────
+
+/// Mode for an admin CSV import operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CsvImportMode {
+    /// Insert every row as a new record.
+    #[default]
+    Insert,
+    /// Dry-run: validate rows but do not write anything.
+    DryRun,
+}
+
+impl CsvImportMode {
+    /// Parse from a form field value.
+    ///
+    /// Returns `None` for unrecognised values so callers can reject them with a
+    /// 400 instead of silently falling back to the destructive `Insert` path.
+    /// An *absent* mode field should default to `Insert` without calling this.
+    #[must_use]
+    pub fn from_form_value(s: &str) -> Option<Self> {
+        match s {
+            "insert" | "Insert" => Some(Self::Insert),
+            "dry_run" | "DryRun" | "dry-run" => Some(Self::DryRun),
+            _ => None,
+        }
+    }
+}
+
+/// The outcome of processing a single imported CSV row.
+#[derive(Debug)]
+pub enum AdminImportRowResult {
+    /// The row was inserted as a new record.
+    Inserted,
+    /// The row updated an existing record.
+    Updated,
+    /// The row was intentionally skipped.
+    Skipped,
+    /// A row-level error (no specific column).
+    RowError(String),
+    /// A field-level error with a column name.
+    FieldError { column: String, message: String },
+}
+
+/// Summary of a completed (or dry-run) admin CSV import.
+#[derive(Debug, Default, Clone)]
+pub struct AdminImportReport {
+    pub inserted: u64,
+    pub updated: u64,
+    pub skipped: u64,
+    pub errors: Vec<AdminImportError>,
+}
+
+/// A single parse/validation error from an admin CSV import.
+#[derive(Debug, Clone)]
+pub struct AdminImportError {
+    /// 1-based CSV line number (header = line 1).
+    pub line: u64,
+    /// Column name, if known.
+    pub column: Option<String>,
+    /// Human-readable description.
+    pub message: String,
 }
 
 /// The core trait that enables a model to be managed in the admin panel.
@@ -204,14 +349,33 @@ pub trait AdminModel: Send + Sync + 'static {
     /// Field metadata for this model.
     fn fields(&self) -> Vec<AdminField>;
 
-    /// Available bulk actions (default: just "Delete selected").
+    /// Available bulk actions.
+    ///
+    /// Defaults to "Delete selected". When `supports_soft_delete()` returns
+    /// `true`, also includes "Restore selected" and "Purge selected" so that
+    /// the admin route validator can dispatch those action names.
     fn actions(&self) -> Vec<AdminAction> {
-        vec![AdminAction {
+        let mut acts = vec![AdminAction {
             name: "delete",
             label: "Delete selected".to_owned(),
             style: ActionStyle::Danger,
             confirm: true,
-        }]
+        }];
+        if self.supports_soft_delete() {
+            acts.push(AdminAction {
+                name: "restore",
+                label: "Restore selected".to_owned(),
+                style: ActionStyle::Default,
+                confirm: false,
+            });
+            acts.push(AdminAction {
+                name: "purge",
+                label: "Purge selected".to_owned(),
+                style: ActionStyle::Danger,
+                confirm: true,
+            });
+        }
+        acts
     }
 
     // ── CRUD operations ─────────────────────────────────────────
@@ -252,6 +416,67 @@ pub trait AdminModel: Send + Sync + 'static {
         id: i64,
     ) -> AdminFuture<'_, ()>;
 
+    /// Whether this model supports soft-delete (defaults to `false`).
+    ///
+    /// When `true`, the admin panel shows a Trash tab with restore/purge.
+    fn supports_soft_delete(&self) -> bool {
+        false
+    }
+
+    /// Restore a soft-deleted record (set `deleted_at = NULL`).
+    ///
+    /// The default returns `AdminError::Other` when `supports_soft_delete()` is
+    /// `false`, so models that opt in must override this method.
+    fn restore<'a>(
+        &'a self,
+        _pool: &'a diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+        _id: i64,
+    ) -> AdminFuture<'a, ()> {
+        Box::pin(async move {
+            Err(AdminError::Other(
+                "this model does not support soft delete; \
+                 override supports_soft_delete() to return true and implement restore()"
+                    .to_owned(),
+            ))
+        })
+    }
+
+    /// Permanently delete (purge) a soft-deleted record.
+    ///
+    /// The default returns `AdminError::Other` when `supports_soft_delete()` is
+    /// `false`.
+    fn purge<'a>(
+        &'a self,
+        _pool: &'a diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+        _id: i64,
+    ) -> AdminFuture<'a, ()> {
+        Box::pin(async move {
+            Err(AdminError::Other(
+                "this model does not support soft delete; \
+                 override supports_soft_delete() to return true and implement purge()"
+                    .to_owned(),
+            ))
+        })
+    }
+
+    /// List soft-deleted records (where `deleted_at IS NOT NULL`).
+    ///
+    /// The default returns `AdminError::Other` when `supports_soft_delete()` is
+    /// `false`.
+    fn list_deleted<'a>(
+        &'a self,
+        _pool: &'a diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+        _params: ListParams,
+    ) -> AdminFuture<'a, ListResult> {
+        Box::pin(async move {
+            Err(AdminError::Other(
+                "this model does not support soft delete; \
+                 override supports_soft_delete() to return true and implement list_deleted()"
+                    .to_owned(),
+            ))
+        })
+    }
+
     /// Execute a bulk action on the given IDs.
     fn execute_action(
         &self,
@@ -259,10 +484,10 @@ pub trait AdminModel: Send + Sync + 'static {
         action: &str,
         ids: Vec<i64>,
     ) -> AdminFuture<'_, u64> {
-        // Default implementation: dispatch the built-in `"delete"` action
-        // by calling `self.delete` for each id. Any other action name
-        // returns an error so it doesn't silently no-op — overriders that
-        // declare custom actions must implement them here.
+        // Default implementation: dispatch the built-in `"delete"`, `"restore"`,
+        // and `"purge"` actions. Any other action name returns an error so it
+        // doesn't silently no-op — overriders that declare custom actions must
+        // implement them here.
         //
         // We clone the pool (deadpool::Pool is Arc-backed, cheap) so the
         // returned future only borrows from `&self` and avoids the
@@ -276,6 +501,22 @@ pub trait AdminModel: Send + Sync + 'static {
                     let mut count: u64 = 0;
                     for id in ids {
                         self.delete(&pool, id).await?;
+                        count += 1;
+                    }
+                    Ok(count)
+                }
+                "restore" => {
+                    let mut count: u64 = 0;
+                    for id in ids {
+                        self.restore(&pool, id).await?;
+                        count += 1;
+                    }
+                    Ok(count)
+                }
+                "purge" => {
+                    let mut count: u64 = 0;
+                    for id in ids {
+                        self.purge(&pool, id).await?;
                         count += 1;
                     }
                     Ok(count)
@@ -318,6 +559,177 @@ pub trait AdminModel: Send + Sync + 'static {
         };
         let fut = self.list(pool, params);
         Box::pin(async move { fut.await.map(|r| r.total) })
+    }
+
+    // ── CSV import / export ─────────────────────────────────────────
+
+    /// Whether this model exposes a `GET /admin/{slug}/export.csv` link.
+    ///
+    /// Defaults to `false` — export must be explicitly opted into to avoid
+    /// silently exposing model data on upgrade. Override to `true` to enable
+    /// the CSV export button and route.
+    fn supports_csv_export(&self) -> bool {
+        false
+    }
+
+    /// Column names written to the CSV header row during export.
+    ///
+    /// Defaults to the ordered names of all non-password, non-hidden fields
+    /// declared in [`fields`]. Override to add computed columns (e.g. a
+    /// joined display value) or to omit sensitive columns (PII redaction).
+    ///
+    /// # PII redaction strategy
+    ///
+    /// To redact a column: remove it from this list. To include a placeholder
+    /// instead of the real value, add the column here and override
+    /// [`AdminModel::csv_export_row`] to return `"[REDACTED]"` for that key.
+    ///
+    /// [`fields`]: AdminModel::fields
+    fn csv_export_columns(&self) -> Vec<&'static str> {
+        self.fields()
+            .into_iter()
+            .filter(|f| {
+                !matches!(f.kind, AdminFieldKind::Password | AdminFieldKind::Hidden) && !f.encrypted
+            })
+            .map(|f| f.name)
+            .collect()
+    }
+
+    /// Serialize a single record (as returned by [`list`]) into an ordered
+    /// list of string values for CSV export.
+    ///
+    /// The default implementation extracts values for each column in
+    /// [`csv_export_columns`] from the JSON record. Override to add computed
+    /// columns (joined values, formatted timestamps, etc.).
+    ///
+    /// [`list`]: AdminModel::list
+    /// [`csv_export_columns`]: AdminModel::csv_export_columns
+    fn csv_export_row(&self, columns: &[&str], record: &Value) -> Vec<String> {
+        columns
+            .iter()
+            .map(|col| {
+                record
+                    .get(*col)
+                    .map(|v| match v {
+                        Value::String(s) => escape_csv_formula(s),
+                        Value::Null => String::new(),
+                        other => other.to_string(),
+                    })
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+
+    /// Whether this model accepts `POST /admin/{slug}/import` CSV uploads.
+    ///
+    /// Defaults to `false` — import must be explicitly opted into because it
+    /// performs bulk writes. Override to `true` and implement
+    /// [`import_csv_row`] to enable the import UI.
+    ///
+    /// [`import_csv_row`]: AdminModel::import_csv_row
+    fn supports_csv_import(&self) -> bool {
+        false
+    }
+
+    /// Process a single CSV row during an admin import.
+    ///
+    /// Receives the **1-based line number** in the CSV file and a map of
+    /// `column_name → value` (all strings; coerce as needed). Return the
+    /// appropriate [`AdminImportRowResult`].
+    ///
+    /// The default always returns `AdminImportRowResult::Skipped` — models
+    /// that set [`supports_csv_import`] to `true` should override this.
+    ///
+    /// [`supports_csv_import`]: AdminModel::supports_csv_import
+    fn import_csv_row<'a>(
+        &'a self,
+        _pool: &'a diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+        _line: u64,
+        _row: std::collections::HashMap<String, String>,
+        _mode: CsvImportMode,
+    ) -> AdminFuture<'a, AdminImportRowResult> {
+        Box::pin(async move { Ok(AdminImportRowResult::Skipped) })
+    }
+
+    /// Whether this model has automatic record version history enabled.
+    ///
+    /// When `true`, the admin panel renders a **History** affordance on the
+    /// detail page and serves `/{slug}/{id}/history`.
+    fn has_history(&self) -> bool {
+        false
+    }
+
+    /// Retrieve a paginated page of version history entries for a record.
+    ///
+    /// The default implementation returns [`AdminError::Other`] so models
+    /// that do not opt in get a clear error instead of a silent no-op.
+    fn get_history<'a>(
+        &'a self,
+        _pool: &'a diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+        _record_id: i64,
+        _page: u64,
+        _per_page: u64,
+    ) -> AdminFuture<'a, AdminHistoryPage> {
+        Box::pin(async move {
+            Err(AdminError::Other(
+                "this model does not have version history enabled; \
+                 use #[repository(Model, versioned = true)] to opt in"
+                    .to_owned(),
+            ))
+        })
+    }
+}
+
+// ── VersionPage → AdminHistoryPage conversion ──────────────────────
+
+impl From<autumn_web::version_history::VersionEntry> for AdminHistoryEntry {
+    fn from(e: autumn_web::version_history::VersionEntry) -> Self {
+        Self {
+            id: e.id,
+            actor: e.actor,
+            op: e.op.to_string(),
+            request_id: e.request_id,
+            changes: e
+                .changes
+                .into_iter()
+                .map(|c| serde_json::to_value(&c).unwrap_or(serde_json::Value::Null))
+                .collect(),
+            recorded_at: e.recorded_at,
+        }
+    }
+}
+
+impl From<autumn_web::version_history::VersionPage> for AdminHistoryPage {
+    /// Convert a [`autumn_web::version_history::VersionPage`] returned by a
+    /// versioned repository's `version_history()` method into an
+    /// [`AdminHistoryPage`] for the admin panel.
+    ///
+    /// ```rust,ignore
+    /// fn get_history<'a>(
+    ///     &'a self, pool: &'a Pool<AsyncPgConnection>,
+    ///     record_id: i64, page: u64, per_page: u64,
+    /// ) -> AdminFuture<'a, AdminHistoryPage> {
+    ///     let pool = pool.clone();
+    ///     Box::pin(async move {
+    ///         let repo = PgPostRepository::from_pool(pool);
+    ///         let filter = autumn_web::VersionFilter { page, per_page, ..Default::default() };
+    ///         repo.version_history(record_id, filter).await
+    ///             .map(AdminHistoryPage::from)
+    ///             .map_err(|e| AdminError::Database(e.to_string()))
+    ///     })
+    /// }
+    /// ```
+    fn from(vp: autumn_web::version_history::VersionPage) -> Self {
+        Self {
+            entries: vp
+                .entries
+                .into_iter()
+                .map(AdminHistoryEntry::from)
+                .collect(),
+            total: vp.total,
+            page: vp.page,
+            per_page: vp.per_page,
+        }
     }
 }
 
@@ -405,6 +817,21 @@ impl ListResult {
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
+
+/// Prefix a CSV cell value with `'` when it starts with a formula-triggering
+/// character (`=`, `+`, `-`, `@`, tab, or CR) to prevent spreadsheet formula
+/// injection.
+fn escape_csv_formula(s: &str) -> String {
+    match s.bytes().next() {
+        Some(b'=' | b'+' | b'-' | b'@' | b'\t' | b'\r') => {
+            let mut out = String::with_capacity(s.len() + 1);
+            out.push('\'');
+            out.push_str(s);
+            out
+        }
+        _ => s.to_owned(),
+    }
+}
 
 /// Convert a `snake_case` field name to a human-readable label.
 ///
@@ -509,6 +936,126 @@ mod tests {
                 }
                 deleted.lock().unwrap().push(id);
                 Ok(())
+            })
+        }
+    }
+
+    /// Test fixture: an `AdminModel` that supports soft delete and records
+    /// which ids were restored/purged. Overrides `supports_soft_delete()` and
+    /// the three soft-delete methods.
+    #[derive(Default)]
+    struct SoftDeleteModel {
+        restored: Mutex<Vec<i64>>,
+        purged: Mutex<Vec<i64>>,
+    }
+
+    impl AdminModel for SoftDeleteModel {
+        fn slug(&self) -> &'static str {
+            "soft"
+        }
+        fn display_name(&self) -> &'static str {
+            "Soft"
+        }
+        fn display_name_plural(&self) -> &'static str {
+            "Softs"
+        }
+        fn fields(&self) -> Vec<AdminField> {
+            vec![]
+        }
+        fn list(
+            &self,
+            _pool: &diesel_async::pooled_connection::deadpool::Pool<
+                diesel_async::AsyncPgConnection,
+            >,
+            _params: ListParams,
+        ) -> AdminFuture<'_, ListResult> {
+            Box::pin(async {
+                Ok(ListResult {
+                    records: vec![],
+                    total: 0,
+                    page: 1,
+                    per_page: 25,
+                })
+            })
+        }
+        fn get(
+            &self,
+            _pool: &diesel_async::pooled_connection::deadpool::Pool<
+                diesel_async::AsyncPgConnection,
+            >,
+            _id: i64,
+        ) -> AdminFuture<'_, Option<Value>> {
+            Box::pin(async { Ok(None) })
+        }
+        fn create(
+            &self,
+            _pool: &diesel_async::pooled_connection::deadpool::Pool<
+                diesel_async::AsyncPgConnection,
+            >,
+            data: Value,
+        ) -> AdminFuture<'_, Value> {
+            Box::pin(async move { Ok(data) })
+        }
+        fn update(
+            &self,
+            _pool: &diesel_async::pooled_connection::deadpool::Pool<
+                diesel_async::AsyncPgConnection,
+            >,
+            _id: i64,
+            data: Value,
+        ) -> AdminFuture<'_, Value> {
+            Box::pin(async move { Ok(data) })
+        }
+        fn delete(
+            &self,
+            _pool: &diesel_async::pooled_connection::deadpool::Pool<
+                diesel_async::AsyncPgConnection,
+            >,
+            _id: i64,
+        ) -> AdminFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+        fn supports_soft_delete(&self) -> bool {
+            true
+        }
+        fn restore<'a>(
+            &'a self,
+            _pool: &'a diesel_async::pooled_connection::deadpool::Pool<
+                diesel_async::AsyncPgConnection,
+            >,
+            id: i64,
+        ) -> AdminFuture<'a, ()> {
+            Box::pin(async move {
+                self.restored.lock().unwrap().push(id);
+                Ok(())
+            })
+        }
+        fn purge<'a>(
+            &'a self,
+            _pool: &'a diesel_async::pooled_connection::deadpool::Pool<
+                diesel_async::AsyncPgConnection,
+            >,
+            id: i64,
+        ) -> AdminFuture<'a, ()> {
+            Box::pin(async move {
+                self.purged.lock().unwrap().push(id);
+                Ok(())
+            })
+        }
+        fn list_deleted<'a>(
+            &'a self,
+            _pool: &'a diesel_async::pooled_connection::deadpool::Pool<
+                diesel_async::AsyncPgConnection,
+            >,
+            _params: ListParams,
+        ) -> AdminFuture<'a, ListResult> {
+            Box::pin(async {
+                Ok(ListResult {
+                    records: vec![],
+                    total: 0,
+                    page: 1,
+                    per_page: 25,
+                })
             })
         }
     }
@@ -659,5 +1206,452 @@ mod tests {
         // Other kinds remain editable by default.
         let text = AdminField::new("name", AdminFieldKind::Text);
         assert!(text.editable);
+    }
+
+    // ── Soft-delete admin support (issue #689) ────────────────────
+
+    #[test]
+    fn admin_model_supports_soft_delete_defaults_to_false() {
+        let model = DeletingModel {
+            deleted: Mutex::new(vec![]),
+            fail_on: None,
+        };
+        assert!(
+            !model.supports_soft_delete(),
+            "AdminModel::supports_soft_delete() must default to false"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_model_restore_returns_error_when_soft_delete_not_supported() {
+        let model = DeletingModel {
+            deleted: Mutex::new(vec![]),
+            fail_on: None,
+        };
+        let pool = dummy_pool();
+        let err = model
+            .restore(&pool, 1)
+            .await
+            .expect_err("restore must error when supports_soft_delete() is false");
+        assert!(
+            matches!(err, AdminError::Other(_)),
+            "restore on non-soft-delete model must return AdminError::Other: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_model_purge_returns_error_when_soft_delete_not_supported() {
+        let model = DeletingModel {
+            deleted: Mutex::new(vec![]),
+            fail_on: None,
+        };
+        let pool = dummy_pool();
+        let err = model
+            .purge(&pool, 1)
+            .await
+            .expect_err("purge must error when supports_soft_delete() is false");
+        assert!(
+            matches!(err, AdminError::Other(_)),
+            "purge on non-soft-delete model must return AdminError::Other: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_model_list_deleted_returns_error_when_soft_delete_not_supported() {
+        let model = DeletingModel {
+            deleted: Mutex::new(vec![]),
+            fail_on: None,
+        };
+        let pool = dummy_pool();
+        let params = ListParams {
+            page: 1,
+            per_page: 25,
+            ..Default::default()
+        };
+        let err = model
+            .list_deleted(&pool, params)
+            .await
+            .expect_err("list_deleted must error when supports_soft_delete() is false");
+        assert!(
+            matches!(err, AdminError::Other(_)),
+            "list_deleted on non-soft-delete model must return AdminError::Other: {err:?}"
+        );
+    }
+
+    #[test]
+    fn default_actions_returns_only_delete_when_soft_delete_not_supported() {
+        let model = DeletingModel {
+            deleted: Mutex::new(vec![]),
+            fail_on: None,
+        };
+        let acts = model.actions();
+        assert_eq!(
+            acts.len(),
+            1,
+            "default model must advertise exactly one action"
+        );
+        assert_eq!(acts[0].name, "delete");
+    }
+
+    #[test]
+    fn actions_includes_restore_and_purge_when_soft_delete_supported() {
+        let model = SoftDeleteModel::default();
+        let acts = model.actions();
+        let names: Vec<&str> = acts.iter().map(|a| a.name).collect();
+        assert!(
+            names.contains(&"restore"),
+            "soft-delete model must advertise restore action; got: {names:?}"
+        );
+        assert!(
+            names.contains(&"purge"),
+            "soft-delete model must advertise purge action; got: {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_action_restore_dispatches_to_restore_method() {
+        let model = SoftDeleteModel::default();
+        let pool = dummy_pool();
+        let count = model
+            .execute_action(&pool, "restore", vec![10, 20])
+            .await
+            .expect("restore action should succeed on soft-delete model");
+        assert_eq!(
+            count, 2,
+            "restore action must return count of restored records"
+        );
+        assert_eq!(*model.restored.lock().unwrap(), vec![10, 20]);
+    }
+
+    #[tokio::test]
+    async fn execute_action_purge_dispatches_to_purge_method() {
+        let model = SoftDeleteModel::default();
+        let pool = dummy_pool();
+        let count = model
+            .execute_action(&pool, "purge", vec![5])
+            .await
+            .expect("purge action should succeed on soft-delete model");
+        assert_eq!(count, 1, "purge action must return count of purged records");
+        assert_eq!(*model.purged.lock().unwrap(), vec![5]);
+    }
+
+    // ── Version history tests (issue #700) ────────────────────────
+
+    #[test]
+    fn admin_model_has_history_defaults_to_false() {
+        let model = DeletingModel {
+            deleted: Mutex::new(vec![]),
+            fail_on: None,
+        };
+        assert!(
+            !model.has_history(),
+            "AdminModel::has_history() must default to false"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_model_get_history_returns_error_when_not_opted_in() {
+        let model = DeletingModel {
+            deleted: Mutex::new(vec![]),
+            fail_on: None,
+        };
+        let pool = dummy_pool();
+        let err = model
+            .get_history(&pool, 42, 1, 25)
+            .await
+            .expect_err("get_history must error when has_history() is false");
+        assert!(
+            matches!(err, AdminError::Other(_)),
+            "get_history on non-versioned model must return AdminError::Other: {err:?}"
+        );
+    }
+
+    #[test]
+    fn admin_history_page_total_pages() {
+        let page = AdminHistoryPage {
+            entries: vec![],
+            total: 51,
+            page: 1,
+            per_page: 25,
+        };
+        assert_eq!(page.total_pages(), 3);
+    }
+
+    #[test]
+    fn admin_history_page_has_next_page() {
+        let page = AdminHistoryPage {
+            entries: vec![],
+            total: 50,
+            page: 1,
+            per_page: 25,
+        };
+        assert!(page.has_next_page());
+    }
+
+    #[test]
+    fn admin_history_page_no_next_on_last() {
+        let page = AdminHistoryPage {
+            entries: vec![],
+            total: 50,
+            page: 2,
+            per_page: 25,
+        };
+        assert!(!page.has_next_page());
+    }
+
+    #[test]
+    fn admin_history_page_zero_per_page() {
+        let page = AdminHistoryPage {
+            entries: vec![],
+            total: 10,
+            page: 1,
+            per_page: 0,
+        };
+        assert_eq!(page.total_pages(), 0);
+    }
+
+    // ── SortDirection and AdminField builder coverage ─────────────
+
+    #[test]
+    fn sort_direction_as_str_returns_correct_values() {
+        assert_eq!(SortDirection::Asc.as_str(), "asc");
+        assert_eq!(SortDirection::Desc.as_str(), "desc");
+    }
+
+    #[test]
+    fn sort_direction_flipped_returns_opposite() {
+        assert_eq!(SortDirection::Asc.flipped(), SortDirection::Desc);
+        assert_eq!(SortDirection::Desc.flipped(), SortDirection::Asc);
+    }
+
+    #[test]
+    fn admin_field_readonly_sets_editable_false() {
+        let field = AdminField::new("created_at", AdminFieldKind::DateTime).readonly();
+        assert!(!field.editable, "readonly() must set editable = false");
+    }
+
+    #[test]
+    fn admin_field_hide_from_list_sets_list_display_false() {
+        let field = AdminField::new("internal_token", AdminFieldKind::Text).hide_from_list();
+        assert!(
+            !field.list_display,
+            "hide_from_list() must set list_display = false"
+        );
+    }
+
+    #[test]
+    fn admin_model_record_display_includes_display_name_and_id() {
+        let model = DeletingModel {
+            deleted: Mutex::new(vec![]),
+            fail_on: None,
+        };
+        let record = serde_json::json!({"id": 7, "name": "foo"});
+        assert_eq!(model.record_display(&record), "Tracked #7");
+    }
+
+    #[test]
+    fn admin_model_record_display_placeholder_when_no_id() {
+        let model = DeletingModel {
+            deleted: Mutex::new(vec![]),
+            fail_on: None,
+        };
+        let record = serde_json::json!({"name": "bar"});
+        assert_eq!(model.record_display(&record), "Tracked <no id>");
+    }
+
+    #[test]
+    fn admin_model_per_page_default_is_25() {
+        let model = DeletingModel {
+            deleted: Mutex::new(vec![]),
+            fail_on: None,
+        };
+        assert_eq!(model.per_page(), 25);
+    }
+
+    #[test]
+    fn version_page_converts_to_admin_history_page() {
+        use autumn_web::version_history::{ColumnChange, VersionEntry, VersionOp, VersionPage};
+        use chrono::Utc;
+
+        let entry = VersionEntry {
+            id: 1,
+            table_name: "posts".to_owned(),
+            record_id: 42,
+            op: VersionOp::Update,
+            actor: "admin".to_owned(),
+            request_id: Some("req-1".to_owned()),
+            changes: vec![ColumnChange::new(
+                "title",
+                Some(serde_json::json!("old")),
+                Some(serde_json::json!("new")),
+            )],
+            recorded_at: Utc::now(),
+        };
+        let vp = VersionPage {
+            entries: vec![entry],
+            total: 1,
+            page: 1,
+            per_page: 25,
+        };
+
+        let ap = AdminHistoryPage::from(vp);
+        assert_eq!(ap.total, 1);
+        assert_eq!(ap.page, 1);
+        assert_eq!(ap.per_page, 25);
+        assert_eq!(ap.entries.len(), 1);
+        let e = &ap.entries[0];
+        assert_eq!(e.id, 1);
+        assert_eq!(e.actor, "admin");
+        assert_eq!(e.op, "update");
+        assert_eq!(e.request_id.as_deref(), Some("req-1"));
+        assert_eq!(e.changes.len(), 1);
+    }
+
+    #[test]
+    fn version_entry_converts_to_admin_history_entry() {
+        use autumn_web::version_history::{ColumnChange, VersionEntry, VersionOp};
+        use chrono::Utc;
+
+        let entry = VersionEntry {
+            id: 7,
+            table_name: "users".to_owned(),
+            record_id: 3,
+            op: VersionOp::Delete,
+            actor: "system".to_owned(),
+            request_id: None,
+            changes: vec![ColumnChange::sensitive("password_digest")],
+            recorded_at: Utc::now(),
+        };
+
+        let admin_entry = AdminHistoryEntry::from(entry);
+        assert_eq!(admin_entry.id, 7);
+        assert_eq!(admin_entry.actor, "system");
+        assert_eq!(admin_entry.op, "delete");
+        assert!(admin_entry.request_id.is_none());
+        assert_eq!(admin_entry.changes.len(), 1);
+    }
+
+    // ── CsvImportMode ────────────────────────────────────────────────
+
+    #[test]
+    fn csv_import_mode_from_form_value_recognises_insert() {
+        assert_eq!(
+            CsvImportMode::from_form_value("insert"),
+            Some(CsvImportMode::Insert)
+        );
+        assert_eq!(
+            CsvImportMode::from_form_value("Insert"),
+            Some(CsvImportMode::Insert)
+        );
+    }
+
+    #[test]
+    fn csv_import_mode_from_form_value_recognises_dry_run() {
+        assert_eq!(
+            CsvImportMode::from_form_value("dry_run"),
+            Some(CsvImportMode::DryRun)
+        );
+        assert_eq!(
+            CsvImportMode::from_form_value("DryRun"),
+            Some(CsvImportMode::DryRun)
+        );
+        assert_eq!(
+            CsvImportMode::from_form_value("dry-run"),
+            Some(CsvImportMode::DryRun)
+        );
+    }
+
+    #[test]
+    fn csv_import_mode_from_form_value_rejects_unknown() {
+        assert_eq!(CsvImportMode::from_form_value("upsert"), None);
+        assert_eq!(CsvImportMode::from_form_value(""), None);
+        assert_eq!(CsvImportMode::from_form_value("INSERT"), None);
+        assert_eq!(CsvImportMode::from_form_value("DRY_RUN"), None);
+    }
+
+    #[test]
+    fn csv_import_mode_default_is_insert() {
+        assert_eq!(CsvImportMode::default(), CsvImportMode::Insert);
+    }
+
+    // ── escape_csv_formula ──────────────────────────────────────────
+
+    #[test]
+    fn escape_csv_formula_prefixes_equals_sign() {
+        assert_eq!(escape_csv_formula("=SUM(A1)"), "'=SUM(A1)");
+    }
+
+    #[test]
+    fn escape_csv_formula_prefixes_plus_and_minus_and_at() {
+        assert_eq!(escape_csv_formula("+cmd"), "'+cmd");
+        assert_eq!(escape_csv_formula("-1+1"), "'-1+1");
+        assert_eq!(escape_csv_formula("@A1"), "'@A1");
+    }
+
+    #[test]
+    fn escape_csv_formula_prefixes_tab_and_cr() {
+        assert_eq!(escape_csv_formula("\thello"), "'\thello");
+        assert_eq!(escape_csv_formula("\rhello"), "'\rhello");
+    }
+
+    #[test]
+    fn escape_csv_formula_leaves_normal_strings_unchanged() {
+        assert_eq!(escape_csv_formula("hello world"), "hello world");
+        assert_eq!(escape_csv_formula("123"), "123");
+        assert_eq!(escape_csv_formula(""), "");
+        assert_eq!(escape_csv_formula("normal,value"), "normal,value");
+    }
+
+    // ── AdminModel CSV defaults ──────────────────────────────────────
+
+    #[test]
+    fn admin_model_supports_csv_export_defaults_to_false() {
+        let model = DeletingModel {
+            deleted: Mutex::new(vec![]),
+            fail_on: None,
+        };
+        assert!(
+            !model.supports_csv_export(),
+            "supports_csv_export must default to false to require explicit opt-in"
+        );
+    }
+
+    #[test]
+    fn admin_model_supports_csv_import_defaults_to_false() {
+        let model = DeletingModel {
+            deleted: Mutex::new(vec![]),
+            fail_on: None,
+        };
+        assert!(
+            !model.supports_csv_import(),
+            "supports_csv_import must default to false"
+        );
+    }
+
+    #[test]
+    fn csv_export_row_extracts_columns_and_escapes_formulas() {
+        let model = DeletingModel {
+            deleted: Mutex::new(vec![]),
+            fail_on: None,
+        };
+        let record = serde_json::json!({
+            "id": 1,
+            "name": "Alice",
+            "formula": "=EVIL()",
+            "amount": 42.5,
+            "active": true,
+            "notes": null,
+        });
+        let columns = &[
+            "id", "name", "formula", "amount", "active", "notes", "missing",
+        ];
+        let row = model.csv_export_row(columns, &record);
+        assert_eq!(row[0], "1");
+        assert_eq!(row[1], "Alice");
+        assert_eq!(row[2], "'=EVIL()", "formula-leading value must be escaped");
+        assert_eq!(row[3], "42.5");
+        assert_eq!(row[4], "true");
+        assert_eq!(row[5], "", "null becomes empty string");
+        assert_eq!(row[6], "", "missing column becomes empty string");
     }
 }

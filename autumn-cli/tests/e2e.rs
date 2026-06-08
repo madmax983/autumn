@@ -71,10 +71,7 @@ fn generated_project_compiles_runs_and_serves() {
     // ── 3. Patch Cargo.toml to use local autumn crate ───────────────
     patch_generated_cargo_toml(&project_dir);
 
-    // ── 4. Remove build.rs (Tailwind CLI not needed for test) ───────
-    let _ = std::fs::remove_file(project_dir.join("build.rs"));
-
-    // ── 5. Build the scaffolded project ─────────────────────────────
+    // ── 4. Build the scaffolded project ─────────────────────────────
     let build_output = Command::new("cargo")
         .args(["build"])
         .current_dir(&project_dir)
@@ -126,7 +123,7 @@ fn generated_project_compiles_runs_and_serves() {
     assert_eq!(resp.status(), 200, "GET / status");
     let body = resp.text().unwrap();
     assert!(
-        body.contains("Welcome to Autumn!"),
+        body.contains("Welcome to test-app!"),
         "GET / body missing welcome text, got: {body}",
     );
 

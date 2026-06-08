@@ -102,6 +102,9 @@ pub fn job_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         pub struct #api_name;
 
         impl #api_name {
+            /// The registered name of this job, as passed to `AppBuilder::jobs`.
+            pub const NAME: &'static str = #job_name;
+
             pub async fn enqueue(args: #args_type) -> ::autumn_web::AutumnResult<()> {
                 let payload = ::autumn_web::reexports::serde_json::to_value(&args)
                     .map_err(|e| ::autumn_web::AutumnError::internal_server_error(::std::io::Error::other(format!("job args serialization failed: {e}"))))?;

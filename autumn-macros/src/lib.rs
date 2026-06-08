@@ -1,3 +1,4 @@
+#![allow(clippy::collapsible_else_if)]
 //! # Autumn Macros
 //!
 //! Proc macros for the Autumn web framework.
@@ -15,7 +16,9 @@ mod api_doc;
 mod authorize;
 mod cached;
 mod collect;
+mod feature_flag;
 mod i18n;
+mod idempotency_guard;
 mod job;
 mod jobs_macro;
 mod mail_previews_macro;
@@ -37,6 +40,7 @@ mod secured;
 mod service;
 mod static_route;
 mod static_routes_macro;
+mod step_up;
 mod tasks_macro;
 mod ws;
 
@@ -413,6 +417,82 @@ pub fn secured(attr: TokenStream, item: TokenStream) -> TokenStream {
     secured::secured_macro(attr.into(), item.into()).into()
 }
 
+/// Require fresh ("step-up") authentication before a route handler runs.
+///
+/// The handler is guarded by a freshness check on the session's
+/// `last_strong_auth_at` claim. When the claim is missing or older than
+/// `max_age` the request is handled as follows:
+///
+/// - **Browser clients** (no `application/json` in `Accept`): redirect to
+///   `/reauth?return_to=<current-path>`.
+/// - **API / JSON clients** (`Accept: application/json`): `401 Unauthorized`
+///   with an RFC 7807 problem-details body (`type` =
+///   `"https://autumn.rs/probs/step-up-required"`) and a
+///   `WWW-Authenticate: StepUp max-age=N` hint header.
+///
+/// # Forms
+///
+/// - `#[step_up]` — default max-age (5 minutes, or the global `[auth.step_up]`
+///   config override)
+/// - `#[step_up(max_age = "5m")]` — custom per-route max-age
+///
+/// # Example
+///
+/// ```ignore
+/// use autumn_web::prelude::*;
+///
+/// // Requires re-authentication within the last 5 minutes.
+/// #[delete("/account")]
+/// #[step_up]
+/// async fn destroy_account() -> AutumnResult<Redirect> {
+///     // ... delete account ...
+///     Ok(Redirect::to("/bye"))
+/// }
+///
+/// // Custom max-age.
+/// #[post("/auth/mfa/remove")]
+/// #[step_up(max_age = "2m")]
+/// async fn remove_mfa() -> AutumnResult<&'static str> {
+///     Ok("MFA removed")
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn step_up(attr: TokenStream, item: TokenStream) -> TokenStream {
+    step_up::step_up_macro(attr.into(), item.into()).into()
+}
+
+/// Gate a route handler on a named feature flag.
+///
+/// If the flag is disabled for the current actor, the handler responds with
+/// `404 Not Found` by default. Provide a `fallback` function to return a
+/// custom response instead.
+///
+/// The flag key is resolved against the `FeatureFlagService` stored in the
+/// `AppState` extensions. Unknown flags are treated as **disabled**
+/// (fail-closed).
+///
+/// # Forms
+///
+/// - `#[feature_flag("key")]` — return 404 when disabled
+/// - `#[feature_flag("key", fallback = my_fn)]` — call `my_fn()` when disabled
+///
+/// # Example
+///
+/// ```ignore
+/// use autumn_web::prelude::*;
+///
+/// #[get("/beta")]
+/// #[feature_flag("beta_dashboard")]
+/// async fn beta_dashboard() -> Markup {
+///     html! { h1 { "Beta Dashboard" } }
+/// }
+/// ```
+///
+#[proc_macro_attribute]
+pub fn feature_flag(attr: TokenStream, item: TokenStream) -> TokenStream {
+    feature_flag::feature_flag_macro(attr.into(), item.into()).into()
+}
+
 /// Enforce a record-level authorization policy on a route handler.
 ///
 /// Resolves the `Policy`
@@ -554,6 +634,7 @@ pub fn cached(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// | `operation_id` | string | Override the default operation id |
 /// | `status` | integer | Success HTTP status code (defaults to `200`) |
 /// | `hidden` | flag / bool | Exclude the route from the generated spec |
+/// | `mcp` | flag / bool | Expose this endpoint as an MCP tool (`mcp = false` force-excludes it). Requires the `mcp` feature and a `mount_mcp` call. |
 ///
 /// # Examples
 ///

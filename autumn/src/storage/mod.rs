@@ -62,15 +62,26 @@ use thiserror::Error;
 
 pub mod blob;
 pub mod config;
+pub mod direct_upload;
 pub mod local;
 pub mod migrations;
+
+#[cfg(feature = "maud")]
+pub mod form_helper;
+
+#[cfg(feature = "variants")]
+pub mod variant;
 
 pub use blob::{Blob, BlobMeta};
 pub use config::{
     StorageBackend, StorageBackendConfigError, StorageBackendPlan, StorageConfig,
-    StorageLocalConfig, StorageS3Config,
+    StorageLocalConfig, StorageS3Config, StorageVariantsConfig,
 };
+pub use direct_upload::{PresignPutResult, complete_direct_upload};
 pub use local::LocalBlobStore;
+
+#[cfg(feature = "variants")]
+pub use variant::{Transform, VariantBudget, VariantError, VariantHandle};
 
 /// Boxed future returned by [`BlobStore`] methods.
 ///
@@ -215,6 +226,39 @@ pub trait BlobStore: Send + Sync + 'static {
     /// mounted serving route. On S3 backends it is a real S3 presigned
     /// URL.
     fn presigned_url<'a>(&'a self, key: &'a str, expires_in: Duration) -> BlobFuture<'a, String>;
+
+    /// Build a time-bounded presigned envelope the browser can use to PUT
+    /// bytes directly to the storage backend, bypassing the Autumn app
+    /// process.
+    ///
+    /// Returns a [`PresignPutResult`] with the URL, HTTP method, and any
+    /// headers the browser must include in the upload request.
+    ///
+    /// Backends that do not support direct PUT uploads return
+    /// [`BlobStoreError::Unsupported`]. Callers that want a graceful fallback
+    /// should check for that variant and fall back to the through-app upload
+    /// path via [`BlobStore::put_stream`].
+    ///
+    /// A signed-URL leak does **not** allow the holder to bind the blob to
+    /// any model: the completion step (recording the [`Blob`] in the
+    /// database) is always the application's own CSRF- and session-protected
+    /// route, not a framework-issued token.
+    fn presign_put<'a>(
+        &'a self,
+        key: &'a str,
+        content_type: &'a str,
+        expires_in: Duration,
+    ) -> BlobFuture<'a, PresignPutResult> {
+        let _ = (key, content_type, expires_in);
+        Box::pin(async {
+            Err(BlobStoreError::Unsupported(
+                "this storage backend does not support direct browser uploads via \
+                 presigned PUT; use the through-app upload path \
+                 (MultipartField::save_to_blob_store) instead"
+                    .into(),
+            ))
+        })
+    }
 }
 
 /// Type alias for a runtime-installed shared [`BlobStore`].
@@ -765,5 +809,68 @@ mod tests {
     fn error_into_autumn_error_preserves_status() {
         let err = BlobStoreError::NotFound("k".into()).into_autumn_error();
         assert_eq!(err.status(), http::StatusCode::NOT_FOUND);
+    }
+
+    // ── RED: presign_put default returns Unsupported ────────────────────────
+
+    struct NoOpStore;
+    impl BlobStore for NoOpStore {
+        fn provider_id(&self) -> &'static str {
+            "noop"
+        }
+        fn put<'a>(&'a self, _: &'a str, _: &'a str, _: bytes::Bytes) -> BlobFuture<'a, Blob> {
+            Box::pin(async { Err(BlobStoreError::Unsupported("noop".into())) })
+        }
+        fn put_stream<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a str,
+            _: ByteStream<'a>,
+        ) -> BlobFuture<'a, Blob> {
+            Box::pin(async { Err(BlobStoreError::Unsupported("noop".into())) })
+        }
+        fn get<'a>(&'a self, _: &'a str) -> BlobFuture<'a, bytes::Bytes> {
+            Box::pin(async { Err(BlobStoreError::Unsupported("noop".into())) })
+        }
+        fn delete<'a>(&'a self, _: &'a str) -> BlobFuture<'a, ()> {
+            Box::pin(async { Err(BlobStoreError::Unsupported("noop".into())) })
+        }
+        fn head<'a>(&'a self, _: &'a str) -> BlobFuture<'a, Option<BlobMeta>> {
+            Box::pin(async { Err(BlobStoreError::Unsupported("noop".into())) })
+        }
+        fn presigned_url<'a>(&'a self, _: &'a str, _: Duration) -> BlobFuture<'a, String> {
+            Box::pin(async { Err(BlobStoreError::Unsupported("noop".into())) })
+        }
+    }
+
+    #[tokio::test]
+    async fn presign_put_default_returns_unsupported() {
+        let store = NoOpStore;
+        let err = store
+            .presign_put("avatars/me.png", "image/png", Duration::from_secs(300))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, BlobStoreError::Unsupported(_)),
+            "expected Unsupported, got {err:?}"
+        );
+        assert_eq!(err.status(), http::StatusCode::NOT_IMPLEMENTED);
+    }
+
+    #[test]
+    fn presign_put_result_fields_accessible() {
+        let r = PresignPutResult {
+            url: "https://example.com/upload".into(),
+            method: "PUT".into(),
+            headers: std::collections::HashMap::from([("Content-Type".into(), "image/png".into())]),
+            expires_in: Duration::from_secs(300),
+        };
+        assert_eq!(r.url, "https://example.com/upload");
+        assert_eq!(r.method, "PUT");
+        assert_eq!(
+            r.headers.get("Content-Type").map(String::as_str),
+            Some("image/png")
+        );
+        assert_eq!(r.expires_in, Duration::from_secs(300));
     }
 }

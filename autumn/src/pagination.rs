@@ -163,7 +163,31 @@ pub const MAX_PAGE_SIZE: u32 = 100;
 /// silently ignored. A list endpoint should never 400 because of a
 /// malformed pager.
 ///
-/// # Examples
+/// # Repository `page()` method
+///
+/// Every `#[repository]`-derived struct generates a `page` method that
+/// accepts a `&PageRequest` and returns a [`Page<Model>`]:
+///
+/// ```rust
+/// use autumn_web::pagination::{Page, PageRequest};
+///
+/// // Simulate what `repo.page(&req)` returns: a Page built from items +
+/// // a total row count.  This doctest exercises the public constructors
+/// // and field visibility (catches pub(crate) regressions).
+/// let req = PageRequest::new(2, 10);
+/// let items: Vec<u32> = (11..=20).collect();
+/// let page: Page<u32> = Page::new(items, 37, &req);
+///
+/// assert_eq!(page.page, 2);
+/// assert_eq!(page.size, 10);
+/// assert_eq!(page.total_elements, 37);
+/// assert_eq!(page.total_pages, 4);
+/// assert!(page.has_next);
+/// assert!(page.has_previous);
+/// assert_eq!(page.content.len(), 10);
+/// ```
+///
+/// # Handler example
 ///
 /// ```rust,no_run
 /// use autumn_web::prelude::*;

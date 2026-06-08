@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::cache::Cache;
+use crate::time::{ClockSource, SystemClock};
 
 /// Newtype wrapper used to store the global cache in the extension map so that
 /// `set_cache` (called from startup hooks) is visible to all `AppState` clones.
@@ -26,6 +27,8 @@ use crate::channels::Channels;
 #[cfg(feature = "db")]
 use crate::db::DbState;
 use crate::middleware;
+#[cfg(feature = "presence")]
+use crate::presence::Presence;
 use crate::probe;
 #[cfg(feature = "ws")]
 use tokio_util::sync::CancellationToken;
@@ -94,12 +97,27 @@ pub struct AppState {
     /// Resolved config properties with source tracking for `/actuator/configprops`.
     pub(crate) config_props: actuator::ConfigProperties,
 
+    /// Registry of plugin-contributed metrics sources, populated by
+    /// [`crate::app::AppBuilder::metrics_source`].
+    pub(crate) metrics_source_registry: actuator::MetricsSourceRegistry,
+
+    /// Registry of custom health indicators, populated by
+    /// [`crate::app::AppBuilder::health_indicator`].
+    pub(crate) health_indicator_registry: actuator::HealthIndicatorRegistry,
+
     /// Named broadcast channel registry for real-time messaging.
     ///
     /// Available when the `ws` feature is enabled. Use
     /// [`channels()`](Self::channels) for convenient access.
     #[cfg(feature = "ws")]
     pub(crate) channels: Channels,
+
+    /// Distributed presence tracker layered on top of [`Channels`].
+    ///
+    /// Available when the `presence` feature is enabled. Use
+    /// [`presence()`](Self::presence) for convenient access.
+    #[cfg(feature = "presence")]
+    pub(crate) presence: Presence,
 
     /// Cancellation token signalled during graceful shutdown.
     ///
@@ -126,6 +144,10 @@ pub struct AppState {
     /// Shared application cache backend. `None` means no global cache has been
     /// registered; `#[cached]` will fall back to its per-function Moka store.
     pub(crate) shared_cache: Option<Arc<dyn Cache>>,
+
+    /// Injected wall-clock. Defaults to [`SystemClock`] (real time).
+    /// Tests override via [`crate::test::TestApp::with_clock`].
+    pub(crate) clock: Arc<dyn ClockSource>,
 }
 
 impl AppState {
@@ -166,6 +188,22 @@ impl AppState {
             .get(&TypeId::of::<T>())
             .cloned()
             .and_then(|value| Arc::downcast::<T>(value).ok())
+    }
+
+    /// Returns the registered error reporters, if any were installed via
+    /// [`AppBuilder::with_error_reporter`](crate::app::AppBuilder::with_error_reporter).
+    ///
+    /// Returns an empty `Vec` when none are registered; the
+    /// [`ReportingLayer`](crate::reporting::ReportingLayer) then falls back to
+    /// the built-in [`LogReporter`](crate::reporting::LogReporter).
+    #[cfg(feature = "reporting")]
+    #[must_use]
+    pub(crate) fn error_reporters(
+        &self,
+    ) -> Vec<std::sync::Arc<dyn crate::reporting::ErrorReporter>> {
+        self.extension::<crate::reporting::RegisteredReporters>()
+            .map(|reporters| reporters.0.clone())
+            .unwrap_or_default()
     }
 
     /// Returns the database connection pool.
@@ -236,6 +274,28 @@ impl AppState {
         &self.config_props
     }
 
+    /// Returns the registry of plugin-contributed metrics sources.
+    #[must_use]
+    pub const fn metrics_source_registry(&self) -> &actuator::MetricsSourceRegistry {
+        &self.metrics_source_registry
+    }
+
+    /// Returns the registry of custom health indicators.
+    #[must_use]
+    pub const fn health_indicator_registry(&self) -> &actuator::HealthIndicatorRegistry {
+        &self.health_indicator_registry
+    }
+
+    /// Returns the resolved [`crate::config::AutumnConfig`] from the extension map.
+    ///
+    /// Falls back to a default config if no config has been installed
+    /// (typically only in tests that don't wire the full startup pipeline).
+    #[must_use]
+    pub fn config(&self) -> crate::config::AutumnConfig {
+        self.extension::<crate::config::AutumnConfig>()
+            .map_or_else(crate::config::AutumnConfig::default, |arc| (*arc).clone())
+    }
+
     /// Returns the shared probe lifecycle state.
     #[must_use]
     pub const fn probes(&self) -> &probe::ProbeState {
@@ -301,6 +361,23 @@ impl AppState {
     #[must_use]
     pub fn with_cache(mut self, cache: Arc<dyn Cache>) -> Self {
         self.shared_cache = Some(cache);
+        self
+    }
+
+    /// Returns the active clock source wired into this state.
+    ///
+    /// Handlers should prefer the [`crate::time::Clock`] extractor; this
+    /// accessor exists for framework internals (middleware, storage) that
+    /// need the time without going through Axum's extractor machinery.
+    #[must_use]
+    pub fn clock(&self) -> &dyn ClockSource {
+        self.clock.as_ref()
+    }
+
+    /// Replace the clock (builder / test helper).
+    #[must_use]
+    pub fn with_clock(mut self, clock: Arc<dyn ClockSource>) -> Self {
+        self.clock = clock;
         self
     }
 
@@ -421,6 +498,13 @@ impl AppState {
         &self.channels
     }
 
+    /// Returns a reference to the distributed presence tracker.
+    #[cfg(feature = "presence")]
+    #[must_use]
+    pub const fn presence(&self) -> &Presence {
+        &self.presence
+    }
+
     /// Returns a high-level broadcast facade for raw and htmx HTML payloads.
     #[cfg(feature = "ws")]
     #[must_use]
@@ -471,6 +555,8 @@ impl AppState {
     /// WebSocket channel registries.
     #[must_use]
     pub fn detached() -> Self {
+        #[cfg(feature = "ws")]
+        let channels = Channels::new(32);
         Self {
             extensions: Arc::new(std::sync::RwLock::new(HashMap::new())),
             #[cfg(feature = "db")]
@@ -486,14 +572,19 @@ impl AppState {
             task_registry: actuator::TaskRegistry::new(),
             job_registry: actuator::JobRegistry::new(),
             config_props: actuator::ConfigProperties::default(),
+            metrics_source_registry: actuator::MetricsSourceRegistry::new(),
+            health_indicator_registry: actuator::HealthIndicatorRegistry::new(),
+            #[cfg(feature = "presence")]
+            presence: Presence::new(channels.clone()),
             #[cfg(feature = "ws")]
-            channels: Channels::new(32),
+            channels,
             #[cfg(feature = "ws")]
             shutdown: CancellationToken::new(),
             policy_registry: PolicyRegistry::default(),
             forbidden_response: ForbiddenResponse::default(),
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
+            clock: Arc::new(SystemClock),
         }
     }
 
@@ -508,6 +599,10 @@ impl AppState {
 
 #[cfg(feature = "db")]
 impl DbState for AppState {
+    fn metrics(&self) -> Option<&crate::middleware::MetricsCollector> {
+        Some(&self.metrics)
+    }
+
     fn pool(
         &self,
     ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>
@@ -527,6 +622,25 @@ impl DbState for AppState {
     ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>
     {
         Self::read_pool(self)
+    }
+
+    fn db_interceptors(
+        &self,
+    ) -> Vec<std::sync::Arc<dyn crate::interceptor::DbConnectionInterceptor>> {
+        self.extension::<Arc<dyn crate::interceptor::DbConnectionInterceptor>>()
+            .map(|arc| vec![(*arc).clone()])
+            .unwrap_or_default()
+    }
+    fn statement_timeout(&self) -> Option<std::time::Duration> {
+        self.extension::<crate::config::AutumnConfig>()
+            .and_then(|cfg| cfg.database.statement_timeout)
+    }
+
+    fn slow_query_threshold(&self) -> std::time::Duration {
+        self.extension::<crate::config::AutumnConfig>().map_or_else(
+            || std::time::Duration::from_millis(500),
+            |cfg| cfg.database.slow_query_threshold,
+        )
     }
 }
 
@@ -562,6 +676,10 @@ impl crate::probe::ProvideProbeState for AppState {
     {
         self.replica_pool.as_ref()
     }
+
+    fn health_indicator_registry(&self) -> Option<&crate::actuator::HealthIndicatorRegistry> {
+        Some(&self.health_indicator_registry)
+    }
 }
 
 impl crate::actuator::ProvideActuatorState for AppState {
@@ -593,6 +711,18 @@ impl crate::actuator::ProvideActuatorState for AppState {
         self.uptime_display()
     }
 
+    fn metrics_source_registry(&self) -> Option<&crate::actuator::MetricsSourceRegistry> {
+        Some(&self.metrics_source_registry)
+    }
+
+    fn health_indicator_registry(&self) -> Option<&crate::actuator::HealthIndicatorRegistry> {
+        Some(&self.health_indicator_registry)
+    }
+
+    fn health_detailed(&self) -> bool {
+        self.health_detailed
+    }
+
     #[cfg(feature = "ws")]
     fn channels(&self) -> &crate::channels::Channels {
         &self.channels
@@ -615,6 +745,12 @@ impl crate::actuator::ProvideActuatorState for AppState {
     // method on your own state type — or in a custom ProvideActuatorState impl —
     // once you have verified that your pages include lang, a skip link, and
     // landmark regions.  See docs/guide/accessibility.md for details.
+
+    #[cfg(feature = "http-client")]
+    fn webhook_outbound(&self) -> Option<crate::webhook_outbound::WebhookOutboundManager> {
+        self.extension::<crate::webhook_outbound::WebhookOutboundManager>()
+            .map(|x| (*x).clone())
+    }
 }
 
 impl std::fmt::Debug for AppState {

@@ -81,8 +81,10 @@ pub use channels::{
     ChannelPublishError, ChannelStats, Channels, ChannelsBackend, LocalChannelsBackend,
 };
 pub mod config;
+pub mod credentials;
 #[cfg(feature = "db")]
 pub mod db;
+pub mod encryption;
 pub mod error;
 pub mod error_pages;
 pub mod extract;
@@ -91,14 +93,18 @@ pub mod health;
 pub mod hooks;
 #[cfg(feature = "i18n")]
 pub mod i18n;
+pub mod idempotency;
 /// Translation lookup macro with compile-time key validation.
 ///
 /// Re-exported from [`crate::i18n::t`] for ergonomic
 /// `autumn_web::t!(locale, "key")` usage.
 #[cfg(feature = "i18n")]
 pub use crate::i18n::t;
+pub mod inspector;
+pub mod interceptor;
 #[cfg(feature = "mail")]
 pub mod mail;
+pub mod maintenance;
 #[cfg(feature = "db")]
 pub mod migrate;
 pub mod plugin;
@@ -113,7 +119,18 @@ pub mod route_listing;
 #[cfg(feature = "db")]
 pub mod repository;
 #[cfg(feature = "db")]
+pub(crate) mod repository_commit_hooks;
+#[cfg(feature = "db")]
 pub use repository::RepositoryError;
+
+/// Automatic record version history for `#[repository]` writes.
+///
+/// See [`version_history`] module documentation for the full API.
+pub mod version_history;
+pub use version_history::{
+    ColumnChange, VersionEntry, VersionFilter, VersionOp, VersionPage, VersionedRecord,
+    compute_delete_changes, compute_diff, compute_insert_changes,
+};
 
 /// Router construction and integration with Axum.
 ///
@@ -126,19 +143,50 @@ pub(crate) mod router;
 pub use hooks::{
     DraftField, FieldDiff, MutationContext, MutationHooks, MutationOp, NoHooks, Patch, UpdateDraft,
 };
+pub mod etag;
+/// Traced outbound HTTP client with retries and test mocks.
+///
+/// See [`http_client::Client`] for the full API. The module is exposed as
+/// `autumn_web::http` so handler code can write `use autumn_web::http::Client`.
+#[cfg(feature = "http-client")]
+pub mod http_client;
+#[cfg(feature = "http-client")]
+pub use http_client as http;
 #[cfg(feature = "flash")]
 pub mod flash;
 #[cfg(feature = "htmx")]
 pub(crate) mod htmx;
+pub mod log;
 pub(crate) mod logging;
+/// Project typed JSON endpoints as Model Context Protocol (MCP) tools so AI
+/// agents can call the real, authenticated handler pipeline.
+///
+/// Enable with the Cargo feature `mcp` (which implies `openapi`).
+#[cfg(feature = "mcp")]
+pub mod mcp;
 pub mod middleware;
 pub mod openapi;
 pub mod pagination;
 pub mod paths;
 pub mod prelude;
 pub use paths::PathExt;
+#[cfg(feature = "presence")]
+pub mod presence;
+#[cfg(feature = "presence")]
+pub use presence::{Presence, PresenceEntry, PresenceEvent, PresenceHandle};
 pub(crate) mod route;
-pub use route::{RepositoryApiMeta, Route};
+pub use route::{RepositoryApiMeta, Route, RouteIdempotency};
+/// First-class Markdown rendering with frontmatter parsing and SSG integration.
+///
+/// Enable with the Cargo feature `markdown`.
+#[cfg(feature = "markdown")]
+pub mod markdown;
+/// Pluggable error reporting: catch handler panics and route panics + 5xx
+/// responses to configured [`ErrorReporter`](reporting::ErrorReporter)s.
+///
+/// Enabled by the `reporting` Cargo feature (on by default).
+#[cfg(feature = "reporting")]
+pub mod reporting;
 pub mod scheduler;
 pub mod security;
 pub mod session;
@@ -147,24 +195,39 @@ pub(crate) mod session_redis;
 pub mod sse;
 /// Static site generation support.
 pub mod static_gen;
+pub mod step_up;
 #[cfg(feature = "storage")]
 pub mod storage;
+pub mod tenancy;
+pub mod time;
 
+pub mod experiments;
+pub mod feature_flags;
 pub mod form;
+pub mod gdpr;
 pub mod job;
+pub mod runtime_config;
 #[cfg(feature = "seed")]
 pub mod seed;
 pub mod task;
 pub mod telemetry;
 pub mod ui;
+/// Active search and autocomplete form primitives with htmx integration.
+///
+/// See [`widgets`] for the full API including [`widgets::active_search`],
+/// [`widgets::autocomplete_input`], and their configuration types.
+pub mod widgets;
 /// Changeset type carrying submitted values + per-field errors.
 pub use form::Changeset;
 /// Changeset form extractor — decodes body + validates, captures errors in [`form::Changeset`].
 pub use form::ChangesetForm;
 /// Trait implemented for all `validator::Validate` types to produce a [`Changeset`].
 pub use form::IntoChangeset;
+pub mod data;
 pub mod validation;
 pub mod webhook;
+#[cfg(feature = "http-client")]
+pub mod webhook_outbound;
 #[cfg(feature = "ws")]
 pub mod ws;
 
@@ -173,6 +236,22 @@ pub mod ws;
 /// This module is semver-exempt. Do not use it directly.
 #[doc(hidden)]
 pub mod __private {
+    #[cfg(feature = "db")]
+    pub use crate::repository_commit_hooks::{
+        RepositoryCommitHookDescriptor, catch_repository_after_hook_unwind,
+        discard_repository_commit_hook_pending, enqueue_repository_commit_hook_on_conn,
+        enqueue_repository_commit_hook_pending_on_conn,
+        enqueue_repository_commit_hooks_bulk_on_conn,
+        enqueue_repository_commit_hooks_pending_bulk_on_conn,
+        finalize_repository_commit_hook_after_hook, kick_repository_commit_hook_dispatcher,
+        mark_repository_commit_hook_after_hook_failed, register_repository_commit_hook_runner,
+        start_repository_commit_hook_pending_finalizer_heartbeat,
+    };
+    #[cfg(feature = "db")]
+    pub use crate::version_history::VersionedRepositoryDescriptor;
+
+    pub use crate::router::check_sunset;
+
     // Shared factory creation depth — bounds cyclic `#[factory_assoc]` chains
     // across all models in a single create() chain.
     //
@@ -183,6 +262,8 @@ pub mod __private {
         pub static FACTORY_DEPTH: u32;
     }
 }
+
+pub use crate::router::RouteVersionMetadata;
 
 /// Create a new [`app::AppBuilder`] for configuring and launching an Autumn server.
 ///
@@ -205,6 +286,7 @@ pub mod __private {
 /// }
 /// ```
 pub use app::app;
+pub use app::{ApiVersion, RegisteredApiVersions};
 /// Async database connection extractor.
 ///
 /// Declare `db: Db` in a handler signature to get a pooled Postgres
@@ -257,7 +339,7 @@ pub use validation::Validated;
 /// Useful for cache-busting or diagnostic logging. The corresponding
 /// minified JS is served automatically at `/static/js/htmx.min.js`.
 #[cfg(feature = "htmx")]
-pub use htmx::{HTMX_CSRF_JS_PATH, HTMX_JS_PATH, HTMX_VERSION};
+pub use htmx::{AUTUMN_WIDGETS_JS_PATH, HTMX_CSRF_JS_PATH, HTMX_JS_PATH, HTMX_VERSION};
 #[cfg(feature = "mail")]
 pub use mail::{
     Mail, MailConfig, MailDeliveryQueue, MailDeliveryQueueHandle, MailError, MailTransport, Mailer,
@@ -663,6 +745,57 @@ pub use auth::API_TOKEN_MIGRATIONS;
 /// ```
 pub use autumn_macros::secured;
 
+/// Require fresh ("step-up") authentication before a route handler runs.
+///
+/// The handler is guarded by a freshness check on the session's
+/// `last_strong_auth_at` claim. When the claim is missing or older than
+/// `max_age` (default: 5 minutes) the request is handled as follows:
+///
+/// - **Browser clients**: redirect to `/reauth?return_to=<current-path>`.
+/// - **API / JSON clients** (`Accept: application/json`): `401` with
+///   RFC 7807 problem-details and `WWW-Authenticate: StepUp max-age=N`.
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// use autumn_web::prelude::*;
+///
+/// // Default 5-minute window.
+/// #[delete("/account")]
+/// #[step_up]
+/// async fn destroy_account() -> AutumnResult<Redirect> {
+///     Ok(Redirect::to("/bye"))
+/// }
+///
+/// // Custom window.
+/// #[post("/auth/mfa/remove")]
+/// #[step_up(max_age = "2m")]
+/// async fn remove_mfa() -> AutumnResult<&'static str> {
+///     Ok("removed")
+/// }
+/// ```
+pub use autumn_macros::step_up;
+
+/// Gate a route handler on a named feature flag. If the flag is disabled for
+/// the current actor the handler responds with `404 Not Found` (default) or
+/// delegates to a custom fallback specified with `fallback = my_fn`.
+///
+/// Requires a [`FeatureFlagService`](crate::feature_flags::FeatureFlagService)
+/// installed in the app's [`AppState`] extensions.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use autumn_web::prelude::*;
+///
+/// #[get("/beta")]
+/// #[feature_flag("beta_dashboard")]
+/// async fn beta_dashboard() -> Markup {
+///     html! { h1 { "Beta!" } }
+/// }
+/// ```
+pub use autumn_macros::feature_flag;
+
 /// Enforce a record-level [`Policy`](crate::authorization::Policy)
 /// before a handler runs. Coexists with [`secured`](macro@secured):
 /// `#[secured]` answers "are you in?", `#[authorize]` answers
@@ -824,6 +957,15 @@ pub use crate::extract::Form;
 /// Query extractor.
 pub use crate::extract::Query;
 
+/// Resolved client IP address after trusted-proxy evaluation.
+pub use crate::extract::ClientAddr;
+
+/// Resolved external host after trusted-proxy evaluation.
+pub use crate::extract::ClientHost;
+
+/// Resolved external scheme (`"http"` / `"https"`) after trusted-proxy evaluation.
+pub use crate::extract::ClientScheme;
+
 /// State extractor.
 /// Re-exported from [Axum](https://docs.rs/axum).
 pub use axum::extract::State;
@@ -856,6 +998,7 @@ pub mod reexports {
     #[cfg(feature = "db")]
     pub use diesel_async;
     pub use http;
+    pub use inventory;
     #[cfg(feature = "mail")]
     pub use lettre;
     #[cfg(feature = "db")]
@@ -869,12 +1012,17 @@ pub mod reexports {
 
 /// Shared application state passed to route handlers.
 pub(crate) mod state;
+#[cfg(feature = "system-tests")]
+pub mod system_test;
 #[allow(
     clippy::missing_panics_doc,
     clippy::must_use_candidate,
     clippy::field_reassign_with_default
 )]
 pub mod test;
+/// Dependency-free HTML parser + CSS-selector matcher backing the structural
+/// HTML assertions on [`test::TestResponse`].
+mod test_html;
 pub use state::AppState;
 
 #[cfg(test)]

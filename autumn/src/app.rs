@@ -67,6 +67,7 @@ use crate::state::AppState;
 pub fn app() -> AppBuilder {
     AppBuilder {
         routes: Vec::new(),
+        api_versions: Vec::new(),
         route_sources: Vec::new(),
         current_plugin: None,
         tasks: Vec::new(),
@@ -79,6 +80,7 @@ pub fn app() -> AppBuilder {
         nest_routers: Vec::new(),
         custom_layers: Vec::new(),
         startup_hooks: Vec::new(),
+        state_initializers: Vec::new(),
         shutdown_hooks: Vec::new(),
         extensions: HashMap::new(),
         registered_plugins: HashSet::new(),
@@ -95,8 +97,12 @@ pub fn app() -> AppBuilder {
         #[cfg(feature = "storage")]
         blob_store: None,
         cache_backend: None,
+        #[cfg(feature = "reporting")]
+        error_reporters: Vec::new(),
         #[cfg(feature = "openapi")]
         openapi: None,
+        #[cfg(feature = "mcp")]
+        mcp: None,
         audit_logger: None,
         #[cfg(feature = "i18n")]
         i18n_bundle: None,
@@ -108,11 +114,24 @@ pub fn app() -> AppBuilder {
         #[cfg(feature = "mail")]
         mail_previews: Vec::new(),
         declared_routes: Vec::new(),
+        idempotency_enabled: false,
+        #[cfg(feature = "mail")]
+        mail_interceptor: None,
+        job_interceptor: None,
+        #[cfg(feature = "db")]
+        db_interceptor: None,
+        #[cfg(feature = "ws")]
+        channels_interceptor: None,
+        #[cfg(feature = "oauth2")]
+        http_interceptor: None,
+        metrics_sources: Vec::new(),
+        health_indicators: Vec::new(),
     }
 }
 
 type StartupHookFuture = Pin<Box<dyn Future<Output = crate::AutumnResult<()>> + Send>>;
 type StartupHook = Box<dyn Fn(AppState) -> StartupHookFuture + Send + Sync>;
+type StateInitializer = Box<dyn FnOnce(&AppState) + Send>;
 type ShutdownHookFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 type ShutdownHook = Box<dyn Fn() -> ShutdownHookFuture + Send + Sync>;
 
@@ -145,6 +164,21 @@ type PoolProviderFactory = Box<
 /// [`PolicyRegistry`](crate::authorization::PolicyRegistry).
 type PolicyRegistration = Box<dyn FnOnce(&crate::authorization::PolicyRegistry) + Send>;
 
+/// Represents an API version registration.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct ApiVersion {
+    /// The version name (e.g. "v1", "v2").
+    pub version: String,
+    /// When this version was deprecated.
+    pub deprecated_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// When this version was sunsetted.
+    pub sunset_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// A wrapper for registered API versions in the app state.
+#[derive(Clone, Debug)]
+pub struct RegisteredApiVersions(pub Vec<ApiVersion>);
+
 /// Builder for configuring and launching an Autumn application.
 ///
 /// Created by [`app()`]. Collect routes with [`.routes()`](Self::routes),
@@ -174,7 +208,9 @@ type PolicyRegistration = Box<dyn FnOnce(&crate::authorization::PolicyRegistry) 
 /// }
 /// ```
 pub struct AppBuilder {
-    routes: Vec<Route>,
+    pub(crate) routes: Vec<Route>,
+    /// Registered API versions.
+    pub api_versions: Vec<ApiVersion>,
     /// Parallel to `routes`: registration origin for each route.
     route_sources: Vec<crate::route_listing::RouteSource>,
     /// Non-None while a plugin's `build()` is executing; routes and scoped
@@ -182,20 +218,21 @@ pub struct AppBuilder {
     current_plugin: Option<String>,
     tasks: Vec<crate::task::TaskInfo>,
     one_off_tasks: Vec<crate::task::OneOffTaskInfo>,
-    jobs: Vec<crate::job::JobInfo>,
+    pub(crate) jobs: Vec<crate::job::JobInfo>,
     pub(crate) static_metas: Vec<crate::static_gen::StaticRouteMeta>,
-    exception_filters: Vec<Arc<dyn ExceptionFilter>>,
-    scoped_groups: Vec<ScopedGroup>,
-    merge_routers: Vec<axum::Router<AppState>>,
-    nest_routers: Vec<(String, axum::Router<AppState>)>,
+    pub(crate) exception_filters: Vec<Arc<dyn ExceptionFilter>>,
+    pub(crate) scoped_groups: Vec<ScopedGroup>,
+    pub(crate) merge_routers: Vec<axum::Router<AppState>>,
+    pub(crate) nest_routers: Vec<(String, axum::Router<AppState>)>,
     /// Custom Tower layers registered via [`AppBuilder::layer`], applied
     /// inside `RequestIdLayer` on ingress so they observe the request ID.
-    custom_layers: Vec<CustomLayerRegistration>,
-    startup_hooks: Vec<StartupHook>,
-    shutdown_hooks: Vec<ShutdownHook>,
-    extensions: HashMap<TypeId, Box<dyn Any + Send>>,
+    pub(crate) custom_layers: Vec<CustomLayerRegistration>,
+    pub(crate) startup_hooks: Vec<StartupHook>,
+    pub(crate) state_initializers: Vec<StateInitializer>,
+    pub(crate) shutdown_hooks: Vec<ShutdownHook>,
+    pub(crate) extensions: HashMap<TypeId, Box<dyn Any + Send>>,
     /// Plugin names that have already been applied, for duplicate detection.
-    registered_plugins: HashSet<String>,
+    pub(crate) registered_plugins: HashSet<String>,
     /// Custom error page renderer (overrides built-in pages).
     error_page_renderer: Option<SharedRenderer>,
     /// Embedded Diesel migrations, registered via `.migrations()`.
@@ -228,6 +265,13 @@ pub struct AppBuilder {
     /// When `Some`, installed onto `AppState` as `shared_cache` before startup
     /// hooks run.
     cache_backend: Option<Arc<dyn crate::cache::Cache>>,
+    /// Error reporters registered via [`AppBuilder::with_error_reporter`].
+    /// Installed onto `AppState` so the
+    /// [`ReportingLayer`](crate::reporting::ReportingLayer) delivers panic and
+    /// 5xx [`ErrorEvent`](crate::reporting::ErrorEvent)s to each. Empty means
+    /// the built-in [`LogReporter`](crate::reporting::LogReporter) is used.
+    #[cfg(feature = "reporting")]
+    pub(crate) error_reporters: Vec<Arc<dyn crate::reporting::ErrorReporter>>,
     /// `OpenAPI` generation configuration. When `Some`, the router mounts
     /// `/v3/api-docs` (serving `openapi.json`) and `/swagger-ui` (if the
     /// Swagger UI path is set). When `None`, no docs endpoints are mounted.
@@ -237,6 +281,12 @@ pub struct AppBuilder {
     /// runtime collision-check machinery.
     #[cfg(feature = "openapi")]
     openapi: Option<crate::openapi::OpenApiConfig>,
+    /// MCP (Model Context Protocol) runtime config. `Some` once
+    /// [`AppBuilder::mount_mcp`] is called; the contained `expose_all` flag is
+    /// flipped by [`AppBuilder::expose_all_as_mcp`]. Gated behind the `mcp`
+    /// feature (which implies `openapi`).
+    #[cfg(feature = "mcp")]
+    mcp: Option<crate::mcp::McpRuntime>,
     /// Shared audit logger used for append-only compliance events.
     audit_logger: Option<Arc<crate::audit::AuditLogger>>,
     /// Loaded i18n translation bundle. When `Some`, an `axum::Extension`
@@ -267,6 +317,27 @@ pub struct AppBuilder {
     /// opaque `nest_routers`. Included in `autumn routes` output even though
     /// the underlying Axum router is not enumerable.
     declared_routes: Vec<crate::route_listing::RouteInfo>,
+    /// Whether `.idempotent()` was called on this builder. Applied to the
+    /// loaded `AutumnConfig` before router assembly so that startup validation
+    /// and `apply_middleware` both see `config.idempotency.enabled = true`.
+    idempotency_enabled: bool,
+    #[cfg(feature = "mail")]
+    mail_interceptor: Option<Arc<dyn crate::interceptor::MailInterceptor>>,
+    job_interceptor: Option<Arc<dyn crate::interceptor::JobInterceptor>>,
+    #[cfg(feature = "db")]
+    db_interceptor: Option<Arc<dyn crate::interceptor::DbConnectionInterceptor>>,
+    #[cfg(feature = "ws")]
+    channels_interceptor: Option<Arc<dyn crate::interceptor::ChannelsInterceptor>>,
+    #[cfg(feature = "oauth2")]
+    http_interceptor: Option<Arc<dyn crate::interceptor::HttpInterceptor>>,
+    /// Plugin-contributed metrics sources registered via [`AppBuilder::metrics_source`].
+    pub(crate) metrics_sources: Vec<(String, Arc<dyn crate::actuator::MetricsSource>)>,
+    /// Custom health indicators registered via [`AppBuilder::health_indicator`].
+    pub(crate) health_indicators: Vec<(
+        String,
+        crate::actuator::IndicatorGroup,
+        Arc<dyn crate::actuator::HealthIndicator>,
+    )>,
 }
 
 /// Boxed builder closure that constructs a durable
@@ -281,14 +352,13 @@ pub(crate) type MailDeliveryQueueFactory = Box<
 ///
 /// Created by [`AppBuilder::scoped`]. The routes are mounted under the
 /// prefix with the middleware applied only to this group.
-pub(crate) struct ScopedGroup {
-    pub(crate) prefix: String,
-    pub(crate) routes: Vec<Route>,
+pub struct ScopedGroup {
+    pub prefix: String,
+    pub routes: Vec<Route>,
     /// Registration origin: user application or a named plugin.
-    pub(crate) source: crate::route_listing::RouteSource,
+    pub source: crate::route_listing::RouteSource,
     /// Closure that applies the layer to a sub-router.
-    pub(crate) apply_layer:
-        Box<dyn FnOnce(axum::Router<AppState>) -> axum::Router<AppState> + Send>,
+    pub apply_layer: Box<dyn FnOnce(axum::Router<AppState>) -> axum::Router<AppState> + Send>,
 }
 
 /// A deferred router mutator that applies a user-registered
@@ -303,6 +373,9 @@ pub(crate) type CustomLayerApplier =
 pub(crate) struct CustomLayerRegistration {
     /// Concrete type for the registered layer.
     pub(crate) type_id: TypeId,
+    /// Concrete type name for generic layer families that need router-time
+    /// classification without unstable specialization.
+    pub(crate) type_name: &'static str,
     /// Deferred router mutation that applies the layer.
     pub(crate) apply: CustomLayerApplier,
 }
@@ -494,6 +567,122 @@ impl AppBuilder {
     #[must_use]
     pub fn openapi(mut self, config: crate::openapi::OpenApiConfig) -> Self {
         self.openapi = Some(config);
+        self
+    }
+
+    /// Mount a Model Context Protocol (MCP) endpoint at `path` (e.g. `/mcp`).
+    ///
+    /// Projects opted-in routes — those tagged `#[api_doc(mcp)]` — as
+    /// agent-callable MCP tools over Streamable HTTP, handling `initialize`,
+    /// `tools/list`, and `tools/call`. A tool's `name`, `description`, and
+    /// `inputSchema` are derived from the handler's existing
+    /// [`ApiDoc`](crate::openapi::ApiDoc), so the tool catalog cannot drift
+    /// from the handler's typed contract. `tools/call` dispatches through the
+    /// real handler pipeline, so `#[secured]`, authorization, rate limits, and
+    /// validation apply identically to agent and HTTP calls.
+    ///
+    /// Opt-in is per-endpoint; nothing is exposed implicitly. Use
+    /// [`expose_all_as_mcp`](Self::expose_all_as_mcp) for the whole-API hatch.
+    ///
+    /// Only **JSON** endpoints are projected: a route is eligible when it
+    /// returns `Json<T>` (the structural signal for a JSON response). The
+    /// generated tool's `body` input is derived solely from a `Json<T>`
+    /// request extractor, so a handler that returns `Json<T>` but reads its
+    /// body via `Form<T>`, `Multipart`, `Bytes`, or `String` should **not** be
+    /// opted in — the tool would carry no body input and replay an empty
+    /// request. Use JSON request bodies for endpoints exposed as MCP tools.
+    ///
+    /// `tools/call` replays through the same pipeline as a direct HTTP request,
+    /// so `#[secured]`, route guards, rate limits, and validation apply
+    /// identically. One caveat applies only in **static/ISR mode** (an app with
+    /// a `dist` manifest): a global [`layer`](Self::layer) is applied outside
+    /// the static-first middleware and is therefore *not* traversed by MCP
+    /// `tools/call` replays. Prefer `#[secured]` or route-level guards (which do
+    /// apply) for MCP-exposed handlers in that mode.
+    ///
+    /// Requires the `mcp` Cargo feature.
+    ///
+    /// ```rust,ignore
+    /// autumn_web::app()
+    ///     .routes(routes![list_todos, create_todo])
+    ///     .mount_mcp("/mcp")
+    ///     .run()
+    ///     .await;
+    /// ```
+    #[cfg(feature = "mcp")]
+    #[must_use]
+    pub fn mount_mcp(mut self, path: impl Into<String>) -> Self {
+        let path = path.into();
+        if let Some(rt) = self.mcp.as_mut() {
+            rt.mount_path = path;
+        } else {
+            self.mcp = Some(crate::mcp::McpRuntime::new(path));
+        }
+        self
+    }
+
+    /// Whole-API escape hatch: expose **every** eligible read (`GET`) endpoint
+    /// as an MCP tool without per-endpoint tags.
+    ///
+    /// This is an explicit, separate opt-in — never the default. It still
+    /// honors per-endpoint exclusions (`#[api_doc(mcp = false)]`) and the
+    /// JSON-only rule, and **mutating verbs (`POST`/`PUT`/`PATCH`/`DELETE`)
+    /// still require an explicit `#[api_doc(mcp)]` opt-in** even under the
+    /// hatch.
+    ///
+    /// On its own this mounts the endpoint at the default `/mcp`; chain
+    /// [`mount_mcp`](Self::mount_mcp) to serve it at a different path.
+    ///
+    /// Requires the `mcp` Cargo feature.
+    #[cfg(feature = "mcp")]
+    #[must_use]
+    pub fn expose_all_as_mcp(mut self) -> Self {
+        if let Some(rt) = self.mcp.as_mut() {
+            rt.expose_all = true;
+        } else {
+            let mut rt = crate::mcp::McpRuntime::new("/mcp");
+            rt.expose_all = true;
+            self.mcp = Some(rt);
+        }
+        self
+    }
+
+    /// Gate the **entire** MCP endpoint — the catalog (`initialize`/
+    /// `tools/list`) as well as tool dispatch — behind a tower `layer`.
+    ///
+    /// The `/mcp` envelope is otherwise reachable without the app's global
+    /// middleware. Pass an auth layer (e.g.
+    /// [`RequireApiToken`](crate::auth::RequireApiToken)) here to require a
+    /// credential for the whole endpoint, the way you'd protect a normal
+    /// route group. Combine with [`mount_mcp`](Self::mount_mcp); the MCP
+    /// transport's spec-required `Origin` validation (sourced from your CORS
+    /// `allowed_origins`) always applies regardless of this layer.
+    ///
+    /// Requires the `mcp` Cargo feature.
+    #[cfg(feature = "mcp")]
+    #[must_use]
+    pub fn secure_mcp<L>(mut self, layer: L) -> Self
+    where
+        L: tower::Layer<axum::routing::Route> + Clone + Send + Sync + 'static,
+        L::Service: tower::Service<
+                axum::http::Request<axum::body::Body>,
+                Response = axum::http::Response<axum::body::Body>,
+                Error = std::convert::Infallible,
+            > + Clone
+            + Send
+            + Sync
+            + 'static,
+        <L::Service as tower::Service<axum::http::Request<axum::body::Body>>>::Future:
+            Send + 'static,
+    {
+        let applier: crate::mcp::McpEndpointLayer = Box::new(move |router| router.layer(layer));
+        if let Some(rt) = self.mcp.as_mut() {
+            rt.endpoint_layer = Some(applier);
+        } else {
+            let mut rt = crate::mcp::McpRuntime::new("/mcp");
+            rt.endpoint_layer = Some(applier);
+            self.mcp = Some(rt);
+        }
         self
     }
 
@@ -703,6 +892,7 @@ impl AppBuilder {
     pub fn layer<L: IntoAppLayer>(mut self, layer: L) -> Self {
         self.custom_layers.push(CustomLayerRegistration {
             type_id: TypeId::of::<L>(),
+            type_name: std::any::type_name::<L>(),
             apply: Box::new(move |router| layer.apply_to(router)),
         });
         self
@@ -718,6 +908,37 @@ impl AppBuilder {
         self.custom_layers
             .iter()
             .any(|registered| registered.type_id == layer_type)
+    }
+
+    /// Enable the HTTP idempotency-key middleware for this application.
+    ///
+    /// Mutating requests (`POST`, `PUT`, `PATCH`, `DELETE`) that carry an
+    /// `Idempotency-Key` header are deduplicated: the first response is cached
+    /// and replayed byte-for-byte on subsequent identical requests.
+    /// Session-mutating responses are cached after the outer session middleware
+    /// has finalized `Set-Cookie`, so retries can observe the successful
+    /// mutation without re-entering the handler.
+    ///
+    /// Raw Axum routers registered with [`merge`](Self::merge) or
+    /// [`nest`](Self::nest) are opaque to Autumn. They are protected from
+    /// duplicate mutating retries by failing closed on cache hits; install
+    /// idempotency and replay-stop layers inside those routers when raw routes
+    /// need successful cached-response replay after their own route-local
+    /// checks.
+    ///
+    /// The storage backend and TTL are taken from the `[idempotency]` block in
+    /// `autumn.toml` (defaulting to in-process memory with a 24 h TTL).
+    /// For multi-replica deployments set `backend = "redis"` and configure
+    /// `[idempotency.redis]`.
+    ///
+    /// # Startup validation
+    ///
+    /// In production (`AUTUMN_PROFILE=production`) the memory backend is
+    /// rejected unless `allow_memory_in_production = true` is set explicitly.
+    #[must_use]
+    pub const fn idempotent(mut self) -> Self {
+        self.idempotency_enabled = true;
+        self
     }
 
     /// Returns the registered custom layer types in registration order.
@@ -741,6 +962,11 @@ impl AppBuilder {
     /// The merged router shares the same [`AppState`] (database pool,
     /// config, etc.) and Autumn's global middleware (request IDs,
     /// security headers, session management) applies to its routes.
+    /// When `.idempotent()` is enabled, retries that hit an existing raw-route
+    /// idempotency record fail closed instead of rerunning the raw handler or
+    /// replaying around opaque route-local checks. Install idempotency and
+    /// replay-stop layers inside the raw router when successful replay is
+    /// required.
     ///
     /// Merged routes are added **after** Autumn's annotated routes.
     /// If both define the same method+path pair, Axum treats that as an
@@ -782,7 +1008,11 @@ impl AppBuilder {
     /// for mounting a self-contained API version or third-party router.
     ///
     /// The nested router shares the same [`AppState`] and Autumn's global
-    /// middleware applies to its routes.
+    /// middleware applies to its routes. When `.idempotent()` is enabled,
+    /// retries that hit an existing raw-route idempotency record fail closed
+    /// instead of rerunning the raw handler or replaying around opaque
+    /// route-local checks. Install idempotency and replay-stop layers inside
+    /// the raw router when successful replay is required.
     ///
     /// Can be called multiple times with different prefixes.
     ///
@@ -856,6 +1086,17 @@ impl AppBuilder {
         self
     }
 
+    /// Register a synchronous initializer that mutates [`AppState`] after
+    /// framework-managed extensions are installed and before job workers start.
+    #[must_use]
+    pub fn state_initializer<F>(mut self, initializer: F) -> Self
+    where
+        F: FnOnce(&AppState) + Send + 'static,
+    {
+        self.state_initializers.push(Box::new(initializer));
+        self
+    }
+
     /// Register an async shutdown hook that runs during graceful shutdown.
     ///
     /// Hooks execute in reverse registration order so later-added runtimes
@@ -867,6 +1108,38 @@ impl AppBuilder {
         Fut: Future<Output = ()> + Send + 'static,
     {
         self.shutdown_hooks.push(Box::new(move || Box::pin(hook())));
+        self
+    }
+
+    /// Register a single API version. If a version with the same name already exists, it is updated.
+    #[must_use]
+    pub fn api_version(mut self, version: ApiVersion) -> Self {
+        if let Some(pos) = self
+            .api_versions
+            .iter()
+            .position(|v| v.version == version.version)
+        {
+            self.api_versions[pos] = version;
+        } else {
+            self.api_versions.push(version);
+        }
+        self
+    }
+
+    /// Register multiple API versions, replacing duplicates.
+    #[must_use]
+    pub fn api_versions(mut self, versions: impl IntoIterator<Item = ApiVersion>) -> Self {
+        for version in versions {
+            if let Some(pos) = self
+                .api_versions
+                .iter()
+                .position(|v| v.version == version.version)
+            {
+                self.api_versions[pos] = version;
+            } else {
+                self.api_versions.push(version);
+            }
+        }
         self
     }
 
@@ -916,6 +1189,55 @@ impl AppBuilder {
         T: Any + Send + 'static,
     {
         self.extensions.get(&TypeId::of::<T>())?.downcast_ref::<T>()
+    }
+
+    #[cfg(feature = "mail")]
+    #[must_use]
+    pub fn with_mail_interceptor(
+        mut self,
+        interceptor: impl crate::interceptor::MailInterceptor,
+    ) -> Self {
+        self.mail_interceptor = Some(Arc::new(interceptor));
+        self
+    }
+
+    #[must_use]
+    pub fn with_job_interceptor(
+        mut self,
+        interceptor: impl crate::interceptor::JobInterceptor,
+    ) -> Self {
+        self.job_interceptor = Some(Arc::new(interceptor));
+        self
+    }
+
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn with_db_interceptor(
+        mut self,
+        interceptor: impl crate::interceptor::DbConnectionInterceptor,
+    ) -> Self {
+        self.db_interceptor = Some(Arc::new(interceptor));
+        self
+    }
+
+    #[cfg(feature = "ws")]
+    #[must_use]
+    pub fn with_channels_interceptor(
+        mut self,
+        interceptor: impl crate::interceptor::ChannelsInterceptor,
+    ) -> Self {
+        self.channels_interceptor = Some(Arc::new(interceptor));
+        self
+    }
+
+    #[cfg(feature = "oauth2")]
+    #[must_use]
+    pub fn with_http_interceptor(
+        mut self,
+        interceptor: impl crate::interceptor::HttpInterceptor,
+    ) -> Self {
+        self.http_interceptor = Some(Arc::new(interceptor));
+        self
     }
 
     /// Register a pre-loaded i18n translation bundle.
@@ -1168,6 +1490,223 @@ impl AppBuilder {
         self
     }
 
+    /// Register an [`ErrorReporter`](crate::reporting::ErrorReporter) for
+    /// unhandled panics and 5xx responses.
+    ///
+    /// Reporters receive a structured
+    /// [`ErrorEvent`](crate::reporting::ErrorEvent) for every caught handler
+    /// panic and every server-error response, carrying request context (route,
+    /// method, request id, status) and — for panics — the panic payload and a
+    /// backtrace (when `RUST_BACKTRACE` is set). Call this multiple times to
+    /// chain reporters; each receives every event. When none are registered,
+    /// the built-in [`LogReporter`](crate::reporting::LogReporter) is used.
+    ///
+    /// Mirrors [`with_blob_store`](Self::with_blob_store) /
+    /// [`with_cache_backend`](Self::with_cache_backend).
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use autumn_web::reporting::{ErrorEvent, ErrorReporter, ReportFuture};
+    ///
+    /// struct MyReporter;
+    /// impl ErrorReporter for MyReporter {
+    ///     fn report<'a>(&'a self, event: &'a ErrorEvent) -> ReportFuture<'a> {
+    ///         Box::pin(async move { eprintln!("error: {} {}", event.status, event.message); })
+    ///     }
+    /// }
+    ///
+    /// # #[autumn_web::main]
+    /// # async fn main() {
+    /// autumn_web::app()
+    ///     .with_error_reporter(MyReporter)
+    /// #   .routes(vec![])
+    /// #   ;
+    /// # }
+    /// ```
+    #[cfg(feature = "reporting")]
+    #[must_use]
+    pub fn with_error_reporter<R: crate::reporting::ErrorReporter>(mut self, reporter: R) -> Self {
+        self.error_reporters
+            .push(Arc::new(reporter) as Arc<dyn crate::reporting::ErrorReporter>);
+        self
+    }
+
+    /// Register a [`FlagStore`](crate::feature_flags::FlagStore) backend for
+    /// feature-flag evaluation.
+    ///
+    /// After registration, the [`Flags`](crate::feature_flags::Flags) extractor
+    /// and `#[feature_flag]` macro are available in route handlers. Without a
+    /// registered store, both return `500 Internal Server Error`.
+    ///
+    /// For tests use [`InMemoryFlagStore`](crate::feature_flags::InMemoryFlagStore);
+    /// in production use the Postgres-backed
+    /// `autumn_web::feature_flags::pg::PgFlagStore`.
+    ///
+    /// # Sharing the store with the poll listener
+    ///
+    /// When using `PgFlagStore` in a multi-replica deployment, pass an `Arc`
+    /// clone so the app service and the poll listener share the **same** cache:
+    ///
+    /// ```rust,ignore
+    /// use std::sync::Arc;
+    /// use std::time::Duration;
+    /// use autumn_web::feature_flags::pg::PgFlagStore;
+    ///
+    /// let store = Arc::new(PgFlagStore::new(&config.database.primary_url));
+    /// PgFlagStore::spawn_poll_listener(Arc::clone(&store), Duration::from_secs(1));
+    /// autumn_web::app()
+    ///     .with_flag_store(Arc::clone(&store))
+    ///     .run()
+    ///     .await;
+    /// ```
+    ///
+    /// `Arc<PgFlagStore>` implements `FlagStore`, so the same `Arc` is
+    /// accepted directly without creating a separate cache instance.
+    ///
+    /// # Basic example
+    ///
+    /// ```rust,ignore
+    /// use autumn_web::feature_flags::InMemoryFlagStore;
+    /// use std::sync::Arc;
+    ///
+    /// autumn_web::app()
+    ///     .with_flag_store(InMemoryFlagStore::new())
+    ///     .run()
+    ///     .await;
+    /// ```
+    #[must_use]
+    pub fn with_flag_store<S>(self, store: S) -> Self
+    where
+        S: crate::feature_flags::FlagStore,
+    {
+        let service = crate::feature_flags::FeatureFlagService::new(Arc::new(store) as Arc<_>);
+        self.state_initializer(move |state| {
+            state.insert_extension(service);
+        })
+    }
+
+    /// Register a feature-flag store with a group-membership resolver.
+    ///
+    /// The resolver is called during flag evaluation to check whether an actor
+    /// belongs to a named group listed in a flag's `group_allowlist`. Without
+    /// registering a resolver, group gates are silently ignored.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use autumn_web::feature_flags::{InMemoryFlagStore, GroupResolver};
+    /// use std::sync::Arc;
+    ///
+    /// let resolver: GroupResolver = Arc::new(|actor_id, group| {
+    ///     group == "staff" && actor_id.starts_with("staff:")
+    /// });
+    ///
+    /// autumn_web::app()
+    ///     .with_flag_store_and_resolver(InMemoryFlagStore::new(), resolver)
+    ///     .run()
+    ///     .await;
+    /// ```
+    #[must_use]
+    pub fn with_flag_store_and_resolver<S>(
+        self,
+        store: S,
+        resolver: crate::feature_flags::GroupResolver,
+    ) -> Self
+    where
+        S: crate::feature_flags::FlagStore,
+    {
+        let service = crate::feature_flags::FeatureFlagService::new(Arc::new(store) as Arc<_>)
+            .with_group_resolver(resolver);
+        self.state_initializer(move |state| {
+            state.insert_extension(service);
+        })
+    }
+
+    /// Register an experiment store, enabling the [`Experiments`] extractor.
+    ///
+    /// Wrap any [`ExperimentStore`] implementation. Use [`InMemoryExperimentStore`]
+    /// for development and tests; use
+    /// [`pg::PgExperimentStore`](crate::experiments::pg::PgExperimentStore)
+    /// for production against the `autumn_experiments` tables.
+    ///
+    /// # Production example (Postgres-backed)
+    ///
+    /// ```rust,ignore
+    /// use std::sync::Arc;
+    /// use std::time::Duration;
+    /// use autumn_web::experiments::pg::PgExperimentStore;
+    ///
+    /// let store = Arc::new(PgExperimentStore::new(&config.database.primary_url));
+    /// PgExperimentStore::spawn_poll_listener(Arc::clone(&store), Duration::from_secs(5));
+    /// autumn_web::app()
+    ///     .with_experiment_store(Arc::clone(&store))
+    ///     .run()
+    ///     .await;
+    /// ```
+    ///
+    /// # Development / test example
+    ///
+    /// ```rust,ignore
+    /// use autumn_web::experiments::InMemoryExperimentStore;
+    ///
+    /// autumn_web::app()
+    ///     .with_experiment_store(InMemoryExperimentStore::new())
+    ///     .run()
+    ///     .await;
+    /// ```
+    ///
+    /// [`Experiments`]: crate::experiments::Experiments
+    /// [`ExperimentStore`]: crate::experiments::ExperimentStore
+    /// [`InMemoryExperimentStore`]: crate::experiments::InMemoryExperimentStore
+    #[must_use]
+    pub fn with_experiment_store<S>(self, store: S) -> Self
+    where
+        S: crate::experiments::ExperimentStore,
+    {
+        let service = crate::experiments::ExperimentService::new(Arc::new(store) as Arc<_>);
+        self.state_initializer(move |state| {
+            state.insert_extension(service);
+        })
+    }
+
+    /// Register an experiment store with a custom [`ExposureSink`].
+    ///
+    /// Use when you want to forward exposure events to an analytics pipeline
+    /// rather than the default `tracing` log.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use autumn_web::experiments::{InMemoryExperimentStore, NoOpExposureSink};
+    /// use std::sync::Arc;
+    ///
+    /// autumn_web::app()
+    ///     .with_experiment_store_and_sink(
+    ///         InMemoryExperimentStore::new(),
+    ///         Arc::new(NoOpExposureSink),
+    ///     )
+    ///     .run()
+    ///     .await;
+    /// ```
+    ///
+    /// [`ExposureSink`]: crate::experiments::ExposureSink
+    #[must_use]
+    pub fn with_experiment_store_and_sink<S>(
+        self,
+        store: S,
+        sink: Arc<dyn crate::experiments::ExposureSink>,
+    ) -> Self
+    where
+        S: crate::experiments::ExperimentStore,
+    {
+        let service = crate::experiments::ExperimentService::new(Arc::new(store) as Arc<_>)
+            .with_exposure_sink(sink);
+        self.state_initializer(move |state| {
+            state.insert_extension(service);
+        })
+    }
+
     /// Register a durable [`MailDeliveryQueue`](crate::mail::MailDeliveryQueue) for
     /// [`Mailer::deliver_later`](crate::mail::Mailer::deliver_later).
     ///
@@ -1343,6 +1882,116 @@ impl AppBuilder {
         self.registered_plugins.contains(name)
     }
 
+    /// Register a named [`MetricsSource`](crate::actuator::MetricsSource) that contributes
+    /// metric families to `/actuator/prometheus` and `/actuator/metrics`.
+    ///
+    /// The `name` is a stable identifier used for:
+    /// - Duplicate-registration detection (same behaviour as duplicate plugins: a
+    ///   `tracing::warn!` is emitted and the second registration is skipped).
+    /// - The `source` label in the `autumn_metrics_source_errors_total` counter
+    ///   that increments when a source panics during a scrape.
+    ///
+    /// `Plugin::build` implementations can call this to wire a source with no
+    /// extra application-level glue code.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use autumn_web::actuator::{MetricsSource, MetricFamily, MetricKind, MetricSample};
+    /// use autumn_web::app::AppBuilder;
+    /// use std::sync::Arc;
+    ///
+    /// struct QueueMetrics;
+    ///
+    /// impl MetricsSource for QueueMetrics {
+    ///     fn collect(&self) -> Vec<MetricFamily> {
+    ///         vec![MetricFamily {
+    ///             name: "myapp_queue_depth".to_string(),
+    ///             help: "Current queue depth".to_string(),
+    ///             kind: MetricKind::Gauge,
+    ///             samples: vec![MetricSample { labels: vec![], value: 42.0 }],
+    ///         }]
+    ///     }
+    /// }
+    ///
+    /// autumn_web::app()
+    ///     .metrics_source("myapp_queue", Arc::new(QueueMetrics));
+    /// ```
+    #[must_use]
+    pub fn metrics_source(
+        mut self,
+        name: impl Into<String>,
+        source: Arc<dyn crate::actuator::MetricsSource>,
+    ) -> Self {
+        let name = name.into();
+        if self.metrics_sources.iter().any(|(n, _)| n == &name) {
+            tracing::warn!(
+                source_name = %name,
+                "MetricsSource '{}' is already registered; skipping duplicate",
+                name
+            );
+            return self;
+        }
+        self.metrics_sources.push((name, source));
+        self
+    }
+
+    /// Register a custom [`HealthIndicator`](crate::actuator::HealthIndicator) with the application.
+    ///
+    /// The indicator's [`check`](crate::actuator::HealthIndicator::check) method is called on every
+    /// `/actuator/health` request (and on `/ready` for `Readiness`-group indicators).
+    ///
+    /// Duplicate registration names are silently ignored (a warning is logged).
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use std::sync::Arc;
+    /// use autumn_web::actuator::{HealthCheckOutput, HealthIndicator};
+    ///
+    /// struct StripeIndicator;
+    /// impl HealthIndicator for StripeIndicator {
+    ///     fn check(&self) -> futures::future::BoxFuture<'_, HealthCheckOutput> {
+    ///         Box::pin(async move { HealthCheckOutput::up() })
+    ///     }
+    /// }
+    ///
+    /// autumn_web::app()
+    ///     .health_indicator("stripe", Arc::new(StripeIndicator));
+    /// ```
+    #[must_use]
+    pub fn health_indicator(
+        mut self,
+        name: impl Into<String>,
+        indicator: Arc<dyn crate::actuator::HealthIndicator>,
+    ) -> Self {
+        let name = name.into();
+        // "db" is a reserved built-in component name. Allowing a custom indicator
+        // under this name would produce an inconsistent response: the custom result
+        // would still gate the aggregate status while the built-in pool check owns
+        // the components.db / checks.database display.
+        #[cfg(feature = "db")]
+        if name == "db" {
+            tracing::warn!(
+                indicator_name = %name,
+                "\"db\" is a reserved built-in health indicator name; registration skipped. \
+                 Use a different name for your custom indicator."
+            );
+            return self;
+        }
+        if self.health_indicators.iter().any(|(n, _, _)| n == &name) {
+            tracing::warn!(
+                indicator_name = %name,
+                "HealthIndicator '{}' is already registered; skipping duplicate",
+                name
+            );
+            return self;
+        }
+        let group = indicator.group();
+        self.health_indicators.push((name, group, indicator));
+        self
+    }
+
     /// Register embedded Diesel migrations with the application.
     ///
     /// When migrations are registered:
@@ -1427,6 +2076,7 @@ impl AppBuilder {
 
         let Self {
             routes,
+            api_versions,
             route_sources: _,
             current_plugin: _,
             tasks,
@@ -1439,6 +2089,7 @@ impl AppBuilder {
             nest_routers,
             custom_layers,
             startup_hooks,
+            state_initializers,
             shutdown_hooks,
             extensions: _,
             registered_plugins: _,
@@ -1455,8 +2106,12 @@ impl AppBuilder {
             #[cfg(feature = "storage")]
             blob_store,
             cache_backend,
+            #[cfg(feature = "reporting")]
+            error_reporters,
             #[cfg(feature = "openapi")]
             openapi,
+            #[cfg(feature = "mcp")]
+            mcp,
             audit_logger,
             #[cfg(feature = "i18n")]
             i18n_bundle,
@@ -1468,13 +2123,40 @@ impl AppBuilder {
             #[cfg(feature = "mail")]
             mail_previews,
             declared_routes: _,
+            idempotency_enabled,
+            #[cfg(feature = "mail")]
+            mail_interceptor,
+            job_interceptor,
+            #[cfg(feature = "db")]
+            db_interceptor,
+            #[cfg(feature = "ws")]
+            channels_interceptor,
+            #[cfg(feature = "oauth2")]
+            http_interceptor,
+            metrics_sources,
+            health_indicators,
         } = self;
 
         let all_routes = routes;
 
         // 1 & 2. Load configuration and initialize logging/telemetry
-        let (config, _telemetry_guard) =
+        let (mut config, _telemetry_guard) =
             load_config_and_telemetry(config_loader_factory, telemetry_provider).await;
+
+        // Apply builder-level flag: `.idempotent()` enables the middleware when
+        // neither `autumn.toml` nor the environment explicitly disable it.
+        // The env var `AUTUMN_IDEMPOTENCY__ENABLED` is re-checked here so
+        // operators can disable idempotency at runtime (e.g. during a Redis
+        // incident) without code changes, even when `.idempotent()` is called.
+        if idempotency_enabled {
+            let env_disabled = std::env::var("AUTUMN_IDEMPOTENCY__ENABLED")
+                .is_ok_and(|v| matches!(v.to_lowercase().as_str(), "false" | "0" | "no" | "off"));
+            // Only apply the builder default when neither the env var nor the
+            // loaded config file explicitly sets enabled = false.
+            if !env_disabled && config.idempotency.enabled != Some(false) {
+                config.idempotency.enabled = Some(true);
+            }
+        }
 
         #[cfg(feature = "i18n")]
         let i18n_bundle =
@@ -1508,11 +2190,16 @@ impl AppBuilder {
         // 4d. Validate signing secret — production must have a stable, private,
         // entropy-meeting secret before the server binds. Dev/test are exempt.
         fail_fast_on_invalid_signing_secret(&config);
+        fail_fast_on_missing_encryption_keys(&config);
+        fail_fast_on_invalid_trusted_hosts(&config);
 
         // 4e. Signed webhook configs must resolve to usable key material
         // before the app binds. Missing secrets should fail before a real
         // provider retry loop starts hammering a broken endpoint.
         fail_fast_on_invalid_webhook_config(&config);
+
+        // 4f. Idempotency backend must be production-ready when enabled.
+        fail_fast_on_invalid_idempotency_config(&config);
 
         // 4f. Provision the configured BlobStore *before* `setup_database`.
         // `LocalBlobStore::new` does real IO (creates + canonicalizes the
@@ -1535,12 +2222,17 @@ impl AppBuilder {
 
         // 5. Create database pool and run migrations (if configured)
         #[cfg(feature = "db")]
-        let database = setup_database(&config, migrations, pool_provider_factory)
-            .await
-            .unwrap_or_else(|e| {
-                tracing::error!("{e}");
-                std::process::exit(1);
-            });
+        let database = setup_database(
+            &config,
+            migrations,
+            pool_provider_factory,
+            RepositoryCommitHookQueueMigrationMode::Runtime,
+        )
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!("{e}");
+            std::process::exit(1);
+        });
         #[cfg(feature = "db")]
         let pool = database.topology;
         #[cfg(feature = "db")]
@@ -1577,6 +2269,95 @@ impl AppBuilder {
             #[cfg(feature = "ws")]
             channels_backend,
         );
+
+        // Instantiate MaintenanceState, load flag synchronously at startup, insert as extension, and start background poller task
+        let maintenance_state = crate::maintenance::MaintenanceState::new();
+        let flag_path = std::path::Path::new(crate::maintenance::MAINTENANCE_FLAG_FILE);
+        if let Ok(Some(cfg)) = crate::maintenance::MaintenanceState::load_from_file(flag_path) {
+            maintenance_state.enable(cfg);
+        }
+        state.insert_extension(maintenance_state.clone());
+
+        let poller_state = maintenance_state.clone();
+        tokio::spawn(async move {
+            let path = std::path::Path::new(crate::maintenance::MAINTENANCE_FLAG_FILE);
+            let interval = std::time::Duration::from_millis(500);
+            loop {
+                let load_res = tokio::task::spawn_blocking(move || {
+                    crate::maintenance::MaintenanceState::load_from_file(path)
+                })
+                .await;
+
+                match load_res {
+                    Ok(Ok(Some(cfg))) => {
+                        if poller_state.get() != Some(cfg.clone()) {
+                            poller_state.enable(cfg);
+                        }
+                    }
+                    Ok(Ok(None)) => {
+                        if poller_state.is_active() {
+                            poller_state.disable();
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        tracing::error!(error = %e, "failed to load maintenance flag file");
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "maintenance poller task panicked");
+                    }
+                }
+                tokio::time::sleep(interval).await;
+            }
+        });
+        #[cfg(feature = "mail")]
+        if let Some(interceptor) = mail_interceptor {
+            state.insert_extension(interceptor);
+        }
+        if let Some(interceptor) = job_interceptor {
+            state.insert_extension(interceptor);
+        }
+        #[cfg(feature = "db")]
+        if let Some(interceptor) = db_interceptor {
+            state.insert_extension(interceptor);
+        }
+        #[cfg(feature = "ws")]
+        if let Some(interceptor) = channels_interceptor {
+            state.insert_extension(interceptor.clone());
+            state.channels = crate::channels::Channels::with_shared_backend(std::sync::Arc::new(
+                crate::channels::InterceptedChannelsBackend::new(
+                    state.channels.backend().clone(),
+                    vec![interceptor],
+                ),
+            ));
+            #[cfg(feature = "presence")]
+            {
+                state.presence = crate::presence::Presence::new(state.channels.clone());
+            }
+        }
+        #[cfg(feature = "oauth2")]
+        if let Some(interceptor) = http_interceptor {
+            state.insert_extension(interceptor);
+        }
+
+        // Populate the metrics source registry from builder registrations.
+        // Duplicate names were already rejected in `metrics_source()`, so
+        // all entries here are unique.
+        for (name, source) in metrics_sources {
+            if let Err(e) = state.metrics_source_registry.register(name, source) {
+                tracing::warn!("{e}");
+            }
+        }
+
+        // Populate the health indicator registry from builder registrations.
+        for (name, group, indicator) in health_indicators {
+            if let Err(e) = state
+                .health_indicator_registry
+                .register(name, group, indicator)
+            {
+                tracing::warn!("{e}");
+            }
+        }
+
         #[cfg(feature = "db")]
         configure_replica_migration_check(&state, replica_migration_check);
         #[cfg(feature = "db")]
@@ -1586,6 +2367,15 @@ impl AppBuilder {
             state.shared_cache = Some(cache);
         } else {
             crate::cache::clear_global_cache();
+        }
+        state.insert_extension(RegisteredApiVersions(api_versions));
+
+        // Install registered error reporters so the reporting layer (wired in
+        // `apply_middleware`) can deliver panic + 5xx events. Empty is fine —
+        // the layer falls back to the built-in `LogReporter`.
+        #[cfg(feature = "reporting")]
+        if !error_reporters.is_empty() {
+            state.insert_extension(crate::reporting::RegisteredReporters(error_reporters));
         }
         // Apply deferred policy / scope registrations onto the live
         // app state. Done before the router is built so any panic
@@ -1625,6 +2415,7 @@ impl AppBuilder {
         #[cfg(feature = "storage")]
         let storage_router = storage_bootstrap.and_then(|b| b.install(&state));
         install_webhook_registry(&state, &config);
+        run_state_initializers(state_initializers, &state);
 
         let env = crate::config::OsEnv;
         let dist_dir = project_dir("dist", &env);
@@ -1660,6 +2451,8 @@ impl AppBuilder {
                 } else {
                     None
                 },
+                #[cfg(feature = "mcp")]
+                mcp,
             },
         )
         .unwrap_or_else(|error| {
@@ -1679,6 +2472,7 @@ impl AppBuilder {
             });
 
         let shutdown_timeout = config.server.shutdown_timeout_secs;
+        let prestop_grace = config.server.prestop_grace_secs;
         let server_shutdown = tokio_util::sync::CancellationToken::new();
 
         if let Err(error) = initialize_job_runtime(jobs, &state, &server_shutdown, &config.jobs) {
@@ -1686,47 +2480,178 @@ impl AppBuilder {
             std::process::exit(1);
         }
 
+        #[cfg(feature = "db")]
+        if let Some(pool) = state.pool().cloned() {
+            crate::repository_commit_hooks::start_repository_commit_hook_worker(
+                pool,
+                server_shutdown.child_token(),
+            );
+        }
+
+        #[cfg(feature = "presence")]
+        {
+            let presence = state.presence().clone();
+            let sweep_shutdown = server_shutdown.child_token();
+            tokio::spawn(async move {
+                let interval = std::time::Duration::from_secs(15);
+                loop {
+                    tokio::select! {
+                        () = tokio::time::sleep(interval) => {
+                            presence.sweep_expired();
+                        }
+                        () = sweep_shutdown.cancelled() => break,
+                    }
+                }
+            });
+        }
+
         tracing::info!(addr = %addr, "Listening");
 
         let server_shutdown_wait = server_shutdown.clone();
+        // Wrap the built router with the HTML form method-override layer at
+        // the very edge — outside path and method routing — so a plain
+        // browser `<form method="post">` carrying `_method=PUT|PATCH|DELETE`
+        // can reach the declared PUT/PATCH/DELETE handler. `Router::layer`
+        // applies middleware per registered method handler in axum 0.8,
+        // which is too late: the inner `MethodRouter` returns `405` before
+        // a layered service ever runs. Wrapping the whole router as a
+        // tower::Service is the documented way to run middleware before
+        // route matching.
+        // TrustedProxiesLayer must be outermost (stamped before MethodOverrideLayer
+        // reads ResolvedClientIdentity for its same-origin form check).
+        let after_method = tower::Layer::layer(
+            &crate::middleware::MethodOverrideLayer::new()
+                .with_max_scan_bytes(config.security.upload.max_request_size_bytes),
+            router,
+        );
+        let service = tower::Layer::layer(
+            &crate::security::TrustedProxiesLayer::from_config(&config.security.trusted_proxies),
+            after_method,
+        );
+        let make_service =
+            axum::ServiceExt::<axum::extract::Request>::into_make_service_with_connect_info::<
+                std::net::SocketAddr,
+            >(service);
         let server_task = tokio::spawn(async move {
-            axum::serve(
-                listener,
-                router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-            )
-            .with_graceful_shutdown(async move {
-                server_shutdown_wait.cancelled().await;
-            })
-            .await
+            axum::serve(listener, make_service)
+                .with_graceful_shutdown(async move {
+                    server_shutdown_wait.cancelled().await;
+                })
+                .await
         });
 
         let shutdown_state = state.clone();
         let shutdown_signal_token = server_shutdown.clone();
         #[cfg(feature = "ws")]
         let websocket_shutdown = state.shutdown.clone();
+        // Clone metrics so the drain-watchdog can record aborted requests.
+        let shutdown_metrics = state.metrics.clone();
 
+        // Shared timestamp: set by shutdown_task when the listener is cancelled
+        // (phase 5). Main reads it after server_task completes to measure only
+        // actual drain time for hook budget — not the app's full uptime.
+        let drain_started_at: std::sync::Arc<std::sync::OnceLock<std::time::Instant>> =
+            std::sync::Arc::new(std::sync::OnceLock::new());
+        let drain_started_clone = std::sync::Arc::clone(&drain_started_at);
+
+        // Notified by main just before server_task.await (after startup hooks
+        // complete). If SIGTERM arrives during startup hooks the watchdog waits
+        // here so the drain deadline is always measured from when drain starts.
+        let drain_phase_notify = std::sync::Arc::new(tokio::sync::Notify::new());
+        let drain_phase_notify_for_watchdog = std::sync::Arc::clone(&drain_phase_notify);
+        // Boolean companion so the watchdog can skip the wait when SIGTERM arrives
+        // after startup has already finished (the common case).
+        let server_entered_drain = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server_entered_drain_for_watchdog = std::sync::Arc::clone(&server_entered_drain);
+
+        // Shutdown task: handles the rolling-deploy lifecycle phases.
+        //
+        // Phases:
+        //   1. SIGTERM / Ctrl-C received
+        //   2. /ready → 503  (probe flips before listener closes)
+        //   3. prestop_grace elapses  (load-balancer deregistration window)
+        //   4. WebSocket sessions receive close frame
+        //   5. TCP listener stops accepting new connections; jobs/scheduler
+        //      stop dequeuing (they share server_shutdown CancellationToken)
+        //   6. In-flight requests drain within shutdown_timeout_secs; if the
+        //      deadline is exceeded the watchdog exits with code 1 and
+        //      records autumn_shutdown_aborted_requests_total.
+        //
+        // Phases 7-9 (on_shutdown hooks, telemetry flush, DB pool close) run
+        // in main after server_task completes — within the remaining portion
+        // of the same shutdown_timeout_secs budget, not an additional window.
         let shutdown_task = tokio::spawn(async move {
+            // Phase 1: Wait for OS signal.
             shutdown_signal().await;
-            shutdown_state.begin_shutdown();
+            tracing::info!(
+                phase = "signal_received",
+                prestop_grace_secs = prestop_grace,
+                shutdown_timeout_secs = shutdown_timeout,
+                "shutdown: graceful shutdown initiated"
+            );
 
+            // Phase 2: flip /ready → 503 strictly before the listener closes.
+            shutdown_state.begin_shutdown();
+            tracing::info!(phase = "ready_draining", "shutdown: /ready now 503");
+
+            // Phase 3: prestop grace — wait for load balancers to deregister.
+            if prestop_grace > 0 {
+                tokio::time::sleep(std::time::Duration::from_secs(prestop_grace)).await;
+            }
+            tracing::info!(phase = "listener_stopping", "shutdown: stopping listener");
+
+            // Phase 4: send WebSocket close frames.
             #[cfg(feature = "ws")]
             websocket_shutdown.cancel();
 
-            if shutdown_timeout > 5 {
-                tokio::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_secs(
-                        shutdown_timeout.saturating_sub(5),
-                    ))
-                    .await;
-                    tracing::warn!(
-                        timeout_secs = shutdown_timeout,
-                        "Shutdown draining near timeout, force-kill may be imminent"
-                    );
-                });
-            }
-
-            run_shutdown_hooks(&shutdown_hooks).await;
+            // Phase 5: stop listener and signal jobs/scheduler to stop dequeuing.
+            // Record drain-start before cancelling so main gets the right hook
+            // budget even in the startup-overlap case.
+            let _ = drain_started_clone.set(std::time::Instant::now());
             shutdown_signal_token.cancel();
+
+            // Phase 6: drain watchdog — if in-flight drain exceeds the budget,
+            // record aborted count and force non-zero exit before hooks run.
+            //
+            // Always measure the deadline from when drain actually starts so that
+            // in-flight requests always get the full shutdown_timeout_secs window:
+            //
+            //   Normal (SIGTERM after startup): server_entered_drain is already
+            //   true, skip the wait, sleep the full budget.
+            //
+            //   Startup-overlap (SIGTERM during hooks): wait for notify, then
+            //   sleep the full budget. Without this, hooks completing just before
+            //   the watchdog fires would let it exit(1) immediately with no fresh
+            //   drain window for requests that arrived after hooks completed.
+            if !server_entered_drain_for_watchdog.load(std::sync::atomic::Ordering::Acquire) {
+                tracing::warn!(
+                    phase = "signal_during_startup",
+                    "shutdown: SIGTERM during startup hooks; waiting for drain phase \
+                     to begin before enforcing the drain deadline"
+                );
+                // Suspend until main fires notify_one() at drain start.
+                // Orchestrator hard-kill backstop: if hooks never complete, the
+                // orchestrator's kill_timeout / terminationGracePeriodSeconds kills us.
+                drain_phase_notify_for_watchdog.notified().await;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(shutdown_timeout)).await;
+            // Guard against the boundary race where server_task completes at
+            // exactly the deadline before main has called shutdown_task.abort().
+            // Zero active requests means drain completed cleanly; return and let
+            // main complete the cleanup path.
+            if shutdown_metrics.snapshot().http.requests_active == 0 {
+                return;
+            }
+            let aborted = shutdown_metrics.snapshot().http.requests_active;
+            shutdown_metrics.record_shutdown_aborted(aborted);
+            tracing::error!(
+                phase = "in_flight_drain",
+                timeout_secs = shutdown_timeout,
+                autumn_shutdown_aborted_requests_total = aborted,
+                exit_code = 1,
+                "shutdown: in_flight_drain phase exceeded deadline; terminating"
+            );
+            std::process::exit(1);
         });
 
         if let Err(error) = run_startup_hooks(&startup_hooks, state.clone()).await {
@@ -1753,17 +2678,38 @@ impl AppBuilder {
             state.probes().mark_startup_complete();
         }
 
+        // Signal the drain phase. The watchdog checks the flag for the common
+        // case (SIGTERM arrives after startup) and waits on the notify for the
+        // rare case (SIGTERM arrived during startup hooks). Both must be set so
+        // the watchdog never re-enforces the deadline before drain actually starts.
+        server_entered_drain.store(true, std::sync::atomic::Ordering::Release);
+        drain_phase_notify.notify_one();
+
+        // Wait for the server to drain all in-flight requests.  The drain
+        // watchdog in shutdown_task will force-exit if drain takes too long.
         let server_result = server_task.await.unwrap_or_else(|e| {
             tracing::error!("Server task join error: {e}");
             std::process::exit(1);
         });
+        // Drain completed within the deadline; abort the watchdog.
         shutdown_task.abort();
         server_result.unwrap_or_else(|e| {
             tracing::error!("Server error: {e}");
             std::process::exit(1);
         });
 
-        tracing::info!("Server shut down cleanly");
+        // Phase 7: run on_shutdown hooks within the *remaining* portion of
+        // shutdown_timeout_secs (drain + hooks share one budget, not two).
+        // Plugin ordering: plugins register during build() before app hooks,
+        // so app hooks run before plugin hooks (LIFO = last-registered first).
+        let drain_elapsed = drain_started_at
+            .get()
+            .map_or(std::time::Duration::ZERO, std::time::Instant::elapsed);
+        let hook_budget =
+            std::time::Duration::from_secs(shutdown_timeout).saturating_sub(drain_elapsed);
+        run_shutdown_hooks_with_timeout(&shutdown_hooks, hook_budget, hook_budget).await;
+
+        tracing::info!(exit_code = 0, "shutdown: all phases completed cleanly");
     }
 
     /// Render all registered static routes to `dist/` and exit.
@@ -1775,6 +2721,7 @@ impl AppBuilder {
     async fn run_build_mode(self) {
         let Self {
             routes,
+            api_versions,
             route_sources: _,
             current_plugin: _,
             tasks: _,
@@ -1782,14 +2729,12 @@ impl AppBuilder {
             jobs: _,
             static_metas,
             exception_filters: _,
-            #[cfg(feature = "openapi")]
             scoped_groups,
-            #[cfg(not(feature = "openapi"))]
-                scoped_groups: _,
             merge_routers: _,
             nest_routers: _,
             custom_layers,
             startup_hooks: _,
+            state_initializers,
             shutdown_hooks: _,
             extensions: _,
             registered_plugins: _,
@@ -1806,8 +2751,12 @@ impl AppBuilder {
             #[cfg(feature = "storage")]
             blob_store,
             cache_backend,
+            #[cfg(feature = "reporting")]
+            error_reporters,
             #[cfg(feature = "openapi")]
             openapi,
+            #[cfg(feature = "mcp")]
+                mcp: _,
             audit_logger: _,
             #[cfg(feature = "i18n")]
             i18n_bundle,
@@ -1819,13 +2768,37 @@ impl AppBuilder {
             #[cfg(feature = "mail")]
             mail_previews,
             declared_routes: _,
+            idempotency_enabled,
+            #[cfg(feature = "mail")]
+            mail_interceptor,
+            job_interceptor,
+            #[cfg(feature = "db")]
+            db_interceptor,
+            #[cfg(feature = "ws")]
+            channels_interceptor,
+            #[cfg(feature = "oauth2")]
+            http_interceptor,
+            metrics_sources,
+            health_indicators,
         } = self;
 
+        let _ = &api_versions;
+        let _ = &metrics_sources;
+        let _ = &health_indicators;
         let all_routes = routes;
 
         // Load config (same as normal startup)
-        let (config, _telemetry_guard) =
+        let (mut config, _telemetry_guard) =
             load_config_and_telemetry(config_loader_factory, telemetry_provider).await;
+        if idempotency_enabled {
+            let env_disabled = std::env::var("AUTUMN_IDEMPOTENCY__ENABLED")
+                .is_ok_and(|v| matches!(v.to_lowercase().as_str(), "false" | "0" | "no" | "off"));
+            // Only apply the builder default when neither the env var nor the
+            // loaded config file explicitly sets enabled = false.
+            if !env_disabled && config.idempotency.enabled != Some(false) {
+                config.idempotency.enabled = Some(true);
+            }
+        }
 
         #[cfg(feature = "i18n")]
         let i18n_bundle =
@@ -1836,8 +2809,15 @@ impl AppBuilder {
         // the emitted dist/openapi.json matches what the runtime spec serves.
         #[cfg(feature = "openapi")]
         let api_docs_snapshot: Vec<crate::openapi::ApiDoc> = {
-            let mut docs: Vec<crate::openapi::ApiDoc> =
-                all_routes.iter().map(|r| r.api_doc.clone()).collect();
+            let mut docs: Vec<crate::openapi::ApiDoc> = all_routes
+                .iter()
+                .map(|r| {
+                    let mut doc = r.api_doc.clone();
+                    doc.api_version = r.api_version;
+                    doc.sunset_opt_out = r.sunset_opt_out;
+                    doc
+                })
+                .collect();
             for group in &scoped_groups {
                 // Mirror the same normalization as the runtime OpenAPI builder:
                 // use join_nested_path for correct trailing-slash handling, and
@@ -1845,6 +2825,8 @@ impl AppBuilder {
                 let prefix_params = crate::router::extract_path_params(&group.prefix);
                 for route in &group.routes {
                     let mut doc = route.api_doc.clone();
+                    doc.api_version = route.api_version;
+                    doc.sunset_opt_out = route.sunset_opt_out;
                     let full = crate::router::join_nested_path(&group.prefix, route.api_doc.path);
                     doc.path = Box::leak(full.into_boxed_str());
                     if !prefix_params.is_empty() {
@@ -1872,6 +2854,8 @@ impl AppBuilder {
         // builds don't run migrations against a doomed boot either.
         fail_fast_on_invalid_session_config(&config, session_store.is_some());
         fail_fast_on_invalid_signing_secret(&config);
+        fail_fast_on_missing_encryption_keys(&config);
+        fail_fast_on_invalid_trusted_hosts(&config);
 
         // Preflight the configured BlobStore the same way `run()` does.
         // Static routes can read presigned URLs out of `BlobStoreState`
@@ -1892,12 +2876,17 @@ impl AppBuilder {
 
         // Build state (with DB if configured)
         #[cfg(feature = "db")]
-        let database = setup_database(&config, vec![], pool_provider_factory)
-            .await
-            .unwrap_or_else(|e| {
-                eprintln!("{e}");
-                std::process::exit(1);
-            });
+        let database = setup_database(
+            &config,
+            vec![],
+            pool_provider_factory,
+            RepositoryCommitHookQueueMigrationMode::StaticBuild,
+        )
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(1);
+        });
         #[cfg(feature = "db")]
         let pool = database.topology;
         #[cfg(feature = "db")]
@@ -1912,6 +2901,36 @@ impl AppBuilder {
             #[cfg(feature = "ws")]
             channels_backend,
         );
+        state.insert_extension(RegisteredApiVersions(api_versions.clone()));
+        #[cfg(feature = "mail")]
+        if let Some(interceptor) = mail_interceptor {
+            state.insert_extension(interceptor);
+        }
+        if let Some(interceptor) = job_interceptor {
+            state.insert_extension(interceptor);
+        }
+        #[cfg(feature = "db")]
+        if let Some(interceptor) = db_interceptor {
+            state.insert_extension(interceptor);
+        }
+        #[cfg(feature = "ws")]
+        if let Some(interceptor) = channels_interceptor {
+            state.insert_extension(interceptor.clone());
+            state.channels = crate::channels::Channels::with_shared_backend(std::sync::Arc::new(
+                crate::channels::InterceptedChannelsBackend::new(
+                    state.channels.backend().clone(),
+                    vec![interceptor],
+                ),
+            ));
+            #[cfg(feature = "presence")]
+            {
+                state.presence = crate::presence::Presence::new(state.channels.clone());
+            }
+        }
+        #[cfg(feature = "oauth2")]
+        if let Some(interceptor) = http_interceptor {
+            state.insert_extension(interceptor);
+        }
         #[cfg(feature = "db")]
         configure_replica_migration_check(&state, replica_migration_check);
         #[cfg(feature = "db")]
@@ -1921,6 +2940,10 @@ impl AppBuilder {
             state.shared_cache = Some(cache);
         } else {
             crate::cache::clear_global_cache();
+        }
+        #[cfg(feature = "reporting")]
+        if !error_reporters.is_empty() {
+            state.insert_extension(crate::reporting::RegisteredReporters(error_reporters));
         }
         // Static-site builds are short-lived and don't run the request loop,
         // so deliver_later is never invoked. install_mailer_with_factory skips
@@ -1965,6 +2988,8 @@ impl AppBuilder {
         // routes the server path serves.
         #[cfg(feature = "storage")]
         let storage_router = storage_bootstrap.and_then(|b| b.install(&state));
+        install_webhook_registry(&state, &config);
+        run_state_initializers(state_initializers, &state);
 
         // Build the full router (same as production). Use the inner builder
         // so the custom session store installed via with_session_store(...)
@@ -1985,7 +3010,7 @@ impl AppBuilder {
             state,
             crate::router::RouterContext {
                 exception_filters: Vec::new(),
-                scoped_groups: Vec::new(),
+                scoped_groups,
                 merge_routers,
                 nest_routers: Vec::new(),
                 custom_layers,
@@ -1993,6 +3018,8 @@ impl AppBuilder {
                 session_store,
                 #[cfg(feature = "openapi")]
                 openapi: None,
+                #[cfg(feature = "mcp")]
+                mcp: None,
             },
         )
         .unwrap_or_else(|error| {
@@ -2021,7 +3048,8 @@ impl AppBuilder {
         // When OpenAPI is configured, write the spec to dist/ so consumers
         // can retrieve a machine-readable API contract alongside the HTML.
         #[cfg(feature = "openapi")]
-        if let Some(openapi_config) = openapi {
+        if let Some(mut openapi_config) = openapi {
+            openapi_config.api_versions = api_versions;
             let openapi_config =
                 openapi_config.session_cookie_name(config.session.cookie_name.clone());
             let docs: Vec<&crate::openapi::ApiDoc> = api_docs_snapshot.iter().collect();
@@ -2048,6 +3076,7 @@ impl AppBuilder {
     async fn run_dump_routes_mode(self) {
         let Self {
             routes,
+            api_versions,
             route_sources,
             scoped_groups,
             merge_routers,
@@ -2059,6 +3088,38 @@ impl AppBuilder {
             openapi,
             ..
         } = self;
+
+        // Validate that all versioned routes use a registered API version
+        let registered_versions: std::collections::HashSet<&str> =
+            api_versions.iter().map(|av| av.version.as_str()).collect();
+
+        for route in &routes {
+            if let Some(ver) = route
+                .api_version
+                .filter(|ver| !registered_versions.contains(*ver))
+            {
+                eprintln!(
+                    "Failed to build router: route '{}' uses unregistered API version '{}'",
+                    route.name, ver
+                );
+                std::process::exit(1);
+            }
+        }
+
+        for group in &scoped_groups {
+            for route in &group.routes {
+                if let Some(ver) = route
+                    .api_version
+                    .filter(|ver| !registered_versions.contains(*ver))
+                {
+                    eprintln!(
+                        "Failed to build router: route '{}' uses unregistered API version '{}'",
+                        route.name, ver
+                    );
+                    std::process::exit(1);
+                }
+            }
+        }
 
         // Raw Axum routers registered via .merge()/.nest() are opaque: there is
         // no public API to enumerate their routes. Always warn so callers know
@@ -2074,8 +3135,18 @@ impl AppBuilder {
         let (config, _telemetry_guard) =
             load_config_and_telemetry(config_loader_factory, telemetry_provider).await;
 
-        let mut infos =
-            crate::route_listing::collect_route_infos(&routes, &route_sources, &scoped_groups);
+        let mut infos = match crate::route_listing::collect_route_infos(
+            &routes,
+            &route_sources,
+            &scoped_groups,
+            &api_versions,
+        ) {
+            Ok(infos) => infos,
+            Err(e) => {
+                eprintln!("Failed to build router: {e}");
+                std::process::exit(1);
+            }
+        };
         infos.extend(declared_routes);
         crate::route_listing::append_framework_routes(&mut infos, &config);
         #[cfg(feature = "openapi")]
@@ -2127,6 +3198,7 @@ impl AppBuilder {
             #[cfg(not(feature = "i18n"))]
                 custom_layers: _,
             startup_hooks,
+            state_initializers,
             shutdown_hooks,
             config_loader_factory,
             #[cfg(feature = "db")]
@@ -2148,6 +3220,15 @@ impl AppBuilder {
             cache_backend,
             #[cfg(feature = "mail")]
             mail_delivery_queue_factory,
+            #[cfg(feature = "mail")]
+            mail_interceptor,
+            job_interceptor,
+            #[cfg(feature = "db")]
+            db_interceptor,
+            #[cfg(feature = "ws")]
+            channels_interceptor,
+            #[cfg(feature = "oauth2")]
+            http_interceptor,
             ..
         } = self;
 
@@ -2180,6 +3261,8 @@ impl AppBuilder {
 
         fail_fast_on_invalid_session_config(&config, session_store.is_some());
         fail_fast_on_invalid_signing_secret(&config);
+        fail_fast_on_missing_encryption_keys(&config);
+        fail_fast_on_invalid_trusted_hosts(&config);
 
         #[cfg(feature = "storage")]
         let storage_bootstrap = blob_store.map_or_else(
@@ -2193,12 +3276,17 @@ impl AppBuilder {
         );
 
         #[cfg(feature = "db")]
-        let database = setup_database(&config, migrations, pool_provider_factory)
-            .await
-            .unwrap_or_else(|error| {
-                eprintln!("{error}");
-                std::process::exit(1);
-            });
+        let database = setup_database(
+            &config,
+            migrations,
+            pool_provider_factory,
+            RepositoryCommitHookQueueMigrationMode::Runtime,
+        )
+        .await
+        .unwrap_or_else(|error| {
+            eprintln!("{error}");
+            std::process::exit(1);
+        });
         #[cfg(feature = "db")]
         let pool = database.topology;
         #[cfg(feature = "db")]
@@ -2213,6 +3301,35 @@ impl AppBuilder {
             #[cfg(feature = "ws")]
             channels_backend,
         );
+        #[cfg(feature = "mail")]
+        if let Some(interceptor) = mail_interceptor {
+            state.insert_extension(interceptor);
+        }
+        if let Some(interceptor) = job_interceptor {
+            state.insert_extension(interceptor);
+        }
+        #[cfg(feature = "db")]
+        if let Some(interceptor) = db_interceptor {
+            state.insert_extension(interceptor);
+        }
+        #[cfg(feature = "ws")]
+        if let Some(interceptor) = channels_interceptor {
+            state.insert_extension(interceptor.clone());
+            state.channels = crate::channels::Channels::with_shared_backend(std::sync::Arc::new(
+                crate::channels::InterceptedChannelsBackend::new(
+                    state.channels.backend().clone(),
+                    vec![interceptor],
+                ),
+            ));
+            #[cfg(feature = "presence")]
+            {
+                state.presence = crate::presence::Presence::new(state.channels.clone());
+            }
+        }
+        #[cfg(feature = "oauth2")]
+        if let Some(interceptor) = http_interceptor {
+            state.insert_extension(interceptor);
+        }
         #[cfg(feature = "db")]
         configure_replica_migration_check(&state, replica_migration_check);
         #[cfg(feature = "db")]
@@ -2249,11 +3366,20 @@ impl AppBuilder {
 
         #[cfg(feature = "storage")]
         let _storage_router = storage_bootstrap.and_then(|bootstrap| bootstrap.install(&state));
+        run_state_initializers(state_initializers, &state);
 
         let task_shutdown = tokio_util::sync::CancellationToken::new();
         if let Err(error) = initialize_job_runtime(jobs, &state, &task_shutdown, &config.jobs) {
             eprintln!("job runtime initialization failed: {error}");
             std::process::exit(1);
+        }
+
+        #[cfg(feature = "db")]
+        if let Some(pool) = state.pool().cloned() {
+            crate::repository_commit_hooks::start_repository_commit_hook_worker(
+                pool,
+                task_shutdown.child_token(),
+            );
         }
 
         if let Err(error) = run_startup_hooks(&startup_hooks, state.clone()).await {
@@ -2265,6 +3391,21 @@ impl AppBuilder {
 
         tracing::info!(task = %task_name, "Running one-off task");
         let span = tracing::info_span!("one_off_task", task = %task_name);
+        #[cfg(feature = "oauth2")]
+        let result = {
+            use crate::interceptor::{ACTIVE_HTTP_INTERCEPTORS, HttpInterceptor};
+            let interceptors: Vec<std::sync::Arc<dyn HttpInterceptor>> = state
+                .extension::<std::sync::Arc<dyn HttpInterceptor>>()
+                .map(|interceptor_arc| vec![(*interceptor_arc).clone()])
+                .unwrap_or_default();
+            ACTIVE_HTTP_INTERCEPTORS
+                .scope(
+                    interceptors,
+                    (task_handler)(state.clone(), args).instrument(span),
+                )
+                .await
+        };
+        #[cfg(not(feature = "oauth2"))]
         let result = (task_handler)(state.clone(), args).instrument(span).await;
 
         task_shutdown.cancel();
@@ -2529,19 +3670,16 @@ async fn execute_task_result_with_optional_lease_ttl(
         execute_task_result(state, handler, start, name, schedule),
     )
     .await
-    .map_or_else(
-        |_| {
-            let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-            Err((
-                duration_ms,
-                format!(
-                    "scheduled task exceeded lease TTL of {}s",
-                    lease_ttl.as_secs()
-                ),
-            ))
-        },
-        std::convert::identity,
-    )
+    .unwrap_or_else(|_| {
+        let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        Err((
+            duration_ms,
+            format!(
+                "scheduled task exceeded lease TTL of {}s",
+                lease_ttl.as_secs()
+            ),
+        ))
+    })
 }
 
 /// Handle the execution of a single fixed-delay task.
@@ -2555,8 +3693,11 @@ async fn execute_fixed_delay_task(
     coordinator: Arc<dyn crate::scheduler::SchedulerCoordinator>,
     lease_ttl: std::time::Duration,
 ) {
-    let tick_key =
-        crate::scheduler::fixed_delay_tick_key(&name, delay, crate::scheduler::now_unix_duration());
+    let tick_key = crate::scheduler::fixed_delay_tick_key(
+        &name,
+        delay,
+        crate::time::clock_unix_duration(state.clock()),
+    );
     let lease = match coordinator
         .try_acquire(&name, &tick_key, coordination)
         .await
@@ -2866,6 +4007,12 @@ async fn run_startup_hooks(hooks: &[StartupHook], state: AppState) -> crate::Aut
     Ok(())
 }
 
+fn run_state_initializers(initializers: Vec<StateInitializer>, state: &AppState) {
+    for initializer in initializers {
+        initializer(state);
+    }
+}
+
 fn initialize_job_runtime(
     jobs: Vec<crate::job::JobInfo>,
     state: &AppState,
@@ -2883,6 +4030,38 @@ fn initialize_job_runtime(
 async fn run_shutdown_hooks(hooks: &[ShutdownHook]) {
     for hook in hooks.iter().rev() {
         hook().await;
+    }
+}
+
+/// Run shutdown hooks in reverse-registration order (LIFO), enforcing a
+/// per-hook timeout and a hard total-budget ceiling.
+///
+/// Plugin ordering rule: plugins register hooks during `build()`, which is
+/// called before any app `on_shutdown` calls, so app hooks run **before**
+/// plugin hooks (LIFO means last-registered runs first).
+///
+/// Overruns are logged at WARN but do not block the remaining budget.
+async fn run_shutdown_hooks_with_timeout(
+    hooks: &[ShutdownHook],
+    per_hook_budget: std::time::Duration,
+    total_budget: std::time::Duration,
+) {
+    let deadline = tokio::time::Instant::now() + total_budget;
+    for hook in hooks.iter().rev() {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            tracing::warn!("shutdown: total hook budget exhausted; skipping remaining hooks");
+            break;
+        }
+        let timeout = remaining.min(per_hook_budget);
+        // Hook overruns are intentionally non-fatal (exit 0 per ADR addendum).
+        // Only drain deadline exhaustion (phase 6) triggers exit(1).
+        if tokio::time::timeout(timeout, hook()).await.is_err() {
+            tracing::warn!(
+                per_hook_budget_ms = timeout.as_millis(),
+                "shutdown: hook overran per-hook timeout; continuing with remaining budget"
+            );
+        }
     }
 }
 
@@ -2935,6 +4114,30 @@ fn fail_fast_on_invalid_session_config(config: &AutumnConfig, has_custom_session
     }
 }
 
+/// Resolve at-rest column-encryption keys at boot (#805).
+///
+/// On success this installs the process-global key ring. When encrypted columns
+/// are registered but the key material under `active_record_encryption` is
+/// missing or malformed, the behaviour mirrors the signing-secret check (#597):
+/// a **hard failure in production** (the server must not bind with unusable
+/// encryption), but only a **warning in dev/test** so zero-config local
+/// development and the example apps continue to run. Apps that do not opt into
+/// encrypted columns are unaffected (no registered columns -> no-op).
+fn fail_fast_on_missing_encryption_keys(config: &AutumnConfig) {
+    if let Err(diagnostic) = crate::encryption::init_attribute_encryption(config.credentials()) {
+        let is_production = matches!(config.profile.as_deref(), Some("prod" | "production"));
+        if is_production {
+            eprintln!("Attribute encryption misconfiguration: {diagnostic}");
+            std::process::exit(1);
+        }
+        eprintln!(
+            "warning: attribute encryption is not fully configured (dev): {diagnostic}\n  \
+             note: encrypted-column reads/writes will fail until keys are set; \
+             this is a hard error in production."
+        );
+    }
+}
+
 /// Fail immediately if the signing secret is misconfigured for the active profile.
 ///
 /// In production, a missing, too-short, or demo-valued signing secret is a
@@ -2982,6 +4185,64 @@ fn fail_fast_on_invalid_webhook_config(config: &AutumnConfig) {
     if let Err(error) = config.security.webhooks.validate(is_production) {
         eprintln!("Invalid signed webhook configuration: {error}");
         std::process::exit(1);
+    }
+}
+
+fn fail_fast_on_invalid_trusted_hosts(config: &AutumnConfig) {
+    let is_production = matches!(config.profile.as_deref(), Some("prod" | "production"));
+    if !is_production {
+        return;
+    }
+    let hosts: Vec<String> = config
+        .security
+        .trusted_hosts
+        .hosts
+        .iter()
+        .map(|h| h.trim().to_owned())
+        .filter(|h| !h.is_empty())
+        .collect();
+    if hosts.is_empty() {
+        eprintln!(
+            "[security.trusted_hosts] is required in production; set hosts = [\"example.com\"] or explicit entries"
+        );
+        std::process::exit(1);
+    }
+    if hosts.iter().any(|h| h == "*") {
+        tracing::warn!("trusted host validation disabled via wildcard '*' in production");
+    }
+}
+
+fn fail_fast_on_invalid_idempotency_config(config: &AutumnConfig) {
+    if !config.idempotency.enabled.unwrap_or(false) {
+        return;
+    }
+    let is_production = matches!(config.profile.as_deref(), Some("prod" | "production"));
+    if is_production
+        && config.idempotency.backend == crate::config::IdempotencyBackend::Memory
+        && !config.idempotency.allow_memory_in_production
+    {
+        eprintln!(
+            "The in-memory idempotency backend is not safe for multi-replica production use.\n\
+             Set `[idempotency] backend = \"redis\"` in autumn.toml, or set \
+             `allow_memory_in_production = true` to suppress this check."
+        );
+        std::process::exit(1);
+    }
+    #[cfg(feature = "redis")]
+    if config.idempotency.backend == crate::config::IdempotencyBackend::Redis {
+        let url_missing = config
+            .idempotency
+            .redis
+            .url
+            .as_deref()
+            .is_none_or(|u| u.trim().is_empty());
+        if url_missing {
+            eprintln!(
+                "Redis idempotency backend requires a connection URL.\n\
+                 Set AUTUMN_IDEMPOTENCY__REDIS__URL or `[idempotency.redis] url` in autumn.toml."
+            );
+            std::process::exit(1);
+        }
     }
 }
 
@@ -3250,6 +4511,7 @@ fn install_i18n_bundle_layer(
     let ext_layer = axum::Extension(bundle);
     custom_layers.push(CustomLayerRegistration {
         type_id: TypeId::of::<axum::Extension<Arc<crate::i18n::Bundle>>>(),
+        type_name: std::any::type_name::<axum::Extension<Arc<crate::i18n::Bundle>>>(),
         apply: Box::new(move |router| router.layer(ext_layer)),
     });
     custom_layers
@@ -3267,7 +4529,14 @@ async fn setup_database(
     config: &AutumnConfig,
     migrations: Vec<crate::migrate::EmbeddedMigrations>,
     pool_provider: Option<PoolProviderFactory>,
+    hook_queue_migration_mode: RepositoryCommitHookQueueMigrationMode,
 ) -> Result<DatabaseBootstrap, String> {
+    let migrations = migrations_with_repository_framework_migrations(
+        migrations,
+        crate::repository_commit_hooks::has_repository_commit_hook_descriptors(),
+        crate::version_history::has_versioned_repository_descriptors(),
+        hook_queue_migration_mode,
+    );
     let check_replica_migrations = !migrations.is_empty();
     let topology = match pool_provider {
         Some(factory) => factory(config.database.clone()).await,
@@ -3320,6 +4589,62 @@ async fn setup_database(
         topology,
         replica_readiness,
         replica_migration_check,
+    })
+}
+
+#[cfg(feature = "db")]
+const REPOSITORY_COMMIT_HOOK_QUEUE_MIGRATION: &str =
+    "20260515000000_create_repository_commit_hook_queue";
+
+#[cfg(feature = "db")]
+const VERSION_HISTORY_MIGRATION: &str = "20260526000000_create_version_history";
+
+#[cfg(feature = "db")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RepositoryCommitHookQueueMigrationMode {
+    Runtime,
+    StaticBuild,
+}
+
+#[cfg(feature = "db")]
+fn migrations_with_repository_framework_migrations(
+    mut migrations: Vec<crate::migrate::EmbeddedMigrations>,
+    hook_queue_required: bool,
+    version_history_required: bool,
+    mode: RepositoryCommitHookQueueMigrationMode,
+) -> Vec<crate::migrate::EmbeddedMigrations> {
+    if hook_queue_required
+        && mode == RepositoryCommitHookQueueMigrationMode::Runtime
+        && !migration_sets_include(&migrations, REPOSITORY_COMMIT_HOOK_QUEUE_MIGRATION)
+    {
+        migrations.push(crate::repository_commit_hooks::REPOSITORY_COMMIT_HOOK_MIGRATIONS);
+    }
+    if version_history_required
+        && mode == RepositoryCommitHookQueueMigrationMode::Runtime
+        && !migration_sets_include(&migrations, VERSION_HISTORY_MIGRATION)
+    {
+        migrations.push(crate::version_history::VERSION_HISTORY_MIGRATIONS);
+    }
+    migrations
+}
+
+#[cfg(feature = "db")]
+fn migration_sets_include(
+    migrations: &[crate::migrate::EmbeddedMigrations],
+    migration_name: &str,
+) -> bool {
+    use diesel::migration::{Migration, MigrationSource as _};
+    use diesel::pg::Pg;
+
+    migrations.iter().any(|source| {
+        let Ok(source_migrations): Result<Vec<Box<dyn Migration<Pg>>>, _> = source.migrations()
+        else {
+            return false;
+        };
+
+        source_migrations
+            .iter()
+            .any(|migration| migration.name().to_string() == migration_name)
     })
 }
 
@@ -3631,6 +4956,9 @@ mod validate_repository_api_policies_tests {
             name: "test_route",
             api_doc: crate::openapi::ApiDoc::default(),
             repository: meta,
+            idempotency: crate::route::RouteIdempotency::Direct,
+            api_version: None,
+            sunset_opt_out: false,
         }
     }
 
@@ -4029,6 +5357,10 @@ fn build_state(
         task_registry: crate::actuator::TaskRegistry::new(),
         job_registry: crate::actuator::JobRegistry::new(),
         config_props: crate::actuator::ConfigProperties::from_config(config),
+        metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
+        health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
+        #[cfg(feature = "presence")]
+        presence: crate::presence::Presence::new(channels.clone()),
         #[cfg(feature = "ws")]
         channels,
         #[cfg(feature = "ws")]
@@ -4037,6 +5369,7 @@ fn build_state(
         forbidden_response: config.security.forbidden_response,
         auth_session_key: config.auth.session_key.clone(),
         shared_cache: None,
+        clock: std::sync::Arc::new(crate::time::SystemClock),
     };
     #[cfg(feature = "db")]
     if state.replica_pool.is_some() {
@@ -4045,6 +5378,9 @@ fn build_state(
             .configure_replica_dependency(config.database.replica_fallback);
     }
     state.insert_extension(config.clone());
+    state.insert_extension(crate::step_up::StepUpGlobalConfig {
+        default_max_age_secs: config.auth.step_up.default_max_age_secs,
+    });
     state
 }
 
@@ -4184,7 +5520,7 @@ fn format_config_summary(config: &AutumnConfig) -> String {
         \n    telemetry:  {telemetry_status}\
         \n    health:     {} (detailed={})\
         \n    actuator:   sensitive={}\
-        \n    shutdown:   {}s",
+        \n    shutdown:   prestop={}s drain={}s",
         config.server.host,
         config.server.port,
         config.log.level,
@@ -4192,6 +5528,7 @@ fn format_config_summary(config: &AutumnConfig) -> String {
         config.health.path,
         config.health.detailed,
         config.actuator.sensitive,
+        config.server.prestop_grace_secs,
         config.server.shutdown_timeout_secs,
     )
 }
@@ -4243,6 +5580,10 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tower::ServiceExt;
 
+    #[cfg(feature = "db")]
+    const APP_TEST_MIGRATIONS: crate::migrate::EmbeddedMigrations =
+        diesel_migrations::embed_migrations!("test_migrations");
+
     /// Shared no-op `MailDeliveryQueue` used by builder tests so the trait
     /// impl body is defined once and exercised by at least one test.
     #[cfg(feature = "mail")]
@@ -4290,14 +5631,19 @@ mod tests {
             task_registry: crate::actuator::TaskRegistry::new(),
             job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
+            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
+            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
+            #[cfg(feature = "presence")]
+            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
             policy_registry: crate::authorization::PolicyRegistry::default(),
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
+            clock: std::sync::Arc::new(crate::time::SystemClock),
         };
         crate::router::build_router(routes, &config, state)
     }
@@ -4360,9 +5706,14 @@ mod tests {
             ..
         } = app().with_pool_provider(PassthroughPoolProvider);
 
-        let database = setup_database(&config, Vec::new(), pool_provider_factory)
-            .await
-            .expect("custom provider should build database topology");
+        let database = setup_database(
+            &config,
+            Vec::new(),
+            pool_provider_factory,
+            RepositoryCommitHookQueueMigrationMode::Runtime,
+        )
+        .await
+        .expect("custom provider should build database topology");
         let topology = database.topology.expect("database should be configured");
 
         assert_eq!(topology.primary().status().max_size, 5);
@@ -4388,6 +5739,226 @@ mod tests {
         assert!(state.read_pool().is_none());
         let (status, _) = crate::probe::readiness_response(&state).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn repository_commit_hook_worker_starts_after_job_runtime_initialization() {
+        let source = include_str!("app.rs").replace("\r\n", "\n");
+        let server_init = "initialize_job_runtime(jobs, &state, &server_shutdown, &config.jobs)";
+        let server_worker = "start_repository_commit_hook_worker(\n                pool,\n                server_shutdown.child_token(),\n            );";
+        let task_init = "initialize_job_runtime(jobs, &state, &task_shutdown, &config.jobs)";
+        let task_worker = "start_repository_commit_hook_worker(\n                pool,\n                task_shutdown.child_token(),\n            );";
+
+        assert!(
+            source
+                .find(server_init)
+                .expect("normal server path should initialize jobs")
+                < source
+                    .find(server_worker)
+                    .expect("normal server path should start repository hook worker"),
+            "normal server startup must initialize jobs before repository commit hooks can enqueue them"
+        );
+        assert!(
+            source
+                .find(task_init)
+                .expect("task runner path should initialize jobs")
+                < source
+                    .find(task_worker)
+                    .expect("task runner path should start repository hook worker"),
+            "task runner startup must initialize jobs before repository commit hooks can enqueue them"
+        );
+    }
+
+    #[test]
+    fn state_initializers_run_before_job_runtime_initialization() {
+        let source = include_str!("app.rs").replace("\r\n", "\n");
+        let server_start = source
+            .find("pub async fn run(self)")
+            .expect("normal server path should exist");
+        let build_mode_start = source
+            .find("async fn run_build_mode(self)")
+            .expect("static build path should follow server path");
+        let task_start = source
+            .find("async fn run_one_off_task_mode(self, requested_name: String)")
+            .expect("task runner path should exist");
+        let server_source = &source[server_start..build_mode_start];
+        let task_source = &source[task_start..];
+        let server_init = "initialize_job_runtime(jobs, &state, &server_shutdown, &config.jobs)";
+        let task_init = "initialize_job_runtime(jobs, &state, &task_shutdown, &config.jobs)";
+        let server_initializer = server_source
+            .find("run_state_initializers(state_initializers, &state);")
+            .expect("normal server path should run state initializers");
+        let task_initializer = task_source
+            .find("run_state_initializers(state_initializers, &state);")
+            .expect("task runner path should run state initializers");
+        let server_job = server_source
+            .find(server_init)
+            .expect("normal server path should initialize jobs");
+        let task_job = task_source
+            .find(task_init)
+            .expect("task runner path should initialize jobs");
+
+        assert!(
+            server_initializer < server_job,
+            "normal server startup must install state-initialized resources before job workers start"
+        );
+        assert!(
+            task_initializer < task_job,
+            "task runner startup must install state-initialized resources before job workers start"
+        );
+    }
+
+    #[test]
+    fn static_builds_run_state_initializers_before_router_build() {
+        let source = include_str!("app.rs").replace("\r\n", "\n");
+        let build_mode_start = source
+            .find("async fn run_build_mode(self)")
+            .expect("static build path should exist");
+        let dump_mode_start = source
+            .find("async fn run_dump_routes_mode(self)")
+            .expect("route dump path should follow static build path");
+        let build_mode_source = &source[build_mode_start..dump_mode_start];
+        let state_initializer = build_mode_source
+            .find("run_state_initializers(state_initializers, &state);")
+            .expect("static build path should run state initializers");
+        let router_build = build_mode_source
+            .find("let router = crate::router::try_build_router_inner(")
+            .expect("static build path should build a router");
+
+        assert!(
+            state_initializer < router_build,
+            "static builds must install state-initialized resources before rendering routes"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn hooked_repository_apps_include_hook_queue_framework_migration() {
+        let migrations = migrations_with_repository_framework_migrations(
+            vec![APP_TEST_MIGRATIONS],
+            true,
+            false,
+            RepositoryCommitHookQueueMigrationMode::Runtime,
+        );
+        let names = migration_names(&migrations);
+
+        assert!(
+            names
+                .iter()
+                .any(|name| name == REPOSITORY_COMMIT_HOOK_QUEUE_MIGRATION),
+            "hooked repository apps must auto-register the durable hook queue migration"
+        );
+        assert!(
+            names.iter().all(|name| !name.contains("api_tokens")),
+            "hooked repository apps must not auto-register unrelated framework migrations: {names:?}"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn runtime_hooked_apps_include_hook_queue_framework_migration_without_app_migrations() {
+        let migrations = migrations_with_repository_framework_migrations(
+            Vec::new(),
+            true,
+            false,
+            RepositoryCommitHookQueueMigrationMode::Runtime,
+        );
+        let names = migration_names(&migrations);
+
+        assert!(
+            names
+                .iter()
+                .any(|name| name == REPOSITORY_COMMIT_HOOK_QUEUE_MIGRATION),
+            "runtime hooked repository apps must install the durable hook queue even when app migrations are managed elsewhere"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn versioned_repository_apps_include_version_history_framework_migration() {
+        let migrations = migrations_with_repository_framework_migrations(
+            vec![APP_TEST_MIGRATIONS],
+            false,
+            true,
+            RepositoryCommitHookQueueMigrationMode::Runtime,
+        );
+        let names = migration_names(&migrations);
+
+        assert!(
+            names.iter().any(|name| name == VERSION_HISTORY_MIGRATION),
+            "versioned repository apps must auto-register the version-history migration"
+        );
+        assert!(
+            names
+                .iter()
+                .all(|name| !name.contains("repository_commit_hook_queue")),
+            "versioned-only repository apps must not auto-register the durable hook queue: {names:?}"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn runtime_versioned_apps_include_version_history_framework_migration_without_app_migrations() {
+        let migrations = migrations_with_repository_framework_migrations(
+            Vec::new(),
+            false,
+            true,
+            RepositoryCommitHookQueueMigrationMode::Runtime,
+        );
+        let names = migration_names(&migrations);
+
+        assert!(
+            names.iter().any(|name| name == VERSION_HISTORY_MIGRATION),
+            "runtime versioned repository apps must install version history even when app migrations are managed elsewhere"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn static_builds_do_not_auto_add_hook_queue_when_no_migrations_registered() {
+        let migrations = migrations_with_repository_framework_migrations(
+            Vec::new(),
+            true,
+            true,
+            RepositoryCommitHookQueueMigrationMode::StaticBuild,
+        );
+
+        assert!(
+            migrations.is_empty(),
+            "static/export builds that pass no migrations must not mutate the database"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn unhooked_apps_do_not_auto_add_hook_queue_framework_migration() {
+        let migrations = migrations_with_repository_framework_migrations(
+            Vec::new(),
+            false,
+            false,
+            RepositoryCommitHookQueueMigrationMode::Runtime,
+        );
+
+        assert!(
+            migrations.is_empty(),
+            "unhooked apps should not get durable hook queue migrations for free"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    fn migration_names(migrations: &[crate::migrate::EmbeddedMigrations]) -> Vec<String> {
+        use diesel::migration::{Migration, MigrationSource as _};
+        use diesel::pg::Pg;
+
+        migrations
+            .iter()
+            .flat_map(|source| {
+                let migrations: Vec<Box<dyn Migration<Pg>>> = source.migrations().unwrap();
+                migrations
+            })
+            .map(|migration| migration.name().to_string())
+            .collect()
     }
 
     #[cfg(feature = "db")]
@@ -4521,6 +6092,9 @@ mod tests {
                 ..Default::default()
             },
             repository: None,
+            idempotency: crate::route::RouteIdempotency::Direct,
+            api_version: None,
+            sunset_opt_out: false,
         }
     }
 
@@ -4636,6 +6210,9 @@ mod tests {
                     ..Default::default()
                 },
                 repository: None,
+                idempotency: crate::route::RouteIdempotency::Direct,
+                api_version: None,
+                sunset_opt_out: false,
             }],
             &config,
             state,
@@ -4649,6 +6226,8 @@ mod tests {
                 session_store: None,
                 #[cfg(feature = "openapi")]
                 openapi: None,
+                #[cfg(feature = "mcp")]
+                mcp: None,
             },
         )
         .expect("router builds");
@@ -4981,14 +6560,19 @@ mod tests {
             task_registry: crate::actuator::TaskRegistry::new(),
             job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
+            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
+            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
+            #[cfg(feature = "presence")]
+            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
             policy_registry: crate::authorization::PolicyRegistry::default(),
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
+            clock: std::sync::Arc::new(crate::time::SystemClock),
         };
         let router =
             crate::router::build_router(vec![test_get_route("/dummy", "dummy")], &config, state);
@@ -5063,6 +6647,9 @@ mod tests {
                 ..Default::default()
             },
             repository: None,
+            idempotency: crate::route::RouteIdempotency::Direct,
+            api_version: None,
+            sunset_opt_out: false,
         }];
         let config = AutumnConfig::default();
         let state = AppState {
@@ -5082,14 +6669,19 @@ mod tests {
             task_registry: crate::actuator::TaskRegistry::new(),
             job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
+            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
+            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
+            #[cfg(feature = "presence")]
+            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
             policy_registry: crate::authorization::PolicyRegistry::default(),
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
+            clock: std::sync::Arc::new(crate::time::SystemClock),
         };
         let router = crate::router::build_router(post_routes, &config, state);
 
@@ -5123,6 +6715,9 @@ mod tests {
                     ..Default::default()
                 },
                 repository: None,
+                idempotency: crate::route::RouteIdempotency::Direct,
+                api_version: None,
+                sunset_opt_out: false,
             },
             Route {
                 method: http::Method::POST,
@@ -5137,6 +6732,9 @@ mod tests {
                     ..Default::default()
                 },
                 repository: None,
+                idempotency: crate::route::RouteIdempotency::Direct,
+                api_version: None,
+                sunset_opt_out: false,
             },
         ];
         let config = AutumnConfig::default();
@@ -5157,14 +6755,19 @@ mod tests {
             task_registry: crate::actuator::TaskRegistry::new(),
             job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
+            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
+            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
+            #[cfg(feature = "presence")]
+            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
             policy_registry: crate::authorization::PolicyRegistry::default(),
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
+            clock: std::sync::Arc::new(crate::time::SystemClock),
         };
         let router = crate::router::build_router(route_list, &config, state);
 
@@ -5445,14 +7048,19 @@ mod tests {
             task_registry: crate::actuator::TaskRegistry::new(),
             job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
+            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
+            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
+            #[cfg(feature = "presence")]
+            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
             policy_registry: crate::authorization::PolicyRegistry::default(),
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
+            clock: std::sync::Arc::new(crate::time::SystemClock),
         };
         let router = crate::router::build_router_with_static(
             vec![test_get_route("/other", "other_page")],
@@ -5506,6 +7114,9 @@ mod tests {
                         ..Default::default()
                     },
                     repository: None,
+                    idempotency: crate::route::RouteIdempotency::Direct,
+                    api_version: None,
+                    sunset_opt_out: false,
                 }],
                 &config,
                 state,
@@ -5560,6 +7171,9 @@ mod tests {
                         ..Default::default()
                     },
                     repository: None,
+                    idempotency: crate::route::RouteIdempotency::Direct,
+                    api_version: None,
+                    sunset_opt_out: false,
                 }]);
 
                 let response = router
@@ -5747,14 +7361,19 @@ mod tests {
             task_registry: crate::actuator::TaskRegistry::new(),
             job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
+            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
+            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
+            #[cfg(feature = "presence")]
+            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
             policy_registry: crate::authorization::PolicyRegistry::default(),
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
+            clock: std::sync::Arc::new(crate::time::SystemClock),
         };
         crate::router::build_router(routes, config, state)
     }
@@ -5893,14 +7512,19 @@ mod tests {
             task_registry: crate::actuator::TaskRegistry::new(),
             job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
+            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
+            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
+            #[cfg(feature = "presence")]
+            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
             policy_registry: crate::authorization::PolicyRegistry::default(),
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
+            clock: std::sync::Arc::new(crate::time::SystemClock),
         };
         let router = crate::router::build_router_with_static(
             vec![test_get_route("/test", "test")],
@@ -5937,14 +7561,19 @@ mod tests {
             task_registry: crate::actuator::TaskRegistry::new(),
             job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
+            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
+            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
+            #[cfg(feature = "presence")]
+            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
             policy_registry: crate::authorization::PolicyRegistry::default(),
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
+            clock: std::sync::Arc::new(crate::time::SystemClock),
         };
         let router = crate::router::build_router_with_static(
             vec![test_get_route("/test", "test")],
@@ -6192,11 +7821,16 @@ mod tests {
             job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             channels: crate::channels::Channels::new(32),
+            #[cfg(feature = "presence")]
+            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
             shutdown: tokio_util::sync::CancellationToken::new(),
             policy_registry: crate::authorization::PolicyRegistry::default(),
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
+            clock: std::sync::Arc::new(crate::time::SystemClock),
+            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
+            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
         };
 
         let mut rx = state.channels().subscribe("sys:tasks");
@@ -6260,11 +7894,16 @@ mod tests {
             job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             channels: crate::channels::Channels::new(32),
+            #[cfg(feature = "presence")]
+            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
             shutdown: tokio_util::sync::CancellationToken::new(),
             policy_registry: crate::authorization::PolicyRegistry::default(),
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
+            clock: std::sync::Arc::new(crate::time::SystemClock),
+            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
+            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
         };
 
         let mut rx = state.channels().subscribe("sys:tasks");
@@ -6944,6 +8583,77 @@ mod tests {
             builder.route_sources[1],
             crate::route_listing::RouteSource::Plugin("outer".to_owned()),
             "second route should be re-attributed to outer plugin after nested build"
+        );
+    }
+
+    // ── shutdown hook timeout tests ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn shutdown_hooks_with_timeout_runs_all_fast_hooks() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let counter = Arc::new(AtomicUsize::new(0));
+        let c1 = Arc::clone(&counter);
+        let c2 = Arc::clone(&counter);
+
+        let hooks: Vec<ShutdownHook> = vec![
+            Box::new(move || {
+                let c = Arc::clone(&c1);
+                Box::pin(async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                })
+            }),
+            Box::new(move || {
+                let c = Arc::clone(&c2);
+                Box::pin(async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                })
+            }),
+        ];
+
+        run_shutdown_hooks_with_timeout(
+            &hooks,
+            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(10),
+        )
+        .await;
+
+        assert_eq!(counter.load(Ordering::SeqCst), 2, "both hooks must run");
+    }
+
+    #[tokio::test]
+    async fn shutdown_hooks_with_timeout_tolerates_slow_hook_overrun() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let fast_ran = Arc::new(AtomicBool::new(false));
+        let fr = Arc::clone(&fast_ran);
+
+        let hooks: Vec<ShutdownHook> = vec![
+            // hook 0 (first registered → runs LAST in LIFO): fast
+            Box::new(move || {
+                let fr = Arc::clone(&fr);
+                Box::pin(async move {
+                    fr.store(true, Ordering::SeqCst);
+                })
+            }),
+            // hook 1 (last registered → runs FIRST in LIFO): slow, exceeds per-hook budget
+            Box::new(|| {
+                Box::pin(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                })
+            }),
+        ];
+
+        // Per-hook budget = 50 ms (hook 0 will overrun).
+        // Total budget = 1 s (ample for hook 1 after the overrun is cut short).
+        run_shutdown_hooks_with_timeout(
+            &hooks,
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_secs(1),
+        )
+        .await;
+
+        assert!(
+            fast_ran.load(Ordering::SeqCst),
+            "fast hook must still run even after slow hook overruns its per-hook budget"
         );
     }
 }

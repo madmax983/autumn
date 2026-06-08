@@ -40,6 +40,213 @@ impl A11yPosture {
     }
 }
 
+// ── Plugin-contributed metrics ──────────────────────────────────
+
+/// Kind of a Prometheus metric family.
+///
+/// Used in [`MetricFamily`] to emit the correct `# TYPE` line in the
+/// Prometheus text format.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MetricKind {
+    /// A monotonically increasing value (e.g., request count).
+    Counter,
+    /// An arbitrary up-or-down value (e.g., queue depth, active connections).
+    Gauge,
+}
+
+impl MetricKind {
+    const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Counter => "counter",
+            Self::Gauge => "gauge",
+        }
+    }
+}
+
+/// A single metric sample with optional label set and a value.
+///
+/// Labels are `(name, value)` pairs rendered as `{name="value"}` in
+/// Prometheus text format.
+#[derive(Debug, Clone)]
+pub struct MetricSample {
+    /// Label key-value pairs. Empty means no labels.
+    pub labels: Vec<(String, String)>,
+    /// The metric value.
+    pub value: f64,
+}
+
+/// A complete metric family: name, kind, help text, and current samples.
+///
+/// Each `MetricFamily` is rendered as one `# HELP` / `# TYPE` block followed
+/// by one line per sample in the Prometheus text format.
+#[derive(Debug, Clone)]
+pub struct MetricFamily {
+    /// Unique metric name (e.g., `"harvest_workflow_completions_total"`).
+    ///
+    /// Use a stable namespace prefix so names don't collide with the built-in
+    /// `autumn_*` families or other registered sources.
+    pub name: String,
+    /// One-line description emitted as `# HELP` in the Prometheus output.
+    pub help: String,
+    /// Metric type: counter, gauge, or histogram.
+    pub kind: MetricKind,
+    /// Current samples.  Each sample produces one line in the scrape output.
+    pub samples: Vec<MetricSample>,
+}
+
+/// Contract for a subsystem that contributes metrics to the unified actuator endpoints.
+///
+/// Implement this trait and register the implementation via
+/// [`crate::app::AppBuilder::metrics_source`] to publish metric families that appear in
+/// `/actuator/prometheus` alongside the built-in `autumn_http_*` families, and
+/// in `/actuator/metrics` under the `sources` key.
+///
+/// # Naming rules
+///
+/// Prefix every metric name with a stable namespace (e.g. `harvest_` for
+/// autumn-harvest, `myapp_` for an application-level source).  The registry
+/// enforces that two sources cannot share the same **registration name**; metric
+/// family name uniqueness is the source's responsibility.
+///
+/// # Sync-snapshot contract
+///
+/// `collect` is called synchronously on the HTTP request goroutine.
+/// Implementations **must not block on I/O** — read from atomics,
+/// `RwLock`-protected snapshots, or channels that already have buffered data.
+/// If async work is needed, collect it into a pre-computed cache and update
+/// that cache from a background task.
+pub trait MetricsSource: Send + Sync + 'static {
+    /// Return zero or more metric families, all read from in-memory state.
+    fn collect(&self) -> Vec<MetricFamily>;
+}
+
+/// Registry of named [`MetricsSource`] implementations.
+///
+/// Maintained by [`crate::app::AppBuilder`] and stored on
+/// [`crate::AppState`]. Provides duplicate-registration detection at startup
+/// and per-source panic isolation at scrape time.
+#[derive(Clone, Default)]
+pub struct MetricsSourceRegistry {
+    inner: Arc<RwLock<MetricsSourceRegistryInner>>,
+}
+
+#[derive(Default)]
+struct MetricsSourceRegistryInner {
+    /// Registered sources in insertion order.
+    sources: Vec<(String, Arc<dyn MetricsSource>)>,
+    /// Per-source scrape-error counter incremented when a source panics.
+    error_counts: HashMap<String, u64>,
+}
+
+impl MetricsSourceRegistry {
+    /// Create a new, empty registry.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register a named source.
+    ///
+    /// Returns `Err` containing a message if a source with `name` has already
+    /// been registered (startup-time collision detection).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string when `name` is already registered.
+    pub fn register(
+        &self,
+        name: impl Into<String>,
+        source: Arc<dyn MetricsSource>,
+    ) -> Result<(), String> {
+        let name = name.into();
+        {
+            let mut inner = self
+                .inner
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if inner.sources.iter().any(|(n, _)| n == &name) {
+                return Err(format!(
+                    "MetricsSource '{name}' is already registered; skipping duplicate"
+                ));
+            }
+            inner.sources.push((name, source));
+        }
+        Ok(())
+    }
+
+    /// Collect from all registered sources, isolating panics.
+    ///
+    /// Returns one entry per registered source; panicking sources contribute an
+    /// empty `Vec<MetricFamily>` and increment their error counter.
+    pub fn collect_all(&self) -> Vec<(String, Vec<MetricFamily>)> {
+        let sources: Vec<(String, Arc<dyn MetricsSource>)> = self
+            .inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .sources
+            .clone();
+
+        let mut results = Vec::with_capacity(sources.len());
+        let mut panicked = Vec::new();
+
+        for (name, source) in &sources {
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| source.collect()));
+            if let Ok(families) = result {
+                results.push((name.clone(), families));
+            } else {
+                tracing::error!(source_name = %name, "MetricsSource panicked during collection");
+                panicked.push(name.clone());
+                results.push((name.clone(), vec![]));
+            }
+        }
+
+        if !panicked.is_empty() {
+            let mut inner = self
+                .inner
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for name in panicked {
+                *inner.error_counts.entry(name).or_insert(0) += 1;
+            }
+        }
+
+        results
+    }
+
+    /// Current per-source scrape-error counts (incremented on panic isolation).
+    #[must_use]
+    pub fn error_counts(&self) -> HashMap<String, u64> {
+        self.inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .error_counts
+            .clone()
+    }
+
+    /// Names of all registered sources, in insertion order.
+    #[must_use]
+    pub fn source_names(&self) -> Vec<String> {
+        self.inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .sources
+            .iter()
+            .map(|(n, _)| n.clone())
+            .collect()
+    }
+
+    /// Returns `true` when no sources have been registered.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .sources
+            .is_empty()
+    }
+}
+
 /// Trait to abstract the state requirements for actuator handlers.
 ///
 /// Implement this trait on your application's state type to provide
@@ -97,6 +304,38 @@ pub trait ProvideActuatorState {
     /// returns all-false (no concerns addressed) — a conservative safe default.
     fn a11y_posture(&self) -> A11yPosture {
         A11yPosture::default()
+    }
+
+    /// Returns the registry of plugin-contributed [`MetricsSource`] implementations.
+    ///
+    /// The default returns `None`, meaning no plugin sources are consulted.
+    /// [`crate::AppState`] overrides this to return its registry, which is
+    /// populated by [`crate::app::AppBuilder::metrics_source`].
+    fn metrics_source_registry(&self) -> Option<&MetricsSourceRegistry> {
+        None
+    }
+
+    /// Returns the registry of [`HealthIndicator`] implementations.
+    ///
+    /// The default returns `None`, meaning no custom indicators are consulted.
+    /// [`crate::AppState`] overrides this to return its registry, which is
+    /// populated by [`crate::app::AppBuilder::health_indicator`].
+    fn health_indicator_registry(&self) -> Option<&HealthIndicatorRegistry> {
+        None
+    }
+
+    /// Returns whether detailed health information should be included in responses.
+    ///
+    /// When `false`, per-component `details` maps are omitted from
+    /// `/actuator/health` output. Defaults to `true`.
+    fn health_detailed(&self) -> bool {
+        true
+    }
+
+    #[cfg(feature = "http-client")]
+    /// Returns the optional webhook outbound manager if enabled/registered.
+    fn webhook_outbound(&self) -> Option<crate::webhook_outbound::WebhookOutboundManager> {
+        None
     }
 }
 
@@ -783,6 +1022,13 @@ impl ConfigProperties {
             &defaults.actuator.sensitive.to_string(),
             profile_str,
         );
+        Self::track_property(
+            props,
+            "actuator.prometheus",
+            &config.actuator.prometheus.to_string(),
+            &defaults.actuator.prometheus.to_string(),
+            profile_str,
+        );
     }
 
     fn track_session_props(
@@ -943,17 +1189,322 @@ impl ConfigProperties {
     }
 }
 
+// ── Health Indicator ─────────────────────────────────────────────
+
+/// Health status reported by a [`HealthIndicator`].
+///
+/// Follows Spring Boot precedence:
+/// `Down` > `OutOfService` > `Unknown` > `Up`
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum HealthStatus {
+    /// The component is functioning normally.
+    #[serde(rename = "UP")]
+    Up,
+    /// The component is unavailable.
+    #[serde(rename = "DOWN")]
+    Down,
+    /// The component is out of service (maintenance, etc.).
+    #[serde(rename = "OUT_OF_SERVICE")]
+    OutOfService,
+    /// The component status cannot be determined.
+    #[serde(rename = "UNKNOWN")]
+    Unknown,
+}
+
+impl HealthStatus {
+    /// Human-readable string for this status.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Up => "UP",
+            Self::Down => "DOWN",
+            Self::OutOfService => "OUT_OF_SERVICE",
+            Self::Unknown => "UNKNOWN",
+        }
+    }
+
+    /// Returns `true` when this status does not indicate a failure
+    /// (`Up` and `Unknown` are healthy; `Down` and `OutOfService` are not).
+    #[must_use]
+    pub const fn is_healthy(self) -> bool {
+        matches!(self, Self::Up | Self::Unknown)
+    }
+}
+
+/// Which group a [`HealthIndicator`] belongs to.
+///
+/// `Readiness` indicators gate both `/ready` and `/actuator/health`.
+/// `HealthOnly` indicators appear only in `/actuator/health`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndicatorGroup {
+    /// Participates in `/ready` and `/actuator/health`.
+    Readiness,
+    /// Participates only in `/actuator/health`.
+    HealthOnly,
+}
+
+/// Output from a single [`HealthIndicator::check`] call.
+#[derive(Debug, Clone)]
+pub struct HealthCheckOutput {
+    /// The health status of this component.
+    pub status: HealthStatus,
+    /// Optional human-readable key-value detail map.
+    pub details: HashMap<String, serde_json::Value>,
+}
+
+impl HealthCheckOutput {
+    /// Create an `Up` output with no details.
+    #[must_use]
+    pub fn up() -> Self {
+        Self {
+            status: HealthStatus::Up,
+            details: HashMap::new(),
+        }
+    }
+
+    /// Create a `Down` output with no details.
+    #[must_use]
+    pub fn down() -> Self {
+        Self {
+            status: HealthStatus::Down,
+            details: HashMap::new(),
+        }
+    }
+
+    /// Attach a detail map to this output.
+    #[must_use]
+    pub fn with_details(mut self, details: HashMap<String, serde_json::Value>) -> Self {
+        self.details = details;
+        self
+    }
+}
+
+/// Contract for a custom health check.
+///
+/// Implement this trait and register it via [`crate::app::AppBuilder::health_indicator`]
+/// to surface the health of an external dependency in `/actuator/health` and optionally
+/// in `/ready`.
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_web::actuator::{HealthCheckOutput, HealthIndicator, HealthStatus};
+///
+/// pub struct StripeIndicator;
+///
+/// impl HealthIndicator for StripeIndicator {
+///     fn check(&self) -> futures::future::BoxFuture<'_, HealthCheckOutput> {
+///         Box::pin(async move {
+///             // TODO: ping Stripe API
+///             HealthCheckOutput::up()
+///         })
+///     }
+/// }
+/// ```
+pub trait HealthIndicator: Send + Sync + 'static {
+    /// Run the check and return the current health output.
+    ///
+    /// The future is polled inside a per-indicator timeout; if it does not
+    /// resolve within [`Self::timeout_ms`] milliseconds it is cancelled and
+    /// the indicator is reported as `Unknown` with `timed_out: true`.
+    fn check(&self) -> futures::future::BoxFuture<'_, HealthCheckOutput>;
+
+    /// Per-indicator timeout in milliseconds. Default: 2 000 ms.
+    fn timeout_ms(&self) -> u64 {
+        2000
+    }
+
+    /// Which probe group this indicator belongs to. Default: [`IndicatorGroup::Readiness`].
+    fn group(&self) -> IndicatorGroup {
+        IndicatorGroup::Readiness
+    }
+}
+
+/// A single result returned from [`HealthIndicatorRegistry::run_all`] or
+/// [`HealthIndicatorRegistry::run_readiness`].
+#[derive(Debug, Clone)]
+pub struct HealthRunResult {
+    /// The registration name of this indicator.
+    pub name: String,
+    /// Which probe group this indicator belongs to.
+    pub group: IndicatorGroup,
+    /// The output of the check (possibly timed-out).
+    pub output: HealthCheckOutput,
+}
+
+type IndicatorList = Vec<(String, IndicatorGroup, Arc<dyn HealthIndicator>)>;
+
+/// Registry of named [`HealthIndicator`] implementations.
+///
+/// Populated by [`crate::app::AppBuilder::health_indicator`] and stored on
+/// [`crate::AppState`]. Provides duplicate-registration detection at startup
+/// and per-indicator timeout enforcement at request time.
+#[derive(Clone, Default)]
+pub struct HealthIndicatorRegistry {
+    inner: Arc<RwLock<IndicatorList>>,
+}
+
+impl HealthIndicatorRegistry {
+    /// Create a new, empty registry.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register a named indicator with its group.
+    ///
+    /// Returns `Err` if a indicator with `name` was already registered.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string when `name` is already registered.
+    pub fn register(
+        &self,
+        name: impl Into<String>,
+        group: IndicatorGroup,
+        indicator: Arc<dyn HealthIndicator>,
+    ) -> Result<(), String> {
+        let name = name.into();
+        let mut inner = self
+            .inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if inner.iter().any(|(n, _, _)| n == &name) {
+            return Err(format!(
+                "HealthIndicator '{name}' is already registered; skipping duplicate"
+            ));
+        }
+        inner.push((name, group, indicator));
+        drop(inner);
+        Ok(())
+    }
+
+    /// Returns `true` when no indicators have been registered.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+    }
+
+    /// Run all registered indicators (both groups) with per-indicator timeouts.
+    ///
+    /// All indicators execute **concurrently**; total wall time is bounded by
+    /// the slowest single indicator rather than N × timeout.
+    pub async fn run_all(&self) -> Vec<HealthRunResult> {
+        let entries = self
+            .inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+
+        futures::future::join_all(
+            entries
+                .into_iter()
+                .map(|(name, group, indicator)| async move {
+                    let output = run_with_timeout(indicator.as_ref()).await;
+                    HealthRunResult {
+                        name,
+                        group,
+                        output,
+                    }
+                }),
+        )
+        .await
+    }
+
+    /// Run only `Readiness`-group indicators with per-indicator timeouts.
+    ///
+    /// All indicators execute **concurrently**; total wall time is bounded by
+    /// the slowest single indicator rather than N × timeout.
+    pub async fn run_readiness(&self) -> Vec<HealthRunResult> {
+        // Clone the full list to release the read lock before async work begins.
+        let entries = self
+            .inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+
+        futures::future::join_all(
+            entries
+                .into_iter()
+                .filter(|(_, g, _)| *g == IndicatorGroup::Readiness)
+                .map(|(name, group, indicator)| async move {
+                    let output = run_with_timeout(indicator.as_ref()).await;
+                    HealthRunResult {
+                        name,
+                        group,
+                        output,
+                    }
+                }),
+        )
+        .await
+    }
+
+    /// Compute the aggregate status following Spring Boot precedence.
+    ///
+    /// Precedence: `Down` > `OutOfService` > `Unknown` > `Up`.
+    /// An empty slice returns `Up`.
+    #[must_use]
+    pub fn aggregate_status(statuses: &[HealthStatus]) -> HealthStatus {
+        let mut overall = HealthStatus::Up;
+        for &s in statuses {
+            overall = match (overall, s) {
+                (_, HealthStatus::Down) | (HealthStatus::Down, _) => HealthStatus::Down,
+                (_, HealthStatus::OutOfService) | (HealthStatus::OutOfService, _) => {
+                    HealthStatus::OutOfService
+                }
+                (_, HealthStatus::Unknown) | (HealthStatus::Unknown, _) => HealthStatus::Unknown,
+                _ => HealthStatus::Up,
+            };
+        }
+        overall
+    }
+}
+
+/// Run a single indicator with its declared timeout. Returns `Unknown` with
+/// `timed_out: true` when the future does not resolve in time.
+async fn run_with_timeout(indicator: &dyn HealthIndicator) -> HealthCheckOutput {
+    let duration = tokio::time::Duration::from_millis(indicator.timeout_ms());
+    match tokio::time::timeout(duration, indicator.check()).await {
+        Ok(output) => output,
+        Err(_elapsed) => {
+            let mut details = HashMap::new();
+            details.insert("timed_out".to_string(), serde_json::Value::Bool(true));
+            HealthCheckOutput {
+                status: HealthStatus::Unknown,
+                details,
+            }
+        }
+    }
+}
+
 // ── Health ──────────────────────────────────────────────────────
 
 /// Enhanced health response for the actuator health endpoint.
 #[derive(Serialize)]
 struct ActuatorHealth {
+    /// Overall aggregate status following Spring Boot precedence.
     status: &'static str,
     version: &'static str,
     profile: String,
     uptime: String,
+    #[cfg(feature = "db")]
+    autumn_after_commit_failures_total: u64,
+    /// Per-component health, keyed by indicator name.
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    components: HashMap<String, ComponentHealth>,
+    /// Backwards-compatible checks block (populated by built-in db indicator).
     #[serde(skip_serializing_if = "Option::is_none")]
     checks: Option<HealthChecks>,
+}
+
+#[derive(Serialize, Clone)]
+struct ComponentHealth {
+    status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    details: Option<serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -970,11 +1521,58 @@ struct DatabaseCheck {
     idle_connections: u64,
 }
 
+fn build_health_components(
+    db_status: Option<HealthStatus>,
+    db_check: Option<&DatabaseCheck>,
+    indicator_results: &[HealthRunResult],
+    detailed: bool,
+) -> HashMap<String, ComponentHealth> {
+    let mut components: HashMap<String, ComponentHealth> = HashMap::new();
+    // Custom indicators first so the built-in "db" key inserted below can never
+    // be overwritten by a user-registered indicator with the same name.
+    for result in indicator_results {
+        let details = (detailed && !result.output.details.is_empty())
+            .then(|| serde_json::to_value(&result.output.details).unwrap_or_default());
+        components.insert(
+            result.name.clone(),
+            ComponentHealth {
+                status: result.output.status.as_str(),
+                details,
+            },
+        );
+    }
+    if let Some(s) = db_status {
+        let details = detailed
+            .then(|| {
+                db_check.map(|d| {
+                    serde_json::json!({
+                        "status": d.status,
+                        "pool_size": d.pool_size,
+                        "active_connections": d.active_connections,
+                        "idle_connections": d.idle_connections,
+                    })
+                })
+            })
+            .flatten();
+        components.insert(
+            "db".to_string(),
+            ComponentHealth {
+                status: s.as_str(),
+                details,
+            },
+        );
+    }
+    components
+}
+
 /// `GET <actuator-prefix>/health`
 pub async fn health<S: ProvideActuatorState + Send + Sync + 'static>(
     State(state): State<S>,
 ) -> impl IntoResponse {
-    let (overall_healthy, db_check) = {
+    let detailed = state.health_detailed();
+
+    // ── built-in db component ────────────────────────────────────
+    let (db_component_status, db_check) = {
         #[cfg(feature = "db")]
         {
             #[allow(clippy::option_if_let_else)]
@@ -986,36 +1584,67 @@ pub async fn health<S: ProvideActuatorState + Send + Sync + 'static>(
                 let idle = available;
                 let active = size.saturating_sub(available);
 
-                let overall_healthy = available > 0 || waiting == 0;
+                let healthy = available > 0 || waiting == 0;
+                let db_status = if healthy {
+                    HealthStatus::Up
+                } else {
+                    HealthStatus::Down
+                };
                 let db_check = Some(DatabaseCheck {
-                    status: if overall_healthy { "ok" } else { "down" },
+                    status: if healthy { "ok" } else { "down" },
                     pool_size: size,
                     active_connections: active,
                     idle_connections: idle,
                 });
-                (overall_healthy, db_check)
+                (Some(db_status), db_check)
             } else {
-                (true, None)
+                (None, None)
             }
         }
-
         #[cfg(not(feature = "db"))]
         {
-            (true, None)
+            (None::<HealthStatus>, None::<DatabaseCheck>)
         }
     };
+
+    // ── registered custom indicators ───────────────────────────
+    let indicator_results = if let Some(registry) = state.health_indicator_registry() {
+        registry.run_all().await
+    } else {
+        Vec::new()
+    };
+
+    // ── aggregate status ────────────────────────────────────────
+    let mut all_statuses: Vec<HealthStatus> =
+        indicator_results.iter().map(|r| r.output.status).collect();
+    if let Some(s) = db_component_status {
+        all_statuses.push(s);
+    }
+    let overall = HealthIndicatorRegistry::aggregate_status(&all_statuses);
+
+    // ── build components map ────────────────────────────────────
+    let components = build_health_components(
+        db_component_status,
+        db_check.as_ref(),
+        &indicator_results,
+        detailed,
+    );
 
     let checks = db_check.map(|db| HealthChecks { database: Some(db) });
 
     let body = ActuatorHealth {
-        status: if overall_healthy { "ok" } else { "degraded" },
+        status: overall.as_str(),
         version: env!("CARGO_PKG_VERSION"),
         profile: state.profile().to_owned(),
         uptime: state.uptime_display(),
+        #[cfg(feature = "db")]
+        autumn_after_commit_failures_total: crate::db::AFTER_COMMIT_FAILURES_TOTAL
+            .load(std::sync::atomic::Ordering::Relaxed),
+        components,
         checks,
     };
 
-    let code = if overall_healthy {
+    let code = if overall.is_healthy() {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
@@ -1118,30 +1747,225 @@ pub(crate) async fn metrics_endpoint<S: ProvideActuatorState + Send + Sync + 'st
     State(state): State<S>,
 ) -> Json<serde_json::Value> {
     let snapshot = state.metrics().snapshot();
-    let result = serde_json::to_value(&snapshot).unwrap_or_default();
+    let mut result = serde_json::to_value(&snapshot).unwrap_or_default();
 
     // Include DB pool stats if available
     #[cfg(feature = "db")]
-    let result = {
-        let mut result = result;
-        if let Some(pool) = state.pool() {
-            let status = pool.status();
-            let db_stats = serde_json::json!({
-                "pool_size": status.max_size,
-                "active_connections": (status.max_size as u64).saturating_sub(status.available as u64),
-                "idle_connections": status.available,
-            });
-            if let serde_json::Value::Object(ref mut map) = result {
-                map.insert("database".to_string(), db_stats);
-            }
+    if let Some(pool) = state.pool() {
+        let status = pool.status();
+        let db_stats = serde_json::json!({
+            "pool_size": status.max_size,
+            "active_connections": (status.max_size as u64).saturating_sub(status.available as u64),
+            "idle_connections": status.available,
+        });
+        if let serde_json::Value::Object(ref mut map) = result {
+            map.insert("database".to_string(), db_stats);
         }
-        result
-    };
+    }
+
+    // Include plugin-contributed sources under the "sources" key
+    if let Some(registry) = state.metrics_source_registry() {
+        let all = registry.collect_all();
+        let mut sources = serde_json::Map::new();
+        for (source_name, families) in all {
+            let families_json: Vec<serde_json::Value> = families
+                .iter()
+                .map(|f| {
+                    serde_json::json!({
+                        "name": f.name,
+                        "help": f.help,
+                        "kind": f.kind.as_str(),
+                        "samples": f.samples.iter().map(|s| {
+                            let labels: serde_json::Map<String, serde_json::Value> = s.labels
+                                .iter()
+                                .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                                .collect();
+                            serde_json::json!({
+                                "labels": labels,
+                                "value": s.value,
+                            })
+                        }).collect::<Vec<_>>(),
+                    })
+                })
+                .collect();
+            sources.insert(source_name, serde_json::Value::Array(families_json));
+        }
+        if let serde_json::Value::Object(ref mut map) = result {
+            map.insert("sources".to_string(), serde_json::Value::Object(sources));
+        }
+    }
 
     Json(result)
 }
 
 // ── Prometheus ─────────────────────────────────────────────────
+
+/// Render label set `{k="v",...}` or empty string for no labels.
+///
+/// Writes directly into a pre-allocated `String` to avoid per-pair heap allocations.
+fn render_labels(labels: &[(String, String)]) -> String {
+    if labels.is_empty() {
+        return String::new();
+    }
+    let mut out = String::with_capacity(64);
+    out.push('{');
+    for (i, (k, v)) in labels.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(k);
+        out.push_str("=\"");
+        for c in v.chars() {
+            match c {
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '"' => out.push_str("\\\""),
+                other => out.push(other),
+            }
+        }
+        out.push('"');
+    }
+    out.push('}');
+    out
+}
+
+/// Returns true if `s` is a valid Prometheus metric name (`[a-zA-Z_:][a-zA-Z0-9_:]*`).
+fn is_valid_metric_name(s: &str) -> bool {
+    let mut it = s.chars();
+    matches!(it.next(), Some(c) if c.is_ascii_alphabetic() || c == '_' || c == ':')
+        && it.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+}
+
+/// Returns true if `s` is a valid Prometheus label name (`[a-zA-Z_][a-zA-Z0-9_]*`).
+fn is_valid_label_name(s: &str) -> bool {
+    let mut it = s.chars();
+    matches!(it.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && it.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Escape a Prometheus HELP string (backslash and newline only).
+fn escape_help_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Format a sample value per Prometheus text format (handles ±Inf and NaN).
+fn format_sample_value(v: f64) -> String {
+    if v == f64::INFINITY {
+        "+Inf".to_string()
+    } else if v == f64::NEG_INFINITY {
+        "-Inf".to_string()
+    } else if v.is_nan() {
+        "NaN".to_string()
+    } else {
+        v.to_string()
+    }
+}
+
+/// Append all plugin-contributed metric families (and their error counters) to `out`.
+///
+/// `emitted_families` must be pre-seeded with the names of every built-in
+/// metric family already written to `out`; families whose names collide are
+/// skipped with a warning so no duplicate `# HELP`/`# TYPE` blocks are emitted.
+fn render_plugin_sources(
+    registry: &MetricsSourceRegistry,
+    out: &mut String,
+    emitted_families: &mut std::collections::HashSet<String>,
+) {
+    use std::fmt::Write;
+
+    let all_sources = registry.collect_all();
+    for (_source_name, families) in &all_sources {
+        for family in families {
+            if !is_valid_metric_name(&family.name) {
+                tracing::warn!(name = %family.name, "MetricsSource returned invalid metric name; skipping family");
+                continue;
+            }
+            if !emitted_families.insert(family.name.clone()) {
+                tracing::warn!(name = %family.name, "MetricsSource returned duplicate metric family name; skipping family");
+                continue;
+            }
+            let _ = writeln!(
+                out,
+                "# HELP {} {}",
+                family.name,
+                escape_help_text(&family.help)
+            );
+            let _ = writeln!(out, "# TYPE {} {}", family.name, family.kind.as_str());
+            let mut emitted_series: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            for sample in &family.samples {
+                let mut bad_key = false;
+                let mut seen_keys = std::collections::HashSet::new();
+                let mut valid_labels: Vec<(String, String)> = Vec::new();
+                for (k, v) in &sample.labels {
+                    if !is_valid_label_name(k) {
+                        tracing::warn!(
+                            label_name = %k,
+                            metric = %family.name,
+                            "MetricsSource returned invalid label name; skipping sample"
+                        );
+                        bad_key = true;
+                        break;
+                    }
+                    if !seen_keys.insert(k.as_str()) {
+                        tracing::warn!(label_name = %k, "MetricsSource returned duplicate label name; dropping duplicate");
+                        continue;
+                    }
+                    valid_labels.push((k.clone(), v.clone()));
+                }
+                if bad_key {
+                    continue;
+                }
+                // Sort by key so {a="1",b="2"} and {b="2",a="1"} produce the
+                // same canonical string and are treated as one series.
+                valid_labels.sort_by(|(a, _), (b, _)| a.cmp(b));
+                let labels = render_labels(&valid_labels);
+                if !emitted_series.insert(labels.clone()) {
+                    tracing::warn!(
+                        metric = %family.name,
+                        labels = %labels,
+                        "MetricsSource returned duplicate series; skipping sample"
+                    );
+                    continue;
+                }
+                let _ = writeln!(
+                    out,
+                    "{}{} {}",
+                    family.name,
+                    labels,
+                    format_sample_value(sample.value)
+                );
+            }
+        }
+    }
+
+    let error_counts = registry.error_counts();
+    if !error_counts.is_empty() {
+        out.push_str(
+            "# HELP autumn_metrics_source_errors_total \
+             Number of scrape errors (panics) per plugin metrics source\n",
+        );
+        out.push_str("# TYPE autumn_metrics_source_errors_total counter\n");
+        let mut names: Vec<&String> = error_counts.keys().collect();
+        names.sort();
+        for name in names {
+            let label = render_labels(&[("source".to_string(), name.clone())]);
+            let _ = writeln!(
+                out,
+                "autumn_metrics_source_errors_total{} {}",
+                label, error_counts[name]
+            );
+        }
+    }
+}
 
 /// `GET <actuator-prefix>/prometheus` -- export metrics in Prometheus format.
 pub(crate) async fn prometheus_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
@@ -1150,7 +1974,7 @@ pub(crate) async fn prometheus_endpoint<S: ProvideActuatorState + Send + Sync + 
     use std::fmt::Write;
 
     let snapshot = state.metrics().snapshot();
-    let mut out = String::with_capacity(1024);
+    let mut out = String::with_capacity(2048);
 
     // requests_total
     out.push_str("# HELP autumn_http_requests_total Total number of HTTP requests\n");
@@ -1194,11 +2018,38 @@ pub(crate) async fn prometheus_endpoint<S: ProvideActuatorState + Send + Sync + 
         snapshot.http.by_status.s5xx
     );
 
+    // autumn_shutdown_aborted_requests_total
+    out.push_str(
+        "# HELP autumn_shutdown_aborted_requests_total \
+         HTTP requests forcibly dropped when the graceful-shutdown drain deadline expired\n",
+    );
+    out.push_str("# TYPE autumn_shutdown_aborted_requests_total counter\n");
+    let _ = writeln!(
+        out,
+        "autumn_shutdown_aborted_requests_total {}",
+        snapshot.http.shutdown_aborted_requests_total
+    );
+
+    // autumn_request_timeouts_total
+    out.push_str(
+        "# HELP autumn_request_timeouts_total \
+         HTTP requests that exceeded the configured per-request timeout\n",
+    );
+    out.push_str("# TYPE autumn_request_timeouts_total counter\n");
+    let _ = writeln!(
+        out,
+        "autumn_request_timeouts_total {}",
+        snapshot.http.request_timeouts_total
+    );
+
     // by_route
     if !snapshot.http.by_route.is_empty() {
         out.push_str("# HELP autumn_http_route_requests_total HTTP requests by route and method\n");
         out.push_str("# TYPE autumn_http_route_requests_total counter\n");
-        for (route_key, metrics) in &snapshot.http.by_route {
+        let mut route_keys: Vec<&String> = snapshot.http.by_route.keys().collect();
+        route_keys.sort();
+        for route_key in route_keys {
+            let metrics = &snapshot.http.by_route[route_key];
             // route_key is formatted as "METHOD /path"
             if let Some((method, path)) = route_key.split_once(' ') {
                 let _ = writeln!(
@@ -1208,6 +2059,24 @@ pub(crate) async fn prometheus_endpoint<S: ProvideActuatorState + Send + Sync + 
                 );
             }
         }
+    }
+
+    // Plugin-contributed metric families — seed with built-in names so
+    // plugins cannot shadow or duplicate them.
+    if let Some(registry) = state.metrics_source_registry() {
+        let mut emitted_families: std::collections::HashSet<String> = [
+            "autumn_http_requests_total",
+            "autumn_http_requests_active",
+            "autumn_http_responses_total",
+            "autumn_shutdown_aborted_requests_total",
+            "autumn_request_timeouts_total",
+            "autumn_http_route_requests_total",
+            "autumn_metrics_source_errors_total",
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+        render_plugin_sources(registry, &mut out, &mut emitted_families);
     }
 
     (
@@ -1319,6 +2188,244 @@ pub(crate) async fn jobs_endpoint<S: ProvideActuatorState + Send + Sync + 'stati
     Json(serde_json::json!({ "jobs": jobs }))
 }
 
+#[cfg(feature = "http-client")]
+/// Request body for `POST <actuator-prefix>/webhooks/replay`.
+#[derive(Deserialize)]
+pub(crate) struct ReplayRequest {
+    log_id: String,
+}
+
+#[cfg(feature = "http-client")]
+async fn enqueue_webhook_replay_job(log_id: &str) -> Result<(), String> {
+    let job_payload = serde_json::json!({
+        "log_id": log_id,
+        "replay": true,
+    });
+
+    let Some(job_client) = crate::job::global_job_client() else {
+        return Err("Global job client is not available".to_string());
+    };
+
+    job_client
+        .enqueue("autumn_webhook_delivery", job_payload)
+        .await
+        .map_err(|e| format!("Failed to enqueue job: {e}"))
+}
+
+#[cfg(feature = "http-client")]
+/// `GET <actuator-prefix>/webhooks/dlq` -- list dead-lettered webhook logs.
+pub(crate) async fn webhooks_dlq_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
+    State(state): State<S>,
+) -> impl IntoResponse {
+    let Some(manager) = state.webhook_outbound() else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(serde_json::json!({
+                "status": "error",
+                "message": "Outbound webhook support is not configured or enabled"
+            })),
+        )
+            .into_response();
+    };
+
+    match manager.store().get_dlq_logs().await {
+        Ok(logs) => (StatusCode::OK, Json(logs)).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "status": "error",
+                "message": format!("Failed to fetch DLQ logs: {}", e)
+            })),
+        )
+            .into_response(),
+    }
+}
+
+#[cfg(feature = "http-client")]
+/// `POST <actuator-prefix>/webhooks/replay` -- replay a dead-lettered webhook log.
+pub(crate) async fn webhooks_replay_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
+    State(state): State<S>,
+    Json(body): Json<ReplayRequest>,
+) -> impl IntoResponse {
+    let Some(manager) = state.webhook_outbound() else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(serde_json::json!({
+                "status": "error",
+                "message": "Outbound webhook support is not configured or enabled"
+            })),
+        )
+            .into_response();
+    };
+
+    let log_opt = match manager.store().get_delivery_log(&body.log_id).await {
+        Ok(log) => log,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "status": "error",
+                    "message": format!("Failed to retrieve log: {}", e)
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let Some(log) = log_opt else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "status": "error",
+                "message": format!("Log with ID {} not found", body.log_id)
+            })),
+        )
+            .into_response();
+    };
+
+    if !log.is_dlq {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "status": "error",
+            "message": format!("Log with ID {} is not in the Dead Letter Queue (DLQ)", body.log_id)
+        }))).into_response();
+    }
+
+    if let Some(response) = blocked_webhook_replay_response(&manager, &log, &body.log_id).await {
+        return response;
+    }
+
+    let subscription_id = log.subscription_id.clone();
+    let original_log = log.clone();
+    let log = reset_webhook_replay_log(log);
+
+    if let Err(e) = manager.store().log_delivery(log).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "status": "error",
+                "message": format!("Failed to update delivery log state: {}", e)
+            })),
+        )
+            .into_response();
+    }
+
+    // Enqueue background delivery job now that the log state is safely reset in the store
+    if let Err(message) = enqueue_webhook_replay_job(&body.log_id).await {
+        if let Err(rollback_error) = manager.store().replace_delivery_log(original_log).await {
+            tracing::error!(
+                log_id = %body.log_id,
+                "Failed to roll back webhook replay log after enqueue failure: {}",
+                rollback_error
+            );
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "status": "error",
+                    "message": format!("{message}; failed to restore DLQ log state: {rollback_error}")
+                })),
+            )
+                .into_response();
+        }
+
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "status": "error",
+                "message": message
+            })),
+        )
+            .into_response();
+    }
+
+    // Reactivate auto-failed subscriptions only after the replay job is queued.
+    if let Err(e) = manager
+        .store()
+        .reactivate_failed_subscription(&subscription_id)
+        .await
+    {
+        tracing::warn!(subscription_id = %subscription_id, "Failed to reactivate subscription during replay: {}", e);
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "ok",
+            "message": format!("Replay successfully enqueued for log {}", body.log_id)
+        })),
+    )
+        .into_response()
+}
+
+#[cfg(feature = "http-client")]
+fn reset_webhook_replay_log(
+    mut log: crate::webhook_outbound::WebhookDeliveryLog,
+) -> crate::webhook_outbound::WebhookDeliveryLog {
+    log.is_dlq = false;
+    log.attempt = 1;
+    log.last_error = None;
+    log.response_status = None;
+    log.response_body = None;
+    log.timestamp = chrono::Utc::now();
+    log
+}
+
+#[cfg(feature = "http-client")]
+async fn blocked_webhook_replay_response(
+    manager: &crate::webhook_outbound::WebhookOutboundManager,
+    log: &crate::webhook_outbound::WebhookDeliveryLog,
+    log_id: &str,
+) -> Option<axum::response::Response> {
+    let subscription = match manager.store().get_subscription(&log.subscription_id).await {
+        Ok(subscription) => subscription,
+        Err(e) => {
+            return Some(
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "status": "error",
+                        "message": format!("Failed to retrieve subscription: {}", e)
+                    })),
+                )
+                    .into_response(),
+            );
+        }
+    };
+
+    let Some(subscription) = subscription else {
+        return Some(
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "status": "error",
+                    "message": format!(
+                        "Subscription {} for replay log {} was not found",
+                        log.subscription_id, log_id
+                    )
+                })),
+            )
+                .into_response(),
+        );
+    };
+
+    if subscription.status != crate::webhook_outbound::WebhookSubscriptionStatus::Disabled {
+        return None;
+    }
+
+    Some(
+        (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "status": "error",
+                "message": format!(
+                    "Subscription {} is disabled; re-enable it before replaying log {}",
+                    log.subscription_id, log_id
+                )
+            })),
+        )
+            .into_response(),
+    )
+}
+
 // ── A11y ───────────────────────────────────────────────────────
 
 /// `GET <actuator-prefix>/a11y` -- scaffold-level accessibility posture.
@@ -1414,7 +2521,11 @@ pub(crate) fn actuator_route_path(prefix: &str, suffix: &str) -> String {
     }
 }
 
-pub(crate) fn actuator_endpoint_paths(prefix: &str, sensitive: bool) -> Vec<String> {
+pub(crate) fn actuator_endpoint_paths(
+    prefix: &str,
+    sensitive: bool,
+    prometheus_enabled: bool,
+) -> Vec<String> {
     let mut paths = vec![
         actuator_route_path(prefix, "/health"),
         actuator_route_path(prefix, "/info"),
@@ -1424,6 +2535,10 @@ pub(crate) fn actuator_endpoint_paths(prefix: &str, sensitive: bool) -> Vec<Stri
         actuator_route_path(prefix, "/ui/metrics"),
     ];
 
+    if prometheus_enabled {
+        paths.push(actuator_route_path(prefix, "/prometheus"));
+    }
+
     if sensitive {
         paths.push(actuator_route_path(prefix, "/env"));
         paths.push(actuator_route_path(prefix, "/configprops"));
@@ -1431,7 +2546,11 @@ pub(crate) fn actuator_endpoint_paths(prefix: &str, sensitive: bool) -> Vec<Stri
         paths.push(actuator_route_path(prefix, "/tasks"));
         paths.push(actuator_route_path(prefix, "/jobs"));
         paths.push(actuator_route_path(prefix, "/ui/tasks"));
-        paths.push(actuator_route_path(prefix, "/prometheus"));
+        #[cfg(feature = "http-client")]
+        {
+            paths.push(actuator_route_path(prefix, "/webhooks/dlq"));
+            paths.push(actuator_route_path(prefix, "/webhooks/replay"));
+        }
         #[cfg(feature = "ws")]
         {
             paths.push(actuator_route_path(prefix, "/channels"));
@@ -1446,20 +2565,29 @@ pub(crate) fn actuator_endpoint_paths(prefix: &str, sensitive: bool) -> Vec<Stri
 ///
 /// In dev mode (or when `actuator.sensitive = true`), all endpoints are
 /// exposed. In prod mode, only health, info, and metrics are available.
+///
+/// The Prometheus scrape endpoint is mounted unconditionally here (independent
+/// of `sensitive`). The framework router mounts the actuator from configuration
+/// and gates `/actuator/prometheus` on the `actuator.prometheus` flag.
 pub fn actuator_router<S: ProvideActuatorState + Send + Sync + Clone + 'static>(
     sensitive: bool,
 ) -> axum::Router<S> {
-    actuator_router_with_prefix("/actuator", sensitive)
+    actuator_router_with_prefix("/actuator", sensitive, true)
 }
 
 /// Build the actuator router at a configured prefix.
 ///
 /// This is the prefix-aware variant used by the framework router.
+///
+/// `prometheus_enabled` controls the `/actuator/prometheus` scrape endpoint
+/// independently of `sensitive`, so platform metrics scraping can be exposed
+/// without also exposing sensitive actuator surfaces.
 pub(crate) fn actuator_router_with_prefix<
     S: ProvideActuatorState + Send + Sync + Clone + 'static,
 >(
     prefix: &str,
     sensitive: bool,
+    prometheus_enabled: bool,
 ) -> axum::Router<S> {
     let mut router = axum::Router::new()
         .route(
@@ -1479,15 +2607,18 @@ pub(crate) fn actuator_router_with_prefix<
             axum::routing::get(a11y_endpoint::<S>),
         );
 
+    if prometheus_enabled {
+        router = router.route(
+            &actuator_route_path(prefix, "/prometheus"),
+            axum::routing::get(prometheus_endpoint::<S>),
+        );
+    }
+
     if sensitive {
         router = router
             .route(
                 &actuator_route_path(prefix, "/env"),
                 axum::routing::get(env_endpoint::<S>),
-            )
-            .route(
-                &actuator_route_path(prefix, "/prometheus"),
-                axum::routing::get(prometheus_endpoint::<S>),
             )
             .route(
                 &actuator_route_path(prefix, "/configprops"),
@@ -1513,6 +2644,18 @@ pub(crate) fn actuator_router_with_prefix<
                 &actuator_route_path(prefix, "/ui/tasks"),
                 axum::routing::get(ui_tasks::<S>),
             );
+        #[cfg(feature = "http-client")]
+        {
+            router = router
+                .route(
+                    &actuator_route_path(prefix, "/webhooks/dlq"),
+                    axum::routing::get(webhooks_dlq_endpoint::<S>),
+                )
+                .route(
+                    &actuator_route_path(prefix, "/webhooks/replay"),
+                    axum::routing::post(webhooks_replay_endpoint::<S>),
+                );
+        }
 
         #[cfg(feature = "system-info")]
         {
@@ -1669,6 +2812,9 @@ mod tests {
         task_registry: TaskRegistry,
         job_registry: JobRegistry,
         config_props: ConfigProperties,
+        metrics_source_registry: MetricsSourceRegistry,
+        #[cfg(feature = "http-client")]
+        webhook_outbound: Option<crate::webhook_outbound::WebhookOutboundManager>,
         #[cfg(feature = "db")]
         pool: Option<
             diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
@@ -1701,6 +2847,13 @@ mod tests {
         fn uptime_display(&self) -> String {
             "test_uptime".to_string()
         }
+        fn metrics_source_registry(&self) -> Option<&MetricsSourceRegistry> {
+            Some(&self.metrics_source_registry)
+        }
+        #[cfg(feature = "http-client")]
+        fn webhook_outbound(&self) -> Option<crate::webhook_outbound::WebhookOutboundManager> {
+            self.webhook_outbound.clone()
+        }
         #[cfg(feature = "db")]
         fn pool(
             &self,
@@ -1730,6 +2883,9 @@ mod tests {
             task_registry: TaskRegistry::new(),
             job_registry: JobRegistry::new(),
             config_props: ConfigProperties::from_config(config),
+            metrics_source_registry: MetricsSourceRegistry::new(),
+            #[cfg(feature = "http-client")]
+            webhook_outbound: None,
             #[cfg(feature = "db")]
             pool: None,
             #[cfg(feature = "ws")]
@@ -1737,6 +2893,313 @@ mod tests {
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
         }
+    }
+
+    #[cfg(feature = "http-client")]
+    fn test_state_with_webhook_outbound(
+        manager: crate::webhook_outbound::WebhookOutboundManager,
+    ) -> TestActuatorState {
+        let mut state = test_state();
+        state.webhook_outbound = Some(manager);
+        state
+    }
+
+    #[cfg(feature = "http-client")]
+    fn replay_test_subscription() -> crate::webhook_outbound::WebhookSubscription {
+        crate::webhook_outbound::WebhookSubscription {
+            id: "sub-replay".to_string(),
+            target_url: "https://example.test/webhook".to_string(),
+            event_topics: vec!["order.created".to_string()],
+            secret: "secret".to_string(),
+            status: crate::webhook_outbound::WebhookSubscriptionStatus::Failed,
+            consecutive_failures: 50,
+        }
+    }
+
+    #[cfg(feature = "http-client")]
+    fn replay_test_dlq_log() -> crate::webhook_outbound::WebhookDeliveryLog {
+        crate::webhook_outbound::WebhookDeliveryLog {
+            id: "log-replay".to_string(),
+            subscription_id: "sub-replay".to_string(),
+            topic: "order.created".to_string(),
+            payload: "{\"id\":123}".to_string(),
+            request_headers: std::collections::HashMap::new(),
+            response_status: Some(503),
+            response_body: Some("unavailable".to_string()),
+            elapsed_ms: 42,
+            attempt: 5,
+            max_attempts: 5,
+            is_dlq: true,
+            last_error: Some("server returned status: 503".to_string()),
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
+    #[cfg(feature = "http-client")]
+    #[tokio::test]
+    async fn webhooks_replay_preserves_dlq_log_and_failures_when_enqueue_is_unavailable() {
+        use crate::webhook_outbound::{
+            InMemoryOutboundWebhookHandler, OutboundWebhookHandler, WebhookOutboundManager,
+        };
+
+        let _guard = crate::job::global_job_runtime_test_lock().lock().await;
+        crate::job::clear_global_job_client();
+
+        let handler = Arc::new(InMemoryOutboundWebhookHandler::new());
+        handler
+            .create_subscription(replay_test_subscription())
+            .await
+            .expect("subscription setup");
+        let original_log = replay_test_dlq_log();
+        handler
+            .log_delivery(original_log.clone())
+            .await
+            .expect("dlq log setup");
+        let failures_before_replay = handler
+            .get_subscription("sub-replay")
+            .await
+            .expect("subscription lookup")
+            .expect("subscription should exist")
+            .consecutive_failures;
+
+        let state = test_state_with_webhook_outbound(WebhookOutboundManager::new(handler.clone()));
+        let response = webhooks_replay_endpoint(
+            State(state),
+            Json(ReplayRequest {
+                log_id: original_log.id.clone(),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let stored_log = handler
+            .get_delivery_log(&original_log.id)
+            .await
+            .expect("delivery log lookup")
+            .expect("delivery log should still exist");
+        assert!(stored_log.is_dlq, "failed enqueue must keep log in DLQ");
+        assert_eq!(stored_log.attempt, original_log.attempt);
+        assert_eq!(stored_log.last_error, original_log.last_error);
+        assert_eq!(stored_log.response_status, original_log.response_status);
+        assert_eq!(stored_log.response_body, original_log.response_body);
+
+        let subscription = handler
+            .get_subscription("sub-replay")
+            .await
+            .expect("subscription lookup")
+            .expect("subscription should exist");
+        assert_eq!(
+            subscription.consecutive_failures, failures_before_replay,
+            "failed enqueue must not reset subscription failure history"
+        );
+        assert_eq!(
+            subscription.status,
+            crate::webhook_outbound::WebhookSubscriptionStatus::Failed,
+            "failed enqueue must not reactivate an auto-failed subscription"
+        );
+
+        crate::job::clear_global_job_client();
+    }
+
+    #[cfg(feature = "http-client")]
+    #[tokio::test]
+    async fn webhooks_replay_rejects_disabled_subscription_without_removing_dlq() {
+        use crate::webhook_outbound::{
+            InMemoryOutboundWebhookHandler, OutboundWebhookHandler, WebhookOutboundManager,
+            WebhookSubscriptionStatus,
+        };
+
+        let _guard = crate::job::global_job_runtime_test_lock().lock().await;
+        crate::job::clear_global_job_client();
+
+        let handler = Arc::new(InMemoryOutboundWebhookHandler::new());
+        let mut subscription = replay_test_subscription();
+        subscription.status = WebhookSubscriptionStatus::Disabled;
+        subscription.consecutive_failures = 0;
+        handler
+            .create_subscription(subscription)
+            .await
+            .expect("subscription setup");
+        let original_log = replay_test_dlq_log();
+        handler
+            .log_delivery(original_log.clone())
+            .await
+            .expect("dlq log setup");
+
+        let state = test_state_with_webhook_outbound(WebhookOutboundManager::new(handler.clone()));
+        let response = webhooks_replay_endpoint(
+            State(state),
+            Json(ReplayRequest {
+                log_id: original_log.id.clone(),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        let stored_log = handler
+            .get_delivery_log(&original_log.id)
+            .await
+            .expect("delivery log lookup")
+            .expect("delivery log should still exist");
+        assert!(stored_log.is_dlq);
+        assert_eq!(stored_log.attempt, original_log.attempt);
+        assert_eq!(stored_log.response_status, original_log.response_status);
+        assert_eq!(stored_log.last_error, original_log.last_error);
+
+        let subscription = handler
+            .get_subscription("sub-replay")
+            .await
+            .expect("subscription lookup")
+            .expect("subscription should exist");
+        assert_eq!(subscription.status, WebhookSubscriptionStatus::Disabled);
+
+        crate::job::clear_global_job_client();
+    }
+
+    #[cfg(feature = "http-client")]
+    #[tokio::test]
+    async fn webhooks_replay_rejects_missing_subscription_without_removing_dlq() {
+        use crate::webhook_outbound::{
+            InMemoryOutboundWebhookHandler, OutboundWebhookHandler, WebhookOutboundManager,
+        };
+
+        let _guard = crate::job::global_job_runtime_test_lock().lock().await;
+        crate::job::clear_global_job_client();
+
+        let handler = Arc::new(InMemoryOutboundWebhookHandler::new());
+        let original_log = replay_test_dlq_log();
+        handler
+            .log_delivery(original_log.clone())
+            .await
+            .expect("dlq log setup");
+
+        let runtime_state = crate::AppState::for_test().with_profile("test");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        crate::job::start_runtime(
+            vec![crate::job::JobInfo {
+                name: "autumn_webhook_delivery".to_string(),
+                max_attempts: 1,
+                initial_backoff_ms: 1,
+                handler: |_state, _payload| Box::pin(async move { Ok(()) }),
+            }],
+            &runtime_state,
+            &shutdown,
+            &crate::config::JobConfig::default(),
+        )
+        .expect("job runtime should start");
+
+        let state = test_state_with_webhook_outbound(WebhookOutboundManager::new(handler.clone()));
+        let response = webhooks_replay_endpoint(
+            State(state),
+            Json(ReplayRequest {
+                log_id: original_log.id.clone(),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let stored_log = handler
+            .get_delivery_log(&original_log.id)
+            .await
+            .expect("delivery log lookup")
+            .expect("delivery log should still exist");
+        assert!(stored_log.is_dlq);
+        assert_eq!(stored_log.attempt, original_log.attempt);
+        assert_eq!(stored_log.response_status, original_log.response_status);
+        assert_eq!(stored_log.response_body, original_log.response_body);
+        assert_eq!(stored_log.last_error, original_log.last_error);
+
+        assert!(
+            handler
+                .get_subscription("sub-replay")
+                .await
+                .expect("subscription lookup")
+                .is_none(),
+            "test setup should leave the subscription missing"
+        );
+
+        shutdown.cancel();
+        crate::job::clear_global_job_client();
+    }
+
+    #[cfg(feature = "http-client")]
+    #[tokio::test]
+    async fn webhooks_replay_resets_log_and_failures_after_enqueue_succeeds() {
+        use crate::webhook_outbound::{
+            InMemoryOutboundWebhookHandler, OutboundWebhookHandler, WebhookOutboundManager,
+        };
+
+        let _guard = crate::job::global_job_runtime_test_lock().lock().await;
+        crate::job::clear_global_job_client();
+
+        let handler = Arc::new(InMemoryOutboundWebhookHandler::new());
+        handler
+            .create_subscription(replay_test_subscription())
+            .await
+            .expect("subscription setup");
+        let original_log = replay_test_dlq_log();
+        handler
+            .log_delivery(original_log.clone())
+            .await
+            .expect("dlq log setup");
+
+        let runtime_state = crate::AppState::for_test().with_profile("test");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        crate::job::start_runtime(
+            vec![crate::job::JobInfo {
+                name: "autumn_webhook_delivery".to_string(),
+                max_attempts: 1,
+                initial_backoff_ms: 1,
+                handler: |_state, _payload| Box::pin(async move { Ok(()) }),
+            }],
+            &runtime_state,
+            &shutdown,
+            &crate::config::JobConfig::default(),
+        )
+        .expect("job runtime should start");
+
+        let state = test_state_with_webhook_outbound(WebhookOutboundManager::new(handler.clone()));
+        let response = webhooks_replay_endpoint(
+            State(state),
+            Json(ReplayRequest {
+                log_id: original_log.id.clone(),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let stored_log = handler
+            .get_delivery_log(&original_log.id)
+            .await
+            .expect("delivery log lookup")
+            .expect("delivery log should still exist");
+        assert!(!stored_log.is_dlq);
+        assert_eq!(stored_log.attempt, 1);
+        assert_eq!(stored_log.last_error, None);
+        assert_eq!(stored_log.response_status, None);
+        assert_eq!(stored_log.response_body, None);
+
+        let subscription = handler
+            .get_subscription("sub-replay")
+            .await
+            .expect("subscription lookup")
+            .expect("subscription should exist");
+        assert_eq!(subscription.consecutive_failures, 0);
+        assert_eq!(
+            subscription.status,
+            crate::webhook_outbound::WebhookSubscriptionStatus::Active
+        );
+
+        shutdown.cancel();
+        crate::job::clear_global_job_client();
     }
 
     #[tokio::test]
@@ -1757,14 +3220,40 @@ mod tests {
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["status"], "ok");
+        assert_eq!(json["status"], "UP");
         assert_eq!(json["profile"], "dev");
         assert!(json["uptime"].is_string());
     }
 
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn actuator_health_exposes_after_commit_failure_counter() {
+        let app = actuator_router(true).with_state(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["autumn_after_commit_failures_total"],
+            crate::db::AFTER_COMMIT_FAILURES_TOTAL.load(std::sync::atomic::Ordering::Relaxed),
+            "/actuator/health should expose the documented after_commit counter"
+        );
+    }
+
     #[tokio::test]
     async fn actuator_routes_respect_custom_prefix() {
-        let app = actuator_router_with_prefix("/ops", true).with_state(test_state());
+        let app = actuator_router_with_prefix("/ops", true, true).with_state(test_state());
 
         let prefixed = app
             .clone()
@@ -2187,10 +3676,14 @@ mod tests {
         assert!(
             text.contains("autumn_http_route_requests_total{method=\"POST\",route=\"/test\"} 1")
         );
+
+        assert!(text.contains("# HELP autumn_request_timeouts_total"));
+        assert!(text.contains("# TYPE autumn_request_timeouts_total counter"));
+        assert!(text.contains("autumn_request_timeouts_total 0"));
     }
 
     #[tokio::test]
-    async fn actuator_prometheus_hidden_in_nonsensitive_mode() {
+    async fn actuator_prometheus_available_in_nonsensitive_mode() {
         let app = actuator_router(false).with_state(test_state());
         let resp = app
             .oneshot(
@@ -2201,7 +3694,98 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn actuator_prometheus_available_when_export_enabled_and_nonsensitive() {
+        // Metrics export decoupled from sensitive: prometheus is reachable even
+        // though sensitive endpoints (env/configprops/loggers/tasks) are not.
+        let app = actuator_router_with_prefix("/actuator", false, true).with_state(test_state());
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/prometheus")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Sensitive surfaces stay closed under the non-sensitive metrics config.
+        for sensitive_path in [
+            "/actuator/env",
+            "/actuator/configprops",
+            "/actuator/loggers",
+            "/actuator/tasks",
+            "/actuator/jobs",
+            "/actuator/ui/tasks",
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(sensitive_path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::NOT_FOUND,
+                "{sensitive_path} should be unavailable when actuator is non-sensitive"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn actuator_prometheus_unavailable_when_export_disabled() {
+        // Regression: with metrics export disabled, the scrape endpoint is gone.
+        let app = actuator_router_with_prefix("/actuator", false, false).with_state(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/prometheus")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn actuator_prometheus_unavailable_when_export_disabled_even_if_sensitive() {
+        // Disabling export wins even when sensitive endpoints are enabled.
+        let app = actuator_router_with_prefix("/actuator", true, false).with_state(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/prometheus")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn actuator_endpoint_paths_respects_prometheus_toggle() {
+        let enabled = actuator_endpoint_paths("/actuator", false, true);
+        assert!(
+            enabled.iter().any(|p| p == "/actuator/prometheus"),
+            "prometheus path should be listed when export is enabled: {enabled:?}"
+        );
+
+        let disabled = actuator_endpoint_paths("/actuator", false, false);
+        assert!(
+            !disabled.iter().any(|p| p == "/actuator/prometheus"),
+            "prometheus path should be absent when export is disabled: {disabled:?}"
+        );
     }
 
     // ── Tasks endpoint tests ───────────────────────────────────
@@ -2613,10 +4197,824 @@ mod tests {
 
     #[tokio::test]
     async fn actuator_a11y_endpoint_paths_includes_a11y() {
-        let paths = actuator_endpoint_paths("/actuator", false);
+        let paths = actuator_endpoint_paths("/actuator", false, true);
         assert!(
             paths.iter().any(|p| p == "/actuator/a11y"),
             "a11y path not found in: {paths:?}"
+        );
+    }
+
+    // ── MetricsSource / MetricsSourceRegistry tests ────────────
+
+    #[test]
+    fn metrics_source_registry_registers_and_collects() {
+        struct FixedSource;
+        impl MetricsSource for FixedSource {
+            fn collect(&self) -> Vec<MetricFamily> {
+                vec![MetricFamily {
+                    name: "plugin_requests_total".to_string(),
+                    help: "Plugin request count".to_string(),
+                    kind: MetricKind::Counter,
+                    samples: vec![MetricSample {
+                        labels: vec![],
+                        value: 42.0,
+                    }],
+                }]
+            }
+        }
+
+        let registry = MetricsSourceRegistry::new();
+        registry
+            .register("myplugin", Arc::new(FixedSource))
+            .unwrap();
+
+        let all = registry.collect_all();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].0, "myplugin");
+        assert_eq!(all[0].1[0].name, "plugin_requests_total");
+        assert!((all[0].1[0].samples[0].value - 42.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn metrics_source_registry_rejects_duplicate_name() {
+        struct EmptySource;
+        impl MetricsSource for EmptySource {
+            fn collect(&self) -> Vec<MetricFamily> {
+                vec![]
+            }
+        }
+
+        let registry = MetricsSourceRegistry::new();
+        registry.register("dup", Arc::new(EmptySource)).unwrap();
+        let result = registry.register("dup", Arc::new(EmptySource));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("dup"));
+    }
+
+    #[test]
+    fn metrics_source_registry_isolates_panicking_source() {
+        struct PanickingSource;
+        impl MetricsSource for PanickingSource {
+            fn collect(&self) -> Vec<MetricFamily> {
+                panic!("source panicked!")
+            }
+        }
+
+        let registry = MetricsSourceRegistry::new();
+        registry
+            .register("panicker", Arc::new(PanickingSource))
+            .unwrap();
+
+        let all = registry.collect_all();
+        assert_eq!(all.len(), 1);
+        assert_eq!(
+            all[0].1.len(),
+            0,
+            "panicking source should yield no families"
+        );
+
+        let errors = registry.error_counts();
+        assert_eq!(errors.get("panicker"), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn prometheus_endpoint_includes_plugin_source_families() {
+        struct GaugeSource;
+        impl MetricsSource for GaugeSource {
+            fn collect(&self) -> Vec<MetricFamily> {
+                vec![MetricFamily {
+                    name: "plugin_queue_depth".to_string(),
+                    help: "Plugin queue depth".to_string(),
+                    kind: MetricKind::Gauge,
+                    samples: vec![MetricSample {
+                        labels: vec![("shard".to_string(), "a".to_string())],
+                        value: 7.0,
+                    }],
+                }]
+            }
+        }
+
+        let state = test_state();
+        state
+            .metrics_source_registry
+            .register("gauge_plugin", Arc::new(GaugeSource))
+            .unwrap();
+
+        let app = actuator_router(true).with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/prometheus")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(
+            text.contains("# HELP plugin_queue_depth Plugin queue depth"),
+            "missing HELP line in:\n{text}"
+        );
+        assert!(
+            text.contains("# TYPE plugin_queue_depth gauge"),
+            "missing TYPE line in:\n{text}"
+        );
+        assert!(
+            text.contains("plugin_queue_depth{shard=\"a\"} 7"),
+            "missing sample line in:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn prometheus_endpoint_emits_error_counter_for_panicking_source() {
+        struct PanickingSource;
+        impl MetricsSource for PanickingSource {
+            fn collect(&self) -> Vec<MetricFamily> {
+                panic!("oops")
+            }
+        }
+
+        let state = test_state();
+        state
+            .metrics_source_registry
+            .register("panic_src", Arc::new(PanickingSource))
+            .unwrap();
+
+        let app = actuator_router(true).with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/prometheus")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(
+            text.contains("autumn_metrics_source_errors_total{source=\"panic_src\"} 1"),
+            "missing error counter in:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_includes_sources_section() {
+        struct SampleSource;
+        impl MetricsSource for SampleSource {
+            fn collect(&self) -> Vec<MetricFamily> {
+                vec![MetricFamily {
+                    name: "custom_counter".to_string(),
+                    help: "A custom counter".to_string(),
+                    kind: MetricKind::Counter,
+                    samples: vec![MetricSample {
+                        labels: vec![],
+                        value: 5.0,
+                    }],
+                }]
+            }
+        }
+
+        let state = test_state();
+        state
+            .metrics_source_registry
+            .register("my_source", Arc::new(SampleSource))
+            .unwrap();
+
+        let app = actuator_router(true).with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert!(
+            json.get("sources").is_some(),
+            "metrics JSON missing 'sources' key"
+        );
+        assert!(
+            json["sources"].get("my_source").is_some(),
+            "sources missing 'my_source' key"
+        );
+    }
+
+    #[test]
+    fn metrics_source_registry_preserves_insertion_order() {
+        struct NamedSource(&'static str);
+        impl MetricsSource for NamedSource {
+            fn collect(&self) -> Vec<MetricFamily> {
+                vec![MetricFamily {
+                    name: self.0.to_string(),
+                    help: String::new(),
+                    kind: MetricKind::Counter,
+                    samples: vec![],
+                }]
+            }
+        }
+
+        let registry = MetricsSourceRegistry::new();
+        registry
+            .register("alpha", Arc::new(NamedSource("alpha_metric")))
+            .unwrap();
+        registry
+            .register("beta", Arc::new(NamedSource("beta_metric")))
+            .unwrap();
+        registry
+            .register("gamma", Arc::new(NamedSource("gamma_metric")))
+            .unwrap();
+
+        let all = registry.collect_all();
+        assert_eq!(all[0].0, "alpha");
+        assert_eq!(all[1].0, "beta");
+        assert_eq!(all[2].0, "gamma");
+    }
+
+    // ── render_plugin_sources edge-case coverage ──────────────────────────
+
+    #[test]
+    fn escape_help_text_escapes_backslash_and_newline() {
+        assert_eq!(escape_help_text("a\\b\nc"), "a\\\\b\\nc");
+        assert_eq!(escape_help_text("plain"), "plain");
+        assert_eq!(escape_help_text(""), "");
+    }
+
+    #[test]
+    fn format_sample_value_handles_special_floats() {
+        assert_eq!(format_sample_value(f64::INFINITY), "+Inf");
+        assert_eq!(format_sample_value(f64::NEG_INFINITY), "-Inf");
+        assert_eq!(format_sample_value(f64::NAN), "NaN");
+        assert_eq!(format_sample_value(0.0), "0");
+        assert_eq!(format_sample_value(1.5), "1.5");
+    }
+
+    #[test]
+    fn is_valid_metric_name_accepts_valid_and_rejects_invalid() {
+        assert!(is_valid_metric_name("http_requests_total"));
+        assert!(is_valid_metric_name("_private"));
+        assert!(is_valid_metric_name("ns:metric"));
+        assert!(!is_valid_metric_name(""));
+        assert!(!is_valid_metric_name("0starts_with_digit"));
+        assert!(!is_valid_metric_name("has-hyphen"));
+    }
+
+    #[test]
+    fn is_valid_label_name_accepts_valid_and_rejects_invalid() {
+        assert!(is_valid_label_name("shard"));
+        assert!(is_valid_label_name("_internal"));
+        assert!(is_valid_label_name("a1"));
+        assert!(!is_valid_label_name(""));
+        assert!(!is_valid_label_name("0starts_digit"));
+        assert!(!is_valid_label_name("has-hyphen"));
+        assert!(!is_valid_label_name("has.dot"));
+    }
+
+    #[tokio::test]
+    async fn prometheus_endpoint_skips_family_with_invalid_metric_name() {
+        struct BadNameSource;
+        impl MetricsSource for BadNameSource {
+            fn collect(&self) -> Vec<MetricFamily> {
+                vec![
+                    MetricFamily {
+                        name: "invalid-name".to_string(),
+                        help: "should be skipped".to_string(),
+                        kind: MetricKind::Counter,
+                        samples: vec![],
+                    },
+                    MetricFamily {
+                        name: "valid_name".to_string(),
+                        help: "should appear".to_string(),
+                        kind: MetricKind::Counter,
+                        samples: vec![MetricSample {
+                            labels: vec![],
+                            value: 1.0,
+                        }],
+                    },
+                ]
+            }
+        }
+
+        let state = test_state();
+        state
+            .metrics_source_registry
+            .register("bad_name_src", Arc::new(BadNameSource))
+            .unwrap();
+
+        let app = actuator_router(true).with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/prometheus")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(
+            !text.contains("invalid-name"),
+            "invalid family must be skipped:\n{text}"
+        );
+        assert!(
+            text.contains("valid_name"),
+            "valid family must appear:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn prometheus_endpoint_skips_sample_with_invalid_label_key() {
+        // A sample containing an invalid label key (bad-key) must be skipped
+        // entirely — not emitted with the bad key dropped — to avoid creating
+        // a phantom duplicate series in the Prometheus scrape.
+        struct DirtyLabelsSource;
+        impl MetricsSource for DirtyLabelsSource {
+            fn collect(&self) -> Vec<MetricFamily> {
+                vec![MetricFamily {
+                    name: "dirty_labels_metric".to_string(),
+                    help: "test".to_string(),
+                    kind: MetricKind::Counter,
+                    samples: vec![
+                        MetricSample {
+                            labels: vec![
+                                ("good".to_string(), "a".to_string()),
+                                ("bad-key".to_string(), "b".to_string()),
+                            ],
+                            value: 1.0,
+                        },
+                        MetricSample {
+                            labels: vec![("good".to_string(), "a".to_string())],
+                            value: 2.0,
+                        },
+                    ],
+                }]
+            }
+        }
+
+        let state = test_state();
+        state
+            .metrics_source_registry
+            .register("dirty", Arc::new(DirtyLabelsSource))
+            .unwrap();
+
+        let app = actuator_router(true).with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/prometheus")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+
+        // First sample (bad-key) must be absent entirely
+        assert!(
+            !text.contains("dirty_labels_metric{good=\"a\"} 1"),
+            "sample with invalid label key must be skipped:\n{text}"
+        );
+        // Second (clean) sample must still appear
+        assert!(
+            text.contains("dirty_labels_metric{good=\"a\"} 2"),
+            "clean sample must appear:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn prometheus_endpoint_deduplicates_label_keys() {
+        struct DupLabelSource;
+        impl MetricsSource for DupLabelSource {
+            fn collect(&self) -> Vec<MetricFamily> {
+                vec![MetricFamily {
+                    name: "dup_label_metric".to_string(),
+                    help: "test".to_string(),
+                    kind: MetricKind::Counter,
+                    samples: vec![MetricSample {
+                        labels: vec![
+                            ("env".to_string(), "prod".to_string()),
+                            ("env".to_string(), "staging".to_string()),
+                        ],
+                        value: 5.0,
+                    }],
+                }]
+            }
+        }
+
+        let state = test_state();
+        state
+            .metrics_source_registry
+            .register("dup_src", Arc::new(DupLabelSource))
+            .unwrap();
+
+        let app = actuator_router(true).with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/prometheus")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+
+        // Only the first occurrence of `env` is kept
+        assert!(
+            text.contains("dup_label_metric{env=\"prod\"} 5"),
+            "first env value must be kept:\n{text}"
+        );
+        assert!(
+            !text.contains("staging"),
+            "duplicate env key value must be dropped:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn prometheus_endpoint_escapes_help_text_and_formats_inf() {
+        struct SpecialSource;
+        impl MetricsSource for SpecialSource {
+            fn collect(&self) -> Vec<MetricFamily> {
+                vec![MetricFamily {
+                    name: "inf_gauge".to_string(),
+                    help: "has\\backslash and\nnewline".to_string(),
+                    kind: MetricKind::Gauge,
+                    samples: vec![
+                        MetricSample {
+                            labels: vec![("dir".to_string(), "pos".to_string())],
+                            value: f64::INFINITY,
+                        },
+                        MetricSample {
+                            labels: vec![("dir".to_string(), "neg".to_string())],
+                            value: f64::NEG_INFINITY,
+                        },
+                    ],
+                }]
+            }
+        }
+
+        let state = test_state();
+        state
+            .metrics_source_registry
+            .register("special", Arc::new(SpecialSource))
+            .unwrap();
+
+        let app = actuator_router(true).with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/prometheus")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(
+            text.contains("# HELP inf_gauge has\\\\backslash and\\nnewline"),
+            "help text must be escaped in:\n{text}"
+        );
+        assert!(
+            text.contains("inf_gauge{dir=\"pos\"} +Inf"),
+            "must render +Inf in:\n{text}"
+        );
+        assert!(
+            text.contains("inf_gauge{dir=\"neg\"} -Inf"),
+            "must render -Inf in:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn prometheus_endpoint_skips_duplicate_family_name_across_sources() {
+        struct FirstSource;
+        impl MetricsSource for FirstSource {
+            fn collect(&self) -> Vec<MetricFamily> {
+                vec![MetricFamily {
+                    name: "shared_counter".to_string(),
+                    help: "from first".to_string(),
+                    kind: MetricKind::Counter,
+                    samples: vec![MetricSample {
+                        labels: vec![],
+                        value: 1.0,
+                    }],
+                }]
+            }
+        }
+        struct SecondSource;
+        impl MetricsSource for SecondSource {
+            fn collect(&self) -> Vec<MetricFamily> {
+                vec![MetricFamily {
+                    name: "shared_counter".to_string(),
+                    help: "from second".to_string(),
+                    kind: MetricKind::Counter,
+                    samples: vec![MetricSample {
+                        labels: vec![],
+                        value: 2.0,
+                    }],
+                }]
+            }
+        }
+
+        let state = test_state();
+        state
+            .metrics_source_registry
+            .register("first", Arc::new(FirstSource))
+            .unwrap();
+        state
+            .metrics_source_registry
+            .register("second", Arc::new(SecondSource))
+            .unwrap();
+
+        let app = actuator_router(true).with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/prometheus")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+
+        let occurrences = text.matches("# HELP shared_counter").count();
+        assert_eq!(
+            occurrences, 1,
+            "must emit exactly one HELP block for shared_counter:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn prometheus_endpoint_skips_builtin_name_collision() {
+        struct ShadowSource;
+        impl MetricsSource for ShadowSource {
+            fn collect(&self) -> Vec<MetricFamily> {
+                vec![MetricFamily {
+                    name: "autumn_http_requests_total".to_string(),
+                    help: "plugin trying to shadow built-in".to_string(),
+                    kind: MetricKind::Counter,
+                    samples: vec![MetricSample {
+                        labels: vec![],
+                        value: 999.0,
+                    }],
+                }]
+            }
+        }
+
+        let state = test_state();
+        state
+            .metrics_source_registry
+            .register("shadow", Arc::new(ShadowSource))
+            .unwrap();
+
+        let app = actuator_router(true).with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/prometheus")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+
+        let occurrences = text.matches("# HELP autumn_http_requests_total").count();
+        assert_eq!(
+            occurrences, 1,
+            "built-in must not be shadowed by plugin:\n{text}"
+        );
+        assert!(
+            !text.contains("999"),
+            "plugin shadow value must not appear:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn prometheus_endpoint_skips_duplicate_series_within_family() {
+        struct DupSeriesSource;
+        impl MetricsSource for DupSeriesSource {
+            fn collect(&self) -> Vec<MetricFamily> {
+                vec![MetricFamily {
+                    name: "dup_series_metric".to_string(),
+                    help: "test".to_string(),
+                    kind: MetricKind::Counter,
+                    samples: vec![
+                        MetricSample {
+                            labels: vec![("region".to_string(), "us".to_string())],
+                            value: 10.0,
+                        },
+                        MetricSample {
+                            labels: vec![("region".to_string(), "us".to_string())],
+                            value: 20.0,
+                        },
+                    ],
+                }]
+            }
+        }
+
+        let state = test_state();
+        state
+            .metrics_source_registry
+            .register("dup_series", Arc::new(DupSeriesSource))
+            .unwrap();
+
+        let app = actuator_router(true).with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/prometheus")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+
+        // First occurrence kept, second skipped
+        assert!(
+            text.contains("dup_series_metric{region=\"us\"} 10"),
+            "first sample must appear:\n{text}"
+        );
+        assert!(
+            !text.contains("dup_series_metric{region=\"us\"} 20"),
+            "duplicate series must be dropped:\n{text}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod health_indicator_tests {
+    use super::*;
+
+    struct AlwaysUp;
+    impl HealthIndicator for AlwaysUp {
+        fn check(&self) -> futures::future::BoxFuture<'_, HealthCheckOutput> {
+            Box::pin(async { HealthCheckOutput::up() })
+        }
+    }
+
+    struct AlwaysDown;
+    impl HealthIndicator for AlwaysDown {
+        fn check(&self) -> futures::future::BoxFuture<'_, HealthCheckOutput> {
+            Box::pin(async { HealthCheckOutput::down() })
+        }
+    }
+
+    #[test]
+    fn health_status_as_str_values() {
+        assert_eq!(HealthStatus::Up.as_str(), "UP");
+        assert_eq!(HealthStatus::Down.as_str(), "DOWN");
+        assert_eq!(HealthStatus::OutOfService.as_str(), "OUT_OF_SERVICE");
+        assert_eq!(HealthStatus::Unknown.as_str(), "UNKNOWN");
+    }
+
+    #[test]
+    fn health_status_is_healthy() {
+        assert!(HealthStatus::Up.is_healthy());
+        assert!(HealthStatus::Unknown.is_healthy());
+        assert!(!HealthStatus::Down.is_healthy());
+        assert!(!HealthStatus::OutOfService.is_healthy());
+    }
+
+    #[test]
+    fn aggregate_status_precedence() {
+        assert_eq!(
+            HealthIndicatorRegistry::aggregate_status(&[HealthStatus::Up]),
+            HealthStatus::Up
+        );
+        assert_eq!(
+            HealthIndicatorRegistry::aggregate_status(&[HealthStatus::Up, HealthStatus::Unknown]),
+            HealthStatus::Unknown
+        );
+        assert_eq!(
+            HealthIndicatorRegistry::aggregate_status(&[
+                HealthStatus::Unknown,
+                HealthStatus::OutOfService
+            ]),
+            HealthStatus::OutOfService
+        );
+        assert_eq!(
+            HealthIndicatorRegistry::aggregate_status(&[
+                HealthStatus::OutOfService,
+                HealthStatus::Down
+            ]),
+            HealthStatus::Down
+        );
+        assert_eq!(
+            HealthIndicatorRegistry::aggregate_status(&[]),
+            HealthStatus::Up
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_run_all_collects_results() {
+        let registry = HealthIndicatorRegistry::new();
+        registry
+            .register("svc_a", IndicatorGroup::Readiness, Arc::new(AlwaysUp))
+            .unwrap();
+        registry
+            .register("svc_b", IndicatorGroup::HealthOnly, Arc::new(AlwaysDown))
+            .unwrap();
+
+        let results = registry.run_all().await;
+        assert_eq!(results.len(), 2);
+        assert!(
+            results
+                .iter()
+                .any(|r| r.name == "svc_a" && r.output.status == HealthStatus::Up)
+        );
+        assert!(
+            results
+                .iter()
+                .any(|r| r.name == "svc_b" && r.output.status == HealthStatus::Down)
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_run_readiness_filters_health_only() {
+        let registry = HealthIndicatorRegistry::new();
+        registry
+            .register("probe_check", IndicatorGroup::Readiness, Arc::new(AlwaysUp))
+            .unwrap();
+        registry
+            .register(
+                "health_only",
+                IndicatorGroup::HealthOnly,
+                Arc::new(AlwaysDown),
+            )
+            .unwrap();
+
+        let results = registry.run_readiness().await;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "probe_check");
+    }
+
+    #[tokio::test]
+    async fn timed_out_indicator_reports_unknown_with_flag() {
+        struct SlowIndicator;
+        impl HealthIndicator for SlowIndicator {
+            fn check(&self) -> futures::future::BoxFuture<'_, HealthCheckOutput> {
+                Box::pin(async {
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    HealthCheckOutput::up()
+                })
+            }
+            fn timeout_ms(&self) -> u64 {
+                5
+            }
+        }
+        let registry = HealthIndicatorRegistry::new();
+        registry
+            .register("slow", IndicatorGroup::Readiness, Arc::new(SlowIndicator))
+            .unwrap();
+        let results = registry.run_all().await;
+        assert_eq!(results[0].output.status, HealthStatus::Unknown);
+        assert_eq!(
+            results[0].output.details.get("timed_out"),
+            Some(&serde_json::Value::Bool(true))
         );
     }
 }

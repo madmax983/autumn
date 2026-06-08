@@ -40,6 +40,8 @@
 //! | `AUTUMN_SERVER__PORT` | `server.port` | `u16` |
 //! | `AUTUMN_SERVER__HOST` | `server.host` | `String` |
 //! | `AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS` | `server.shutdown_timeout_secs` | `u64` |
+//! | `AUTUMN_SERVER__PRESTOP_GRACE_SECS` | `server.prestop_grace_secs` | `u64` |
+//! | `AUTUMN_SERVER__TIMEOUTS__REQUEST_TIMEOUT_MS` | `server.timeouts.request_timeout_ms` | `u64` |
 //! | `AUTUMN_DATABASE__URL` | `database.url` | `String` |
 //! | `AUTUMN_DATABASE__PRIMARY_URL` | `database.primary_url` | `String` |
 //! | `AUTUMN_DATABASE__REPLICA_URL` | `database.replica_url` | `String` |
@@ -86,13 +88,14 @@
 //! | `AUTUMN_CHANNELS__CAPACITY` | `channels.capacity` | `usize` |
 //! | `AUTUMN_CHANNELS__REDIS__URL` | `channels.redis.url` | `String` |
 //! | `AUTUMN_CHANNELS__REDIS__KEY_PREFIX` | `channels.redis.key_prefix` | `String` |
-//! | `AUTUMN_JOBS__BACKEND` | `jobs.backend` | `local` / `redis` |
+//! | `AUTUMN_JOBS__BACKEND` | `jobs.backend` | `local` / `postgres` / `redis` |
 //! | `AUTUMN_JOBS__WORKERS` | `jobs.workers` | `usize` |
 //! | `AUTUMN_JOBS__MAX_ATTEMPTS` | `jobs.max_attempts` | `u32` |
 //! | `AUTUMN_JOBS__INITIAL_BACKOFF_MS` | `jobs.initial_backoff_ms` | `u64` |
 //! | `AUTUMN_JOBS__REDIS__URL` | `jobs.redis.url` | `String` |
 //! | `AUTUMN_JOBS__REDIS__KEY_PREFIX` | `jobs.redis.key_prefix` | `String` |
 //! | `AUTUMN_JOBS__REDIS__VISIBILITY_TIMEOUT_MS` | `jobs.redis.visibility_timeout_ms` | `u64` |
+//! | `AUTUMN_JOBS__POSTGRES__VISIBILITY_TIMEOUT_MS` | `jobs.postgres.visibility_timeout_ms` | `u64` |
 //! | `AUTUMN_SCHEDULER__BACKEND` | `scheduler.backend` | `in_process` / `postgres` |
 //! | `AUTUMN_SCHEDULER__LEASE_TTL_SECS` | `scheduler.lease_ttl_secs` | `u64` |
 //! | `AUTUMN_SCHEDULER__REPLICA_ID` | `scheduler.replica_id` | `String` |
@@ -114,6 +117,14 @@
 //! | `AUTUMN_SECURITY__WEBHOOKS__REPLAY__REDIS__URL` | `security.webhooks.replay.redis.url` | `String` |
 //! | `AUTUMN_SECURITY__WEBHOOKS__REPLAY__REDIS__KEY_PREFIX` | `security.webhooks.replay.redis.key_prefix` | `String` |
 //! | `AUTUMN_SECURITY__WEBHOOKS__REPLAY__ALLOW_MEMORY_IN_PRODUCTION` | `security.webhooks.replay.allow_memory_in_production` | `bool` |
+//! | `AUTUMN_DEV__INSPECTOR_PATH` | `dev.inspector_path` | `String` |
+//! | `AUTUMN_DEV__INSPECTOR_CAPACITY` | `dev.inspector_capacity` | `usize` |
+//! | `AUTUMN_DEV__INSPECTOR_N_PLUS_ONE_THRESHOLD` | `dev.inspector_n_plus_one_threshold` | `usize` |
+//! | `AUTUMN_COMPRESSION__ENABLED` | `compression.enabled` | `bool` |
+//! | `AUTUMN_AUTH__LOCKOUT__ENABLED` | `auth.lockout.enabled` | `bool` |
+//! | `AUTUMN_AUTH__LOCKOUT__THRESHOLD` | `auth.lockout.threshold` | `i32` |
+//! | `AUTUMN_AUTH__LOCKOUT__WINDOW_SECS` | `auth.lockout.window_secs` | `u64` |
+//! | `AUTUMN_AUTH__LOCKOUT__COOLOFF_SECS` | `auth.lockout.cooloff_secs` | `u64` |
 
 use std::path::{Path, PathBuf};
 
@@ -388,6 +399,10 @@ fn profile_defaults_as_toml(profile: &str) -> toml::Value {
             let mut server = toml::map::Map::new();
             server.insert("host".into(), "127.0.0.1".into());
             server.insert("shutdown_timeout_secs".into(), toml::Value::Integer(1));
+            // Zero-out the prestop grace in dev: there is no load balancer to
+            // deregister, so the 5-second default would add unnecessary latency
+            // on every Ctrl-C.
+            server.insert("prestop_grace_secs".into(), toml::Value::Integer(0));
             table.insert("server".into(), toml::Value::Table(server));
 
             let mut health = toml::map::Map::new();
@@ -413,6 +428,23 @@ fn profile_defaults_as_toml(profile: &str) -> toml::Value {
             let mut storage = toml::map::Map::new();
             storage.insert("backend".into(), "local".into());
             table.insert("storage".into(), toml::Value::Table(storage));
+            // Dev: trust X-Forwarded-* from loopback only so local reverse
+            // proxies (nginx, caddy, etc. on 127.0.0.1/::1) work out of the box.
+            let mut trusted_proxies = toml::map::Map::new();
+            trusted_proxies.insert("trust_forwarded_headers".into(), toml::Value::Boolean(true));
+            trusted_proxies.insert(
+                "ranges".into(),
+                toml::Value::Array(vec![
+                    toml::Value::String("127.0.0.0/8".to_owned()),
+                    toml::Value::String("::1/128".to_owned()),
+                ]),
+            );
+            let mut security = toml::map::Map::new();
+            security.insert(
+                "trusted_proxies".into(),
+                toml::Value::Table(trusted_proxies),
+            );
+            table.insert("security".into(), toml::Value::Table(security));
             // Dev: CSRF disabled (default), HSTS off (default)
         }
         "prod" => {
@@ -428,6 +460,9 @@ fn profile_defaults_as_toml(profile: &str) -> toml::Value {
             let mut server = toml::map::Map::new();
             server.insert("host".into(), "0.0.0.0".into());
             server.insert("shutdown_timeout_secs".into(), toml::Value::Integer(30));
+            let mut timeouts = toml::map::Map::new();
+            timeouts.insert("request_timeout_ms".into(), toml::Value::Integer(30_000));
+            server.insert("timeouts".into(), toml::Value::Table(timeouts));
             table.insert("server".into(), toml::Value::Table(server));
 
             let mut health = toml::map::Map::new();
@@ -587,6 +622,10 @@ pub enum ConfigError {
     /// database URL scheme).
     #[error("configuration error: {0}")]
     Validation(String),
+
+    /// The credentials file exists but could not be decrypted.
+    #[error("credentials error: {0}")]
+    Credentials(String),
 }
 
 /// Top-level framework configuration.
@@ -659,6 +698,14 @@ pub struct AutumnConfig {
     #[serde(default)]
     pub cache: CacheConfig,
 
+    /// Row-level multi-tenancy settings.
+    #[serde(default)]
+    pub tenancy: TenancyConfig,
+
+    /// HTTP idempotency-key middleware settings.
+    #[serde(default)]
+    pub idempotency: IdempotencyConfig,
+
     /// Real-time channel backend settings.
     #[serde(default)]
     pub channels: ChannelConfig,
@@ -701,6 +748,250 @@ pub struct AutumnConfig {
     /// to suppress the spec endpoint in production.
     #[serde(default, rename = "openapi")]
     pub openapi_runtime: OpenApiRuntimeConfig,
+
+    /// Encrypted credentials store loaded from `config/credentials/<env>.toml.enc`.
+    ///
+    /// Empty when no credentials file exists (existing apps continue to boot unchanged).
+    /// Prefer using `config.credentials().get::<String>("stripe_key")` for type-safe access.
+    #[serde(skip)]
+    pub credentials: crate::credentials::CredentialsStore,
+
+    /// Outbound HTTP settings (`[http]` section in `autumn.toml`).
+    ///
+    /// The nested `[http.client]` sub-table configures the outbound client.
+    #[cfg(feature = "http-client")]
+    #[serde(default, rename = "http")]
+    pub http: HttpConfig,
+
+    /// Developer-experience settings (`[dev]` section in `autumn.toml`).
+    ///
+    /// Controls the request inspector and other dev-only features.
+    /// These settings have no effect outside the `dev` profile.
+    #[serde(default)]
+    pub dev: DevConfig,
+
+    /// Error-reporting settings (`[reporting]` section in `autumn.toml`).
+    ///
+    /// Controls delivery of panic + 5xx [`ErrorEvent`](crate::reporting::ErrorEvent)s
+    /// to registered reporters. Honored only when the `reporting` cargo
+    /// feature is enabled.
+    #[cfg(feature = "reporting")]
+    #[serde(default)]
+    pub reporting: ReportingConfig,
+
+    /// Response compression settings (`[compression]` section in `autumn.toml`).
+    ///
+    /// Compression is **off by default**. Enable with:
+    /// ```toml
+    /// [compression]
+    /// enabled = true
+    /// ```
+    /// or via `AUTUMN_COMPRESSION__ENABLED=true`.
+    #[serde(default)]
+    pub compression: CompressionConfig,
+
+    /// Bot protection / CAPTCHA settings (`[bot_protection]` section in `autumn.toml`).
+    ///
+    /// Requires a CAPTCHA token on mutating requests (POST/PUT/PATCH/DELETE) to
+    /// protect public-facing forms against automated abuse.
+    ///
+    /// # Example
+    ///
+    /// ```toml
+    /// [bot_protection]
+    /// enabled    = true
+    /// provider   = "turnstile"      # "turnstile" (default) or "hcaptcha"
+    /// site_key   = "0x4AAAA..."     # public key — safe to commit
+    /// secret_key = "..."            # private key — use env var!
+    /// dev_bypass = false
+    /// ```
+    #[serde(default)]
+    pub bot_protection: crate::security::captcha::BotProtectionConfig,
+}
+
+/// Error-reporting settings (`[reporting]` section in `autumn.toml`).
+///
+/// # Example `autumn.toml`
+///
+/// ```toml
+/// [reporting]
+/// enabled = true      # deliver events to reporters (default: true)
+/// sample_rate = 0.25  # report ~25% of events (default: 1.0 = all)
+/// ```
+///
+/// Note: `enabled = false` only suppresses *delivery* to reporters. Handler
+/// panics are still caught and converted to a clean 500 response regardless of
+/// this setting.
+#[cfg(feature = "reporting")]
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReportingConfig {
+    /// Whether error events are delivered to registered reporters.
+    ///
+    /// Defaults to `true`. When `false`, panics are still caught and turned
+    /// into clean 500 responses, but no [`ErrorEvent`](crate::reporting::ErrorEvent)
+    /// is dispatched.
+    #[serde(default = "default_reporting_enabled")]
+    pub enabled: bool,
+    /// Fraction of events to deliver, in `[0.0, 1.0]`.
+    ///
+    /// `1.0` (the default) reports every event; `0.0` reports none. Values
+    /// outside the range are clamped at the extremes.
+    #[serde(default = "default_reporting_sample_rate")]
+    pub sample_rate: f64,
+}
+
+#[cfg(feature = "reporting")]
+impl Default for ReportingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_reporting_enabled(),
+            sample_rate: default_reporting_sample_rate(),
+        }
+    }
+}
+
+#[cfg(feature = "reporting")]
+const fn default_reporting_enabled() -> bool {
+    true
+}
+
+#[cfg(feature = "reporting")]
+const fn default_reporting_sample_rate() -> f64 {
+    1.0
+}
+
+/// Developer-experience settings (`[dev]` section in `autumn.toml`).
+///
+/// All fields are ignored outside the `dev` profile.
+///
+/// # Example `autumn.toml`
+///
+/// ```toml
+/// [dev]
+/// inspector_path = "/_autumn/inspect"
+/// inspector_capacity = 200
+/// inspector_n_plus_one_threshold = 3
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct DevConfig {
+    /// Mount path for the request inspector UI.
+    ///
+    /// Default: `"/_autumn/inspect"`. Only active in the `dev` profile;
+    /// ignored everywhere else.
+    #[serde(default = "default_inspector_path")]
+    pub inspector_path: String,
+
+    /// Maximum number of requests retained in the in-memory ring buffer.
+    ///
+    /// Default: `100`. Set to `0` to disable recording without removing
+    /// the middleware.
+    #[serde(default = "default_inspector_capacity")]
+    pub inspector_capacity: usize,
+
+    /// Minimum number of structurally identical SQL statements in a single
+    /// request before an N+1 warning is emitted.
+    ///
+    /// Default: `5`. Set to `0` to disable N+1 detection.
+    #[serde(default = "default_inspector_n_plus_one_threshold")]
+    pub inspector_n_plus_one_threshold: usize,
+}
+
+impl Default for DevConfig {
+    fn default() -> Self {
+        Self {
+            inspector_path: default_inspector_path(),
+            inspector_capacity: default_inspector_capacity(),
+            inspector_n_plus_one_threshold: default_inspector_n_plus_one_threshold(),
+        }
+    }
+}
+
+fn default_inspector_path() -> String {
+    "/_autumn/inspect".to_owned()
+}
+
+const fn default_inspector_capacity() -> usize {
+    100
+}
+
+const fn default_inspector_n_plus_one_threshold() -> usize {
+    5
+}
+
+/// Top-level `[http]` configuration section.
+#[cfg(feature = "http-client")]
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct HttpConfig {
+    /// Outbound HTTP client settings (`[http.client]`).
+    #[serde(default)]
+    pub client: HttpClientConfig,
+}
+
+/// Configuration for the outbound HTTP client (`[http.client]` in `autumn.toml`).
+///
+/// # Example `autumn.toml`
+///
+/// ```toml
+/// [http.client]
+/// timeout_secs = 30
+/// max_retries  = 3
+///
+/// [http.client.base_urls]
+/// stripe   = "https://api.stripe.com"
+/// sendgrid = "https://api.sendgrid.com"
+/// ```
+#[cfg(feature = "http-client")]
+#[derive(Debug, Clone, Deserialize)]
+pub struct HttpClientConfig {
+    /// Per-request timeout in seconds. Default: 30.
+    #[serde(default = "default_http_timeout_secs")]
+    pub timeout_secs: u64,
+
+    /// Maximum retry attempts for transient failures on idempotent methods.
+    /// Default: 3 (four total attempts).
+    #[serde(default = "default_http_max_retries")]
+    pub max_retries: u32,
+
+    /// Maximum Retry-After sleep duration in seconds to accept before clamping.
+    /// Default: 10.
+    #[serde(default = "default_http_max_retry_after_secs")]
+    pub max_retry_after_secs: u64,
+
+    /// Named base URL aliases, e.g. `stripe = "https://api.stripe.com"`.
+    ///
+    /// A [`Client`](crate::http_client::Client) configured with `.named("stripe")` will
+    /// prepend this URL to relative request paths and match against mocks
+    /// registered for that alias via
+    /// [`TestApp::http_mock`](crate::test::TestApp::http_mock).
+    #[serde(default)]
+    pub base_urls: std::collections::HashMap<String, String>,
+}
+
+#[cfg(feature = "http-client")]
+const fn default_http_timeout_secs() -> u64 {
+    30
+}
+
+#[cfg(feature = "http-client")]
+const fn default_http_max_retries() -> u32 {
+    3
+}
+
+#[cfg(feature = "http-client")]
+const fn default_http_max_retry_after_secs() -> u64 {
+    10
+}
+
+#[cfg(feature = "http-client")]
+impl Default for HttpClientConfig {
+    fn default() -> Self {
+        Self {
+            timeout_secs: default_http_timeout_secs(),
+            max_retries: default_http_max_retries(),
+            max_retry_after_secs: default_http_max_retry_after_secs(),
+            base_urls: std::collections::HashMap::new(),
+        }
+    }
 }
 
 impl axum::extract::FromRequestParts<crate::AppState> for AutumnConfig {
@@ -976,6 +1267,106 @@ fn default_scheduler_key_prefix() -> String {
     "autumn:scheduler".to_owned()
 }
 
+/// Storage backend selection for HTTP idempotency keys.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum IdempotencyBackend {
+    #[default]
+    Memory,
+    Redis,
+}
+
+impl IdempotencyBackend {
+    /// Parse an environment variable value for idempotency backend selection.
+    #[must_use]
+    pub fn from_env_value(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "memory" | "mem" => Some(Self::Memory),
+            "redis" => Some(Self::Redis),
+            _ => None,
+        }
+    }
+}
+
+/// Redis connection settings for the idempotency backend.
+#[derive(Debug, Clone, Deserialize)]
+pub struct IdempotencyRedisConfig {
+    /// Redis connection URL (e.g. `redis://localhost:6379`).
+    pub url: Option<String>,
+    /// Key prefix for all idempotency entries and locks stored in Redis.
+    #[serde(default = "default_idempotency_redis_key_prefix")]
+    pub key_prefix: String,
+}
+
+impl Default for IdempotencyRedisConfig {
+    fn default() -> Self {
+        Self {
+            url: None,
+            key_prefix: default_idempotency_redis_key_prefix(),
+        }
+    }
+}
+
+fn default_idempotency_redis_key_prefix() -> String {
+    "autumn:idempotency".to_owned()
+}
+
+/// HTTP idempotency-key middleware settings.
+#[derive(Debug, Clone, Deserialize)]
+pub struct IdempotencyConfig {
+    /// Enable the idempotency-key middleware.
+    ///
+    /// When `true`, mutating requests that carry an `Idempotency-Key` header
+    /// are deduplicated using the configured backend.
+    ///
+    /// `None` means the field was absent from the config file; the
+    /// `AppBuilder::idempotent()` builder flag may still enable it.
+    /// `Some(false)` is an explicit operator opt-out that overrides the builder.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// Storage backend for idempotency records.
+    #[serde(default)]
+    pub backend: IdempotencyBackend,
+    /// Time-to-live in seconds for stored idempotency records.
+    #[serde(default = "default_idempotency_ttl_secs")]
+    pub ttl_secs: u64,
+    /// Maximum stale lifetime for distributed in-flight locks.
+    ///
+    /// The lock is released as soon as the handler finishes. This value is only
+    /// the backend safety expiry for crashes or lost unlocks, so it should be
+    /// comfortably longer than any supported mutating request duration.
+    #[serde(default = "default_idempotency_in_flight_ttl_secs")]
+    pub in_flight_ttl_secs: u64,
+    /// Allow the in-memory backend in production environments.
+    #[serde(default)]
+    pub allow_memory_in_production: bool,
+    /// Redis connection settings (used when `backend = "redis"`).
+    #[serde(default)]
+    pub redis: IdempotencyRedisConfig,
+}
+
+impl Default for IdempotencyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: None,
+            backend: IdempotencyBackend::default(),
+            ttl_secs: default_idempotency_ttl_secs(),
+            in_flight_ttl_secs: default_idempotency_in_flight_ttl_secs(),
+            allow_memory_in_production: false,
+            redis: IdempotencyRedisConfig::default(),
+        }
+    }
+}
+
+const fn default_idempotency_ttl_secs() -> u64 {
+    86_400
+}
+
+const fn default_idempotency_in_flight_ttl_secs() -> u64 {
+    86_400
+}
+
 /// `OpenAPI` spec runtime exposure settings.
 ///
 /// Populated from the `[openapi]` block in `autumn.toml`. When
@@ -1028,6 +1419,7 @@ pub struct JobConfig {
     /// Runtime backend selection.
     ///
     /// - `local` (default): in-process Tokio queue
+    /// - `postgres`: Postgres-backed durable queue (requires `db` feature)
     /// - `redis`: Redis-backed durable queue (requires `redis` feature)
     #[serde(default = "default_job_backend")]
     pub backend: String,
@@ -1043,6 +1435,9 @@ pub struct JobConfig {
     /// Redis backend options.
     #[serde(default)]
     pub redis: JobRedisConfig,
+    /// Postgres backend options.
+    #[serde(default)]
+    pub postgres: JobPostgresConfig,
 }
 
 impl Default for JobConfig {
@@ -1053,6 +1448,7 @@ impl Default for JobConfig {
             max_attempts: default_job_max_attempts(),
             initial_backoff_ms: default_job_backoff_ms(),
             redis: JobRedisConfig::default(),
+            postgres: JobPostgresConfig::default(),
         }
     }
 }
@@ -1081,6 +1477,29 @@ impl Default for JobRedisConfig {
     }
 }
 
+/// Postgres backend configuration options for the job runner.
+#[derive(Debug, Clone, Deserialize)]
+pub struct JobPostgresConfig {
+    /// Duration before an in-flight job claim is considered stale and recovered.
+    ///
+    /// Workers that crash mid-job have their claim reclaimed by another worker
+    /// within this bound. Default: 30 seconds.
+    #[serde(default = "default_jobs_pg_visibility_timeout_ms")]
+    pub visibility_timeout_ms: u64,
+}
+
+impl Default for JobPostgresConfig {
+    fn default() -> Self {
+        Self {
+            visibility_timeout_ms: default_jobs_pg_visibility_timeout_ms(),
+        }
+    }
+}
+
+const fn default_jobs_pg_visibility_timeout_ms() -> u64 {
+    30_000
+}
+
 fn default_job_backend() -> String {
     "local".to_owned()
 }
@@ -1106,6 +1525,15 @@ const fn default_jobs_redis_visibility_timeout_ms() -> u64 {
 }
 
 impl AutumnConfig {
+    /// Access the decrypted credentials store.
+    ///
+    /// Returns an empty store when no credentials file was found (the feature is opt-in).
+    /// Use `config.credentials().get::<String>("stripe_key")` to access values.
+    #[must_use]
+    pub const fn credentials(&self) -> &crate::credentials::CredentialsStore {
+        &self.credentials
+    }
+
     /// Load configuration with profile-aware layering.
     ///
     /// Applies the six-layer configuration system:
@@ -1194,7 +1622,92 @@ impl AutumnConfig {
         }
 
         config.validate()?;
+
+        let base_dir: PathBuf = env
+            .var("AUTUMN_MANIFEST_DIR")
+            .map_or_else(|_| PathBuf::from("."), PathBuf::from);
+        let cred_profile = config.profile.as_deref().unwrap_or("dev");
+        let master_key_override = env.var("AUTUMN_MASTER_KEY").ok();
+        config.credentials = crate::credentials::load_credentials_with_key_override(
+            cred_profile,
+            &base_dir,
+            master_key_override.as_deref(),
+        )
+        .map_err(|e| ConfigError::Credentials(e.to_string()))?;
+
+        #[cfg(feature = "oauth2")]
+        {
+            config.expand_oauth2_providers();
+        }
+
         Ok(config)
+    }
+
+    /// Helper method to expand `OAuth2` preset configurations and resolve credentials-backed values.
+    #[cfg(feature = "oauth2")]
+    fn expand_oauth2_providers(&mut self) {
+        let provider_names: Vec<String> = self.auth.oauth2.providers.keys().cloned().collect();
+        for name in provider_names {
+            // 1. Expand from preset if available
+            if let (Some(preset), Some(p)) = (
+                crate::auth::provider_preset(&name),
+                self.auth.oauth2.providers.get_mut(&name),
+            ) {
+                if p.authorize_url.is_empty() {
+                    p.authorize_url = preset.authorize_url;
+                }
+                if p.token_url.is_empty() {
+                    p.token_url = preset.token_url;
+                }
+                if p.userinfo_url.is_none() {
+                    p.userinfo_url = preset.userinfo_url;
+                }
+                if p.scope.is_empty() || p.scope == "default" {
+                    p.scope = preset.scope;
+                }
+                if p.issuer.is_none() {
+                    p.issuer = preset.issuer;
+                }
+                if p.jwks_url.is_none() {
+                    p.jwks_url = preset.jwks_url;
+                }
+                if p.discovery_url.is_none() {
+                    p.discovery_url = preset.discovery_url;
+                }
+            }
+
+            // 2. Resolve credentials-backed secrets/IDs
+            if let Some(p) = self.auth.oauth2.providers.get_mut(&name) {
+                let normalized_name = name
+                    .chars()
+                    .map(|c| if c.is_alphanumeric() { c } else { '_' })
+                    .collect::<String>()
+                    .to_lowercase();
+
+                let id_key = format!("oauth2_{normalized_name}_client_id");
+                if p.client_id.is_empty() {
+                    if let Some(id) = self.credentials.get::<String>(&id_key) {
+                        p.client_id = id;
+                    } else if let Some(id) = self
+                        .credentials
+                        .get::<String>(&format!("oauth2_{name}_client_id"))
+                    {
+                        p.client_id = id;
+                    }
+                }
+                let secret_key = format!("oauth2_{normalized_name}_client_secret");
+                if p.client_secret.is_empty() {
+                    if let Some(secret) = self.credentials.get::<String>(&secret_key) {
+                        p.client_secret = secret;
+                    } else if let Some(secret) = self
+                        .credentials
+                        .get::<String>(&format!("oauth2_{name}_client_secret"))
+                    {
+                        p.client_secret = secret;
+                    }
+                }
+            }
+        }
     }
 
     /// Load configuration from a specific TOML file path.
@@ -1256,6 +1769,7 @@ impl AutumnConfig {
     /// - `AUTUMN_SERVER__PORT` → `server.port` (u16)
     /// - `AUTUMN_SERVER__HOST` → `server.host` (String)
     /// - `AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS` → `server.shutdown_timeout_secs` (u64)
+    /// - `AUTUMN_SERVER__PRESTOP_GRACE_SECS` → `server.prestop_grace_secs` (u64)
     ///
     /// # Database
     /// - `AUTUMN_DATABASE__PRIMARY_URL` -> `database.primary_url` (String)
@@ -1322,10 +1836,115 @@ impl AutumnConfig {
         self.apply_scheduler_env_overrides_with_env(env);
         self.apply_auth_env_overrides_with_env(env);
         self.apply_security_env_overrides_with_env(env);
+        self.apply_bot_protection_env_overrides_with_env(env);
+        self.apply_idempotency_env_overrides_with_env(env);
+        self.apply_dev_env_overrides_with_env(env);
+        self.apply_compression_env_overrides_with_env(env);
+        self.apply_actuator_env_overrides_with_env(env);
+        #[cfg(feature = "reporting")]
+        self.apply_reporting_env_overrides_with_env(env);
         #[cfg(feature = "storage")]
         self.apply_storage_env_overrides_with_env(env);
         #[cfg(feature = "mail")]
         self.apply_mail_env_overrides_with_env(env);
+    }
+
+    #[cfg(feature = "reporting")]
+    fn apply_reporting_env_overrides_with_env(&mut self, env: &dyn Env) {
+        parse_env_bool(
+            env,
+            "AUTUMN_REPORTING__ENABLED",
+            &mut self.reporting.enabled,
+        );
+        parse_env(
+            env,
+            "AUTUMN_REPORTING__SAMPLE_RATE",
+            &mut self.reporting.sample_rate,
+        );
+    }
+
+    fn apply_dev_env_overrides_with_env(&mut self, env: &dyn Env) {
+        parse_env_string(
+            env,
+            "AUTUMN_DEV__INSPECTOR_PATH",
+            &mut self.dev.inspector_path,
+        );
+        parse_env(
+            env,
+            "AUTUMN_DEV__INSPECTOR_CAPACITY",
+            &mut self.dev.inspector_capacity,
+        );
+        parse_env(
+            env,
+            "AUTUMN_DEV__INSPECTOR_N_PLUS_ONE_THRESHOLD",
+            &mut self.dev.inspector_n_plus_one_threshold,
+        );
+    }
+
+    fn apply_compression_env_overrides_with_env(&mut self, env: &dyn Env) {
+        parse_env_bool(
+            env,
+            "AUTUMN_COMPRESSION__ENABLED",
+            &mut self.compression.enabled,
+        );
+    }
+
+    fn apply_actuator_env_overrides_with_env(&mut self, env: &dyn Env) {
+        parse_env_string(env, "AUTUMN_ACTUATOR__PREFIX", &mut self.actuator.prefix);
+        parse_env_bool(
+            env,
+            "AUTUMN_ACTUATOR__SENSITIVE",
+            &mut self.actuator.sensitive,
+        );
+        // Security-sensitive: operators disable the Prometheus scrape endpoint
+        // with AUTUMN_ACTUATOR__PROMETHEUS=false; the override must be honored
+        // so the endpoint is not left exposed against the operator's intent.
+        parse_env_bool(
+            env,
+            "AUTUMN_ACTUATOR__PROMETHEUS",
+            &mut self.actuator.prometheus,
+        );
+    }
+
+    fn apply_idempotency_env_overrides_with_env(&mut self, env: &dyn Env) {
+        parse_env_option_bool(
+            env,
+            "AUTUMN_IDEMPOTENCY__ENABLED",
+            &mut self.idempotency.enabled,
+        );
+        if let Ok(val) = env.var("AUTUMN_IDEMPOTENCY__BACKEND") {
+            match IdempotencyBackend::from_env_value(&val) {
+                Some(backend) => self.idempotency.backend = backend,
+                None => eprintln!(
+                    "Warning: unrecognised AUTUMN_IDEMPOTENCY__BACKEND value {val:?}; ignoring"
+                ),
+            }
+        }
+        parse_env(
+            env,
+            "AUTUMN_IDEMPOTENCY__TTL_SECS",
+            &mut self.idempotency.ttl_secs,
+        );
+        parse_env(
+            env,
+            "AUTUMN_IDEMPOTENCY__IN_FLIGHT_TTL_SECS",
+            &mut self.idempotency.in_flight_ttl_secs,
+        );
+        parse_env_bool(
+            env,
+            "AUTUMN_IDEMPOTENCY__ALLOW_MEMORY_IN_PRODUCTION",
+            &mut self.idempotency.allow_memory_in_production,
+        );
+        parse_env_string(
+            env,
+            "AUTUMN_IDEMPOTENCY__REDIS__URL",
+            self.idempotency.redis.url.get_or_insert_with(String::new),
+        );
+        parse_env_string(
+            env,
+            "AUTUMN_IDEMPOTENCY__REDIS__KEY_PREFIX",
+            &mut self.idempotency.redis.key_prefix,
+        );
     }
 
     fn apply_server_env_overrides_with_env(&mut self, env: &dyn Env) {
@@ -1335,6 +1954,16 @@ impl AutumnConfig {
             env,
             "AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS",
             &mut self.server.shutdown_timeout_secs,
+        );
+        parse_env(
+            env,
+            "AUTUMN_SERVER__PRESTOP_GRACE_SECS",
+            &mut self.server.prestop_grace_secs,
+        );
+        parse_env_option(
+            env,
+            "AUTUMN_SERVER__TIMEOUTS__REQUEST_TIMEOUT_MS",
+            &mut self.server.timeouts.request_timeout_ms,
         );
     }
 
@@ -1606,6 +2235,11 @@ impl AutumnConfig {
             "AUTUMN_JOBS__REDIS__VISIBILITY_TIMEOUT_MS",
             &mut self.jobs.redis.visibility_timeout_ms,
         );
+        parse_env(
+            env,
+            "AUTUMN_JOBS__POSTGRES__VISIBILITY_TIMEOUT_MS",
+            &mut self.jobs.postgres.visibility_timeout_ms,
+        );
     }
 
     fn apply_scheduler_env_overrides_with_env(&mut self, env: &dyn Env) {
@@ -1638,6 +2272,53 @@ impl AutumnConfig {
     fn apply_auth_env_overrides_with_env(&mut self, env: &dyn Env) {
         parse_env(env, "AUTUMN_AUTH__BCRYPT_COST", &mut self.auth.bcrypt_cost);
         parse_env_string(env, "AUTUMN_AUTH__SESSION_KEY", &mut self.auth.session_key);
+        parse_env(
+            env,
+            "AUTUMN_AUTH__LOCKOUT__ENABLED",
+            &mut self.auth.lockout.enabled,
+        );
+        parse_env(
+            env,
+            "AUTUMN_AUTH__LOCKOUT__THRESHOLD",
+            &mut self.auth.lockout.threshold,
+        );
+        parse_env(
+            env,
+            "AUTUMN_AUTH__LOCKOUT__WINDOW_SECS",
+            &mut self.auth.lockout.window_secs,
+        );
+        parse_env(
+            env,
+            "AUTUMN_AUTH__LOCKOUT__COOLOFF_SECS",
+            &mut self.auth.lockout.cooloff_secs,
+        );
+        #[cfg(feature = "oauth2")]
+        {
+            let provider_names: Vec<String> = self.auth.oauth2.providers.keys().cloned().collect();
+            for name in provider_names {
+                let upper = name
+                    .chars()
+                    .map(|c| if c.is_alphanumeric() { c } else { '_' })
+                    .collect::<String>()
+                    .to_uppercase();
+
+                let client_id_var = format!("AUTUMN_AUTH__OAUTH2__{upper}__CLIENT_ID");
+                if let Ok(id) = env.var(&client_id_var)
+                    && !id.is_empty()
+                    && let Some(p) = self.auth.oauth2.providers.get_mut(&name)
+                {
+                    p.client_id = id;
+                }
+
+                let client_secret_var = format!("AUTUMN_AUTH__OAUTH2__{upper}__CLIENT_SECRET");
+                if let Ok(secret) = env.var(&client_secret_var)
+                    && !secret.is_empty()
+                    && let Some(p) = self.auth.oauth2.providers.get_mut(&name)
+                {
+                    p.client_secret = secret;
+                }
+            }
+        }
     }
 
     /// Apply `AUTUMN_SECURITY__*` environment variable overrides.
@@ -1736,8 +2417,79 @@ impl AutumnConfig {
             "AUTUMN_SECURITY__SIGNING_SECRET",
             &mut self.security.signing_secret.secret,
         );
+        parse_env_csv(
+            env,
+            "AUTUMN_SECURITY__TRUSTED_HOSTS__HOSTS",
+            &mut self.security.trusted_hosts.hosts,
+        );
+
+        // Top-level trusted-proxy policy
+        parse_env_csv(
+            env,
+            "AUTUMN_SECURITY__TRUSTED_PROXIES__RANGES",
+            &mut self.security.trusted_proxies.ranges,
+        );
+        parse_env_bool(
+            env,
+            "AUTUMN_SECURITY__TRUSTED_PROXIES__TRUST_FORWARDED_HEADERS",
+            &mut self.security.trusted_proxies.trust_forwarded_headers,
+        );
+        if let Ok(val) = env.var("AUTUMN_SECURITY__TRUSTED_PROXIES__TRUSTED_HOPS") {
+            if let Ok(hops) = val.trim().parse::<u32>() {
+                self.security.trusted_proxies.trusted_hops = Some(hops);
+            } else {
+                tracing::warn!(
+                    "ignoring invalid AUTUMN_SECURITY__TRUSTED_PROXIES__TRUSTED_HOPS={val:?}: \
+                     expected a non-negative integer"
+                );
+            }
+        }
 
         self.security.webhooks.apply_env_overrides_with_env(env);
+    }
+
+    fn apply_bot_protection_env_overrides_with_env(&mut self, env: &dyn Env) {
+        parse_env_bool(
+            env,
+            "AUTUMN_BOT_PROTECTION__ENABLED",
+            &mut self.bot_protection.enabled,
+        );
+        parse_env_bool(
+            env,
+            "AUTUMN_BOT_PROTECTION__DEV_BYPASS",
+            &mut self.bot_protection.dev_bypass,
+        );
+        if let Ok(val) = env.var("AUTUMN_BOT_PROTECTION__PROVIDER") {
+            match val.to_lowercase().as_str() {
+                "turnstile" => {
+                    self.bot_protection.provider =
+                        crate::security::captcha::CaptchaProviderKind::Turnstile;
+                }
+                "hcaptcha" => {
+                    self.bot_protection.provider =
+                        crate::security::captcha::CaptchaProviderKind::HCaptcha;
+                }
+                _ => tracing::warn!(
+                    "ignoring unrecognised AUTUMN_BOT_PROTECTION__PROVIDER={val:?}: \
+                     expected \"turnstile\" or \"hcaptcha\""
+                ),
+            }
+        }
+        parse_env_option_string(
+            env,
+            "AUTUMN_BOT_PROTECTION__SITE_KEY",
+            &mut self.bot_protection.site_key,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_BOT_PROTECTION__SECRET_KEY",
+            &mut self.bot_protection.secret_key,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_BOT_PROTECTION__FORM_FIELD",
+            &mut self.bot_protection.form_field,
+        );
     }
 
     fn apply_rate_limit_env_overrides_with_env(&mut self, env: &dyn Env) {
@@ -1766,6 +2518,49 @@ impl AutumnConfig {
             "AUTUMN_SECURITY__RATE_LIMIT__TRUSTED_PROXIES",
             &mut self.security.rate_limit.trusted_proxies,
         );
+        if let Ok(val) = env.var("AUTUMN_SECURITY__RATE_LIMIT__KEY_STRATEGY") {
+            match crate::security::config::KeyStrategy::from_env_value(&val) {
+                Some(strategy) => self.security.rate_limit.key_strategy = strategy,
+                None => eprintln!(
+                    "Warning: AUTUMN_SECURITY__RATE_LIMIT__KEY_STRATEGY={val:?} is not valid \
+                     (expected ip, api_token, or authenticated_principal), ignoring"
+                ),
+            }
+        }
+        // BACKEND is always parsed so misconfiguration is surfaced even without
+        // the redis feature (build_backend will warn and fall back to memory).
+        if let Ok(val) = env.var("AUTUMN_SECURITY__RATE_LIMIT__BACKEND") {
+            match crate::security::config::RateLimitBackend::from_env_value(&val) {
+                Some(backend) => self.security.rate_limit.backend = backend,
+                None => eprintln!(
+                    "Warning: AUTUMN_SECURITY__RATE_LIMIT__BACKEND={val:?} is not valid \
+                     (expected memory or redis), ignoring"
+                ),
+            }
+        }
+        #[cfg(feature = "redis")]
+        {
+            use crate::security::config::RateLimitBackendFailure;
+            if let Ok(val) = env.var("AUTUMN_SECURITY__RATE_LIMIT__ON_BACKEND_FAILURE") {
+                match RateLimitBackendFailure::from_env_value(&val) {
+                    Some(mode) => self.security.rate_limit.on_backend_failure = mode,
+                    None => eprintln!(
+                        "Warning: AUTUMN_SECURITY__RATE_LIMIT__ON_BACKEND_FAILURE={val:?} is not \
+                         valid (expected fail_open or fail_closed), ignoring"
+                    ),
+                }
+            }
+            parse_env_option_string(
+                env,
+                "AUTUMN_SECURITY__RATE_LIMIT__REDIS__URL",
+                &mut self.security.rate_limit.redis.url,
+            );
+            parse_env_string(
+                env,
+                "AUTUMN_SECURITY__RATE_LIMIT__REDIS__KEY_PREFIX",
+                &mut self.security.rate_limit.redis.key_prefix,
+            );
+        }
     }
 
     #[cfg(feature = "storage")]
@@ -1846,6 +2641,21 @@ impl AutumnConfig {
             env,
             "AUTUMN_STORAGE__S3__DEFAULT_URL_EXPIRY_SECS",
             &mut self.storage.s3.default_url_expiry_secs,
+        );
+        parse_env(
+            env,
+            "AUTUMN_STORAGE__VARIANTS__MAX_SOURCE_BYTES",
+            &mut self.storage.variants.max_source_bytes,
+        );
+        parse_env(
+            env,
+            "AUTUMN_STORAGE__VARIANTS__MAX_SOURCE_WIDTH",
+            &mut self.storage.variants.max_source_width,
+        );
+        parse_env(
+            env,
+            "AUTUMN_STORAGE__VARIANTS__MAX_SOURCE_HEIGHT",
+            &mut self.storage.variants.max_source_height,
         );
     }
 
@@ -1935,6 +2745,29 @@ impl AutumnConfig {
 /// assert_eq!(server.port, 3000);
 /// assert_eq!(server.host, "127.0.0.1");
 /// ```
+/// Per-request timeout configuration.
+///
+/// Controls how long the server waits for a complete request-response cycle
+/// before returning `408 Request Timeout`. A value of `None` or `0` disables
+/// the timeout (the default, so existing applications are unaffected).
+///
+/// # `autumn.toml` example
+///
+/// ```toml
+/// [server.timeouts]
+/// request_timeout_ms = 30000  # 30 seconds
+/// ```
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RequestTimeoutsConfig {
+    /// Maximum time in milliseconds allowed for a complete request-response
+    /// cycle. When exceeded the framework returns `408 Request Timeout` with
+    /// a Problem Details body. `None` (default) or `0` disables the timeout.
+    ///
+    /// Configured via `AUTUMN_SERVER__TIMEOUTS__REQUEST_TIMEOUT_MS`.
+    #[serde(default)]
+    pub request_timeout_ms: Option<u64>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerConfig {
     /// Port to listen on. Default: `3000`.
@@ -1956,6 +2789,25 @@ pub struct ServerConfig {
     /// requests to complete before forcibly terminating.
     #[serde(default = "default_shutdown_timeout")]
     pub shutdown_timeout_secs: u64,
+
+    /// Seconds between `/ready` returning 503 and the TCP listener
+    /// closing to new connections. Default: `5`.
+    ///
+    /// This gap gives upstream load balancers time to deregister the
+    /// replica before it stops accepting new connections, preventing
+    /// connection resets on in-flight requests from the LB tier.
+    /// Must be tuned to match the LB's health-check interval + deregistration
+    /// propagation time. Set to `0` to disable the grace period.
+    #[serde(default = "default_prestop_grace")]
+    pub prestop_grace_secs: u64,
+
+    /// Per-request timeout configuration.
+    ///
+    /// Controls request-cycle timeouts for `DoS` protection. By default
+    /// all timeouts are disabled so existing applications are unaffected.
+    /// Set `request_timeout_ms` in `[server.timeouts]` to enable.
+    #[serde(default)]
+    pub timeouts: RequestTimeoutsConfig,
 }
 
 /// Behavior when a configured read replica is unavailable or stale.
@@ -2070,6 +2922,17 @@ pub struct DatabaseConfig {
     /// explicit migration job (`autumn migrate`) instead.
     #[serde(default)]
     pub auto_migrate_in_production: bool,
+
+    /// Optional database statement timeout.
+    #[serde(deserialize_with = "deserialize_option_duration", default)]
+    pub statement_timeout: Option<std::time::Duration>,
+
+    /// Slow query threshold. Default: `500ms`.
+    #[serde(
+        deserialize_with = "deserialize_duration",
+        default = "default_slow_query_threshold"
+    )]
+    pub slow_query_threshold: std::time::Duration,
 }
 
 impl DatabaseConfig {
@@ -2152,6 +3015,14 @@ pub struct LogConfig {
     /// Log output format. Default: [`LogFormat::Auto`].
     #[serde(default)]
     pub format: LogFormat,
+
+    /// Additional sensitive parameter keys to scrub from logs/traces.
+    #[serde(default)]
+    pub filter_parameters: Vec<String>,
+
+    /// Explicitly remove default sensitive keys from the built-in deny-list.
+    #[serde(default)]
+    pub unfilter_parameters: Vec<String>,
 }
 
 /// Log output format.
@@ -2310,6 +3181,16 @@ pub struct ActuatorConfig {
     /// Defaults vary by profile: `true` for dev, `false` for prod.
     #[serde(default)]
     pub sensitive: bool,
+
+    /// When `true`, mount the `/actuator/prometheus` scrape endpoint.
+    ///
+    /// This is **independent of [`Self::sensitive`]**: a production app can
+    /// expose Prometheus metrics for platform scraping (e.g. Fly.io `[metrics]`)
+    /// while keeping `sensitive = false` so env/configprops/loggers/tasks/jobs
+    /// stay off the public surface. Set to `false` to remove the scrape
+    /// endpoint entirely (it then returns `404`). Default: `true`.
+    #[serde(default = "default_actuator_prometheus")]
+    pub prometheus: bool,
 }
 
 impl Default for ActuatorConfig {
@@ -2317,12 +3198,17 @@ impl Default for ActuatorConfig {
         Self {
             prefix: default_actuator_prefix(),
             sensitive: false,
+            prometheus: default_actuator_prometheus(),
         }
     }
 }
 
 fn default_actuator_prefix() -> String {
     "/actuator".to_owned()
+}
+
+const fn default_actuator_prometheus() -> bool {
+    true
 }
 
 /// CORS (Cross-Origin Resource Sharing) configuration.
@@ -2443,6 +3329,62 @@ const fn default_cors_max_age() -> u64 {
     86400
 }
 
+// ── CompressionConfig ──────────────────────────────────────────────────────
+
+/// Response compression settings (`[compression]` section in `autumn.toml`).
+///
+/// Compression is **off by default** to avoid the [BREACH/CRIME] class of
+/// compression side-channel attacks, where an attacker can infer secret
+/// content (e.g. CSRF tokens) by observing how the compressed size changes as
+/// they inject attacker-controlled bytes alongside the secret. Enable only when
+/// you understand the tradeoff — or when a CDN / reverse-proxy handles TLS and
+/// terminates there.
+///
+/// [BREACH/CRIME]: https://breachattack.com/
+///
+/// # One-liner opt-in
+///
+/// ```toml
+/// [compression]
+/// enabled = true
+/// ```
+///
+/// # Environment variable override
+///
+/// | Variable | Field | Type |
+/// |----------|-------|------|
+/// | `AUTUMN_COMPRESSION__ENABLED` | `enabled` | `bool` |
+///
+/// # `ETag` compatibility
+///
+/// Autumn's framework-managed compression layer is applied **outside** any
+/// user-registered `EtagLayer`, so `ETags` are computed on the uncompressed body.
+/// Because `CompressionLayer` sets `Vary: Accept-Encoding`, caches correctly
+/// store separate entries per encoding. Using weak `ETags` (`W/`) when
+/// compression is enabled is safe per RFC 7232 §2.1 (weak comparison allows
+/// encoding variations).
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_web::config::CompressionConfig;
+///
+/// let cfg = CompressionConfig::default();
+/// assert!(!cfg.enabled);
+/// ```
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct CompressionConfig {
+    /// Enable response compression. Default: `false`.
+    ///
+    /// When `true`, the framework inserts a `CompressionLayer` that honors the
+    /// client's `Accept-Encoding` header (gzip and brotli supported) and sets
+    /// `Vary: Accept-Encoding` on all compressible responses.
+    /// Non-compressible content types (images, archives) and responses that
+    /// already carry `Content-Encoding` are passed through unchanged.
+    #[serde(default)]
+    pub enabled: bool,
+}
+
 /// Parse an environment variable into a typed target, logging a warning on failure.
 fn parse_env<T: std::str::FromStr>(env: &dyn Env, key: &str, target: &mut T) {
     if let Ok(val) = env.var(key) {
@@ -2488,6 +3430,16 @@ fn parse_env_bool(env: &dyn Env, key: &str, target: &mut bool) {
     }
 }
 
+fn parse_env_option_bool(env: &dyn Env, key: &str, target: &mut Option<bool>) {
+    if let Ok(val) = env.var(key) {
+        match val.as_str() {
+            "true" | "1" => *target = Some(true),
+            "false" | "0" => *target = Some(false),
+            _ => eprintln!("Warning: {key}={val:?} is not valid (expected true/false), ignoring"),
+        }
+    }
+}
+
 fn parse_env_csv(env: &dyn Env, key: &str, target: &mut Vec<String>) {
     if let Ok(val) = env.var(key) {
         *target = val.split(',').map(|s| s.trim().to_owned()).collect();
@@ -2506,6 +3458,10 @@ fn default_host() -> String {
 
 const fn default_shutdown_timeout() -> u64 {
     30
+}
+
+const fn default_prestop_grace() -> u64 {
+    5
 }
 
 const fn default_pool_size() -> usize {
@@ -2556,6 +3512,8 @@ impl Default for ServerConfig {
             port: default_port(),
             host: default_host(),
             shutdown_timeout_secs: default_shutdown_timeout(),
+            prestop_grace_secs: default_prestop_grace(),
+            timeouts: RequestTimeoutsConfig::default(),
         }
     }
 }
@@ -2572,6 +3530,8 @@ impl Default for DatabaseConfig {
             replica_fallback: ReplicaFallback::default(),
             connect_timeout_secs: default_connect_timeout(),
             auto_migrate_in_production: false,
+            statement_timeout: None,
+            slow_query_threshold: default_slow_query_threshold(),
         }
     }
 }
@@ -2581,6 +3541,8 @@ impl Default for LogConfig {
         Self {
             level: default_log_level(),
             format: LogFormat::default(),
+            filter_parameters: Vec::new(),
+            unfilter_parameters: Vec::new(),
         }
     }
 }
@@ -2672,6 +3634,186 @@ impl TomlEnvConfigLoader {
 impl ConfigLoader for TomlEnvConfigLoader {
     async fn load(&self) -> Result<AutumnConfig, ConfigError> {
         AutumnConfig::load_with_env(&OsEnv)
+    }
+}
+
+const fn default_slow_query_threshold() -> std::time::Duration {
+    std::time::Duration::from_millis(500)
+}
+
+/// Parses a duration string like "500ms", "5s", "2m", "1h",
+/// or a plain integer representing milliseconds.
+///
+/// # Errors
+/// Returns a `String` describing the parse failure when the input is empty,
+/// has an unrecognised suffix, or contains a non-numeric value.
+pub fn parse_duration_str(s: &str) -> Result<std::time::Duration, String> {
+    if s.is_empty() {
+        return Err("duration string is empty".to_owned());
+    }
+
+    // Check if it's a plain integer
+    if let Ok(ms) = s.parse::<u64>() {
+        return Ok(std::time::Duration::from_millis(ms));
+    }
+
+    // Try parsing suffix
+    if let Some(val_str) = s.strip_suffix("ms") {
+        let val = val_str
+            .parse::<u64>()
+            .map_err(|e| format!("invalid duration integer: {e}"))?;
+        return Ok(std::time::Duration::from_millis(val));
+    }
+
+    if let Some(val_str) = s.strip_suffix('s') {
+        let val = val_str
+            .parse::<u64>()
+            .map_err(|e| format!("invalid duration integer: {e}"))?;
+        return Ok(std::time::Duration::from_secs(val));
+    }
+
+    if let Some(val_str) = s.strip_suffix('m') {
+        let val = val_str
+            .parse::<u64>()
+            .map_err(|e| format!("invalid duration integer: {e}"))?;
+        let secs = val.checked_mul(60).ok_or_else(|| {
+            format!("duration overflow: '{s}' exceeds maximum representable value")
+        })?;
+        return Ok(std::time::Duration::from_secs(secs));
+    }
+
+    if let Some(val_str) = s.strip_suffix('h') {
+        let val = val_str
+            .parse::<u64>()
+            .map_err(|e| format!("invalid duration integer: {e}"))?;
+        let secs = val.checked_mul(3600).ok_or_else(|| {
+            format!("duration overflow: '{s}' exceeds maximum representable value")
+        })?;
+        return Ok(std::time::Duration::from_secs(secs));
+    }
+
+    Err(format!("invalid duration format: '{s}'"))
+}
+
+/// Deserialises a TOML/JSON value into a [`std::time::Duration`].
+///
+/// Accepts either a string (`"500ms"`, `"5s"`, `"2m"`, `"1h"`) or a bare
+/// integer (interpreted as milliseconds).
+///
+/// # Errors
+/// Returns a deserialisation error if the value is not a valid duration.
+pub fn deserialize_duration<'de, D>(deserializer: D) -> Result<std::time::Duration, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum DurationOrStr {
+        String(String),
+        Integer(u64),
+    }
+
+    match DurationOrStr::deserialize(deserializer)? {
+        DurationOrStr::String(s) => parse_duration_str(&s).map_err(serde::de::Error::custom),
+        DurationOrStr::Integer(i) => Ok(std::time::Duration::from_millis(i)),
+    }
+}
+
+/// Deserialises an optional TOML/JSON value into <code>Option&lt;[std::time::Duration]&gt;</code>.
+///
+/// Accepts either a string (`"500ms"`, `"5s"`, `"2m"`, `"1h"`), a bare
+/// integer (milliseconds), or `null`/absent to mean no timeout.
+///
+/// # Errors
+/// Returns a deserialisation error if the value is present but invalid.
+pub fn deserialize_option_duration<'de, D>(
+    deserializer: D,
+) -> Result<Option<std::time::Duration>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    struct Wrapper(#[serde(deserialize_with = "deserialize_duration")] std::time::Duration);
+
+    Option::<Wrapper>::deserialize(deserializer).map(|opt| opt.map(|w| w.0))
+}
+
+/// Row-level multi-tenancy configuration.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TenancyConfig {
+    /// Whether row-level multi-tenancy is enabled.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Source configuration from which the tenant ID is extracted.
+    /// Values can be "header" (default), "subdomain", "session", "jwt".
+    #[serde(default = "default_tenancy_source")]
+    pub source: String,
+
+    /// Header name to lookup if source is "header". Default: "x-tenant-id".
+    #[serde(default = "default_tenancy_header_name")]
+    pub header_name: String,
+
+    /// Session key to lookup if source is "session". Default: "`tenant_id`".
+    #[serde(default = "default_tenancy_session_key")]
+    pub session_key: String,
+
+    /// JWT claim to lookup if source is "jwt". Default: "`tenant_id`".
+    #[serde(default = "default_tenancy_jwt_claim")]
+    pub jwt_claim: String,
+
+    /// JWT secret key used to verify the JWT signature.
+    #[serde(default)]
+    pub jwt_secret: Option<String>,
+
+    /// Expected JWT issuer to validate.
+    #[serde(default)]
+    pub jwt_issuer: Option<String>,
+
+    /// Expected JWT audience (`aud` claim) to validate.
+    /// When set, audience checking is enabled; when `None`, audience checking
+    /// is skipped for backward compatibility.
+    #[serde(default)]
+    pub jwt_audience: Option<String>,
+
+    /// Optional base domain for subdomain tenancy.
+    #[serde(default)]
+    pub base_domain: Option<String>,
+}
+
+fn default_tenancy_source() -> String {
+    "header".to_string()
+}
+
+fn default_tenancy_header_name() -> String {
+    "x-tenant-id".to_string()
+}
+
+fn default_tenancy_session_key() -> String {
+    "tenant_id".to_string()
+}
+
+fn default_tenancy_jwt_claim() -> String {
+    "tenant_id".to_string()
+}
+
+impl Default for TenancyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            source: default_tenancy_source(),
+            header_name: default_tenancy_header_name(),
+            session_key: default_tenancy_session_key(),
+            jwt_claim: default_tenancy_jwt_claim(),
+            jwt_secret: None,
+            jwt_issuer: None,
+            jwt_audience: None,
+            base_domain: None,
+        }
     }
 }
 
@@ -3166,6 +4308,37 @@ path = "/healthz"
     }
 
     #[test]
+    fn env_override_actuator_prometheus_disables() {
+        // Operators must be able to remove the scrape endpoint via the
+        // documented AUTUMN_SECTION__FIELD convention, not just TOML.
+        let env = MockEnv::new().with("AUTUMN_ACTUATOR__PROMETHEUS", "false");
+        let mut config = AutumnConfig::default();
+        assert!(config.actuator.prometheus, "default should be enabled");
+        config.apply_env_overrides_with_env(&env);
+        assert!(
+            !config.actuator.prometheus,
+            "AUTUMN_ACTUATOR__PROMETHEUS=false must disable the scrape endpoint"
+        );
+    }
+
+    #[test]
+    fn env_override_actuator_sensitive() {
+        let env = MockEnv::new().with("AUTUMN_ACTUATOR__SENSITIVE", "true");
+        let mut config = AutumnConfig::default();
+        assert!(!config.actuator.sensitive);
+        config.apply_env_overrides_with_env(&env);
+        assert!(config.actuator.sensitive);
+    }
+
+    #[test]
+    fn env_override_actuator_prefix() {
+        let env = MockEnv::new().with("AUTUMN_ACTUATOR__PREFIX", "/ops");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.actuator.prefix, "/ops");
+    }
+
+    #[test]
     fn env_override_database_url_wins_over_file_primary_url() {
         let env = MockEnv::new().with("AUTUMN_DATABASE__URL", "postgres://env.example/app");
         let mut config = AutumnConfig::default();
@@ -3208,6 +4381,20 @@ path = "/healthz"
         assert_eq!(config.database.pool_size, 25);
     }
 
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn env_override_reporting() {
+        let env = MockEnv::new()
+            .with("AUTUMN_REPORTING__ENABLED", "false")
+            .with("AUTUMN_REPORTING__SAMPLE_RATE", "0.1");
+        let mut config = AutumnConfig::default();
+        assert!(config.reporting.enabled);
+        assert!((config.reporting.sample_rate - 1.0).abs() < f64::EPSILON);
+        config.apply_env_overrides_with_env(&env);
+        assert!(!config.reporting.enabled);
+        assert!((config.reporting.sample_rate - 0.1).abs() < f64::EPSILON);
+    }
+
     #[test]
     fn env_override_connect_timeout() {
         let env = MockEnv::new().with("AUTUMN_DATABASE__CONNECT_TIMEOUT_SECS", "15");
@@ -3248,7 +4435,10 @@ path = "/healthz"
                 "AWS_SECRET_ACCESS_KEY",
             )
             .with("AUTUMN_STORAGE__S3__FORCE_PATH_STYLE", "true")
-            .with("AUTUMN_STORAGE__S3__DEFAULT_URL_EXPIRY_SECS", "99");
+            .with("AUTUMN_STORAGE__S3__DEFAULT_URL_EXPIRY_SECS", "99")
+            .with("AUTUMN_STORAGE__VARIANTS__MAX_SOURCE_BYTES", "5242880")
+            .with("AUTUMN_STORAGE__VARIANTS__MAX_SOURCE_WIDTH", "2000")
+            .with("AUTUMN_STORAGE__VARIANTS__MAX_SOURCE_HEIGHT", "1500");
         let mut config = AutumnConfig::default();
 
         config.apply_env_overrides_with_env(&env);
@@ -3280,6 +4470,9 @@ path = "/healthz"
         );
         assert!(config.storage.s3.force_path_style);
         assert_eq!(config.storage.s3.default_url_expiry_secs, 99);
+        assert_eq!(config.storage.variants.max_source_bytes, 5_242_880);
+        assert_eq!(config.storage.variants.max_source_width, 2_000);
+        assert_eq!(config.storage.variants.max_source_height, 1_500);
     }
 
     #[test]
@@ -3494,6 +4687,86 @@ path = "/healthz"
             config.security.rate_limit.trusted_proxies,
             vec!["10.0.0.10", "203.0.113.0/24"]
         );
+    }
+
+    #[test]
+    fn env_override_rate_limit_backend_redis() {
+        use crate::security::config::RateLimitBackend;
+        let env = MockEnv::new().with("AUTUMN_SECURITY__RATE_LIMIT__BACKEND", "redis");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.security.rate_limit.backend, RateLimitBackend::Redis);
+    }
+
+    #[test]
+    fn env_override_rate_limit_backend_memory() {
+        use crate::security::config::RateLimitBackend;
+        let env = MockEnv::new().with("AUTUMN_SECURITY__RATE_LIMIT__BACKEND", "memory");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.security.rate_limit.backend, RateLimitBackend::Memory);
+    }
+
+    #[test]
+    fn env_override_rate_limit_backend_invalid_ignored() {
+        use crate::security::config::RateLimitBackend;
+        let env = MockEnv::new().with("AUTUMN_SECURITY__RATE_LIMIT__BACKEND", "postgres");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.security.rate_limit.backend, RateLimitBackend::Memory);
+    }
+
+    #[cfg(feature = "redis")]
+    #[test]
+    fn env_override_rate_limit_on_backend_failure_fail_closed() {
+        use crate::security::config::RateLimitBackendFailure;
+        let env = MockEnv::new().with(
+            "AUTUMN_SECURITY__RATE_LIMIT__ON_BACKEND_FAILURE",
+            "fail_closed",
+        );
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(
+            config.security.rate_limit.on_backend_failure,
+            RateLimitBackendFailure::FailClosed
+        );
+    }
+
+    #[cfg(feature = "redis")]
+    #[test]
+    fn env_override_rate_limit_on_backend_failure_invalid_ignored() {
+        use crate::security::config::RateLimitBackendFailure;
+        let env = MockEnv::new().with("AUTUMN_SECURITY__RATE_LIMIT__ON_BACKEND_FAILURE", "explode");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(
+            config.security.rate_limit.on_backend_failure,
+            RateLimitBackendFailure::FailOpen
+        );
+    }
+
+    #[cfg(feature = "redis")]
+    #[test]
+    fn env_override_rate_limit_redis_url() {
+        let env = MockEnv::new().with(
+            "AUTUMN_SECURITY__RATE_LIMIT__REDIS__URL",
+            "redis://myhost:6379",
+        );
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(
+            config.security.rate_limit.redis.url.as_deref(),
+            Some("redis://myhost:6379")
+        );
+    }
+
+    #[cfg(feature = "redis")]
+    #[test]
+    fn env_override_rate_limit_redis_key_prefix() {
+        let env = MockEnv::new().with("AUTUMN_SECURITY__RATE_LIMIT__REDIS__KEY_PREFIX", "prod:rl");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.security.rate_limit.redis.key_prefix, "prod:rl");
     }
 
     #[test]
@@ -3765,9 +5038,33 @@ path = "/healthz"
         assert_eq!(config.log.format, LogFormat::Pretty);
         assert_eq!(config.server.host, "127.0.0.1");
         assert_eq!(config.server.shutdown_timeout_secs, 1);
+        assert_eq!(
+            config.server.prestop_grace_secs, 0,
+            "dev profile must set prestop_grace_secs = 0 so Ctrl-C is instant"
+        );
         assert_eq!(config.telemetry.environment, "development");
         assert!(config.health.detailed);
         assert_eq!(config.cors.allowed_origins, vec!["*"]);
+        assert!(
+            config.security.trusted_proxies.trust_forwarded_headers,
+            "dev profile must trust forwarded headers from loopback"
+        );
+        assert!(
+            config
+                .security
+                .trusted_proxies
+                .ranges
+                .contains(&"127.0.0.0/8".to_owned()),
+            "dev profile must include 127.0.0.0/8 as trusted proxy range"
+        );
+        assert!(
+            config
+                .security
+                .trusted_proxies
+                .ranges
+                .contains(&"::1/128".to_owned()),
+            "dev profile must include ::1/128 as trusted proxy range"
+        );
     }
 
     #[test]
@@ -4387,6 +5684,20 @@ path = "/healthz"
         let config = ActuatorConfig::default();
         assert_eq!(config.prefix, "/actuator");
         assert!(!config.sensitive);
+        // Prometheus metrics export is on by default and independent of
+        // `sensitive`, so platform scraping works without exposing env/loggers.
+        assert!(config.prometheus);
+    }
+
+    #[test]
+    fn actuator_prometheus_can_be_disabled_via_toml() {
+        let toml = r"
+            sensitive = false
+            prometheus = false
+        ";
+        let config: ActuatorConfig = toml::from_str(toml).unwrap();
+        assert!(!config.sensitive);
+        assert!(!config.prometheus);
     }
 
     #[test]
@@ -4678,6 +5989,243 @@ path = "/api-spec.json"
         assert!(
             !config.mail.allow_in_process_deliver_later_in_production,
             "flag should default to false when env var is not set"
+        );
+    }
+
+    // ── credentials integration ───────────────────────────────────────────
+
+    #[test]
+    fn config_credentials_empty_when_no_directory() {
+        let env = MockEnv::new();
+        let config = AutumnConfig::load_with_env(&env).unwrap();
+        assert!(
+            config.credentials().is_empty(),
+            "existing apps without config/credentials/ must boot with an empty credentials store"
+        );
+    }
+
+    #[test]
+    fn config_has_credentials_accessor() {
+        let config = AutumnConfig::default();
+        let _store = config.credentials();
+    }
+
+    #[test]
+    fn config_credentials_loaded_when_file_present() {
+        use crate::credentials::{MasterKey, encrypt};
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let key = MasterKey::generate();
+        let ct = encrypt(&key, b"stripe_key = \"sk_test_xyz\"\n");
+        std::fs::create_dir_all(tmp.path().join("config/credentials")).unwrap();
+        std::fs::write(tmp.path().join("config/credentials/dev.toml.enc"), &ct).unwrap();
+
+        let env = MockEnv::new()
+            .with("AUTUMN_MASTER_KEY", &key.to_hex())
+            .with("AUTUMN_MANIFEST_DIR", tmp.path().to_str().unwrap());
+        let config = AutumnConfig::load_with_env(&env).unwrap();
+        let val: Option<String> = config.credentials().get("stripe_key");
+        assert_eq!(val.as_deref(), Some("sk_test_xyz"));
+    }
+
+    #[cfg(feature = "oauth2")]
+    #[test]
+    fn config_resolves_oauth_credentials_by_convention() {
+        use crate::credentials::{MasterKey, encrypt};
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let key = MasterKey::generate();
+        let ct = encrypt(
+            &key,
+            b"oauth2_github_client_id = \"git-id-123\"\noauth2_github_client_secret = \"git-secret-456\"\n",
+        );
+        std::fs::create_dir_all(tmp.path().join("config/credentials")).unwrap();
+        std::fs::write(tmp.path().join("config/credentials/dev.toml.enc"), &ct).unwrap();
+
+        // Write a base configuration with an empty/blank github provider defined
+        std::fs::create_dir_all(tmp.path().join("config")).unwrap();
+        let config_toml = r#"
+[auth.oauth2.github]
+client_id = ""
+client_secret = ""
+authorize_url = "https://github.com/login/oauth/authorize"
+token_url = "https://github.com/login/oauth/access_token"
+redirect_uri = "http://localhost:3000/auth/github/callback"
+"#;
+        std::fs::write(tmp.path().join("autumn.toml"), config_toml).unwrap();
+
+        let env = MockEnv::new()
+            .with("AUTUMN_MASTER_KEY", &key.to_hex())
+            .with("AUTUMN_MANIFEST_DIR", tmp.path().to_str().unwrap());
+        let config = AutumnConfig::load_with_env(&env).unwrap();
+        let github = config.auth.oauth2.providers.get("github").unwrap();
+        assert_eq!(github.client_id, "git-id-123");
+        assert_eq!(github.client_secret, "git-secret-456");
+    }
+
+    #[test]
+    fn config_fails_with_credentials_error_when_key_is_invalid() {
+        use crate::credentials::encrypt;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        // Write an encrypted file but supply a wrong-length key so validation fails
+        let bogus_key = "zz".repeat(32); // 64 chars but not valid hex
+        let ct = encrypt(&crate::credentials::MasterKey::generate(), b"x = \"y\"\n");
+        std::fs::create_dir_all(tmp.path().join("config/credentials")).unwrap();
+        std::fs::write(tmp.path().join("config/credentials/dev.toml.enc"), &ct).unwrap();
+
+        let env = MockEnv::new()
+            .with("AUTUMN_MASTER_KEY", &bogus_key)
+            .with("AUTUMN_MANIFEST_DIR", tmp.path().to_str().unwrap());
+        let err = AutumnConfig::load_with_env(&env).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Credentials(_)),
+            "bad master key should produce ConfigError::Credentials, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_parse_duration_str() {
+        assert_eq!(
+            parse_duration_str("500ms").unwrap(),
+            std::time::Duration::from_millis(500)
+        );
+        assert_eq!(
+            parse_duration_str("5s").unwrap(),
+            std::time::Duration::from_secs(5)
+        );
+        assert_eq!(
+            parse_duration_str("2m").unwrap(),
+            std::time::Duration::from_secs(120)
+        );
+        assert_eq!(
+            parse_duration_str("1h").unwrap(),
+            std::time::Duration::from_secs(3600)
+        );
+        assert_eq!(
+            parse_duration_str("1000").unwrap(),
+            std::time::Duration::from_secs(1)
+        );
+        assert!(parse_duration_str("abc").is_err());
+        assert!(parse_duration_str("").is_err());
+    }
+
+    #[test]
+    fn test_database_config_duration_deserialization() {
+        #[derive(Debug, Deserialize)]
+        struct TestConfig {
+            #[serde(deserialize_with = "deserialize_option_duration", default)]
+            timeout: Option<std::time::Duration>,
+            #[serde(deserialize_with = "deserialize_duration")]
+            threshold: std::time::Duration,
+        }
+
+        let toml_str = r#"
+            timeout = "2s"
+            threshold = "100ms"
+        "#;
+        let parsed: TestConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(parsed.timeout, Some(std::time::Duration::from_secs(2)));
+        assert_eq!(parsed.threshold, std::time::Duration::from_millis(100));
+
+        let toml_str_null = r#"
+            threshold = "500"
+        "#;
+        let parsed_null: TestConfig = toml::from_str(toml_str_null).unwrap();
+        assert_eq!(parsed_null.timeout, None);
+        assert_eq!(parsed_null.threshold, std::time::Duration::from_millis(500));
+    }
+
+    // ── RequestTimeoutsConfig ──────────────────────────────────────────────
+
+    #[test]
+    fn request_timeouts_config_defaults_to_none() {
+        let config = RequestTimeoutsConfig::default();
+        assert!(config.request_timeout_ms.is_none());
+    }
+
+    #[test]
+    fn server_config_timeouts_defaults_to_disabled() {
+        let config = ServerConfig::default();
+        assert!(config.timeouts.request_timeout_ms.is_none());
+    }
+
+    #[test]
+    fn request_timeouts_config_can_be_set_via_toml() {
+        let toml_str = "request_timeout_ms = 5000";
+        let config: RequestTimeoutsConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.request_timeout_ms, Some(5000));
+    }
+
+    #[test]
+    fn server_config_timeouts_deserialize_nested() {
+        let toml_str = r#"
+            port = 3000
+            host = "127.0.0.1"
+            shutdown_timeout_secs = 30
+            prestop_grace_secs = 5
+
+            [timeouts]
+            request_timeout_ms = 15000
+        "#;
+        let config: ServerConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.timeouts.request_timeout_ms, Some(15_000));
+    }
+
+    #[test]
+    fn autumn_config_server_timeouts_roundtrip() {
+        let mut config = AutumnConfig::default();
+        config.server.timeouts.request_timeout_ms = Some(20_000);
+        assert_eq!(config.server.timeouts.request_timeout_ms, Some(20_000));
+    }
+
+    #[test]
+    fn server_timeouts_env_var_override() {
+        struct FakeEnv(std::collections::HashMap<String, String>);
+        impl Env for FakeEnv {
+            fn var(&self, key: &str) -> Result<String, std::env::VarError> {
+                self.0
+                    .get(key)
+                    .cloned()
+                    .ok_or(std::env::VarError::NotPresent)
+            }
+        }
+
+        let mut config = AutumnConfig::default();
+        let env = FakeEnv(
+            [(
+                "AUTUMN_SERVER__TIMEOUTS__REQUEST_TIMEOUT_MS".to_owned(),
+                "8000".to_owned(),
+            )]
+            .into(),
+        );
+        config.apply_server_env_overrides_with_env(&env);
+        assert_eq!(config.server.timeouts.request_timeout_ms, Some(8000));
+    }
+
+    #[test]
+    fn prod_profile_sets_request_timeout_30s() {
+        let defaults = profile_defaults_as_toml("prod");
+        let toml_str = toml::to_string(&defaults).unwrap();
+        let config: AutumnConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(
+            config.server.timeouts.request_timeout_ms,
+            Some(30_000),
+            "prod profile must enable the 30-second request timeout by default"
+        );
+    }
+
+    #[test]
+    fn dev_profile_leaves_request_timeout_disabled() {
+        let defaults = profile_defaults_as_toml("dev");
+        let toml_str = toml::to_string(&defaults).unwrap();
+        let config: AutumnConfig = toml::from_str(&toml_str).unwrap();
+        assert!(
+            config.server.timeouts.request_timeout_ms.is_none(),
+            "dev profile must not enable a request timeout by default"
         );
     }
 }

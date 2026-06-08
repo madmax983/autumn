@@ -1,0 +1,146 @@
+name: Dev-Loop Latency Gate
+
+# Scheduled weekly + manual trigger.
+# Per-PR: only the `--dry-run` budget table check runs (no live server needed).
+# Weekly / manual: the full measurement run executes against examples/hello.
+#
+# Checks that are too flaky or expensive for every PR (live browser polling,
+# database-backed paths) are gated behind the `workflow_dispatch` and
+# `schedule` triggers only.  They are excluded from per-PR required checks via
+# the `if: github.event_name != 'pull_request'` condition on the measure job.
+on:
+  schedule:
+    # Every Monday at 06:00 UTC
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+    inputs:
+      example:
+        description: "Example project to benchmark (e.g. examples/hello)"
+        required: false
+        default: "examples/hello"
+      runs:
+        description: "Number of measurement runs per change class"
+        required: false
+        default: "5"
+      fail_on_regression:
+        description: "Exit 1 if any change class exceeds its budget"
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+  pull_request:
+    branches: [trunk, trunk-dev]
+    paths:
+      # Re-run when the benchmark module, CLI plumbing, or docs change
+      - "autumn-cli/src/dev_loop_bench.rs"
+      - "autumn-cli/src/main.rs"
+      - "docs/guide/dev-loop-latency.md"
+      - ".github/workflows/dev-loop-latency.yml"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ── Budget table smoke-check (runs on every PR, no live server) ────────────
+  budget-table:
+    name: Budget table (dry-run)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.7.8
+
+      - name: Build CLI
+        run: cargo build -p autumn-cli
+
+      - name: Print budget table
+        run: |
+          AUTUMN_BENCH_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+          AUTUMN_BENCH_RUST_VERSION="$(rustc --version)" \
+          ./target/debug/autumn dev-loop-bench --dry-run
+
+  # ── Unit tests for measurement module ─────────────────────────────────────
+  unit-tests:
+    name: Measurement unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.7.8
+
+      - name: Run dev_loop_bench unit tests
+        run: |
+          cargo test -p autumn-cli \
+            dev_loop_bench \
+            2>&1 | tee test-output.txt
+          grep -E "^test result:" test-output.txt
+
+  # ── Live measurement (scheduled / manual only) ─────────────────────────────
+  measure:
+    name: Measure dev-loop latency (${{ inputs.example || 'examples/hello' }})
+    runs-on: ubuntu-latest
+    # Only run live measurement on schedule or manual dispatch, not on PRs.
+    if: github.event_name != 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.7.8
+
+      - name: Build CLI
+        run: cargo build -p autumn-cli
+
+      - name: Run dev-loop benchmark
+        id: bench
+        env:
+          AUTUMN_BENCH_TIMESTAMP: ${{ fromJSON('""') || '' }}
+          AUTUMN_BENCH_RUST_VERSION: ${{ fromJSON('""') || '' }}
+        run: |
+          export AUTUMN_BENCH_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          export AUTUMN_BENCH_RUST_VERSION="$(rustc --version)"
+          EXAMPLE="${{ inputs.example || 'examples/hello' }}"
+          RUNS="${{ inputs.runs || '5' }}"
+          FAIL="${{ inputs.fail_on_regression || 'true' }}"
+          FAIL_FLAG=""
+          if [ "$FAIL" = "true" ]; then FAIL_FLAG="--fail-on-regression"; fi
+          ./target/debug/autumn dev-loop-bench \
+            --example "$EXAMPLE" \
+            --runs "$RUNS" \
+            --output dev-loop-report.json \
+            $FAIL_FLAG | tee dev-loop-summary.txt
+          echo "example=$EXAMPLE" >> "$GITHUB_OUTPUT"
+
+      - name: Upload JSON report
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: dev-loop-report-${{ github.run_id }}
+          path: |
+            dev-loop-report.json
+            dev-loop-summary.txt
+          retention-days: 90
+
+      - name: Post summary
+        if: always()
+        run: |
+          echo "## Dev-Loop Latency Report" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`\`\`" >> "$GITHUB_STEP_SUMMARY"
+          cat dev-loop-summary.txt >> "$GITHUB_STEP_SUMMARY"
+          echo "\`\`\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Full JSON report archived as workflow artifact \`dev-loop-report-${{ github.run_id }}\`." >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "See [dev-loop-latency.md](https://github.com/${{ github.repository }}/blob/${{ github.sha }}/docs/guide/dev-loop-latency.md) for the budget matrix and methodology." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Regression gate
+        if: ${{ inputs.fail_on_regression == 'true' || inputs.fail_on_regression == '' }}
+        run: |
+          ALL_PASSED=$(jq -r '.all_passed' dev-loop-report.json 2>/dev/null || echo "true")
+          if [ "$ALL_PASSED" != "true" ]; then
+            echo "::error::One or more dev-loop change classes exceeded the latency budget."
+            echo "::error::See the report artifact for per-class diagnostics and next actions."
+            exit 1
+          fi

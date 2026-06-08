@@ -158,6 +158,33 @@ fn live_reload_script() -> String {
     format!(r#"<script src="{LIVE_RELOAD_SCRIPT_PATH}"></script>"#)
 }
 
+/// Extension type stored in response extensions by [`capture_matched_path_middleware`].
+///
+/// The outer [`ErrorPageContextLayer`] reads this to include the matched route
+/// pattern in the dev error overlay.
+///
+/// [`ErrorPageContextLayer`]: crate::middleware::error_page_filter::ErrorPageContextLayer
+#[derive(Clone, Debug)]
+pub struct DevMatchedPath(pub String);
+
+/// Axum `from_fn` middleware that captures the matched route pattern, storing
+/// it in response extensions for the dev error overlay.
+///
+/// Applied via `router.route_layer(...)` in dev profile so it runs *after*
+/// route matching (where `MatchedPath` is available).
+pub async fn capture_matched_path_middleware(
+    matched_path: Option<axum::extract::MatchedPath>,
+    request: Request<Body>,
+    next: Next,
+) -> Response<Body> {
+    let pattern = matched_path.map(|mp| mp.as_str().to_owned());
+    let mut response = next.run(request).await;
+    if let Some(p) = pattern {
+        response.extensions_mut().insert(DevMatchedPath(p));
+    }
+    response
+}
+
 fn live_reload_script_body() -> String {
     format!(
         r#"(() => {{

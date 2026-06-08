@@ -372,14 +372,15 @@ fn normalize_path_for_collision(path: &str) -> String {
 ///
 /// Returns both a `CheckResult` and the full list of `CollisionDiagnostic` values
 /// so callers can serialize detailed collision info in JSON output.
+/// ⚡ Bolt: Optimization - Uses borrowed `&str` keys for the hash map to eliminate heap allocations per route during grouping. Allocations are deferred to only the subset of routes that actually collide.
 pub fn check_collisions(routes: &[RouteInfo]) -> (CheckResult, Vec<CollisionDiagnostic>) {
     use std::collections::HashMap;
 
-    let mut by_key: HashMap<(String, String), Vec<&RouteInfo>> = HashMap::new();
+    let mut by_key: HashMap<(&str, String), Vec<&RouteInfo>> = HashMap::new();
     for route in routes {
         by_key
             .entry((
-                route.method.clone(),
+                route.method.as_str(),
                 normalize_path_for_collision(&route.path),
             ))
             .or_default()
@@ -390,7 +391,7 @@ pub fn check_collisions(routes: &[RouteInfo]) -> (CheckResult, Vec<CollisionDiag
         .into_iter()
         .filter(|(_, rs)| rs.len() > 1)
         .map(|((method, path), rs)| CollisionDiagnostic {
-            method,
+            method: method.to_string(),
             path,
             contributors: rs
                 .iter()
@@ -509,6 +510,7 @@ pub fn check_sensitive_surfaces(
 /// attributed to the named plugin. Returns `Skip` when no routes are
 /// attributed to the plugin.
 #[must_use]
+/// ⚡ Bolt: Optimization - Uses borrowed `&str` keys for the deduplication map to avoid allocating new Strings for every route's method and path.
 pub fn check_duplicate_registration(plugin_name: &str, routes: &[RouteInfo]) -> CheckResult {
     use std::collections::HashMap;
 
@@ -526,10 +528,10 @@ pub fn check_duplicate_registration(plugin_name: &str, routes: &[RouteInfo]) -> 
         };
     }
 
-    let mut counts: HashMap<(String, String), usize> = HashMap::new();
+    let mut counts: HashMap<(&str, &str), usize> = HashMap::new();
     for route in &plugin_routes {
         *counts
-            .entry((route.method.clone(), route.path.clone()))
+            .entry((route.method.as_str(), route.path.as_str()))
             .or_insert(0) += 1;
     }
 
@@ -616,6 +618,9 @@ mod tests {
             handler: format!("{}_handler", path.trim_start_matches('/').replace('/', "_")),
             source,
             middleware: vec![],
+            api_version: None,
+            status: None,
+            sunset_opt_out: None,
         }
     }
 

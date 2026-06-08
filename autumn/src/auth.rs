@@ -399,6 +399,191 @@ pub struct AuthConfig {
     #[cfg(feature = "oauth2")]
     #[serde(default)]
     pub oauth2: OAuth2Config,
+
+    /// Account-linking policy for unknown OAuth2/OIDC identities.
+    ///
+    /// - `create_account` (default): a new local account is created on first sign-in.
+    /// - `require_local_signup_first`: returns an error unless the user already has
+    ///   a local account linked to their provider identity.
+    #[cfg(feature = "oauth2")]
+    #[serde(default)]
+    pub oauth_linking_policy: OAuthLinkingPolicy,
+
+    /// `WebAuthn` / passkey configuration.
+    ///
+    /// Required when using `autumn generate auth --passkeys`. Set in `autumn.toml`:
+    ///
+    /// ```toml
+    /// [auth.webauthn]
+    /// rp_id = "example.com"
+    /// rp_name = "My App"
+    /// rp_origin = "https://example.com"
+    /// ```
+    #[cfg(feature = "webauthn")]
+    #[serde(default)]
+    pub webauthn: WebAuthnConfig,
+
+    /// Account lockout policy for the generated login endpoint.
+    ///
+    /// Protects individual accounts from credential-stuffing attacks by locking
+    /// them after a burst of failed login attempts, even when those attempts
+    /// arrive from rotating source IPs.
+    ///
+    /// Configure in `autumn.toml`:
+    ///
+    /// ```toml
+    /// [auth.lockout]
+    /// enabled = true          # set to false to disable (e.g. when using external policy)
+    /// threshold = 10          # failed attempts before lockout
+    /// window_secs = 60        # sliding window for counting failures
+    /// cooloff_secs = 900      # lock duration in seconds (15 minutes)
+    /// ```
+    ///
+    /// Set `threshold = 0` or `enabled = false` to disable lockout entirely and
+    /// restore pre-lockout behaviour for apps with a stronger external policy.
+    #[serde(default)]
+    pub lockout: LockoutConfig,
+
+    /// Step-up ("sudo mode") authentication configuration.
+    ///
+    /// Controls the global default freshness window for `#[step_up]`-protected
+    /// routes. Individual routes can override the default with
+    /// `#[step_up(max_age = "Nm")]`.
+    ///
+    /// Configure in `autumn.toml`:
+    ///
+    /// ```toml
+    /// [auth.step_up]
+    /// default_max_age_secs = 300  # 5 minutes (default)
+    /// ```
+    #[serde(default)]
+    pub step_up: StepUpConfig,
+}
+
+/// Account lockout policy configuration.
+///
+/// Read from the `[auth.lockout]` section of `autumn.toml`.
+/// All fields have safe production defaults.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct LockoutConfig {
+    /// Whether account lockout is enabled (default: `true`).
+    ///
+    /// Set to `false` to disable lockout globally without removing the columns.
+    #[serde(default = "default_lockout_enabled")]
+    pub enabled: bool,
+
+    /// Number of consecutive failed login attempts before an account is locked
+    /// (default: `10`). Set to `0` to disable lockout.
+    #[serde(default = "default_lockout_threshold")]
+    pub threshold: i32,
+
+    /// Sliding window in seconds over which `threshold` failures trigger lockout
+    /// (default: `60`). Reserved for future per-window counting; current
+    /// implementation counts all failures since the last successful login.
+    #[serde(default = "default_lockout_window_secs")]
+    pub window_secs: u64,
+
+    /// Cool-off period in seconds before a locked account is automatically
+    /// unlocked (default: `900`, i.e. 15 minutes). An account also unlocks
+    /// immediately on the first successful login after cool-off elapses.
+    #[serde(default = "default_lockout_cooloff_secs")]
+    pub cooloff_secs: u64,
+}
+
+const fn default_lockout_enabled() -> bool {
+    true
+}
+
+const fn default_lockout_threshold() -> i32 {
+    10
+}
+
+const fn default_lockout_window_secs() -> u64 {
+    60
+}
+
+const fn default_lockout_cooloff_secs() -> u64 {
+    900
+}
+
+impl Default for LockoutConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_lockout_enabled(),
+            threshold: default_lockout_threshold(),
+            window_secs: default_lockout_window_secs(),
+            cooloff_secs: default_lockout_cooloff_secs(),
+        }
+    }
+}
+/// Step-up authentication configuration.
+///
+/// Read from the `[auth.step_up]` section of `autumn.toml`.
+/// All fields have safe defaults.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct StepUpConfig {
+    /// Maximum age (in seconds) of the `last_strong_auth_at` session claim
+    /// before the user must re-authenticate (default: `300`, i.e. 5 minutes).
+    ///
+    /// Individual routes can override this with
+    /// `#[step_up(max_age = "Nm")]`.
+    #[serde(default = "default_step_up_max_age_secs")]
+    pub default_max_age_secs: u64,
+}
+
+const fn default_step_up_max_age_secs() -> u64 {
+    crate::step_up::DEFAULT_MAX_AGE_SECS
+}
+
+impl Default for StepUpConfig {
+    fn default() -> Self {
+        Self {
+            default_max_age_secs: crate::step_up::DEFAULT_MAX_AGE_SECS,
+        }
+    }
+}
+
+/// `WebAuthn` / passkey Relying Party configuration.
+///
+/// Read from the `[auth.webauthn]` section of `autumn.toml`.
+#[cfg(feature = "webauthn")]
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct WebAuthnConfig {
+    /// The Relying Party ID (typically the domain, e.g. `"example.com"`).
+    #[serde(default = "default_rp_id")]
+    pub rp_id: String,
+    /// A human-readable name for the Relying Party shown in authenticator dialogs.
+    #[serde(default = "default_rp_name")]
+    pub rp_name: String,
+    /// The full origin of the Relying Party (e.g. `"https://example.com"`).
+    #[serde(default = "default_rp_origin")]
+    pub rp_origin: String,
+}
+
+#[cfg(feature = "webauthn")]
+impl Default for WebAuthnConfig {
+    fn default() -> Self {
+        Self {
+            rp_id: default_rp_id(),
+            rp_name: default_rp_name(),
+            rp_origin: default_rp_origin(),
+        }
+    }
+}
+
+#[cfg(feature = "webauthn")]
+const fn default_rp_id() -> String {
+    String::new()
+}
+
+#[cfg(feature = "webauthn")]
+fn default_rp_name() -> String {
+    "My App".to_owned()
+}
+
+#[cfg(feature = "webauthn")]
+const fn default_rp_origin() -> String {
+    String::new()
 }
 
 const fn default_bcrypt_cost() -> u32 {
@@ -444,17 +629,22 @@ pub struct OAuth2Config {
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct OAuth2ProviderConfig {
     /// The client ID provided by the `OAuth2` identity provider.
+    #[serde(default)]
     pub client_id: String,
     /// The client secret provided by the `OAuth2` identity provider.
+    #[serde(default)]
     pub client_secret: String,
     /// The authorization endpoint URL where users are redirected to authenticate.
+    #[serde(default)]
     pub authorize_url: String,
     /// The token endpoint URL used to exchange an authorization code for tokens.
+    #[serde(default)]
     pub token_url: String,
     /// The optional userinfo endpoint URL used to fetch profile details.
     #[serde(default)]
     pub userinfo_url: Option<String>,
     /// The local redirect URI registered with the identity provider (e.g., `http://localhost/auth/callback`).
+    #[serde(default)]
     pub redirect_uri: String,
     /// The requested scope string (e.g., `openid profile email`).
     #[serde(default = "default_provider_scope")]
@@ -465,6 +655,111 @@ pub struct OAuth2ProviderConfig {
     /// JWKS endpoint URL used to verify ID token signatures.
     #[serde(default)]
     pub jwks_url: Option<String>,
+    /// OIDC discovery base URL (e.g. `https://accounts.google.com`).
+    ///
+    /// When set, the framework appends `/.well-known/openid-configuration` and fetches
+    /// the discovery document to populate `authorize_url`, `token_url`, `userinfo_url`,
+    /// `jwks_url`, and `issuer` automatically. Explicit fields take precedence.
+    #[serde(default)]
+    pub discovery_url: Option<String>,
+}
+
+#[cfg(feature = "oauth2")]
+/// Policy for linking an OAuth2/OIDC identity to a local user account.
+///
+/// Configured under `[auth]` in `autumn.toml`:
+///
+/// ```toml
+/// [auth]
+/// oauth_linking_policy = "create_account"   # default
+/// # or
+/// oauth_linking_policy = "require_local_signup_first"
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OAuthLinkingPolicy {
+    /// An unknown `OAuth2` identity automatically creates a new local account.
+    /// This is the default for apps where social login is the primary sign-up path.
+    #[default]
+    CreateAccount,
+    /// An unknown `OAuth2` identity returns a clear error unless the user already
+    /// has a local account (linked separately). Choose this when social login is
+    /// supplemental and you want explicit control over account creation.
+    RequireLocalSignupFirst,
+}
+
+#[cfg(feature = "oauth2")]
+/// Returns a pre-populated [`OAuth2ProviderConfig`] for well-known providers.
+///
+/// `client_id`, `client_secret`, and `redirect_uri` are left empty and must be
+/// supplied by the application from `autumn.toml` or environment variables.
+///
+/// # Supported providers
+///
+/// | Key | Protocol | Notes |
+/// |-----|----------|-------|
+/// | `google` | OIDC | Uses `discovery_url`; scopes: `openid profile email` |
+/// | `github` | `OAuth2` | Userinfo endpoint; no OIDC discovery |
+/// | `microsoft` | OIDC | Uses `discovery_url` (common tenant); scopes: `openid profile email` |
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use autumn_web::auth::provider_preset;
+/// if let Some(mut preset) = provider_preset("google") {
+///     preset.client_id = std::env::var("GOOGLE_CLIENT_ID").unwrap_or_default();
+///     preset.client_secret = std::env::var("GOOGLE_CLIENT_SECRET").unwrap_or_default();
+///     preset.redirect_uri = "http://localhost:3000/auth/google/callback".into();
+/// }
+/// ```
+#[must_use]
+pub fn provider_preset(name: &str) -> Option<OAuth2ProviderConfig> {
+    match name {
+        "google" => Some(OAuth2ProviderConfig {
+            client_id: String::new(),
+            client_secret: String::new(),
+            authorize_url: "https://accounts.google.com/o/oauth2/v2/auth".into(),
+            token_url: "https://oauth2.googleapis.com/token".into(),
+            userinfo_url: Some("https://openidconnect.googleapis.com/v1/userinfo".into()),
+            redirect_uri: String::new(),
+            scope: "openid profile email".into(),
+            issuer: Some("https://accounts.google.com".into()),
+            jwks_url: Some("https://www.googleapis.com/oauth2/v3/certs".into()),
+            discovery_url: Some("https://accounts.google.com".into()),
+        }),
+        "github" => Some(OAuth2ProviderConfig {
+            client_id: String::new(),
+            client_secret: String::new(),
+            authorize_url: "https://github.com/login/oauth/authorize".into(),
+            token_url: "https://github.com/login/oauth/access_token".into(),
+            userinfo_url: Some("https://api.github.com/user".into()),
+            redirect_uri: String::new(),
+            scope: "read:user user:email".into(),
+            issuer: None,
+            jwks_url: None,
+            discovery_url: None,
+        }),
+        "microsoft" => Some(OAuth2ProviderConfig {
+            client_id: String::new(),
+            client_secret: String::new(),
+            authorize_url: "https://login.microsoftonline.com/common/oauth2/v2.0/authorize".into(),
+            token_url: "https://login.microsoftonline.com/common/oauth2/v2.0/token".into(),
+            userinfo_url: None,
+            redirect_uri: String::new(),
+            scope: "openid profile email".into(),
+            // ⚠ The `common` endpoint is a routing alias — ID tokens it issues carry
+            // a tenant-specific `iss` claim (`https://login.microsoftonline.com/{tid}/v2.0`),
+            // which will NOT match this issuer and will fail validation.
+            //
+            // Single-tenant apps: replace every `common` segment with your tenant ID.
+            // Multi-tenant apps: use the `organizations` or `consumers` endpoint and
+            // override `issuer` with the concrete tenant ID after decoding the `tid` claim.
+            issuer: Some("https://login.microsoftonline.com/common/v2.0".into()),
+            jwks_url: Some("https://login.microsoftonline.com/common/discovery/v2.0/keys".into()),
+            discovery_url: Some("https://login.microsoftonline.com/common/v2.0".into()),
+        }),
+        _ => None,
+    }
 }
 
 #[cfg(feature = "oauth2")]
@@ -505,6 +800,9 @@ struct OAuth2TokenResponse {
 #[cfg(feature = "oauth2")]
 /// Build an `OAuth2` authorization URL and persist anti-CSRF state + nonce in session.
 ///
+/// PKCE (S256) is always enabled: a `code_verifier` is generated, stored in the
+/// session, and the corresponding `code_challenge` is added to the URL.
+///
 /// # Errors
 ///
 /// Returns an error if `authorize_url` is not a valid URL.
@@ -513,13 +811,33 @@ pub async fn oauth2_authorize_url(
     provider_name: &str,
     provider: &OAuth2ProviderConfig,
 ) -> crate::AutumnResult<String> {
+    use base64::Engine as _;
+    use sha2::Digest as _;
+
     let state = uuid::Uuid::new_v4().to_string();
     let nonce = uuid::Uuid::new_v4().to_string();
+
+    // PKCE S256: generate a 32-byte random verifier, base64url-encode it.
+    let mut verifier_bytes = [0u8; 32];
+    getrandom::getrandom(&mut verifier_bytes).map_err(|e| {
+        crate::AutumnError::service_unavailable_msg(format!("pkce rng failed: {e}"))
+    })?;
+    let code_verifier = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(verifier_bytes);
+    // code_challenge = BASE64URL(SHA256(ASCII(code_verifier)))
+    let digest = sha2::Sha256::digest(code_verifier.as_bytes());
+    let code_challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest);
+
     session
         .insert(format!("oauth2:{provider_name}:state"), state.clone())
         .await;
     session
         .insert(format!("oauth2:{provider_name}:nonce"), nonce.clone())
+        .await;
+    session
+        .insert(
+            format!("oauth2:{provider_name}:code_verifier"),
+            code_verifier,
+        )
         .await;
 
     let mut url = Url::parse(&provider.authorize_url)
@@ -534,6 +852,8 @@ pub async fn oauth2_authorize_url(
         }
         q.append_pair("state", &state);
         q.append_pair("nonce", &nonce);
+        q.append_pair("code_challenge", &code_challenge);
+        q.append_pair("code_challenge_method", "S256");
     }
     Ok(url.into())
 }
@@ -541,9 +861,14 @@ pub async fn oauth2_authorize_url(
 #[cfg(feature = "oauth2")]
 /// Exchange callback code for tokens, validate state/nonce, and return OIDC identity.
 ///
-/// On success this method rotates the session ID and writes:
-/// - `session_key` (OIDC `sub`)
-/// - `auth_provider` (provider key, like `github`)
+/// On success this method rotates the session ID (preventing session fixation) and
+/// writes `auth_provider` to the session. It does **not** set the application
+/// session key — callers are responsible for resolving or creating a local user
+/// account and then calling `session.insert(session_key, local_user_id)`.
+///
+/// The PKCE `code_verifier` is read from the session (stored by
+/// [`oauth2_authorize_url`]) and included in the token exchange for every
+/// provider, regardless of whether the provider is confidential or public.
 ///
 /// # Errors
 ///
@@ -551,17 +876,23 @@ pub async fn oauth2_authorize_url(
 /// fails, ID token/userinfo payloads are invalid, or identity extraction fails.
 pub async fn oauth2_finish_login(
     session: &crate::session::Session,
-    session_key: &str,
     provider_name: &str,
     provider: &OAuth2ProviderConfig,
     callback: &OAuth2Callback,
 ) -> crate::AutumnResult<OidcIdentity> {
     validate_callback_state(session, provider_name, callback).await?;
-    let token = exchange_oauth2_token(provider, callback).await?;
+    // Retrieve (and consume) the PKCE code_verifier stored during authorize.
+    let code_verifier = session
+        .remove(&format!("oauth2:{provider_name}:code_verifier"))
+        .await
+        .ok_or_else(|| {
+            crate::AutumnError::unauthorized_msg("oauth2 code_verifier missing from session")
+        })?;
+    let token = exchange_oauth2_token(provider, callback, code_verifier).await?;
     let (claims, source) = load_identity_claims(provider, &token).await?;
     validate_oidc_nonce(session, provider_name, &claims, source).await?;
     let subject = extract_subject(&claims, source)?;
-    finalize_oauth2_session(session, session_key, provider_name, subject, claims).await
+    finalize_oauth2_session(session, provider_name, subject, claims).await
 }
 
 #[cfg(feature = "oauth2")]
@@ -594,17 +925,21 @@ async fn validate_callback_state(
 async fn exchange_oauth2_token(
     provider: &OAuth2ProviderConfig,
     callback: &OAuth2Callback,
+    code_verifier: String,
 ) -> crate::AutumnResult<OAuth2TokenResponse> {
+    // Build the base form fields; PKCE code_verifier is appended.
+    let form_fields: Vec<(&str, String)> = vec![
+        ("grant_type", "authorization_code".to_owned()),
+        ("code", callback.code.clone()),
+        ("redirect_uri", provider.redirect_uri.clone()),
+        ("client_id", provider.client_id.clone()),
+        ("client_secret", provider.client_secret.clone()),
+        ("code_verifier", code_verifier),
+    ];
     let token_response = oauth_http_client()?
         .post(&provider.token_url)
         .header(reqwest::header::ACCEPT, "application/json")
-        .form(&[
-            ("grant_type", "authorization_code"),
-            ("code", callback.code.as_str()),
-            ("redirect_uri", provider.redirect_uri.as_str()),
-            ("client_id", provider.client_id.as_str()),
-            ("client_secret", provider.client_secret.as_str()),
-        ])
+        .form(&form_fields)
         .send()
         .await
         .map_err(|e| {
@@ -695,12 +1030,12 @@ async fn validate_oidc_nonce(
 #[cfg(feature = "oauth2")]
 async fn finalize_oauth2_session(
     session: &crate::session::Session,
-    session_key: &str,
     provider_name: &str,
     subject: String,
     claims: serde_json::Value,
 ) -> crate::AutumnResult<OidcIdentity> {
-    session.insert(session_key, subject.clone()).await;
+    // Write provider metadata only — callers set the application session key
+    // after resolving or creating the local user record.
     session.insert("auth_provider", provider_name).await;
     session.rotate_id().await;
     Ok(OidcIdentity {
@@ -833,7 +1168,36 @@ async fn validate_and_decode_id_token(
         .map_err(|e| crate::AutumnError::unauthorized_msg(format!("invalid jwk key: {e}")))?;
 
     let mut validation = jsonwebtoken::Validation::new(alg);
-    validation.set_issuer(&[issuer]);
+    let mut issuers = vec![issuer.to_owned()];
+    let is_multi_tenant = issuer.contains("/common/")
+        || issuer.contains("/organizations/")
+        || issuer.contains("/consumers/");
+    if let (true, true, Some(payload_b64)) = (
+        issuer.contains("login.microsoftonline.com"),
+        is_multi_tenant,
+        token.split('.').nth(1),
+    ) {
+        use base64::Engine as _;
+        let extract_microsoft_iss = || -> Option<String> {
+            let payload_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(payload_b64)
+                .ok()?;
+            let claims: serde_json::Value = serde_json::from_slice(&payload_bytes).ok()?;
+            let unverified_iss = claims.get("iss")?.as_str()?;
+            if unverified_iss.starts_with("https://login.microsoftonline.com/")
+                && unverified_iss.ends_with("/v2.0")
+            {
+                Some(unverified_iss.to_owned())
+            } else {
+                None
+            }
+        };
+        if let Some(unverified_iss) = extract_microsoft_iss() {
+            issuers.push(unverified_iss);
+        }
+    }
+    let issuer_refs: Vec<&str> = issuers.iter().map(String::as_str).collect();
+    validation.set_issuer(&issuer_refs);
     validation.set_audience(std::slice::from_ref(&provider.client_id));
     validation.required_spec_claims = ["exp", "iss", "aud", "sub"]
         .into_iter()
@@ -848,15 +1212,139 @@ async fn validate_and_decode_id_token(
 }
 
 #[cfg(feature = "oauth2")]
-fn oauth_http_client() -> crate::AutumnResult<reqwest::Client> {
-    reqwest::Client::builder()
+#[derive(Clone)]
+pub struct HttpClient {
+    inner: reqwest::Client,
+}
+
+#[cfg(feature = "oauth2")]
+pub struct HttpRequestBuilder {
+    client: reqwest::Client,
+    builder: reqwest::RequestBuilder,
+}
+
+#[cfg(feature = "oauth2")]
+#[allow(
+    clippy::must_use_candidate,
+    clippy::missing_const_for_fn,
+    clippy::return_self_not_must_use,
+    clippy::missing_errors_doc,
+    clippy::redundant_closure_for_method_calls
+)]
+impl HttpClient {
+    #[must_use]
+    pub const fn new(inner: reqwest::Client) -> Self {
+        Self { inner }
+    }
+
+    #[must_use]
+    pub fn post(&self, url: &str) -> HttpRequestBuilder {
+        HttpRequestBuilder {
+            client: self.inner.clone(),
+            builder: self.inner.post(url),
+        }
+    }
+
+    #[must_use]
+    pub fn get(&self, url: &str) -> HttpRequestBuilder {
+        HttpRequestBuilder {
+            client: self.inner.clone(),
+            builder: self.inner.get(url),
+        }
+    }
+}
+
+#[cfg(feature = "oauth2")]
+#[allow(
+    clippy::must_use_candidate,
+    clippy::missing_const_for_fn,
+    clippy::return_self_not_must_use,
+    clippy::missing_errors_doc,
+    clippy::redundant_closure_for_method_calls
+)]
+impl HttpRequestBuilder {
+    #[must_use]
+    pub fn header<K, V>(mut self, key: K, value: V) -> Self
+    where
+        reqwest::header::HeaderName: TryFrom<K>,
+        <reqwest::header::HeaderName as TryFrom<K>>::Error: Into<http::Error>,
+        reqwest::header::HeaderValue: TryFrom<V>,
+        <reqwest::header::HeaderValue as TryFrom<V>>::Error: Into<http::Error>,
+    {
+        self.builder = self.builder.header(key, value);
+        self
+    }
+
+    #[must_use]
+    pub fn bearer_auth<T>(mut self, token: T) -> Self
+    where
+        T: std::fmt::Display,
+    {
+        self.builder = self.builder.bearer_auth(token);
+        self
+    }
+
+    #[must_use]
+    pub fn form<T: serde::Serialize + ?Sized>(mut self, form: &T) -> Self {
+        self.builder = self.builder.form(form);
+        self
+    }
+
+    /// Sends the request through the interceptor chain.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `reqwest::Error` if building the request, sending the request, or
+    /// intercepting the call fails.
+    pub async fn send(self) -> Result<reqwest::Response, reqwest::Error> {
+        let req = self.builder.build()?;
+        let interceptors = crate::interceptor::ACTIVE_HTTP_INTERCEPTORS
+            .try_with(Clone::clone)
+            .unwrap_or_default();
+        run_http_chain(req, interceptors, self.client.clone(), 0).await
+    }
+}
+
+#[cfg(feature = "oauth2")]
+fn run_http_chain(
+    req: reqwest::Request,
+    interceptors: Vec<Arc<dyn crate::interceptor::HttpInterceptor>>,
+    client: reqwest::Client,
+    idx: usize,
+) -> std::pin::Pin<
+    Box<
+        dyn std::future::Future<Output = Result<reqwest::Response, reqwest::Error>>
+            + Send
+            + 'static,
+    >,
+> {
+    Box::pin(async move {
+        if idx < interceptors.len() {
+            let interceptor = interceptors[idx].clone();
+            let next_interceptors = interceptors.clone();
+            let next_client = client.clone();
+            let next_fn = move |r: reqwest::Request| {
+                run_http_chain(r, next_interceptors.clone(), next_client.clone(), idx + 1)
+            };
+            let fut = interceptor.intercept(req, &next_fn);
+            fut.await
+        } else {
+            client.execute(req).await
+        }
+    })
+}
+
+#[cfg(feature = "oauth2")]
+fn oauth_http_client() -> crate::AutumnResult<HttpClient> {
+    let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(OAUTH_HTTP_TIMEOUT_SECS))
         .build()
         .map_err(|e| {
             crate::AutumnError::service_unavailable_msg(format!(
                 "failed to build oauth http client: {e}"
             ))
-        })
+        })?;
+    Ok(HttpClient::new(client))
 }
 
 impl Default for AuthConfig {
@@ -866,6 +1354,12 @@ impl Default for AuthConfig {
             session_key: default_session_key(),
             #[cfg(feature = "oauth2")]
             oauth2: OAuth2Config::default(),
+            #[cfg(feature = "oauth2")]
+            oauth_linking_policy: OAuthLinkingPolicy::default(),
+            #[cfg(feature = "webauthn")]
+            webauthn: WebAuthnConfig::default(),
+            lockout: LockoutConfig::default(),
+            step_up: StepUpConfig::default(),
         }
     }
 }
@@ -1257,6 +1751,7 @@ fn api_token_error_response<ResBody: From<String> + Default>(
             message,
             details: None,
             problem_type: None,
+            backtrace_string: None,
         });
     response
 }
@@ -1522,6 +2017,7 @@ mod tests {
             scope: "openid profile".into(),
             issuer: None,
             jwks_url: None,
+            discovery_url: None,
         };
         let url = oauth2_authorize_url(&session, "github", &provider)
             .await
@@ -1545,6 +2041,7 @@ mod tests {
             scope: String::new(),
             issuer: None,
             jwks_url: None,
+            discovery_url: None,
         };
         let url = oauth2_authorize_url(&session, "github", &provider)
             .await
@@ -1565,6 +2062,7 @@ mod tests {
             scope: "openid profile".into(),
             issuer: None,
             jwks_url: None,
+            discovery_url: None,
         };
         let err = validate_and_decode_id_token("bad.token.value", &provider)
             .await
@@ -1697,14 +2195,19 @@ mod tests {
             task_registry: crate::actuator::TaskRegistry::new(),
             job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
+            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
+            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
+            #[cfg(feature = "presence")]
+            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
             policy_registry: crate::authorization::PolicyRegistry::default(),
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
+            clock: std::sync::Arc::new(crate::time::SystemClock),
         };
 
         let app = Router::new().route("/", get(handler)).with_state(state);
@@ -1756,14 +2259,19 @@ mod tests {
             task_registry: crate::actuator::TaskRegistry::new(),
             job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
+            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
+            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
+            #[cfg(feature = "presence")]
+            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
             policy_registry: crate::authorization::PolicyRegistry::default(),
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
+            clock: std::sync::Arc::new(crate::time::SystemClock),
         };
 
         // Middleware that inserts a user into extensions
@@ -1823,14 +2331,19 @@ mod tests {
             task_registry: crate::actuator::TaskRegistry::new(),
             job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
+            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
+            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
+            #[cfg(feature = "presence")]
+            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
             policy_registry: crate::authorization::PolicyRegistry::default(),
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
+            clock: std::sync::Arc::new(crate::time::SystemClock),
         };
 
         let app = Router::new()
@@ -1946,14 +2459,19 @@ mod tests {
             task_registry: crate::actuator::TaskRegistry::new(),
             job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
+            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
+            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
+            #[cfg(feature = "presence")]
+            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
             policy_registry: crate::authorization::PolicyRegistry::default(),
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
+            clock: std::sync::Arc::new(crate::time::SystemClock),
         };
 
         let app = Router::new()
@@ -2019,14 +2537,19 @@ mod tests {
             task_registry: crate::actuator::TaskRegistry::new(),
             job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
+            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
+            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
+            #[cfg(feature = "presence")]
+            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
             policy_registry: crate::authorization::PolicyRegistry::default(),
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
+            clock: std::sync::Arc::new(crate::time::SystemClock),
         };
 
         let app = Router::new()
@@ -2097,14 +2620,19 @@ mod tests {
             task_registry: crate::actuator::TaskRegistry::new(),
             job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
+            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
+            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
+            #[cfg(feature = "presence")]
+            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
             policy_registry: crate::authorization::PolicyRegistry::default(),
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
             auth_session_key: "uid".to_owned(),
             shared_cache: None,
+            clock: std::sync::Arc::new(crate::time::SystemClock),
         };
 
         let app = Router::new()
@@ -2175,14 +2703,19 @@ mod tests {
             task_registry: crate::actuator::TaskRegistry::new(),
             job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
+            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
+            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
+            #[cfg(feature = "presence")]
+            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
             policy_registry: crate::authorization::PolicyRegistry::default(),
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
+            clock: std::sync::Arc::new(crate::time::SystemClock),
         };
 
         let app = Router::new()
@@ -2249,14 +2782,19 @@ mod tests {
             task_registry: crate::actuator::TaskRegistry::new(),
             job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
+            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
+            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
+            #[cfg(feature = "presence")]
+            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
             policy_registry: crate::authorization::PolicyRegistry::default(),
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
+            clock: std::sync::Arc::new(crate::time::SystemClock),
         };
 
         let app = Router::new()
@@ -2316,14 +2854,19 @@ mod tests {
             task_registry: crate::actuator::TaskRegistry::new(),
             job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
+            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
+            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
+            #[cfg(feature = "presence")]
+            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
             policy_registry: crate::authorization::PolicyRegistry::default(),
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
+            clock: std::sync::Arc::new(crate::time::SystemClock),
         };
 
         let app = Router::new()
@@ -2511,7 +3054,87 @@ mod tests {
     }
 }
 
-// ── API token tests ───────────────────────────────────────────────────────────
+// ── HttpRequestBuilder interceptor task-local scope tests ────────────────────
+
+#[cfg(feature = "oauth2")]
+#[cfg(test)]
+mod http_interceptor_task_local_tests {
+    use crate::interceptor::{ACTIVE_HTTP_INTERCEPTORS, HttpInterceptor, HttpInterceptorFuture};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    struct FlagInterceptor {
+        fired: Arc<AtomicBool>,
+    }
+
+    impl HttpInterceptor for FlagInterceptor {
+        fn intercept<'a>(
+            &'a self,
+            req: reqwest::Request,
+            next: &'a dyn Fn(reqwest::Request) -> HttpInterceptorFuture<'a>,
+        ) -> HttpInterceptorFuture<'a> {
+            self.fired.store(true, Ordering::SeqCst);
+            // Delegate to next so the caller gets a real (likely connection-refused)
+            // error back — we discard it in the test with `let _ = ...`.
+            next(req)
+        }
+    }
+
+    /// Proves the task-local scope contract: when `ACTIVE_HTTP_INTERCEPTORS` is
+    /// set via `.scope()` (as `run_one_off_task_mode` must do), the interceptor
+    /// fires on every `HttpRequestBuilder::send` call within that scope.
+    #[tokio::test]
+    async fn http_request_builder_send_fires_interceptor_inside_scope() {
+        let fired = Arc::new(AtomicBool::new(false));
+        let interceptor: Arc<dyn HttpInterceptor> = Arc::new(FlagInterceptor {
+            fired: Arc::clone(&fired),
+        });
+
+        let client = reqwest::Client::new();
+        let http_client = super::HttpClient::new(client);
+
+        ACTIVE_HTTP_INTERCEPTORS
+            .scope(vec![interceptor], async {
+                let _ = http_client
+                    .get("http://127.0.0.1:54321/noreply")
+                    .send()
+                    .await;
+            })
+            .await;
+
+        assert!(
+            fired.load(Ordering::SeqCst),
+            "interceptor must fire when ACTIVE_HTTP_INTERCEPTORS scope is established"
+        );
+    }
+
+    /// Proves the regression: without a scope, the interceptor is silently
+    /// skipped. The fix in `run_one_off_task_mode` wraps the task handler in
+    /// `ACTIVE_HTTP_INTERCEPTORS.scope(...)` so that registered interceptors are
+    /// always active during task execution.
+    #[tokio::test]
+    async fn http_request_builder_send_skips_interceptor_outside_scope() {
+        let fired = Arc::new(AtomicBool::new(false));
+        let _interceptor: Arc<dyn HttpInterceptor> = Arc::new(FlagInterceptor {
+            fired: Arc::clone(&fired),
+        });
+
+        // Intentionally do NOT establish a scope — simulating pre-fix task mode.
+        let client = reqwest::Client::new();
+        let http_client = super::HttpClient::new(client);
+        let _ = http_client
+            .get("http://127.0.0.1:54321/noreply")
+            .send()
+            .await;
+
+        assert!(
+            !fired.load(Ordering::SeqCst),
+            "interceptor must NOT fire when ACTIVE_HTTP_INTERCEPTORS scope is absent"
+        );
+    }
+}
 
 #[cfg(test)]
 mod api_token_tests {
@@ -3075,5 +3698,195 @@ mod api_token_tests {
         let layer2 = RequireApiToken::new(store2);
         let mut svc2 = layer2.layer(MockService { ready: true });
         assert!(svc2.poll_ready(&mut cx).is_ready());
+    }
+}
+
+// ── OAuth2 unit tests (separate module for clean imports) ─────────────────────
+
+#[cfg(feature = "oauth2")]
+#[cfg(test)]
+mod oauth2_unit_tests {
+    use std::collections::HashMap;
+
+    use super::{
+        AuthConfig, OAuth2ProviderConfig, OAuthLinkingPolicy, oauth2_authorize_url, provider_preset,
+    };
+
+    #[allow(dead_code)]
+    fn make_provider(authorize_url: &str) -> OAuth2ProviderConfig {
+        OAuth2ProviderConfig {
+            client_id: "cid".into(),
+            client_secret: "secret".into(),
+            authorize_url: authorize_url.into(),
+            token_url: "https://idp.example/token".into(),
+            userinfo_url: None,
+            redirect_uri: "http://localhost:3000/callback".into(),
+            scope: "openid profile".into(),
+            issuer: None,
+            jwks_url: None,
+            discovery_url: None,
+        }
+    }
+
+    #[test]
+    fn provider_preset_google_returns_oidc_config() {
+        let preset = provider_preset("google").expect("google preset must exist");
+        assert!(
+            !preset.authorize_url.is_empty(),
+            "google authorize_url must not be empty"
+        );
+        assert!(
+            !preset.token_url.is_empty(),
+            "google token_url must not be empty"
+        );
+        assert!(
+            preset.discovery_url.is_some(),
+            "google must have discovery_url for OIDC"
+        );
+        assert!(
+            preset.scope.contains("openid"),
+            "google preset scope must include openid: {}",
+            preset.scope
+        );
+        assert!(
+            preset.scope.contains("email"),
+            "google preset scope must include email: {}",
+            preset.scope
+        );
+        assert_eq!(
+            preset.client_id, "",
+            "client_id must be empty in preset (user fills in)"
+        );
+        assert_eq!(
+            preset.client_secret, "",
+            "client_secret must be empty in preset"
+        );
+        assert_eq!(
+            preset.redirect_uri, "",
+            "redirect_uri must be empty in preset"
+        );
+    }
+
+    #[cfg(feature = "oauth2")]
+    #[test]
+    fn provider_preset_github_returns_pure_oauth2_config() {
+        let preset = provider_preset("github").expect("github preset must exist");
+        assert!(
+            !preset.authorize_url.is_empty(),
+            "github authorize_url must not be empty"
+        );
+        assert!(
+            !preset.token_url.is_empty(),
+            "github token_url must not be empty"
+        );
+        assert!(
+            preset.userinfo_url.is_some(),
+            "github must have userinfo_url (it is not OIDC)"
+        );
+        assert!(
+            preset.discovery_url.is_none(),
+            "github must NOT have discovery_url (pure OAuth2)"
+        );
+    }
+
+    #[cfg(feature = "oauth2")]
+    #[test]
+    fn provider_preset_microsoft_returns_oidc_config() {
+        let preset = provider_preset("microsoft").expect("microsoft preset must exist");
+        assert!(
+            !preset.authorize_url.is_empty(),
+            "microsoft authorize_url must not be empty"
+        );
+        assert!(
+            preset.discovery_url.is_some(),
+            "microsoft must have discovery_url for OIDC"
+        );
+        assert!(
+            preset.scope.contains("openid"),
+            "microsoft preset scope must include openid: {}",
+            preset.scope
+        );
+    }
+
+    #[cfg(feature = "oauth2")]
+    #[test]
+    fn provider_preset_unknown_returns_none() {
+        assert!(
+            provider_preset("nonexistent_provider_xyz").is_none(),
+            "unknown provider must return None"
+        );
+    }
+
+    #[cfg(feature = "oauth2")]
+    #[tokio::test]
+    async fn oauth2_authorize_url_includes_pkce_code_challenge() {
+        let session = crate::session::Session::new_for_test("s1".into(), HashMap::new());
+        let provider = OAuth2ProviderConfig {
+            client_id: "cid".into(),
+            client_secret: "secret".into(),
+            authorize_url: "https://idp.example/authorize".into(),
+            token_url: "https://idp.example/token".into(),
+            userinfo_url: None,
+            redirect_uri: "http://localhost:3000/callback".into(),
+            scope: "openid profile".into(),
+            issuer: None,
+            jwks_url: None,
+            discovery_url: None,
+        };
+        let url = oauth2_authorize_url(&session, "testprovider", &provider)
+            .await
+            .unwrap();
+        assert!(
+            url.contains("code_challenge="),
+            "PKCE code_challenge must be present in URL: {url}"
+        );
+        assert!(
+            url.contains("code_challenge_method=S256"),
+            "PKCE method must be S256: {url}"
+        );
+        assert!(
+            session
+                .get("oauth2:testprovider:code_verifier")
+                .await
+                .is_some(),
+            "code_verifier must be stored in session for later exchange"
+        );
+    }
+
+    #[cfg(feature = "oauth2")]
+    #[test]
+    fn oauth2_provider_config_has_discovery_url_field() {
+        let provider = OAuth2ProviderConfig {
+            client_id: "cid".into(),
+            client_secret: "secret".into(),
+            authorize_url: "https://idp.example/authorize".into(),
+            token_url: "https://idp.example/token".into(),
+            userinfo_url: None,
+            redirect_uri: "http://localhost:3000/callback".into(),
+            scope: String::new(),
+            issuer: None,
+            jwks_url: None,
+            discovery_url: Some("https://idp.example".into()),
+        };
+        assert_eq!(
+            provider.discovery_url.as_deref(),
+            Some("https://idp.example"),
+            "discovery_url must be accessible as a field"
+        );
+    }
+
+    #[cfg(feature = "oauth2")]
+    #[test]
+    fn auth_config_has_oauth_linking_policy() {
+        let config = AuthConfig::default();
+        // Default policy must be CreateAccount so unknown provider identities
+        // automatically create a local user record.
+        assert!(
+            matches!(
+                config.oauth_linking_policy,
+                OAuthLinkingPolicy::CreateAccount
+            ),
+            "default linking policy must be CreateAccount"
+        );
     }
 }

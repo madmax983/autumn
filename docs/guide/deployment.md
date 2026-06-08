@@ -14,7 +14,7 @@ internet connection.
 - **Rust 1.88.0+** with `cargo`
 - **Docker** (or Docker Desktop) — `docker --version`
 - **PostgreSQL** accessible at a connection string you control (local or remote)
-- The `autumn` CLI - `cargo install autumn-cli --version 0.4.0`
+- The `autumn` CLI - `cargo install autumn-cli --version 0.5.0`
 
 ---
 
@@ -108,7 +108,7 @@ Visit [http://localhost:3000/health](http://localhost:3000/health) — a healthy
 response looks like:
 
 ```json
-{ "status": "ok", "version": "0.4.0" }
+{ "status": "ok", "version": "0.5.0" }
 ```
 
 > **Migration failure stops the rollout.** If the primary URL is wrong or the
@@ -189,6 +189,32 @@ this file. Pass them as environment variables at runtime:
 priority layer — see the
 [config reference](getting-started.md#environment-variable-overrides).
 
+## Trusted hosts (Host-header allow-list)
+
+Autumn supports a host allow-list to prevent host-header rebinding and cache-poisoning style attacks.
+
+```toml
+[security.trusted_hosts]
+hosts = ["app.example.com", ".example.com"]
+```
+
+- `app.example.com` matches exactly that hostname.
+- `.example.com` matches both `example.com` and any subdomain like `api.example.com`.
+- `hosts = ["*"]` disables host filtering (escape hatch; not recommended for production).
+
+In `prod`/`production` profile, startup fails when `security.trusted_hosts.hosts` is empty.
+Health/probe routes (`/actuator/health`, `/live`, `/ready`, `/startup`) intentionally bypass host checks so orchestration probes remain reliable.
+
+### Runnable repro
+
+```bash
+# Expected: 400 + application/problem+json
+curl -i http://localhost:3000/ -H 'Host: evil.example'
+
+# Expected: normal route response
+curl -i http://localhost:3000/ -H 'Host: app.example.com'
+```
+
 ---
 
 ## Deploy to fly.io
@@ -199,20 +225,110 @@ Scaffold a `fly.toml` alongside the production Dockerfile:
 autumn release init --force --target fly
 ```
 
-This creates `fly.toml` wired to the same `Dockerfile` and `/health` check.
+The generated `fly.toml` includes four first-class integrations:
+
+| Feature | What it does |
+|---|---|
+| `/live` + `/ready` checks | Fly uses `/live` to decide machine restarts; `/ready` to gate traffic routing. Autumn flips `/ready` to 503 at drain start so Fly deregisters before the listener closes. |
+| `kill_timeout = 45` | Fly waits 45 s after SIGTERM before SIGKILL — `prestop_grace_secs (5) + shutdown_timeout_secs (30) + 10 s buffer` for the process to log and exit cleanly. Value is an integer (seconds); Fly does not accept a string like `"45s"`. |
+| `[metrics]` → `/actuator/prometheus` | Fly scrapes Autumn's Prometheus text endpoint and surfaces it in the dashboard. No extra agent needed. Controlled by `actuator.prometheus` (default on) and independent of `actuator.sensitive` — see [Prometheus metrics for platform scraping](#prometheus-metrics-for-platform-scraping). |
+| `[deploy]` `release_command` (opt-in) | When uncommented, migrations run in a one-shot machine before new app machines start; a failed migration aborts the deploy before any traffic-serving machine is replaced. |
 
 Deploy:
 
 ```bash
 fly launch --no-deploy          # creates the app on fly.io
 fly secrets set AUTUMN_DATABASE__PRIMARY_URL="postgres://user:pass@host:5432/myapp_prod"
-AUTUMN_DATABASE__PRIMARY_URL="postgres://user:pass@host:5432/myapp_prod" autumn migrate
+fly secrets set AUTUMN_SECURITY__SIGNING_SECRET="$(openssl rand -hex 32)"
 fly deploy
 ```
 
-Run the migration step once before `fly deploy`. If you add a read replica,
-configure `AUTUMN_DATABASE__REPLICA_URL` separately and gate readiness until the
-replica has replayed the latest Diesel migration.
+**Using a database?** Uncomment the `release_command` line in `fly.toml` before
+the first `fly deploy`:
+
+```toml
+[deploy]
+  release_command = "autumn migrate"
+```
+
+With it enabled, Fly runs `autumn migrate` in a temporary machine before new app
+machines start. A failed migration aborts the deploy before any traffic-serving
+machine is replaced — keeping the old version live. The line is commented out by
+default because `autumn migrate` exits non-zero when no database URL is set,
+which would fail the first deploy of a database-free app.
+
+If you add a read replica, set `AUTUMN_DATABASE__REPLICA_URL` as a secret and
+Autumn gates `/ready` until the replica has replayed the latest migration.
+
+---
+
+## Prometheus metrics for platform scraping
+
+Autumn exposes a Prometheus text endpoint at `/actuator/prometheus`. It is
+controlled by `actuator.prometheus` (default **`true`**) and is **independent of
+`actuator.sensitive`**. That separation is the whole point: a production app can
+let Fly.io (or any scraper) collect metrics while keeping `actuator.sensitive =
+false`, so `/actuator/env`, `/actuator/configprops`, `/actuator/loggers`,
+`/actuator/tasks`, `/actuator/jobs`, and the actuator task UI stay off the
+public surface.
+
+```toml
+# autumn.toml — metrics on, sensitive surfaces off (the safe production shape)
+[actuator]
+sensitive  = false   # env/configprops/loggers/tasks/jobs NOT mounted
+prometheus = true    # /actuator/prometheus still scrapeable
+```
+
+To remove the scrape endpoint entirely (it then returns `404`), set
+`prometheus = false` — either in `autumn.toml` or via the environment override
+`AUTUMN_ACTUATOR__PROMETHEUS=false` (the whole `[actuator]` section follows the
+standard `AUTUMN_SECTION__FIELD` convention). Regression tests assert both
+directions — the endpoint is present under the non-sensitive config and absent
+when export is disabled.
+
+The generated `fly.toml` wires Fly's `[metrics]` block to this endpoint:
+
+```toml
+[metrics]
+  port = 3000
+  path = "/actuator/prometheus"
+```
+
+### Keeping metrics off the public HTTP service
+
+`/actuator/prometheus` carries operational counters, not secrets, but you may
+still want it unreachable from public traffic. The Fly-native way is to scrape a
+**separate, non-public port** rather than the port behind `[http_service]`.
+Bind a second internal listener and point `[metrics]` at it:
+
+```toml
+[metrics]
+  port = 9091                       # internal-only; no [http_service] on it
+  path = "/actuator/prometheus"
+```
+
+Fly scrapes `[metrics]` over the private 6PN network, so a port that has no
+`[http_service]` / `force_https` mapping is reachable by the Fly metrics
+collector but not by the public internet. Front the public app on its own port
+and reserve the metrics port for scraping. (If you only run a single listener,
+gate access at the edge or accept that the counters are publicly readable —
+they contain no credentials.)
+
+### OTLP tracing and Prometheus are separate telemetry paths
+
+Enabling OTLP tracing (`telemetry.enabled = true` + `telemetry.otlp_endpoint`)
+initializes **span export to an OTLP collector**. It does **not** feed
+OpenTelemetry metrics into `/actuator/prometheus`. The Prometheus endpoint is
+backed by Autumn's in-process request `MetricsCollector` snapshot plus any
+registered [`MetricsSource`](metrics-sources.md) families — it is a distinct
+pipeline from the OTLP trace exporter. Treat them as two independent channels:
+
+- **Tracing** → OTLP collector (Jaeger, Tempo, Honeycomb, …) via the OTLP path.
+- **Metrics** → `/actuator/prometheus` scraped by Fly `[metrics]` or Prometheus.
+
+Turning on one does not populate the other. Bridging OTLP metrics into the
+Prometheus scrape would require an explicit metrics exporter/bridge, which
+Autumn does not add implicitly.
 
 ---
 
@@ -330,6 +446,45 @@ With this setup:
 - Signed blob URLs generated on replica 1 are served correctly by replica 2
   (same HMAC key).
 - CSRF tokens validate regardless of which replica handles the form submission.
+
+### Global rate limiting
+
+By default the rate limiter keeps per-IP token buckets **in memory per replica**.
+A 3-replica deployment therefore permits up to 3× the configured rate — enough
+to undermine the protection intended by your `requests_per_second` setting.
+
+To enforce the budget globally, point the rate limiter at the same Redis instance
+as your session store:
+
+```toml
+[security.rate_limit]
+enabled = true
+requests_per_second = 10.0
+burst = 20
+backend = "redis"
+on_backend_failure = "fail_open"   # or "fail_closed"
+
+[security.rate_limit.redis]
+url = "redis://redis:6379"
+key_prefix = "myapp:rate_limit"
+```
+
+Or with environment variables alongside the session and cache settings:
+
+```bash
+AUTUMN_SECURITY__RATE_LIMIT__BACKEND=redis
+AUTUMN_SECURITY__RATE_LIMIT__REDIS__URL=redis://redis:6379
+```
+
+| Setting | Effect |
+|---|---|
+| `backend = "memory"` | Default. Each replica enforces the limit independently. |
+| `backend = "redis"` | Global enforcement via atomic Lua token-bucket in Redis. |
+| `on_backend_failure = "fail_open"` | Requests pass through when Redis is unreachable (default). |
+| `on_backend_failure = "fail_closed"` | Requests receive `429` until Redis recovers. |
+
+One `tracing::warn!` is emitted when Redis becomes unavailable and again when it
+recovers, so log volume stays low during outages.
 
 ---
 

@@ -42,6 +42,7 @@
 mod defaults;
 pub(crate) mod dev_badge;
 pub(crate) mod renderer;
+pub(crate) mod source;
 
 pub use defaults::DefaultErrorPages;
 pub use renderer::{ErrorContext, ErrorPageRenderer};

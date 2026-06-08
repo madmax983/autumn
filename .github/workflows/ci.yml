@@ -35,6 +35,11 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - name: Free disk space (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2.7.8
         continue-on-error: true
@@ -42,7 +47,9 @@ jobs:
         run: cargo test --workspace
       - name: Run Docker-dependent tests
         if: runner.os == 'Linux'
-        run: cargo test -p autumn-web --test db_hooks_lifecycle -- --ignored
+        run: |
+          cargo test -p autumn-web --test db_hooks_lifecycle -- --ignored
+          cargo test -p autumn-web --all-features --test feature_flags_pg_integration -- --ignored
 
   coverage:
     name: Coverage
@@ -60,6 +67,8 @@ jobs:
           cargo llvm-cov --workspace --all-features --no-report
           cargo llvm-cov --no-report -p autumn-web --all-features \
             --test db_hooks_lifecycle -- --ignored
+          cargo llvm-cov --no-report -p autumn-web --all-features \
+            --test feature_flags_pg_integration -- --ignored
           cargo llvm-cov report --lcov --output-path lcov.info
       - name: Upload to Codecov
         uses: codecov/codecov-action@v6

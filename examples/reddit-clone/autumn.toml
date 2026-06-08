@@ -2,6 +2,12 @@
 host = "127.0.0.1"
 port = 3000
 
+[jobs]
+backend = "postgres"
+workers = 2
+max_attempts = 5
+initial_backoff_ms = 500
+
 [log]
 level = "info"
 format = "Pretty"
@@ -11,6 +17,23 @@ path = "/health"
 
 [security.csrf]
 enabled = true
+
+[idempotency]
+# Deduplicate retried POST/PUT/PATCH/DELETE requests using the Idempotency-Key
+# header. Clients should send a unique key per logical operation; duplicate
+# requests with the same key (and identical body) replay the cached response.
+enabled  = true
+backend  = "memory"   # use "redis" in production (see below)
+ttl_secs = 86400      # cache responses for 24 hours
+
+# Production: switch to the Redis backend so deduplication works across replicas.
+# Uncomment and set AUTUMN_IDEMPOTENCY__REDIS__URL in the environment.
+#
+# [profile.prod.idempotency]
+# backend = "redis"
+#
+# [profile.prod.idempotency.redis]
+# url = "redis://redis:6379/0"
 
 # Production file-storage configuration. Uncomment to push uploaded
 # blobs (avatars, attachments) to an S3-compatible bucket so they

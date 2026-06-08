@@ -36,6 +36,12 @@ pub use diesel_migrations::EmbeddedMigrations;
 /// Re-export the `embed_migrations!` macro.
 pub use diesel_migrations::embed_migrations;
 
+/// Embedded Autumn framework migrations.
+///
+/// These are applied by `autumn migrate` and are also registered
+/// automatically at startup when a framework feature requires its own table.
+pub const FRAMEWORK_MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
+
 /// Result of running pending migrations.
 #[derive(Debug)]
 pub struct MigrationResult {
@@ -283,7 +289,11 @@ pub(crate) fn auto_migrate(
                 if is_prod {
                     tracing::warn!(
                         "Production profile detected: automatic migrations are disabled by default. \
-                         Set database.auto_migrate_in_production=true to opt in."
+                         Run `autumn migrate check` to review safety before applying, then \
+                         `autumn migrate` in your deployment job. \
+                         Set database.auto_migrate_in_production=true only for single-process \
+                         deployments after confirming all pending migrations are safe for a \
+                         rolling deploy (expand/contract pattern)."
                     );
                 }
                 tracing::warn!(

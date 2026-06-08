@@ -29,6 +29,10 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
+fn normalize_hygiene_doc(content: &str) -> String {
+    content.replace("\r\n", "\n").replace("//! ", "")
+}
+
 fn workspace_package_value(root_toml: &toml::Value, key: &str) -> String {
     root_toml
         .get("workspace")
@@ -94,6 +98,46 @@ fn member_manifest_forbids_unsafe_code(manifest_toml: &toml::Value) -> bool {
         .and_then(toml::Value::as_str);
 
     local_unsafe_code_lint.map_or(inherits_workspace_lints, |level| level == "forbid")
+}
+
+#[test]
+fn workspace_test_profile_keeps_ci_artifacts_bounded() {
+    let root = workspace_root();
+    let root_toml = read_workspace_manifest(&root);
+    let test_profile = root_toml
+        .get("profile")
+        .and_then(|profile| profile.get("test"))
+        .unwrap_or_else(|| {
+            panic!(
+                "workspace Cargo.toml must set [profile.test] so `cargo test --workspace` \
+                 does not fill CI disks with full debug artifacts"
+            )
+        });
+
+    assert_eq!(
+        test_profile.get("debug").and_then(toml::Value::as_str),
+        Some("line-tables-only"),
+        "[profile.test] should keep only line-table debug info for useful panic locations \
+         without full debug artifact bloat",
+    );
+    assert_eq!(
+        test_profile
+            .get("incremental")
+            .and_then(toml::Value::as_bool),
+        Some(false),
+        "[profile.test] should disable incremental caches in CI-sized test builds",
+    );
+
+    let build_override = test_profile
+        .get("build-override")
+        .unwrap_or_else(|| panic!("[profile.test.build-override] should be set"));
+    assert_eq!(
+        build_override
+            .get("debug")
+            .and_then(toml::Value::as_integer),
+        Some(0),
+        "[profile.test.build-override] should avoid debug info for build scripts and proc macros",
+    );
 }
 
 #[test]
@@ -341,6 +385,162 @@ fn publish_dry_run_script_uses_list_not_no_verify() {
 }
 
 #[test]
+fn shell_release_scripts_are_lf_normalized() {
+    let root = workspace_root();
+    let attributes_path = root.join(".gitattributes");
+    let attributes = std::fs::read_to_string(&attributes_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", attributes_path.display()));
+    assert!(
+        attributes.contains("*.sh text eol=lf"),
+        ".gitattributes must force LF checkout for shell scripts so release gates run under bash"
+    );
+
+    let scripts_dir = root.join("scripts");
+    for entry in std::fs::read_dir(&scripts_dir)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", scripts_dir.display()))
+    {
+        let entry = entry.unwrap_or_else(|err| panic!("failed to read script entry: {err}"));
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("sh") {
+            continue;
+        }
+
+        let bytes = std::fs::read(&path)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+        assert!(
+            !bytes.windows(2).any(|window| window == b"\r\n"),
+            "{} must use LF line endings; CRLF makes bash treat options and blank lines as containing carriage returns",
+            path.display()
+        );
+    }
+}
+
+#[test]
+fn semver_script_installs_tool_without_lto_hotspot() {
+    let root = workspace_root();
+    let script_path = root.join("scripts/check-semver.sh");
+    let script = std::fs::read_to_string(&script_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", script_path.display()));
+    let release_lto_assignment = [
+        "CARGO_PROFILE_RELEASE_LTO=\"",
+        "$",
+        "{",
+        "CARGO_PROFILE_RELEASE_LTO:-false",
+        "}\"",
+    ]
+    .concat();
+    let release_codegen_units_assignment = [
+        "CARGO_PROFILE_RELEASE_CODEGEN_UNITS=\"",
+        "$",
+        "{",
+        "CARGO_PROFILE_RELEASE_CODEGEN_UNITS:-16",
+        "}\"",
+    ]
+    .concat();
+
+    assert!(
+        script.contains(&release_lto_assignment),
+        "{} must disable release LTO only for auto-installing cargo-semver-checks; Windows rustc has crashed in that installer profile",
+        script_path.display(),
+    );
+    assert!(
+        script.contains(&release_codegen_units_assignment),
+        "{} must avoid codegen-units=1 only for auto-installing cargo-semver-checks",
+        script_path.display(),
+    );
+    assert!(
+        script.contains("cargo install cargo-semver-checks --locked"),
+        "{} must still install cargo-semver-checks when the tool is missing",
+        script_path.display(),
+    );
+}
+
+#[test]
+fn semver_script_checks_optional_features_with_pinned_rustdoc_toolchain() {
+    let root = workspace_root();
+    let script_path = root.join("scripts/check-semver.sh");
+    let script = std::fs::read_to_string(&script_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", script_path.display()));
+
+    assert!(
+        script.contains(r#"semver_toolchain="${AUTUMN_SEMVER_RUST_VERSION:-1.92.0}""#),
+        "{} must pin the semver rustdoc toolchain to Rust 1.92.0 by default",
+        script_path.display(),
+    );
+    assert!(
+        script.contains(r#"SEMVER_CARGO=(rustup run "$semver_toolchain" cargo)"#),
+        "{} must run cargo-semver-checks through the pinned semver toolchain",
+        script_path.display(),
+    );
+    assert!(
+        !script.contains("--default-features"),
+        "{} must not narrow SemVer coverage to default features only",
+        script_path.display(),
+    );
+    assert!(
+        !script.contains("--all-features"),
+        "{} should use cargo-semver-checks' default feature heuristic, not force every internal/test feature",
+        script_path.display(),
+    );
+
+    let workflow_path = root.join(".github/workflows/publish-gate.yml");
+    let workflow = std::fs::read_to_string(&workflow_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", workflow_path.display()));
+    let semver_job = workflow
+        .split("  semver:")
+        .nth(1)
+        .and_then(|job| job.split("\n  # ---").next())
+        .unwrap_or_else(|| panic!("{} must define a semver job", workflow_path.display()));
+    assert!(
+        semver_job.contains("dtolnay/rust-toolchain@1.92.0"),
+        "{} semver job must install the pinned Rust 1.92.0 toolchain",
+        workflow_path.display(),
+    );
+    assert!(
+        !semver_job.contains("dtolnay/rust-toolchain@stable"),
+        "{} semver job must not follow latest stable rustdoc JSON",
+        workflow_path.display(),
+    );
+}
+
+#[test]
+fn webauthn_docs_explain_native_openssl_vcpkg_prerequisite() {
+    let root = workspace_root();
+    let guide_path = root.join("docs/guide/generators.md");
+    let guide = std::fs::read_to_string(&guide_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", guide_path.display()));
+
+    for required in ["WebAuthn", "OpenSSL", "vcpkg", "VCPKG_ROOT"] {
+        assert!(
+            guide.contains(required),
+            "{} must document the WebAuthn/OpenSSL native dependency prerequisite `{required}`",
+            guide_path.display(),
+        );
+    }
+}
+
+#[test]
+fn publish_gate_prepare_release_does_not_mutate_changelog() {
+    let root = workspace_root();
+    let workflow_path = root.join(".github/workflows/publish-gate.yml");
+    let workflow = std::fs::read_to_string(&workflow_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", workflow_path.display()));
+
+    for forbidden in [
+        "git-cliff --config cliff.toml --output CHANGELOG.md",
+        "Commit CHANGELOG.md to trunk",
+        "git commit -m \"docs: update CHANGELOG.md",
+        "git push origin HEAD:trunk",
+        "contents: write",
+    ] {
+        assert!(
+            !workflow.contains(forbidden),
+            "publish-gate must not mutate CHANGELOG.md from a detached tag checkout; found `{forbidden}`",
+        );
+    }
+}
+
+#[test]
 fn release_notes_script_detects_breaking_section_with_long_changelog_entry() {
     let root = workspace_root();
     let tmp = tempfile::TempDir::new().expect("tempdir");
@@ -422,4 +622,277 @@ fn bookmarks_example_tracks_regenerated_scaffold_layout() {
             "issue #534 expects the old flat bookmarks source file to be replaced: {replaced_path}",
         );
     }
+}
+
+#[test]
+fn after_commit_docs_do_not_promise_crash_safe_delivery() {
+    let root = workspace_root();
+    let transactions_path = root.join("docs/guide/transactions.md");
+    let transactions = std::fs::read_to_string(&transactions_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", transactions_path.display()));
+
+    assert!(
+        transactions.contains("not a crash-safe delivery mechanism"),
+        "{} must explicitly warn that process-local after_commit callbacks can be lost after commit",
+        transactions_path.display(),
+    );
+    assert!(
+        transactions.contains("durable outbox"),
+        "{} must point crash-safe side effects at an in-transaction outbox or queue",
+        transactions_path.display(),
+    );
+    assert!(
+        !transactions.contains("Autumn eliminates this race with `after_commit` callbacks"),
+        "{} must not claim after_commit eliminates the DB-commit/process-crash race",
+        transactions_path.display(),
+    );
+}
+
+#[test]
+fn version_history_docs_put_sensitive_attribute_on_repository_trait() {
+    let root = workspace_root();
+    for rel_path in [
+        "docs/guide/version-history.md",
+        "autumn/src/version_history.rs",
+    ] {
+        let path = root.join(rel_path);
+        let content = std::fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+        let content = normalize_hygiene_doc(&content);
+        let attr = "#[version_history(sensitive = [\"password_digest\", \"reset_token\"])]";
+        let repo = "#[repository(Post, versioned = true)]";
+
+        assert!(
+            content.contains(&format!("{attr}\n{repo}")),
+            "{rel_path} must put #[version_history(...)] on the repository trait, not inside its empty body",
+        );
+        assert!(
+            !content.contains(&format!("{repo}\npub trait PostRepository {{\n    {attr}")),
+            "{rel_path} must not show #[version_history(...)] as an item inside the trait body",
+        );
+    }
+}
+
+#[test]
+fn hygiene_doc_normalization_accepts_windows_line_endings() {
+    let attr = "#[version_history(sensitive = [\"password_digest\", \"reset_token\"])]";
+    let repo = "#[repository(Post, versioned = true)]";
+    let content = format!("{attr}\r\n{repo}\r\npub trait PostRepository {{}}\r\n");
+    let content = normalize_hygiene_doc(&content);
+
+    assert!(content.contains(&format!("{attr}\n{repo}")));
+}
+
+#[test]
+fn version_history_migration_has_tenant_scope_column_and_index() {
+    let root = workspace_root();
+    let migration_path =
+        root.join("autumn/migrations/20260526000000_create_version_history/up.sql");
+    let migration = std::fs::read_to_string(&migration_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", migration_path.display()));
+
+    assert!(
+        migration.contains("tenant_id   TEXT"),
+        "{} must store tenant_id so tenant-scoped history reads can fail closed",
+        migration_path.display(),
+    );
+    assert!(
+        migration.contains("(table_name, tenant_id, record_id, recorded_at ASC)"),
+        "{} must index tenant-scoped history lookups",
+        migration_path.display(),
+    );
+}
+
+// ── Generator conformance CI gate (issue #1017) ───────────────────────────────
+
+#[test]
+fn generator_conformance_ci_gate_is_configured() {
+    let root = workspace_root();
+
+    // AC-1 / AC-2: A dedicated workflow file must exist that runs the ignored
+    // generator conformance tests (compiled compile/serve gates) — NOT just
+    // `cargo test --workspace` which skips all `#[ignore]`d tests.
+    let workflow_path = root.join(".github/workflows/generator-conformance.yml");
+    let workflow = std::fs::read_to_string(&workflow_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", workflow_path.display()));
+
+    // The three non-Postgres gates must be invoked explicitly via --ignored.
+    for test_name in [
+        "generated_project_compiles_runs_and_serves",
+        "generated_scaffold_cargo_checks",
+        "generated_scaffold_config_cargo_checks",
+    ] {
+        assert!(
+            workflow.contains(test_name),
+            "generator-conformance.yml must invoke `{test_name}` via --ignored; \
+             these tests are CI-gated, not abandoned — see CONTRIBUTING.md",
+        );
+    }
+
+    // The Postgres-dependent gate must also be present (AC-2).
+    assert!(
+        workflow.contains("generated_scaffold_serves_posts_index_and_json_api"),
+        "generator-conformance.yml must run the Postgres e2e gate \
+         `generated_scaffold_serves_posts_index_and_json_api`",
+    );
+
+    // The auth/TOTP generator gate must also be included so that changes to
+    // autumn-cli/src/generate/auth.rs are caught alongside scaffold changes.
+    assert!(
+        workflow.contains("generated_auth_totp_cargo_checks"),
+        "generator-conformance.yml must run `generated_auth_totp_cargo_checks` so \
+         auth generator changes are compile-verified alongside scaffold changes",
+    );
+
+    // AC-4: path filters must cover the generator template surface, the
+    // entire autumn-web public API (autumn/src/**), and crate manifests so
+    // that manifest-only dependency/feature changes also trigger the gate.
+    for path_fragment in [
+        "autumn-cli/src/generate",
+        "autumn-cli/src/templates",
+        "autumn-cli/src/new.rs",
+        "autumn-cli/src/migrate.rs",
+        "autumn-cli/Cargo.toml",
+        "autumn/src/",
+        "autumn/Cargo.toml",
+        "autumn-macros",
+    ] {
+        assert!(
+            workflow.contains(path_fragment),
+            "generator-conformance.yml must declare a path filter covering `{path_fragment}`",
+        );
+    }
+
+    // AC-4: a scheduled run catches regressions on branches where the path
+    // filter would not trigger.
+    assert!(
+        workflow.contains("schedule"),
+        "generator-conformance.yml must include a cron schedule so generator rot \
+         is caught even when no template or prelude file was touched directly",
+    );
+}
+
+#[test]
+fn contributing_documents_ignored_generator_tests() {
+    let root = workspace_root();
+
+    // AC-6: CONTRIBUTING.md must explain that the generator conformance tests
+    // carry #[ignore] annotations but are still machine-verified by CI, so
+    // contributors do not assume these tests are abandoned.
+    let contributing_path = root.join("CONTRIBUTING.md");
+    let contributing = std::fs::read_to_string(&contributing_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", contributing_path.display()));
+
+    assert!(
+        contributing.contains("generator-conformance"),
+        "CONTRIBUTING.md must mention the `generator-conformance` CI gate",
+    );
+    assert!(
+        contributing.contains("#[ignore]"),
+        "CONTRIBUTING.md must explain that `#[ignore]` on generator tests means \
+         CI-gated, not abandoned",
+    );
+    assert!(
+        contributing.contains("autumn-cli/src/generate")
+            && contributing.contains("autumn-cli/src/templates"),
+        "CONTRIBUTING.md must name the generator template paths that trigger the gate",
+    );
+}
+
+#[test]
+fn runtime_config_migration_sorts_after_existing_framework_versions() {
+    let root = workspace_root();
+    let migrations_dir = root.join("autumn/migrations");
+    let mut runtime_config_version = None;
+    let mut version_history_version = None;
+
+    for entry in std::fs::read_dir(&migrations_dir)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", migrations_dir.display()))
+    {
+        let entry = entry.unwrap_or_else(|err| panic!("failed to read migration entry: {err}"));
+        let file_name = entry.file_name();
+        let file_name = file_name.to_string_lossy();
+        let Some((version, name)) = file_name.split_once('_') else {
+            continue;
+        };
+
+        match name {
+            "create_runtime_config" => runtime_config_version = Some(version.to_owned()),
+            "create_version_history" => version_history_version = Some(version.to_owned()),
+            _ => {}
+        }
+    }
+
+    let runtime_config_version =
+        runtime_config_version.expect("runtime config framework migration must exist");
+    let version_history_version =
+        version_history_version.expect("version history framework migration must exist");
+
+    assert!(
+        runtime_config_version > version_history_version,
+        "runtime config migration must sort after version history so new deployments roll back in release order"
+    );
+}
+
+#[test]
+fn benchmark_runtime_startup_applies_packaged_migrations() {
+    let root = workspace_root();
+
+    let spring_properties_path =
+        root.join("benchmarks/runtime/spring-boot/src/main/resources/application.properties");
+    let spring_properties = std::fs::read_to_string(&spring_properties_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", spring_properties_path.display()));
+    assert!(
+        spring_properties.contains("spring.flyway.enabled=true"),
+        "{} must keep Flyway enabled so standalone fresh benchmark databases get the packaged schema",
+        spring_properties_path.display(),
+    );
+    assert!(
+        !spring_properties.contains("spring.flyway.enabled=false"),
+        "{} must not disable Flyway for standalone benchmark runs",
+        spring_properties_path.display(),
+    );
+
+    let django_dockerfile_path = root.join("benchmarks/runtime/django/Dockerfile");
+    let django_dockerfile = std::fs::read_to_string(&django_dockerfile_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", django_dockerfile_path.display()));
+    assert!(
+        django_dockerfile.contains("python manage.py migrate --noinput &&")
+            && django_dockerfile.contains("gunicorn benchapp.asgi:application"),
+        "{} must run Django migrations before serving the benchmark",
+        django_dockerfile_path.display(),
+    );
+
+    let autumn_main_path = root.join("benchmarks/runtime/autumn/src/main.rs");
+    let autumn_main = std::fs::read_to_string(&autumn_main_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", autumn_main_path.display()));
+    assert!(
+        autumn_main.contains("embed_migrations!()")
+            && autumn_main.contains(".migrations(MIGRATIONS)"),
+        "{} must register benchmark migrations before running Autumn",
+        autumn_main_path.display(),
+    );
+
+    let rails_dockerfile_path = root.join("benchmarks/runtime/rails/Dockerfile");
+    let rails_dockerfile = std::fs::read_to_string(&rails_dockerfile_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", rails_dockerfile_path.display()));
+    assert!(
+        rails_dockerfile.contains("bundle exec rails db:migrate && bundle exec puma"),
+        "{} must run Rails migrations before starting Puma",
+        rails_dockerfile_path.display(),
+    );
+
+    let loco_production_path = root.join("benchmarks/runtime/loco/config/production.yaml");
+    let loco_production = std::fs::read_to_string(&loco_production_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", loco_production_path.display()));
+    assert!(
+        loco_production.contains("auto_migrate: true"),
+        "{} must keep Loco auto-migration enabled for fresh benchmark databases",
+        loco_production_path.display(),
+    );
+    assert!(
+        !loco_production.contains("auto_migrate: false"),
+        "{} must not disable Loco auto-migration for standalone benchmark runs",
+        loco_production_path.display(),
+    );
 }

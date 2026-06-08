@@ -5,20 +5,23 @@
 //! the same five files every time they add a resource.
 //!
 //! Three subcommands live here:
-//! - [`model::run`] — model + migration + schema entry
+//! - [`model::plan_model_with_options`] — model + migration + schema entry
 //! - [`migration::run`] — migration only (with optional add/remove DSL)
 //! - [`scaffold::run`] — model + repository + HTML routes + smoke test +
 //!   `routes![]` registration
 
 pub mod admin;
 pub mod auth;
+pub mod config;
 pub mod dsl;
 pub mod emit;
+pub mod mailer;
 pub mod migration;
 pub mod model;
 pub mod naming;
 pub mod scaffold;
 pub mod schema_edit;
+pub mod system_test;
 pub mod task;
 
 use std::path::{Path, PathBuf};
@@ -50,6 +53,10 @@ pub enum GenerateError {
     /// Filesystem error during code emission.
     #[error("{0}")]
     Io(#[from] std::io::Error),
+
+    /// Generator config file is invalid or missing a required section.
+    #[error("{0}")]
+    Config(String),
 }
 
 /// ⚡ Bolt optimization: Formats collision paths directly into a pre-allocated

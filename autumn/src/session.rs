@@ -97,6 +97,7 @@ struct SessionInner {
     id: String,
     old_id: Option<String>,
     data: HashMap<String, String>,
+    cookie_backed: bool,
     dirty: bool,
     destroyed: bool,
 }
@@ -106,15 +107,24 @@ impl Session {
     #[doc(hidden)]
     #[must_use]
     pub fn new_for_test(id: String, data: HashMap<String, String>) -> Self {
-        Self::new(id, data)
+        Self::new_cookie_backed(id, data)
     }
 
     fn new(id: String, data: HashMap<String, String>) -> Self {
+        Self::with_cookie_state(id, data, false)
+    }
+
+    fn new_cookie_backed(id: String, data: HashMap<String, String>) -> Self {
+        Self::with_cookie_state(id, data, true)
+    }
+
+    fn with_cookie_state(id: String, data: HashMap<String, String>, cookie_backed: bool) -> Self {
         Self {
             inner: Arc::new(RwLock::new(SessionInner {
                 id,
                 old_id: None,
                 data,
+                cookie_backed,
                 dirty: false,
                 destroyed: false,
             })),
@@ -124,6 +134,17 @@ impl Session {
     /// Returns the session ID.
     pub async fn id(&self) -> String {
         self.inner.read().await.id.clone()
+    }
+
+    /// Returns whether this session ID came from a valid request cookie rather
+    /// than being generated for the current request.
+    pub async fn is_cookie_backed(&self) -> bool {
+        self.inner.read().await.cookie_backed
+    }
+
+    pub(crate) async fn has_pending_changes(&self) -> bool {
+        let inner = self.inner.read().await;
+        inner.dirty || inner.destroyed
     }
 
     /// Get a value from the session.
@@ -724,10 +745,14 @@ where
                 }
             };
 
+            let mut stale_cookie_session_id = None;
             let (session_id, data) = if let Some(ref id) = existing_id {
                 match store.load(id).await {
                     Ok(Some(data)) => (id.clone(), data),
-                    Ok(None) => (Uuid::new_v4().to_string(), HashMap::new()),
+                    Ok(None) => {
+                        stale_cookie_session_id = Some(id.clone());
+                        (Uuid::new_v4().to_string(), HashMap::new())
+                    }
                     Err(error) => return Ok(session_store_unavailable_response(&error)),
                 }
             } else {
@@ -735,7 +760,18 @@ where
             };
 
             // 2. Create session handle and insert into extensions
-            let session = Session::new(session_id.clone(), data);
+            let cookie_backed = existing_id.as_ref().is_some_and(|id| id == &session_id);
+            let session = if cookie_backed {
+                Session::new_cookie_backed(session_id.clone(), data)
+            } else {
+                Session::new(session_id.clone(), data)
+            };
+            let current_session_scope = cookie_backed.then(|| session_id.clone());
+            req.extensions_mut()
+                .insert(crate::idempotency::IdempotencySessionScope::new(
+                    current_session_scope,
+                    stale_cookie_session_id,
+                ));
             req.extensions_mut().insert(session.clone());
 
             // 3. Call inner service
@@ -745,21 +781,32 @@ where
             let inner_guard = session.inner.read().await;
             if inner_guard.destroyed {
                 if let Err(error) = store.destroy(&session_id).await {
+                    crate::idempotency::keep_deferred_session_commit_locked(&mut response);
                     return Ok(session_store_unavailable_response(&error));
                 }
                 if let Ok(val) = HeaderValue::from_str(&build_expire_cookie(&config)) {
                     response.headers_mut().append(SET_COOKIE, val);
                 }
+                crate::idempotency::add_deferred_session_replay_key(
+                    &response,
+                    None,
+                    inner_guard.cookie_backed,
+                );
             } else if inner_guard.dirty {
                 let data = inner_guard.data.clone();
                 let sid = inner_guard.id.clone();
+                let primary_replay_after_guard_denial =
+                    inner_guard.cookie_backed && inner_guard.old_id.is_some();
                 if let Some(ref old_id) = inner_guard.old_id
                     && let Err(error) = store.destroy(old_id).await
                 {
+                    drop(inner_guard);
+                    crate::idempotency::keep_deferred_session_commit_locked(&mut response);
                     return Ok(session_store_unavailable_response(&error));
                 }
                 drop(inner_guard);
                 if let Err(error) = store.save(&sid, data).await {
+                    crate::idempotency::keep_deferred_session_commit_locked(&mut response);
                     return Ok(session_store_unavailable_response(&error));
                 }
                 // Sign the session ID when signing keys are active
@@ -770,6 +817,15 @@ where
                 if let Ok(val) = HeaderValue::from_str(&build_set_cookie(&config, &cookie_value)) {
                     response.headers_mut().append(SET_COOKIE, val);
                 }
+                crate::idempotency::add_deferred_session_replay_key(
+                    &response,
+                    Some(&sid),
+                    primary_replay_after_guard_denial,
+                );
+            }
+
+            if crate::idempotency::finalize_deferred_session_commit(&mut response).is_err() {
+                return Ok(crate::idempotency::persistence_failed_response());
             }
 
             Ok(response)
@@ -1147,14 +1203,19 @@ mod tests {
             task_registry: crate::actuator::TaskRegistry::new(),
             job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
+            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
+            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
+            #[cfg(feature = "presence")]
+            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
             policy_registry: crate::authorization::PolicyRegistry::default(),
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
+            clock: std::sync::Arc::new(crate::time::SystemClock),
         };
 
         let app = Router::new()
@@ -1195,14 +1256,19 @@ mod tests {
             task_registry: crate::actuator::TaskRegistry::new(),
             job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
+            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
+            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
+            #[cfg(feature = "presence")]
+            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
             policy_registry: crate::authorization::PolicyRegistry::default(),
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
+            clock: std::sync::Arc::new(crate::time::SystemClock),
         }
     }
 

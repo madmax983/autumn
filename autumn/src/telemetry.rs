@@ -225,6 +225,15 @@ pub fn init(
         eprintln!("Warning: {warning}");
     }
 
+    let opted_out_defaults =
+        crate::log::filter::normalized_opt_out_defaults(&log.unfilter_parameters);
+    if !opted_out_defaults.is_empty() {
+        eprintln!(
+            "Warning: log.unfilter_parameters opted out built-in sensitive keys: {}",
+            opted_out_defaults.join(", ")
+        );
+    }
+
     match &runtime.trace_export {
         TraceExport::Disabled => init_logging_only(log, runtime.log_format),
         TraceExport::Otlp(otlp) => {

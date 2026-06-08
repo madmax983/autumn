@@ -10,7 +10,7 @@ use super::naming::{pascal, pluralize, snake};
 use super::schema_edit::{
     add_mod_declaration, append_schema_table, create_table_sql_with_metadata, drop_table_sql,
 };
-use super::{Flags, GenerateError, ensure_project_root, timestamp_now};
+use super::{GenerateError, ensure_project_root};
 
 /// Optional metadata applied to generated model fields.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -21,6 +21,9 @@ pub struct ModelOptions {
     pub validations: Vec<String>,
     /// Default specs in `field=value` form.
     pub defaults: Vec<String>,
+    /// Emit a `deleted_at: Option<NaiveDateTime>` field and a nullable
+    /// `deleted_at TIMESTAMP NULL` column for soft-delete support.
+    pub soft_delete: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -54,6 +57,7 @@ impl ModelMetadata {
 ///
 /// # Errors
 /// Surfaces project-layout, DSL, and naming errors before any file is written.
+#[allow(dead_code)]
 pub fn plan_model(
     project_root: &Path,
     name: &str,
@@ -91,6 +95,27 @@ pub fn plan_model_with_options(
     let snake_name = snake(name);
     let table = pluralize(&snake_name);
 
+    // When soft_delete is enabled, append a virtual `deleted_at` field so
+    // the SQL migration and schema.rs block include the nullable column.
+    let schema_fields: std::borrow::Cow<[Field]> = if options.soft_delete {
+        if fields.iter().any(|f| f.name == "deleted_at") {
+            return Err(GenerateError::InvalidField {
+                token: "deleted_at".to_owned(),
+                reason: "'deleted_at' is managed by --soft-delete; remove it from the field list"
+                    .to_owned(),
+            });
+        }
+        let mut augmented = fields.clone();
+        augmented.push(Field {
+            name: "deleted_at".to_owned(),
+            kind: FieldKind::NaiveDateTime,
+            nullable: true,
+        });
+        std::borrow::Cow::Owned(augmented)
+    } else {
+        std::borrow::Cow::Borrowed(&fields)
+    };
+
     let mut plan = Plan::new(project_root);
 
     // (a) `src/models/<snake>.rs` + `src/models/mod.rs`
@@ -98,7 +123,13 @@ pub fn plan_model_with_options(
     let model_file = models_dir.join(format!("{snake_name}.rs"));
     plan.create(
         model_file,
-        render_model_file(&pascal_name, &table, &fields, &metadata),
+        render_model_file(
+            &pascal_name,
+            &table,
+            &fields,
+            &metadata,
+            options.soft_delete,
+        ),
     );
 
     let mod_path = models_dir.join("mod.rs");
@@ -108,8 +139,12 @@ pub fn plan_model_with_options(
     // (b) Diesel migration
     let migration_dir_name = format!("{timestamp}_create_{table}");
     let migration_dir = project_root.join("migrations").join(&migration_dir_name);
-    let up_sql =
-        create_table_sql_with_metadata(&table, &fields, metadata.indexes(), metadata.defaults());
+    let up_sql = create_table_sql_with_metadata(
+        &table,
+        &schema_fields,
+        metadata.indexes(),
+        metadata.defaults(),
+    );
     plan.create(migration_dir.join("up.sql"), up_sql);
     plan.create(migration_dir.join("down.sql"), drop_table_sql(&table));
 
@@ -118,7 +153,7 @@ pub fn plan_model_with_options(
     let schema_existing = read_or_empty(&schema_path);
     plan.modify(
         schema_path,
-        append_schema_table(&schema_existing, &table, &fields),
+        append_schema_table(&schema_existing, &table, &schema_fields),
     );
 
     // (d) `Cargo.toml` deps — `#[autumn_web::model]` expands to references
@@ -589,12 +624,14 @@ fn sql_default_literal(field: &Field, value: &str) -> Result<String, String> {
             .parse::<f64>()
             .map(|_| value.to_owned())
             .map_err(|_| "float defaults must be valid numbers".to_owned()),
-        FieldKind::Uuid | FieldKind::NaiveDateTime | FieldKind::DateTime | FieldKind::Bytea => {
-            Err(format!(
-                "defaults for {} fields are not supported by `autumn generate` yet",
-                field.rust_type()
-            ))
-        }
+        FieldKind::Uuid
+        | FieldKind::NaiveDateTime
+        | FieldKind::DateTime
+        | FieldKind::Bytea
+        | FieldKind::Attachment => Err(format!(
+            "defaults for {} fields are not supported by `autumn generate` yet",
+            field.rust_type()
+        )),
     }
 }
 
@@ -603,6 +640,7 @@ fn render_model_file(
     table: &str,
     fields: &[Field],
     metadata: &ModelMetadata,
+    soft_delete: bool,
 ) -> String {
     use std::fmt::Write as _;
     let mut out = String::with_capacity(fields.len() * 128 + 256);
@@ -632,32 +670,17 @@ fn render_model_file(
     }
     out.push_str("    #[default]\n");
     out.push_str("    pub created_at: chrono::NaiveDateTime,\n");
+    if soft_delete {
+        out.push_str("    pub deleted_at: Option<chrono::NaiveDateTime>,\n");
+    }
     out.push_str("}\n");
     out
-}
-
-/// CLI entry point — plan and execute, exiting nonzero on any error.
-pub fn run(name: &str, field_tokens: &[String], flags: Flags) {
-    let cwd = match std::env::current_dir() {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("Error: cannot determine current directory: {e}");
-            std::process::exit(1);
-        }
-    };
-    let timestamp = timestamp_now();
-    match plan_model(&cwd, name, field_tokens, &timestamp).and_then(|p| p.execute(flags)) {
-        Ok(()) => {}
-        Err(e) => {
-            eprintln!("Error: {e}");
-            std::process::exit(1);
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::generate::Flags;
     use crate::generate::emit::Action;
     use std::fs;
     use tempfile::TempDir;
@@ -1106,6 +1129,138 @@ autumn-web = \"0.3\"\n";
                 "diesel = { version = \"2\", features = [\"postgres\", \"chrono\", \"uuid\"] }"
             ),
             "Diesel schema Uuid fields need diesel's uuid feature:\n{cargo_toml}"
+        );
+    }
+
+    // ── Soft-delete model generation (issue #689) ─────────────────
+
+    #[test]
+    fn plan_model_with_soft_delete_emits_deleted_at_migration_column() {
+        let tmp = project();
+        let plan = plan_model_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+            &ModelOptions {
+                soft_delete: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let up = fs::read_to_string(
+            tmp.path()
+                .join("migrations/20260427000000_create_posts/up.sql"),
+        )
+        .unwrap();
+        assert!(
+            up.contains("deleted_at"),
+            "soft_delete migration must include deleted_at column: {up}"
+        );
+        assert!(
+            up.contains("NULL"),
+            "soft_delete deleted_at must be nullable (no NOT NULL): {up}"
+        );
+    }
+
+    #[test]
+    fn plan_model_with_soft_delete_emits_deleted_at_field_in_struct() {
+        let tmp = project();
+        let plan = plan_model_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+            &ModelOptions {
+                soft_delete: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let model = fs::read_to_string(tmp.path().join("src/models/post.rs")).unwrap();
+        assert!(
+            model.contains("deleted_at"),
+            "soft_delete model struct must include deleted_at field: {model}"
+        );
+        assert!(
+            model.contains("Option<"),
+            "soft_delete deleted_at field must be Option<...>: {model}"
+        );
+    }
+
+    #[test]
+    fn plan_model_without_soft_delete_does_not_emit_deleted_at() {
+        let tmp = project();
+        let plan = plan_model(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let model = fs::read_to_string(tmp.path().join("src/models/post.rs")).unwrap();
+        assert!(
+            !model.contains("deleted_at"),
+            "model without soft_delete must not contain deleted_at: {model}"
+        );
+        let up = fs::read_to_string(
+            tmp.path()
+                .join("migrations/20260427000000_create_posts/up.sql"),
+        )
+        .unwrap();
+        assert!(
+            !up.contains("deleted_at"),
+            "migration without soft_delete must not contain deleted_at: {up}"
+        );
+    }
+
+    #[test]
+    fn plan_model_soft_delete_rejects_explicit_deleted_at_field() {
+        let tmp = project();
+        let err = plan_model_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "deleted_at:NaiveDateTime".into()],
+            "20260427000000",
+            &ModelOptions {
+                soft_delete: true,
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("deleted_at"),
+            "providing deleted_at with soft_delete must error; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn plan_model_soft_delete_schema_includes_deleted_at_column() {
+        let tmp = project();
+        let plan = plan_model_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+            &ModelOptions {
+                soft_delete: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let schema = fs::read_to_string(tmp.path().join("src/schema.rs")).unwrap();
+        assert!(
+            schema.contains("deleted_at"),
+            "schema.rs must include deleted_at column when soft_delete is enabled: {schema}"
         );
     }
 }

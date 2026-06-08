@@ -13,11 +13,14 @@
 //! migrations (via `.migrations()` on `AppBuilder`). This CLI command
 //! is a convenience wrapper for explicit migration management.
 
+pub mod safety;
+
 use std::path::Path;
 use std::process::Command;
 
-use autumn_web::auth::API_TOKEN_MIGRATIONS;
-use autumn_web::migrate::{EmbeddedMigrations, MigrationError, MigrationResult};
+use autumn_web::migrate::{
+    EmbeddedMigrations, FRAMEWORK_MIGRATIONS, MigrationError, MigrationResult,
+};
 
 /// Default directory containing Diesel migration files.
 const DEFAULT_MIGRATIONS_DIR: &str = "migrations";
@@ -29,11 +32,20 @@ pub enum MigrateAction {
     Run,
     /// Show migration status (pending / applied).
     Status,
+    /// Preflight safety check — classifies all migration SQL files and returns
+    /// a non-zero exit code if any unsafe or unclassified operations are found.
+    Check,
 }
 
 /// Run the migrate command.
-pub fn run(action: MigrateAction) {
+pub fn run(action: MigrateAction, with_maintenance: bool) {
     eprintln!("\u{1F342} autumn migrate\n");
+
+    if action == MigrateAction::Check {
+        let migrations_dir = resolve_migrations_dir();
+        run_safety_check(&migrations_dir);
+        return;
+    }
 
     // 1. Resolve database URL from autumn.toml + env
     let database_url = resolve_database_url();
@@ -44,16 +56,224 @@ pub fn run(action: MigrateAction) {
     // 3. Check that diesel CLI is available
     check_diesel_cli();
 
-    // 4. Execute the appropriate diesel command
+    // 4. Enable maintenance mode if requested
+    if with_maintenance && action == MigrateAction::Run {
+        enable_maintenance_for_migrate();
+    }
+
+    // 5. Execute the appropriate diesel command
     match action {
         MigrateAction::Run => {
-            run_migrations(&database_url, &migrations_dir);
-            run_framework_migrations(&database_url);
+            run_migrations_with_maintenance(&database_url, &migrations_dir, with_maintenance);
         }
         MigrateAction::Status => {
             show_status(&database_url, &migrations_dir);
             show_framework_status(&database_url);
         }
+        MigrateAction::Check => unreachable!("handled above"),
+    }
+}
+
+/// Enable maintenance mode before a migrate run.
+fn enable_maintenance_for_migrate() {
+    use autumn_web::maintenance::{MAINTENANCE_FLAG_FILE, MaintenanceConfig, MaintenanceState};
+    let path = std::path::Path::new(MAINTENANCE_FLAG_FILE);
+    let config = MaintenanceConfig {
+        message: Some("Database migration in progress. Please try again in a moment.".to_owned()),
+        ..Default::default()
+    };
+    match MaintenanceState::save_to_file(path, &config) {
+        Ok(()) => eprintln!("  \u{26A0}\u{FE0F}  Maintenance mode ENABLED (--with-maintenance)"),
+        Err(e) => {
+            eprintln!("\u{274C} Failed to enable maintenance mode: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Disable maintenance mode after a successful migrate run.
+fn disable_maintenance_after_migrate() {
+    use autumn_web::maintenance::{MAINTENANCE_FLAG_FILE, MaintenanceState};
+    let path = std::path::Path::new(MAINTENANCE_FLAG_FILE);
+    match MaintenanceState::remove_flag_file(path) {
+        Ok(_) => eprintln!("  \u{2713} Maintenance mode DISABLED — normal traffic resuming"),
+        Err(e) => eprintln!("\u{26A0}\u{FE0F}  Could not remove maintenance flag: {e}"),
+    }
+}
+
+fn run_migrations_with_maintenance(
+    database_url: &str,
+    migrations_dir: &str,
+    with_maintenance: bool,
+) {
+    eprintln!("  Running pending migrations...\n");
+    let dir = std::path::Path::new(migrations_dir);
+    let status = Command::new("diesel")
+        .args(["migration", "run", "--migration-dir"])
+        .arg(dir)
+        .env("DATABASE_URL", database_url)
+        .status();
+
+    let success = match status {
+        Ok(s) if s.success() => {
+            eprintln!("\n\u{2713} Migrations applied successfully.");
+            true
+        }
+        Ok(_) => {
+            eprintln!(
+                "\n\u{274C} Migration failed in {}. Check the error output above.",
+                dir.display()
+            );
+            false
+        }
+        Err(e) => {
+            eprintln!("\u{274C} Failed to run diesel migration run: {e}");
+            false
+        }
+    };
+
+    if success {
+        run_framework_migrations(database_url);
+        if with_maintenance {
+            // Only disable maintenance when everything succeeded
+            disable_maintenance_after_migrate();
+        }
+    } else {
+        if with_maintenance {
+            eprintln!();
+            eprintln!(
+                "  \u{26A0}\u{FE0F}  Migration failed — maintenance mode left ON for safety."
+            );
+            eprintln!("      Fix the migration then run `autumn migrate` to retry.");
+            eprintln!("      Run `autumn maintenance off` to re-open traffic manually.");
+        }
+        std::process::exit(1);
+    }
+}
+
+/// Run the migration safety preflight check against all SQL files in `migrations_dir`.
+///
+/// Prints a human-readable report to stderr and exits with code 1 if any
+/// unsafe or potentially-blocking operations are detected.
+fn run_safety_check(migrations_dir: &str) {
+    let reports = match check_migrations_in_dir(Path::new(migrations_dir)) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("\u{2717} Migration safety check failed: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    if reports.is_empty() {
+        eprintln!("\u{2713} No migrations found in {migrations_dir}/");
+        return;
+    }
+
+    let total = reports.len();
+    eprintln!("  Scanning {total} migration(s) in {migrations_dir}/...\n");
+
+    for (name, findings) in &reports {
+        if safety::is_safe(findings) {
+            eprintln!("  \u{2713} {name}  [safe]");
+        } else {
+            eprintln!("  \u{2717} {name}");
+            for f in findings {
+                eprintln!("      \u{2022} {} [{}]", f.operation, f.risk);
+                eprintln!("        Why:  {}", f.why);
+                eprintln!("        Next: {}", f.next_action);
+            }
+        }
+    }
+
+    let any_unsafe = reports
+        .iter()
+        .any(|(_, findings)| safety::has_unsafe_findings(findings));
+
+    eprintln!();
+    if any_unsafe {
+        eprintln!(
+            "\u{2717} One or more migrations contain operations that are unsafe for a live \
+             rolling deploy."
+        );
+        eprintln!("  Review the findings above, apply the expand/contract pattern where needed,");
+        eprintln!("  or coordinate a maintenance window before deploying these migrations.");
+        std::process::exit(1);
+    } else {
+        eprintln!("\u{2713} All {total} migration(s) are safe for a rolling deploy.");
+    }
+}
+
+/// Read every migration directory in `dir`, classify its `up.sql`, and return
+/// a sorted list of `(migration_name, findings)` pairs.
+///
+/// Migration directories that have no `up.sql` are silently skipped.
+pub fn check_migrations_in_dir(
+    dir: &Path,
+) -> Result<Vec<(String, Vec<safety::SafetyFinding>)>, String> {
+    let mut entries: Vec<_> = std::fs::read_dir(dir)
+        .map_err(|e| format!("cannot read {}: {e}", dir.display()))?
+        .filter_map(std::result::Result::ok)
+        .filter(|entry| entry.path().is_dir())
+        .collect();
+
+    // Sort by directory name (which starts with a timestamp) for stable output.
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+
+    let mut results = Vec::new();
+    for entry in entries {
+        let migration_name = entry.file_name().to_string_lossy().into_owned();
+        let up_sql_path = entry.path().join("up.sql");
+        if !up_sql_path.exists() {
+            continue;
+        }
+        let sql = std::fs::read_to_string(&up_sql_path)
+            .map_err(|e| format!("cannot read {}: {e}", up_sql_path.display()))?;
+        let mut findings = safety::classify_sql(&sql);
+        check_concurrent_index_transaction_opt_out(&sql, &entry.path(), &mut findings);
+        results.push((migration_name, findings));
+    }
+
+    Ok(results)
+}
+
+/// If the SQL uses `CREATE INDEX CONCURRENTLY` but the migration directory does not
+/// opt out of Diesel's default transaction wrapping via `metadata.toml`, add a
+/// `PotentiallyBlocking` finding.
+///
+/// `PostgreSQL` rejects `CREATE INDEX CONCURRENTLY` inside a transaction block.
+/// Without `run_in_transaction = false` in `metadata.toml`, Diesel wraps the
+/// migration in a transaction and the deployment job will fail.
+fn check_concurrent_index_transaction_opt_out(
+    sql: &str,
+    migration_dir: &Path,
+    findings: &mut Vec<safety::SafetyFinding>,
+) {
+    if !safety::contains_concurrent_index(sql) {
+        return;
+    }
+
+    let metadata_path = migration_dir.join("metadata.toml");
+    let opted_out = std::fs::read_to_string(&metadata_path)
+        .ok()
+        .and_then(|content| toml::from_str::<toml::Table>(&content).ok())
+        .and_then(|table| {
+            table
+                .get("run_in_transaction")
+                .and_then(toml::Value::as_bool)
+        })
+        .is_some_and(|v| !v);
+
+    if !opted_out {
+        findings.push(safety::SafetyFinding {
+            operation: "CONCURRENTLY index operation (missing transaction opt-out)".to_owned(),
+            risk: safety::RiskLevel::PotentiallyBlocking,
+            why: "`PostgreSQL` rejects `CREATE INDEX CONCURRENTLY` and `DROP INDEX CONCURRENTLY` \
+                  inside a transaction block. Diesel wraps migrations in a transaction by default, \
+                  so this migration will fail at deploy time unless the transaction is disabled.",
+            next_action: "Add `run_in_transaction = false` to the migration's `metadata.toml` \
+                          (create the file if absent). Example: \
+                          echo 'run_in_transaction = false' > migrations/<name>/metadata.toml",
+        });
     }
 }
 
@@ -155,12 +375,6 @@ fn check_diesel_cli() {
     }
 }
 
-/// Run pending migrations via `diesel migration run`.
-fn run_migrations(database_url: &str, migrations_dir: &str) {
-    eprintln!("  Running pending migrations...\n");
-    run_diesel_migration_run(database_url, Path::new(migrations_dir), "Migrations");
-}
-
 fn run_framework_migrations(database_url: &str) {
     eprintln!("  Running pending Autumn framework migrations...\n");
 
@@ -188,35 +402,7 @@ fn run_framework_migrations_inner<F>(
 where
     F: FnOnce(&str, EmbeddedMigrations) -> Result<MigrationResult, MigrationError>,
 {
-    run_pending(database_url, API_TOKEN_MIGRATIONS)
-}
-
-fn run_diesel_migration_run(database_url: &str, migrations_dir: &Path, label: &str) {
-    let status = Command::new("diesel")
-        .args(["migration", "run", "--migration-dir"])
-        .arg(migrations_dir)
-        .env("DATABASE_URL", database_url)
-        .status();
-
-    match status {
-        Ok(s) if s.success() => {
-            eprintln!("\n\u{2713} {label} applied successfully.");
-        }
-        Ok(_) => {
-            eprintln!(
-                "\n\u{2717} Migration failed in {}. Check the error output above for the failing SQL.",
-                migrations_dir.display()
-            );
-            std::process::exit(1);
-        }
-        Err(e) => {
-            eprintln!(
-                "\u{2717} Failed to run diesel migration run for {}: {e}",
-                migrations_dir.display()
-            );
-            std::process::exit(1);
-        }
-    }
+    run_pending(database_url, FRAMEWORK_MIGRATIONS)
 }
 
 /// Show migration status via `diesel migration pending`.
@@ -253,7 +439,7 @@ fn pending_framework_migrations_inner<F>(
 where
     F: FnOnce(&str, EmbeddedMigrations) -> Result<Vec<String>, MigrationError>,
 {
-    pending_migrations(database_url, API_TOKEN_MIGRATIONS)
+    pending_migrations(database_url, FRAMEWORK_MIGRATIONS)
 }
 
 fn show_diesel_migration_status(database_url: &str, migrations_dir: &Path) {
@@ -291,7 +477,128 @@ mod tests {
     fn migrate_action_eq() {
         assert_eq!(MigrateAction::Run, MigrateAction::Run);
         assert_eq!(MigrateAction::Status, MigrateAction::Status);
+        assert_eq!(MigrateAction::Check, MigrateAction::Check);
         assert_ne!(MigrateAction::Run, MigrateAction::Status);
+        assert_ne!(MigrateAction::Run, MigrateAction::Check);
+    }
+
+    // ── check_migrations_in_dir ────────────────────────────────────────────
+
+    fn write_migration(dir: &std::path::Path, name: &str, up_sql: &str) {
+        let migration_dir = dir.join(name);
+        std::fs::create_dir_all(&migration_dir).unwrap();
+        std::fs::write(migration_dir.join("up.sql"), up_sql).unwrap();
+        std::fs::write(migration_dir.join("down.sql"), "").unwrap();
+    }
+
+    #[test]
+    fn check_empty_migrations_dir_returns_empty() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let results = check_migrations_in_dir(tmp.path()).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn check_safe_migration_produces_no_findings() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_migration(
+            tmp.path(),
+            "20260101000000_create_posts",
+            "CREATE TABLE posts (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL);",
+        );
+
+        let results = check_migrations_in_dir(tmp.path()).unwrap();
+        assert_eq!(results.len(), 1);
+        let (name, findings) = &results[0];
+        assert_eq!(name, "20260101000000_create_posts");
+        assert!(
+            findings.is_empty(),
+            "CREATE TABLE should produce no findings"
+        );
+    }
+
+    #[test]
+    fn check_destructive_migration_produces_findings() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_migration(
+            tmp.path(),
+            "20260102000000_remove_body_from_posts",
+            "ALTER TABLE posts DROP COLUMN body;",
+        );
+
+        let results = check_migrations_in_dir(tmp.path()).unwrap();
+        assert_eq!(results.len(), 1);
+        let (_, findings) = &results[0];
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].risk, safety::RiskLevel::Destructive);
+    }
+
+    #[test]
+    fn check_results_are_sorted_by_migration_name() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_migration(tmp.path(), "20260103000000_third", "SELECT 1;");
+        write_migration(tmp.path(), "20260101000000_first", "SELECT 1;");
+        write_migration(tmp.path(), "20260102000000_second", "SELECT 1;");
+
+        let results = check_migrations_in_dir(tmp.path()).unwrap();
+        let names: Vec<_> = results.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "20260101000000_first",
+                "20260102000000_second",
+                "20260103000000_third"
+            ]
+        );
+    }
+
+    #[test]
+    fn check_directories_without_up_sql_are_skipped() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join("incomplete_migration")).unwrap();
+        write_migration(tmp.path(), "20260101000000_valid", "SELECT 1;");
+
+        let results = check_migrations_in_dir(tmp.path()).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, "20260101000000_valid");
+    }
+
+    #[test]
+    fn check_multiple_migrations_reports_each() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_migration(
+            tmp.path(),
+            "20260101000000_create_posts",
+            "CREATE TABLE posts (id BIGSERIAL PRIMARY KEY);",
+        );
+        write_migration(
+            tmp.path(),
+            "20260102000000_remove_body",
+            "ALTER TABLE posts DROP COLUMN body;",
+        );
+
+        let results = check_migrations_in_dir(tmp.path()).unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results[0].1.is_empty(), "first migration should be safe");
+        assert!(
+            !results[1].1.is_empty(),
+            "second migration should have findings"
+        );
+    }
+
+    #[test]
+    fn check_non_concurrent_index_is_flagged() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_migration(
+            tmp.path(),
+            "20260103000000_add_index",
+            "CREATE INDEX idx_posts_title ON posts (title);",
+        );
+
+        let results = check_migrations_in_dir(tmp.path()).unwrap();
+        let (_, findings) = &results[0];
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].risk, safety::RiskLevel::PotentiallyBlocking);
     }
 
     #[test]
@@ -346,12 +653,13 @@ mod tests {
     }
 
     #[test]
-    fn embedded_api_token_migrations_include_real_schema_migration() {
+    fn embedded_framework_migrations_include_durable_hook_queue() {
         use autumn_web::reexports::diesel::migration::{Migration, MigrationSource};
         use autumn_web::reexports::diesel::pg::Pg;
 
-        let migrations: Vec<Box<dyn Migration<Pg>>> =
-            autumn_web::auth::API_TOKEN_MIGRATIONS.migrations().unwrap();
+        let migrations: Vec<Box<dyn Migration<Pg>>> = autumn_web::migrate::FRAMEWORK_MIGRATIONS
+            .migrations()
+            .unwrap();
         let names: Vec<_> = migrations
             .iter()
             .map(|migration| migration.name().to_string())
@@ -361,7 +669,13 @@ mod tests {
             names
                 .iter()
                 .any(|name| name == "20260512000000_create_api_tokens"),
-            "API token embedded migrations must include the timestamped schema migration: {names:?}"
+            "framework migrations must include the timestamped API token schema migration: {names:?}"
+        );
+        assert!(
+            names
+                .iter()
+                .any(|name| name == "20260515000000_create_repository_commit_hook_queue"),
+            "framework migrations must include the durable repository commit hook queue: {names:?}"
         );
     }
 
@@ -427,5 +741,251 @@ replica_url = "postgres://replica:5432/app"
         let url = resolve_primary_database_url_from_sources(env_var, Some(&table)).unwrap();
 
         assert_eq!(url, "postgres://primary:5432/app");
+    }
+
+    // ── check_concurrent_index_transaction_opt_out ────────────────────────
+
+    #[test]
+    fn concurrent_index_without_metadata_toml_is_flagged() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let migration_dir = tmp.path().join("20260104000000_add_index");
+        std::fs::create_dir_all(&migration_dir).unwrap();
+
+        let sql = "CREATE INDEX CONCURRENTLY idx_posts_title ON posts (title);";
+        let mut findings = Vec::new();
+        check_concurrent_index_transaction_opt_out(sql, &migration_dir, &mut findings);
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].risk, safety::RiskLevel::PotentiallyBlocking);
+        assert!(
+            findings[0].operation.contains("CONCURRENTLY"),
+            "finding should mention CONCURRENTLY"
+        );
+        assert!(
+            findings[0]
+                .next_action
+                .contains("run_in_transaction = false"),
+            "next_action should guide user to metadata.toml"
+        );
+    }
+
+    #[test]
+    fn concurrent_index_with_run_in_transaction_false_is_not_flagged() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let migration_dir = tmp.path().join("20260104000000_add_index");
+        std::fs::create_dir_all(&migration_dir).unwrap();
+        std::fs::write(
+            migration_dir.join("metadata.toml"),
+            "run_in_transaction = false\n",
+        )
+        .unwrap();
+
+        let sql = "CREATE INDEX CONCURRENTLY idx_posts_title ON posts (title);";
+        let mut findings = Vec::new();
+        check_concurrent_index_transaction_opt_out(sql, &migration_dir, &mut findings);
+
+        assert!(
+            findings.is_empty(),
+            "correctly opted-out CONCURRENTLY should produce no additional findings"
+        );
+    }
+
+    #[test]
+    fn concurrent_index_with_run_in_transaction_false_no_spaces_is_not_flagged() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let migration_dir = tmp.path().join("20260104000000_add_index");
+        std::fs::create_dir_all(&migration_dir).unwrap();
+        std::fs::write(
+            migration_dir.join("metadata.toml"),
+            "run_in_transaction=false\n",
+        )
+        .unwrap();
+
+        let sql = "CREATE INDEX CONCURRENTLY idx_posts_title ON posts (title);";
+        let mut findings = Vec::new();
+        check_concurrent_index_transaction_opt_out(sql, &migration_dir, &mut findings);
+
+        assert!(
+            findings.is_empty(),
+            "TOML `run_in_transaction=false` (no spaces) should also suppress the finding"
+        );
+    }
+
+    #[test]
+    fn concurrent_index_with_commented_out_flag_is_flagged() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let migration_dir = tmp.path().join("20260104000000_add_index");
+        std::fs::create_dir_all(&migration_dir).unwrap();
+        std::fs::write(
+            migration_dir.join("metadata.toml"),
+            "# run_in_transaction = false\n",
+        )
+        .unwrap();
+
+        let sql = "CREATE INDEX CONCURRENTLY idx_posts_title ON posts (title);";
+        let mut findings = Vec::new();
+        check_concurrent_index_transaction_opt_out(sql, &migration_dir, &mut findings);
+
+        assert_eq!(
+            findings.len(),
+            1,
+            "a commented-out opt-out should NOT suppress the finding"
+        );
+        assert_eq!(findings[0].risk, safety::RiskLevel::PotentiallyBlocking);
+    }
+
+    #[test]
+    fn concurrent_index_with_metadata_toml_missing_flag_is_flagged() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let migration_dir = tmp.path().join("20260104000000_add_index");
+        std::fs::create_dir_all(&migration_dir).unwrap();
+        std::fs::write(
+            migration_dir.join("metadata.toml"),
+            "# Diesel migration metadata\n",
+        )
+        .unwrap();
+
+        let sql = "CREATE INDEX CONCURRENTLY idx_posts_title ON posts (title);";
+        let mut findings = Vec::new();
+        check_concurrent_index_transaction_opt_out(sql, &migration_dir, &mut findings);
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].risk, safety::RiskLevel::PotentiallyBlocking);
+    }
+
+    #[test]
+    fn non_concurrent_index_is_not_flagged_by_opt_out_check() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let migration_dir = tmp.path().join("20260104000000_add_index");
+        std::fs::create_dir_all(&migration_dir).unwrap();
+
+        let sql = "CREATE INDEX idx_posts_title ON posts (title);";
+        let mut findings = Vec::new();
+        check_concurrent_index_transaction_opt_out(sql, &migration_dir, &mut findings);
+
+        assert!(
+            findings.is_empty(),
+            "non-CONCURRENTLY index should not be flagged by opt-out check"
+        );
+    }
+
+    #[test]
+    fn concurrent_index_in_sql_comment_is_not_flagged() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let migration_dir = tmp.path().join("20260104000000_add_index");
+        std::fs::create_dir_all(&migration_dir).unwrap();
+
+        // The concurrent index is only mentioned in a comment; the actual
+        // statement is a plain (non-concurrent) CREATE INDEX.
+        let sql = "-- TODO: switch to CREATE INDEX CONCURRENTLY once traffic drops\n\
+                   CREATE INDEX idx_posts_title ON posts (title);";
+        let mut findings = Vec::new();
+        check_concurrent_index_transaction_opt_out(sql, &migration_dir, &mut findings);
+
+        assert!(
+            findings.is_empty(),
+            "a CONCURRENTLY reference inside a SQL comment must not trigger the opt-out check"
+        );
+    }
+
+    #[test]
+    fn concurrent_unique_index_without_metadata_toml_is_flagged() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let migration_dir = tmp.path().join("20260104000000_add_unique_index");
+        std::fs::create_dir_all(&migration_dir).unwrap();
+
+        let sql = "CREATE UNIQUE INDEX CONCURRENTLY idx_posts_slug ON posts (slug);";
+        let mut findings = Vec::new();
+        check_concurrent_index_transaction_opt_out(sql, &migration_dir, &mut findings);
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].risk, safety::RiskLevel::PotentiallyBlocking);
+    }
+
+    #[test]
+    fn concurrent_index_multiline_without_metadata_toml_is_flagged() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let migration_dir = tmp.path().join("20260104000000_add_index");
+        std::fs::create_dir_all(&migration_dir).unwrap();
+
+        let sql = "CREATE INDEX\n  CONCURRENTLY idx_posts_title ON posts (title);";
+        let mut findings = Vec::new();
+        check_concurrent_index_transaction_opt_out(sql, &migration_dir, &mut findings);
+
+        assert_eq!(
+            findings.len(),
+            1,
+            "multi-line CREATE INDEX CONCURRENTLY should be flagged when metadata.toml is absent"
+        );
+        assert_eq!(findings[0].risk, safety::RiskLevel::PotentiallyBlocking);
+    }
+
+    #[test]
+    fn check_migrations_in_dir_flags_concurrent_index_without_metadata() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let migration_dir = tmp.path().join("20260104000000_add_index");
+        std::fs::create_dir_all(&migration_dir).unwrap();
+        std::fs::write(
+            migration_dir.join("up.sql"),
+            "CREATE INDEX CONCURRENTLY idx_posts_title ON posts (title);",
+        )
+        .unwrap();
+        std::fs::write(migration_dir.join("down.sql"), "").unwrap();
+
+        let results = check_migrations_in_dir(tmp.path()).unwrap();
+        assert_eq!(results.len(), 1);
+        let (_, findings) = &results[0];
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.operation.contains("CONCURRENTLY")),
+            "missing metadata.toml should produce a CONCURRENTLY finding"
+        );
+    }
+
+    #[test]
+    fn drop_index_concurrently_without_metadata_toml_is_flagged() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let migration_dir = tmp.path().join("20260104000000_drop_index");
+        std::fs::create_dir_all(&migration_dir).unwrap();
+
+        let sql = "DROP INDEX CONCURRENTLY idx_posts_title;";
+        let mut findings = Vec::new();
+        check_concurrent_index_transaction_opt_out(sql, &migration_dir, &mut findings);
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].risk, safety::RiskLevel::PotentiallyBlocking);
+        assert!(
+            findings[0].operation.contains("CONCURRENTLY"),
+            "finding should mention CONCURRENTLY"
+        );
+    }
+
+    #[test]
+    fn check_migrations_in_dir_concurrent_index_with_metadata_is_safe() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let migration_dir = tmp.path().join("20260104000000_add_index");
+        std::fs::create_dir_all(&migration_dir).unwrap();
+        std::fs::write(
+            migration_dir.join("up.sql"),
+            "CREATE INDEX CONCURRENTLY idx_posts_title ON posts (title);",
+        )
+        .unwrap();
+        std::fs::write(migration_dir.join("down.sql"), "").unwrap();
+        std::fs::write(
+            migration_dir.join("metadata.toml"),
+            "run_in_transaction = false\n",
+        )
+        .unwrap();
+
+        let results = check_migrations_in_dir(tmp.path()).unwrap();
+        assert_eq!(results.len(), 1);
+        let (_, findings) = &results[0];
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.operation.contains("CONCURRENTLY")),
+            "opted-out CONCURRENTLY should not produce a transaction opt-out finding"
+        );
     }
 }

@@ -3,6 +3,7 @@
 //! These endpoints provide a REST-style API alongside the HTML routes,
 //! demonstrating that Autumn handlers can return either HTML or JSON.
 
+use autumn_web::config::AutumnConfig;
 use autumn_web::{AppState, AutumnResult, Db, Json, Path, get, job, post};
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
@@ -53,4 +54,32 @@ pub async fn enqueue_publish_webhook(id: Path<i64>) -> AutumnResult<Json<serde_j
         "job": "publish_webhook",
         "post_id": *id
     })))
+}
+
+/// Report whether a Stripe key is configured via the encrypted credentials store.
+///
+/// This endpoint demonstrates reading from `config/credentials/development.toml.enc`
+/// at runtime via `config.credentials().get::<String>("stripe_secret_key")`.
+/// Set `AUTUMN_MASTER_KEY` (or place the key in `config/master.key`) before running.
+///
+/// The actual key value is never included in the response — this is intentional.
+#[get("/api/credentials-status")]
+pub async fn credentials_status(config: AutumnConfig) -> Json<serde_json::Value> {
+    let stripe_configured = config
+        .credentials()
+        .get::<String>("stripe_secret_key")
+        .map(|k| !k.is_empty() && k != "sk_test_placeholder")
+        .unwrap_or(false);
+
+    let sendgrid_configured = config
+        .credentials()
+        .get::<String>("sendgrid_api_key")
+        .map(|k| !k.is_empty() && k != "SG_placeholder")
+        .unwrap_or(false);
+
+    Json(serde_json::json!({
+        "credentials_loaded": !config.credentials().is_empty(),
+        "stripe_configured": stripe_configured,
+        "sendgrid_configured": sendgrid_configured,
+    }))
 }

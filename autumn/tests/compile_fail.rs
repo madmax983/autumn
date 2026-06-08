@@ -34,6 +34,9 @@ fn compile_fail_tests() {
     // would otherwise only fail at request time with `500`.
     #[cfg(feature = "db")]
     t.compile_fail("tests/compile-fail/repository_invalid_policy_type.rs");
+
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/repository_bulk_upsert_many_hooks.rs");
 }
 
 #[test]
@@ -70,6 +73,14 @@ fn compile_pass_tests() {
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/model_factory.rs");
 
+    // Encrypted column field attribute (requires db feature)
+    #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/model_encrypted.rs");
+
+    // Full versioned repository over an encrypted model (requires db feature)
+    #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/repository_encrypted.rs");
+
     // Model factory composition (#[factory_assoc]) — requires db feature
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/model_factory_composition.rs");
@@ -80,6 +91,8 @@ fn compile_pass_tests() {
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/repository_with_hooks.rs");
     #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/repository_hooks_serde_skipped_model.rs");
+    #[cfg(feature = "db")]
     t.pass("tests/compile-pass/repository_with_api.rs");
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/repository_with_hooks_and_api.rs");
@@ -87,6 +100,10 @@ fn compile_pass_tests() {
     t.pass("tests/compile-pass/repository_with_policy.rs");
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/repository_policy_non_serialize_new.rs");
+    #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/repository_versioned.rs");
+    #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/repository_tenant_scoped_versioned_optional_tenant.rs");
 
     // Cached macro
     t.pass("tests/compile-pass/cached_basic.rs");
@@ -105,6 +122,10 @@ fn compile_pass_tests() {
     t.pass("tests/compile-pass/model_lock_version.rs");
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/repository_lock_version.rs");
+
+    // Soft delete (requires db feature)
+    #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/repository_soft_delete.rs");
 }
 
 #[cfg(feature = "db")]

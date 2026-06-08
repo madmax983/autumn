@@ -13,6 +13,7 @@ use autumn_web::prelude::*;
 use autumn_web::session::{MemoryStore, SessionConfig, SessionLayer, SessionStore};
 use autumn_web::test::TestApp;
 use http::StatusCode;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 // ── Test resource and policy ──────────────────────────────────
 
@@ -37,10 +38,25 @@ impl Policy<Note> for AdminOrOwnerPolicy {
     }
 }
 
+#[derive(Default, Clone)]
+struct AnonymousTogglePolicy;
+
+impl Policy<Note> for AnonymousTogglePolicy {
+    fn can_update<'a>(&'a self, _ctx: &'a PolicyContext, _note: &'a Note) -> BoxFuture<'a, bool> {
+        Box::pin(async move { ANONYMOUS_POLICY_ALLOWED.load(Ordering::SeqCst) })
+    }
+}
+
 const FIXED_NOTE: Note = Note {
     id: 1,
     author_id: 42,
 };
+static SECURED_ADMIN_MUTATION_CALLS: AtomicUsize = AtomicUsize::new(0);
+static SECURED_ADMIN_REPLAY_CALLS: AtomicUsize = AtomicUsize::new(0);
+static AUTHORIZE_SESSION_ROTATION_CALLS: AtomicUsize = AtomicUsize::new(0);
+static AUTHORIZE_SESSION_TOUCH_CALLS: AtomicUsize = AtomicUsize::new(0);
+static AUTHORIZE_ANONYMOUS_SESSION_TOUCH_CALLS: AtomicUsize = AtomicUsize::new(0);
+static ANONYMOUS_POLICY_ALLOWED: AtomicBool = AtomicBool::new(true);
 
 // ── Hand-written handler exercising the inline `authorize` helper ──
 
@@ -52,6 +68,20 @@ async fn update_note_inline(
 ) -> AutumnResult<&'static str> {
     let _ = id;
     autumn_web::authorization::authorize::<Note>(&state, &session, "update", &FIXED_NOTE).await?;
+    Ok("ok")
+}
+
+#[autumn_web::post("/secured-admin")]
+#[autumn_web::secured("admin")]
+async fn secured_admin_mutation() -> AutumnResult<&'static str> {
+    SECURED_ADMIN_MUTATION_CALLS.fetch_add(1, Ordering::SeqCst);
+    Ok("ok")
+}
+
+#[autumn_web::post("/secured-admin-replay")]
+#[autumn_web::secured("admin")]
+async fn secured_admin_replay_mutation() -> AutumnResult<&'static str> {
+    SECURED_ADMIN_REPLAY_CALLS.fetch_add(1, Ordering::SeqCst);
     Ok("ok")
 }
 
@@ -182,6 +212,49 @@ async fn update_note_attr(
     Ok("ok")
 }
 
+#[autumn_web::post("/notes-attr-rotate/{id}")]
+#[autumn_web::authorize("update", resource = Note)]
+async fn update_note_attr_rotate(
+    autumn_web::extract::Path(id): autumn_web::extract::Path<i64>,
+    LoadedNote(note): LoadedNote,
+    session: Session,
+) -> AutumnResult<&'static str> {
+    let _ = id;
+    let _ = note;
+    AUTHORIZE_SESSION_ROTATION_CALLS.fetch_add(1, Ordering::SeqCst);
+    session.insert("user_id", "999").await;
+    session.rotate_id().await;
+    Ok("authorized-rotated")
+}
+
+#[autumn_web::post("/notes-attr-touch/{id}")]
+#[autumn_web::authorize("update", resource = Note)]
+async fn update_note_attr_touch(
+    autumn_web::extract::Path(id): autumn_web::extract::Path<i64>,
+    LoadedNote(note): LoadedNote,
+    session: Session,
+) -> AutumnResult<&'static str> {
+    let _ = id;
+    let _ = note;
+    AUTHORIZE_SESSION_TOUCH_CALLS.fetch_add(1, Ordering::SeqCst);
+    session.insert("flash", "saved").await;
+    Ok("authorized-touched")
+}
+
+#[autumn_web::post("/notes-anon-touch/{id}")]
+#[autumn_web::authorize("update", resource = Note)]
+async fn update_note_anonymous_touch(
+    autumn_web::extract::Path(id): autumn_web::extract::Path<i64>,
+    LoadedNote(note): LoadedNote,
+    session: Session,
+) -> AutumnResult<&'static str> {
+    let _ = id;
+    let _ = note;
+    AUTHORIZE_ANONYMOUS_SESSION_TOUCH_CALLS.fetch_add(1, Ordering::SeqCst);
+    session.insert("flash", "saved").await;
+    Ok("anonymous-touched")
+}
+
 fn build_attr_app(
     store: MemoryStore,
     forbidden_response: ForbiddenResponse,
@@ -191,6 +264,74 @@ fn build_attr_app(
         .policy::<Note, _>(AdminOrOwnerPolicy)
         .forbidden_response(forbidden_response)
         .layer(SessionLayer::new(store, SessionConfig::default()))
+        .build()
+}
+
+fn build_idempotent_attr_app(
+    store: MemoryStore,
+    forbidden_response: ForbiddenResponse,
+) -> autumn_web::test::TestClient {
+    TestApp::new()
+        .routes(routes![update_note_attr])
+        .policy::<Note, _>(AdminOrOwnerPolicy)
+        .forbidden_response(forbidden_response)
+        .layer(SessionLayer::new(store, SessionConfig::default()))
+        .idempotent()
+        .build()
+}
+
+fn build_idempotent_attr_rotation_app(
+    store: MemoryStore,
+    forbidden_response: ForbiddenResponse,
+) -> autumn_web::test::TestClient {
+    TestApp::new()
+        .routes(routes![update_note_attr_rotate])
+        .policy::<Note, _>(AdminOrOwnerPolicy)
+        .forbidden_response(forbidden_response)
+        .layer(SessionLayer::new(store, SessionConfig::default()))
+        .idempotent()
+        .build()
+}
+
+fn build_idempotent_attr_touch_app(
+    store: MemoryStore,
+    forbidden_response: ForbiddenResponse,
+) -> autumn_web::test::TestClient {
+    TestApp::new()
+        .routes(routes![update_note_attr_touch])
+        .policy::<Note, _>(AdminOrOwnerPolicy)
+        .forbidden_response(forbidden_response)
+        .layer(SessionLayer::new(store, SessionConfig::default()))
+        .idempotent()
+        .build()
+}
+
+fn build_idempotent_anonymous_touch_app(
+    store: MemoryStore,
+    forbidden_response: ForbiddenResponse,
+) -> autumn_web::test::TestClient {
+    TestApp::new()
+        .routes(routes![update_note_anonymous_touch])
+        .policy::<Note, _>(AnonymousTogglePolicy)
+        .forbidden_response(forbidden_response)
+        .layer(SessionLayer::new(store, SessionConfig::default()))
+        .idempotent()
+        .build()
+}
+
+fn build_idempotent_secured_app(store: MemoryStore) -> autumn_web::test::TestClient {
+    TestApp::new()
+        .routes(routes![secured_admin_mutation])
+        .layer(SessionLayer::new(store, SessionConfig::default()))
+        .idempotent()
+        .build()
+}
+
+fn build_idempotent_secured_replay_app(store: MemoryStore) -> autumn_web::test::TestClient {
+    TestApp::new()
+        .routes(routes![secured_admin_replay_mutation])
+        .layer(SessionLayer::new(store, SessionConfig::default()))
+        .idempotent()
         .build()
 }
 
@@ -240,6 +381,238 @@ async fn attribute_macro_honors_forbidden_response_override() {
     let client = build_attr_app(store, ForbiddenResponse::Forbidden403);
     let response = post_with_session(&client, "/notes-attr/1", "sess-stranger").await;
     assert_eq!(response.status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn idempotent_replay_does_not_bypass_authorize_policy_changes() {
+    let store = MemoryStore::new();
+    seed_session(&store, "sess-policy", "999", Some("admin")).await;
+    let client = build_idempotent_attr_app(store.clone(), ForbiddenResponse::Forbidden403);
+
+    let first = client
+        .post("/notes-attr/1")
+        .header("Cookie", "autumn.sid=sess-policy")
+        .header("idempotency-key", "policy-recheck-key")
+        .send()
+        .await;
+    assert_eq!(first.status, StatusCode::OK);
+
+    seed_session(&store, "sess-policy", "999", None).await;
+
+    let retry = client
+        .post("/notes-attr/1")
+        .header("Cookie", "autumn.sid=sess-policy")
+        .header("idempotency-key", "policy-recheck-key")
+        .send()
+        .await;
+    assert_eq!(
+        retry.status,
+        StatusCode::FORBIDDEN,
+        "cached idempotency replay must not skip the current #[authorize] policy check"
+    );
+    assert_eq!(retry.header("x-idempotent-replayed"), None);
+}
+
+#[tokio::test]
+async fn idempotent_authorize_session_rotation_replays_final_cookie_for_old_cookie() {
+    AUTHORIZE_SESSION_ROTATION_CALLS.store(0, Ordering::SeqCst);
+    let store = MemoryStore::new();
+    seed_session(&store, "sess-authorize-rotate", "999", Some("admin")).await;
+    let client = build_idempotent_attr_rotation_app(store.clone(), ForbiddenResponse::Forbidden403);
+
+    let first = client
+        .post("/notes-attr-rotate/1")
+        .header("Cookie", "autumn.sid=sess-authorize-rotate")
+        .header("idempotency-key", "authorize-rotation-key")
+        .send()
+        .await;
+    first.assert_ok();
+    let set_cookie = first
+        .header("set-cookie")
+        .expect("authorized rotating session response should set a new cookie")
+        .to_owned();
+    let new_cookie = set_cookie
+        .split(';')
+        .next()
+        .expect("set-cookie should start with a cookie pair")
+        .to_owned();
+    let new_session_id = new_cookie
+        .strip_prefix("autumn.sid=")
+        .expect("set-cookie should use the default Autumn session cookie")
+        .to_owned();
+
+    let retry = client
+        .post("/notes-attr-rotate/1")
+        .header("Cookie", "autumn.sid=sess-authorize-rotate")
+        .header("idempotency-key", "authorize-rotation-key")
+        .send()
+        .await;
+    retry.assert_ok();
+    assert_eq!(retry.header("x-idempotent-replayed"), Some("true"));
+    assert!(
+        retry.header("set-cookie").is_some(),
+        "old-cookie retries must receive the finalized rotated session cookie"
+    );
+    assert_eq!(
+        AUTHORIZE_SESSION_ROTATION_CALLS.load(Ordering::SeqCst),
+        1,
+        "authorized session-rotating retries must not re-enter the handler"
+    );
+
+    store.destroy(&new_session_id).await.unwrap();
+    let accepted_cookie_retry = client
+        .post("/notes-attr-rotate/1")
+        .header("Cookie", &new_cookie)
+        .header("idempotency-key", "authorize-rotation-key")
+        .send()
+        .await;
+    assert_eq!(
+        accepted_cookie_retry.status,
+        StatusCode::FORBIDDEN,
+        "a retry after accepting a now-revoked rotated cookie must run current policy checks"
+    );
+    assert_eq!(accepted_cookie_retry.header("x-idempotent-replayed"), None);
+    assert_eq!(
+        AUTHORIZE_SESSION_ROTATION_CALLS.load(Ordering::SeqCst),
+        1,
+        "accepted-cookie policy denials must not re-enter the mutating handler"
+    );
+}
+
+#[tokio::test]
+async fn idempotent_authorize_same_session_mutation_denial_does_not_replay_cached_success() {
+    AUTHORIZE_SESSION_TOUCH_CALLS.store(0, Ordering::SeqCst);
+    let store = MemoryStore::new();
+    seed_session(&store, "sess-authorize-touch", "999", Some("admin")).await;
+    let client = build_idempotent_attr_touch_app(store.clone(), ForbiddenResponse::Forbidden403);
+
+    let first = client
+        .post("/notes-attr-touch/1")
+        .header("Cookie", "autumn.sid=sess-authorize-touch")
+        .header("idempotency-key", "authorize-touch-key")
+        .send()
+        .await;
+    first.assert_ok();
+    assert!(first.header("set-cookie").is_some());
+
+    store
+        .save("sess-authorize-touch", std::collections::HashMap::new())
+        .await
+        .unwrap();
+    let retry = client
+        .post("/notes-attr-touch/1")
+        .header("Cookie", "autumn.sid=sess-authorize-touch")
+        .header("idempotency-key", "authorize-touch-key")
+        .send()
+        .await;
+    assert_eq!(
+        retry.status,
+        StatusCode::FORBIDDEN,
+        "dirty same-session retries must run current policy checks instead of replaying cached success"
+    );
+    assert_eq!(retry.header("x-idempotent-replayed"), None);
+    assert_eq!(
+        AUTHORIZE_SESSION_TOUCH_CALLS.load(Ordering::SeqCst),
+        1,
+        "same-session policy denials must not re-enter the mutating handler"
+    );
+}
+
+#[tokio::test]
+async fn idempotent_anonymous_session_mutation_denial_does_not_replay_cached_success() {
+    AUTHORIZE_ANONYMOUS_SESSION_TOUCH_CALLS.store(0, Ordering::SeqCst);
+    ANONYMOUS_POLICY_ALLOWED.store(true, Ordering::SeqCst);
+    let store = MemoryStore::new();
+    let client = build_idempotent_anonymous_touch_app(store, ForbiddenResponse::Forbidden403);
+
+    let first = client
+        .post("/notes-anon-touch/1")
+        .header("idempotency-key", "authorize-anonymous-touch-key")
+        .send()
+        .await;
+    first.assert_ok();
+    assert!(
+        first.header("set-cookie").is_some(),
+        "anonymous session mutation should persist the new session cookie"
+    );
+
+    ANONYMOUS_POLICY_ALLOWED.store(false, Ordering::SeqCst);
+    let retry = client
+        .post("/notes-anon-touch/1")
+        .header("idempotency-key", "authorize-anonymous-touch-key")
+        .send()
+        .await;
+    assert_eq!(
+        retry.status,
+        StatusCode::FORBIDDEN,
+        "anonymous retries must run current policy checks instead of replaying cached success"
+    );
+    assert_eq!(retry.header("x-idempotent-replayed"), None);
+    assert_eq!(
+        AUTHORIZE_ANONYMOUS_SESSION_TOUCH_CALLS.load(Ordering::SeqCst),
+        1,
+        "anonymous policy denials must not re-enter the mutating handler"
+    );
+}
+
+#[tokio::test]
+async fn idempotent_replay_does_not_bypass_secured_role_changes() {
+    let store = MemoryStore::new();
+    seed_session(&store, "sess-secured", "999", Some("admin")).await;
+    let client = build_idempotent_secured_app(store.clone());
+
+    let first = client
+        .post("/secured-admin")
+        .header("Cookie", "autumn.sid=sess-secured")
+        .header("idempotency-key", "secured-recheck-key")
+        .send()
+        .await;
+    assert_eq!(first.status, StatusCode::OK);
+
+    seed_session(&store, "sess-secured", "999", Some("viewer")).await;
+
+    let retry = client
+        .post("/secured-admin")
+        .header("Cookie", "autumn.sid=sess-secured")
+        .header("idempotency-key", "secured-recheck-key")
+        .send()
+        .await;
+    assert_eq!(
+        retry.status,
+        StatusCode::FORBIDDEN,
+        "cached idempotency replay must not skip the current #[secured] role check"
+    );
+    assert_eq!(retry.header("x-idempotent-replayed"), None);
+}
+
+#[tokio::test]
+async fn idempotent_authorized_secured_mutation_replays_without_rerunning_handler() {
+    SECURED_ADMIN_REPLAY_CALLS.store(0, Ordering::SeqCst);
+    let store = MemoryStore::new();
+    seed_session(&store, "sess-secured-replay", "999", Some("admin")).await;
+    let client = build_idempotent_secured_replay_app(store);
+
+    client
+        .post("/secured-admin-replay")
+        .header("Cookie", "autumn.sid=sess-secured-replay")
+        .header("idempotency-key", "secured-replay-key")
+        .send()
+        .await
+        .assert_ok();
+
+    let replay = client
+        .post("/secured-admin-replay")
+        .header("Cookie", "autumn.sid=sess-secured-replay")
+        .header("idempotency-key", "secured-replay-key")
+        .send()
+        .await;
+    replay.assert_ok();
+    assert_eq!(replay.header("x-idempotent-replayed"), Some("true"));
+    assert_eq!(
+        SECURED_ADMIN_REPLAY_CALLS.load(Ordering::SeqCst),
+        1,
+        "authorized idempotent retries must replay instead of re-entering the mutating handler"
+    );
 }
 
 // ── #[authorize] stacked with #[secured] ──────────────────────

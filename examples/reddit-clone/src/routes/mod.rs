@@ -2,6 +2,7 @@ pub mod about;
 pub mod auth;
 pub mod avatars;
 pub mod comments;
+pub mod errors;
 pub mod layout;
 pub mod live;
 pub mod posts;

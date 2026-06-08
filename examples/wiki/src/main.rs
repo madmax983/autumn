@@ -27,12 +27,16 @@ async fn main() {
             routes::pages::edit_form,
             routes::pages::update,
             routes::pages::history,
+            routes::pages::search,
             repositories::page_api_list,
             repositories::page_api_get,
             repositories::page_api_create,
             repositories::page_api_update,
             repositories::page_api_delete,
+            routes::docs::show,
+            routes::docs::index,
         ])
+        .static_routes(static_routes![routes::docs::show])
         .run()
         .await;
 }

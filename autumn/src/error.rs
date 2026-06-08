@@ -137,6 +137,11 @@ pub struct AutumnError {
     status: StatusCode,
     details: Option<std::collections::HashMap<String, Vec<String>>>,
     problem_type: Option<&'static str>,
+    cache_idempotency_response: bool,
+    /// Backtrace captured at error creation time in debug builds.
+    /// Transferred to `AutumnErrorInfo` for the dev overlay.
+    #[cfg(debug_assertions)]
+    pub(crate) backtrace_string: Option<String>,
 }
 
 /// Convenience alias -- the standard return type for Autumn handlers.
@@ -166,6 +171,9 @@ where
             status: StatusCode::INTERNAL_SERVER_ERROR,
             details: None,
             problem_type: None,
+            cache_idempotency_response: false,
+            #[cfg(debug_assertions)]
+            backtrace_string: Some(format!("{}", std::backtrace::Backtrace::force_capture())),
         }
     }
 }
@@ -206,6 +214,9 @@ impl AutumnError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             details: None,
             problem_type: None,
+            cache_idempotency_response: false,
+            #[cfg(debug_assertions)]
+            backtrace_string: Some(format!("{}", std::backtrace::Backtrace::force_capture())),
         }
     }
 
@@ -226,6 +237,9 @@ impl AutumnError {
             status: StatusCode::NOT_FOUND,
             details: None,
             problem_type: None,
+            cache_idempotency_response: false,
+            #[cfg(debug_assertions)]
+            backtrace_string: Some(format!("{}", std::backtrace::Backtrace::force_capture())),
         }
     }
 
@@ -246,6 +260,9 @@ impl AutumnError {
             status: StatusCode::BAD_REQUEST,
             details: None,
             problem_type: None,
+            cache_idempotency_response: false,
+            #[cfg(debug_assertions)]
+            backtrace_string: Some(format!("{}", std::backtrace::Backtrace::force_capture())),
         }
     }
 
@@ -269,6 +286,9 @@ impl AutumnError {
             status: StatusCode::UNPROCESSABLE_ENTITY,
             details: None,
             problem_type: None,
+            cache_idempotency_response: false,
+            #[cfg(debug_assertions)]
+            backtrace_string: Some(format!("{}", std::backtrace::Backtrace::force_capture())),
         }
     }
 
@@ -289,6 +309,9 @@ impl AutumnError {
             status: StatusCode::SERVICE_UNAVAILABLE,
             details: None,
             problem_type: None,
+            cache_idempotency_response: false,
+            #[cfg(debug_assertions)]
+            backtrace_string: Some(format!("{}", std::backtrace::Backtrace::force_capture())),
         }
     }
 
@@ -309,6 +332,9 @@ impl AutumnError {
             status: StatusCode::UNAUTHORIZED,
             details: None,
             problem_type: None,
+            cache_idempotency_response: false,
+            #[cfg(debug_assertions)]
+            backtrace_string: Some(format!("{}", std::backtrace::Backtrace::force_capture())),
         }
     }
 
@@ -329,6 +355,9 @@ impl AutumnError {
             status: StatusCode::FORBIDDEN,
             details: None,
             problem_type: None,
+            cache_idempotency_response: false,
+            #[cfg(debug_assertions)]
+            backtrace_string: Some(format!("{}", std::backtrace::Backtrace::force_capture())),
         }
     }
 
@@ -360,6 +389,9 @@ impl AutumnError {
             status: StatusCode::UNPROCESSABLE_ENTITY,
             details: Some(details),
             problem_type: None,
+            cache_idempotency_response: false,
+            #[cfg(debug_assertions)]
+            backtrace_string: Some(format!("{}", std::backtrace::Backtrace::force_capture())),
         }
     }
 
@@ -491,6 +523,9 @@ impl AutumnError {
             status: StatusCode::CONFLICT,
             details: None,
             problem_type: Some("https://autumn.dev/problems/conflict"),
+            cache_idempotency_response: false,
+            #[cfg(debug_assertions)]
+            backtrace_string: Some(format!("{}", std::backtrace::Backtrace::force_capture())),
         }
     }
 
@@ -509,6 +544,72 @@ impl AutumnError {
         Self::conflict(StringError(msg.into()))
     }
 
+    /// Create a `410 Gone` error.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use autumn_web::error::AutumnError;
+    /// use http::StatusCode;
+    ///
+    /// let err = AutumnError::gone(std::io::Error::other("sunsetted"));
+    /// assert_eq!(err.status(), StatusCode::GONE);
+    /// ```
+    pub fn gone(err: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self {
+            inner: Box::new(err),
+            status: StatusCode::GONE,
+            details: None,
+            problem_type: Some("https://autumn.dev/problems/gone"),
+            cache_idempotency_response: false,
+            #[cfg(debug_assertions)]
+            backtrace_string: Some(format!("{}", std::backtrace::Backtrace::force_capture())),
+        }
+    }
+
+    /// Create a `410 Gone` error from a plain string message.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use autumn_web::error::AutumnError;
+    /// use http::StatusCode;
+    ///
+    /// let err = AutumnError::gone_msg("API version has been sunsetted");
+    /// assert_eq!(err.status(), StatusCode::GONE);
+    /// ```
+    pub fn gone_msg(msg: impl Into<String>) -> Self {
+        Self::gone(StringError(msg.into()))
+    }
+
+    /// Create a `503 Service Unavailable` error indicating that a database
+    /// query was cancelled due to a statement timeout (Postgres `57014`).
+    ///
+    /// The problem details payload carries `"autumn.query_timeout"` as the
+    /// machine-readable code, which allows clients to distinguish a transient
+    /// timeout from other 503 conditions and apply appropriate retry logic.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use autumn_web::error::AutumnError;
+    /// use http::StatusCode;
+    ///
+    /// let err = AutumnError::query_timeout("query exceeded statement_timeout");
+    /// assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
+    /// ```
+    pub fn query_timeout(msg: impl Into<String>) -> Self {
+        Self {
+            inner: Box::new(StringError(msg.into())),
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            details: None,
+            problem_type: Some("https://autumn.dev/problems/query-timeout"),
+            cache_idempotency_response: false,
+            #[cfg(debug_assertions)]
+            backtrace_string: Some(format!("{}", std::backtrace::Backtrace::force_capture())),
+        }
+    }
+
     /// Returns the HTTP status code associated with this error.
     ///
     /// # Examples
@@ -525,6 +626,13 @@ impl AutumnError {
         self.status
     }
 
+    #[doc(hidden)]
+    #[must_use]
+    pub(crate) const fn cache_idempotency_response(mut self) -> Self {
+        self.cache_idempotency_response = true;
+        self
+    }
+
     /// Return the wrapped error's source chain as displayable messages.
     ///
     /// The top-level [`AutumnError`] display already prints the wrapped error
@@ -539,6 +647,13 @@ impl AutumnError {
         }
         chain
     }
+
+    /// Try to downcast the inner error to a specific type.
+    #[must_use]
+    pub fn downcast_ref<T: std::error::Error + 'static>(&self) -> Option<&T> {
+        let err: &(dyn std::error::Error + 'static) = self.inner.as_ref();
+        err.downcast_ref::<T>()
+    }
 }
 
 impl std::fmt::Display for AutumnError {
@@ -548,13 +663,18 @@ impl std::fmt::Display for AutumnError {
 }
 
 impl std::fmt::Debug for AutumnError {
+    #[allow(clippy::missing_fields_in_debug)]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AutumnError")
             .field("status", &self.status)
             .field("inner", &self.inner)
             .field("details", &self.details)
             .field("problem_type", &self.problem_type)
-            .finish()
+            .field(
+                "cache_idempotency_response",
+                &self.cache_idempotency_response,
+            )
+            .finish_non_exhaustive()
     }
 }
 
@@ -588,6 +708,20 @@ pub(crate) fn problem_details(
         detail
     };
 
+    // When an explicit problem type URI is provided, derive the machine-readable
+    // code from its path segment (last path component, hyphens → underscores,
+    // prefixed with "autumn."). This avoids having to enumerate every error type
+    // in a separate match table.
+    //
+    // Example: "https://autumn.dev/problems/query-timeout" → "autumn.query_timeout"
+    let code = explicit_type.map_or_else(
+        || problem_code_for(status, has_validation_errors).to_owned(),
+        |etype| {
+            let slug = etype.rsplit('/').next().unwrap_or(etype);
+            format!("autumn.{}", slug.replace('-', "_"))
+        },
+    );
+
     ProblemDetails {
         type_uri: explicit_type
             .unwrap_or_else(|| problem_type_for(status, has_validation_errors))
@@ -596,7 +730,7 @@ pub(crate) fn problem_details(
         status: status.as_u16(),
         detail: safe_detail,
         instance,
-        code: problem_code_for(status, has_validation_errors).to_owned(),
+        code,
         request_id,
         errors: validation_errors(details),
     }
@@ -659,6 +793,7 @@ const fn problem_type_for(status: StatusCode, has_validation_errors: bool) -> &'
         StatusCode::UNAUTHORIZED => "https://autumn.dev/problems/unauthorized",
         StatusCode::FORBIDDEN => "https://autumn.dev/problems/forbidden",
         StatusCode::NOT_FOUND => "https://autumn.dev/problems/not-found",
+        StatusCode::GONE => "https://autumn.dev/problems/gone",
         StatusCode::CONFLICT => "https://autumn.dev/problems/conflict",
         StatusCode::PAYLOAD_TOO_LARGE => "https://autumn.dev/problems/payload-too-large",
         StatusCode::UNPROCESSABLE_ENTITY => "https://autumn.dev/problems/unprocessable-entity",
@@ -679,6 +814,7 @@ fn problem_title_for(status: StatusCode, has_validation_errors: bool) -> &'stati
         StatusCode::UNAUTHORIZED => "Unauthorized",
         StatusCode::FORBIDDEN => "Forbidden",
         StatusCode::NOT_FOUND => "Not Found",
+        StatusCode::GONE => "Gone",
         StatusCode::CONFLICT => "Conflict",
         StatusCode::PAYLOAD_TOO_LARGE => "Payload Too Large",
         StatusCode::UNPROCESSABLE_ENTITY => "Unprocessable Entity",
@@ -699,6 +835,7 @@ fn problem_code_for(status: StatusCode, has_validation_errors: bool) -> &'static
         StatusCode::UNAUTHORIZED => "autumn.unauthorized",
         StatusCode::FORBIDDEN => "autumn.forbidden",
         StatusCode::NOT_FOUND => "autumn.not_found",
+        StatusCode::GONE => "autumn.gone",
         StatusCode::CONFLICT => "autumn.conflict",
         StatusCode::PAYLOAD_TOO_LARGE => "autumn.payload_too_large",
         StatusCode::UNPROCESSABLE_ENTITY => "autumn.unprocessable_entity",
@@ -721,10 +858,24 @@ fn server_error_detail(status: StatusCode) -> String {
 
 impl IntoResponse for AutumnError {
     fn into_response(self) -> Response {
-        let status = self.status;
+        let mut status = self.status;
         let message = self.inner.to_string();
+        let mut problem_type = self.problem_type;
+
+        // Automatically map database query cancellation (statement timeout) to 503 Service Unavailable
+        let err_str = message.to_lowercase();
+        if err_str.contains("57014")
+            || err_str.contains("query_canceled")
+            || err_str.contains("canceling statement due to statement timeout")
+            || err_str.contains("statement timeout")
+            || err_str.contains("query canceled")
+        {
+            status = StatusCode::SERVICE_UNAVAILABLE;
+            problem_type = Some("https://autumn.dev/problems/query-timeout");
+        }
+
         let details = self.details.clone();
-        let problem_type = self.problem_type;
+        let cache_idempotency_response = self.cache_idempotency_response;
 
         // Stash error metadata for exception filters to inspect without
         // parsing the response body.
@@ -733,6 +884,10 @@ impl IntoResponse for AutumnError {
             message: message.clone(),
             details: details.clone(),
             problem_type,
+            #[cfg(debug_assertions)]
+            backtrace_string: self.backtrace_string.clone(),
+            #[cfg(not(debug_assertions))]
+            backtrace_string: None,
         };
 
         let body = problem_details(
@@ -754,6 +909,11 @@ impl IntoResponse for AutumnError {
                 "HX-Trigger",
                 HeaderValue::from_static(r#"{"autumn:conflict":true}"#),
             );
+        }
+        if cache_idempotency_response {
+            response
+                .extensions_mut()
+                .insert(crate::idempotency::IdempotencyCacheCommittedErrorResponse);
         }
         response.extensions_mut().insert(error_info);
         response
@@ -995,6 +1155,19 @@ mod tests {
         let err = AutumnError::conflict_msg("please reload and retry");
         assert_eq!(err.status(), StatusCode::CONFLICT);
         assert_eq!(err.to_string(), "please reload and retry");
+    }
+
+    #[test]
+    fn gone_is_410() {
+        let err = AutumnError::gone(TestError("sunsetted".into()));
+        assert_eq!(err.status(), StatusCode::GONE);
+    }
+
+    #[test]
+    fn gone_msg_is_410() {
+        let err = AutumnError::gone_msg("API version has been sunsetted");
+        assert_eq!(err.status(), StatusCode::GONE);
+        assert_eq!(err.to_string(), "API version has been sunsetted");
     }
 
     #[tokio::test]

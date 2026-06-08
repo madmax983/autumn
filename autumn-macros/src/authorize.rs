@@ -121,6 +121,7 @@ fn expect_ident(expr: &Expr, hint: &str) -> syn::Result<Ident> {
     }
 }
 
+use crate::idempotency_guard::block_has_replay_guard;
 use crate::param_helpers::has_input_named;
 
 fn snake_case(name: &str) -> String {
@@ -138,6 +139,7 @@ fn snake_case(name: &str) -> String {
     out
 }
 
+#[allow(clippy::too_many_lines)]
 pub fn authorize_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // Parse the args first; the parser may surface a leading `"action"`
     // string literal as the bare-Path action via the `Meta::Path` branch
@@ -205,18 +207,93 @@ pub fn authorize_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         };
         input_fn.sig.inputs.insert(0, session_param);
     }
+    if !has_input_named(&input_fn, "__autumn_idempotency_replay") {
+        let idempotency_param: syn::FnArg = parse_quote! {
+            __autumn_idempotency_replay: ::core::option::Option<
+                ::autumn_web::reexports::axum::extract::Extension<
+                    ::autumn_web::idempotency::IdempotencyReplayResponse
+                >
+            >
+        };
+        input_fn.sig.inputs.insert(0, idempotency_param);
+    }
+    if !has_input_named(&input_fn, "__autumn_route_version") {
+        let route_version_param: syn::FnArg = parse_quote! {
+            __autumn_route_version: ::core::option::Option<
+                ::autumn_web::reexports::axum::extract::Extension<
+                    ::autumn_web::RouteVersionMetadata
+                >
+            >
+        };
+        input_fn.sig.inputs.insert(0, route_version_param);
+    }
 
     let action_lit = syn::LitStr::new(&action_str, proc_macro2::Span::call_site());
     let original_body = &input_fn.block;
+    let original_response = match &input_fn.sig.output {
+        syn::ReturnType::Default => quote! {
+            let __autumn_inner: () = (async move #original_body).await;
+            ::autumn_web::reexports::axum::response::IntoResponse::into_response(__autumn_inner)
+        },
+        syn::ReturnType::Type(_, ty) if matches!(ty.as_ref(), syn::Type::ImplTrait(_)) => quote! {
+            ::autumn_web::reexports::axum::response::IntoResponse::into_response(
+                (async move #original_body).await
+            )
+        },
+        syn::ReturnType::Type(_, ty) => quote! {
+            let __autumn_inner: #ty = (async move #original_body).await;
+            ::autumn_web::reexports::axum::response::IntoResponse::into_response(__autumn_inner)
+        },
+    };
+    let body_already_has_replay_guard = block_has_replay_guard(original_body);
+    let replay_stop = if body_already_has_replay_guard {
+        quote! {}
+    } else {
+        quote! {
+            const __AUTUMN_IDEMPOTENCY_REPLAY_GUARD: () = ();
+            if let ::core::option::Option::Some(__autumn_response) =
+                ::autumn_web::idempotency::__replay_response(&__autumn_idempotency_replay)
+            {
+                return __autumn_response;
+            }
+        }
+    };
+    input_fn
+        .attrs
+        .push(parse_quote!(#[allow(clippy::too_many_arguments)]));
+    input_fn.sig.output = parse_quote! {
+        -> ::autumn_web::reexports::axum::response::Response
+    };
     input_fn.block = parse_quote! {
         {
-            ::autumn_web::authorization::__check_policy::<#resource_ident>(
+            if let ::core::result::Result::Err(__autumn_error) = ::autumn_web::authorization::__check_policy::<#resource_ident>(
                 &__autumn_state,
                 &__autumn_session,
                 #action_lit,
                 &#from_ident,
-            ).await?;
-            #original_body
+            ).await {
+                if let ::core::option::Option::Some(__autumn_response) =
+                    ::autumn_web::idempotency::__replay_finalized_session_response_for_anonymous(
+                        &__autumn_session,
+                        __autumn_state.auth_session_key(),
+                        &__autumn_idempotency_replay,
+                    )
+                    .await
+                {
+                    return __autumn_response;
+                }
+                return ::autumn_web::reexports::axum::response::IntoResponse::into_response(__autumn_error);
+            }
+            if let ::core::option::Option::Some(::autumn_web::reexports::axum::extract::Extension(__autumn_meta)) = &__autumn_route_version {
+                if let ::core::option::Option::Some(__autumn_response) = ::autumn_web::__private::check_sunset(
+                    &__autumn_state,
+                    __autumn_meta,
+                ) {
+                    return __autumn_response;
+                }
+            }
+            #replay_stop
+            #original_response
         }
     };
 
@@ -292,5 +369,42 @@ mod tests {
         assert_eq!(snake_case("Post"), "post");
         assert_eq!(snake_case("BlogPost"), "blog_post");
         assert_eq!(snake_case("HTTPRequest"), "h_t_t_p_request");
+    }
+
+    #[test]
+    fn authorize_string_literal_replay_guard_still_injects_replay_stop() {
+        let generated = authorize_macro(
+            quote::quote! { "update", resource = Post },
+            quote::quote! {
+                async fn update_post(post: Post) -> &'static str {
+                    let _ = "__AUTUMN_IDEMPOTENCY_REPLAY_GUARD";
+                    "ok"
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("__replay_response"),
+            "plain handler text must not suppress the generated replay stop: {generated}"
+        );
+    }
+
+    #[test]
+    fn authorize_denial_can_replay_finalized_session_response_for_old_cookie() {
+        let generated = authorize_macro(
+            quote::quote! { "update", resource = Post },
+            quote::quote! {
+                async fn update_post(post: Post) -> &'static str {
+                    "ok"
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("__replay_finalized_session_response_for_anonymous"),
+            "authorized handlers must let old destroyed-session retries receive cached finalized Set-Cookie responses: {generated}"
+        );
     }
 }

@@ -40,10 +40,14 @@ SendWelcomeEmailJob::enqueue(WelcomeEmailArgs { user_id: 42 }).await?;
 
 ```toml
 [jobs]
-backend = "local"   # local | redis
+backend = "local"   # local | postgres | redis
 workers = 2
 max_attempts = 5
 initial_backoff_ms = 250
+
+[jobs.postgres]
+# Reuses the configured [database] pool. No extra URL needed.
+visibility_timeout_ms = 30000   # default: 30 000 ms
 
 [jobs.redis]
 url = "redis://127.0.0.1/"
@@ -51,8 +55,41 @@ key_prefix = "autumn:jobs"
 visibility_timeout_ms = 30000
 ```
 
-- `local`: in-process queue, zero configuration.
-- `redis`: durable, Redis-backed queue for multi-replica workers.
+| Backend | Durable | Multi-replica safe | Extra infra |
+|---|---|---|---|
+| `local` | No | No (in-process) | None |
+| `postgres` | Yes | Yes (SKIP LOCKED) | DB only — no Redis |
+| `redis` | Yes | Yes | Redis |
+
+- `local`: in-process channel, zero configuration. Jobs are lost on restart. Fine
+  for development or single-process demos.
+- `postgres`: Postgres-backed queue that reuses your existing `[database]` pool.
+  Jobs survive restarts and are claimed atomically across replicas via
+  `SELECT … FOR UPDATE SKIP LOCKED`. Requires the `db` feature and an
+  `autumn migrate` run before the first worker starts.
+- `redis`: Durable, Redis-backed queue for multi-replica workers. Higher
+  throughput ceiling than `postgres` but adds Redis as an infrastructure dependency.
+
+## Postgres delivery semantics
+
+The Postgres backend provides **at-least-once delivery**. Each job is a row in
+the `autumn_jobs` table. Workers claim a row atomically with
+`UPDATE … WHERE id IN (SELECT … FOR UPDATE SKIP LOCKED)`, which prevents any
+two replicas from claiming the same job simultaneously.
+
+A claimed job's status is set to `running` with a `claimed_at` timestamp and a
+`claimed_by` worker id. A maintenance loop running inside each worker process
+requeues jobs whose `claimed_at` is older than `jobs.postgres.visibility_timeout_ms`.
+Recovered stale claims consume another attempt and record a `last_error`
+explaining the visibility timeout.
+
+If a job exhausts `max_attempts`, its status is set to `failed`; it is no longer
+retried.
+
+Because the backend provides at-least-once delivery, handlers must be idempotent.
+A slow worker that outlives the visibility timeout can overlap with a recovered
+retry, so external side effects should use natural idempotency keys such as the
+job id, a domain aggregate id, or a provider idempotency token.
 
 ## Redis delivery semantics
 
@@ -103,6 +140,85 @@ replica serving the actuator request.
 
 ## Migration notes
 
-When using `jobs.backend = "redis"`, no SQL migration is required.
+When using `jobs.backend = "local"` or `jobs.backend = "redis"`, no SQL migration
+is required.
 
-For cloud-native rollout, run your app migrations as a one-shot `autumn migrate` job before scaling web and workers.
+When using `jobs.backend = "postgres"`, the `autumn_jobs` table must exist before
+workers start. Run your app migrations as a one-shot `autumn migrate` job before
+scaling web and worker replicas:
+
+```bash
+autumn migrate   # creates autumn_jobs, your domain tables, etc.
+```
+
+The migration is bundled with the framework and is applied automatically by
+`autumn migrate` as long as the `db` feature is enabled.
+
+---
+
+## Transactional enqueue
+
+When a job must be coordinated with a database write, choose the API based on
+which guarantee you need:
+
+- `enqueue_after_commit` prevents jobs for rolled-back data on any backend, but
+  the post-commit callback is process-local and can be lost if the process exits
+  after commit.
+- `enqueue_in_tx` / `enqueue_on_conn` on the Postgres backend write the job row
+  in the same transaction as the domain row, which is the crash-safe handoff.
+
+### `enqueue_after_commit` — any backend
+
+`autumn_web::job::enqueue_after_commit` registers the enqueue as an
+after-commit callback inside the surrounding `db.tx` block. The job is only
+dispatched if the transaction commits. Works with every job backend.
+
+This is not crash-safe delivery. If the process exits after the transaction
+commits but before the callback runs, no job may be recorded. Use this for
+rollback coordination across backends, not as a durable outbox substitute.
+
+```rust,no_run
+use autumn_web::prelude::*;
+use scoped_futures::ScopedFutureExt;
+
+async fn create_order(mut db: Db) -> AutumnResult<()> {
+    db.tx(|conn| async move {
+        // ... INSERT order ...
+
+        // Enqueued only after INSERT commits; dropped if the tx rolls back.
+        // For crash-safe Postgres handoff, use enqueue_in_tx instead.
+        autumn_web::job::enqueue_after_commit("ship_order", &args).await?;
+
+        Ok::<_, AutumnError>(())
+    }.scope_boxed())
+    .await
+}
+```
+
+### `enqueue_in_tx` / `enqueue_on_conn` — Postgres backend only
+
+On the Postgres backend the job row can live in the **same transaction** as
+the domain row. Both commit or roll back together, avoiding the post-commit
+process crash window at the cost of being limited to the `postgres` backend.
+
+```rust,no_run
+use autumn_web::prelude::*;
+use scoped_futures::ScopedFutureExt;
+
+async fn create_order(mut db: Db) -> AutumnResult<()> {
+    db.tx(|conn| async move {
+        // ... INSERT order using conn ...
+
+        // Job row written into the same transaction.
+        autumn_web::job::enqueue_in_tx("ship_order", &args, conn).await?;
+
+        Ok::<_, AutumnError>(())
+    }.scope_boxed())
+    .await
+}
+```
+
+See [Transactions -> after_commit](transactions.md#after_commit--post-commit-process-local-callbacks)
+for a full comparison of the two strategies and guidance on when to use each.
+
+For cloud-native rollout run the migration job first, then start web and workers.

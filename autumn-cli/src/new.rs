@@ -3,7 +3,10 @@
 //! Generates a complete Autumn project directory from embedded templates.
 
 use std::fs;
+use std::io::Write;
 use std::path::Path;
+
+use autumn_web::credentials::{MasterKey, encrypt};
 
 mod templates {
     pub const CARGO_TOML: &str = include_str!("templates/Cargo.toml.tmpl");
@@ -85,6 +88,7 @@ pub fn generate_with(name: &str, parent_dir: &Path, opts: GenerateOptions) -> Re
     fs::create_dir_all(project_dir.join("static/css"))?;
     fs::create_dir_all(project_dir.join("migrations"))?;
     fs::create_dir_all(project_dir.join("tests"))?;
+    fs::create_dir_all(project_dir.join("config/credentials"))?;
     if opts.with_i18n {
         fs::create_dir_all(project_dir.join("i18n"))?;
     }
@@ -142,6 +146,8 @@ pub fn generate_with(name: &str, parent_dir: &Path, opts: GenerateOptions) -> Re
     )?;
     fs::write(project_dir.join(".gitignore"), render(templates::GITIGNORE))?;
     fs::write(project_dir.join("migrations/.gitkeep"), "")?;
+
+    scaffold_credentials(&project_dir, name)?;
     fs::write(
         project_dir.join("tests/integration_test.rs"),
         render(templates::INTEGRATION_TEST),
@@ -150,6 +156,42 @@ pub fn generate_with(name: &str, parent_dir: &Path, opts: GenerateOptions) -> Re
     write_optional_scaffold_files(&project_dir, name, opts, &render)?;
 
     print_scaffold_summary(name, opts);
+
+    Ok(())
+}
+
+fn scaffold_credentials(project_dir: &Path, name: &str) -> Result<(), NewError> {
+    let master_key = MasterKey::generate();
+    let key_path = project_dir.join("config/master.key");
+
+    if let Some(parent) = key_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut f = options.open(&key_path)?;
+    f.write_all(master_key.to_hex().as_bytes())?;
+
+    let template = format!(
+        "# Encrypted credentials for '{name}'\n\
+         # Run `autumn credentials edit` to update these values.\n\
+         # Do NOT commit config/master.key to version control.\n\
+         \n\
+         # stripe_secret_key = \"sk_live_...\"\n\
+         # sendgrid_api_key = \"SG...\"\n\
+         # s3_access_key_id = \"AKIA...\"\n"
+    );
+    let ciphertext = encrypt(&master_key, template.as_bytes());
+    fs::write(
+        project_dir.join("config/credentials/development.toml.enc"),
+        ciphertext,
+    )?;
 
     Ok(())
 }
@@ -170,6 +212,8 @@ fn print_scaffold_summary(name: &str, opts: GenerateOptions) {
     println!("  Created {name}/.gitignore");
     println!("  Created {name}/migrations/");
     println!("  Created {name}/tests/integration_test.rs");
+    println!("  Created {name}/config/master.key (keep secret — never commit)");
+    println!("  Created {name}/config/credentials/development.toml.enc");
     if opts.with_i18n {
         println!("  Created {name}/i18n/en.ftl");
     }
@@ -374,6 +418,12 @@ mod tests {
         assert!(p.join("autumn.toml").is_file());
         assert!(p.join("Dockerfile").is_file());
         assert!(p.join(".dockerignore").is_file());
+        let dockerignore = std::fs::read_to_string(p.join(".dockerignore")).unwrap();
+        assert!(
+            dockerignore.contains("/config/master.key")
+                || dockerignore.contains("config/master.key"),
+            ".dockerignore must exclude config/master.key: {dockerignore}"
+        );
         assert!(p.join("build.rs").is_file());
         assert!(p.join(".gitignore").is_file());
         assert!(p.join("static/css/input.css").is_file());
@@ -627,7 +677,10 @@ mod tests {
                 if path.is_dir() {
                     files.extend(walkdir(&path));
                 } else {
-                    files.push(path);
+                    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                    if ext != "enc" {
+                        files.push(path);
+                    }
                 }
             }
         }
@@ -743,5 +796,122 @@ mod tests {
                 entry.display()
             );
         }
+    }
+
+    // ── credentials scaffolding tests ─────────────────────────────────────
+
+    #[test]
+    fn generates_config_credentials_directory() {
+        let tmp = TempDir::new().unwrap();
+        generate("cred-app", tmp.path()).unwrap();
+        let p = tmp.path().join("cred-app");
+        assert!(
+            p.join("config/credentials").is_dir(),
+            "config/credentials/ directory must be created by autumn new"
+        );
+    }
+
+    #[test]
+    fn generates_development_enc_file() {
+        let tmp = TempDir::new().unwrap();
+        generate("cred-enc-app", tmp.path()).unwrap();
+        let p = tmp.path().join("cred-enc-app");
+        assert!(
+            p.join("config/credentials/development.toml.enc").is_file(),
+            "config/credentials/development.toml.enc must be created by autumn new"
+        );
+    }
+
+    #[test]
+    fn generates_master_key_file() {
+        let tmp = TempDir::new().unwrap();
+        generate("key-app", tmp.path()).unwrap();
+        let p = tmp.path().join("key-app");
+        assert!(
+            p.join("config/master.key").is_file(),
+            "config/master.key must be created by autumn new"
+        );
+    }
+
+    #[test]
+    fn master_key_file_contains_64_hex_chars() {
+        let tmp = TempDir::new().unwrap();
+        generate("key-hex-app", tmp.path()).unwrap();
+        let key = fs::read_to_string(tmp.path().join("key-hex-app/config/master.key")).unwrap();
+        let key = key.trim();
+        assert_eq!(key.len(), 64, "master.key must contain 64 hex chars");
+        assert!(
+            key.chars().all(|c| c.is_ascii_hexdigit()),
+            "master.key must be valid hex"
+        );
+    }
+
+    #[test]
+    fn gitignore_includes_master_key() {
+        let tmp = TempDir::new().unwrap();
+        generate("gi-key-app", tmp.path()).unwrap();
+        let content = fs::read_to_string(tmp.path().join("gi-key-app/.gitignore")).unwrap();
+        assert!(
+            content.contains("config/master.key"),
+            ".gitignore must exclude config/master.key, got:\n{content}"
+        );
+    }
+
+    #[test]
+    fn gitignore_does_not_exclude_enc_files() {
+        let tmp = TempDir::new().unwrap();
+        generate("gi-enc-app", tmp.path()).unwrap();
+        let content = fs::read_to_string(tmp.path().join("gi-enc-app/.gitignore")).unwrap();
+        assert!(
+            !content.contains("*.enc"),
+            ".gitignore must NOT exclude .enc files (they're safe to commit), got:\n{content}"
+        );
+    }
+
+    #[test]
+    fn development_enc_file_is_decryptable_with_master_key() {
+        use autumn_web::credentials::{MasterKey, decrypt};
+        let tmp = TempDir::new().unwrap();
+        generate("roundtrip-cred-app", tmp.path()).unwrap();
+        let p = tmp.path().join("roundtrip-cred-app");
+        let key_hex = fs::read_to_string(p.join("config/master.key")).unwrap();
+        let key = MasterKey::from_hex_pub(key_hex.trim()).expect("master.key should be valid hex");
+        let ct = fs::read(p.join("config/credentials/development.toml.enc")).unwrap();
+        let pt = decrypt(&key, &ct).expect("development.toml.enc should decrypt with master.key");
+        let s = String::from_utf8(pt).unwrap();
+        assert!(
+            s.contains("stripe_secret_key") || s.contains('#'),
+            "decrypted content should have placeholder comments"
+        );
+    }
+
+    #[test]
+    fn two_new_projects_get_different_master_keys() {
+        let tmp1 = TempDir::new().unwrap();
+        let tmp2 = TempDir::new().unwrap();
+        generate("app-a", tmp1.path()).unwrap();
+        generate("app-b", tmp2.path()).unwrap();
+        let k1 = fs::read_to_string(tmp1.path().join("app-a/config/master.key")).unwrap();
+        let k2 = fs::read_to_string(tmp2.path().join("app-b/config/master.key")).unwrap();
+        assert_ne!(
+            k1.trim(),
+            k2.trim(),
+            "each project must get a unique master key"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn master_key_file_has_secure_permissions() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = TempDir::new().unwrap();
+        generate("secure-key-app", tmp.path()).unwrap();
+        let p = tmp.path().join("secure-key-app/config/master.key");
+        let meta = fs::metadata(&p).unwrap();
+        let mode = meta.mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "master.key permissions must be 0o600, got {mode:#o}"
+        );
     }
 }

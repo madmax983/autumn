@@ -10,7 +10,8 @@
 //! |-----------|--------|-------------|
 //! | Security headers | `headers` | X-Frame-Options, X-Content-Type-Options, HSTS, CSP, etc. |
 //! | CSRF protection | `csrf` | Token-based CSRF validation for mutating requests |
-//! | Rate limiting | `rate_limit` | Per-client-IP token-bucket throttling with `429` + `Retry-After` |
+//! | Rate limiting | `rate_limit` | Per-client-IP token-bucket; memory (default) or Redis backend for multi-replica global enforcement |
+//! | Bot protection | `captcha` | Pluggable CAPTCHA verification (Turnstile, hCaptcha); dev-mode bypass (`[bot_protection]` in `autumn.toml`) |
 //! | Configuration | `config` | `[security]` section in `autumn.toml` |
 //!
 //! Authentication, session management, and password hashing live in
@@ -31,6 +32,14 @@
 //! ## Configuration
 //!
 //! ```toml
+//! # Bot protection / CAPTCHA (top-level section, not under [security])
+//! [bot_protection]
+//! enabled    = true
+//! provider   = "turnstile"    # "turnstile" (default) or "hcaptcha"
+//! site_key   = "0x4AAAA..."  # client-side widget key
+//! secret_key = "..."          # server-side secret — use env var!
+//! dev_bypass = false
+//!
 //! [security.headers]
 //! x_frame_options = "DENY"            # or "SAMEORIGIN", "" to disable
 //! x_content_type_options = true        # X-Content-Type-Options: nosniff
@@ -40,6 +49,10 @@
 //! content_security_policy = "default-src 'self'; ..."  # htmx-friendly default; "" disables
 //! referrer_policy = "strict-origin-when-cross-origin"
 //! permissions_policy = ""              # set to enable Permissions-Policy
+//!
+//! # Per-request CSP nonces — removes 'unsafe-inline', enables CspNonce extractor
+//! [security.headers.csp_nonce]
+//! enabled = true
 //!
 //! [security.csrf]
 //! enabled = true                       # auto-enabled in prod
@@ -52,6 +65,14 @@
 //! burst = 20
 //! trust_forwarded_headers = true       # only behind trusted proxies
 //! trusted_proxies = ["10.0.0.10", "203.0.113.0/24"]
+//!
+//! # Multi-replica: share the budget globally across all pods
+//! backend = "redis"                    # "memory" (default) or "redis"
+//! on_backend_failure = "fail_open"     # "fail_open" (default) or "fail_closed"
+//!
+//! [security.rate_limit.redis]
+//! url = "redis://redis:6379"
+//! key_prefix = "myapp:rate_limit"
 //! ```
 //!
 //! ## Quick start
@@ -74,17 +95,72 @@
 //!     }
 //! }
 //! ```
+//!
+//! For CSP nonces in inline scripts and styles
+//! (requires `security.headers.csp_nonce.enabled = true`):
+//!
+//! ```rust,ignore
+//! use autumn_web::prelude::*;
+//! use autumn_web::security::CspNonce;
+//!
+//! #[get("/page")]
+//! async fn page(nonce: CspNonce) -> Markup {
+//!     html! {
+//!         script nonce=(nonce.value()) { "console.log('ready')" }
+//!         style  nonce=(nonce.value()) { "body { margin: 0 }" }
+//!     }
+//! }
+//! ```
+//!
+//! For bot protection on public forms (requires `bot_protection.enabled = true`):
+//!
+//! ```rust,ignore
+//! use autumn_web::prelude::*;
+//! use autumn_web::config::AutumnConfig;
+//! use autumn_web::security::captcha::bot_protection_widget;
+//!
+//! #[get("/signup")]
+//! async fn signup_form(config: AutumnConfig) -> Markup {
+//!     html! {
+//!         form method="POST" action="/signup" {
+//!             input type="email" name="email";
+//!             (bot_protection_widget(&config.bot_protection))
+//!             button { "Sign up" }
+//!         }
+//!     }
+//! }
+//!
+//! #[post("/signup")]
+//! async fn signup_submit() -> &'static str {
+//!     // Only reached if CAPTCHA passes — bot protection verified automatically
+//!     "Welcome!"
+//! }
+//! ```
 
+pub mod captcha;
 pub(crate) mod config;
 pub(crate) mod csrf;
 pub(crate) mod headers;
-pub(crate) mod rate_limit;
+pub mod proxy;
+pub mod rate_limit;
+pub(crate) mod trusted_proxies;
 
 // Re-export commonly used types at the module level.
-pub use config::{
-    CsrfConfig, HeadersConfig, RateLimitConfig, SecurityConfig, UploadConfig,
-    default_content_security_policy,
+#[cfg(feature = "maud")]
+pub use captcha::bot_protection_widget;
+pub use captcha::{
+    AlwaysPassProvider, BotProtectionConfig, BotProtectionLayer, CaptchaProvider,
+    CaptchaProviderKind, TestCaptchaProvider,
 };
-pub use csrf::{CsrfFormField, CsrfLayer, CsrfToken};
-pub use headers::SecurityHeadersLayer;
-pub use rate_limit::RateLimitLayer;
+pub use config::{
+    CspNonceConfig, CsrfConfig, HeadersConfig, KeyStrategy, RateLimitBackend, RateLimitConfig,
+    RateLimitTierConfig, SecurityConfig, TrustedProxiesConfig, UploadConfig,
+    default_content_security_policy, hmac_sha256_hex,
+};
+#[cfg(feature = "redis")]
+pub use config::{RateLimitBackendFailure, RateLimitRedisConfig};
+pub use csrf::{CsrfFormField, CsrfLayer, CsrfToken, CsrfTokenHeader};
+pub use headers::{CspNonce, SecurityHeadersLayer};
+pub use proxy::TrustedProxy;
+pub use rate_limit::{RateLimitExempt, RateLimitLayer, RateLimitOverride, RateLimitPrincipal};
+pub use trusted_proxies::{ProxyResolver, ResolvedClientIdentity, TrustedProxiesLayer};

@@ -1,3 +1,4 @@
+pub mod docs;
 pub mod pages;
 
 #[cfg(test)]

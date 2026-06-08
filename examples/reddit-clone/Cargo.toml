@@ -6,8 +6,11 @@ publish = false
 default-run = "reddit-clone"
 
 [dependencies]
-autumn-web = { path = "../../autumn", features = ["mail", "ws", "storage", "multipart", "redis"] }
+autumn-web = { path = "../../autumn", features = ["mail", "ws", "presence", "storage", "multipart", "redis", "variants"] }
+async-stream = "0.3"
+axum = { workspace = true }
 bytes = "1"
+tokio-stream = { workspace = true }
 chrono = { version = "0.4", features = ["serde"] }
 diesel = { version = "2", features = ["postgres", "chrono", "serde_json"] }
 diesel-async = { version = "0.8", features = ["postgres"] }
@@ -28,12 +31,14 @@ thiserror = { workspace = true }
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
+autumn-web = { path = "../../autumn", features = ["test-support"] }
 autumn-storage-s3 = { path = "../../autumn-storage-s3" }
 aws-sdk-s3 = "1"
 temp-env = { version = "0.3.6", features = ["async_closure"] }
 tempfile = "3"
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
+tracing-subscriber = "0.3"
 
 [lints.rust]
 unsafe_code = "forbid"

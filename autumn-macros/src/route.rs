@@ -17,12 +17,14 @@ use quote::{format_ident, quote};
 use syn::{FnArg, LitStr, ReturnType, Type};
 
 use crate::api_doc;
+use crate::idempotency_guard::block_has_replay_guard;
 use crate::parse;
 
 /// Core implementation shared by all route macros (`#[get]`, `#[post]`, etc.).
 ///
 /// `http_method` is the uppercase method name (e.g., `"GET"`).
 /// `axum_fn` is the lowercase axum routing function name (e.g., `"get"`).
+#[allow(clippy::too_many_lines)]
 pub fn route_macro(
     http_method: &str,
     axum_fn: &str,
@@ -68,10 +70,27 @@ pub fn route_macro(
     let method_const = format_ident!("{}", http_method); // e.g., GET
     let routing_fn = format_ident!("{}", axum_fn); // e.g., get
 
+    // When #[feature_flag] is stacked, it prepends a gate parameter of type
+    // `__AutumnFlagGate_{handler_name}` to the handler inputs. Since route macros
+    // run before attribute macros lower down the chain, we must detect this attribute
+    // and manually propagate the gate parameter to the primitive wrapper so that
+    // the wrapper's call to the handler compiles.
+    let has_feature_flag_attr = input_fn.attrs.iter().any(|a| {
+        a.path()
+            .segments
+            .last()
+            .is_some_and(|s| s.ident == "feature_flag")
+    });
     let primitive_wrapper = if should_stringify_primitive_output(&input_fn.sig.output) {
         let wrapper_name = format_ident!("__autumn_primitive_handler_{}", fn_name);
         let mut wrapper_inputs = Vec::new();
         let mut call_args = Vec::new();
+
+        if has_feature_flag_attr {
+            let gate_ident = format_ident!("__AutumnFlagGate_{}", fn_name);
+            wrapper_inputs.push(quote! { __autumn_gate: #gate_ident });
+            call_args.push(quote! { __autumn_gate });
+        }
 
         for (idx, arg) in input_fn.sig.inputs.iter().enumerate() {
             match arg {
@@ -105,8 +124,6 @@ pub fn route_macro(
         || fn_name.clone(),
         |_| format_ident!("__autumn_primitive_handler_{}", fn_name),
     );
-    let handler_expr = build_handler_expr(&routing_fn, &handler_name, &interceptors);
-
     // ── OpenAPI metadata ────────────────────────────────────────
     let path_params = api_doc::extract_path_params(&path.value());
     let path_params_tokens = api_doc::emit_path_param_slice(&path_params);
@@ -114,8 +131,31 @@ pub fn route_macro(
     let response_body = api_doc::schema_option(api_doc::infer_response_body(&input_fn));
     let query_schema = api_doc::schema_option(api_doc::infer_query_params(&input_fn));
     let (secured, required_roles) = api_doc::extract_secured_info(&input_fn);
+    let has_feature_flag = has_feature_flag_attr || has_expanded_feature_flag_gate(&input_fn);
+    let body_guarded_replay = secured
+        || has_authorize_guard(&input_fn)
+        || has_feature_flag
+        || has_step_up_guard(&input_fn);
+    let intercepted_route = !interceptors.is_empty();
+    let handler_expr = build_handler_expr(
+        &routing_fn,
+        &handler_name,
+        &interceptors,
+        !body_guarded_replay && !intercepted_route,
+    );
+    let route_idempotency = if intercepted_route {
+        quote! { ::autumn_web::RouteIdempotency::Direct }
+    } else {
+        quote! { ::autumn_web::RouteIdempotency::ReplayThroughInner }
+    };
     let api_doc_fields = api_doc_attr.emit_ident_fields(fn_name);
     let http_method_lit = LitStr::new(http_method, Span::call_site());
+    let api_version_expr = route_args.api_version.as_ref().map_or_else(
+        || quote! { ::core::option::Option::None },
+        |lit| quote! { ::core::option::Option::Some(#lit) },
+    );
+    let sunset_opt_out_val = route_args.sunset_opt_out;
+    let has_policy_val = has_policy_only(&input_fn);
 
     // ── Path helper ─────────────────────────────────────────────
     let path_helper = emit_path_helper(&path_helper_name, &path, &path_params);
@@ -134,6 +174,8 @@ pub fn route_macro(
                 path: #path,
                 handler: #handler_expr,
                 name: ::core::stringify!(#fn_name),
+                api_version: #api_version_expr,
+                sunset_opt_out: #sunset_opt_out_val,
                 api_doc: ::autumn_web::openapi::ApiDoc {
                     method: #http_method_lit,
                     path: #path,
@@ -144,9 +186,13 @@ pub fn route_macro(
                     secured: #secured,
                     required_roles: #required_roles,
                     register_schemas: ::core::option::Option::None,
+                    api_version: #api_version_expr,
+                    sunset_opt_out: #sunset_opt_out_val,
+                    has_policy: #has_policy_val,
                     #api_doc_fields
                 },
                 repository: ::core::option::Option::None,
+                idempotency: #route_idempotency,
             }
         }
 
@@ -161,8 +207,16 @@ fn build_handler_expr(
     routing_fn: &proc_macro2::Ident,
     handler_name: &proc_macro2::Ident,
     interceptors: &[syn::Path],
+    include_replay_layer: bool,
 ) -> TokenStream {
     let mut expr = quote! { ::autumn_web::reexports::axum::routing::#routing_fn(#handler_name) };
+    if include_replay_layer {
+        expr = quote! {
+            ::autumn_web::reexports::axum::routing::MethodRouter::<
+                ::autumn_web::AppState, ::core::convert::Infallible
+            >::layer(#expr, ::autumn_web::idempotency::IdempotencyReplayLayer)
+        };
+    }
     for interceptor in interceptors.iter().rev() {
         // Explicit type annotation avoids inference ambiguity with chained .layer() calls.
         expr = quote! {
@@ -172,6 +226,52 @@ fn build_handler_expr(
         };
     }
     expr
+}
+
+fn has_authorize_guard(input_fn: &syn::ItemFn) -> bool {
+    input_fn.attrs.iter().any(|attr| {
+        attr.path()
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == "authorize")
+    }) || block_has_replay_guard(&input_fn.block)
+        || crate::api_doc::has_policy_check_in_stmts(&input_fn.block.stmts)
+}
+
+fn has_step_up_guard(input_fn: &syn::ItemFn) -> bool {
+    input_fn.attrs.iter().any(|attr| {
+        attr.path()
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == "step_up")
+    })
+}
+
+fn has_policy_only(input_fn: &syn::ItemFn) -> bool {
+    input_fn.attrs.iter().any(|attr| {
+        attr.path()
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == "authorize")
+    }) || crate::api_doc::has_policy_check_in_stmts(&input_fn.block.stmts)
+}
+
+fn has_expanded_feature_flag_gate(input_fn: &syn::ItemFn) -> bool {
+    input_fn.sig.inputs.iter().any(|arg| {
+        let FnArg::Typed(pat_type) = arg else {
+            return false;
+        };
+        let Type::Path(type_path) = pat_type.ty.as_ref() else {
+            return false;
+        };
+        let Some(last_segment) = type_path.path.segments.last() else {
+            return false;
+        };
+        last_segment
+            .ident
+            .to_string()
+            .starts_with("__AutumnFlagGate_")
+    })
 }
 
 /// When a `name = "..."` override is active, emit a `pub use` alias for the
@@ -229,9 +329,16 @@ fn emit_path_helper(
     // Rust keywords (you cannot write `format!("{type}")` in generated code).
     let format_str = positional_format_string(&path.value());
     let format_lit = LitStr::new(&format_str, path.span());
-    let encoded_params: Vec<TokenStream> = param_idents
+    let encoded_params: Vec<TokenStream> = params
         .iter()
-        .map(|ident| quote! { ::autumn_web::paths::encode_path_segment(#ident) })
+        .zip(param_idents.iter())
+        .map(|(param, ident)| {
+            if param.starts_with('*') {
+                quote! { ::autumn_web::paths::encode_catch_all_param(#ident) }
+            } else {
+                quote! { ::autumn_web::paths::encode_path_segment(#ident) }
+            }
+        })
         .collect();
 
     quote! {
@@ -322,7 +429,9 @@ fn should_stringify_primitive_output(output: &ReturnType) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::positional_format_string;
+    use quote::quote;
+
+    use super::{positional_format_string, route_macro};
 
     #[test]
     fn positional_plain_params() {
@@ -380,6 +489,77 @@ mod tests {
         assert_eq!(
             positional_format_string("/{{literal}}/{id}"),
             "/{{literal}}/{}"
+        );
+    }
+
+    #[test]
+    fn route_macro_string_literal_replay_guard_still_injects_layer() {
+        let generated = route_macro(
+            "POST",
+            "post",
+            quote! { "/items" },
+            quote! {
+                async fn create_item() -> &'static str {
+                    let _ = "__AUTUMN_IDEMPOTENCY_REPLAY_GUARD";
+                    "created"
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("IdempotencyReplayLayer"),
+            "plain handler text must not be mistaken for a generated replay stop: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_interceptor_uses_direct_idempotency() {
+        let generated = route_macro(
+            "POST",
+            "post",
+            quote! { "/items" },
+            quote! {
+                #[intercept(TenantLayer)]
+                async fn create_item() -> &'static str {
+                    "created"
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("RouteIdempotency :: Direct"),
+            "intercepted routes must fail closed when replay scope is not explicit: {generated}"
+        );
+        assert!(
+            !generated.contains("IdempotencyReplayLayer"),
+            "intercepted routes must not advertise an implicit replay stop: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_parses_api_version_and_sunset_opt_out() {
+        let generated = route_macro(
+            "GET",
+            "get",
+            quote! { "/items", api_version = "v1", sunset_opt_out = true },
+            quote! {
+                async fn get_items() -> &'static str {
+                    "items"
+                }
+            },
+        )
+        .to_string();
+
+        // Check that api_version and sunset_opt_out are generated in Route constructor
+        assert!(
+            generated.contains("api_version"),
+            "should generate api_version field: {generated}"
+        );
+        assert!(
+            generated.contains("sunset_opt_out"),
+            "should generate sunset_opt_out field: {generated}"
         );
     }
 }

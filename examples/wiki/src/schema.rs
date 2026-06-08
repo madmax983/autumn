@@ -1,4 +1,14 @@
 diesel::table! {
+    api_credentials (id) {
+        id -> Int8,
+        label -> Text,
+        // Stored as an opaque AES-256-GCM envelope (#805), not plaintext.
+        token -> Text,
+        created_at -> Timestamp,
+    }
+}
+
+diesel::table! {
     pages (id) {
         id -> Int8,
         title -> Text,

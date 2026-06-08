@@ -4,6 +4,15 @@
 //! and passes them through a chain of user-registered filters before the
 //! response is sent to the client.
 //!
+//! # Reporting vs. filtering
+//!
+//! An [`ExceptionFilter`] transforms the *response*. To catch handler panics
+//! and ship panic + 5xx *events* to an external sink (Sentry, Slack, a custom
+//! reporter), use the panic-aware [`reporting`](crate::reporting) module and
+//! [`AppBuilder::with_error_reporter`](crate::app::AppBuilder::with_error_reporter).
+//! The two compose: filters shape what the client sees, reporters decide where
+//! failures go.
+//!
 //! # How it works
 //!
 //! When `AutumnError::into_response()` runs, it stashes an
@@ -64,6 +73,9 @@ pub struct AutumnErrorInfo {
     pub details: Option<std::collections::HashMap<String, Vec<String>>>,
     /// Optional explicit Problem Details type URI.
     pub problem_type: Option<&'static str>,
+    /// Formatted backtrace string captured at error creation time (debug builds only).
+    /// Used by the dev error overlay to render the stack trace section.
+    pub backtrace_string: Option<String>,
 }
 
 impl AutumnErrorInfo {
@@ -351,6 +363,7 @@ mod tests {
             message: "database unavailable".into(),
             details: None,
             problem_type: None,
+            backtrace_string: None,
         };
         let mut original = (StatusCode::INTERNAL_SERVER_ERROR, "old error body").into_response();
         original.headers_mut().insert(
@@ -460,6 +473,7 @@ mod tests {
             message: "not found".into(),
             details: None,
             problem_type: None,
+            backtrace_string: None,
         };
         let response = info.into_default_response();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
@@ -472,6 +486,7 @@ mod tests {
             message: "database password leaked".into(),
             details: None,
             problem_type: None,
+            backtrace_string: None,
         };
         let response = info.into_default_response();
 

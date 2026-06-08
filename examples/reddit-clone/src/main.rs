@@ -15,9 +15,15 @@
 //   Scheduled tasks     -> #[scheduled(every = "15m")] hot-rank recalculator
 //   WebSockets          -> #[ws] live feed with Channels + durable app-db relay + pluggable bus
 //   Background Jobs     -> #[job] onboarding + post-publication side effects
+//   Idempotency keys    -> POST/PUT/DELETE deduplication via Idempotency-Key header
 //   Profiles            -> autumn.toml + autumn-dev.toml dev overrides
 //   Actuator            -> /health, /actuator/health, /actuator/info, /actuator/tasks
 //   HTML stack          -> Maud templates, htmx interactivity, Tailwind CSS
+//   Runtime config      -> ConfigRegistry + RuntimeConfigService; live-tunable posts_per_page
+//                          and registration_open without a restart (see src/config.rs)
+//   Feature flags       -> AppBuilder::with_flag_store, Flags extractor, fragment + handler gating,
+//                          25% rollout of new_ui_preview (see src/feature_flags.rs,
+//                          routes/posts.rs front_page). Toggle live: autumn flags enable post_awards
 //
 // Run with:   cargo run -p reddit-clone   (first dev boot applies reddit migrations and
 //                                          starts the job runtime + durable live-feed relay)
@@ -26,18 +32,55 @@
 // API test:   curl http://localhost:3000/api/posts
 //             curl http://localhost:3000/api/subreddits
 
+use autumn_web::actuator::{HealthCheckOutput, HealthIndicator, HealthStatus};
+use autumn_web::config::AutumnConfig;
 use autumn_web::migrate::{EmbeddedMigrations, embed_migrations};
 use autumn_web::prelude::*;
+use autumn_web::webhook_outbound::{InMemoryOutboundWebhookStore, OutboundWebhookPlugin};
 use reddit_clone::models::Post;
 use reddit_clone::policies::PostPolicy;
 use reddit_clone::{live_events, repositories, routes, tasks};
+use std::collections::HashMap;
+use std::sync::Arc;
+
+/// Example custom health indicator: verifies the live-feed relay is reachable.
+///
+/// In a real app this would ping Redis, an SMTP server, or a payment gateway.
+/// This demo always returns `UP` — swap in real connectivity logic as needed.
+struct LiveFeedRelayIndicator;
+
+impl HealthIndicator for LiveFeedRelayIndicator {
+    fn check(&self) -> futures::future::BoxFuture<'_, HealthCheckOutput> {
+        Box::pin(async move {
+            // In production: attempt a lightweight ping to the Redis pub/sub
+            // channel used by the live-feed relay and return Down on failure.
+            let mut details = HashMap::new();
+            details.insert("backend".to_string(), serde_json::json!("in_process"));
+            HealthCheckOutput {
+                status: HealthStatus::Up,
+                details,
+            }
+        })
+    }
+}
 
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
 
 #[autumn_web::main]
 async fn main() {
+    let webhook_store = Arc::new(InMemoryOutboundWebhookStore::new());
+    let webhook_plugin = OutboundWebhookPlugin::new(webhook_store);
+
+    // Feature flags: InMemoryFlagStore in dev, PgFlagStore when a DB URL is present.
+    // Pre-configured: new_ui_preview at 25% rollout, post_awards off.
+    // Toggle live without restart: autumn flags enable post_awards
+    let app_config = AutumnConfig::load().unwrap_or_default();
+    let flag_store = reddit_clone::feature_flags::build_store(&app_config);
+
     autumn_web::app()
+        .migrations(autumn_web::migrate::FRAMEWORK_MIGRATIONS)
         .migrations(MIGRATIONS)
+        .with_flag_store(flag_store)
         .routes(routes![
             routes::posts::front_page,
             routes::about::about,
@@ -67,10 +110,17 @@ async fn main() {
             routes::live::live_feed_health,
             routes::live::live_feed,
             routes::live::subreddit_feed,
+            routes::live::subreddit_viewers,
+            routes::live::subreddit_viewer_stream,
             repositories::subreddit_api_list,
             repositories::subreddit_api_get,
             repositories::post_api_list,
             repositories::post_api_get,
+            // Dev-only error routes for smoke-testing the dev error overlay.
+            // These return 404 in production (profile guard is in ErrorPageFilter).
+            routes::errors::trigger_error,
+            routes::errors::trigger_panic,
+            routes::errors::trigger_404,
         ])
         .mail_previews(routes::auth::mail_previews())
         .policy::<Post, _>(PostPolicy)
@@ -80,7 +130,13 @@ async fn main() {
             tasks::prune_live_feed_events
         ])
         .jobs(reddit_clone::jobs::registered_jobs())
+        .plugin(webhook_plugin)
         .plugin(live_events::LiveFeedPlugin::new())
+        // Custom health indicator — visible at GET /actuator/health under "live_feed_relay".
+        // Gates /ready (IndicatorGroup::Readiness by default), so a degraded relay
+        // will block rolling deploys until it recovers.
+        .health_indicator("live_feed_relay", Arc::new(LiveFeedRelayIndicator))
+        .idempotent()
         .run()
         .await;
 }

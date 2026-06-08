@@ -14,6 +14,10 @@ pub struct RouteAttrArgs {
     /// Override for the path-helper function name. When `None`, the helper
     /// name matches the handler function name.
     pub name_override: Option<LitStr>,
+    /// API version of the route (e.g. "v1")
+    pub api_version: Option<LitStr>,
+    /// Whether this route opts out of sunset 410 response
+    pub sunset_opt_out: bool,
 }
 
 impl RouteAttrArgs {
@@ -31,28 +35,40 @@ impl RouteAttrArgs {
 impl syn::parse::Parse for RouteAttrArgs {
     fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
         let path: LitStr = input.parse()?;
+        let mut name_override = None;
+        let mut api_version = None;
+        let mut sunset_opt_out = false;
 
-        let name_override = if input.peek(Token![,]) {
+        while input.peek(Token![,]) {
             let _comma: Token![,] = input.parse()?;
+            if input.is_empty() {
+                break;
+            }
             let key: Ident = input.parse()?;
-            if key != "name" {
+            let _eq: Token![=] = input.parse()?;
+            if key == "name" {
+                name_override = Some(input.parse::<LitStr>()?);
+            } else if key == "api_version" {
+                api_version = Some(input.parse::<LitStr>()?);
+            } else if key == "sunset_opt_out" {
+                let val: syn::LitBool = input.parse()?;
+                sunset_opt_out = val.value();
+            } else {
                 return Err(syn::Error::new(
                     key.span(),
                     format!(
                         "unknown route attribute key `{key}`. \
-                         Supported keys: `name`."
+                         Supported keys: `name`, `api_version`, `sunset_opt_out`."
                     ),
                 ));
             }
-            let _eq: Token![=] = input.parse()?;
-            Some(input.parse::<LitStr>()?)
-        } else {
-            None
-        };
+        }
 
         Ok(Self {
             path,
             name_override,
+            api_version,
+            sunset_opt_out,
         })
     }
 }

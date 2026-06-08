@@ -127,6 +127,70 @@ The name detection is purely cosmetic — Autumn treats both `Post` and
 `Remove…From…`, the generator just emits empty `up.sql` and `down.sql`
 files for you to fill in.
 
+### Generated safety comments
+
+When `autumn generate migration` produces SQL that could be dangerous for a
+rolling deploy, it prepends an `-- autumn-safety:` comment to the statement:
+
+```sql
+-- autumn-safety: potentially-blocking
+ALTER TABLE posts ADD COLUMN score INTEGER NOT NULL;
+```
+
+```sql
+-- autumn-safety: destructive
+ALTER TABLE posts DROP COLUMN body;
+```
+
+These comments are purely informational; they do not change runtime behavior.
+`autumn migrate check` strips them before classifying statements so they do not
+produce duplicate findings.
+
+### Expand/contract: safe column rename or removal
+
+The naive approach — `autumn generate migration RenameBodyToContent` then hand-
+editing the SQL to `RENAME COLUMN body TO content` — produces an `irreversible`
+finding from `autumn migrate check` because old replicas still running the prior
+code will error on any query that references the old name.
+
+The expand/contract pattern splits the change into two consecutive deploys:
+
+**Step 1 — Expand** (add the new column alongside the old one):
+
+```bash
+autumn generate migration AddContentToPosts content:String
+```
+
+Edit the generated `up.sql` to copy existing data:
+
+```sql
+ALTER TABLE posts ADD COLUMN content TEXT;
+UPDATE posts SET content = body WHERE content IS NULL;
+```
+
+Deploy this. All replicas now see both `body` and `content`. Update application
+code to dual-write both columns and read from `content`.
+
+**Step 2 — Contract** (remove the old column once all replicas run the new code):
+
+```bash
+autumn generate migration RemoveBodyFromPosts body:String
+```
+
+The generated `up.sql` will contain:
+
+```sql
+-- autumn-safety: destructive
+ALTER TABLE posts DROP COLUMN body;
+```
+
+Run `autumn migrate check` — the finding will now be `destructive`, not
+`irreversible`, because the column rename is already complete. This migration is
+safe to apply because no running code references `body` any longer.
+
+The same two-step pattern applies to column type changes and to removing columns
+with foreign-key references.
+
 ## `autumn generate task`
 
 For operational scripts that should run through the full Autumn app context.
@@ -168,16 +232,57 @@ Everything `model` produces, plus:
   block that auto-generates CRUD methods plus JSON REST handlers.
 - `src/repositories/mod.rs` — module aggregator.
 - `src/routes/<plural>.rs` — Maud HTML handlers for `index`, `show`, `new_form`,
-  `create`, `edit_form`, and `update`.
-- `src/routes/mod.rs` — module aggregator.
+  `create`, `edit_form`, and `update`. (Skipped if `--api` is set).
+- `src/routes/mod.rs` — module aggregator. (Skipped if `--api` is set).
 - `tests/<snake>.rs` — a smoke test that hits `GET /<plural>` against
   a running server and asserts a 2xx response (skipped unless
-  `AUTUMN_TEST_BASE_URL` is set).
+  `AUTUMN_TEST_BASE_URL` is set). For `--api` scaffolds, this performs a JSON-based
+  CRUD round-trip.
 - `src/main.rs` — the `mod` declarations plus `routes![…]` entries get
   added in place. Existing entries are preserved; rerunning the generator
-  with the same arguments is a no-op. The scaffold registers only read-only
-  API routes (`GET /api/<plural>` and `GET /api/<plural>/{id}`) by default;
-  mount `POST`/`PUT`/`DELETE` handlers only after adding a repository policy.
+  with the same arguments is a no-op. By default, the scaffold registers only
+  read-only API routes (`GET /api/<plural>` and `GET /api/<plural>/{id}`); mount
+  `POST`/`PUT`/`DELETE` handlers only after adding a repository policy. For `--api`
+  scaffolds, all 5 JSON endpoints (GET index/show, POST, PUT, DELETE) are automatically registered.
+
+### No-JavaScript edit and delete flows
+
+The scaffolded HTML routes accept ordinary browser form submissions
+because Autumn's [method-override middleware](./middleware.md) rewrites
+a `POST` carrying `_method=PUT|PATCH|DELETE` into the declared method
+**before route matching**. That means you can keep your generated
+handlers as `#[put]` / `#[delete]` and still serve clients with
+JavaScript disabled — no parallel POST-only routes required.
+
+Use [`autumn_web::form::method_input`](../../autumn/src/form.rs)
+(or `ChangesetForm::form_tag` with `"delete"` / `"put"` /
+`"patch"`) inside generated edit views and any custom edit/delete
+buttons you add later:
+
+```rust,ignore
+use autumn_web::form::method_input;
+use autumn_web::security::CsrfToken;
+
+#[get("/bookmarks/{id}/edit")]
+async fn edit_form(id: Path<i64>, csrf: Option<CsrfToken>) -> Markup {
+    html! {
+        // Delete button as a plain HTML form — works without htmx.
+        form method="post" action=(format!("/bookmarks/{}", *id)) {
+            (method_input("DELETE"))
+            @if let Some(token) = csrf.as_ref() {
+                input type="hidden" name="_csrf" value=(token.token());
+            }
+            button type="submit" { "Delete" }
+        }
+    }
+}
+```
+
+`autumn routes` and `/actuator/routes` keep reporting the declared
+method (`PUT`, `PATCH`, or `DELETE`); the rewrite is a transport
+concession, not a routing one. CSRF protection still treats the
+overridden mutation as unsafe and rejects submissions without a valid
+token with `403 Forbidden`.
 
 Metadata flags let you keep common model and repository polish in the
 generation step:
@@ -199,6 +304,7 @@ autumn generate scaffold Bookmark url:String title:String tag:String alive:bool 
 | `--validate FIELD=RULE` | Adds `#[validate(...)]` and the `validator` dependency. Supported rules: `url`, `email`, and `length:min=N,max=N` on `String` / `Text` fields. |
 | `--default FIELD=VALUE` | Adds `#[default]` and a SQL `DEFAULT` for bool, string/text, integer, and float fields. `i32` defaults must fit PostgreSQL's `INTEGER` range. Defaulted fields are omitted from generated HTML forms and update columns because the model macro keeps them out of `NewX`. |
 | `--query METHOD:FIELD` | Adds a derived repository method such as `find_by_tag(tag: String) -> Vec<Model>`. The `find_by_` suffix must match `FIELD`. |
+| `--api` | Generates a JSON API-only scaffold (skips HTML routes/templates, registers 5 REST JSON routes, and generates a JSON-based smoke test). |
 
 | Generated file                        | Existing concept it maps to                                                                |
 | ------------------------------------- | ------------------------------------------------------------------------------------------ |
@@ -238,13 +344,64 @@ intentionally small and documents which gaps are outside the generic generator:
 | Hourly `#[scheduled]` link checker | Operational workflow; generate or write a task separately. |
 | Mounting `POST`/`PUT`/`DELETE` JSON API routes | Application policy; scaffold keeps only read APIs registered by default. |
 
+### Reusable scaffold config (`autumn.generate.toml`)
+
+Long scaffolds with many metadata flags can be checked in as a TOML file
+so the intent is reviewable and reproducible without spelunking shell
+history. Create a file at any path — `autumn.generate.toml` is the
+conventional name — with one `[scaffold.<ResourceName>]` section per
+resource:
+
+```toml
+[scaffold.Bookmark]
+fields      = ["url:String", "title:String", "tag:String", "alive:bool"]
+indexes     = ["url", "tag"]
+validations = ["url=url", "title=length:min=1,max=200"]
+defaults    = ["alive=true"]
+queries     = ["find_by_tag:tag", "find_by_alive:alive"]
+api         = true # Optional: JSON API-only scaffold
+```
+
+Pass the file with `--config`:
+
+```bash
+autumn generate scaffold Bookmark --config autumn.generate.toml
+```
+
+All the same keys are supported as their CLI counterparts — see the
+metadata flags table above for the accepted syntax of each.
+
+**Precedence rules (CLI wins):** if a CLI flag is supplied alongside
+`--config`, it completely replaces the corresponding TOML list for that
+key. An empty CLI slice (i.e. the flag was not passed) falls back to the
+TOML value. This matches normal CLI ergonomics where the explicit flag is
+always authoritative:
+
+| Scenario | Effective value |
+|---|---|
+| TOML only | TOML list |
+| CLI only (no `--config`) | CLI list |
+| Both, CLI non-empty | CLI list (TOML ignored for that key) |
+| Both, CLI empty / flag absent | TOML list |
+
+This applies independently to each key: you can keep `fields` and
+`validations` from TOML while overriding `indexes` on the CLI for a
+one-off variant.
+
+The config is additive, not a replacement — existing CLI flags always
+work without a config file, and the config never changes the output of
+any previously working invocation.
+
 ### Slow live scaffold verification
 
 The CLI test suite includes two ignored scaffold checks:
 
 ```bash
-# Compile-check the generated app and its generated smoke test.
+# Compile-check the generated app and its generated smoke test (CLI flags).
 cargo test -p autumn-cli --test generate generated_scaffold_cargo_checks -- --ignored --exact
+
+# Compile-check a config-file-driven scaffold (--config flag).
+cargo test -p autumn-cli --test generate generated_scaffold_config_cargo_checks -- --ignored --exact
 
 # Boot Postgres, run `autumn migrate`, start the generated server, and
 # verify GET /posts and GET /api/posts over real HTTP.
@@ -254,6 +411,18 @@ cargo test -p autumn-cli --test generate generated_scaffold_serves_posts_index_a
 The live HTTP test requires Docker access for the Postgres testcontainer and
 the `diesel` CLI on `PATH`, because `autumn migrate` delegates to
 `diesel migration run`.
+
+### WebAuthn native dependency note
+
+`autumn generate auth --passkeys` enables the `webauthn` feature and adds
+`webauthn-rs`. That dependency currently builds through OpenSSL. On Ubuntu CI
+the system OpenSSL toolchain is already available, but Windows developers need
+to install the OpenSSL libraries through `vcpkg` and set `VCPKG_ROOT` so
+`openssl-sys` can find them.
+
+The release SemVer gate checks `autumn-web` optional public feature APIs, so this
+native dependency must be present on machines that run `scripts/check-semver.sh`
+locally.
 
 ## Common flags
 

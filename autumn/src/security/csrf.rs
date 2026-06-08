@@ -67,6 +67,15 @@ const CSRF_FORBIDDEN_MESSAGE: &str = "CSRF token missing or invalid";
 #[derive(Clone, Debug)]
 pub struct CsrfFormField(pub String);
 
+/// The configured CSRF token header name, placed in request extensions by [`CsrfLayer`].
+///
+/// Templates can read this to emit the correct `data-header` attribute on the
+/// `<meta name="csrf-token">` tag so JavaScript CSRF helpers (e.g. the admin panel
+/// multipart submit handler) use the configured header name rather than defaulting
+/// to `X-CSRF-Token`.
+#[derive(Clone, Debug)]
+pub struct CsrfTokenHeader(pub String);
+
 /// A CSRF token extracted from the request.
 ///
 /// Use this as a handler parameter to access the CSRF token for embedding
@@ -173,6 +182,37 @@ where
     }
 }
 
+impl<S> FromRequestParts<S> for CsrfTokenHeader
+where
+    S: Send + Sync,
+{
+    type Rejection = (StatusCode, &'static str);
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        parts.extensions.get::<Self>().cloned().ok_or((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "CSRF token header not found in request extensions. Is CsrfLayer enabled?",
+        ))
+    }
+}
+
+impl<S> OptionalFromRequestParts<S> for CsrfTokenHeader
+where
+    S: Send + Sync,
+{
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Option<Self>, Self::Rejection> {
+        Ok(parts.extensions.get::<Self>().cloned())
+    }
+}
+
 /// Shared CSRF configuration.
 #[derive(Debug, Clone)]
 struct CsrfSettings {
@@ -182,6 +222,7 @@ struct CsrfSettings {
     safe_methods: Vec<http::Method>,
     exempt_paths: Vec<String>,
     signing_keys: Option<Arc<crate::security::config::ResolvedSigningKeys>>,
+    max_scan_bytes: usize,
 }
 
 /// Tower [`Layer`] that applies CSRF protection.
@@ -215,8 +256,18 @@ impl CsrfLayer {
                 safe_methods,
                 exempt_paths: config.exempt_paths.clone(),
                 signing_keys: None,
+                max_scan_bytes: 2 * 1024 * 1024,
             }),
         }
+    }
+
+    /// Limit the form-body bytes read when scanning for the CSRF token field.
+    /// The effective limit is `min(n, 2 MiB)`.
+    #[must_use]
+    pub(crate) fn with_max_scan_bytes(mut self, n: usize) -> Self {
+        let settings = Arc::make_mut(&mut self.settings);
+        settings.max_scan_bytes = n.min(2 * 1024 * 1024);
+        self
     }
 
     /// Attach signing keys so CSRF tokens are HMAC-signed.
@@ -230,6 +281,15 @@ impl CsrfLayer {
         keys: Arc<crate::security::config::ResolvedSigningKeys>,
     ) -> Self {
         Arc::make_mut(&mut self.settings).signing_keys = Some(keys);
+        self
+    }
+
+    /// Add a path prefix that is exempt from CSRF validation.
+    #[must_use]
+    pub fn with_exempt_path(mut self, path: impl Into<String>) -> Self {
+        Arc::make_mut(&mut self.settings)
+            .exempt_paths
+            .push(path.into());
         self
     }
 }
@@ -332,11 +392,15 @@ where
 
     fn call(&mut self, mut req: Request<axum::body::Body>) -> Self::Future {
         let path = req.uri().path();
-        let is_exempt = self
-            .settings
-            .exempt_paths
-            .iter()
-            .any(|prefix| path.starts_with(prefix.as_str()));
+        let is_exempt = self.settings.exempt_paths.iter().any(|prefix| {
+            if path == prefix {
+                true
+            } else if let Some(stripped) = path.strip_prefix(prefix) {
+                prefix.ends_with('/') || stripped.starts_with('/')
+            } else {
+                false
+            }
+        });
         let is_safe = is_exempt || self.settings.safe_methods.contains(req.method());
         let raw_cookie_token = extract_cookie_token(req.headers(), &self.settings.cookie_name);
 
@@ -360,10 +424,14 @@ where
             }
         });
 
-        // Insert CsrfToken and the configured form field name into request extensions.
+        // Insert CsrfToken, the configured form field name, and the configured
+        // token header name into request extensions.
         req.extensions_mut().insert(CsrfToken(token.clone()));
         req.extensions_mut()
             .insert(CsrfFormField(self.settings.form_field.clone()));
+        req.extensions_mut().insert(CsrfTokenHeader(
+            self.settings.token_header.as_str().to_owned(),
+        ));
 
         // Check if we need to set a cookie
         let set_cookie = if cookie_token.is_none() {
@@ -483,6 +551,26 @@ async fn verify_csrf_token(
         return true;
     }
 
+    // 1b. Check query parameter (e.g. `_csrf`) before falling back to body
+    let query_token = req.uri().query().and_then(|q| {
+        url::form_urlencoded::parse(q.as_bytes())
+            .find(|(key, _)| key == "_csrf" || key == settings.form_field.as_str())
+            .map(|(_, val)| val.into_owned())
+    });
+
+    if let (Some(c), Some(q)) = (cookie_token, &query_token)
+        && !c.is_empty()
+        && !q.is_empty()
+        && validate_cookie_token_hmac(c, settings)
+        && constant_time_eq(c, q)
+    {
+        token_found = true;
+    }
+
+    if token_found {
+        return true;
+    }
+
     // 2. Check form field (if not found in header)
     let content_type = req
         .headers()
@@ -498,7 +586,7 @@ async fn verify_csrf_token(
     let body = std::mem::replace(req.body_mut(), axum::body::Body::empty());
 
     // Limit body size to avoid DoS when extracting form field
-    let bytes = axum::body::to_bytes(body, 2 * 1024 * 1024)
+    let bytes = axum::body::to_bytes(body, settings.max_scan_bytes)
         .await
         .unwrap_or_else(|_| axum::body::Bytes::new());
 
@@ -540,6 +628,29 @@ mod tests {
                     .header("Cookie", format!("autumn-csrf={raw_token}"))
                     .header("Content-Type", "application/x-www-form-urlencoded")
                     .body(Body::from(format!("_csrf={encoded_token}")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn post_with_query_param_token_passes() {
+        let raw_token = "abc+123/xyz=456";
+        let encoded_token = "abc%2B123%2Fxyz%3D456";
+        let app = Router::new()
+            .route("/submit", post(|| async { "created" }))
+            .layer(CsrfLayer::from_config(&default_csrf_config()));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/submit?_csrf={encoded_token}"))
+                    .header("Cookie", format!("autumn-csrf={raw_token}"))
+                    .body(Body::empty())
                     .unwrap(),
             )
             .await
@@ -697,6 +808,64 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/form/submit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn exempt_path_exact_or_subtree_only() {
+        let config = CsrfConfig {
+            enabled: true,
+            exempt_paths: vec!["/webhooks/stripe".to_string()],
+            ..Default::default()
+        };
+        let app = Router::new()
+            .route("/webhooks/stripe", post(|| async { "stripe" }))
+            .route(
+                "/webhooks/stripe/events",
+                post(|| async { "stripe events" }),
+            )
+            .route("/webhooks/stripe-admin", post(|| async { "stripe admin" }))
+            .layer(CsrfLayer::from_config(&config));
+
+        // Exact match of exempt path should skip CSRF validation
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/webhooks/stripe")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Slash-delimited subtree of exempt path should skip CSRF validation
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/webhooks/stripe/events")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Unrelated path starting with same prefix should NOT skip CSRF validation
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/webhooks/stripe-admin")
                     .body(Body::empty())
                     .unwrap(),
             )

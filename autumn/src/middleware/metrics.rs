@@ -29,6 +29,7 @@ pub struct MetricsCollector {
 #[derive(Debug, Default)]
 struct Shard {
     by_route: HashMap<String, RouteMetrics>,
+    by_query: HashMap<String, RouteMetrics>,
 }
 
 #[derive(Debug)]
@@ -43,6 +44,18 @@ struct MetricsInner {
     by_status: StatusBuckets,
     /// Global latency samples (bounded ring buffer).
     latencies_ms: RwLock<VecDeque<u64>>,
+    /// Idempotency-key cache hits (replayed responses).
+    idempotency_hits: AtomicU64,
+    /// Idempotency-key cache misses (new requests).
+    idempotency_misses: AtomicU64,
+    /// Idempotency-key conflicts (concurrent duplicate requests returned 409).
+    idempotency_conflicts: AtomicU64,
+    /// Requests still in-flight when the drain deadline expired and were
+    /// forcibly dropped. Exposed as `autumn_shutdown_aborted_requests_total`.
+    shutdown_aborted_requests: AtomicU64,
+    /// Requests that exceeded the configured per-request timeout.
+    /// Exposed as `autumn_request_timeouts_total`.
+    request_timeouts_total: AtomicU64,
 }
 
 #[derive(Debug, Default)]
@@ -88,15 +101,60 @@ impl MetricsCollector {
                 shards,
                 by_status: StatusBuckets::default(),
                 latencies_ms: RwLock::new(VecDeque::with_capacity(MAX_LATENCY_SAMPLES)),
+                idempotency_hits: AtomicU64::new(0),
+                idempotency_misses: AtomicU64::new(0),
+                idempotency_conflicts: AtomicU64::new(0),
+                shutdown_aborted_requests: AtomicU64::new(0),
+                request_timeouts_total: AtomicU64::new(0),
             }),
         }
+    }
+
+    /// Record `count` requests that were forcibly aborted because the drain
+    /// deadline expired. Increments `autumn_shutdown_aborted_requests_total`.
+    pub fn record_shutdown_aborted(&self, count: u64) {
+        if count > 0 {
+            self.inner
+                .shutdown_aborted_requests
+                .fetch_add(count, Ordering::Relaxed);
+        }
+    }
+
+    /// Increment the per-request timeout counter (`autumn_request_timeouts_total`).
+    pub fn record_request_timeout(&self) {
+        self.inner
+            .request_timeouts_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment the idempotency cache hit counter.
+    pub fn record_idempotency_hit(&self) {
+        self.inner.idempotency_hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment the idempotency cache miss counter.
+    pub fn record_idempotency_miss(&self) {
+        self.inner
+            .idempotency_misses
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment the idempotency conflict counter (concurrent duplicate request).
+    pub fn record_idempotency_conflict(&self) {
+        self.inner
+            .idempotency_conflicts
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record a completed request.
     pub fn record(&self, method: &str, route: &str, status: u16, latency_ms: u64) {
         self.inner.requests_total.fetch_add(1, Ordering::Relaxed);
+        self.record_status(status);
+        self.record_global_latency(latency_ms);
+        self.record_route(method, route, latency_ms);
+    }
 
-        // Status bucket
+    fn record_status(&self, status: u16) {
         match status / 100 {
             2 => self
                 .inner
@@ -120,18 +178,18 @@ impl MetricsCollector {
                 .fetch_add(1, Ordering::Relaxed),
             _ => 0,
         };
+    }
 
-        // Global latency
-        {
-            if let Ok(mut latencies) = self.inner.latencies_ms.write() {
-                if latencies.len() >= MAX_LATENCY_SAMPLES {
-                    latencies.pop_front();
-                }
-                latencies.push_back(latency_ms);
+    fn record_global_latency(&self, latency_ms: u64) {
+        if let Ok(mut latencies) = self.inner.latencies_ms.write() {
+            if latencies.len() >= MAX_LATENCY_SAMPLES {
+                latencies.pop_front();
             }
+            latencies.push_back(latency_ms);
         }
+    }
 
-        // Per-route (sharded)
+    fn record_route(&self, method: &str, route: &str, latency_ms: u64) {
         // ⚡ Bolt Optimization:
         // FNV-1a hash is faster than DefaultHasher (SipHash) for short strings like routes.
         // We don't need cryptographic security or HashDoS resistance here since this is internal.
@@ -189,6 +247,26 @@ impl MetricsCollector {
         }
     }
 
+    /// Record a database query's duration.
+    pub fn record_db_query(&self, key: &str, latency_ms: u64) {
+        // Hash key to determine shard index using FNV-1a
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in key.bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0100_0000_01b3);
+        }
+        let shard_idx = usize::try_from(hash % (SHARD_COUNT as u64)).unwrap_or_default();
+
+        if let Ok(mut shard) = self.inner.shards[shard_idx].write() {
+            let entry = shard.by_query.entry(key.to_owned()).or_default();
+            entry.count += 1;
+            if entry.latencies_ms.len() >= MAX_LATENCY_SAMPLES {
+                entry.latencies_ms.pop_front();
+            }
+            entry.latencies_ms.push_back(latency_ms);
+        }
+    }
+
     fn increment_active(&self) {
         self.inner.requests_active.fetch_add(1, Ordering::Relaxed);
     }
@@ -208,6 +286,7 @@ impl MetricsCollector {
             .unwrap_or_default();
 
         let mut by_route = HashMap::new();
+        let mut db_queries = HashMap::new();
         for shard_lock in &self.inner.shards {
             if let Ok(shard) = shard_lock.read() {
                 for (k, v) in &shard.by_route {
@@ -215,6 +294,18 @@ impl MetricsCollector {
                     by_route.insert(
                         k.clone(),
                         RouteSnapshot {
+                            count: v.count,
+                            p50_ms: pcts.p50,
+                            p95_ms: pcts.p95,
+                            p99_ms: pcts.p99,
+                        },
+                    );
+                }
+                for (k, v) in &shard.by_query {
+                    let pcts = compute_percentiles(&v.latencies_ms);
+                    db_queries.insert(
+                        k.clone(),
+                        DbQueryMetric {
                             count: v.count,
                             p50_ms: pcts.p50,
                             p95_ms: pcts.p95,
@@ -241,7 +332,18 @@ impl MetricsCollector {
                     s4xx: self.inner.by_status.status_4xx.load(Ordering::Relaxed),
                     s5xx: self.inner.by_status.status_5xx.load(Ordering::Relaxed),
                 },
+                shutdown_aborted_requests_total: self
+                    .inner
+                    .shutdown_aborted_requests
+                    .load(Ordering::Relaxed),
+                request_timeouts_total: self.inner.request_timeouts_total.load(Ordering::Relaxed),
             },
+            idempotency: IdempotencyMetricsSnapshot {
+                hits: self.inner.idempotency_hits.load(Ordering::Relaxed),
+                misses: self.inner.idempotency_misses.load(Ordering::Relaxed),
+                conflicts: self.inner.idempotency_conflicts.load(Ordering::Relaxed),
+            },
+            db_queries,
         }
     }
 }
@@ -252,11 +354,36 @@ impl Default for MetricsCollector {
     }
 }
 
+/// Serializable DB query snapshot returned in the `/actuator/metrics` JSON object under "`db_queries`".
+#[derive(Serialize, Clone, Debug)]
+pub struct DbQueryMetric {
+    pub count: u64,
+    pub p50_ms: u64,
+    pub p95_ms: u64,
+    pub p99_ms: u64,
+}
+
 /// Serializable metrics snapshot returned by `/actuator/metrics`.
 #[derive(Serialize)]
 pub struct MetricsSnapshot {
     /// HTTP-specific metrics including latency and status codes.
     pub http: HttpMetrics,
+    /// Idempotency-key middleware counters (zero when middleware is not enabled).
+    pub idempotency: IdempotencyMetricsSnapshot,
+    /// Database queries tracked.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub db_queries: HashMap<String, DbQueryMetric>,
+}
+
+/// Idempotency-key middleware counters.
+#[derive(Serialize, Default)]
+pub struct IdempotencyMetricsSnapshot {
+    /// Number of requests served from the idempotency cache (replayed responses).
+    pub hits: u64,
+    /// Number of new requests processed through to the handler.
+    pub misses: u64,
+    /// Number of 409 Conflict responses issued for concurrent duplicate keys.
+    pub conflicts: u64,
 }
 
 /// A snapshot of HTTP metrics across the entire application.
@@ -272,6 +399,12 @@ pub struct HttpMetrics {
     pub by_route: HashMap<String, RouteSnapshot>,
     /// Global distribution of HTTP status codes.
     pub by_status: StatusSnapshot,
+    /// Requests forcibly dropped when the graceful-shutdown drain deadline
+    /// expired (`autumn_shutdown_aborted_requests_total`).
+    pub shutdown_aborted_requests_total: u64,
+    /// Requests that exceeded the configured per-request timeout
+    /// (`autumn_request_timeouts_total`).
+    pub request_timeouts_total: u64,
 }
 
 /// Percentiles for latency measurements.
@@ -428,6 +561,15 @@ where
 pin_project! {
     #[project = MetricsFutureProj]
     /// Future that records metrics after the inner service completes.
+    ///
+    /// **Known limitation:** `requests_active` tracks the tower service future
+    /// lifecycle, not the response-body lifecycle. For SSE / streaming handlers
+    /// the service future completes when the handler returns the `Response`
+    /// (with a streaming body), so `requests_active` is decremented before the
+    /// body is fully sent to the client. This means the
+    /// `autumn_shutdown_aborted_requests_total` watchdog counter may read `0`
+    /// even when streaming connections are still open during graceful shutdown.
+    /// Fixing this requires connection-level tracking at the Hyper layer.
     pub struct MetricsFuture<F> {
         #[pin]
         inner: F,
@@ -622,5 +764,33 @@ mod tests {
         let snap2 = collector.snapshot();
         let route_snap2 = snap2.http.by_route.get(&key).unwrap();
         assert_eq!(route_snap2.count, 2);
+    }
+
+    // ── request_timeouts_total ─────────────────────────────────────────────
+
+    #[test]
+    fn collector_request_timeouts_starts_at_zero() {
+        let collector = MetricsCollector::new();
+        let snap = collector.snapshot();
+        assert_eq!(snap.http.request_timeouts_total, 0);
+    }
+
+    #[test]
+    fn collector_records_request_timeout() {
+        let collector = MetricsCollector::new();
+        collector.record_request_timeout();
+        collector.record_request_timeout();
+        let snap = collector.snapshot();
+        assert_eq!(snap.http.request_timeouts_total, 2);
+    }
+
+    #[test]
+    fn request_timeouts_total_independent_of_regular_requests() {
+        let collector = MetricsCollector::new();
+        collector.record("GET", "/api", 200, 5);
+        collector.record_request_timeout();
+        let snap = collector.snapshot();
+        assert_eq!(snap.http.requests_total, 1);
+        assert_eq!(snap.http.request_timeouts_total, 1);
     }
 }

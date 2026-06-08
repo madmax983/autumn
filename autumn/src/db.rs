@@ -26,14 +26,175 @@
 //! ```
 
 use axum::extract::FromRequestParts;
+use diesel;
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::deadpool::Pool;
+use futures::FutureExt as _;
+use std::any::Any;
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::Instrument as _;
 
 use crate::config::DatabaseConfig;
 use crate::error::AutumnError;
+
+// ── After-commit callback infrastructure ─────────────────────────────────────
+
+/// A boxed async callback registered for post-transaction execution.
+///
+/// Stored in [`AFTER_COMMIT_REGISTRY`] during an active [`Db::tx`] block.
+/// The registry is drained and each callback is awaited after the transaction
+/// commits successfully. On rollback or panic the callbacks are dropped
+/// without being called.
+pub type CommitCallback = Box<
+    dyn FnOnce() -> Pin<Box<dyn Future<Output = crate::AutumnResult<()>> + Send + 'static>>
+        + Send
+        + 'static,
+>;
+
+tokio::task_local! {
+    /// Task-local registry used by [`Db::tx`] to accumulate after-commit
+    /// callbacks. Only set while the [`Db::tx`] future is being polled;
+    /// absent outside a transaction block.
+    pub static AFTER_COMMIT_REGISTRY: Arc<Mutex<Vec<CommitCallback>>>;
+}
+
+/// Total count of after-commit callback errors since process start.
+///
+/// Incremented each time a callback registered via [`register_after_commit`]
+/// or [`Db::tx`] returns an error **after** the transaction has already
+/// committed. The underlying transaction is unaffected; this counter surfaces
+/// failures for alerting and dashboards.
+///
+/// Exposed by the `/actuator/health` endpoint as the top-level
+/// `autumn_after_commit_failures_total` field.
+pub static AFTER_COMMIT_FAILURES_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn record_after_commit_failure() -> u64 {
+    AFTER_COMMIT_FAILURES_TOTAL.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+pub(crate) fn reject_ambient_after_commit_registry_for_tx() -> Result<(), AutumnError> {
+    if AFTER_COMMIT_REGISTRY.try_with(|_| ()).is_ok() {
+        return Err(AutumnError::bad_request_msg(
+            "Nested Db::tx calls are not supported",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn spawn_committed_after_commit_callbacks(
+    callbacks: Vec<CommitCallback>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if callbacks.is_empty() {
+        return None;
+    }
+
+    Some(tokio::task::spawn(async move {
+        for cb in callbacks {
+            let result = match std::panic::catch_unwind(AssertUnwindSafe(cb)) {
+                Ok(callback) => AssertUnwindSafe(callback).catch_unwind().await,
+                Err(panic) => Err(panic),
+            };
+
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    let failures_total = record_after_commit_failure();
+                    tracing::error!(
+                        autumn.after_commit.failures_total = failures_total,
+                        "after_commit callback failed (tx already committed): {e}"
+                    );
+                }
+                Err(panic) => {
+                    let failures_total = record_after_commit_failure();
+                    let panic = after_commit_panic_message(&*panic);
+                    tracing::error!(
+                        autumn.after_commit.failures_total = failures_total,
+                        "after_commit callback panicked (tx already committed): {panic}"
+                    );
+                }
+            }
+        }
+    }))
+}
+
+fn after_commit_panic_message(payload: &(dyn Any + Send)) -> String {
+    match (
+        payload.downcast_ref::<&'static str>(),
+        payload.downcast_ref::<String>(),
+    ) {
+        (Some(message), _) => (*message).to_owned(),
+        (_, Some(message)) => message.clone(),
+        (None, None) => "non-string panic payload".to_owned(),
+    }
+}
+
+/// Register a callback to run after the current database transaction commits.
+///
+/// If called inside a [`Db::tx`] block, the callback is deferred until the
+/// transaction commits successfully. On rollback the callback is dropped
+/// without being called.
+///
+/// The deferred callback is process-local work spawned after commit. It avoids
+/// side effects for rolled-back transactions, but it is not a crash-safe
+/// delivery mechanism. For side effects that must survive process exit, write a
+/// durable outbox or queue row inside the same database transaction and use
+/// this callback only as an optional wake-up hint.
+///
+/// If called **outside** any active transaction, the callback runs immediately
+/// (eager execution) with a `debug`-level log note.
+///
+/// # Panics
+///
+/// Panics if the internal registry mutex is poisoned (only possible if a
+/// previous thread holding the lock panicked, which should not occur in normal
+/// operation).
+///
+/// # Example
+///
+/// ```rust,ignore
+/// db.tx(move |conn| {
+///     scoped_boxed(async move {
+///         diesel::insert_into(users::table).values(&new_user).execute(conn).await?;
+///         autumn_web::db::register_after_commit(|| async {
+///             welcome_email_job.enqueue("user_id", user_id).await
+///         }).await;
+///         Ok(())
+///     })
+/// }).await?;
+/// ```
+pub async fn register_after_commit<F, Fut>(f: F)
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = crate::AutumnResult<()>> + Send + 'static,
+{
+    let mut f_opt = Some(f);
+    AFTER_COMMIT_REGISTRY
+        .try_with(|registry| {
+            let f = f_opt.take().expect("closure only entered once");
+            let boxed: CommitCallback = Box::new(move || Box::pin(f()));
+            registry.lock().expect("registry lock").push(boxed);
+        })
+        .ok();
+
+    // If still Some, the task-local wasn't set — we're outside a tx; run eagerly.
+    if let Some(f) = f_opt {
+        tracing::debug!("register_after_commit: no active transaction; running callback eagerly");
+        if let Err(e) = f().await {
+            let failures_total = record_after_commit_failure();
+            tracing::error!(
+                autumn.after_commit.failures_total = failures_total,
+                "register_after_commit eager callback failed: {e}"
+            );
+        }
+    }
+}
 
 /// Trait to abstract the state requirement for the `Db` extractor.
 /// This breaks the circular dependency between the database extractor
@@ -41,6 +202,11 @@ use crate::error::AutumnError;
 pub trait DbState {
     /// Returns the database connection pool, if configured.
     fn pool(&self) -> Option<&Pool<AsyncPgConnection>>;
+
+    /// Returns the metrics collector, if configured.
+    fn metrics(&self) -> Option<&crate::middleware::MetricsCollector> {
+        None
+    }
 
     /// Returns the read/replica connection pool, if configured.
     fn replica_pool(&self) -> Option<&Pool<AsyncPgConnection>> {
@@ -53,6 +219,351 @@ pub trait DbState {
     fn read_pool(&self) -> Option<&Pool<AsyncPgConnection>> {
         self.replica_pool().or_else(|| self.pool())
     }
+
+    /// Returns any registered database connection checkout interceptors.
+    fn db_interceptors(
+        &self,
+    ) -> Vec<std::sync::Arc<dyn crate::interceptor::DbConnectionInterceptor>> {
+        Vec::new()
+    }
+    /// Returns the global statement timeout, if configured.
+    fn statement_timeout(&self) -> Option<std::time::Duration> {
+        None
+    }
+
+    /// Returns the slow query threshold.
+    fn slow_query_threshold(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(500)
+    }
+}
+
+// ── SQL telemetry helpers ─────────────────────────────────────────────────────
+
+/// Scrub a SQL string to remove literal parameter values.
+///
+/// Replaces values with `?` placeholders to prevent PII leakage in
+/// slow-query logs while still surfacing the query shape for performance
+/// analysis.
+///
+/// Rules:
+/// - Single-quoted string literals `'...'` → `'?'`
+/// - Unquoted integer/float literals → `?`
+/// - Postgres `$N` positional parameters are left untouched
+///
+/// # Examples
+///
+/// ```
+/// use autumn_web::db::scrub_sql;
+///
+/// assert_eq!(scrub_sql("SELECT * FROM users WHERE name = 'Alice'"),
+///            "SELECT * FROM users WHERE name = '?'");
+/// assert_eq!(scrub_sql("SELECT * FROM orders WHERE id = 42"),
+///            "SELECT * FROM orders WHERE id = ?");
+/// assert_eq!(scrub_sql("SELECT * FROM t WHERE x = $1"),
+///            "SELECT * FROM t WHERE x = $1");
+/// ```
+/// Consumes the body of an E-string escape literal and its closing `'`.
+///
+/// Called after the opening `'` has already been consumed. Handles
+/// `\'` backslash-escaped quotes so they do not prematurely close the string.
+fn consume_estring_body(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    loop {
+        match chars.next() {
+            None => break,
+            Some('\'') => {
+                if chars.peek() == Some(&'\'') {
+                    chars.next(); // consume the doubled quote
+                } else {
+                    break;
+                }
+            }
+            Some('\\') => {
+                chars.next(); // skip the character after the backslash
+            }
+            Some(_) => {}
+        }
+    }
+}
+
+/// Consumes the body of a dollar-quoted string and its closing `$tag$`.
+///
+/// Called after the opening `$tag$` delimiter has already been consumed.
+/// Uses a simple sliding-window match — sufficient for valid SQL.
+fn consume_dollar_quoted_body(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, tag: &str) {
+    let closing: Vec<char> = format!("${tag}$").chars().collect();
+    let clen = closing.len();
+    let mut match_count = 0usize;
+    for sc in chars.by_ref() {
+        if sc == closing[match_count] {
+            match_count += 1;
+            if match_count == clen {
+                break; // Found the closing delimiter.
+            }
+        } else {
+            match_count = 0;
+            // The current char may start a new partial match.
+            if sc == closing[0] {
+                match_count = 1;
+            }
+        }
+    }
+}
+
+/// Returns true for every char that can legally precede a bare numeric
+/// literal in SQL — whitespace, comparison, arithmetic, and structural chars.
+#[inline]
+const fn is_separator(c: char) -> bool {
+    matches!(
+        c,
+        ' ' | '\t' | '\n'          // whitespace
+        | '=' | '<' | '>'          // comparison
+        | '!' | '+' | '-'          // arithmetic / negation (signed literals)
+        | '*' | '/' | '%'          // arithmetic operators
+        | '(' | ',' // structure
+    )
+}
+
+#[must_use]
+pub fn scrub_sql(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    // Tracks whether the last character written was a separator, so a digit
+    // at the current position starts a standalone literal rather than being
+    // part of an identifier like `table1` or `col2`.
+    let mut prev_is_sep = true; // treat start-of-input as a separator boundary
+
+    let mut chars = sql.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        // ── E-string literal  E'...' / e'...'  (backslash-escape aware) ──
+        // Must be checked before the single-quote handler so we consume the
+        // `E` prefix and don't leave it in the fingerprint.
+        if (c == 'E' || c == 'e') && chars.peek() == Some(&'\'') {
+            chars.next(); // consume the opening '
+            out.push_str("'?'");
+            prev_is_sep = false;
+            consume_estring_body(&mut chars);
+            continue;
+        }
+
+        // ── Single-quoted string literal ─────────────────────────────────
+        if c == '\'' {
+            out.push_str("'?'");
+            prev_is_sep = false;
+            loop {
+                match chars.next() {
+                    None => break,
+                    Some('\'') => {
+                        if chars.peek() == Some(&'\'') {
+                            // Escaped quote ('') — consume both, stay inside string
+                            chars.next();
+                        } else {
+                            // Closing quote
+                            break;
+                        }
+                    }
+                    Some(_) => {}
+                }
+            }
+            continue;
+        }
+
+        // ── Dollar sign: positional parameter or dollar-quoted string ─────
+        if c == '$' {
+            let next_ch = chars.peek().copied();
+
+            // Positional parameter $N — pass through verbatim.
+            if next_ch.is_some_and(|nc| nc.is_ascii_digit()) {
+                out.push('$');
+                prev_is_sep = false;
+                while chars.peek().is_some_and(char::is_ascii_digit) {
+                    if let Some(d) = chars.next() {
+                        out.push(d);
+                    }
+                }
+                continue;
+            }
+
+            // Dollar-quoted string: $$ (anonymous) or $tag$ (tagged).
+            // Collect the optional tag, looking for the second `$`.
+            let mut tag = String::new();
+            let mut found_closing_dollar = false;
+
+            if next_ch == Some('$') {
+                // Anonymous $$: consume the second `$`.
+                chars.next();
+                found_closing_dollar = true;
+            } else if next_ch.is_some_and(|nc| nc.is_alphabetic() || nc == '_') {
+                // Accumulate tag chars until we hit `$` or a non-identifier char.
+                while let Some(&tc) = chars.peek() {
+                    if tc == '$' {
+                        chars.next(); // consume the closing `$` of the opening tag
+                        found_closing_dollar = true;
+                        break;
+                    } else if tc.is_alphanumeric() || tc == '_' {
+                        tag.push(tc);
+                        chars.next();
+                    } else {
+                        // Not a valid tag character — not a dollar-quoted string.
+                        break;
+                    }
+                }
+            }
+
+            if found_closing_dollar {
+                out.push_str("'?'");
+                prev_is_sep = false;
+                consume_dollar_quoted_body(&mut chars, &tag);
+            } else {
+                // Not a recognisable dollar form — emit $ and any partial tag.
+                out.push('$');
+                out.push_str(&tag);
+                prev_is_sep = false;
+            }
+            continue;
+        }
+
+        // ── Unquoted numeric literal ──────────────────────────────────────
+        // Only scrub when preceded by a separator to avoid stomping on
+        // identifiers like `table1`, `col2`, or `alias99`.
+        let is_leading_dot =
+            c == '.' && prev_is_sep && chars.peek().is_some_and(char::is_ascii_digit);
+        if (c.is_ascii_digit() && prev_is_sep) || is_leading_dot {
+            out.push('?');
+            if is_leading_dot {
+                chars.next(); // consume the leading dot
+            }
+            // Consume integer/decimal digits, underscores, and dots.
+            while chars
+                .peek()
+                .is_some_and(|d| d.is_ascii_digit() || *d == '.' || *d == '_')
+            {
+                chars.next();
+            }
+            // Consume optional scientific-notation exponent: e/E [+/-] <digits>.
+            if chars.peek().is_some_and(|e| *e == 'e' || *e == 'E') {
+                chars.next(); // consume 'e'/'E'
+                if chars.peek().is_some_and(|s| *s == '+' || *s == '-') {
+                    chars.next(); // consume optional sign
+                }
+                while chars.peek().is_some_and(char::is_ascii_digit) {
+                    chars.next();
+                }
+            }
+            prev_is_sep = false;
+            continue;
+        }
+
+        // ── Regular character ─────────────────────────────────────────────
+        out.push(c);
+        prev_is_sep = is_separator(c);
+    }
+
+    out
+}
+
+/// Instrument a database query: time it, log slow queries with a scrubbed SQL
+/// fingerprint, record metrics, and map Postgres `57014` (statement timeout)
+/// to [`AutumnError::query_timeout`].
+///
+/// # Parameters
+/// - `sql`: The raw SQL string for slow-query fingerprinting (scrubbed before logging).
+/// - `route_key`: Label string used for metrics, e.g. `"GET /users"`.
+/// - `slow_threshold`: Queries taking longer than this emit a `WARN` log.
+/// - `metrics`: The [`crate::middleware::MetricsCollector`] to record into.
+/// - `query`: The async closure that actually executes the query.
+///
+/// # Returns
+/// The result of `query()`, with Postgres `57014` mapped to
+/// [`AutumnError::query_timeout`].
+///
+/// # Errors
+/// Returns [`AutumnError`] from the underlying query, or [`AutumnError::query_timeout`]
+/// when Postgres cancels the statement due to `statement_timeout`.
+pub async fn run_instrumented<F, Fut, T>(
+    sql: &str,
+    route_key: &str,
+    slow_threshold: std::time::Duration,
+    metrics: &crate::middleware::metrics::MetricsCollector,
+    query: F,
+) -> Result<T, AutumnError>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<T, diesel::result::Error>>,
+{
+    let start = std::time::Instant::now();
+    let result = query().await;
+    let elapsed = start.elapsed();
+    let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+
+    // Record metrics regardless of success/failure
+    let verb = sql.split_whitespace().next().unwrap_or("?");
+    let metric_key = format!("{route_key} {verb}");
+    metrics.record_db_query(&metric_key, elapsed_ms);
+
+    // Log slow queries with scrubbed SQL
+    if elapsed >= slow_threshold {
+        let fingerprint = scrub_sql(sql);
+        tracing::warn!(
+            route = %route_key,
+            sql = %fingerprint,
+            duration_ms = elapsed_ms,
+            "slow database query"
+        );
+    }
+
+    // Map result — translate Postgres 57014 to query_timeout
+    result.map_err(|db_err| {
+        if is_query_canceled(&db_err) {
+            tracing::warn!(
+                route = %route_key,
+                duration_ms = elapsed_ms,
+                "database query cancelled: statement_timeout exceeded"
+            );
+            AutumnError::query_timeout(format!(
+                "Database query timed out after {elapsed_ms}ms (statement_timeout exceeded)"
+            ))
+        } else {
+            AutumnError::from(db_err)
+        }
+    })
+}
+
+/// Check whether a Diesel error wraps a Postgres `57014` `query_canceled` error.
+///
+/// Prefers downcasting through the source chain to find a
+/// [`tokio_postgres::Error`] and checking its SQL state code directly,
+/// which is more robust than string-matching error messages.
+fn is_query_canceled(err: &diesel::result::Error) -> bool {
+    // Robust string-matching first to catch wrapped/unwrapped representations
+    let err_str = err.to_string().to_lowercase();
+    if err_str.contains("57014")
+        || err_str.contains("query_canceled")
+        || err_str.contains("canceling statement due to statement timeout")
+        || err_str.contains("statement timeout")
+        || err_str.contains("query canceled")
+    {
+        return true;
+    }
+
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(err);
+
+    while let Some(e) = source {
+        // Try downcasting to tokio_postgres::Error
+        if e.downcast_ref::<tokio_postgres::Error>()
+            .and_then(|pg_err| pg_err.code())
+            == Some(&tokio_postgres::error::SqlState::QUERY_CANCELED)
+        {
+            return true;
+        }
+        // Try downcasting to tokio_postgres::error::DbError
+        if e.downcast_ref::<tokio_postgres::error::DbError>()
+            .is_some_and(|db_err| db_err.code() == &tokio_postgres::error::SqlState::QUERY_CANCELED)
+        {
+            return true;
+        }
+        source = e.source();
+    }
+    false
 }
 
 /// Error type for pool creation failures.
@@ -184,7 +695,7 @@ pub fn create_topology(config: &DatabaseConfig) -> Result<Option<DatabaseTopolog
 // ── Db extractor ─────────────────────────────────────────────
 
 /// Connection type managed by the deadpool pool.
-type PooledConnection = diesel_async::pooled_connection::deadpool::Object<AsyncPgConnection>;
+pub type PooledConnection = diesel_async::pooled_connection::deadpool::Object<AsyncPgConnection>;
 
 struct TxDepthGuard<'a> {
     depth: &'a mut usize,
@@ -228,6 +739,10 @@ impl Drop for TxDepthGuard<'_> {
 ///     Ok("database is reachable")
 /// }
 /// ```
+/// Extension/extractor struct for route-level statement timeout override.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StatementTimeout(pub std::time::Duration);
+
 pub struct Db {
     conn: PooledConnection,
     /// Span covering the full checkout-to-release window. Dropped when
@@ -239,6 +754,11 @@ pub struct Db {
     span: tracing::Span,
     tx_depth: usize,
     tx_poisoned: bool,
+    route_key: Option<String>,
+    metrics: Option<crate::middleware::MetricsCollector>,
+    slow_query_threshold: std::time::Duration,
+    start_time: std::time::Instant,
+    is_test_tx: bool,
 }
 
 impl Db {
@@ -279,6 +799,11 @@ impl Db {
     /// - this `Db` is already inside a transaction,
     /// - this `Db` has been poisoned by a previously cancelled/dropped
     ///   transaction future.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal after-commit registry mutex is poisoned (only
+    /// possible if a previous thread holding the lock panicked).
     pub async fn tx<'a, T, E, F>(&'a mut self, f: F) -> Result<T, crate::error::AutumnError>
     where
         T: Send + 'a,
@@ -302,6 +827,7 @@ impl Db {
                 "Nested Db::tx calls are not supported",
             ));
         }
+        reject_ambient_after_commit_registry_for_tx()?;
         self.tx_depth += 1;
         let mut guard = TxDepthGuard {
             depth: &mut self.tx_depth,
@@ -309,12 +835,36 @@ impl Db {
             disarmed: false,
         };
 
-        let result = self
-            .conn
-            .transaction::<T, E, _>(f)
+        // Each tx gets its own callback registry shared with the task-local so
+        // that code running inside the closure (jobs, mailer, hooks) can push
+        // callbacks without having access to `Db` directly. The `Arc` lets us
+        // read the registry after the `scope` future completes.
+        let registry: Arc<Mutex<Vec<CommitCallback>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let result = AFTER_COMMIT_REGISTRY
+            .scope(registry.clone(), self.conn.transaction::<T, E, _>(f))
             .await
             .map_err(Into::into);
+
         guard.disarmed = true;
+
+        // On commit: spawn the registered callbacks outside the transaction
+        // connection, but await them sequentially inside that task so callback
+        // dependencies observe registration order.
+        // Errors are counted and logged; they do NOT affect the committed tx.
+        // In transactional tests (outer transaction is rolled back), we suppress
+        // spawning these callbacks to prevent observing uncommitted side effects.
+        if result.is_ok() {
+            let callbacks: Vec<CommitCallback> = {
+                let mut reg = registry.lock().expect("registry lock");
+                std::mem::take(&mut *reg)
+            };
+
+            if !callbacks.is_empty() && !self.is_test_tx {
+                let _ = spawn_committed_after_commit_callbacks(callbacks);
+            }
+        }
+
         result
     }
 }
@@ -347,9 +897,12 @@ where
     type Rejection = AutumnError;
 
     async fn from_request_parts(
-        _parts: &mut axum::http::request::Parts,
+        parts: &mut axum::http::request::Parts,
         state: &S,
     ) -> Result<Self, Self::Rejection> {
+        const PG_TIMEOUT_MAX_MS: u64 = i32::MAX as u64;
+        use diesel_async::RunQueryDsl as _;
+
         let pool = state
             .pool()
             .ok_or_else(|| AutumnError::service_unavailable_msg("Database not configured"))?;
@@ -365,21 +918,91 @@ where
             otel.kind = "client",
             db.system = "postgresql",
         );
-        let conn = async {
+        let interceptors = state.db_interceptors();
+
+        let mut checkout_future: std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<PooledConnection, AutumnError>> + Send + '_,
+            >,
+        > = Box::pin(async {
             pool.get().await.map_err(|e| {
                 tracing::error!("Failed to acquire database connection: {e}");
                 AutumnError::service_unavailable_msg(e.to_string())
             })
+        });
+        for interceptor in &interceptors {
+            let ctx = crate::interceptor::DbCheckoutContext {
+                pool_name: "primary".to_string(),
+            };
+            checkout_future = interceptor.intercept_checkout(ctx, checkout_future);
         }
-        .instrument(span.clone())
-        .await?;
+
+        let mut conn = checkout_future.instrument(span.clone()).await?;
+
+        let timeout_override = parts.extensions.get::<StatementTimeout>().copied();
+        // Postgres statement_timeout is a signed 32-bit integer (milliseconds).
+        // Cap at i32::MAX to avoid a confusing 503 for very large configured values.
+        let timeout_ms = timeout_override
+            .map(|t| t.0)
+            .or_else(|| state.statement_timeout())
+            .map_or(0u64, |d| {
+                u64::try_from(d.as_millis())
+                    .unwrap_or(PG_TIMEOUT_MAX_MS)
+                    .min(PG_TIMEOUT_MAX_MS)
+            });
+
+        diesel::sql_query(format!("SET statement_timeout = {timeout_ms}"))
+            .execute(&mut conn)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to set database statement_timeout to {timeout_ms}ms: {e}");
+                AutumnError::service_unavailable_msg(format!("Database initialization error: {e}"))
+            })?;
+
+        let matched_path = parts
+            .extensions
+            .get::<axum::extract::MatchedPath>()
+            .map_or_else(|| parts.uri.path(), axum::extract::MatchedPath::as_str);
+        let route_key = format!("{} {}", parts.method, matched_path);
+        let metrics = state.metrics();
+        let slow_query_threshold = state.slow_query_threshold();
+        let start_time = std::time::Instant::now();
+        let is_test_tx = interceptors.iter().any(|i| i.is_transactional_test());
 
         Ok(Self {
             conn,
             span,
             tx_depth: 0,
             tx_poisoned: false,
+            route_key: Some(route_key),
+            metrics: metrics.cloned(),
+            slow_query_threshold,
+            start_time,
+            is_test_tx,
         })
+    }
+}
+
+impl Drop for Db {
+    fn drop(&mut self) {
+        if let (Some(route_key), Some(metrics)) = (&self.route_key, &self.metrics) {
+            let elapsed = self.start_time.elapsed();
+            let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+
+            // Record DB query metric
+            let metric_key = format!("{route_key} SELECT");
+            metrics.record_db_query(&metric_key, elapsed_ms);
+
+            // Log slow query if it exceeds the threshold
+            if elapsed >= self.slow_query_threshold {
+                tracing::warn!(
+                    route = %route_key,
+                    sql = "SELECT ?",
+                    duration_ms = elapsed_ms,
+                    "slow database query"
+                );
+            }
+        }
     }
 }
 
@@ -500,7 +1123,259 @@ impl DatabasePoolProvider for DieselDeadpoolPoolProvider {
 mod tests {
     use super::*;
     use crate::config::DatabaseConfig;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::time::Duration;
+
+    // ── after_commit tests ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn register_after_commit_outside_tx_runs_eagerly() {
+        // When called outside a db.tx block, the callback should run immediately.
+        let counter = Arc::new(AtomicUsize::new(0));
+        let c = counter.clone();
+        register_after_commit(move || async move {
+            c.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+        .await;
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn register_after_commit_eager_failure_increments_failure_counter() {
+        let before = AFTER_COMMIT_FAILURES_TOTAL.load(Ordering::Relaxed);
+
+        register_after_commit(|| async {
+            Err(crate::AutumnError::internal_server_error_msg(
+                "deliberate eager after-commit failure",
+            ))
+        })
+        .await;
+
+        let after = AFTER_COMMIT_FAILURES_TOTAL.load(Ordering::Relaxed);
+        assert!(
+            after > before,
+            "eager after_commit failures should be counted for recovery signals"
+        );
+    }
+
+    #[tokio::test]
+    async fn register_after_commit_inside_scope_defers_until_drained() {
+        // Inside a task-local scope (simulating Db::tx), callbacks are deferred.
+        let counter = Arc::new(AtomicUsize::new(0));
+        let c = counter.clone();
+
+        let registry = Arc::new(std::sync::Mutex::new(Vec::<CommitCallback>::new()));
+
+        // Simulate being inside a db.tx by setting the task-local
+        AFTER_COMMIT_REGISTRY
+            .scope(registry.clone(), async {
+                register_after_commit(move || async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+                .await;
+            })
+            .await;
+
+        // Callback must NOT have run yet
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+
+        // Drain and run the callbacks (simulating post-commit)
+        let callbacks: Vec<CommitCallback> = {
+            let mut reg = registry.lock().unwrap();
+            std::mem::take(&mut *reg)
+        };
+        for cb in callbacks {
+            cb().await.unwrap();
+        }
+
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn register_after_commit_on_rollback_callbacks_dropped() {
+        // Callbacks registered inside a tx scope that is NOT drained are dropped.
+        let counter = Arc::new(AtomicUsize::new(0));
+        let c = counter.clone();
+
+        let registry = Arc::new(std::sync::Mutex::new(Vec::<CommitCallback>::new()));
+
+        AFTER_COMMIT_REGISTRY
+            .scope(registry.clone(), async {
+                register_after_commit(move || async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+                .await;
+            })
+            .await;
+
+        // Simulate rollback: drop the callbacks without running them
+        drop(registry);
+
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn register_after_commit_callbacks_run_in_registration_order() {
+        let order = Arc::new(std::sync::Mutex::new(Vec::<u32>::new()));
+        let registry = Arc::new(std::sync::Mutex::new(Vec::<CommitCallback>::new()));
+
+        let o1 = order.clone();
+        let o2 = order.clone();
+        let o3 = order.clone();
+
+        AFTER_COMMIT_REGISTRY
+            .scope(registry.clone(), async {
+                register_after_commit(move || async move {
+                    o1.lock().unwrap().push(1);
+                    Ok(())
+                })
+                .await;
+                register_after_commit(move || async move {
+                    o2.lock().unwrap().push(2);
+                    Ok(())
+                })
+                .await;
+                register_after_commit(move || async move {
+                    o3.lock().unwrap().push(3);
+                    Ok(())
+                })
+                .await;
+            })
+            .await;
+
+        let callbacks: Vec<CommitCallback> = {
+            let mut reg = registry.lock().unwrap();
+            std::mem::take(&mut *reg)
+        };
+        for cb in callbacks {
+            cb().await.unwrap();
+        }
+
+        assert_eq!(*order.lock().unwrap(), vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn production_after_commit_drain_preserves_registration_order() {
+        let order = Arc::new(std::sync::Mutex::new(Vec::<u32>::new()));
+        let (release_first, wait_first) = tokio::sync::oneshot::channel::<()>();
+
+        let first_order = order.clone();
+        let second_order = order.clone();
+        let callbacks: Vec<CommitCallback> = vec![
+            Box::new(move || {
+                Box::pin(async move {
+                    wait_first
+                        .await
+                        .expect("test should release first callback");
+                    first_order.lock().unwrap().push(1);
+                    Ok(())
+                })
+            }),
+            Box::new(move || {
+                Box::pin(async move {
+                    second_order.lock().unwrap().push(2);
+                    Ok(())
+                })
+            }),
+        ];
+
+        let drain = spawn_committed_after_commit_callbacks(callbacks)
+            .expect("non-empty callback list should spawn a drain task");
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            *order.lock().unwrap(),
+            Vec::<u32>::new(),
+            "later callbacks must wait for earlier callbacks to finish"
+        );
+
+        release_first
+            .send(())
+            .expect("first callback receiver alive");
+        drain.await.expect("drain task should not panic");
+
+        assert_eq!(*order.lock().unwrap(), vec![1, 2]);
+    }
+
+    #[tokio::test]
+    async fn production_after_commit_drain_isolates_panicking_callbacks() {
+        let before = AFTER_COMMIT_FAILURES_TOTAL.load(Ordering::Relaxed);
+        let ran_later = Arc::new(AtomicU64::new(0));
+        let later = ran_later.clone();
+
+        let callbacks: Vec<CommitCallback> = vec![
+            Box::new(|| Box::pin(async { panic!("deliberate after_commit panic") })),
+            Box::new(move || {
+                Box::pin(async move {
+                    later.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+            }),
+        ];
+
+        let drain = spawn_committed_after_commit_callbacks(callbacks)
+            .expect("non-empty callback list should spawn a drain task");
+        drain.await.expect("panicking callback should be isolated");
+
+        assert_eq!(
+            ran_later.load(Ordering::SeqCst),
+            1,
+            "later callbacks must still run after an earlier callback panics"
+        );
+        let after = AFTER_COMMIT_FAILURES_TOTAL.load(Ordering::Relaxed);
+        assert!(
+            after > before,
+            "panicking after_commit callbacks must increment the failure counter"
+        );
+    }
+
+    #[tokio::test]
+    async fn db_tx_rejects_ambient_after_commit_registry() {
+        let registry = Arc::new(std::sync::Mutex::new(Vec::<CommitCallback>::new()));
+
+        let err = AFTER_COMMIT_REGISTRY
+            .scope(registry, async {
+                reject_ambient_after_commit_registry_for_tx().expect_err(
+                    "starting Db::tx inside an ambient transaction registry should fail",
+                )
+            })
+            .await;
+
+        assert!(
+            err.to_string().contains("Nested Db::tx calls"),
+            "unexpected nested transaction error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn register_after_commit_callback_error_is_swallowed() {
+        // A failing callback is logged but doesn't panic or propagate.
+        let registry = Arc::new(std::sync::Mutex::new(Vec::<CommitCallback>::new()));
+
+        AFTER_COMMIT_REGISTRY
+            .scope(registry.clone(), async {
+                register_after_commit(|| async {
+                    Err(crate::AutumnError::internal_server_error_msg(
+                        "deliberate error",
+                    ))
+                })
+                .await;
+            })
+            .await;
+
+        let callbacks: Vec<CommitCallback> = {
+            let mut reg = registry.lock().unwrap();
+            std::mem::take(&mut *reg)
+        };
+        // Running a failing callback should not panic
+        for cb in callbacks {
+            let _ = cb().await;
+        }
+    }
 
     // ── Pool provider trait tests ────────────────────────────────
 
@@ -726,5 +1601,204 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn database_topology_primary_only_has_no_replica() {
+        let config = DatabaseConfig {
+            primary_url: Some("postgres://user:pass@localhost/db".to_string()),
+            ..DatabaseConfig::default()
+        };
+        let topology = create_topology(&config).unwrap().unwrap();
+
+        let primary = topology.primary().clone();
+
+        let new_topology = DatabaseTopology::primary_only(primary);
+        assert!(
+            new_topology.replica().is_none(),
+            "primary_only must set replica to None"
+        );
+    }
+
+    #[tokio::test]
+    async fn database_topology_from_pools_retains_replica() {
+        let config = DatabaseConfig {
+            primary_url: Some("postgres://user:pass@localhost/db".to_string()),
+            replica_url: Some("postgres://user:pass@localhost/db_replica".to_string()),
+            ..DatabaseConfig::default()
+        };
+        let topology = create_topology(&config).unwrap().unwrap();
+
+        let primary = topology.primary().clone();
+        let replica = topology.replica().cloned();
+
+        let new_topology = DatabaseTopology::from_pools(primary, replica);
+        assert!(
+            new_topology.replica().is_some(),
+            "from_pools must preserve the replica pool"
+        );
+    }
+
+    // ── scrub_sql tests ───────────────────────────────────────────────────────
+
+    #[test]
+    fn scrub_sql_strips_string_literals() {
+        assert_eq!(
+            super::scrub_sql("SELECT * FROM users WHERE name = 'Alice'"),
+            "SELECT * FROM users WHERE name = '?'"
+        );
+    }
+
+    #[test]
+    fn scrub_sql_strips_numeric_literals() {
+        assert_eq!(
+            super::scrub_sql("SELECT * FROM orders WHERE id = 42"),
+            "SELECT * FROM orders WHERE id = ?"
+        );
+    }
+
+    #[test]
+    fn scrub_sql_preserves_pg_positional_params() {
+        assert_eq!(
+            super::scrub_sql("SELECT * FROM t WHERE x = $1 AND y = $2"),
+            "SELECT * FROM t WHERE x = $1 AND y = $2"
+        );
+    }
+
+    #[test]
+    fn scrub_sql_does_not_stomp_identifiers() {
+        // "table1" should not be replaced because it's not preceded by a separator
+        assert_eq!(
+            super::scrub_sql("SELECT * FROM table1 WHERE active = true"),
+            "SELECT * FROM table1 WHERE active = true"
+        );
+    }
+
+    #[test]
+    fn scrub_sql_multiple_literals_in_one_query() {
+        assert_eq!(
+            super::scrub_sql("INSERT INTO users (name, age) VALUES ('Bob', 30)"),
+            "INSERT INTO users (name, age) VALUES ('?', ?)"
+        );
+    }
+
+    #[test]
+    fn scrub_sql_handles_escaped_single_quotes() {
+        assert_eq!(
+            super::scrub_sql("SELECT * FROM t WHERE s = 'it''s a test'"),
+            "SELECT * FROM t WHERE s = '?'"
+        );
+    }
+
+    #[test]
+    fn scrub_sql_empty_string() {
+        assert_eq!(super::scrub_sql(""), "");
+    }
+
+    // ── Bug fixes: exponent suffix, dollar-quoted strings, E-string escapes ──
+
+    #[test]
+    fn scrub_sql_scientific_notation_integer_exponent() {
+        // 1e6 should be fully redacted to ? (the "e6" part is the exponent)
+        assert_eq!(
+            super::scrub_sql("SELECT * FROM t WHERE n = 1e6"),
+            "SELECT * FROM t WHERE n = ?"
+        );
+    }
+
+    #[test]
+    fn scrub_sql_scientific_notation_float_exponent() {
+        // 2.5E-4 should be fully redacted: digit + decimal + E + sign + digit(s)
+        assert_eq!(
+            super::scrub_sql("SELECT * FROM t WHERE n = 2.5E-4"),
+            "SELECT * FROM t WHERE n = ?"
+        );
+    }
+
+    #[test]
+    fn scrub_sql_scientific_notation_uppercase_positive_exponent() {
+        // 3E+10 — uppercase E with explicit + sign
+        assert_eq!(
+            super::scrub_sql("SELECT * FROM t WHERE n = 3E+10"),
+            "SELECT * FROM t WHERE n = ?"
+        );
+    }
+
+    #[test]
+    fn scrub_sql_dollar_quoted_anonymous() {
+        // $$...$$ dollar-quoted string: content must be fully redacted
+        assert_eq!(super::scrub_sql("SELECT $$secret value$$"), "SELECT '?'");
+    }
+
+    #[test]
+    fn scrub_sql_dollar_quoted_with_tag() {
+        // $tag$...$tag$ — tagged dollar-quoted string
+        assert_eq!(
+            super::scrub_sql("SELECT $body$hello world$body$"),
+            "SELECT '?'"
+        );
+    }
+
+    #[test]
+    fn scrub_sql_dollar_quoted_does_not_affect_positional_params() {
+        // $1, $2 positional params must still pass through unmodified
+        assert_eq!(
+            super::scrub_sql("SELECT $1, $2 FROM $$secret$$ WHERE id = $3"),
+            "SELECT $1, $2 FROM '?' WHERE id = $3"
+        );
+    }
+
+    #[test]
+    fn scrub_sql_estring_backslash_escaped_quote() {
+        // E'it\'s secret' — backslash-escaped quote inside E'' string
+        assert_eq!(
+            super::scrub_sql(r"SELECT E'it\'s secret' FROM t"),
+            "SELECT '?' FROM t"
+        );
+    }
+
+    #[test]
+    fn scrub_sql_estring_uppercase() {
+        // Uppercase E prefix variant E'...'
+        assert_eq!(
+            super::scrub_sql("SELECT E'hello world' FROM t"),
+            "SELECT '?' FROM t"
+        );
+    }
+
+    #[test]
+    fn scrub_sql_estring_multiple_backslash_escapes() {
+        // Multiple backslash sequences inside one E'' literal
+        assert_eq!(
+            super::scrub_sql(r"SELECT E'line1\nline2' FROM t"),
+            "SELECT '?' FROM t"
+        );
+    }
+
+    #[test]
+    fn scrub_sql_leading_dot_numeric_literals() {
+        assert_eq!(super::scrub_sql("SELECT .5"), "SELECT ?");
+        assert_eq!(super::scrub_sql("SELECT .25 + .75"), "SELECT ? + ?");
+        assert_eq!(super::scrub_sql("SELECT t.col"), "SELECT t.col");
+        assert_eq!(
+            super::scrub_sql("SELECT schema.table.col"),
+            "SELECT schema.table.col"
+        );
+    }
+
+    #[test]
+    fn scrub_sql_estring_doubled_quote_escape() {
+        assert_eq!(
+            super::scrub_sql("SELECT E'it''s secret' FROM t"),
+            "SELECT '?' FROM t"
+        );
+    }
+
+    #[test]
+    fn scrub_sql_numeric_literal_underscore_grouping() {
+        assert_eq!(super::scrub_sql("SELECT 5_432_000"), "SELECT ?");
+        assert_eq!(super::scrub_sql("SELECT 1_000.5_0"), "SELECT ?");
+        assert_eq!(super::scrub_sql("SELECT col_5_val"), "SELECT col_5_val");
+        assert_eq!(super::scrub_sql("SELECT col_5"), "SELECT col_5");
     }
 }

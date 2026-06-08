@@ -53,6 +53,14 @@ pub trait ProvideProbeState {
         None
     }
 
+    /// Returns the registry of [`crate::actuator::HealthIndicator`] implementations.
+    ///
+    /// The default returns `None`. [`crate::AppState`] overrides this to return
+    /// its registry so that `/ready` can run readiness-group indicators.
+    fn health_indicator_registry(&self) -> Option<&crate::actuator::HealthIndicatorRegistry> {
+        None
+    }
+
     /// Helper method to mark the application startup as complete.
     ///
     /// Delegates to [`ProbeState::mark_startup_complete`].
@@ -483,6 +491,7 @@ where
 fn probe_response<S: ProvideProbeState>(
     state: &S,
     kind: ProbeKind,
+    indicator_ready: bool,
 ) -> (StatusCode, Json<ProbeResponse>) {
     let startup_complete = state.probes().is_startup_complete();
     let shutting_down = state.probes().is_shutting_down();
@@ -492,7 +501,9 @@ fn probe_response<S: ProvideProbeState>(
         ProbeKind::Live => (StatusCode::OK, "ok"),
         ProbeKind::Startup if startup_complete => (StatusCode::OK, "ok"),
         ProbeKind::Startup => (StatusCode::SERVICE_UNAVAILABLE, "starting"),
-        ProbeKind::Ready if startup_complete && !shutting_down && dependencies_ready => {
+        ProbeKind::Ready
+            if startup_complete && !shutting_down && dependencies_ready && indicator_ready =>
+        {
             (StatusCode::OK, "ok")
         }
         ProbeKind::Ready => (StatusCode::SERVICE_UNAVAILABLE, "degraded"),
@@ -522,11 +533,30 @@ fn probe_response<S: ProvideProbeState>(
     (status_code, Json(body))
 }
 
+/// Return `true` when the `/ready` response will be 503 regardless of indicator
+/// results — avoids running potentially slow indicators unnecessarily.
+fn already_degraded<S: ProvideProbeState>(state: &S) -> bool {
+    let probes = state.probes();
+    !probes.is_startup_complete() || probes.is_shutting_down() || !dependency_readiness(state).0
+}
+
+/// Run all readiness-group [`HealthIndicator`]s and return `false` if any are
+/// `Down` or `OutOfService`.
+async fn check_readiness_indicators<S: ProvideProbeState + Sync>(state: &S) -> bool {
+    let Some(registry) = state.health_indicator_registry() else {
+        return true;
+    };
+    let results = registry.run_readiness().await;
+    let statuses: Vec<crate::actuator::HealthStatus> =
+        results.iter().map(|r| r.output.status).collect();
+    crate::actuator::HealthIndicatorRegistry::aggregate_status(&statuses).is_healthy()
+}
+
 /// `GET /live`
 pub async fn live_handler<S: ProvideProbeState + Send + Sync + 'static>(
     State(state): State<S>,
 ) -> impl IntoResponse {
-    probe_response(&state, ProbeKind::Live)
+    probe_response(&state, ProbeKind::Live, true)
 }
 
 /// `GET /ready`
@@ -535,14 +565,20 @@ pub async fn ready_handler<S: ProvideProbeState + Send + Sync + 'static>(
 ) -> impl IntoResponse {
     #[cfg(feature = "db")]
     refresh_replica_readiness(&state).await;
-    probe_response(&state, ProbeKind::Ready)
+    // Skip slow indicator checks when the probe will be 503 regardless.
+    let indicator_ready = if already_degraded(&state) {
+        true
+    } else {
+        check_readiness_indicators(&state).await
+    };
+    probe_response(&state, ProbeKind::Ready, indicator_ready)
 }
 
 /// `GET /startup`
 pub async fn startup_handler<S: ProvideProbeState + Send + Sync + 'static>(
     State(state): State<S>,
 ) -> impl IntoResponse {
-    probe_response(&state, ProbeKind::Startup)
+    probe_response(&state, ProbeKind::Startup, true)
 }
 
 /// Compatibility alias for the legacy `/health` endpoint.
@@ -551,7 +587,12 @@ pub(crate) async fn readiness_response<S: ProvideProbeState + Sync>(
 ) -> (StatusCode, Json<ProbeResponse>) {
     #[cfg(feature = "db")]
     refresh_replica_readiness(state).await;
-    probe_response(state, ProbeKind::Ready)
+    let indicator_ready = if already_degraded(state) {
+        true
+    } else {
+        check_readiness_indicators(state).await
+    };
+    probe_response(state, ProbeKind::Ready, indicator_ready)
 }
 
 #[cfg(test)]
@@ -603,7 +644,7 @@ mod tests {
     #[test]
     fn test_live_handler_returns_ok() {
         let state = TestProbeState::new();
-        let (status, Json(response)) = probe_response(&state, ProbeKind::Live);
+        let (status, Json(response)) = probe_response(&state, ProbeKind::Live, true);
         assert_eq!(status, StatusCode::OK);
         assert_eq!(response.status, "ok");
     }
@@ -611,7 +652,7 @@ mod tests {
     #[tokio::test]
     async fn test_startup_handler_pending() {
         let state = TestProbeState::new();
-        let (status, Json(response)) = probe_response(&state, ProbeKind::Startup);
+        let (status, Json(response)) = probe_response(&state, ProbeKind::Startup, true);
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.status, "starting");
     }
@@ -620,7 +661,7 @@ mod tests {
     async fn test_startup_handler_complete() {
         let state = TestProbeState::new();
         state.mark_startup_complete();
-        let (status, Json(response)) = probe_response(&state, ProbeKind::Startup);
+        let (status, Json(response)) = probe_response(&state, ProbeKind::Startup, true);
         assert_eq!(status, StatusCode::OK);
         assert_eq!(response.status, "ok");
     }
@@ -628,7 +669,7 @@ mod tests {
     #[tokio::test]
     async fn test_ready_handler_pending_startup() {
         let state = TestProbeState::new();
-        let (status, Json(response)) = probe_response(&state, ProbeKind::Ready);
+        let (status, Json(response)) = probe_response(&state, ProbeKind::Ready, true);
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.status, "degraded");
     }
@@ -637,7 +678,7 @@ mod tests {
     async fn test_ready_handler_complete_startup() {
         let state = TestProbeState::new();
         state.mark_startup_complete();
-        let (status, Json(response)) = probe_response(&state, ProbeKind::Ready);
+        let (status, Json(response)) = probe_response(&state, ProbeKind::Ready, true);
         assert_eq!(status, StatusCode::OK);
         assert_eq!(response.status, "ok");
     }
@@ -647,7 +688,7 @@ mod tests {
         let state = TestProbeState::new();
         state.mark_startup_complete();
         state.probes().begin_shutdown();
-        let (status, Json(response)) = probe_response(&state, ProbeKind::Ready);
+        let (status, Json(response)) = probe_response(&state, ProbeKind::Ready, true);
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.status, "degraded");
     }
@@ -664,7 +705,7 @@ mod tests {
             .probes()
             .mark_replica_unready("replica migrations lag primary");
 
-        let (status, Json(response)) = probe_response(&state, ProbeKind::Ready);
+        let (status, Json(response)) = probe_response(&state, ProbeKind::Ready, true);
 
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.status, "degraded");
@@ -767,7 +808,7 @@ mod tests {
             .probes()
             .mark_replica_unready("replica migrations lag primary");
 
-        let (status, Json(response)) = probe_response(&state, ProbeKind::Ready);
+        let (status, Json(response)) = probe_response(&state, ProbeKind::Ready, true);
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(response.status, "ok");
@@ -800,7 +841,7 @@ mod tests {
         let mut state = TestProbeState::new();
         state.health_detailed = false;
 
-        let (_, Json(response)) = probe_response(&state, ProbeKind::Live);
+        let (_, Json(response)) = probe_response(&state, ProbeKind::Live, true);
         assert!(response.version.is_none());
         assert!(response.profile.is_none());
         assert!(response.uptime.is_none());
@@ -813,5 +854,119 @@ mod tests {
         assert!(!state.draining());
         state.begin_draining();
         assert!(state.draining());
+    }
+
+    // ── HealthIndicator integration with /ready ──────────────────
+
+    struct TestProbeStateWithIndicators {
+        probes: ProbeState,
+        health_detailed: bool,
+        profile: String,
+        registry: crate::actuator::HealthIndicatorRegistry,
+    }
+
+    impl ProvideProbeState for TestProbeStateWithIndicators {
+        fn probes(&self) -> &ProbeState {
+            &self.probes
+        }
+
+        fn health_detailed(&self) -> bool {
+            self.health_detailed
+        }
+
+        fn profile(&self) -> &str {
+            &self.profile
+        }
+
+        fn uptime_display(&self) -> String {
+            "test uptime".to_string()
+        }
+
+        #[cfg(feature = "db")]
+        fn pool(
+            &self,
+        ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>
+        {
+            None
+        }
+
+        fn health_indicator_registry(&self) -> Option<&crate::actuator::HealthIndicatorRegistry> {
+            Some(&self.registry)
+        }
+    }
+
+    impl TestProbeStateWithIndicators {
+        fn new(registry: crate::actuator::HealthIndicatorRegistry) -> Self {
+            let probes = ProbeState::pending_startup();
+            probes.mark_startup_complete();
+            Self {
+                probes,
+                health_detailed: true,
+                profile: "test".to_string(),
+                registry,
+            }
+        }
+    }
+
+    struct AlwaysDown;
+    impl crate::actuator::HealthIndicator for AlwaysDown {
+        fn check(&self) -> futures::future::BoxFuture<'_, crate::actuator::HealthCheckOutput> {
+            Box::pin(async { crate::actuator::HealthCheckOutput::down() })
+        }
+    }
+
+    struct AlwaysUp;
+    impl crate::actuator::HealthIndicator for AlwaysUp {
+        fn check(&self) -> futures::future::BoxFuture<'_, crate::actuator::HealthCheckOutput> {
+            Box::pin(async { crate::actuator::HealthCheckOutput::up() })
+        }
+    }
+
+    #[tokio::test]
+    async fn ready_is_degraded_when_readiness_indicator_is_down() {
+        let registry = crate::actuator::HealthIndicatorRegistry::new();
+        registry
+            .register(
+                "svc",
+                crate::actuator::IndicatorGroup::Readiness,
+                std::sync::Arc::new(AlwaysDown),
+            )
+            .unwrap();
+        let state = TestProbeStateWithIndicators::new(registry);
+        let (status, Json(response)) = readiness_response(&state).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.status, "degraded");
+    }
+
+    #[tokio::test]
+    async fn ready_is_ok_when_readiness_indicator_is_up() {
+        let registry = crate::actuator::HealthIndicatorRegistry::new();
+        registry
+            .register(
+                "svc",
+                crate::actuator::IndicatorGroup::Readiness,
+                std::sync::Arc::new(AlwaysUp),
+            )
+            .unwrap();
+        let state = TestProbeStateWithIndicators::new(registry);
+        let (status, Json(response)) = readiness_response(&state).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(response.status, "ok");
+    }
+
+    #[tokio::test]
+    async fn ready_is_ok_when_health_only_indicator_is_down() {
+        let registry = crate::actuator::HealthIndicatorRegistry::new();
+        registry
+            .register(
+                "svc",
+                crate::actuator::IndicatorGroup::HealthOnly,
+                std::sync::Arc::new(AlwaysDown),
+            )
+            .unwrap();
+        let state = TestProbeStateWithIndicators::new(registry);
+        let (status, Json(response)) = readiness_response(&state).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(response.status, "ok");
     }
 }

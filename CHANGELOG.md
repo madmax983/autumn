@@ -5,6 +5,127 @@ All notable changes to the Autumn framework will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **mcp:** Expose typed endpoints as Model Context Protocol (MCP) tools so AI agents can call your API (#1117)
+  - New `mcp` Cargo feature (implies `openapi`). `AppBuilder::mount_mcp("/mcp")` serves a spec-compliant MCP endpoint over Streamable HTTP, handling `initialize`, `tools/list`, and `tools/call`.
+  - Endpoints opt in per-route via `#[api_doc(mcp)]`; nothing is exposed implicitly. `#[api_doc(mcp = false)]` force-excludes a route.
+  - A whole-API hatch, `AppBuilder::expose_all_as_mcp()`, auto-includes every eligible `GET`, but mutating verbs (`POST`/`PUT`/`PATCH`/`DELETE`) still require an explicit `#[api_doc(mcp)]` opt-in, and per-endpoint exclusions are always honored.
+  - Each tool's `name`, `description`, and `inputSchema` are derived from the existing `ApiDoc` (operation id, summary/description, merged request-body + `Query` + path-param schemas) — there is no second, hand-maintained schema, so the tool catalog cannot drift from the handler's typed contract.
+  - `tools/call` dispatches through the **real handler pipeline** (the same in-process path the test client uses), so `#[secured]`, authorization, tenancy, rate limits, and validation apply identically to an agent call and an HTTP call.
+  - Agent authentication reuses the existing bearer-token surface (`RequireApiToken` / `ApiTokenStore`): the `Authorization`, `Cookie`, and `X-CSRF-Token` headers presented to `/mcp` are forwarded into the dispatched call, so bearer, session (`#[secured]`), and CSRF-protected routes behave identically to a direct request.
+  - `Origin` validation (MCP Streamable-HTTP spec requirement) is enforced against the app's CORS `allowed_origins`: a browser `Origin` not in the allowlist gets `403`, while requests without an `Origin` (non-browser agents) pass — defending against DNS-rebinding without breaking agent clients.
+  - `AppBuilder::secure_mcp(layer)` gates the entire `/mcp` endpoint (catalog included) behind any tower layer, e.g. `RequireApiToken`.
+  - JSON-RPC robustness: rejects requests missing `jsonrpc: "2.0"`, empty/malformed batches, and non-object `arguments` with `-32600`/`-32602`; negotiates only supported protocol versions; enforces required `body` arguments; serializes array query fields with form/explode semantics; and reuses the framework path-segment encoder. Tool-result bodies are capped at 10 MiB. Duplicate tool names (same `operation_id`) keep the first registration with a build-time warning.
+  - HTTP method maps to MCP safety annotations: `GET` → `readOnlyHint`; `DELETE` → `destructiveHint`.
+  - Only JSON-in/JSON-out endpoints are eligible; HTML/Maud routes (no response schema) are auto-excluded with a build-time log note.
+  - `examples/todo-app` gains an `/mcp` endpoint exposing `list_json` (read) and `create_json` (explicitly-opted-in write) behind `RequireApiToken`.
+
+- **actuator:** Decouple the Prometheus scrape endpoint from sensitive mode (#857)
+  - New `actuator.prometheus` config flag (default `true`) controls
+    `/actuator/prometheus` **independently of** `actuator.sensitive`. Production
+    apps can expose Prometheus metrics for platform scraping (e.g. Fly.io
+    `[metrics]`) while keeping `sensitive = false`, so `/actuator/env`,
+    `/actuator/configprops`, `/actuator/loggers`, `/actuator/tasks`,
+    `/actuator/jobs`, and the actuator task UI stay off the public surface.
+  - Set `actuator.prometheus = false` (or `AUTUMN_ACTUATOR__PROMETHEUS=false`)
+    to remove the scrape endpoint entirely (it then returns `404`). The flag is
+    surfaced in `/actuator/configprops`.
+  - The `[actuator]` section now honors environment overrides
+    (`AUTUMN_ACTUATOR__PREFIX`, `AUTUMN_ACTUATOR__SENSITIVE`,
+    `AUTUMN_ACTUATOR__PROMETHEUS`), matching the documented
+    `AUTUMN_SECTION__FIELD` convention. Previously the actuator section was only
+    configurable via TOML.
+  - Docs: `docs/guide/deployment.md` now describes the safe Fly.io deployment
+    shape, including scraping a private/non-public metrics port, and clarifies
+    that OTLP tracing and the Prometheus scrape endpoint are separate telemetry
+    paths — enabling OTLP does not add OpenTelemetry metrics to
+    `/actuator/prometheus` without an explicit bridge/exporter.
+- **testing:** CSS-selector HTML assertions on `TestResponse` (#1147)
+  - Autumn renders server-side HTML (Maud + htmx), so the in-process test client can now assert on page *structure* by CSS selector instead of brittle substrings. New chainable methods on `TestResponse`: `assert_selector(css)`, `assert_no_selector(css)`, `assert_selector_count(css, n)`, `assert_text(css, expected)`, `assert_text_contains(css, sub)`, and `assert_attr(css, attr, expected)`.
+  - Non-asserting accessors for custom assertions: `selector_count(css) -> usize`, `selector_text(css) -> Vec<String>`, and `selector_attr(css, attr) -> Vec<Option<String>>` — each returns matches in document order.
+  - Backed by a dependency-free HTML parser and CSS-selector matcher (`tag`, `.class`, `#id`, `[attr]`/`[attr=v]`/`[attr^=v]`/`[attr$=v]`/`[attr*=v]`, compound selectors, selector lists, and descendant/child combinators). Parses fragments literally, so bare `<tr>` htmx swaps are selectable — a spec HTML5 tree builder would foster-parent and drop them.
+  - Assertions survive cosmetic template changes (whitespace, attribute order, wrapping markup) that break the equivalent `assert_body_contains` test. Failure messages print the selector, expected-vs-actual value, and a truncated outline of the parsed HTML.
+  - Purely additive: no breaking change to existing assertions; no new published dependency. See the `autumn::test` module docs and `docs/guide/testing.md` for a worked example.
+
+## [0.5.0] - 2026-06-04
+
+### Added
+
+- **dev inspector:** Built-in request inspector with N+1 query detection (#701)
+  - In `dev` profile, `autumn-web` automatically mounts a request inspector UI at `/_autumn/inspect` (configurable via `[dev] inspector_path`). The route does not exist in `prod` or `test` profiles.
+  - The inspector records the last N requests (default `N = 100`, configurable via `[dev] inspector_capacity`) in a bounded in-memory ring buffer. Each record includes HTTP method, path, status code, wall time, response Content-Type and Content-Length.
+  - An N+1 detector flags any request that issued ≥ M structurally identical SQL statements (default `M = 5`, configurable via `[dev] inspector_n_plus_one_threshold`). The flag includes the offending SQL template and the repetition count.
+  - A `RequestInspector` Axum extractor is available to handlers in `dev` profile to append SQL query records (with SQL text, bound parameters, elapsed time, and `file:line` call site). Integration tests can use the extractor to assert "this request issued exactly K queries."
+  - The inspector UI (server-rendered HTML, no client-side framework) lists requests newest-first with method, path, status, duration, query count, and an N+1 warning badge. Clicking a request opens a detail view with a per-query timing table and a `curl` snippet to reproduce the request.
+  - The inspector excludes its own requests from the ring buffer to avoid feedback loops.
+  - New `[dev]` config section: `inspector_path`, `inspector_capacity`, `inspector_n_plus_one_threshold`.
+  - Existing apps require zero changes — the inspector is purely additive.
+  - See `docs/guide/dev-inspector.md` for the full guide.
+
+- **pagination:** Wire first-class pagination into `#[repository]` and scaffold (#681)
+  - `#[repository]` now generates a `page(req: &PageRequest) -> AutumnResult<Page<Model>>` method on every repository struct, enabling offset pagination without hand-written SQL.  Results are ordered by `id DESC` for deterministic page boundaries.
+  - `#[repository(Model, cursor_key = field)]` additionally generates `cursor_page(req: &CursorRequest) -> AutumnResult<CursorPage<Model>>` — keyset pagination sorted by `(field DESC, id DESC)`.  The cursor payload encodes both the sort-key value and `id` so the keyset filter is always correct: `WHERE (field < after_k) OR (field = after_k AND id < after_id)`.
+  - `autumn generate scaffold` index actions use the `PageRequest` extractor directly.  Out-of-range values are clamped silently (consistent with the framework rule that list endpoints never 400 for bad paging params).
+  - Scaffold-generated routes include a `pagination_nav` Maud helper with htmx-friendly Previous / Next links.
+  - `examples/todo-app` updated: `Todo::page` added; HTML list view uses `PageRequest` and renders pagination controls.
+  - `docs/guide/pagination.md` added, covering: offset vs cursor decision guide, macro entry points, overriding page size, declaring a cursor key, htmx wiring.
+
+To opt out of the generated `page` method: implement your own list handler using `repo.find_all()` or a custom Diesel query.  The `find_all` method is unchanged.
+
+- **security:** Centralize trusted-proxies policy across forwarded-header middleware (#812)
+  - **New `[security.trusted_proxies]` config block** at the top level of `[security]`.
+    Configure once; every framework middleware (rate limiter, method-override origin check,
+    CSRF, HSTS detection, tracing fields) honours the same trust boundary automatically.
+    Fields: `ranges` (CIDR list), `trusted_hops` (peel-N-from-right strategy), and
+    `trust_forwarded_headers` (global on/off switch). Profile-aware defaults: `dev` trusts
+    loopback only; `prod` defaults to no forwarding trust until configured.
+  - **New extractors** in `autumn_web::extract`: `ClientAddr` (resolved client IP),
+    `ClientHost` (resolved external hostname), `ClientScheme` (`"http"` / `"https"` after
+    `X-Forwarded-Proto` evaluation). These are the only blessed way to read client identity
+    from handlers and middleware — direct `X-Forwarded-*` reads are now rejected by the
+    new CI `grep` guard.
+  - **Deprecation:** `security.rate_limit.trusted_proxies` and
+    `security.rate_limit.trust_forwarded_headers` continue to work for one minor release
+    with a deprecation warning at startup pointing at the new top-level config.
+    `autumn doctor --strict` fails when both old and new are set with conflicting values.
+  - **Regression fixes:** Closes three related CVEs — PR #753 (`X-Forwarded-For`
+    rate-limit bypass), PR #785 and PR #791 (`X-Forwarded-Host` CSRF/method-override
+    spoofing bypass in `MethodOverrideLayer`). The PoC from PR #791 is now covered by
+    a regression test that validates the override is rejected when the
+    `ResolvedClientIdentity` host does not match the `Origin` header.
+  - **Plugin author guide** added to `docs/guide/middleware.md` and
+    `docs/guide/extensibility.md`: "Never read `X-Forwarded-*` directly. Use
+    `ClientAddr` / `ClientHost` / `ClientScheme` extractors."
+- **configuration:** Add TOML config file support to generated scaffolds and a runtime configuration system for live-tunable operational knobs (#773, #931).
+- **data and repositories:** Add soft delete, high-performance bulk CRUD, Postgres full-text search, automatic version history, CSV import/export, and per-query statement timeout/slow-query telemetry support (#858, #881, #905, #922, #1075, #865).
+- **development loop:** Add the dev-mode error overlay, generator conformance CI gate, dev-loop latency budgets, and framework runtime benchmarks (#1080, #1079, #920, #756).
+- **HTTP and routing:** Add safe HTML method override handling, ETag conditional GET helpers, per-request timeout and body-size middleware, first-class response compression, and API versioning with deprecation and sunset lifecycles (#605, #853, #996, #1083, #1077).
+- **operations:** Add rolling-deploy shutdown contracts, maintenance mode middleware and CLI commands, W3C trace-context propagation across jobs/mailers, traced outbound HTTP client retries/mocks, outbound signed webhooks with retries/DLQ/actuator endpoints, and pluggable error reporting for panics and 5xx responses (#843, #917, #854, #863, #923, #1047).
+- **security:** Add encrypted credentials, at-rest attribute encryption, direct browser-to-storage uploads, trusted-host validation, CSP nonces, log parameter scrubbing, per-principal/API-token rate limits, TOTP auth scaffolding, and WebAuthn passkey scaffolding (#849, #1058, #860, #885, #915, #903, #1001, #1057, #1070).
+- **state and collaboration:** Add after-commit callbacks, HTTP idempotency-key middleware, row-level multi-tenancy, Redis-backed global rate limiting, first-class feature flags, A/B experiments, distributed presence, active search/autocomplete widgets, inline field validation, and an injectable `Clock` extractor for deterministic tests (#778, #779, #876, #764, #1000, #1016, #973, #989, #991, #1014).
+- **content and tooling:** Add Markdown rendering with frontmatter/SSG support, `autumn generate mailer`, migration safety preflight checks, and plugin hooks at framework-owned dependency boundaries (#921, #866, #762, #862).
+
+### Fixed
+
+- **tenancy:** Normalize hostnames to lowercase in subdomain mode for DNS case-insensitivity
+- **tenancy:** Add `jwt_audience` config field; enable audience validation when configured
+- Keep the release gate from mutating the changelog during validation (#763).
+- Fix rate-limit `X-Forwarded-For` spoofing bypasses and add targeted mutant-killing coverage for proxy handling (#753, #787, #789).
+- Fix benchmark and CI lint/doc-build regressions across the 0.5.0 line (#783, #800, #801, #1041).
+
+### Changed
+
+- Move the static file layer inside the user middleware stack so custom middleware observes static responses consistently (#845).
+- Revert the OAuth2/OIDC social-login scaffold from this release line after review; the TOTP and WebAuthn scaffolds remain in scope for 0.5.0 (#1046).
+
+### Documentation
+
+- Add and refresh guides for pagination, hooks and transactions, dev inspector, runtime configuration, CSV/admin data flows, API versioning, compression, and first-run release smoke coverage.
+
+
 ## [0.4.0] - 2026-05-12
 
 ### Added

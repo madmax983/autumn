@@ -149,8 +149,13 @@ pub fn ws_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     secured: false,
                     required_roles: &[],
                     register_schemas: ::core::option::Option::None,
+                    api_version: ::core::option::Option::None,
+                    ..::core::default::Default::default()
                 },
                 repository: ::core::option::Option::None,
+                idempotency: ::autumn_web::RouteIdempotency::Direct,
+                api_version: ::core::option::Option::None,
+                sunset_opt_out: false,
             }
         }
     }

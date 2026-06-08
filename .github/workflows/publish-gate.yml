@@ -46,12 +46,23 @@ jobs:
         run: ./scripts/check-examples.sh
 
   # ---------------------------------------------------------------------------
+  # 0b. Benchmark harness structure gate
+  # ---------------------------------------------------------------------------
+  benchmarks:
+    name: Benchmark harness structure gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check benchmark harness completeness
+        run: ./scripts/check-benchmarks.sh
+
+  # ---------------------------------------------------------------------------
   # 1. Crate metadata
   # ---------------------------------------------------------------------------
   metadata:
     name: Crate metadata
     runs-on: ubuntu-latest
-    needs: examples
+    needs: [examples, benchmarks]
     steps:
       - uses: actions/checkout@v4
       - name: Check required crates.io metadata fields
@@ -99,7 +110,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.92.0
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-semver-checks
         uses: taiki-e/install-action@cargo-semver-checks
@@ -198,37 +209,24 @@ jobs:
     # produced when every check passes.
     needs: [semver, release-notes, smoke]
     if: github.ref_type == 'tag'
-    permissions:
-      contents: write
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
       - name: Install git-cliff
         uses: taiki-e/install-action@git-cliff
-      - name: Generate release notes and update CHANGELOG
+      - name: Generate release notes artifact
         run: |
+          # CHANGELOG.md must be updated before tagging so the packaged crates
+          # include the release notes. Do not commit from this detached tag
+          # checkout; that races with trunk and can block the GitHub Release.
           git-cliff --config cliff.toml --latest --strip header > RELEASE_NOTES.md
-          git-cliff --config cliff.toml --output CHANGELOG.md
-      - name: Commit CHANGELOG.md to trunk
-        env:
-          RELEASE_TAG: ${{ github.ref_name }}
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add CHANGELOG.md
-          if ! git diff --staged --quiet; then
-            git commit -m "docs: update CHANGELOG.md for ${RELEASE_TAG}"
-            git push origin HEAD:trunk
-          else
-            echo "CHANGELOG.md already up to date — skipping commit"
-          fi
       - name: Record release tag
         env:
           RELEASE_TAG: ${{ github.ref_name }}
         run: printf '%s' "${RELEASE_TAG}" > release-tag.txt
       - name: Upload release artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-artifacts
           path: |

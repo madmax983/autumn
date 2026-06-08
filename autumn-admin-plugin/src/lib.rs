@@ -33,6 +33,8 @@
 //! First-party plugin: `autumn-<name>-plugin`.
 
 mod auth;
+pub mod experiments;
+pub mod feature_flags;
 mod registry;
 mod routes;
 mod templates;
@@ -40,14 +42,16 @@ mod traits;
 
 pub use registry::AdminRegistry;
 pub use traits::{
-    AdminAction, AdminError, AdminField, AdminFieldKind, AdminFuture, AdminModel, ListParams,
-    ListResult, SortDirection,
+    AdminAction, AdminError, AdminField, AdminFieldKind, AdminFuture, AdminHistoryEntry,
+    AdminHistoryPage, AdminImportError, AdminImportReport, AdminImportRowResult, AdminModel,
+    CsvImportMode, ListParams, ListResult, SelectOption, SortDirection,
 };
 
 /// Common downstream imports for implementing admin models.
 pub mod prelude {
     pub use crate::{
-        AdminError, AdminField, AdminFieldKind, AdminFuture, AdminModel, ListParams, ListResult,
+        AdminError, AdminField, AdminFieldKind, AdminFuture, AdminHistoryEntry, AdminHistoryPage,
+        AdminImportRowResult, AdminModel, CsvImportMode, ListParams, ListResult, SelectOption,
         SortDirection,
     };
 }
@@ -58,6 +62,7 @@ use std::sync::Arc;
 use autumn_web::app::AppBuilder;
 use autumn_web::plugin::Plugin;
 use autumn_web::route_listing::RouteInfo;
+use autumn_web::runtime_config::RuntimeConfigService;
 
 /// The admin panel plugin.
 ///
@@ -69,6 +74,16 @@ pub struct AdminPlugin {
     actuator_prefix: String,
     auth_session_key: String,
     require_role: Option<String>,
+    runtime_config: Option<Arc<RuntimeConfigService>>,
+    /// When `true`, every mutating action (create, update, destroy) on any
+    /// registered model requires step-up authentication before proceeding.
+    ///
+    /// Enables this with [`AdminPlugin::with_step_up_mutations`].
+    step_up_mutations: bool,
+    /// Freshness window for step-up checks on admin mutations (seconds).
+    /// Defaults to [`autumn_web::step_up::DEFAULT_MAX_AGE_SECS`].
+    /// Override with [`AdminPlugin::with_step_up_max_age`].
+    step_up_max_age_secs: u64,
 }
 
 impl AdminPlugin {
@@ -86,6 +101,9 @@ impl AdminPlugin {
             actuator_prefix: "/actuator".to_owned(),
             auth_session_key: "user_id".to_owned(),
             require_role: Some("admin".to_owned()),
+            runtime_config: None,
+            step_up_mutations: false,
+            step_up_max_age_secs: autumn_web::step_up::DEFAULT_MAX_AGE_SECS,
         }
     }
 
@@ -140,6 +158,61 @@ impl AdminPlugin {
         self.registry.register(model);
         self
     }
+
+    /// Enable the runtime config management page.
+    ///
+    /// Mounts `GET /config`, `POST /config/{key}/set`, `POST /config/{key}/unset`,
+    /// and `GET /config/{key}/history` under the admin prefix, and adds a
+    /// "Runtime Config" item to the sidebar navigation.
+    #[must_use]
+    pub fn with_runtime_config(mut self, svc: Arc<RuntimeConfigService>) -> Self {
+        self.runtime_config = Some(svc);
+        self
+    }
+
+    /// Require step-up (fresh) authentication before any mutating admin action.
+    ///
+    /// When enabled, every `POST` (create/update) and `DELETE` (destroy) request
+    /// to the admin panel is checked against the session's `last_strong_auth_at`
+    /// claim using the global step-up max-age configured in `[auth.step_up]`
+    /// (default: 5 minutes). Requests without a valid fresh-auth claim are
+    /// redirected to `/reauth?return_to=…` (HTML clients) or receive a
+    /// `401 step_up_required` problem-details response (JSON clients).
+    ///
+    /// Highly recommended for production admin panels to reduce the blast radius
+    /// of a hijacked admin session.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// AdminPlugin::new()
+    ///     .register(UserAdmin::default())
+    ///     .with_step_up_mutations()
+    /// ```
+    #[must_use]
+    pub const fn with_step_up_mutations(mut self) -> Self {
+        self.step_up_mutations = true;
+        self
+    }
+
+    /// Override the step-up freshness window for admin mutations.
+    ///
+    /// Only meaningful when [`with_step_up_mutations`](Self::with_step_up_mutations)
+    /// is also called. Calls `with_step_up_mutations` implicitly.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// AdminPlugin::new()
+    ///     .register(UserAdmin::default())
+    ///     .with_step_up_max_age(600) // 10-minute window
+    /// ```
+    #[must_use]
+    pub const fn with_step_up_max_age(mut self, secs: u64) -> Self {
+        self.step_up_mutations = true;
+        self.step_up_max_age_secs = secs;
+        self
+    }
 }
 
 impl Default for AdminPlugin {
@@ -160,7 +233,17 @@ impl Plugin for AdminPlugin {
             actuator_prefix,
             auth_session_key,
             require_role,
+            runtime_config,
+            step_up_mutations,
+            step_up_max_age_secs,
         } = self;
+        let has_config = runtime_config.is_some();
+        // "config" slug only conflicts when the runtime-config routes are mounted.
+        assert!(
+            !(has_config && registry.get("config").is_some()),
+            "autumn-admin: model slug 'config' conflicts with the mounted runtime-config \
+             routes; rename the model or don't call with_runtime_config",
+        );
         let registry = Arc::new(registry);
         let router = routes::admin_router(
             Arc::clone(&registry),
@@ -168,6 +251,9 @@ impl Plugin for AdminPlugin {
             actuator_prefix.clone(),
             auth_session_key.clone(),
             require_role.clone(),
+            runtime_config,
+            step_up_mutations,
+            step_up_max_age_secs,
         );
 
         tracing::info!(
@@ -176,13 +262,14 @@ impl Plugin for AdminPlugin {
             auth_session_key = %auth_session_key,
             models = registry.model_count(),
             role = require_role.as_deref().unwrap_or("<none>"),
+            step_up_mutations = %step_up_mutations,
             "🍂 Autumn Admin mounted"
         );
 
         // Declare routes for `autumn routes` listing. The underlying Axum router
         // is added via nest() which is opaque to route enumeration, so we
         // explicitly register route metadata here.
-        let declared = admin_route_infos(&prefix);
+        let declared = admin_route_infos(&prefix, has_config);
 
         app.nest(&prefix, router).declare_plugin_routes(declared)
     }
@@ -190,35 +277,57 @@ impl Plugin for AdminPlugin {
 
 /// Generate the route metadata list for this plugin's mounted routes.
 ///
+/// `has_config` must match whether `with_runtime_config` was called; config
+/// routes are only mounted when a `RuntimeConfigService` is provided, so
+/// including them unconditionally would produce false route-collision signals.
+///
 /// Kept in sync with `routes::admin_router` — update here when routes are
 /// added or removed from the admin router.
-pub(crate) fn admin_route_infos(prefix: &str) -> Vec<RouteInfo> {
-    [
+pub(crate) fn admin_route_infos(prefix: &str, has_config: bool) -> Vec<RouteInfo> {
+    let mut entries: Vec<(&str, String)> = vec![
         ("GET", prefix.to_string()),
         ("GET", format!("{prefix}/jobs")),
         ("GET", format!("{prefix}/jobs/counters")),
         ("POST", format!("{prefix}/jobs/{{id}}/retry")),
         ("POST", format!("{prefix}/jobs/{{id}}/discard")),
         ("POST", format!("{prefix}/jobs/{{id}}/cancel")),
+    ];
+    if has_config {
+        entries.extend([
+            ("GET", format!("{prefix}/config")),
+            ("POST", format!("{prefix}/config/{{key}}/set")),
+            ("POST", format!("{prefix}/config/{{key}}/unset")),
+            ("GET", format!("{prefix}/config/{{key}}/history")),
+        ]);
+    }
+    entries.extend([
         ("GET", format!("{prefix}/{{slug}}")),
         ("POST", format!("{prefix}/{{slug}}")),
         ("GET", format!("{prefix}/{{slug}}/new")),
+        ("GET", format!("{prefix}/{{slug}}/export.csv")),
+        ("GET", format!("{prefix}/{{slug}}/import")),
+        ("POST", format!("{prefix}/{{slug}}/import")),
         ("GET", format!("{prefix}/{{slug}}/{{id}}")),
         ("POST", format!("{prefix}/{{slug}}/{{id}}")),
         ("DELETE", format!("{prefix}/{{slug}}/{{id}}")),
         ("GET", format!("{prefix}/{{slug}}/{{id}}/edit")),
+        ("GET", format!("{prefix}/{{slug}}/{{id}}/history")),
         ("POST", format!("{prefix}/{{slug}}/actions")),
         ("GET", format!("{prefix}{}", &*routes::ADMIN_JS_PATH)),
-    ]
-    .into_iter()
-    .map(|(method, path)| RouteInfo {
-        method: method.to_owned(),
-        path,
-        handler: format!("admin::{}", method.to_lowercase()),
-        source: autumn_web::route_listing::RouteSource::User, // overwritten by declare_plugin_routes
-        middleware: vec![],
-    })
-    .collect()
+    ]);
+    entries
+        .into_iter()
+        .map(|(method, path)| RouteInfo {
+            method: method.to_owned(),
+            path,
+            handler: format!("admin::{}", method.to_lowercase()),
+            source: autumn_web::route_listing::RouteSource::User, // overwritten by declare_plugin_routes
+            middleware: vec![],
+            api_version: None,
+            status: None,
+            sunset_opt_out: None,
+        })
+        .collect()
 }
 
 // ── Conformance reference tests ────────────────────────────────────────────
@@ -242,7 +351,11 @@ mod conformance_tests {
     /// attributed to the plugin. Reuses `admin_route_infos` from the outer
     /// module and overrides the source to `Plugin(PLUGIN_NAME)`.
     fn admin_routes(prefix: &str) -> Vec<RouteInfo> {
-        super::admin_route_infos(prefix)
+        admin_routes_with_config(prefix, true)
+    }
+
+    fn admin_routes_with_config(prefix: &str, has_config: bool) -> Vec<RouteInfo> {
+        super::admin_route_infos(prefix, has_config)
             .into_iter()
             .map(|mut r| {
                 r.source = RouteSource::Plugin(PLUGIN_NAME.to_owned());
@@ -295,6 +408,48 @@ mod conformance_tests {
             assert!(
                 declared.contains(&(method, path)),
                 "missing declared admin job route {method} {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn admin_plugin_declares_builtin_config_routes_when_enabled() {
+        let routes = admin_routes_with_config("/admin", true);
+        let declared: std::collections::HashSet<(&str, &str)> = routes
+            .iter()
+            .map(|route| (route.method.as_str(), route.path.as_str()))
+            .collect();
+
+        for (method, path) in [
+            ("GET", "/admin/config"),
+            ("POST", "/admin/config/{key}/set"),
+            ("POST", "/admin/config/{key}/unset"),
+            ("GET", "/admin/config/{key}/history"),
+        ] {
+            assert!(
+                declared.contains(&(method, path)),
+                "missing declared admin config route {method} {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn admin_plugin_omits_config_routes_when_disabled() {
+        let routes = admin_routes_with_config("/admin", false);
+        let declared: std::collections::HashSet<(&str, &str)> = routes
+            .iter()
+            .map(|route| (route.method.as_str(), route.path.as_str()))
+            .collect();
+
+        for (method, path) in [
+            ("GET", "/admin/config"),
+            ("POST", "/admin/config/{key}/set"),
+            ("POST", "/admin/config/{key}/unset"),
+            ("GET", "/admin/config/{key}/history"),
+        ] {
+            assert!(
+                !declared.contains(&(method, path)),
+                "config route {method} {path} should not be declared when has_config=false"
             );
         }
     }
@@ -373,6 +528,9 @@ mod conformance_tests {
             handler: "host::admin_redirect".to_owned(),
             source: RouteSource::User,
             middleware: vec![],
+            api_version: None,
+            status: None,
+            sunset_opt_out: None,
         });
         let (result, diagnostics) = autumn_web::plugin_conformance::check_collisions(&routes);
         assert_eq!(
