@@ -27,7 +27,7 @@ autumn routes --format json --user-only
 If the user passes `--method` or `--filter`, append them:
 
 ```bash
-autumn routes --format json --user-only --method POST --filter posts
+autumn routes --format json --user-only --method POST --filter /posts
 ```
 
 Capture stdout, stderr, and exit code.

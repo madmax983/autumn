@@ -46,8 +46,13 @@ Check every file you review against these items. Report only items that fail.
 
 ### Security (CRITICAL — always check)
 
-- **Missing `#[secured]`**: Any route that modifies data or reads user-private
-  data must have `#[secured]` or `#[secured("role")]`.
+- **Missing `#[secured]`**: Browser session routes that modify data or read
+  user-private data must have `#[secured]` or `#[secured("role")]`. Do NOT
+  flag routes whose extractors already enforce auth via another mechanism:
+  `SignedWebhook` (HMAC-verified webhook handlers), `RequireApiToken`
+  (bearer-token API routes), or any handler that calls `.api_token()` or
+  checks `webhook.provider()`. Adding `#[secured]` on top of those would
+  be the wrong fix.
 - **Missing CSRF token**: Every `<form method="POST">` (or PUT/PATCH/DELETE)
   in Maud templates must contain:
   ```rust

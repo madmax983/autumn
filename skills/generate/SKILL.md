@@ -37,21 +37,25 @@ accept aliases like `Integer` or `Boolean`.
 
 | Token | SQL type | Rust type |
 |---|---|---|
-| `String` | `VARCHAR(255) NOT NULL` | `String` |
-| `Text` | `TEXT NOT NULL` | `String` |
+| `String` | `TEXT NOT NULL` | `String` |
+| `Text` | `TEXT NOT NULL` | `String` (alias for String) |
 | `i32` | `INTEGER NOT NULL` | `i32` |
 | `i64` | `BIGINT NOT NULL` | `i64` |
-| `f32` | `FLOAT4 NOT NULL` | `f32` |
-| `f64` | `FLOAT8 NOT NULL` | `f64` |
-| `bool` | `BOOLEAN NOT NULL DEFAULT false` | `bool` |
+| `f32` | `REAL NOT NULL` | `f32` |
+| `f64` | `DOUBLE PRECISION NOT NULL` | `f64` |
+| `bool` | `BOOLEAN NOT NULL` | `bool` |
 | `NaiveDateTime` | `TIMESTAMP NOT NULL` | `NaiveDateTime` |
-| `DateTime` | `TIMESTAMPTZ NOT NULL DEFAULT NOW()` | `DateTime<Utc>` |
-| `Uuid` | `UUID NOT NULL DEFAULT gen_random_uuid()` | `Uuid` |
+| `DateTime` | `TIMESTAMPTZ NOT NULL` | `DateTime<Utc>` |
+| `Uuid` | `UUID NOT NULL` | `Uuid` |
 | `Bytea` | `BYTEA NOT NULL` | `Vec<u8>` |
-| `Attachment` | `JSONB NULL` (blob metadata) | optional file attachment |
-| `references:Model` | `BIGINT NOT NULL REFERENCES models(id)` | `i64` (FK) |
+| `Attachment` | `JSONB NULL` (blob metadata) | `Option<Blob>` (always nullable) |
+| `Option<T>` | Nullable version of any above | `Option<T>` |
 | `name:unique` | Adds `UNIQUE` constraint | — |
 | `name:index` | Adds B-tree index | — |
+
+**Foreign keys are not in the DSL.** To add an FK column (e.g. `user_id`), scaffold the
+model with an `i64` field and then hand-edit the generated migration to add
+`REFERENCES users(id)` and an index.
 
 **Do not use UUID as a primary key.** Primary keys are always `i64` /
 `BIGSERIAL`. Use `Uuid` as a secondary column for external correlation only.
@@ -100,9 +104,22 @@ Next steps:
 ### mailer
 ```
 Next steps:
-1. Call the mailer from a job or route:
-   UserMailer::welcome(&user).deliver_later().await?;
-2. Preview at: http://localhost:3000/dev/mailer/previews (dev mode)
+1. The #[mailer] macro generates send_<method> (async) and deliver_later_<method>
+   (fire-and-forget) from each fn in the impl block. Call from a handler or job:
+
+   // async send (awaits delivery):
+   UserMailer.send_welcome(&mailer, to, username).await?;
+
+   // fire-and-forget (background, no await):
+   UserMailer.deliver_later_welcome(&mailer, to, username);
+
+   Both take a &Mailer extractor as their first argument after &self.
+   Add `mailer: Mailer` to the handler's extractor list to get the handle.
+
+2. Register mail previews in main.rs if using #[mailer_preview]:
+   .mail_previews(mail_previews![UserMailer])
+
+3. Preview at: http://localhost:3000/dev/mailer/previews (dev mode)
 ```
 
 ### task

@@ -31,7 +31,7 @@ async fn create_post_returns_redirect() {
 
     let res = client
         .post("/posts")
-        .form(&[("title", "Hello"), ("body", "World")])
+        .form("title=Hello&body=World")  // form() takes a URL-encoded &str
         .send()
         .await;
 
@@ -51,9 +51,9 @@ better in tests.
 
 ```rust
 // Good: free functions
-pub async fn find_post(conn: &mut AsyncPgConnection, id: i64) -> AutumnResult<Post> {
+pub async fn find_post(conn: &mut AsyncPgConnection, post_id: i64) -> AutumnResult<Post> {
     use crate::schema::posts::dsl::*;
-    posts.filter(post_id.eq(id))
+    posts.find(post_id)  // generated PK column is `id`; use .find() for primary key lookups
         .first(conn)
         .await
         .map_err(|_| AutumnError::not_found_msg("post not found"))

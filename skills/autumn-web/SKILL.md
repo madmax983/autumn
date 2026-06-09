@@ -90,6 +90,19 @@ validator = { version = "0.20", features = ["derive"] }
 Use `pq-sys = { version = "0.7", features = ["bundled_without_openssl"] }`
 when avoiding a system libpq install.
 
+For a reddit-clone-style app with live feeds, file uploads, and blob variants:
+```toml
+autumn-web = { version = "0.5", features = [
+    "mail",       # transactional email + mailer previews
+    "ws",         # WebSocket routes, SSE, broadcast channels
+    "presence",   # Presence extractor for online-user tracking
+    "storage",    # BlobStore + Blob columns + signed URLs
+    "multipart",  # multipart/form-data file uploads
+    "redis",      # Redis sessions, channels, and job backend
+    "variants",   # blob.variant(...) image transformation
+] }
+```
+
 ## Feature flags
 
 Defaults: `maud`, `htmx`, `tailwind`, `db`, `cache-moka`.
