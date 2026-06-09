@@ -1019,8 +1019,11 @@ fn rewrite_features_line(line: &str, feature: &str) -> String {
     {
         let abs_end = open + close_rel;
         let body = &line[open + 1..abs_end];
-        let separator = if body.trim().trim_end_matches(',').trim().is_empty() {
+        let body_trimmed = body.trim();
+        let separator = if body_trimmed.is_empty() {
             ""
+        } else if body_trimmed.ends_with(',') {
+            " "
         } else {
             ", "
         };
@@ -1067,8 +1070,11 @@ fn rewrite_dep_with_feature(line: &str, feature: &str) -> String {
         if let Some(bracket_end_rel) = line[abs_start..].find(']') {
             let abs_end = abs_start + bracket_end_rel;
             let body = &line[abs_start + 1..abs_end];
-            let separator = if body.trim().trim_end_matches(',').trim().is_empty() {
+            let body_trimmed = body.trim();
+            let separator = if body_trimmed.is_empty() {
                 ""
+            } else if body_trimmed.ends_with(',') {
+                " "
             } else {
                 ", "
             };
