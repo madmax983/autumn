@@ -993,7 +993,7 @@ fn ses_dispatch_handler(
 
 #[cfg(feature = "inbound-ses")]
 #[tokio::test]
-async fn ses_subscription_confirmation_returns_200() {
+async fn ses_subscription_confirmation_fetch_failure_returns_500() {
     set_skip_sns_verification();
 
     let router = InboundMailRouter::new()
@@ -1023,7 +1023,9 @@ async fn ses_subscription_confirmation_returns_200() {
         .body(body)
         .send()
         .await
-        .assert_status(200);
+        // The SubscribeURL is unreachable in tests, so the handler returns 500 and SNS
+        // will retry the SubscriptionConfirmation delivery.
+        .assert_status(500);
 }
 
 #[cfg(feature = "inbound-ses")]

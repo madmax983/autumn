@@ -1041,7 +1041,7 @@ pub(crate) fn parse_ses(body: &Bytes) -> Result<SnsParseResult, StatusCode> {
                         .and_then(|d| d.as_array())
                         .map(|arr| {
                             arr.iter()
-                                .filter_map(|v| v.as_str().map(|s| s.to_lowercase()))
+                                .filter_map(|v| v.as_str().map(str::to_owned))
                                 .collect()
                         })
                         .unwrap_or_default();
@@ -1049,9 +1049,12 @@ pub(crate) fn parse_ses(body: &Bytes) -> Result<SnsParseResult, StatusCode> {
                 }
             };
             let mut email = parse_rfc5322(Bytes::from(raw));
-            // Merge envelope recipients not already present in the RFC 5322 To header.
+            // Merge envelope recipients not already in the RFC 5322 To header.
+            // Compare case-insensitively to avoid duplicates while preserving original
+            // casing (needed for plus-address token extraction).
             for addr in envelope_to {
-                if !email.to.contains(&addr) {
+                let addr_lower = addr.to_ascii_lowercase();
+                if !email.to.iter().any(|t| t.to_ascii_lowercase() == addr_lower) {
                     email.to.push(addr);
                 }
             }
@@ -1329,12 +1332,12 @@ fn extract_multipart_bodies(
             .unwrap_or(part);
 
         // Split part into headers and body at the blank-line separator.
-        let Some((part_header_bytes, part_body_bytes)) = find_subslice(part, b"\r\n\r\n")
+        // If no blank-line separator exists, the part has no headers — treat the
+        // entire content as the body with empty headers (RFC 2045 §5.2 defaults apply).
+        let (part_header_bytes, part_body_bytes) = find_subslice(part, b"\r\n\r\n")
             .map(|p| (&part[..p], &part[p + 4..]))
             .or_else(|| find_subslice(part, b"\n\n").map(|p| (&part[..p], &part[p + 2..])))
-        else {
-            continue;
-        };
+            .unwrap_or((&part[..0], part));
 
         let part_headers = String::from_utf8_lossy(part_header_bytes);
         // Per RFC 2045 §5.2, a missing Content-Type defaults to text/plain.
@@ -1695,8 +1698,9 @@ fn parse_mailgun_form_data(
             });
         } else {
             // Text field: lossy conversion is acceptable.
-            let value = String::from_utf8_lossy(body_bytes).into_owned();
-            map.insert(name, value.trim_end_matches(['\r', '\n']).to_string());
+            // Do not trim trailing newlines — the boundary separator is already excluded
+            // by the line-anchored boundary split, so trailing content is intentional.
+            map.insert(name, String::from_utf8_lossy(body_bytes).into_owned());
         }
     }
     (map, file_parts)
@@ -1830,14 +1834,23 @@ fn build_ses_route(
             match parse_ses(&body) {
                 #[cfg(feature = "inbound-ses")]
                 Ok(SnsParseResult::SubscriptionConfirmation { url }) => {
-                    if let Err(e) = http_client.get(&url).send().await {
-                        // Log and continue: SNS will retry the SubscriptionConfirmation.
-                        tracing::error!(
-                            error = %e,
-                            "inbound_mail.ses: SNS subscription confirmation fetch failed"
-                        );
+                    match http_client
+                        .get(&url)
+                        .send()
+                        .await
+                        .and_then(|r| r.error_for_status())
+                    {
+                        Ok(_) => StatusCode::OK,
+                        Err(e) => {
+                            // Return 5xx so SNS retries the SubscriptionConfirmation delivery,
+                            // giving us another chance to GET the SubscribeURL.
+                            tracing::error!(
+                                error = %e,
+                                "inbound_mail.ses: SNS subscription confirmation fetch failed"
+                            );
+                            StatusCode::INTERNAL_SERVER_ERROR
+                        }
                     }
-                    StatusCode::OK
                 }
                 #[cfg(not(feature = "inbound-ses"))]
                 Ok(SnsParseResult::SubscriptionConfirmation { .. }) => StatusCode::OK,
