@@ -100,8 +100,15 @@ where
         // it directly, rather than whatever child span happens to be current.
         let ctx =
             LogContext::with_filter(request_id, Arc::clone(&self.filter)).with_span(span.clone());
-        let fut = self.inner.call(req).instrument(span);
-        context::scoped(ctx, fut)
+
+        // Construct the inner future with the request span entered *and* the log
+        // context installed, so any synchronous work a downstream layer performs
+        // in its own `Service::call` (logging, `with_log_field`) is correlated
+        // too — not just the async polling of the returned future.
+        let inner = span
+            .in_scope(|| context::sync_scope(ctx.clone(), || self.inner.call(req)))
+            .instrument(span);
+        context::scoped(ctx, inner)
     }
 }
 
@@ -197,6 +204,47 @@ mod tests {
             assert_eq!(handled.request_id.as_deref(), Some(header_id.as_str()));
             assert_eq!(handled.user_id.as_deref(), Some("42"));
         });
+    }
+
+    #[tokio::test]
+    async fn downstream_synchronous_call_runs_inside_the_context() {
+        // A downstream service that inspects the context in its *synchronous*
+        // `Service::call` (before returning a future) must already see it.
+        #[derive(Clone)]
+        struct ProbeService {
+            seen: Arc<Mutex<Option<bool>>>,
+        }
+        impl Service<Request<Body>> for ProbeService {
+            type Response = axum::response::Response;
+            type Error = std::convert::Infallible;
+            type Future =
+                std::future::Ready<Result<axum::response::Response, std::convert::Infallible>>;
+            fn poll_ready(
+                &mut self,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
+            }
+            fn call(&mut self, _req: Request<Body>) -> Self::Future {
+                *self.seen.lock().unwrap() = Some(context::current().is_some());
+                std::future::ready(Ok(axum::response::Response::new(Body::empty())))
+            }
+        }
+
+        let seen = Arc::new(Mutex::new(None));
+        let svc = LogContextLayer::new(filter()).layer(ProbeService {
+            seen: Arc::clone(&seen),
+        });
+        let _ = svc
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            Some(true),
+            "downstream Service::call should run inside the log context"
+        );
     }
 
     #[tokio::test]

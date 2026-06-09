@@ -41,6 +41,11 @@ tokio::task_local! {
     static CURRENT: LogContext;
 }
 
+/// Field keys reserved for the built-in correlation ids. Custom fields using
+/// these names are ignored so they can never shadow the authoritative values
+/// when [`LogFields`] flattens custom fields alongside the core ids.
+const RESERVED_FIELD_KEYS: [&str; 3] = ["request_id", "user_id", "tenant_id"];
+
 /// A snapshot of the fields carried by the current request context.
 ///
 /// Returned by [`LogContext::snapshot`] / [`snapshot`]. Serializes to a flat
@@ -158,6 +163,11 @@ impl LogContext {
     /// [`ParameterFilter`]) are replaced with `[FILTERED]` before storage.
     pub fn insert_field(&self, key: impl Into<String>, value: impl Into<String>) {
         let key = key.into();
+        // Never let a custom field shadow a built-in correlation id: the core
+        // ids have dedicated setters and are flattened alongside `fields`.
+        if RESERVED_FIELD_KEYS.contains(&key.as_str()) {
+            return;
+        }
         let value = if self.filter.matches_key(&key) {
             FILTERED_PLACEHOLDER.to_owned()
         } else {
@@ -205,6 +215,14 @@ pub fn scoped<F: Future>(
     future: F,
 ) -> tokio::task::futures::TaskLocalFuture<LogContext, F> {
     CURRENT.scope(ctx, future)
+}
+
+/// Run a synchronous closure with `ctx` installed as the current context.
+///
+/// Used by the middleware so a downstream layer's synchronous `Service::call`
+/// work (which runs before the request future is polled) is also correlated.
+pub fn sync_scope<R>(ctx: LogContext, f: impl FnOnce() -> R) -> R {
+    CURRENT.sync_scope(ctx, f)
 }
 
 /// Return a handle to the current request context, if one is installed.
@@ -319,6 +337,32 @@ mod tests {
             let snap = snapshot().unwrap();
             assert_eq!(snap.fields.get("password").map(String::as_str), Some(FILTERED_PLACEHOLDER));
             assert_eq!(snap.fields.get("order_id").map(String::as_str), Some("ok"));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn custom_fields_cannot_shadow_core_correlation_ids() {
+        let ctx = LogContext::new(Some("real-req".to_owned()));
+        scope(ctx, async {
+            set_user_id("real-user");
+            // Attempt to override core ids via the custom-field channel.
+            with_log_field("request_id", "spoofed");
+            with_log_field("user_id", "spoofed");
+            with_log_field("tenant_id", "spoofed");
+            with_log_field("order_id", "kept");
+
+            let snap = snapshot().unwrap();
+            assert_eq!(snap.request_id.as_deref(), Some("real-req"));
+            assert_eq!(snap.user_id.as_deref(), Some("real-user"));
+            assert!(!snap.fields.contains_key("request_id"));
+            assert!(!snap.fields.contains_key("user_id"));
+            assert!(!snap.fields.contains_key("tenant_id"));
+            assert_eq!(snap.fields.get("order_id").map(String::as_str), Some("kept"));
+
+            // Serialized form has exactly one request_id, carrying the real value.
+            let v = serde_json::to_value(&snap).unwrap();
+            assert_eq!(v["request_id"], "real-req");
         })
         .await;
     }
