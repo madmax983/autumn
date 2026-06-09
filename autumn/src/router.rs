@@ -1524,9 +1524,14 @@ where
     S: Clone + Send + Sync + 'static,
 {
     if config.bot_protection.enabled {
+        let mut exempt = config.security.csrf.exempt_paths.clone();
+        for endpoint in &config.security.webhooks.endpoints {
+            exempt.push(endpoint.path.clone());
+        }
         let layer =
             crate::security::captcha::BotProtectionLayer::from_config(&config.bot_protection)
-                .with_max_scan_bytes(config.security.upload.max_request_size_bytes);
+                .with_max_scan_bytes(config.security.upload.max_request_size_bytes)
+                .with_exempt_paths(exempt);
         tracing::info!(
             provider = ?config.bot_protection.provider,
             dev_bypass = config.bot_protection.dev_bypass,

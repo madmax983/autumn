@@ -1357,7 +1357,7 @@ fn extract_multipart_bodies(
             .or_else(|| find_subslice(part, b"\n\n").map(|p| (&part[..p], &part[p + 2..])))
             .unwrap_or((&part[..0], part));
 
-        let part_headers = String::from_utf8_lossy(part_header_bytes);
+        let part_headers = unfold_mime_headers(&String::from_utf8_lossy(part_header_bytes));
         // Per RFC 2045 §5.2, a missing Content-Type defaults to text/plain.
         let part_ct_lower = part_headers
             .lines()
@@ -1586,6 +1586,52 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
+/// Unfold RFC 2822 §2.2.3 header folding.
+///
+/// A CRLF (or bare LF) immediately before a whitespace character is a fold
+/// point; the line ending is dropped so the header reads as one logical line.
+fn unfold_mime_headers(s: &str) -> String {
+    s.replace("\r\n ", " ")
+        .replace("\r\n\t", "\t")
+        .replace("\n ", " ")
+        .replace("\n\t", "\t")
+}
+
+/// Find the first part-end delimiter (`crlf_delim` preferred over `lf_delim`)
+/// whose immediately following byte is a valid MIME terminator.
+///
+/// Per RFC 2046 §5.1.1, a boundary delimiter must be followed by `\r\n`, `\n`,
+/// `--`, SP, HT, or end-of-input — never by an arbitrary character such as a
+/// digit. This prevents a boundary-prefix false match (e.g. `\r\n--abc` inside
+/// `\r\n--abc123`) from prematurely ending a MIME part.
+fn find_part_end(body: &[u8], crlf_delim: &[u8], lf_delim: &[u8]) -> Option<usize> {
+    let mut pos = 0;
+    while let Some(rel) = find_subslice(&body[pos..], crlf_delim) {
+        let abs = pos + rel;
+        let after = abs + crlf_delim.len();
+        if matches!(
+            body.get(after),
+            None | Some(b'\r') | Some(b'\n') | Some(b'-') | Some(b' ') | Some(b'\t')
+        ) {
+            return Some(abs);
+        }
+        pos = abs + 1;
+    }
+    pos = 0;
+    while let Some(rel) = find_subslice(&body[pos..], lf_delim) {
+        let abs = pos + rel;
+        let after = abs + lf_delim.len();
+        if matches!(
+            body.get(after),
+            None | Some(b'\r') | Some(b'\n') | Some(b'-') | Some(b' ') | Some(b'\t')
+        ) {
+            return Some(abs);
+        }
+        pos = abs + 1;
+    }
+    None
+}
+
 /// Parse a `multipart/form-data` Mailgun webhook body into a field map and attachment list.
 ///
 /// Operates at the byte level so binary file parts are not corrupted by lossy UTF-8 conversion.
@@ -1612,7 +1658,17 @@ fn parse_mailgun_form_data(
         let Some(rel) = find_subslice(&body[search_from..], delim_bytes) else {
             break;
         };
-        let after_delim = search_from + rel + delim_bytes.len();
+        let abs = search_from + rel;
+        let after_delim = abs + delim_bytes.len();
+
+        // RFC 2046: boundary must be followed by a valid terminator byte.
+        if !matches!(
+            body.get(after_delim),
+            None | Some(b'\r') | Some(b'\n') | Some(b'-') | Some(b' ') | Some(b'\t')
+        ) {
+            search_from = abs + 1;
+            continue;
+        }
 
         // "--{boundary}--" is the final delimiter — stop.
         if body[after_delim..].starts_with(b"--") {
@@ -1629,9 +1685,10 @@ fn parse_mailgun_form_data(
         };
 
         // The part body ends just before the next "\r\n--{boundary}" or "\n--{boundary}".
-        let part_end = find_subslice(&body[part_start..], crlf_delim_bytes)
+        // `find_part_end` validates the terminator byte to avoid false matches on
+        // boundary-prefix strings (e.g. "\r\n--abc" inside "\r\n--abc123").
+        let part_end = find_part_end(&body[part_start..], crlf_delim_bytes, lf_delim_bytes)
             .map(|p| part_start + p)
-            .or_else(|| find_subslice(&body[part_start..], lf_delim_bytes).map(|p| part_start + p))
             .unwrap_or(body.len());
 
         search_from = part_end;
@@ -1646,8 +1703,9 @@ fn parse_mailgun_form_data(
             continue;
         };
 
-        // Headers are ASCII; lossy conversion is safe here.
-        let headers_str = String::from_utf8_lossy(headers_bytes);
+        // Headers are ASCII; lossy conversion is safe here.  Unfold before
+        // parsing so a folded Content-Disposition reads as one logical line.
+        let headers_str = unfold_mime_headers(&String::from_utf8_lossy(headers_bytes));
 
         let disposition = headers_str
             .lines()
@@ -2729,6 +2787,81 @@ mod tests {
         assert_eq!(atts.len(), 1);
         // The CRLF before the boundary delimiter is stripped by MIME before QP decode.
         assert_eq!(atts[0].data.as_ref(), b"Hello World");
+    }
+
+    #[test]
+    fn unfold_mime_headers_drops_crlf_fold() {
+        let folded = "Content-Type: text/plain;\r\n charset=utf-8";
+        assert_eq!(
+            unfold_mime_headers(folded),
+            "Content-Type: text/plain; charset=utf-8"
+        );
+    }
+
+    #[test]
+    fn unfold_mime_headers_drops_lf_fold() {
+        let folded = "Content-Disposition: form-data;\n name=\"field1\"";
+        assert_eq!(
+            unfold_mime_headers(folded),
+            "Content-Disposition: form-data; name=\"field1\""
+        );
+    }
+
+    #[test]
+    fn extract_multipart_bodies_folded_content_type() {
+        let b = "bnd";
+        let body = format!(
+            "--{b}\r\n\
+             Content-Type: text/plain;\r\n charset=utf-8\r\n\
+             \r\n\
+             Hello\r\n\
+             --{b}--\r\n"
+        );
+        let ct = format!("multipart/mixed; boundary={b}");
+        let (text, _, _) = extract_multipart_bodies(body.as_bytes(), &ct);
+        assert_eq!(
+            text.as_deref(),
+            Some("Hello"),
+            "folded Content-Type must be unfolded before parsing"
+        );
+    }
+
+    #[test]
+    fn parse_mailgun_form_data_folded_content_disposition() {
+        let b = "bnd";
+        let body = format!(
+            "--{b}\r\n\
+             Content-Disposition: form-data;\r\n name=\"field1\"\r\n\
+             \r\n\
+             hello\r\n\
+             --{b}--\r\n"
+        );
+        let ct = format!("multipart/form-data; boundary={b}");
+        let (fields, _) = parse_mailgun_form_data(body.as_bytes(), &ct);
+        assert_eq!(
+            fields.get("field1").map(String::as_str),
+            Some("hello"),
+            "folded Content-Disposition must be unfolded before name extraction"
+        );
+    }
+
+    #[test]
+    fn parse_mailgun_form_data_boundary_prefix_not_split() {
+        // A line that starts with "--{boundary}" followed by non-terminator bytes
+        // (e.g. "--abc123") must NOT be treated as a valid MIME part boundary.
+        let b = "abc";
+        let body = format!(
+            "--{b}\r\nContent-Disposition: form-data; name=\"field1\"\r\n\r\nvalue1\r\n\
+             --{b}123\r\nextra content\r\n\
+             --{b}--\r\n"
+        );
+        let ct = format!("multipart/form-data; boundary={b}");
+        let (fields, _) = parse_mailgun_form_data(body.as_bytes(), &ct);
+        assert_eq!(
+            fields.get("field1").map(String::as_str),
+            Some("value1\r\n--abc123\r\nextra content"),
+            "boundary prefix followed by non-terminator must not split the part"
+        );
     }
 
     #[test]

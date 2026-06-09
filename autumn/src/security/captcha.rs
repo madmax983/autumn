@@ -422,6 +422,8 @@ struct BotProtectionSettings {
     form_field: String,
     /// Maximum body bytes scanned when searching for the CAPTCHA token field.
     max_scan_bytes: usize,
+    /// Paths that are exempt from CAPTCHA verification (e.g. inbound webhook endpoints).
+    exempt_paths: Vec<String>,
 }
 
 /// Tower [`Layer`] that enforces CAPTCHA verification on mutating requests.
@@ -457,6 +459,7 @@ impl BotProtectionLayer {
                 dev_bypass: false,
                 form_field,
                 max_scan_bytes: 2 * 1024 * 1024,
+                exempt_paths: Vec::new(),
             }),
         }
     }
@@ -517,6 +520,7 @@ impl BotProtectionLayer {
                 dev_bypass: config.dev_bypass,
                 form_field,
                 max_scan_bytes: 2 * 1024 * 1024,
+                exempt_paths: Vec::new(),
             }),
         }
     }
@@ -546,6 +550,23 @@ impl BotProtectionLayer {
     pub fn with_max_scan_bytes(mut self, bytes: usize) -> Self {
         let settings = Arc::make_mut(&mut self.settings);
         settings.max_scan_bytes = bytes;
+        self
+    }
+
+    /// Set the path prefixes exempt from CAPTCHA verification.
+    ///
+    /// POST requests whose URI path starts with any prefix in `paths` skip the
+    /// CAPTCHA check entirely. Use this for webhook endpoints that call into
+    /// the application programmatically (e.g. inbound mail, payment callbacks)
+    /// and therefore cannot present a CAPTCHA token.
+    ///
+    /// The framework wires CSRF-exempt paths and webhook endpoint paths
+    /// automatically; use this builder only when constructing a scoped
+    /// [`BotProtectionLayer`] directly.
+    #[must_use]
+    pub fn with_exempt_paths(mut self, paths: Vec<String>) -> Self {
+        let settings = Arc::make_mut(&mut self.settings);
+        settings.exempt_paths = paths;
         self
     }
 }
@@ -662,6 +683,18 @@ where
     fn call(&mut self, mut req: Request<axum::body::Body>) -> Self::Future {
         // Safe methods (GET, HEAD, OPTIONS, TRACE) are always exempt.
         if is_safe_method(req.method()) {
+            let mut inner = self.inner.clone();
+            std::mem::swap(&mut self.inner, &mut inner);
+            return Box::pin(async move { inner.call(req).await });
+        }
+
+        // Webhook/API paths that cannot carry a CAPTCHA token are exempt.
+        if self
+            .settings
+            .exempt_paths
+            .iter()
+            .any(|ep| req.uri().path().starts_with(ep.as_str()))
+        {
             let mut inner = self.inner.clone();
             std::mem::swap(&mut self.inner, &mut inner);
             return Box::pin(async move { inner.call(req).await });
@@ -1023,6 +1056,29 @@ mod tests {
         };
         let html = bot_protection_widget(&config).into_string();
         assert!(html.is_empty());
+    }
+
+    #[tokio::test]
+    async fn exempt_path_bypasses_captcha() {
+        let layer = BotProtectionLayer::new(Arc::new(TestCaptchaProvider::new("required")))
+            .with_exempt_paths(vec!["/webhook/".to_string()]);
+        let app = Router::new()
+            .route("/webhook/inbound", post(ok_handler))
+            .layer(layer);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/webhook/inbound")
+                    .header("Content-Type", "application/x-www-form-urlencoded")
+                    .body(Body::from("field=value"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]
