@@ -2487,7 +2487,7 @@ impl AppBuilder {
                 // so the application can still start and the conflict is visible.
                 if all_routes
                     .iter()
-                    .any(|r| r.method.eq_ignore_ascii_case("POST") && r.path == path)
+                    .any(|r| r.method == http::Method::POST && r.path == path.as_str())
                 {
                     tracing::warn!(
                         path = %path,

@@ -1216,6 +1216,9 @@ fn parse_rfc5322(raw: Bytes) -> InboundEmail {
                     .decode(stripped.as_bytes())
                     .map(Bytes::from)
                     .unwrap_or_else(|_| Bytes::copy_from_slice(body_bytes))
+            } else if cte == "quoted-printable" {
+                let body_str = String::from_utf8_lossy(body_bytes).into_owned();
+                Bytes::from(decode_transfer_encoding(&body_str, &cte).into_bytes())
             } else {
                 Bytes::copy_from_slice(body_bytes)
             };
@@ -3017,6 +3020,31 @@ mod tests {
         assert_eq!(att.filename.as_deref(), Some("doc.pdf"));
         // The decoded bytes should match the original PDF stub.
         assert_eq!(att.data.as_ref(), b"%PDF-1.0");
+    }
+
+    #[test]
+    fn rfc5322_single_part_attachment_qp_decoded() {
+        // A single-part attachment with Content-Transfer-Encoding: quoted-printable
+        // must have its body decoded; handlers must not receive raw QP bytes.
+        let raw = "From: s@example.com\r\nTo: r@example.com\r\n\
+                   Content-Type: application/octet-stream\r\n\
+                   Content-Transfer-Encoding: quoted-printable\r\n\
+                   Content-Disposition: attachment; filename=\"hello.txt\"\r\n\
+                   \r\n\
+                   Hello=20World\r\n";
+        let email = parse_rfc5322(Bytes::from_static(raw.as_bytes()));
+        assert!(email.text_body.is_none());
+        assert!(email.html_body.is_none());
+        assert_eq!(email.attachments.len(), 1);
+        let att = &email.attachments[0];
+        assert_eq!(att.filename.as_deref(), Some("hello.txt"));
+        // The QP-decoded body retains the trailing CRLF from the message line.
+        let decoded = std::str::from_utf8(att.data.as_ref()).unwrap_or("<non-utf8>");
+        assert_eq!(
+            decoded.trim_end_matches(|c| c == '\r' || c == '\n'),
+            "Hello World",
+            "QP-encoded attachment must be decoded: got {decoded:?}"
+        );
     }
 
     #[test]
