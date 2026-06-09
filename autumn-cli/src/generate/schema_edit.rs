@@ -891,63 +891,66 @@ pub fn ensure_autumn_web_feature(existing: &str, feature: &str) -> String {
         if key_part != "[dependencies.autumn-web]" {
             continue;
         }
-        let section_start = i + 1;
-        // Section ends at the next TOML table header.
-        let section_end = lines[section_start..]
-            .iter()
-            .position(|l| {
-                let t = l.trim();
-                t.starts_with('[') && !t.is_empty()
-            })
-            .map_or(lines.len(), |p| section_start + p);
-
-        // Idempotency check across the whole section.
-        if lines[section_start..section_end]
-            .iter()
-            .any(|l| l.contains(&feature_quoted))
-        {
-            return existing.to_owned();
-        }
-
-        // Look for an existing `features = [...]` line in the section.
-        for (j, &sect_line) in lines[section_start..section_end].iter().enumerate() {
-            let abs_j = section_start + j;
-            if sect_line.trim_start().starts_with("features") {
-                let new_feat_line = rewrite_features_line(sect_line, feature);
-                return splice_feature_at(
-                    &lines,
-                    abs_j,
-                    &new_feat_line,
-                    sect_line,
-                    &feature_quoted,
-                    existing.ends_with('\n'),
-                );
-            }
-        }
-
-        // No features key found — append one before the section end.
-        let feat_line = format!("features = [{feature_quoted}]");
-        let insert_before = section_end;
-        let mut out = String::with_capacity(existing.len() + feat_line.len() + 2);
-        for (k, &l) in lines.iter().enumerate() {
-            if k == insert_before {
-                out.push_str(&feat_line);
-                out.push('\n');
-            }
-            out.push_str(l);
-            out.push('\n');
-        }
-        if insert_before == lines.len() {
-            out.push_str(&feat_line);
-            out.push('\n');
-        }
-        if !existing.ends_with('\n') && out.ends_with('\n') {
-            out.pop();
-        }
-        return out;
+        return add_feature_to_deps_section(&lines, i + 1, existing, feature, &feature_quoted);
     }
 
     existing.to_owned()
+}
+
+/// Add `feature` to a `[dependencies.autumn-web]` section starting at `section_start`.
+fn add_feature_to_deps_section(
+    lines: &[&str],
+    section_start: usize,
+    existing: &str,
+    feature: &str,
+    feature_quoted: &str,
+) -> String {
+    let section_end = lines[section_start..]
+        .iter()
+        .position(|l| {
+            let t = l.trim();
+            t.starts_with('[') && !t.is_empty()
+        })
+        .map_or(lines.len(), |p| section_start + p);
+
+    if lines[section_start..section_end]
+        .iter()
+        .any(|l| l.contains(feature_quoted))
+    {
+        return existing.to_owned();
+    }
+
+    for (j, &sect_line) in lines[section_start..section_end].iter().enumerate() {
+        if sect_line.trim_start().starts_with("features") {
+            return splice_feature_at(
+                lines,
+                section_start + j,
+                &rewrite_features_line(sect_line, feature),
+                sect_line,
+                feature_quoted,
+                existing.ends_with('\n'),
+            );
+        }
+    }
+
+    let feat_line = format!("features = [{feature_quoted}]");
+    let mut out = String::with_capacity(existing.len() + feat_line.len() + 2);
+    for (k, &l) in lines.iter().enumerate() {
+        if k == section_end {
+            out.push_str(&feat_line);
+            out.push('\n');
+        }
+        out.push_str(l);
+        out.push('\n');
+    }
+    if section_end == lines.len() {
+        out.push_str(&feat_line);
+        out.push('\n');
+    }
+    if !existing.ends_with('\n') && out.ends_with('\n') {
+        out.pop();
+    }
+    out
 }
 
 /// Append `feature` to a standalone `features = [...]` TOML line.
