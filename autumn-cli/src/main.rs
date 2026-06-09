@@ -1087,12 +1087,12 @@ enum GenerateCommands {
     ///
     /// Example:
     ///
-    ///   autumn generate system-test <Name>
-    ///   autumn generate system-test <Name> --dry-run
+    ///   autumn generate system-test `<Name>`
+    ///   autumn generate system-test `<Name>` --dry-run
     ///
     /// After generation, run with:
     ///
-    ///   cargo test --features system-tests --test <name> -- --include-ignored
+    ///   cargo test --features system-tests --test `<name>` -- --include-ignored
     #[command(name = "system-test", verbatim_doc_comment)]
     SystemTest {
         /// Test name (`PascalCase` or `snake_case`, e.g. `TodoFlow`).
