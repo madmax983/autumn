@@ -19,16 +19,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `request_id`/`user_id`/`tenant_id`, so every `tracing` event emitted during
     the request automatically correlates back to it — no manual field threading.
   - When the request authenticates, `user_id` is added to the context
-    automatically (from the `#[secured]` session check); when multi-tenancy
-    resolves a tenant, `tenant_id` is added automatically (from the tenancy
-    middleware).
+    automatically (from both the `#[secured]` session check and the `RequireAuth`
+    middleware); when multi-tenancy resolves a tenant, `tenant_id` is added
+    automatically (from the tenancy middleware).
   - Handler/service code can attach custom fields with
     `autumn_web::log::context::with_log_field("order_id", id)` (re-exported from
-    the prelude); those fields appear on all subsequent context snapshots /
-    captured events for the rest of the request.
+    the prelude). The well-known ids (`request_id`/`user_id`/`tenant_id`) ride the
+    request span and render in ordinary `tracing` output; custom fields are
+    carried in the context for **structured** consumers — the actuator log buffer
+    (#1168), the access line (#999), or any context-aware layer — rather than the
+    default stdout formatter. Reserved keys cannot be shadowed by custom fields.
+  - The context stays active while a streaming/SSE response body is produced (the
+    body is re-scoped per frame, mirroring tenancy), and synchronous work in a
+    downstream layer's `Service::call` is correlated too.
   - Context is isolated per request (nothing leaks across requests) and a
     `tokio::spawn`'d task does **not** inherit it unless explicitly propagated via
-    `log::context::in_current_context(..)`.
+    `log::context::in_current_context(..)`, which re-enters the request span too.
   - Sensitive custom-field values are scrubbed through the existing
     `log/filter.rs` key filter (#697), so secrets never enter the context output.
   - Additive, non-breaking surface (minor version bump). Establishes the

@@ -12,10 +12,14 @@
 //! the default ingress path. Place it inner to `RequestIdLayer` so the request
 //! id is available.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use axum::http::{Request, Response};
+use http_body::{Body as HttpBody, Frame, SizeHint};
+use pin_project_lite::pin_project;
 use tower::{Layer, Service};
 use tracing::Instrument as _;
 
@@ -66,13 +70,13 @@ pub struct LogContextService<S> {
 impl<S, ReqBody, ResBody> Service<Request<ReqBody>> for LogContextService<S>
 where
     S: Service<Request<ReqBody>, Response = Response<ResBody>>,
+    S::Future: Send + 'static,
+    S::Error: 'static,
+    ResBody: HttpBody + Send + 'static,
 {
-    type Response = S::Response;
+    type Response = Response<LogContextBody<ResBody>>;
     type Error = S::Error;
-    type Future = tokio::task::futures::TaskLocalFuture<
-        LogContext,
-        tracing::instrument::Instrumented<S::Future>,
-    >;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx)
@@ -99,6 +103,7 @@ where
         // it directly, rather than whatever child span happens to be current.
         let ctx =
             LogContext::with_filter(request_id, Arc::clone(&self.filter)).with_span(span.clone());
+        let body_ctx = ctx.clone();
 
         // Construct the inner future with the request span entered *and* the log
         // context installed, so any synchronous work a downstream layer performs
@@ -107,7 +112,60 @@ where
         let inner = span
             .in_scope(|| context::sync_scope(ctx.clone(), || self.inner.call(req)))
             .instrument(span);
-        context::scoped(ctx, inner)
+
+        // Wrap the response body so the context is re-established on every frame
+        // poll: a lazy/streaming body (SSE, `Body::from_stream`) is produced
+        // after this future resolves, otherwise dropping the context before any
+        // stream code runs. Mirrors `TenantPropagatingBody`.
+        Box::pin(context::scoped(ctx, async move {
+            let response = inner.await?;
+            let (parts, body) = response.into_parts();
+            Ok(Response::from_parts(
+                parts,
+                LogContextBody::new(body, body_ctx),
+            ))
+        }))
+    }
+}
+
+pin_project! {
+    /// Response body wrapper that re-establishes the request [`LogContext`] (and
+    /// re-enters its span) on every frame poll, so logs emitted while producing
+    /// lazy/streaming response bodies stay correlated to the originating request.
+    pub struct LogContextBody<B> {
+        #[pin]
+        inner: B,
+        ctx: LogContext,
+    }
+}
+
+impl<B> LogContextBody<B> {
+    const fn new(inner: B, ctx: LogContext) -> Self {
+        Self { inner, ctx }
+    }
+}
+
+impl<B: HttpBody> HttpBody for LogContextBody<B> {
+    type Data = B::Data;
+    type Error = B::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.project();
+        let ctx = this.ctx.clone();
+        let span = ctx.span();
+        let _entered = span.enter();
+        context::sync_scope(ctx, || this.inner.poll_frame(cx))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
     }
 }
 
@@ -149,6 +207,59 @@ mod tests {
 
     fn filter() -> Arc<ParameterFilter> {
         Arc::new(ParameterFilter::default())
+    }
+
+    #[tokio::test]
+    async fn streaming_body_frames_re_establish_the_context() {
+        // A response body produced lazily is polled after the request future has
+        // resolved (and the task-local scope has ended). LogContextBody must
+        // re-install the context for each frame poll.
+        struct ProbeBody {
+            // The request_id observed during each frame poll (one entry per poll).
+            seen: Arc<Mutex<Vec<Option<String>>>>,
+            done: bool,
+        }
+        impl HttpBody for ProbeBody {
+            type Data = axum::body::Bytes;
+            type Error = std::convert::Infallible;
+            fn poll_frame(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+                // Record what the context looks like *during* frame production.
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .push(context::snapshot().and_then(|s| s.request_id));
+                if self.done {
+                    Poll::Ready(None)
+                } else {
+                    self.done = true;
+                    Poll::Ready(Some(Ok(Frame::data(axum::body::Bytes::from_static(b"x")))))
+                }
+            }
+        }
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let ctx = LogContext::new(Some("req-stream".to_owned()));
+        let body = LogContextBody::new(
+            ProbeBody {
+                seen: Arc::clone(&seen),
+                done: false,
+            },
+            ctx,
+        );
+
+        // Poll the wrapped body with NO ambient context installed.
+        let mut body = Box::pin(body);
+        let _ = std::future::poll_fn(|cx| body.as_mut().poll_frame(cx)).await;
+
+        let captured = seen.lock().unwrap().clone();
+        assert_eq!(
+            captured,
+            vec![Some("req-stream".to_owned())],
+            "streaming body frame production lost the request context"
+        );
     }
 
     #[test]

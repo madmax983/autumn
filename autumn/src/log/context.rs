@@ -19,6 +19,15 @@
 //! moved onto a new task with [`tokio::spawn`] does **not** inherit the current
 //! request context — call [`in_current_context`] to propagate it explicitly.
 //!
+//! # What renders where
+//!
+//! The well-known correlation ids (`request_id`/`user_id`/`tenant_id`) ride the
+//! request span, so they appear in ordinary `tracing` output for every event.
+//! Custom fields added via [`with_log_field`] live in the request context and
+//! are surfaced by **structured** consumers — the actuator log buffer (#1168),
+//! the access line (#999), or any context-aware layer — rather than the default
+//! stdout formatter.
+//!
 //! # Example
 //!
 //! ```rust,no_run
@@ -26,7 +35,9 @@
 //!
 //! // deep inside a handler
 //! context::with_log_field("order_id", "A-1001");
-//! tracing::info!("charged card"); // carries request_id, user_id, order_id
+//! // request_id/user_id render on this line via the request span; order_id is
+//! // carried in the context for structured consumers.
+//! tracing::info!("charged card");
 //! ```
 
 use std::collections::BTreeMap;
@@ -177,6 +188,14 @@ impl LogContext {
         if let Ok(mut guard) = self.inner.write() {
             guard.fields.insert(key, value);
         }
+    }
+
+    /// Clone the request span attached to this context (or a disabled span when
+    /// none is attached). Used to re-enter the span while re-establishing the
+    /// context during streaming response-body production.
+    #[must_use]
+    pub fn span(&self) -> tracing::Span {
+        self.span.clone()
     }
 
     /// Take a point-in-time snapshot of all fields on this context.
