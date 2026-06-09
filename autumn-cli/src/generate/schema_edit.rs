@@ -790,9 +790,12 @@ pub fn ensure_autumn_web_feature(existing: &str, feature: &str) -> String {
         if !in_deps {
             continue;
         }
-        // Only inspect lines that start with `autumn-web`.
+        // Match only the exact `autumn-web` key — not prefixes like `autumn-web-admin`.
         let after_ws = line.trim_start();
-        if !after_ws.starts_with("autumn-web") {
+        let Some(rest) = after_ws.strip_prefix("autumn-web") else {
+            continue;
+        };
+        if rest.starts_with(|c: char| c != '=' && !c.is_whitespace()) {
             continue;
         }
         // Idempotency check.

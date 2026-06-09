@@ -1136,45 +1136,43 @@ async fn mailgun_empty_signing_key_returns_500() {
         .assert_status(500);
 }
 
-// ── on_complaint API ──────────────────────────────────────────────────────────
+// ── on_spam API ───────────────────────────────────────────────────────────────
 
-static COMPLAINT_CALLS: AtomicUsize = AtomicUsize::new(0);
+static SPAM_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 
-fn complaint_fn(
+fn spam_fn(
     email: InboundEmail,
 ) -> std::pin::Pin<
     Box<dyn std::future::Future<Output = autumn_web::AutumnResult<()>> + Send + 'static>,
 > {
-    COMPLAINT_CALLS.fetch_add(1, Ordering::SeqCst);
+    SPAM_HANDLER_CALLS.fetch_add(1, Ordering::SeqCst);
     let _ = email;
     Box::pin(async { Ok(()) })
 }
 
 #[test]
-fn on_complaint_registers_handler() {
+fn on_spam_registers_handler() {
     // Verify the builder API compiles and stores the handler without panicking.
     let router = InboundMailRouter::new()
         .endpoint(InboundMailEndpointConfig::generic("/inbound"))
-        .on_complaint(complaint_fn);
-    // complaint_handler is pub(crate) so we can't assert on it, but registration
-    // must not panic.
+        .on_spam(spam_fn);
     drop(router);
 }
 
 #[tokio::test]
-async fn mailgun_complaint_dispatched_to_handler() {
-    COMPLAINT_CALLS.store(0, Ordering::SeqCst);
+async fn mailgun_spam_flagged_dispatched_to_spam_handler() {
+    SPAM_HANDLER_CALLS.store(0, Ordering::SeqCst);
 
     let ts = &std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs()
         .to_string();
-    let key = "complaint-key";
+    let key = "spam-key";
     let body = mailgun_form(
         key,
         ts,
-        "compl-tok",
+        "spam-tok",
         &[
             ("from", "sender@example.com"),
             ("to", "user@example.com"),
@@ -1190,7 +1188,7 @@ async fn mailgun_complaint_dispatched_to_handler() {
             processing: ProcessingMode::Sync,
             handler: noop_handler,
         })
-        .on_complaint(complaint_fn);
+        .on_spam(spam_fn);
 
     let client = TestApp::new()
         .inbound_mail_router(router)
@@ -1205,5 +1203,5 @@ async fn mailgun_complaint_dispatched_to_handler() {
         .await
         .assert_status(200);
 
-    assert_eq!(COMPLAINT_CALLS.load(Ordering::SeqCst), 1);
+    assert_eq!(SPAM_HANDLER_CALLS.load(Ordering::SeqCst), 1);
 }

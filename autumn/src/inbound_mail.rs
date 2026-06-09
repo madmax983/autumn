@@ -686,7 +686,7 @@ pub struct InboundMailRouter {
     pub(crate) handlers: Vec<InboundMailHandlerInfo>,
     pub(crate) fallback: Option<InboundMailHandlerFn>,
     pub(crate) bounce_handler: Option<InboundMailHandlerFn>,
-    pub(crate) complaint_handler: Option<InboundMailHandlerFn>,
+    pub(crate) spam_handler: Option<InboundMailHandlerFn>,
 }
 
 impl Default for InboundMailRouter {
@@ -704,7 +704,7 @@ impl InboundMailRouter {
             handlers: Vec::new(),
             fallback: None,
             bounce_handler: None,
-            complaint_handler: None,
+            spam_handler: None,
         }
     }
 
@@ -739,10 +739,12 @@ impl InboundMailRouter {
         self
     }
 
-    /// Register a handler for complaint events.
+    /// Register a handler invoked when the provider marks the message as spam
+    /// (e.g. `X-Mailgun-Sflag: Yes`). This is a provider-side spam verdict, not
+    /// a user-initiated complaint/FBL event.
     #[must_use]
-    pub fn on_complaint(mut self, f: InboundMailHandlerFn) -> Self {
-        self.complaint_handler = Some(f);
+    pub fn on_spam(mut self, f: InboundMailHandlerFn) -> Self {
+        self.spam_handler = Some(f);
         self
     }
 
@@ -750,7 +752,7 @@ impl InboundMailRouter {
     ///
     /// Evaluation order:
     /// 1. Bounce handler (when `x-mailgun-bounced-address` header present).
-    /// 2. Complaint handler (when `x-mailgun-spam-flag: YES` header present).
+    /// 2. Spam handler (when provider spam verdict is `"yes"`).
     /// 3. Registered handlers, in order.
     /// 4. Fallback handler, if registered.
     /// 5. Log + drop with a `WARN` trace.
@@ -762,13 +764,13 @@ impl InboundMailRouter {
             return handler(email).await;
         }
 
-        // Complaint detection: Mailgun sets X-Mailgun-Sflag to "Yes" for spam complaints.
+        // Spam dispatch: provider-side spam verdict (e.g. X-Mailgun-Sflag: Yes).
         if email
             .spam_report
             .as_ref()
             .and_then(|r| r.verdict.as_deref())
             .map_or(false, |v| v.eq_ignore_ascii_case("yes"))
-            && let Some(handler) = self.complaint_handler
+            && let Some(handler) = self.spam_handler
         {
             return handler(email).await;
         }
@@ -1141,12 +1143,12 @@ fn parse_rfc5322(raw: Bytes) -> InboundEmail {
         .get("content-transfer-encoding")
         .map(|s| s.to_ascii_lowercase())
         .unwrap_or_default();
-    let body_str = body_block.trim().to_string();
+    let body_str = body_block.to_string();
     // Normalise the MIME type/subtype for matching (RFC 2045 §5 — case-insensitive),
     // but pass the original `content_type` value to boundary extraction so that
     // case-sensitive boundary parameter values are preserved.
     let ct_lower = content_type.to_ascii_lowercase();
-    let (text_body, html_body, attachments) = if body_str.is_empty() {
+    let (text_body, html_body, attachments) = if body_str.trim().is_empty() {
         (None, None, Vec::new())
     } else if ct_lower.starts_with("multipart/") {
         extract_multipart_bodies(&body_str, &content_type)
@@ -1274,16 +1276,17 @@ fn extract_multipart_bodies(
             continue;
         };
         // Lowercased content-type for matching; original-case for boundary extraction.
+        // Per RFC 2045 §5.2, a missing Content-Type defaults to text/plain.
         let part_ct_lower = part_headers
             .lines()
             .find(|l| l.to_ascii_lowercase().starts_with("content-type:"))
             .map(|l| l[13..].trim().to_ascii_lowercase())
-            .unwrap_or_default();
+            .unwrap_or_else(|| "text/plain".to_string());
         let part_ct_orig = part_headers
             .lines()
             .find(|l| l.to_ascii_lowercase().starts_with("content-type:"))
             .map(|l| l[13..].trim().to_string())
-            .unwrap_or_default();
+            .unwrap_or_else(|| "text/plain".to_string());
         let part_cte = part_headers
             .lines()
             .find(|l| {
@@ -1292,25 +1295,23 @@ fn extract_multipart_bodies(
             })
             .map(|l| l[26..].trim().to_ascii_lowercase())
             .unwrap_or_default();
+        // Keep original case for value extraction; only compare names case-insensitively.
         let disposition = part_headers
             .lines()
             .find(|l| l.to_ascii_lowercase().starts_with("content-disposition:"))
-            .map(|l| {
-                l[l.find(':').map_or(0, |p| p + 1)..]
-                    .trim()
-                    .to_ascii_lowercase()
-            })
+            .map(|l| l[l.find(':').map_or(0, |p| p + 1)..].trim().to_string())
             .unwrap_or_default();
+        let disposition_lower = disposition.to_ascii_lowercase();
         // Strip trailing boundary marker (e.g. "\r\n--boundary--").
         let text = part_body
             .find(&format!("\r\n--{boundary}"))
             .or_else(|| part_body.find(&format!("\n--{boundary}")))
             .map_or(part_body, |end| &part_body[..end])
             .trim();
-        let is_attachment = disposition.starts_with("attachment")
+        let is_attachment = disposition_lower.starts_with("attachment")
             || disposition
                 .split(';')
-                .any(|s| s.trim().starts_with("filename="));
+                .any(|s| s.trim().to_ascii_lowercase().starts_with("filename="));
         if part_ct_lower.starts_with("multipart/") {
             // Recurse into nested multipart parts (e.g. multipart/alternative).
             let (nested_text, nested_html, nested_atts) =
@@ -1330,8 +1331,11 @@ fn extract_multipart_bodies(
             // Collect attachment parts (binary or explicitly marked as attachment).
             let filename = disposition.split(';').find_map(|seg| {
                 let seg = seg.trim();
-                seg.strip_prefix("filename=")
-                    .map(|v| v.trim_matches('"').to_string())
+                if seg.to_ascii_lowercase().starts_with("filename=") {
+                    Some(seg["filename=".len()..].trim_matches('"').to_string())
+                } else {
+                    None
+                }
             });
             let ct_only = part_ct_lower
                 .split(';')
@@ -1763,11 +1767,11 @@ fn build_ses_route(
                 #[cfg(feature = "inbound-ses")]
                 Ok(SnsParseResult::SubscriptionConfirmation { url }) => {
                     if let Err(e) = http_client.get(&url).send().await {
+                        // Log and continue: SNS will retry the SubscriptionConfirmation.
                         tracing::error!(
                             error = %e,
                             "inbound_mail.ses: SNS subscription confirmation fetch failed"
                         );
-                        return StatusCode::INTERNAL_SERVER_ERROR;
                     }
                     StatusCode::OK
                 }
