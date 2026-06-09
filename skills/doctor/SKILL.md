@@ -57,13 +57,16 @@ cargo install autumn-cli --version 0.5.0
 
 ## Common FAIL remedies
 
-| Check | Remedy |
+These names match what `autumn doctor --json` actually emits in the `name` field:
+
+| Check name | Remedy |
 |---|---|
-| `signing_secret_missing` | `export AUTUMN_SECURITY__SIGNING_SECRET="$(openssl rand -hex 32)"` |
+| `signing_secret` | `export AUTUMN_SECURITY__SIGNING_SECRET="$(openssl rand -hex 32)"` |
 | `pending_migrations` | Run `autumn migrate` before deployment |
-| `allow_unauthorized_repository_api` | Add `policy = YourPolicy` to `#[repository]` or set `security.allow_unauthorized_repository_api = true` explicitly |
-| `allow_in_process_deliver_later` | Wire `Mailer::deliver_later` to a durable queue or set the config flag explicitly |
-| `webhook_replay_in_memory` | Set `security.webhooks.replay.backend = "redis"` for multi-replica prod |
+| `db_connectivity` | Verify `AUTUMN_DATABASE__PRIMARY_URL` and that Postgres is reachable |
+| `trusted_hosts` | Set explicit `[security] trusted_hosts` in `autumn.toml` for production |
+| `rate_limit_key_strategy` | Set `rate_limit.key_strategy` to `"ip"`, `"api_token"`, or `"authenticated_principal"` |
+| `version_compat` | Upgrade `autumn-cli` to match the framework version: `cargo install autumn-cli --version 0.5.0` |
 
 ## Secrets redaction
 

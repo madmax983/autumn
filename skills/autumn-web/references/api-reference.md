@@ -80,8 +80,10 @@ All publishable crates share `[workspace.package].version = "0.5.0"`.
 
 - Route macros: `get`, `post`, `put`, `patch`, `delete`, `routes`, `main`,
   `static_get`, `static_routes`, `scheduled`, `tasks`, `job`, `jobs`, `task`,
-  `one_off_tasks`, `secured`, `authorize`, `service`, `repository`, `model`,
-  `cached`, `api_doc`, `oauth2_callback`, `paths`, `ws` when enabled.
+  `one_off_tasks`, `secured`, `authorize`, `service`, `cached`, `api_doc`,
+  `oauth2_callback`, `paths`, `step_up`, `ws` (when `ws` feature enabled).
+  **Note**: `#[model]` and `#[repository]` are NOT in the prelude — use
+  `#[autumn_web::model]` and `#[autumn_web::repository]` (qualified paths).
 - Rendering: `asset_url`, `Markup`, `PreEscaped`, `html!`.
 - Extractors: `Db`, `Form`, `Json`, `Path`, `Query`, `State`, `Session`,
   `Auth`, `ApiToken`, `RequireApiToken`, `CsrfToken`, `CsrfFormField`,
@@ -134,7 +136,7 @@ All publishable crates share `[workspace.package].version = "0.5.0"`.
 
 ```toml
 [features]
-default = ["maud", "htmx", "tailwind", "db", "cache-moka"]
+default = ["maud", "htmx", "tailwind", "db", "cache-moka", "http-client", "reporting"]
 ws = ["dep:tokio-stream"]
 flash = []
 cache-moka = ["dep:moka"]
@@ -172,6 +174,10 @@ storage = ["diesel?/serde_json"]
 mail = ["dep:lettre", "maud"]
 seed = ["db"]
 system-info = []
+reporting = []
+webauthn = ["dep:webauthn-rs"]
+csv = ["dep:csv"]
+system-tests = ["dep:chromiumoxide"]
 ```
 
 `storage-s3` is not a feature in 0.5.0. Use `autumn-storage-s3 = "0.5"`.

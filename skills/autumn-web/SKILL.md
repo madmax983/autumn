@@ -199,9 +199,11 @@ async fn create(db: Db, Valid(Form(input)): Valid<Form<CreatePost>>) -> AutumnRe
 }
 
 #[patch("/posts/{id}")]
+#[secured]
 async fn patch(Path(id): Path<i64>, db: Db) -> AutumnResult<Markup> { /* ... */ }
 
 #[delete("/posts/{id}")]
+#[secured]
 async fn delete_post(Path(id): Path<i64>, db: Db) -> AutumnResult<Markup> { /* ... */ }
 
 #[static_get("/about")]

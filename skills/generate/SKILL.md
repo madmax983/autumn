@@ -129,13 +129,18 @@ Next steps:
 1. The generator writes the file to tasks/<name>.rs at the project root
    (not inside src/). Move it to src/tasks/<name>.rs or src/tasks.rs,
    or reference it from src/main.rs with:
-   #[path = "../tasks/<name>.rs"]
-   mod <name>;
+   // Generator writes tasks/<snake_name>.rs at project root.
+   // In src/main.rs, reference it with a path attribute:
+   #[path = "../tasks/recalculate_counts.rs"]
+   mod recalculate_counts;
 
-2. Register in main.rs:
-   .one_off_tasks(one_off_tasks![<name>::<name>])
+   // Or move the file to src/tasks/<snake_name>.rs and add:
+   // mod tasks; (with src/tasks/<snake_name>.rs inside it)
 
-3. Invoke with: autumn task <name> -- --dry-run
+2. Register in main.rs (use the snake_case module and function name):
+   .one_off_tasks(one_off_tasks![recalculate_counts::recalculate_counts])
+
+3. Invoke with: autumn task recalculate_counts -- --dry-run
 ```
 
 ## Flags

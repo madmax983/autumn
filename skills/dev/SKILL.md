@@ -3,7 +3,7 @@ name: dev
 description: >
   Use when the user runs /autumn:dev, asks to start the Autumn development
   server, enable hot reload, or check what's running locally.
-argument-hint: "[--port <N>] [--profile <name>]"
+argument-hint: "[--package <name>] [--show-config]"
 allowed-tools:
   - Bash
   - Read

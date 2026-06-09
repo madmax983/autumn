@@ -3,7 +3,7 @@ name: new
 description: >
   Use when the user runs /autumn:new, asks to create a new Autumn web
   application, or wants to scaffold a fresh project with the autumn CLI.
-argument-hint: "<app-name> [--api]"
+argument-hint: "<app-name> [--with-i18n] [--with-seed]"
 allowed-tools:
   - Bash
   - Read
