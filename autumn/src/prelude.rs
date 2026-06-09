@@ -160,6 +160,10 @@ pub use crate::auth::RequireApiToken;
 pub use crate::session::Session;
 /// Tenant extractor and context helpers.
 pub use crate::tenancy::{Tenant, with_tenant};
+/// Request-scoped log context helper: attach a custom field to the current
+/// request so every subsequent `tracing` event carries it. See
+/// [`crate::log::context`] for the full surface.
+pub use crate::log::context::with_log_field;
 
 // ── Authorization ────────────────────────────────────────────────
 /// Record-level authorization primitives. See

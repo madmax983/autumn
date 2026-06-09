@@ -1914,6 +1914,20 @@ fn apply_middleware(
         ));
     }
 
+    // Request-scoped log context (#1169). Established for every request, inner
+    // to `RequestIdLayer` (so the request id is available to seed it) and outer
+    // to tenancy, user layers, and the handler (so all of them, and every
+    // `tracing` event they emit, inherit the same correlating context). The
+    // filter mirrors the error-page scrubber so sensitive custom fields never
+    // enter the context output.
+    let mut log_context_filter_parameters = config.log.filter_parameters.clone();
+    log_context_filter_parameters.extend(crate::encryption::registered_encrypted_column_names());
+    let log_context_filter = Arc::new(crate::log::filter::ParameterFilter::new(
+        &log_context_filter_parameters,
+        &config.log.unfilter_parameters,
+    ));
+    let router = router.layer(crate::middleware::LogContextLayer::new(log_context_filter));
+
     let router = router.layer(RequestIdLayer).layer(security_headers);
 
     let router = crate::session::apply_session_layer(
