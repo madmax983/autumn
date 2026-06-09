@@ -2645,4 +2645,79 @@ mod tests {
         };
         assert!(email.primary_recipient().is_none());
     }
+
+    #[test]
+    fn extract_multipart_bodies_headerless_part_treated_as_text_plain() {
+        // A part with no headers at all (no blank-line separator after boundary)
+        // must still yield a text_body, defaulting to text/plain per RFC 2045 §5.2.
+        let b = "bnd";
+        let body = format!("--{b}\r\nHello headerless\r\n--{b}--\r\n");
+        let ct = format!("multipart/mixed; boundary={b}");
+        let (text, html, atts) = extract_multipart_bodies(body.as_bytes(), &ct);
+        assert_eq!(text.as_deref(), Some("Hello headerless"), "headerless part must become text_body");
+        assert!(html.is_none());
+        assert!(atts.is_empty());
+    }
+
+    #[test]
+    fn extract_multipart_bodies_boundary_inside_content_not_split() {
+        // A boundary token that appears in the middle of a line (not at line-start)
+        // must NOT be treated as a MIME boundary delimiter.
+        let b = "abc";
+        let body = format!(
+            "--{b}\r\nContent-Type: text/plain\r\n\r\nsee --{b} here, not a split\r\n--{b}--\r\n"
+        );
+        let ct = format!("multipart/mixed; boundary={b}");
+        let (text, _html, _atts) = extract_multipart_bodies(body.as_bytes(), &ct);
+        assert_eq!(
+            text.as_deref(),
+            Some("see --abc here, not a split"),
+            "mid-line boundary must be treated as content"
+        );
+    }
+
+    #[test]
+    fn extract_multipart_bodies_attachment_quoted_printable_decoded() {
+        use base64::Engine as _;
+        let b = "bndqp";
+        // QP-encoded attachment: "Hello=20World" decodes to "Hello World"
+        let body = format!(
+            "--{b}\r\n\
+             Content-Type: application/octet-stream\r\n\
+             Content-Disposition: attachment; filename=\"out.txt\"\r\n\
+             Content-Transfer-Encoding: quoted-printable\r\n\
+             \r\n\
+             Hello=20World\r\n\
+             --{b}--\r\n"
+        );
+        let ct = format!("multipart/mixed; boundary={b}");
+        let (_text, _html, atts) = extract_multipart_bodies(body.as_bytes(), &ct);
+        assert_eq!(atts.len(), 1);
+        assert_eq!(atts[0].data.as_ref(), b"Hello World\r\n");
+    }
+
+    #[test]
+    fn parse_ses_notification_preserves_envelope_recipient_casing() {
+        // Bcc recipients in mail.destination must retain original case so that
+        // extract_token can recover the exact token from a plus-address.
+        let msg_json = serde_json::json!({
+            "content": "From: sender@example.com\r\nTo: support@example.com\r\nSubject: hi\r\n\r\nbody",
+            "mail": {
+                "destination": ["Replies+ABC@app.example"]
+            }
+        });
+        let sns = serde_json::json!({
+            "Type": "Notification",
+            "Message": msg_json.to_string()
+        });
+        let result = parse_ses(&Bytes::from(sns.to_string()));
+        let email = match result.unwrap() {
+            SnsParseResult::Email(e) => *e,
+            other => panic!("expected Email, got {other:?}"),
+        };
+        assert!(
+            email.to.iter().any(|a| a == "Replies+ABC@app.example"),
+            "original casing must be preserved; got: {:?}", email.to
+        );
+    }
 }

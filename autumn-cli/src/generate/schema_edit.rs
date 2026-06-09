@@ -2568,6 +2568,94 @@ async fn main() {\n\
     }
 
     #[test]
+    fn ensure_feature_trailing_comment_on_string_dep() {
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = \"0.6\" # framework\n";
+        let updated = ensure_autumn_web_feature(cargo, "mail");
+        assert!(
+            updated.contains("\"mail\""),
+            "must add feature despite trailing comment: {updated}"
+        );
+        assert!(updated.contains("version"), "must preserve version: {updated}");
+    }
+
+    #[test]
+    fn ensure_feature_trailing_comma_in_features_list() {
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = { version = \"0.6\", features = [\"db\",] }\n";
+        let updated = ensure_autumn_web_feature(cargo, "mail");
+        assert!(
+            updated.contains("\"mail\""),
+            "must add feature after trailing comma: {updated}"
+        );
+        assert!(
+            !updated.contains(",,"),
+            "must not produce double comma: {updated}"
+        );
+    }
+
+    #[test]
+    fn ensure_feature_dotted_workspace_inserts_features_line() {
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web.workspace = true\n";
+        let updated = ensure_autumn_web_feature(cargo, "inbound-mailgun");
+        assert!(
+            updated.contains("\"inbound-mailgun\""),
+            "must insert features line: {updated}"
+        );
+        assert!(
+            updated.contains("autumn-web.features"),
+            "must use dotted key form: {updated}"
+        );
+    }
+
+    #[test]
+    fn ensure_feature_dotted_workspace_existing_features_line_spliced() {
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web.workspace = true\nautumn-web.features = [\"db\"]\n";
+        let updated = ensure_autumn_web_feature(cargo, "mail");
+        assert!(
+            updated.contains("\"mail\""),
+            "must splice into existing features line: {updated}"
+        );
+        assert!(
+            updated.contains("\"db\""),
+            "must preserve existing feature: {updated}"
+        );
+    }
+
+    #[test]
+    fn ensure_feature_dotted_workspace_idempotent() {
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web.workspace = true\nautumn-web.features = [\"inbound-mailgun\"]\n";
+        let updated = ensure_autumn_web_feature(cargo, "inbound-mailgun");
+        assert_eq!(cargo, updated, "already-present feature must be a no-op");
+    }
+
+    #[test]
+    fn ensure_feature_multiline_inline_table_inserts_features() {
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = {\n  version = \"0.6\"\n}\n";
+        let updated = ensure_autumn_web_feature(cargo, "mail");
+        assert!(
+            updated.contains("\"mail\""),
+            "must add feature to multiline inline table: {updated}"
+        );
+    }
+
+    #[test]
+    fn ensure_feature_multiline_inline_table_idempotent() {
+        let cargo =
+            "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = {\n  version = \"0.6\",\n  features = [\"mail\"]\n}\n";
+        let updated = ensure_autumn_web_feature(cargo, "mail");
+        assert_eq!(cargo, updated, "already-present feature must be a no-op");
+    }
+
+    #[test]
+    fn ensure_feature_multiline_section_trailing_comment_on_header() {
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies.autumn-web] # pinned\nversion = \"0.6\"\n";
+        let updated = ensure_autumn_web_feature(cargo, "mail");
+        assert!(
+            updated.contains("\"mail\""),
+            "must handle trailing comment on section header: {updated}"
+        );
+    }
+
+    #[test]
     fn add_mail_preview_unclosed_bracket_returns_unchanged() {
         // Malformed source: `mail_previews![` with no closing `]`.
         let src = "app()\n    .mail_previews(mail_previews![Foo)\n    .run()\n    .await;\n";
