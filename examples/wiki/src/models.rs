@@ -50,7 +50,7 @@ pub struct Page {
 
 impl Page {
     pub fn can_publish(&self) -> bool {
-        !self.title.is_empty() && !self.body.is_empty()
+        !self.title.trim().is_empty() && !self.body.trim().is_empty()
     }
 }
 

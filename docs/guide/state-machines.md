@@ -108,23 +108,27 @@ impl MutationHooks for OrderHooks {
         draft: &mut UpdateDraft<Order>,
     ) -> AutumnResult<()> {
         if draft.after.status != draft.before.status {
-            // Validate the edge and call any guards; returns 400 on failure.
-            draft.before.transition_status_to(&draft.after.status)?;
+            // Build a "proposed" record: new field values but the current
+            // status, so guards evaluate the content being persisted rather
+            // than stale before-state values.
+            let mut proposed = draft.after.clone();
+            proposed.status = draft.before.status.clone();
+            proposed.transition_status_to(&draft.after.status)?;
         }
         Ok(())
     }
 }
 ```
 
-`draft.before` holds the record's current state from the database. Calling
-`transition_status_to` on it checks whether the `before` status can move to the
-`after` status, and whether any guard defined on that edge passes.
+**Why clone?** Guards run on `self`, which in the simple `draft.before.transition_status_to(...)` pattern means they see the record's *old* field values. If a user submits a status change together with edits to fields the guard reads (e.g. clearing a body field while publishing), the guard would evaluate the old data and give the wrong answer. Cloning `draft.after` and then restoring only the `status` to the before-value lets the edge lookup work correctly while the guard sees the *proposed* final content.
 
 If you only want to check without returning an error (for example, to pick a
 default):
 
 ```rust
-if !draft.before.can_transition_status_to(&draft.after.status) {
+let mut proposed = draft.after.clone();
+proposed.status = draft.before.status.clone();
+if !proposed.can_transition_status_to(&draft.after.status) {
     draft.after.status = draft.before.status.clone(); // revert silently
 }
 ```

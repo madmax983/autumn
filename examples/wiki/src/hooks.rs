@@ -25,6 +25,15 @@ impl MutationHooks for PageHooks {
             new.status = "draft".into();
         }
 
+        // Only draft and published are valid initial statuses; archived can only
+        // be reached via a transition from published.
+        if !matches!(new.status.as_str(), "draft" | "published") {
+            return Err(autumn_web::AutumnError::bad_request_msg(format!(
+                "Invalid initial status `{}`; pages must start as `draft` or `published`",
+                new.status
+            )));
+        }
+
         // Enforce the can_publish guard even on direct creates so a page
         // cannot be born already published with an empty title or body.
         if new.status == "published" && (new.title.trim().is_empty() || new.body.trim().is_empty())
@@ -237,6 +246,49 @@ mod tests {
         assert!(
             result.is_err(),
             "guard must reject publishing with empty body"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_before_create_rejects_invalid_initial_status() {
+        let hooks = PageHooks;
+        let mut ctx = MutationContext::new(MutationOp::Update);
+        let mut new = NewPage {
+            title: "My Page".into(),
+            slug: String::new(),
+            body: "Content".into(),
+            status: "archived".into(),
+        };
+        let result = hooks.before_create(&mut ctx, &mut new).await;
+        assert!(
+            result.is_err(),
+            "creating a page with status=archived must fail"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_before_update_rejects_whitespace_only_publish() {
+        let hooks = PageHooks;
+        let mut ctx = MutationContext::new(MutationOp::Update);
+        let before = Page {
+            id: 1,
+            title: "My Page".into(),
+            slug: "my-page".into(),
+            body: "Some content".into(),
+            status: "draft".into(),
+            lock_version: 0,
+            created_at: Utc::now().naive_utc(),
+            updated_at: Utc::now().naive_utc(),
+        };
+        let mut after = before.clone();
+        after.status = "published".into();
+        after.body = "   ".into(); // whitespace-only
+
+        let mut draft = UpdateDraft { before, after };
+        let result = hooks.before_update(&mut ctx, &mut draft).await;
+        assert!(
+            result.is_err(),
+            "guard must reject publishing with whitespace-only body"
         );
     }
 

@@ -516,6 +516,8 @@ fn excluded_from_new(field: &Field) -> bool {
 
 /// Convert a `snake_case` identifier to `PascalCase`.
 fn pascal_case(s: &str) -> String {
+    // Strip the raw-identifier prefix so `r#type` produces `Type`, not `R#type`.
+    let s = s.strip_prefix("r#").unwrap_or(s);
     s.split('_')
         .map(|word| {
             let mut chars = word.chars();
@@ -754,7 +756,10 @@ fn parse_state_machine_spec(field: &syn::Field) -> syn::Result<Option<StateMachi
 /// a `can_transition_{field}_to` predicate, and a `transition_{field}_to` method.
 fn emit_state_machine_impl(model_name: &syn::Ident, spec: &StateMachineSpec) -> TokenStream {
     let field = &spec.field_ident;
-    let field_str = field.to_string();
+    let raw_field_str = field.to_string();
+    // Strip the raw-identifier prefix so `r#type` produces `type`-derived names
+    // rather than trying to create identifiers like `can_transition_r#type_to`.
+    let field_str = raw_field_str.strip_prefix("r#").unwrap_or(&raw_field_str);
     let field_upper = field_str.to_uppercase();
 
     let const_name = format_ident!("__AUTUMN_SM_{field_upper}_TRANSITIONS");
@@ -3027,6 +3032,32 @@ mod tests {
         assert!(
             generated.contains("not a valid Rust identifier"),
             "invalid guard identifier must emit a compile error: {generated}"
+        );
+    }
+
+    #[test]
+    fn state_machine_raw_identifier_field_generates_clean_names() {
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Order {
+                    #[id]
+                    pub id: i64,
+                    #[state_machine(transitions(
+                        pending -> processing,
+                    ))]
+                    pub r#type: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+        assert!(
+            generated.contains("can_transition_type_to"),
+            "raw identifier field must strip r# prefix for generated method name: {generated}"
+        );
+        assert!(
+            generated.contains("__AUTUMN_SM_TYPE_TRANSITIONS"),
+            "raw identifier field must strip r# prefix for generated const name: {generated}"
         );
     }
 
