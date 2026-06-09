@@ -1839,22 +1839,12 @@ fn parse_mailgun_form_data(
             .map(|l| l[l.find(':').map_or(0, |p| p + 1)..].trim().to_string())
             .unwrap_or_default();
 
-        let name = disposition.split(';').find_map(|seg| {
-            let seg = seg.trim();
-            let (k, v) = seg.split_once('=')?;
-            k.trim()
-                .eq_ignore_ascii_case("name")
-                .then(|| v.trim().trim_matches('"').to_string())
-        });
+        // Use the quote-aware parser so that filenames containing semicolons,
+        // e.g. filename="Q1;final.pdf", are not truncated at the semicolon.
+        let name = mime_param(&disposition, "name");
         let Some(name) = name else { continue };
 
-        let filename = disposition.split(';').find_map(|seg| {
-            let seg = seg.trim();
-            let (k, v) = seg.split_once('=')?;
-            k.trim()
-                .eq_ignore_ascii_case("filename")
-                .then(|| v.trim().trim_matches('"').to_string())
-        });
+        let filename = mime_param(&disposition, "filename");
 
         if let Some(filename) = filename {
             // File part: use raw bytes from the original buffer to avoid lossy UTF-8 corruption.
@@ -2000,6 +1990,18 @@ fn build_ses_route(
     use axum::extract::DefaultBodyLimit;
     use axum::routing::post;
 
+    // Fail closed: without a topic ARN every SNS-signed notification from any
+    // AWS account passes signature verification.  A third party could subscribe
+    // this endpoint to their own topic and deliver arbitrary payloads.  Emit an
+    // error at startup so the misconfiguration is visible immediately.
+    if topic_arn.is_none() {
+        tracing::error!(
+            path = %path,
+            "inbound_mail.ses: no topic_arn configured — all requests to this SES \
+             endpoint will be rejected until one is set via .with_topic_arn(\"arn:aws:sns:…\")"
+        );
+    }
+
     // One shared client per route for SNS cert fetching.
     #[cfg(feature = "inbound-ses")]
     let http_client = reqwest::Client::new();
@@ -2010,6 +2012,11 @@ fn build_ses_route(
         let http_client = http_client.clone();
         let topic_arn = topic_arn.clone();
         async move {
+            // Fail closed: reject every request if no topic ARN was configured.
+            if topic_arn.is_none() {
+                return StatusCode::SERVICE_UNAVAILABLE;
+            }
+
             // Reject SES notifications when the `inbound-ses` feature is off: the
             // signature verifier is not compiled in, so accepting requests would
             // bypass SNS authentication entirely.

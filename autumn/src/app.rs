@@ -2480,6 +2480,8 @@ impl AppBuilder {
         }
         #[cfg(feature = "inbound-mail")]
         if let Some(ref im_router) = inbound_mail_router {
+            let mut registered_inbound: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
             for (path, axum_router) in crate::inbound_mail::build_routes(im_router) {
                 // Preflight collision check: if an annotated POST route already
                 // claims this path, merging an opaque router at the same path
@@ -2493,6 +2495,15 @@ impl AppBuilder {
                         path = %path,
                         "inbound_mail: skipping webhook route — a POST handler is \
                          already registered at this path by the application"
+                    );
+                    continue;
+                }
+                // Also guard against two inbound endpoints sharing the same path,
+                // which would cause the same Axum merge panic.
+                if !registered_inbound.insert(path.clone()) {
+                    tracing::warn!(
+                        path = %path,
+                        "inbound_mail: skipping duplicate inbound webhook path"
                     );
                     continue;
                 }
