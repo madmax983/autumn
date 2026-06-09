@@ -123,6 +123,10 @@ fn compile_pass_tests() {
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/repository_lock_version.rs");
 
+    // Declarative state machines: #[state_machine(transitions(...))] (requires db feature)
+    #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/model_state_machine.rs");
+
     // Soft delete (requires db feature)
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/repository_soft_delete.rs");
