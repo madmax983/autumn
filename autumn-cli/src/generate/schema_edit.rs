@@ -803,6 +803,56 @@ pub fn ensure_autumn_web_feature(existing: &str, feature: &str) -> String {
             return existing.to_owned();
         }
         let new_line = rewrite_dep_with_feature(line, feature);
+        if new_line == line {
+            // Multiline inline table (e.g. `autumn-web = {` without closing `}` on same line).
+            // Find the closing `}` line and handle features within the table block.
+            let Some(close_idx) = lines[i + 1..]
+                .iter()
+                .position(|l| l.trim_start().starts_with('}'))
+                .map(|p| i + 1 + p)
+            else {
+                continue; // malformed or not yet closed; skip
+            };
+            // Idempotency check across the full inline table.
+            if lines[i..=close_idx]
+                .iter()
+                .any(|l| l.contains(&feature_quoted))
+            {
+                return existing.to_owned();
+            }
+            // Look for an existing `features` line inside the table.
+            for (j, &sec_line) in lines[i + 1..close_idx].iter().enumerate() {
+                if sec_line.trim_start().starts_with("features") {
+                    return splice_feature_at(
+                        &lines,
+                        i + 1 + j,
+                        &rewrite_features_line(sec_line, feature),
+                        sec_line,
+                        &feature_quoted,
+                        existing.ends_with('\n'),
+                    );
+                }
+            }
+            // No features key: insert one before the closing `}`.
+            let indent = lines[close_idx]
+                .chars()
+                .take_while(|c| c.is_ascii_whitespace())
+                .collect::<String>();
+            let new_feat = format!("{indent}features = [{feature_quoted}],");
+            let mut out = String::with_capacity(existing.len() + 32);
+            for (k, &l) in lines.iter().enumerate() {
+                if k == close_idx {
+                    out.push_str(&new_feat);
+                    out.push('\n');
+                }
+                out.push_str(l);
+                out.push('\n');
+            }
+            if !existing.ends_with('\n') {
+                out.pop();
+            }
+            return out;
+        }
         let mut out = String::with_capacity(existing.len() + 32);
         for (j, &l) in lines.iter().enumerate() {
             out.push_str(if j == i { &new_line } else { l });
