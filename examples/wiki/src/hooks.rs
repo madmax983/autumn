@@ -67,6 +67,15 @@ impl MutationHooks for PageHooks {
             proposed.transition_status_to(&draft.after.status)?;
         }
 
+        // Maintain the published-page content invariant even when status is
+        // unchanged; an edit that clears title/body on an already-published
+        // page must be rejected the same way a direct published create would be.
+        if draft.after.status == "published" && !draft.after.can_publish() {
+            return Err(autumn_web::AutumnError::bad_request_msg(
+                "A published page must have a non-empty title and body",
+            ));
+        }
+
         Ok(())
     }
 }
@@ -247,6 +256,54 @@ mod tests {
             result.is_err(),
             "guard must reject publishing with empty body"
         );
+    }
+
+    #[tokio::test]
+    async fn test_before_update_rejects_clearing_body_on_published_page() {
+        // Status stays "published" but body is cleared — must be rejected.
+        let hooks = PageHooks;
+        let mut ctx = MutationContext::new(MutationOp::Update);
+        let before = Page {
+            id: 1,
+            title: "My Page".into(),
+            slug: "my-page".into(),
+            body: "Original content".into(),
+            status: "published".into(),
+            lock_version: 0,
+            created_at: Utc::now().naive_utc(),
+            updated_at: Utc::now().naive_utc(),
+        };
+        let mut after = before.clone();
+        after.body = String::new(); // clear body without changing status
+
+        let mut draft = UpdateDraft { before, after };
+        let result = hooks.before_update(&mut ctx, &mut draft).await;
+        assert!(
+            result.is_err(),
+            "clearing body on a published page must fail"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_before_update_allows_content_edits_on_published_page() {
+        // Editing title/body on a published page is fine as long as they stay non-empty.
+        let hooks = PageHooks;
+        let mut ctx = MutationContext::new(MutationOp::Update);
+        let before = Page {
+            id: 1,
+            title: "My Page".into(),
+            slug: "my-page".into(),
+            body: "Original content".into(),
+            status: "published".into(),
+            lock_version: 0,
+            created_at: Utc::now().naive_utc(),
+            updated_at: Utc::now().naive_utc(),
+        };
+        let mut after = before.clone();
+        after.body = "Updated content".into();
+
+        let mut draft = UpdateDraft { before, after };
+        hooks.before_update(&mut ctx, &mut draft).await.unwrap();
     }
 
     #[tokio::test]
