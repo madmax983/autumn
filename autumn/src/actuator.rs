@@ -3750,7 +3750,9 @@ mod tests {
         // families with version="canary" so a controller can compare cohorts.
         let mut state = test_state();
         state.deploy_version = crate::canary::CANARY.to_owned();
+        // Latencies in ms: spread so p50 < p95/p99 and the slowest is 1200 ms.
         state.metrics().record("GET", "/test", 200, 10);
+        state.metrics().record("GET", "/test", 200, 20);
         state.metrics().record("GET", "/test", 500, 1200);
 
         let app = actuator_router(true).with_state(state);
@@ -3768,13 +3770,31 @@ mod tests {
             .unwrap();
         let text = String::from_utf8(body.to_vec()).unwrap();
 
-        assert!(text.contains("autumn_http_requests_total{version=\"canary\"} 2"));
+        assert!(text.contains("autumn_http_requests_total{version=\"canary\"} 3"));
         assert!(text.contains("autumn_http_responses_total{version=\"canary\",status=\"5xx\"} 1"));
-        assert!(text.contains(
-            "autumn_http_request_duration_seconds{version=\"canary\",quantile=\"0.99\"}"
-        ));
         // Must not leak the default "stable" label when running as canary.
         assert!(!text.contains("version=\"stable\""));
+
+        // Verify the percentile math: values are reported in seconds (ms / 1000)
+        // and satisfy the quantile invariant p50 <= p95 <= p99.
+        let quantile = |q: &str| -> f64 {
+            let needle = format!(
+                "autumn_http_request_duration_seconds{{version=\"canary\",quantile=\"{q}\"}} "
+            );
+            let line = text
+                .lines()
+                .find(|l| l.starts_with(&needle))
+                .unwrap_or_else(|| panic!("missing duration line for quantile {q}"));
+            line[needle.len()..].trim().parse().unwrap()
+        };
+        let (p50, p95, p99) = (quantile("0.5"), quantile("0.95"), quantile("0.99"));
+        assert!(p50 <= p95, "p50 ({p50}) must be <= p95 ({p95})");
+        assert!(p95 <= p99, "p95 ({p95}) must be <= p99 ({p99})");
+        // Slowest sample was 1200 ms, so the top quantile must read 1.2 seconds.
+        assert!(
+            (p99 - 1.2).abs() < f64::EPSILON,
+            "p99 should be 1.2s, got {p99}"
+        );
     }
 
     #[tokio::test]

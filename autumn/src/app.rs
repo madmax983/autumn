@@ -5607,11 +5607,13 @@ async fn shutdown_signal() {
 /// on every boot. Only the transition from absent → present triggers a
 /// rollback (see [`crate::canary::should_trigger_rollback`]).
 async fn canary_rollback_signal(path: &std::path::Path) {
-    let mut baseline = crate::canary::CanaryState::rollback_flag_present(path);
+    // Use async stat so the 500 ms poll never blocks the executor thread.
+    let flag_present = || async { tokio::fs::metadata(path).await.is_ok() };
+    let mut baseline = flag_present().await;
     let interval = std::time::Duration::from_millis(500);
     loop {
         tokio::time::sleep(interval).await;
-        let present = crate::canary::CanaryState::rollback_flag_present(path);
+        let present = flag_present().await;
         if crate::canary::should_trigger_rollback(baseline, present) {
             return;
         }
