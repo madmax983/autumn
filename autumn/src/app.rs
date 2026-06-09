@@ -2481,6 +2481,21 @@ impl AppBuilder {
         #[cfg(feature = "inbound-mail")]
         if let Some(ref im_router) = inbound_mail_router {
             for (path, axum_router) in crate::inbound_mail::build_routes(im_router) {
+                // Preflight collision check: if an annotated POST route already
+                // claims this path, merging an opaque router at the same path
+                // would cause Axum to panic at startup.  Warn and skip instead
+                // so the application can still start and the conflict is visible.
+                if all_routes
+                    .iter()
+                    .any(|r| r.method.eq_ignore_ascii_case("POST") && r.path == path)
+                {
+                    tracing::warn!(
+                        path = %path,
+                        "inbound_mail: skipping webhook route — a POST handler is \
+                         already registered at this path by the application"
+                    );
+                    continue;
+                }
                 // Exempt each inbound webhook path from CSRF: these routes receive
                 // provider-signed POST requests that never carry a CSRF token.
                 config.security.csrf.exempt_paths.push(path);

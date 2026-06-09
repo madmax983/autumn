@@ -939,8 +939,11 @@ pub fn ensure_autumn_web_feature(existing: &str, feature: &str) -> String {
                 continue;
             }
         }
-        // Idempotency check.
-        if line.contains(&feature_quoted) {
+        // Idempotency check: strip any trailing TOML comment so that a line such as
+        //   autumn-web = { version = "0.6" } # add "inbound-mailgun" later
+        // does not falsely appear to already have the feature enabled.
+        let line_code = line.split_once('#').map_or(line, |(before, _)| before);
+        if line_code.contains(&feature_quoted) {
             return existing.to_owned();
         }
         let new_line = rewrite_dep_with_feature(line, feature);
@@ -3444,5 +3447,27 @@ pub struct Comment {
         let (lang, fields) = parse_model_search_config_for_table(content, "comments").unwrap();
         assert_eq!(lang, "simple");
         assert_eq!(fields, vec![("body".to_string(), 'D')]);
+    }
+
+    #[test]
+    fn ensure_feature_comment_mentions_feature_still_adds_it() {
+        // A comment on the dep line that *mentions* the feature name must not fool
+        // the idempotency check into skipping the actual feature insertion.
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = { version = \"0.6\" } # add \"inbound-mailgun\" later\n";
+        let updated = ensure_autumn_web_feature(cargo, "inbound-mailgun");
+        assert!(
+            updated.contains("features"),
+            "feature must actually be added: {updated}"
+        );
+        // The feature must appear in the dep value, not just in the comment.
+        let dep_line = updated
+            .lines()
+            .find(|l| l.contains("autumn-web"))
+            .unwrap_or("");
+        let code_part = dep_line.split_once('#').map_or(dep_line, |(b, _)| b);
+        assert!(
+            code_part.contains("\"inbound-mailgun\""),
+            "feature must be present in the code portion of the dep line: {dep_line}"
+        );
     }
 }
