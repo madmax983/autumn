@@ -1289,6 +1289,8 @@ fn extract_multipart_bodies(
     let mut attachments: Vec<Attachment> = Vec::new();
 
     // Split body into parts by finding each boundary delimiter.
+    // RFC 2046 §5.1.1: boundaries must appear at the start of a line.
+    // Skip any `--boundary` that is not preceded by `\n` (or at the body start).
     let mut raw_parts: Vec<&[u8]> = Vec::new();
     let mut pos = 0;
     loop {
@@ -1298,6 +1300,12 @@ fn extract_multipart_bodies(
                 break;
             }
             Some(rel) => {
+                let abs = pos + rel;
+                if abs > 0 && body.get(abs - 1) != Some(&b'\n') {
+                    // Not at a line start — skip this false match.
+                    pos += rel + 1;
+                    continue;
+                }
                 raw_parts.push(&body[pos..pos + rel]);
                 pos += rel + delim.len();
             }
@@ -1402,6 +1410,9 @@ fn extract_multipart_bodies(
                     .decode(stripped.as_bytes())
                     .map(Bytes::from)
                     .unwrap_or_else(|_| Bytes::copy_from_slice(part_body_bytes))
+            } else if part_cte == "quoted-printable" {
+                let s = String::from_utf8_lossy(part_body_bytes);
+                Bytes::from(decode_quoted_printable(&s).into_bytes())
             } else {
                 Bytes::copy_from_slice(part_body_bytes)
             };

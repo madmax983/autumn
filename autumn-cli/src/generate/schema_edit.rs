@@ -816,6 +816,60 @@ fn add_feature_to_multiline_inline_table(
     Some(out)
 }
 
+/// Handle the dotted key form `autumn-web.* = ...` inside a `[dependencies]` section.
+///
+/// Looks for an existing `autumn-web.features` key in the section to splice into;
+/// if none is found, inserts one immediately after `dep_line_idx`.
+fn patch_dotted_dep(
+    lines: &[&str],
+    dep_line_idx: usize,
+    existing: &str,
+    feature: &str,
+    feature_quoted: &str,
+) -> String {
+    let section_end = lines[dep_line_idx + 1..]
+        .iter()
+        .position(|l| is_toml_table_header(l.trim()))
+        .map_or(lines.len(), |p| dep_line_idx + 1 + p);
+
+    if lines[dep_line_idx..section_end]
+        .iter()
+        .any(|l| l.trim_start().starts_with("autumn-web") && l.contains(feature_quoted))
+    {
+        return existing.to_owned();
+    }
+
+    for (j, &sec_line) in lines[dep_line_idx..section_end].iter().enumerate() {
+        if sec_line.trim_start().starts_with("autumn-web.features") {
+            let new_line = rewrite_features_line(sec_line, feature);
+            let mut out = String::with_capacity(existing.len() + 32);
+            for (k, &l) in lines.iter().enumerate() {
+                out.push_str(if k == dep_line_idx + j { &new_line } else { l });
+                out.push('\n');
+            }
+            if !existing.ends_with('\n') {
+                out.pop();
+            }
+            return out;
+        }
+    }
+
+    let new_feat = format!("autumn-web.features = [{feature_quoted}]");
+    let mut out = String::with_capacity(existing.len() + new_feat.len() + 2);
+    for (k, &l) in lines.iter().enumerate() {
+        out.push_str(l);
+        out.push('\n');
+        if k == dep_line_idx {
+            out.push_str(&new_feat);
+            out.push('\n');
+        }
+    }
+    if !existing.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
 /// Ensure the `autumn-web` dependency in `Cargo.toml` includes `feature`.
 ///
 /// Handles four common forms of the dependency declaration:
@@ -852,6 +906,10 @@ pub fn ensure_autumn_web_feature(existing: &str, feature: &str) -> String {
         let Some(rest) = after_ws.strip_prefix("autumn-web") else {
             continue;
         };
+        if rest.starts_with('.') {
+            // Dotted key form: autumn-web.workspace = true, autumn-web.features = [...], etc.
+            return patch_dotted_dep(&lines, i, existing, feature, &feature_quoted);
+        }
         if rest.starts_with(|c: char| c != '=' && !c.is_whitespace()) {
             continue;
         }
@@ -961,7 +1019,11 @@ fn rewrite_features_line(line: &str, feature: &str) -> String {
     {
         let abs_end = open + close_rel;
         let body = &line[open + 1..abs_end];
-        let separator = if body.trim().is_empty() { "" } else { ", " };
+        let separator = if body.trim().trim_end_matches(',').trim().is_empty() {
+            ""
+        } else {
+            ", "
+        };
         return format!(
             "{}{}{}{}",
             &line[..abs_end],
@@ -978,17 +1040,19 @@ fn rewrite_dep_with_feature(line: &str, feature: &str) -> String {
     let feature_quoted = format!("\"{feature}\"");
     let trimmed = line.trim();
 
-    // Form 1: autumn-web = "x.y.z"
+    // Form 1: autumn-web = "x.y.z"  (optional trailing TOML comment)
     if let Some(rest) = trimmed.strip_prefix("autumn-web") {
         let rest = rest.trim_start_matches([' ', '=', '\t']);
-        if rest.starts_with('"')
-            && let Some(version) = rest.strip_prefix('"').and_then(|r| r.strip_suffix('"'))
-        {
-            let indent_len = line.len() - line.trim_start().len();
-            let indent = &line[..indent_len];
-            return format!(
-                "{indent}autumn-web = {{ version = \"{version}\", features = [{feature_quoted}] }}"
-            );
+        if rest.starts_with('"') {
+            // Strip any trailing `# comment` before matching the closing quote.
+            let value_str = rest.split('#').next().unwrap_or(rest).trim_end();
+            if let Some(version) = value_str.strip_prefix('"').and_then(|r| r.strip_suffix('"')) {
+                let indent_len = line.len() - line.trim_start().len();
+                let indent = &line[..indent_len];
+                return format!(
+                    "{indent}autumn-web = {{ version = \"{version}\", features = [{feature_quoted}] }}"
+                );
+            }
         }
     }
 
@@ -1000,7 +1064,11 @@ fn rewrite_dep_with_feature(line: &str, feature: &str) -> String {
         if let Some(bracket_end_rel) = line[abs_start..].find(']') {
             let abs_end = abs_start + bracket_end_rel;
             let body = &line[abs_start + 1..abs_end];
-            let separator = if body.trim().is_empty() { "" } else { ", " };
+            let separator = if body.trim().trim_end_matches(',').trim().is_empty() {
+                ""
+            } else {
+                ", "
+            };
             return format!(
                 "{}{}{}{}",
                 &line[..abs_end],
