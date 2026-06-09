@@ -55,7 +55,10 @@ File-generating commands (all `autumn generate` subcommands write to disk):
 - `autumn release init`
 - `autumn credentials edit`
 
-Live runtime/database mutations:
+High-impact runtime/database operations:
+- `autumn migrate` (without `check` or `status` — applies pending migrations)
+- `autumn seed` (runs the project's seed binary)
+- `autumn task <name>` (executes arbitrary registered operational code)
 - `autumn maintenance on|off`
 - `autumn flags enable|disable|set-rollout|allow`
 - `autumn experiments set-weights|conclude|override`

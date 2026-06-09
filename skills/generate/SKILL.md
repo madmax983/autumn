@@ -118,7 +118,9 @@ Next steps:
    Both take a &Mailer extractor as their first argument after &self.
    Add `mailer: Mailer` to the handler's extractor list to get the handle.
 
-2. Register mail previews in main.rs if using #[mailer_preview]:
+2. The generator already adds mod mailers; and .mail_previews(...) to main.rs.
+   The type lives at mailers::<snake>::<PascalName>Mailer, e.g.:
+   use mailers::user::UserMailer;
    .mail_previews(mail_previews![UserMailer])
 
 3. Preview at: http://localhost:3000/_autumn/mail (dev mode only)

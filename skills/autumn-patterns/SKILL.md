@@ -23,6 +23,8 @@ autumn-web = { version = "0.5", features = ["test-support"] }
 ```
 
 ```rust
+use autumn_web::test::TestApp;  // not in prelude; requires test-support feature
+
 #[tokio::test]
 async fn create_post_returns_redirect() {
     let client = TestApp::new()
@@ -117,11 +119,11 @@ pub async fn send_welcome_email(state: AppState, args: SendWelcomeEmailArgs) -> 
     let pool = state.pool().ok_or_else(|| AutumnError::service_unavailable_msg("no db"))?;
     let mut conn = pool.get().await.map_err(AutumnError::from)?;
     let user = find_user(&mut conn, args.user_id).await?;
-    // Mailer is stored as an AppState extension when the mail feature is enabled
+    // state.extension::<Mailer>() returns Option<Arc<Mailer>>
     let mailer = state.extension::<Mailer>()
         .ok_or_else(|| AutumnError::service_unavailable_msg("mailer not configured"))?;
-    // generated method: send_welcome(&Mailer, args...) — async, returns Result
-    UserMailer.send_welcome(mailer, user.email.clone(), user.username.clone()).await?;
+    // generated helpers take &Mailer — deref the Arc:
+    UserMailer.send_welcome(&*mailer, user.email.clone(), user.username.clone()).await?;
     Ok(())
 }
 

@@ -267,7 +267,7 @@ async fn dashboard(session: Session) -> AutumnResult<Markup> { /* ... */ }
 async fn admin_panel() -> AutumnResult<Markup> { /* ... */ }
 
 // Record-level auth on repository-generated REST endpoints:
-#[repository(Post, api = "/api/posts", policy = PostPolicy, scope = PostScope)]
+#[autumn_web::repository(Post, api = "/api/posts", policy = PostPolicy, scope = PostScope)]
 pub trait PostRepository {}
 
 // Manual handler: load the record first, then check inline.

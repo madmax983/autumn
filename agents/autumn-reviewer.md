@@ -59,8 +59,11 @@ Check every file you review against these items. Report only items that fail.
   name. A form without ANY hidden token field is the issue to flag — do NOT
   require the literal `_csrf` string if the app uses a custom field name.
   The handler must accept `CsrfToken` as an extractor if forms are rendered.
-- **Unvalidated form/JSON input**: Mutations must use `Valid<Form<T>>` or
-  `Valid<Json<T>>`, not raw `Form<T>` or `Json<T>`.
+- **Unvalidated form/JSON input**: Flag mutation handlers that use raw
+  `Form<T>` or `Json<T>` with no validation path at all — no `Valid<>` wrapper,
+  no `ChangesetForm`, no manual `.validate()` call, and no body-level error
+  checks. Do NOT flag `Form<T>` that is followed by explicit validation logic
+  or uses a `Changeset`/`ChangesetForm` helper; those are supported patterns.
 - **Route-level authorization missing**: Check that record-level operations
   (edit, delete, update) have `#[authorize("action", resource = Model)]` or
   explicit ownership checks in the handler body.
@@ -79,8 +82,10 @@ Check every file you review against these items. Report only items that fail.
 - **Route not in `main.rs`**: If a new handler function has `#[get]`, `#[post]`,
   etc., check whether it appears in `.routes(routes![...])`. Missing registration
   means the route silently 404s.
-- **Job not in `main.rs`**: A `#[job]`-annotated function must be in
-  `.jobs(jobs![...])`.
+- **Job not registered**: A `#[job]`-annotated function must appear in a
+  `.jobs(...)` call — either literally in `jobs![fn_name]` or via a helper
+  function that returns `Vec<JobInfo>` (e.g. `.jobs(registered_jobs())`).
+  Only flag when no `.jobs(...)` is present at all or the job is provably absent.
 - **Task not in `main.rs`**: A `#[task]` function must be in
   `.one_off_tasks(one_off_tasks![...])`.
 
