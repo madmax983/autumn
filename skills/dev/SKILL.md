@@ -65,7 +65,7 @@ If `autumn-admin-plugin` is installed:
 | `http://localhost:3000/admin` | Admin dashboard |
 
 If the `mail` feature is enabled:
-| `http://localhost:3000/dev/mailer/previews` | Mailer preview |
+| `http://localhost:3000/_autumn/mail` | Mailer preview (dev profile only) |
 
 ## Hot reload behavior
 

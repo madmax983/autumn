@@ -54,10 +54,10 @@ Check every file you review against these items. Report only items that fail.
   checks `webhook.provider()`. Adding `#[secured]` on top of those would
   be the wrong fix.
 - **Missing CSRF token**: Every `<form method="POST">` (or PUT/PATCH/DELETE)
-  in Maud templates must contain:
-  ```rust
-  input type="hidden" name="_csrf" value=(csrf.token());
-  ```
+  in Maud templates must contain a hidden CSRF field. The default field name is
+  `_csrf` (`security.csrf.form_field` in autumn.toml); accept any configured
+  name. A form without ANY hidden token field is the issue to flag — do NOT
+  require the literal `_csrf` string if the app uses a custom field name.
   The handler must accept `CsrfToken` as an extractor if forms are rendered.
 - **Unvalidated form/JSON input**: Mutations must use `Valid<Form<T>>` or
   `Valid<Json<T>>`, not raw `Form<T>` or `Json<T>`.

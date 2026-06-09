@@ -273,8 +273,11 @@ pub trait PostRepository {}
 #[post("/posts/{id}")]
 #[secured]
 async fn update_post(Path(id): Path<i64>, mut db: Db, session: Session) -> AutumnResult<Markup> {
+    // session.get() returns Option<String>; parse to i64
     let user_id: i64 = session.get("user_id").await
-        .ok_or_else(|| AutumnError::unauthorized())?;
+        .ok_or_else(|| AutumnError::unauthorized_msg("Login required"))?
+        .parse()
+        .map_err(|_| AutumnError::bad_request_msg("Invalid session"))?;
     let post = find_post(&mut *db, id).await?;
     if post.user_id != user_id {
         return Err(AutumnError::forbidden_msg("not your post"));

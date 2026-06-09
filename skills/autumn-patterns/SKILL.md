@@ -117,10 +117,11 @@ pub async fn send_welcome_email(state: AppState, args: SendWelcomeEmailArgs) -> 
     let pool = state.pool().ok_or_else(|| AutumnError::service_unavailable_msg("no db"))?;
     let mut conn = pool.get().await.map_err(AutumnError::from)?;
     let user = find_user(&mut conn, args.user_id).await?;
-    // get the configured Mailer handle from AppState
-    let mailer = state.mailer().ok_or_else(|| AutumnError::service_unavailable_msg("no mailer"))?;
+    // Mailer is stored as an AppState extension when the mail feature is enabled
+    let mailer = state.extension::<Mailer>()
+        .ok_or_else(|| AutumnError::service_unavailable_msg("mailer not configured"))?;
     // generated method: send_welcome(&Mailer, args...) — async, returns Result
-    UserMailer.send_welcome(&mailer, user.email.clone(), user.username.clone()).await?;
+    UserMailer.send_welcome(mailer, user.email.clone(), user.username.clone()).await?;
     Ok(())
 }
 

@@ -24,7 +24,7 @@ preview and get confirmation before executing any mutating generator.
 | `scaffold` | `scaffold Post title:String body:Text` | Model + migration + routes (index/show/new/create/edit/update/delete) + views + smoke test. Also updates `src/main.rs`. |
 | `model` | `model Post title:String body:Text` | Model struct + migration |
 | `migration` | `migration add_slug_to_posts` | Empty timestamped migration file |
-| `mailer` | `mailer UserMailer` | Mailer struct + email templates |
+| `mailer` | `mailer User` | Mailer struct + email templates (generator appends `Mailer` → produces `UserMailer`) |
 | `task` | `task RecalculateCounts` | `#[task]` operational command |
 | `auth` | `auth User --oauth github,google` | Full auth scaffold (login/register/password reset/OAuth) |
 | `admin` | `admin Post` | Admin plugin resource page |
@@ -48,7 +48,7 @@ accept aliases like `Integer` or `Boolean`.
 | `DateTime` | `TIMESTAMPTZ NOT NULL` | `DateTime<Utc>` |
 | `Uuid` | `UUID NOT NULL` | `Uuid` |
 | `Bytea` | `BYTEA NOT NULL` | `Vec<u8>` |
-| `Attachment` | `JSONB NULL` (blob metadata) | `Option<Blob>` (always nullable) |
+| `Attachment` | `JSONB NULL` (blob metadata) | `Option<Blob>` (always nullable) — **requires `storage` feature in Cargo.toml**; generator does not add it automatically |
 | `Option<T>` | Nullable version of any above | `Option<T>` |
 
 **Indexes and UNIQUE constraints are not field tokens.** Add them by hand in the
@@ -120,7 +120,7 @@ Next steps:
 2. Register mail previews in main.rs if using #[mailer_preview]:
    .mail_previews(mail_previews![UserMailer])
 
-3. Preview at: http://localhost:3000/dev/mailer/previews (dev mode)
+3. Preview at: http://localhost:3000/_autumn/mail (dev mode only)
 ```
 
 ### task

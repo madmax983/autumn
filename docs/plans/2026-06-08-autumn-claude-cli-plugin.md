@@ -38,7 +38,7 @@ Safe read-only commands:
 - `autumn config list`
 - `autumn flags list`
 - `autumn experiments list`
-- `autumn dev-loop-bench --dry-run --json`
+- `autumn dev-loop-bench --dry-run` (note: `--dry-run` outputs a table, not JSON; omit `--json` here)
 
 Project-mutating commands requiring explicit confirmation:
 
