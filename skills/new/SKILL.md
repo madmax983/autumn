@@ -17,15 +17,17 @@ setup`, and walks the user through the first-run configuration.
 
 ## Execution flow
 
-1. Confirm the app name and target directory:
+1. Confirm the app name, flags, and target directory:
    ```
-   Will create: autumn new <app-name>
+   Will create: autumn new <app-name> [--with-i18n] [--with-seed]
    Directory:   ./<app-name>/
    ```
+   Pass any flags the user provided (e.g. `--with-i18n`, `--with-seed`) through
+   to the command — they can only be applied at creation time, not added later.
 2. Ask for confirmation before proceeding.
-3. Run:
+3. Run with the user's flags:
    ```bash
-   autumn new <app-name>
+   autumn new <app-name> [--with-i18n] [--with-seed]
    ```
 4. Change into the new directory and run:
    ```bash

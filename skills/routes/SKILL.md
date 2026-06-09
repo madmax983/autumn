@@ -18,13 +18,19 @@ in the current Autumn project.
 ## Execution
 
 Run from the project root (directory containing `autumn.toml`). Always use
-JSON output:
+JSON output. Include `--user-only` by default to hide framework internals,
+but omit it when the user explicitly wants to see framework routes (actuator,
+health probes, static assets, admin):
 
 ```bash
+# Default — user routes only
 autumn routes --format json --user-only
+
+# When user wants all routes (framework + user)
+autumn routes --format json
 ```
 
-If the user passes `--method` or `--filter`, append them:
+If the user passes `--method` or `--filter`, append them to whichever form is appropriate:
 
 ```bash
 autumn routes --format json --user-only --method POST --filter /posts

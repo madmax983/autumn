@@ -80,8 +80,10 @@ Check every file you review against these items. Report only items that fail.
 ### Registration (MEDIUM)
 
 - **Route not in `main.rs`**: If a new handler function has `#[get]`, `#[post]`,
-  etc., check whether it appears in `.routes(routes![...])`. Missing registration
-  means the route silently 404s.
+  etc., check whether it is reachable from the app builder — either directly in
+  `.routes(routes![fn_name])`, via a helper that returns `Vec<Route>` (e.g.
+  `.routes(module::routes())`), or inside a `.scoped(...)` group. Only flag
+  when the handler is provably absent from all registration paths.
 - **Job not registered**: A `#[job]`-annotated function must appear in a
   `.jobs(...)` call — either literally in `jobs![fn_name]` or via a helper
   function that returns `Vec<JobInfo>` (e.g. `.jobs(registered_jobs())`).

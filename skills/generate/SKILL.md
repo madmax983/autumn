@@ -109,11 +109,17 @@ Next steps:
 1. The #[mailer] macro generates send_<method> (async) and deliver_later_<method>
    (fire-and-forget) from each fn in the impl block. Call from a handler or job:
 
+   // The generated method name matches the snake_case of your mailer name.
+   // For `autumn generate mailer User`, the method is named `user`:
    // async send (awaits delivery):
-   UserMailer.send_welcome(&mailer, to, username).await?;
+   UserMailer.send_user(&mailer, to).await?;
 
    // fire-and-forget (background, no await):
-   UserMailer.deliver_later_welcome(&mailer, to, username);
+   UserMailer.deliver_later_user(&mailer, to);
+
+   // Rename the method in the generated file to get send_welcome, etc.:
+   // pub fn welcome(&self, to: String) -> Mail { ... }
+   // → generates send_welcome / deliver_later_welcome
 
    Both take a &Mailer extractor as their first argument after &self.
    Add `mailer: Mailer` to the handler's extractor list to get the handle.
