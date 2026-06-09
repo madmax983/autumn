@@ -2654,7 +2654,11 @@ mod tests {
         let body = format!("--{b}\r\nHello headerless\r\n--{b}--\r\n");
         let ct = format!("multipart/mixed; boundary={b}");
         let (text, html, atts) = extract_multipart_bodies(body.as_bytes(), &ct);
-        assert_eq!(text.as_deref(), Some("Hello headerless"), "headerless part must become text_body");
+        assert_eq!(
+            text.as_deref(),
+            Some("Hello headerless"),
+            "headerless part must become text_body"
+        );
         assert!(html.is_none());
         assert!(atts.is_empty());
     }
@@ -2717,7 +2721,8 @@ mod tests {
         };
         assert!(
             email.to.iter().any(|a| a == "Replies+ABC@app.example"),
-            "original casing must be preserved; got: {:?}", email.to
+            "original casing must be preserved; got: {:?}",
+            email.to
         );
     }
 }
