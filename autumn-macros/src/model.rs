@@ -686,7 +686,19 @@ fn parse_transitions(
         let guard = if content.peek(syn::Token![:]) {
             content.parse::<syn::Token![:]>()?;
             let lit: syn::LitStr = content.parse()?;
-            Some(lit.value())
+            let guard_str = lit.value();
+            // Validate that the guard name is a plain Rust identifier so that
+            // format_ident! doesn't panic on names like "can-ship" or "can ship".
+            syn::parse_str::<syn::Ident>(&guard_str).map_err(|_| {
+                syn::Error::new_spanned(
+                    &lit,
+                    format!(
+                        "`{guard_str}` is not a valid Rust identifier; \
+                         guard names must be a plain function name such as `can_ship`"
+                    ),
+                )
+            })?;
+            Some(guard_str)
         } else {
             None
         };
@@ -2993,6 +3005,28 @@ mod tests {
         assert!(
             generated.contains("multiple `#[state_machine]` attributes are not allowed"),
             "duplicate #[state_machine] on same field must emit a compile error: {generated}"
+        );
+    }
+
+    #[test]
+    fn state_machine_invalid_guard_identifier_is_rejected() {
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Order {
+                    #[id]
+                    pub id: i64,
+                    #[state_machine(transitions(
+                        pending -> processing: "can-ship",
+                    ))]
+                    pub status: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+        assert!(
+            generated.contains("not a valid Rust identifier"),
+            "invalid guard identifier must emit a compile error: {generated}"
         );
     }
 

@@ -25,6 +25,14 @@ impl MutationHooks for PageHooks {
             new.status = "draft".into();
         }
 
+        // Enforce the can_publish guard even on direct creates so a page
+        // cannot be born already published with an empty title or body.
+        if new.status == "published" && (new.title.trim().is_empty() || new.body.trim().is_empty()) {
+            return Err(autumn_web::AutumnError::bad_request_msg(
+                "Cannot create a published page with an empty title or body",
+            ));
+        }
+
         Ok(())
     }
 
@@ -40,8 +48,13 @@ impl MutationHooks for PageHooks {
 
         // Enforce state machine transitions; returns 400 for invalid edges or
         // when the can_publish guard rejects draft -> published.
+        // Evaluate guards against the proposed (after) content by cloning the
+        // new record and restoring the current status, so can_publish sees the
+        // title/body the user is submitting, not the old values.
         if draft.after.status != draft.before.status {
-            draft.before.transition_status_to(&draft.after.status)?;
+            let mut proposed = draft.after.clone();
+            proposed.status = draft.before.status.clone();
+            proposed.transition_status_to(&draft.after.status)?;
         }
 
         Ok(())
@@ -195,5 +208,59 @@ mod tests {
         let result = hooks.before_update(&mut ctx, &mut draft).await;
 
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_before_update_guard_sees_proposed_content() {
+        // Updating status AND clearing body in the same request must be rejected —
+        // the guard should evaluate the body being submitted, not the old body.
+        let hooks = PageHooks;
+        let mut ctx = MutationContext::new(MutationOp::Update);
+        let before = Page {
+            id: 1,
+            title: "My Page".into(),
+            slug: "my-page".into(),
+            body: "Has content".into(),
+            status: "draft".into(),
+            lock_version: 0,
+            created_at: Utc::now().naive_utc(),
+            updated_at: Utc::now().naive_utc(),
+        };
+        let mut after = before.clone();
+        after.status = "published".into();
+        after.body = String::new(); // clearing body in the same update
+
+        let mut draft = UpdateDraft { before, after };
+        let result = hooks.before_update(&mut ctx, &mut draft).await;
+
+        assert!(result.is_err(), "guard must reject publishing with empty body");
+    }
+
+    #[tokio::test]
+    async fn test_before_create_rejects_published_with_empty_body() {
+        let hooks = PageHooks;
+        let mut ctx = MutationContext::new(MutationOp::Update);
+        let mut new = NewPage {
+            title: "My Page".into(),
+            slug: String::new(),
+            body: String::new(),
+            status: "published".into(),
+        };
+        let result = hooks.before_create(&mut ctx, &mut new).await;
+        assert!(result.is_err(), "creating published page with empty body must fail");
+    }
+
+    #[tokio::test]
+    async fn test_before_create_allows_published_with_content() {
+        let hooks = PageHooks;
+        let mut ctx = MutationContext::new(MutationOp::Update);
+        let mut new = NewPage {
+            title: "My Page".into(),
+            slug: String::new(),
+            body: "Non-empty body".into(),
+            status: "published".into(),
+        };
+        hooks.before_create(&mut ctx, &mut new).await.unwrap();
+        assert_eq!(new.status, "published");
     }
 }
