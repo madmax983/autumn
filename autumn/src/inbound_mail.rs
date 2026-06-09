@@ -286,6 +286,15 @@ mod sns_verify {
                 tracing::error!(error = %e, "inbound_mail.ses: failed to fetch SNS cert");
                 StatusCode::BAD_GATEWAY
             })?
+            .error_for_status()
+            .map_err(|e| {
+                tracing::error!(
+                    error = %e,
+                    "inbound_mail.ses: SNS cert endpoint returned an error status; \
+                     treating as transient so SNS will retry"
+                );
+                StatusCode::SERVICE_UNAVAILABLE
+            })?
             .text()
             .await
             .map_err(|_| StatusCode::BAD_GATEWAY)?;

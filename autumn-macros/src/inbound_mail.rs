@@ -161,7 +161,7 @@ pub fn inbound_mail_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 .to
                 .as_deref()
                 .unwrap_or("")
-                .trim_end_matches(['*', '.', '+'])
+                .trim_end_matches('*')
                 .to_string();
             quote! { ::autumn_web::inbound_mail::RecipientPattern::LocalPrefix(#prefix.to_string()) }
         }
