@@ -27,7 +27,7 @@ preview and get confirmation before executing any mutating generator.
 | `mailer` | `mailer User` | Mailer struct + email templates (generator appends `Mailer` → produces `UserMailer`) |
 | `task` | `task RecalculateCounts` | `#[task]` operational command |
 | `auth` | `auth User --oauth github,google` | Full auth scaffold (login/register/password reset/OAuth) |
-| `admin` | `admin Post` | Admin plugin resource page |
+| `admin` | `admin Post title:String body:Text` | Admin plugin resource page — fields must be supplied explicitly; generator does not read the model |
 | `system-test` | `system-test checkout_flow` | System test fixture (name must be `snake_case` or `PascalCase` — no hyphens) |
 | `pwa` | `pwa` | PWA scaffolding — manifest, service worker, offline shell, icons, route handlers, smoke test |
 
