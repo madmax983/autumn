@@ -971,6 +971,21 @@ mod tests {
     }
 
     #[test]
+    fn app_state_deploy_version_defaults_to_stable() {
+        use crate::actuator::ProvideActuatorState;
+        let state = AppState::for_test();
+        assert_eq!(state.deploy_version(), crate::canary::STABLE);
+    }
+
+    #[test]
+    fn app_state_deploy_version_reads_canary_extension() {
+        use crate::actuator::ProvideActuatorState;
+        let state = AppState::for_test();
+        state.insert_extension(crate::canary::CanaryState::new(crate::canary::CANARY));
+        assert_eq!(state.deploy_version(), crate::canary::CANARY);
+    }
+
+    #[test]
     fn app_state_profile_default() {
         let state = AppState::for_test();
         assert_eq!(state.profile(), "default");

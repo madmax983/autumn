@@ -281,6 +281,39 @@ mod tests {
     // ── CanaryState ────────────────────────────────────────────────────────
 
     #[test]
+    fn from_env_reads_canary_flag() {
+        temp_env::with_vars(
+            [
+                ("AUTUMN_DEPLOY_VERSION", None::<&str>),
+                ("AUTUMN_CANARY", Some("true")),
+            ],
+            || assert_eq!(CanaryState::from_env().version(), CANARY),
+        );
+    }
+
+    #[test]
+    fn from_env_explicit_version_wins_over_flag() {
+        temp_env::with_vars(
+            [
+                ("AUTUMN_DEPLOY_VERSION", Some("v2")),
+                ("AUTUMN_CANARY", Some("true")),
+            ],
+            || assert_eq!(CanaryState::from_env().version(), "v2"),
+        );
+    }
+
+    #[test]
+    fn from_env_defaults_to_stable() {
+        temp_env::with_vars(
+            [
+                ("AUTUMN_DEPLOY_VERSION", None::<&str>),
+                ("AUTUMN_CANARY", None::<&str>),
+            ],
+            || assert_eq!(CanaryState::from_env().version(), STABLE),
+        );
+    }
+
+    #[test]
     fn state_reports_version() {
         let state = CanaryState::new("canary");
         assert_eq!(state.version(), "canary");
