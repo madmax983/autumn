@@ -2947,8 +2947,7 @@ mod tests {
         // The generated constant/methods may contain the word though.
         let struct_block = generated
             .find("pub struct Order")
-            .map(|i| &generated[i..i + 500])
-            .unwrap_or("");
+            .map_or("", |i| &generated[i..i + 500]);
         assert!(
             !struct_block.contains("# [state_machine]")
                 && !struct_block.contains("#[state_machine]"),

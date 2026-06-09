@@ -38,6 +38,12 @@ impl MutationHooks for PageHooks {
             draft.after.slug = slugify(&draft.after.title);
         }
 
+        // Enforce state machine transitions; returns 400 for invalid edges or
+        // when the can_publish guard rejects draft -> published.
+        if draft.after.status != draft.before.status {
+            draft.before.transition_status_to(&draft.after.status)?;
+        }
+
         Ok(())
     }
 }
