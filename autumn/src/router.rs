@@ -1908,6 +1908,44 @@ fn apply_middleware(
     //   BodyLimit/UploadConfig → MethodOverride → RateLimit → CSRF → CORS → handler
     router = apply_request_timeout_middleware(router, config, state.metrics.clone());
 
+    let router = apply_observability_middleware(router, config, state, security_headers);
+
+    let router = crate::session::apply_session_layer(
+        router,
+        &config.session,
+        config.profile.as_deref(),
+        session_store,
+        signing_keys_opt,
+    )?;
+    tracing::debug!(backend = ?config.session.backend, "Session management enabled");
+
+    let router = apply_exception_filters_and_metrics(
+        router,
+        config,
+        state,
+        exception_filters,
+        error_page_renderer,
+    );
+
+    // Response compression is applied outermost (outside ExceptionFilter) so that
+    // exception filters which rebuild the response body (e.g. ProblemDetailsFilter
+    // normalising AutumnErrors to JSON Problem Details) do so before the body is
+    // encoded. If compression were inner to ExceptionFilter, the filter would
+    // inherit a Content-Encoding: gzip header on the rebuilt uncompressed body,
+    // causing clients to receive uncompressed bytes labeled as gzip.
+    // User-registered layers (EtagLayer etc.) remain inner to Compression, so
+    // ETags are still computed on the uncompressed body before encoding occurs.
+    let router = apply_compression_middleware(router, config);
+
+    Ok(router)
+}
+
+fn apply_observability_middleware(
+    mut router: axum::Router<AppState>,
+    config: &AutumnConfig,
+    #[allow(unused_variables)] state: &AppState,
+    security_headers: crate::security::SecurityHeadersLayer,
+) -> axum::Router<AppState> {
     // Error-reporting + panic-catch layer. Placed inner to `RequestIdLayer`
     // (so the request id is available when a handler panics) and outer to the
     // timeout, user layers, and handler (so their panics are caught and turned
@@ -1936,17 +1974,16 @@ fn apply_middleware(
     ));
     let router = router.layer(crate::middleware::LogContextLayer::new(log_context_filter));
 
-    let router = router.layer(RequestIdLayer).layer(security_headers);
+    router.layer(RequestIdLayer).layer(security_headers)
+}
 
-    let router = crate::session::apply_session_layer(
-        router,
-        &config.session,
-        config.profile.as_deref(),
-        session_store,
-        signing_keys_opt,
-    )?;
-    tracing::debug!(backend = ?config.session.backend, "Session management enabled");
-
+fn apply_exception_filters_and_metrics(
+    router: axum::Router<AppState>,
+    config: &AutumnConfig,
+    state: &AppState,
+    exception_filters: Vec<Arc<dyn ExceptionFilter>>,
+    error_page_renderer: Option<SharedRenderer>,
+) -> axum::Router<AppState> {
     // Error page filter: renders HTML error pages for browser requests.
     // Always registered (uses default renderer if no custom one is provided).
     let is_dev = config
@@ -1994,22 +2031,10 @@ fn apply_middleware(
     //   Metrics -> ExceptionFilter -> ErrorPageContext -> Session ->
     //   SecurityHeaders -> RequestId -> [user layers, non-static build] ->
     //   Tenancy -> RateLimit -> CSRF -> CORS -> handler
-    let router = router
+    router
         .layer(crate::middleware::error_page_filter::ErrorPageContextLayer { is_dev })
         .layer(ExceptionFilterLayer::new(all_filters))
-        .layer(crate::middleware::MetricsLayer::new(state.metrics.clone()));
-
-    // Response compression is applied outermost (outside ExceptionFilter) so that
-    // exception filters which rebuild the response body (e.g. ProblemDetailsFilter
-    // normalising AutumnErrors to JSON Problem Details) do so before the body is
-    // encoded. If compression were inner to ExceptionFilter, the filter would
-    // inherit a Content-Encoding: gzip header on the rebuilt uncompressed body,
-    // causing clients to receive uncompressed bytes labeled as gzip.
-    // User-registered layers (EtagLayer etc.) remain inner to Compression, so
-    // ETags are still computed on the uncompressed body before encoding occurs.
-    let router = apply_compression_middleware(router, config);
-
-    Ok(router)
+        .layer(crate::middleware::MetricsLayer::new(state.metrics.clone()))
 }
 
 async fn trusted_host_middleware(
