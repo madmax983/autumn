@@ -332,6 +332,17 @@ pub trait ProvideActuatorState {
         true
     }
 
+    /// Returns the deploy-version label for this replica (e.g. `"stable"` or
+    /// `"canary"`), used to tag Prometheus metrics so a canary controller can
+    /// compare canary vs. stable cohorts.
+    ///
+    /// Defaults to [`crate::canary::STABLE`]. [`crate::AppState`] overrides this
+    /// to return the value resolved from `AUTUMN_DEPLOY_VERSION` /
+    /// `AUTUMN_CANARY` (see [`crate::canary`]).
+    fn deploy_version(&self) -> String {
+        crate::canary::STABLE.to_owned()
+    }
+
     #[cfg(feature = "http-client")]
     /// Returns the optional webhook outbound manager if enabled/registered.
     fn webhook_outbound(&self) -> Option<crate::webhook_outbound::WebhookOutboundManager> {
@@ -1843,6 +1854,20 @@ fn is_valid_label_name(s: &str) -> bool {
         && it.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// Escape a Prometheus label value (backslash, newline, and double-quote).
+fn escape_prometheus_label_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '"' => out.push_str("\\\""),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 /// Escape a Prometheus HELP string (backslash and newline only).
 fn escape_help_text(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
@@ -1967,21 +1992,22 @@ fn render_plugin_sources(
     }
 }
 
-/// `GET <actuator-prefix>/prometheus` -- export metrics in Prometheus format.
-pub(crate) async fn prometheus_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
-    State(state): State<S>,
-) -> impl IntoResponse {
+/// Render the built-in `autumn_http_*` metric families into `out`, tagged with
+/// the replica's deploy `version` label so canary and stable cohorts can be
+/// compared by a controller scraping both.
+fn write_builtin_http_metrics(
+    out: &mut String,
+    version: &str,
+    snapshot: &crate::middleware::metrics::MetricsSnapshot,
+) {
     use std::fmt::Write;
-
-    let snapshot = state.metrics().snapshot();
-    let mut out = String::with_capacity(2048);
 
     // requests_total
     out.push_str("# HELP autumn_http_requests_total Total number of HTTP requests\n");
     out.push_str("# TYPE autumn_http_requests_total counter\n");
     let _ = writeln!(
         out,
-        "autumn_http_requests_total {}",
+        "autumn_http_requests_total{{version=\"{version}\"}} {}",
         snapshot.http.requests_total
     );
 
@@ -1990,33 +2016,44 @@ pub(crate) async fn prometheus_endpoint<S: ProvideActuatorState + Send + Sync + 
     out.push_str("# TYPE autumn_http_requests_active gauge\n");
     let _ = writeln!(
         out,
-        "autumn_http_requests_active {}",
+        "autumn_http_requests_active{{version=\"{version}\"}} {}",
         snapshot.http.requests_active
     );
 
     // by_status
     out.push_str("# HELP autumn_http_responses_total HTTP responses by status code\n");
     out.push_str("# TYPE autumn_http_responses_total counter\n");
-    let _ = writeln!(
-        out,
-        "autumn_http_responses_total{{status=\"2xx\"}} {}",
-        snapshot.http.by_status.s2xx
+    for (status, count) in [
+        ("2xx", snapshot.http.by_status.s2xx),
+        ("3xx", snapshot.http.by_status.s3xx),
+        ("4xx", snapshot.http.by_status.s4xx),
+        ("5xx", snapshot.http.by_status.s5xx),
+    ] {
+        let _ = writeln!(
+            out,
+            "autumn_http_responses_total{{version=\"{version}\",status=\"{status}\"}} {count}"
+        );
+    }
+
+    // request_duration_seconds — global latency percentiles exposed as Prometheus
+    // summary-style quantiles, labelled by deploy version so a canary controller
+    // can gate promotion on p99 latency per cohort.
+    out.push_str(
+        "# HELP autumn_http_request_duration_seconds HTTP request latency percentiles in seconds\n",
     );
-    let _ = writeln!(
-        out,
-        "autumn_http_responses_total{{status=\"3xx\"}} {}",
-        snapshot.http.by_status.s3xx
-    );
-    let _ = writeln!(
-        out,
-        "autumn_http_responses_total{{status=\"4xx\"}} {}",
-        snapshot.http.by_status.s4xx
-    );
-    let _ = writeln!(
-        out,
-        "autumn_http_responses_total{{status=\"5xx\"}} {}",
-        snapshot.http.by_status.s5xx
-    );
+    out.push_str("# TYPE autumn_http_request_duration_seconds summary\n");
+    for (quantile, millis) in [
+        ("0.5", snapshot.http.latency_ms.p50),
+        ("0.95", snapshot.http.latency_ms.p95),
+        ("0.99", snapshot.http.latency_ms.p99),
+    ] {
+        #[allow(clippy::cast_precision_loss)]
+        let seconds = millis as f64 / 1000.0;
+        let _ = writeln!(
+            out,
+            "autumn_http_request_duration_seconds{{version=\"{version}\",quantile=\"{quantile}\"}} {seconds}"
+        );
+    }
 
     // autumn_shutdown_aborted_requests_total
     out.push_str(
@@ -2026,7 +2063,7 @@ pub(crate) async fn prometheus_endpoint<S: ProvideActuatorState + Send + Sync + 
     out.push_str("# TYPE autumn_shutdown_aborted_requests_total counter\n");
     let _ = writeln!(
         out,
-        "autumn_shutdown_aborted_requests_total {}",
+        "autumn_shutdown_aborted_requests_total{{version=\"{version}\"}} {}",
         snapshot.http.shutdown_aborted_requests_total
     );
 
@@ -2038,7 +2075,7 @@ pub(crate) async fn prometheus_endpoint<S: ProvideActuatorState + Send + Sync + 
     out.push_str("# TYPE autumn_request_timeouts_total counter\n");
     let _ = writeln!(
         out,
-        "autumn_request_timeouts_total {}",
+        "autumn_request_timeouts_total{{version=\"{version}\"}} {}",
         snapshot.http.request_timeouts_total
     );
 
@@ -2054,12 +2091,26 @@ pub(crate) async fn prometheus_endpoint<S: ProvideActuatorState + Send + Sync + 
             if let Some((method, path)) = route_key.split_once(' ') {
                 let _ = writeln!(
                     out,
-                    "autumn_http_route_requests_total{{method=\"{}\",route=\"{}\"}} {}",
-                    method, path, metrics.count
+                    "autumn_http_route_requests_total{{version=\"{version}\",method=\"{method}\",route=\"{path}\"}} {}",
+                    metrics.count
                 );
             }
         }
     }
+}
+
+/// `GET <actuator-prefix>/prometheus` -- export metrics in Prometheus format.
+pub(crate) async fn prometheus_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
+    State(state): State<S>,
+) -> impl IntoResponse {
+    let snapshot = state.metrics().snapshot();
+    // Deploy-version label so a canary controller can compare canary vs. stable
+    // cohorts. Escaped defensively in case an operator sets an exotic value via
+    // AUTUMN_DEPLOY_VERSION.
+    let version = escape_prometheus_label_value(&state.deploy_version());
+    let mut out = String::with_capacity(2048);
+
+    write_builtin_http_metrics(&mut out, &version, &snapshot);
 
     // Plugin-contributed metric families — seed with built-in names so
     // plugins cannot shadow or duplicate them.
@@ -2068,6 +2119,7 @@ pub(crate) async fn prometheus_endpoint<S: ProvideActuatorState + Send + Sync + 
             "autumn_http_requests_total",
             "autumn_http_requests_active",
             "autumn_http_responses_total",
+            "autumn_http_request_duration_seconds",
             "autumn_shutdown_aborted_requests_total",
             "autumn_request_timeouts_total",
             "autumn_http_route_requests_total",
@@ -2807,6 +2859,7 @@ mod tests {
     #[derive(Clone)]
     struct TestActuatorState {
         profile: String,
+        deploy_version: String,
         metrics: crate::middleware::MetricsCollector,
         log_levels: LogLevels,
         task_registry: TaskRegistry,
@@ -2847,6 +2900,9 @@ mod tests {
         fn uptime_display(&self) -> String {
             "test_uptime".to_string()
         }
+        fn deploy_version(&self) -> String {
+            self.deploy_version.clone()
+        }
         fn metrics_source_registry(&self) -> Option<&MetricsSourceRegistry> {
             Some(&self.metrics_source_registry)
         }
@@ -2878,6 +2934,7 @@ mod tests {
     fn test_state_with_config(config: &AutumnConfig) -> TestActuatorState {
         TestActuatorState {
             profile: config.profile.clone().unwrap_or_else(|| "dev".into()),
+            deploy_version: crate::canary::STABLE.to_owned(),
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: LogLevels::new("info"),
             task_registry: TaskRegistry::new(),
@@ -3664,22 +3721,81 @@ mod tests {
 
         assert!(text.contains("# HELP autumn_http_requests_total Total number of HTTP requests"));
         assert!(text.contains("# TYPE autumn_http_requests_total counter"));
-        assert!(text.contains("autumn_http_requests_total 2"));
+        assert!(text.contains("autumn_http_requests_total{version=\"stable\"} 2"));
 
-        assert!(text.contains("autumn_http_requests_active "));
-        assert!(text.contains("autumn_http_responses_total{status=\"2xx\"} 1"));
-        assert!(text.contains("autumn_http_responses_total{status=\"5xx\"} 1"));
+        assert!(text.contains("autumn_http_requests_active{version=\"stable\"} "));
+        assert!(text.contains("autumn_http_responses_total{version=\"stable\",status=\"2xx\"} 1"));
+        assert!(text.contains("autumn_http_responses_total{version=\"stable\",status=\"5xx\"} 1"));
 
-        assert!(
-            text.contains("autumn_http_route_requests_total{method=\"GET\",route=\"/test\"} 1")
-        );
-        assert!(
-            text.contains("autumn_http_route_requests_total{method=\"POST\",route=\"/test\"} 1")
-        );
+        // Latency percentiles are exposed in seconds, labelled by version.
+        assert!(text.contains("# TYPE autumn_http_request_duration_seconds summary"));
+        assert!(text.contains(
+            "autumn_http_request_duration_seconds{version=\"stable\",quantile=\"0.99\"}"
+        ));
+
+        assert!(text.contains(
+            "autumn_http_route_requests_total{version=\"stable\",method=\"GET\",route=\"/test\"} 1"
+        ));
+        assert!(text.contains(
+            "autumn_http_route_requests_total{version=\"stable\",method=\"POST\",route=\"/test\"} 1"
+        ));
 
         assert!(text.contains("# HELP autumn_request_timeouts_total"));
         assert!(text.contains("# TYPE autumn_request_timeouts_total counter"));
-        assert!(text.contains("autumn_request_timeouts_total 0"));
+        assert!(text.contains("autumn_request_timeouts_total{version=\"stable\"} 0"));
+    }
+
+    #[tokio::test]
+    async fn actuator_prometheus_labels_metrics_with_canary_version() {
+        // A replica whose deploy_version() is "canary" must tag its metric
+        // families with version="canary" so a controller can compare cohorts.
+        let mut state = test_state();
+        state.deploy_version = crate::canary::CANARY.to_owned();
+        // Latencies in ms: spread so p50 < p95/p99 and the slowest is 1200 ms.
+        state.metrics().record("GET", "/test", 200, 10);
+        state.metrics().record("GET", "/test", 200, 20);
+        state.metrics().record("GET", "/test", 500, 1200);
+
+        let app = actuator_router(true).with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/prometheus")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(text.contains("autumn_http_requests_total{version=\"canary\"} 3"));
+        assert!(text.contains("autumn_http_responses_total{version=\"canary\",status=\"5xx\"} 1"));
+        // Must not leak the default "stable" label when running as canary.
+        assert!(!text.contains("version=\"stable\""));
+
+        // Verify the percentile math: values are reported in seconds (ms / 1000)
+        // and satisfy the quantile invariant p50 <= p95 <= p99.
+        let quantile = |q: &str| -> f64 {
+            let needle = format!(
+                "autumn_http_request_duration_seconds{{version=\"canary\",quantile=\"{q}\"}} "
+            );
+            let line = text
+                .lines()
+                .find(|l| l.starts_with(&needle))
+                .unwrap_or_else(|| panic!("missing duration line for quantile {q}"));
+            line[needle.len()..].trim().parse().unwrap()
+        };
+        let (p50, p95, p99) = (quantile("0.5"), quantile("0.95"), quantile("0.99"));
+        assert!(p50 <= p95, "p50 ({p50}) must be <= p95 ({p95})");
+        assert!(p95 <= p99, "p95 ({p95}) must be <= p99 ({p99})");
+        // Slowest sample was 1200 ms, so the top quantile must read 1.2 seconds.
+        assert!(
+            (p99 - 1.2).abs() < f64::EPSILON,
+            "p99 should be 1.2s, got {p99}"
+        );
     }
 
     #[tokio::test]
@@ -4822,6 +4938,59 @@ mod tests {
         assert_eq!(
             occurrences, 1,
             "built-in must not be shadowed by plugin:\n{text}"
+        );
+        assert!(
+            !text.contains("999"),
+            "plugin shadow value must not appear:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn prometheus_endpoint_skips_builtin_duration_family_collision() {
+        // The new built-in latency family must be in the duplicate guard so a
+        // plugin emitting the same family cannot produce a second HELP/TYPE block.
+        struct ShadowLatency;
+        impl MetricsSource for ShadowLatency {
+            fn collect(&self) -> Vec<MetricFamily> {
+                vec![MetricFamily {
+                    name: "autumn_http_request_duration_seconds".to_string(),
+                    help: "plugin trying to shadow built-in latency".to_string(),
+                    kind: MetricKind::Gauge,
+                    samples: vec![MetricSample {
+                        labels: vec![],
+                        value: 999.0,
+                    }],
+                }]
+            }
+        }
+
+        let state = test_state();
+        state
+            .metrics_source_registry
+            .register("shadow_latency", Arc::new(ShadowLatency))
+            .unwrap();
+
+        let app = actuator_router(true).with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/prometheus")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+
+        let occurrences = text
+            .matches("# HELP autumn_http_request_duration_seconds")
+            .count();
+        assert_eq!(
+            occurrences, 1,
+            "built-in latency family must not be shadowed by plugin:\n{text}"
         );
         assert!(
             !text.contains("999"),

@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 
 mod build;
+mod canary;
 mod check;
 mod config;
 mod credentials;
@@ -402,6 +403,22 @@ enum Commands {
     #[command(subcommand, verbatim_doc_comment)]
     Maintenance(MaintenanceCommands),
 
+    /// Drive canary rollback / promotion at the framework level.
+    ///
+    /// Autumn does not own the load-balancer traffic split (platform concern).
+    /// These commands drive the framework primitives a canary controller needs:
+    /// `rollback` tells a bad canary replica to drain and exit cleanly (no
+    /// manual SIGTERM); `promote` clears the rollback signal; `status` reports
+    /// whether a rollback is pending.
+    ///
+    /// # Examples
+    ///
+    ///   autumn canary rollback --reason "p99 latency exceeded"
+    ///   autumn canary promote
+    ///   autumn canary status
+    #[command(subcommand, verbatim_doc_comment)]
+    Canary(CanaryCommands),
+
     /// Print every mounted route — method, path, handler, source, middleware.
     ///
     /// Compiles the application (debug profile) and introspects its route
@@ -679,6 +696,35 @@ enum MaintenanceCommands {
     ///
     /// Exits 0 on success (or when maintenance was already off).
     Off,
+}
+
+/// Subcommands for `autumn canary`.
+#[derive(Subcommand)]
+enum CanaryCommands {
+    /// Signal a canary rollback: write the flag file so the canary replica
+    /// drains (/ready → 503) and exits cleanly without a manual SIGTERM.
+    ///
+    /// The running replica detects the flag within ~500 ms.
+    ///
+    /// # Examples
+    ///
+    ///   autumn canary rollback
+    ///   autumn canary rollback --reason "error rate spiked" --by ci-controller
+    #[command(verbatim_doc_comment)]
+    Rollback {
+        /// Human-readable reason recorded in the rollback flag.
+        #[arg(long, value_name = "REASON")]
+        reason: Option<String>,
+        /// Identifier of the actor or controller requesting the rollback.
+        #[arg(long, value_name = "WHO")]
+        by: Option<String>,
+    },
+    /// Promote the canary: clear any pending rollback flag.
+    ///
+    /// Shifting platform traffic to 100% remains a platform action.
+    Promote,
+    /// Report whether a canary rollback is currently pending.
+    Status,
 }
 
 /// Subcommands for `autumn token`.
@@ -1214,6 +1260,17 @@ fn run_command(command: Commands) {
             MaintenanceCommands::Off => {
                 maintenance::run_off(None);
             }
+        },
+        Commands::Canary(cmd) => match cmd {
+            CanaryCommands::Rollback { reason, by } => {
+                canary::run_rollback(&canary::RollbackOptions {
+                    reason: reason.as_deref(),
+                    requested_by: by.as_deref(),
+                    flag_file: None,
+                });
+            }
+            CanaryCommands::Promote => canary::run_promote(None),
+            CanaryCommands::Status => canary::run_status(None),
         },
         Commands::Monitor { url, interval } => monitor::run(&url, interval),
         Commands::Export { url, output } => export::run(&url, &output),

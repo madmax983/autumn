@@ -46,6 +46,8 @@ pub use crate::assets::asset_url;
 pub use maud::{Markup, PreEscaped, html};
 
 // ── Extractors ───────────────────────────────────────────────────
+/// Canary traffic-routing extractor (reads the `X-Canary` header).
+pub use crate::canary::CanaryRoute;
 /// Database connection extractor.
 #[cfg(feature = "db")]
 pub use crate::db::Db;
