@@ -75,7 +75,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-autumn-web = { version = "0.4", features = ["db", "htmx", "maud"] }
+autumn-web = { version = "0.5", features = ["db", "htmx", "maud"] }
 chrono = { version = "0.4", features = ["serde"] }
 diesel = { version = "2", features = ["postgres", "chrono"] }
 diesel-async = { version = "0.8", features = ["postgres"] }
@@ -100,8 +100,10 @@ Defaults: `maud`, `htmx`, `tailwind`, `db`, `cache-moka`.
 | `flash` | Flash messages |
 | `multipart` | Multipart uploads |
 | `redis` | Redis sessions, channels, jobs, webhook replay, and integration points |
-| `oauth2` | OAuth2/OIDC callback support |
+| `oauth2` | OAuth2/OIDC helpers and `autumn generate auth --oauth` scaffolding |
 | `openapi` | OpenAPI route metadata and spec generation |
+| `mcp` | Project typed JSON endpoints as MCP tools; implies `openapi` |
+| `markdown` | Markdown rendering with frontmatter and static-site support |
 | `telemetry-otlp` | OpenTelemetry OTLP export |
 | `test-support` | Testcontainers-backed `TestApp`, `TestClient`, and `TestDb` |
 | `i18n` | Locale extractor and compile-time checked translations |
@@ -110,8 +112,8 @@ Defaults: `maud`, `htmx`, `tailwind`, `db`, `cache-moka`.
 | `seed` | `SeedContext` for seed binaries |
 | `system-info` | Optional system information in actuator surfaces |
 
-For S3 storage add `autumn-storage-s3 = "0.4"`; `storage-s3` is no longer an
-`autumn-web` feature. For a shared Redis cache add `autumn-cache-redis = "0.4"`.
+For S3 storage add `autumn-storage-s3 = "0.5"`; `storage-s3` is no longer an
+`autumn-web` feature. For a shared Redis cache add `autumn-cache-redis = "0.5"`.
 
 ## main.rs pattern
 
@@ -261,6 +263,22 @@ export AUTUMN_SECURITY__SIGNING_SECRET="$(openssl rand -hex 32)"
 For rotation, set `[security.signing_secret].previous_secrets` until old
 cookies, CSRF tokens, flash state, and signed storage URLs expire.
 
+## OAuth2/OIDC scaffolding
+
+OAuth2/OIDC social login is in the 0.5.0 line. Do not repeat the stale
+changelog claim that it was reverted; the revert was followed by a reapply and
+review fixes. Prefer the current tree and `docs/guide/oauth.md` over that old
+summary line.
+
+```bash
+autumn generate auth User --oauth github,google
+```
+
+The generator creates `src/routes/oauth.rs`, an `oauth_identities` migration,
+login buttons, and `[auth.oauth2.<provider>]` config stubs. The flow uses
+PKCE S256, state validation, OIDC nonce validation, and provider presets for
+GitHub, Google, and Microsoft. OAuth support stays behind the `oauth2` feature.
+
 ## Signed webhooks
 
 Autumn 0.4.0 added `SignedWebhook` for Stripe, GitHub, Slack, and generic
@@ -317,8 +335,8 @@ lower-level counters.
 For local or pluggable file storage:
 
 ```toml
-autumn-web = { version = "0.4", features = ["storage", "multipart"] }
-autumn-storage-s3 = "0.4" # when storage.backend = "s3"
+autumn-web = { version = "0.5", features = ["storage", "multipart"] }
+autumn-storage-s3 = "0.5" # when storage.backend = "s3"
 ```
 
 ```rust
@@ -331,8 +349,8 @@ autumn_web::app().with_blob_store(store).run().await;
 For shared Redis cache:
 
 ```toml
-autumn-web = { version = "0.4", features = ["redis"] }
-autumn-cache-redis = "0.4"
+autumn-web = { version = "0.5", features = ["redis"] }
+autumn-cache-redis = "0.5"
 ```
 
 ```rust
@@ -367,7 +385,7 @@ Use `AUTUMN_SECTION__FIELD` for env overrides, for example
 
 ## Error handling
 
-JSON errors are standardized as RFC 7807-style Problem Details in 0.4.0.
+JSON errors are standardized as RFC 7807-style Problem Details.
 Handlers should return `AutumnResult<T>` and use the typed constructors:
 
 ```rust
@@ -392,29 +410,45 @@ autumn new my-app
 autumn setup
 autumn dev
 autumn build
-autumn migrate
-autumn task <name>
+autumn migrate check
+autumn migrate --with-maintenance
+autumn task --list
+autumn task <name> -- --arg value
 autumn generate model Post title:String body:Text
 autumn generate migration add_posts
-autumn generate scaffold Post title:String body:Text
+autumn generate scaffold Post title:String body:Text --api
+autumn generate auth User --oauth github,google --totp --passkeys
 autumn generate admin Post
-autumn plugin-check
+autumn generate mailer UserMailer welcome
+autumn generate system-test todo-flow
+autumn routes --format json --user-only
+autumn doctor --strict --json
+autumn config list
+autumn flags list
+autumn experiments list
+autumn maintenance on --message "Migrating database"
+autumn webhook sim generic http://localhost:3000/webhooks/test secret '{"ok":true}'
+autumn dev-loop-bench --dry-run
+autumn plugin-check --plugin-name autumn-admin-plugin --prefix /admin
 ```
 
 `autumn doctor --strict` is the deployment sanity check. It reports unsafe
 production defaults, missing primaries, stale replica migrations, missing
 signing secrets, and other config problems without printing credentials.
 
-## 0.4.0 migration traps
+## 0.5.0 release traps
 
 - `AUTUMN_SECURITY__SIGNING_SECRET` is required in `prod` / `production`.
-- `storage-s3` was removed from `autumn-web`; use `autumn-storage-s3 = "0.4"`.
+- Use `autumn-storage-s3 = "0.5"` and `autumn-cache-redis = "0.5"`; these
+  are companion crates, not `autumn-web` feature names.
 - Repository-generated APIs require a policy in production unless
   `security.allow_unauthorized_repository_api = true` is explicit.
 - `Mailer::deliver_later` requires a durable queue in production unless
   `mail.allow_in_process_deliver_later_in_production = true` is explicit.
 - Signed webhook replay protection should use Redis in multi-replica prod.
-- Read `docs/migrations/0.4.0.md` before upgrading production apps.
+- OAuth2/OIDC social-login scaffolding is present. If release notes disagree,
+  verify `autumn-cli/src/generate/auth.rs`, `docs/guide/oauth.md`, and current
+  branch history before summarizing the release.
 
 ## Design invariants
 
@@ -477,9 +511,16 @@ touched crate so examples compile from an external-consumer perspective.
 - `docs/guide/getting-started.md`
 - `docs/guide/docs-smoke.md`
 - `docs/guide/cloud-native.md`
+- `docs/guide/oauth.md`
+- `docs/guide/mcp.md`
+- `docs/guide/feature-flags.md`
+- `docs/guide/experiments.md`
+- `docs/guide/runtime-config.md`
 - `docs/guide/signed-webhooks.md`
 - `docs/guide/storage.md`
-- `docs/guide/operating-background-jobs.md`
-- `docs/guide/scheduled-multi-replica.md`
+- `docs/guide/jobs.md`
+- `docs/guide/maintenance-mode.md`
+- `docs/guide/dev-loop-latency.md`
+- `docs/guide/system-tests.md`
 - `docs/guide/testing.md`
 - `docs/autumn-workflow-architecture.md`
