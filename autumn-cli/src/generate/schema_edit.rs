@@ -2575,7 +2575,10 @@ async fn main() {\n\
             updated.contains("\"mail\""),
             "must add feature despite trailing comment: {updated}"
         );
-        assert!(updated.contains("version"), "must preserve version: {updated}");
+        assert!(
+            updated.contains("version"),
+            "must preserve version: {updated}"
+        );
     }
 
     #[test]
@@ -2629,7 +2632,8 @@ async fn main() {\n\
 
     #[test]
     fn ensure_feature_multiline_inline_table_inserts_features() {
-        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = {\n  version = \"0.6\"\n}\n";
+        let cargo =
+            "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = {\n  version = \"0.6\"\n}\n";
         let updated = ensure_autumn_web_feature(cargo, "mail");
         assert!(
             updated.contains("\"mail\""),
@@ -2639,15 +2643,15 @@ async fn main() {\n\
 
     #[test]
     fn ensure_feature_multiline_inline_table_idempotent() {
-        let cargo =
-            "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = {\n  version = \"0.6\",\n  features = [\"mail\"]\n}\n";
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = {\n  version = \"0.6\",\n  features = [\"mail\"]\n}\n";
         let updated = ensure_autumn_web_feature(cargo, "mail");
         assert_eq!(cargo, updated, "already-present feature must be a no-op");
     }
 
     #[test]
     fn ensure_feature_multiline_section_trailing_comment_on_header() {
-        let cargo = "[package]\nname=\"x\"\n\n[dependencies.autumn-web] # pinned\nversion = \"0.6\"\n";
+        let cargo =
+            "[package]\nname=\"x\"\n\n[dependencies.autumn-web] # pinned\nversion = \"0.6\"\n";
         let updated = ensure_autumn_web_feature(cargo, "mail");
         assert!(
             updated.contains("\"mail\""),
