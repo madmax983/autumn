@@ -925,7 +925,7 @@ pub fn ensure_autumn_web_feature(existing: &str, feature: &str) -> String {
             }
         } else {
             // Check for a renamed dep: `aw = { package = "autumn-web", ... }`.
-            let val = after_ws.split_once('=').map(|x| x.1).unwrap_or("");
+            let val = after_ws.split_once('=').map_or("", |x| x.1);
             if !val.contains(r#"package = "autumn-web""#)
                 && !val.contains(r#"package="autumn-web""#)
             {
