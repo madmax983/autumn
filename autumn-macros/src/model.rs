@@ -755,10 +755,10 @@ fn emit_state_machine_impl(model_name: &syn::Ident, spec: &StateMachineSpec) -> 
         .map(|t| {
             let from = &t.from;
             let to = &t.to;
-            match &t.guard {
-                Some(g) => quote! { (#from, #to, ::core::option::Option::Some(#g)) },
-                None => quote! { (#from, #to, ::core::option::Option::None) },
-            }
+            t.guard.as_ref().map_or_else(
+                || quote! { (#from, #to, ::core::option::Option::None) },
+                |g| quote! { (#from, #to, ::core::option::Option::Some(#g)) },
+            )
         })
         .collect();
 
@@ -768,12 +768,13 @@ fn emit_state_machine_impl(model_name: &syn::Ident, spec: &StateMachineSpec) -> 
         .map(|t| {
             let from = &t.from;
             let to = &t.to;
-            if let Some(g) = &t.guard {
-                let guard_fn = format_ident!("{g}");
-                quote! { (#from, #to) => self.#guard_fn() }
-            } else {
-                quote! { (#from, #to) => true }
-            }
+            t.guard.as_ref().map_or_else(
+                || quote! { (#from, #to) => true },
+                |g| {
+                    let guard_fn = format_ident!("{g}");
+                    quote! { (#from, #to) => self.#guard_fn() }
+                },
+            )
         })
         .collect();
 
