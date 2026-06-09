@@ -1862,6 +1862,33 @@ pub async fn record_login_session(
     Ok(())
 }}
 
+/// Re-point the tracked session row at the current (rotated) session id.
+///
+/// `session.rotate_id()` changes the opaque id, and with it the digest the
+/// row is keyed by. Any flow that rotates while *staying logged in* (e.g.
+/// step-up reauth) must call this with the digest captured before the
+/// rotation, or the very next request would look up a missing row, be
+/// treated as revoked, and 401.
+pub async fn rebind_tracked_session(
+    db: &mut Db,
+    session: &Session,
+    old_token_digest: &str,
+) -> AutumnResult<()> {{
+    let new_digest = session_token_digest(session).await;
+    diesel::update(
+        {sess_table}::table.filter({sess_table}::token_digest.eq(old_token_digest)),
+    )
+    .set({sess_table}::token_digest.eq(&new_digest))
+    .execute(&mut **db)
+    .await
+    .map_err(|e| {{
+        AutumnError::internal_server_error_msg(format!(
+            "Failed to rebind tracked session: {{e}}"
+        ))
+    }})?;
+    Ok(())
+}}
+
 /// Validate the tracked session row for the authenticated user and return
 /// the current {pascal_name}.
 ///
@@ -1949,9 +1976,16 @@ fn sessions_list_fragment(
                             " · last seen " (s.last_seen_at.format("%Y-%m-%d %H:%M UTC").to_string())
                         }}
                         @if !current {{
-                            button hx-post={{ "/account/sessions/" (s.id) "/revoke" }}
-                                hx-target="#session-list" hx-swap="outerHTML" {{
-                                "Revoke"
+                            // Real form so revocation works without JavaScript;
+                            // htmx intercepts the submit for an in-place swap.
+                            form method="post" action={{ "/account/sessions/" (s.id) "/revoke" }}
+                                hx-post={{ "/account/sessions/" (s.id) "/revoke" }}
+                                hx-target="#session-list" hx-swap="outerHTML"
+                                style="display:inline" {{
+                                @if let Some(csrf) = csrf {{
+                                    input type="hidden" name=(csrf_name) value=(csrf.token());
+                                }}
+                                button type="submit" {{ "Revoke" }}
                             }}
                         }}
                         form action={{ "/account/sessions/" (s.id) "/label" }} method="post"
@@ -1966,9 +2000,15 @@ fn sessions_list_fragment(
                     }}
                 }}
             }}
-            button hx-post="/account/sessions/revoke-others"
+            // Real form so bulk revocation works without JavaScript; htmx
+            // intercepts the submit for an in-place swap.
+            form method="post" action="/account/sessions/revoke-others"
+                hx-post="/account/sessions/revoke-others"
                 hx-target="#session-list" hx-swap="outerHTML" {{
-                "Sign out everywhere else"
+                @if let Some(csrf) = csrf {{
+                    input type="hidden" name=(csrf_name) value=(csrf.token());
+                }}
+                button type="submit" {{ "Sign out everywhere else" }}
             }}
         }}
     }}
@@ -2674,6 +2714,8 @@ pub struct ReauthForm {{
 #[get("/reauth")]
 pub async fn reauth_form(
     session: Session,
+    State(state): State<AppState>,
+    mut db: Db,
     Query(params): Query<std::collections::HashMap<String, String>>,
     csrf: Option<CsrfToken>,
     csrf_field: Option<CsrfFormField>,
@@ -2681,6 +2723,8 @@ pub async fn reauth_form(
     if session.get("{snake_name}_id").await.is_none() {{
         return Ok(redirect_to("/login").into_response());
     }}
+    // Validates the tracked session row (401s immediately if revoked).
+    let _ = require_tracked_session(&session, &mut db, &state).await?;
     let return_to = params.get("return_to").cloned().unwrap_or_default();
     Ok(layout("Confirm your identity", html! {{
         h1 {{ "Confirm your identity" }}
@@ -2864,7 +2908,12 @@ pub async fn reauth(
     {totp_reauth_check}
     // Rotate session ID before elevating privileges to prevent session fixation
     // attacks where a stolen cookie is used to benefit from a legitimate reauth.
+    // The tracked session row is keyed by the digest of the id, so capture the
+    // pre-rotation digest and re-point the row at the new id — otherwise the
+    // redirected step-up request would find no row and be treated as revoked.
+    let pre_rotation_digest = session_token_digest(&session).await;
     session.rotate_id().await;
+    rebind_tracked_session(&mut db, &session, &pre_rotation_digest).await?;
     session.remove("reauth_pw_ok").await;
     // Refresh the step-up claim.
     autumn_web::step_up::set_last_strong_auth_at(&session).await;
@@ -3402,14 +3451,13 @@ async fn send_confirmation_email(mailer: &Mailer, to: &str, token: &str) -> Autu
 #[get("/account/data-export")]
 pub async fn data_export_form(
     session: Session,
+    State(state): State<AppState>,
+    mut db: Db,
     csrf: Option<CsrfToken>,
     csrf_field: Option<CsrfFormField>,
 ) -> AutumnResult<Response> {{
-    let auth = session
-        .get("{snake_name}_id")
-        .await
-        .ok_or_else(|| AutumnError::unauthorized_msg("Not authenticated."))?;
-    let _ = auth;
+    // Validates the tracked session row (401s immediately if revoked).
+    let _ = require_tracked_session(&session, &mut db, &state).await?;
     Ok(layout("Download My Data", html! {{
         h1 {{ "Download My Data" }}
         p {{
@@ -3527,14 +3575,13 @@ pub struct DeleteAccountForm {{
 #[get("/account/delete")]
 pub async fn delete_account_form(
     session: Session,
+    State(state): State<AppState>,
+    mut db: Db,
     csrf: Option<CsrfToken>,
     csrf_field: Option<CsrfFormField>,
 ) -> AutumnResult<Response> {{
-    let auth = session
-        .get("{snake_name}_id")
-        .await
-        .ok_or_else(|| AutumnError::unauthorized_msg("Not authenticated."))?;
-    let _ = auth;
+    // Validates the tracked session row (401s immediately if revoked).
+    let _ = require_tracked_session(&session, &mut db, &state).await?;
     Ok(layout("Delete My Account", html! {{
         h1 {{ "Delete My Account" }}
         p class="warning" {{
@@ -6763,11 +6810,13 @@ pub struct PasskeyRevokeForm {
 pub async fn passkey_register_page(
     session: Session,
     State(state): State<AppState>,
+    mut db: Db,
     csrf: Option<CsrfToken>,
     csrf_header: Option<CsrfTokenHeader>,
     nonce: Option<CspNonce>,
 ) -> AutumnResult<Markup> {
-    let _ = (session, state);
+    // Validates the tracked session row (401s immediately if revoked).
+    let _ = crate::routes::auth::require_tracked_session(&session, &mut db, &state).await?;
     let csrf_token = csrf.map(|t| t.token().to_owned()).unwrap_or_default();
     let csrf_header_name = csrf_header.map(|h| h.0.clone()).unwrap_or_else(|| "X-CSRF-Token".to_owned());
     let script_nonce = nonce.map(|n| n.value().to_owned());
@@ -6821,11 +6870,11 @@ pub async fn passkey_register_begin(
     State(state): State<AppState>,
     mut db: Db,
 ) -> AutumnResult<axum::Json<serde_json::Value>> {
-    let __SNAKE___id: i64 = session
-        .get(state.auth_session_key())
-        .await
-        .and_then(|s| s.parse().ok())
-        .ok_or_else(|| AutumnError::unauthorized_msg("Not authenticated."))?;
+    // Validates the tracked session row (401s immediately if revoked).
+    let __SNAKE___id: i64 =
+        crate::routes::auth::require_tracked_session(&session, &mut db, &state)
+            .await?
+            .id;
     let __SNAKE___email = session
         .get("__SNAKE___email")
         .await

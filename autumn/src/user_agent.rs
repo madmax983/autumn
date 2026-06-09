@@ -93,9 +93,12 @@ pub fn parse_user_agent(ua: &str) -> ParsedUserAgent {
         };
     }
 
-    let family = parse_family(&lower);
+    // Scan for bot markers once; the result feeds both the family and the
+    // device class so the string is not re-scanned per field.
+    let bot = bot_family(&lower);
+    let family = bot.unwrap_or_else(|| parse_family(&lower));
     let os = parse_os(&lower);
-    let device_class = parse_device_class(&lower, family);
+    let device_class = parse_device_class(&lower, family, os, bot.is_some());
 
     ParsedUserAgent {
         family: family.to_owned(),
@@ -137,10 +140,8 @@ fn bot_family(lower: &str) -> Option<&'static str> {
         })
 }
 
+/// Browser family for non-bot agents; `bot_family` is checked by the caller.
 fn parse_family(lower: &str) -> &'static str {
-    if let Some(bot) = bot_family(lower) {
-        return bot;
-    }
     // Order matters: Edge/Opera/Samsung Internet embed "chrome", and
     // Chrome embeds "safari", so check the most specific tokens first.
     if lower.contains("edg/") || lower.contains("edge/") {
@@ -179,8 +180,8 @@ fn parse_os(lower: &str) -> &'static str {
     }
 }
 
-fn parse_device_class(lower: &str, family: &'static str) -> DeviceClass {
-    if bot_family(lower).is_some() {
+fn parse_device_class(lower: &str, family: &str, os: &str, is_bot: bool) -> DeviceClass {
+    if is_bot {
         return DeviceClass::Bot;
     }
     if lower.contains("ipad") || lower.contains("tablet") {
@@ -197,7 +198,7 @@ fn parse_device_class(lower: &str, family: &'static str) -> DeviceClass {
     if lower.contains("iphone") || lower.contains("ipod") || lower.contains("mobile") {
         return DeviceClass::Mobile;
     }
-    if family == "Unknown" && parse_os(lower) == "Unknown" {
+    if family == "Unknown" && os == "Unknown" {
         return DeviceClass::Unknown;
     }
     DeviceClass::Desktop

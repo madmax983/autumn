@@ -2161,7 +2161,7 @@ fn generate_auth_sessions_migration_schema_and_model() {
 }
 
 /// AC2 + AC4 + AC6 — routes record the session on login, validate it on
-/// authenticated requests (with bounded last_seen_at writes), destroy
+/// authenticated requests (with bounded `last_seen_at` writes), destroy
 /// revoked sessions immediately, and serve the /account/sessions page.
 #[test]
 fn generate_auth_sessions_routes_and_page() {
@@ -2294,7 +2294,7 @@ fn generate_auth_totp_changes_revoke_other_sessions() {
     );
 }
 
-/// AC5 (WebAuthn) — passkey add/remove revoke all *other* sessions by default,
+/// AC5 (`WebAuthn`) — passkey add/remove revoke all *other* sessions by default,
 /// and passkey login records a session row.
 #[test]
 fn generate_auth_passkeys_changes_revoke_other_sessions() {
@@ -2366,6 +2366,93 @@ fn generate_auth_sessions_docs_emitted() {
         assert!(
             docs.contains(needle),
             "session-management.md missing: {needle}"
+        );
+    }
+}
+
+/// PR #1176 review hardening: reauth must re-point the tracked session row
+/// after rotating the session id (otherwise step-up locks the user out),
+/// every protected handler — including GET form pages — must go through the
+/// tracked-session gate, and the revocation controls must work without
+/// JavaScript (real forms, htmx as progressive enhancement).
+#[test]
+fn generate_auth_sessions_review_hardening() {
+    let (_tmp, project) = fresh_project("auth-sess-hardening");
+    run_autumn(&project, &["generate", "auth", "User"]);
+    let routes = fs::read_to_string(project.join("src/routes/auth.rs")).unwrap();
+
+    // P1: reauth rotates the session id and must rebind the tracked row to
+    // the new digest, after the rotation.
+    let reauth_start = routes
+        .find("pub async fn reauth(")
+        .expect("missing reauth handler");
+    let reauth = &routes[reauth_start..];
+    let reauth = &reauth[..reauth.find("\n// ──").unwrap_or(reauth.len())];
+    let rotate_at = reauth
+        .find("session.rotate_id()")
+        .expect("reauth must rotate");
+    let rebind_at = reauth
+        .find("rebind_tracked_session")
+        .expect("reauth must rebind the tracked session row after rotation");
+    assert!(
+        rotate_at < rebind_at,
+        "reauth must rebind AFTER rotating the session id"
+    );
+
+    // P2: protected GET form pages validate the tracked row too, so a revoked
+    // device's next request 401s no matter which authenticated route it hits.
+    for handler in [
+        "pub async fn data_export_form",
+        "pub async fn delete_account_form",
+        "pub async fn reauth_form",
+    ] {
+        let start = routes
+            .find(handler)
+            .unwrap_or_else(|| panic!("missing {handler}"));
+        let body = &routes[start..];
+        let body = &body[..body.find("\n/// `").unwrap_or(body.len())];
+        assert!(
+            body.contains("require_tracked_session"),
+            "{handler} must validate the tracked session row"
+        );
+    }
+
+    // P2: revocation controls are real POST forms (usable without JS), with
+    // htmx attributes for in-place swaps when JS is available.
+    assert!(
+        routes.contains("form method=\"post\" action=\"/account/sessions/revoke-others\""),
+        "bulk revoke must be a real form for non-JS fallback"
+    );
+    assert!(
+        routes.contains("action={ \"/account/sessions/\" (s.id) \"/revoke\" }"),
+        "per-session revoke must be a real form for non-JS fallback"
+    );
+    assert!(
+        routes.contains("hx-post=\"/account/sessions/revoke-others\""),
+        "bulk revoke keeps htmx enhancement"
+    );
+}
+
+/// PR #1176 review hardening for `--passkeys`: the registration page and
+/// challenge endpoint must also validate the tracked session row.
+#[test]
+fn generate_auth_passkeys_pages_gated_on_tracked_session() {
+    let (_tmp, project) = fresh_project("auth-sess-pk-gate");
+    run_autumn(&project, &["generate", "auth", "User", "--passkeys"]);
+    let routes = fs::read_to_string(project.join("src/routes/passkeys.rs")).unwrap();
+
+    for handler in [
+        "pub async fn passkey_register_page",
+        "pub async fn passkey_register_begin",
+    ] {
+        let start = routes
+            .find(handler)
+            .unwrap_or_else(|| panic!("missing {handler}"));
+        let body = &routes[start..];
+        let body = &body[..body.find("\n/// `").unwrap_or(body.len())];
+        assert!(
+            body.contains("require_tracked_session"),
+            "{handler} must validate the tracked session row"
         );
     }
 }
