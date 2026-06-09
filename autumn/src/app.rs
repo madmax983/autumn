@@ -2496,9 +2496,11 @@ impl AppBuilder {
                     );
                     continue;
                 }
-                // Exempt each inbound webhook path from CSRF: these routes receive
-                // provider-signed POST requests that never carry a CSRF token.
-                config.security.csrf.exempt_paths.push(path);
+                // Exempt each inbound webhook path from both CSRF and CAPTCHA:
+                // these routes receive provider-signed POST requests that never
+                // carry a CSRF or CAPTCHA token.
+                config.security.csrf.exempt_paths.push(path.clone());
+                config.security.captcha_exempt_paths.push(path);
                 merge_routers.push(axum_router);
             }
         }

@@ -1524,7 +1524,10 @@ where
     S: Clone + Send + Sync + 'static,
 {
     if config.bot_protection.enabled {
-        let mut exempt = config.security.csrf.exempt_paths.clone();
+        // Use the dedicated captcha_exempt_paths list — NOT csrf.exempt_paths —
+        // so that a route exempt from CSRF for non-cookie auth reasons does not
+        // automatically bypass bot-protection as well.
+        let mut exempt = config.security.captcha_exempt_paths.clone();
         for endpoint in &config.security.webhooks.endpoints {
             exempt.push(endpoint.path.clone());
         }

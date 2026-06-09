@@ -1094,7 +1094,8 @@ impl TestApp {
         #[cfg(feature = "inbound-mail")]
         if let Some(ref im_router) = self.inbound_mail_router {
             for (path, axum_router) in crate::inbound_mail::build_routes(im_router) {
-                self.config.security.csrf.exempt_paths.push(path);
+                self.config.security.csrf.exempt_paths.push(path.clone());
+                self.config.security.captcha_exempt_paths.push(path);
                 merge_routers.push(axum_router);
             }
         }

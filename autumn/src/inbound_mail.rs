@@ -1193,16 +1193,9 @@ fn parse_rfc5322(raw: Bytes) -> InboundEmail {
                 && !ct_lower.starts_with("text/")
                 && !ct_lower.starts_with("message/"));
         if is_attachment {
-            let filename = parsed_headers.get("content-disposition").and_then(|d| {
-                d.split(';').find_map(|seg| {
-                    let seg = seg.trim();
-                    if seg.to_ascii_lowercase().starts_with("filename=") {
-                        Some(seg["filename=".len()..].trim_matches('"').to_string())
-                    } else {
-                        None
-                    }
-                })
-            });
+            let filename = parsed_headers
+                .get("content-disposition")
+                .and_then(|d| mime_param(d, "filename"));
             let ct_only = ct_lower
                 .split(';')
                 .next()
@@ -1219,8 +1212,7 @@ fn parse_rfc5322(raw: Bytes) -> InboundEmail {
                     .map(Bytes::from)
                     .unwrap_or_else(|_| Bytes::copy_from_slice(body_bytes))
             } else if cte == "quoted-printable" {
-                let body_str = String::from_utf8_lossy(body_bytes).into_owned();
-                Bytes::from(decode_transfer_encoding(&body_str, &cte).into_bytes())
+                Bytes::from(decode_quoted_printable_bytes(body_bytes))
             } else {
                 Bytes::copy_from_slice(body_bytes)
             };
@@ -1285,27 +1277,30 @@ fn decode_transfer_encoding(body: &str, cte: &str) -> String {
     }
 }
 
-/// Decode a quoted-printable encoded string per RFC 2045.
-fn decode_quoted_printable(input: &str) -> String {
+/// Decode quoted-printable bytes per RFC 2045, returning the raw decoded bytes.
+///
+/// This is the canonical implementation used by both text and binary paths.
+/// For text bodies the caller can convert to `String`; for binary attachment
+/// bodies the `Vec<u8>` is used directly so no UTF-8 lossy replacement occurs.
+fn decode_quoted_printable_bytes(input: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(input.len());
-    let bytes = input.as_bytes();
     let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'=' {
-            if i + 1 < bytes.len() && (bytes[i + 1] == b'\n' || bytes[i + 1] == b'\r') {
+    while i < input.len() {
+        if input[i] == b'=' {
+            if i + 1 < input.len() && (input[i + 1] == b'\n' || input[i + 1] == b'\r') {
                 // Soft line break: `=\n` or `=\r\n`
                 i += 1;
-                if i + 1 < bytes.len() && bytes[i] == b'\r' && bytes[i + 1] == b'\n' {
+                if i + 1 < input.len() && input[i] == b'\r' && input[i + 1] == b'\n' {
                     i += 2;
                 } else {
                     i += 1;
                 }
-            } else if i + 2 < bytes.len()
-                && bytes[i + 1].is_ascii_hexdigit()
-                && bytes[i + 2].is_ascii_hexdigit()
+            } else if i + 2 < input.len()
+                && input[i + 1].is_ascii_hexdigit()
+                && input[i + 2].is_ascii_hexdigit()
             {
-                let hi = (bytes[i + 1] as char).to_digit(16).unwrap_or(0) as u8;
-                let lo = (bytes[i + 2] as char).to_digit(16).unwrap_or(0) as u8;
+                let hi = (input[i + 1] as char).to_digit(16).unwrap_or(0) as u8;
+                let lo = (input[i + 2] as char).to_digit(16).unwrap_or(0) as u8;
                 out.push((hi << 4) | lo);
                 i += 3;
             } else {
@@ -1313,11 +1308,82 @@ fn decode_quoted_printable(input: &str) -> String {
                 i += 1;
             }
         } else {
-            out.push(bytes[i]);
+            out.push(input[i]);
             i += 1;
         }
     }
+    out
+}
+
+/// Decode a quoted-printable encoded string per RFC 2045.
+///
+/// For text bodies only — the result is a `String` so non-UTF-8 bytes in the
+/// decoded stream are replaced with `U+FFFD`.  Binary attachment paths should
+/// use [`decode_quoted_printable_bytes`] to avoid that replacement.
+fn decode_quoted_printable(input: &str) -> String {
+    let out = decode_quoted_printable_bytes(input.as_bytes());
     String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+}
+
+/// Extract a named parameter from a semicolon-separated MIME header value,
+/// correctly handling quoted strings so that a semicolon inside a quoted
+/// filename (e.g. `filename="Q1;final.pdf"`) is not treated as a separator.
+fn mime_param(header_val: &str, name: &str) -> Option<String> {
+    let bytes = header_val.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    while i < len {
+        // Skip whitespace / leading semicolon between parameters.
+        while i < len && (bytes[i] == b';' || bytes[i] == b' ' || bytes[i] == b'\t') {
+            i += 1;
+        }
+        if i >= len {
+            break;
+        }
+        // Read the key up to '=' or ';'.
+        let key_start = i;
+        while i < len && bytes[i] != b'=' && bytes[i] != b';' {
+            i += 1;
+        }
+        let key = header_val[key_start..i].trim();
+        if i >= len || bytes[i] == b';' {
+            continue;
+        }
+        i += 1; // skip '='
+        // Skip whitespace before the value.
+        while i < len && (bytes[i] == b' ' || bytes[i] == b'\t') {
+            i += 1;
+        }
+        if i >= len {
+            break;
+        }
+        // Read the value, respecting double-quoted strings.
+        let val = if bytes[i] == b'"' {
+            i += 1; // skip opening '"'
+            let mut val = String::new();
+            while i < len && bytes[i] != b'"' {
+                if bytes[i] == b'\\' && i + 1 < len {
+                    i += 1; // skip backslash escape
+                }
+                val.push(bytes[i] as char);
+                i += 1;
+            }
+            if i < len {
+                i += 1;
+            } // skip closing '"'
+            val
+        } else {
+            let val_start = i;
+            while i < len && bytes[i] != b';' {
+                i += 1;
+            }
+            header_val[val_start..i].trim().to_string()
+        };
+        if key.eq_ignore_ascii_case(name) {
+            return Some(val);
+        }
+    }
+    None
 }
 
 /// Extract the MIME boundary parameter from a `Content-Type` header value.
@@ -1444,9 +1510,7 @@ fn extract_multipart_bodies(
             .unwrap_or_default();
         let disposition_lower = disposition.to_ascii_lowercase();
         let is_attachment = disposition_lower.starts_with("attachment")
-            || disposition
-                .split(';')
-                .any(|s| s.trim().to_ascii_lowercase().starts_with("filename="));
+            || mime_param(&disposition, "filename").is_some();
 
         if part_ct_lower.starts_with("multipart/") {
             // Recurse into nested multipart parts (e.g. multipart/alternative).
@@ -1467,14 +1531,7 @@ fn extract_multipart_bodies(
             html_body = Some(decode_transfer_encoding(&s, &part_cte));
         } else if is_attachment || !part_ct_lower.starts_with("text/") {
             // Collect attachment parts; use raw bytes to avoid UTF-8 corruption.
-            let filename = disposition.split(';').find_map(|seg| {
-                let seg = seg.trim();
-                if seg.to_ascii_lowercase().starts_with("filename=") {
-                    Some(seg["filename=".len()..].trim_matches('"').to_string())
-                } else {
-                    None
-                }
-            });
+            let filename = mime_param(&disposition, "filename");
             let ct_only = part_ct_lower
                 .split(';')
                 .next()
@@ -1491,8 +1548,9 @@ fn extract_multipart_bodies(
                     .map(Bytes::from)
                     .unwrap_or_else(|_| Bytes::copy_from_slice(part_body_bytes))
             } else if part_cte == "quoted-printable" {
-                let s = String::from_utf8_lossy(part_body_bytes);
-                Bytes::from(decode_quoted_printable(&s).into_bytes())
+                // Use the byte-returning decoder to avoid UTF-8 replacement for
+                // non-text attachments whose decoded bytes may not be valid UTF-8.
+                Bytes::from(decode_quoted_printable_bytes(part_body_bytes))
             } else {
                 Bytes::copy_from_slice(part_body_bytes)
             };
@@ -3049,6 +3107,48 @@ mod tests {
         assert_eq!(att.filename.as_deref(), Some("doc.pdf"));
         // The decoded bytes should match the original PDF stub.
         assert_eq!(att.data.as_ref(), b"%PDF-1.0");
+    }
+
+    #[test]
+    fn rfc5322_attachment_filename_with_semicolon() {
+        // A filename that contains a semicolon must not be truncated when the
+        // Content-Disposition parameter is parsed.
+        let b64 = base64::engine::general_purpose::STANDARD.encode(b"data");
+        let raw = format!(
+            "From: s@example.com\r\nTo: r@example.com\r\n\
+             Content-Type: application/pdf\r\n\
+             Content-Transfer-Encoding: base64\r\n\
+             Content-Disposition: attachment; filename=\"Q1;final.pdf\"\r\n\
+             \r\n\
+             {b64}\r\n"
+        );
+        let email = parse_rfc5322(Bytes::from(raw.into_bytes()));
+        assert_eq!(email.attachments.len(), 1);
+        assert_eq!(
+            email.attachments[0].filename.as_deref(),
+            Some("Q1;final.pdf"),
+            "semicolon inside quoted filename must not be treated as a parameter separator"
+        );
+    }
+
+    #[test]
+    fn rfc5322_attachment_qp_binary_not_corrupted() {
+        // A QP-encoded attachment with non-UTF-8 bytes (=FF) must not have those
+        // bytes replaced by U+FFFD when decoded.
+        let raw = "From: s@example.com\r\nTo: r@example.com\r\n\
+                   Content-Type: application/octet-stream\r\n\
+                   Content-Transfer-Encoding: quoted-printable\r\n\
+                   Content-Disposition: attachment; filename=\"bin.dat\"\r\n\
+                   \r\n\
+                   =FF=80\r\n";
+        let email = parse_rfc5322(Bytes::from_static(raw.as_bytes()));
+        assert_eq!(email.attachments.len(), 1);
+        let data = &email.attachments[0].data;
+        assert_eq!(
+            data.as_ref(),
+            b"\xFF\x80\r\n",
+            "non-UTF-8 QP bytes must not be corrupted by UTF-8 replacement"
+        );
     }
 
     #[test]
