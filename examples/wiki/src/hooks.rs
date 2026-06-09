@@ -27,7 +27,8 @@ impl MutationHooks for PageHooks {
 
         // Enforce the can_publish guard even on direct creates so a page
         // cannot be born already published with an empty title or body.
-        if new.status == "published" && (new.title.trim().is_empty() || new.body.trim().is_empty()) {
+        if new.status == "published" && (new.title.trim().is_empty() || new.body.trim().is_empty())
+        {
             return Err(autumn_web::AutumnError::bad_request_msg(
                 "Cannot create a published page with an empty title or body",
             ));
@@ -233,7 +234,10 @@ mod tests {
         let mut draft = UpdateDraft { before, after };
         let result = hooks.before_update(&mut ctx, &mut draft).await;
 
-        assert!(result.is_err(), "guard must reject publishing with empty body");
+        assert!(
+            result.is_err(),
+            "guard must reject publishing with empty body"
+        );
     }
 
     #[tokio::test]
@@ -247,7 +251,10 @@ mod tests {
             status: "published".into(),
         };
         let result = hooks.before_create(&mut ctx, &mut new).await;
-        assert!(result.is_err(), "creating published page with empty body must fail");
+        assert!(
+            result.is_err(),
+            "creating published page with empty body must fail"
+        );
     }
 
     #[tokio::test]
