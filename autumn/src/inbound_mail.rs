@@ -879,7 +879,9 @@ pub(crate) fn parse_mailgun(
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
         .cast_signed();
-    if (now - ts).abs() > 300 {
+    // Use abs_diff to avoid signed overflow when `ts` is an extreme value
+    // (e.g. i64::MIN), which would panic in debug builds before the rejection runs.
+    if now.abs_diff(ts) > 300 {
         tracing::warn!("inbound_mail.mailgun: timestamp outside 5-minute window");
         return Err(StatusCode::UNAUTHORIZED);
     }
@@ -2192,6 +2194,33 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs())
             .to_string()
+    }
+
+    #[test]
+    fn mailgun_parse_extreme_timestamp_returns_401_not_panic() {
+        // i64::MIN as a timestamp would overflow `(now - ts).abs()` in debug
+        // builds before the stale-window check rejects it.  Ensure we get 401.
+        for ts_str in &[
+            i64::MIN.to_string(),
+            i64::MAX.to_string(),
+            "9999999999999999999".to_string(),
+        ] {
+            let form: HashMap<String, String> = [
+                ("from".to_string(), "u@example.com".to_string()),
+                ("to".to_string(), "s@example.com".to_string()),
+                ("timestamp".to_string(), ts_str.clone()),
+                ("token".to_string(), "tok".to_string()),
+                ("signature".to_string(), "sig".to_string()),
+            ]
+            .into_iter()
+            .collect();
+            let result = parse_mailgun(&form, "key", Vec::new());
+            // Either a parse error (non-i64) or a 401 — must never panic.
+            assert!(
+                result.is_err(),
+                "extreme timestamp {ts_str} must be rejected, not panic"
+            );
+        }
     }
 
     #[test]

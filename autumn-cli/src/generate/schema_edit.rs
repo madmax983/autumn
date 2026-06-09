@@ -920,6 +920,12 @@ pub fn ensure_autumn_web_feature(existing: &str, feature: &str) -> String {
         if !in_deps {
             continue;
         }
+        // Skip commented-out lines so that a commented dep like
+        //   # aw = { package = "autumn-web" }
+        // does not shadow the real dependency below it.
+        if trimmed.starts_with('#') {
+            continue;
+        }
         // Match either the exact `autumn-web` key or a renamed dep with `package = "autumn-web"`.
         let after_ws = line.trim_start();
         if let Some(rest) = after_ws.strip_prefix("autumn-web") {
@@ -936,6 +942,13 @@ pub fn ensure_autumn_web_feature(existing: &str, feature: &str) -> String {
             if !val.contains(r#"package = "autumn-web""#)
                 && !val.contains(r#"package="autumn-web""#)
             {
+                continue;
+            }
+            // The alias must be importable as `autumn_web`; an alias such as
+            // `aw` produces a crate named `aw`, not `autumn_web`, so the
+            // generated code (`use autumn_web::...`) would fail to compile.
+            let alias = after_ws.split_once('=').map_or("", |(k, _)| k.trim());
+            if alias.replace('-', "_") != "autumn_web" {
                 continue;
             }
         }
@@ -2681,21 +2694,58 @@ async fn main() {\n\
     }
 
     #[test]
-    fn ensure_feature_package_alias_dep() {
-        // Renamed dep: `aw = { package = "autumn-web", version = "0.6" }`
+    fn ensure_feature_package_alias_dep_skipped_for_non_autumn_web_alias() {
+        // An alias whose name does not normalise to `autumn_web` (e.g. `aw`)
+        // must be skipped — the generated code imports `autumn_web::`, so adding
+        // the feature to a crate named `aw` would leave the project uncompilable.
         let cargo = "[package]\nname=\"x\"\n\n[dependencies]\naw = { package = \"autumn-web\", version = \"0.6\" }\n";
+        let updated = ensure_autumn_web_feature(cargo, "mail");
+        assert_eq!(
+            cargo, updated,
+            "non-autumn_web alias must be left unchanged"
+        );
+    }
+
+    #[test]
+    fn ensure_feature_package_alias_dep_autumn_web_alias() {
+        // An alias explicitly named `autumn_web` (with underscore) and
+        // `package = "autumn-web"` is compatible with generated imports.
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nautumn_web = { package = \"autumn-web\", version = \"0.6\" }\n";
         let updated = ensure_autumn_web_feature(cargo, "mail");
         assert!(
             updated.contains("\"mail\""),
-            "must add feature to renamed dep: {updated}"
+            "autumn_web alias must have feature added: {updated}"
         );
     }
 
     #[test]
     fn ensure_feature_package_alias_dep_idempotent() {
-        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\naw = { package = \"autumn-web\", version = \"0.6\", features = [\"mail\"] }\n";
+        // Same as above but the feature is already present; must be a no-op.
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nautumn_web = { package = \"autumn-web\", version = \"0.6\", features = [\"mail\"] }\n";
         let updated = ensure_autumn_web_feature(cargo, "mail");
         assert_eq!(cargo, updated, "already-present feature must be a no-op");
+    }
+
+    #[test]
+    fn ensure_feature_commented_dep_line_is_skipped() {
+        // A commented-out dep like `# aw = { package = "autumn-web" }` must not
+        // be treated as the actual dependency.  The real dep below must be updated.
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\n# aw = { package = \"autumn-web\", version = \"0.6\" }\nautumn-web = \"0.6\"\n";
+        let updated = ensure_autumn_web_feature(cargo, "inbound-mailgun");
+        // The comment line must be unchanged.
+        assert!(
+            updated.contains("# aw = { package"),
+            "comment line must be preserved as-is: {updated}"
+        );
+        // The real dep must have the feature added.
+        let real_dep_line = updated
+            .lines()
+            .find(|l| l.trim_start().starts_with("autumn-web") && !l.trim_start().starts_with('#'))
+            .unwrap_or("");
+        assert!(
+            real_dep_line.contains("\"inbound-mailgun\""),
+            "feature must be added to the real dep line: {real_dep_line}"
+        );
     }
 
     #[test]
