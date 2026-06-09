@@ -150,4 +150,50 @@ mod tests {
         assert!(err.to_string().contains("99"));
         assert!(err.to_string().contains("3"));
     }
+
+    #[tokio::test]
+    async fn test_before_update_allows_valid_status_transition() {
+        let hooks = PageHooks;
+        let mut ctx = MutationContext::new(MutationOp::Update);
+        let before = Page {
+            id: 1,
+            title: "My Page".into(),
+            slug: "my-page".into(),
+            body: "Some content".into(),
+            status: "draft".into(),
+            lock_version: 0,
+            created_at: Utc::now().naive_utc(),
+            updated_at: Utc::now().naive_utc(),
+        };
+        let mut after = before.clone();
+        after.status = "published".into();
+
+        let mut draft = UpdateDraft { before, after };
+        hooks.before_update(&mut ctx, &mut draft).await.unwrap();
+
+        assert_eq!(draft.after.status, "published");
+    }
+
+    #[tokio::test]
+    async fn test_before_update_rejects_invalid_status_transition() {
+        let hooks = PageHooks;
+        let mut ctx = MutationContext::new(MutationOp::Update);
+        let before = Page {
+            id: 1,
+            title: "My Page".into(),
+            slug: "my-page".into(),
+            body: "Some content".into(),
+            status: "published".into(),
+            lock_version: 0,
+            created_at: Utc::now().naive_utc(),
+            updated_at: Utc::now().naive_utc(),
+        };
+        let mut after = before.clone();
+        after.status = "draft".into(); // published -> draft is not a defined edge
+
+        let mut draft = UpdateDraft { before, after };
+        let result = hooks.before_update(&mut ctx, &mut draft).await;
+
+        assert!(result.is_err());
+    }
 }
