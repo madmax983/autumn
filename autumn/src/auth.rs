@@ -466,6 +466,23 @@ pub struct AuthConfig {
     /// ```
     #[serde(default)]
     pub step_up: StepUpConfig,
+
+    /// Active-session tracking and revocation policy (issue #819).
+    ///
+    /// Controls whether credential-changing events (password change, TOTP
+    /// enrollment/disable, `WebAuthn` key add/remove) revoke all *other*
+    /// login sessions (default: on), and how often `last_seen_at` is
+    /// written per session.
+    ///
+    /// Configure in `autumn.toml`:
+    ///
+    /// ```toml
+    /// [auth.sessions]
+    /// revoke_on_credential_change = true
+    /// last_seen_update_secs = 60
+    /// ```
+    #[serde(default)]
+    pub sessions: SessionTrackingConfig,
 }
 
 /// Account lockout policy configuration.
@@ -547,6 +564,56 @@ impl Default for StepUpConfig {
     fn default() -> Self {
         Self {
             default_max_age_secs: crate::step_up::DEFAULT_MAX_AGE_SECS,
+        }
+    }
+}
+
+/// Active-session tracking configuration (issue #819).
+///
+/// Read from the `[auth.sessions]` section of `autumn.toml`. Used by the
+/// session-management machinery emitted by `autumn generate auth`: a
+/// persisted row per login session, a device list at `/account/sessions`,
+/// and per-session / bulk revocation.
+///
+/// ```toml
+/// [auth.sessions]
+/// revoke_on_credential_change = true  # default
+/// last_seen_update_secs = 60          # default
+/// ```
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+pub struct SessionTrackingConfig {
+    /// Revoke all *other* login sessions when credentials change —
+    /// password change/reset, TOTP enrollment or disable, and `WebAuthn`
+    /// key add/remove (default: `true`).
+    ///
+    /// Leave this on unless an external policy handles credential-change
+    /// hygiene: it is the standard response to credential theft.
+    #[serde(default = "default_true_flag")]
+    pub revoke_on_credential_change: bool,
+
+    /// Minimum number of seconds between `last_seen_at` writes for a given
+    /// session (default: `60`).
+    ///
+    /// Bounds write amplification: authenticated requests inside the window
+    /// skip the `UPDATE`, so a busy session costs at most one write per
+    /// window rather than one per request.
+    #[serde(default = "default_last_seen_update_secs")]
+    pub last_seen_update_secs: u64,
+}
+
+const fn default_true_flag() -> bool {
+    true
+}
+
+const fn default_last_seen_update_secs() -> u64 {
+    60
+}
+
+impl Default for SessionTrackingConfig {
+    fn default() -> Self {
+        Self {
+            revoke_on_credential_change: true,
+            last_seen_update_secs: default_last_seen_update_secs(),
         }
     }
 }
@@ -1368,6 +1435,7 @@ impl Default for AuthConfig {
             webauthn: WebAuthnConfig::default(),
             lockout: LockoutConfig::default(),
             step_up: StepUpConfig::default(),
+            sessions: SessionTrackingConfig::default(),
         }
     }
 }
@@ -1988,6 +2056,30 @@ mod tests {
         assert_eq!(config.session_key, "user_id");
         #[cfg(feature = "oauth2")]
         assert!(config.oauth2.providers.is_empty());
+    }
+
+    /// Issue #819 — credential-changing events revoke other sessions by
+    /// default, and `last_seen_at` writes are throttled to one per minute.
+    #[test]
+    fn session_tracking_config_defaults_to_revoke_on_credential_change() {
+        let config = AuthConfig::default();
+        assert!(config.sessions.revoke_on_credential_change);
+        assert_eq!(config.sessions.last_seen_update_secs, 60);
+    }
+
+    /// `[auth.sessions]` can be disabled / tuned from `autumn.toml`.
+    #[test]
+    fn session_tracking_config_deserializes_from_toml() {
+        let cfg: crate::config::AutumnConfig = toml::from_str(
+            r"
+            [auth.sessions]
+            revoke_on_credential_change = false
+            last_seen_update_secs = 5
+            ",
+        )
+        .expect("config must parse");
+        assert!(!cfg.auth.sessions.revoke_on_credential_change);
+        assert_eq!(cfg.auth.sessions.last_seen_update_secs, 5);
     }
 
     #[cfg(feature = "oauth2")]

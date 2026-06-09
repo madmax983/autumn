@@ -2068,3 +2068,304 @@ fn generate_auth_confirmation_routes_registered_in_main() {
         "main.rs must register resend_confirmation route"
     );
 }
+
+// ── Active session management (issue #819) ────────────────────────────────────
+//
+// `autumn generate auth` must emit first-class login-session tracking: a
+// per-login session row (token digest, IP, parsed User-Agent, label), per-request
+// validation with throttled `last_seen_at` updates, revocation APIs on the user
+// model, an `/account/sessions` Maud+htmx page, auto-revocation on
+// credential-changing events, integration tests, and privacy documentation.
+
+/// AC1 — a session row is persisted per login with token digest, user id,
+/// timestamps, IP, parsed User-Agent fields, and an optional device label.
+#[test]
+fn generate_auth_sessions_migration_schema_and_model() {
+    let (_tmp, project) = fresh_project("auth-sess-app");
+    run_autumn(&project, &["generate", "auth", "User"]);
+
+    let migrations: Vec<_> = fs::read_dir(project.join("migrations"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().ends_with("_create_users"))
+        .collect();
+    assert_eq!(migrations.len(), 1, "expected one create_users migration");
+    let up = fs::read_to_string(migrations[0].path().join("up.sql")).unwrap();
+    assert!(
+        up.contains("CREATE TABLE user_sessions"),
+        "up.sql missing CREATE TABLE user_sessions:\n{up}"
+    );
+    for column in [
+        "user_id BIGINT NOT NULL REFERENCES users",
+        "token_digest TEXT NOT NULL UNIQUE",
+        "ip TEXT NOT NULL",
+        "user_agent TEXT NOT NULL",
+        "ua_family TEXT NOT NULL",
+        "ua_os TEXT NOT NULL",
+        "ua_device TEXT NOT NULL",
+        "label TEXT NULL",
+        "last_seen_at TIMESTAMP NOT NULL",
+    ] {
+        assert!(up.contains(column), "up.sql missing column: {column}\n{up}");
+    }
+    let down = fs::read_to_string(migrations[0].path().join("down.sql")).unwrap();
+    assert!(
+        down.contains("DROP TABLE user_sessions"),
+        "down.sql must drop user_sessions"
+    );
+    // Dependent table must drop before the referenced users table.
+    assert!(
+        down.find("DROP TABLE user_sessions").unwrap() < down.find("DROP TABLE users").unwrap(),
+        "user_sessions must be dropped before users"
+    );
+
+    // schema.rs gains the table block.
+    let schema = fs::read_to_string(project.join("src/schema.rs")).unwrap();
+    assert!(
+        schema.contains("user_sessions (id)"),
+        "schema.rs missing user_sessions block"
+    );
+    assert!(
+        schema.contains("token_digest -> Text"),
+        "schema.rs missing token_digest column"
+    );
+
+    // Model file: session row + revocation APIs on the user model (AC3).
+    let model = fs::read_to_string(project.join("src/models/user_session.rs")).unwrap();
+    assert!(
+        model.contains("pub struct UserSession"),
+        "model missing UserSession struct"
+    );
+    for needle in [
+        "pub token_digest: String",
+        "pub last_seen_at: chrono::NaiveDateTime",
+        "pub label: Option<String>",
+        "pub async fn sessions(",
+        "pub async fn revoke_session(",
+        "pub async fn revoke_other_sessions(",
+        "pub async fn revoke_all_sessions(",
+    ] {
+        assert!(model.contains(needle), "user_session.rs missing: {needle}");
+    }
+    // The raw session id must never be stored — only its digest.
+    assert!(
+        !model.contains("pub token: String"),
+        "raw session token must not be stored"
+    );
+
+    let mod_rs = fs::read_to_string(project.join("src/models/mod.rs")).unwrap();
+    assert!(
+        mod_rs.contains("pub mod user_session;"),
+        "models/mod.rs missing pub mod user_session"
+    );
+}
+
+/// AC2 + AC4 + AC6 — routes record the session on login, validate it on
+/// authenticated requests (with bounded last_seen_at writes), destroy
+/// revoked sessions immediately, and serve the /account/sessions page.
+#[test]
+fn generate_auth_sessions_routes_and_page() {
+    let (_tmp, project) = fresh_project("auth-sess-routes");
+    run_autumn(&project, &["generate", "auth", "User"]);
+
+    let routes = fs::read_to_string(project.join("src/routes/auth.rs")).unwrap();
+
+    // Login + logout lifecycle.
+    assert!(
+        routes.contains("pub async fn record_login_session"),
+        "routes missing record_login_session helper"
+    );
+    assert!(
+        routes.contains("pub async fn session_token_digest"),
+        "routes missing session_token_digest helper"
+    );
+    assert!(
+        routes.contains("autumn_web::user_agent::parse_user_agent"),
+        "login must parse the User-Agent via autumn_web::user_agent"
+    );
+    // The tracked-session gate: row lookup + throttled last_seen_at update.
+    assert!(
+        routes.contains("pub async fn require_tracked_session"),
+        "routes missing require_tracked_session gate"
+    );
+    assert!(
+        routes.contains("last_seen_update_secs"),
+        "last_seen_at updates must be throttled via config"
+    );
+    // Revoked sessions are destroyed so a replayed cookie cannot resurrect them.
+    assert!(
+        routes.contains("session.destroy()"),
+        "require_tracked_session must destroy revoked sessions"
+    );
+
+    // The sessions page + revocation handlers (AC6).
+    for needle in [
+        "pub async fn sessions_page",
+        "pub async fn sessions_revoke",
+        "pub async fn sessions_revoke_others",
+        "pub async fn sessions_label",
+        "#[get(\"/account/sessions\")]",
+        "#[post(\"/account/sessions/{id}/revoke\")]",
+        "#[post(\"/account/sessions/revoke-others\")]",
+        "#[post(\"/account/sessions/{id}/label\")]",
+    ] {
+        assert!(routes.contains(needle), "routes/auth.rs missing: {needle}");
+    }
+    // htmx-powered page with a one-click "sign out everywhere else".
+    assert!(
+        routes.contains("hx-post"),
+        "sessions page must use htmx for revocation"
+    );
+    assert!(
+        routes.to_lowercase().contains("sign out everywhere else"),
+        "sessions page must offer one-click bulk revocation"
+    );
+
+    // main.rs registers the new handlers.
+    let main = fs::read_to_string(project.join("src/main.rs")).unwrap();
+    for entry in [
+        "routes::auth::sessions_page",
+        "routes::auth::sessions_revoke",
+        "routes::auth::sessions_revoke_others",
+        "routes::auth::sessions_label",
+    ] {
+        assert!(main.contains(entry), "main.rs missing route: {entry}");
+    }
+}
+
+/// AC5 (password change) — resetting the password revokes existing sessions
+/// by default, gated on the `[auth.sessions]` config flag.
+#[test]
+fn generate_auth_reset_password_revokes_sessions() {
+    let (_tmp, project) = fresh_project("auth-sess-reset");
+    run_autumn(&project, &["generate", "auth", "User"]);
+
+    let routes = fs::read_to_string(project.join("src/routes/auth.rs")).unwrap();
+    let reset_body = &routes[routes.find("pub async fn reset_password(").unwrap()..];
+    let reset_body = &reset_body[..reset_body.find("\n// ──").unwrap_or(reset_body.len())];
+    assert!(
+        reset_body.contains("revoke_all_sessions"),
+        "reset_password must revoke existing sessions"
+    );
+    assert!(
+        reset_body.contains("revoke_on_credential_change"),
+        "session revocation on password change must be configurable"
+    );
+    assert!(
+        reset_body.contains("record_login_session"),
+        "reset_password logs the user in and must record the new session"
+    );
+}
+
+/// AC5 (TOTP) — enrollment and disable revoke all *other* sessions by default.
+#[test]
+fn generate_auth_totp_changes_revoke_other_sessions() {
+    let (_tmp, project) = fresh_project("auth-sess-totp");
+    run_autumn(&project, &["generate", "auth", "User", "--totp"]);
+
+    let routes = fs::read_to_string(project.join("src/routes/auth.rs")).unwrap();
+    for handler in [
+        "pub async fn two_factor_confirm",
+        "pub async fn two_factor_disable",
+    ] {
+        let start = routes
+            .find(handler)
+            .unwrap_or_else(|| panic!("missing {handler}"));
+        let body = &routes[start..];
+        let body = &body[..body.find("\n/// `").unwrap_or(body.len())];
+        assert!(
+            body.contains("revoke_other_sessions"),
+            "{handler} must revoke other sessions"
+        );
+        assert!(
+            body.contains("revoke_on_credential_change"),
+            "{handler} revocation must be configurable"
+        );
+    }
+    // Completing a TOTP login also records the session row.
+    assert!(
+        routes.contains("pub async fn login_verify"),
+        "missing login_verify"
+    );
+    let verify = &routes[routes.find("pub async fn login_verify(").unwrap()..];
+    assert!(
+        verify.contains("record_login_session"),
+        "login_verify completes a login and must record the session row"
+    );
+}
+
+/// AC5 (WebAuthn) — passkey add/remove revoke all *other* sessions by default,
+/// and passkey login records a session row.
+#[test]
+fn generate_auth_passkeys_changes_revoke_other_sessions() {
+    let (_tmp, project) = fresh_project("auth-sess-passkeys");
+    run_autumn(&project, &["generate", "auth", "User", "--passkeys"]);
+
+    let routes = fs::read_to_string(project.join("src/routes/passkeys.rs")).unwrap();
+    for handler in [
+        "pub async fn passkey_register_finish",
+        "pub async fn passkey_revoke",
+    ] {
+        let start = routes
+            .find(handler)
+            .unwrap_or_else(|| panic!("missing {handler}"));
+        let body = &routes[start..];
+        let body = &body[..body.find("\n/// `").unwrap_or(body.len())];
+        assert!(
+            body.contains("revoke_other_sessions"),
+            "{handler} must revoke other sessions"
+        );
+        assert!(
+            body.contains("revoke_on_credential_change"),
+            "{handler} revocation must be configurable"
+        );
+    }
+    let login_finish = &routes[routes.find("pub async fn passkey_login_finish(").unwrap()..];
+    assert!(
+        login_finish.contains("record_login_session"),
+        "passkey_login_finish completes a login and must record the session row"
+    );
+}
+
+/// AC7 — the generated integration tests cover the two-client revocation flow.
+#[test]
+fn generate_auth_sessions_tests_emitted() {
+    let (_tmp, project) = fresh_project("auth-sess-tests");
+    run_autumn(&project, &["generate", "auth", "User"]);
+
+    let tests = fs::read_to_string(project.join("tests/auth_sessions.rs")).unwrap();
+    for needle in [
+        "fn sessions_page_rejects_anonymous",
+        "fn revoked_session_next_request_401s",
+        "fn revoke_other_sessions_keeps_current_session_alive",
+        "/account/sessions",
+    ] {
+        assert!(
+            tests.contains(needle),
+            "tests/auth_sessions.rs missing: {needle}"
+        );
+    }
+}
+
+/// AC8 — documentation covers privacy posture for stored IP/UA and how to
+/// plug in a custom User-Agent parser.
+#[test]
+fn generate_auth_sessions_docs_emitted() {
+    let (_tmp, project) = fresh_project("auth-sess-docs");
+    run_autumn(&project, &["generate", "auth", "User"]);
+
+    let docs = fs::read_to_string(project.join("docs/guide/session-management.md")).unwrap();
+    for needle in [
+        "## Privacy",
+        "retention",
+        "parse_user_agent",
+        "revoke_on_credential_change",
+        "/account/sessions",
+        "CREATE TABLE user_sessions",
+    ] {
+        assert!(
+            docs.contains(needle),
+            "session-management.md missing: {needle}"
+        );
+    }
+}
