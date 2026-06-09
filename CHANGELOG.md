@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **log:** Request-scoped log context that auto-tags every log line (#1169)
+  - An always-on `LogContextLayer` establishes a fresh `tokio::task_local`
+    `log::context::LogContext` for **every** HTTP request, seeded with the same
+    `request_id` used by the `x-request-id` header and error pages. It is not
+    gated behind `telemetry-otlp` and is applied inner to `RequestIdLayer` so the
+    request id is always available.
+  - The request is driven inside a `tracing` span carrying
+    `request_id`/`user_id`/`tenant_id`, so every `tracing` event emitted during
+    the request automatically correlates back to it — no manual field threading.
+  - When the request authenticates, `user_id` is added to the context
+    automatically (from both the `#[secured]` session check and the `RequireAuth`
+    middleware); when multi-tenancy resolves a tenant, `tenant_id` is added
+    automatically (from the tenancy middleware).
+  - Handler/service code can attach custom fields with
+    `autumn_web::log::context::with_log_field("order_id", id)` (re-exported from
+    the prelude). The well-known ids (`request_id`/`user_id`/`tenant_id`) ride the
+    request span and render in ordinary `tracing` output; custom fields are
+    carried in the context for **structured** consumers — the actuator log buffer
+    (#1168), the access line (#999), or any context-aware layer — rather than the
+    default stdout formatter. Reserved keys cannot be shadowed by custom fields.
+  - The context stays active while a streaming/SSE response body is produced (the
+    body is re-scoped per frame, mirroring tenancy), and synchronous work in a
+    downstream layer's `Service::call` is correlated too.
+  - Context is isolated per request (nothing leaks across requests) and a
+    `tokio::spawn`'d task does **not** inherit it unless explicitly propagated via
+    `log::context::in_current_context(..)`, which re-enters the request span too.
+  - Sensitive custom-field values are scrubbed through the existing
+    `log/filter.rs` key filter (#697), so secrets never enter the context output.
+  - Additive, non-breaking surface (minor version bump). Establishes the
+    correlating primitive consumed by the per-request access line (#999) and the
+    actuator log-view buffer (#1168).
 - **mcp:** Expose typed endpoints as Model Context Protocol (MCP) tools so AI agents can call your API (#1117)
   - New `mcp` Cargo feature (implies `openapi`). `AppBuilder::mount_mcp("/mcp")` serves a spec-compliant MCP endpoint over Streamable HTTP, handling `initialize`, `tools/list`, and `tools/call`.
   - Endpoints opt in per-route via `#[api_doc(mcp)]`; nothing is exposed implicitly. `#[api_doc(mcp = false)]` force-excludes a route.
