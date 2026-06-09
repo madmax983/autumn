@@ -2016,6 +2016,12 @@ impl AutumnConfig {
 
     fn apply_log_env_overrides_with_env(&mut self, env: &dyn Env) {
         parse_env_string(env, "AUTUMN_LOG__LEVEL", &mut self.log.level);
+        parse_env_bool(env, "AUTUMN_LOG__ACCESS_LOG", &mut self.log.access_log);
+        parse_env_csv(
+            env,
+            "AUTUMN_LOG__ACCESS_LOG_EXCLUDE",
+            &mut self.log.access_log_exclude,
+        );
         if let Ok(val) = env.var("AUTUMN_LOG__FORMAT") {
             match val.as_str() {
                 "Auto" => self.log.format = LogFormat::Auto,
@@ -3037,12 +3043,14 @@ pub struct LogConfig {
     pub access_log: bool,
 
     /// Path prefixes excluded from access logging so steady-state probe and
-    /// asset traffic does not drown application signal.
-    /// Default: `["/health", "/actuator", "/static"]`.
+    /// asset traffic does not drown application signal. Default:
+    /// `["/health", "/live", "/ready", "/startup", "/actuator", "/static"]`
+    /// (the built-in probe, actuator, and static-asset mounts).
     ///
     /// Prefixes match whole path segments: `"/actuator"` excludes
     /// `/actuator/health` but not `/actuators`. Setting this replaces the
-    /// default set entirely.
+    /// default set entirely — and if you move the probe endpoints
+    /// (`health.path` etc.), mirror the new paths here.
     #[serde(default = "default_access_log_exclude")]
     pub access_log_exclude: Vec<String>,
 }
@@ -3505,6 +3513,9 @@ const fn default_access_log() -> bool {
 fn default_access_log_exclude() -> Vec<String> {
     vec![
         "/health".to_owned(),
+        "/live".to_owned(),
+        "/ready".to_owned(),
+        "/startup".to_owned(),
         "/actuator".to_owned(),
         "/static".to_owned(),
     ]
@@ -4314,8 +4325,31 @@ path = "/healthz"
         assert!(log.access_log);
         assert_eq!(
             log.access_log_exclude,
-            vec!["/health", "/actuator", "/static"]
+            vec![
+                "/health",
+                "/live",
+                "/ready",
+                "/startup",
+                "/actuator",
+                "/static"
+            ]
         );
+    }
+
+    #[test]
+    fn env_override_access_log_off() {
+        let env = MockEnv::new().with("AUTUMN_LOG__ACCESS_LOG", "false");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert!(!config.log.access_log);
+    }
+
+    #[test]
+    fn env_override_access_log_exclude_csv() {
+        let env = MockEnv::new().with("AUTUMN_LOG__ACCESS_LOG_EXCLUDE", "/internal, /probes");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.log.access_log_exclude, vec!["/internal", "/probes"]);
     }
 
     #[test]

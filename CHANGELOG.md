@@ -20,11 +20,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     **no** `telemetry-otlp` feature and no OTLP collector — operators on
     `docker logs` / platform log drains get request-level visibility for free.
   - Steady-state probe/asset noise is excluded by default (`/health`,
-    `/actuator/*`, `/static/*`); the set is configurable via
-    `log.access_log_exclude` (whole-segment prefix matching). Unmatched
-    requests log the low-cardinality `_unmatched` route label.
-  - On by default; turn off with `log.access_log = false` in `autumn.toml` —
-    no recompile needed.
+    `/live`, `/ready`, `/startup`, `/actuator/*`, `/static/*`); the set is
+    configurable via `log.access_log_exclude` (whole-segment prefix matching)
+    or `AUTUMN_LOG__ACCESS_LOG_EXCLUDE` (comma-separated). Unmatched requests
+    log the low-cardinality `_unmatched` route label.
+  - On by default; turn off with `log.access_log = false` in `autumn.toml`
+    or `AUTUMN_LOG__ACCESS_LOG=false` — no recompile needed.
   - The line never includes query strings, headers, or bodies, preserving the
     log-scrubbing posture established for logs (#697) by construction.
   - Additive `LogConfig` fields only (`access_log`, `access_log_exclude`);

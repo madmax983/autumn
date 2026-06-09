@@ -63,9 +63,13 @@ Probe and asset noise is excluded by default; both knobs live in `[log]`:
 access_log = true
 
 # Path prefixes to skip (whole-segment match; replaces the default set:
-# "/health", "/actuator", "/static").
+# "/health", "/live", "/ready", "/startup", "/actuator", "/static").
 access_log_exclude = ["/health", "/actuator", "/static", "/uptime-probe"]
 ```
+
+Both knobs also honor environment overrides for TOML-less deployments:
+`AUTUMN_LOG__ACCESS_LOG=false` and
+`AUTUMN_LOG__ACCESS_LOG_EXCLUDE=/health,/internal` (comma-separated).
 
 ## Startup warnings
 

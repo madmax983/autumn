@@ -13,10 +13,11 @@
 //! bodies, preserving the log scrubbing posture established for logs (#697) by
 //! construction.
 //!
-//! Access logging is on by default (`log.access_log = true`). Steady-state
-//! probe and asset noise is excluded via `log.access_log_exclude`
-//! (default: `/health`, `/actuator`, `/static`), matched on whole path
-//! segments so `/healthz` is still logged while `/actuator/health` is not.
+//! Access logging is on by default (`log.access_log = true`; overridable via
+//! `AUTUMN_LOG__ACCESS_LOG`). Steady-state probe and asset noise is excluded
+//! via `log.access_log_exclude` (default: `/health`, `/live`, `/ready`,
+//! `/startup`, `/actuator`, `/static`), matched on whole path segments so
+//! `/healthz` is still logged while `/actuator/health` is not.
 //!
 //! Applied automatically by the framework router, inner to
 //! [`RequestIdLayer`](crate::middleware::RequestIdLayer) (so the request id is

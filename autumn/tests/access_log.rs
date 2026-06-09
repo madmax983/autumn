@@ -203,6 +203,9 @@ async fn health_actuator_and_static_are_excluded_by_default() {
     let client = TestApp::new().routes(routes![show_user]).build();
 
     client.get("/health").send().await.assert_ok();
+    client.get("/live").send().await.assert_ok();
+    client.get("/ready").send().await.assert_ok();
+    client.get("/startup").send().await.assert_ok();
     client.get("/actuator/health").send().await;
     client.get("/static/app.css").send().await;
     assert!(
