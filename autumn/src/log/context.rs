@@ -34,6 +34,7 @@ use std::future::Future;
 use std::sync::{Arc, RwLock};
 
 use serde::Serialize;
+use tracing::Instrument as _;
 
 use crate::log::filter::{FILTERED_PLACEHOLDER, ParameterFilter};
 
@@ -282,7 +283,13 @@ pub fn in_current_context<F: Future>(future: F) -> impl Future<Output = F::Outpu
     let ctx = current();
     async move {
         match ctx {
-            Some(ctx) => scope(ctx, future).await,
+            Some(ctx) => {
+                // Re-enter the request span too, so ordinary `tracing` output
+                // from the spawned work carries request_id/user_id/tenant_id —
+                // not just consumers that read the task-local snapshot.
+                let span = ctx.span.clone();
+                scope(ctx, future.instrument(span)).await
+            }
             None => future.await,
         }
     }
@@ -323,7 +330,10 @@ mod tests {
             with_log_field("order_id", "A-1001");
             // A later read in the same request sees the field.
             let snap = snapshot().unwrap();
-            assert_eq!(snap.fields.get("order_id").map(String::as_str), Some("A-1001"));
+            assert_eq!(
+                snap.fields.get("order_id").map(String::as_str),
+                Some("A-1001")
+            );
         })
         .await;
     }
@@ -335,7 +345,10 @@ mod tests {
             with_log_field("password", "hunter2");
             with_log_field("order_id", "ok");
             let snap = snapshot().unwrap();
-            assert_eq!(snap.fields.get("password").map(String::as_str), Some(FILTERED_PLACEHOLDER));
+            assert_eq!(
+                snap.fields.get("password").map(String::as_str),
+                Some(FILTERED_PLACEHOLDER)
+            );
             assert_eq!(snap.fields.get("order_id").map(String::as_str), Some("ok"));
         })
         .await;
@@ -358,7 +371,10 @@ mod tests {
             assert!(!snap.fields.contains_key("request_id"));
             assert!(!snap.fields.contains_key("user_id"));
             assert!(!snap.fields.contains_key("tenant_id"));
-            assert_eq!(snap.fields.get("order_id").map(String::as_str), Some("kept"));
+            assert_eq!(
+                snap.fields.get("order_id").map(String::as_str),
+                Some("kept")
+            );
 
             // Serialized form has exactly one request_id, carrying the real value.
             let v = serde_json::to_value(&snap).unwrap();
@@ -388,7 +404,10 @@ mod tests {
         scope(second, async {
             let snap = snapshot().unwrap();
             assert_eq!(snap.request_id.as_deref(), Some("req-B"));
-            assert!(snap.fields.is_empty(), "fields from request A leaked into B");
+            assert!(
+                snap.fields.is_empty(),
+                "fields from request A leaked into B"
+            );
         })
         .await;
     }
@@ -398,9 +417,7 @@ mod tests {
         let ctx = LogContext::new(Some("req-1".to_owned()));
         scope(ctx, async {
             // A bare spawn starts with no context.
-            let bare = tokio::spawn(async { current().is_some() })
-                .await
-                .unwrap();
+            let bare = tokio::spawn(async { current().is_some() }).await.unwrap();
             assert!(!bare, "spawned task silently inherited request context");
 
             // Explicit propagation carries it across the spawn boundary.

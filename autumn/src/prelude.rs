@@ -156,14 +156,14 @@ pub use crate::auth::ApiToken;
 pub use crate::auth::Auth;
 /// Tower layer that validates `Authorization: Bearer <token>` on API routes.
 pub use crate::auth::RequireApiToken;
-/// Session extractor for accessing per-user session data.
-pub use crate::session::Session;
-/// Tenant extractor and context helpers.
-pub use crate::tenancy::{Tenant, with_tenant};
 /// Request-scoped log context helper: attach a custom field to the current
 /// request so every subsequent `tracing` event carries it. See
 /// [`crate::log::context`] for the full surface.
 pub use crate::log::context::with_log_field;
+/// Session extractor for accessing per-user session data.
+pub use crate::session::Session;
+/// Tenant extractor and context helpers.
+pub use crate::tenancy::{Tenant, with_tenant};
 
 // ── Authorization ────────────────────────────────────────────────
 /// Record-level authorization primitives. See

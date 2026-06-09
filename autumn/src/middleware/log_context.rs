@@ -69,18 +69,17 @@ where
 {
     type Response = S::Response;
     type Error = S::Error;
-    type Future =
-        tokio::task::futures::TaskLocalFuture<LogContext, tracing::instrument::Instrumented<S::Future>>;
+    type Future = tokio::task::futures::TaskLocalFuture<
+        LogContext,
+        tracing::instrument::Instrumented<S::Future>,
+    >;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx)
     }
 
     fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
-        let request_id = req
-            .extensions()
-            .get::<RequestId>()
-            .map(ToString::to_string);
+        let request_id = req.extensions().get::<RequestId>().map(ToString::to_string);
 
         // Open an always-on request span carrying the well-known correlation
         // fields. They are declared up front (Empty) so `set_user_id` /
@@ -117,14 +116,14 @@ mod tests {
     use super::*;
     use crate::log::context;
     use crate::middleware::RequestIdLayer;
+    use axum::Router;
     use axum::body::Body;
     use axum::routing::get;
-    use axum::Router;
     use std::sync::Mutex;
     use tower::ServiceExt as _;
     use tracing::subscriber::with_default;
-    use tracing_subscriber::layer::SubscriberExt as _;
     use tracing_subscriber::Layer as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
 
     /// Test tracing layer that records the request context snapshot observed at
     /// the moment each event is emitted.
@@ -181,11 +180,9 @@ mod tests {
                 .build()
                 .unwrap();
             let response = rt.block_on(async {
-                app.oneshot(
-                    Request::builder().uri("/").body(Body::empty()).unwrap(),
-                )
-                .await
-                .unwrap()
+                app.oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+                    .await
+                    .unwrap()
             });
 
             let header_id = response
@@ -196,11 +193,14 @@ mod tests {
                 .unwrap()
                 .to_owned();
 
-            let events = seen.lock().unwrap();
-            let handled = events
-                .iter()
-                .find(|f| f.request_id.is_some())
-                .expect("expected at least one event carrying request context");
+            let handled = {
+                let events = seen.lock().unwrap();
+                events
+                    .iter()
+                    .find(|f| f.request_id.is_some())
+                    .cloned()
+                    .expect("expected at least one event carrying request context")
+            };
             assert_eq!(handled.request_id.as_deref(), Some(header_id.as_str()));
             assert_eq!(handled.user_id.as_deref(), Some("42"));
         });
@@ -219,10 +219,7 @@ mod tests {
             type Error = std::convert::Infallible;
             type Future =
                 std::future::Ready<Result<axum::response::Response, std::convert::Infallible>>;
-            fn poll_ready(
-                &mut self,
-                _cx: &mut Context<'_>,
-            ) -> Poll<Result<(), Self::Error>> {
+            fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
                 Poll::Ready(Ok(()))
             }
             fn call(&mut self, _req: Request<Body>) -> Self::Future {
@@ -303,13 +300,19 @@ mod tests {
                     .unwrap()
             });
 
-            let events = seen.lock().unwrap();
-            let fields = events
-                .iter()
-                .find(|f| f.fields.contains_key("order_id"))
-                .expect("expected an event carrying the custom field");
+            let fields = {
+                let events = seen.lock().unwrap();
+                events
+                    .iter()
+                    .find(|f| f.fields.contains_key("order_id"))
+                    .cloned()
+                    .expect("expected an event carrying the custom field")
+            };
             assert_eq!(fields.tenant_id.as_deref(), Some("acme"));
-            assert_eq!(fields.fields.get("order_id").map(String::as_str), Some("A-1001"));
+            assert_eq!(
+                fields.fields.get("order_id").map(String::as_str),
+                Some("A-1001")
+            );
             assert_eq!(
                 fields.fields.get("password").map(String::as_str),
                 Some(crate::log::filter::FILTERED_PLACEHOLDER),

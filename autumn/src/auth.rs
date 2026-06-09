@@ -347,13 +347,17 @@ where
             // Check if session has the required key
             let session = req.extensions().get::<crate::session::Session>().cloned();
 
-            let is_authenticated = if let Some(ref session) = session {
-                session.contains_key(&session_key).await
+            let user_id = if let Some(ref session) = session {
+                session.get(&session_key).await
             } else {
-                false
+                None
             };
 
-            if is_authenticated {
+            if let Some(user_id) = user_id {
+                // Tag the request-scoped log context (#1169) so handler logs for
+                // middleware-authenticated requests carry `user_id` too, matching
+                // the `#[secured]` path.
+                crate::log::context::set_user_id(user_id);
                 inner.call(req).await
             } else {
                 let body = crate::error::problem_details_json_string(
