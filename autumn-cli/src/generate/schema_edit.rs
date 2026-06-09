@@ -796,9 +796,32 @@ pub fn ensure_autumn_web_feature(existing: &str, feature: &str) -> String {
             if sect_line.trim_start().starts_with("features") {
                 let new_feat_line = rewrite_features_line(sect_line, feature);
                 let mut out = String::with_capacity(existing.len() + 32);
-                for (k, &l) in lines.iter().enumerate() {
-                    out.push_str(if k == abs_j { &new_feat_line } else { l });
-                    out.push('\n');
+                if new_feat_line == sect_line {
+                    // Multiline features array: `]` is on a later line.
+                    // Find the closing `]` and insert the new entry before it.
+                    let close_idx = lines[abs_j..]
+                        .iter()
+                        .position(|l| l.trim() == "]")
+                        .map_or(abs_j, |p| abs_j + p);
+                    let indent = lines
+                        .get(abs_j + 1)
+                        .filter(|l| !l.trim().is_empty() && l.trim() != "]")
+                        .map(|l| &l[..l.len() - l.trim_start().len()])
+                        .unwrap_or("    ");
+                    let new_entry = format!("{indent}{feature_quoted},");
+                    for (k, &l) in lines.iter().enumerate() {
+                        if k == close_idx {
+                            out.push_str(&new_entry);
+                            out.push('\n');
+                        }
+                        out.push_str(l);
+                        out.push('\n');
+                    }
+                } else {
+                    for (k, &l) in lines.iter().enumerate() {
+                        out.push_str(if k == abs_j { &new_feat_line } else { l });
+                        out.push('\n');
+                    }
                 }
                 if !existing.ends_with('\n') {
                     out.pop();

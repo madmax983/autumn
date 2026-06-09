@@ -990,35 +990,29 @@ fn parse_mailgun_headers(json: &str) -> HashMap<String, String> {
 
 /// Parse and authenticate an SES-via-SNS notification.
 ///
-/// Handles `SubscriptionConfirmation` (logs the subscribe URL) and
-/// `Notification` (extracts the raw email from the `Message` field).
-pub(crate) fn parse_ses(body: &Bytes, headers: &HeaderMap) -> Result<SnsParseResult, StatusCode> {
-    let msg_type = headers
-        .get("x-amz-sns-message-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
+/// Handles `SubscriptionConfirmation` and `Notification` (extracts the raw
+/// email from the `Message` field). The `Type` field is read from the verified
+/// JSON body rather than the unverified HTTP header.
+pub(crate) fn parse_ses(body: &Bytes) -> Result<SnsParseResult, StatusCode> {
+    let json: serde_json::Value =
+        serde_json::from_slice(body).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let msg_type = json.get("Type").and_then(|t| t.as_str()).unwrap_or("");
 
     match msg_type {
         "SubscriptionConfirmation" => {
-            let json: serde_json::Value =
-                serde_json::from_slice(body).map_err(|_| StatusCode::BAD_REQUEST)?;
             let url = json
                 .get("SubscribeURL")
                 .and_then(|u| u.as_str())
                 .unwrap_or("");
-            tracing::warn!(
+            tracing::info!(
                 subscribe_url = %url,
-                "inbound_mail.ses: SNS SubscriptionConfirmation received — \
-                 SES notifications will NOT be delivered until you visit the \
-                 SubscribeURL above to confirm the subscription"
+                "inbound_mail.ses: SNS SubscriptionConfirmation received — confirming automatically"
             );
             Ok(SnsParseResult::SubscriptionConfirmation {
                 url: url.to_string(),
             })
         }
         "Notification" => {
-            let json: serde_json::Value =
-                serde_json::from_slice(body).map_err(|_| StatusCode::BAD_REQUEST)?;
             let message = json.get("Message").and_then(|m| m.as_str()).unwrap_or("");
             // The SNS Message may be (a) a plain base64-encoded RFC 5322 email,
             // (b) a raw RFC 5322 string, or (c) a JSON object with a "content"
@@ -1050,10 +1044,7 @@ pub(crate) fn parse_ses(body: &Bytes, headers: &HeaderMap) -> Result<SnsParseRes
 /// Possible outcomes of parsing an SNS notification body.
 #[derive(Debug)]
 pub(crate) enum SnsParseResult {
-    SubscriptionConfirmation {
-        #[allow(dead_code)]
-        url: String,
-    },
+    SubscriptionConfirmation { url: String },
     Email(Box<InboundEmail>),
 }
 
@@ -1739,7 +1730,7 @@ fn build_ses_route(
     #[cfg(feature = "inbound-ses")]
     let http_client = reqwest::Client::new();
 
-    let handler = move |headers: HeaderMap, body: Bytes| {
+    let handler = move |_headers: HeaderMap, body: Bytes| {
         let router = Arc::clone(&router);
         #[cfg(feature = "inbound-ses")]
         let http_client = http_client.clone();
@@ -1768,7 +1759,19 @@ fn build_ses_route(
                 }
             }
 
-            match parse_ses(&body, &headers) {
+            match parse_ses(&body) {
+                #[cfg(feature = "inbound-ses")]
+                Ok(SnsParseResult::SubscriptionConfirmation { url }) => {
+                    if let Err(e) = http_client.get(&url).send().await {
+                        tracing::error!(
+                            error = %e,
+                            "inbound_mail.ses: SNS subscription confirmation fetch failed"
+                        );
+                        return StatusCode::INTERNAL_SERVER_ERROR;
+                    }
+                    StatusCode::OK
+                }
+                #[cfg(not(feature = "inbound-ses"))]
                 Ok(SnsParseResult::SubscriptionConfirmation { .. }) => StatusCode::OK,
                 Ok(SnsParseResult::Email(email)) => match router.dispatch(*email).await {
                     Ok(()) => StatusCode::OK,
@@ -2142,16 +2145,12 @@ mod tests {
 
     #[test]
     fn parse_ses_subscription_confirmation() {
-        let headers = HeaderMap::from_iter([(
-            http::header::HeaderName::from_static("x-amz-sns-message-type"),
-            "SubscriptionConfirmation".parse().unwrap(),
-        )]);
         let payload = serde_json::json!({
             "Type": "SubscriptionConfirmation",
             "SubscribeURL": "https://sns.example.com/confirm?token=abc"
         });
         let body = Bytes::from(payload.to_string());
-        let result = parse_ses(&body, &headers);
+        let result = parse_ses(&body);
         assert!(
             matches!(result, Ok(SnsParseResult::SubscriptionConfirmation { .. })),
             "expected SubscriptionConfirmation"
@@ -2164,12 +2163,8 @@ mod tests {
         let raw =
             "From: sender@example.com\r\nTo: recv@example.com\r\nSubject: SES-Base64\r\n\r\nHi";
         let encoded = base64::engine::general_purpose::STANDARD.encode(raw);
-        let headers = HeaderMap::from_iter([(
-            http::header::HeaderName::from_static("x-amz-sns-message-type"),
-            "Notification".parse().unwrap(),
-        )]);
         let sns = serde_json::json!({ "Type": "Notification", "Message": encoded });
-        let result = parse_ses(&Bytes::from(sns.to_string()), &headers);
+        let result = parse_ses(&Bytes::from(sns.to_string()));
         let Ok(SnsParseResult::Email(email)) = result else {
             panic!("expected Email result, got: {result:?}");
         };
@@ -2182,15 +2177,11 @@ mod tests {
         let raw = "From: sender@example.com\r\nTo: dest@example.com\r\nSubject: Nested\r\n\r\nBody";
         let encoded = base64::engine::general_purpose::STANDARD.encode(raw);
         let msg_json = serde_json::json!({ "content": encoded });
-        let headers = HeaderMap::from_iter([(
-            http::header::HeaderName::from_static("x-amz-sns-message-type"),
-            "Notification".parse().unwrap(),
-        )]);
         let sns = serde_json::json!({
             "Type": "Notification",
             "Message": msg_json.to_string()
         });
-        let result = parse_ses(&Bytes::from(sns.to_string()), &headers);
+        let result = parse_ses(&Bytes::from(sns.to_string()));
         let Ok(SnsParseResult::Email(email)) = result else {
             panic!("expected Email, got: {result:?}");
         };
@@ -2199,11 +2190,7 @@ mod tests {
 
     #[test]
     fn parse_ses_unknown_type_returns_400() {
-        let headers = HeaderMap::from_iter([(
-            http::header::HeaderName::from_static("x-amz-sns-message-type"),
-            "UnknownType".parse().unwrap(),
-        )]);
-        let result = parse_ses(&Bytes::from("{}"), &headers);
+        let result = parse_ses(&Bytes::from("{}"));
         assert_eq!(result.unwrap_err(), StatusCode::BAD_REQUEST);
     }
 
@@ -2487,17 +2474,13 @@ mod tests {
 
     #[test]
     fn parse_ses_notification_json_message_no_content_returns_422() {
-        let headers = HeaderMap::from_iter([(
-            http::header::HeaderName::from_static("x-amz-sns-message-type"),
-            "Notification".parse().unwrap(),
-        )]);
         // Message is valid JSON but missing the required "content" field.
         let msg_json = serde_json::json!({ "other_field": "value" });
         let sns = serde_json::json!({
             "Type": "Notification",
             "Message": msg_json.to_string()
         });
-        let result = parse_ses(&Bytes::from(sns.to_string()), &headers);
+        let result = parse_ses(&Bytes::from(sns.to_string()));
         assert_eq!(result.unwrap_err(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
