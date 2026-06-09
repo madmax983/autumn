@@ -817,11 +817,10 @@ fn add_feature_to_multiline_inline_table(
         if Some(k) == last_entry_idx && !l.trim_end().ends_with(',') {
             out.push_str(l.trim_end());
             out.push(',');
-            out.push('\n');
         } else {
             out.push_str(l);
-            out.push('\n');
         }
+        out.push('\n');
     }
     if !existing.ends_with('\n') {
         out.pop();
@@ -926,7 +925,7 @@ pub fn ensure_autumn_web_feature(existing: &str, feature: &str) -> String {
             }
         } else {
             // Check for a renamed dep: `aw = { package = "autumn-web", ... }`.
-            let val = after_ws.splitn(2, '=').nth(1).unwrap_or("");
+            let val = after_ws.split_once('=').map(|x| x.1).unwrap_or("");
             if !val.contains(r#"package = "autumn-web""#)
                 && !val.contains(r#"package="autumn-web""#)
             {
