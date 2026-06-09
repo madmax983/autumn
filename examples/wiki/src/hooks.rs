@@ -307,6 +307,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_before_create_defaults_empty_status_to_draft() {
+        let hooks = PageHooks;
+        let mut ctx = MutationContext::new(MutationOp::Update);
+        let mut new = NewPage {
+            title: "My Page".into(),
+            slug: String::new(),
+            body: "Some content".into(),
+            status: String::new(), // empty — should be defaulted to "draft"
+        };
+        hooks.before_create(&mut ctx, &mut new).await.unwrap();
+        assert_eq!(new.status, "draft");
+    }
+
+    #[tokio::test]
     async fn test_before_create_rejects_invalid_initial_status() {
         let hooks = PageHooks;
         let mut ctx = MutationContext::new(MutationOp::Update);
