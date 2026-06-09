@@ -1296,14 +1296,18 @@ fn extract_multipart_bodies(
     let mut attachments: Vec<Attachment> = Vec::new();
 
     // Split body into parts by finding each boundary delimiter.
-    // RFC 2046 §5.1.1: boundaries must appear at the start of a line.
-    // Skip any `--boundary` that is not preceded by `\n` (or at the body start).
+    // RFC 2046 §5.1.1: boundaries must appear at the start of a line and be followed by a
+    // valid terminator (CRLF, `-`, SP, HT, or EOF) — not an arbitrary character like a digit.
+    //
+    // `seg_start` tracks the beginning of the current segment independently of `pos` (the
+    // search cursor), so that advancing past a false-positive match does not discard content.
     let mut raw_parts: Vec<&[u8]> = Vec::new();
     let mut pos = 0;
+    let mut seg_start = 0;
     loop {
         match find_subslice(&body[pos..], delim) {
             None => {
-                raw_parts.push(&body[pos..]);
+                raw_parts.push(&body[seg_start..]);
                 break;
             }
             Some(rel) => {
@@ -1313,8 +1317,18 @@ fn extract_multipart_bodies(
                     pos += rel + 1;
                     continue;
                 }
-                raw_parts.push(&body[pos..pos + rel]);
-                pos += rel + delim.len();
+                // Boundary must be followed by a valid MIME terminator.
+                let after = abs + delim.len();
+                if !matches!(
+                    body.get(after),
+                    None | Some(b'\r') | Some(b'\n') | Some(b'-') | Some(b' ') | Some(b'\t')
+                ) {
+                    pos += rel + 1;
+                    continue;
+                }
+                raw_parts.push(&body[seg_start..abs]);
+                seg_start = abs + delim.len();
+                pos = seg_start;
             }
         }
     }
@@ -2681,8 +2695,24 @@ mod tests {
     }
 
     #[test]
+    fn extract_multipart_bodies_boundary_prefix_not_split() {
+        // If the boundary is "abc" but the line starts with "--abc123" (extended token),
+        // the RFC 2046 terminator check must reject it as a non-boundary.
+        let b = "abc";
+        let body = format!(
+            "--{b}\r\nContent-Type: text/plain\r\n\r\nhello\r\n--{b}123\r\nmore content\r\n--{b}--\r\n"
+        );
+        let ct = format!("multipart/mixed; boundary={b}");
+        let (text, _html, _atts) = extract_multipart_bodies(body.as_bytes(), &ct);
+        assert_eq!(
+            text.as_deref(),
+            Some("hello\r\n--abc123\r\nmore content"),
+            "boundary prefix followed by non-terminator must not split: {text:?}"
+        );
+    }
+
+    #[test]
     fn extract_multipart_bodies_attachment_quoted_printable_decoded() {
-        use base64::Engine as _;
         let b = "bndqp";
         // QP-encoded attachment: "Hello=20World" decodes to "Hello World"
         let body = format!(
@@ -2697,7 +2727,8 @@ mod tests {
         let ct = format!("multipart/mixed; boundary={b}");
         let (_text, _html, atts) = extract_multipart_bodies(body.as_bytes(), &ct);
         assert_eq!(atts.len(), 1);
-        assert_eq!(atts[0].data.as_ref(), b"Hello World\r\n");
+        // The CRLF before the boundary delimiter is stripped by MIME before QP decode.
+        assert_eq!(atts[0].data.as_ref(), b"Hello World");
     }
 
     #[test]

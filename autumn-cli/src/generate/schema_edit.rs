@@ -801,14 +801,27 @@ fn add_feature_to_multiline_inline_table(
         .take_while(char::is_ascii_whitespace)
         .collect::<String>();
     let new_feat = format!("{indent}features = [{feature_quoted}],");
+
+    // Ensure the last entry before `}` has a trailing comma (required between inline-table entries).
+    let last_entry_idx = lines[open_idx + 1..close_idx]
+        .iter()
+        .rposition(|l| !l.trim().is_empty())
+        .map(|p| open_idx + 1 + p);
+
     let mut out = String::with_capacity(existing.len() + 32);
     for (k, &l) in lines.iter().enumerate() {
         if k == close_idx {
             out.push_str(&new_feat);
             out.push('\n');
         }
-        out.push_str(l);
-        out.push('\n');
+        if Some(k) == last_entry_idx && !l.trim_end().ends_with(',') {
+            out.push_str(l.trim_end());
+            out.push(',');
+            out.push('\n');
+        } else {
+            out.push_str(l);
+            out.push('\n');
+        }
     }
     if !existing.ends_with('\n') {
         out.pop();
@@ -901,17 +914,24 @@ pub fn ensure_autumn_web_feature(existing: &str, feature: &str) -> String {
         if !in_deps {
             continue;
         }
-        // Match only the exact `autumn-web` key — not prefixes like `autumn-web-admin`.
+        // Match either the exact `autumn-web` key or a renamed dep with `package = "autumn-web"`.
         let after_ws = line.trim_start();
-        let Some(rest) = after_ws.strip_prefix("autumn-web") else {
-            continue;
-        };
-        if rest.starts_with('.') {
-            // Dotted key form: autumn-web.workspace = true, autumn-web.features = [...], etc.
-            return patch_dotted_dep(&lines, i, existing, feature, &feature_quoted);
-        }
-        if rest.starts_with(|c: char| c != '=' && !c.is_whitespace()) {
-            continue;
+        if let Some(rest) = after_ws.strip_prefix("autumn-web") {
+            if rest.starts_with('.') {
+                // Dotted key form: autumn-web.workspace = true, autumn-web.features = [...], etc.
+                return patch_dotted_dep(&lines, i, existing, feature, &feature_quoted);
+            }
+            if rest.starts_with(|c: char| c != '=' && !c.is_whitespace()) {
+                continue;
+            }
+        } else {
+            // Check for a renamed dep: `aw = { package = "autumn-web", ... }`.
+            let val = after_ws.splitn(2, '=').nth(1).unwrap_or("");
+            if !val.contains(r#"package = "autumn-web""#)
+                && !val.contains(r#"package="autumn-web""#)
+            {
+                continue;
+            }
         }
         // Idempotency check.
         if line.contains(&feature_quoted) {
@@ -2645,6 +2665,28 @@ async fn main() {\n\
             updated.contains("\"mail\""),
             "must add feature to multiline inline table: {updated}"
         );
+        assert!(
+            updated.contains("version = \"0.6\","),
+            "must add trailing comma to preceding entry: {updated}"
+        );
+    }
+
+    #[test]
+    fn ensure_feature_package_alias_dep() {
+        // Renamed dep: `aw = { package = "autumn-web", version = "0.6" }`
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\naw = { package = \"autumn-web\", version = \"0.6\" }\n";
+        let updated = ensure_autumn_web_feature(cargo, "mail");
+        assert!(
+            updated.contains("\"mail\""),
+            "must add feature to renamed dep: {updated}"
+        );
+    }
+
+    #[test]
+    fn ensure_feature_package_alias_dep_idempotent() {
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\naw = { package = \"autumn-web\", version = \"0.6\", features = [\"mail\"] }\n";
+        let updated = ensure_autumn_web_feature(cargo, "mail");
+        assert_eq!(cargo, updated, "already-present feature must be a no-op");
     }
 
     #[test]
