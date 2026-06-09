@@ -89,9 +89,10 @@ Next steps:
 ### model
 ```
 Next steps:
-1. Add the model module to src/main.rs or src/models/mod.rs
+1. The generator already created src/models/<snake>.rs and added
+   `pub mod <snake>;` to src/models/mod.rs — no manual wiring needed.
 2. Run: autumn migrate
-3. Implement repository functions in src/repositories/<name>.rs
+3. Implement repository functions (free functions or #[autumn_web::repository])
 ```
 
 ### migration

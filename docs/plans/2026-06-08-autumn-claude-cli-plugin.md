@@ -42,17 +42,26 @@ Safe read-only commands:
 
 Project-mutating commands requiring explicit confirmation:
 
+File-generating commands (all `autumn generate` subcommands write to disk):
 - `autumn new`
 - `autumn generate model`
 - `autumn generate scaffold`
-- `autumn generate auth`
+- `autumn generate migration`
 - `autumn generate mailer`
+- `autumn generate task`
+- `autumn generate auth`
+- `autumn generate admin`
 - `autumn generate system-test`
 - `autumn release init`
 - `autumn credentials edit`
+
+Live runtime/database mutations:
 - `autumn maintenance on|off`
 - `autumn flags enable|disable|set-rollout|allow`
 - `autumn experiments set-weights|conclude|override`
+- `autumn config set|unset`
+- `autumn data import`
+- `autumn token issue|revoke`
 
 Commands that touch live HTTP/database state must include the resolved project
 root, profile, database/source URL if relevant, and a redacted command preview

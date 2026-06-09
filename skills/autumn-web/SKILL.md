@@ -231,7 +231,8 @@ Autumn uses Diesel + diesel-async for Postgres. Primary keys are `i64` /
 when external correlation needs them.
 
 ```rust
-#[model(table = "posts")]
+// #[model] and #[repository] are NOT in prelude — use qualified paths:
+#[autumn_web::model(table = "posts")]
 #[derive(Validate)]
 pub struct Post {
     pub id: i64,
@@ -245,7 +246,7 @@ Repository-generated APIs in production must either declare a policy or be
 explicitly acknowledged in config:
 
 ```rust
-#[repository(Post, api = "/api/posts", policy = PostPolicy, scope = PostScope)]
+#[autumn_web::repository(Post, api = "/api/posts", policy = PostPolicy, scope = PostScope)]
 pub trait PostRepository {}
 ```
 
@@ -454,7 +455,7 @@ autumn generate migration add_posts
 autumn generate scaffold Post title:String body:Text --api
 autumn generate auth User --oauth github,google --totp --passkeys
 autumn generate admin Post
-autumn generate mailer UserMailer
+autumn generate mailer User
 autumn generate system-test todo_flow
 autumn routes --format json --user-only
 autumn doctor --strict --json
