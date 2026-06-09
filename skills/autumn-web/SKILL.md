@@ -427,7 +427,7 @@ autumn config list
 autumn flags list
 autumn experiments list
 autumn maintenance on --message "Migrating database"
-autumn webhook sim generic http://localhost:3000/webhooks/test secret '{"ok":true}'
+autumn webhook sim generic http://localhost:3000/webhooks/test --secret mysecret --payload '{"ok":true}'
 autumn dev-loop-bench --dry-run
 autumn plugin-check --plugin-name autumn-admin-plugin --prefix /admin
 ```

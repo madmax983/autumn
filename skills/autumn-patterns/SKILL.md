@@ -25,8 +25,9 @@ autumn-web = { version = "0.5", features = ["test-support"] }
 ```rust
 #[tokio::test]
 async fn create_post_returns_redirect() {
-    let app = TestApp::new().await;
-    let client = app.client();
+    let client = TestApp::new()
+        .routes(routes![posts::create])
+        .build();  // synchronous; returns TestClient
 
     let res = client
         .post("/posts")
@@ -34,8 +35,8 @@ async fn create_post_returns_redirect() {
         .send()
         .await;
 
-    assert_eq!(res.status(), 302);
-    assert!(res.headers()["location"].to_str().unwrap().contains("/posts/"));
+    res.assert_status(302);
+    assert!(res.header("location").contains("/posts/"));
 }
 ```
 
@@ -100,16 +101,27 @@ async fn publish_post(Path(id): Path<i64>, db: Db) -> AutumnResult<Redirect> {
 Use `#[job]` for request-triggered work with retries. Keep jobs idempotent —
 they may run more than once.
 
+The `#[job]` macro requires exactly two arguments: `AppState` and a typed
+args struct (serializable). The macro generates a `PascalCaseJob` struct with
+a static `enqueue` method.
+
 ```rust
-#[job]
-pub async fn send_welcome_email(user_id: i64, db: Db) -> AutumnResult<()> {
-    let user = find_user(&mut *db, user_id).await?;
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SendWelcomeEmailArgs {
+    pub user_id: i64,
+}
+
+#[job(name = "send_welcome_email", max_attempts = 3, backoff_ms = 500)]
+pub async fn send_welcome_email(state: AppState, args: SendWelcomeEmailArgs) -> AutumnResult<()> {
+    let pool = state.pool().ok_or_else(|| AutumnError::service_unavailable_msg("no db"))?;
+    let mut conn = pool.get().await.map_err(AutumnError::from)?;
+    let user = find_user(&mut conn, args.user_id).await?;
     UserMailer::welcome(&user).deliver_now().await?;
     Ok(())
 }
 
-// Enqueue from a handler:
-send_welcome_email::enqueue(user.id).await?;
+// Enqueue from a handler (generated struct name = PascalCase + "Job"):
+SendWelcomeEmailJob::enqueue(SendWelcomeEmailArgs { user_id: user.id }).await?;
 ```
 
 Use `#[scheduled]` for recurring work. Use `#[task]` for operator-invoked

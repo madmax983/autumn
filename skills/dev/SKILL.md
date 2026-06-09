@@ -17,12 +17,12 @@ Start the Autumn development server with hot reload.
 
 Before running `autumn dev`, verify:
 
-1. **Database is reachable** — check `autumn.toml` or `AUTUMN_DATABASE__PRIMARY_URL`:
-   ```bash
-   autumn migrate check
-   ```
-   If this fails, the database is not available or migrations are pending.
-   Pending migrations are a warning, not a blocker for `autumn dev`.
+1. **Database URL is configured** — check `autumn.toml` or the env var
+   `AUTUMN_DATABASE__PRIMARY_URL` is set. `autumn dev` will fail at startup
+   if no database URL is present. Note: `autumn migrate check` analyzes
+   migration SQL files only and does NOT test connectivity — to verify the
+   database is reachable, attempt `autumn migrate status` or start the server
+   and watch the startup logs.
 
 2. **Tailwind binary is present** — if `autumn setup` has not been run:
    ```bash
@@ -35,10 +35,14 @@ Before running `autumn dev`, verify:
 autumn dev
 ```
 
-With optional flags:
+For workspace projects, specify the package:
 ```bash
-autumn dev --port 8080
-autumn dev --profile staging
+autumn dev --package my-app
+```
+
+To log all registered routes, tasks, middleware, and config at startup:
+```bash
+autumn dev --show-config
 ```
 
 `autumn dev` uses the `dev` profile automatically in debug builds

@@ -64,7 +64,10 @@ First-run checklist:
 
 ## Flags
 
-- `--api`: Create an API-only project (no Maud/htmx/Tailwind, JSON responses)
+- `--with-i18n`: Scaffold the optional i18n module (Fluent translations at
+  `i18n/en.ftl`, the `[i18n]` block in `autumn.toml`, and the `i18n` feature
+  on `autumn-web`).
+- `--with-seed`: Scaffold a stub `src/bin/seed.rs` for database seeding.
 
 ## Key files to know
 

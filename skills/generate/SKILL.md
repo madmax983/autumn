@@ -21,27 +21,34 @@ preview and get confirmation before executing any mutating generator.
 
 | Subcommand | Example | What it creates |
 |---|---|---|
-| `scaffold` | `scaffold Post title:String body:Text` | Model + migration + controller (index/show/new/create/edit/update/delete) + views + smoke test |
+| `scaffold` | `scaffold Post title:String body:Text` | Model + migration + routes (index/show/new/create/edit/update/delete) + views + smoke test. Also updates `src/main.rs`. |
 | `model` | `model Post title:String body:Text` | Model struct + migration |
 | `migration` | `migration add_slug_to_posts` | Empty timestamped migration file |
-| `controller` | `controller Posts` | Routes file with CRUD stubs |
-| `mailer` | `mailer UserMailer welcome` | Mailer struct + email templates |
+| `mailer` | `mailer UserMailer` | Mailer struct + email templates |
 | `task` | `task RecalculateCounts` | `#[task]` operational command |
 | `auth` | `auth User --oauth github,google` | Full auth scaffold (login/register/password reset/OAuth) |
 | `admin` | `admin Post` | Admin plugin resource page |
-| `system-test` | `system-test checkout-flow` | System test fixture |
+| `system-test` | `system-test checkout_flow` | System test fixture (name must be `snake_case` or `PascalCase` — no hyphens) |
 
 ## Field type reference
+
+Use the exact tokens below — the DSL parser is case-sensitive and does not
+accept aliases like `Integer` or `Boolean`.
 
 | Token | SQL type | Rust type |
 |---|---|---|
 | `String` | `VARCHAR(255) NOT NULL` | `String` |
 | `Text` | `TEXT NOT NULL` | `String` |
-| `Integer` / `BigInt` | `BIGINT NOT NULL` | `i64` |
-| `Float` | `FLOAT8 NOT NULL` | `f64` |
-| `Boolean` | `BOOLEAN NOT NULL DEFAULT false` | `bool` |
+| `i32` | `INTEGER NOT NULL` | `i32` |
+| `i64` | `BIGINT NOT NULL` | `i64` |
+| `f32` | `FLOAT4 NOT NULL` | `f32` |
+| `f64` | `FLOAT8 NOT NULL` | `f64` |
+| `bool` | `BOOLEAN NOT NULL DEFAULT false` | `bool` |
+| `NaiveDateTime` | `TIMESTAMP NOT NULL` | `NaiveDateTime` |
 | `DateTime` | `TIMESTAMPTZ NOT NULL DEFAULT NOW()` | `DateTime<Utc>` |
 | `Uuid` | `UUID NOT NULL DEFAULT gen_random_uuid()` | `Uuid` |
+| `Bytea` | `BYTEA NOT NULL` | `Vec<u8>` |
+| `Attachment` | `JSONB NULL` (blob metadata) | optional file attachment |
 | `references:Model` | `BIGINT NOT NULL REFERENCES models(id)` | `i64` (FK) |
 | `name:unique` | Adds `UNIQUE` constraint | — |
 | `name:index` | Adds B-tree index | — |
@@ -69,18 +76,9 @@ preview and get confirmation before executing any mutating generator.
 ### scaffold
 ```
 Next steps:
-1. Register routes in main.rs:
-   .routes(routes![
-       routes::posts::index,
-       routes::posts::show,
-       routes::posts::new,
-       routes::posts::create,
-       routes::posts::edit,
-       routes::posts::update,
-       routes::posts::delete_post,
-   ])
-2. Run: autumn migrate
-3. Run: autumn dev
+1. Run: autumn migrate   (the generator already updated src/main.rs)
+2. Run: autumn dev
+3. Visit: http://localhost:3000/<plural>
 ```
 
 ### model
@@ -97,14 +95,6 @@ Next steps:
 1. Edit the generated migration file in migrations/<timestamp>_<name>/
 2. Write up.sql (and down.sql if rollback matters)
 3. Run: autumn migrate
-```
-
-### controller
-```
-Next steps:
-1. Register routes in main.rs:
-   .routes(routes![routes::<name>::index, ...])
-2. Add #[secured] to routes that require authentication
 ```
 
 ### mailer

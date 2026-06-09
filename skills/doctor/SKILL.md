@@ -37,8 +37,8 @@ were found — treat it as signal, not as a hard stop.
 The `--json` flag emits a structured result. Parse it and present a summary
 grouped by severity:
 
-- **FAIL** items: deployment blockers — list each one with the fix action from
-  the `remedy` field.
+- **FAIL** items: deployment blockers — list each one with the `detail` field
+  and the one-line `hint` field if present.
 - **WARN** items: non-blocking but worth flagging — list the most important ones.
 - **PASS** items: do not enumerate unless asked; just report the total count.
 
