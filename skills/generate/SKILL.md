@@ -29,6 +29,7 @@ preview and get confirmation before executing any mutating generator.
 | `auth` | `auth User --oauth github,google` | Full auth scaffold (login/register/password reset/OAuth) |
 | `admin` | `admin Post` | Admin plugin resource page |
 | `system-test` | `system-test checkout_flow` | System test fixture (name must be `snake_case` or `PascalCase` — no hyphens) |
+| `pwa` | `pwa` | PWA scaffolding — manifest, service worker, offline shell, icons, route handlers, smoke test |
 
 ## Field type reference
 
@@ -150,6 +151,25 @@ Next steps:
    .one_off_tasks(one_off_tasks![recalculate_counts::recalculate_counts])
 
 3. Invoke with: autumn task recalculate_counts -- --dry-run
+```
+
+### pwa
+```
+Next steps:
+1. The generator already:
+   - Created static/manifest.webmanifest, static/service-worker.js,
+     static/pwa-register.js, static/icons/icon.svg (+ maskable variant)
+   - Added route handlers (/manifest.webmanifest, /service-worker.js,
+     /pwa-register.js, /offline) and PWA <meta>/<link> tags to src/main.rs
+   - Created tests/system/pwa_smoke.rs and added system-tests to Cargo.toml
+
+2. Replace static/icons/icon.svg with a real PNG icon for mobile installation.
+   For iOS, also add 180×180 apple-touch-icon.png.
+
+3. Edit static/manifest.webmanifest to set your app name, theme_color,
+   background_color, and start_url.
+
+4. Run the smoke test: cargo test --features system-tests pwa_smoke
 ```
 
 ## Flags

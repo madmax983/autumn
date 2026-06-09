@@ -437,6 +437,48 @@ Err(AutumnError::service_unavailable_msg("queue unavailable"))?;
 Clients that prefer JSON receive `application/problem+json` with `type`,
 `title`, `status`, `detail`, `instance`, `code`, `request_id`, and `errors`.
 
+## Canary deploys
+
+Autumn provides framework primitives a canary controller drives — it does not
+own the load-balancer traffic split (that stays a platform concern).
+
+**Label the canary replica** (env var, no code change):
+```bash
+AUTUMN_DEPLOY_VERSION=canary   # explicit label (any string)
+# …or the boolean shorthand:
+AUTUMN_CANARY=true             # resolves to version="canary"
+```
+
+Stable replicas leave both unset → `version="stable"`.
+
+**Prometheus metrics** are tagged with the `version` label so a controller can
+compare cohorts:
+```
+autumn_http_requests_total{version="canary"} 412
+autumn_http_responses_total{version="canary",status="5xx"} 3
+autumn_http_request_duration_seconds{version="canary",quantile="0.99"} 1.2
+```
+
+**`CanaryRoute` extractor** (in `prelude::*`) — lets a handler see whether the
+LB routed this specific request to the canary (`X-Canary: true`):
+```rust
+async fn handler(canary: CanaryRoute) -> String {
+    if canary.routed_to_canary { "canary".into() } else { "stable".into() }
+}
+```
+
+**Rollback** — when a controller decides the canary is unhealthy:
+```bash
+autumn canary rollback --reason "p99 latency exceeded" --by ci-controller
+# The replica flips /ready → 503 and drains cleanly (same as SIGTERM).
+autumn canary status    # check flag state
+autumn canary promote   # clear the rollback flag after traffic is moved
+```
+
+The rollback flag file lives at `tmp/autumn-canary-rollback.json`. A controller
+that cannot exec into the replica can write it directly. The flag is sticky
+across restarts — clear it with `autumn canary promote` once traffic has moved.
+
 ## CLI
 
 ```bash
@@ -457,12 +499,16 @@ autumn generate auth User --oauth github,google --totp --passkeys
 autumn generate admin Post
 autumn generate mailer User
 autumn generate system-test todo_flow
+autumn generate pwa
 autumn routes --format json --user-only
 autumn doctor --strict --json
 autumn config list
 autumn flags list
 autumn experiments list
 autumn maintenance on --message "Migrating database"
+autumn canary rollback --reason "p99 latency exceeded"
+autumn canary status
+autumn canary promote
 autumn webhook sim generic http://localhost:3000/webhooks/test --secret mysecret --payload '{"ok":true}'
 autumn dev-loop-bench --dry-run
 autumn plugin-check --plugin-name autumn-admin-plugin --prefix /admin
