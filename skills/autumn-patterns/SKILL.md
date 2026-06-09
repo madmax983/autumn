@@ -36,7 +36,8 @@ async fn create_post_returns_redirect() {
         .await;
 
     res.assert_status(302);
-    assert!(res.header("location").contains("/posts/"));
+    // header() returns Option<&str>
+    assert!(res.header("location").is_some_and(|loc| loc.contains("/posts/")));
 }
 ```
 
@@ -89,7 +90,7 @@ impl<'a> PostService<'a> {
 // In the handler:
 #[post("/posts/{id}/publish")]
 #[secured]
-async fn publish_post(Path(id): Path<i64>, db: Db) -> AutumnResult<Redirect> {
+async fn publish_post(Path(id): Path<i64>, mut db: Db) -> AutumnResult<Redirect> {
     let mut svc = PostService::new(&mut *db);
     svc.publish(id).await?;
     Ok(Redirect::to(&format!("/posts/{}", id)))
@@ -116,7 +117,10 @@ pub async fn send_welcome_email(state: AppState, args: SendWelcomeEmailArgs) -> 
     let pool = state.pool().ok_or_else(|| AutumnError::service_unavailable_msg("no db"))?;
     let mut conn = pool.get().await.map_err(AutumnError::from)?;
     let user = find_user(&mut conn, args.user_id).await?;
-    UserMailer::welcome(&user).deliver_now().await?;
+    // get the configured Mailer handle from AppState
+    let mailer = state.mailer().ok_or_else(|| AutumnError::service_unavailable_msg("no mailer"))?;
+    // generated method: send_welcome(&Mailer, args...) — async, returns Result
+    UserMailer.send_welcome(&mailer, user.email.clone(), user.username.clone()).await?;
     Ok(())
 }
 
@@ -143,7 +147,9 @@ Before shipping any route:
 - [ ] Secrets in env vars, not in `autumn.toml`
 
 ```rust
-// Every POST form must include the CSRF token
+// Every POST form must include the CSRF token.
+// `_csrf` is the default field name; if you set `security.csrf.form_field`
+// in autumn.toml, use that value instead (or read it via CsrfConfig).
 #[get("/posts/new")]
 async fn new_post(csrf: CsrfToken) -> Markup {
     html! {

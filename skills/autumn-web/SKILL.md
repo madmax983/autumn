@@ -131,8 +131,10 @@ For S3 storage add `autumn-storage-s3 = "0.5"`; `storage-s3` is no longer an
 ## main.rs pattern
 
 ```rust
+mod jobs;
 mod routes;
 mod schema;
+mod tasks;
 
 use autumn_web::migrate::{embed_migrations, EmbeddedMigrations};
 use autumn_web::prelude::*;
@@ -261,10 +263,25 @@ async fn dashboard(session: Session) -> AutumnResult<Markup> { /* ... */ }
 #[secured("admin")]
 async fn admin_panel() -> AutumnResult<Markup> { /* ... */ }
 
+// Record-level auth on repository-generated REST endpoints:
+#[repository(Post, api = "/api/posts", policy = PostPolicy, scope = PostScope)]
+pub trait PostRepository {}
+
+// Manual handler: load the record first, then check inline.
+// #[authorize] is used by the repository macro; for manual handlers
+// the pattern is explicit ownership checks in the body:
 #[post("/posts/{id}")]
 #[secured]
-#[authorize("update", resource = Post)]
-async fn update_post(post: Post) -> AutumnResult<Markup> { /* ... */ }
+async fn update_post(Path(id): Path<i64>, mut db: Db, session: Session) -> AutumnResult<Markup> {
+    let user_id: i64 = session.get("user_id").await
+        .ok_or_else(|| AutumnError::unauthorized())?;
+    let post = find_post(&mut *db, id).await?;
+    if post.user_id != user_id {
+        return Err(AutumnError::forbidden_msg("not your post"));
+    }
+    /* ... */
+    Ok(html! { "updated" })
+}
 ```
 
 In `prod` / `production`, configure a stable signing secret or startup fails:
@@ -432,8 +449,8 @@ autumn generate migration add_posts
 autumn generate scaffold Post title:String body:Text --api
 autumn generate auth User --oauth github,google --totp --passkeys
 autumn generate admin Post
-autumn generate mailer UserMailer welcome
-autumn generate system-test todo-flow
+autumn generate mailer UserMailer
+autumn generate system-test todo_flow
 autumn routes --format json --user-only
 autumn doctor --strict --json
 autumn config list

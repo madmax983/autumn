@@ -50,8 +50,9 @@ accept aliases like `Integer` or `Boolean`.
 | `Bytea` | `BYTEA NOT NULL` | `Vec<u8>` |
 | `Attachment` | `JSONB NULL` (blob metadata) | `Option<Blob>` (always nullable) |
 | `Option<T>` | Nullable version of any above | `Option<T>` |
-| `name:unique` | Adds `UNIQUE` constraint | — |
-| `name:index` | Adds B-tree index | — |
+
+**Indexes and UNIQUE constraints are not field tokens.** Add them by hand in the
+generated migration's `up.sql` after scaffolding.
 
 **Foreign keys are not in the DSL.** To add an FK column (e.g. `user_id`), scaffold the
 model with an `i64` field and then hand-edit the generated migration to add
@@ -125,9 +126,16 @@ Next steps:
 ### task
 ```
 Next steps:
-1. Register in main.rs:
-   .one_off_tasks(one_off_tasks![tasks::recalculate_counts])
-2. Invoke with: autumn task recalculate_counts -- --dry-run
+1. The generator writes the file to tasks/<name>.rs at the project root
+   (not inside src/). Move it to src/tasks/<name>.rs or src/tasks.rs,
+   or reference it from src/main.rs with:
+   #[path = "../tasks/<name>.rs"]
+   mod <name>;
+
+2. Register in main.rs:
+   .one_off_tasks(one_off_tasks![<name>::<name>])
+
+3. Invoke with: autumn task <name> -- --dry-run
 ```
 
 ## Flags

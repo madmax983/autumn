@@ -77,7 +77,7 @@ changes.
 
 | Symptom | Fix |
 |---|---|
-| `Error: Address already in use` | Port 3000 is taken. Use `--port 3001` or kill the existing process. |
+| `Error: Address already in use` | Port 3000 is taken. Set `AUTUMN_SERVER__PORT=3001 autumn dev` or kill the existing process. |
 | `Error: connection refused` | Database is not running. Start Postgres first. |
 | Compile error shown in terminal | Fix the Rust error; `autumn dev` will retry on next save. |
 | `autumn setup` not found | Run `cargo install autumn-cli --version 0.5.0` |
