@@ -732,7 +732,14 @@ fn splice_feature_at(
     if new_feat_line == original_line {
         let close_idx = lines[feat_idx..]
             .iter()
-            .position(|l| l.trim() == "]")
+            .position(|l| {
+                // Strip a trailing TOML comment before comparing so that
+                // `] # framework features` is recognised as the closing bracket.
+                l.trim()
+                    .split_once('#')
+                    .map_or_else(|| l.trim(), |(before, _)| before.trim())
+                    == "]"
+            })
             .map_or(feat_idx, |p| feat_idx + p);
         let indent = lines
             .get(feat_idx + 1)

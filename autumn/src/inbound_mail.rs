@@ -1177,19 +1177,67 @@ fn parse_rfc5322(raw: Bytes) -> InboundEmail {
         // Pass raw bytes so binary attachment parts are not corrupted.
         extract_multipart_bodies(body_bytes, &content_type)
     } else {
-        let body_str = String::from_utf8_lossy(body_bytes).into_owned();
-        if ct_lower.contains("text/html") {
+        let disposition = parsed_headers
+            .get("content-disposition")
+            .map(|s| s.to_ascii_lowercase())
+            .unwrap_or_default();
+        let is_attachment = disposition.starts_with("attachment")
+            || (!ct_lower.is_empty()
+                && !ct_lower.starts_with("text/")
+                && !ct_lower.starts_with("message/"));
+        if is_attachment {
+            let filename = parsed_headers.get("content-disposition").and_then(|d| {
+                d.split(';').find_map(|seg| {
+                    let seg = seg.trim();
+                    if seg.to_ascii_lowercase().starts_with("filename=") {
+                        Some(seg["filename=".len()..].trim_matches('"').to_string())
+                    } else {
+                        None
+                    }
+                })
+            });
+            let ct_only = ct_lower
+                .split(';')
+                .next()
+                .map(str::trim)
+                .unwrap_or("application/octet-stream")
+                .to_string();
+            let data = if cte == "base64" {
+                let stripped: String = String::from_utf8_lossy(body_bytes)
+                    .chars()
+                    .filter(|c| !c.is_ascii_whitespace())
+                    .collect();
+                base64::engine::general_purpose::STANDARD
+                    .decode(stripped.as_bytes())
+                    .map(Bytes::from)
+                    .unwrap_or_else(|_| Bytes::copy_from_slice(body_bytes))
+            } else {
+                Bytes::copy_from_slice(body_bytes)
+            };
             (
                 None,
-                Some(decode_transfer_encoding(&body_str, &cte)),
-                Vec::new(),
+                None,
+                vec![Attachment {
+                    filename,
+                    content_type: ct_only,
+                    data,
+                }],
             )
         } else {
-            (
-                Some(decode_transfer_encoding(&body_str, &cte)),
-                None,
-                Vec::new(),
-            )
+            let body_str = String::from_utf8_lossy(body_bytes).into_owned();
+            if ct_lower.contains("text/html") {
+                (
+                    None,
+                    Some(decode_transfer_encoding(&body_str, &cte)),
+                    Vec::new(),
+                )
+            } else {
+                (
+                    Some(decode_transfer_encoding(&body_str, &cte)),
+                    None,
+                    Vec::new(),
+                )
+            }
         }
     };
 
@@ -1660,6 +1708,12 @@ fn parse_mailgun_form_data(
         };
         let abs = search_from + rel;
         let after_delim = abs + delim_bytes.len();
+
+        // RFC 2046 §5.1.1: boundary must start at the beginning of a line.
+        if abs > 0 && body.get(abs - 1) != Some(&b'\n') {
+            search_from = abs + 1;
+            continue;
+        }
 
         // RFC 2046: boundary must be followed by a valid terminator byte.
         if !matches!(
@@ -2862,6 +2916,61 @@ mod tests {
             Some("value1\r\n--abc123\r\nextra content"),
             "boundary prefix followed by non-terminator must not split the part"
         );
+    }
+
+    #[test]
+    fn parse_mailgun_form_data_boundary_must_start_at_line() {
+        // A boundary string that appears mid-line (not at position 0 or immediately
+        // after a newline) must NOT be treated as a valid MIME part boundary.
+        let b = "sep";
+        // Embed the delimiter string mid-line inside the value of field1.
+        let body = format!(
+            "--{b}\r\nContent-Disposition: form-data; name=\"field1\"\r\n\r\nvalue with --{b} inside\r\n\
+             --{b}\r\nContent-Disposition: form-data; name=\"field2\"\r\n\r\nvalue2\r\n\
+             --{b}--\r\n"
+        );
+        let ct = format!("multipart/form-data; boundary={b}");
+        let (fields, _) = parse_mailgun_form_data(body.as_bytes(), &ct);
+        assert_eq!(
+            fields.get("field1").map(String::as_str),
+            Some("value with --sep inside"),
+            "boundary embedded mid-line must not split the part"
+        );
+        assert_eq!(fields.get("field2").map(String::as_str), Some("value2"),);
+    }
+
+    #[test]
+    fn rfc5322_single_part_pdf_collected_as_attachment() {
+        // A non-multipart message whose Content-Type is application/pdf must have
+        // its body collected as an Attachment rather than placed in text_body.
+        let pdf_b64 = "JVBERi0xLjA="; // minimal %PDF-1.0 stub, base64-encoded
+        let raw = format!(
+            "From: sender@example.com\r\nTo: inbox@example.com\r\n\
+             Content-Type: application/pdf\r\n\
+             Content-Transfer-Encoding: base64\r\n\
+             Content-Disposition: attachment; filename=\"doc.pdf\"\r\n\
+             \r\n\
+             {pdf_b64}\r\n"
+        );
+        let email = parse_rfc5322(Bytes::from(raw.into_bytes()));
+        assert!(
+            email.text_body.is_none(),
+            "text_body should be empty for attachment"
+        );
+        assert!(
+            email.html_body.is_none(),
+            "html_body should be empty for attachment"
+        );
+        assert_eq!(
+            email.attachments.len(),
+            1,
+            "should have exactly one attachment"
+        );
+        let att = &email.attachments[0];
+        assert_eq!(att.content_type, "application/pdf");
+        assert_eq!(att.filename.as_deref(), Some("doc.pdf"));
+        // The decoded bytes should match the original PDF stub.
+        assert_eq!(att.data.as_ref(), b"%PDF-1.0");
     }
 
     #[test]

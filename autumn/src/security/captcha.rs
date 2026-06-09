@@ -689,12 +689,16 @@ where
         }
 
         // Webhook/API paths that cannot carry a CAPTCHA token are exempt.
-        if self
-            .settings
-            .exempt_paths
-            .iter()
-            .any(|ep| req.uri().path().starts_with(ep.as_str()))
-        {
+        // Require an exact match or a path-segment boundary (trailing `/`) so
+        // that exempting `/inbound/mailgun` does not accidentally exempt
+        // `/inbound/mailgun-settings` or other adjacent routes.
+        if self.settings.exempt_paths.iter().any(|ep| {
+            let path = req.uri().path();
+            let e = ep.as_str();
+            path == e
+                || path.starts_with(e)
+                    && (e.ends_with('/') || path.as_bytes().get(e.len()) == Some(&b'/'))
+        }) {
             let mut inner = self.inner.clone();
             std::mem::swap(&mut self.inner, &mut inner);
             return Box::pin(async move { inner.call(req).await });
@@ -1056,6 +1060,52 @@ mod tests {
         };
         let html = bot_protection_widget(&config).into_string();
         assert!(html.is_empty());
+    }
+
+    #[tokio::test]
+    async fn exempt_path_does_not_bleed_to_adjacent_routes() {
+        // Exempting "/webhook/inbound" must not exempt "/webhook/inbound-other".
+        let layer = BotProtectionLayer::new(Arc::new(TestCaptchaProvider::new("required")))
+            .with_exempt_paths(vec!["/webhook/inbound".to_string()]);
+        let app = Router::new()
+            .route("/webhook/inbound", post(ok_handler))
+            .route("/webhook/inbound-other", post(ok_handler))
+            .layer(layer);
+
+        let exempt = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/webhook/inbound")
+                    .header("Content-Type", "application/x-www-form-urlencoded")
+                    .body(Body::from("field=value"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            exempt.status(),
+            StatusCode::OK,
+            "exact path should be exempt"
+        );
+
+        let adjacent = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/webhook/inbound-other")
+                    .header("Content-Type", "application/x-www-form-urlencoded")
+                    .body(Body::from("field=value"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            adjacent.status(),
+            StatusCode::BAD_REQUEST,
+            "adjacent route must not be exempt"
+        );
     }
 
     #[tokio::test]
