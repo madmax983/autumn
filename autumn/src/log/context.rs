@@ -81,6 +81,11 @@ impl LogFields {
 pub struct LogContext {
     inner: Arc<RwLock<Inner>>,
     filter: Arc<ParameterFilter>,
+    /// The request span carrying the well-known correlation fields. Holding it
+    /// directly (rather than relying on [`tracing::Span::current`]) means
+    /// `set_user_id` / `set_tenant_id` record onto the request span even when
+    /// invoked from inside a nested child span.
+    span: tracing::Span,
 }
 
 #[derive(Default)]
@@ -109,20 +114,43 @@ impl LogContext {
                 ..Inner::default()
             })),
             filter,
+            span: tracing::Span::none(),
         }
     }
 
+    /// Attach the request span that carries the well-known correlation fields.
+    ///
+    /// Used by the middleware so [`set_user_id`](Self::set_user_id) /
+    /// [`set_tenant_id`](Self::set_tenant_id) record onto the request span
+    /// regardless of any nested child span that happens to be current.
+    #[must_use]
+    pub fn with_span(mut self, span: tracing::Span) -> Self {
+        self.span = span;
+        self
+    }
+
     /// Record the authenticated user id on this context.
+    ///
+    /// Also records `user_id` on the attached request span (if any) so it
+    /// surfaces in standard log output for every event in the request.
     pub fn set_user_id(&self, user_id: impl Into<String>) {
+        let user_id = user_id.into();
+        self.span
+            .record("user_id", tracing::field::display(&user_id));
         if let Ok(mut guard) = self.inner.write() {
-            guard.user_id = Some(user_id.into());
+            guard.user_id = Some(user_id);
         }
     }
 
     /// Record the resolved tenant id on this context.
+    ///
+    /// Also records `tenant_id` on the attached request span (if any).
     pub fn set_tenant_id(&self, tenant_id: impl Into<String>) {
+        let tenant_id = tenant_id.into();
+        self.span
+            .record("tenant_id", tracing::field::display(&tenant_id));
         if let Ok(mut guard) = self.inner.write() {
-            guard.tenant_id = Some(tenant_id.into());
+            guard.tenant_id = Some(tenant_id);
         }
     }
 
@@ -202,24 +230,20 @@ pub fn with_log_field(key: impl Into<String>, value: impl Into<String>) {
 
 /// Record the authenticated user id on the current request context.
 ///
-/// Also records `user_id` on the current [`tracing`] span so it surfaces in
-/// standard log output. No-op when called outside of a request.
+/// Also records `user_id` on the request span so it surfaces in standard log
+/// output. No-op when called outside of a request.
 pub fn set_user_id(user_id: impl Into<String>) {
     if let Some(ctx) = current() {
-        let user_id = user_id.into();
-        tracing::Span::current().record("user_id", tracing::field::display(&user_id));
         ctx.set_user_id(user_id);
     }
 }
 
 /// Record the resolved tenant id on the current request context.
 ///
-/// Also records `tenant_id` on the current [`tracing`] span. No-op when called
-/// outside of a request.
+/// Also records `tenant_id` on the request span. No-op when called outside of a
+/// request.
 pub fn set_tenant_id(tenant_id: impl Into<String>) {
     if let Some(ctx) = current() {
-        let tenant_id = tenant_id.into();
-        tracing::Span::current().record("tenant_id", tracing::field::display(&tenant_id));
         ctx.set_tenant_id(tenant_id);
     }
 }

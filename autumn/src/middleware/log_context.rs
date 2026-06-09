@@ -96,7 +96,10 @@ where
             span.record("request_id", tracing::field::display(rid));
         }
 
-        let ctx = LogContext::with_filter(request_id, Arc::clone(&self.filter));
+        // Attach the request span so `set_user_id` / `set_tenant_id` record onto
+        // it directly, rather than whatever child span happens to be current.
+        let ctx =
+            LogContext::with_filter(request_id, Arc::clone(&self.filter)).with_span(span.clone());
         let fut = self.inner.call(req).instrument(span);
         context::scoped(ctx, fut)
     }
@@ -265,6 +268,71 @@ mod tests {
                 "sensitive custom field should be scrubbed by the layer filter"
             );
         });
+    }
+
+    #[test]
+    fn user_id_renders_even_when_set_from_a_nested_child_span() {
+        // Regression guard: `set_user_id` must record onto the request span, not
+        // whatever child span is current — otherwise the field is silently
+        // dropped from log output when set from inside e.g. a DB-query span.
+        #[derive(Clone)]
+        struct BufWriter(Arc<Mutex<Vec<u8>>>);
+        struct BufGuard(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for BufGuard {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for BufWriter {
+            type Writer = BufGuard;
+            fn make_writer(&'a self) -> Self::Writer {
+                BufGuard(Arc::clone(&self.0))
+            }
+        }
+
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(BufWriter(Arc::clone(&buf))),
+        );
+
+        with_default(subscriber, || {
+            let app = Router::new()
+                .route(
+                    "/",
+                    get(|| async {
+                        // Emit from inside a nested child span.
+                        let child = tracing::info_span!("child");
+                        let _guard = child.enter();
+                        context::set_user_id("42");
+                        tracing::info!("from child");
+                        "ok"
+                    }),
+                )
+                .layer(LogContextLayer::new(filter()))
+                .layer(RequestIdLayer);
+
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                app.oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+                    .await
+                    .unwrap()
+            });
+        });
+
+        let out = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            out.contains("user_id=42"),
+            "user_id should be recorded on the request span and rendered; got: {out}"
+        );
     }
 
     #[tokio::test]
