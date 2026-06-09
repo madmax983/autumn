@@ -3002,6 +3002,7 @@ impl DatabaseConfig {
 /// let log = LogConfig::default();
 /// assert_eq!(log.level, "info");
 /// assert_eq!(log.format, LogFormat::Auto);
+/// assert!(log.access_log);
 /// ```
 #[derive(Debug, Clone, Deserialize)]
 pub struct LogConfig {
@@ -3023,6 +3024,27 @@ pub struct LogConfig {
     /// Explicitly remove default sensitive keys from the built-in deny-list.
     #[serde(default)]
     pub unfilter_parameters: Vec<String>,
+
+    /// Emit one structured access-log event per served HTTP request.
+    /// Default: `true`.
+    ///
+    /// The event (target `autumn::access`, level `INFO`) carries `method`,
+    /// `route` (the matched low-cardinality template), `status`,
+    /// `duration_ms`, and `request_id`, and is rendered by the standard
+    /// subscriber according to [`format`](Self::format). It requires no
+    /// telemetry feature or collector.
+    #[serde(default = "default_access_log")]
+    pub access_log: bool,
+
+    /// Path prefixes excluded from access logging so steady-state probe and
+    /// asset traffic does not drown application signal.
+    /// Default: `["/health", "/actuator", "/static"]`.
+    ///
+    /// Prefixes match whole path segments: `"/actuator"` excludes
+    /// `/actuator/health` but not `/actuators`. Setting this replaces the
+    /// default set entirely.
+    #[serde(default = "default_access_log_exclude")]
+    pub access_log_exclude: Vec<String>,
 }
 
 /// Log output format.
@@ -3476,6 +3498,18 @@ fn default_log_level() -> String {
     "info".to_owned()
 }
 
+const fn default_access_log() -> bool {
+    true
+}
+
+fn default_access_log_exclude() -> Vec<String> {
+    vec![
+        "/health".to_owned(),
+        "/actuator".to_owned(),
+        "/static".to_owned(),
+    ]
+}
+
 fn default_telemetry_service_name() -> String {
     "autumn-app".to_owned()
 }
@@ -3543,6 +3577,8 @@ impl Default for LogConfig {
             format: LogFormat::default(),
             filter_parameters: Vec::new(),
             unfilter_parameters: Vec::new(),
+            access_log: default_access_log(),
+            access_log_exclude: default_access_log_exclude(),
         }
     }
 }
@@ -4270,6 +4306,31 @@ path = "/healthz"
         assert_eq!(config.server.host, "127.0.0.1");
         assert_eq!(config.database.pool_size, 10);
         assert_eq!(config.log.level, "info");
+    }
+
+    #[test]
+    fn access_log_defaults_on_with_probe_and_asset_exclusions() {
+        let log = LogConfig::default();
+        assert!(log.access_log);
+        assert_eq!(
+            log.access_log_exclude,
+            vec!["/health", "/actuator", "/static"]
+        );
+    }
+
+    #[test]
+    fn access_log_is_configurable_from_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("autumn.toml");
+        std::fs::write(
+            &path,
+            "[log]\naccess_log = false\naccess_log_exclude = [\"/internal\"]\n",
+        )
+        .unwrap();
+
+        let config = AutumnConfig::load_from(&path).unwrap();
+        assert!(!config.log.access_log);
+        assert_eq!(config.log.access_log_exclude, vec!["/internal"]);
     }
 
     #[test]

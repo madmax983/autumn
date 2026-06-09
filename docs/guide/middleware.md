@@ -62,11 +62,19 @@ order:
               └─ Session
                    └─ SecurityHeaders
                         └─ RequestId
-                             └─ [your .layer() calls, first = outermost]
-                                  └─ CSRF
-                                       └─ CORS
-                                            └─ route handler
+                             └─ LogContext
+                                  └─ AccessLog
+                                       └─ [your .layer() calls, first = outermost]
+                                            └─ CSRF
+                                                 └─ CORS
+                                                      └─ route handler
 ```
+
+`LogContext` establishes the request-scoped log context (request id
+correlation for every log line), and `AccessLog` emits the structured
+per-request access line (`autumn::access`) when the response comes back out —
+both sit inside `RequestId` so the id is always available, and outside your
+layers so short-circuit responses you produce are still logged.
 
 The ordering guarantee that matters most: **user layers run inside
 `RequestIdLayer` on ingress**, so every `.layer()` you register can read the

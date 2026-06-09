@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **log:** Structured per-request access log, on by default (#999)
+  - Every served HTTP request now emits **exactly one** structured access-log
+    event (`tracing` target `autumn::access`, level `INFO`) at the response
+    boundary, carrying `method`, `route` (the matched low-cardinality template,
+    e.g. `/users/{id}` — never the raw path), `status`, `duration_ms`, and the
+    `request_id` that matches the `x-request-id` header and error pages.
+  - Rendered by the standard subscriber, so it honors `log.format`: a readable
+    line under `pretty`, a single JSON object per line under `json`. Works with
+    **no** `telemetry-otlp` feature and no OTLP collector — operators on
+    `docker logs` / platform log drains get request-level visibility for free.
+  - Steady-state probe/asset noise is excluded by default (`/health`,
+    `/actuator/*`, `/static/*`); the set is configurable via
+    `log.access_log_exclude` (whole-segment prefix matching). Unmatched
+    requests log the low-cardinality `_unmatched` route label.
+  - On by default; turn off with `log.access_log = false` in `autumn.toml` —
+    no recompile needed.
+  - The line never includes query strings, headers, or bodies, preserving the
+    log-scrubbing posture established for logs (#697) by construction.
+  - Additive `LogConfig` fields only (`access_log`, `access_log_exclude`);
+    non-breaking, minor version bump.
+
 - **log:** Request-scoped log context that auto-tags every log line (#1169)
   - An always-on `LogContextLayer` establishes a fresh `tokio::task_local`
     `log::context::LogContext` for **every** HTTP request, seeded with the same

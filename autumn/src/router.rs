@@ -1896,8 +1896,8 @@ fn apply_middleware(
     //
     // Full ingress layer order (outermost → innermost):
     //   TraceContext → Compression → Metrics → ExceptionFilter → ErrorPageContext → Session →
-    //   SecurityHeaders → RequestId → Timeout → [user layers] → Tenancy →
-    //   BodyLimit/UploadConfig → MethodOverride → RateLimit → CSRF → CORS → handler
+    //   SecurityHeaders → RequestId → LogContext → AccessLog → Timeout → [user layers] →
+    //   Tenancy → BodyLimit/UploadConfig → MethodOverride → RateLimit → CSRF → CORS → handler
     router = apply_request_timeout_middleware(router, config, state.metrics.clone());
 
     // Error-reporting + panic-catch layer. Placed inner to `RequestIdLayer`
@@ -1911,6 +1911,18 @@ fn apply_middleware(
             state.error_reporters(),
             config.reporting.enabled,
             config.reporting.sample_rate,
+        ));
+    }
+
+    // Structured per-request access log (#999): one INFO event (target
+    // `autumn::access`) per served request, emitted at the response boundary.
+    // Inner to RequestId (so the request id is available) and to LogContext
+    // (so the event is emitted inside the request span); outer to the
+    // reporting and timeout layers so panics-turned-500s and timeout
+    // responses are logged with the status the client receives.
+    if config.log.access_log {
+        router = router.layer(crate::middleware::AccessLogLayer::new(
+            config.log.access_log_exclude.clone(),
         ));
     }
 
@@ -1984,7 +1996,8 @@ fn apply_middleware(
     //   [user layers, when SSG/ISG dist dir active] ->
     //   StaticFileMiddleware (when SSG/ISG enabled) ->
     //   Metrics -> ExceptionFilter -> ErrorPageContext -> Session ->
-    //   SecurityHeaders -> RequestId -> [user layers, non-static build] ->
+    //   SecurityHeaders -> RequestId -> LogContext -> AccessLog ->
+    //   [user layers, non-static build] ->
     //   Tenancy -> RateLimit -> CSRF -> CORS -> handler
     let router = router
         .layer(crate::middleware::error_page_filter::ErrorPageContextLayer { is_dev })
