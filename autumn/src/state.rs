@@ -723,6 +723,13 @@ impl crate::actuator::ProvideActuatorState for AppState {
         self.health_detailed
     }
 
+    fn deploy_version(&self) -> String {
+        self.extension::<crate::canary::CanaryState>().map_or_else(
+            || crate::canary::STABLE.to_owned(),
+            |c| c.version().to_owned(),
+        )
+    }
+
     #[cfg(feature = "ws")]
     fn channels(&self) -> &crate::channels::Channels {
         &self.channels

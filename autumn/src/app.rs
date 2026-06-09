@@ -2309,6 +2309,19 @@ impl AppBuilder {
                 tokio::time::sleep(interval).await;
             }
         });
+
+        // Resolve the canary deploy-version label (AUTUMN_DEPLOY_VERSION /
+        // AUTUMN_CANARY) once at startup and publish it so the actuator metrics
+        // endpoint can tag every metric family with version="stable|canary".
+        let canary_state = crate::canary::CanaryState::from_env();
+        if canary_state.is_canary() {
+            tracing::info!(
+                version = canary_state.version(),
+                "canary: replica labelled as canary cohort"
+            );
+        }
+        state.insert_extension(canary_state);
+
         #[cfg(feature = "mail")]
         if let Some(interceptor) = mail_interceptor {
             state.insert_extension(interceptor);
@@ -5542,10 +5555,16 @@ pub(crate) fn project_dir(subdir: &str, env: &dyn crate::config::Env) -> std::pa
     )
 }
 
-/// Wait for a shutdown signal (Ctrl+C or SIGTERM on Unix).
+/// Wait for a shutdown signal (Ctrl+C, SIGTERM on Unix, or a canary rollback
+/// flag file written by a controller).
 ///
-/// Returns when either signal is received. Axum's `with_graceful_shutdown`
+/// Returns when any signal is received. Axum's `with_graceful_shutdown`
 /// then stops accepting new connections and drains in-flight requests.
+///
+/// The canary rollback arm lets a progressive-delivery controller drain and
+/// retire a bad canary replica without sending `SIGTERM` by hand: it writes
+/// [`crate::canary::CANARY_ROLLBACK_FLAG_FILE`] and Autumn runs the identical
+/// graceful-shutdown sequence (ready → 503, prestop grace, drain, clean exit).
 async fn shutdown_signal() {
     let ctrl_c = async {
         tokio::signal::ctrl_c()
@@ -5566,9 +5585,37 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();
 
+    let canary_rollback = async {
+        canary_rollback_signal(std::path::Path::new(
+            crate::canary::CANARY_ROLLBACK_FLAG_FILE,
+        ))
+        .await;
+        tracing::info!("Canary rollback signalled, starting graceful shutdown");
+    };
+
     tokio::select! {
         () = ctrl_c => {},
         () = terminate => {},
+        () = canary_rollback => {},
+    }
+}
+
+/// Resolve when the canary rollback flag file *newly appears* at `path`.
+///
+/// The flag state present at boot is treated as the baseline so a stale flag
+/// left over from a previous run cannot force a crash-looping replica to drain
+/// on every boot. Only the transition from absent → present triggers a
+/// rollback (see [`crate::canary::should_trigger_rollback`]).
+async fn canary_rollback_signal(path: &std::path::Path) {
+    let mut baseline = crate::canary::CanaryState::rollback_flag_present(path);
+    let interval = std::time::Duration::from_millis(500);
+    loop {
+        tokio::time::sleep(interval).await;
+        let present = crate::canary::CanaryState::rollback_flag_present(path);
+        if crate::canary::should_trigger_rollback(baseline, present) {
+            return;
+        }
+        baseline = present;
     }
 }
 
@@ -5646,6 +5693,53 @@ mod tests {
             clock: std::sync::Arc::new(crate::time::SystemClock),
         };
         crate::router::build_router(routes, &config, state)
+    }
+
+    #[tokio::test]
+    async fn canary_rollback_signal_resolves_when_flag_newly_written() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("canary-rollback.json");
+
+        // Flag is absent at boot; writing it after start must resolve the signal.
+        let writer_path = path.clone();
+        let writer = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            crate::canary::CanaryState::write_rollback_flag(
+                &writer_path,
+                &crate::canary::RollbackSignal::default(),
+            )
+            .unwrap();
+        });
+
+        let signalled = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            canary_rollback_signal(&path),
+        )
+        .await;
+        assert!(signalled.is_ok(), "rollback signal should resolve");
+        writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn canary_rollback_signal_ignores_stale_flag_present_at_boot() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("canary-rollback.json");
+        // Flag already present at boot — treated as baseline, must NOT trigger.
+        crate::canary::CanaryState::write_rollback_flag(
+            &path,
+            &crate::canary::RollbackSignal::default(),
+        )
+        .unwrap();
+
+        let signalled = tokio::time::timeout(
+            std::time::Duration::from_millis(1200),
+            canary_rollback_signal(&path),
+        )
+        .await;
+        assert!(
+            signalled.is_err(),
+            "a stale flag present at boot must not trigger rollback"
+        );
     }
 
     #[cfg(feature = "db")]

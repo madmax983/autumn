@@ -80,6 +80,7 @@ pub use channels::{
     Broadcast, BroadcastError, BroadcastPayload, ChannelBackendConfigError, ChannelMessage,
     ChannelPublishError, ChannelStats, Channels, ChannelsBackend, LocalChannelsBackend,
 };
+pub mod canary;
 pub mod config;
 pub mod credentials;
 #[cfg(feature = "db")]
