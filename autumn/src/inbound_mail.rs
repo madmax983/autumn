@@ -1104,11 +1104,10 @@ pub(crate) fn parse_generic(
 /// Multi-part MIME bodies are accepted but only the first part is extracted.
 fn parse_rfc5322(raw: Bytes) -> InboundEmail {
     // Split at the byte level so body bytes are preserved exactly for binary attachments.
-    let (header_bytes, body_bytes): (&[u8], &[u8]) =
-        find_subslice(&raw, b"\r\n\r\n")
-            .map(|p| (&raw[..p], &raw[p + 4..]))
-            .or_else(|| find_subslice(&raw, b"\n\n").map(|p| (&raw[..p], &raw[p + 2..])))
-            .unwrap_or((raw.as_ref(), &[]));
+    let (header_bytes, body_bytes): (&[u8], &[u8]) = find_subslice(&raw, b"\r\n\r\n")
+        .map(|p| (&raw[..p], &raw[p + 4..]))
+        .or_else(|| find_subslice(&raw, b"\n\n").map(|p| (&raw[..p], &raw[p + 2..])))
+        .unwrap_or((raw.as_ref(), &[]));
     let header_block = String::from_utf8_lossy(header_bytes);
 
     let mut from = String::new();
@@ -1164,20 +1163,28 @@ fn parse_rfc5322(raw: Bytes) -> InboundEmail {
     // but pass the original `content_type` value to boundary extraction so that
     // case-sensitive boundary parameter values are preserved.
     let ct_lower = content_type.to_ascii_lowercase();
-    let (text_body, html_body, attachments) =
-        if body_bytes.iter().all(|b| b.is_ascii_whitespace()) {
-            (None, None, Vec::new())
-        } else if ct_lower.starts_with("multipart/") {
-            // Pass raw bytes so binary attachment parts are not corrupted.
-            extract_multipart_bodies(body_bytes, &content_type)
+    let (text_body, html_body, attachments) = if body_bytes.iter().all(|b| b.is_ascii_whitespace())
+    {
+        (None, None, Vec::new())
+    } else if ct_lower.starts_with("multipart/") {
+        // Pass raw bytes so binary attachment parts are not corrupted.
+        extract_multipart_bodies(body_bytes, &content_type)
+    } else {
+        let body_str = String::from_utf8_lossy(body_bytes).into_owned();
+        if ct_lower.contains("text/html") {
+            (
+                None,
+                Some(decode_transfer_encoding(&body_str, &cte)),
+                Vec::new(),
+            )
         } else {
-            let body_str = String::from_utf8_lossy(body_bytes).into_owned();
-            if ct_lower.contains("text/html") {
-                (None, Some(decode_transfer_encoding(&body_str, &cte)), Vec::new())
-            } else {
-                (Some(decode_transfer_encoding(&body_str, &cte)), None, Vec::new())
-            }
-        };
+            (
+                Some(decode_transfer_encoding(&body_str, &cte)),
+                None,
+                Vec::new(),
+            )
+        }
+    };
 
     InboundEmail {
         from,
@@ -1269,7 +1276,11 @@ fn extract_multipart_bodies(
     content_type: &str,
 ) -> (Option<String>, Option<String>, Vec<Attachment>) {
     let Some(boundary) = extract_boundary(content_type) else {
-        return (Some(String::from_utf8_lossy(body).into_owned()), None, Vec::new());
+        return (
+            Some(String::from_utf8_lossy(body).into_owned()),
+            None,
+            Vec::new(),
+        );
     };
     let delimiter = format!("--{boundary}");
     let delim = delimiter.as_bytes();
@@ -1295,9 +1306,7 @@ fn extract_multipart_bodies(
 
     for part in raw_parts.into_iter().skip(1) {
         // End-boundary remainder starts with `--`; blank/whitespace-only parts are noise.
-        if part.starts_with(b"--")
-            || part.iter().all(|b| b.is_ascii_whitespace() || *b == b'-')
-        {
+        if part.starts_with(b"--") || part.iter().all(|b| b.is_ascii_whitespace() || *b == b'-') {
             continue;
         }
         // Strip leading CRLF/LF (the newline after the boundary marker line).
@@ -1333,7 +1342,10 @@ fn extract_multipart_bodies(
             .unwrap_or_else(|| "text/plain".to_string());
         let part_cte = part_headers
             .lines()
-            .find(|l| l.to_ascii_lowercase().starts_with("content-transfer-encoding:"))
+            .find(|l| {
+                l.to_ascii_lowercase()
+                    .starts_with("content-transfer-encoding:")
+            })
             .map(|l| l[26..].trim().to_ascii_lowercase())
             .unwrap_or_default();
         // Keep original case for value extraction; only compare names case-insensitively.
