@@ -1054,7 +1054,11 @@ pub(crate) fn parse_ses(body: &Bytes) -> Result<SnsParseResult, StatusCode> {
             // casing (needed for plus-address token extraction).
             for addr in envelope_to {
                 let addr_lower = addr.to_ascii_lowercase();
-                if !email.to.iter().any(|t| t.to_ascii_lowercase() == addr_lower) {
+                if !email
+                    .to
+                    .iter()
+                    .any(|t| t.to_ascii_lowercase() == addr_lower)
+                {
                     email.to.push(addr);
                 }
             }
