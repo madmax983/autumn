@@ -1160,3 +1160,50 @@ fn on_complaint_registers_handler() {
     // must not panic.
     drop(router);
 }
+
+#[tokio::test]
+async fn mailgun_complaint_dispatched_to_handler() {
+    COMPLAINT_CALLS.store(0, Ordering::SeqCst);
+
+    let ts = &std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        .to_string();
+    let key = "complaint-key";
+    let body = mailgun_form(
+        key,
+        ts,
+        "compl-tok",
+        &[
+            ("from", "sender@example.com"),
+            ("to", "user@example.com"),
+            ("X-Mailgun-Sflag", "Yes"),
+        ],
+    );
+
+    let router = InboundMailRouter::new()
+        .endpoint(InboundMailEndpointConfig::mailgun("/inbound/mailgun", key))
+        .handler(InboundMailHandlerInfo {
+            name: "regular",
+            pattern: RecipientPattern::Any,
+            processing: ProcessingMode::Sync,
+            handler: noop_handler,
+        })
+        .on_complaint(complaint_fn);
+
+    let client = TestApp::new()
+        .inbound_mail_router(router)
+        .routes(routes![ping])
+        .build();
+
+    client
+        .post("/inbound/mailgun")
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(body)
+        .send()
+        .await
+        .assert_status(200);
+
+    assert_eq!(COMPLAINT_CALLS.load(Ordering::SeqCst), 1);
+}

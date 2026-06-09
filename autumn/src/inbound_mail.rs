@@ -2409,6 +2409,158 @@ mod tests {
     }
 
     #[test]
+    fn find_subslice_basic_cases() {
+        assert_eq!(find_subslice(b"hello world", b"world"), Some(6));
+        assert_eq!(find_subslice(b"hello world", b"xyz"), None);
+        assert_eq!(find_subslice(b"", b"abc"), None);
+        assert_eq!(find_subslice(b"abc", b"abc"), Some(0));
+        assert_eq!(find_subslice(b"aabb", b""), Some(0));
+    }
+
+    #[test]
+    fn parse_mailgun_form_data_binary_file_preserved() {
+        // Verify that non-UTF-8 binary bytes are not corrupted by the parser.
+        let b = "formbnd";
+        let binary_payload: &[u8] = &[0x80u8, 0xFFu8, 0x00u8, 0x42u8];
+        let mut body: Vec<u8> = Vec::new();
+        body.extend_from_slice(
+            format!("--{b}\r\nContent-Disposition: form-data; name=\"field1\"\r\n\r\nvalue1\r\n")
+                .as_bytes(),
+        );
+        body.extend_from_slice(
+            format!(
+                "--{b}\r\nContent-Disposition: form-data; name=\"attachment-1\"; \
+                 filename=\"test.bin\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(binary_payload);
+        body.extend_from_slice(format!("\r\n--{b}--\r\n").as_bytes());
+
+        let ct = format!("multipart/form-data; boundary={b}");
+        let (fields, files) = parse_mailgun_form_data(&body, &ct);
+
+        assert_eq!(fields.get("field1").map(String::as_str), Some("value1"));
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].filename.as_deref(), Some("test.bin"));
+        assert_eq!(files[0].data.as_ref(), binary_payload);
+    }
+
+    #[test]
+    fn extract_multipart_bodies_collects_attachment() {
+        let b = "bndatt";
+        let body = format!(
+            "--{b}\r\nContent-Type: text/plain\r\n\r\nText body\r\n\
+             --{b}\r\nContent-Type: application/pdf\r\n\
+             Content-Disposition: attachment; filename=\"doc.pdf\"\r\n\r\nPDFdata\r\n\
+             --{b}--\r\n"
+        );
+        let ct = format!("multipart/mixed; boundary={b}");
+        let (text, html, atts) = extract_multipart_bodies(&body, &ct);
+        assert_eq!(text.as_deref(), Some("Text body"));
+        assert!(html.is_none());
+        assert_eq!(atts.len(), 1);
+        assert_eq!(atts[0].filename.as_deref(), Some("doc.pdf"));
+        assert_eq!(atts[0].content_type, "application/pdf");
+        assert_eq!(atts[0].data.as_ref(), b"PDFdata");
+    }
+
+    #[test]
+    fn extract_multipart_bodies_nested_multipart_alternative() {
+        let inner = "inner42";
+        let outer = "outer42";
+        let inner_body = format!(
+            "--{inner}\r\nContent-Type: text/plain\r\n\r\nPlain text\r\n\
+             --{inner}\r\nContent-Type: text/html\r\n\r\n<b>HTML</b>\r\n\
+             --{inner}--\r\n"
+        );
+        let body = format!(
+            "--{outer}\r\nContent-Type: multipart/alternative; boundary={inner}\r\n\r\n\
+             {inner_body}\
+             --{outer}--\r\n"
+        );
+        let ct = format!("multipart/mixed; boundary={outer}");
+        let (text, html, _) = extract_multipart_bodies(&body, &ct);
+        assert_eq!(text.as_deref(), Some("Plain text"));
+        assert_eq!(html.as_deref(), Some("<b>HTML</b>"));
+    }
+
+    #[test]
+    fn parse_ses_notification_json_message_no_content_returns_422() {
+        let headers = HeaderMap::from_iter([(
+            http::header::HeaderName::from_static("x-amz-sns-message-type"),
+            "Notification".parse().unwrap(),
+        )]);
+        // Message is valid JSON but missing the required "content" field.
+        let msg_json = serde_json::json!({ "other_field": "value" });
+        let sns = serde_json::json!({
+            "Type": "Notification",
+            "Message": msg_json.to_string()
+        });
+        let result = parse_ses(&Bytes::from(sns.to_string()), &headers);
+        assert_eq!(result.unwrap_err(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[cfg(feature = "inbound-ses")]
+    #[test]
+    fn is_valid_sns_cert_url_accepts_aws_https() {
+        assert!(sns_verify::is_valid_sns_cert_url(
+            "https://sns.us-east-1.amazonaws.com/SimpleNotificationService-abc.pem"
+        ));
+        assert!(sns_verify::is_valid_sns_cert_url(
+            "https://sns.ap-southeast-2.amazonaws.com/cert.pem"
+        ));
+        assert!(sns_verify::is_valid_sns_cert_url(
+            "https://sns.cn-north-1.amazonaws.com.cn/cert.pem"
+        ));
+    }
+
+    #[cfg(feature = "inbound-ses")]
+    #[test]
+    fn is_valid_sns_cert_url_rejects_invalid() {
+        // http (not https)
+        assert!(!sns_verify::is_valid_sns_cert_url(
+            "http://sns.us-east-1.amazonaws.com/cert.pem"
+        ));
+        // non-AWS domain
+        assert!(!sns_verify::is_valid_sns_cert_url(
+            "https://evil.com/cert.pem"
+        ));
+        // not starting with sns.
+        assert!(!sns_verify::is_valid_sns_cert_url(
+            "https://s3.amazonaws.com/cert.pem"
+        ));
+        // double-dot (path traversal attempt)
+        assert!(!sns_verify::is_valid_sns_cert_url(
+            "https://sns..amazonaws.com/cert.pem"
+        ));
+    }
+
+    #[cfg(feature = "inbound-ses")]
+    #[test]
+    fn canonical_string_notification_includes_required_fields() {
+        let json = serde_json::json!({
+            "Type": "Notification",
+            "MessageId": "abc-123",
+            "Message": "hello world",
+            "Timestamp": "2024-01-01T00:00:00.000Z",
+            "TopicArn": "arn:aws:sns:us-east-1:123:MyTopic"
+        });
+        let result = sns_verify::canonical_string(&json, "Notification").unwrap();
+        // Each present field should appear as "FieldName\nvalue\n".
+        assert!(result.contains("Message\nhello world\n"));
+        assert!(result.contains("MessageId\nabc-123\n"));
+        assert!(result.contains("Type\nNotification\n"));
+    }
+
+    #[cfg(feature = "inbound-ses")]
+    #[test]
+    fn canonical_string_unknown_type_returns_none() {
+        let json = serde_json::json!({ "Type": "UnknownType" });
+        assert!(sns_verify::canonical_string(&json, "UnknownType").is_none());
+    }
+
+    #[test]
     fn primary_recipient_returns_none_for_empty_to() {
         let email = InboundEmail {
             from: "a@b.com".to_string(),
