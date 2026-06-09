@@ -10246,8 +10246,12 @@ mod tests {
             .find("data_export")
             .expect("data_export route must be present");
         let export_body = &routes[export_pos..export_pos + 500.min(routes.len() - export_pos)];
+        // Authentication is enforced either via the tracked-session gate
+        // (#819) or a session/Auth extractor check.
         assert!(
-            export_body.contains("Auth") || export_body.contains("auth"),
+            export_body.contains("require_tracked_session")
+                || export_body.contains("Auth")
+                || export_body.contains("auth"),
             "data_export route must require authentication: {export_body}"
         );
     }
