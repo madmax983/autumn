@@ -385,6 +385,11 @@ pub struct InboundEmail {
     /// Plus-address tag captured by the routing DSL (e.g. `ticket-42` from
     /// `replies+ticket-42@app.example`).
     pub plus_token: Option<String>,
+    /// Set to `true` only when the provider's top-level webhook field
+    /// (e.g. Mailgun's `X-Mailgun-Bounced-Address` form field) signals a
+    /// bounce.  Never derived from forwarded message headers so that a sender
+    /// cannot spoof bounce routing by injecting that header into their email.
+    pub is_bounce: bool,
 }
 
 impl InboundEmail {
@@ -757,8 +762,8 @@ impl InboundMailRouter {
     /// 4. Fallback handler, if registered.
     /// 5. Log + drop with a `WARN` trace.
     pub(crate) async fn dispatch(&self, mut email: InboundEmail) -> crate::AutumnResult<()> {
-        // Bounce detection via Mailgun header.
-        if email.headers.contains_key("x-mailgun-bounced-address")
+        // Bounce detection via provider-set flag (never derived from forwarded headers).
+        if email.is_bounce
             && let Some(handler) = self.bounce_handler
         {
             return handler(email).await;
@@ -904,14 +909,13 @@ pub(crate) fn parse_mailgun(
 
     let headers = parse_mailgun_headers(form.get("message-headers").map_or("", String::as_str));
 
-    // Bounce signalling via form field.
-    let mut final_headers = headers;
-    if let Some(bounced) = form
+    // Bounce detection: only trust the provider's top-level webhook field, never
+    // forwarded message headers (which a sender could forge).
+    let is_bounce = form
         .get("X-Mailgun-Bounced-Address")
         .or_else(|| form.get("x-mailgun-bounced-address"))
-    {
-        final_headers.insert("x-mailgun-bounced-address".to_string(), bounced.clone());
-    }
+        .is_some();
+    let final_headers = headers;
 
     let spam_score = form
         .get("X-Mailgun-Spam-Score")
@@ -969,6 +973,7 @@ pub(crate) fn parse_mailgun(
             .map(|s| Bytes::from(s.as_bytes().to_vec()))
             .unwrap_or_default(),
         plus_token: None,
+        is_bounce,
     })
 }
 
@@ -1253,6 +1258,7 @@ fn parse_rfc5322(raw: Bytes) -> InboundEmail {
         spam_report: None,
         raw,
         plus_token: None,
+        is_bounce: false,
     }
 }
 
@@ -1761,27 +1767,30 @@ fn parse_mailgun_form_data(
         // parsing so a folded Content-Disposition reads as one logical line.
         let headers_str = unfold_mime_headers(&String::from_utf8_lossy(headers_bytes));
 
+        // Preserve the original disposition value so that filename casing is not
+        // corrupted — parameter values are case-sensitive (RFC 2183 §2).
+        // Key matching (name=, filename=) is done case-insensitively.
         let disposition = headers_str
             .lines()
             .find(|l| l.to_ascii_lowercase().starts_with("content-disposition:"))
-            .map(|l| {
-                l[l.find(':').map_or(0, |p| p + 1)..]
-                    .trim()
-                    .to_ascii_lowercase()
-            })
+            .map(|l| l[l.find(':').map_or(0, |p| p + 1)..].trim().to_string())
             .unwrap_or_default();
 
         let name = disposition.split(';').find_map(|seg| {
             let seg = seg.trim();
-            seg.strip_prefix("name=")
-                .map(|v| v.trim_matches('"').to_string())
+            let (k, v) = seg.split_once('=')?;
+            k.trim()
+                .eq_ignore_ascii_case("name")
+                .then(|| v.trim().trim_matches('"').to_string())
         });
         let Some(name) = name else { continue };
 
         let filename = disposition.split(';').find_map(|seg| {
             let seg = seg.trim();
-            seg.strip_prefix("filename=")
-                .map(|v| v.trim_matches('"').to_string())
+            let (k, v) = seg.split_once('=')?;
+            k.trim()
+                .eq_ignore_ascii_case("filename")
+                .then(|| v.trim().trim_matches('"').to_string())
         });
 
         if let Some(filename) = filename {
@@ -2252,7 +2261,42 @@ mod tests {
         .collect();
 
         let email = parse_mailgun(&form, key, Vec::new()).unwrap();
-        assert!(email.headers.contains_key("x-mailgun-bounced-address"));
+        assert!(email.is_bounce, "top-level bounce field must set is_bounce");
+        // The injected header must NOT appear in email.headers — bounce state is
+        // tracked only via is_bounce to prevent spoofing via message-headers.
+        assert!(
+            !email.headers.contains_key("x-mailgun-bounced-address"),
+            "bounce header must not bleed into forwarded headers map"
+        );
+    }
+
+    #[test]
+    fn mailgun_bounce_not_triggered_by_injected_message_header() {
+        // A sender that embeds X-Mailgun-Bounced-Address in their own email headers
+        // must not have those headers treated as a provider bounce signal.
+        let ts = now_ts();
+        let tok = "regtoken";
+        let key = "spoof-key";
+        let sig = compute_mailgun_signature(&ts, tok, key);
+        // Simulate Mailgun including the injected header in message-headers JSON.
+        let injected_headers = r#"[["X-Mailgun-Bounced-Address", "victim@example.com"]]"#;
+        let form: HashMap<String, String> = [
+            ("from".to_string(), "attacker@evil.example".to_string()),
+            ("to".to_string(), "support@company.com".to_string()),
+            ("subject".to_string(), "Normal email".to_string()),
+            ("timestamp".to_string(), ts),
+            ("token".to_string(), tok.to_string()),
+            ("signature".to_string(), sig),
+            ("message-headers".to_string(), injected_headers.to_string()),
+        ]
+        .into_iter()
+        .collect();
+
+        let email = parse_mailgun(&form, key, Vec::new()).unwrap();
+        assert!(
+            !email.is_bounce,
+            "injected message-header must not set is_bounce"
+        );
     }
 
     #[test]
@@ -2602,6 +2646,7 @@ mod tests {
             spam_report: None,
             raw: Bytes::new(),
             plus_token: None,
+            is_bounce: false,
         };
         assert_eq!(email.primary_recipient(), Some("first@x.com"));
     }
@@ -2768,6 +2813,7 @@ mod tests {
             spam_report: None,
             raw: Bytes::new(),
             plus_token: None,
+            is_bounce: false,
         };
         assert!(email.primary_recipient().is_none());
     }
@@ -2971,6 +3017,29 @@ mod tests {
         assert_eq!(att.filename.as_deref(), Some("doc.pdf"));
         // The decoded bytes should match the original PDF stub.
         assert_eq!(att.data.as_ref(), b"%PDF-1.0");
+    }
+
+    #[test]
+    fn parse_mailgun_form_data_preserves_filename_casing() {
+        // RFC 2183 §2: parameter values are case-sensitive.
+        // A filename like "Q1-Report.PDF" must not be lowercased to "q1-report.pdf".
+        let b = "bound";
+        let body = format!(
+            "--{b}\r\n\
+             Content-Disposition: form-data; name=\"upload\"; filename=\"Q1-Report.PDF\"\r\n\
+             Content-Type: application/pdf\r\n\
+             \r\n\
+             %PDF\r\n\
+             --{b}--\r\n"
+        );
+        let ct = format!("multipart/form-data; boundary={b}");
+        let (_, files) = parse_mailgun_form_data(body.as_bytes(), &ct);
+        assert_eq!(files.len(), 1);
+        assert_eq!(
+            files[0].filename.as_deref(),
+            Some("Q1-Report.PDF"),
+            "original filename casing must be preserved"
+        );
     }
 
     #[test]

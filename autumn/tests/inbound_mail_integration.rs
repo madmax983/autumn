@@ -79,6 +79,7 @@ fn inbound_email_has_all_required_fields() {
         spam_report: None,
         raw: Bytes::from_static(b""),
         plus_token: None,
+        is_bounce: false,
     };
     assert_eq!(email.from, "sender@example.com");
     assert_eq!(email.to, vec!["support@company.com"]);
@@ -115,6 +116,7 @@ fn inbound_email_plus_token_accessor() {
         spam_report: None,
         raw: Bytes::new(),
         plus_token: Some("abc123".to_string()),
+        is_bounce: false,
     };
     assert_eq!(email.plus_token(), Some("abc123"));
 }
