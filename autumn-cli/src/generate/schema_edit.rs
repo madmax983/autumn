@@ -816,7 +816,9 @@ pub fn ensure_autumn_web_feature(existing: &str, feature: &str) -> String {
 
     // Pass 2: multiline section form `[dependencies.autumn-web]`.
     for (i, &line) in lines.iter().enumerate() {
-        if line.trim() != "[dependencies.autumn-web]" {
+        // Strip trailing TOML line-comment before comparing the section header.
+        let key_part = line.trim().splitn(2, '#').next().unwrap_or("").trim();
+        if key_part != "[dependencies.autumn-web]" {
             continue;
         }
         let section_start = i + 1;

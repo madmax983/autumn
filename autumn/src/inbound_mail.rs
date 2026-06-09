@@ -1019,21 +1019,42 @@ pub(crate) fn parse_ses(body: &Bytes) -> Result<SnsParseResult, StatusCode> {
             // The SNS Message may be (a) a plain base64-encoded RFC 5322 email,
             // (b) a raw RFC 5322 string, or (c) a JSON object with a "content"
             // field containing the base64-encoded email (SES default action format).
-            let raw: Vec<u8> = match serde_json::from_str::<serde_json::Value>(message) {
-                Err(_) => base64::engine::general_purpose::STANDARD
-                    .decode(message)
-                    .unwrap_or_else(|_| message.as_bytes().to_vec()),
+            let (raw, envelope_to) = match serde_json::from_str::<serde_json::Value>(message) {
+                Err(_) => {
+                    let bytes = base64::engine::general_purpose::STANDARD
+                        .decode(message)
+                        .unwrap_or_else(|_| message.as_bytes().to_vec());
+                    (bytes, Vec::new())
+                }
                 Ok(msg_json) => {
                     let content = msg_json
                         .get("content")
                         .and_then(|c| c.as_str())
                         .ok_or(StatusCode::UNPROCESSABLE_ENTITY)?;
-                    base64::engine::general_purpose::STANDARD
+                    let bytes = base64::engine::general_purpose::STANDARD
                         .decode(content)
-                        .unwrap_or_else(|_| content.as_bytes().to_vec())
+                        .unwrap_or_else(|_| content.as_bytes().to_vec());
+                    // Preserve SES envelope recipients (mail.destination) for Bcc/alias routing.
+                    let envelope_to: Vec<String> = msg_json
+                        .get("mail")
+                        .and_then(|m| m.get("destination"))
+                        .and_then(|d| d.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(|s| s.to_lowercase()))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    (bytes, envelope_to)
                 }
             };
-            let email = parse_rfc5322(Bytes::from(raw));
+            let mut email = parse_rfc5322(Bytes::from(raw));
+            // Merge envelope recipients not already present in the RFC 5322 To header.
+            for addr in envelope_to {
+                if !email.to.contains(&addr) {
+                    email.to.push(addr);
+                }
+            }
             Ok(SnsParseResult::Email(Box::new(email)))
         }
         _ => {
@@ -1082,17 +1103,13 @@ pub(crate) fn parse_generic(
 /// Handles folded headers, plain-text and HTML bodies (single-part only).
 /// Multi-part MIME bodies are accepted but only the first part is extracted.
 fn parse_rfc5322(raw: Bytes) -> InboundEmail {
-    let text = String::from_utf8_lossy(&raw);
-
-    let (header_block, body_block) = text.find("\r\n\r\n").map_or_else(
-        || {
-            text.find("\n\n").map_or_else(
-                || (text.as_ref(), ""),
-                |pos| (&text[..pos], &text[pos + 2..]),
-            )
-        },
-        |pos| (&text[..pos], &text[pos + 4..]),
-    );
+    // Split at the byte level so body bytes are preserved exactly for binary attachments.
+    let (header_bytes, body_bytes): (&[u8], &[u8]) =
+        find_subslice(&raw, b"\r\n\r\n")
+            .map(|p| (&raw[..p], &raw[p + 4..]))
+            .or_else(|| find_subslice(&raw, b"\n\n").map(|p| (&raw[..p], &raw[p + 2..])))
+            .unwrap_or((raw.as_ref(), &[]));
+    let header_block = String::from_utf8_lossy(header_bytes);
 
     let mut from = String::new();
     let mut to = Vec::new();
@@ -1143,28 +1160,24 @@ fn parse_rfc5322(raw: Bytes) -> InboundEmail {
         .get("content-transfer-encoding")
         .map(|s| s.to_ascii_lowercase())
         .unwrap_or_default();
-    let body_str = body_block.to_string();
     // Normalise the MIME type/subtype for matching (RFC 2045 §5 — case-insensitive),
     // but pass the original `content_type` value to boundary extraction so that
     // case-sensitive boundary parameter values are preserved.
     let ct_lower = content_type.to_ascii_lowercase();
-    let (text_body, html_body, attachments) = if body_str.trim().is_empty() {
-        (None, None, Vec::new())
-    } else if ct_lower.starts_with("multipart/") {
-        extract_multipart_bodies(&body_str, &content_type)
-    } else if ct_lower.contains("text/html") {
-        (
-            None,
-            Some(decode_transfer_encoding(&body_str, &cte)),
-            Vec::new(),
-        )
-    } else {
-        (
-            Some(decode_transfer_encoding(&body_str, &cte)),
-            None,
-            Vec::new(),
-        )
-    };
+    let (text_body, html_body, attachments) =
+        if body_bytes.iter().all(|b| b.is_ascii_whitespace()) {
+            (None, None, Vec::new())
+        } else if ct_lower.starts_with("multipart/") {
+            // Pass raw bytes so binary attachment parts are not corrupted.
+            extract_multipart_bodies(body_bytes, &content_type)
+        } else {
+            let body_str = String::from_utf8_lossy(body_bytes).into_owned();
+            if ct_lower.contains("text/html") {
+                (None, Some(decode_transfer_encoding(&body_str, &cte)), Vec::new())
+            } else {
+                (Some(decode_transfer_encoding(&body_str, &cte)), None, Vec::new())
+            }
+        };
 
     InboundEmail {
         from,
@@ -1249,33 +1262,64 @@ fn extract_boundary(content_type: &str) -> Option<String> {
 
 /// Split a MIME multipart body and return `(text/plain, text/html, attachments)`.
 ///
-/// Recurses into nested `multipart/*` parts (e.g. `multipart/alternative`
-/// inside `multipart/mixed`) so that both text and HTML bodies are extracted
-/// even when the outer type is `multipart/mixed`.
+/// Accepts raw bytes so non-base64 attachment parts are stored without UTF-8
+/// round-trip corruption. Recurses into nested `multipart/*` parts.
 fn extract_multipart_bodies(
-    body: &str,
+    body: &[u8],
     content_type: &str,
 ) -> (Option<String>, Option<String>, Vec<Attachment>) {
     let Some(boundary) = extract_boundary(content_type) else {
-        return (Some(body.to_string()), None, Vec::new());
+        return (Some(String::from_utf8_lossy(body).into_owned()), None, Vec::new());
     };
     let delimiter = format!("--{boundary}");
+    let delim = delimiter.as_bytes();
     let mut text_body: Option<String> = None;
     let mut html_body: Option<String> = None;
     let mut attachments: Vec<Attachment> = Vec::new();
 
-    for part in body.split(&delimiter).skip(1) {
-        if part.trim_start_matches('-').trim().is_empty() {
+    // Split body into parts by finding each boundary delimiter.
+    let mut raw_parts: Vec<&[u8]> = Vec::new();
+    let mut pos = 0;
+    loop {
+        match find_subslice(&body[pos..], delim) {
+            None => {
+                raw_parts.push(&body[pos..]);
+                break;
+            }
+            Some(rel) => {
+                raw_parts.push(&body[pos..pos + rel]);
+                pos += rel + delim.len();
+            }
+        }
+    }
+
+    for part in raw_parts.into_iter().skip(1) {
+        // End-boundary remainder starts with `--`; blank/whitespace-only parts are noise.
+        if part.starts_with(b"--")
+            || part.iter().all(|b| b.is_ascii_whitespace() || *b == b'-')
+        {
             continue;
         }
-        let (part_headers, part_body) = if let Some(pos) = part.find("\r\n\r\n") {
-            (&part[..pos], &part[pos + 4..])
-        } else if let Some(pos) = part.find("\n\n") {
-            (&part[..pos], &part[pos + 2..])
-        } else {
+        // Strip leading CRLF/LF (the newline after the boundary marker line).
+        let part = part
+            .strip_prefix(b"\r\n")
+            .or_else(|| part.strip_prefix(b"\n"))
+            .unwrap_or(part);
+        // Strip trailing CRLF/LF (the line ending before the next boundary).
+        let part = part
+            .strip_suffix(b"\r\n")
+            .or_else(|| part.strip_suffix(b"\n"))
+            .unwrap_or(part);
+
+        // Split part into headers and body at the blank-line separator.
+        let Some((part_header_bytes, part_body_bytes)) = find_subslice(part, b"\r\n\r\n")
+            .map(|p| (&part[..p], &part[p + 4..]))
+            .or_else(|| find_subslice(part, b"\n\n").map(|p| (&part[..p], &part[p + 2..])))
+        else {
             continue;
         };
-        // Lowercased content-type for matching; original-case for boundary extraction.
+
+        let part_headers = String::from_utf8_lossy(part_header_bytes);
         // Per RFC 2045 §5.2, a missing Content-Type defaults to text/plain.
         let part_ct_lower = part_headers
             .lines()
@@ -1289,10 +1333,7 @@ fn extract_multipart_bodies(
             .unwrap_or_else(|| "text/plain".to_string());
         let part_cte = part_headers
             .lines()
-            .find(|l| {
-                l.to_ascii_lowercase()
-                    .starts_with("content-transfer-encoding:")
-            })
+            .find(|l| l.to_ascii_lowercase().starts_with("content-transfer-encoding:"))
             .map(|l| l[26..].trim().to_ascii_lowercase())
             .unwrap_or_default();
         // Keep original case for value extraction; only compare names case-insensitively.
@@ -1302,20 +1343,15 @@ fn extract_multipart_bodies(
             .map(|l| l[l.find(':').map_or(0, |p| p + 1)..].trim().to_string())
             .unwrap_or_default();
         let disposition_lower = disposition.to_ascii_lowercase();
-        // Strip trailing boundary marker (e.g. "\r\n--boundary--").
-        let text = part_body
-            .find(&format!("\r\n--{boundary}"))
-            .or_else(|| part_body.find(&format!("\n--{boundary}")))
-            .map_or(part_body, |end| &part_body[..end])
-            .trim();
         let is_attachment = disposition_lower.starts_with("attachment")
             || disposition
                 .split(';')
                 .any(|s| s.trim().to_ascii_lowercase().starts_with("filename="));
+
         if part_ct_lower.starts_with("multipart/") {
             // Recurse into nested multipart parts (e.g. multipart/alternative).
             let (nested_text, nested_html, nested_atts) =
-                extract_multipart_bodies(text, &part_ct_orig);
+                extract_multipart_bodies(part_body_bytes, &part_ct_orig);
             if text_body.is_none() {
                 text_body = nested_text;
             }
@@ -1324,11 +1360,13 @@ fn extract_multipart_bodies(
             }
             attachments.extend(nested_atts);
         } else if !is_attachment && part_ct_lower.starts_with("text/plain") && text_body.is_none() {
-            text_body = Some(decode_transfer_encoding(text, &part_cte));
+            let s = String::from_utf8_lossy(part_body_bytes).into_owned();
+            text_body = Some(decode_transfer_encoding(&s, &part_cte));
         } else if !is_attachment && part_ct_lower.starts_with("text/html") && html_body.is_none() {
-            html_body = Some(decode_transfer_encoding(text, &part_cte));
+            let s = String::from_utf8_lossy(part_body_bytes).into_owned();
+            html_body = Some(decode_transfer_encoding(&s, &part_cte));
         } else if is_attachment || !part_ct_lower.starts_with("text/") {
-            // Collect attachment parts (binary or explicitly marked as attachment).
+            // Collect attachment parts; use raw bytes to avoid UTF-8 corruption.
             let filename = disposition.split(';').find_map(|seg| {
                 let seg = seg.trim();
                 if seg.to_ascii_lowercase().starts_with("filename=") {
@@ -1344,13 +1382,16 @@ fn extract_multipart_bodies(
                 .unwrap_or("application/octet-stream")
                 .to_string();
             let data = if part_cte == "base64" {
-                let stripped: String = text.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+                let stripped: String = String::from_utf8_lossy(part_body_bytes)
+                    .chars()
+                    .filter(|c| !c.is_ascii_whitespace())
+                    .collect();
                 base64::engine::general_purpose::STANDARD
                     .decode(stripped.as_bytes())
                     .map(Bytes::from)
-                    .unwrap_or_else(|_| Bytes::from(text.as_bytes().to_vec()))
+                    .unwrap_or_else(|_| Bytes::copy_from_slice(part_body_bytes))
             } else {
-                Bytes::from(text.as_bytes().to_vec())
+                Bytes::copy_from_slice(part_body_bytes)
             };
             attachments.push(Attachment {
                 filename,
@@ -2301,7 +2342,7 @@ mod tests {
             "--{b}\r\nContent-Type: text/plain\r\nContent-Transfer-Encoding: base64\r\n\r\n{encoded}\r\n--{b}--\r\n"
         );
         let ct = format!("multipart/mixed; boundary={b}");
-        let (text, _html, _) = extract_multipart_bodies(&body, &ct);
+        let (text, _html, _) = extract_multipart_bodies(body.as_bytes(), &ct);
         assert_eq!(text.unwrap(), plain);
     }
 
@@ -2312,7 +2353,7 @@ mod tests {
             "--{b}\r\nContent-Type: text/plain\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\nHello=20World\r\n--{b}--\r\n"
         );
         let ct = format!("multipart/mixed; boundary={b}");
-        let (text, _html, _) = extract_multipart_bodies(&body, &ct);
+        let (text, _html, _) = extract_multipart_bodies(body.as_bytes(), &ct);
         assert_eq!(text.unwrap(), "Hello World");
     }
 
@@ -2346,14 +2387,14 @@ mod tests {
              --{b}--\r\n"
         );
         let ct = format!("multipart/alternative; boundary={b}");
-        let (text, html, _) = extract_multipart_bodies(&body, &ct);
+        let (text, html, _) = extract_multipart_bodies(body.as_bytes(), &ct);
         assert_eq!(text.as_deref(), Some("Hello text"));
         assert_eq!(html.as_deref(), Some("<b>Hello</b>"));
     }
 
     #[test]
     fn extract_multipart_bodies_no_boundary_returns_body_as_text() {
-        let (text, html, _) = extract_multipart_bodies("plain text", "text/plain");
+        let (text, html, _) = extract_multipart_bodies(b"plain text", "text/plain");
         assert_eq!(text.as_deref(), Some("plain text"));
         assert!(html.is_none());
     }
@@ -2447,7 +2488,7 @@ mod tests {
              --{b}--\r\n"
         );
         let ct = format!("multipart/mixed; boundary={b}");
-        let (text, html, atts) = extract_multipart_bodies(&body, &ct);
+        let (text, html, atts) = extract_multipart_bodies(body.as_bytes(), &ct);
         assert_eq!(text.as_deref(), Some("Text body"));
         assert!(html.is_none());
         assert_eq!(atts.len(), 1);
@@ -2471,7 +2512,7 @@ mod tests {
              --{outer}--\r\n"
         );
         let ct = format!("multipart/mixed; boundary={outer}");
-        let (text, html, _) = extract_multipart_bodies(&body, &ct);
+        let (text, html, _) = extract_multipart_bodies(body.as_bytes(), &ct);
         assert_eq!(text.as_deref(), Some("Plain text"));
         assert_eq!(html.as_deref(), Some("<b>HTML</b>"));
     }
