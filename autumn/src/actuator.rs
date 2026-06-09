@@ -2091,7 +2091,7 @@ fn write_builtin_http_metrics(
             if let Some((method, path)) = route_key.split_once(' ') {
                 let _ = writeln!(
                     out,
-                    "autumn_http_route_requests_total{{method=\"{method}\",route=\"{path}\"}} {}",
+                    "autumn_http_route_requests_total{{version=\"{version}\",method=\"{method}\",route=\"{path}\"}} {}",
                     metrics.count
                 );
             }
@@ -2119,6 +2119,7 @@ pub(crate) async fn prometheus_endpoint<S: ProvideActuatorState + Send + Sync + 
             "autumn_http_requests_total",
             "autumn_http_requests_active",
             "autumn_http_responses_total",
+            "autumn_http_request_duration_seconds",
             "autumn_shutdown_aborted_requests_total",
             "autumn_request_timeouts_total",
             "autumn_http_route_requests_total",
@@ -3732,12 +3733,12 @@ mod tests {
             "autumn_http_request_duration_seconds{version=\"stable\",quantile=\"0.99\"}"
         ));
 
-        assert!(
-            text.contains("autumn_http_route_requests_total{method=\"GET\",route=\"/test\"} 1")
-        );
-        assert!(
-            text.contains("autumn_http_route_requests_total{method=\"POST\",route=\"/test\"} 1")
-        );
+        assert!(text.contains(
+            "autumn_http_route_requests_total{version=\"stable\",method=\"GET\",route=\"/test\"} 1"
+        ));
+        assert!(text.contains(
+            "autumn_http_route_requests_total{version=\"stable\",method=\"POST\",route=\"/test\"} 1"
+        ));
 
         assert!(text.contains("# HELP autumn_request_timeouts_total"));
         assert!(text.contains("# TYPE autumn_request_timeouts_total counter"));
@@ -4937,6 +4938,59 @@ mod tests {
         assert_eq!(
             occurrences, 1,
             "built-in must not be shadowed by plugin:\n{text}"
+        );
+        assert!(
+            !text.contains("999"),
+            "plugin shadow value must not appear:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn prometheus_endpoint_skips_builtin_duration_family_collision() {
+        // The new built-in latency family must be in the duplicate guard so a
+        // plugin emitting the same family cannot produce a second HELP/TYPE block.
+        struct ShadowLatency;
+        impl MetricsSource for ShadowLatency {
+            fn collect(&self) -> Vec<MetricFamily> {
+                vec![MetricFamily {
+                    name: "autumn_http_request_duration_seconds".to_string(),
+                    help: "plugin trying to shadow built-in latency".to_string(),
+                    kind: MetricKind::Gauge,
+                    samples: vec![MetricSample {
+                        labels: vec![],
+                        value: 999.0,
+                    }],
+                }]
+            }
+        }
+
+        let state = test_state();
+        state
+            .metrics_source_registry
+            .register("shadow_latency", Arc::new(ShadowLatency))
+            .unwrap();
+
+        let app = actuator_router(true).with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/prometheus")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+
+        let occurrences = text
+            .matches("# HELP autumn_http_request_duration_seconds")
+            .count();
+        assert_eq!(
+            occurrences, 1,
+            "built-in latency family must not be shadowed by plugin:\n{text}"
         );
         assert!(
             !text.contains("999"),

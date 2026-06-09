@@ -341,6 +341,11 @@ protocol mirrors [maintenance mode](#how-it-works) so a controller that cannot
 run the CLI can write the JSON directly. Because the flag lives in the replica's
 working directory, target the specific canary container.
 
+The flag is **sticky across restarts**: if a supervisor restarts the replica
+while the flag is still present, it flips `/ready` to draining at startup and
+drains again instead of rejoining the canary cohort. Clear it with
+`autumn canary promote` (or scale the replica to zero) once traffic has moved.
+
 > **Promotion** is a platform action: once metrics look good, shift the LB
 > weight to 100% (or relabel the canary as the new stable) using your platform's
 > mechanism, then `autumn canary promote` to clear any stale rollback flag.

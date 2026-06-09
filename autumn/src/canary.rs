@@ -88,16 +88,6 @@ pub fn deploy_version_from_env() -> String {
     resolve_deploy_version(explicit.as_deref(), canary_flag.as_deref())
 }
 
-/// Decide whether a freshly-observed flag state should trigger a rollback.
-///
-/// Returns `true` only on the transition from *absent* to *present*, so a stale
-/// flag left over from a previous run does not cause a crash-looping replica to
-/// drain immediately on every boot.
-#[must_use]
-pub const fn should_trigger_rollback(baseline_present: bool, now_present: bool) -> bool {
-    now_present && !baseline_present
-}
-
 /// Payload written to the rollback flag file by a controller.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RollbackSignal {
@@ -323,16 +313,6 @@ mod tests {
         let clone = state.clone();
         state.request_rollback();
         assert!(clone.rollback_requested());
-    }
-
-    // ── should_trigger_rollback ────────────────────────────────────────────
-
-    #[test]
-    fn rollback_triggers_only_on_transition_to_present() {
-        assert!(should_trigger_rollback(false, true));
-        assert!(!should_trigger_rollback(true, true)); // already present at boot
-        assert!(!should_trigger_rollback(false, false));
-        assert!(!should_trigger_rollback(true, false));
     }
 
     // ── file protocol ──────────────────────────────────────────────────────
