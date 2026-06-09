@@ -396,3 +396,18 @@ async fn json_format_renders_the_event_as_a_single_json_object_line() {
     assert!(fields["duration_ms"].is_number());
     assert!(fields["request_id"].is_string());
 }
+
+#[tokio::test]
+async fn method_mismatch_405_is_access_logged() {
+    let (capture, _guard) = install_capture();
+    let client = TestApp::new().routes(routes![show_user]).build();
+
+    // show_user is GET-only; POST to the same path should 405.
+    let resp = client.post("/users/1").send().await;
+    resp.assert_status(405);
+
+    let events = capture.captured();
+    assert_eq!(events.len(), 1, "got {events:?}");
+    assert_eq!(events[0].field("status"), Some("405"));
+    assert_eq!(events[0].field("method"), Some("POST"));
+}
