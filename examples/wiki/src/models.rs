@@ -37,7 +37,6 @@ pub struct Page {
     #[state_machine(transitions(
         draft -> published: "can_publish",
         published -> archived,
-        draft -> archived,
     ))]
     pub status: String,
     #[lock_version]
