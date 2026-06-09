@@ -759,6 +759,63 @@ fn splice_feature_at(
     out
 }
 
+/// Add `feature` to a multiline inline TOML table for `autumn-web`
+/// (e.g. `autumn-web = {\n  ...\n}`).
+///
+/// Returns `None` if the table is malformed (no closing `}`).
+/// Returns `Some(out)` with the (possibly modified) complete document otherwise.
+fn add_feature_to_multiline_inline_table(
+    lines: &[&str],
+    open_idx: usize,
+    existing: &str,
+    feature: &str,
+    feature_quoted: &str,
+) -> Option<String> {
+    let close_idx = lines[open_idx + 1..]
+        .iter()
+        .position(|l| l.trim_start().starts_with('}'))
+        .map(|p| open_idx + 1 + p)?;
+
+    if lines[open_idx..=close_idx]
+        .iter()
+        .any(|l| l.contains(feature_quoted))
+    {
+        return Some(existing.to_owned());
+    }
+
+    for (j, &sec_line) in lines[open_idx + 1..close_idx].iter().enumerate() {
+        if sec_line.trim_start().starts_with("features") {
+            return Some(splice_feature_at(
+                lines,
+                open_idx + 1 + j,
+                &rewrite_features_line(sec_line, feature),
+                sec_line,
+                feature_quoted,
+                existing.ends_with('\n'),
+            ));
+        }
+    }
+
+    let indent = lines[close_idx]
+        .chars()
+        .take_while(char::is_ascii_whitespace)
+        .collect::<String>();
+    let new_feat = format!("{indent}features = [{feature_quoted}],");
+    let mut out = String::with_capacity(existing.len() + 32);
+    for (k, &l) in lines.iter().enumerate() {
+        if k == close_idx {
+            out.push_str(&new_feat);
+            out.push('\n');
+        }
+        out.push_str(l);
+        out.push('\n');
+    }
+    if !existing.ends_with('\n') {
+        out.pop();
+    }
+    Some(out)
+}
+
 /// Ensure the `autumn-web` dependency in `Cargo.toml` includes `feature`.
 ///
 /// Handles four common forms of the dependency declaration:
@@ -804,54 +861,17 @@ pub fn ensure_autumn_web_feature(existing: &str, feature: &str) -> String {
         }
         let new_line = rewrite_dep_with_feature(line, feature);
         if new_line == line {
-            // Multiline inline table (e.g. `autumn-web = {` without closing `}` on same line).
-            // Find the closing `}` line and handle features within the table block.
-            let Some(close_idx) = lines[i + 1..]
-                .iter()
-                .position(|l| l.trim_start().starts_with('}'))
-                .map(|p| i + 1 + p)
-            else {
-                continue; // malformed or not yet closed; skip
-            };
-            // Idempotency check across the full inline table.
-            if lines[i..=close_idx]
-                .iter()
-                .any(|l| l.contains(&feature_quoted))
-            {
-                return existing.to_owned();
+            // Multiline inline table — delegate to helper.
+            match add_feature_to_multiline_inline_table(
+                &lines,
+                i,
+                existing,
+                feature,
+                &feature_quoted,
+            ) {
+                None => continue,
+                Some(result) => return result,
             }
-            // Look for an existing `features` line inside the table.
-            for (j, &sec_line) in lines[i + 1..close_idx].iter().enumerate() {
-                if sec_line.trim_start().starts_with("features") {
-                    return splice_feature_at(
-                        &lines,
-                        i + 1 + j,
-                        &rewrite_features_line(sec_line, feature),
-                        sec_line,
-                        &feature_quoted,
-                        existing.ends_with('\n'),
-                    );
-                }
-            }
-            // No features key: insert one before the closing `}`.
-            let indent = lines[close_idx]
-                .chars()
-                .take_while(|c| c.is_ascii_whitespace())
-                .collect::<String>();
-            let new_feat = format!("{indent}features = [{feature_quoted}],");
-            let mut out = String::with_capacity(existing.len() + 32);
-            for (k, &l) in lines.iter().enumerate() {
-                if k == close_idx {
-                    out.push_str(&new_feat);
-                    out.push('\n');
-                }
-                out.push_str(l);
-                out.push('\n');
-            }
-            if !existing.ends_with('\n') {
-                out.pop();
-            }
-            return out;
         }
         let mut out = String::with_capacity(existing.len() + 32);
         for (j, &l) in lines.iter().enumerate() {
