@@ -966,6 +966,7 @@ async fn generic_multipart_email_parsed() {
 
 // ── SES / SNS HTTP endpoint ───────────────────────────────────────────────────
 
+#[cfg(feature = "inbound-ses")]
 static SES_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 /// Disable SNS signature verification for the remainder of this test process.
@@ -973,12 +974,13 @@ static SES_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 /// Uses the `SKIP_SNS_VERIFICATION` atomic flag exported by `autumn_web::inbound_mail`
 /// rather than `std::env::set_var` (which is `unsafe` in edition 2024) or
 /// `temp_env::async_with_vars` (which races when two tests run concurrently).
+#[cfg(feature = "inbound-ses")]
 fn set_skip_sns_verification() {
-    #[cfg(feature = "inbound-ses")]
     autumn_web::inbound_mail::SKIP_SNS_VERIFICATION
         .store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
+#[cfg(feature = "inbound-ses")]
 fn ses_dispatch_handler(
     email: InboundEmail,
 ) -> std::pin::Pin<
@@ -989,6 +991,7 @@ fn ses_dispatch_handler(
     Box::pin(async { Ok(()) })
 }
 
+#[cfg(feature = "inbound-ses")]
 #[tokio::test]
 async fn ses_subscription_confirmation_returns_200() {
     set_skip_sns_verification();
@@ -1023,6 +1026,7 @@ async fn ses_subscription_confirmation_returns_200() {
         .assert_status(200);
 }
 
+#[cfg(feature = "inbound-ses")]
 #[tokio::test]
 async fn ses_notification_dispatches_to_handler() {
     set_skip_sns_verification();
@@ -1070,6 +1074,7 @@ async fn ses_notification_dispatches_to_handler() {
     assert_eq!(SES_HANDLER_CALLS.load(Ordering::SeqCst), 1);
 }
 
+#[cfg(feature = "inbound-ses")]
 #[tokio::test]
 async fn ses_bad_json_returns_400() {
     let router = InboundMailRouter::new()
