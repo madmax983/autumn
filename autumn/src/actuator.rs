@@ -2063,7 +2063,7 @@ fn write_builtin_http_metrics(
     out.push_str("# TYPE autumn_shutdown_aborted_requests_total counter\n");
     let _ = writeln!(
         out,
-        "autumn_shutdown_aborted_requests_total {}",
+        "autumn_shutdown_aborted_requests_total{{version=\"{version}\"}} {}",
         snapshot.http.shutdown_aborted_requests_total
     );
 
@@ -2075,7 +2075,7 @@ fn write_builtin_http_metrics(
     out.push_str("# TYPE autumn_request_timeouts_total counter\n");
     let _ = writeln!(
         out,
-        "autumn_request_timeouts_total {}",
+        "autumn_request_timeouts_total{{version=\"{version}\"}} {}",
         snapshot.http.request_timeouts_total
     );
 
@@ -3742,7 +3742,7 @@ mod tests {
 
         assert!(text.contains("# HELP autumn_request_timeouts_total"));
         assert!(text.contains("# TYPE autumn_request_timeouts_total counter"));
-        assert!(text.contains("autumn_request_timeouts_total 0"));
+        assert!(text.contains("autumn_request_timeouts_total{version=\"stable\"} 0"));
     }
 
     #[tokio::test]
