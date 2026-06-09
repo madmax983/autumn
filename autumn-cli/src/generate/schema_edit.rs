@@ -715,13 +715,188 @@ fn insert_mail_previews_call(existing: &str, mailer_type: &str) -> String {
 
 // ── Cargo.toml: feature injection ────────────────────────────────────────
 
+/// Rewrite `lines` so that a feature is added at or near `feat_idx`.
+///
+/// If `new_feat_line != original_line` the single-line `features = [...]` was
+/// already rewritten; just splice it in. Otherwise the array is multiline:
+/// scan forward for the closing `]` and insert a new entry before it.
+fn splice_feature_at(
+    lines: &[&str],
+    feat_idx: usize,
+    new_feat_line: &str,
+    original_line: &str,
+    feature_quoted: &str,
+    ends_with_newline: bool,
+) -> String {
+    let mut out = String::with_capacity(lines.len() * 40);
+    if new_feat_line == original_line {
+        let close_idx = lines[feat_idx..]
+            .iter()
+            .position(|l| {
+                // Strip a trailing TOML comment before comparing so that
+                // `] # framework features` is recognised as the closing bracket.
+                l.trim()
+                    .split_once('#')
+                    .map_or_else(|| l.trim(), |(before, _)| before.trim())
+                    == "]"
+            })
+            .map_or(feat_idx, |p| feat_idx + p);
+        let indent = lines
+            .get(feat_idx + 1)
+            .filter(|l| !l.trim().is_empty() && l.trim() != "]")
+            .map_or("    ", |l| &l[..l.len() - l.trim_start().len()]);
+        let new_entry = format!("{indent}{feature_quoted},");
+        for (k, &l) in lines.iter().enumerate() {
+            if k == close_idx {
+                out.push_str(&new_entry);
+                out.push('\n');
+            }
+            out.push_str(l);
+            out.push('\n');
+        }
+    } else {
+        for (k, &l) in lines.iter().enumerate() {
+            out.push_str(if k == feat_idx { new_feat_line } else { l });
+            out.push('\n');
+        }
+    }
+    if !ends_with_newline {
+        out.pop();
+    }
+    out
+}
+
+/// Add `feature` to a multiline inline TOML table for `autumn-web`
+/// (e.g. `autumn-web = {\n  ...\n}`).
+///
+/// Returns `None` if the table is malformed (no closing `}`).
+/// Returns `Some(out)` with the (possibly modified) complete document otherwise.
+fn add_feature_to_multiline_inline_table(
+    lines: &[&str],
+    open_idx: usize,
+    existing: &str,
+    feature: &str,
+    feature_quoted: &str,
+) -> Option<String> {
+    let close_idx = lines[open_idx + 1..]
+        .iter()
+        .position(|l| l.trim_start().starts_with('}'))
+        .map(|p| open_idx + 1 + p)?;
+
+    if lines[open_idx..=close_idx]
+        .iter()
+        .any(|l| l.contains(feature_quoted))
+    {
+        return Some(existing.to_owned());
+    }
+
+    for (j, &sec_line) in lines[open_idx + 1..close_idx].iter().enumerate() {
+        if sec_line.trim_start().starts_with("features") {
+            return Some(splice_feature_at(
+                lines,
+                open_idx + 1 + j,
+                &rewrite_features_line(sec_line, feature),
+                sec_line,
+                feature_quoted,
+                existing.ends_with('\n'),
+            ));
+        }
+    }
+
+    let indent = lines[close_idx]
+        .chars()
+        .take_while(char::is_ascii_whitespace)
+        .collect::<String>();
+    let new_feat = format!("{indent}features = [{feature_quoted}],");
+
+    // Ensure the last entry before `}` has a trailing comma (required between inline-table entries).
+    let last_entry_idx = lines[open_idx + 1..close_idx]
+        .iter()
+        .rposition(|l| !l.trim().is_empty())
+        .map(|p| open_idx + 1 + p);
+
+    let mut out = String::with_capacity(existing.len() + 32);
+    for (k, &l) in lines.iter().enumerate() {
+        if k == close_idx {
+            out.push_str(&new_feat);
+            out.push('\n');
+        }
+        if Some(k) == last_entry_idx && !l.trim_end().ends_with(',') {
+            out.push_str(l.trim_end());
+            out.push(',');
+        } else {
+            out.push_str(l);
+        }
+        out.push('\n');
+    }
+    if !existing.ends_with('\n') {
+        out.pop();
+    }
+    Some(out)
+}
+
+/// Handle the dotted key form `autumn-web.* = ...` inside a `[dependencies]` section.
+///
+/// Looks for an existing `autumn-web.features` key in the section to splice into;
+/// if none is found, inserts one immediately after `dep_line_idx`.
+fn patch_dotted_dep(
+    lines: &[&str],
+    dep_line_idx: usize,
+    existing: &str,
+    feature: &str,
+    feature_quoted: &str,
+) -> String {
+    let section_end = lines[dep_line_idx + 1..]
+        .iter()
+        .position(|l| is_toml_table_header(l.trim()))
+        .map_or(lines.len(), |p| dep_line_idx + 1 + p);
+
+    if lines[dep_line_idx..section_end]
+        .iter()
+        .any(|l| l.trim_start().starts_with("autumn-web") && l.contains(feature_quoted))
+    {
+        return existing.to_owned();
+    }
+
+    for (j, &sec_line) in lines[dep_line_idx..section_end].iter().enumerate() {
+        if sec_line.trim_start().starts_with("autumn-web.features") {
+            let new_line = rewrite_features_line(sec_line, feature);
+            let mut out = String::with_capacity(existing.len() + 32);
+            for (k, &l) in lines.iter().enumerate() {
+                out.push_str(if k == dep_line_idx + j { &new_line } else { l });
+                out.push('\n');
+            }
+            if !existing.ends_with('\n') {
+                out.pop();
+            }
+            return out;
+        }
+    }
+
+    let new_feat = format!("autumn-web.features = [{feature_quoted}]");
+    let mut out = String::with_capacity(existing.len() + new_feat.len() + 2);
+    for (k, &l) in lines.iter().enumerate() {
+        out.push_str(l);
+        out.push('\n');
+        if k == dep_line_idx {
+            out.push_str(&new_feat);
+            out.push('\n');
+        }
+    }
+    if !existing.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
 /// Ensure the `autumn-web` dependency in `Cargo.toml` includes `feature`.
 ///
-/// Handles the three most common forms of the dependency declaration:
+/// Handles four common forms of the dependency declaration:
 ///
 ///   1. `autumn-web = "x.y.z"` → `autumn-web = { version = "x.y.z", features = ["mail"] }`
 ///   2. `autumn-web = { version = "x.y.z" }` → adds `features = ["mail"]`
 ///   3. `autumn-web = { ..., features = ["other"] }` → appends `"mail"` to the list
+///   4. `[dependencies.autumn-web]` section with a separate `features` key (multiline form)
 ///
 /// Idempotent: a second call with the same feature is a no-op.
 /// Returns `existing` unchanged when the `autumn-web` dep cannot be found.
@@ -731,6 +906,7 @@ pub fn ensure_autumn_web_feature(existing: &str, feature: &str) -> String {
     let lines: Vec<&str> = existing.lines().collect();
     let mut in_deps = false;
 
+    // Pass 1: inline form under [dependencies].
     for (i, &line) in lines.iter().enumerate() {
         let trimmed = line.trim();
         if is_dependencies_header(trimmed) {
@@ -744,16 +920,59 @@ pub fn ensure_autumn_web_feature(existing: &str, feature: &str) -> String {
         if !in_deps {
             continue;
         }
-        // Only inspect lines that start with `autumn-web`.
-        let after_ws = line.trim_start();
-        if !after_ws.starts_with("autumn-web") {
+        // Skip commented-out lines so that a commented dep like
+        //   # aw = { package = "autumn-web" }
+        // does not shadow the real dependency below it.
+        if trimmed.starts_with('#') {
             continue;
         }
-        // Idempotency check.
-        if line.contains(&feature_quoted) {
+        // Match either the exact `autumn-web` key or a renamed dep with `package = "autumn-web"`.
+        let after_ws = line.trim_start();
+        if let Some(rest) = after_ws.strip_prefix("autumn-web") {
+            if rest.starts_with('.') {
+                // Dotted key form: autumn-web.workspace = true, autumn-web.features = [...], etc.
+                return patch_dotted_dep(&lines, i, existing, feature, &feature_quoted);
+            }
+            if rest.starts_with(|c: char| c != '=' && !c.is_whitespace()) {
+                continue;
+            }
+        } else {
+            // Check for a renamed dep: `aw = { package = "autumn-web", ... }`.
+            let val = after_ws.split_once('=').map_or("", |x| x.1);
+            if !val.contains(r#"package = "autumn-web""#)
+                && !val.contains(r#"package="autumn-web""#)
+            {
+                continue;
+            }
+            // The alias must be importable as `autumn_web`; an alias such as
+            // `aw` produces a crate named `aw`, not `autumn_web`, so the
+            // generated code (`use autumn_web::...`) would fail to compile.
+            let alias = after_ws.split_once('=').map_or("", |(k, _)| k.trim());
+            if alias.replace('-', "_") != "autumn_web" {
+                continue;
+            }
+        }
+        // Idempotency check: strip any trailing TOML comment so that a line such as
+        //   autumn-web = { version = "0.6" } # add "inbound-mailgun" later
+        // does not falsely appear to already have the feature enabled.
+        let line_code = line.split_once('#').map_or(line, |(before, _)| before);
+        if line_code.contains(&feature_quoted) {
             return existing.to_owned();
         }
         let new_line = rewrite_dep_with_feature(line, feature);
+        if new_line == line {
+            // Multiline inline table — delegate to helper.
+            match add_feature_to_multiline_inline_table(
+                &lines,
+                i,
+                existing,
+                feature,
+                &feature_quoted,
+            ) {
+                None => continue,
+                Some(result) => return result,
+            }
+        }
         let mut out = String::with_capacity(existing.len() + 32);
         for (j, &l) in lines.iter().enumerate() {
             out.push_str(if j == i { &new_line } else { l });
@@ -764,7 +983,137 @@ pub fn ensure_autumn_web_feature(existing: &str, feature: &str) -> String {
         }
         return out;
     }
+
+    // Pass 2: multiline section form `[dependencies.autumn-web]`.
+    for (i, &line) in lines.iter().enumerate() {
+        // Strip trailing TOML line-comment before comparing the section header.
+        let key_part = line.trim().split('#').next().unwrap_or("").trim();
+        if key_part != "[dependencies.autumn-web]" {
+            continue;
+        }
+        return add_feature_to_deps_section(&lines, i + 1, existing, feature, &feature_quoted);
+    }
+
+    // Pass 2b: `[dependencies.autumn_web]` table section whose body declares
+    // `package = "autumn-web"` — Cargo's table-key form of a renamed dep.
+    if let Some(start) =
+        find_section_start_with_autumn_web_package(&lines, "[dependencies.autumn_web]")
+    {
+        return add_feature_to_deps_section(&lines, start, existing, feature, &feature_quoted);
+    }
+
     existing.to_owned()
+}
+
+/// Scan `lines` for a section header matching `key` (after stripping inline TOML comments)
+/// whose body contains a `package = "autumn-web"` key.  Returns the index of the first body
+/// line when found, so the caller can pass it directly to `add_feature_to_deps_section`.
+fn find_section_start_with_autumn_web_package(lines: &[&str], key: &str) -> Option<usize> {
+    for (i, &line) in lines.iter().enumerate() {
+        let key_part = line.trim().split('#').next().unwrap_or("").trim();
+        if key_part != key {
+            continue;
+        }
+        let section_start = i + 1;
+        let section_end = lines[section_start..]
+            .iter()
+            .position(|l| {
+                let t = l.trim();
+                t.starts_with('[') && !t.is_empty()
+            })
+            .map_or(lines.len(), |p| section_start + p);
+        let has_pkg = lines[section_start..section_end].iter().any(|l| {
+            let code = l.split_once('#').map_or(*l, |(b, _)| b);
+            code.contains(r#"package = "autumn-web""#) || code.contains(r#"package="autumn-web""#)
+        });
+        if has_pkg {
+            return Some(section_start);
+        }
+    }
+    None
+}
+
+/// Add `feature` to a `[dependencies.autumn-web]` section starting at `section_start`.
+fn add_feature_to_deps_section(
+    lines: &[&str],
+    section_start: usize,
+    existing: &str,
+    feature: &str,
+    feature_quoted: &str,
+) -> String {
+    let section_end = lines[section_start..]
+        .iter()
+        .position(|l| {
+            let t = l.trim();
+            t.starts_with('[') && !t.is_empty()
+        })
+        .map_or(lines.len(), |p| section_start + p);
+
+    if lines[section_start..section_end]
+        .iter()
+        .any(|l| l.contains(feature_quoted))
+    {
+        return existing.to_owned();
+    }
+
+    for (j, &sect_line) in lines[section_start..section_end].iter().enumerate() {
+        if sect_line.trim_start().starts_with("features") {
+            return splice_feature_at(
+                lines,
+                section_start + j,
+                &rewrite_features_line(sect_line, feature),
+                sect_line,
+                feature_quoted,
+                existing.ends_with('\n'),
+            );
+        }
+    }
+
+    let feat_line = format!("features = [{feature_quoted}]");
+    let mut out = String::with_capacity(existing.len() + feat_line.len() + 2);
+    for (k, &l) in lines.iter().enumerate() {
+        if k == section_end {
+            out.push_str(&feat_line);
+            out.push('\n');
+        }
+        out.push_str(l);
+        out.push('\n');
+    }
+    if section_end == lines.len() {
+        out.push_str(&feat_line);
+        out.push('\n');
+    }
+    if !existing.ends_with('\n') && out.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
+/// Append `feature` to a standalone `features = [...]` TOML line.
+fn rewrite_features_line(line: &str, feature: &str) -> String {
+    let feature_quoted = format!("\"{feature}\"");
+    if let Some(open) = line.find('[')
+        && let Some(close_rel) = line[open..].find(']')
+    {
+        let abs_end = open + close_rel;
+        let body = &line[open + 1..abs_end];
+        let body_trimmed = body.trim();
+        let separator = if body_trimmed.is_empty() {
+            ""
+        } else if body_trimmed.ends_with(',') {
+            " "
+        } else {
+            ", "
+        };
+        return format!(
+            "{}{}{}{}",
+            &line[..abs_end],
+            separator,
+            feature_quoted,
+            &line[abs_end..]
+        );
+    }
+    line.to_owned()
 }
 
 /// Rewrite a single `autumn-web = …` TOML line to include `feature`.
@@ -772,17 +1121,22 @@ fn rewrite_dep_with_feature(line: &str, feature: &str) -> String {
     let feature_quoted = format!("\"{feature}\"");
     let trimmed = line.trim();
 
-    // Form 1: autumn-web = "x.y.z"
+    // Form 1: autumn-web = "x.y.z"  (optional trailing TOML comment)
     if let Some(rest) = trimmed.strip_prefix("autumn-web") {
         let rest = rest.trim_start_matches([' ', '=', '\t']);
-        if rest.starts_with('"')
-            && let Some(version) = rest.strip_prefix('"').and_then(|r| r.strip_suffix('"'))
-        {
-            let indent_len = line.len() - line.trim_start().len();
-            let indent = &line[..indent_len];
-            return format!(
-                "{indent}autumn-web = {{ version = \"{version}\", features = [{feature_quoted}] }}"
-            );
+        if rest.starts_with('"') {
+            // Strip any trailing `# comment` before matching the closing quote.
+            let value_str = rest.split('#').next().unwrap_or(rest).trim_end();
+            if let Some(version) = value_str
+                .strip_prefix('"')
+                .and_then(|r| r.strip_suffix('"'))
+            {
+                let indent_len = line.len() - line.trim_start().len();
+                let indent = &line[..indent_len];
+                return format!(
+                    "{indent}autumn-web = {{ version = \"{version}\", features = [{feature_quoted}] }}"
+                );
+            }
         }
     }
 
@@ -794,7 +1148,14 @@ fn rewrite_dep_with_feature(line: &str, feature: &str) -> String {
         if let Some(bracket_end_rel) = line[abs_start..].find(']') {
             let abs_end = abs_start + bracket_end_rel;
             let body = &line[abs_start + 1..abs_end];
-            let separator = if body.trim().is_empty() { "" } else { ", " };
+            let body_trimmed = body.trim();
+            let separator = if body_trimmed.is_empty() {
+                ""
+            } else if body_trimmed.ends_with(',') {
+                " "
+            } else {
+                ", "
+            };
             return format!(
                 "{}{}{}{}",
                 &line[..abs_end],
@@ -2260,6 +2621,188 @@ async fn main() {\n\
     }
 
     #[test]
+    fn ensure_feature_multiline_section_adds_to_existing_features() {
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies.autumn-web]\nversion = \"0.6\"\nfeatures = [\"db\"]\n";
+        let updated = ensure_autumn_web_feature(cargo, "inbound-mailgun");
+        assert!(
+            updated.contains("\"inbound-mailgun\""),
+            "must add feature to section: {updated}"
+        );
+        assert!(updated.contains("\"db\""), "must preserve existing feature");
+    }
+
+    #[test]
+    fn ensure_feature_multiline_section_inserts_features_when_absent() {
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies.autumn-web]\nversion = \"0.6\"\n";
+        let updated = ensure_autumn_web_feature(cargo, "inbound-mailgun");
+        assert!(
+            updated.contains("\"inbound-mailgun\""),
+            "must insert features line: {updated}"
+        );
+    }
+
+    #[test]
+    fn ensure_feature_multiline_section_idempotent() {
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies.autumn-web]\nversion = \"0.6\"\nfeatures = [\"inbound-mailgun\"]\n";
+        let updated = ensure_autumn_web_feature(cargo, "inbound-mailgun");
+        assert_eq!(
+            cargo, updated,
+            "already-present feature in section must be a no-op"
+        );
+    }
+
+    #[test]
+    fn ensure_feature_trailing_comment_on_string_dep() {
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = \"0.6\" # framework\n";
+        let updated = ensure_autumn_web_feature(cargo, "mail");
+        assert!(
+            updated.contains("\"mail\""),
+            "must add feature despite trailing comment: {updated}"
+        );
+        assert!(
+            updated.contains("version"),
+            "must preserve version: {updated}"
+        );
+    }
+
+    #[test]
+    fn ensure_feature_trailing_comma_in_features_list() {
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = { version = \"0.6\", features = [\"db\",] }\n";
+        let updated = ensure_autumn_web_feature(cargo, "mail");
+        assert!(
+            updated.contains("\"mail\""),
+            "must add feature after trailing comma: {updated}"
+        );
+        assert!(
+            !updated.contains(",,"),
+            "must not produce double comma: {updated}"
+        );
+    }
+
+    #[test]
+    fn ensure_feature_dotted_workspace_inserts_features_line() {
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web.workspace = true\n";
+        let updated = ensure_autumn_web_feature(cargo, "inbound-mailgun");
+        assert!(
+            updated.contains("\"inbound-mailgun\""),
+            "must insert features line: {updated}"
+        );
+        assert!(
+            updated.contains("autumn-web.features"),
+            "must use dotted key form: {updated}"
+        );
+    }
+
+    #[test]
+    fn ensure_feature_dotted_workspace_existing_features_line_spliced() {
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web.workspace = true\nautumn-web.features = [\"db\"]\n";
+        let updated = ensure_autumn_web_feature(cargo, "mail");
+        assert!(
+            updated.contains("\"mail\""),
+            "must splice into existing features line: {updated}"
+        );
+        assert!(
+            updated.contains("\"db\""),
+            "must preserve existing feature: {updated}"
+        );
+    }
+
+    #[test]
+    fn ensure_feature_dotted_workspace_idempotent() {
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web.workspace = true\nautumn-web.features = [\"inbound-mailgun\"]\n";
+        let updated = ensure_autumn_web_feature(cargo, "inbound-mailgun");
+        assert_eq!(cargo, updated, "already-present feature must be a no-op");
+    }
+
+    #[test]
+    fn ensure_feature_multiline_inline_table_inserts_features() {
+        let cargo =
+            "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = {\n  version = \"0.6\"\n}\n";
+        let updated = ensure_autumn_web_feature(cargo, "mail");
+        assert!(
+            updated.contains("\"mail\""),
+            "must add feature to multiline inline table: {updated}"
+        );
+        assert!(
+            updated.contains("version = \"0.6\","),
+            "must add trailing comma to preceding entry: {updated}"
+        );
+    }
+
+    #[test]
+    fn ensure_feature_package_alias_dep_skipped_for_non_autumn_web_alias() {
+        // An alias whose name does not normalise to `autumn_web` (e.g. `aw`)
+        // must be skipped — the generated code imports `autumn_web::`, so adding
+        // the feature to a crate named `aw` would leave the project uncompilable.
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\naw = { package = \"autumn-web\", version = \"0.6\" }\n";
+        let updated = ensure_autumn_web_feature(cargo, "mail");
+        assert_eq!(
+            cargo, updated,
+            "non-autumn_web alias must be left unchanged"
+        );
+    }
+
+    #[test]
+    fn ensure_feature_package_alias_dep_autumn_web_alias() {
+        // An alias explicitly named `autumn_web` (with underscore) and
+        // `package = "autumn-web"` is compatible with generated imports.
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nautumn_web = { package = \"autumn-web\", version = \"0.6\" }\n";
+        let updated = ensure_autumn_web_feature(cargo, "mail");
+        assert!(
+            updated.contains("\"mail\""),
+            "autumn_web alias must have feature added: {updated}"
+        );
+    }
+
+    #[test]
+    fn ensure_feature_package_alias_dep_idempotent() {
+        // Same as above but the feature is already present; must be a no-op.
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nautumn_web = { package = \"autumn-web\", version = \"0.6\", features = [\"mail\"] }\n";
+        let updated = ensure_autumn_web_feature(cargo, "mail");
+        assert_eq!(cargo, updated, "already-present feature must be a no-op");
+    }
+
+    #[test]
+    fn ensure_feature_commented_dep_line_is_skipped() {
+        // A commented-out dep like `# aw = { package = "autumn-web" }` must not
+        // be treated as the actual dependency.  The real dep below must be updated.
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\n# aw = { package = \"autumn-web\", version = \"0.6\" }\nautumn-web = \"0.6\"\n";
+        let updated = ensure_autumn_web_feature(cargo, "inbound-mailgun");
+        // The comment line must be unchanged.
+        assert!(
+            updated.contains("# aw = { package"),
+            "comment line must be preserved as-is: {updated}"
+        );
+        // The real dep must have the feature added.
+        let real_dep_line = updated
+            .lines()
+            .find(|l| l.trim_start().starts_with("autumn-web") && !l.trim_start().starts_with('#'))
+            .unwrap_or("");
+        assert!(
+            real_dep_line.contains("\"inbound-mailgun\""),
+            "feature must be added to the real dep line: {real_dep_line}"
+        );
+    }
+
+    #[test]
+    fn ensure_feature_multiline_inline_table_idempotent() {
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = {\n  version = \"0.6\",\n  features = [\"mail\"]\n}\n";
+        let updated = ensure_autumn_web_feature(cargo, "mail");
+        assert_eq!(cargo, updated, "already-present feature must be a no-op");
+    }
+
+    #[test]
+    fn ensure_feature_multiline_section_trailing_comment_on_header() {
+        let cargo =
+            "[package]\nname=\"x\"\n\n[dependencies.autumn-web] # pinned\nversion = \"0.6\"\n";
+        let updated = ensure_autumn_web_feature(cargo, "mail");
+        assert!(
+            updated.contains("\"mail\""),
+            "must handle trailing comment on section header: {updated}"
+        );
+    }
+
+    #[test]
     fn add_mail_preview_unclosed_bracket_returns_unchanged() {
         // Malformed source: `mail_previews![` with no closing `]`.
         let src = "app()\n    .mail_previews(mail_previews![Foo)\n    .run()\n    .await;\n";
@@ -2990,5 +3533,27 @@ pub struct Comment {
         let (lang, fields) = parse_model_search_config_for_table(content, "comments").unwrap();
         assert_eq!(lang, "simple");
         assert_eq!(fields, vec![("body".to_string(), 'D')]);
+    }
+
+    #[test]
+    fn ensure_feature_comment_mentions_feature_still_adds_it() {
+        // A comment on the dep line that *mentions* the feature name must not fool
+        // the idempotency check into skipping the actual feature insertion.
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = { version = \"0.6\" } # add \"inbound-mailgun\" later\n";
+        let updated = ensure_autumn_web_feature(cargo, "inbound-mailgun");
+        assert!(
+            updated.contains("features"),
+            "feature must actually be added: {updated}"
+        );
+        // The feature must appear in the dep value, not just in the comment.
+        let dep_line = updated
+            .lines()
+            .find(|l| l.contains("autumn-web"))
+            .unwrap_or("");
+        let code_part = dep_line.split_once('#').map_or(dep_line, |(b, _)| b);
+        assert!(
+            code_part.contains("\"inbound-mailgun\""),
+            "feature must be present in the code portion of the dep line: {dep_line}"
+        );
     }
 }

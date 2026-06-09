@@ -15,6 +15,7 @@ pub mod auth;
 pub mod config;
 pub mod dsl;
 pub mod emit;
+pub mod inbound_mail;
 pub mod mailer;
 pub mod migration;
 pub mod model;

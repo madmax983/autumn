@@ -1524,9 +1524,17 @@ where
     S: Clone + Send + Sync + 'static,
 {
     if config.bot_protection.enabled {
+        // Use the dedicated captcha_exempt_paths list — NOT csrf.exempt_paths —
+        // so that a route exempt from CSRF for non-cookie auth reasons does not
+        // automatically bypass bot-protection as well.
+        let mut exempt = config.security.captcha_exempt_paths.clone();
+        for endpoint in &config.security.webhooks.endpoints {
+            exempt.push(endpoint.path.clone());
+        }
         let layer =
             crate::security::captcha::BotProtectionLayer::from_config(&config.bot_protection)
-                .with_max_scan_bytes(config.security.upload.max_request_size_bytes);
+                .with_max_scan_bytes(config.security.upload.max_request_size_bytes)
+                .with_exempt_paths(exempt);
         tracing::info!(
             provider = ?config.bot_protection.provider,
             dev_bypass = config.bot_protection.dev_bypass,
