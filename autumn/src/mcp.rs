@@ -2275,6 +2275,48 @@ mod tests {
     }
 
     #[test]
+    fn split_host_port_handles_basic_cases() {
+        assert_eq!(split_host_port("example.com"), ("example.com", None));
+        assert_eq!(
+            split_host_port("example.com:8080"),
+            ("example.com", Some("8080"))
+        );
+        assert_eq!(
+            split_host_port("localhost:3000"),
+            ("localhost", Some("3000"))
+        );
+    }
+
+    #[test]
+    fn split_host_port_handles_ipv6() {
+        assert_eq!(split_host_port("[::1]"), ("[::1]", None));
+        assert_eq!(split_host_port("[::1]:8080"), ("[::1]", Some("8080")));
+        assert_eq!(
+            split_host_port("[2001:db8::1]:443"),
+            ("[2001:db8::1]", Some("443"))
+        );
+    }
+
+    #[test]
+    fn split_host_port_rejects_invalid_ipv6() {
+        // Missing closing bracket
+        assert_eq!(split_host_port("[::1"), ("[::1", None));
+        assert_eq!(split_host_port("[::1:8080"), ("[::1:8080", None));
+    }
+
+    #[test]
+    fn split_host_port_rejects_invalid_port() {
+        // Non-digit port
+        assert_eq!(
+            split_host_port("example.com:abc"),
+            ("example.com:abc", None)
+        );
+        assert_eq!(split_host_port("example.com:"), ("example.com:", None));
+        assert_eq!(split_host_port("[::1]:abc"), ("[::1]:abc", None));
+        assert_eq!(split_host_port("[::1]:"), ("[::1]:", None));
+    }
+
+    #[test]
     fn origin_allowlist_enforced() {
         let s = server(vec!["https://ok.example".to_owned()]);
         assert!(s.origin_allowed("https://ok.example", None, None));
