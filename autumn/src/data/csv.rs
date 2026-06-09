@@ -178,7 +178,12 @@ pub enum ImportRowResult {
     /// A row-level error occurred.
     RowError(String),
     /// A field-level error occurred (column name + message).
-    FieldError { column: String, message: String },
+    FieldError {
+        /// The column name that caused the error.
+        column: String,
+        /// The error message.
+        message: String,
+    },
 }
 
 // ── CsvSchema trait ───────────────────────────────────────────────────────────

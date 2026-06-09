@@ -273,15 +273,23 @@ impl std::fmt::Display for ConfigValue {
 pub enum ConfigValidator {
     /// Inclusive integer range. Either bound may be omitted.
     IntRange {
+        /// The lowest acceptable value. Prevents configuration drift from
+        /// breaking assumptions about floor limits (e.g. negative thread counts).
         #[serde(skip_serializing_if = "Option::is_none")]
         min: Option<i64>,
+        /// The highest acceptable value. Acts as a safety net against
+        /// resource exhaustion (e.g. allocating billion-byte buffers).
         #[serde(skip_serializing_if = "Option::is_none")]
         max: Option<i64>,
     },
     /// Inclusive float range. Either bound may be omitted.
     FloatRange {
+        /// The lowest acceptable value. Crucial for bounded inputs
+        /// like percentages or multiplier floors.
         #[serde(skip_serializing_if = "Option::is_none")]
         min: Option<f64>,
+        /// The highest acceptable value. Caps extreme inputs
+        /// preventing out-of-bounds calculations.
         #[serde(skip_serializing_if = "Option::is_none")]
         max: Option<f64>,
     },
@@ -548,10 +556,15 @@ fn re_class_matches(inner: &[u8], ch: u8) -> bool {
 /// Build via [`ConfigKeySchema::new`] and add validators with the builder API.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigKeySchema {
+    /// The unique name of the config key.
     pub name: String,
+    /// The expected type of the configuration value.
     pub value_type: ConfigValueType,
+    /// The default value used if no override is set.
     pub default: ConfigValue,
+    /// Optional human-readable description of what this key controls.
     pub description: Option<String>,
+    /// List of validators applied to values when written.
     pub validators: Vec<ConfigValidator>,
 }
 
@@ -632,13 +645,21 @@ pub enum RegistryError {
         "config key '{key}': default value type {default_type} does not match declared type {declared_type}"
     )]
     DefaultTypeMismatch {
+        /// The name of the config key.
         key: String,
+        /// The declared type of the config key.
         declared_type: ConfigValueType,
+        /// The actual type of the default value.
         default_type: ConfigValueType,
     },
     /// The declared default value does not satisfy the declared validators.
     #[error("config key '{key}': default value is invalid: {reason}")]
-    InvalidDefault { key: String, reason: String },
+    InvalidDefault {
+        /// The name of the config key.
+        key: String,
+        /// The reason the default value is invalid.
+        reason: String,
+    },
     /// The key name is empty or contains disallowed characters (only `[a-z0-9_]` allowed).
     #[error("invalid config key name '{0}': must match [a-z][a-z0-9_]*")]
     InvalidKeyName(String),
@@ -1327,11 +1348,21 @@ pub enum ConfigError {
 
     /// The raw string could not be parsed as the key's declared type.
     #[error("config key '{key}': type error — {reason}")]
-    TypeMismatch { key: String, reason: String },
+    TypeMismatch {
+        /// The name of the config key.
+        key: String,
+        /// The reason the type mismatch occurred.
+        reason: String,
+    },
 
     /// A declared validator rejected the value.
     #[error("config key '{key}': validation failed — {reason}")]
-    ValidationFailed { key: String, reason: String },
+    ValidationFailed {
+        /// The name of the config key.
+        key: String,
+        /// The reason the validation failed.
+        reason: String,
+    },
 
     /// The backing store returned an error.
     #[error("config store error: {0}")]
@@ -1343,11 +1374,17 @@ pub enum ConfigError {
 /// A snapshot of a single config key: schema defaults + current override.
 #[derive(Debug, Clone)]
 pub struct ConfigEntry {
+    /// The unique name of the config key.
     pub name: String,
+    /// The expected type of the configuration value.
     pub value_type: ConfigValueType,
+    /// The currently active value.
     pub current: ConfigValue,
+    /// The default value for the key.
     pub default: ConfigValue,
+    /// Whether the current value is overridden.
     pub is_overridden: bool,
+    /// Optional human-readable description of what this key controls.
     pub description: Option<String>,
 }
 
