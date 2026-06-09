@@ -58,9 +58,27 @@ impl AccessLogLayer {
     #[must_use]
     pub fn new(exclude: Vec<String>) -> Self {
         Self {
-            exclude: exclude.into(),
+            exclude: normalize_exclusions(exclude),
         }
     }
+}
+
+/// Normalize configured exclusion prefixes once at construction so the
+/// per-request check is a plain prefix match: trailing slashes are stripped
+/// and empty / slash-only entries are dropped.
+fn normalize_exclusions(exclude: Vec<String>) -> Arc<[String]> {
+    exclude
+        .into_iter()
+        .map(|prefix| {
+            let trimmed = prefix.trim_end_matches('/');
+            if trimmed.len() == prefix.len() {
+                prefix
+            } else {
+                trimmed.to_owned()
+            }
+        })
+        .filter(|prefix| !prefix.is_empty())
+        .collect()
 }
 
 impl<S> Layer<S> for AccessLogLayer {
@@ -125,14 +143,11 @@ where
 
 /// Returns `true` when `path` equals an exclusion prefix or lives under it as
 /// a whole path segment (`/actuator` excludes `/actuator/health`, not
-/// `/actuators`). Trailing slashes on configured prefixes are ignored.
+/// `/actuators`). Prefixes are pre-normalized by [`normalize_exclusions`].
 fn is_excluded(path: &str, exclude: &[String]) -> bool {
     exclude.iter().any(|prefix| {
-        let prefix = prefix.trim_end_matches('/');
-        !prefix.is_empty()
-            && path
-                .strip_prefix(prefix)
-                .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+        path.strip_prefix(prefix.as_str())
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
     })
 }
 
@@ -180,8 +195,8 @@ where
 mod tests {
     use super::*;
 
-    fn exclude(prefixes: &[&str]) -> Vec<String> {
-        prefixes.iter().map(|p| (*p).to_owned()).collect()
+    fn exclude(prefixes: &[&str]) -> Arc<[String]> {
+        normalize_exclusions(prefixes.iter().map(|p| (*p).to_owned()).collect())
     }
 
     #[test]
