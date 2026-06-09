@@ -994,7 +994,43 @@ pub fn ensure_autumn_web_feature(existing: &str, feature: &str) -> String {
         return add_feature_to_deps_section(&lines, i + 1, existing, feature, &feature_quoted);
     }
 
+    // Pass 2b: `[dependencies.autumn_web]` table section whose body declares
+    // `package = "autumn-web"` — Cargo's table-key form of a renamed dep.
+    if let Some(start) =
+        find_section_start_with_autumn_web_package(&lines, "[dependencies.autumn_web]")
+    {
+        return add_feature_to_deps_section(&lines, start, existing, feature, &feature_quoted);
+    }
+
     existing.to_owned()
+}
+
+/// Scan `lines` for a section header matching `key` (after stripping inline TOML comments)
+/// whose body contains a `package = "autumn-web"` key.  Returns the index of the first body
+/// line when found, so the caller can pass it directly to `add_feature_to_deps_section`.
+fn find_section_start_with_autumn_web_package(lines: &[&str], key: &str) -> Option<usize> {
+    for (i, &line) in lines.iter().enumerate() {
+        let key_part = line.trim().split('#').next().unwrap_or("").trim();
+        if key_part != key {
+            continue;
+        }
+        let section_start = i + 1;
+        let section_end = lines[section_start..]
+            .iter()
+            .position(|l| {
+                let t = l.trim();
+                t.starts_with('[') && !t.is_empty()
+            })
+            .map_or(lines.len(), |p| section_start + p);
+        let has_pkg = lines[section_start..section_end].iter().any(|l| {
+            let code = l.split_once('#').map_or(*l, |(b, _)| b);
+            code.contains(r#"package = "autumn-web""#) || code.contains(r#"package="autumn-web""#)
+        });
+        if has_pkg {
+            return Some(section_start);
+        }
+    }
+    None
 }
 
 /// Add `feature` to a `[dependencies.autumn-web]` section starting at `section_start`.

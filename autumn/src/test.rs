@@ -1093,7 +1093,34 @@ impl TestApp {
         let mut merge_routers = self.merge_routers;
         #[cfg(feature = "inbound-mail")]
         if let Some(ref im_router) = self.inbound_mail_router {
+            let mut registered_inbound: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
             for (path, axum_router) in crate::inbound_mail::build_routes(im_router) {
+                if self
+                    .routes
+                    .iter()
+                    .any(|r| r.method == Method::POST && r.path == path.as_str())
+                    || self.scoped_groups.iter().any(|g| {
+                        g.routes.iter().any(|r| {
+                            r.method == http::Method::POST
+                                && format!("{}{}", g.prefix, r.path) == path.as_str()
+                        })
+                    })
+                {
+                    tracing::warn!(
+                        path = %path,
+                        "inbound_mail: skipping webhook route — a POST handler is \
+                         already registered at this path by the application"
+                    );
+                    continue;
+                }
+                if !registered_inbound.insert(path.clone()) {
+                    tracing::warn!(
+                        path = %path,
+                        "inbound_mail: skipping duplicate inbound webhook path"
+                    );
+                    continue;
+                }
                 self.config.security.csrf.exempt_paths.push(path.clone());
                 self.config.security.captcha_exempt_paths.push(path);
                 merge_routers.push(axum_router);

@@ -2490,6 +2490,12 @@ impl AppBuilder {
                 if all_routes
                     .iter()
                     .any(|r| r.method == http::Method::POST && r.path == path.as_str())
+                    || scoped_groups.iter().any(|g| {
+                        g.routes.iter().any(|r| {
+                            r.method == http::Method::POST
+                                && format!("{}{}", g.prefix, r.path) == path.as_str()
+                        })
+                    })
                 {
                     tracing::warn!(
                         path = %path,

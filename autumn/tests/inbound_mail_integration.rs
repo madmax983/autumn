@@ -999,7 +999,10 @@ async fn ses_subscription_confirmation_fetch_failure_returns_500() {
     set_skip_sns_verification();
 
     let router = InboundMailRouter::new()
-        .endpoint(InboundMailEndpointConfig::ses("/inbound/ses"))
+        .endpoint(
+            InboundMailEndpointConfig::ses("/inbound/ses")
+                .with_topic_arn("arn:aws:sns:us-east-1:123456789012:test-topic"),
+        )
         .handler(InboundMailHandlerInfo {
             name: "ses",
             pattern: RecipientPattern::Any,
@@ -1053,7 +1056,10 @@ async fn ses_notification_dispatches_to_handler() {
     .to_string();
 
     let router = InboundMailRouter::new()
-        .endpoint(InboundMailEndpointConfig::ses("/inbound/ses"))
+        .endpoint(
+            InboundMailEndpointConfig::ses("/inbound/ses")
+                .with_topic_arn("arn:aws:sns:us-east-1:123456789012:test-topic"),
+        )
         .handler(InboundMailHandlerInfo {
             name: "ses_notify",
             pattern: RecipientPattern::Any,
@@ -1082,7 +1088,10 @@ async fn ses_notification_dispatches_to_handler() {
 #[tokio::test]
 async fn ses_bad_json_returns_400() {
     let router = InboundMailRouter::new()
-        .endpoint(InboundMailEndpointConfig::ses("/inbound/ses"))
+        .endpoint(
+            InboundMailEndpointConfig::ses("/inbound/ses")
+                .with_topic_arn("arn:aws:sns:us-east-1:123456789012:test-topic"),
+        )
         .handler(InboundMailHandlerInfo {
             name: "ses_bad",
             pattern: RecipientPattern::Any,
