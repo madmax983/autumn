@@ -1046,7 +1046,10 @@ fn rewrite_dep_with_feature(line: &str, feature: &str) -> String {
         if rest.starts_with('"') {
             // Strip any trailing `# comment` before matching the closing quote.
             let value_str = rest.split('#').next().unwrap_or(rest).trim_end();
-            if let Some(version) = value_str.strip_prefix('"').and_then(|r| r.strip_suffix('"')) {
+            if let Some(version) = value_str
+                .strip_prefix('"')
+                .and_then(|r| r.strip_suffix('"'))
+            {
                 let indent_len = line.len() - line.trim_start().len();
                 let indent = &line[..indent_len];
                 return format!(
