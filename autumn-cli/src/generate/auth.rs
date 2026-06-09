@@ -5291,6 +5291,11 @@ pub async fn oauth_callback(
     //
     //   session.insert(&auth_cfg.session_key, local_user_id.to_string()).await;
     //
+    //   // Track the OAuth login as an active session (device list + revocation,
+    //   // issue #819) — add `MaybeClientIp(addr_ip)` and `headers: HeaderMap`
+    //   // extractors to this handler, then:
+    //   crate::routes::auth::record_login_session(&mut db, &session, local_user_id, addr_ip, &headers).await?;
+    //
     // Until the above is implemented the user will NOT be logged in after the OAuth
     // callback — that is intentional to avoid authenticating without a local account.
 {totp_callback_note}    let _ = identity;
