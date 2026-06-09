@@ -111,9 +111,7 @@ fn detect_pattern(to: &str) -> TokenStream {
 
     // LocalPrefix: ends with `*` or `.*`.
     if to.ends_with('*') {
-        let prefix = to
-            .trim_end_matches('*')
-            .trim_end_matches('.');
+        let prefix = to.trim_end_matches('*').trim_end_matches('.');
         let p = prefix.to_string();
         return quote! {
             ::autumn_web::inbound_mail::RecipientPattern::LocalPrefix(#p.to_string())
