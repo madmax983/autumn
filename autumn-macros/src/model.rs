@@ -668,7 +668,9 @@ struct StateMachineSpec {
 }
 
 /// Parse the inner `transitions(a -> b, b -> c: "guard", ...)` token tree.
-fn parse_transitions(input: syn::parse::ParseStream<'_>) -> syn::Result<Vec<StateMachineTransition>> {
+fn parse_transitions(
+    input: syn::parse::ParseStream<'_>,
+) -> syn::Result<Vec<StateMachineTransition>> {
     let kw: syn::Ident = input.parse()?;
     if kw != "transitions" {
         return Err(syn::Error::new(kw.span(), "expected `transitions(...)`"));
@@ -701,20 +703,39 @@ fn parse_transitions(input: syn::parse::ParseStream<'_>) -> syn::Result<Vec<Stat
 }
 
 /// Parse `#[state_machine(transitions(...))]` from a field, returning the spec when present.
+///
+/// Validates:
+/// - Only `String` fields are supported (the generated `.as_str()` call requires it).
+/// - Multiple `#[state_machine]` attributes on the same field are rejected.
 fn parse_state_machine_spec(field: &syn::Field) -> syn::Result<Option<StateMachineSpec>> {
     let Some(ident) = field.ident.as_ref() else {
         return Ok(None);
     };
+    let mut spec: Option<StateMachineSpec> = None;
     for attr in &field.attrs {
         if attr.path().is_ident("state_machine") {
+            if spec.is_some() {
+                return Err(syn::Error::new_spanned(
+                    attr,
+                    "multiple `#[state_machine]` attributes are not allowed on a single field",
+                ));
+            }
+            let is_string = matches!(&field.ty, syn::Type::Path(p)
+                if p.path.segments.last().is_some_and(|s| s.ident == "String"));
+            if !is_string {
+                return Err(syn::Error::new_spanned(
+                    &field.ty,
+                    "`#[state_machine]` is only supported on `String` fields",
+                ));
+            }
             let transitions = attr.parse_args_with(parse_transitions)?;
-            return Ok(Some(StateMachineSpec {
+            spec = Some(StateMachineSpec {
                 field_ident: ident.clone(),
                 transitions,
-            }));
+            });
         }
     }
-    Ok(None)
+    Ok(spec)
 }
 
 /// Emit the three state machine items for one field: a transitions constant,
@@ -2854,8 +2875,7 @@ mod tests {
         );
         let generated = output.to_string();
         assert!(
-            generated.contains("Some (\"can_ship\")")
-                || generated.contains("Some(\"can_ship\")"),
+            generated.contains("Some (\"can_ship\")") || generated.contains("Some(\"can_ship\")"),
             "guarded transition must store the guard name in the transition table: {generated}"
         );
     }
@@ -2932,6 +2952,47 @@ mod tests {
             !struct_block.contains("# [state_machine]")
                 && !struct_block.contains("#[state_machine]"),
             "`state_machine` attribute must not appear on the generated Diesel struct field: {struct_block}"
+        );
+    }
+
+    #[test]
+    fn state_machine_on_non_string_field_is_rejected() {
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Order {
+                    #[id]
+                    pub id: i64,
+                    #[state_machine(transitions(pending -> processing))]
+                    pub amount: i64,
+                }
+            },
+        );
+        let generated = output.to_string();
+        assert!(
+            generated.contains("only supported on `String` fields"),
+            "#[state_machine] on a non-String field must emit a compile error: {generated}"
+        );
+    }
+
+    #[test]
+    fn state_machine_duplicate_attribute_on_same_field_is_rejected() {
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Order {
+                    #[id]
+                    pub id: i64,
+                    #[state_machine(transitions(pending -> processing))]
+                    #[state_machine(transitions(processing -> shipped))]
+                    pub status: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+        assert!(
+            generated.contains("multiple `#[state_machine]` attributes are not allowed"),
+            "duplicate #[state_machine] on same field must emit a compile error: {generated}"
         );
     }
 
