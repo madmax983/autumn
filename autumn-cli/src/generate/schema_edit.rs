@@ -715,6 +715,50 @@ fn insert_mail_previews_call(existing: &str, mailer_type: &str) -> String {
 
 // ── Cargo.toml: feature injection ────────────────────────────────────────
 
+/// Rewrite `lines` so that a feature is added at or near `feat_idx`.
+///
+/// If `new_feat_line != original_line` the single-line `features = [...]` was
+/// already rewritten; just splice it in. Otherwise the array is multiline:
+/// scan forward for the closing `]` and insert a new entry before it.
+fn splice_feature_at(
+    lines: &[&str],
+    feat_idx: usize,
+    new_feat_line: &str,
+    original_line: &str,
+    feature_quoted: &str,
+    ends_with_newline: bool,
+) -> String {
+    let mut out = String::with_capacity(lines.len() * 40);
+    if new_feat_line == original_line {
+        let close_idx = lines[feat_idx..]
+            .iter()
+            .position(|l| l.trim() == "]")
+            .map_or(feat_idx, |p| feat_idx + p);
+        let indent = lines
+            .get(feat_idx + 1)
+            .filter(|l| !l.trim().is_empty() && l.trim() != "]")
+            .map_or("    ", |l| &l[..l.len() - l.trim_start().len()]);
+        let new_entry = format!("{indent}{feature_quoted},");
+        for (k, &l) in lines.iter().enumerate() {
+            if k == close_idx {
+                out.push_str(&new_entry);
+                out.push('\n');
+            }
+            out.push_str(l);
+            out.push('\n');
+        }
+    } else {
+        for (k, &l) in lines.iter().enumerate() {
+            out.push_str(if k == feat_idx { new_feat_line } else { l });
+            out.push('\n');
+        }
+    }
+    if !ends_with_newline {
+        out.pop();
+    }
+    out
+}
+
 /// Ensure the `autumn-web` dependency in `Cargo.toml` includes `feature`.
 ///
 /// Handles four common forms of the dependency declaration:
@@ -795,38 +839,14 @@ pub fn ensure_autumn_web_feature(existing: &str, feature: &str) -> String {
             let abs_j = section_start + j;
             if sect_line.trim_start().starts_with("features") {
                 let new_feat_line = rewrite_features_line(sect_line, feature);
-                let mut out = String::with_capacity(existing.len() + 32);
-                if new_feat_line == sect_line {
-                    // Multiline features array: `]` is on a later line.
-                    // Find the closing `]` and insert the new entry before it.
-                    let close_idx = lines[abs_j..]
-                        .iter()
-                        .position(|l| l.trim() == "]")
-                        .map_or(abs_j, |p| abs_j + p);
-                    let indent = lines
-                        .get(abs_j + 1)
-                        .filter(|l| !l.trim().is_empty() && l.trim() != "]")
-                        .map(|l| &l[..l.len() - l.trim_start().len()])
-                        .unwrap_or("    ");
-                    let new_entry = format!("{indent}{feature_quoted},");
-                    for (k, &l) in lines.iter().enumerate() {
-                        if k == close_idx {
-                            out.push_str(&new_entry);
-                            out.push('\n');
-                        }
-                        out.push_str(l);
-                        out.push('\n');
-                    }
-                } else {
-                    for (k, &l) in lines.iter().enumerate() {
-                        out.push_str(if k == abs_j { &new_feat_line } else { l });
-                        out.push('\n');
-                    }
-                }
-                if !existing.ends_with('\n') {
-                    out.pop();
-                }
-                return out;
+                return splice_feature_at(
+                    &lines,
+                    abs_j,
+                    &new_feat_line,
+                    sect_line,
+                    &feature_quoted,
+                    existing.ends_with('\n'),
+                );
             }
         }
 
