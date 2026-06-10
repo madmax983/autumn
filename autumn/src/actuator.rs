@@ -486,15 +486,34 @@ pub struct JobStatus {
     pub queued: u64,
     /// Number of currently running jobs.
     pub in_flight: u64,
+    /// Approximate jobs currently waiting on a free concurrency slot.
+    pub blocked_on_concurrency: u64,
     /// Total successful executions.
     pub total_successes: u64,
     /// Total failed executions.
     pub total_failures: u64,
     /// Total dead-lettered executions.
     pub dead_letters: u64,
+    /// Total enqueues coalesced because a matching unique job was already held.
+    pub total_deduplicated: u64,
     /// Last observed error for this job, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+}
+
+impl JobStatus {
+    const fn empty() -> Self {
+        Self {
+            queued: 0,
+            in_flight: 0,
+            blocked_on_concurrency: 0,
+            total_successes: 0,
+            total_failures: 0,
+            dead_letters: 0,
+            total_deduplicated: 0,
+            last_error: None,
+        }
+    }
 }
 
 /// Registry of ad-hoc jobs and their runtime status.
@@ -515,29 +534,59 @@ impl JobRegistry {
     /// Register a job name with initial counters.
     pub fn register(&self, name: &str) {
         if let Ok(mut guard) = self.inner.write() {
-            guard.entry(name.to_string()).or_insert(JobStatus {
-                queued: 0,
-                in_flight: 0,
-                total_successes: 0,
-                total_failures: 0,
-                dead_letters: 0,
-                last_error: None,
-            });
+            guard.entry(name.to_string()).or_insert(JobStatus::empty());
         }
     }
 
     /// Record that a new job instance was enqueued.
     pub fn record_enqueue(&self, name: &str) {
         if let Ok(mut guard) = self.inner.write() {
-            let status = guard.entry(name.to_string()).or_insert(JobStatus {
-                queued: 0,
-                in_flight: 0,
-                total_successes: 0,
-                total_failures: 0,
-                dead_letters: 0,
-                last_error: None,
-            });
+            let status = guard.entry(name.to_string()).or_insert(JobStatus::empty());
             status.queued = status.queued.saturating_add(1);
+        }
+    }
+
+    /// Record that an enqueue was coalesced into an existing unique job.
+    ///
+    /// Reverses the `record_enqueue` bookkeeping for the coalesced instance
+    /// and bumps the deduplication counter.
+    pub fn record_deduplicated(&self, name: &str) {
+        if let Ok(mut guard) = self.inner.write()
+            && let Some(status) = guard.get_mut(name)
+        {
+            status.queued = status.queued.saturating_sub(1);
+            status.total_deduplicated = status.total_deduplicated.saturating_add(1);
+        }
+    }
+
+    /// Record that a job is parked waiting on a free concurrency slot.
+    pub fn record_concurrency_blocked(&self, name: &str) {
+        if let Ok(mut guard) = self.inner.write()
+            && let Some(status) = guard.get_mut(name)
+        {
+            status.blocked_on_concurrency = status.blocked_on_concurrency.saturating_add(1);
+        }
+    }
+
+    /// Record that a parked job was released back to the queue.
+    pub fn record_concurrency_unblocked(&self, name: &str) {
+        if let Ok(mut guard) = self.inner.write()
+            && let Some(status) = guard.get_mut(name)
+        {
+            status.blocked_on_concurrency = status.blocked_on_concurrency.saturating_sub(1);
+        }
+    }
+
+    /// Replace the blocked-on-concurrency gauges from a backend-wide survey.
+    ///
+    /// Names absent from `counts` are reset to zero. Used by the durable
+    /// backends whose blocked set is observed periodically rather than
+    /// tracked per event.
+    pub fn set_concurrency_blocked_counts(&self, counts: &HashMap<String, u64>) {
+        if let Ok(mut guard) = self.inner.write() {
+            for (name, status) in guard.iter_mut() {
+                status.blocked_on_concurrency = counts.get(name).copied().unwrap_or(0);
+            }
         }
     }
 
@@ -3141,6 +3190,8 @@ mod tests {
                 name: "autumn_webhook_delivery".to_string(),
                 max_attempts: 1,
                 initial_backoff_ms: 1,
+                uniqueness: None,
+                concurrency: None,
                 handler: |_state, _payload| Box::pin(async move { Ok(()) }),
             }],
             &runtime_state,
@@ -3213,6 +3264,8 @@ mod tests {
                 name: "autumn_webhook_delivery".to_string(),
                 max_attempts: 1,
                 initial_backoff_ms: 1,
+                uniqueness: None,
+                concurrency: None,
                 handler: |_state, _payload| Box::pin(async move { Ok(()) }),
             }],
             &runtime_state,

@@ -299,6 +299,8 @@ async fn job_interceptor_intercepts_enqueue_and_execute() {
         name: "test-job".to_string(),
         max_attempts: 1,
         initial_backoff_ms: 1,
+        uniqueness: None,
+        concurrency: None,
         handler: test_job_handler,
     };
 

@@ -25,6 +25,52 @@ pub type JobHandler =
 const DEFAULT_JOB_ADMIN_HISTORY_LIMIT: usize = 1_000;
 const DEFAULT_JOB_ADMIN_PER_PAGE: u64 = 25;
 
+/// Uniqueness window controlling how long a unique job's key stays held.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobUniquenessWindow {
+    /// The key is held while the job is pending and released when execution
+    /// starts, so a duplicate may be enqueued once the original is running.
+    Pending,
+    /// The key is held while the job is pending **or** running and released
+    /// when it finishes (success or terminal failure). This is the default.
+    Running,
+    /// The key is held for this many milliseconds from enqueue time, deduping
+    /// bursts even after the original job completed within the window.
+    TtlMs(u64),
+}
+
+impl JobUniquenessWindow {
+    /// Stable serialization tag persisted with durable job records.
+    #[must_use]
+    pub const fn tag(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::TtlMs(_) => "ttl",
+        }
+    }
+}
+
+/// Uniqueness configuration declared with `#[job(unique, ...)]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobUniqueness {
+    /// Payload field names the unique key derives from.
+    ///
+    /// Empty means the key is a stable hash of the full args payload.
+    pub by: Vec<String>,
+    /// How long the unique key stays held.
+    pub window: JobUniquenessWindow,
+}
+
+/// Concurrency limit configuration declared with `#[job(concurrency = N)]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobConcurrency {
+    /// Maximum simultaneously-executing jobs of this type.
+    pub limit: u32,
+    /// Optional payload field that scopes the limit per distinct value.
+    pub key: Option<String>,
+}
+
 /// Metadata describing a registered background job.
 #[derive(Clone)]
 pub struct JobInfo {
@@ -34,8 +80,32 @@ pub struct JobInfo {
     pub max_attempts: u32,
     /// Base delay in milliseconds before the first retry (scales exponentially).
     pub initial_backoff_ms: u64,
+    /// Uniqueness (dedup) configuration; `None` means no dedup.
+    pub uniqueness: Option<JobUniqueness>,
+    /// In-flight concurrency cap; `None` means unbounded per-type concurrency.
+    pub concurrency: Option<JobConcurrency>,
     /// The async function that executes the job logic.
     pub handler: JobHandler,
+}
+
+impl JobInfo {
+    /// Construct job metadata with no uniqueness or concurrency constraints.
+    #[must_use]
+    pub fn new(
+        name: impl Into<String>,
+        max_attempts: u32,
+        initial_backoff_ms: u64,
+        handler: JobHandler,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            max_attempts,
+            initial_backoff_ms,
+            uniqueness: None,
+            concurrency: None,
+            handler,
+        }
+    }
 }
 
 /// The runtime client for interacting with the job queue.
@@ -111,6 +181,8 @@ pub enum JobAdminStatus {
     Canceled,
     /// Re-enqueued by an operator from a failed entry.
     Retried,
+    /// Coalesced at enqueue time into an already-held unique job.
+    Deduplicated,
 }
 
 impl JobAdminStatus {
@@ -126,6 +198,7 @@ impl JobAdminStatus {
             Self::Discarded => "discarded",
             Self::Canceled => "canceled",
             Self::Retried => "retried",
+            Self::Deduplicated => "deduplicated",
         }
     }
 }
@@ -474,6 +547,16 @@ impl JobAdminMemoryBackend {
         }
     }
 
+    fn record_deduplicated(&self, id: &str) {
+        if let Ok(mut inner) = self.inner.write()
+            && let Some(record) = inner.records.get_mut(id)
+        {
+            record.status = JobAdminStatus::Deduplicated;
+            record.finished_at = Some(chrono::Utc::now());
+            prune_job_admin_history(&mut inner);
+        }
+    }
+
     fn retry_payload(&self, id: &str) -> AutumnResult<(String, Value)> {
         let mut inner = self
             .inner
@@ -741,6 +824,92 @@ fn paginate_job_admin_records(
         .collect();
 
     JobAdminPage::new(page_records, total, page, per_page)
+}
+
+/// Append a canonical (sorted-key) JSON encoding of `value` to `out`.
+///
+/// `serde_json::to_string` is already deterministic for a given `Value`, but
+/// two semantically-equal payloads can carry different key orders (e.g. when
+/// built manually vs. via struct serialization). Sorting object keys makes the
+/// derived unique key stable across producers and app instances.
+fn write_canonical_json(value: &Value, out: &mut String) {
+    match value {
+        Value::Object(map) => {
+            out.push('{');
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            for (index, key) in keys.iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                out.push_str(&serde_json::to_string(key).unwrap_or_default());
+                out.push(':');
+                write_canonical_json(&map[*key], out);
+            }
+            out.push('}');
+        }
+        Value::Array(items) => {
+            out.push('[');
+            for (index, item) in items.iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                write_canonical_json(item, out);
+            }
+            out.push(']');
+        }
+        other => out.push_str(&other.to_string()),
+    }
+}
+
+/// FNV-1a 64-bit hash: deterministic across processes, releases, and replicas,
+/// unlike `std::hash::DefaultHasher` whose output is not a stability guarantee.
+fn fnv1a_64(input: &str) -> u64 {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = OFFSET_BASIS;
+    for byte in input.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
+}
+
+/// Derive the uniqueness key for a job payload.
+///
+/// With `unique_by` fields configured the key concatenates the canonical JSON
+/// of each selected field (missing fields read as `null`); otherwise it is a
+/// stable hash of the full canonicalized payload.
+fn job_unique_key(uniqueness: &JobUniqueness, payload: &Value) -> String {
+    if uniqueness.by.is_empty() {
+        let mut canonical = String::new();
+        write_canonical_json(payload, &mut canonical);
+        return format!("args:{:016x}", fnv1a_64(&canonical));
+    }
+    let mut key = String::new();
+    for (index, field) in uniqueness.by.iter().enumerate() {
+        if index > 0 {
+            key.push('\u{1f}');
+        }
+        key.push_str(field);
+        key.push('=');
+        let value = payload.get(field).unwrap_or(&Value::Null);
+        write_canonical_json(value, &mut key);
+    }
+    key
+}
+
+/// Resolve the concurrency scope value for a job payload.
+///
+/// Returns `None` when the limit is unscoped (one shared slot pool per job
+/// type). A configured-but-missing field reads as canonical `null` so all
+/// payloads lacking the field share one scope.
+fn job_concurrency_scope(concurrency: &JobConcurrency, payload: &Value) -> Option<String> {
+    concurrency.key.as_ref().map(|field| {
+        let mut scope = String::new();
+        write_canonical_json(payload.get(field).unwrap_or(&Value::Null), &mut scope);
+        scope
+    })
 }
 
 fn job_payload_identity(payload: &Value) -> (Option<String>, Option<String>) {
@@ -4936,6 +5105,8 @@ mod tests {
                 name: "noop".to_string(),
                 max_attempts: 3,
                 initial_backoff_ms: 10,
+                uniqueness: None,
+                concurrency: None,
                 handler: |_state, _payload| Box::pin(async move { Ok(()) }),
             }],
             &state,
@@ -5011,6 +5182,8 @@ mod tests {
                 name: "noop".to_string(),
                 max_attempts: 3,
                 initial_backoff_ms: 10,
+                uniqueness: None,
+                concurrency: None,
                 handler: |_state, _payload| Box::pin(async move { Ok(()) }),
             }],
             &state,
@@ -5049,6 +5222,8 @@ mod tests {
                 name: "panic".to_string(),
                 max_attempts: 3,
                 initial_backoff_ms: 1,
+                uniqueness: None,
+                concurrency: None,
                 handler: panicking_handler,
             },
         );
@@ -5104,6 +5279,8 @@ mod tests {
                 name: "flaky".to_string(),
                 max_attempts: 2,
                 initial_backoff_ms: 1,
+                uniqueness: None,
+                concurrency: None,
                 handler: always_fail_handler,
             },
         );
@@ -5161,6 +5338,8 @@ mod tests {
                 name: "flaky".to_string(),
                 max_attempts: 1,
                 initial_backoff_ms: 1,
+                uniqueness: None,
+                concurrency: None,
                 handler: always_fail_handler,
             },
         );
@@ -5213,6 +5392,8 @@ mod tests {
                 name: "flaky".to_string(),
                 max_attempts: 2,
                 initial_backoff_ms: 60_000,
+                uniqueness: None,
+                concurrency: None,
                 handler: always_fail_handler,
             },
         );
@@ -5314,12 +5495,16 @@ mod tests {
                 name: "slow".to_string(),
                 max_attempts: 3,
                 initial_backoff_ms: 250,
+                uniqueness: None,
+                concurrency: None,
                 handler: redis_counting_success_handler,
             },
             JobInfo {
                 name: "fast".to_string(),
                 max_attempts: 3,
                 initial_backoff_ms: 25,
+                uniqueness: None,
+                concurrency: None,
                 handler: redis_counting_success_handler,
             },
         ];
@@ -6091,6 +6276,8 @@ mod tests {
                 name: "known".to_string(),
                 max_attempts: 3,
                 initial_backoff_ms: 10,
+                uniqueness: None,
+                concurrency: None,
                 handler: |_state, _payload| Box::pin(async move { Ok(()) }),
             }],
             &state,
@@ -6138,12 +6325,16 @@ mod tests {
                     name: "dupe".to_string(),
                     max_attempts: 1,
                     initial_backoff_ms: 1,
+                    uniqueness: None,
+                    concurrency: None,
                     handler: |_state, _payload| Box::pin(async move { Ok(()) }),
                 },
                 JobInfo {
                     name: "dupe".to_string(),
                     max_attempts: 1,
                     initial_backoff_ms: 1,
+                    uniqueness: None,
+                    concurrency: None,
                     handler: |_state, _payload| Box::pin(async move { Ok(()) }),
                 },
             ],
@@ -6180,6 +6371,8 @@ mod tests {
                 name: "known".to_string(),
                 max_attempts: 1,
                 initial_backoff_ms: 1,
+                uniqueness: None,
+                concurrency: None,
                 handler: |_state, _payload| Box::pin(async move { Ok(()) }),
             }],
             &state,
@@ -6219,6 +6412,8 @@ mod tests {
                 name: "known".to_string(),
                 max_attempts: 1,
                 initial_backoff_ms: 1,
+                uniqueness: None,
+                concurrency: None,
                 handler: |_state, _payload| Box::pin(async move { Ok(()) }),
             }],
             &state,
@@ -7054,6 +7249,8 @@ mod tests {
                     name: "test_job".to_string(),
                     max_attempts: 1,
                     initial_backoff_ms: 1,
+                    uniqueness: None,
+                    concurrency: None,
                     handler: |_state, _payload| Box::pin(async move { Ok(()) }),
                 }],
                 &state,
@@ -7705,6 +7902,8 @@ mod tests {
                     name: "noop".to_string(),
                     max_attempts: 1,
                     initial_backoff_ms: 0,
+                    uniqueness: None,
+                    concurrency: None,
                     handler: |_state, _payload| Box::pin(async { Ok(()) }),
                 },
             );
@@ -7862,5 +8061,680 @@ mod tests {
                 assert_eq!(job.name, "test_job");
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod uniqueness_concurrency_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::time::Duration;
+
+    /// Poll `cond` every few milliseconds until it holds or `deadline_ms` passes.
+    async fn wait_for(deadline_ms: u64, mut cond: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_millis(deadline_ms);
+        while std::time::Instant::now() < deadline {
+            if cond() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        cond()
+    }
+
+    fn unique_job(name: &str, window: JobUniquenessWindow, handler: JobHandler) -> JobInfo {
+        JobInfo {
+            name: name.to_string(),
+            max_attempts: 1,
+            initial_backoff_ms: 1,
+            uniqueness: Some(JobUniqueness {
+                by: Vec::new(),
+                window,
+            }),
+            concurrency: None,
+            handler,
+        }
+    }
+
+    fn successes(state: &AppState, name: &str) -> u64 {
+        state
+            .job_registry()
+            .snapshot()
+            .get(name)
+            .map_or(0, |s| s.total_successes)
+    }
+
+    fn deduplicated(state: &AppState, name: &str) -> u64 {
+        state
+            .job_registry()
+            .snapshot()
+            .get(name)
+            .map_or(0, |s| s.total_deduplicated)
+    }
+
+    // ── unique key derivation ────────────────────────────────────────────────
+
+    #[test]
+    fn default_unique_key_is_stable_for_equal_args_regardless_of_field_order() {
+        let uniqueness = JobUniqueness {
+            by: Vec::new(),
+            window: JobUniquenessWindow::Running,
+        };
+        let a = serde_json::json!({"x": 1, "y": {"b": 2, "a": [1, 2]}});
+        let b = serde_json::json!({"y": {"a": [1, 2], "b": 2}, "x": 1});
+        let c = serde_json::json!({"x": 1, "y": {"b": 2, "a": [2, 1]}});
+        assert_eq!(job_unique_key(&uniqueness, &a), job_unique_key(&uniqueness, &b));
+        assert_ne!(job_unique_key(&uniqueness, &a), job_unique_key(&uniqueness, &c));
+    }
+
+    #[test]
+    fn unique_by_key_uses_selected_fields_only() {
+        let uniqueness = JobUniqueness {
+            by: vec!["account_id".to_string()],
+            window: JobUniquenessWindow::Running,
+        };
+        let a = serde_json::json!({"account_id": 7, "attempt_marker": "first"});
+        let b = serde_json::json!({"account_id": 7, "attempt_marker": "second"});
+        let c = serde_json::json!({"account_id": 8, "attempt_marker": "first"});
+        assert_eq!(job_unique_key(&uniqueness, &a), job_unique_key(&uniqueness, &b));
+        assert_ne!(job_unique_key(&uniqueness, &a), job_unique_key(&uniqueness, &c));
+    }
+
+    #[test]
+    fn unique_by_key_treats_missing_fields_as_null() {
+        let uniqueness = JobUniqueness {
+            by: vec!["account_id".to_string()],
+            window: JobUniquenessWindow::Running,
+        };
+        let a = serde_json::json!({});
+        let b = serde_json::json!({"other": true});
+        assert_eq!(job_unique_key(&uniqueness, &a), job_unique_key(&uniqueness, &b));
+    }
+
+    // ── registry counters ────────────────────────────────────────────────────
+
+    #[test]
+    fn registry_records_deduplicated_enqueues() {
+        let registry = crate::actuator::JobRegistry::new();
+        registry.register("dedup_job");
+        registry.record_enqueue("dedup_job");
+        registry.record_deduplicated("dedup_job");
+        let snapshot = registry.snapshot();
+        let status = &snapshot["dedup_job"];
+        assert_eq!(status.queued, 0);
+        assert_eq!(status.total_deduplicated, 1);
+    }
+
+    #[test]
+    fn registry_tracks_blocked_on_concurrency_gauge() {
+        let registry = crate::actuator::JobRegistry::new();
+        registry.register("limited");
+        registry.record_concurrency_blocked("limited");
+        registry.record_concurrency_blocked("limited");
+        assert_eq!(registry.snapshot()["limited"].blocked_on_concurrency, 2);
+        registry.record_concurrency_unblocked("limited");
+        assert_eq!(registry.snapshot()["limited"].blocked_on_concurrency, 1);
+
+        let mut counts = HashMap::new();
+        counts.insert("limited".to_string(), 5_u64);
+        registry.set_concurrency_blocked_counts(&counts);
+        assert_eq!(registry.snapshot()["limited"].blocked_on_concurrency, 5);
+        registry.set_concurrency_blocked_counts(&HashMap::new());
+        assert_eq!(registry.snapshot()["limited"].blocked_on_concurrency, 0);
+    }
+
+    #[test]
+    fn deduplicated_admin_status_label_is_stable() {
+        assert_eq!(JobAdminStatus::Deduplicated.label(), "deduplicated");
+    }
+
+    // ── local backend: uniqueness ────────────────────────────────────────────
+
+    static UNIQUE_BURST_CALLS: AtomicUsize = AtomicUsize::new(0);
+    fn unique_burst_handler(
+        _state: AppState,
+        _payload: Value,
+    ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'static>> {
+        Box::pin(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            UNIQUE_BURST_CALLS.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+    }
+
+    #[tokio::test]
+    async fn local_unique_job_coalesces_duplicate_burst_enqueues() {
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+        UNIQUE_BURST_CALLS.store(0, Ordering::SeqCst);
+
+        let state = AppState::for_test().with_profile("dev");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        start_local_runtime(
+            vec![unique_job(
+                "unique_burst",
+                JobUniquenessWindow::Running,
+                unique_burst_handler,
+            )],
+            &state,
+            &shutdown,
+            2,
+            5,
+            250,
+        );
+
+        let payload = serde_json::json!({"invoice_id": 42});
+        enqueue("unique_burst", payload.clone()).await.unwrap();
+        enqueue("unique_burst", payload.clone()).await.unwrap();
+
+        assert!(
+            wait_for(2_000, || successes(&state, "unique_burst") >= 1).await,
+            "first execution should complete"
+        );
+        // Give a would-be duplicate ample time to run.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        assert_eq!(
+            UNIQUE_BURST_CALLS.load(Ordering::SeqCst),
+            1,
+            "burst of two identical enqueues must execute exactly once"
+        );
+        assert_eq!(deduplicated(&state, "unique_burst"), 1);
+        assert_eq!(successes(&state, "unique_burst"), 1);
+
+        shutdown.cancel();
+        clear_global_job_client();
+    }
+
+    static UNIQUE_RELEASE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    fn unique_release_handler(
+        _state: AppState,
+        _payload: Value,
+    ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'static>> {
+        Box::pin(async move {
+            UNIQUE_RELEASE_CALLS.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+    }
+
+    #[tokio::test]
+    async fn local_unique_key_is_released_on_success() {
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+        UNIQUE_RELEASE_CALLS.store(0, Ordering::SeqCst);
+
+        let state = AppState::for_test().with_profile("dev");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        start_local_runtime(
+            vec![unique_job(
+                "unique_release",
+                JobUniquenessWindow::Running,
+                unique_release_handler,
+            )],
+            &state,
+            &shutdown,
+            1,
+            5,
+            250,
+        );
+
+        let payload = serde_json::json!({"invoice_id": 1});
+        enqueue("unique_release", payload.clone()).await.unwrap();
+        assert!(wait_for(2_000, || successes(&state, "unique_release") == 1).await);
+
+        enqueue("unique_release", payload).await.unwrap();
+        assert!(
+            wait_for(2_000, || successes(&state, "unique_release") == 2).await,
+            "key must be released after success so the job can run again"
+        );
+        assert_eq!(UNIQUE_RELEASE_CALLS.load(Ordering::SeqCst), 2);
+        assert_eq!(deduplicated(&state, "unique_release"), 0);
+
+        shutdown.cancel();
+        clear_global_job_client();
+    }
+
+    static UNIQUE_FAIL_CALLS: AtomicUsize = AtomicUsize::new(0);
+    fn unique_fail_handler(
+        _state: AppState,
+        _payload: Value,
+    ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'static>> {
+        Box::pin(async move {
+            UNIQUE_FAIL_CALLS.fetch_add(1, Ordering::SeqCst);
+            Err(AutumnError::internal_server_error(std::io::Error::other(
+                "forced failure",
+            )))
+        })
+    }
+
+    #[tokio::test]
+    async fn local_unique_key_is_released_on_terminal_failure() {
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+        UNIQUE_FAIL_CALLS.store(0, Ordering::SeqCst);
+
+        let state = AppState::for_test().with_profile("dev");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        start_local_runtime(
+            vec![unique_job(
+                "unique_terminal",
+                JobUniquenessWindow::Running,
+                unique_fail_handler,
+            )],
+            &state,
+            &shutdown,
+            1,
+            5,
+            250,
+        );
+
+        let failures = |state: &AppState| {
+            state
+                .job_registry()
+                .snapshot()
+                .get("unique_terminal")
+                .map_or(0, |s| s.total_failures)
+        };
+
+        let payload = serde_json::json!({"invoice_id": 2});
+        enqueue("unique_terminal", payload.clone()).await.unwrap();
+        assert!(wait_for(2_000, || failures(&state) == 1).await);
+
+        enqueue("unique_terminal", payload).await.unwrap();
+        assert!(
+            wait_for(2_000, || failures(&state) == 2).await,
+            "key must be released after terminal failure"
+        );
+        assert_eq!(UNIQUE_FAIL_CALLS.load(Ordering::SeqCst), 2);
+
+        shutdown.cancel();
+        clear_global_job_client();
+    }
+
+    static UNIQUE_PENDING_CALLS: AtomicUsize = AtomicUsize::new(0);
+    fn unique_pending_handler(
+        _state: AppState,
+        _payload: Value,
+    ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'static>> {
+        Box::pin(async move {
+            UNIQUE_PENDING_CALLS.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            Ok(())
+        })
+    }
+
+    #[tokio::test]
+    async fn local_unique_pending_window_releases_key_when_execution_starts() {
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+        UNIQUE_PENDING_CALLS.store(0, Ordering::SeqCst);
+
+        let state = AppState::for_test().with_profile("dev");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        start_local_runtime(
+            vec![unique_job(
+                "unique_pending",
+                JobUniquenessWindow::Pending,
+                unique_pending_handler,
+            )],
+            &state,
+            &shutdown,
+            2,
+            5,
+            250,
+        );
+
+        let payload = serde_json::json!({"invoice_id": 3});
+        enqueue("unique_pending", payload.clone()).await.unwrap();
+        assert!(
+            wait_for(2_000, || UNIQUE_PENDING_CALLS.load(Ordering::SeqCst) >= 1).await,
+            "first job should start"
+        );
+
+        // The original is still running, but the pending window released the
+        // key when execution started, so a second enqueue is allowed.
+        enqueue("unique_pending", payload).await.unwrap();
+        assert!(
+            wait_for(2_000, || successes(&state, "unique_pending") == 2).await,
+            "second enqueue should run while the first is mid-flight"
+        );
+        assert_eq!(UNIQUE_PENDING_CALLS.load(Ordering::SeqCst), 2);
+        assert_eq!(deduplicated(&state, "unique_pending"), 0);
+
+        shutdown.cancel();
+        clear_global_job_client();
+    }
+
+    static UNIQUE_TTL_CALLS: AtomicUsize = AtomicUsize::new(0);
+    fn unique_ttl_handler(
+        _state: AppState,
+        _payload: Value,
+    ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'static>> {
+        Box::pin(async move {
+            UNIQUE_TTL_CALLS.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+    }
+
+    #[tokio::test]
+    async fn local_unique_ttl_window_dedupes_after_completion_until_expiry() {
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+        UNIQUE_TTL_CALLS.store(0, Ordering::SeqCst);
+
+        let state = AppState::for_test().with_profile("dev");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        start_local_runtime(
+            vec![unique_job(
+                "unique_ttl",
+                JobUniquenessWindow::TtlMs(250),
+                unique_ttl_handler,
+            )],
+            &state,
+            &shutdown,
+            1,
+            5,
+            250,
+        );
+
+        let payload = serde_json::json!({"invoice_id": 4});
+        enqueue("unique_ttl", payload.clone()).await.unwrap();
+        assert!(wait_for(2_000, || successes(&state, "unique_ttl") == 1).await);
+
+        // Inside the TTL window: coalesced even though the first run finished.
+        enqueue("unique_ttl", payload.clone()).await.unwrap();
+        assert!(wait_for(2_000, || deduplicated(&state, "unique_ttl") == 1).await);
+
+        // After expiry: a fresh enqueue runs.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        enqueue("unique_ttl", payload).await.unwrap();
+        assert!(wait_for(2_000, || successes(&state, "unique_ttl") == 2).await);
+        assert_eq!(UNIQUE_TTL_CALLS.load(Ordering::SeqCst), 2);
+
+        shutdown.cancel();
+        clear_global_job_client();
+    }
+
+    static UNIQUE_BY_CALLS: AtomicUsize = AtomicUsize::new(0);
+    fn unique_by_handler(
+        _state: AppState,
+        _payload: Value,
+    ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'static>> {
+        Box::pin(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            UNIQUE_BY_CALLS.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+    }
+
+    #[tokio::test]
+    async fn local_unique_by_scopes_dedup_to_selected_fields() {
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+        UNIQUE_BY_CALLS.store(0, Ordering::SeqCst);
+
+        let state = AppState::for_test().with_profile("dev");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        start_local_runtime(
+            vec![JobInfo {
+                name: "unique_by_field".to_string(),
+                max_attempts: 1,
+                initial_backoff_ms: 1,
+                uniqueness: Some(JobUniqueness {
+                    by: vec!["account_id".to_string()],
+                    window: JobUniquenessWindow::Running,
+                }),
+                concurrency: None,
+                handler: unique_by_handler,
+            }],
+            &state,
+            &shutdown,
+            2,
+            5,
+            250,
+        );
+
+        enqueue(
+            "unique_by_field",
+            serde_json::json!({"account_id": 1, "note": "a"}),
+        )
+        .await
+        .unwrap();
+        // Same account, different other fields: coalesced.
+        enqueue(
+            "unique_by_field",
+            serde_json::json!({"account_id": 1, "note": "b"}),
+        )
+        .await
+        .unwrap();
+        // Different account: runs.
+        enqueue(
+            "unique_by_field",
+            serde_json::json!({"account_id": 2, "note": "a"}),
+        )
+        .await
+        .unwrap();
+
+        assert!(wait_for(2_000, || successes(&state, "unique_by_field") == 2).await);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(UNIQUE_BY_CALLS.load(Ordering::SeqCst), 2);
+        assert_eq!(deduplicated(&state, "unique_by_field"), 1);
+
+        shutdown.cancel();
+        clear_global_job_client();
+    }
+
+    // ── local backend: concurrency limits ────────────────────────────────────
+
+    static CONC_CURRENT: AtomicUsize = AtomicUsize::new(0);
+    static CONC_MAX: AtomicUsize = AtomicUsize::new(0);
+    static CONC_DONE: AtomicUsize = AtomicUsize::new(0);
+    fn concurrency_probe_handler(
+        _state: AppState,
+        _payload: Value,
+    ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'static>> {
+        Box::pin(async move {
+            let current = CONC_CURRENT.fetch_add(1, Ordering::SeqCst) + 1;
+            CONC_MAX.fetch_max(current, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            CONC_CURRENT.fetch_sub(1, Ordering::SeqCst);
+            CONC_DONE.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+    }
+
+    #[tokio::test]
+    async fn local_concurrency_limit_caps_simultaneous_executions() {
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+        CONC_CURRENT.store(0, Ordering::SeqCst);
+        CONC_MAX.store(0, Ordering::SeqCst);
+        CONC_DONE.store(0, Ordering::SeqCst);
+
+        let state = AppState::for_test().with_profile("dev");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        start_local_runtime(
+            vec![JobInfo {
+                name: "recalculate".to_string(),
+                max_attempts: 1,
+                initial_backoff_ms: 1,
+                uniqueness: None,
+                concurrency: Some(JobConcurrency {
+                    limit: 2,
+                    key: None,
+                }),
+                handler: concurrency_probe_handler,
+            }],
+            &state,
+            &shutdown,
+            4,
+            5,
+            250,
+        );
+
+        for marker in 0..6 {
+            enqueue("recalculate", serde_json::json!({"marker": marker}))
+                .await
+                .unwrap();
+        }
+
+        assert!(
+            wait_for(5_000, || CONC_DONE.load(Ordering::SeqCst) == 6).await,
+            "all K > limit jobs must eventually complete; got {}",
+            CONC_DONE.load(Ordering::SeqCst)
+        );
+        assert!(
+            CONC_MAX.load(Ordering::SeqCst) <= 2,
+            "observed {} simultaneous executions for limit 2",
+            CONC_MAX.load(Ordering::SeqCst)
+        );
+        assert_eq!(successes(&state, "recalculate"), 6);
+
+        shutdown.cancel();
+        clear_global_job_client();
+    }
+
+    static KEYED_CURRENT_A: AtomicUsize = AtomicUsize::new(0);
+    static KEYED_CURRENT_B: AtomicUsize = AtomicUsize::new(0);
+    static KEYED_MAX_A: AtomicUsize = AtomicUsize::new(0);
+    static KEYED_MAX_B: AtomicUsize = AtomicUsize::new(0);
+    static KEYED_DONE: AtomicUsize = AtomicUsize::new(0);
+    fn keyed_concurrency_handler(
+        _state: AppState,
+        payload: Value,
+    ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'static>> {
+        Box::pin(async move {
+            let account = payload["account_id"].as_str().unwrap_or("a").to_string();
+            let (current, max) = if account == "a" {
+                (&KEYED_CURRENT_A, &KEYED_MAX_A)
+            } else {
+                (&KEYED_CURRENT_B, &KEYED_MAX_B)
+            };
+            let now = current.fetch_add(1, Ordering::SeqCst) + 1;
+            max.fetch_max(now, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            current.fetch_sub(1, Ordering::SeqCst);
+            KEYED_DONE.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+    }
+
+    #[tokio::test]
+    async fn local_concurrency_key_scopes_limit_per_key_value() {
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+        for counter in [
+            &KEYED_CURRENT_A,
+            &KEYED_CURRENT_B,
+            &KEYED_MAX_A,
+            &KEYED_MAX_B,
+            &KEYED_DONE,
+        ] {
+            counter.store(0, Ordering::SeqCst);
+        }
+
+        let state = AppState::for_test().with_profile("dev");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        start_local_runtime(
+            vec![JobInfo {
+                name: "per_account".to_string(),
+                max_attempts: 1,
+                initial_backoff_ms: 1,
+                uniqueness: None,
+                concurrency: Some(JobConcurrency {
+                    limit: 1,
+                    key: Some("account_id".to_string()),
+                }),
+                handler: keyed_concurrency_handler,
+            }],
+            &state,
+            &shutdown,
+            4,
+            5,
+            250,
+        );
+
+        for marker in 0..2 {
+            enqueue(
+                "per_account",
+                serde_json::json!({"account_id": "a", "marker": marker}),
+            )
+            .await
+            .unwrap();
+            enqueue(
+                "per_account",
+                serde_json::json!({"account_id": "b", "marker": marker}),
+            )
+            .await
+            .unwrap();
+        }
+
+        assert!(
+            wait_for(5_000, || KEYED_DONE.load(Ordering::SeqCst) == 4).await,
+            "all keyed jobs must complete; got {}",
+            KEYED_DONE.load(Ordering::SeqCst)
+        );
+        assert!(KEYED_MAX_A.load(Ordering::SeqCst) <= 1);
+        assert!(KEYED_MAX_B.load(Ordering::SeqCst) <= 1);
+
+        shutdown.cancel();
+        clear_global_job_client();
+    }
+
+    static SLOT_RELEASE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    fn slot_release_failing_handler(
+        _state: AppState,
+        _payload: Value,
+    ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'static>> {
+        Box::pin(async move {
+            SLOT_RELEASE_CALLS.fetch_add(1, Ordering::SeqCst);
+            Err(AutumnError::internal_server_error(std::io::Error::other(
+                "forced failure",
+            )))
+        })
+    }
+
+    #[tokio::test]
+    async fn local_concurrency_slot_is_released_on_failure() {
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+        SLOT_RELEASE_CALLS.store(0, Ordering::SeqCst);
+
+        let state = AppState::for_test().with_profile("dev");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        start_local_runtime(
+            vec![JobInfo {
+                name: "limited_failing".to_string(),
+                max_attempts: 1,
+                initial_backoff_ms: 1,
+                uniqueness: None,
+                concurrency: Some(JobConcurrency {
+                    limit: 1,
+                    key: None,
+                }),
+                handler: slot_release_failing_handler,
+            }],
+            &state,
+            &shutdown,
+            2,
+            5,
+            250,
+        );
+
+        enqueue("limited_failing", serde_json::json!({"marker": 1}))
+            .await
+            .unwrap();
+        enqueue("limited_failing", serde_json::json!({"marker": 2}))
+            .await
+            .unwrap();
+
+        assert!(
+            wait_for(5_000, || SLOT_RELEASE_CALLS.load(Ordering::SeqCst) == 2).await,
+            "slot must be released after a failure so the next job runs; got {}",
+            SLOT_RELEASE_CALLS.load(Ordering::SeqCst)
+        );
+
+        shutdown.cancel();
+        clear_global_job_client();
     }
 }
