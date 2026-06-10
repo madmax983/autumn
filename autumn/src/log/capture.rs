@@ -58,7 +58,7 @@ pub struct LogCaptureConfig {
     pub capacity: usize,
 }
 
-fn default_capacity() -> usize {
+const fn default_capacity() -> usize {
     1000
 }
 
@@ -74,7 +74,7 @@ impl Default for LogCaptureConfig {
 // ── CapturedLogEntry ──────────────────────────────────────────
 
 /// A single captured tracing event stored in the [`LogBuffer`].
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct CapturedLogEntry {
     /// ISO 8601 timestamp with millisecond precision (`2024-01-15T12:34:56.789Z`).
     pub timestamp: String,
@@ -165,18 +165,19 @@ impl LogBuffer {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let iter = guard.entries.iter().filter(|e| {
-            min_level.map_or(true, |filter| {
-                level_from_str(&e.level).map_or(false, |lvl| lvl <= filter)
-            })
+            min_level.is_none_or(|filter| level_from_str(&e.level).is_some_and(|lvl| lvl <= filter))
         });
 
         if let Some(n) = limit {
             // Take the last N matching entries (newest-last in the original order).
             let mut result: Vec<_> = iter.rev().take(n).cloned().collect();
+            drop(guard);
             result.reverse();
             result
         } else {
-            iter.cloned().collect()
+            let result = iter.cloned().collect();
+            drop(guard);
+            result
         }
     }
 
@@ -207,6 +208,7 @@ impl LogBuffer {
 /// Parse a level string (case-insensitive) into a `tracing::Level`.
 ///
 /// Returns `None` for unrecognised strings so callers can handle gracefully.
+#[must_use]
 pub fn level_from_str(s: &str) -> Option<Level> {
     match s {
         "ERROR" | "error" => Some(Level::ERROR),
@@ -247,12 +249,13 @@ pub struct LogCaptureLayer {
 impl LogCaptureLayer {
     /// Wrap `buffer` in a new capture layer.
     #[must_use]
-    pub fn new(buffer: LogBuffer) -> Self {
+    pub const fn new(buffer: LogBuffer) -> Self {
         Self { buffer }
     }
 
     /// Return the underlying buffer (for wiring into `AppState`).
-    pub fn buffer(&self) -> &LogBuffer {
+    #[must_use]
+    pub const fn buffer(&self) -> &LogBuffer {
         &self.buffer
     }
 }
@@ -273,7 +276,7 @@ impl<S: Subscriber + for<'a> LookupSpan<'a>> Layer<S> for LogCaptureLayer {
         // Scrub sensitive field values in-place to avoid re-allocating the map.
         let filter = self.buffer.filter();
         let mut fields = visitor.fields;
-        for (k, v) in fields.iter_mut() {
+        for (k, v) in &mut fields {
             if filter.matches_key(k) {
                 *v = serde_json::Value::String(FILTERED_PLACEHOLDER.to_owned());
             }
