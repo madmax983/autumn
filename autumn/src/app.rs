@@ -2555,26 +2555,46 @@ impl AppBuilder {
             merge_routers.push(router);
         }
 
-        // Register SEO routes (/robots.txt and /sitemap.xml) when sitemap
-        // sources are configured. Entries are collected from all registered
-        // sources and baked into the response at startup.
-        if !seo_sources.is_empty() {
+        // Register SEO routes (/robots.txt and /sitemap.xml) when any SEO
+        // configuration is present or dynamic sources are registered.
+        // Entries are collected from all registered sources and baked into
+        // the response at startup.
+        {
             let seo_cfg = &config.seo;
-            let profile = config.profile.as_deref().unwrap_or("dev");
-            let base_url = seo_cfg.base_url.as_deref();
-            let additional_rules = seo_cfg.robots.additional_rules.clone();
-            let mut sitemap_entries = Vec::new();
-            for source in &seo_sources {
-                let mut entries = source.entries().await;
-                sitemap_entries.append(&mut entries);
+            let has_seo_config = seo_cfg.base_url.is_some()
+                || !seo_cfg.robots.additional_rules.is_empty()
+                || seo_cfg.robots.allow_all.is_some()
+                || seo_cfg.robots.sitemap_url.is_some();
+            if !seo_sources.is_empty() || has_seo_config {
+                let raw_profile = config.profile.as_deref().unwrap_or("dev");
+                // Honour the explicit allow_all override from [seo.robots].
+                let profile = match seo_cfg.robots.allow_all {
+                    Some(true) => "prod",
+                    Some(false) => "dev",
+                    None => raw_profile,
+                };
+                // Trim trailing slash so base_url = "https://example.com/" works.
+                let base_url = seo_cfg.base_url.as_deref().map(|u| u.trim_end_matches('/'));
+                let additional_rules = &seo_cfg.robots.additional_rules;
+                let mut sitemap_entries = Vec::new();
+                for source in &seo_sources {
+                    let mut entries = source.entries().await;
+                    sitemap_entries.append(&mut entries);
+                }
+                // Derive the sitemap URL for robots.txt, preferring an explicit
+                // [seo.robots] sitemap_url when configured.
+                let derived_sitemap_url = base_url.map(|b| format!("{b}/sitemap.xml"));
+                let sitemap_url_for_robots = seo_cfg
+                    .robots
+                    .sitemap_url
+                    .as_deref()
+                    .or(derived_sitemap_url.as_deref());
+                let robots_body =
+                    crate::seo::robots_txt(profile, sitemap_url_for_robots, additional_rules);
+                let sitemap_body = crate::seo::sitemap_xml(&sitemap_entries, base_url);
+                let seo_router = crate::seo::build_seo_router_from_bodies(robots_body, sitemap_body);
+                merge_routers.push(seo_router);
             }
-            let seo_router = crate::seo::build_seo_router_with_entries(
-                profile,
-                base_url,
-                &additional_rules,
-                sitemap_entries,
-            );
-            merge_routers.push(seo_router);
         }
 
         #[cfg(feature = "inbound-mail")]
@@ -3268,9 +3288,14 @@ impl AppBuilder {
 
         // Write robots.txt and sitemap.xml to dist/
         {
-            let profile = config.profile.as_deref().unwrap_or("dev");
             let seo_cfg = &config.seo;
-            let base_url = seo_cfg.base_url.as_deref();
+            let raw_profile = config.profile.as_deref().unwrap_or("dev");
+            let profile = match seo_cfg.robots.allow_all {
+                Some(true) => "prod",
+                Some(false) => "dev",
+                None => raw_profile,
+            };
+            let base_url = seo_cfg.base_url.as_deref().map(|u| u.trim_end_matches('/'));
             let additional_rules = &seo_cfg.robots.additional_rules;
             let mut sitemap_entries = Vec::new();
             for source in &seo_sources {
@@ -3281,15 +3306,23 @@ impl AppBuilder {
             if let Some(bu) = base_url {
                 for meta in &static_metas {
                     if !meta.path.contains('{') {
-                        sitemap_entries
-                            .push(crate::seo::SitemapEntry::new(format!("{bu}{}", meta.path)));
+                        sitemap_entries.push(crate::seo::SitemapEntry::new(
+                            format!("{bu}{}", meta.path),
+                        ));
                     }
                 }
             }
+            let derived_sitemap_url = base_url.map(|b| format!("{b}/sitemap.xml"));
+            let sitemap_url_for_robots = seo_cfg
+                .robots
+                .sitemap_url
+                .as_deref()
+                .or(derived_sitemap_url.as_deref());
             match crate::seo::write_seo_files(
                 &dist_dir,
                 profile,
                 base_url,
+                sitemap_url_for_robots,
                 additional_rules,
                 &sitemap_entries,
             )

@@ -422,7 +422,7 @@ mod endpoint_tests {
     async fn sitemap_xml_endpoint_returns_200() {
         let entries = vec![SitemapEntry::new("https://example.com/")];
         let router: Router =
-            build_seo_router_with_entries("prod", Some("https://example.com"), &[], entries);
+            build_seo_router_with_entries("prod", Some("https://example.com"), &[], &entries);
 
         let response = router
             .oneshot(
@@ -441,7 +441,7 @@ mod endpoint_tests {
     async fn sitemap_xml_endpoint_returns_application_xml() {
         let entries = vec![SitemapEntry::new("https://example.com/")];
         let router: Router =
-            build_seo_router_with_entries("prod", Some("https://example.com"), &[], entries);
+            build_seo_router_with_entries("prod", Some("https://example.com"), &[], &entries);
 
         let response = router
             .oneshot(
@@ -473,7 +473,7 @@ async fn write_seo_files_creates_robots_txt() {
     use autumn_web::seo::write_seo_files;
 
     let dir = tempfile::tempdir().unwrap();
-    write_seo_files(dir.path(), "prod", None, &[], &[])
+    write_seo_files(dir.path(), "prod", None, None, &[], &[])
         .await
         .unwrap();
     let robots_path = dir.path().join("robots.txt");
@@ -495,6 +495,7 @@ async fn write_seo_files_creates_sitemap_xml() {
         dir.path(),
         "prod",
         Some("https://example.com"),
+        None,
         &[],
         &entries,
     )
@@ -519,7 +520,7 @@ async fn write_seo_files_injects_sitemap_url_in_robots() {
     use autumn_web::seo::write_seo_files;
 
     let dir = tempfile::tempdir().unwrap();
-    write_seo_files(dir.path(), "prod", Some("https://example.com"), &[], &[])
+    write_seo_files(dir.path(), "prod", Some("https://example.com"), None, &[], &[])
         .await
         .unwrap();
 

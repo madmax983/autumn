@@ -66,6 +66,7 @@
 //!
 //! The framework defaults: `dev`/`test` → disallow all; `prod` → allow all.
 
+use std::fmt::Write as _;
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
@@ -106,19 +107,22 @@ impl SitemapEntry {
     }
 
     /// Set the last modified date (ISO 8601, e.g. `"2026-01-15"`).
+    #[must_use]
     pub fn lastmod(mut self, lastmod: impl Into<String>) -> Self {
         self.lastmod = Some(lastmod.into());
         self
     }
 
     /// Set the suggested change frequency.
-    pub fn changefreq(mut self, changefreq: SitemapChangefreq) -> Self {
+    #[must_use]
+    pub const fn changefreq(mut self, changefreq: SitemapChangefreq) -> Self {
         self.changefreq = Some(changefreq);
         self
     }
 
     /// Set the priority (clamped to 0.0–1.0).
-    pub fn priority(mut self, priority: f32) -> Self {
+    #[must_use]
+    pub const fn priority(mut self, priority: f32) -> Self {
         self.priority = Some(priority.clamp(0.0, 1.0));
         self
     }
@@ -139,7 +143,8 @@ pub enum SitemapChangefreq {
 }
 
 impl SitemapChangefreq {
-    fn as_str(self) -> &'static str {
+    #[must_use]
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Always => "always",
             Self::Hourly => "hourly",
@@ -207,6 +212,7 @@ pub struct RegisteredSeoConfig(pub crate::config::SeoConfig);
 /// * `profile` — The active profile (`"dev"`, `"test"`, or `"prod"`).
 /// * `sitemap_url` — Optional sitemap URL to inject as a `Sitemap:` directive.
 /// * `additional_rules` — Extra lines to append (e.g. `"Disallow: /admin"`).
+#[must_use]
 pub fn robots_txt(profile: &str, sitemap_url: Option<&str>, additional_rules: &[String]) -> String {
     let mut txt = String::new();
 
@@ -223,7 +229,10 @@ pub fn robots_txt(profile: &str, sitemap_url: Option<&str>, additional_rules: &[
     }
 
     if let Some(url) = sitemap_url {
-        txt.push_str(&format!("\nSitemap: {url}\n"));
+        txt.push('\n');
+        txt.push_str("Sitemap: ");
+        txt.push_str(url);
+        txt.push('\n');
     }
 
     txt
@@ -242,6 +251,7 @@ pub fn robots_txt(profile: &str, sitemap_url: Option<&str>, additional_rules: &[
 /// * `entries` — The sitemap entries to include.
 /// * `base_url` — The site base URL (e.g. `"https://example.com"`), used to
 ///   build sub-sitemap URLs in sitemapindex mode.
+#[must_use]
 pub fn sitemap_xml(entries: &[SitemapEntry], base_url: Option<&str>) -> String {
     const CHUNK_SIZE: usize = 50_000;
 
@@ -253,6 +263,7 @@ pub fn sitemap_xml(entries: &[SitemapEntry], base_url: Option<&str>) -> String {
 }
 
 /// Build a `<urlset>` sitemap.
+#[must_use]
 pub(crate) fn sitemap_urlset_xml(entries: &[SitemapEntry]) -> String {
     let mut xml = String::from(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
@@ -260,15 +271,23 @@ pub(crate) fn sitemap_urlset_xml(entries: &[SitemapEntry]) -> String {
     );
     for entry in entries {
         xml.push_str("\n  <url>");
-        xml.push_str(&format!("\n    <loc>{}</loc>", xml_escape(&entry.loc)));
+        xml.push_str("\n    <loc>");
+        xml.push_str(&xml_escape(&entry.loc));
+        xml.push_str("</loc>");
         if let Some(lastmod) = &entry.lastmod {
-            xml.push_str(&format!("\n    <lastmod>{lastmod}</lastmod>"));
+            xml.push_str("\n    <lastmod>");
+            xml.push_str(lastmod);
+            xml.push_str("</lastmod>");
         }
         if let Some(freq) = entry.changefreq {
-            xml.push_str(&format!("\n    <changefreq>{}</changefreq>", freq.as_str()));
+            xml.push_str("\n    <changefreq>");
+            xml.push_str(freq.as_str());
+            xml.push_str("</changefreq>");
         }
         if let Some(prio) = entry.priority {
-            xml.push_str(&format!("\n    <priority>{prio:.1}</priority>"));
+            xml.push_str("\n    <priority>");
+            write!(xml, "{prio:.1}").ok();
+            xml.push_str("</priority>");
         }
         xml.push_str("\n  </url>");
     }
@@ -285,21 +304,30 @@ fn sitemap_index_xml(entries: &[SitemapEntry], base_url: &str, chunk_size: usize
     );
     for i in 0..chunk_count {
         let idx = i + 1;
-        xml.push_str(&format!(
-            "\n  <sitemap>\n    <loc>{base_url}/sitemap-{idx}.xml</loc>\n  </sitemap>"
-        ));
+        xml.push_str("\n  <sitemap>\n    <loc>");
+        xml.push_str(base_url);
+        xml.push_str("/sitemap-");
+        write!(xml, "{idx}").ok();
+        xml.push_str(".xml</loc>\n  </sitemap>");
     }
     xml.push_str("\n</sitemapindex>");
     xml
 }
 
-/// Escape XML special characters.
+/// Escape XML special characters in a single pass over the input.
 fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
+    let mut escaped = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&apos;"),
+            _ => escaped.push(c),
+        }
+    }
+    escaped
 }
 
 // ── SeoMeta builder ───────────────────────────────────────────────────────────
@@ -346,17 +374,20 @@ pub struct SeoMeta {
 
 impl SeoMeta {
     /// Create a new, empty builder.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Set the page `<title>` (also used as the default OG/Twitter title).
+    #[must_use]
     pub fn title(mut self, title: impl Into<String>) -> Self {
         self.title = Some(title.into());
         self
     }
 
     /// Set the `<meta name="description">` content.
+    #[must_use]
     pub fn description(mut self, description: impl Into<String>) -> Self {
         self.description = Some(description.into());
         self
@@ -365,36 +396,42 @@ impl SeoMeta {
     /// Set the `<link rel="canonical">` URL.
     ///
     /// Also used as the `og:url` fallback.
+    #[must_use]
     pub fn canonical(mut self, url: impl Into<String>) -> Self {
         self.canonical = Some(url.into());
         self
     }
 
     /// Set the `og:image` URL.
+    #[must_use]
     pub fn og_image(mut self, url: impl Into<String>) -> Self {
         self.og_image = Some(url.into());
         self
     }
 
     /// Set the `og:type` value (default: omitted; common: `"website"`, `"article"`).
+    #[must_use]
     pub fn og_type(mut self, og_type: impl Into<String>) -> Self {
         self.og_type = Some(og_type.into());
         self
     }
 
     /// Override the `og:title` (defaults to `title()`).
+    #[must_use]
     pub fn og_title(mut self, title: impl Into<String>) -> Self {
         self.og_title = Some(title.into());
         self
     }
 
     /// Override the `og:description` (defaults to `description()`).
+    #[must_use]
     pub fn og_description(mut self, desc: impl Into<String>) -> Self {
         self.og_description = Some(desc.into());
         self
     }
 
     /// Set the `og:url` (defaults to `canonical()` if not set).
+    #[must_use]
     pub fn og_url(mut self, url: impl Into<String>) -> Self {
         self.og_url = Some(url.into());
         self
@@ -403,30 +440,35 @@ impl SeoMeta {
     /// Set the `twitter:card` type (e.g. `"summary_large_image"`).
     ///
     /// When set, `twitter:title` and `twitter:description` are also emitted.
+    #[must_use]
     pub fn twitter_card(mut self, card_type: impl Into<String>) -> Self {
         self.twitter_card = Some(card_type.into());
         self
     }
 
     /// Override the `twitter:title` (defaults to `title()`).
+    #[must_use]
     pub fn twitter_title(mut self, title: impl Into<String>) -> Self {
         self.twitter_title = Some(title.into());
         self
     }
 
     /// Override the `twitter:description` (defaults to `description()`).
+    #[must_use]
     pub fn twitter_description(mut self, desc: impl Into<String>) -> Self {
         self.twitter_description = Some(desc.into());
         self
     }
 
     /// Set the `twitter:image` URL.
+    #[must_use]
     pub fn twitter_image(mut self, url: impl Into<String>) -> Self {
         self.twitter_image = Some(url.into());
         self
     }
 
     /// Set the `<meta name="robots">` directive (e.g. `"noindex"`, `"nofollow"`).
+    #[must_use]
     pub fn robots(mut self, directive: impl Into<String>) -> Self {
         self.robots_directive = Some(directive.into());
         self
@@ -437,6 +479,7 @@ impl SeoMeta {
     /// Emits only the tags that have been configured. Empty builders produce
     /// no output.
     #[cfg(feature = "maud")]
+    #[must_use]
     pub fn render(&self) -> Markup {
         let og_title = self.og_title.as_ref().or(self.title.as_ref());
         let og_desc = self.og_description.as_ref().or(self.description.as_ref());
@@ -513,51 +556,67 @@ pub fn build_seo_router<S>(
 where
     S: Clone + Send + Sync + 'static,
 {
-    build_seo_router_with_entries(profile, base_url, additional_rules, Vec::new())
+    build_seo_router_with_entries(profile, base_url, additional_rules, &[])
 }
 
 /// Build a SEO router with a pre-populated list of sitemap entries.
+///
+/// # Panics
+///
+/// This function will not panic in practice. The `Response::builder()` calls
+/// inside the route handlers use hard-coded, well-formed `Content-Type` header
+/// values that can never produce an error.
 pub fn build_seo_router_with_entries<S>(
     profile: &str,
     base_url: Option<&str>,
     additional_rules: &[String],
-    entries: Vec<SitemapEntry>,
+    entries: &[SitemapEntry],
 ) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
+    let base_url = base_url.map(|u| u.trim_end_matches('/'));
     let sitemap_url = base_url.map(|b| format!("{b}/sitemap.xml"));
     let robots_body = robots_txt(profile, sitemap_url.as_deref(), additional_rules);
-    let sitemap_body = sitemap_xml(&entries, base_url);
+    let sitemap_body = sitemap_xml(entries, base_url);
+    build_seo_router_from_bodies(robots_body, sitemap_body)
+}
 
+/// Build a SEO router from pre-rendered `robots.txt` and `sitemap.xml` bodies.
+///
+/// Use this when you need full control over how the bodies are generated
+/// (e.g. to honour `[seo.robots] sitemap_url` or `allow_all` overrides).
+///
+/// # Panics
+///
+/// In practice this function cannot panic. The hard-coded `Content-Type`
+/// header values are always valid.
+pub fn build_seo_router_from_bodies<S>(robots_body: String, sitemap_body: String) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
     Router::<S>::new()
         .route(
             "/robots.txt",
-            get({
-                let robots_body = robots_body.clone();
-                move || {
-                    let body = robots_body.clone();
-                    async move {
-                        Response::builder()
-                            .header("Content-Type", "text/plain; charset=utf-8")
-                            .body(Body::from(body))
-                            .unwrap()
-                    }
+            get(move || {
+                let body = robots_body.clone();
+                async move {
+                    Response::builder()
+                        .header("Content-Type", "text/plain; charset=utf-8")
+                        .body(Body::from(body))
+                        .unwrap()
                 }
             }),
         )
         .route(
             "/sitemap.xml",
-            get({
-                let sitemap_body = sitemap_body.clone();
-                move || {
-                    let body = sitemap_body.clone();
-                    async move {
-                        Response::builder()
-                            .header("Content-Type", "application/xml; charset=utf-8")
-                            .body(Body::from(body))
-                            .unwrap()
-                    }
+            get(move || {
+                let body = sitemap_body.clone();
+                async move {
+                    Response::builder()
+                        .header("Content-Type", "application/xml; charset=utf-8")
+                        .body(Body::from(body))
+                        .unwrap()
                 }
             }),
         )
@@ -584,11 +643,14 @@ pub async fn write_seo_files(
     dist_dir: &Path,
     profile: &str,
     base_url: Option<&str>,
+    sitemap_url_override: Option<&str>,
     additional_rules: &[String],
     entries: &[SitemapEntry],
 ) -> Result<(), std::io::Error> {
-    let sitemap_url = base_url.map(|b| format!("{b}/sitemap.xml"));
-    let robots = robots_txt(profile, sitemap_url.as_deref(), additional_rules);
+    let base_url = base_url.map(|u| u.trim_end_matches('/'));
+    let derived_sitemap_url = base_url.map(|b| format!("{b}/sitemap.xml"));
+    let sitemap_url = sitemap_url_override.or(derived_sitemap_url.as_deref());
+    let robots = robots_txt(profile, sitemap_url, additional_rules);
     let sitemap = sitemap_xml(entries, base_url);
 
     tokio::fs::write(dist_dir.join("robots.txt"), robots).await?;
