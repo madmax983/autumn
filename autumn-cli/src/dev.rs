@@ -221,7 +221,35 @@ pub fn run(package: Option<&str>, show_config: bool) {
 
     let normalized_dirs = sanitize_custom_watch_dirs(load_dev_config(Path::new(AUTUMN_TOML)));
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let custom_watch_dirs = resolve_custom_watch_dirs(&normalized_dirs, &cwd);
+    let mut custom_watch_dirs = resolve_custom_watch_dirs(&normalized_dirs, &cwd);
+
+    // Dynamically discover all top-level directories except target and hidden directories
+    // so we can watch them and correctly classify their changes.
+    if let Ok(entries) = std::fs::read_dir(&cwd) {
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if name.starts_with('.') || name == "target" {
+                continue;
+            }
+            // Avoid duplicates if already explicitly configured
+            if !custom_watch_dirs
+                .iter()
+                .any(|d| d.relative.to_string_lossy() == name)
+            {
+                let absolute = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+                custom_watch_dirs.push(CustomWatchDir {
+                    relative: PathBuf::from(name),
+                    absolute,
+                });
+            }
+        }
+    }
 
     // Set up file watcher
     let (tx, rx) = mpsc::channel();
@@ -230,23 +258,15 @@ pub fn run(package: Option<&str>, show_config: bool) {
 
     let watcher = debouncer.watcher();
 
-    // Watch the default directories.
-    for dir in DEFAULT_WATCH_DIRS {
-        let path = Path::new(dir);
-        if path.exists()
-            && let Err(e) = watcher.watch(path, notify::RecursiveMode::Recursive)
-        {
-            eprintln!("  Warning: could not watch {dir}/: {e}");
-        }
-    }
-
-    // Watch any additional directories from `[dev] watch_dirs` in autumn.toml.
     for dir in &custom_watch_dirs {
         let display = dir.relative.display();
         if let Err(e) = watcher.watch(&dir.relative, notify::RecursiveMode::Recursive) {
             eprintln!("  Warning: could not watch {display}/: {e}");
         } else {
-            eprintln!("  Watching custom directory: {display}/");
+            // Only print for explicitly configured custom dirs, otherwise it's too noisy
+            if normalized_dirs.contains(&display.to_string()) {
+                eprintln!("  Watching custom directory: {display}/");
+            }
         }
     }
 
