@@ -1426,7 +1426,9 @@ impl JobClient {
             )));
         }
 
-        let res = self.enqueue_durable_inner(id, name, payload, max_attempts, backoff_ms).await;
+        let res = self
+            .enqueue_durable_inner(id, name, payload, max_attempts, backoff_ms)
+            .await;
         breaker.after_call(res.is_ok());
         res
     }
@@ -7896,9 +7898,12 @@ mod tests {
             half_open_trial_count: 2,
         };
         let breaker = crate::circuit_breaker::global_registry().get_or_create("job_queue", policy);
-        
+
         // Ensure it is closed initially
-        assert_eq!(breaker.state(), crate::circuit_breaker::CircuitState::Closed);
+        assert_eq!(
+            breaker.state(),
+            crate::circuit_breaker::CircuitState::Closed
+        );
 
         let client = JobClient {
             local_sender: None,
@@ -7915,29 +7920,37 @@ mod tests {
         };
 
         for _ in 0..3 {
-            let res = client.enqueue_durable(
-                "job_id".to_string(),
-                "job_name",
-                serde_json::Value::Null,
-                1,
-                1000,
-            ).await;
+            let res = client
+                .enqueue_durable(
+                    "job_id".to_string(),
+                    "job_name",
+                    serde_json::Value::Null,
+                    1,
+                    1000,
+                )
+                .await;
             assert!(res.is_err());
         }
 
         // Breaker should be Open now!
         assert_eq!(breaker.state(), crate::circuit_breaker::CircuitState::Open);
 
-        let res = client.enqueue_durable(
-            "job_id".to_string(),
-            "job_name",
-            serde_json::Value::Null,
-            1,
-            1000,
-        ).await;
-        
+        let res = client
+            .enqueue_durable(
+                "job_id".to_string(),
+                "job_name",
+                serde_json::Value::Null,
+                1,
+                1000,
+            )
+            .await;
+
         assert!(res.is_err());
         let err_str = res.err().unwrap().to_string();
-        assert!(err_str.contains("circuit breaker") || err_str.contains("open") || err_str.contains("Open"));
+        assert!(
+            err_str.contains("circuit breaker")
+                || err_str.contains("open")
+                || err_str.contains("Open")
+        );
     }
 }

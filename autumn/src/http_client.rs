@@ -1767,7 +1767,7 @@ mod tests {
         rc.circuit_breaker.defaults.failure_ratio_threshold = Some(0.5);
         rc.circuit_breaker.defaults.minimum_sample_count = Some(3);
         rc.circuit_breaker.defaults.open_duration_secs = Some(10);
-        
+
         let client = Client::new();
         // Attach the resilience config
         let client = Client {
@@ -1787,7 +1787,7 @@ mod tests {
         // Now the breaker for 127.0.0.1 should be OPEN, and next request should fail fast
         let res = client.get(&url).send().await;
         assert!(matches!(res, Err(ClientError::CircuitBreakerOpen)));
-        
+
         // Assert that the server was only hit 3 times
         assert_eq!(hit.load(SeqOrdering::SeqCst), 3);
     }

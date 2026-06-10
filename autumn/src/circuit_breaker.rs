@@ -1,4 +1,13 @@
-#![allow(clippy::missing_panics_doc, clippy::missing_errors_doc, clippy::must_use_candidate, clippy::new_without_default, clippy::missing_const_for_fn, clippy::items_after_statements, clippy::cast_precision_loss, clippy::collapsible_if)]
+#![allow(
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    clippy::must_use_candidate,
+    clippy::new_without_default,
+    clippy::missing_const_for_fn,
+    clippy::items_after_statements,
+    clippy::cast_precision_loss,
+    clippy::collapsible_if
+)]
 
 use std::collections::HashMap;
 use std::future::Future;

@@ -1017,7 +1017,8 @@ impl MailTransport for SmtpTransport {
     ) -> Pin<Box<dyn Future<Output = Result<(), MailError>> + Send + 'a>> {
         Box::pin(async move {
             let policy = crate::circuit_breaker::CircuitBreakerPolicy::default();
-            let breaker = crate::circuit_breaker::global_registry().get_or_create("smtp_mailer", policy);
+            let breaker =
+                crate::circuit_breaker::global_registry().get_or_create("smtp_mailer", policy);
 
             if breaker.before_call().is_err() {
                 return Err(MailError::RuntimeUnavailable(
@@ -2684,10 +2685,14 @@ mod tests {
             open_duration: std::time::Duration::from_secs(60),
             half_open_trial_count: 2,
         };
-        let breaker = crate::circuit_breaker::global_registry().get_or_create("smtp_mailer", policy);
-        
+        let breaker =
+            crate::circuit_breaker::global_registry().get_or_create("smtp_mailer", policy);
+
         // Ensure it is closed initially
-        assert_eq!(breaker.state(), crate::circuit_breaker::CircuitState::Closed);
+        assert_eq!(
+            breaker.state(),
+            crate::circuit_breaker::CircuitState::Closed
+        );
 
         // Build an SMTP transport pointing to a bogus localhost port so it fails
         let config = SmtpConfig {
@@ -2719,7 +2724,12 @@ mod tests {
         let res = transport.send(mail.clone()).await;
         assert!(res.is_err());
         let err_str = res.err().unwrap().to_string();
-        assert!(err_str.contains("circuit breaker") || err_str.contains("open") || err_str.contains("Open") || err_str.contains("runtime unavailable"));
+        assert!(
+            err_str.contains("circuit breaker")
+                || err_str.contains("open")
+                || err_str.contains("Open")
+                || err_str.contains("runtime unavailable")
+        );
 
         crate::circuit_breaker::global_registry().clear();
     }
