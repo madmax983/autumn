@@ -622,6 +622,62 @@ where
         )
 }
 
+// ── App-level SEO helpers (shared by run() and run_build_mode()) ──────────────
+
+/// Return `true` when the `[seo]` config section contains any non-default value.
+pub(crate) fn has_seo_config(seo_cfg: &crate::config::SeoConfig) -> bool {
+    seo_cfg.base_url.is_some()
+        || !seo_cfg.robots.additional_rules.is_empty()
+        || seo_cfg.robots.allow_all.is_some()
+        || seo_cfg.robots.sitemap_url.is_some()
+}
+
+/// Resolve the effective robots.txt profile from `raw_profile` and the
+/// optional `allow_all` override in `[seo.robots]`.
+pub(crate) fn effective_seo_profile<'a>(raw_profile: &'a str, allow_all: Option<bool>) -> &'a str {
+    match allow_all {
+        Some(true) => "prod",
+        Some(false) => "dev",
+        None => raw_profile,
+    }
+}
+
+/// Collect sitemap entries from dynamic sources and static path hints, then
+/// build the `robots.txt` and `sitemap.xml` bodies.
+///
+/// Called by both `AppBuilder::run` (server mode) and
+/// `AppBuilder::run_build_mode` (static build mode).
+pub(crate) async fn assemble_seo_bodies(
+    profile: &str,
+    base_url: Option<&str>,
+    sitemap_url_override: Option<&str>,
+    additional_rules: &[String],
+    sources: &[Arc<dyn SitemapSource>],
+    static_paths: &[&str],
+) -> (String, String) {
+    let base_url = base_url.map(|u| u.trim_end_matches('/'));
+
+    let mut sitemap_entries = Vec::new();
+    for source in sources {
+        let mut entries = source.entries().await;
+        sitemap_entries.append(&mut entries);
+    }
+
+    if let Some(bu) = base_url {
+        for path in static_paths {
+            if !path.contains('{') {
+                sitemap_entries.push(SitemapEntry::new(format!("{bu}{path}")));
+            }
+        }
+    }
+
+    let derived_sitemap_url = base_url.map(|b| format!("{b}/sitemap.xml"));
+    let sitemap_url = sitemap_url_override.or(derived_sitemap_url.as_deref());
+    let robots_body = robots_txt(profile, sitemap_url, additional_rules);
+    let sitemap_body = sitemap_xml(&sitemap_entries, base_url);
+    (robots_body, sitemap_body)
+}
+
 // ── Static build helpers ──────────────────────────────────────────────────────
 
 /// Write `robots.txt` and `sitemap.xml` to `dist_dir` as part of `autumn build`.
@@ -698,5 +754,163 @@ mod tests {
         let txt = robots_txt("staging", None, &[]);
         assert!(txt.contains("Disallow: /"));
         assert!(!txt.contains("Allow: /"));
+    }
+
+    #[test]
+    fn has_seo_config_false_when_empty() {
+        let cfg = crate::config::SeoConfig::default();
+        assert!(!has_seo_config(&cfg));
+    }
+
+    #[test]
+    fn has_seo_config_true_when_base_url_set() {
+        let mut cfg = crate::config::SeoConfig::default();
+        cfg.base_url = Some("https://example.com".to_string());
+        assert!(has_seo_config(&cfg));
+    }
+
+    #[test]
+    fn has_seo_config_true_when_allow_all_set() {
+        let mut cfg = crate::config::SeoConfig::default();
+        cfg.robots.allow_all = Some(true);
+        assert!(has_seo_config(&cfg));
+    }
+
+    #[test]
+    fn has_seo_config_true_when_sitemap_url_set() {
+        let mut cfg = crate::config::SeoConfig::default();
+        cfg.robots.sitemap_url = Some("https://example.com/sitemap.xml".to_string());
+        assert!(has_seo_config(&cfg));
+    }
+
+    #[test]
+    fn has_seo_config_true_when_additional_rules_set() {
+        let mut cfg = crate::config::SeoConfig::default();
+        cfg.robots.additional_rules = vec!["Disallow: /admin".to_string()];
+        assert!(has_seo_config(&cfg));
+    }
+
+    #[test]
+    fn effective_seo_profile_respects_allow_all_true() {
+        assert_eq!(effective_seo_profile("dev", Some(true)), "prod");
+    }
+
+    #[test]
+    fn effective_seo_profile_respects_allow_all_false() {
+        assert_eq!(effective_seo_profile("prod", Some(false)), "dev");
+    }
+
+    #[test]
+    fn effective_seo_profile_falls_back_to_raw_when_none() {
+        assert_eq!(effective_seo_profile("staging", None), "staging");
+    }
+
+    struct SimpleSitemapSource {
+        entries: Vec<SitemapEntry>,
+    }
+
+    impl SitemapSource for SimpleSitemapSource {
+        fn entries(
+            &self,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Vec<SitemapEntry>> + Send + '_>,
+        > {
+            let entries = self.entries.clone();
+            Box::pin(async move { entries })
+        }
+    }
+
+    #[tokio::test]
+    async fn assemble_seo_bodies_empty() {
+        let (robots, sitemap) =
+            assemble_seo_bodies("prod", None, None, &[], &[], &[]).await;
+        assert!(robots.contains("Allow: /"));
+        assert!(sitemap.contains("<urlset"));
+    }
+
+    #[tokio::test]
+    async fn assemble_seo_bodies_collects_source_entries() {
+        let source = Arc::new(SimpleSitemapSource {
+            entries: vec![SitemapEntry::new("https://example.com/post/1")],
+        }) as Arc<dyn SitemapSource>;
+        let (_, sitemap) = assemble_seo_bodies(
+            "prod",
+            Some("https://example.com"),
+            None,
+            &[],
+            &[source],
+            &[],
+        )
+        .await;
+        assert!(
+            sitemap.contains("https://example.com/post/1"),
+            "should include source entry; got:\n{sitemap}"
+        );
+    }
+
+    #[tokio::test]
+    async fn assemble_seo_bodies_includes_static_paths() {
+        let (_, sitemap) = assemble_seo_bodies(
+            "prod",
+            Some("https://example.com"),
+            None,
+            &[],
+            &[],
+            &["/about", "/contact"],
+        )
+        .await;
+        assert!(sitemap.contains("https://example.com/about"));
+        assert!(sitemap.contains("https://example.com/contact"));
+    }
+
+    #[tokio::test]
+    async fn assemble_seo_bodies_skips_dynamic_paths() {
+        let (_, sitemap) = assemble_seo_bodies(
+            "prod",
+            Some("https://example.com"),
+            None,
+            &[],
+            &[],
+            &["/posts/{slug}"],
+        )
+        .await;
+        assert!(
+            !sitemap.contains("/posts/"),
+            "should skip paths with params; got:\n{sitemap}"
+        );
+    }
+
+    #[tokio::test]
+    async fn assemble_seo_bodies_uses_sitemap_url_override() {
+        let (robots, _) = assemble_seo_bodies(
+            "prod",
+            Some("https://example.com"),
+            Some("https://cdn.example.com/sitemap.xml"),
+            &[],
+            &[],
+            &[],
+        )
+        .await;
+        assert!(
+            robots.contains("Sitemap: https://cdn.example.com/sitemap.xml"),
+            "should use override url; got:\n{robots}"
+        );
+    }
+
+    #[tokio::test]
+    async fn assemble_seo_bodies_trims_trailing_slash() {
+        let (_, sitemap) = assemble_seo_bodies(
+            "prod",
+            Some("https://example.com/"),
+            None,
+            &[],
+            &[],
+            &["/about"],
+        )
+        .await;
+        assert!(
+            sitemap.contains("https://example.com/about"),
+            "base_url trailing slash should be trimmed; got:\n{sitemap}"
+        );
     }
 }

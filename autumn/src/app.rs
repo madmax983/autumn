@@ -2557,54 +2557,24 @@ impl AppBuilder {
 
         // Register SEO routes (/robots.txt and /sitemap.xml) when any SEO
         // configuration is present or dynamic sources are registered.
-        // Entries are collected from all registered sources and baked into
-        // the response at startup.
-        {
+        if !seo_sources.is_empty() || crate::seo::has_seo_config(&config.seo) {
             let seo_cfg = &config.seo;
-            let has_seo_config = seo_cfg.base_url.is_some()
-                || !seo_cfg.robots.additional_rules.is_empty()
-                || seo_cfg.robots.allow_all.is_some()
-                || seo_cfg.robots.sitemap_url.is_some();
-            if !seo_sources.is_empty() || has_seo_config {
-                let raw_profile = config.profile.as_deref().unwrap_or("dev");
-                // Honour the explicit allow_all override from [seo.robots].
-                let profile = match seo_cfg.robots.allow_all {
-                    Some(true) => "prod",
-                    Some(false) => "dev",
-                    None => raw_profile,
-                };
-                // Trim trailing slash so base_url = "https://example.com/" works.
-                let base_url = seo_cfg.base_url.as_deref().map(|u| u.trim_end_matches('/'));
-                let additional_rules = &seo_cfg.robots.additional_rules;
-                let mut sitemap_entries = Vec::new();
-                for source in &seo_sources {
-                    let mut entries = source.entries().await;
-                    sitemap_entries.append(&mut entries);
-                }
-                // Auto-include simple static routes (no path params) in the sitemap.
-                if let Some(bu) = base_url {
-                    for meta in &static_metas {
-                        if !meta.path.contains('{') {
-                            sitemap_entries
-                                .push(crate::seo::SitemapEntry::new(format!("{bu}{}", meta.path)));
-                        }
-                    }
-                }
-                // Derive the sitemap URL for robots.txt, preferring an explicit
-                // [seo.robots] sitemap_url when configured.
-                let derived_sitemap_url = base_url.map(|b| format!("{b}/sitemap.xml"));
-                let sitemap_url_for_robots = seo_cfg
-                    .robots
-                    .sitemap_url
-                    .as_deref()
-                    .or(derived_sitemap_url.as_deref());
-                let robots_body =
-                    crate::seo::robots_txt(profile, sitemap_url_for_robots, additional_rules);
-                let sitemap_body = crate::seo::sitemap_xml(&sitemap_entries, base_url);
-                let seo_router =
-                    crate::seo::build_seo_router_from_bodies(robots_body, sitemap_body);
-                merge_routers.push(seo_router);
-            }
+            let raw_profile = config.profile.as_deref().unwrap_or("dev");
+            let profile =
+                crate::seo::effective_seo_profile(raw_profile, seo_cfg.robots.allow_all);
+            let static_paths: Vec<&str> = static_metas.iter().map(|m| m.path).collect();
+            let (robots_body, sitemap_body) = crate::seo::assemble_seo_bodies(
+                profile,
+                seo_cfg.base_url.as_deref(),
+                seo_cfg.robots.sitemap_url.as_deref(),
+                &seo_cfg.robots.additional_rules,
+                &seo_sources,
+                &static_paths,
+            )
+            .await;
+            let seo_router =
+                crate::seo::build_seo_router_from_bodies(robots_body, sitemap_body);
+            merge_routers.push(seo_router);
         }
 
         #[cfg(feature = "inbound-mail")]
@@ -3299,74 +3269,49 @@ impl AppBuilder {
         // Write robots.txt and sitemap.xml to dist/ — only when SEO is explicitly
         // configured or dynamic sources are registered, and never overwrite files
         // already produced by a custom #[static_get("/robots.txt")] route.
-        {
+        if !seo_sources.is_empty() || crate::seo::has_seo_config(&config.seo) {
             let seo_cfg = &config.seo;
-            let has_seo_config = seo_cfg.base_url.is_some()
-                || !seo_cfg.robots.additional_rules.is_empty()
-                || seo_cfg.robots.allow_all.is_some()
-                || seo_cfg.robots.sitemap_url.is_some();
-            if !seo_sources.is_empty() || has_seo_config {
-                let raw_profile = config.profile.as_deref().unwrap_or("dev");
-                let profile = match seo_cfg.robots.allow_all {
-                    Some(true) => "prod",
-                    Some(false) => "dev",
-                    None => raw_profile,
-                };
-                let base_url = seo_cfg.base_url.as_deref().map(|u| u.trim_end_matches('/'));
-                let additional_rules = &seo_cfg.robots.additional_rules;
-                let mut sitemap_entries = Vec::new();
-                for source in &seo_sources {
-                    let mut entries = source.entries().await;
-                    sitemap_entries.append(&mut entries);
+            let raw_profile = config.profile.as_deref().unwrap_or("dev");
+            let profile =
+                crate::seo::effective_seo_profile(raw_profile, seo_cfg.robots.allow_all);
+            let static_paths: Vec<&str> = static_metas.iter().map(|m| m.path).collect();
+            let (robots_body, sitemap_body) = crate::seo::assemble_seo_bodies(
+                profile,
+                seo_cfg.base_url.as_deref(),
+                seo_cfg.robots.sitemap_url.as_deref(),
+                &seo_cfg.robots.additional_rules,
+                &seo_sources,
+                &static_paths,
+            )
+            .await;
+            // Write each file only if it wasn't already produced by a
+            // custom #[static_get] route.
+            let robots_path = dist_dir.join("robots.txt");
+            let sitemap_path = dist_dir.join("sitemap.xml");
+            if robots_path.exists() {
+                eprintln!(
+                    "  \u{2713} SEO: robots.txt already present (custom static route), skipping"
+                );
+            } else {
+                match tokio::fs::write(&robots_path, robots_body).await {
+                    Ok(()) => eprintln!(
+                        "  \u{2713} SEO: robots.txt written \u{2192} {}",
+                        robots_path.display()
+                    ),
+                    Err(e) => eprintln!("  \u{26A0} Failed to write robots.txt: {e}"),
                 }
-                // Build entries from static route metas (auto-include static pages)
-                if let Some(bu) = base_url {
-                    for meta in &static_metas {
-                        if !meta.path.contains('{') {
-                            sitemap_entries
-                                .push(crate::seo::SitemapEntry::new(format!("{bu}{}", meta.path)));
-                        }
-                    }
-                }
-                let derived_sitemap_url = base_url.map(|b| format!("{b}/sitemap.xml"));
-                let sitemap_url_for_robots = seo_cfg
-                    .robots
-                    .sitemap_url
-                    .as_deref()
-                    .or(derived_sitemap_url.as_deref());
-                // Write each file only if it wasn't already produced by a
-                // custom #[static_get] route.
-                let robots_path = dist_dir.join("robots.txt");
-                let sitemap_path = dist_dir.join("sitemap.xml");
-                if robots_path.exists() {
-                    eprintln!(
-                        "  \u{2713} SEO: robots.txt already present (custom static route), skipping"
-                    );
-                } else {
-                    let derived_sitemap_url2 = base_url.map(|b| format!("{b}/sitemap.xml"));
-                    let surl = sitemap_url_for_robots.or(derived_sitemap_url2.as_deref());
-                    let content = crate::seo::robots_txt(profile, surl, additional_rules);
-                    match tokio::fs::write(&robots_path, content).await {
-                        Ok(()) => eprintln!(
-                            "  \u{2713} SEO: robots.txt written \u{2192} {}",
-                            robots_path.display()
-                        ),
-                        Err(e) => eprintln!("  \u{26A0} Failed to write robots.txt: {e}"),
-                    }
-                }
-                if sitemap_path.exists() {
-                    eprintln!(
-                        "  \u{2713} SEO: sitemap.xml already present (custom static route), skipping"
-                    );
-                } else {
-                    let content = crate::seo::sitemap_xml(&sitemap_entries, base_url);
-                    match tokio::fs::write(&sitemap_path, content).await {
-                        Ok(()) => eprintln!(
-                            "  \u{2713} SEO: sitemap.xml written \u{2192} {}",
-                            sitemap_path.display()
-                        ),
-                        Err(e) => eprintln!("  \u{26A0} Failed to write sitemap.xml: {e}"),
-                    }
+            }
+            if sitemap_path.exists() {
+                eprintln!(
+                    "  \u{2713} SEO: sitemap.xml already present (custom static route), skipping"
+                );
+            } else {
+                match tokio::fs::write(&sitemap_path, sitemap_body).await {
+                    Ok(()) => eprintln!(
+                        "  \u{2713} SEO: sitemap.xml written \u{2192} {}",
+                        sitemap_path.display()
+                    ),
+                    Err(e) => eprintln!("  \u{26A0} Failed to write sitemap.xml: {e}"),
                 }
             }
         }

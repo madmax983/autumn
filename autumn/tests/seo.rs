@@ -537,3 +537,187 @@ async fn write_seo_files_injects_sitemap_url_in_robots() {
         "robots.txt should auto-inject sitemap URL; got:\n{robots}"
     );
 }
+
+#[tokio::test]
+async fn write_seo_files_respects_sitemap_url_override() {
+    use autumn_web::seo::write_seo_files;
+
+    let dir = tempfile::tempdir().unwrap();
+    write_seo_files(
+        dir.path(),
+        "prod",
+        Some("https://example.com"),
+        Some("https://cdn.example.com/sitemap.xml"),
+        &[],
+        &[],
+    )
+    .await
+    .unwrap();
+
+    let robots = std::fs::read_to_string(dir.path().join("robots.txt")).unwrap();
+    assert!(
+        robots.contains("Sitemap: https://cdn.example.com/sitemap.xml"),
+        "should use sitemap_url_override; got:\n{robots}"
+    );
+    assert!(
+        !robots.contains("Sitemap: https://example.com/sitemap.xml"),
+        "should not use derived sitemap url; got:\n{robots}"
+    );
+}
+
+// ── SitemapChangefreq coverage ────────────────────────────────────────────────
+
+#[test]
+fn sitemap_changefreq_all_variants_render() {
+    let variants = [
+        (SitemapChangefreq::Always, "always"),
+        (SitemapChangefreq::Hourly, "hourly"),
+        (SitemapChangefreq::Daily, "daily"),
+        (SitemapChangefreq::Weekly, "weekly"),
+        (SitemapChangefreq::Monthly, "monthly"),
+        (SitemapChangefreq::Yearly, "yearly"),
+        (SitemapChangefreq::Never, "never"),
+    ];
+    for (freq, expected) in variants {
+        let entries = vec![SitemapEntry::new("https://example.com/").changefreq(freq)];
+        let xml = sitemap_xml(&entries, None);
+        assert!(
+            xml.contains(&format!("<changefreq>{expected}</changefreq>")),
+            "should render {expected}; got:\n{xml}"
+        );
+    }
+}
+
+// ── build_seo_router_from_bodies endpoint tests ───────────────────────────────
+
+mod router_from_bodies_tests {
+    use autumn_web::seo::build_seo_router_from_bodies;
+    use axum::Router;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn serves_robots_body() {
+        let router: Router =
+            build_seo_router_from_bodies("User-agent: *\nAllow: /\n".to_string(), String::new());
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/robots.txt")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn serves_sitemap_body() {
+        let router: Router = build_seo_router_from_bodies(
+            String::new(),
+            "<?xml version=\"1.0\"?><urlset/>".to_string(),
+        );
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/sitemap.xml")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+}
+
+// ── SeoMeta additional field coverage ────────────────────────────────────────
+
+#[cfg(feature = "maud")]
+mod meta_extra_tests {
+    use super::*;
+
+    #[test]
+    fn seometa_og_type_renders() {
+        let meta = SeoMeta::new().og_type("article");
+        let rendered = meta.render().into_string();
+        assert!(
+            rendered.contains(r#"property="og:type""#),
+            "should have og:type; got:\n{rendered}"
+        );
+        assert!(rendered.contains("article"), "should have og:type value");
+    }
+
+    #[test]
+    fn seometa_og_description_overrides_description() {
+        let meta = SeoMeta::new()
+            .description("Generic desc")
+            .og_description("OG specific desc");
+        let rendered = meta.render().into_string();
+        assert!(
+            rendered.contains("OG specific desc"),
+            "og_description should override description for OG; got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn seometa_og_url_explicit_override() {
+        let meta = SeoMeta::new().og_url("https://example.com/canonical-og");
+        let rendered = meta.render().into_string();
+        assert!(
+            rendered.contains(r#"property="og:url""#),
+            "should have og:url; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("https://example.com/canonical-og"),
+            "should have explicit og:url; got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn seometa_twitter_image_renders() {
+        let meta = SeoMeta::new()
+            .twitter_card("summary_large_image")
+            .twitter_image("https://example.com/og.jpg");
+        let rendered = meta.render().into_string();
+        assert!(
+            rendered.contains(r#"name="twitter:image""#),
+            "should have twitter:image; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("https://example.com/og.jpg"),
+            "should have twitter:image url; got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn seometa_twitter_title_override() {
+        let meta = SeoMeta::new()
+            .title("Generic Title")
+            .twitter_card("summary")
+            .twitter_title("Twitter-specific Title");
+        let rendered = meta.render().into_string();
+        assert!(
+            rendered.contains("Twitter-specific Title"),
+            "twitter_title should override for twitter:title; got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn seometa_twitter_description_override() {
+        let meta = SeoMeta::new()
+            .description("Generic desc")
+            .twitter_card("summary")
+            .twitter_description("Twitter-specific desc");
+        let rendered = meta.render().into_string();
+        assert!(
+            rendered.contains("Twitter-specific desc"),
+            "twitter_description should override for twitter:description; got:\n{rendered}"
+        );
+    }
+}
