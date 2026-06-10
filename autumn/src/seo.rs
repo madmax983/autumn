@@ -625,7 +625,7 @@ where
 // ── App-level SEO helpers (shared by run() and run_build_mode()) ──────────────
 
 /// Return `true` when the `[seo]` config section contains any non-default value.
-pub(crate) fn has_seo_config(seo_cfg: &crate::config::SeoConfig) -> bool {
+pub(crate) const fn has_seo_config(seo_cfg: &crate::config::SeoConfig) -> bool {
     seo_cfg.base_url.is_some()
         || !seo_cfg.robots.additional_rules.is_empty()
         || seo_cfg.robots.allow_all.is_some()
@@ -634,7 +634,7 @@ pub(crate) fn has_seo_config(seo_cfg: &crate::config::SeoConfig) -> bool {
 
 /// Resolve the effective robots.txt profile from `raw_profile` and the
 /// optional `allow_all` override in `[seo.robots]`.
-pub(crate) fn effective_seo_profile<'a>(raw_profile: &'a str, allow_all: Option<bool>) -> &'a str {
+pub(crate) const fn effective_seo_profile(raw_profile: &str, allow_all: Option<bool>) -> &str {
     match allow_all {
         Some(true) => "prod",
         Some(false) => "dev",
@@ -764,29 +764,46 @@ mod tests {
 
     #[test]
     fn has_seo_config_true_when_base_url_set() {
-        let mut cfg = crate::config::SeoConfig::default();
-        cfg.base_url = Some("https://example.com".to_string());
+        let cfg = crate::config::SeoConfig {
+            base_url: Some("https://example.com".to_string()),
+            ..Default::default()
+        };
         assert!(has_seo_config(&cfg));
     }
 
     #[test]
     fn has_seo_config_true_when_allow_all_set() {
-        let mut cfg = crate::config::SeoConfig::default();
-        cfg.robots.allow_all = Some(true);
+        let cfg = crate::config::SeoConfig {
+            robots: crate::config::RobotsConfig {
+                allow_all: Some(true),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
         assert!(has_seo_config(&cfg));
     }
 
     #[test]
     fn has_seo_config_true_when_sitemap_url_set() {
-        let mut cfg = crate::config::SeoConfig::default();
-        cfg.robots.sitemap_url = Some("https://example.com/sitemap.xml".to_string());
+        let cfg = crate::config::SeoConfig {
+            robots: crate::config::RobotsConfig {
+                sitemap_url: Some("https://example.com/sitemap.xml".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
         assert!(has_seo_config(&cfg));
     }
 
     #[test]
     fn has_seo_config_true_when_additional_rules_set() {
-        let mut cfg = crate::config::SeoConfig::default();
-        cfg.robots.additional_rules = vec!["Disallow: /admin".to_string()];
+        let cfg = crate::config::SeoConfig {
+            robots: crate::config::RobotsConfig {
+                additional_rules: vec!["Disallow: /admin".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
         assert!(has_seo_config(&cfg));
     }
 
