@@ -502,6 +502,70 @@ pub fn check_sensitive_surfaces(
     }
 }
 
+/// Check that sensitive-named routes actually have security middleware applied.
+///
+/// Iterates over sensitive routes attributed to this plugin and verifies that
+/// at least one middleware contains "secured" or "authorize".
+///
+/// Returns `Pass` when no sensitive routes are found, or all have middleware.
+#[must_use]
+pub fn check_route_authorization_middleware(
+    plugin_name: &str,
+    routes: &[RouteInfo],
+) -> CheckResult {
+    let sensitive_plugin_routes: Vec<&RouteInfo> = routes
+        .iter()
+        .filter(|r| {
+            matches!(&r.source, RouteSource::Plugin(n) if n == plugin_name)
+                && is_sensitive_path(&r.path)
+        })
+        .collect();
+
+    if sensitive_plugin_routes.is_empty() {
+        return CheckResult {
+            name: "route-authorization-middleware".to_owned(),
+            status: CheckStatus::Pass,
+            message: "No sensitive-named routes detected".to_owned(),
+            diagnostics: vec![],
+        };
+    }
+
+    let mut diagnostics = Vec::new();
+
+    for route in &sensitive_plugin_routes {
+        let has_auth = route.middleware.iter().any(|m| m.contains("secured") || m.contains("authorize"));
+
+        if !has_auth {
+            diagnostics.push(format!(
+                "{} {} \u{2014} missing auth middleware. Apply #[secured] or #[authorize]",
+                route.method, route.path
+            ));
+        }
+    }
+
+    if diagnostics.is_empty() {
+        CheckResult {
+            name: "route-authorization-middleware".to_owned(),
+            status: CheckStatus::Pass,
+            message: format!(
+                "{} sensitive route(s) have auth middleware",
+                sensitive_plugin_routes.len()
+            ),
+            diagnostics: vec![],
+        }
+    } else {
+        CheckResult {
+            name: "route-authorization-middleware".to_owned(),
+            status: CheckStatus::Fail,
+            message: format!(
+                "{} sensitive-named route(s) lack auth middleware",
+                diagnostics.len()
+            ),
+            diagnostics,
+        }
+    }
+}
+
 /// Check that the plugin's routes are not duplicated, which would indicate the
 /// plugin was registered more than once and the framework's dedup logic was
 /// bypassed.
@@ -595,6 +659,11 @@ pub fn run_conformance(config: &ConformanceConfig, routes: &[RouteInfo]) -> Conf
         &config.plugin_name,
         routes,
         &config.sensitive_routes,
+    ));
+
+    checks.push(check_route_authorization_middleware(
+        &config.plugin_name,
+        routes,
     ));
 
     checks.push(check_duplicate_registration(&config.plugin_name, routes));
@@ -933,6 +1002,39 @@ mod tests {
     }
 
     #[test]
+    fn auth_middleware_missing_fails() {
+        let routes = vec![make_route("GET", "/admin/dashboard", plugin("myplugin"))];
+        let result = check_route_authorization_middleware("myplugin", &routes);
+        assert_eq!(result.status, CheckStatus::Fail, "{}", result.message);
+        assert!(result.diagnostics[0].contains("missing auth middleware"));
+    }
+
+    #[test]
+    fn auth_middleware_present_passes() {
+        let mut route = make_route("GET", "/admin/dashboard", plugin("myplugin"));
+        route.middleware.push("secured".to_owned());
+        let routes = vec![route];
+        let result = check_route_authorization_middleware("myplugin", &routes);
+        assert_eq!(result.status, CheckStatus::Pass, "{}", result.message);
+    }
+
+    #[test]
+    fn auth_middleware_authorize_present_passes() {
+        let mut route = make_route("GET", "/admin/dashboard", plugin("myplugin"));
+        route.middleware.push("authorize".to_owned());
+        let routes = vec![route];
+        let result = check_route_authorization_middleware("myplugin", &routes);
+        assert_eq!(result.status, CheckStatus::Pass, "{}", result.message);
+    }
+
+    #[test]
+    fn auth_middleware_skips_non_sensitive() {
+        let routes = vec![make_route("GET", "/public/dashboard", plugin("myplugin"))];
+        let result = check_route_authorization_middleware("myplugin", &routes);
+        assert_eq!(result.status, CheckStatus::Pass, "{}", result.message);
+    }
+
+    #[test]
     fn sensitive_debug_route_undeclared_fails() {
         let routes = vec![make_route("GET", "/debug/state", plugin("myplugin"))];
         let result = check_sensitive_surfaces("myplugin", &routes, &[]);
@@ -1045,10 +1147,12 @@ mod tests {
 
     #[test]
     fn run_conformance_all_pass_when_clean() {
-        let routes = vec![
-            make_route("GET", "/admin", plugin("admin")),
-            make_route("POST", "/admin/items", plugin("admin")),
-        ];
+        let mut r1 = make_route("GET", "/admin", plugin("admin"));
+        r1.middleware.push("secured".to_owned());
+        let mut r2 = make_route("POST", "/admin/items", plugin("admin"));
+        r2.middleware.push("secured".to_owned());
+        let routes = vec![r1, r2];
+
         let config = ConformanceConfig::new("admin")
             .prefix("/admin")
             .sensitive_route("/admin", "Role: admin required");
