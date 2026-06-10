@@ -65,6 +65,29 @@ use crate::session::Session;
 /// rust edition).
 pub type BoxFuture<'a, T> = Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
 
+// ── State Provider ───────────────────────────────────────────────
+
+/// Trait to abstract the state requirements for authorization handlers.
+///
+/// Implement this trait on your application's state type to provide
+/// the necessary dependencies for policy and scope checks.
+pub trait ProvideAuthorizationState {
+    /// Returns the session key used to store the authenticated user ID.
+    fn auth_session_key(&self) -> &str;
+
+    /// Returns the active policy registry.
+    fn policy_registry(&self) -> &crate::authorization::PolicyRegistry;
+
+    /// Returns the default forbidden response for the application.
+    fn forbidden_response(&self) -> &crate::authorization::ForbiddenResponse;
+
+    /// Returns the database connection pool, if configured.
+    #[cfg(feature = "db")]
+    fn pool(
+        &self,
+    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>;
+}
+
 // ── PolicyContext ────────────────────────────────────────────────
 
 /// Per-request context handed to every policy and scope check.
@@ -130,7 +153,7 @@ impl PolicyContext {
     /// Build a fully-populated [`PolicyContext`] from `AppState` +
     /// `Session`. Used by the `#[authorize]` macro and
     /// `#[repository(policy = ...)]`-generated handlers.
-    pub async fn from_request(state: &crate::AppState, session: &Session) -> Self {
+    pub async fn from_request(state: &impl ProvideAuthorizationState, session: &Session) -> Self {
         let mut ctx = Self::from_session(session, state.auth_session_key()).await;
         ctx.policy_registry = state.policy_registry().clone();
         #[cfg(feature = "db")]
@@ -621,7 +644,7 @@ impl<'de> serde::Deserialize<'de> for ForbiddenResponse {
 /// }
 /// ```
 pub async fn authorize<R>(
-    state: &crate::AppState,
+    state: &impl ProvideAuthorizationState,
     session: &Session,
     action: &str,
     resource: &R,
@@ -651,7 +674,7 @@ where
 /// the public API** — call [`authorize`] from user code.
 #[doc(hidden)]
 pub async fn __check_policy<R>(
-    state: &crate::AppState,
+    state: &impl ProvideAuthorizationState,
     session: &Session,
     action: &str,
     resource: &R,
@@ -673,7 +696,7 @@ where
 /// alias for older macro output.
 #[doc(hidden)]
 pub async fn __check_policy_create<R>(
-    state: &crate::AppState,
+    state: &impl ProvideAuthorizationState,
     session: &Session,
 ) -> crate::AutumnResult<()>
 where
@@ -692,7 +715,7 @@ where
 /// only `autumn-web` is upgraded.
 #[doc(hidden)]
 pub async fn __check_policy_create_payload<R>(
-    state: &crate::AppState,
+    state: &impl ProvideAuthorizationState,
     session: &Session,
     payload: &serde_json::Value,
 ) -> crate::AutumnResult<()>
@@ -713,7 +736,7 @@ where
 /// Returns the configured deny response when the policy denies.
 /// Returns `500` when no policy is registered for `R`.
 pub async fn authorize_create<R>(
-    state: &crate::AppState,
+    state: &impl ProvideAuthorizationState,
     session: &Session,
 ) -> crate::AutumnResult<()>
 where
@@ -749,7 +772,7 @@ where
 /// Returns the configured deny response when the policy denies.
 /// Returns `500` when no policy is registered for `R`.
 pub async fn authorize_create_payload<R>(
-    state: &crate::AppState,
+    state: &impl ProvideAuthorizationState,
     session: &Session,
     payload: &serde_json::Value,
 ) -> crate::AutumnResult<()>
