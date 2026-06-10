@@ -1,0 +1,170 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+use axum::{Router, routing::get};
+use axum::http::StatusCode;
+use autumn_web::prelude::*;
+use autumn_web::test::TestApp;
+use autumn_web::http_client::{Client, ClientError};
+use autumn_web::config::AutumnConfig;
+
+#[get("/call-downstream/{port}")]
+async fn call_downstream(
+    client: Client,
+    axum::extract::Path(port): axum::extract::Path<u16>,
+) -> Result<String, (StatusCode, String)> {
+    let url = format!("http://127.0.0.98:{port}/downstream-target");
+    match client.get(&url).send().await {
+        Ok(res) => Ok(format!("Status: {}", res.status())),
+        Err(ClientError::CircuitBreakerOpen) => Err((StatusCode::SERVICE_UNAVAILABLE, "circuit breaker open".to_string())),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    }
+}
+
+#[get("/unrelated")]
+async fn unrelated() -> &'static str {
+    "unrelated ok"
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn test_circuit_breaker_downstream_outage_flow() {
+    // 1. Setup mock downstream server that can simulate an outage
+    let is_outage = Arc::new(AtomicBool::new(false));
+    let is_outage_clone = is_outage.clone();
+    let mock_app = Router::new().route(
+        "/downstream-target",
+        get(move || {
+            let outage = is_outage_clone.load(Ordering::SeqCst);
+            async move {
+                if outage {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                } else {
+                    StatusCode::OK
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.98:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let port = addr.port();
+    tokio::spawn(async move {
+        axum::serve(listener, mock_app).await.unwrap();
+    });
+
+    // 2. Configure Autumn app with short circuit breaker settings for testing
+    let mut config = AutumnConfig::default();
+    config.health.detailed = true;
+    config.resilience.circuit_breaker.defaults.failure_ratio_threshold = Some(0.5);
+    config.resilience.circuit_breaker.defaults.minimum_sample_count = Some(2);
+    config.resilience.circuit_breaker.defaults.open_duration_secs = Some(1); // 1s open duration
+    config.resilience.circuit_breaker.defaults.sample_window_secs = Some(10);
+    config.resilience.circuit_breaker.defaults.half_open_trial_count = Some(1);
+
+    let client = TestApp::new()
+        .config(config)
+        .routes(routes![call_downstream, unrelated])
+        .build();
+
+    // ── CLOSED State ──
+    // Happy path request
+    let resp = client
+        .get(&format!("/call-downstream/{port}"))
+        .send()
+        .await;
+    resp.assert_ok();
+
+    // /actuator/health is UP
+    let health_resp = client.get("/actuator/health").send().await;
+    health_resp.assert_ok();
+    health_resp.assert_json::<serde_json::Value, _>(|val| {
+        assert_eq!(val["status"], "UP");
+    });
+
+    // ── Downstream Outage triggers ──
+    is_outage.store(true, Ordering::SeqCst);
+
+    // Fail 2 times to trip the breaker (minimum_sample_count = 2)
+    for i in 0..2 {
+        let resp = client
+            .get(&format!("/call-downstream/{port}"))
+            .send()
+            .await;
+        println!("FAIL REQUEST {}: status={}, body={}", i, resp.status, resp.text());
+    }
+
+    println!("BREAKERS AFTER FAILURES: {:?}", autumn_web::circuit_breaker::global_registry().all_breakers()
+        .iter()
+        .map(|b| (b.name().to_string(), b.state(), b.failure_ratio(), b.config().clone()))
+        .collect::<Vec<_>>());
+
+    // ── OPEN State ──
+    // Next request should fail fast with 503 SERVICE_UNAVAILABLE from the breaker
+    let start_fast = std::time::Instant::now();
+    let resp_open = client
+        .get(&format!("/call-downstream/{port}"))
+        .send()
+        .await;
+    println!("OPEN REQUEST status={}, body={}", resp_open.status, resp_open.text());
+    resp_open.assert_status(503);
+    assert_eq!(resp_open.text(), "circuit breaker open");
+    let fast_elapsed = start_fast.elapsed();
+    assert!(fast_elapsed < Duration::from_millis(100), "Should fail fast under 100ms");
+
+    // Unrelated route latency stays low
+    let start_unrelated = std::time::Instant::now();
+    let resp_unrelated = client.get("/unrelated").send().await;
+    resp_unrelated.assert_ok();
+    assert_eq!(resp_unrelated.text(), "unrelated ok");
+    let unrelated_elapsed = start_unrelated.elapsed();
+    assert!(unrelated_elapsed < Duration::from_millis(50), "Unrelated latency must be very low");
+
+    // /health (compatibility) stays UP!
+    let comp_health = client.get("/health").send().await;
+    comp_health.assert_ok();
+    comp_health.assert_json::<serde_json::Value, _>(|val| {
+        assert_eq!(val["status"], "ok");
+    });
+
+    // /actuator/health is DOWN!
+    let act_health = client.get("/actuator/health").send().await;
+    act_health.assert_status(503);
+    act_health.assert_json::<serde_json::Value, _>(|val| {
+        assert_eq!(val["status"], "DOWN");
+        let cb_details = &val["components"]["circuit_breaker.127.0.0.98"];
+        assert_eq!(cb_details["status"], "DOWN");
+        assert_eq!(cb_details["details"]["state"], "OPEN");
+    });
+
+    // ── HALF-OPEN & CLOSED State Recovery ──
+    // Wait for the open_duration (1s) to expire so it transitions to HalfOpen
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+
+    // Resolve downstream outage
+    is_outage.store(false, Ordering::SeqCst);
+
+    // This request will be a trial in HalfOpen. Since downstream is healthy, it should succeed,
+    // and since half_open_trial_count = 1, it should transition the breaker back to Closed.
+    let resp_recover = client
+        .get(&format!("/call-downstream/{port}"))
+        .send()
+        .await;
+    resp_recover.assert_ok();
+
+    // Now the breaker is Closed again. Subsequent request is successful.
+    let resp_final = client
+        .get(&format!("/call-downstream/{port}"))
+        .send()
+        .await;
+    resp_final.assert_ok();
+
+    // /actuator/health returns to UP
+    let act_health_final = client.get("/actuator/health").send().await;
+    act_health_final.assert_ok();
+    act_health_final.assert_json::<serde_json::Value, _>(|val| {
+        assert_eq!(val["status"], "UP");
+        let cb_details = &val["components"]["circuit_breaker.127.0.0.98"];
+        assert_eq!(cb_details["status"], "UP");
+        assert_eq!(cb_details["details"]["state"], "CLOSED");
+    });
+}

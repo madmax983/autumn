@@ -1006,8 +1006,7 @@ impl TestApp {
         crate::app::install_webhook_registry(&state, &self.config);
 
         // Install AutumnConfig so DbState::statement_timeout / slow_query_threshold
-        // read the test-supplied config rather than always returning defaults.
-        #[cfg(feature = "db")]
+        // and HTTP Client resilience can read the test-supplied config.
         state.insert_extension(self.config.clone());
 
         #[cfg(feature = "mail")]

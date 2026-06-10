@@ -70,6 +70,9 @@ pub enum ClientError {
     /// No mock entry matched the outgoing request.
     #[error("no mock registered for {0} {1}")]
     NoMock(String, String),
+    /// The outbound circuit breaker is open.
+    #[error("outbound circuit breaker is open")]
+    CircuitBreakerOpen,
 }
 
 // ── Response ─────────────────────────────────────────────────────────────────
@@ -447,6 +450,8 @@ pub struct Client {
     retry_policy: RetryPolicy,
     /// When present (test builds), matching requests bypass the network.
     mock: Option<Arc<MockRegistry>>,
+    /// Resilience configuration for circuit breakers.
+    resilience_config: Option<Arc<crate::config::ResilienceConfig>>,
 }
 
 impl Client {
@@ -481,6 +486,7 @@ impl Client {
                 request_timeout: Some(timeout),
             },
             mock: None,
+            resilience_config: None,
         }
     }
 
@@ -509,6 +515,7 @@ impl Client {
                 request_timeout: Some(timeout),
             },
             mock: None,
+            resilience_config: None,
         }
     }
 
@@ -526,6 +533,11 @@ impl Client {
                 .map(|c| Arc::new(c.http.clone()))
         });
         let mut client = config.map_or_else(Self::new, |cfg| Self::from_config(&cfg.client));
+
+        let resilience = state
+            .extension::<crate::config::AutumnConfig>()
+            .map(|c| Arc::new(c.resilience.clone()));
+        client.resilience_config = resilience;
 
         if let Some(ext) = state.extension::<HttpMockRegistryExt>() {
             client = client.with_mock(ext.0.clone());
@@ -554,6 +566,7 @@ impl Client {
             base_urls: self.base_urls.clone(),
             retry_policy: self.retry_policy.clone(),
             mock: self.mock.clone(),
+            resilience_config: self.resilience_config.clone(),
         }
     }
 
@@ -567,6 +580,7 @@ impl Client {
             base_urls: self.base_urls.clone(),
             retry_policy: self.retry_policy.clone(),
             mock: self.mock.clone(),
+            resilience_config: self.resilience_config.clone(),
         }
     }
 
@@ -594,6 +608,7 @@ impl Client {
             mock: self.mock.clone(),
             alias: self.alias.clone(),
             pending_error: None,
+            resilience_config: self.resilience_config.clone(),
         }
     }
 
@@ -656,6 +671,8 @@ pub struct RequestBuilder {
     alias: Option<String>,
     /// Captures errors from `json()` or invalid headers to surface in `send()`.
     pending_error: Option<ClientError>,
+    /// Resilience configuration for circuit breakers.
+    resilience_config: Option<Arc<crate::config::ResilienceConfig>>,
 }
 
 impl RequestBuilder {
@@ -754,6 +771,71 @@ impl RequestBuilder {
             return Err(err);
         }
 
+        // ── Resilience / Circuit Breaker ──────────────────────────────────
+        let host = url::Url::parse(&self.url)
+            .ok()
+            .and_then(|u| u.host_str().map(ToOwned::to_owned))
+            .unwrap_or_else(|| "unknown".to_owned());
+
+        let mut policy = crate::circuit_breaker::CircuitBreakerPolicy::default();
+        if let Some(ref rc) = self.resilience_config {
+            let defs = &rc.circuit_breaker.defaults;
+            if let Some(ratio) = defs.failure_ratio_threshold {
+                policy.failure_ratio_threshold = ratio;
+            }
+            if let Some(window) = defs.sample_window_secs {
+                policy.sample_window = Duration::from_secs(window);
+            }
+            if let Some(count) = defs.minimum_sample_count {
+                policy.minimum_sample_count = count;
+            }
+            if let Some(duration) = defs.open_duration_secs {
+                policy.open_duration = Duration::from_secs(duration);
+            }
+            if let Some(trials) = defs.half_open_trial_count {
+                policy.half_open_trial_count = trials;
+            }
+
+            if let Some(host_cfg) = rc.circuit_breaker.hosts.get(&host) {
+                if let Some(ratio) = host_cfg.failure_ratio_threshold {
+                    policy.failure_ratio_threshold = ratio;
+                }
+                if let Some(window) = host_cfg.sample_window_secs {
+                    policy.sample_window = Duration::from_secs(window);
+                }
+                if let Some(count) = host_cfg.minimum_sample_count {
+                    policy.minimum_sample_count = count;
+                }
+                if let Some(duration) = host_cfg.open_duration_secs {
+                    policy.open_duration = Duration::from_secs(duration);
+                }
+                if let Some(trials) = host_cfg.half_open_trial_count {
+                    policy.half_open_trial_count = trials;
+                }
+            }
+        }
+
+        let breaker = crate::circuit_breaker::global_registry().get_or_create(&host, policy);
+
+        // Check if circuit breaker is open
+        if breaker.before_call().is_err() {
+            return Err(ClientError::CircuitBreakerOpen);
+        }
+
+        let res = self.send_inner().await;
+        match &res {
+            Ok(resp) => {
+                let success = resp.status().as_u16() < 500;
+                breaker.after_call(success);
+            }
+            Err(_) => {
+                breaker.after_call(false);
+            }
+        }
+        res
+    }
+
+    async fn send_inner(self) -> Result<Response, ClientError> {
         // ── Mock short-circuit ──────────────────────────────────────────────
         if let Some(ref mock) = self.mock {
             match mock.find_match(&self.method, &self.url, self.alias.as_deref()) {
@@ -1656,5 +1738,57 @@ mod tests {
         let err = ClientError::NoMock("GET".to_owned(), "/path".to_owned());
         assert!(err.to_string().contains("GET"));
         assert!(err.to_string().contains("/path"));
+    }
+
+    // TEST 40: Outbound circuit breaker integration trips and fails fast.
+    #[tokio::test]
+    async fn test_http_client_circuit_breaker_integration() {
+        use axum::{Router, routing::get};
+        use std::sync::atomic::{AtomicU32, Ordering as SeqOrdering};
+
+        let hit = Arc::new(AtomicU32::new(0));
+        let hit2 = hit.clone();
+        let app = Router::new().route(
+            "/flaky",
+            get(move || {
+                let c = hit2.clone();
+                async move {
+                    c.fetch_add(1, SeqOrdering::SeqCst);
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.99:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        // Build a resilience config with custom thresholds
+        let mut rc = crate::config::ResilienceConfig::default();
+        rc.circuit_breaker.defaults.failure_ratio_threshold = Some(0.5);
+        rc.circuit_breaker.defaults.minimum_sample_count = Some(3);
+        rc.circuit_breaker.defaults.open_duration_secs = Some(10);
+        
+        let client = Client::new();
+        // Attach the resilience config
+        let client = Client {
+            resilience_config: Some(Arc::new(rc)),
+            ..client
+        };
+
+        let url = format!("http://127.0.0.99:{}/flaky", addr.port());
+
+        // Send 3 requests (all fail with 500)
+        for _ in 0..3 {
+            let res = client.get(&url).send().await;
+            let res = res.unwrap();
+            assert_eq!(res.status().as_u16(), 500);
+        }
+
+        // Now the breaker for 127.0.0.1 should be OPEN, and next request should fail fast
+        let res = client.get(&url).send().await;
+        assert!(matches!(res, Err(ClientError::CircuitBreakerOpen)));
+        
+        // Assert that the server was only hit 3 times
+        assert_eq!(hit.load(SeqOrdering::SeqCst), 3);
     }
 }

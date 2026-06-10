@@ -1417,6 +1417,28 @@ impl JobClient {
         max_attempts: u32,
         backoff_ms: u64,
     ) -> AutumnResult<()> {
+        let policy = crate::circuit_breaker::CircuitBreakerPolicy::default();
+        let breaker = crate::circuit_breaker::global_registry().get_or_create("job_queue", policy);
+
+        if breaker.before_call().is_err() {
+            return Err(AutumnError::internal_server_error(std::io::Error::other(
+                "job queue circuit breaker is open",
+            )));
+        }
+
+        let res = self.enqueue_durable_inner(id, name, payload, max_attempts, backoff_ms).await;
+        breaker.after_call(res.is_ok());
+        res
+    }
+
+    async fn enqueue_durable_inner(
+        &self,
+        id: String,
+        name: &str,
+        payload: Value,
+        max_attempts: u32,
+        backoff_ms: u64,
+    ) -> AutumnResult<()> {
         #[cfg(feature = "redis")]
         if let Some(redis) = &self.redis {
             return redis
@@ -7862,5 +7884,60 @@ mod tests {
                 assert_eq!(job.name, "test_job");
             });
         }
+    }
+
+    #[tokio::test]
+    async fn test_job_enqueue_durable_circuit_breaker() {
+        let policy = crate::circuit_breaker::CircuitBreakerPolicy {
+            failure_ratio_threshold: 0.5,
+            sample_window: Duration::from_secs(10),
+            minimum_sample_count: 3,
+            open_duration: Duration::from_secs(60),
+            half_open_trial_count: 2,
+        };
+        let breaker = crate::circuit_breaker::global_registry().get_or_create("job_queue", policy);
+        
+        // Ensure it is closed initially
+        assert_eq!(breaker.state(), crate::circuit_breaker::CircuitState::Closed);
+
+        let client = JobClient {
+            local_sender: None,
+            #[cfg(feature = "redis")]
+            redis: None,
+            #[cfg(feature = "db")]
+            pg_pool: None,
+            registry: crate::actuator::JobRegistry::new(),
+            job_admin: JobAdminMemoryBackend::new_for_test(32),
+            default_max_attempts: 1,
+            default_initial_backoff_ms: 1000,
+            per_job_defaults: HashMap::new(),
+            interceptor: None,
+        };
+
+        for _ in 0..3 {
+            let res = client.enqueue_durable(
+                "job_id".to_string(),
+                "job_name",
+                serde_json::Value::Null,
+                1,
+                1000,
+            ).await;
+            assert!(res.is_err());
+        }
+
+        // Breaker should be Open now!
+        assert_eq!(breaker.state(), crate::circuit_breaker::CircuitState::Open);
+
+        let res = client.enqueue_durable(
+            "job_id".to_string(),
+            "job_name",
+            serde_json::Value::Null,
+            1,
+            1000,
+        ).await;
+        
+        assert!(res.is_err());
+        let err_str = res.err().unwrap().to_string();
+        assert!(err_str.contains("circuit breaker") || err_str.contains("open") || err_str.contains("Open"));
     }
 }

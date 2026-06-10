@@ -1016,9 +1016,20 @@ impl MailTransport for SmtpTransport {
         mail: Mail,
     ) -> Pin<Box<dyn Future<Output = Result<(), MailError>> + Send + 'a>> {
         Box::pin(async move {
+            let policy = crate::circuit_breaker::CircuitBreakerPolicy::default();
+            let breaker = crate::circuit_breaker::global_registry().get_or_create("smtp_mailer", policy);
+
+            if breaker.before_call().is_err() {
+                return Err(MailError::RuntimeUnavailable(
+                    "smtp mailer circuit breaker is open".to_owned(),
+                ));
+            }
+
             let message = lettre_message(&mail)?;
-            self.inner.send(message).await?;
-            Ok(())
+            let res = self.inner.send(message).await;
+            breaker.after_call(res.is_ok());
+
+            res.map(|_| ()).map_err(Into::into)
         })
     }
 }
@@ -2659,5 +2670,57 @@ mod tests {
         let res = intercepted.send(mail).await;
         assert!(res.is_err());
         assert_eq!(TRANSPORT_CALLS.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_smtp_transport_circuit_breaker() {
+        let _lock = crate::circuit_breaker::TEST_LOCK.lock().unwrap();
+        crate::circuit_breaker::global_registry().clear();
+        let policy = crate::circuit_breaker::CircuitBreakerPolicy {
+            failure_ratio_threshold: 0.5,
+            sample_window: std::time::Duration::from_secs(10),
+            minimum_sample_count: 3,
+            open_duration: std::time::Duration::from_secs(60),
+            half_open_trial_count: 2,
+        };
+        let breaker = crate::circuit_breaker::global_registry().get_or_create("smtp_mailer", policy);
+        
+        // Ensure it is closed initially
+        assert_eq!(breaker.state(), crate::circuit_breaker::CircuitState::Closed);
+
+        // Build an SMTP transport pointing to a bogus localhost port so it fails
+        let config = SmtpConfig {
+            host: Some("127.0.0.1".to_string()),
+            port: Some(9999), // Bogus port
+            tls: TlsMode::Disabled,
+            username: None,
+            password_env: None,
+        };
+        let transport = SmtpTransport::new(config).unwrap();
+
+        let mail = Mail::builder()
+            .from("sender@example.com")
+            .to("test@example.com")
+            .subject("test")
+            .text("body")
+            .build()
+            .unwrap();
+
+        // Send 3 times — all should fail and trip the breaker
+        for _ in 0..3 {
+            let res = transport.send(mail.clone()).await;
+            assert!(res.is_err());
+        }
+
+        assert_eq!(breaker.state(), crate::circuit_breaker::CircuitState::Open);
+
+        // 4th send should fail fast with a circuit breaker error
+        let res = transport.send(mail.clone()).await;
+        assert!(res.is_err());
+        let err_str = res.err().unwrap().to_string();
+        assert!(err_str.contains("circuit breaker") || err_str.contains("open") || err_str.contains("Open") || err_str.contains("runtime unavailable"));
+
+        crate::circuit_breaker::global_registry().clear();
     }
 }

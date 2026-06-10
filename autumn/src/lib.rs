@@ -90,6 +90,7 @@ pub mod error;
 pub mod error_pages;
 pub mod extract;
 pub mod health;
+pub mod circuit_breaker;
 #[cfg(feature = "db")]
 pub mod hooks;
 #[cfg(feature = "i18n")]
