@@ -1,6 +1,8 @@
 // SEO toolkit integration tests.
 
-use autumn_web::seo::{SeoMeta, SitemapChangefreq, SitemapEntry, SitemapSource, robots_txt, sitemap_xml};
+use autumn_web::seo::{
+    SeoMeta, SitemapChangefreq, SitemapEntry, SitemapSource, robots_txt, sitemap_xml,
+};
 use std::future::Future;
 use std::pin::Pin;
 
@@ -48,10 +50,19 @@ fn robots_txt_no_sitemap_when_not_provided() {
 
 #[test]
 fn robots_txt_includes_additional_rules() {
-    let rules = vec!["Disallow: /admin".to_string(), "Crawl-delay: 10".to_string()];
+    let rules = vec![
+        "Disallow: /admin".to_string(),
+        "Crawl-delay: 10".to_string(),
+    ];
     let txt = robots_txt("prod", None, &rules);
-    assert!(txt.contains("Disallow: /admin"), "should include additional rules");
-    assert!(txt.contains("Crawl-delay: 10"), "should include crawl delay rule");
+    assert!(
+        txt.contains("Disallow: /admin"),
+        "should include additional rules"
+    );
+    assert!(
+        txt.contains("Crawl-delay: 10"),
+        "should include crawl delay rule"
+    );
 }
 
 // ── sitemap_xml() unit tests ─────────────────────────────────────────────────
@@ -60,10 +71,19 @@ fn robots_txt_includes_additional_rules() {
 fn sitemap_xml_valid_urlset_structure() {
     let entries = vec![SitemapEntry::new("https://example.com/about")];
     let xml = sitemap_xml(&entries, None);
-    assert!(xml.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?>"), "should start with XML declaration");
+    assert!(
+        xml.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?>"),
+        "should start with XML declaration"
+    );
     assert!(xml.contains("<urlset"), "should have urlset element");
-    assert!(xml.contains("http://www.sitemaps.org/schemas/sitemap/0.9"), "should have sitemap namespace");
-    assert!(xml.contains("<loc>https://example.com/about</loc>"), "should have location URL");
+    assert!(
+        xml.contains("http://www.sitemaps.org/schemas/sitemap/0.9"),
+        "should have sitemap namespace"
+    );
+    assert!(
+        xml.contains("<loc>https://example.com/about</loc>"),
+        "should have location URL"
+    );
     assert!(xml.contains("</urlset>"), "should close urlset");
 }
 
@@ -71,23 +91,31 @@ fn sitemap_xml_valid_urlset_structure() {
 fn sitemap_xml_includes_lastmod() {
     let entries = vec![SitemapEntry::new("https://example.com/").lastmod("2026-01-15")];
     let xml = sitemap_xml(&entries, None);
-    assert!(xml.contains("<lastmod>2026-01-15</lastmod>"), "should include lastmod");
+    assert!(
+        xml.contains("<lastmod>2026-01-15</lastmod>"),
+        "should include lastmod"
+    );
 }
 
 #[test]
 fn sitemap_xml_includes_changefreq() {
-    let entries = vec![
-        SitemapEntry::new("https://example.com/").changefreq(SitemapChangefreq::Weekly),
-    ];
+    let entries =
+        vec![SitemapEntry::new("https://example.com/").changefreq(SitemapChangefreq::Weekly)];
     let xml = sitemap_xml(&entries, None);
-    assert!(xml.contains("<changefreq>weekly</changefreq>"), "should include changefreq");
+    assert!(
+        xml.contains("<changefreq>weekly</changefreq>"),
+        "should include changefreq"
+    );
 }
 
 #[test]
 fn sitemap_xml_includes_priority() {
     let entries = vec![SitemapEntry::new("https://example.com/").priority(0.8)];
     let xml = sitemap_xml(&entries, None);
-    assert!(xml.contains("<priority>0.8</priority>"), "should include priority");
+    assert!(
+        xml.contains("<priority>0.8</priority>"),
+        "should include priority"
+    );
 }
 
 #[test]
@@ -109,9 +137,18 @@ fn sitemap_xml_generates_sitemapindex_for_large_sites() {
         .map(|i| SitemapEntry::new(format!("https://example.com/page/{i}")))
         .collect();
     let xml = sitemap_xml(&entries, Some("https://example.com"));
-    assert!(xml.contains("<sitemapindex"), "should use sitemapindex for large sites");
-    assert!(xml.contains("<sitemap>"), "should have sitemap entries in index");
-    assert!(xml.contains("https://example.com/sitemap-1.xml"), "should reference sub-sitemaps");
+    assert!(
+        xml.contains("<sitemapindex"),
+        "should use sitemapindex for large sites"
+    );
+    assert!(
+        xml.contains("<sitemap>"),
+        "should have sitemap entries in index"
+    );
+    assert!(
+        xml.contains("https://example.com/sitemap-1.xml"),
+        "should reference sub-sitemaps"
+    );
 }
 
 #[test]
@@ -135,7 +172,10 @@ mod meta_tag_tests {
     fn seometa_renders_title() {
         let meta = SeoMeta::new().title("My Blog Post");
         let rendered = meta.render().into_string();
-        assert!(rendered.contains("<title>My Blog Post</title>"), "should render title; got:\n{rendered}");
+        assert!(
+            rendered.contains("<title>My Blog Post</title>"),
+            "should render title; got:\n{rendered}"
+        );
     }
 
     #[test]
@@ -173,9 +213,18 @@ mod meta_tag_tests {
             .description("Post Description")
             .og_image("https://example.com/og.jpg");
         let rendered = meta.render().into_string();
-        assert!(rendered.contains(r#"property="og:title""#), "should have og:title; got:\n{rendered}");
-        assert!(rendered.contains(r#"property="og:description""#), "should have og:description; got:\n{rendered}");
-        assert!(rendered.contains(r#"property="og:image""#), "should have og:image; got:\n{rendered}");
+        assert!(
+            rendered.contains(r#"property="og:title""#),
+            "should have og:title; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(r#"property="og:description""#),
+            "should have og:description; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(r#"property="og:image""#),
+            "should have og:image; got:\n{rendered}"
+        );
     }
 
     #[test]
@@ -184,8 +233,14 @@ mod meta_tag_tests {
             .title("Generic Title")
             .og_title("OG Specific Title");
         let rendered = meta.render().into_string();
-        assert!(rendered.contains("OG Specific Title"), "og_title should override title for OG; got:\n{rendered}");
-        assert!(rendered.contains("<title>Generic Title</title>"), "page title should remain unchanged");
+        assert!(
+            rendered.contains("OG Specific Title"),
+            "og_title should override title for OG; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("<title>Generic Title</title>"),
+            "page title should remain unchanged"
+        );
     }
 
     #[test]
@@ -194,9 +249,18 @@ mod meta_tag_tests {
             .title("Post Title")
             .twitter_card("summary_large_image");
         let rendered = meta.render().into_string();
-        assert!(rendered.contains(r#"name="twitter:card""#), "should have twitter:card; got:\n{rendered}");
-        assert!(rendered.contains("summary_large_image"), "should have card type; got:\n{rendered}");
-        assert!(rendered.contains(r#"name="twitter:title""#), "should have twitter:title when card set; got:\n{rendered}");
+        assert!(
+            rendered.contains(r#"name="twitter:card""#),
+            "should have twitter:card; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("summary_large_image"),
+            "should have card type; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(r#"name="twitter:title""#),
+            "should have twitter:title when card set; got:\n{rendered}"
+        );
     }
 
     #[test]
@@ -213,8 +277,14 @@ mod meta_tag_tests {
     fn seometa_renders_robots_directive() {
         let meta = SeoMeta::new().robots("noindex");
         let rendered = meta.render().into_string();
-        assert!(rendered.contains(r#"name="robots""#), "should have robots meta; got:\n{rendered}");
-        assert!(rendered.contains("noindex"), "should have noindex directive; got:\n{rendered}");
+        assert!(
+            rendered.contains(r#"name="robots""#),
+            "should have robots meta; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("noindex"),
+            "should have noindex directive; got:\n{rendered}"
+        );
     }
 
     #[test]
@@ -232,8 +302,14 @@ mod meta_tag_tests {
         let meta = SeoMeta::new();
         let rendered = meta.render().into_string();
         // Empty meta should produce empty/minimal markup - no spurious tags
-        assert!(!rendered.contains("<title>"), "empty meta should not render title");
-        assert!(!rendered.contains(r#"name="description""#), "empty meta should not render description");
+        assert!(
+            !rendered.contains("<title>"),
+            "empty meta should not render title"
+        );
+        assert!(
+            !rendered.contains(r#"name="description""#),
+            "empty meta should not render description"
+        );
     }
 }
 
@@ -292,11 +368,11 @@ fn seo_config_defaults_are_empty() {
 // ── HTTP endpoint tests ──────────────────────────────────────────────────────
 
 mod endpoint_tests {
+    use autumn_web::seo::{SitemapEntry, build_seo_router, build_seo_router_with_entries};
     use axum::Router;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
-    use autumn_web::seo::{SitemapEntry, build_seo_router, build_seo_router_with_entries};
 
     /// Verifies that when SEO routes are enabled, /robots.txt returns 200.
     #[tokio::test]
@@ -345,7 +421,8 @@ mod endpoint_tests {
     #[tokio::test]
     async fn sitemap_xml_endpoint_returns_200() {
         let entries = vec![SitemapEntry::new("https://example.com/")];
-        let router: Router = build_seo_router_with_entries("prod", Some("https://example.com"), &[], entries);
+        let router: Router =
+            build_seo_router_with_entries("prod", Some("https://example.com"), &[], entries);
 
         let response = router
             .oneshot(
@@ -363,7 +440,8 @@ mod endpoint_tests {
     #[tokio::test]
     async fn sitemap_xml_endpoint_returns_application_xml() {
         let entries = vec![SitemapEntry::new("https://example.com/")];
-        let router: Router = build_seo_router_with_entries("prod", Some("https://example.com"), &[], entries);
+        let router: Router =
+            build_seo_router_with_entries("prod", Some("https://example.com"), &[], entries);
 
         let response = router
             .oneshot(
@@ -395,11 +473,16 @@ async fn write_seo_files_creates_robots_txt() {
     use autumn_web::seo::write_seo_files;
 
     let dir = tempfile::tempdir().unwrap();
-    write_seo_files(dir.path(), "prod", None, &[], &[]).await.unwrap();
+    write_seo_files(dir.path(), "prod", None, &[], &[])
+        .await
+        .unwrap();
     let robots_path = dir.path().join("robots.txt");
     assert!(robots_path.exists(), "dist/robots.txt should be written");
     let content = std::fs::read_to_string(&robots_path).unwrap();
-    assert!(content.contains("Allow: /"), "prod robots.txt should allow all");
+    assert!(
+        content.contains("Allow: /"),
+        "prod robots.txt should allow all"
+    );
 }
 
 #[tokio::test]
@@ -408,13 +491,27 @@ async fn write_seo_files_creates_sitemap_xml() {
 
     let dir = tempfile::tempdir().unwrap();
     let entries = vec![SitemapEntry::new("https://example.com/about")];
-    write_seo_files(dir.path(), "prod", Some("https://example.com"), &[], &entries).await.unwrap();
+    write_seo_files(
+        dir.path(),
+        "prod",
+        Some("https://example.com"),
+        &[],
+        &entries,
+    )
+    .await
+    .unwrap();
 
     let sitemap_path = dir.path().join("sitemap.xml");
     assert!(sitemap_path.exists(), "dist/sitemap.xml should be written");
     let content = std::fs::read_to_string(&sitemap_path).unwrap();
-    assert!(content.contains("<urlset"), "sitemap.xml should have urlset");
-    assert!(content.contains("https://example.com/about"), "sitemap should include provided entries");
+    assert!(
+        content.contains("<urlset"),
+        "sitemap.xml should have urlset"
+    );
+    assert!(
+        content.contains("https://example.com/about"),
+        "sitemap should include provided entries"
+    );
 }
 
 #[tokio::test]
@@ -422,7 +519,9 @@ async fn write_seo_files_injects_sitemap_url_in_robots() {
     use autumn_web::seo::write_seo_files;
 
     let dir = tempfile::tempdir().unwrap();
-    write_seo_files(dir.path(), "prod", Some("https://example.com"), &[], &[]).await.unwrap();
+    write_seo_files(dir.path(), "prod", Some("https://example.com"), &[], &[])
+        .await
+        .unwrap();
 
     let robots = std::fs::read_to_string(dir.path().join("robots.txt")).unwrap();
     assert!(

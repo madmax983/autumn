@@ -26,7 +26,13 @@ use crate::schema::posts;
 /// Accepts an optional [`SeoMeta`] to inject per-page meta tags. Falls back
 /// to a sensible site-wide description when omitted.
 pub fn layout(locale: &Locale, title: &str, content: Markup) -> Markup {
-    layout_with_seo(locale, SeoMeta::new().title(title).description("A blog built with the Autumn web framework for Rust."), content)
+    layout_with_seo(
+        locale,
+        SeoMeta::new()
+            .title(title)
+            .description("A blog built with the Autumn web framework for Rust."),
+        content,
+    )
 }
 
 /// Layout variant accepting an explicit [`SeoMeta`] builder.

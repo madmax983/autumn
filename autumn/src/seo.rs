@@ -441,7 +441,10 @@ impl SeoMeta {
         let og_title = self.og_title.as_ref().or(self.title.as_ref());
         let og_desc = self.og_description.as_ref().or(self.description.as_ref());
         let twitter_title = self.twitter_title.as_ref().or(self.title.as_ref());
-        let twitter_desc = self.twitter_description.as_ref().or(self.description.as_ref());
+        let twitter_desc = self
+            .twitter_description
+            .as_ref()
+            .or(self.description.as_ref());
         let og_url = self.og_url.as_ref().or(self.canonical.as_ref());
         let has_twitter = self.twitter_card.is_some();
 
@@ -564,7 +567,7 @@ where
 
 /// Write `robots.txt` and `sitemap.xml` to `dist_dir` as part of `autumn build`.
 ///
-/// Called by [`AppBuilder::run_build_mode`] after static routes are rendered.
+/// Called by `AppBuilder::run_build_mode` after static routes are rendered.
 ///
 /// # Arguments
 ///
@@ -622,7 +625,10 @@ mod tests {
 
     #[test]
     fn xml_escape_replaces_special_chars() {
-        assert_eq!(xml_escape("a&b<c>d\"e'f"), "a&amp;b&lt;c&gt;d&quot;e&apos;f");
+        assert_eq!(
+            xml_escape("a&b<c>d\"e'f"),
+            "a&amp;b&lt;c&gt;d&quot;e&apos;f"
+        );
     }
 
     #[test]

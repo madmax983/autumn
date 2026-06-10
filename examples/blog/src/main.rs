@@ -24,9 +24,8 @@ impl SitemapSource for BlogSitemapSource {
     fn entries(&self) -> Pin<Box<dyn Future<Output = Vec<SitemapEntry>> + Send>> {
         Box::pin(async {
             vec![
-                SitemapEntry::new("https://autumn-demo.example.com/").changefreq(
-                    autumn_web::seo::SitemapChangefreq::Weekly,
-                ),
+                SitemapEntry::new("https://autumn-demo.example.com/")
+                    .changefreq(autumn_web::seo::SitemapChangefreq::Weekly),
                 SitemapEntry::new("https://autumn-demo.example.com/about"),
             ]
         })
