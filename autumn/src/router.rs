@@ -2790,6 +2790,83 @@ mod tests {
         assert_eq!(legacy.status(), StatusCode::NOT_FOUND);
     }
 
+    /// Pins the production access-log wiring (#999): the layer is applied in
+    /// `apply_startup_barrier`, outside the barrier itself, so even requests
+    /// rejected with 503 before the app router runs emit one access event
+    /// carrying the status the client receives.
+    #[test]
+    fn startup_barrier_503s_are_access_logged() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        #[derive(Clone, Default)]
+        struct Capture {
+            events: Arc<std::sync::Mutex<Vec<std::collections::BTreeMap<String, String>>>>,
+        }
+        struct Visitor<'a>(&'a mut std::collections::BTreeMap<String, String>);
+        impl tracing::field::Visit for Visitor<'_> {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.0.insert(field.name().to_owned(), format!("{value:?}"));
+            }
+            fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+                self.0.insert(field.name().to_owned(), value.to_string());
+            }
+        }
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Capture {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if event.metadata().target() != crate::middleware::ACCESS_LOG_TARGET {
+                    return;
+                }
+                let mut fields = std::collections::BTreeMap::new();
+                event.record(&mut Visitor(&mut fields));
+                self.events.lock().unwrap().push(fields);
+            }
+        }
+
+        let capture = Capture::default();
+        let events = Arc::clone(&capture.events);
+        let subscriber = tracing_subscriber::registry().with(capture);
+
+        tracing::subscriber::with_default(subscriber, || {
+            // With startup incomplete, the barrier rejects non-probe requests
+            // with 503 before the app router runs.
+            let state = AppState::for_test()
+                .with_profile("test")
+                .with_startup_complete(false);
+            let app = build_router(Vec::new(), &AutumnConfig::default(), state);
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let response = rt.block_on(async {
+                app.oneshot(
+                    Request::builder()
+                        .uri("/not-a-probe")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            });
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        });
+
+        let events = events.lock().unwrap().clone();
+        assert_eq!(
+            events.len(),
+            1,
+            "a barrier-rejected request should emit one access event: {events:?}"
+        );
+        assert_eq!(events[0].get("status").map(String::as_str), Some("503"));
+        assert!(
+            !events[0].contains_key("request_id"),
+            "barrier short-circuits before RequestIdLayer, so no request id"
+        );
+    }
+
     #[test]
     fn try_build_router_rejects_invalid_session_backend_config() {
         let mut config = AutumnConfig::default();
