@@ -398,7 +398,7 @@ async fn json_format_renders_the_event_as_a_single_json_object_line() {
 }
 
 #[tokio::test]
-async fn exception_filter_rewrites_are_visible_to_the_access_log() {
+async fn filter_rewrites_log_handler_status_without_double_logging() {
     use autumn_web::middleware::{
         AccessLogLayer, AutumnErrorInfo, ExceptionFilter, ExceptionFilterLayer,
     };
@@ -419,8 +419,11 @@ async fn exception_filter_rewrites_are_visible_to_the_access_log() {
     }
 
     let (capture, _guard) = install_capture();
-    // Production ordering: AccessLog is OUTER to the exception-filter chain,
-    // so the logged status must be the rewritten one the client receives.
+    // Production ordering: the primary access log is INNER to the
+    // exception-filter chain (in-span, correlated), with the fallback
+    // outermost. The `AccessLogEmitted` marker must keep the fallback silent,
+    // and the logged status is the handler's response — the documented,
+    // accepted tradeoff of the in-context primary placement.
     let app = axum::Router::new()
         .route(
             "/boom",
@@ -428,8 +431,9 @@ async fn exception_filter_rewrites_are_visible_to_the_access_log() {
                 Err::<String, _>(autumn_web::error::AutumnError::not_found_msg("gone"))
             }),
         )
+        .layer(AccessLogLayer::new(Vec::new()))
         .layer(ExceptionFilterLayer::new(vec![Arc::new(Rewrite)]))
-        .layer(AccessLogLayer::new(Vec::new()));
+        .layer(AccessLogLayer::fallback(Vec::new()));
 
     let response = app
         .oneshot(
@@ -446,11 +450,60 @@ async fn exception_filter_rewrites_are_visible_to_the_access_log() {
     );
 
     let events = capture.captured();
-    assert_eq!(events.len(), 1, "got {events:?}");
+    assert_eq!(
+        events.len(),
+        1,
+        "the marker must keep the fallback silent: {events:?}"
+    );
     assert_eq!(
         events[0].field("status"),
-        Some("503"),
-        "access log must record the filter-rewritten status the client receives"
+        Some("404"),
+        "primary placement logs the handler status (accepted tradeoff)"
+    );
+}
+
+/// A response produced by a layer OUTER to the primary access log (here: a
+/// short-circuiting middleware standing in for a session-store outage 503)
+/// carries no `AccessLogEmitted` marker, so the outermost fallback logs it.
+#[tokio::test]
+async fn short_circuits_above_the_primary_are_logged_by_the_fallback() {
+    use autumn_web::middleware::AccessLogLayer;
+    use axum::response::IntoResponse as _;
+    use tower::ServiceExt as _;
+
+    let (capture, _guard) = install_capture();
+    let app = axum::Router::new()
+        .route("/ok", axum::routing::get(|| async { "ok" }))
+        .layer(AccessLogLayer::new(Vec::new()))
+        // Stands in for SessionLayer's store.load failure path: rejects
+        // without calling the inner service (and the primary layer).
+        .layer(axum::middleware::from_fn(
+            |_req: axum::extract::Request, _next: axum::middleware::Next| async {
+                (axum::http::StatusCode::SERVICE_UNAVAILABLE, "store down").into_response()
+            },
+        ))
+        .layer(AccessLogLayer::fallback(Vec::new()));
+
+    let response = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/ok")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    );
+
+    let events = capture.captured();
+    assert_eq!(events.len(), 1, "got {events:?}");
+    assert_eq!(events[0].field("status"), Some("503"));
+    assert!(
+        events[0].field("request_id").is_none(),
+        "short-circuit never ran RequestIdLayer, so no request id"
     );
 }
 

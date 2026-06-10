@@ -20,14 +20,28 @@
 //! `/startup`, `/actuator`, `/static`), matched on whole path segments so
 //! `/healthz` is still logged while `/actuator/health` is not.
 //!
-//! Applied automatically by the framework router at the **outermost** assembly
-//! point — outside the startup barrier, the static-first (SSG/ISR) middleware,
-//! the session layer, and the exception-filter chain — so the logged `status`
-//! is always the status the client receives, including startup 503s,
-//! pre-built static page hits, session-store outage 503s, and
-//! filter-rewritten error responses. Short-circuit responses produced before
-//! `RequestIdLayer` runs carry no `x-request-id` and log without a
-//! `request_id` field.
+//! Applied automatically by the framework router in **two** positions:
+//!
+//! - The **primary** layer ([`AccessLogLayer::new`]) sits inner to
+//!   [`RequestIdLayer`](crate::middleware::RequestIdLayer) and the log-context
+//!   layer, so the event is emitted inside the request span with the request
+//!   id taken from the request extension. Once it emits, it flips the
+//!   [`AccessLogEmitted`] sentinel the fallback planted in the request
+//!   extensions, keeping the fallback silent.
+//! - A **fallback** layer ([`AccessLogLayer::fallback`]) sits at the outermost
+//!   router assembly point — outside the startup barrier, the static-first
+//!   (SSG/ISR) middleware, the session layer, and the late MCP endpoint
+//!   merge — and emits only for responses the primary never saw: startup
+//!   503s, pre-built static page hits, session-store outage 503s, and MCP
+//!   endpoint requests. Those short-circuits never ran `RequestIdLayer`, so
+//!   the fallback reads `request_id` from the `x-request-id` response header
+//!   when present and omits it otherwise.
+//!
+//! Known accepted tradeoff of the in-context primary placement: a custom
+//! exception filter (or a session-store save failure) that *rewrites* an
+//! already-produced response does so after the line was emitted, so the
+//! logged `status` reflects the handler's response in that narrow case. The
+//! built-in filters preserve status.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -50,21 +64,55 @@ pub const ACCESS_LOG_TARGET: &str = "autumn::access";
 /// `route` field low-cardinality. Mirrors the metrics layer.
 pub const UNMATCHED_ROUTE: &str = "_unmatched";
 
+/// Shared sentinel coordinating the primary and fallback access-log layers.
+///
+/// The fallback inserts it into the **request** extensions on the way in, and
+/// the primary flips it once it emits, so the fallback only logs requests
+/// that short-circuited before reaching the primary. It rides the request
+/// (not the response) because error-page/exception filters may rebuild the
+/// response entirely, which would drop a response-side marker.
+#[derive(Clone, Debug, Default)]
+pub struct AccessLogEmitted(Arc<std::sync::atomic::AtomicBool>);
+
+impl AccessLogEmitted {
+    fn mark(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    fn is_marked(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
 /// Tower [`Layer`] that emits one structured access-log event per served
 /// request. Applied automatically by the framework router when
 /// `log.access_log` is enabled (the default).
 #[derive(Clone, Debug)]
 pub struct AccessLogLayer {
     exclude: Arc<[String]>,
+    fallback: bool,
 }
 
 impl AccessLogLayer {
-    /// Create a new layer. Requests whose path falls under one of the
-    /// `exclude` prefixes (whole-segment match) are not logged.
+    /// Create the primary layer. Requests whose path falls under one of the
+    /// `exclude` prefixes (whole-segment match) are not logged. Emitted
+    /// responses are stamped with [`AccessLogEmitted`].
     #[must_use]
     pub fn new(exclude: Vec<String>) -> Self {
         Self {
             exclude: normalize_exclusions(exclude),
+            fallback: false,
+        }
+    }
+
+    /// Create the outermost fallback layer: it emits only for responses that
+    /// do **not** carry the [`AccessLogEmitted`] marker — i.e. requests that
+    /// short-circuited before the primary layer ran.
+    #[must_use]
+    pub fn fallback(exclude: Vec<String>) -> Self {
+        Self {
+            exclude: normalize_exclusions(exclude),
+            fallback: true,
         }
     }
 }
@@ -94,6 +142,7 @@ impl<S> Layer<S> for AccessLogLayer {
         AccessLogService {
             inner,
             exclude: Arc::clone(&self.exclude),
+            fallback: self.fallback,
         }
     }
 }
@@ -103,6 +152,7 @@ impl<S> Layer<S> for AccessLogLayer {
 pub struct AccessLogService<S> {
     inner: S,
     exclude: Arc<[String]>,
+    fallback: bool,
 }
 
 /// Request facts captured before the inner service consumes the request.
@@ -110,6 +160,7 @@ pub struct AccessLogService<S> {
 struct RequestMeta {
     method: Method,
     route: Option<String>,
+    request_id: Option<String>,
 }
 
 impl<S, ReqBody, ResBody> Service<Request<ReqBody>> for AccessLogService<S>
@@ -125,6 +176,7 @@ where
     }
 
     fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
+        let mut req = req;
         let meta = if is_excluded(req.uri().path(), &self.exclude) {
             None
         } else {
@@ -134,13 +186,32 @@ where
                     .extensions()
                     .get::<MatchedPath>()
                     .map(|matched| matched.as_str().to_owned()),
+                // Set by RequestIdLayer, which sits outer to the primary
+                // layer. Absent at the outermost fallback position.
+                request_id: req
+                    .extensions()
+                    .get::<crate::middleware::RequestId>()
+                    .map(ToString::to_string),
             })
+        };
+
+        // The fallback plants the sentinel for the primary to flip; the
+        // primary picks it up when present (it is absent in bare setups
+        // that apply only the primary layer).
+        let sentinel = if self.fallback {
+            let sentinel = AccessLogEmitted::default();
+            req.extensions_mut().insert(sentinel.clone());
+            Some(sentinel)
+        } else {
+            req.extensions().get::<AccessLogEmitted>().cloned()
         };
 
         AccessLogFuture {
             inner: self.inner.call(req),
             meta,
             start: Instant::now(),
+            fallback: self.fallback,
+            sentinel,
         }
     }
 }
@@ -163,6 +234,8 @@ pin_project! {
         inner: F,
         meta: Option<RequestMeta>,
         start: Instant,
+        fallback: bool,
+        sentinel: Option<AccessLogEmitted>,
     }
 }
 
@@ -176,16 +249,25 @@ where
         let this = self.project();
         match this.inner.poll(cx) {
             Poll::Ready(Ok(response)) => {
-                if let Some(meta) = this.meta.take() {
+                let already_emitted = *this.fallback
+                    && this
+                        .sentinel
+                        .as_ref()
+                        .is_some_and(AccessLogEmitted::is_marked);
+                if let Some(meta) = this.meta.take()
+                    && !already_emitted
+                {
                     let duration_ms = this.start.elapsed().as_secs_f64() * 1000.0;
-                    // Read the request id off the response: the header is
-                    // stamped by RequestIdLayer, which sits inner to this
-                    // layer. Responses short-circuited before it (startup
-                    // 503s, static-first hits) have none and log without it.
-                    let request_id = response
+                    // The primary layer reads the id from the request
+                    // extension; the fallback covers short-circuits that may
+                    // never have run RequestIdLayer, so it falls back to the
+                    // `x-request-id` response header and omits the field when
+                    // neither is present.
+                    let header_id = response
                         .headers()
                         .get(&X_REQUEST_ID)
                         .and_then(|value| value.to_str().ok());
+                    let request_id = meta.request_id.as_deref().or(header_id);
                     tracing::info!(
                         target: ACCESS_LOG_TARGET,
                         method = %meta.method,
@@ -195,6 +277,11 @@ where
                         request_id,
                         "request served"
                     );
+                    if !*this.fallback
+                        && let Some(sentinel) = this.sentinel.as_ref()
+                    {
+                        sentinel.mark();
+                    }
                 }
                 Poll::Ready(Ok(response))
             }

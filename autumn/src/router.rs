@@ -1895,10 +1895,11 @@ fn apply_middleware(
     // layer is available when the timeout fires — see request_timeout_handler).
     //
     // Full ingress layer order (outermost → innermost):
-    //   TraceContext → AccessLog (applied in apply_startup_barrier) → StartupBarrier →
-    //   Compression → Metrics → ExceptionFilter → ErrorPageContext → Session →
-    //   SecurityHeaders → RequestId → LogContext → Timeout → [user layers] →
-    //   Tenancy → BodyLimit/UploadConfig → MethodOverride → RateLimit → CSRF → CORS → handler
+    //   TraceContext → AccessLog-fallback (applied in apply_startup_barrier) →
+    //   StartupBarrier → Compression → Metrics → ExceptionFilter → ErrorPageContext →
+    //   Session → SecurityHeaders → RequestId → LogContext → AccessLog-primary →
+    //   Timeout → [user layers] → Tenancy → BodyLimit/UploadConfig →
+    //   MethodOverride → RateLimit → CSRF → CORS → handler
     router = apply_request_timeout_middleware(router, config, state.metrics.clone());
 
     // Error-reporting + panic-catch layer. Placed inner to `RequestIdLayer`
@@ -1912,6 +1913,21 @@ fn apply_middleware(
             state.error_reporters(),
             config.reporting.enabled,
             config.reporting.sample_rate,
+        ));
+    }
+
+    // Structured per-request access log (#999), primary emitter: one INFO
+    // event (target `autumn::access`) per served request at the response
+    // boundary. Inner to RequestId (so the request id is available) and to
+    // LogContext (so the event is emitted inside the request span); outer to
+    // the reporting and timeout layers so panics-turned-500s and timeout
+    // responses are logged with the status the client receives. Emitted
+    // responses are marked so the outermost fallback (apply_startup_barrier)
+    // does not double-log; that fallback covers requests that short-circuit
+    // before this layer runs.
+    if config.log.access_log {
+        router = router.layer(crate::middleware::AccessLogLayer::new(
+            config.log.access_log_exclude.clone(),
         ));
     }
 
@@ -1985,10 +2001,10 @@ fn apply_middleware(
     //   [user layers, when SSG/ISG dist dir active] ->
     //   StaticFileMiddleware (when SSG/ISG enabled) ->
     //   Metrics -> ExceptionFilter -> ErrorPageContext -> Session ->
-    //   SecurityHeaders -> RequestId -> LogContext ->
+    //   SecurityHeaders -> RequestId -> LogContext -> AccessLog-primary ->
     //   [user layers, non-static build] ->
     //   Tenancy -> RateLimit -> CSRF -> CORS -> handler
-    //   (AccessLog sits outermost, applied in apply_startup_barrier.)
+    //   (An AccessLog fallback sits outermost, applied in apply_startup_barrier.)
     let router = router
         .layer(crate::middleware::error_page_filter::ErrorPageContextLayer { is_dev })
         .layer(ExceptionFilterLayer::new(all_filters))
@@ -2375,17 +2391,18 @@ fn apply_startup_barrier(
         barrier_state,
         startup_barrier,
     ));
-    // Structured per-request access log (#999), applied OUTSIDE the startup
-    // barrier, the static-first (SSG/ISR) middleware, the session layer, and
-    // the exception-filter chain — every production build path funnels
-    // through this function, including after the late MCP endpoint merge —
-    // so the logged status is always the status the client receives:
-    // startup 503s, pre-built static page hits, session-store outage 503s,
-    // and filter-rewritten error responses included. The request id is read
-    // from the `x-request-id` response header stamped by RequestIdLayer;
-    // short-circuit responses produced before that layer log without one.
+    // Access-log fallback (#999), applied OUTSIDE the startup barrier, the
+    // static-first (SSG/ISR) middleware, the session layer, and the
+    // exception-filter chain — every production build path funnels through
+    // this function, including after the late MCP endpoint merge. It emits
+    // only for responses the primary in-stack layer never saw (it checks the
+    // AccessLogEmitted response marker), giving startup 503s, pre-built
+    // static page hits, session-store outage 503s, and MCP endpoint requests
+    // an access line too. Those short-circuits never ran RequestIdLayer, so
+    // the fallback reads `x-request-id` from the response when present and
+    // logs without a request id otherwise.
     let router = if config.log.access_log {
-        router.layer(crate::middleware::AccessLogLayer::new(
+        router.layer(crate::middleware::AccessLogLayer::fallback(
             config.log.access_log_exclude.clone(),
         ))
     } else {

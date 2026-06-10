@@ -30,7 +30,9 @@ pub(crate) mod request_id;
 #[cfg(feature = "telemetry-otlp")]
 pub(crate) mod trace_context;
 
-pub use access_log::{ACCESS_LOG_TARGET, AccessLogLayer, AccessLogService, UNMATCHED_ROUTE};
+pub use access_log::{
+    ACCESS_LOG_TARGET, AccessLogEmitted, AccessLogLayer, AccessLogService, UNMATCHED_ROUTE,
+};
 pub use exception_filter::{AutumnErrorInfo, ExceptionFilter, ExceptionFilterLayer};
 pub use log_context::{LogContextLayer, LogContextService};
 pub use maintenance::{DEFAULT_HEALTH_PREFIX, MaintenanceLayer, MaintenanceService};
