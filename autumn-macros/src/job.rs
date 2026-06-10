@@ -9,7 +9,9 @@ struct JobAttrs {
     name: Option<String>,
     max_attempts: Option<u32>,
     backoff_ms: Option<u64>,
-    unique: bool,
+    /// `None` = unconfigured; `Some(false)` = explicit opt-out, which is an
+    /// error when combined with other uniqueness attributes.
+    unique: Option<bool>,
     unique_by: Option<Vec<String>>,
     unique_window: Option<String>,
     unique_for_ms: Option<u64>,
@@ -43,18 +45,23 @@ fn parse_uniqueness_arg(
     if meta.path.is_ident("unique") {
         if meta.input.peek(syn::Token![=]) {
             let value: LitBool = meta.value()?.parse()?;
-            result.unique = value.value();
+            result.unique = Some(value.value());
         } else {
-            result.unique = true;
+            result.unique = Some(true);
         }
     } else if meta.path.is_ident("unique_by") {
         let value: LitStr = meta.value()?.parse()?;
-        let fields: Vec<String> = value
+        // Sort and deduplicate so the derived key is canonical regardless of
+        // declaration order — two app versions listing the same fields in a
+        // different order still coalesce each other's jobs.
+        let mut fields: Vec<String> = value
             .value()
             .split(',')
             .map(|field| field.trim().to_string())
             .filter(|field| !field.is_empty())
             .collect();
+        fields.sort();
+        fields.dedup();
         if fields.is_empty() {
             return Err(
                 meta.error("unique_by must list at least one args field, e.g. \"account_id\"")
@@ -122,7 +129,14 @@ fn validate_job_attrs(result: &mut JobAttrs) -> syn::Result<()> {
         || result.unique_window.is_some()
         || result.unique_for_ms.is_some();
     if uniqueness_configured {
-        result.unique = true;
+        if result.unique == Some(false) {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "explicit `unique = false` is incompatible with other uniqueness attributes \
+                 (`unique_by`, `unique_window`, `unique_for_ms`)",
+            ));
+        }
+        result.unique = Some(true);
     }
     Ok(())
 }
@@ -132,7 +146,7 @@ fn parse_job_args(attr: TokenStream) -> syn::Result<JobAttrs> {
         name: None,
         max_attempts: None,
         backoff_ms: None,
-        unique: false,
+        unique: None,
         unique_by: None,
         unique_window: None,
         unique_for_ms: None,
@@ -172,7 +186,7 @@ fn pascal_case(name: &str) -> String {
 }
 
 fn uniqueness_tokens(attrs: &JobAttrs) -> TokenStream {
-    if !attrs.unique {
+    if !attrs.unique.unwrap_or(false) {
         return quote! { ::std::option::Option::None };
     }
     let by = attrs.unique_by.clone().unwrap_or_default();
@@ -310,14 +324,14 @@ mod tests {
         assert_eq!(attrs.name.as_deref(), Some("send_email"));
         assert_eq!(attrs.max_attempts, Some(3));
         assert_eq!(attrs.backoff_ms, Some(10));
-        assert!(!attrs.unique);
+        assert_eq!(attrs.unique, None);
         assert!(attrs.concurrency.is_none());
     }
 
     #[test]
     fn parses_bare_unique_flag() {
         let attrs = parse(quote! { unique }).expect("parse");
-        assert!(attrs.unique);
+        assert_eq!(attrs.unique, Some(true));
         assert!(attrs.unique_by.is_none());
         assert!(attrs.unique_for_ms.is_none());
     }
@@ -325,19 +339,38 @@ mod tests {
     #[test]
     fn parses_unique_with_explicit_bool() {
         let attrs = parse(quote! { unique = true }).expect("parse");
-        assert!(attrs.unique);
+        assert_eq!(attrs.unique, Some(true));
         let attrs = parse(quote! { unique = false }).expect("parse");
-        assert!(!attrs.unique);
+        assert_eq!(attrs.unique, Some(false));
     }
 
     #[test]
     fn unique_by_lists_trimmed_fields_and_implies_unique() {
         let attrs = parse(quote! { unique_by = "account_id, region" }).expect("parse");
-        assert!(attrs.unique);
+        assert_eq!(attrs.unique, Some(true));
         assert_eq!(
             attrs.unique_by.as_deref(),
             Some(&["account_id".to_string(), "region".to_string()][..])
         );
+    }
+
+    #[test]
+    fn unique_by_fields_are_sorted_and_deduplicated() {
+        let attrs = parse(quote! { unique_by = "region, account_id, region" }).expect("parse");
+        assert_eq!(
+            attrs.unique_by.as_deref(),
+            Some(&["account_id".to_string(), "region".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn explicit_unique_false_conflicts_with_other_uniqueness_attributes() {
+        assert!(parse(quote! { unique = false, unique_by = "account_id" }).is_err());
+        assert!(parse(quote! { unique = false, unique_window = "pending" }).is_err());
+        assert!(parse(quote! { unique = false, unique_for_ms = 1000 }).is_err());
+        // A lone opt-out stays a no-op.
+        let attrs = parse(quote! { unique = false }).expect("parse");
+        assert_eq!(attrs.unique, Some(false));
     }
 
     #[test]
@@ -350,7 +383,7 @@ mod tests {
     #[test]
     fn unique_for_ms_implies_unique_and_rejects_zero() {
         let attrs = parse(quote! { unique_for_ms = 60000 }).expect("parse");
-        assert!(attrs.unique);
+        assert_eq!(attrs.unique, Some(true));
         assert_eq!(attrs.unique_for_ms, Some(60_000));
         assert!(parse(quote! { unique_for_ms = 0 }).is_err());
     }
