@@ -116,6 +116,64 @@ domain aggregate id, or provider idempotency token.
 - Redis retries are scheduled in Redis before the worker moves on, so a crash
   during the backoff window does not drop the job.
 
+## Uniqueness and concurrency limits
+
+`#[job]` can declare dedup and in-flight caps directly, so double-submits and
+bursts cannot duplicate side effects or overwhelm downstream systems — no
+hand-rolled advisory locks in job bodies.
+
+```rust,ignore
+// At most one identical sync in flight: a burst of N identical enqueues
+// runs exactly once. The key defaults to a stable hash of the full args.
+#[job(unique)]
+async fn sync_search_index(state: AppState, args: SyncArgs) -> AutumnResult<()> { … }
+
+// Key by selected args fields, and cap simultaneous executions per account.
+#[job(unique_by = "account_id", concurrency = 1, concurrency_key = "account_id")]
+async fn recalculate_account(state: AppState, args: RecalcArgs) -> AutumnResult<()> { … }
+
+// Debounce: coalesce repeat enqueues for 60s from the first enqueue,
+// even after the job completed.
+#[job(unique_for_ms = 60_000)]
+async fn rebuild_report(state: AppState, args: ReportArgs) -> AutumnResult<()> { … }
+```
+
+Attributes:
+
+| Attribute | Meaning |
+|---|---|
+| `unique` | Dedupe on a stable hash of the full args payload. |
+| `unique_by = "a, b"` | Dedupe on the listed args fields (implies `unique`). |
+| `unique_window = "running"` | Default: key held while the job is pending **or** running; released when it settles. |
+| `unique_window = "pending"` | Key released when execution starts, so a new instance may queue while one runs. |
+| `unique_for_ms = N` | TTL window: key held for `N` ms from enqueue (and while in flight on Postgres), even past completion. Mutually exclusive with `unique_window`. |
+| `concurrency = N` | At most `N` simultaneously-executing jobs of this type. |
+| `concurrency_key = "field"` | Scope the limit per distinct value of this args field. |
+
+Semantics:
+
+- A coalesced enqueue is a **no-op `Ok(())`**; it is counted as
+  `total_deduplicated` in `/actuator/jobs` and recorded with the
+  `deduplicated` job-admin status.
+- Jobs over the concurrency cap **wait** (they stay enqueued/parked and run
+  when a slot frees) — they are never dropped.
+- Keys and slots are released on success, terminal failure, **and worker
+  crash**: Postgres ties them to row status recovered by the visibility
+  timeout; Redis settles them in the claim-validated transition and
+  stale-recovery scripts, with a TTL backstop on lock keys.
+- Enforcement is **distributed-safe** across replicas on the durable
+  backends: Postgres uses a partial unique index plus `ON CONFLICT DO
+  NOTHING` for dedup and (only when a limited job is registered) a
+  transaction-scoped advisory lock around claims; Redis uses `SET NX PX`
+  locks and atomic Lua claim/settle scripts.
+- With neither attribute set, behavior is unchanged: no dedup and unbounded
+  per-type concurrency.
+- Retries keep the unique key held (the job is still in flight) but release
+  the concurrency slot while waiting out the backoff.
+- The Postgres backend needs the additive `autumn migrate` migration that
+  adds the nullable `unique_key`/`unique_window`/`concurrency_key`/
+  `concurrency_limit` columns; rows and jobs without them behave as before.
+
 ## Observability
 
 Mount `autumn-admin-plugin` to get the built-in operator dashboard at
@@ -128,9 +186,11 @@ setup, action semantics, and bounded refresh behavior.
 
 - `queued`
 - `in_flight`
+- `blocked_on_concurrency`
 - `total_successes`
 - `total_failures`
 - `dead_letters`
+- `total_deduplicated`
 - `last_error`
 
 For Redis deployments these counters are process-local operational telemetry,
