@@ -676,4 +676,107 @@ mod tests {
         assert_eq!(snap.len(), 1);
         assert!(snap[0].request_id.is_none());
     }
+
+    // ── GREEN: FieldVisitor numeric and bool types ─────────────
+
+    #[tokio::test]
+    async fn green_layer_field_visitor_records_numeric_and_bool_types() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let buf = LogBuffer::new(10, ParameterFilter::default());
+        let layer = LogCaptureLayer::new(buf.clone());
+        let subscriber = tracing_subscriber::registry().with(layer);
+        let _guard = tracing::dispatcher::set_default(&tracing::Dispatch::new(subscriber));
+
+        tracing::info!(count = 42i64, size = 100u64, ratio = 0.5f64, active = true, "typed fields");
+
+        let snap = buf.snapshot(None, None);
+        assert_eq!(snap.len(), 1);
+        let entry = &snap[0];
+        assert_eq!(entry.fields["count"].as_i64().unwrap(), 42);
+        assert_eq!(entry.fields["size"].as_u64().unwrap(), 100);
+        assert!((entry.fields["ratio"].as_f64().unwrap() - 0.5).abs() < f64::EPSILON);
+        assert!(entry.fields["active"].as_bool().unwrap());
+    }
+
+    // ── GREEN: level_from_str mixed-case fallback paths ────────
+
+    #[test]
+    fn green_level_from_str_mixed_case_hits_fallback_branches() {
+        // "Error", "Warn", "Debug", "Trace" are not in the fast-path arms;
+        // they fall through to the eq_ignore_ascii_case branches.
+        assert_eq!(level_from_str("Error"), Some(Level::ERROR));
+        assert_eq!(level_from_str("Warn"), Some(Level::WARN));
+        assert_eq!(level_from_str("Debug"), Some(Level::DEBUG));
+        assert_eq!(level_from_str("Trace"), Some(Level::TRACE));
+    }
+
+    // ── GREEN: LogBuffer Debug impl and is_empty ───────────────
+
+    #[test]
+    fn green_buffer_debug_format_shows_len() {
+        let buf = LogBuffer::new(10, ParameterFilter::default());
+        buf.push(make_entry("INFO", "a"));
+        let s = format!("{buf:?}");
+        assert!(s.contains("len"), "Debug output should contain 'len': {s}");
+    }
+
+    #[test]
+    fn green_buffer_is_empty_false_when_has_entries() {
+        let buf = LogBuffer::new(10, ParameterFilter::default());
+        assert!(buf.is_empty());
+        buf.push(make_entry("INFO", "a"));
+        assert!(!buf.is_empty());
+    }
+
+    // ── GREEN: context field scrubbing (filter matches) ────────
+
+    #[tokio::test]
+    async fn green_layer_scrubs_sensitive_context_user_id_and_tenant_id() {
+        use crate::log::context::{LogContext, scope};
+        use tracing_subscriber::layer::SubscriberExt;
+
+        // Build a filter that considers user_id and tenant_id sensitive.
+        let filter = ParameterFilter::new(
+            &[
+                "user_id".to_owned(),
+                "tenant_id".to_owned(),
+                "region".to_owned(),
+            ],
+            &[],
+        );
+        let buf = LogBuffer::new(10, filter);
+        let layer = LogCaptureLayer::new(buf.clone());
+        let subscriber = tracing_subscriber::registry().with(layer);
+        let _guard = tracing::dispatcher::set_default(&tracing::Dispatch::new(subscriber));
+
+        let ctx = LogContext::new(None);
+        ctx.set_user_id("secret-user");
+        ctx.set_tenant_id("secret-tenant");
+        ctx.insert_field("region", "eu-west-1");
+
+        scope(ctx, async {
+            tracing::info!("context scrub test");
+        })
+        .await;
+
+        let snap = buf.snapshot(None, None);
+        assert_eq!(snap.len(), 1);
+        let entry = &snap[0];
+        assert_eq!(
+            entry.fields["user_id"].as_str().unwrap(),
+            FILTERED_PLACEHOLDER,
+            "user_id from context must be scrubbed"
+        );
+        assert_eq!(
+            entry.fields["tenant_id"].as_str().unwrap(),
+            FILTERED_PLACEHOLDER,
+            "tenant_id from context must be scrubbed"
+        );
+        assert_eq!(
+            entry.fields["region"].as_str().unwrap(),
+            FILTERED_PLACEHOLDER,
+            "custom context field matching filter must be scrubbed"
+        );
+    }
 }
