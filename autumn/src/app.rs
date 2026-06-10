@@ -124,6 +124,7 @@ pub fn app() -> AppBuilder {
         channels_interceptor: None,
         #[cfg(feature = "oauth2")]
         http_interceptor: None,
+        seo_sources: Vec::new(),
         metrics_sources: Vec::new(),
         health_indicators: Vec::new(),
         #[cfg(feature = "inbound-mail")]
@@ -332,6 +333,10 @@ pub struct AppBuilder {
     channels_interceptor: Option<Arc<dyn crate::interceptor::ChannelsInterceptor>>,
     #[cfg(feature = "oauth2")]
     http_interceptor: Option<Arc<dyn crate::interceptor::HttpInterceptor>>,
+    /// Sitemap sources registered via [`AppBuilder::seo_source`].
+    /// Each source provides dynamic URL entries for `/sitemap.xml`.
+    seo_sources: Vec<Arc<dyn crate::seo::SitemapSource>>,
+
     /// Plugin-contributed metrics sources registered via [`AppBuilder::metrics_source`].
     pub(crate) metrics_sources: Vec<(String, Arc<dyn crate::actuator::MetricsSource>)>,
     /// Custom health indicators registered via [`AppBuilder::health_indicator`].
@@ -520,6 +525,49 @@ impl AppBuilder {
     #[must_use]
     pub fn static_routes(mut self, metas: Vec<crate::static_gen::StaticRouteMeta>) -> Self {
         self.static_metas.extend(metas);
+        self
+    }
+
+    /// Register a [`SitemapSource`](crate::seo::SitemapSource) for dynamic sitemap entries.
+    ///
+    /// When called at least once, the framework automatically serves `/sitemap.xml` and
+    /// `/robots.txt`. Dynamic sources (e.g. blog posts from a database) produce entries
+    /// collected at request time.
+    ///
+    /// Combine with `[seo] base_url` in `autumn.toml` to auto-inject the `Sitemap:`
+    /// directive in `robots.txt` and compute canonical URLs.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use autumn_web::prelude::*;
+    /// use autumn_web::seo::{SitemapEntry, SitemapSource};
+    /// use std::pin::Pin;
+    /// use std::future::Future;
+    ///
+    /// struct PostsSitemap;
+    ///
+    /// impl SitemapSource for PostsSitemap {
+    ///     fn entries(&self) -> Pin<Box<dyn Future<Output = Vec<SitemapEntry>> + Send>> {
+    ///         Box::pin(async {
+    ///             vec![SitemapEntry::new("https://example.com/posts/hello")]
+    ///         })
+    ///     }
+    /// }
+    ///
+    /// # #[autumn_web::main]
+    /// # async fn main() {
+    /// # #[get("/")] async fn index() -> &'static str { "" }
+    /// autumn_web::app()
+    ///     .routes(routes![index])
+    ///     .seo_source(PostsSitemap)
+    ///     .run()
+    ///     .await;
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn seo_source<S: crate::seo::SitemapSource + 'static>(mut self, source: S) -> Self {
+        self.seo_sources.push(Arc::new(source));
         self
     }
 
@@ -2176,6 +2224,7 @@ impl AppBuilder {
             channels_interceptor,
             #[cfg(feature = "oauth2")]
             http_interceptor,
+            seo_sources,
             metrics_sources,
             health_indicators,
             #[cfg(feature = "inbound-mail")]
@@ -2505,6 +2554,29 @@ impl AppBuilder {
         if let Some(router) = storage_router {
             merge_routers.push(router);
         }
+
+        // Register SEO routes (/robots.txt and /sitemap.xml) when sitemap
+        // sources are configured. Entries are collected from all registered
+        // sources and baked into the response at startup.
+        if !seo_sources.is_empty() {
+            let seo_cfg = &config.seo;
+            let profile = config.profile.as_deref().unwrap_or("dev");
+            let base_url = seo_cfg.base_url.as_deref();
+            let additional_rules = seo_cfg.robots.additional_rules.clone();
+            let mut sitemap_entries = Vec::new();
+            for source in &seo_sources {
+                let mut entries = source.entries().await;
+                sitemap_entries.append(&mut entries);
+            }
+            let seo_router = crate::seo::build_seo_router_with_entries(
+                profile,
+                base_url,
+                &additional_rules,
+                sitemap_entries,
+            );
+            merge_routers.push(seo_router);
+        }
+
         #[cfg(feature = "inbound-mail")]
         if let Some(ref im_router) = inbound_mail_router {
             let mut registered_inbound: std::collections::HashSet<String> =
@@ -2902,6 +2974,7 @@ impl AppBuilder {
             channels_interceptor,
             #[cfg(feature = "oauth2")]
             http_interceptor,
+            seo_sources,
             metrics_sources,
             health_indicators,
             #[cfg(feature = "inbound-mail")]
@@ -3189,6 +3262,49 @@ impl AppBuilder {
                 }
                 Err(e) => {
                     eprintln!("  \u{26A0} Failed to write OpenAPI spec: {e}");
+                }
+            }
+        }
+
+        // Write robots.txt and sitemap.xml to dist/
+        {
+            let profile = config.profile.as_deref().unwrap_or("dev");
+            let seo_cfg = &config.seo;
+            let base_url = seo_cfg.base_url.as_deref();
+            let additional_rules = &seo_cfg.robots.additional_rules;
+            let mut sitemap_entries = Vec::new();
+            for source in &seo_sources {
+                let mut entries = source.entries().await;
+                sitemap_entries.append(&mut entries);
+            }
+            // Build entries from static route metas (auto-include static pages)
+            if let Some(bu) = base_url {
+                for meta in &static_metas {
+                    if !meta.path.contains('{') {
+                        sitemap_entries.push(crate::seo::SitemapEntry::new(
+                            format!("{bu}{}", meta.path),
+                        ));
+                    }
+                }
+            }
+            match crate::seo::write_seo_files(
+                &dist_dir,
+                profile,
+                base_url,
+                additional_rules,
+                &sitemap_entries,
+            )
+            .await
+            {
+                Ok(()) => {
+                    eprintln!(
+                        "  \u{2713} SEO files written \u{2192} {}/robots.txt, {}/sitemap.xml",
+                        dist_dir.display(),
+                        dist_dir.display()
+                    );
+                }
+                Err(e) => {
+                    eprintln!("  \u{26A0} Failed to write SEO files: {e}");
                 }
             }
         }

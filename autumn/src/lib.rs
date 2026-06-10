@@ -83,6 +83,7 @@ pub use channels::{
 pub mod canary;
 pub mod config;
 pub mod credentials;
+pub mod seo;
 #[cfg(feature = "db")]
 pub mod db;
 pub mod encryption;
