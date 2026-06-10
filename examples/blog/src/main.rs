@@ -6,9 +6,32 @@ mod tasks;
 
 use autumn_admin_plugin::AdminPlugin;
 use autumn_web::migrate::{EmbeddedMigrations, embed_migrations};
+use autumn_web::seo::{SitemapEntry, SitemapSource};
 use autumn_web::{jobs, one_off_tasks, routes, static_routes};
+use std::future::Future;
+use std::pin::Pin;
 
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
+
+/// Dynamic sitemap source: provides a URL for every published blog post.
+///
+/// In a real app this would query the database; here we return a
+/// representative static list so `autumn build` and the running server
+/// produce a valid `/sitemap.xml` without requiring a live database.
+struct BlogSitemapSource;
+
+impl SitemapSource for BlogSitemapSource {
+    fn entries(&self) -> Pin<Box<dyn Future<Output = Vec<SitemapEntry>> + Send>> {
+        Box::pin(async {
+            vec![
+                SitemapEntry::new("https://autumn-demo.example.com/").changefreq(
+                    autumn_web::seo::SitemapChangefreq::Weekly,
+                ),
+                SitemapEntry::new("https://autumn-demo.example.com/about"),
+            ]
+        })
+    }
+}
 
 #[autumn_web::main]
 async fn main() {
@@ -24,6 +47,9 @@ async fn main() {
                 .require_role(None::<String>)
                 .register(admin::PostAdmin),
         )
+        // Register the sitemap source: mounts /robots.txt and /sitemap.xml.
+        // Configure [seo] base_url in autumn.toml for canonical URL injection.
+        .seo_source(BlogSitemapSource)
         .routes(routes![
             // Public routes
             routes::about::about, // #[static_get] — pre-rendered
