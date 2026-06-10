@@ -1,0 +1,560 @@
+//! In-memory log capture layer and bounded ring buffer.
+//!
+//! When `log.capture.enabled = true`, a [`LogCaptureLayer`] is installed
+//! alongside the rest of the tracing subscriber stack.  It writes every
+//! `tracing` event into a [`LogBuffer`] — a bounded ring-buffer that evicts
+//! the oldest entry when capacity is reached.  The buffer is exposed by the
+//! `/actuator/logfile` endpoint so recent structured log entries are visible
+//! over HTTP without SSH access or an external aggregator.
+//!
+//! Sensitive field values are scrubbed using the same [`ParameterFilter`] that
+//! guards the rest of the logging pipeline.  The `request_id` field is read
+//! from the current [`crate::log::context`] task-local, tying log entries to
+//! the request that produced them.
+
+use std::collections::VecDeque;
+use std::sync::{Arc, RwLock};
+
+use chrono::SecondsFormat;
+use serde::{Deserialize, Serialize};
+use tracing::field::{Field, Visit};
+use tracing::{Event, Level, Subscriber};
+use tracing_subscriber::Layer;
+use tracing_subscriber::layer::Context;
+use tracing_subscriber::registry::LookupSpan;
+
+use crate::log::filter::{FILTERED_PLACEHOLDER, ParameterFilter};
+
+// ── Config ─────────────────────────────────────────────────────
+
+/// Configuration for the in-memory log capture buffer.
+///
+/// Nested under `[log.capture]` in `autumn.toml` or via
+/// `AUTUMN_LOG__CAPTURE__*` environment variables.
+///
+/// # Examples
+///
+/// ```rust
+/// use autumn_web::log::capture::LogCaptureConfig;
+///
+/// let cfg = LogCaptureConfig::default();
+/// assert!(!cfg.enabled);
+/// assert_eq!(cfg.capacity, 1000);
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct LogCaptureConfig {
+    /// Enable the in-memory capture buffer.  Default: `false`.
+    ///
+    /// When disabled, no capture layer is installed and the buffer is never
+    /// populated.  The `/actuator/logfile` endpoint returns an empty list.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Maximum number of entries to retain.  Default: `1000`.
+    ///
+    /// Once capacity is reached the oldest entry is evicted to make room for
+    /// the new one — the buffer never grows beyond this size.
+    #[serde(default = "default_capacity")]
+    pub capacity: usize,
+}
+
+fn default_capacity() -> usize {
+    1000
+}
+
+impl Default for LogCaptureConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            capacity: default_capacity(),
+        }
+    }
+}
+
+// ── CapturedLogEntry ──────────────────────────────────────────
+
+/// A single captured tracing event stored in the [`LogBuffer`].
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct CapturedLogEntry {
+    /// ISO 8601 timestamp with millisecond precision (`2024-01-15T12:34:56.789Z`).
+    pub timestamp: String,
+    /// Tracing level: `"TRACE"`, `"DEBUG"`, `"INFO"`, `"WARN"`, or `"ERROR"`.
+    pub level: String,
+    /// The `tracing` target (typically the module path, e.g. `"myapp::orders"`).
+    pub target: String,
+    /// The event message (the first positional argument to the macro).
+    pub message: String,
+    /// Structured key-value fields attached to the event.
+    ///
+    /// Values whose key is on the sensitive-key deny-list are replaced with
+    /// `"[FILTERED]"` before storage.
+    #[serde(skip_serializing_if = "serde_json::Map::is_empty")]
+    pub fields: serde_json::Map<String, serde_json::Value>,
+    /// Request correlation id, when the event was emitted inside a request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+}
+
+// ── LogBuffer ─────────────────────────────────────────────────
+
+struct LogBufferInner {
+    capacity: usize,
+    entries: VecDeque<CapturedLogEntry>,
+}
+
+/// Thread-safe bounded ring-buffer of recent log entries.
+///
+/// [`LogBuffer`] is `Clone`: clones share the same underlying storage via
+/// `Arc`, so both the capture layer and the actuator endpoint refer to the
+/// same buffer.
+#[derive(Clone)]
+pub struct LogBuffer {
+    inner: Arc<RwLock<LogBufferInner>>,
+    filter: Arc<ParameterFilter>,
+}
+
+impl std::fmt::Debug for LogBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let len = self.len();
+        f.debug_struct("LogBuffer").field("len", &len).finish()
+    }
+}
+
+impl LogBuffer {
+    /// Create a new buffer with the given capacity and sensitive-key filter.
+    #[must_use]
+    pub fn new(capacity: usize, filter: ParameterFilter) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(LogBufferInner {
+                capacity,
+                entries: VecDeque::with_capacity(capacity.min(1024)),
+            })),
+            filter: Arc::new(filter),
+        }
+    }
+
+    /// Push a new entry, evicting the oldest if at capacity.
+    pub fn push(&self, entry: CapturedLogEntry) {
+        let mut guard = self
+            .inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if guard.capacity > 0 && guard.entries.len() >= guard.capacity {
+            guard.entries.pop_front();
+        }
+        if guard.capacity > 0 {
+            guard.entries.push_back(entry);
+        }
+    }
+
+    /// Snapshot recent entries, optionally filtered by minimum level and/or count.
+    ///
+    /// `min_level` keeps entries whose severity is ≥ the given level (e.g.
+    /// `Level::WARN` keeps only WARN and ERROR entries).  `limit` caps the
+    /// result to the *N* most-recent matching entries.  The returned slice is
+    /// always in chronological order (oldest first).
+    #[must_use]
+    pub fn snapshot(&self, min_level: Option<Level>, limit: Option<usize>) -> Vec<CapturedLogEntry> {
+        let guard = self
+            .inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let iter = guard.entries.iter().filter(|e| {
+            min_level.map_or(true, |filter| {
+                level_from_str(&e.level)
+                    .map_or(false, |lvl| lvl <= filter)
+            })
+        });
+
+        if let Some(n) = limit {
+            // Take the last N matching entries (newest-last in the original order).
+            let all: Vec<_> = iter.cloned().collect();
+            let start = all.len().saturating_sub(n);
+            all[start..].to_vec()
+        } else {
+            iter.cloned().collect()
+        }
+    }
+
+    /// Number of entries currently stored.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entries
+            .len()
+    }
+
+    /// `true` when no entries are stored.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Expose the shared parameter filter for field scrubbing.
+    pub(crate) fn filter(&self) -> &ParameterFilter {
+        &self.filter
+    }
+}
+
+// ── Level helpers ──────────────────────────────────────────────
+
+/// Parse a level string (case-insensitive) into a `tracing::Level`.
+///
+/// Returns `None` for unrecognised strings so callers can handle gracefully.
+pub fn level_from_str(s: &str) -> Option<Level> {
+    match s.to_ascii_uppercase().as_str() {
+        "TRACE" => Some(Level::TRACE),
+        "DEBUG" => Some(Level::DEBUG),
+        "INFO" => Some(Level::INFO),
+        "WARN" => Some(Level::WARN),
+        "ERROR" => Some(Level::ERROR),
+        _ => None,
+    }
+}
+
+// ── LogCaptureLayer ───────────────────────────────────────────
+
+/// `tracing_subscriber` layer that captures events into a [`LogBuffer`].
+///
+/// Install this via [`crate::telemetry::init`] by enabling
+/// `log.capture.enabled`.  It sits in the subscriber stack alongside the
+/// existing stdout/JSON and OTLP layers and does not affect their output.
+pub struct LogCaptureLayer {
+    buffer: LogBuffer,
+}
+
+impl LogCaptureLayer {
+    /// Wrap `buffer` in a new capture layer.
+    #[must_use]
+    pub fn new(buffer: LogBuffer) -> Self {
+        Self { buffer }
+    }
+
+    /// Return the underlying buffer (for wiring into `AppState`).
+    pub fn buffer(&self) -> &LogBuffer {
+        &self.buffer
+    }
+}
+
+impl<S: Subscriber + for<'a> LookupSpan<'a>> Layer<S> for LogCaptureLayer {
+    fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+        let mut visitor = FieldVisitor {
+            message: None,
+            fields: serde_json::Map::new(),
+        };
+        event.record(&mut visitor);
+
+        let message = visitor.message.unwrap_or_default();
+        let level = event.metadata().level().to_string();
+        let target = event.metadata().target().to_owned();
+        let timestamp = chrono::Utc::now()
+            .to_rfc3339_opts(SecondsFormat::Millis, true);
+
+        // Scrub sensitive field values before storage.
+        let filter = self.buffer.filter();
+        let scrubbed = visitor
+            .fields
+            .into_iter()
+            .map(|(k, v)| {
+                if filter.matches_key(&k) {
+                    (k, serde_json::Value::String(FILTERED_PLACEHOLDER.to_owned()))
+                } else {
+                    (k, v)
+                }
+            })
+            .collect();
+
+        // Pull request_id from the task-local log context if available.
+        let request_id = crate::log::context::snapshot().and_then(|s| s.request_id);
+
+        let entry = CapturedLogEntry {
+            timestamp,
+            level,
+            target,
+            message,
+            fields: scrubbed,
+            request_id,
+        };
+
+        self.buffer.push(entry);
+    }
+}
+
+// ── Field visitor ─────────────────────────────────────────────
+
+struct FieldVisitor {
+    message: Option<String>,
+    fields: serde_json::Map<String, serde_json::Value>,
+}
+
+impl Visit for FieldVisitor {
+    fn record_str(&mut self, field: &Field, value: &str) {
+        if field.name() == "message" {
+            self.message = Some(value.to_owned());
+        } else {
+            self.fields.insert(
+                field.name().to_owned(),
+                serde_json::Value::String(value.to_owned()),
+            );
+        }
+    }
+
+    fn record_i64(&mut self, field: &Field, value: i64) {
+        self.fields.insert(
+            field.name().to_owned(),
+            serde_json::Value::Number(value.into()),
+        );
+    }
+
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        if let Some(n) = serde_json::Number::from_u128(u128::from(value)) {
+            self.fields
+                .insert(field.name().to_owned(), serde_json::Value::Number(n));
+        }
+    }
+
+    fn record_f64(&mut self, field: &Field, value: f64) {
+        if let Some(n) = serde_json::Number::from_f64(value) {
+            self.fields
+                .insert(field.name().to_owned(), serde_json::Value::Number(n));
+        }
+    }
+
+    fn record_bool(&mut self, field: &Field, value: bool) {
+        self.fields
+            .insert(field.name().to_owned(), serde_json::Value::Bool(value));
+    }
+
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        let s = format!("{value:?}");
+        if field.name() == "message" {
+            self.message = Some(s);
+        } else {
+            self.fields
+                .insert(field.name().to_owned(), serde_json::Value::String(s));
+        }
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_entry(level: &str, msg: &str) -> CapturedLogEntry {
+        CapturedLogEntry {
+            timestamp: "2024-01-01T00:00:00.000Z".to_owned(),
+            level: level.to_owned(),
+            target: "test".to_owned(),
+            message: msg.to_owned(),
+            fields: serde_json::Map::new(),
+            request_id: None,
+        }
+    }
+
+    // ── RED: LogBuffer bounded capacity ──────────────────────
+
+    #[test]
+    fn red_buffer_evicts_oldest_at_capacity() {
+        let buf = LogBuffer::new(3, ParameterFilter::default());
+        buf.push(make_entry("INFO", "first"));
+        buf.push(make_entry("INFO", "second"));
+        buf.push(make_entry("INFO", "third"));
+        buf.push(make_entry("INFO", "fourth")); // should evict "first"
+
+        let snap = buf.snapshot(None, None);
+        assert_eq!(snap.len(), 3);
+        assert_eq!(snap[0].message, "second");
+        assert_eq!(snap[2].message, "fourth");
+    }
+
+    #[test]
+    fn red_buffer_zero_capacity_stores_nothing() {
+        let buf = LogBuffer::new(0, ParameterFilter::default());
+        buf.push(make_entry("INFO", "msg"));
+        assert_eq!(buf.len(), 0);
+        assert!(buf.snapshot(None, None).is_empty());
+    }
+
+    #[test]
+    fn red_buffer_snapshot_respects_limit() {
+        let buf = LogBuffer::new(100, ParameterFilter::default());
+        for i in 0..10u32 {
+            buf.push(make_entry("INFO", &format!("msg-{i}")));
+        }
+        let snap = buf.snapshot(None, Some(3));
+        assert_eq!(snap.len(), 3);
+        // limit takes the most recent N entries in chronological order
+        assert_eq!(snap[0].message, "msg-7");
+        assert_eq!(snap[2].message, "msg-9");
+    }
+
+    #[test]
+    fn red_buffer_snapshot_level_filter_excludes_debug_when_min_info() {
+        let buf = LogBuffer::new(100, ParameterFilter::default());
+        buf.push(make_entry("DEBUG", "debug-msg"));
+        buf.push(make_entry("INFO", "info-msg"));
+        buf.push(make_entry("WARN", "warn-msg"));
+
+        let snap = buf.snapshot(Some(Level::INFO), None);
+        assert_eq!(snap.len(), 2);
+        assert!(snap.iter().all(|e| e.level != "DEBUG"));
+    }
+
+    #[test]
+    fn red_buffer_snapshot_level_filter_error_only() {
+        let buf = LogBuffer::new(100, ParameterFilter::default());
+        buf.push(make_entry("INFO", "info"));
+        buf.push(make_entry("WARN", "warn"));
+        buf.push(make_entry("ERROR", "error"));
+
+        let snap = buf.snapshot(Some(Level::ERROR), None);
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].level, "ERROR");
+    }
+
+    #[test]
+    fn red_buffer_snapshot_no_filter_returns_all() {
+        let buf = LogBuffer::new(100, ParameterFilter::default());
+        buf.push(make_entry("TRACE", "t"));
+        buf.push(make_entry("ERROR", "e"));
+        let snap = buf.snapshot(None, None);
+        assert_eq!(snap.len(), 2);
+    }
+
+    // ── RED: LogBuffer sensitive field scrubbing ──────────────
+
+    #[test]
+    fn red_buffer_push_does_not_scrub_fields_directly() {
+        // Scrubbing happens in LogCaptureLayer, not in push; push is raw.
+        let buf = LogBuffer::new(10, ParameterFilter::default());
+        let mut entry = make_entry("INFO", "login");
+        entry.fields.insert(
+            "password".to_owned(),
+            serde_json::Value::String("hunter2".to_owned()),
+        );
+        buf.push(entry.clone());
+        let snap = buf.snapshot(None, None);
+        // push stores whatever it's given (scrubbing is the layer's job)
+        assert_eq!(snap[0].fields["password"], "hunter2");
+    }
+
+    // ── RED: LogBuffer clone shares storage ────────────────────
+
+    #[test]
+    fn red_buffer_clone_shares_storage() {
+        let buf = LogBuffer::new(10, ParameterFilter::default());
+        let clone = buf.clone();
+        buf.push(make_entry("INFO", "shared"));
+        assert_eq!(clone.len(), 1);
+    }
+
+    // ── RED: level_from_str ────────────────────────────────────
+
+    #[test]
+    fn red_level_from_str_parses_case_insensitive() {
+        assert_eq!(level_from_str("error"), Some(Level::ERROR));
+        assert_eq!(level_from_str("WARN"), Some(Level::WARN));
+        assert_eq!(level_from_str("Info"), Some(Level::INFO));
+        assert_eq!(level_from_str("debug"), Some(Level::DEBUG));
+        assert_eq!(level_from_str("TRACE"), Some(Level::TRACE));
+        assert_eq!(level_from_str("bogus"), None);
+    }
+
+    // ── RED: LogCaptureConfig defaults ────────────────────────
+
+    #[test]
+    fn red_capture_config_default_is_disabled_with_1000_capacity() {
+        let cfg = LogCaptureConfig::default();
+        assert!(!cfg.enabled);
+        assert_eq!(cfg.capacity, 1000);
+    }
+
+    // ── RED: LogBuffer snapshot newest-last ordering ──────────
+
+    #[test]
+    fn red_snapshot_returns_entries_in_insertion_order() {
+        let buf = LogBuffer::new(10, ParameterFilter::default());
+        buf.push(make_entry("INFO", "a"));
+        buf.push(make_entry("INFO", "b"));
+        buf.push(make_entry("INFO", "c"));
+
+        let snap = buf.snapshot(None, None);
+        assert_eq!(snap[0].message, "a");
+        assert_eq!(snap[1].message, "b");
+        assert_eq!(snap[2].message, "c");
+    }
+
+    // ── GREEN: LogCaptureLayer via tracing subscriber ─────────
+
+    #[tokio::test]
+    async fn green_layer_captures_event_with_structured_fields_and_scrubs_sensitive_keys() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let buf = LogBuffer::new(10, ParameterFilter::default());
+        let layer = LogCaptureLayer::new(buf.clone());
+
+        // Install into a *dispatch* (not global) so the test doesn't fight
+        // with other tests for the global subscriber slot.
+        let subscriber = tracing_subscriber::registry().with(layer);
+        let _guard = tracing::dispatcher::set_default(&tracing::Dispatch::new(subscriber));
+
+        tracing::info!(order_id = "A-1001", password = "hunter2", "order placed");
+
+        let snap = buf.snapshot(None, None);
+        assert_eq!(snap.len(), 1);
+        let entry = &snap[0];
+        assert_eq!(entry.message, "order placed");
+        assert_eq!(entry.level, "INFO");
+        assert_eq!(entry.fields["order_id"].as_str().unwrap(), "A-1001");
+        // sensitive key scrubbed
+        assert_eq!(
+            entry.fields["password"].as_str().unwrap(),
+            crate::log::filter::FILTERED_PLACEHOLDER
+        );
+    }
+
+    #[tokio::test]
+    async fn green_layer_captures_multiple_levels() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let buf = LogBuffer::new(10, ParameterFilter::default());
+        let layer = LogCaptureLayer::new(buf.clone());
+        let subscriber = tracing_subscriber::registry().with(layer);
+        let _guard = tracing::dispatcher::set_default(&tracing::Dispatch::new(subscriber));
+
+        tracing::warn!("something went wrong");
+        tracing::error!("fatal error");
+
+        let snap = buf.snapshot(None, None);
+        assert_eq!(snap.len(), 2);
+        assert_eq!(snap[0].level, "WARN");
+        assert_eq!(snap[1].level, "ERROR");
+    }
+
+    #[tokio::test]
+    async fn green_layer_is_additive_does_not_affect_other_layers() {
+        // This test verifies the layer is truly additive by ensuring the
+        // buffer receives events even when multiple layers are stacked.
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let buf = LogBuffer::new(10, ParameterFilter::default());
+        let capture = LogCaptureLayer::new(buf.clone());
+
+        // Stack capture + a no-op fmt layer (simulating the existing pipeline).
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer().with_writer(std::io::sink))
+            .with(capture);
+        let _guard = tracing::dispatcher::set_default(&tracing::Dispatch::new(subscriber));
+
+        tracing::info!("additive test");
+
+        // Both the fmt layer and the capture layer ran; capture has the entry.
+        assert_eq!(buf.len(), 1);
+        assert_eq!(buf.snapshot(None, None)[0].message, "additive test");
+    }
+}

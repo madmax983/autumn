@@ -758,6 +758,11 @@ impl crate::actuator::ProvideActuatorState for AppState {
         self.extension::<crate::webhook_outbound::WebhookOutboundManager>()
             .map(|x| (*x).clone())
     }
+
+    fn log_buffer(&self) -> Option<crate::log::capture::LogBuffer> {
+        self.extension::<crate::log::capture::LogBuffer>()
+            .map(|x| (*x).clone())
+    }
 }
 
 impl std::fmt::Debug for AppState {

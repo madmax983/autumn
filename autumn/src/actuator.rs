@@ -348,6 +348,15 @@ pub trait ProvideActuatorState {
     fn webhook_outbound(&self) -> Option<crate::webhook_outbound::WebhookOutboundManager> {
         None
     }
+
+    /// Returns the in-memory log capture buffer, if capture is enabled.
+    ///
+    /// The default returns `None` (capture disabled). [`crate::AppState`]
+    /// overrides this to return the buffer installed at startup when
+    /// `log.capture.enabled = true`.
+    fn log_buffer(&self) -> Option<crate::log::capture::LogBuffer> {
+        None
+    }
 }
 
 // ── Shared types for AppState ──────────────────────────────────
@@ -898,6 +907,20 @@ impl ConfigProperties {
             "log.format",
             &format!("{:?}", config.log.format),
             &format!("{:?}", defaults.log.format),
+            profile_str,
+        );
+        Self::track_property(
+            props,
+            "log.capture.enabled",
+            &config.log.capture.enabled.to_string(),
+            &defaults.log.capture.enabled.to_string(),
+            profile_str,
+        );
+        Self::track_property(
+            props,
+            "log.capture.capacity",
+            &config.log.capture.capacity.to_string(),
+            &defaults.log.capture.capacity.to_string(),
             profile_str,
         );
     }
@@ -2219,6 +2242,65 @@ pub(crate) async fn loggers_put<S: ProvideActuatorState + Send + Sync + 'static>
     )
 }
 
+// ── Logfile (sensitive) ────────────────────────────────────────
+
+/// Query parameters for `GET <actuator-prefix>/logfile`.
+#[derive(Debug, Deserialize, Default)]
+pub(crate) struct LogfileQuery {
+    /// Minimum log level to include (case-insensitive).
+    ///
+    /// Valid values: `trace`, `debug`, `info`, `warn`, `error`.
+    /// When absent all levels are returned.
+    pub level: Option<String>,
+    /// Maximum number of entries to return (most-recent N, newest-last).
+    pub limit: Option<usize>,
+}
+
+/// JSON response shape for `GET <actuator-prefix>/logfile`.
+#[derive(Debug, Serialize)]
+pub(crate) struct LogfileResponse {
+    /// Captured log entries, oldest first.
+    pub entries: Vec<crate::log::capture::CapturedLogEntry>,
+    /// Total entries in the buffer (before `limit` is applied).
+    pub total: usize,
+    /// `true` when the capture buffer is enabled and populated by the layer.
+    pub capture_enabled: bool,
+}
+
+/// `GET <actuator-prefix>/logfile` — recent structured log entries.
+///
+/// Returns entries from the in-memory capture buffer, filtered by `?level=`
+/// and capped by `?limit=`. Only available when `actuator.sensitive = true`
+/// and `log.capture.enabled = true`.  When capture is disabled the endpoint
+/// still responds with `200` and an empty list so API consumers can handle
+/// the case uniformly.
+pub(crate) async fn logfile_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
+    State(state): State<S>,
+    axum::extract::Query(query): axum::extract::Query<LogfileQuery>,
+) -> axum::Json<LogfileResponse> {
+    let min_level = query
+        .level
+        .as_deref()
+        .and_then(crate::log::capture::level_from_str);
+
+    match state.log_buffer() {
+        None => axum::Json(LogfileResponse {
+            entries: vec![],
+            total: 0,
+            capture_enabled: false,
+        }),
+        Some(buf) => {
+            let total = buf.len();
+            let entries = buf.snapshot(min_level, query.limit);
+            axum::Json(LogfileResponse {
+                entries,
+                total,
+                capture_enabled: true,
+            })
+        }
+    }
+}
+
 // ── Tasks (sensitive) ──────────────────────────────────────────
 
 /// `GET <actuator-prefix>/tasks` -- scheduled task status.
@@ -2595,6 +2677,7 @@ pub(crate) fn actuator_endpoint_paths(
         paths.push(actuator_route_path(prefix, "/env"));
         paths.push(actuator_route_path(prefix, "/configprops"));
         paths.push(actuator_route_path(prefix, "/loggers"));
+        paths.push(actuator_route_path(prefix, "/logfile"));
         paths.push(actuator_route_path(prefix, "/tasks"));
         paths.push(actuator_route_path(prefix, "/jobs"));
         paths.push(actuator_route_path(prefix, "/ui/tasks"));
@@ -2683,6 +2766,10 @@ pub(crate) fn actuator_router_with_prefix<
             .route(
                 &actuator_route_path(prefix, "/loggers/{name}"),
                 axum::routing::put(loggers_put::<S>),
+            )
+            .route(
+                &actuator_route_path(prefix, "/logfile"),
+                axum::routing::get(logfile_endpoint::<S>),
             )
             .route(
                 &actuator_route_path(prefix, "/tasks"),
@@ -2866,6 +2953,7 @@ mod tests {
         job_registry: JobRegistry,
         config_props: ConfigProperties,
         metrics_source_registry: MetricsSourceRegistry,
+        log_buffer: Option<crate::log::capture::LogBuffer>,
         #[cfg(feature = "http-client")]
         webhook_outbound: Option<crate::webhook_outbound::WebhookOutboundManager>,
         #[cfg(feature = "db")]
@@ -2925,6 +3013,9 @@ mod tests {
         fn shutdown_token(&self) -> tokio_util::sync::CancellationToken {
             self.shutdown.clone()
         }
+        fn log_buffer(&self) -> Option<crate::log::capture::LogBuffer> {
+            self.log_buffer.clone()
+        }
     }
 
     fn test_state() -> TestActuatorState {
@@ -2941,6 +3032,7 @@ mod tests {
             job_registry: JobRegistry::new(),
             config_props: ConfigProperties::from_config(config),
             metrics_source_registry: MetricsSourceRegistry::new(),
+            log_buffer: None,
             #[cfg(feature = "http-client")]
             webhook_outbound: None,
             #[cfg(feature = "db")]
@@ -5051,6 +5143,203 @@ mod tests {
             !text.contains("dup_series_metric{region=\"us\"} 20"),
             "duplicate series must be dropped:\n{text}"
         );
+    }
+
+    // ── RED then GREEN: /actuator/logfile endpoint ─────────────
+
+    fn make_log_buffer_with_entries() -> crate::log::capture::LogBuffer {
+        use crate::log::capture::{CapturedLogEntry, LogBuffer};
+        use crate::log::filter::ParameterFilter;
+        let buf = LogBuffer::new(100, ParameterFilter::default());
+        buf.push(CapturedLogEntry {
+            timestamp: "2024-01-01T00:00:00.000Z".to_owned(),
+            level: "INFO".to_owned(),
+            target: "myapp::orders".to_owned(),
+            message: "order created".to_owned(),
+            fields: {
+                let mut m = serde_json::Map::new();
+                m.insert("order_id".to_owned(), serde_json::json!("A-1001"));
+                m
+            },
+            request_id: Some("req-abc".to_owned()),
+        });
+        buf.push(CapturedLogEntry {
+            timestamp: "2024-01-01T00:00:01.000Z".to_owned(),
+            level: "WARN".to_owned(),
+            target: "myapp::payments".to_owned(),
+            message: "payment slow".to_owned(),
+            fields: serde_json::Map::new(),
+            request_id: None,
+        });
+        buf.push(CapturedLogEntry {
+            timestamp: "2024-01-01T00:00:02.000Z".to_owned(),
+            level: "ERROR".to_owned(),
+            target: "myapp::payments".to_owned(),
+            message: "payment failed".to_owned(),
+            fields: serde_json::Map::new(),
+            request_id: None,
+        });
+        buf
+    }
+
+    #[tokio::test]
+    async fn green_logfile_returns_empty_when_capture_disabled() {
+        let state = test_state(); // log_buffer = None
+        let response = logfile_endpoint(
+            State(state),
+            axum::extract::Query(LogfileQuery::default()),
+        )
+        .await;
+        let body = response.0;
+        assert!(!body.capture_enabled);
+        assert!(body.entries.is_empty());
+        assert_eq!(body.total, 0);
+    }
+
+    #[tokio::test]
+    async fn green_logfile_returns_all_entries_when_no_filter() {
+        let mut state = test_state();
+        state.log_buffer = Some(make_log_buffer_with_entries());
+
+        let response = logfile_endpoint(
+            State(state),
+            axum::extract::Query(LogfileQuery::default()),
+        )
+        .await;
+        let body = response.0;
+        assert!(body.capture_enabled);
+        assert_eq!(body.total, 3);
+        assert_eq!(body.entries.len(), 3);
+        // newest-last ordering
+        assert_eq!(body.entries[0].level, "INFO");
+        assert_eq!(body.entries[2].level, "ERROR");
+    }
+
+    #[tokio::test]
+    async fn green_logfile_level_filter_excludes_info_when_min_warn() {
+        let mut state = test_state();
+        state.log_buffer = Some(make_log_buffer_with_entries());
+
+        let response = logfile_endpoint(
+            State(state),
+            axum::extract::Query(LogfileQuery {
+                level: Some("warn".to_owned()),
+                limit: None,
+            }),
+        )
+        .await;
+        let body = response.0;
+        assert_eq!(body.entries.len(), 2);
+        assert!(body.entries.iter().all(|e| e.level != "INFO"));
+    }
+
+    #[tokio::test]
+    async fn green_logfile_limit_returns_most_recent_n() {
+        let mut state = test_state();
+        state.log_buffer = Some(make_log_buffer_with_entries());
+
+        let response = logfile_endpoint(
+            State(state),
+            axum::extract::Query(LogfileQuery {
+                level: None,
+                limit: Some(2),
+            }),
+        )
+        .await;
+        let body = response.0;
+        assert_eq!(body.entries.len(), 2);
+        // Most recent 2 = WARN and ERROR
+        assert_eq!(body.entries[0].level, "WARN");
+        assert_eq!(body.entries[1].level, "ERROR");
+    }
+
+    #[tokio::test]
+    async fn green_logfile_sensitive_fields_in_response_are_served_scrubbed() {
+        use crate::log::capture::{CapturedLogEntry, LogBuffer};
+        use crate::log::filter::{FILTERED_PLACEHOLDER, ParameterFilter};
+        let buf = LogBuffer::new(10, ParameterFilter::default());
+        // The layer scrubs before storage; simulate stored entry with scrubbed value.
+        buf.push(CapturedLogEntry {
+            timestamp: "2024-01-01T00:00:00.000Z".to_owned(),
+            level: "INFO".to_owned(),
+            target: "auth".to_owned(),
+            message: "login attempt".to_owned(),
+            fields: {
+                let mut m = serde_json::Map::new();
+                m.insert(
+                    "password".to_owned(),
+                    serde_json::Value::String(FILTERED_PLACEHOLDER.to_owned()),
+                );
+                m
+            },
+            request_id: None,
+        });
+
+        let mut state = test_state();
+        state.log_buffer = Some(buf);
+
+        let response = logfile_endpoint(
+            State(state),
+            axum::extract::Query(LogfileQuery::default()),
+        )
+        .await;
+        let body = response.0;
+        assert_eq!(
+            body.entries[0].fields["password"].as_str().unwrap(),
+            FILTERED_PLACEHOLDER,
+            "sensitive value must remain scrubbed in the response"
+        );
+    }
+
+    #[tokio::test]
+    async fn green_logfile_endpoint_in_sensitive_router() {
+        // The endpoint must be reachable when sensitive=true.
+        let state = test_state();
+        let app = actuator_router::<TestActuatorState>(true).with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/logfile")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn green_logfile_endpoint_not_in_non_sensitive_router() {
+        // The endpoint must NOT be reachable when sensitive=false.
+        let state = test_state();
+        let app = actuator_router::<TestActuatorState>(false).with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/logfile")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn green_logfile_structured_fields_preserved() {
+        let mut state = test_state();
+        state.log_buffer = Some(make_log_buffer_with_entries());
+
+        let response = logfile_endpoint(
+            State(state),
+            axum::extract::Query(LogfileQuery::default()),
+        )
+        .await;
+        let body = response.0;
+        let first = &body.entries[0];
+        assert_eq!(first.target, "myapp::orders");
+        assert_eq!(first.fields["order_id"].as_str().unwrap(), "A-1001");
+        assert_eq!(first.request_id.as_deref(), Some("req-abc"));
     }
 }
 
