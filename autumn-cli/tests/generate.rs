@@ -2244,7 +2244,7 @@ fn generate_auth_reset_password_revokes_sessions() {
     let reset_body = &routes[routes.find("pub async fn reset_password(").unwrap()..];
     let reset_body = &reset_body[..reset_body.find("\n// ──").unwrap_or(reset_body.len())];
     assert!(
-        reset_body.contains("revoke_all_sessions"),
+        reset_body.contains("revoke_existing_sessions") || reset_body.contains("user_sessions"),
         "reset_password must revoke existing sessions"
     );
     assert!(
@@ -2274,7 +2274,7 @@ fn generate_auth_totp_changes_revoke_other_sessions() {
         let body = &routes[start..];
         let body = &body[..body.find("\n/// `").unwrap_or(body.len())];
         assert!(
-            body.contains("revoke_other_sessions"),
+            body.contains("token_digest.ne(") || body.contains("revoke_other_sessions"),
             "{handler} must revoke other sessions"
         );
         assert!(
@@ -2455,4 +2455,111 @@ fn generate_auth_passkeys_pages_gated_on_tracked_session() {
             "{handler} must validate the tracked session row"
         );
     }
+}
+
+/// PR #1176 Codex round 2: login flows must delete the consumed session's
+/// tracked row before rotating (no phantom devices), the password-reset
+/// commit must be atomic with its session revocation (no consumed-token 500
+/// limbo), and the TOTP reset-commit path gets the same treatment.
+#[test]
+fn generate_auth_sessions_codex_round2() {
+    let (_tmp, project) = fresh_project("auth-sess-codex2");
+    run_autumn(&project, &["generate", "auth", "User"]);
+    let routes = fs::read_to_string(project.join("src/routes/auth.rs")).unwrap();
+
+    let body_of = |handler: &str| {
+        let start = routes
+            .find(handler)
+            .unwrap_or_else(|| panic!("missing {handler}"));
+        let body = &routes[start..];
+        &body[..body.find("\n/// `").unwrap_or(body.len())]
+    };
+
+    // Re-login from an already-tracked browser: the old row must be removed
+    // BEFORE the rotation that destroys its session id.
+    let login = body_of("pub async fn login(");
+    let untrack_at = login
+        .find("untrack_current_session")
+        .expect("login must untrack the consumed session row");
+    let rotate_at = login
+        .find("session.rotate_id()")
+        .expect("login must rotate");
+    assert!(
+        untrack_at < rotate_at,
+        "login must untrack BEFORE rotating the session id"
+    );
+    for handler in [
+        "pub async fn confirm_email(",
+        "pub async fn reset_password(",
+    ] {
+        assert!(
+            body_of(handler).contains("untrack_current_session"),
+            "{handler} rotates while logging in and must untrack the old row"
+        );
+    }
+    assert!(
+        body_of("pub async fn logout(").contains("untrack_current_session"),
+        "logout shares the untrack helper"
+    );
+
+    // Password change + session revocation + token consumption are one
+    // transaction: a failure rolls everything back so the reset link
+    // remains usable, and no path leaves sessions unrevoked after the
+    // password actually changed.
+    let reset = body_of("pub async fn reset_password(");
+    assert!(
+        reset.contains(".transaction"),
+        "reset_password must commit password + revocation atomically"
+    );
+    assert!(
+        reset.contains("revoke_on_credential_change") && reset.contains("user_sessions"),
+        "reset_password revocation must stay config-gated and target user_sessions"
+    );
+}
+
+/// PR #1176 Codex round 2 (`--totp`): the post-enrollment/disable revocation
+/// happens inside the existing transactions so a revocation failure can
+/// never 500 after the credential change committed (which would hide the
+/// one-time recovery codes), and the deferred-reset commit in `login_verify`
+/// is atomic with its revocation.
+#[test]
+fn generate_auth_totp_revocation_is_atomic() {
+    let (_tmp, project) = fresh_project("auth-sess-totp-atomic");
+    run_autumn(&project, &["generate", "auth", "User", "--totp"]);
+    let routes = fs::read_to_string(project.join("src/routes/auth.rs")).unwrap();
+
+    let body_of = |handler: &str| {
+        let start = routes
+            .find(handler)
+            .unwrap_or_else(|| panic!("missing {handler}"));
+        let body = &routes[start..];
+        &body[..body.find("\n/// `").unwrap_or(body.len())]
+    };
+
+    for handler in [
+        "pub async fn two_factor_confirm(",
+        "pub async fn two_factor_disable(",
+    ] {
+        let body = body_of(handler);
+        assert!(
+            body.contains("revoke_on_credential_change"),
+            "{handler} revocation must stay config-gated"
+        );
+        // The other-sessions delete lives inside the credential txn.
+        assert!(
+            body.contains("token_digest.ne("),
+            "{handler} must revoke other sessions inside its transaction"
+        );
+        assert!(
+            !body.contains("revoke_other_sessions(&mut *db"),
+            "{handler} must not revoke outside the transaction (a post-commit \
+             failure would 500 after the credential change)"
+        );
+    }
+
+    let verify = body_of("pub async fn login_verify(");
+    assert!(
+        verify.contains(".transaction"),
+        "login_verify's deferred password-reset commit must be atomic with revocation"
+    );
 }

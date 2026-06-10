@@ -1778,6 +1778,7 @@ use autumn_web::prelude::*;
 use axum::extract::Path;
 use axum::response::{{IntoResponse, Response}};
 use diesel::prelude::*;
+use diesel_async::AsyncConnection as _;
 use diesel_async::RunQueryDsl;
 use serde::Deserialize;
 
@@ -1884,6 +1885,27 @@ pub async fn rebind_tracked_session(
     .map_err(|e| {{
         AutumnError::internal_server_error_msg(format!(
             "Failed to rebind tracked session: {{e}}"
+        ))
+    }})?;
+    Ok(())
+}}
+
+/// Delete the tracked row for the *current* session id, if any.
+///
+/// Login flows call this before `session.rotate_id()`: the rotation
+/// destroys the old server-side session, so a row keyed to its digest
+/// could never authenticate again and would linger as a phantom device on
+/// the previous account's sessions page. Logout uses it too.
+pub async fn untrack_current_session(db: &mut Db, session: &Session) -> AutumnResult<()> {{
+    let token_digest = session_token_digest(session).await;
+    diesel::delete(
+        {sess_table}::table.filter({sess_table}::token_digest.eq(&token_digest)),
+    )
+    .execute(&mut **db)
+    .await
+    .map_err(|e| {{
+        AutumnError::internal_server_error_msg(format!(
+            "Failed to clean up tracked session: {{e}}"
         ))
     }})?;
     Ok(())
@@ -2515,6 +2537,10 @@ pub async fn login(
         return Err(auth_err());
     }}
 
+    // This browser may already hold a tracked session (re-login or account
+    // switch). The rotation below destroys that session id, so drop its row
+    // now — otherwise it would linger as a phantom device.
+    untrack_current_session(&mut db, &session).await?;
 {totp_login_branch}
     session.rotate_id().await;
 {totp_clear_pending}    session.insert("{snake_name}_id", {snake_name}.id.to_string()).await;
@@ -2537,12 +2563,8 @@ pub async fn login(
 /// too so the device disappears from the active-sessions list.
 #[post("/logout")]
 pub async fn logout(session: Session, mut db: Db) -> AutumnResult<Response> {{
-    let token_digest = session_token_digest(&session).await;
-    let _ = diesel::delete(
-        {sess_table}::table.filter({sess_table}::token_digest.eq(&token_digest)),
-    )
-    .execute(&mut *db)
-    .await;
+    // Best-effort: the device must sign out even if the row delete hiccups.
+    let _ = untrack_current_session(&mut db, &session).await;
     session.destroy().await;
     Ok(redirect_to("/login"))
 }}
@@ -3106,24 +3128,46 @@ pub async fn reset_password(
     if {snake_name}.email_confirmed_at.is_none() {{
         return Ok(redirect_to("/check-your-email"));
     }}
-{totp_reset_branch}
-    diesel::update({table}::table.find({snake_name}.id))
-        .set((
-            {table}::password_digest.eq(&new_digest),
-            {table}::reset_token_digest.eq(None::<String>),
-            {table}::reset_token_expires_at.eq(None::<chrono::NaiveDateTime>),
-        ))
-        .execute(&mut *db)
-        .await?;
 
-    // Credential changed: revoke every existing session (defaulted on,
-    // configurable via [auth.sessions].revoke_on_credential_change). The
-    // standard response to credential theft — a stolen session on another
-    // device must not survive the password rotation. This brand-new login
-    // is recorded below.
-    if state.config().auth.sessions.revoke_on_credential_change {{
-        let _ = {snake_name}.revoke_all_sessions(&mut *db).await?;
-    }}
+    // This browser may already hold a tracked session. The rotation below
+    // (or inside the 2FA branch) destroys that session id, so drop its row
+    // now — otherwise it would linger as a phantom device.
+    untrack_current_session(&mut db, &session).await?;
+{totp_reset_branch}
+    // Commit the password change, the reset-token consumption, and the
+    // session revocation atomically: if any part fails everything rolls
+    // back, so the reset link stays usable and no state is half-applied.
+    // Revoking every existing session is the standard response to
+    // credential theft (defaulted on, configurable via
+    // [auth.sessions].revoke_on_credential_change); this brand-new login is
+    // recorded below.
+    let revoke_existing_sessions = state.config().auth.sessions.revoke_on_credential_change;
+    let {snake_name}_id = {snake_name}.id;
+    (*db)
+        .transaction::<_, diesel::result::Error, _>(|conn| {{
+            Box::pin(async move {{
+                diesel::update({table}::table.find({snake_name}_id))
+                    .set((
+                        {table}::password_digest.eq(&new_digest),
+                        {table}::reset_token_digest.eq(None::<String>),
+                        {table}::reset_token_expires_at.eq(None::<chrono::NaiveDateTime>),
+                    ))
+                    .execute(conn)
+                    .await?;
+                if revoke_existing_sessions {{
+                    diesel::delete(
+                        {sess_table}::table.filter({sess_table}::user_id.eq({snake_name}_id)),
+                    )
+                    .execute(conn)
+                    .await?;
+                }}
+                Ok(())
+            }})
+        }})
+        .await
+        .map_err(|e| {{
+            AutumnError::internal_server_error_msg(format!("Failed to reset password: {{e}}"))
+        }})?;
 
     // Rotate session to invalidate any previous authenticated state.
     session.rotate_id().await;
@@ -3264,6 +3308,11 @@ pub async fn confirm_email(
              Please request a new confirmation email.",
         )
     }})?;
+
+    // This browser may already hold a tracked session for another account.
+    // The rotation below (or inside the 2FA branch) destroys that session
+    // id, so drop its row now — otherwise it would linger as a phantom device.
+    untrack_current_session(&mut db, &session).await?;
 
     // For 2FA-enabled accounts, redirect to /login/verify before granting a
     // full session — email confirmation proves address ownership, not TOTP possession.
@@ -5530,7 +5579,6 @@ const fn totp_imports_src() -> &'static str {
      use aes_gcm::{Aes256Gcm, Key, Nonce};\n\
      use base64::Engine as _;\n\
      use base64::engine::general_purpose::STANDARD as B64;\n\
-     use diesel_async::AsyncConnection as _;\n\
      use totp_rs::{Algorithm, Secret, TOTP};\n\
      use crate::models::recovery_code::{NewRecoveryCode, RecoveryCode};\n\
      use crate::schema::recovery_codes;\n"
@@ -6162,6 +6210,11 @@ pub async fn two_factor_confirm(
         plaintext_codes.push(code);
     }
 
+    // Capture the revocation policy up front so the delete can run inside
+    // the same transaction as the enablement (a post-commit failure here
+    // would 500 before the one-time recovery codes are ever shown).
+    let revoke_other_sessions_in_txn = state.config().auth.sessions.revoke_on_credential_change;
+    let current_token_digest = session_token_digest(&session).await;
     let txn_result = (*db)
         .transaction::<_, diesel::result::Error, _>(|conn| {
         Box::pin(async move {
@@ -6202,6 +6255,18 @@ pub async fn two_factor_confirm(
             if claimed != 1 {
                 return Err(diesel::result::Error::RollbackTransaction);
             }
+            // Credential change (second factor enrolled): sign out every
+            // *other* device in the same transaction (defaulted on,
+            // configurable via [auth.sessions].revoke_on_credential_change).
+            if revoke_other_sessions_in_txn {
+                diesel::delete(
+                    __SESSTABLE__::table
+                        .filter(__SESSTABLE__::user_id.eq(user_id))
+                        .filter(__SESSTABLE__::token_digest.ne(current_token_digest)),
+                )
+                .execute(conn)
+                .await?;
+            }
             Ok(())
         })
         })
@@ -6221,17 +6286,6 @@ pub async fn two_factor_confirm(
     }
 
     session.remove("totp_pending_secret").await;
-
-    // Credential change (second factor enrolled): sign out every *other*
-    // device (defaulted on, configurable via
-    // [auth.sessions].revoke_on_credential_change). A stolen session on
-    // another device must not survive a 2FA enrollment.
-    if state.config().auth.sessions.revoke_on_credential_change {
-        let current_digest = session_token_digest(&session).await;
-        let _ = __SNAKE__
-            .revoke_other_sessions(&mut *db, &current_digest)
-            .await?;
-    }
 
     Ok(layout("Save Your Recovery Codes", html! {
         h1 { "Two-factor authentication enabled" }
@@ -6303,10 +6357,14 @@ pub async fn two_factor_disable(
         ));
     }
 
-    // Disable the factor and delete the recovery codes in one transaction so a
-    // mid-operation failure can't leave the account with 2FA turned off but
-    // stale recovery codes still present (or vice versa).
+    // Disable the factor, delete the recovery codes, and revoke every
+    // *other* session in one transaction so a mid-operation failure can't
+    // leave the account half-changed — and so a revocation failure can't
+    // 500 after the factor was already removed. Revocation is defaulted on,
+    // configurable via [auth.sessions].revoke_on_credential_change.
     let user_id = __SNAKE__.id;
+    let revoke_other_sessions_in_txn = state.config().auth.sessions.revoke_on_credential_change;
+    let current_token_digest = session_token_digest(&session).await;
     (*db)
         .transaction::<_, diesel::result::Error, _>(|conn| {
             Box::pin(async move {
@@ -6321,21 +6379,20 @@ pub async fn two_factor_disable(
                 diesel::delete(recovery_codes::table.filter(recovery_codes::user_id.eq(user_id)))
                     .execute(conn)
                     .await?;
+                if revoke_other_sessions_in_txn {
+                    diesel::delete(
+                        __SESSTABLE__::table
+                            .filter(__SESSTABLE__::user_id.eq(user_id))
+                            .filter(__SESSTABLE__::token_digest.ne(current_token_digest)),
+                    )
+                    .execute(conn)
+                    .await?;
+                }
                 Ok(())
             })
         })
         .await
         .map_err(|_| AutumnError::internal_server_error_msg("Failed to disable two-factor."))?;
-
-    // Credential change (second factor removed): sign out every *other*
-    // device (defaulted on, configurable via
-    // [auth.sessions].revoke_on_credential_change).
-    if state.config().auth.sessions.revoke_on_credential_change {
-        let current_digest = session_token_digest(&session).await;
-        let _ = __SNAKE__
-            .revoke_other_sessions(&mut *db, &current_digest)
-            .await?;
-    }
 
     Ok(redirect_to("/account/2fa"))
 }
@@ -6471,17 +6528,41 @@ pub async fn login_verify(
         session.remove("totp_pending_reset_token").await;
         let committed = if let Some(token) = stored_token {
             let now = chrono::Utc::now().naive_utc();
-            let updated = diesel::update(__TABLE__::table.find(__SNAKE__.id))
-                .filter(__TABLE__::reset_token_digest.eq(Some(token.as_str())))
-                .filter(__TABLE__::reset_token_expires_at.gt(now))
-                .set((
-                    __TABLE__::password_digest.eq(&new_digest),
-                    __TABLE__::reset_token_digest.eq(None::<String>),
-                    __TABLE__::reset_token_expires_at.eq(None::<chrono::NaiveDateTime>),
-                ))
-                .execute(&mut *db)
-                .await?;
-            updated == 1
+            // Commit the password change and the session revocation
+            // atomically; a transaction error rolls both back (token
+            // preserved) and is treated as not-committed below.
+            let revoke_existing_sessions =
+                state.config().auth.sessions.revoke_on_credential_change;
+            let user_id = __SNAKE__.id;
+            (*db)
+                .transaction::<_, diesel::result::Error, _>(|conn| {
+                    Box::pin(async move {
+                        let updated = diesel::update(__TABLE__::table.find(user_id))
+                            .filter(__TABLE__::reset_token_digest.eq(Some(token.as_str())))
+                            .filter(__TABLE__::reset_token_expires_at.gt(now))
+                            .set((
+                                __TABLE__::password_digest.eq(&new_digest),
+                                __TABLE__::reset_token_digest.eq(None::<String>),
+                                __TABLE__::reset_token_expires_at.eq(None::<chrono::NaiveDateTime>),
+                            ))
+                            .execute(conn)
+                            .await?;
+                        // Password changed: revoke every existing session in
+                        // the same transaction (defaulted on, configurable via
+                        // [auth.sessions].revoke_on_credential_change). The
+                        // fresh login is recorded below.
+                        if updated == 1 && revoke_existing_sessions {
+                            diesel::delete(
+                                __SESSTABLE__::table.filter(__SESSTABLE__::user_id.eq(user_id)),
+                            )
+                            .execute(conn)
+                            .await?;
+                        }
+                        Ok(updated == 1)
+                    })
+                })
+                .await
+                .unwrap_or(false)
         } else {
             false
         };
@@ -6497,15 +6578,11 @@ pub async fn login_verify(
                 "Reset link expired or already used. Please restart the password reset.",
             ));
         }
-        // Password changed: revoke every existing session (defaulted on,
-        // configurable via [auth.sessions].revoke_on_credential_change).
-        // The fresh login is recorded below.
-        if state.config().auth.sessions.revoke_on_credential_change {
-            let _ = __SNAKE__.revoke_all_sessions(&mut *db).await?;
-        }
     }
 
-    // Promote the pending session to a fully authenticated one.
+    // Promote the pending session to a fully authenticated one. Drop any
+    // tracked row for the pending id first — the rotation destroys it.
+    untrack_current_session(&mut db, &session).await?;
     let from_confirmation = session.get("totp_pending_confirmation").await.is_some();
     session.rotate_id().await;
     session.remove("totp_pending_id").await;
@@ -6537,6 +6614,7 @@ pub async fn login_verify(
     TPL.replace("__PASCAL__", pascal_name)
         .replace("__SNAKE__", snake_name)
         .replace("__TABLE__", table)
+        .replace("__SESSTABLE__", &sessions_table_name(snake_name))
 }
 
 /// Markdown appended to `docs/guide/authentication.md` under `--totp`.
@@ -6978,12 +7056,18 @@ pub async fn passkey_register_finish(
         .map_err(|_| AutumnError::internal_server_error_msg("Failed to store passkey."))?;
     // Credential change (passkey added): sign out every *other* device
     // (defaulted on, configurable via
-    // [auth.sessions].revoke_on_credential_change).
+    // [auth.sessions].revoke_on_credential_change). Best-effort: the
+    // passkey is already stored, so a revocation hiccup must not turn the
+    // successful registration into a 500 (the client could retry and store
+    // a duplicate credential).
     if state.config().auth.sessions.revoke_on_credential_change {
         let current_digest = crate::routes::auth::session_token_digest(&session).await;
-        let _ = current
+        if let Err(e) = current
             .revoke_other_sessions(&mut *db, &current_digest)
-            .await?;
+            .await
+        {
+            tracing::warn!("failed to revoke other sessions after passkey registration: {e}");
+        }
     }
     Ok(axum::Json(serde_json::json!({ "ok": true })))
 }
@@ -7163,6 +7247,9 @@ pub async fn passkey_login_finish(
                 AutumnError::internal_server_error_msg("Failed to update credential timestamp.")
             })?;
     }
+    // Drop any tracked row for the pre-login session — the rotation below
+    // destroys its id, which would otherwise leave a phantom device.
+    crate::routes::auth::untrack_current_session(&mut db, &session).await?;
     session.rotate_id().await;
     session
         .insert("__SNAKE___id", __SNAKE___id.to_string())
@@ -7260,12 +7347,17 @@ pub async fn passkey_revoke(
     .map_err(|_| AutumnError::internal_server_error_msg("Failed to revoke passkey."))?;
     // Credential change (passkey removed): sign out every *other* device
     // (defaulted on, configurable via
-    // [auth.sessions].revoke_on_credential_change).
+    // [auth.sessions].revoke_on_credential_change). Best-effort: the
+    // passkey is already deleted, so a revocation hiccup must not turn the
+    // successful removal into a 500.
     if state.config().auth.sessions.revoke_on_credential_change {
         let current_digest = crate::routes::auth::session_token_digest(&session).await;
-        let _ = current
+        if let Err(e) = current
             .revoke_other_sessions(&mut *db, &current_digest)
-            .await?;
+            .await
+        {
+            tracing::warn!("failed to revoke other sessions after passkey removal: {e}");
+        }
     }
     Ok(redirect_to("/passkeys"))
 }
@@ -9215,7 +9307,8 @@ mod tests {
         let reset_pos = routes
             .find("pub async fn reset_password(")
             .expect("reset_password fn");
-        let reset_body = &routes[reset_pos..reset_pos + 3200.min(routes.len() - reset_pos)];
+        let reset_tail = &routes[reset_pos..];
+        let reset_body = &reset_tail[..reset_tail.find("\n/// `").unwrap_or(reset_tail.len())];
         // The deferral branch (which returns to /login/verify) must come BEFORE
         // the password_digest UPDATE in the handler body.
         let park_at = reset_body
@@ -9251,7 +9344,8 @@ mod tests {
         let reset_pos = routes
             .find("pub async fn reset_password(")
             .expect("reset_password fn");
-        let reset_body = &routes[reset_pos..reset_pos + 3200.min(routes.len() - reset_pos)];
+        let reset_tail = &routes[reset_pos..];
+        let reset_body = &reset_tail[..reset_tail.find("\n/// `").unwrap_or(reset_tail.len())];
         assert!(
             reset_body.contains("totp_pending_reset_token"),
             "reset_password 2FA branch must park the token digest: {reset_body}"
