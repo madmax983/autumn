@@ -22,8 +22,11 @@ const TRUNCATED_RESPONSE_BODY_SUFFIX: &str = "\n[truncated]";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum WebhookSubscriptionStatus {
+    /// The subscription is active and delivering events.
     Active,
+    /// The subscription is intentionally disabled by the user or an admin.
     Disabled,
+    /// The subscription has been automatically disabled due to excessive consecutive delivery failures.
     Failed,
 }
 
@@ -48,29 +51,48 @@ impl std::fmt::Display for WebhookSubscriptionStatus {
 /// A registered webhook subscription targeting a consumer endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebhookSubscription {
+    /// The unique identifier of the subscription.
     pub id: String,
+    /// The URL endpoint where webhook events should be delivered.
     pub target_url: String,
+    /// The list of event topics the subscription is listening for (e.g. `["orders.created"]`).
     pub event_topics: Vec<String>,
+    /// The cryptographic secret used to sign outgoing webhook payloads.
     pub secret: String,
+    /// The current delivery status of the subscription.
     pub status: WebhookSubscriptionStatus,
+    /// The number of consecutive failed delivery attempts (auto-fails at 50).
     pub consecutive_failures: u32,
 }
 
 /// A structured log of an outbound webhook delivery attempt.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebhookDeliveryLog {
+    /// The unique identifier of this delivery attempt.
     pub id: String,
+    /// The ID of the subscription this delivery belongs to.
     pub subscription_id: String,
+    /// The event topic being delivered.
     pub topic: String,
+    /// The serialized JSON payload being sent.
     pub payload: String,
+    /// The HTTP headers included in the delivery request.
     pub request_headers: HashMap<String, String>,
+    /// The HTTP status code returned by the receiver, if reachable.
     pub response_status: Option<u16>,
+    /// The response body returned by the receiver, truncated to a reasonable size.
     pub response_body: Option<String>,
+    /// The time taken for the HTTP request in milliseconds.
     pub elapsed_ms: u64,
+    /// The attempt number for this delivery (1 for first try).
     pub attempt: u32,
+    /// The maximum number of attempts allowed for this delivery before failing permanently.
     pub max_attempts: u32,
+    /// Whether this delivery has exhausted all attempts and is now in the Dead Letter Queue.
     pub is_dlq: bool,
+    /// A description of the last error encountered, if the request failed without an HTTP response.
     pub last_error: Option<String>,
+    /// The timestamp when the delivery was attempted.
     pub timestamp: DateTime<Utc>,
 }
 
