@@ -13,7 +13,7 @@
 //! the request that produced them.
 
 use std::collections::VecDeque;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use chrono::SecondsFormat;
 use serde::{Deserialize, Serialize};
@@ -109,7 +109,7 @@ struct LogBufferInner {
 /// same buffer.
 #[derive(Clone)]
 pub struct LogBuffer {
-    inner: Arc<RwLock<LogBufferInner>>,
+    inner: Arc<std::sync::Mutex<LogBufferInner>>,
     filter: Arc<ParameterFilter>,
 }
 
@@ -125,7 +125,7 @@ impl LogBuffer {
     #[must_use]
     pub fn new(capacity: usize, filter: ParameterFilter) -> Self {
         Self {
-            inner: Arc::new(RwLock::new(LogBufferInner {
+            inner: Arc::new(std::sync::Mutex::new(LogBufferInner {
                 capacity,
                 entries: VecDeque::with_capacity(capacity.min(1024)),
             })),
@@ -137,7 +137,7 @@ impl LogBuffer {
     pub fn push(&self, entry: CapturedLogEntry) {
         let mut guard = self
             .inner
-            .write()
+            .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if guard.capacity > 0 && guard.entries.len() >= guard.capacity {
             guard.entries.pop_front();
@@ -154,24 +154,27 @@ impl LogBuffer {
     /// result to the *N* most-recent matching entries.  The returned slice is
     /// always in chronological order (oldest first).
     #[must_use]
-    pub fn snapshot(&self, min_level: Option<Level>, limit: Option<usize>) -> Vec<CapturedLogEntry> {
+    pub fn snapshot(
+        &self,
+        min_level: Option<Level>,
+        limit: Option<usize>,
+    ) -> Vec<CapturedLogEntry> {
         let guard = self
             .inner
-            .read()
+            .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let iter = guard.entries.iter().filter(|e| {
             min_level.map_or(true, |filter| {
-                level_from_str(&e.level)
-                    .map_or(false, |lvl| lvl <= filter)
+                level_from_str(&e.level).map_or(false, |lvl| lvl <= filter)
             })
         });
 
         if let Some(n) = limit {
             // Take the last N matching entries (newest-last in the original order).
-            let all: Vec<_> = iter.cloned().collect();
-            let start = all.len().saturating_sub(n);
-            all[start..].to_vec()
+            let mut result: Vec<_> = iter.rev().take(n).cloned().collect();
+            result.reverse();
+            result
         } else {
             iter.cloned().collect()
         }
@@ -181,7 +184,7 @@ impl LogBuffer {
     #[must_use]
     pub fn len(&self) -> usize {
         self.inner
-            .read()
+            .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .entries
             .len()
@@ -205,13 +208,27 @@ impl LogBuffer {
 ///
 /// Returns `None` for unrecognised strings so callers can handle gracefully.
 pub fn level_from_str(s: &str) -> Option<Level> {
-    match s.to_ascii_uppercase().as_str() {
-        "TRACE" => Some(Level::TRACE),
-        "DEBUG" => Some(Level::DEBUG),
-        "INFO" => Some(Level::INFO),
-        "WARN" => Some(Level::WARN),
-        "ERROR" => Some(Level::ERROR),
-        _ => None,
+    match s {
+        "ERROR" | "error" => Some(Level::ERROR),
+        "WARN" | "warn" => Some(Level::WARN),
+        "INFO" | "info" => Some(Level::INFO),
+        "DEBUG" | "debug" => Some(Level::DEBUG),
+        "TRACE" | "trace" => Some(Level::TRACE),
+        _ => {
+            if s.eq_ignore_ascii_case("ERROR") {
+                Some(Level::ERROR)
+            } else if s.eq_ignore_ascii_case("WARN") {
+                Some(Level::WARN)
+            } else if s.eq_ignore_ascii_case("INFO") {
+                Some(Level::INFO)
+            } else if s.eq_ignore_ascii_case("DEBUG") {
+                Some(Level::DEBUG)
+            } else if s.eq_ignore_ascii_case("TRACE") {
+                Some(Level::TRACE)
+            } else {
+                None
+            }
+        }
     }
 }
 
@@ -222,6 +239,7 @@ pub fn level_from_str(s: &str) -> Option<Level> {
 /// Install this via [`crate::telemetry::init`] by enabling
 /// `log.capture.enabled`.  It sits in the subscriber stack alongside the
 /// existing stdout/JSON and OTLP layers and does not affect their output.
+#[derive(Clone)]
 pub struct LogCaptureLayer {
     buffer: LogBuffer,
 }
@@ -248,34 +266,60 @@ impl<S: Subscriber + for<'a> LookupSpan<'a>> Layer<S> for LogCaptureLayer {
         event.record(&mut visitor);
 
         let message = visitor.message.unwrap_or_default();
-        let level = event.metadata().level().to_string();
+        let level = event.metadata().level().as_str().to_owned();
         let target = event.metadata().target().to_owned();
-        let timestamp = chrono::Utc::now()
-            .to_rfc3339_opts(SecondsFormat::Millis, true);
+        let timestamp = chrono::Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
 
-        // Scrub sensitive field values before storage.
+        // Scrub sensitive field values in-place to avoid re-allocating the map.
         let filter = self.buffer.filter();
-        let scrubbed = visitor
-            .fields
-            .into_iter()
-            .map(|(k, v)| {
-                if filter.matches_key(&k) {
-                    (k, serde_json::Value::String(FILTERED_PLACEHOLDER.to_owned()))
-                } else {
-                    (k, v)
-                }
-            })
-            .collect();
+        let mut fields = visitor.fields;
+        for (k, v) in fields.iter_mut() {
+            if filter.matches_key(k) {
+                *v = serde_json::Value::String(FILTERED_PLACEHOLDER.to_owned());
+            }
+        }
 
-        // Pull request_id from the task-local log context if available.
-        let request_id = crate::log::context::snapshot().and_then(|s| s.request_id);
+        // Pull full request context (request_id, user_id, tenant_id, custom fields)
+        // from the task-local log context.  Event-level fields take priority;
+        // context fields are only inserted when the key does not already exist.
+        // All values are run through the same sensitive-key filter.
+        let request_id;
+        if let Some(ctx) = crate::log::context::snapshot() {
+            request_id = ctx.request_id;
+            if let Some(uid) = ctx.user_id {
+                let val = if filter.matches_key("user_id") {
+                    serde_json::Value::String(FILTERED_PLACEHOLDER.to_owned())
+                } else {
+                    serde_json::Value::String(uid)
+                };
+                fields.entry("user_id".to_owned()).or_insert(val);
+            }
+            if let Some(tid) = ctx.tenant_id {
+                let val = if filter.matches_key("tenant_id") {
+                    serde_json::Value::String(FILTERED_PLACEHOLDER.to_owned())
+                } else {
+                    serde_json::Value::String(tid)
+                };
+                fields.entry("tenant_id".to_owned()).or_insert(val);
+            }
+            for (k, v) in ctx.fields {
+                let val = if filter.matches_key(&k) {
+                    serde_json::Value::String(FILTERED_PLACEHOLDER.to_owned())
+                } else {
+                    serde_json::Value::String(v)
+                };
+                fields.entry(k).or_insert(val);
+            }
+        } else {
+            request_id = None;
+        }
 
         let entry = CapturedLogEntry {
             timestamp,
             level,
             target,
             message,
-            fields: scrubbed,
+            fields,
             request_id,
         };
 

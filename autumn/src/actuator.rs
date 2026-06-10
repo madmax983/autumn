@@ -2274,16 +2274,33 @@ pub(crate) struct LogfileResponse {
 /// and `log.capture.enabled = true`.  When capture is disabled the endpoint
 /// still responds with `200` and an empty list so API consumers can handle
 /// the case uniformly.
+///
+/// Returns `400 Bad Request` when an unrecognised `?level=` value is supplied
+/// so that typos (e.g. `?level=warning`) are rejected rather than silently
+/// broadening the response to all captured entries.
 pub(crate) async fn logfile_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
     State(state): State<S>,
     axum::extract::Query(query): axum::extract::Query<LogfileQuery>,
-) -> axum::Json<LogfileResponse> {
-    let min_level = query
-        .level
-        .as_deref()
-        .and_then(crate::log::capture::level_from_str);
+) -> Result<axum::Json<LogfileResponse>, (StatusCode, axum::Json<serde_json::Value>)> {
+    let min_level = match query.level.as_deref() {
+        None => None,
+        Some(s) => match crate::log::capture::level_from_str(s) {
+            Some(level) => Some(level),
+            None => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    axum::Json(serde_json::json!({
+                        "error": format!(
+                            "invalid level {:?}; valid values: TRACE, DEBUG, INFO, WARN, ERROR",
+                            s
+                        )
+                    })),
+                ));
+            }
+        },
+    };
 
-    match state.log_buffer() {
+    Ok(match state.log_buffer() {
         None => axum::Json(LogfileResponse {
             entries: vec![],
             total: 0,
@@ -2298,7 +2315,7 @@ pub(crate) async fn logfile_endpoint<S: ProvideActuatorState + Send + Sync + 'st
                 capture_enabled: true,
             })
         }
-    }
+    })
 }
 
 // ── Tasks (sensitive) ──────────────────────────────────────────
@@ -5185,11 +5202,10 @@ mod tests {
     #[tokio::test]
     async fn green_logfile_returns_empty_when_capture_disabled() {
         let state = test_state(); // log_buffer = None
-        let response = logfile_endpoint(
-            State(state),
-            axum::extract::Query(LogfileQuery::default()),
-        )
-        .await;
+        let response =
+            logfile_endpoint(State(state), axum::extract::Query(LogfileQuery::default()))
+                .await
+                .unwrap();
         let body = response.0;
         assert!(!body.capture_enabled);
         assert!(body.entries.is_empty());
@@ -5201,11 +5217,10 @@ mod tests {
         let mut state = test_state();
         state.log_buffer = Some(make_log_buffer_with_entries());
 
-        let response = logfile_endpoint(
-            State(state),
-            axum::extract::Query(LogfileQuery::default()),
-        )
-        .await;
+        let response =
+            logfile_endpoint(State(state), axum::extract::Query(LogfileQuery::default()))
+                .await
+                .unwrap();
         let body = response.0;
         assert!(body.capture_enabled);
         assert_eq!(body.total, 3);
@@ -5227,7 +5242,8 @@ mod tests {
                 limit: None,
             }),
         )
-        .await;
+        .await
+        .unwrap();
         let body = response.0;
         assert_eq!(body.entries.len(), 2);
         assert!(body.entries.iter().all(|e| e.level != "INFO"));
@@ -5245,7 +5261,8 @@ mod tests {
                 limit: Some(2),
             }),
         )
-        .await;
+        .await
+        .unwrap();
         let body = response.0;
         assert_eq!(body.entries.len(), 2);
         // Most recent 2 = WARN and ERROR
@@ -5278,17 +5295,31 @@ mod tests {
         let mut state = test_state();
         state.log_buffer = Some(buf);
 
-        let response = logfile_endpoint(
-            State(state),
-            axum::extract::Query(LogfileQuery::default()),
-        )
-        .await;
+        let response =
+            logfile_endpoint(State(state), axum::extract::Query(LogfileQuery::default()))
+                .await
+                .unwrap();
         let body = response.0;
         assert_eq!(
             body.entries[0].fields["password"].as_str().unwrap(),
             FILTERED_PLACEHOLDER,
             "sensitive value must remain scrubbed in the response"
         );
+    }
+
+    #[tokio::test]
+    async fn green_logfile_invalid_level_returns_400() {
+        let state = test_state();
+        let result = logfile_endpoint(
+            State(state),
+            axum::extract::Query(LogfileQuery {
+                level: Some("warning".to_owned()), // invalid — should be "warn"
+                limit: None,
+            }),
+        )
+        .await;
+        let (status, _body) = result.unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -5330,11 +5361,10 @@ mod tests {
         let mut state = test_state();
         state.log_buffer = Some(make_log_buffer_with_entries());
 
-        let response = logfile_endpoint(
-            State(state),
-            axum::extract::Query(LogfileQuery::default()),
-        )
-        .await;
+        let response =
+            logfile_endpoint(State(state), axum::extract::Query(LogfileQuery::default()))
+                .await
+                .unwrap();
         let body = response.0;
         let first = &body.entries[0];
         assert_eq!(first.target, "myapp::orders");

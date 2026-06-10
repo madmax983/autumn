@@ -341,10 +341,11 @@ fn build_capture_layer(
     if !log.capture.enabled {
         return None;
     }
-    let filter = crate::log::filter::ParameterFilter::new(
-        &log.filter_parameters,
-        &log.unfilter_parameters,
-    );
+    // Include encrypted-column names so plaintext values never reach the buffer.
+    let mut filter_parameters = log.filter_parameters.clone();
+    filter_parameters.extend(crate::encryption::registered_encrypted_column_names());
+    let filter =
+        crate::log::filter::ParameterFilter::new(&filter_parameters, &log.unfilter_parameters);
     let buffer = crate::log::capture::LogBuffer::new(log.capture.capacity, filter);
     let layer = crate::log::capture::LogCaptureLayer::new(buffer.clone());
     Some((layer, buffer))
@@ -356,15 +357,7 @@ fn init_logging_only(
 ) -> Result<TelemetryGuard, TelemetryInitError> {
     let filter = build_filter(log);
     let capture = build_capture_layer(log);
-    let capture_layer = capture.as_ref().map(|(layer, _)| {
-        // SAFETY: LogCaptureLayer implements Layer<S> for any S.
-        // We take a reference here to get Option<&LogCaptureLayer> — but we
-        // need to pass an owned value.  Clone is not available on the layer, so
-        // we reconstruct from the buffer clone.
-        crate::log::capture::LogCaptureLayer::new(
-            layer.buffer().clone(),
-        )
-    });
+    let capture_layer = capture.as_ref().map(|(layer, _)| layer.clone());
 
     match log_format {
         ResolvedLogFormat::Json => tracing_subscriber::registry()
@@ -410,9 +403,7 @@ fn init_otlp_runtime(
     let tracer = provider.tracer("autumn-web");
     let filter = build_filter(log);
     let capture = build_capture_layer(log);
-    let capture_layer = capture.as_ref().map(|(layer, _)| {
-        crate::log::capture::LogCaptureLayer::new(layer.buffer().clone())
-    });
+    let capture_layer = capture.as_ref().map(|(layer, _)| layer.clone());
 
     match log_format {
         ResolvedLogFormat::Json => tracing_subscriber::registry()
