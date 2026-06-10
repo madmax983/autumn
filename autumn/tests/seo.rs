@@ -320,7 +320,7 @@ struct TestSitemapSource {
 }
 
 impl SitemapSource for TestSitemapSource {
-    fn entries(&self) -> Pin<Box<dyn Future<Output = Vec<SitemapEntry>> + Send>> {
+    fn entries(&self) -> Pin<Box<dyn Future<Output = Vec<SitemapEntry>> + Send + '_>> {
         let entries = self.entries.clone();
         Box::pin(async move { entries })
     }

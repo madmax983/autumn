@@ -37,7 +37,7 @@
 //! struct BlogSitemapSource;
 //!
 //! impl SitemapSource for BlogSitemapSource {
-//!     fn entries(&self) -> Pin<Box<dyn Future<Output = Vec<SitemapEntry>> + Send>> {
+//!     fn entries(&self) -> Pin<Box<dyn Future<Output = Vec<SitemapEntry>> + Send + '_>> {
 //!         Box::pin(async {
 //!             vec![SitemapEntry::new("https://example.com/posts/hello")]
 //!         })
@@ -174,7 +174,7 @@ impl SitemapChangefreq {
 /// struct PostSitemapSource;
 ///
 /// impl SitemapSource for PostSitemapSource {
-///     fn entries(&self) -> Pin<Box<dyn Future<Output = Vec<SitemapEntry>> + Send>> {
+///     fn entries(&self) -> Pin<Box<dyn Future<Output = Vec<SitemapEntry>> + Send + '_>> {
 ///         Box::pin(async {
 ///             vec![
 ///                 SitemapEntry::new("https://example.com/posts/hello-world")
@@ -187,7 +187,7 @@ impl SitemapChangefreq {
 /// ```
 pub trait SitemapSource: Send + Sync {
     /// Return the sitemap entries for this source.
-    fn entries(&self) -> Pin<Box<dyn Future<Output = Vec<SitemapEntry>> + Send>>;
+    fn entries(&self) -> Pin<Box<dyn Future<Output = Vec<SitemapEntry>> + Send + '_>>;
 }
 
 // ── Internal AppState extension newtypes ──────────────────────────────────────

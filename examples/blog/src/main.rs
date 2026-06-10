@@ -21,7 +21,7 @@ const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
 struct BlogSitemapSource;
 
 impl SitemapSource for BlogSitemapSource {
-    fn entries(&self) -> Pin<Box<dyn Future<Output = Vec<SitemapEntry>> + Send>> {
+    fn entries(&self) -> Pin<Box<dyn Future<Output = Vec<SitemapEntry>> + Send + '_>> {
         Box::pin(async {
             vec![
                 SitemapEntry::new("https://autumn-demo.example.com/")
