@@ -114,6 +114,7 @@ impl JobInfo {
 #[derive(Clone)]
 pub struct JobClient {
     local_sender: Option<tokio::sync::mpsc::Sender<QueuedJob>>,
+    local_coordination: Option<Arc<LocalJobCoordination>>,
     #[cfg(feature = "redis")]
     redis: Option<RedisClient>,
     #[cfg(feature = "db")]
@@ -122,8 +123,67 @@ pub struct JobClient {
     job_admin: JobAdminMemoryBackend,
     default_max_attempts: u32,
     default_initial_backoff_ms: u64,
-    per_job_defaults: HashMap<String, (u32, u64)>,
+    per_job_settings: HashMap<String, JobRuntimeSettings>,
     pub interceptor: Option<Arc<dyn crate::interceptor::JobInterceptor>>,
+}
+
+/// Per-job configuration captured from [`JobInfo`] at runtime start.
+#[derive(Debug, Clone, Default)]
+struct JobRuntimeSettings {
+    max_attempts: u32,
+    initial_backoff_ms: u64,
+    uniqueness: Option<JobUniqueness>,
+    concurrency: Option<JobConcurrency>,
+}
+
+#[cfg(test)]
+impl JobRuntimeSettings {
+    fn basic(max_attempts: u32, initial_backoff_ms: u64) -> Self {
+        Self {
+            max_attempts,
+            initial_backoff_ms,
+            ..Self::default()
+        }
+    }
+}
+
+/// Uniqueness/concurrency values resolved against one concrete payload.
+#[derive(Debug, Clone, Default)]
+struct ResolvedJobConstraints {
+    unique_key: Option<String>,
+    unique_window: Option<JobUniquenessWindow>,
+    concurrency_limit: Option<u32>,
+    concurrency_scope: Option<String>,
+}
+
+impl ResolvedJobConstraints {
+    fn for_payload(settings: &JobRuntimeSettings, payload: &Value) -> Self {
+        let (unique_key, unique_window) = settings.uniqueness.as_ref().map_or((None, None), |u| {
+            (Some(job_unique_key(u, payload)), Some(u.window))
+        });
+        let (concurrency_limit, concurrency_scope) =
+            settings.concurrency.as_ref().map_or((None, None), |c| {
+                (Some(c.limit), job_concurrency_scope(c, payload))
+            });
+        Self {
+            unique_key,
+            unique_window,
+            concurrency_limit,
+            concurrency_scope,
+        }
+    }
+
+    #[cfg(any(feature = "redis", feature = "db"))]
+    fn unique_window_tag(&self) -> Option<&'static str> {
+        self.unique_window.map(JobUniquenessWindow::tag)
+    }
+}
+
+/// Whether an enqueue stored a new job or coalesced into an existing one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnqueueOutcome {
+    Queued,
+    Deduplicated,
 }
 
 #[derive(Debug)]
@@ -964,6 +1024,21 @@ struct RedisJobRecord {
     claimed_at_ms: Option<u64>,
     #[serde(default)]
     last_error: Option<String>,
+    /// Resolved uniqueness key; absent for non-unique jobs.
+    ///
+    /// `skip_serializing_if` keeps the field truly absent (not `null`) so the
+    /// claim script's `record['unique_key']` checks read `nil` in Lua.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    unique_key: Option<String>,
+    /// Uniqueness window tag: "pending", "running", or "ttl".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    unique_window: Option<String>,
+    /// Resolved concurrency scope value; absent for unscoped limits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    concurrency_key: Option<String>,
+    /// In-flight cap for this job's concurrency group.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    concurrency_limit: Option<u32>,
     /// W3C `traceparent` captured when the job was enqueued.
     #[cfg(feature = "telemetry-otlp")]
     #[serde(default)]
@@ -1029,6 +1104,64 @@ impl RedisMaintenanceThrottle {
 #[cfg(feature = "redis")]
 const REDIS_STALE_MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// How long a parked (concurrency-blocked) job waits before re-entering the
+/// queue for another claim attempt.
+#[cfg(feature = "redis")]
+const REDIS_CONCURRENCY_REQUEUE_DELAY_MS: u64 = 100;
+
+/// Cadence for promoting parked jobs back into the queue.
+#[cfg(feature = "redis")]
+const REDIS_BLOCKED_PROMOTION_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(REDIS_CONCURRENCY_REQUEUE_DELAY_MS);
+
+/// Maximum queue entries one claim call will scan past blocked jobs.
+#[cfg(feature = "redis")]
+const REDIS_CLAIM_SCAN_LIMIT: usize = 8;
+
+/// Safety TTL on unique locks for the pending/running windows.
+///
+/// Those locks are normally released by the claim/transition scripts; the TTL
+/// only bounds the damage if the job record itself is lost (e.g. a flushed
+/// keyspace), so a dead key can never deadlock uniqueness forever.
+#[cfg(feature = "redis")]
+const REDIS_UNIQUE_LOCK_TTL_BACKSTOP_MS: u64 = 86_400_000;
+
+#[cfg(feature = "redis")]
+fn redis_unique_lock_key(unique_prefix: &str, name: &str, unique_key: &str) -> String {
+    format!("{unique_prefix}{name}:{unique_key}")
+}
+
+#[cfg(feature = "redis")]
+fn redis_concurrency_counter_key(
+    concurrency_prefix: &str,
+    name: &str,
+    scope: Option<&str>,
+) -> String {
+    format!("{concurrency_prefix}{name}:{}", scope.unwrap_or(""))
+}
+
+/// Lock TTL for a unique job record: the window TTL itself, or the crash
+/// backstop for the pending/running windows.
+#[cfg(feature = "redis")]
+const fn redis_unique_lock_ttl_ms(window: Option<JobUniquenessWindow>) -> u64 {
+    match window {
+        Some(JobUniquenessWindow::TtlMs(ms)) => ms,
+        _ => REDIS_UNIQUE_LOCK_TTL_BACKSTOP_MS,
+    }
+}
+
+/// Whether a settling transition should release the unique lock.
+///
+/// TTL-window locks expire by time so a burst keeps coalescing after
+/// completion; retry transitions keep the lock because the job is still in
+/// flight.
+#[cfg(feature = "redis")]
+fn redis_release_unique_on_settle(record: &RedisJobRecord, mode: &str) -> bool {
+    record.unique_key.is_some()
+        && record.unique_window.as_deref() != Some("ttl")
+        && matches!(mode, "success" | "dead")
+}
+
 #[cfg(feature = "redis")]
 const REDIS_WORKER_IDLE_SLEEP_MAX: std::time::Duration = std::time::Duration::from_millis(200);
 
@@ -1056,13 +1189,34 @@ struct RedisWorkerConfig {
     delayed_key: String,
     dead_key: String,
     completed_key: String,
+    blocked_key: String,
     record_prefix: String,
     dead_record_prefix: String,
+    unique_prefix: String,
+    concurrency_prefix: String,
     worker_id: String,
     visibility_timeout_ms: u64,
     default_attempts: u32,
     default_backoff: u64,
     retry_promotion_interval: std::time::Duration,
+}
+
+#[cfg(feature = "redis")]
+impl RedisWorkerConfig {
+    fn unique_lock_key_for(&self, record: &RedisJobRecord) -> String {
+        record.unique_key.as_deref().map_or_else(
+            || format!("{}-", self.unique_prefix),
+            |key| redis_unique_lock_key(&self.unique_prefix, &record.name, key),
+        )
+    }
+
+    fn concurrency_counter_key_for(&self, record: &RedisJobRecord) -> String {
+        redis_concurrency_counter_key(
+            &self.concurrency_prefix,
+            &record.name,
+            record.concurrency_key.as_deref(),
+        )
+    }
 }
 
 static GLOBAL_JOB_CLIENT: OnceLock<RwLock<Option<Arc<JobClient>>>> = OnceLock::new();
@@ -1401,23 +1555,24 @@ impl JobClient {
     ///
     /// Returns an internal error when `name` does not match a registered job
     /// or enqueueing fails in the active backend.
+    #[allow(clippy::too_many_lines)]
     pub async fn enqueue(&self, name: &str, payload: Value) -> AutumnResult<()> {
-        let Some((job_max_attempts, job_backoff_ms)) = self.per_job_defaults.get(name).copied()
-        else {
+        let Some(settings) = self.per_job_settings.get(name) else {
             return Err(AutumnError::internal_server_error(std::io::Error::other(
                 format!("job '{name}' is not registered; add it to AppBuilder::jobs()"),
             )));
         };
-        let job_max_attempts = if job_max_attempts != 0 {
-            job_max_attempts
+        let job_max_attempts = if settings.max_attempts != 0 {
+            settings.max_attempts
         } else {
             self.default_max_attempts
         };
-        let job_backoff_ms = if job_backoff_ms != 0 {
-            job_backoff_ms
+        let job_backoff_ms = if settings.initial_backoff_ms != 0 {
+            settings.initial_backoff_ms
         } else {
             self.default_initial_backoff_ms
         };
+        let constraints = ResolvedJobConstraints::for_payload(settings, &payload);
         let id = uuid::Uuid::new_v4().to_string();
         self.registry.record_enqueue(name);
         self.job_admin
@@ -1430,10 +1585,19 @@ impl JobClient {
         let payload_clone = payload.clone();
         let actual_enqueue = async move {
             started_clone.store(true, ::std::sync::atomic::Ordering::SeqCst);
-            let result = if let Some(sender) = &self.local_sender {
+            let outcome = if let Some(sender) = &self.local_sender {
+                if let (Some(unique_key), Some(window), Some(coordination)) = (
+                    constraints.unique_key.as_deref(),
+                    constraints.unique_window,
+                    self.local_coordination.as_deref(),
+                ) && !coordination.try_acquire_unique(name, unique_key, &id_for_enqueue, window)
+                {
+                    self.record_deduplicated_enqueue(name, &id_for_enqueue);
+                    return Ok(());
+                }
                 #[cfg(feature = "telemetry-otlp")]
                 let (traceparent, tracestate) = capture_job_trace_context();
-                sender
+                let send_result = sender
                     .send(QueuedJob {
                         id: id_for_enqueue.clone(),
                         name: name.to_string(),
@@ -1451,7 +1615,16 @@ impl JobClient {
                         AutumnError::internal_server_error(std::io::Error::other(format!(
                             "failed to enqueue job: {e}"
                         )))
-                    })
+                    });
+                if send_result.is_err()
+                    && let (Some(unique_key), Some(coordination)) = (
+                        constraints.unique_key.as_deref(),
+                        self.local_coordination.as_deref(),
+                    )
+                {
+                    coordination.release_unique(name, unique_key, &id_for_enqueue);
+                }
+                send_result.map(|()| EnqueueOutcome::Queued)
             } else {
                 self.enqueue_durable(
                     id_for_enqueue.clone(),
@@ -1459,8 +1632,17 @@ impl JobClient {
                     payload_clone.clone(),
                     job_max_attempts,
                     job_backoff_ms,
+                    &constraints,
                 )
                 .await
+            };
+            let result = match outcome {
+                Ok(EnqueueOutcome::Queued) => Ok(()),
+                Ok(EnqueueOutcome::Deduplicated) => {
+                    self.record_deduplicated_enqueue(name, &id_for_enqueue);
+                    return Ok(());
+                }
+                Err(error) => Err(error),
             };
             if result.is_err() {
                 self.registry.record_cancel(name);
@@ -1528,7 +1710,7 @@ impl JobClient {
         // Validate name eagerly so a typo/unregistered job fails the
         // transaction (before any DB commit) rather than being silently
         // dropped later when the deferred callback runs.
-        if !self.per_job_defaults.contains_key(name) {
+        if !self.per_job_settings.contains_key(name) {
             return Err(AutumnError::internal_server_error(std::io::Error::other(
                 format!("job '{name}' is not registered; add it to AppBuilder::jobs()"),
             )));
@@ -1578,6 +1760,13 @@ impl JobClient {
         Ok(())
     }
 
+    /// Mark a coalesced enqueue in the registry counters and admin record.
+    fn record_deduplicated_enqueue(&self, name: &str, id: &str) {
+        tracing::debug!(job = %name, job_id = %id, "job enqueue coalesced into existing unique job");
+        self.registry.record_deduplicated(name);
+        self.job_admin.record_deduplicated(id);
+    }
+
     async fn enqueue_durable(
         &self,
         id: String,
@@ -1585,18 +1774,28 @@ impl JobClient {
         payload: Value,
         max_attempts: u32,
         backoff_ms: u64,
-    ) -> AutumnResult<()> {
+        constraints: &ResolvedJobConstraints,
+    ) -> AutumnResult<EnqueueOutcome> {
         #[cfg(feature = "redis")]
         if let Some(redis) = &self.redis {
             return redis
-                .enqueue(id, name, payload, max_attempts, backoff_ms)
+                .enqueue(id, name, payload, max_attempts, backoff_ms, constraints)
                 .await;
         }
         #[cfg(feature = "db")]
         if let Some(pool) = &self.pg_pool {
-            return pg_enqueue_job(pool, id, name, payload, max_attempts, backoff_ms).await;
+            return pg_enqueue_job(
+                pool,
+                id,
+                name,
+                payload,
+                max_attempts,
+                backoff_ms,
+                constraints,
+            )
+            .await;
         }
-        let _ = (id, name, payload, max_attempts, backoff_ms);
+        let _ = (id, name, payload, max_attempts, backoff_ms, constraints);
         Err(AutumnError::internal_server_error(std::io::Error::other(
             "job runtime backend is unavailable",
         )))
@@ -1621,36 +1820,52 @@ impl JobClient {
         payload: Value,
         conn: &mut diesel_async::AsyncPgConnection,
     ) -> AutumnResult<()> {
-        let Some((job_max_attempts, job_backoff_ms)) = self.per_job_defaults.get(name).copied()
-        else {
+        let Some(settings) = self.per_job_settings.get(name) else {
             return Err(AutumnError::internal_server_error(std::io::Error::other(
                 format!("job '{name}' is not registered; add it to AppBuilder::jobs()"),
             )));
         };
-        let job_max_attempts = if job_max_attempts != 0 {
-            job_max_attempts
+        let job_max_attempts = if settings.max_attempts != 0 {
+            settings.max_attempts
         } else {
             self.default_max_attempts
         };
-        let job_backoff_ms = if job_backoff_ms != 0 {
-            job_backoff_ms
+        let job_backoff_ms = if settings.initial_backoff_ms != 0 {
+            settings.initial_backoff_ms
         } else {
             self.default_initial_backoff_ms
         };
+        let constraints = ResolvedJobConstraints::for_payload(settings, &payload);
         let id = uuid::Uuid::new_v4().to_string();
 
         // Postgres transactional path: the caller controls when the surrounding
         // transaction commits, so we cannot safely update process-local counters
         // here — the row may disappear on rollback while the counter persists.
         if self.pg_pool.is_some() {
-            let actual_enqueue = pg_enqueue_on_conn(
-                conn,
-                id,
-                name,
-                payload.clone(),
-                job_max_attempts,
-                job_backoff_ms,
-            );
+            let id_for_enqueue = id.clone();
+            let payload_for_enqueue = payload.clone();
+            let constraints_ref = &constraints;
+            let actual_enqueue = async move {
+                let outcome = pg_enqueue_on_conn(
+                    conn,
+                    id_for_enqueue.clone(),
+                    name,
+                    payload_for_enqueue,
+                    job_max_attempts,
+                    job_backoff_ms,
+                    constraints_ref,
+                )
+                .await?;
+                if outcome == EnqueueOutcome::Deduplicated {
+                    // A dedup decision is final even if the surrounding
+                    // transaction rolls back (no row was ever written), so the
+                    // counter can be recorded immediately. Balance the queued
+                    // gauge that record_deduplicated decrements.
+                    self.registry.record_enqueue(name);
+                    self.record_deduplicated_enqueue(name, &id_for_enqueue);
+                }
+                Ok(())
+            };
             return if let Some(interceptor) = &self.interceptor {
                 let interceptor = (*interceptor).clone();
                 run_enqueue_interceptor(interceptor, name, &payload, Box::pin(actual_enqueue)).await
@@ -1659,69 +1874,10 @@ impl JobClient {
             };
         }
 
-        self.registry.record_enqueue(name);
-        self.job_admin
-            .record_enqueue(id.clone(), name, payload.clone(), 1, job_max_attempts);
-
-        let started = ::std::sync::Arc::new(::std::sync::atomic::AtomicBool::new(false));
-        let started_clone = started.clone();
-
-        #[cfg(feature = "telemetry-otlp")]
-        let (traceparent, tracestate) = capture_job_trace_context();
-
-        let id_for_enqueue = id.clone();
-        let payload_clone = payload.clone();
-        let actual_enqueue = async move {
-            started_clone.store(true, ::std::sync::atomic::Ordering::SeqCst);
-            let result = if let Some(sender) = &self.local_sender {
-                sender
-                    .send(QueuedJob {
-                        id: id_for_enqueue.clone(),
-                        name: name.to_string(),
-                        payload: payload_clone.clone(),
-                        attempt: 1,
-                        max_attempts: job_max_attempts,
-                        initial_backoff_ms: job_backoff_ms,
-                        #[cfg(feature = "telemetry-otlp")]
-                        traceparent,
-                        #[cfg(feature = "telemetry-otlp")]
-                        tracestate,
-                    })
-                    .await
-                    .map_err(|e| {
-                        AutumnError::internal_server_error(std::io::Error::other(format!(
-                            "failed to enqueue job: {e}"
-                        )))
-                    })
-            } else {
-                self.enqueue_durable(
-                    id_for_enqueue.clone(),
-                    name,
-                    payload_clone.clone(),
-                    job_max_attempts,
-                    job_backoff_ms,
-                )
-                .await
-            };
-            if result.is_err() {
-                self.registry.record_cancel(name);
-                self.job_admin.record_cancelled(&id_for_enqueue);
-            }
-            result
-        };
-
-        let res = if let Some(interceptor) = &self.interceptor {
-            let interceptor = (*interceptor).clone();
-            run_enqueue_interceptor(interceptor, name, &payload, Box::pin(actual_enqueue)).await
-        } else {
-            actual_enqueue.await
-        };
-
-        if !started.load(::std::sync::atomic::Ordering::SeqCst) {
-            self.registry.record_cancel(name);
-            self.job_admin.record_cancelled(&id);
-        }
-        res
+        // For the redis and local backends `conn` is irrelevant; the normal
+        // enqueue path already applies interceptors, bookkeeping, uniqueness,
+        // and concurrency metadata.
+        self.enqueue(name, payload).await
     }
 }
 
@@ -1803,6 +1959,136 @@ pub fn start_runtime(
     }
 }
 
+/// Process-local uniqueness holds and concurrency slots for the local backend.
+///
+/// The local backend is in-process and non-durable, so a plain mutex-guarded
+/// map is sufficient: a crashed process loses the queue itself along with any
+/// held keys, which means a dead worker can never deadlock a key beyond the
+/// process lifetime.
+#[derive(Default)]
+pub(crate) struct LocalJobCoordination {
+    inner: std::sync::Mutex<LocalJobCoordinationInner>,
+}
+
+#[derive(Default)]
+struct LocalJobCoordinationInner {
+    unique_holds: HashMap<String, LocalUniqueHold>,
+    running_slots: HashMap<String, u32>,
+    waiting: HashMap<String, VecDeque<QueuedJob>>,
+}
+
+struct LocalUniqueHold {
+    job_id: String,
+    expires_at: Option<std::time::Instant>,
+}
+
+fn local_unique_hold_key(name: &str, unique_key: &str) -> String {
+    format!("{name}\u{1f}{unique_key}")
+}
+
+fn local_concurrency_group(name: &str, scope: Option<&str>) -> String {
+    scope.map_or_else(|| name.to_string(), |scope| format!("{name}\u{1f}{scope}"))
+}
+
+enum LocalSlotDecision {
+    Acquired(QueuedJob),
+    Parked,
+}
+
+impl LocalJobCoordination {
+    /// Try to hold the unique key for `job_id`; `false` means an equivalent
+    /// job already holds it (the enqueue should coalesce).
+    fn try_acquire_unique(
+        &self,
+        name: &str,
+        unique_key: &str,
+        job_id: &str,
+        window: JobUniquenessWindow,
+    ) -> bool {
+        let Ok(mut inner) = self.inner.lock() else {
+            return true;
+        };
+        let key = local_unique_hold_key(name, unique_key);
+        let now = std::time::Instant::now();
+        if let Some(hold) = inner.unique_holds.get(&key) {
+            let expired = hold.expires_at.is_some_and(|expires_at| expires_at <= now);
+            if !expired {
+                return false;
+            }
+        }
+        let expires_at = match window {
+            JobUniquenessWindow::TtlMs(ms) => Some(now + std::time::Duration::from_millis(ms)),
+            JobUniquenessWindow::Pending | JobUniquenessWindow::Running => None,
+        };
+        inner.unique_holds.insert(
+            key,
+            LocalUniqueHold {
+                job_id: job_id.to_owned(),
+                expires_at,
+            },
+        );
+        true
+    }
+
+    /// Release the unique key if `job_id` is still the holder.
+    ///
+    /// TTL-window holds are intentionally never released here; they expire by
+    /// time so a burst keeps coalescing even after the job completed.
+    fn release_unique(&self, name: &str, unique_key: &str, job_id: &str) {
+        let Ok(mut inner) = self.inner.lock() else {
+            return;
+        };
+        let key = local_unique_hold_key(name, unique_key);
+        let holder_matches = inner
+            .unique_holds
+            .get(&key)
+            .is_some_and(|hold| hold.job_id == job_id && hold.expires_at.is_none());
+        if holder_matches {
+            inner.unique_holds.remove(&key);
+        }
+    }
+
+    /// Acquire a concurrency slot for `group`, or park the job until one
+    /// frees up. Parked jobs are resumed by [`Self::release_slot`].
+    fn acquire_slot_or_park(&self, group: &str, limit: u32, job: QueuedJob) -> LocalSlotDecision {
+        let Ok(mut inner) = self.inner.lock() else {
+            return LocalSlotDecision::Acquired(job);
+        };
+        let running = inner.running_slots.get(group).copied().unwrap_or(0);
+        if running >= limit {
+            inner
+                .waiting
+                .entry(group.to_string())
+                .or_default()
+                .push_back(job);
+            return LocalSlotDecision::Parked;
+        }
+        *inner.running_slots.entry(group.to_string()).or_insert(0) += 1;
+        LocalSlotDecision::Acquired(job)
+    }
+
+    /// Free one slot for `group` and hand back the next parked job, if any.
+    fn release_slot(&self, group: &str) -> Option<QueuedJob> {
+        let Ok(mut inner) = self.inner.lock() else {
+            return None;
+        };
+        if let Some(count) = inner.running_slots.get_mut(group) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                inner.running_slots.remove(group);
+            }
+        }
+        let next = inner
+            .waiting
+            .get_mut(group)
+            .and_then(std::collections::VecDeque::pop_front);
+        if inner.waiting.get(group).is_some_and(VecDeque::is_empty) {
+            inner.waiting.remove(group);
+        }
+        next
+    }
+}
+
 pub(crate) fn start_local_runtime(
     jobs: Vec<JobInfo>,
     state: &AppState,
@@ -1812,7 +2098,7 @@ pub(crate) fn start_local_runtime(
     default_initial_backoff_ms: u64,
 ) {
     let job_admin = default_job_admin_backend_for_state(state);
-    let per_job_defaults = build_per_job_defaults(&jobs);
+    let per_job_settings = build_per_job_settings(&jobs);
     let jobs_by_name: Arc<RwLock<HashMap<String, JobInfo>>> = Arc::new(RwLock::new(
         jobs.into_iter().map(|j| (j.name.clone(), j)).collect(),
     ));
@@ -1827,9 +2113,11 @@ pub(crate) fn start_local_runtime(
     let worker_count = workers.max(1);
     let (tx, rx) = tokio::sync::mpsc::channel::<QueuedJob>(1024);
     let shared_rx = Arc::new(tokio::sync::Mutex::new(rx));
+    let coordination = Arc::new(LocalJobCoordination::default());
 
     let client = JobClient {
         local_sender: Some(tx.clone()),
+        local_coordination: Some(Arc::clone(&coordination)),
         #[cfg(feature = "redis")]
         redis: None,
         #[cfg(feature = "db")]
@@ -1838,7 +2126,7 @@ pub(crate) fn start_local_runtime(
         job_admin: job_admin.clone(),
         default_max_attempts,
         default_initial_backoff_ms,
-        per_job_defaults,
+        per_job_settings,
         interceptor: state
             .extension::<Arc<dyn crate::interceptor::JobInterceptor>>()
             .map(|arc| (*arc).clone()),
@@ -1852,6 +2140,7 @@ pub(crate) fn start_local_runtime(
         let jobs_by_name = Arc::clone(&jobs_by_name);
         let shared_rx = Arc::clone(&shared_rx);
         let shutdown = shutdown.clone();
+        let coordination = Arc::clone(&coordination);
 
         tokio::spawn(async move {
             loop {
@@ -1862,7 +2151,7 @@ pub(crate) fn start_local_runtime(
                         guard.recv().await
                     } => {
                         let Some(job) = maybe else { break; };
-                        execute_local_job(job, &jobs_by_name, &tx, &state, &job_admin).await;
+                        execute_local_job(job, &jobs_by_name, &tx, &state, &job_admin, &coordination).await;
                     }
                 }
             }
@@ -1870,32 +2159,88 @@ pub(crate) fn start_local_runtime(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn execute_local_job(
     job: QueuedJob,
     jobs_by_name: &Arc<RwLock<HashMap<String, JobInfo>>>,
     tx: &tokio::sync::mpsc::Sender<QueuedJob>,
     state: &AppState,
     job_admin: &JobAdminMemoryBackend,
+    coordination: &Arc<LocalJobCoordination>,
 ) {
-    if job_admin.try_record_start(&job.id, job.attempt) == JobAdminStartDecision::Canceled {
-        state.job_registry.record_cancel(&job.name);
-        job_admin.record_cancelled(&job.id);
-        return;
-    }
-    state.job_registry.record_start(&job.name);
-
-    let Some((handler, info_max_attempts, info_backoff_ms)) = jobs_by_name
+    let maybe_info = jobs_by_name
         .read()
         .expect("job registry lock poisoned")
         .get(&job.name)
-        .map(|info| (info.handler, info.max_attempts, info.initial_backoff_ms))
+        .map(|info| {
+            (
+                info.handler,
+                info.max_attempts,
+                info.initial_backoff_ms,
+                info.uniqueness.clone(),
+                info.concurrency.clone(),
+            )
+        });
+    let Some((handler, info_max_attempts, info_backoff_ms, uniqueness, concurrency)) = maybe_info
     else {
+        if job_admin.try_record_start(&job.id, job.attempt) == JobAdminStartDecision::Canceled {
+            state.job_registry.record_cancel(&job.name);
+            job_admin.record_cancelled(&job.id);
+            return;
+        }
+        state.job_registry.record_start(&job.name);
         state
             .job_registry
             .record_failure(&job.name, format!("unknown job '{}'", job.name), true);
         job_admin.record_failure(&job.id, format!("unknown job '{}'", job.name));
         return;
     };
+
+    // Concurrency gate: park the job when its group is saturated. Parked jobs
+    // keep their enqueued status and resume when release_slot pops them.
+    let job_name = job.name.clone();
+    let concurrency_group = concurrency.as_ref().map(|conc| {
+        let scope = job_concurrency_scope(conc, &job.payload);
+        (
+            local_concurrency_group(&job.name, scope.as_deref()),
+            conc.limit,
+        )
+    });
+    let job = if let Some((group, limit)) = &concurrency_group {
+        match coordination.acquire_slot_or_park(group, *limit, job) {
+            LocalSlotDecision::Acquired(job) => job,
+            LocalSlotDecision::Parked => {
+                state.job_registry.record_concurrency_blocked(&job_name);
+                return;
+            }
+        }
+    } else {
+        job
+    };
+
+    if job_admin.try_record_start(&job.id, job.attempt) == JobAdminStartDecision::Canceled {
+        state.job_registry.record_cancel(&job.name);
+        job_admin.record_cancelled(&job.id);
+        release_local_unique_hold(
+            coordination,
+            uniqueness.as_ref(),
+            &job.name,
+            &job.payload,
+            &job.id,
+        );
+        finish_local_slot(coordination, concurrency_group.as_ref(), tx, state);
+        return;
+    }
+    state.job_registry.record_start(&job.name);
+
+    // A pending-window unique key is held only until execution starts.
+    if let Some(unique) = &uniqueness
+        && unique.window == JobUniquenessWindow::Pending
+    {
+        let key = job_unique_key(unique, &job.payload);
+        coordination.release_unique(&job.name, &key, &job.id);
+    }
+
     let max_attempts = if job.max_attempts != 0 {
         job.max_attempts
     } else if info_max_attempts != 0 {
@@ -1925,9 +2270,18 @@ async fn execute_local_job(
         JobExecutionOutcome::Succeeded => {
             state.job_registry.record_success(&job.name);
             job_admin.record_success(&job.id);
+            release_local_unique_hold(
+                coordination,
+                uniqueness.as_ref(),
+                &job.name,
+                &job.payload,
+                &job.id,
+            );
         }
         JobExecutionOutcome::Failed(error) => {
             if job.attempt < max_attempts {
+                // The unique key stays held across retries: the job is still
+                // logically in flight until it settles.
                 state
                     .job_registry
                     .record_retry(&job.name, &error, job.attempt);
@@ -1967,6 +2321,13 @@ async fn execute_local_job(
                     .job_registry
                     .record_failure(&job.name, error.clone(), true);
                 job_admin.record_failure(&job.id, error);
+                release_local_unique_hold(
+                    coordination,
+                    uniqueness.as_ref(),
+                    &job.name,
+                    &job.payload,
+                    &job.id,
+                );
             }
         }
         JobExecutionOutcome::Panicked(error) => {
@@ -1975,7 +2336,52 @@ async fn execute_local_job(
                 .job_registry
                 .record_failure(&job.name, error.clone(), true);
             job_admin.record_failure(&job.id, error);
+            release_local_unique_hold(
+                coordination,
+                uniqueness.as_ref(),
+                &job.name,
+                &job.payload,
+                &job.id,
+            );
         }
+    }
+
+    // The concurrency slot frees as soon as the handler is no longer running,
+    // including while a retry waits out its backoff.
+    finish_local_slot(coordination, concurrency_group.as_ref(), tx, state);
+}
+
+/// Release a unique hold after a job settles. No-op for TTL-window holds
+/// (they expire by time) and when another job has since taken the key.
+fn release_local_unique_hold(
+    coordination: &Arc<LocalJobCoordination>,
+    uniqueness: Option<&JobUniqueness>,
+    name: &str,
+    payload: &Value,
+    job_id: &str,
+) {
+    if let Some(unique) = uniqueness {
+        let key = job_unique_key(unique, payload);
+        coordination.release_unique(name, &key, job_id);
+    }
+}
+
+/// Free the job's concurrency slot and resume the next parked job, if any.
+fn finish_local_slot(
+    coordination: &Arc<LocalJobCoordination>,
+    concurrency_group: Option<&(String, u32)>,
+    tx: &tokio::sync::mpsc::Sender<QueuedJob>,
+    state: &AppState,
+) {
+    let Some((group, _limit)) = concurrency_group else {
+        return;
+    };
+    if let Some(next) = coordination.release_slot(group) {
+        state.job_registry.record_concurrency_unblocked(&next.name);
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let _ = tx.send(next).await;
+        });
     }
 }
 
@@ -1985,6 +2391,7 @@ struct RedisClient {
     connection: redis::aio::ConnectionManager,
     queue_key: String,
     record_prefix: String,
+    unique_prefix: String,
 }
 
 #[cfg(feature = "redis")]
@@ -2099,6 +2506,21 @@ fn encode_redis_record(record: &RedisJobRecord) -> AutumnResult<String> {
     })
 }
 
+/// Atomic enqueue: optionally takes the unique lock (`SET NX PX`), and only
+/// when the lock is acquired stores the record and pushes the queue entry.
+/// Returns 0 when the lock is already held, i.e. the enqueue coalesced.
+#[cfg(feature = "redis")]
+const REDIS_ENQUEUE_SCRIPT: &str = r"
+if ARGV[3] == '1' then
+  if not redis.call('SET', KEYS[3], ARGV[2], 'NX', 'PX', tonumber(ARGV[4])) then
+    return 0
+  end
+end
+redis.call('SET', KEYS[1], ARGV[1])
+redis.call('LPUSH', KEYS[2], ARGV[2])
+return 1
+";
+
 #[cfg(feature = "redis")]
 impl RedisClient {
     async fn enqueue(
@@ -2108,7 +2530,8 @@ impl RedisClient {
         payload: Value,
         default_max_attempts: u32,
         default_initial_backoff_ms: u64,
-    ) -> AutumnResult<()> {
+        constraints: &ResolvedJobConstraints,
+    ) -> AutumnResult<EnqueueOutcome> {
         #[cfg(feature = "telemetry-otlp")]
         let (traceparent, tracestate) = capture_job_trace_context();
         let mut connection = self.connection.clone();
@@ -2125,6 +2548,14 @@ impl RedisClient {
             claimed_by: None,
             claimed_at_ms: None,
             last_error: None,
+            unique_key: constraints.unique_key.clone(),
+            unique_window: constraints.unique_window_tag().map(str::to_owned),
+            concurrency_key: if constraints.concurrency_limit.is_some() {
+                constraints.concurrency_scope.clone()
+            } else {
+                None
+            },
+            concurrency_limit: constraints.concurrency_limit,
             #[cfg(feature = "telemetry-otlp")]
             traceparent,
             #[cfg(feature = "telemetry-otlp")]
@@ -2132,24 +2563,39 @@ impl RedisClient {
         };
         let encoded = encode_redis_record(&msg)?;
         let record_key = redis_record_key(&self.record_prefix, &id);
+        let unique_lock_key = constraints.unique_key.as_deref().map_or_else(
+            || format!("{}-", self.unique_prefix),
+            |key| redis_unique_lock_key(&self.unique_prefix, name, key),
+        );
+        let has_unique = if constraints.unique_key.is_some() {
+            "1"
+        } else {
+            "0"
+        };
+        let lock_ttl_ms = redis_unique_lock_ttl_ms(constraints.unique_window);
 
-        redis::pipe()
-            .atomic()
-            .cmd("SET")
+        let stored: i64 = redis::cmd("EVAL")
+            .arg(REDIS_ENQUEUE_SCRIPT)
+            .arg(3)
             .arg(record_key)
-            .arg(encoded)
-            .ignore()
-            .cmd("LPUSH")
             .arg(&self.queue_key)
+            .arg(unique_lock_key)
+            .arg(encoded)
             .arg(id)
-            .ignore()
-            .query_async::<()>(&mut connection)
+            .arg(has_unique)
+            .arg(lock_ttl_ms)
+            .query_async(&mut connection)
             .await
             .map_err(|e| {
                 AutumnError::internal_server_error(std::io::Error::other(format!(
                     "enqueue durable job failed: {e}"
                 )))
-            })
+            })?;
+        if stored == 1 {
+            Ok(EnqueueOutcome::Queued)
+        } else {
+            Ok(EnqueueOutcome::Deduplicated)
+        }
     }
 }
 
@@ -2583,42 +3029,82 @@ async fn claim_next_redis_job(
     connection: &mut redis::aio::ConnectionManager,
     worker_config: &RedisWorkerConfig,
 ) -> Result<Option<RedisJobRecord>, redis::RedisError> {
+    // Pops queue entries until one is claimable. Jobs whose concurrency group
+    // is saturated are parked into the blocked zset (KEYS[4]) with a short
+    // due time and retried via promotion; the scan bound keeps one call from
+    // walking an arbitrarily long queue. The concurrency counter INCR is
+    // atomic with the claim itself, so two workers can never both observe a
+    // free slot for the last opening in a group.
     const CLAIM_SCRIPT: &str = r"
-local id = redis.call('RPOP', KEYS[1])
-if not id then
-  return nil
+local function scope_string(value)
+  if value == nil or value == cjson.null then
+    return ''
+  end
+  return tostring(value)
 end
-local key = KEYS[3] .. id
-local body = redis.call('GET', key)
-if not body then
-  return nil
+for attempt = 1, tonumber(ARGV[6]) do
+  local id = redis.call('RPOP', KEYS[1])
+  if not id then
+    return nil
+  end
+  local key = KEYS[3] .. id
+  local body = redis.call('GET', key)
+  if body then
+    local ok, record = pcall(cjson.decode, body)
+    if not ok then
+      redis.call('ZADD', KEYS[2], ARGV[3], id)
+      return { id, body }
+    end
+    local blocked = false
+    if record['concurrency_limit'] and record['concurrency_limit'] ~= cjson.null then
+      local counter = ARGV[4] .. record['name'] .. ':' .. scope_string(record['concurrency_key'])
+      local current = tonumber(redis.call('GET', counter) or '0')
+      if current >= tonumber(record['concurrency_limit']) then
+        redis.call('ZADD', KEYS[4], ARGV[5], id)
+        blocked = true
+      else
+        redis.call('INCR', counter)
+      end
+    end
+    if not blocked then
+      if record['unique_key'] and record['unique_key'] ~= cjson.null
+         and record['unique_window'] == 'pending' then
+        local lock = ARGV[7] .. record['name'] .. ':' .. record['unique_key']
+        if redis.call('GET', lock) == record['id'] then
+          redis.call('DEL', lock)
+        end
+      end
+      record['claimed_by'] = ARGV[1]
+      record['claimed_at_ms'] = tonumber(ARGV[2])
+      record['started_at_ms'] = tonumber(ARGV[2])
+      record['finished_at_ms'] = nil
+      local updated = cjson.encode(record)
+      redis.call('SET', key, updated)
+      redis.call('ZADD', KEYS[2], ARGV[3], id)
+      return { id, updated }
+    end
+  end
 end
-local ok, record = pcall(cjson.decode, body)
-if not ok then
-  redis.call('ZADD', KEYS[2], ARGV[3], id)
-  return { id, body }
-end
-record['claimed_by'] = ARGV[1]
-record['claimed_at_ms'] = tonumber(ARGV[2])
-record['started_at_ms'] = tonumber(ARGV[2])
-record['finished_at_ms'] = nil
-local updated = cjson.encode(record)
-redis.call('SET', key, updated)
-redis.call('ZADD', KEYS[2], ARGV[3], id)
-return { id, updated }
+return nil
 ";
 
     let now_ms = now_unix_ms();
     let deadline_ms = now_ms.saturating_add(worker_config.visibility_timeout_ms);
+    let blocked_due_ms = now_ms.saturating_add(REDIS_CONCURRENCY_REQUEUE_DELAY_MS);
     let response: Option<(String, String)> = redis::cmd("EVAL")
         .arg(CLAIM_SCRIPT)
-        .arg(3)
+        .arg(4)
         .arg(&worker_config.queue_key)
         .arg(&worker_config.processing_key)
         .arg(&worker_config.record_prefix)
+        .arg(&worker_config.blocked_key)
         .arg(&worker_config.worker_id)
         .arg(now_ms)
         .arg(deadline_ms)
+        .arg(&worker_config.concurrency_prefix)
+        .arg(blocked_due_ms)
+        .arg(REDIS_CLAIM_SCAN_LIMIT)
+        .arg(&worker_config.unique_prefix)
         .query_async(connection)
         .await?;
 
@@ -2631,6 +3117,10 @@ return { id, updated }
         Err(error) => {
             tracing::warn!(job_id = %id, error = %error, "invalid durable job record");
             let malformed_id = id.clone();
+            // The Lua side may have already taken a concurrency slot for this
+            // record (cjson decoded it even though serde did not); read the
+            // raw fields back to settle the counter and unique lock.
+            settle_malformed_redis_claim(connection, worker_config, &body).await;
             let malformed = serde_json::json!({
                 "id": id,
                 "error": error.to_string(),
@@ -2646,6 +3136,65 @@ return { id, updated }
         }
     }
 }
+
+/// Settle the concurrency counter and unique lock for a record that the claim
+/// script decoded (and therefore claimed a slot for) but serde rejected.
+#[cfg(feature = "redis")]
+async fn settle_malformed_redis_claim(
+    connection: &mut redis::aio::ConnectionManager,
+    worker_config: &RedisWorkerConfig,
+    body: &str,
+) {
+    let Ok(raw) = serde_json::from_str::<Value>(body) else {
+        return;
+    };
+    let Some(name) = raw.get("name").and_then(Value::as_str) else {
+        return;
+    };
+    if raw.get("concurrency_limit").is_some_and(Value::is_u64) {
+        let scope = raw
+            .get("concurrency_key")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let counter = redis_concurrency_counter_key(
+            &worker_config.concurrency_prefix,
+            name,
+            scope.as_deref(),
+        );
+        let _ = redis::cmd("EVAL")
+            .arg(REDIS_COUNTER_DECREMENT_SCRIPT)
+            .arg(1)
+            .arg(counter)
+            .query_async::<i64>(connection)
+            .await;
+    }
+    if let (Some(unique_key), Some(id)) = (
+        raw.get("unique_key").and_then(Value::as_str),
+        raw.get("id").and_then(Value::as_str),
+    ) && raw.get("unique_window").and_then(Value::as_str) != Some("ttl")
+    {
+        let lock = redis_unique_lock_key(&worker_config.unique_prefix, name, unique_key);
+        let _ = redis::cmd("EVAL")
+            .arg("if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) end return 0")
+            .arg(1)
+            .arg(lock)
+            .arg(id)
+            .query_async::<i64>(connection)
+            .await;
+    }
+}
+
+/// Decrement a concurrency counter, deleting it at zero.
+#[cfg(feature = "redis")]
+const REDIS_COUNTER_DECREMENT_SCRIPT: &str = r"
+local current = tonumber(redis.call('GET', KEYS[1]) or '0')
+if current <= 1 then
+  redis.call('DEL', KEYS[1])
+  return 0
+end
+redis.call('SET', KEYS[1], current - 1)
+return current - 1
+";
 
 #[cfg(feature = "redis")]
 async fn record_enqueues_for_redis_ids(
@@ -2723,6 +3272,66 @@ return promoted
     Ok(())
 }
 
+/// Move parked (concurrency-blocked) jobs whose retry time arrived back into
+/// the queue. Unlike retry promotion this records no bookkeeping: a parked
+/// job never stopped being enqueued from the dashboard's point of view.
+#[cfg(feature = "redis")]
+async fn promote_due_blocked_redis_jobs(
+    connection: &mut redis::aio::ConnectionManager,
+    worker_config: &RedisWorkerConfig,
+) -> Result<(), redis::RedisError> {
+    const PROMOTE_BLOCKED_SCRIPT: &str = r"
+local ids = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, ARGV[2])
+for _, id in ipairs(ids) do
+  if redis.call('ZREM', KEYS[1], id) == 1 then
+    redis.call('LPUSH', KEYS[2], id)
+  end
+end
+return #ids
+";
+    let _promoted: i64 = redis::cmd("EVAL")
+        .arg(PROMOTE_BLOCKED_SCRIPT)
+        .arg(2)
+        .arg(&worker_config.blocked_key)
+        .arg(&worker_config.queue_key)
+        .arg(now_unix_ms())
+        .arg(64_usize)
+        .query_async(connection)
+        .await?;
+    Ok(())
+}
+
+/// Publish per-name blocked-on-concurrency gauges from the blocked zset.
+#[cfg(feature = "redis")]
+async fn update_redis_blocked_gauges(
+    connection: &mut redis::aio::ConnectionManager,
+    worker_config: &RedisWorkerConfig,
+    state: &AppState,
+) -> Result<(), redis::RedisError> {
+    let ids: Vec<String> = redis::cmd("ZRANGE")
+        .arg(&worker_config.blocked_key)
+        .arg(0)
+        .arg(1023)
+        .query_async(connection)
+        .await?;
+    let mut counts: HashMap<String, u64> = HashMap::new();
+    if !ids.is_empty() {
+        let keys: Vec<String> = ids
+            .iter()
+            .map(|id| redis_record_key(&worker_config.record_prefix, id))
+            .collect();
+        let bodies: Vec<Option<String>> =
+            redis::cmd("MGET").arg(keys).query_async(connection).await?;
+        for body in bodies.into_iter().flatten() {
+            if let Ok(record) = serde_json::from_str::<RedisJobRecord>(&body) {
+                *counts.entry(record.name).or_insert(0) += 1;
+            }
+        }
+    }
+    state.job_registry.set_concurrency_blocked_counts(&counts);
+    Ok(())
+}
+
 #[cfg(feature = "redis")]
 fn expected_claim_args(record: &RedisJobRecord) -> Option<(&str, u64)> {
     Some((record.claimed_by.as_deref()?, record.claimed_at_ms?))
@@ -2756,6 +3365,17 @@ if record['claimed_at_ms'] ~= tonumber(ARGV[3]) then
   return 0
 end
 redis.call('ZREM', KEYS[1], ARGV[1])
+if ARGV[9] == '1' then
+  local slots = tonumber(redis.call('GET', KEYS[8]) or '0')
+  if slots <= 1 then
+    redis.call('DEL', KEYS[8])
+  else
+    redis.call('SET', KEYS[8], slots - 1)
+  end
+end
+if ARGV[8] == '1' and redis.call('GET', KEYS[7]) == ARGV[1] then
+  redis.call('DEL', KEYS[7])
+end
 if ARGV[4] == 'success' then
   redis.call('LPUSH', KEYS[5], ARGV[5])
   redis.call('LTRIM', KEYS[5], 0, tonumber(ARGV[7]) - 1)
@@ -2787,15 +3407,30 @@ async fn apply_claimed_redis_transition(
         return Ok(false);
     };
 
+    // The concurrency slot frees on every settle (success, retry backoff,
+    // dead-letter): the handler is no longer executing in any of them. The
+    // unique lock is only released on terminal settles for non-TTL windows.
+    let release_unique = if redis_release_unique_on_settle(expected, mode) {
+        "1"
+    } else {
+        "0"
+    };
+    let decrement_slot = if expected.concurrency_limit.is_some() {
+        "1"
+    } else {
+        "0"
+    };
     let applied: usize = redis::cmd("EVAL")
         .arg(CLAIMED_REDIS_TRANSITION_SCRIPT)
-        .arg(6)
+        .arg(8)
         .arg(&worker_config.processing_key)
         .arg(&worker_config.record_prefix)
         .arg(&worker_config.delayed_key)
         .arg(&worker_config.dead_key)
         .arg(&worker_config.completed_key)
         .arg(&worker_config.dead_record_prefix)
+        .arg(worker_config.unique_lock_key_for(expected))
+        .arg(worker_config.concurrency_counter_key_for(expected))
         .arg(&expected.id)
         .arg(claimed_by)
         .arg(claimed_at_ms)
@@ -2803,6 +3438,8 @@ async fn apply_claimed_redis_transition(
         .arg(encoded_record.unwrap_or_default())
         .arg(due_at_ms.unwrap_or_default())
         .arg(DEFAULT_JOB_ADMIN_HISTORY_LIMIT)
+        .arg(release_unique)
+        .arg(decrement_slot)
         .query_async(connection)
         .await?;
 
@@ -2908,6 +3545,17 @@ if record['claimed_at_ms'] ~= tonumber(ARGV[3]) then
   return 0
 end
 redis.call('ZREM', KEYS[1], ARGV[1])
+if ARGV[8] == '1' then
+  local slots = tonumber(redis.call('GET', KEYS[7]) or '0')
+  if slots <= 1 then
+    redis.call('DEL', KEYS[7])
+  else
+    redis.call('SET', KEYS[7], slots - 1)
+  end
+end
+if ARGV[7] == '1' and redis.call('GET', KEYS[6]) == ARGV[1] then
+  redis.call('DEL', KEYS[6])
+end
 if ARGV[4] == 'requeue' then
   redis.call('SET', key, ARGV[5])
   redis.call('LPUSH', KEYS[3], ARGV[1])
@@ -2941,20 +3589,37 @@ async fn apply_stale_redis_recovery(
         return Ok(false);
     };
 
+    // A reclaimed worker crash must free the concurrency slot in both modes
+    // (the handler is gone either way); the unique lock is released only when
+    // the job dead-letters — a requeued job is still logically in flight.
+    let release_unique = if redis_release_unique_on_settle(expected, mode) {
+        "1"
+    } else {
+        "0"
+    };
+    let decrement_slot = if expected.concurrency_limit.is_some() {
+        "1"
+    } else {
+        "0"
+    };
     let applied: usize = redis::cmd("EVAL")
         .arg(STALE_REDIS_RECOVERY_SCRIPT)
-        .arg(5)
+        .arg(7)
         .arg(&worker_config.processing_key)
         .arg(&worker_config.record_prefix)
         .arg(&worker_config.queue_key)
         .arg(&worker_config.dead_key)
         .arg(&worker_config.dead_record_prefix)
+        .arg(worker_config.unique_lock_key_for(expected))
+        .arg(worker_config.concurrency_counter_key_for(expected))
         .arg(&expected.id)
         .arg(claimed_by)
         .arg(claimed_at_ms)
         .arg(mode)
         .arg(encoded)
         .arg(DEFAULT_JOB_ADMIN_HISTORY_LIMIT)
+        .arg(release_unique)
+        .arg(decrement_slot)
         .query_async(connection)
         .await?;
 
@@ -3066,6 +3731,10 @@ fn spawn_redis_worker(
             std::time::Instant::now(),
             REDIS_STALE_MAINTENANCE_INTERVAL,
         );
+        let mut blocked_promotion_throttle = RedisMaintenanceThrottle::new(
+            std::time::Instant::now(),
+            REDIS_BLOCKED_PROMOTION_INTERVAL,
+        );
         let idle_sleep = redis_worker_idle_sleep(worker_config.retry_promotion_interval);
 
         loop {
@@ -3093,6 +3762,18 @@ fn spawn_redis_worker(
                         tracing::warn!(error = %error, "redis job worker stale recovery failed");
                     }
                 }
+                if let Err(error) =
+                    update_redis_blocked_gauges(&mut connection, &worker_config, &state).await
+                {
+                    tracing::warn!(error = %error, "redis blocked-concurrency survey failed");
+                }
+            }
+
+            if blocked_promotion_throttle.take_due(std::time::Instant::now())
+                && let Err(error) =
+                    promote_due_blocked_redis_jobs(&mut connection, &worker_config).await
+            {
+                tracing::warn!(error = %error, "redis blocked job promotion failed");
             }
 
             let Some(record) = (match claim_next_redis_job(&mut connection, &worker_config).await {
@@ -3358,6 +4039,7 @@ async fn process_redis_job_record(
 }
 
 #[cfg(feature = "redis")]
+#[allow(clippy::too_many_lines)]
 fn start_redis_runtime(
     jobs: Vec<JobInfo>,
     state: &AppState,
@@ -3391,8 +4073,11 @@ fn start_redis_runtime(
     let delayed_key = format!("{}:delayed", config.redis.key_prefix);
     let dead_key = format!("{}:dead", config.redis.key_prefix);
     let completed_key = format!("{}:completed", config.redis.key_prefix);
+    let blocked_key = format!("{}:blocked", config.redis.key_prefix);
     let record_prefix = format!("{}:record:", config.redis.key_prefix);
     let dead_record_prefix = format!("{}:dead-record:", config.redis.key_prefix);
+    let unique_prefix = format!("{}:unique:", config.redis.key_prefix);
+    let concurrency_prefix = format!("{}:concurrency:", config.redis.key_prefix);
 
     if job_admin_backend(state).is_none() {
         state.insert_extension(JobAdminBackendEntry(Arc::new(RedisJobAdminBackend::new(
@@ -3407,7 +4092,7 @@ fn start_redis_runtime(
         ))));
     }
 
-    let per_job_defaults = build_per_job_defaults(&jobs);
+    let per_job_settings = build_per_job_settings(&jobs);
     let retry_promotion_interval = std::time::Duration::from_millis(
         redis_retry_promotion_interval_ms(config.initial_backoff_ms, &jobs),
     );
@@ -3424,10 +4109,12 @@ fn start_redis_runtime(
 
     init_global_job_client(JobClient {
         local_sender: None,
+        local_coordination: None,
         redis: Some(RedisClient {
             connection: producer_connection,
             queue_key: queue_key.clone(),
             record_prefix: record_prefix.clone(),
+            unique_prefix: unique_prefix.clone(),
         }),
         #[cfg(feature = "db")]
         pg_pool: None,
@@ -3435,7 +4122,7 @@ fn start_redis_runtime(
         job_admin: job_admin.clone(),
         default_max_attempts: config.max_attempts,
         default_initial_backoff_ms: config.initial_backoff_ms,
-        per_job_defaults,
+        per_job_settings,
         interceptor: state
             .extension::<Arc<dyn crate::interceptor::JobInterceptor>>()
             .map(|arc| (*arc).clone()),
@@ -3455,8 +4142,11 @@ fn start_redis_runtime(
                 delayed_key: delayed_key.clone(),
                 dead_key: dead_key.clone(),
                 completed_key: completed_key.clone(),
+                blocked_key: blocked_key.clone(),
                 record_prefix: record_prefix.clone(),
                 dead_record_prefix: dead_record_prefix.clone(),
+                unique_prefix: unique_prefix.clone(),
+                concurrency_prefix: concurrency_prefix.clone(),
                 worker_id: format!("{}:{}", std::process::id(), uuid::Uuid::new_v4()),
                 visibility_timeout_ms: config.redis.visibility_timeout_ms,
                 default_attempts: config.max_attempts,
@@ -3744,6 +4434,112 @@ fn pg_retry_delay_ms(initial_backoff_ms: i64, attempt: i32) -> i64 {
     initial_backoff_ms.saturating_mul(2_i64.saturating_pow(exp))
 }
 
+/// Shared INSERT for new job rows, with uniqueness dedup applied in SQL.
+///
+/// The `WHERE ... NOT EXISTS` guard handles the common dedup paths (an
+/// in-flight twin, or — for TTL windows — any twin enqueued within the
+/// window), and the `ON CONFLICT DO NOTHING` against the partial unique index
+/// `idx_autumn_jobs_unique_inflight` closes the race where two app instances
+/// pass the guard simultaneously. Zero rows inserted for a unique job means
+/// the enqueue was coalesced.
+#[cfg(feature = "db")]
+async fn pg_insert_job(
+    conn: &mut diesel_async::AsyncPgConnection,
+    id: String,
+    name: &str,
+    payload: Value,
+    max_attempts: u32,
+    initial_backoff_ms: u64,
+    constraints: &ResolvedJobConstraints,
+) -> AutumnResult<EnqueueOutcome> {
+    use diesel_async::RunQueryDsl as _;
+
+    const DEDUP_GUARD: &str = "($6::TEXT IS NULL OR NOT EXISTS ( \
+           SELECT 1 FROM autumn_jobs dup \
+           WHERE dup.name = $2 AND dup.unique_key = $6 \
+             AND (dup.status IN ('enqueued', 'running') \
+                  OR ($8::BIGINT IS NOT NULL \
+                      AND dup.enqueued_at > NOW() - ($8 * INTERVAL '1 millisecond'))) \
+         ))";
+    const UNIQUE_CONFLICT: &str = "ON CONFLICT (name, unique_key) \
+         WHERE unique_key IS NOT NULL AND status IN ('enqueued', 'running') DO NOTHING";
+
+    #[cfg(feature = "telemetry-otlp")]
+    let (traceparent, tracestate) = capture_job_trace_context();
+    let payload_str = serde_json::to_string(&payload).map_err(|e| {
+        AutumnError::internal_server_error_msg(format!("serialize job payload: {e}"))
+    })?;
+    let unique_ttl_ms = match constraints.unique_window {
+        Some(JobUniquenessWindow::TtlMs(ms)) => Some(i64::try_from(ms).unwrap_or(i64::MAX)),
+        _ => None,
+    };
+    let has_unique_key = constraints.unique_key.is_some();
+    let concurrency_limit = constraints
+        .concurrency_limit
+        .map(|limit| i32::try_from(limit).unwrap_or(i32::MAX));
+    // Scope the concurrency key to a canonical value only when a limit is set;
+    // an unscoped limit shares one pool per job name (NULL concurrency_key).
+    let concurrency_key = if constraints.concurrency_limit.is_some() {
+        constraints.concurrency_scope.clone()
+    } else {
+        None
+    };
+
+    #[cfg(not(feature = "telemetry-otlp"))]
+    let query = diesel::sql_query(format!(
+        "INSERT INTO autumn_jobs \
+         (id, name, payload, status, attempt, max_attempts, initial_backoff_ms, \
+          enqueued_at, run_at, unique_key, unique_window, concurrency_key, concurrency_limit) \
+         SELECT $1, $2, $3::JSONB, 'enqueued', 1, $4, $5, NOW(), NOW(), $6, $7, $9, $10 \
+         WHERE {DEDUP_GUARD} \
+         {UNIQUE_CONFLICT}"
+    ))
+    .bind::<diesel::sql_types::Text, _>(id)
+    .bind::<diesel::sql_types::Text, _>(name)
+    .bind::<diesel::sql_types::Text, _>(payload_str)
+    .bind::<diesel::sql_types::Integer, _>(i32::try_from(max_attempts).unwrap_or(i32::MAX))
+    .bind::<diesel::sql_types::BigInt, _>(i64::try_from(initial_backoff_ms).unwrap_or(i64::MAX))
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(constraints.unique_key.clone())
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(
+        constraints.unique_window_tag().map(str::to_owned),
+    )
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::BigInt>, _>(unique_ttl_ms)
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(concurrency_key)
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Integer>, _>(concurrency_limit);
+    #[cfg(feature = "telemetry-otlp")]
+    let query = diesel::sql_query(format!(
+        "INSERT INTO autumn_jobs \
+         (id, name, payload, status, attempt, max_attempts, initial_backoff_ms, \
+          enqueued_at, run_at, unique_key, unique_window, concurrency_key, concurrency_limit, \
+          traceparent, tracestate) \
+         SELECT $1, $2, $3::JSONB, 'enqueued', 1, $4, $5, NOW(), NOW(), $6, $7, $9, $10, $11, $12 \
+         WHERE {DEDUP_GUARD} \
+         {UNIQUE_CONFLICT}"
+    ))
+    .bind::<diesel::sql_types::Text, _>(id)
+    .bind::<diesel::sql_types::Text, _>(name)
+    .bind::<diesel::sql_types::Text, _>(payload_str)
+    .bind::<diesel::sql_types::Integer, _>(i32::try_from(max_attempts).unwrap_or(i32::MAX))
+    .bind::<diesel::sql_types::BigInt, _>(i64::try_from(initial_backoff_ms).unwrap_or(i64::MAX))
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(constraints.unique_key.clone())
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(
+        constraints.unique_window_tag().map(str::to_owned),
+    )
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::BigInt>, _>(unique_ttl_ms)
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(concurrency_key)
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Integer>, _>(concurrency_limit)
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(traceparent)
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(tracestate);
+
+    let inserted = query.execute(conn).await.map_err(|e| {
+        AutumnError::internal_server_error_msg(format!("pg job enqueue failed: {e}"))
+    })?;
+    if inserted == 0 && has_unique_key {
+        return Ok(EnqueueOutcome::Deduplicated);
+    }
+    Ok(EnqueueOutcome::Queued)
+}
+
 /// Insert a new job row into `autumn_jobs`.
 #[cfg(feature = "db")]
 async fn pg_enqueue_job(
@@ -3753,48 +4549,22 @@ async fn pg_enqueue_job(
     payload: Value,
     max_attempts: u32,
     initial_backoff_ms: u64,
-) -> AutumnResult<()> {
-    use diesel_async::RunQueryDsl as _;
-
-    #[cfg(feature = "telemetry-otlp")]
-    let (traceparent, tracestate) = capture_job_trace_context();
+    constraints: &ResolvedJobConstraints,
+) -> AutumnResult<EnqueueOutcome> {
     let mut conn = pool
         .get()
         .await
         .map_err(|e| AutumnError::internal_server_error_msg(format!("pg job pool error: {e}")))?;
-    let payload_str = serde_json::to_string(&payload).map_err(|e| {
-        AutumnError::internal_server_error_msg(format!("serialize job payload: {e}"))
-    })?;
-    #[cfg(not(feature = "telemetry-otlp"))]
-    let query = diesel::sql_query(
-        "INSERT INTO autumn_jobs \
-         (id, name, payload, status, attempt, max_attempts, initial_backoff_ms, enqueued_at, run_at) \
-         VALUES ($1, $2, $3::JSONB, 'enqueued', 1, $4, $5, NOW(), NOW())",
+    pg_insert_job(
+        &mut conn,
+        id,
+        name,
+        payload,
+        max_attempts,
+        initial_backoff_ms,
+        constraints,
     )
-    .bind::<diesel::sql_types::Text, _>(id)
-    .bind::<diesel::sql_types::Text, _>(name)
-    .bind::<diesel::sql_types::Text, _>(payload_str)
-    .bind::<diesel::sql_types::Integer, _>(i32::try_from(max_attempts).unwrap_or(i32::MAX))
-    .bind::<diesel::sql_types::BigInt, _>(i64::try_from(initial_backoff_ms).unwrap_or(i64::MAX));
-    #[cfg(feature = "telemetry-otlp")]
-    let query = diesel::sql_query(
-        "INSERT INTO autumn_jobs \
-         (id, name, payload, status, attempt, max_attempts, initial_backoff_ms, \
-          enqueued_at, run_at, traceparent, tracestate) \
-         VALUES ($1, $2, $3::JSONB, 'enqueued', 1, $4, $5, NOW(), NOW(), $6, $7)",
-    )
-    .bind::<diesel::sql_types::Text, _>(id)
-    .bind::<diesel::sql_types::Text, _>(name)
-    .bind::<diesel::sql_types::Text, _>(payload_str)
-    .bind::<diesel::sql_types::Integer, _>(i32::try_from(max_attempts).unwrap_or(i32::MAX))
-    .bind::<diesel::sql_types::BigInt, _>(i64::try_from(initial_backoff_ms).unwrap_or(i64::MAX))
-    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(traceparent)
-    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(tracestate);
-    query
-        .execute(&mut *conn)
-        .await
-        .map(|_| ())
-        .map_err(|e| AutumnError::internal_server_error_msg(format!("pg job enqueue failed: {e}")))
+    .await
 }
 
 /// Insert a job into `autumn_jobs` using an **already-open connection**.
@@ -3810,77 +4580,146 @@ async fn pg_enqueue_on_conn(
     payload: Value,
     max_attempts: u32,
     initial_backoff_ms: u64,
-) -> AutumnResult<()> {
-    use diesel_async::RunQueryDsl as _;
-
-    #[cfg(feature = "telemetry-otlp")]
-    let (traceparent, tracestate) = capture_job_trace_context();
-    let payload_str = serde_json::to_string(&payload).map_err(|e| {
-        AutumnError::internal_server_error_msg(format!("serialize job payload: {e}"))
-    })?;
-    #[cfg(not(feature = "telemetry-otlp"))]
-    let query = diesel::sql_query(
-        "INSERT INTO autumn_jobs \
-         (id, name, payload, status, attempt, max_attempts, initial_backoff_ms, enqueued_at, run_at) \
-         VALUES ($1, $2, $3::JSONB, 'enqueued', 1, $4, $5, NOW(), NOW())",
+    constraints: &ResolvedJobConstraints,
+) -> AutumnResult<EnqueueOutcome> {
+    pg_insert_job(
+        conn,
+        id,
+        name,
+        payload,
+        max_attempts,
+        initial_backoff_ms,
+        constraints,
     )
-    .bind::<diesel::sql_types::Text, _>(id)
-    .bind::<diesel::sql_types::Text, _>(name)
-    .bind::<diesel::sql_types::Text, _>(payload_str)
-    .bind::<diesel::sql_types::Integer, _>(i32::try_from(max_attempts).unwrap_or(i32::MAX))
-    .bind::<diesel::sql_types::BigInt, _>(i64::try_from(initial_backoff_ms).unwrap_or(i64::MAX));
-    #[cfg(feature = "telemetry-otlp")]
-    let query = diesel::sql_query(
-        "INSERT INTO autumn_jobs \
-         (id, name, payload, status, attempt, max_attempts, initial_backoff_ms, \
-          enqueued_at, run_at, traceparent, tracestate) \
-         VALUES ($1, $2, $3::JSONB, 'enqueued', 1, $4, $5, NOW(), NOW(), $6, $7)",
-    )
-    .bind::<diesel::sql_types::Text, _>(id)
-    .bind::<diesel::sql_types::Text, _>(name)
-    .bind::<diesel::sql_types::Text, _>(payload_str)
-    .bind::<diesel::sql_types::Integer, _>(i32::try_from(max_attempts).unwrap_or(i32::MAX))
-    .bind::<diesel::sql_types::BigInt, _>(i64::try_from(initial_backoff_ms).unwrap_or(i64::MAX))
-    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(traceparent)
-    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(tracestate);
-    query
-        .execute(conn)
-        .await
-        .map(|_| ())
-        .map_err(|e| AutumnError::internal_server_error_msg(format!("pg job enqueue failed: {e}")))
+    .await
 }
 
 /// Atomically claim the next ready job with `SELECT … FOR UPDATE SKIP LOCKED`.
 ///
 /// Returns `None` if the queue is empty or all ready rows are locked by
 /// competing workers.
+/// Advisory lock key serializing claims when concurrency-limited jobs exist.
+///
+/// The claim query counts running jobs per concurrency group; without
+/// serialization two workers could both observe a free slot and exceed the
+/// cap. The lock is transaction-scoped and only taken when at least one
+/// registered job declares a concurrency limit, so unconstrained deployments
+/// keep fully parallel claims.
 #[cfg(feature = "db")]
-async fn pg_claim_next_job(pool: &PgPool, worker_id: &str) -> Option<PgJobRow> {
-    use diesel::OptionalExtension as _;
-    use diesel_async::RunQueryDsl as _;
+const PG_CLAIM_ADVISORY_LOCK_KEY: i64 = 0x6175_7475_6d6e_6a62; // "autumnjb"
 
-    let mut conn = pool.get().await.ok()?;
-    let sql = format!(
+#[cfg(feature = "db")]
+fn pg_claim_sql() -> String {
+    format!(
         "UPDATE autumn_jobs \
-         SET status = 'running', started_at = NOW(), claimed_by = $1, claimed_at = NOW() \
+         SET status = 'running', started_at = NOW(), claimed_by = $1, claimed_at = NOW(), \
+             unique_key = CASE WHEN unique_window = 'pending' THEN NULL ELSE unique_key END \
          WHERE id = ( \
-           SELECT id FROM autumn_jobs \
-           WHERE status = 'enqueued' AND run_at <= NOW() \
-           ORDER BY run_at ASC \
+           SELECT candidate.id FROM autumn_jobs candidate \
+           WHERE candidate.status = 'enqueued' AND candidate.run_at <= NOW() \
+             AND (candidate.concurrency_limit IS NULL OR ( \
+               SELECT COUNT(*) FROM autumn_jobs running \
+               WHERE running.status = 'running' \
+                 AND running.name = candidate.name \
+                 AND running.concurrency_key IS NOT DISTINCT FROM candidate.concurrency_key \
+             ) < candidate.concurrency_limit) \
+           ORDER BY candidate.run_at ASC \
            LIMIT 1 \
            FOR UPDATE SKIP LOCKED \
          ) \
          RETURNING {PG_JOB_SELECT_COLS}"
-    );
-    diesel::sql_query(sql)
-        .bind::<diesel::sql_types::Text, _>(worker_id)
-        .get_result::<PgJobRow>(&mut *conn)
-        .await
-        .optional()
-        .unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "postgres job claim query failed");
-            None
+    )
+}
+
+#[cfg(feature = "db")]
+async fn pg_claim_next_job(
+    pool: &PgPool,
+    worker_id: &str,
+    serialize_claims: bool,
+) -> Option<PgJobRow> {
+    use diesel::OptionalExtension as _;
+    use diesel_async::{AsyncConnection as _, RunQueryDsl as _};
+    use scoped_futures::ScopedFutureExt as _;
+
+    let mut conn = pool.get().await.ok()?;
+    let sql = pg_claim_sql();
+    let claimed = if serialize_claims {
+        let worker_id = worker_id.to_owned();
+        conn.transaction::<Option<PgJobRow>, diesel::result::Error, _>(move |conn| {
+            async move {
+                diesel::sql_query("SELECT pg_advisory_xact_lock($1)")
+                    .bind::<diesel::sql_types::BigInt, _>(PG_CLAIM_ADVISORY_LOCK_KEY)
+                    .execute(conn)
+                    .await?;
+                diesel::sql_query(sql)
+                    .bind::<diesel::sql_types::Text, _>(worker_id)
+                    .get_result::<PgJobRow>(conn)
+                    .await
+                    .optional()
+            }
+            .scope_boxed()
         })
+        .await
+    } else {
+        diesel::sql_query(sql)
+            .bind::<diesel::sql_types::Text, _>(worker_id)
+            .get_result::<PgJobRow>(&mut *conn)
+            .await
+            .optional()
+    };
+    claimed.unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "postgres job claim query failed");
+        None
+    })
+}
+
+/// Row shape for per-name aggregate count queries.
+#[cfg(feature = "db")]
+#[derive(diesel::QueryableByName)]
+struct PgNameCount {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    name: String,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    count: i64,
+}
+
+/// Survey enqueued jobs whose concurrency group is saturated and publish the
+/// per-name counts as `blocked_on_concurrency` gauges.
+#[cfg(feature = "db")]
+async fn pg_update_concurrency_blocked_gauges(pool: &PgPool, state: &AppState) {
+    use diesel_async::RunQueryDsl as _;
+
+    let Ok(mut conn) = pool.get().await else {
+        return;
+    };
+    let rows = diesel::sql_query(
+        "SELECT blocked.name AS name, COUNT(*) AS count \
+         FROM autumn_jobs blocked \
+         WHERE blocked.status = 'enqueued' \
+           AND blocked.run_at <= NOW() \
+           AND blocked.concurrency_limit IS NOT NULL \
+           AND ( \
+             SELECT COUNT(*) FROM autumn_jobs running \
+             WHERE running.status = 'running' \
+               AND running.name = blocked.name \
+               AND running.concurrency_key IS NOT DISTINCT FROM blocked.concurrency_key \
+           ) >= blocked.concurrency_limit \
+         GROUP BY blocked.name",
+    )
+    .load::<PgNameCount>(&mut *conn)
+    .await;
+    match rows {
+        Ok(rows) => {
+            let counts: HashMap<String, u64> = rows
+                .into_iter()
+                .map(|row| (row.name, u64::try_from(row.count).unwrap_or(0)))
+                .collect();
+            state.job_registry.set_concurrency_blocked_counts(&counts);
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "postgres blocked-concurrency survey failed");
+        }
+    }
 }
 
 /// Mark a running job as completed.
@@ -4140,13 +4979,20 @@ async fn pg_execute_job(
 async fn pg_maintenance_loop(
     pool: PgPool,
     visibility_timeout_ms: u64,
+    state: AppState,
+    survey_blocked: bool,
     shutdown: tokio_util::sync::CancellationToken,
 ) {
     let mut interval = tokio::time::interval(PG_MAINTENANCE_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
-            _ = interval.tick() => pg_recover_stale_claims(&pool, visibility_timeout_ms).await,
+            _ = interval.tick() => {
+                pg_recover_stale_claims(&pool, visibility_timeout_ms).await;
+                if survey_blocked {
+                    pg_update_concurrency_blocked_gauges(&pool, &state).await;
+                }
+            }
             () = shutdown.cancelled() => break,
         }
     }
@@ -4159,10 +5005,11 @@ async fn pg_worker_loop(
     jobs_by_name: Arc<RwLock<HashMap<String, JobInfo>>>,
     state: AppState,
     job_admin: JobAdminMemoryBackend,
+    serialize_claims: bool,
     shutdown: tokio_util::sync::CancellationToken,
 ) {
     loop {
-        match pg_claim_next_job(&pool, &worker_id).await {
+        match pg_claim_next_job(&pool, &worker_id, serialize_claims).await {
             Some(row) => {
                 pg_execute_job(row, &jobs_by_name, &pool, &worker_id, &state, &job_admin).await;
                 if shutdown.is_cancelled() {
@@ -4252,7 +5099,8 @@ impl PgJobAdminBackend {
             "UPDATE autumn_jobs \
              SET status = 'enqueued', attempt = 1, run_at = NOW(), enqueued_at = NOW(), \
                  started_at = NULL, finished_at = NULL, \
-                 claimed_by = NULL, claimed_at = NULL, last_error = NULL \
+                 claimed_by = NULL, claimed_at = NULL, last_error = NULL, \
+                 unique_key = NULL \
              WHERE id = $1 AND status = 'failed'",
         )
         .bind::<diesel::sql_types::Text, _>(id)
@@ -4451,7 +5299,8 @@ fn start_postgres_runtime(
     })?;
 
     let job_admin = JobAdminMemoryBackend::new();
-    let per_job_defaults = build_per_job_defaults(&jobs);
+    let per_job_settings = build_per_job_settings(&jobs);
+    let serialize_claims = any_job_has_concurrency(&jobs);
     let jobs_by_name: Arc<RwLock<HashMap<String, JobInfo>>> = Arc::new(RwLock::new(
         jobs.into_iter().map(|j| (j.name.clone(), j)).collect(),
     ));
@@ -4471,6 +5320,7 @@ fn start_postgres_runtime(
 
     init_global_job_client(JobClient {
         local_sender: None,
+        local_coordination: None,
         #[cfg(feature = "redis")]
         redis: None,
         pg_pool: Some(pool.clone()),
@@ -4478,7 +5328,7 @@ fn start_postgres_runtime(
         job_admin: job_admin.clone(),
         default_max_attempts: config.max_attempts,
         default_initial_backoff_ms: config.initial_backoff_ms,
-        per_job_defaults,
+        per_job_settings,
         interceptor: state
             .extension::<Arc<dyn crate::interceptor::JobInterceptor>>()
             .map(|arc| (*arc).clone()),
@@ -4490,9 +5340,17 @@ fn start_postgres_runtime(
     // Single maintenance task shared across all workers.
     {
         let pool = pool.clone();
+        let state = state.clone();
         let shutdown = shutdown.clone();
         tokio::spawn(async move {
-            pg_maintenance_loop(pool, visibility_timeout_ms, shutdown).await;
+            pg_maintenance_loop(
+                pool,
+                visibility_timeout_ms,
+                state,
+                serialize_claims,
+                shutdown,
+            )
+            .await;
         });
     }
 
@@ -4504,17 +5362,42 @@ fn start_postgres_runtime(
         let shutdown = shutdown.clone();
         tokio::spawn(async move {
             let worker_id = format!("{}:{}", std::process::id(), uuid::Uuid::new_v4());
-            pg_worker_loop(pool, worker_id, jobs_by_name, state, job_admin, shutdown).await;
+            pg_worker_loop(
+                pool,
+                worker_id,
+                jobs_by_name,
+                state,
+                job_admin,
+                serialize_claims,
+                shutdown,
+            )
+            .await;
         });
     }
 
     Ok(())
 }
 
-fn build_per_job_defaults(jobs: &[JobInfo]) -> HashMap<String, (u32, u64)> {
+fn build_per_job_settings(jobs: &[JobInfo]) -> HashMap<String, JobRuntimeSettings> {
     jobs.iter()
-        .map(|job| (job.name.clone(), (job.max_attempts, job.initial_backoff_ms)))
+        .map(|job| {
+            (
+                job.name.clone(),
+                JobRuntimeSettings {
+                    max_attempts: job.max_attempts,
+                    initial_backoff_ms: job.initial_backoff_ms,
+                    uniqueness: job.uniqueness.clone(),
+                    concurrency: job.concurrency.clone(),
+                },
+            )
+        })
         .collect()
+}
+
+/// Whether any registered job declares a concurrency limit.
+#[cfg(feature = "db")]
+fn any_job_has_concurrency(jobs: &[JobInfo]) -> bool {
+    jobs.iter().any(|job| job.concurrency.is_some())
 }
 
 fn validate_unique_job_names(jobs: &[JobInfo]) -> Result<(), String> {
@@ -4671,6 +5554,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(1);
         init_global_job_client(JobClient {
             local_sender: Some(tx),
+            local_coordination: None,
             #[cfg(feature = "redis")]
             redis: None,
             #[cfg(feature = "db")]
@@ -4679,7 +5563,10 @@ mod tests {
             job_admin: backend.clone(),
             default_max_attempts: 5,
             default_initial_backoff_ms: 250,
-            per_job_defaults: HashMap::from([("send_email".to_string(), (5, 250))]),
+            per_job_settings: HashMap::from([(
+                "send_email".to_string(),
+                JobRuntimeSettings::basic(5, 250),
+            )]),
             interceptor: None,
         });
 
@@ -4732,6 +5619,7 @@ mod tests {
         drop(rx);
         init_global_job_client(JobClient {
             local_sender: Some(tx),
+            local_coordination: None,
             #[cfg(feature = "redis")]
             redis: None,
             #[cfg(feature = "db")]
@@ -4740,7 +5628,10 @@ mod tests {
             job_admin: backend.clone(),
             default_max_attempts: 5,
             default_initial_backoff_ms: 250,
-            per_job_defaults: HashMap::from([("send_email".to_string(), (5, 250))]),
+            per_job_settings: HashMap::from([(
+                "send_email".to_string(),
+                JobRuntimeSettings::basic(5, 250),
+            )]),
             interceptor: None,
         });
 
@@ -4784,6 +5675,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(2);
         init_global_job_client(JobClient {
             local_sender: Some(tx),
+            local_coordination: None,
             #[cfg(feature = "redis")]
             redis: None,
             #[cfg(feature = "db")]
@@ -4792,7 +5684,10 @@ mod tests {
             job_admin: backend.clone(),
             default_max_attempts: 5,
             default_initial_backoff_ms: 250,
-            per_job_defaults: HashMap::from([("send_email".to_string(), (5, 250))]),
+            per_job_settings: HashMap::from([(
+                "send_email".to_string(),
+                JobRuntimeSettings::basic(5, 250),
+            )]),
             interceptor: None,
         });
 
@@ -5011,6 +5906,7 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::channel(16);
         let client = JobClient {
             local_sender: Some(tx),
+            local_coordination: None,
             #[cfg(feature = "redis")]
             redis: None,
             #[cfg(feature = "db")]
@@ -5019,9 +5915,9 @@ mod tests {
             job_admin: JobAdminMemoryBackend::new_for_test(32),
             default_max_attempts: 3,
             default_initial_backoff_ms: 100,
-            per_job_defaults: std::collections::HashMap::from([(
+            per_job_settings: std::collections::HashMap::from([(
                 "test_job".to_string(),
-                (3_u32, 100_u64),
+                JobRuntimeSettings::basic(3, 100),
             )]),
             interceptor: Some(Arc::new(PanickingEnqueueInterceptor)),
         };
@@ -5069,6 +5965,7 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::channel(16);
         let client = JobClient {
             local_sender: Some(tx),
+            local_coordination: None,
             #[cfg(feature = "redis")]
             redis: None,
             #[cfg(feature = "db")]
@@ -5077,9 +5974,9 @@ mod tests {
             job_admin: JobAdminMemoryBackend::new_for_test(32),
             default_max_attempts: 3,
             default_initial_backoff_ms: 100,
-            per_job_defaults: std::collections::HashMap::from([(
+            per_job_settings: std::collections::HashMap::from([(
                 "test_job".to_string(),
-                (3_u32, 100_u64),
+                JobRuntimeSettings::basic(3, 100),
             )]),
             interceptor: Some(Arc::new(AsyncPanickingEnqueueInterceptor)),
         };
@@ -5249,6 +6146,7 @@ mod tests {
             &tx,
             &state,
             &job_admin,
+            &Arc::new(LocalJobCoordination::default()),
         )
         .await;
 
@@ -5306,6 +6204,7 @@ mod tests {
             &tx,
             &state,
             &job_admin,
+            &Arc::new(LocalJobCoordination::default()),
         )
         .await;
 
@@ -5365,6 +6264,7 @@ mod tests {
             &tx,
             &state,
             &job_admin,
+            &Arc::new(LocalJobCoordination::default()),
         )
         .await;
 
@@ -5419,6 +6319,7 @@ mod tests {
             &tx,
             &state,
             &job_admin,
+            &Arc::new(LocalJobCoordination::default()),
         )
         .await;
 
@@ -5458,6 +6359,10 @@ mod tests {
             claimed_by: None,
             claimed_at_ms: None,
             last_error: None,
+            unique_key: None,
+            unique_window: None,
+            concurrency_key: None,
+            concurrency_limit: None,
             #[cfg(feature = "telemetry-otlp")]
             traceparent: None,
             #[cfg(feature = "telemetry-otlp")]
@@ -5675,8 +6580,11 @@ mod tests {
             delayed_key: format!("{prefix}:delayed"),
             dead_key: format!("{prefix}:dead"),
             completed_key: format!("{prefix}:completed"),
+            blocked_key: format!("{prefix}:blocked"),
             record_prefix: format!("{prefix}:record:"),
             dead_record_prefix: format!("{prefix}:dead-record:"),
+            unique_prefix: format!("{prefix}:unique:"),
+            concurrency_prefix: format!("{prefix}:concurrency:"),
             worker_id: worker_id.to_string(),
             visibility_timeout_ms,
             default_attempts: 3,
@@ -5710,6 +6618,8 @@ mod tests {
                 name: "send_email".to_string(),
                 max_attempts,
                 initial_backoff_ms: 1,
+                uniqueness: None,
+                concurrency: None,
                 handler,
             },
         )])))
@@ -5726,6 +6636,7 @@ mod tests {
             connection,
             queue_key: worker_config.queue_key.clone(),
             record_prefix: worker_config.record_prefix.clone(),
+            unique_prefix: worker_config.unique_prefix.clone(),
         };
         producer
             .enqueue(
@@ -5734,6 +6645,7 @@ mod tests {
                 serde_json::json!({ "user_id": 42 }),
                 max_attempts,
                 1,
+                &ResolvedJobConstraints::default(),
             )
             .await
             .unwrap();
@@ -5767,6 +6679,7 @@ mod tests {
     }
 
     #[cfg(feature = "redis")]
+    #[allow(clippy::too_many_lines)]
     fn redis_admin_seed_records(now: u64) -> RedisAdminSeedRecords {
         RedisAdminSeedRecords {
             enqueued: RedisJobRecord {
@@ -5782,6 +6695,10 @@ mod tests {
                 claimed_by: None,
                 claimed_at_ms: None,
                 last_error: None,
+                unique_key: None,
+                unique_window: None,
+                concurrency_key: None,
+                concurrency_limit: None,
                 #[cfg(feature = "telemetry-otlp")]
                 traceparent: None,
                 #[cfg(feature = "telemetry-otlp")]
@@ -5800,6 +6717,10 @@ mod tests {
                 claimed_by: Some("worker-a".to_string()),
                 claimed_at_ms: Some(now.saturating_sub(2_000)),
                 last_error: None,
+                unique_key: None,
+                unique_window: None,
+                concurrency_key: None,
+                concurrency_limit: None,
                 #[cfg(feature = "telemetry-otlp")]
                 traceparent: None,
                 #[cfg(feature = "telemetry-otlp")]
@@ -5818,6 +6739,10 @@ mod tests {
                 claimed_by: None,
                 claimed_at_ms: None,
                 last_error: None,
+                unique_key: None,
+                unique_window: None,
+                concurrency_key: None,
+                concurrency_limit: None,
                 #[cfg(feature = "telemetry-otlp")]
                 traceparent: None,
                 #[cfg(feature = "telemetry-otlp")]
@@ -5836,6 +6761,10 @@ mod tests {
                 claimed_by: None,
                 claimed_at_ms: None,
                 last_error: Some("smtp refused recipient".to_string()),
+                unique_key: None,
+                unique_window: None,
+                concurrency_key: None,
+                concurrency_limit: None,
                 #[cfg(feature = "telemetry-otlp")]
                 traceparent: None,
                 #[cfg(feature = "telemetry-otlp")]
@@ -5854,6 +6783,10 @@ mod tests {
                 claimed_by: None,
                 claimed_at_ms: None,
                 last_error: Some("endpoint returned 410".to_string()),
+                unique_key: None,
+                unique_window: None,
+                concurrency_key: None,
+                concurrency_limit: None,
                 #[cfg(feature = "telemetry-otlp")]
                 traceparent: None,
                 #[cfg(feature = "telemetry-otlp")]
@@ -6264,6 +7197,311 @@ mod tests {
         assert!(!dead_record_exists);
     }
 
+    #[cfg(feature = "redis")]
+    #[test]
+    fn redis_release_unique_on_settle_applies_to_terminal_non_ttl_only() {
+        let mut record = redis_test_record(1, 3);
+        record.unique_key = Some("k".to_string());
+        record.unique_window = Some("running".to_string());
+        assert!(redis_release_unique_on_settle(&record, "success"));
+        assert!(redis_release_unique_on_settle(&record, "dead"));
+        assert!(!redis_release_unique_on_settle(&record, "retry"));
+
+        record.unique_window = Some("ttl".to_string());
+        assert!(
+            !redis_release_unique_on_settle(&record, "success"),
+            "TTL-window locks expire by time, never by settle"
+        );
+
+        record.unique_key = None;
+        record.unique_window = None;
+        assert!(!redis_release_unique_on_settle(&record, "success"));
+    }
+
+    #[cfg(feature = "redis")]
+    #[test]
+    fn redis_unique_lock_ttl_uses_window_ttl_or_crash_backstop() {
+        assert_eq!(
+            redis_unique_lock_ttl_ms(Some(JobUniquenessWindow::TtlMs(5_000))),
+            5_000
+        );
+        assert_eq!(
+            redis_unique_lock_ttl_ms(Some(JobUniquenessWindow::Running)),
+            REDIS_UNIQUE_LOCK_TTL_BACKSTOP_MS
+        );
+        assert_eq!(
+            redis_unique_lock_ttl_ms(None),
+            REDIS_UNIQUE_LOCK_TTL_BACKSTOP_MS
+        );
+    }
+
+    #[cfg(feature = "redis")]
+    #[test]
+    fn redis_record_without_constraint_fields_deserializes_as_none() {
+        // Records written by pre-#829 producers have none of the new fields.
+        let legacy = r#"{"id":"a","name":"send_email","payload":{},"attempt":1,
+            "max_attempts":3,"initial_backoff_ms":10}"#;
+        let record: RedisJobRecord = serde_json::from_str(legacy).unwrap();
+        assert!(record.unique_key.is_none());
+        assert!(record.unique_window.is_none());
+        assert!(record.concurrency_key.is_none());
+        assert!(record.concurrency_limit.is_none());
+
+        // And None fields stay absent on the wire so Lua sees nil, not null.
+        let encoded = encode_redis_record(&record).unwrap();
+        assert!(!encoded.contains("unique_key"));
+        assert!(!encoded.contains("concurrency_limit"));
+    }
+
+    #[cfg(feature = "redis")]
+    async fn redis_enqueue_with_constraints(
+        client: &redis::Client,
+        worker_config: &RedisWorkerConfig,
+        id: &str,
+        name: &str,
+        constraints: &ResolvedJobConstraints,
+    ) -> EnqueueOutcome {
+        let connection = new_redis_connection_manager(client, "test redis producer").unwrap();
+        let producer = RedisClient {
+            connection,
+            queue_key: worker_config.queue_key.clone(),
+            record_prefix: worker_config.record_prefix.clone(),
+            unique_prefix: worker_config.unique_prefix.clone(),
+        };
+        producer
+            .enqueue(
+                id.to_string(),
+                name,
+                serde_json::json!({ "marker": id }),
+                3,
+                1,
+                constraints,
+            )
+            .await
+            .unwrap()
+    }
+
+    #[cfg(feature = "redis")]
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn redis_unique_enqueue_coalesces_burst_and_releases_on_success() {
+        let (_container, client) = redis_test_client().await;
+        let worker_config = redis_test_worker_config("uniq", "worker-1", 30_000);
+        let mut connection = new_redis_connection_manager(&client, "test redis worker").unwrap();
+
+        let constraints = ResolvedJobConstraints {
+            unique_key: Some("invoice-7".to_string()),
+            unique_window: Some(JobUniquenessWindow::Running),
+            concurrency_limit: None,
+            concurrency_scope: None,
+        };
+        let first = redis_enqueue_with_constraints(
+            &client,
+            &worker_config,
+            "u1",
+            "send_invoice",
+            &constraints,
+        )
+        .await;
+        let second = redis_enqueue_with_constraints(
+            &client,
+            &worker_config,
+            "u2",
+            "send_invoice",
+            &constraints,
+        )
+        .await;
+        assert_eq!(first, EnqueueOutcome::Queued);
+        assert_eq!(
+            second,
+            EnqueueOutcome::Deduplicated,
+            "burst of two identical unique enqueues must coalesce"
+        );
+        let queued: i64 = redis::cmd("LLEN")
+            .arg(&worker_config.queue_key)
+            .query_async(&mut connection)
+            .await
+            .unwrap();
+        assert_eq!(queued, 1, "exactly one queue entry for the burst");
+
+        // While in flight, the key is still held.
+        let record = claim_next_redis_job(&mut connection, &worker_config)
+            .await
+            .unwrap()
+            .expect("claim the single job");
+        let inflight = redis_enqueue_with_constraints(
+            &client,
+            &worker_config,
+            "u3",
+            "send_invoice",
+            &constraints,
+        )
+        .await;
+        assert_eq!(inflight, EnqueueOutcome::Deduplicated);
+
+        // Success releases the lock; a new enqueue is accepted.
+        assert!(
+            ack_redis_success(&mut connection, &worker_config, &record)
+                .await
+                .unwrap()
+        );
+        let after = redis_enqueue_with_constraints(
+            &client,
+            &worker_config,
+            "u4",
+            "send_invoice",
+            &constraints,
+        )
+        .await;
+        assert_eq!(after, EnqueueOutcome::Queued);
+    }
+
+    #[cfg(feature = "redis")]
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn redis_concurrency_limit_blocks_claims_until_settle() {
+        let (_container, client) = redis_test_client().await;
+        let worker_config = redis_test_worker_config("cap", "worker-1", 30_000);
+        let mut connection = new_redis_connection_manager(&client, "test redis worker").unwrap();
+
+        let constraints = ResolvedJobConstraints {
+            unique_key: None,
+            unique_window: None,
+            concurrency_limit: Some(1),
+            concurrency_scope: Some("acct-9".to_string()),
+        };
+        for id in ["c1", "c2"] {
+            assert_eq!(
+                redis_enqueue_with_constraints(
+                    &client,
+                    &worker_config,
+                    id,
+                    "recalculate",
+                    &constraints
+                )
+                .await,
+                EnqueueOutcome::Queued
+            );
+        }
+
+        let first = claim_next_redis_job(&mut connection, &worker_config)
+            .await
+            .unwrap()
+            .expect("first claim");
+        assert!(
+            claim_next_redis_job(&mut connection, &worker_config)
+                .await
+                .unwrap()
+                .is_none(),
+            "second claim must park behind the concurrency limit"
+        );
+        let parked: i64 = redis::cmd("ZCARD")
+            .arg(&worker_config.blocked_key)
+            .query_async(&mut connection)
+            .await
+            .unwrap();
+        assert_eq!(parked, 1);
+
+        // Settle the running job, wait out the requeue delay, promote, claim.
+        assert!(
+            ack_redis_success(&mut connection, &worker_config, &first)
+                .await
+                .unwrap()
+        );
+        tokio::time::sleep(Duration::from_millis(
+            REDIS_CONCURRENCY_REQUEUE_DELAY_MS + 50,
+        ))
+        .await;
+        promote_due_blocked_redis_jobs(&mut connection, &worker_config)
+            .await
+            .unwrap();
+        let second = claim_next_redis_job(&mut connection, &worker_config)
+            .await
+            .unwrap()
+            .expect("slot freed after settle");
+        assert_ne!(second.id, first.id);
+    }
+
+    #[cfg(feature = "redis")]
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn redis_stale_recovery_frees_slot_and_dead_letter_releases_lock() {
+        let (_container, client) = redis_test_client().await;
+        // 10ms visibility timeout: an unsettled claim is immediately stale.
+        let worker_config = redis_test_worker_config("crash", "dead-worker", 10);
+        let mut connection = new_redis_connection_manager(&client, "test redis worker").unwrap();
+        let state = AppState::for_test().with_profile("dev");
+        state.job_registry().register("crashy");
+        let job_admin = JobAdminMemoryBackend::new_for_test(32);
+
+        let constraints = ResolvedJobConstraints {
+            unique_key: Some("crash-key".to_string()),
+            unique_window: Some(JobUniquenessWindow::Running),
+            concurrency_limit: Some(1),
+            concurrency_scope: None,
+        };
+        let connection_producer =
+            new_redis_connection_manager(&client, "test redis producer").unwrap();
+        let producer = RedisClient {
+            connection: connection_producer,
+            queue_key: worker_config.queue_key.clone(),
+            record_prefix: worker_config.record_prefix.clone(),
+            unique_prefix: worker_config.unique_prefix.clone(),
+        };
+        // max_attempts = 1 so stale recovery dead-letters instead of requeueing.
+        assert_eq!(
+            producer
+                .enqueue(
+                    "x1".to_string(),
+                    "crashy",
+                    serde_json::json!({}),
+                    1,
+                    1,
+                    &constraints,
+                )
+                .await
+                .unwrap(),
+            EnqueueOutcome::Queued
+        );
+
+        // Simulate a crashed worker: claim, never settle.
+        let _claimed = claim_next_redis_job(&mut connection, &worker_config)
+            .await
+            .unwrap()
+            .expect("claim");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        recover_stale_redis_jobs(&mut connection, &worker_config, &state, &job_admin)
+            .await
+            .unwrap();
+
+        // The dead-letter released both the unique lock and the slot.
+        let counter: Option<String> = redis::cmd("GET")
+            .arg(redis_concurrency_counter_key(
+                &worker_config.concurrency_prefix,
+                "crashy",
+                None,
+            ))
+            .query_async(&mut connection)
+            .await
+            .unwrap();
+        assert!(counter.is_none(), "slot must be freed after stale recovery");
+        assert_eq!(
+            producer
+                .enqueue(
+                    "x2".to_string(),
+                    "crashy",
+                    serde_json::json!({}),
+                    1,
+                    1,
+                    &constraints,
+                )
+                .await
+                .unwrap(),
+            EnqueueOutcome::Queued,
+            "a dead worker must not deadlock the unique key"
+        );
+    }
+
     #[tokio::test]
     async fn enqueue_rejects_unregistered_job_name_before_queueing() {
         let _guard = global_job_runtime_test_lock().lock().await;
@@ -6439,6 +7677,7 @@ mod tests {
 
         init_global_job_client(JobClient {
             local_sender: None,
+            local_coordination: None,
             #[cfg(feature = "redis")]
             redis: None,
             #[cfg(feature = "db")]
@@ -6447,7 +7686,7 @@ mod tests {
             job_admin: JobAdminMemoryBackend::new_for_test(32),
             default_max_attempts: 3,
             default_initial_backoff_ms: 250,
-            per_job_defaults: HashMap::new(),
+            per_job_settings: HashMap::new(),
             interceptor: None,
         });
         assert!(global_job_client().is_some());
@@ -6789,6 +8028,7 @@ mod tests {
             &tx,
             &state,
             &job_admin,
+            &Arc::new(LocalJobCoordination::default()),
         )
         .await;
 
@@ -7286,6 +8526,28 @@ mod tests {
             .execute(&mut *conn)
             .await
             .unwrap();
+            diesel::sql_query(include_str!(
+                "../migrations/20260610000000_add_job_uniqueness_concurrency/up.sql"
+            ))
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        }
+
+        fn unique_constraints(key: &str, window: JobUniquenessWindow) -> ResolvedJobConstraints {
+            ResolvedJobConstraints {
+                unique_key: Some(key.to_string()),
+                unique_window: Some(window),
+                ..ResolvedJobConstraints::default()
+            }
+        }
+
+        fn limited_constraints(limit: u32, scope: Option<&str>) -> ResolvedJobConstraints {
+            ResolvedJobConstraints {
+                concurrency_limit: Some(limit),
+                concurrency_scope: scope.map(str::to_owned),
+                ..ResolvedJobConstraints::default()
+            }
         }
 
         async fn pg_exec(pool: &PgPool, sql: &str) {
@@ -7314,11 +8576,12 @@ mod tests {
                 serde_json::json!({ "user_id": 42 }),
                 5,
                 250,
+                &ResolvedJobConstraints::default(),
             )
             .await
             .expect("enqueue should succeed");
 
-            let claimed = pg_claim_next_job(&pool, "test-worker")
+            let claimed = pg_claim_next_job(&pool, "test-worker", false)
                 .await
                 .expect("claim should return a job");
 
@@ -7360,13 +8623,14 @@ mod tests {
                 serde_json::json!({}),
                 5,
                 250,
+                &ResolvedJobConstraints::default(),
             )
             .await
             .unwrap();
 
             let (claim_a, claim_b) = tokio::join!(
-                pg_claim_next_job(&pool, "worker-a"),
-                pg_claim_next_job(&pool, "worker-b")
+                pg_claim_next_job(&pool, "worker-a", false),
+                pg_claim_next_job(&pool, "worker-b", false)
             );
 
             let both = claim_a.is_some() && claim_b.is_some();
@@ -7389,12 +8653,20 @@ mod tests {
             pg_run_migration(&pool).await;
 
             let job_id = uuid::Uuid::new_v4().to_string();
-            pg_enqueue_job(&pool, job_id.clone(), "flaky", serde_json::json!({}), 2, 1)
-                .await
-                .unwrap();
+            pg_enqueue_job(
+                &pool,
+                job_id.clone(),
+                "flaky",
+                serde_json::json!({}),
+                2,
+                1,
+                &ResolvedJobConstraints::default(),
+            )
+            .await
+            .unwrap();
 
             // Attempt 1: claim and fail
-            let job = pg_claim_next_job(&pool, "worker-1")
+            let job = pg_claim_next_job(&pool, "worker-1", false)
                 .await
                 .expect("first claim should succeed");
             assert_eq!(job.attempt, 1);
@@ -7414,7 +8686,7 @@ mod tests {
             .await;
 
             // Attempt 2: claim and fail again (max_attempts = 2 → dead-letter)
-            let job2 = pg_claim_next_job(&pool, "worker-1")
+            let job2 = pg_claim_next_job(&pool, "worker-1", false)
                 .await
                 .expect("second claim should succeed");
             assert_eq!(job2.attempt, 2);
@@ -7441,11 +8713,21 @@ mod tests {
             pg_run_migration(&pool).await;
 
             let job_id = uuid::Uuid::new_v4().to_string();
-            pg_enqueue_job(&pool, job_id.clone(), "crashy", serde_json::json!({}), 3, 1)
+            pg_enqueue_job(
+                &pool,
+                job_id.clone(),
+                "crashy",
+                serde_json::json!({}),
+                3,
+                1,
+                &ResolvedJobConstraints::default(),
+            )
+            .await
+            .unwrap();
+
+            let _ = pg_claim_next_job(&pool, "crashed-worker", false)
                 .await
                 .unwrap();
-
-            let _ = pg_claim_next_job(&pool, "crashed-worker").await.unwrap();
 
             // Backdate claimed_at to simulate visibility timeout expiry
             pg_exec(&pool, &format!(
@@ -7489,6 +8771,7 @@ mod tests {
                 serde_json::json!({}),
                 5,
                 250,
+                &ResolvedJobConstraints::default(),
             )
             .await
             .unwrap();
@@ -7501,10 +8784,11 @@ mod tests {
                 serde_json::json!({}),
                 5,
                 250,
+                &ResolvedJobConstraints::default(),
             )
             .await
             .unwrap();
-            let _ = pg_claim_next_job(&pool, "w1").await;
+            let _ = pg_claim_next_job(&pool, "w1", false).await;
 
             // Completed
             pg_enqueue_job(
@@ -7514,6 +8798,7 @@ mod tests {
                 serde_json::json!({}),
                 5,
                 250,
+                &ResolvedJobConstraints::default(),
             )
             .await
             .unwrap();
@@ -7524,7 +8809,7 @@ mod tests {
                 "UPDATE autumn_jobs SET run_at = NOW() - INTERVAL '1 second' WHERE id = 'cmp-1'",
             )
             .await;
-            let job_c = pg_claim_next_job(&pool, "w1")
+            let job_c = pg_claim_next_job(&pool, "w1", false)
                 .await
                 .expect("completed job to claim");
             pg_ack_success(&pool, &job_c.id, "w1").await.unwrap();
@@ -7537,6 +8822,7 @@ mod tests {
                 serde_json::json!({}),
                 1,
                 1,
+                &ResolvedJobConstraints::default(),
             )
             .await
             .unwrap();
@@ -7545,7 +8831,7 @@ mod tests {
                 "UPDATE autumn_jobs SET run_at = NOW() - INTERVAL '1 second' WHERE id = 'fail-1'",
             )
             .await;
-            let job_f = pg_claim_next_job(&pool, "w1")
+            let job_f = pg_claim_next_job(&pool, "w1", false)
                 .await
                 .expect("failed job to claim");
             pg_nack_failure(&pool, &job_f.id, "w1", "server down", &job_f)
@@ -7589,10 +8875,11 @@ mod tests {
                 serde_json::json!({}),
                 1,
                 1,
+                &ResolvedJobConstraints::default(),
             )
             .await
             .unwrap();
-            let jf = pg_claim_next_job(&pool, "w").await.unwrap();
+            let jf = pg_claim_next_job(&pool, "w", false).await.unwrap();
             pg_nack_failure(&pool, &jf.id, "w", "boom", &jf)
                 .await
                 .unwrap();
@@ -7610,6 +8897,7 @@ mod tests {
                 serde_json::json!({}),
                 1,
                 1,
+                &ResolvedJobConstraints::default(),
             )
             .await
             .unwrap();
@@ -7618,7 +8906,7 @@ mod tests {
                 "UPDATE autumn_jobs SET run_at = NOW() - INTERVAL '1 second' WHERE id = 'fail-d'",
             )
             .await;
-            let jd = pg_claim_next_job(&pool, "w").await.unwrap();
+            let jd = pg_claim_next_job(&pool, "w", false).await.unwrap();
             pg_nack_failure(&pool, &jd.id, "w", "boom", &jd)
                 .await
                 .unwrap();
@@ -7638,6 +8926,7 @@ mod tests {
                 serde_json::json!({}),
                 5,
                 1,
+                &ResolvedJobConstraints::default(),
             )
             .await
             .unwrap();
@@ -7650,6 +8939,331 @@ mod tests {
         }
 
         /// Helper: fetch a single job row by id for test assertions.
+        #[tokio::test]
+        #[ignore = "requires Docker (testcontainers)"]
+        async fn pg_unique_enqueue_coalesces_burst_then_releases_on_completion() {
+            use testcontainers::runners::AsyncRunner as _;
+            use testcontainers_modules::postgres::Postgres;
+
+            let container = Postgres::default().start().await.unwrap();
+            let port = container.get_host_port_ipv4(5432).await.unwrap();
+            let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+            let pool = pg_test_pool(&url);
+            pg_run_migration(&pool).await;
+
+            let constraints = unique_constraints("invoice-7", JobUniquenessWindow::Running);
+            let first = pg_enqueue_job(
+                &pool,
+                "uniq-1".to_string(),
+                "send_invoice",
+                serde_json::json!({"invoice": 7}),
+                3,
+                10,
+                &constraints,
+            )
+            .await
+            .unwrap();
+            let second = pg_enqueue_job(
+                &pool,
+                "uniq-2".to_string(),
+                "send_invoice",
+                serde_json::json!({"invoice": 7}),
+                3,
+                10,
+                &constraints,
+            )
+            .await
+            .unwrap();
+            assert_eq!(first, EnqueueOutcome::Queued);
+            assert_eq!(
+                second,
+                EnqueueOutcome::Deduplicated,
+                "a burst of two identical unique enqueues must coalesce"
+            );
+
+            // Exactly one row exists and exactly one execution happens.
+            let row = pg_claim_next_job(&pool, "w1", false)
+                .await
+                .expect("one job");
+            assert!(pg_claim_next_job(&pool, "w1", false).await.is_none());
+
+            // While running, the key is still held.
+            let blocked = pg_enqueue_job(
+                &pool,
+                "uniq-3".to_string(),
+                "send_invoice",
+                serde_json::json!({"invoice": 7}),
+                3,
+                10,
+                &constraints,
+            )
+            .await
+            .unwrap();
+            assert_eq!(blocked, EnqueueOutcome::Deduplicated);
+
+            // Success releases the key; the next enqueue is accepted.
+            assert!(pg_ack_success(&pool, &row.id, "w1").await.unwrap());
+            let after = pg_enqueue_job(
+                &pool,
+                "uniq-4".to_string(),
+                "send_invoice",
+                serde_json::json!({"invoice": 7}),
+                3,
+                10,
+                &constraints,
+            )
+            .await
+            .unwrap();
+            assert_eq!(after, EnqueueOutcome::Queued);
+        }
+
+        #[tokio::test]
+        #[ignore = "requires Docker (testcontainers)"]
+        async fn pg_unique_pending_window_releases_key_when_claimed() {
+            use testcontainers::runners::AsyncRunner as _;
+            use testcontainers_modules::postgres::Postgres;
+
+            let container = Postgres::default().start().await.unwrap();
+            let port = container.get_host_port_ipv4(5432).await.unwrap();
+            let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+            let pool = pg_test_pool(&url);
+            pg_run_migration(&pool).await;
+
+            let constraints = unique_constraints("acct-1", JobUniquenessWindow::Pending);
+            pg_enqueue_job(
+                &pool,
+                "pend-1".to_string(),
+                "sync_account",
+                serde_json::json!({}),
+                3,
+                10,
+                &constraints,
+            )
+            .await
+            .unwrap();
+
+            // While pending the key is held.
+            let dup = pg_enqueue_job(
+                &pool,
+                "pend-2".to_string(),
+                "sync_account",
+                serde_json::json!({}),
+                3,
+                10,
+                &constraints,
+            )
+            .await
+            .unwrap();
+            assert_eq!(dup, EnqueueOutcome::Deduplicated);
+
+            // Claiming clears the key, so a new enqueue is accepted while the
+            // original is still running.
+            let claimed = pg_claim_next_job(&pool, "w1", false).await.expect("claim");
+            assert_eq!(claimed.id, "pend-1");
+            let while_running = pg_enqueue_job(
+                &pool,
+                "pend-3".to_string(),
+                "sync_account",
+                serde_json::json!({}),
+                3,
+                10,
+                &constraints,
+            )
+            .await
+            .unwrap();
+            assert_eq!(while_running, EnqueueOutcome::Queued);
+        }
+
+        #[tokio::test]
+        #[ignore = "requires Docker (testcontainers)"]
+        async fn pg_unique_ttl_window_dedupes_past_completion_until_expiry() {
+            use testcontainers::runners::AsyncRunner as _;
+            use testcontainers_modules::postgres::Postgres;
+
+            let container = Postgres::default().start().await.unwrap();
+            let port = container.get_host_port_ipv4(5432).await.unwrap();
+            let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+            let pool = pg_test_pool(&url);
+            pg_run_migration(&pool).await;
+
+            let constraints = unique_constraints("hourly", JobUniquenessWindow::TtlMs(400));
+            pg_enqueue_job(
+                &pool,
+                "ttl-1".to_string(),
+                "rebuild_index",
+                serde_json::json!({}),
+                3,
+                10,
+                &constraints,
+            )
+            .await
+            .unwrap();
+            let row = pg_claim_next_job(&pool, "w1", false).await.expect("claim");
+            assert!(pg_ack_success(&pool, &row.id, "w1").await.unwrap());
+
+            // Completed, but still inside the TTL window: coalesced.
+            let inside = pg_enqueue_job(
+                &pool,
+                "ttl-2".to_string(),
+                "rebuild_index",
+                serde_json::json!({}),
+                3,
+                10,
+                &constraints,
+            )
+            .await
+            .unwrap();
+            assert_eq!(inside, EnqueueOutcome::Deduplicated);
+
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let outside = pg_enqueue_job(
+                &pool,
+                "ttl-3".to_string(),
+                "rebuild_index",
+                serde_json::json!({}),
+                3,
+                10,
+                &constraints,
+            )
+            .await
+            .unwrap();
+            assert_eq!(outside, EnqueueOutcome::Queued);
+        }
+
+        #[tokio::test]
+        #[ignore = "requires Docker (testcontainers)"]
+        async fn pg_claim_enforces_concurrency_limit_and_frees_slot_on_settle() {
+            use testcontainers::runners::AsyncRunner as _;
+            use testcontainers_modules::postgres::Postgres;
+
+            let container = Postgres::default().start().await.unwrap();
+            let port = container.get_host_port_ipv4(5432).await.unwrap();
+            let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+            let pool = pg_test_pool(&url);
+            pg_run_migration(&pool).await;
+
+            let constraints = limited_constraints(1, Some("acct-9"));
+            for id in ["cap-1", "cap-2", "cap-3"] {
+                pg_enqueue_job(
+                    &pool,
+                    id.to_string(),
+                    "recalculate",
+                    serde_json::json!({}),
+                    3,
+                    10,
+                    &constraints,
+                )
+                .await
+                .unwrap();
+            }
+
+            // Limit 1: only one claim succeeds even with serialized claims on.
+            let first = pg_claim_next_job(&pool, "w1", true)
+                .await
+                .expect("claim one");
+            assert!(
+                pg_claim_next_job(&pool, "w2", true).await.is_none(),
+                "second claim must wait for the concurrency slot"
+            );
+
+            // Settling the running job frees the slot for the next claim.
+            assert!(pg_ack_success(&pool, &first.id, "w1").await.unwrap());
+            let second = pg_claim_next_job(&pool, "w2", true)
+                .await
+                .expect("next claim");
+            assert_ne!(second.id, first.id);
+            assert!(pg_claim_next_job(&pool, "w3", true).await.is_none());
+
+            // A different scope is not blocked by this group.
+            let other_scope = limited_constraints(1, Some("acct-10"));
+            pg_enqueue_job(
+                &pool,
+                "cap-other".to_string(),
+                "recalculate",
+                serde_json::json!({}),
+                3,
+                10,
+                &other_scope,
+            )
+            .await
+            .unwrap();
+            let other = pg_claim_next_job(&pool, "w3", true)
+                .await
+                .expect("other scope");
+            assert_eq!(other.id, "cap-other");
+        }
+
+        #[tokio::test]
+        #[ignore = "requires Docker (testcontainers)"]
+        async fn pg_stale_claim_recovery_frees_unique_key_and_concurrency_slot() {
+            use testcontainers::runners::AsyncRunner as _;
+            use testcontainers_modules::postgres::Postgres;
+
+            let container = Postgres::default().start().await.unwrap();
+            let port = container.get_host_port_ipv4(5432).await.unwrap();
+            let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+            let pool = pg_test_pool(&url);
+            pg_run_migration(&pool).await;
+
+            let constraints = ResolvedJobConstraints {
+                unique_key: Some("crash-key".to_string()),
+                unique_window: Some(JobUniquenessWindow::Running),
+                concurrency_limit: Some(1),
+                concurrency_scope: None,
+            };
+            pg_enqueue_job(
+                &pool,
+                "crash-1".to_string(),
+                "crashy",
+                serde_json::json!({}),
+                1,
+                10,
+                &constraints,
+            )
+            .await
+            .unwrap();
+
+            // Simulate a worker crash: claim and never settle.
+            let row = pg_claim_next_job(&pool, "dead-worker", true)
+                .await
+                .expect("claim");
+            assert_eq!(row.id, "crash-1");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            // Stale recovery dead-letters the final attempt, which must free
+            // both the unique key and the concurrency slot.
+            pg_recover_stale_claims(&pool, 10).await;
+            let recovered = pg_fetch_by_id(&pool, "crash-1").await.unwrap();
+            assert_eq!(recovered.status, "failed");
+
+            let constraints_again = ResolvedJobConstraints {
+                unique_key: Some("crash-key".to_string()),
+                unique_window: Some(JobUniquenessWindow::Running),
+                concurrency_limit: Some(1),
+                concurrency_scope: None,
+            };
+            let outcome = pg_enqueue_job(
+                &pool,
+                "crash-2".to_string(),
+                "crashy",
+                serde_json::json!({}),
+                1,
+                10,
+                &constraints_again,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                outcome,
+                EnqueueOutcome::Queued,
+                "a dead worker must not deadlock the unique key"
+            );
+            assert!(
+                pg_claim_next_job(&pool, "w2", true).await.is_some(),
+                "the concurrency slot must be free after stale recovery"
+            );
+        }
+
         async fn pg_fetch_by_id(pool: &PgPool, id: &str) -> Option<PgJobRow> {
             use diesel::OptionalExtension as _;
             let mut conn = pool.get().await.unwrap();
@@ -7670,6 +9284,7 @@ mod tests {
         let (tx, rx) = mpsc::channel(16);
         let client = JobClient {
             local_sender: Some(tx),
+            local_coordination: None,
             #[cfg(feature = "redis")]
             redis: None,
             #[cfg(feature = "db")]
@@ -7678,7 +9293,10 @@ mod tests {
             job_admin: JobAdminMemoryBackend::new_for_test(32),
             default_max_attempts: 3,
             default_initial_backoff_ms: 100,
-            per_job_defaults: HashMap::from([("test_job".to_string(), (3_u32, 100_u64))]),
+            per_job_settings: HashMap::from([(
+                "test_job".to_string(),
+                JobRuntimeSettings::basic(3, 100),
+            )]),
             interceptor: None,
         };
         (client, rx)
@@ -7836,6 +9454,10 @@ mod tests {
                 claimed_by: None,
                 claimed_at_ms: None,
                 last_error: None,
+                unique_key: None,
+                unique_window: None,
+                concurrency_key: None,
+                concurrency_limit: None,
                 traceparent: Some(
                     "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01".to_string(),
                 ),
@@ -7960,6 +9582,10 @@ mod tests {
                 claimed_by: None,
                 claimed_at_ms: None,
                 last_error: None,
+                unique_key: None,
+                unique_window: None,
+                concurrency_key: None,
+                concurrency_limit: None,
                 traceparent: Some(
                     "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01".to_string(),
                 ),
@@ -8038,6 +9664,7 @@ mod tests {
             let (tx, mut rx) = mpsc::channel(16);
             let client = JobClient {
                 local_sender: Some(tx),
+                local_coordination: None,
                 #[cfg(feature = "redis")]
                 redis: None,
                 #[cfg(feature = "db")]
@@ -8046,7 +9673,10 @@ mod tests {
                 job_admin: JobAdminMemoryBackend::new_for_test(32),
                 default_max_attempts: 3,
                 default_initial_backoff_ms: 100,
-                per_job_defaults: HashMap::from([("test_job".to_string(), (3_u32, 100_u64))]),
+                per_job_settings: HashMap::from([(
+                    "test_job".to_string(),
+                    JobRuntimeSettings::basic(3, 100),
+                )]),
                 interceptor: None,
             };
             rt.block_on(async {
@@ -8123,8 +9753,14 @@ mod uniqueness_concurrency_tests {
         let a = serde_json::json!({"x": 1, "y": {"b": 2, "a": [1, 2]}});
         let b = serde_json::json!({"y": {"a": [1, 2], "b": 2}, "x": 1});
         let c = serde_json::json!({"x": 1, "y": {"b": 2, "a": [2, 1]}});
-        assert_eq!(job_unique_key(&uniqueness, &a), job_unique_key(&uniqueness, &b));
-        assert_ne!(job_unique_key(&uniqueness, &a), job_unique_key(&uniqueness, &c));
+        assert_eq!(
+            job_unique_key(&uniqueness, &a),
+            job_unique_key(&uniqueness, &b)
+        );
+        assert_ne!(
+            job_unique_key(&uniqueness, &a),
+            job_unique_key(&uniqueness, &c)
+        );
     }
 
     #[test]
@@ -8136,8 +9772,14 @@ mod uniqueness_concurrency_tests {
         let a = serde_json::json!({"account_id": 7, "attempt_marker": "first"});
         let b = serde_json::json!({"account_id": 7, "attempt_marker": "second"});
         let c = serde_json::json!({"account_id": 8, "attempt_marker": "first"});
-        assert_eq!(job_unique_key(&uniqueness, &a), job_unique_key(&uniqueness, &b));
-        assert_ne!(job_unique_key(&uniqueness, &a), job_unique_key(&uniqueness, &c));
+        assert_eq!(
+            job_unique_key(&uniqueness, &a),
+            job_unique_key(&uniqueness, &b)
+        );
+        assert_ne!(
+            job_unique_key(&uniqueness, &a),
+            job_unique_key(&uniqueness, &c)
+        );
     }
 
     #[test]
@@ -8148,7 +9790,10 @@ mod uniqueness_concurrency_tests {
         };
         let a = serde_json::json!({});
         let b = serde_json::json!({"other": true});
-        assert_eq!(job_unique_key(&uniqueness, &a), job_unique_key(&uniqueness, &b));
+        assert_eq!(
+            job_unique_key(&uniqueness, &a),
+            job_unique_key(&uniqueness, &b)
+        );
     }
 
     // ── registry counters ────────────────────────────────────────────────────

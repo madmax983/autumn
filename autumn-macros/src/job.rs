@@ -17,95 +17,95 @@ struct JobAttrs {
     concurrency_key: Option<String>,
 }
 
-fn parse_job_args(attr: TokenStream) -> syn::Result<JobAttrs> {
-    let mut result = JobAttrs {
-        name: None,
-        max_attempts: None,
-        backoff_ms: None,
-        unique: false,
-        unique_by: None,
-        unique_window: None,
-        unique_for_ms: None,
-        concurrency: None,
-        concurrency_key: None,
-    };
+fn parse_basic_arg(
+    meta: &syn::meta::ParseNestedMeta<'_>,
+    result: &mut JobAttrs,
+) -> syn::Result<bool> {
+    if meta.path.is_ident("name") {
+        let value: LitStr = meta.value()?.parse()?;
+        result.name = Some(value.value());
+    } else if meta.path.is_ident("max_attempts") {
+        let value: LitInt = meta.value()?.parse()?;
+        result.max_attempts = Some(value.base10_parse::<u32>()?);
+    } else if meta.path.is_ident("backoff_ms") {
+        let value: LitInt = meta.value()?.parse()?;
+        result.backoff_ms = Some(value.base10_parse::<u64>()?);
+    } else {
+        return Ok(false);
+    }
+    Ok(true)
+}
 
-    syn::meta::parser(|meta| {
-        if meta.path.is_ident("name") {
-            let value: LitStr = meta.value()?.parse()?;
-            result.name = Some(value.value());
-            Ok(())
-        } else if meta.path.is_ident("max_attempts") {
-            let value: LitInt = meta.value()?.parse()?;
-            result.max_attempts = Some(value.base10_parse::<u32>()?);
-            Ok(())
-        } else if meta.path.is_ident("backoff_ms") {
-            let value: LitInt = meta.value()?.parse()?;
-            result.backoff_ms = Some(value.base10_parse::<u64>()?);
-            Ok(())
-        } else if meta.path.is_ident("unique") {
-            if meta.input.peek(syn::Token![=]) {
-                let value: LitBool = meta.value()?.parse()?;
-                result.unique = value.value();
-            } else {
-                result.unique = true;
-            }
-            Ok(())
-        } else if meta.path.is_ident("unique_by") {
-            let value: LitStr = meta.value()?.parse()?;
-            let fields: Vec<String> = value
-                .value()
-                .split(',')
-                .map(|field| field.trim().to_string())
-                .filter(|field| !field.is_empty())
-                .collect();
-            if fields.is_empty() {
-                return Err(meta
-                    .error("unique_by must list at least one args field, e.g. \"account_id\""));
-            }
-            result.unique_by = Some(fields);
-            Ok(())
-        } else if meta.path.is_ident("unique_window") {
-            let value: LitStr = meta.value()?.parse()?;
-            let window = value.value();
-            if window != "pending" && window != "running" {
-                return Err(meta.error("unique_window must be \"pending\" or \"running\""));
-            }
-            result.unique_window = Some(window);
-            Ok(())
-        } else if meta.path.is_ident("unique_for_ms") {
-            let value: LitInt = meta.value()?.parse()?;
-            let ms = value.base10_parse::<u64>()?;
-            if ms == 0 {
-                return Err(meta.error("unique_for_ms must be greater than zero"));
-            }
-            result.unique_for_ms = Some(ms);
-            Ok(())
-        } else if meta.path.is_ident("concurrency") {
-            let value: LitInt = meta.value()?.parse()?;
-            let limit = value.base10_parse::<u32>()?;
-            if limit == 0 {
-                return Err(meta.error("concurrency must be greater than zero"));
-            }
-            result.concurrency = Some(limit);
-            Ok(())
-        } else if meta.path.is_ident("concurrency_key") {
-            let value: LitStr = meta.value()?.parse()?;
-            let key = value.value().trim().to_string();
-            if key.is_empty() {
-                return Err(meta.error("concurrency_key must name an args field"));
-            }
-            result.concurrency_key = Some(key);
-            Ok(())
+fn parse_uniqueness_arg(
+    meta: &syn::meta::ParseNestedMeta<'_>,
+    result: &mut JobAttrs,
+) -> syn::Result<bool> {
+    if meta.path.is_ident("unique") {
+        if meta.input.peek(syn::Token![=]) {
+            let value: LitBool = meta.value()?.parse()?;
+            result.unique = value.value();
         } else {
-            Err(meta.error(
-                "unsupported attribute: expected name, max_attempts, backoff_ms, unique, \
-                 unique_by, unique_window, unique_for_ms, concurrency, or concurrency_key",
-            ))
+            result.unique = true;
         }
-    })
-    .parse2(attr)?;
+    } else if meta.path.is_ident("unique_by") {
+        let value: LitStr = meta.value()?.parse()?;
+        let fields: Vec<String> = value
+            .value()
+            .split(',')
+            .map(|field| field.trim().to_string())
+            .filter(|field| !field.is_empty())
+            .collect();
+        if fields.is_empty() {
+            return Err(
+                meta.error("unique_by must list at least one args field, e.g. \"account_id\"")
+            );
+        }
+        result.unique_by = Some(fields);
+    } else if meta.path.is_ident("unique_window") {
+        let value: LitStr = meta.value()?.parse()?;
+        let window = value.value();
+        if window != "pending" && window != "running" {
+            return Err(meta.error("unique_window must be \"pending\" or \"running\""));
+        }
+        result.unique_window = Some(window);
+    } else if meta.path.is_ident("unique_for_ms") {
+        let value: LitInt = meta.value()?.parse()?;
+        let ms = value.base10_parse::<u64>()?;
+        if ms == 0 {
+            return Err(meta.error("unique_for_ms must be greater than zero"));
+        }
+        result.unique_for_ms = Some(ms);
+    } else {
+        return Ok(false);
+    }
+    Ok(true)
+}
 
+fn parse_concurrency_arg(
+    meta: &syn::meta::ParseNestedMeta<'_>,
+    result: &mut JobAttrs,
+) -> syn::Result<bool> {
+    if meta.path.is_ident("concurrency") {
+        let value: LitInt = meta.value()?.parse()?;
+        let limit = value.base10_parse::<u32>()?;
+        if limit == 0 {
+            return Err(meta.error("concurrency must be greater than zero"));
+        }
+        result.concurrency = Some(limit);
+    } else if meta.path.is_ident("concurrency_key") {
+        let value: LitStr = meta.value()?.parse()?;
+        let key = value.value().trim().to_string();
+        if key.is_empty() {
+            return Err(meta.error("concurrency_key must name an args field"));
+        }
+        result.concurrency_key = Some(key);
+    } else {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+fn validate_job_attrs(result: &mut JobAttrs) -> syn::Result<()> {
     if result.unique_window.is_some() && result.unique_for_ms.is_some() {
         return Err(syn::Error::new(
             proc_macro2::Span::call_site(),
@@ -124,7 +124,38 @@ fn parse_job_args(attr: TokenStream) -> syn::Result<JobAttrs> {
     if uniqueness_configured {
         result.unique = true;
     }
+    Ok(())
+}
 
+fn parse_job_args(attr: TokenStream) -> syn::Result<JobAttrs> {
+    let mut result = JobAttrs {
+        name: None,
+        max_attempts: None,
+        backoff_ms: None,
+        unique: false,
+        unique_by: None,
+        unique_window: None,
+        unique_for_ms: None,
+        concurrency: None,
+        concurrency_key: None,
+    };
+
+    syn::meta::parser(|meta| {
+        if parse_basic_arg(&meta, &mut result)?
+            || parse_uniqueness_arg(&meta, &mut result)?
+            || parse_concurrency_arg(&meta, &mut result)?
+        {
+            Ok(())
+        } else {
+            Err(meta.error(
+                "unsupported attribute: expected name, max_attempts, backoff_ms, unique, \
+                 unique_by, unique_window, unique_for_ms, concurrency, or concurrency_key",
+            ))
+        }
+    })
+    .parse2(attr)?;
+
+    validate_job_attrs(&mut result)?;
     Ok(result)
 }
 
@@ -361,7 +392,10 @@ mod tests {
         )
         .to_string();
         assert!(expanded.contains("JobUniqueness"), "{expanded}");
-        assert!(expanded.contains("JobUniquenessWindow :: Running"), "{expanded}");
+        assert!(
+            expanded.contains("JobUniquenessWindow :: Running"),
+            "{expanded}"
+        );
         assert!(expanded.contains("JobConcurrency"), "{expanded}");
         assert!(expanded.contains("limit : 2u32"), "{expanded}");
     }
@@ -377,7 +411,13 @@ mod tests {
             },
         )
         .to_string();
-        assert!(expanded.contains("uniqueness : :: std :: option :: Option :: None"), "{expanded}");
-        assert!(expanded.contains("concurrency : :: std :: option :: Option :: None"), "{expanded}");
+        assert!(
+            expanded.contains("uniqueness : :: std :: option :: Option :: None"),
+            "{expanded}"
+        );
+        assert!(
+            expanded.contains("concurrency : :: std :: option :: Option :: None"),
+            "{expanded}"
+        );
     }
 }
