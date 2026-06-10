@@ -812,9 +812,8 @@ mod tests {
     impl SitemapSource for SimpleSitemapSource {
         fn entries(
             &self,
-        ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Vec<SitemapEntry>> + Send + '_>,
-        > {
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<SitemapEntry>> + Send + '_>>
+        {
             let entries = self.entries.clone();
             Box::pin(async move { entries })
         }
@@ -822,8 +821,7 @@ mod tests {
 
     #[tokio::test]
     async fn assemble_seo_bodies_empty() {
-        let (robots, sitemap) =
-            assemble_seo_bodies("prod", None, None, &[], &[], &[]).await;
+        let (robots, sitemap) = assemble_seo_bodies("prod", None, None, &[], &[], &[]).await;
         assert!(robots.contains("Allow: /"));
         assert!(sitemap.contains("<urlset"));
     }

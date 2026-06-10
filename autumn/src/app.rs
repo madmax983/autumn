@@ -2560,8 +2560,7 @@ impl AppBuilder {
         if !seo_sources.is_empty() || crate::seo::has_seo_config(&config.seo) {
             let seo_cfg = &config.seo;
             let raw_profile = config.profile.as_deref().unwrap_or("dev");
-            let profile =
-                crate::seo::effective_seo_profile(raw_profile, seo_cfg.robots.allow_all);
+            let profile = crate::seo::effective_seo_profile(raw_profile, seo_cfg.robots.allow_all);
             let static_paths: Vec<&str> = static_metas.iter().map(|m| m.path).collect();
             let (robots_body, sitemap_body) = crate::seo::assemble_seo_bodies(
                 profile,
@@ -2572,8 +2571,7 @@ impl AppBuilder {
                 &static_paths,
             )
             .await;
-            let seo_router =
-                crate::seo::build_seo_router_from_bodies(robots_body, sitemap_body);
+            let seo_router = crate::seo::build_seo_router_from_bodies(robots_body, sitemap_body);
             merge_routers.push(seo_router);
         }
 
@@ -3272,8 +3270,7 @@ impl AppBuilder {
         if !seo_sources.is_empty() || crate::seo::has_seo_config(&config.seo) {
             let seo_cfg = &config.seo;
             let raw_profile = config.profile.as_deref().unwrap_or("dev");
-            let profile =
-                crate::seo::effective_seo_profile(raw_profile, seo_cfg.robots.allow_all);
+            let profile = crate::seo::effective_seo_profile(raw_profile, seo_cfg.robots.allow_all);
             let static_paths: Vec<&str> = static_metas.iter().map(|m| m.path).collect();
             let (robots_body, sitemap_body) = crate::seo::assemble_seo_bodies(
                 profile,
