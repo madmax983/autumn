@@ -204,10 +204,10 @@ pub use crate::http_client::Client;
 // ── SEO helpers ──────────────────────────────────────────────────
 /// Per-page SEO meta tag builder (title, description, canonical, OG, Twitter).
 pub use crate::seo::SeoMeta;
-/// A single sitemap entry (URL, lastmod, changefreq, priority).
-pub use crate::seo::SitemapEntry;
 /// Sitemap change frequency values.
 pub use crate::seo::SitemapChangefreq;
+/// A single sitemap entry (URL, lastmod, changefreq, priority).
+pub use crate::seo::SitemapEntry;
 /// Trait for dynamic sitemap URL providers (e.g. database-driven blog posts).
 pub use crate::seo::SitemapSource;
 

@@ -83,7 +83,6 @@ pub use channels::{
 pub mod canary;
 pub mod config;
 pub mod credentials;
-pub mod seo;
 #[cfg(feature = "db")]
 pub mod db;
 pub mod encryption;
@@ -96,6 +95,7 @@ pub mod hooks;
 #[cfg(feature = "i18n")]
 pub mod i18n;
 pub mod idempotency;
+pub mod seo;
 /// Translation lookup macro with compile-time key validation.
 ///
 /// Re-exported from [`crate::i18n::t`] for ergonomic

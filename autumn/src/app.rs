@@ -3281,9 +3281,8 @@ impl AppBuilder {
             if let Some(bu) = base_url {
                 for meta in &static_metas {
                     if !meta.path.contains('{') {
-                        sitemap_entries.push(crate::seo::SitemapEntry::new(
-                            format!("{bu}{}", meta.path),
-                        ));
+                        sitemap_entries
+                            .push(crate::seo::SitemapEntry::new(format!("{bu}{}", meta.path)));
                     }
                 }
             }
