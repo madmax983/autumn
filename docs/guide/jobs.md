@@ -171,6 +171,12 @@ Semantics:
 - Retries keep a `running`-window key held (the job is still in flight) and
   re-acquire a `pending`-window key while waiting out the backoff; the
   concurrency slot is released during the backoff either way.
+- After a pending-window job's first execution attempt, dedup is **best
+  effort**: the key is released when execution starts (that is the window's
+  contract), so a duplicate accepted while the job runs legitimately holds
+  the key, and a retry or crash-recovered attempt then waits as pending
+  without it. Workloads that must never overlap should use the default
+  `running` window, which holds the key until the job settles.
 - Operator actions respect uniqueness: canceling an enqueued job (including
   one parked behind a concurrency slot) releases its key immediately, and
   retrying a failed unique job re-takes the key — or fails with a clear

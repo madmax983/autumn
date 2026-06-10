@@ -2331,9 +2331,12 @@ async fn execute_local_job(
             if job.attempt < max_attempts {
                 // Running-window keys stay held across retries (the job is
                 // still in flight until it settles). A pending-window key was
-                // released when execution started, so re-acquire it now —
-                // best effort — to keep duplicates coalescing while the retry
-                // waits out its backoff as a pending job again.
+                // released when execution started, so re-acquire it now to
+                // keep duplicates coalescing while the retry waits out its
+                // backoff as a pending job again. Best effort by design: if a
+                // duplicate was legitimately accepted while this job ran, it
+                // owns the key and this retry proceeds without one (see the
+                // pending-window contract in docs/guide/jobs.md).
                 if let Some(unique) = &uniqueness
                     && unique.window == JobUniquenessWindow::Pending
                 {
