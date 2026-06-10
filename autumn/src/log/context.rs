@@ -6,8 +6,9 @@
 //! tenant id. Handler and service code can attach additional fields with
 //! [`with_log_field`]; those fields are then observable by every
 //! context-aware consumer for the remainder of the request — the actuator log
-//! buffer (#1168), the per-request access line (#999), and any custom
-//! [`tracing`] layer.
+//! buffer (#1168) and any custom [`tracing`] layer. (The per-request access
+//! line (#999) is emitted at the outermost router boundary, outside this
+//! context, and carries its own `request_id` field.)
 //!
 //! The context lives in a [`tokio::task_local`], mirroring the pattern already
 //! used by tenancy and the database connection scope. It is **always-on** and
@@ -24,9 +25,8 @@
 //! The well-known correlation ids (`request_id`/`user_id`/`tenant_id`) ride the
 //! request span, so they appear in ordinary `tracing` output for every event.
 //! Custom fields added via [`with_log_field`] live in the request context and
-//! are surfaced by **structured** consumers — the actuator log buffer (#1168),
-//! the access line (#999), or any context-aware layer — rather than the default
-//! stdout formatter.
+//! are surfaced by **structured** consumers — the actuator log buffer (#1168)
+//! or any context-aware layer — rather than the default stdout formatter.
 //!
 //! # Example
 //!

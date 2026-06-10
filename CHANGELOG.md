@@ -15,6 +15,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     boundary, carrying `method`, `route` (the matched low-cardinality template,
     e.g. `/users/{id}` — never the raw path), `status`, `duration_ms`, and the
     `request_id` that matches the `x-request-id` header and error pages.
+  - Emitted from the **outermost** router boundary — outside the startup
+    barrier, the static-first (SSG/ISR) middleware, the session layer, the
+    exception-filter chain, and the late-mounted MCP endpoint merge — so the
+    logged status is always the status the client receives (startup 503s,
+    pre-built static page hits, session-store outage 503s, and
+    filter-rewritten error responses included).
   - Rendered by the standard subscriber, so it honors `log.format`: a readable
     line under `pretty`, a single JSON object per line under `json`. Works with
     **no** `telemetry-otlp` feature and no OTLP collector — operators on

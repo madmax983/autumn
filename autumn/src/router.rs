@@ -1895,8 +1895,9 @@ fn apply_middleware(
     // layer is available when the timeout fires — see request_timeout_handler).
     //
     // Full ingress layer order (outermost → innermost):
-    //   TraceContext → Compression → Metrics → ExceptionFilter → ErrorPageContext → Session →
-    //   SecurityHeaders → RequestId → LogContext → AccessLog → Timeout → [user layers] →
+    //   TraceContext → AccessLog (applied in apply_startup_barrier) → StartupBarrier →
+    //   Compression → Metrics → ExceptionFilter → ErrorPageContext → Session →
+    //   SecurityHeaders → RequestId → LogContext → Timeout → [user layers] →
     //   Tenancy → BodyLimit/UploadConfig → MethodOverride → RateLimit → CSRF → CORS → handler
     router = apply_request_timeout_middleware(router, config, state.metrics.clone());
 
@@ -1911,18 +1912,6 @@ fn apply_middleware(
             state.error_reporters(),
             config.reporting.enabled,
             config.reporting.sample_rate,
-        ));
-    }
-
-    // Structured per-request access log (#999): one INFO event (target
-    // `autumn::access`) per served request, emitted at the response boundary.
-    // Inner to RequestId (so the request id is available) and to LogContext
-    // (so the event is emitted inside the request span); outer to the
-    // reporting and timeout layers so panics-turned-500s and timeout
-    // responses are logged with the status the client receives.
-    if config.log.access_log {
-        router = router.layer(crate::middleware::AccessLogLayer::new(
-            config.log.access_log_exclude.clone(),
         ));
     }
 
@@ -1996,9 +1985,10 @@ fn apply_middleware(
     //   [user layers, when SSG/ISG dist dir active] ->
     //   StaticFileMiddleware (when SSG/ISG enabled) ->
     //   Metrics -> ExceptionFilter -> ErrorPageContext -> Session ->
-    //   SecurityHeaders -> RequestId -> LogContext -> AccessLog ->
+    //   SecurityHeaders -> RequestId -> LogContext ->
     //   [user layers, non-static build] ->
     //   Tenancy -> RateLimit -> CSRF -> CORS -> handler
+    //   (AccessLog sits outermost, applied in apply_startup_barrier.)
     let router = router
         .layer(crate::middleware::error_page_filter::ErrorPageContextLayer { is_dev })
         .layer(ExceptionFilterLayer::new(all_filters))
@@ -2385,13 +2375,30 @@ fn apply_startup_barrier(
         barrier_state,
         startup_barrier,
     ));
+    // Structured per-request access log (#999), applied OUTSIDE the startup
+    // barrier, the static-first (SSG/ISR) middleware, the session layer, and
+    // the exception-filter chain — every production build path funnels
+    // through this function, including after the late MCP endpoint merge —
+    // so the logged status is always the status the client receives:
+    // startup 503s, pre-built static page hits, session-store outage 503s,
+    // and filter-rewritten error responses included. The request id is read
+    // from the `x-request-id` response header stamped by RequestIdLayer;
+    // short-circuit responses produced before that layer log without one.
+    let router = if config.log.access_log {
+        router.layer(crate::middleware::AccessLogLayer::new(
+            config.log.access_log_exclude.clone(),
+        ))
+    } else {
+        router
+    };
     // W3C Trace Context propagation wraps the startup barrier (and the
     // static-first middleware above it) so short-circuit responses —
     // startup 503s and pre-built static file hits — still extract the
     // incoming `traceparent` and inject the current context into the
     // outgoing response. Applied here rather than inside `apply_middleware`
     // because those outer wrappers can return without ever invoking the
-    // inner router.
+    // inner router. Outer to AccessLog so the access event is emitted while
+    // the trace context is current.
     #[cfg(feature = "telemetry-otlp")]
     let router = router.layer(crate::middleware::TraceContextLayer);
     router

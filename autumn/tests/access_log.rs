@@ -398,6 +398,63 @@ async fn json_format_renders_the_event_as_a_single_json_object_line() {
 }
 
 #[tokio::test]
+async fn exception_filter_rewrites_are_visible_to_the_access_log() {
+    use autumn_web::middleware::{
+        AccessLogLayer, AutumnErrorInfo, ExceptionFilter, ExceptionFilterLayer,
+    };
+    use axum::response::IntoResponse as _;
+    use tower::ServiceExt as _;
+
+    // A filter that replaces the handler's error response entirely, like the
+    // documented `filter_can_replace_response` capability.
+    struct Rewrite;
+    impl ExceptionFilter for Rewrite {
+        fn filter(
+            &self,
+            _error: &AutumnErrorInfo,
+            _response: axum::response::Response,
+        ) -> axum::response::Response {
+            (axum::http::StatusCode::SERVICE_UNAVAILABLE, "down").into_response()
+        }
+    }
+
+    let (capture, _guard) = install_capture();
+    // Production ordering: AccessLog is OUTER to the exception-filter chain,
+    // so the logged status must be the rewritten one the client receives.
+    let app = axum::Router::new()
+        .route(
+            "/boom",
+            axum::routing::get(|| async {
+                Err::<String, _>(autumn_web::error::AutumnError::not_found_msg("gone"))
+            }),
+        )
+        .layer(ExceptionFilterLayer::new(vec![Arc::new(Rewrite)]))
+        .layer(AccessLogLayer::new(Vec::new()));
+
+    let response = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/boom")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    );
+
+    let events = capture.captured();
+    assert_eq!(events.len(), 1, "got {events:?}");
+    assert_eq!(
+        events[0].field("status"),
+        Some("503"),
+        "access log must record the filter-rewritten status the client receives"
+    );
+}
+
+#[tokio::test]
 async fn method_mismatch_405_is_access_logged() {
     let (capture, _guard) = install_capture();
     let client = TestApp::new().routes(routes![show_user]).build();

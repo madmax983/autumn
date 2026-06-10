@@ -56,14 +56,14 @@ On a request's **ingress** path (outermost → innermost), layers run in this
 order:
 
 ```
-  Metrics
-    └─ ExceptionFilter
-         └─ ErrorPageContext
-              └─ Session
-                   └─ SecurityHeaders
-                        └─ RequestId
-                             └─ LogContext
-                                  └─ AccessLog
+  AccessLog
+    └─ Metrics
+         └─ ExceptionFilter
+              └─ ErrorPageContext
+                   └─ Session
+                        └─ SecurityHeaders
+                             └─ RequestId
+                                  └─ LogContext
                                        └─ [your .layer() calls, first = outermost]
                                             └─ CSRF
                                                  └─ CORS
@@ -71,10 +71,13 @@ order:
 ```
 
 `LogContext` establishes the request-scoped log context (request id
-correlation for every log line), and `AccessLog` emits the structured
-per-request access line (`autumn::access`) when the response comes back out —
-both sit inside `RequestId` so the id is always available, and outside your
-layers so short-circuit responses you produce are still logged.
+correlation for every log line); it sits inside `RequestId` so the id is
+always available, and outside your layers so events they emit are correlated.
+`AccessLog` emits the structured per-request access line (`autumn::access`)
+from the **outermost** position — outside the session and exception-filter
+layers (and, in production, outside the startup barrier and static-first
+middleware) — so the logged status is always the status the client receives;
+it reads the request id off the `x-request-id` response header.
 
 The ordering guarantee that matters most: **user layers run inside
 `RequestIdLayer` on ingress**, so every `.layer()` you register can read the

@@ -1086,6 +1086,17 @@ impl TestApp {
             },
         )
         .expect("failed to build test router");
+        // Mirror production's outermost access-log placement (#999): in
+        // production the layer is applied in `apply_startup_barrier`, outside
+        // the session and exception-filter layers, so tests observe the same
+        // final-response statuses an operator would see in the access log.
+        let router = if self.config.log.access_log {
+            router.layer(crate::middleware::AccessLogLayer::new(
+                self.config.log.access_log_exclude.clone(),
+            ))
+        } else {
+            router
+        };
         TestClient {
             router,
             probes,

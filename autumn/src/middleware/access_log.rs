@@ -4,8 +4,9 @@
 //! `INFO`) at the point each response is returned, carrying the HTTP method,
 //! the matched low-cardinality route template (never the raw path), the
 //! response status code, the request duration in milliseconds, and the
-//! request's `request_id` (the same value used by the `x-request-id` header
-//! and error pages).
+//! request's `request_id` (read from the `x-request-id` response header
+//! stamped by [`RequestIdLayer`](crate::middleware::RequestIdLayer), so it
+//! matches error pages and the header clients see).
 //!
 //! The event flows through the already-installed subscriber, so it honors
 //! `LogConfig.format` (`pretty` / `json`) and works with **no** telemetry
@@ -19,10 +20,14 @@
 //! `/startup`, `/actuator`, `/static`), matched on whole path segments so
 //! `/healthz` is still logged while `/actuator/health` is not.
 //!
-//! Applied automatically by the framework router, inner to
-//! [`RequestIdLayer`](crate::middleware::RequestIdLayer) (so the request id is
-//! available) and to the log-context layer (so the event is emitted inside the
-//! request span).
+//! Applied automatically by the framework router at the **outermost** assembly
+//! point — outside the startup barrier, the static-first (SSG/ISR) middleware,
+//! the session layer, and the exception-filter chain — so the logged `status`
+//! is always the status the client receives, including startup 503s,
+//! pre-built static page hits, session-store outage 503s, and
+//! filter-rewritten error responses. Short-circuit responses produced before
+//! `RequestIdLayer` runs carry no `x-request-id` and log without a
+//! `request_id` field.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -31,11 +36,11 @@ use std::task::{Context, Poll};
 use std::time::Instant;
 
 use axum::extract::MatchedPath;
-use axum::http::{Method, Request, Response};
+use axum::http::{HeaderName, Method, Request, Response};
 use pin_project_lite::pin_project;
 use tower::{Layer, Service};
 
-use crate::middleware::RequestId;
+static X_REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
 
 /// `tracing` target carried by every access-log event, e.g. for filtering
 /// (`autumn::access=off`) or routing in a custom layer.
@@ -105,7 +110,6 @@ pub struct AccessLogService<S> {
 struct RequestMeta {
     method: Method,
     route: Option<String>,
-    request_id: Option<String>,
 }
 
 impl<S, ReqBody, ResBody> Service<Request<ReqBody>> for AccessLogService<S>
@@ -130,7 +134,6 @@ where
                     .extensions()
                     .get::<MatchedPath>()
                     .map(|matched| matched.as_str().to_owned()),
-                request_id: req.extensions().get::<RequestId>().map(ToString::to_string),
             })
         };
 
@@ -175,13 +178,21 @@ where
             Poll::Ready(Ok(response)) => {
                 if let Some(meta) = this.meta.take() {
                     let duration_ms = this.start.elapsed().as_secs_f64() * 1000.0;
+                    // Read the request id off the response: the header is
+                    // stamped by RequestIdLayer, which sits inner to this
+                    // layer. Responses short-circuited before it (startup
+                    // 503s, static-first hits) have none and log without it.
+                    let request_id = response
+                        .headers()
+                        .get(&X_REQUEST_ID)
+                        .and_then(|value| value.to_str().ok());
                     tracing::info!(
                         target: ACCESS_LOG_TARGET,
                         method = %meta.method,
                         route = meta.route.as_deref().unwrap_or(UNMATCHED_ROUTE),
                         status = response.status().as_u16(),
                         duration_ms,
-                        request_id = meta.request_id.as_deref(),
+                        request_id,
                         "request served"
                     );
                 }
