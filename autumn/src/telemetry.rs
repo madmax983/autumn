@@ -604,6 +604,30 @@ mod tests {
         drop(guard);
     }
     #[test]
+    fn build_capture_layer_returns_none_when_disabled() {
+        let log = LogConfig::default(); // capture.enabled = false
+        assert!(build_capture_layer(&log).is_none());
+    }
+
+    #[test]
+    fn build_capture_layer_returns_layer_and_buffer_when_enabled() {
+        let log = LogConfig {
+            capture: crate::log::capture::LogCaptureConfig {
+                enabled: true,
+                capacity: 50,
+            },
+            ..Default::default()
+        };
+        let result = build_capture_layer(&log);
+        assert!(
+            result.is_some(),
+            "should build layer when capture.enabled = true"
+        );
+        let (_, buffer) = result.unwrap();
+        assert!(buffer.is_empty(), "newly created buffer should be empty");
+    }
+
+    #[test]
     fn build_filter_falls_back_to_info_on_invalid_level() {
         let log = LogConfig {
             level: "this_is_not_a_valid_directive_it_lacks_an_equal_sign_and_is_not_a_level,foo=bar=baz=invalid".to_owned(),

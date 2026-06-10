@@ -604,4 +604,76 @@ mod tests {
         assert_eq!(buf.len(), 1);
         assert_eq!(buf.snapshot(None, None)[0].message, "additive test");
     }
+
+    // ── GREEN: LogContext fields captured in on_event ─────────
+
+    #[tokio::test]
+    async fn green_layer_captures_request_context_user_tenant_and_custom_fields() {
+        use crate::log::context::{LogContext, scope};
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let buf = LogBuffer::new(10, ParameterFilter::default());
+        let layer = LogCaptureLayer::new(buf.clone());
+        let subscriber = tracing_subscriber::registry().with(layer);
+        let _guard = tracing::dispatcher::set_default(&tracing::Dispatch::new(subscriber));
+
+        let ctx = LogContext::new(Some("req-context-test".to_owned()));
+        ctx.set_user_id("user-42");
+        ctx.set_tenant_id("tenant-99");
+        ctx.insert_field("region", "eu-west-1");
+
+        scope(ctx, async {
+            tracing::info!("context fields test");
+        })
+        .await;
+
+        let snap = buf.snapshot(None, None);
+        assert_eq!(snap.len(), 1);
+        let entry = &snap[0];
+        assert_eq!(entry.request_id.as_deref(), Some("req-context-test"));
+        assert_eq!(entry.fields["user_id"].as_str().unwrap(), "user-42");
+        assert_eq!(entry.fields["tenant_id"].as_str().unwrap(), "tenant-99");
+        assert_eq!(entry.fields["region"].as_str().unwrap(), "eu-west-1");
+    }
+
+    #[tokio::test]
+    async fn green_layer_event_field_takes_priority_over_context_field() {
+        use crate::log::context::{LogContext, scope};
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let buf = LogBuffer::new(10, ParameterFilter::default());
+        let layer = LogCaptureLayer::new(buf.clone());
+        let subscriber = tracing_subscriber::registry().with(layer);
+        let _guard = tracing::dispatcher::set_default(&tracing::Dispatch::new(subscriber));
+
+        let ctx = LogContext::new(None);
+        ctx.set_user_id("context-user");
+
+        scope(ctx, async {
+            // Event-level field takes priority over the context field.
+            tracing::info!(user_id = "event-user", "priority test");
+        })
+        .await;
+
+        let snap = buf.snapshot(None, None);
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].fields["user_id"].as_str().unwrap(), "event-user");
+    }
+
+    #[tokio::test]
+    async fn green_layer_no_context_sets_request_id_to_none() {
+        // When no LogContext is active, request_id must be None.
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let buf = LogBuffer::new(10, ParameterFilter::default());
+        let layer = LogCaptureLayer::new(buf.clone());
+        let subscriber = tracing_subscriber::registry().with(layer);
+        let _guard = tracing::dispatcher::set_default(&tracing::Dispatch::new(subscriber));
+
+        tracing::info!("no context");
+
+        let snap = buf.snapshot(None, None);
+        assert_eq!(snap.len(), 1);
+        assert!(snap[0].request_id.is_none());
+    }
 }
