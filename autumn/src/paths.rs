@@ -53,23 +53,28 @@ pub fn encode_path_segment(value: impl std::fmt::Display) -> String {
 /// Percent-encode a catch-all path parameter (starts with `*`).
 ///
 /// Splitting on `/` allows preserving directory slashes while percent-encoding
-/// other characters in each segment.
+/// other characters in each segment. This implementation uses a single pre-allocated
+/// buffer to eliminate intermediate allocations (`Vec` and `String`s) during encoding.
 #[doc(hidden)]
 #[must_use]
 pub fn encode_catch_all_param(value: impl std::fmt::Display) -> String {
     let s = value.to_string();
-    s.split('/')
-        .map(|segment| {
-            if segment == "." {
-                "%2E".to_string()
-            } else if segment == ".." {
-                "%2E%2E".to_string()
-            } else {
-                percent_encode(segment)
-            }
-        })
-        .collect::<Vec<String>>()
-        .join("/")
+    let mut result = String::with_capacity(s.len() + s.len() / 4);
+    let mut first = true;
+    for segment in s.split('/') {
+        if !first {
+            result.push('/');
+        }
+        first = false;
+        if segment == "." {
+            result.push_str("%2E");
+        } else if segment == ".." {
+            result.push_str("%2E%2E");
+        } else {
+            percent_encode_to(segment, &mut result);
+        }
+    }
+    result
 }
 
 /// Percent-encode a query component per RFC 3986.
@@ -78,6 +83,11 @@ pub fn encode_catch_all_param(value: impl std::fmt::Display) -> String {
 /// unchanged; everything else is `%XX`-encoded.
 fn percent_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
+    percent_encode_to(s, &mut out);
+    out
+}
+
+fn percent_encode_to(s: &str, out: &mut String) {
     for byte in s.bytes() {
         match byte {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
@@ -100,7 +110,6 @@ fn percent_encode(s: &str) -> String {
             }
         }
     }
-    out
 }
 
 #[cfg(test)]
