@@ -52,7 +52,11 @@ Check every file you review against these items. Report only items that fail.
   `SignedWebhook` (HMAC-verified webhook handlers), `RequireApiToken`
   (bearer-token API routes), or any handler that calls `.api_token()` or
   checks `webhook.provider()`. Adding `#[secured]` on top of those would
-  be the wrong fix.
+  be the wrong fix. Also do NOT flag **public auth entry points** — handlers
+  whose sole purpose is to establish authentication (signup, register, login,
+  forgot-password, reset-password, OAuth callbacks, passkey ceremony handlers).
+  These intentionally mutate session/user state before a principal is
+  authenticated; guarding them with `#[secured]` would break the auth flow.
 - **Missing CSRF token**: Every `<form method="POST">` (or PUT/PATCH/DELETE)
   in Maud templates must contain a hidden CSRF field. The default field name is
   `_csrf` (`security.csrf.form_field` in autumn.toml); accept any configured

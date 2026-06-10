@@ -4,7 +4,7 @@ description: >
   Use when the user runs /autumn:routes, asks to list registered routes,
   inspect route handlers, check what endpoints exist, or audit an Autumn
   app's routing table.
-argument-hint: "[--user-only] [--method GET|POST|...] [--filter <pattern>]"
+argument-hint: "[-p <package>] [--bin <bin>] [--user-only] [--method GET|POST|...] [--filter <pattern>]"
 allowed-tools:
   - Bash
   - Read
@@ -20,11 +20,21 @@ in the current Autumn project.
 Run from the project root (directory containing `autumn.toml`). Always use
 JSON output. Include `--user-only` by default to hide framework internals,
 but omit it when the user explicitly wants to see framework routes (actuator,
-health probes, static assets, admin):
+health probes, static assets, admin).
+
+In **workspace** or **multi-binary** projects, pass `-p <package>` (and
+optionally `--bin <bin>`) so `autumn routes` targets the correct binary;
+omitting these in a workspace causes an error when multiple candidates exist.
 
 ```bash
-# Default — user routes only
+# Single-binary project — user routes only
 autumn routes --format json --user-only
+
+# Workspace project — target a specific package
+autumn routes --format json --user-only -p blog
+
+# Multi-binary package — also specify the binary
+autumn routes --format json --user-only -p api --bin server
 
 # When user wants all routes (framework + user)
 autumn routes --format json

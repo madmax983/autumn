@@ -318,8 +318,12 @@ GitHub, Google, and Microsoft. OAuth support stays behind the `oauth2` feature.
 ## Signed webhooks
 
 Autumn 0.4.0 added `SignedWebhook` for Stripe, GitHub, Slack, and generic
-HMAC callbacks. The extractor verifies the exact raw body bytes, timestamp, and
-replay key before handler logic runs.
+HMAC callbacks. The extractor verifies the exact raw body bytes and replay key
+before handler logic runs. Timestamp freshness is **provider-specific**: Stripe
+(signature `t=` field) and Slack (`X-Slack-Request-Timestamp`) validate staleness
+automatically; GitHub and generic-HMAC providers only check the body signature
+unless you add `timestamp_header` to the `[webhooks.<name>]` config block
+explicitly.
 
 ```rust
 #[post("/webhooks/stripe")]
@@ -496,7 +500,7 @@ autumn generate model Post title:String body:Text
 autumn generate migration add_posts
 autumn generate scaffold Post title:String body:Text --api
 autumn generate auth User --oauth github,google --totp --passkeys
-autumn generate admin Post
+autumn generate admin Post title:String body:Text published:bool
 autumn generate mailer User
 autumn generate system-test todo_flow
 autumn generate pwa
