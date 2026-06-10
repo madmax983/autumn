@@ -181,7 +181,7 @@ impl ResolvedJobConstraints {
 
 /// Whether an enqueue stored a new job or coalesced into an existing one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EnqueueOutcome {
+pub(crate) enum EnqueueOutcome {
     Queued,
     Deduplicated,
 }
@@ -10761,9 +10761,12 @@ mod uniqueness_concurrency_tests {
         );
 
         // First instance fails terminally, releasing the key.
-        enqueue("retry_conflict", serde_json::json!({"k": 1, "mode": "fail"}))
-            .await
-            .unwrap();
+        enqueue(
+            "retry_conflict",
+            serde_json::json!({"k": 1, "mode": "fail"}),
+        )
+        .await
+        .unwrap();
         let failures = |state: &AppState| {
             state
                 .job_registry()
@@ -10774,9 +10777,12 @@ mod uniqueness_concurrency_tests {
         assert!(wait_for(2_000, || failures(&state) == 1).await);
 
         // An equivalent job takes the key and holds it while running slowly.
-        enqueue("retry_conflict", serde_json::json!({"k": 1, "mode": "slow"}))
-            .await
-            .unwrap();
+        enqueue(
+            "retry_conflict",
+            serde_json::json!({"k": 1, "mode": "slow"}),
+        )
+        .await
+        .unwrap();
         let in_flight = |state: &AppState| {
             state
                 .job_registry()
