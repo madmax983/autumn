@@ -800,8 +800,18 @@ impl JobAdminBackend for JobAdminMemoryBackend {
                 AutumnError::service_unavailable_msg("job runtime is not initialized")
             })?;
             let (name, payload) = self.retry_payload(&id)?;
-            match client.enqueue(&name, payload).await {
-                Ok(()) => Ok(()),
+            match client.enqueue_with_outcome(&name, payload).await {
+                Ok(EnqueueOutcome::Queued) => Ok(()),
+                Ok(EnqueueOutcome::Deduplicated) => {
+                    // No retry was actually queued: an equivalent unique job
+                    // already holds the key. Restore the failed record and
+                    // surface the same conflict the durable backends report.
+                    self.restore_failed_retry(&id);
+                    Err(AutumnError::bad_request_msg(
+                        "an equivalent unique job is already pending or running; \
+                         retry after it settles",
+                    ))
+                }
                 Err(error) => {
                     self.restore_failed_retry(&id);
                     Err(error)
@@ -1573,6 +1583,19 @@ impl JobClient {
     /// or enqueueing fails in the active backend.
     #[allow(clippy::too_many_lines)]
     pub async fn enqueue(&self, name: &str, payload: Value) -> AutumnResult<()> {
+        self.enqueue_with_outcome(name, payload).await.map(|_| ())
+    }
+
+    /// Enqueue like [`Self::enqueue`], reporting whether the job was stored
+    /// or coalesced into an existing unique job. Used by operator paths that
+    /// must distinguish "queued a retry" from "an equivalent job already
+    /// exists".
+    #[allow(clippy::too_many_lines)]
+    pub(crate) async fn enqueue_with_outcome(
+        &self,
+        name: &str,
+        payload: Value,
+    ) -> AutumnResult<EnqueueOutcome> {
         let Some(settings) = self.per_job_settings.get(name) else {
             return Err(AutumnError::internal_server_error(std::io::Error::other(
                 format!("job '{name}' is not registered; add it to AppBuilder::jobs()"),
@@ -1596,6 +1619,8 @@ impl JobClient {
 
         let started = ::std::sync::Arc::new(::std::sync::atomic::AtomicBool::new(false));
         let started_clone = started.clone();
+        let deduplicated = ::std::sync::Arc::new(::std::sync::atomic::AtomicBool::new(false));
+        let deduplicated_clone = deduplicated.clone();
 
         let id_for_enqueue = id.clone();
         let payload_clone = payload.clone();
@@ -1609,6 +1634,7 @@ impl JobClient {
                 ) && !coordination.try_acquire_unique(name, unique_key, &id_for_enqueue, window)
                 {
                     self.record_deduplicated_enqueue(name, &id_for_enqueue);
+                    deduplicated_clone.store(true, ::std::sync::atomic::Ordering::SeqCst);
                     return Ok(());
                 }
                 #[cfg(feature = "telemetry-otlp")]
@@ -1656,6 +1682,7 @@ impl JobClient {
                 Ok(EnqueueOutcome::Queued) => Ok(()),
                 Ok(EnqueueOutcome::Deduplicated) => {
                     self.record_deduplicated_enqueue(name, &id_for_enqueue);
+                    deduplicated_clone.store(true, ::std::sync::atomic::Ordering::SeqCst);
                     return Ok(());
                 }
                 Err(error) => Err(error),
@@ -1678,7 +1705,13 @@ impl JobClient {
             self.registry.record_cancel(name);
             self.job_admin.record_cancelled(&id);
         }
-        res
+        res.map(|()| {
+            if deduplicated.load(::std::sync::atomic::Ordering::SeqCst) {
+                EnqueueOutcome::Deduplicated
+            } else {
+                EnqueueOutcome::Queued
+            }
+        })
     }
 
     /// Enqueue a job that fires **only after the surrounding transaction commits**.
@@ -10681,6 +10714,94 @@ mod uniqueness_concurrency_tests {
         );
         assert!(KEYED_MAX_A.load(Ordering::SeqCst) <= 1);
         assert!(KEYED_MAX_B.load(Ordering::SeqCst) <= 1);
+
+        shutdown.cancel();
+        clear_global_job_client();
+    }
+
+    fn keyed_fail_or_slow_handler(
+        _state: AppState,
+        payload: Value,
+    ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'static>> {
+        Box::pin(async move {
+            if payload["mode"] == "fail" {
+                return Err(AutumnError::internal_server_error(std::io::Error::other(
+                    "forced failure",
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            Ok(())
+        })
+    }
+
+    #[tokio::test]
+    async fn local_admin_retry_reports_conflict_when_equivalent_unique_job_is_held() {
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+
+        let state = AppState::for_test().with_profile("dev");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        start_local_runtime(
+            vec![JobInfo {
+                name: "retry_conflict".to_string(),
+                max_attempts: 1,
+                initial_backoff_ms: 1,
+                uniqueness: Some(JobUniqueness {
+                    by: vec!["k".to_string()],
+                    window: JobUniquenessWindow::Running,
+                }),
+                concurrency: None,
+                handler: keyed_fail_or_slow_handler,
+            }],
+            &state,
+            &shutdown,
+            2,
+            5,
+            250,
+        );
+
+        // First instance fails terminally, releasing the key.
+        enqueue("retry_conflict", serde_json::json!({"k": 1, "mode": "fail"}))
+            .await
+            .unwrap();
+        let failures = |state: &AppState| {
+            state
+                .job_registry()
+                .snapshot()
+                .get("retry_conflict")
+                .map_or(0, |s| s.total_failures)
+        };
+        assert!(wait_for(2_000, || failures(&state) == 1).await);
+
+        // An equivalent job takes the key and holds it while running slowly.
+        enqueue("retry_conflict", serde_json::json!({"k": 1, "mode": "slow"}))
+            .await
+            .unwrap();
+        let in_flight = |state: &AppState| {
+            state
+                .job_registry()
+                .snapshot()
+                .get("retry_conflict")
+                .map_or(0, |s| s.in_flight)
+        };
+        assert!(wait_for(2_000, || in_flight(&state) == 1).await);
+
+        // Retrying the failed record must report a conflict, not a silent
+        // success that queued nothing.
+        let admin = job_admin_backend(&state).expect("admin backend");
+        let snapshot = admin.snapshot(JobAdminQuery::default()).await.unwrap();
+        let failed_id = snapshot.failed.records[0].id.clone();
+        let error = admin.retry(&failed_id).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("an equivalent unique job is already pending or running"),
+            "{error}"
+        );
+
+        // The record is restored to failed so the operator can retry later.
+        let snapshot = admin.snapshot(JobAdminQuery::default()).await.unwrap();
+        assert_eq!(snapshot.failed.records[0].id, failed_id);
 
         shutdown.cancel();
         clear_global_job_client();
