@@ -141,6 +141,7 @@ pub mod captcha;
 pub(crate) mod config;
 pub(crate) mod csrf;
 pub(crate) mod headers;
+/// Trusted proxy and IP address verification logic for rate limiting and auditing.
 pub mod proxy;
 pub mod rate_limit;
 pub(crate) mod trusted_proxies;

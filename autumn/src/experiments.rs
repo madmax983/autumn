@@ -1505,6 +1505,7 @@ impl axum::extract::FromRequestParts<crate::AppState> for Experiments {
 // ── pg module ─────────────────────────────────────────────────────────────────
 
 #[cfg(feature = "db")]
+/// PostgreSQL-backed storage for experiment variants, resolving assignments via DB lookups.
 pub mod pg {
     use super::{
         Assignment, ChangeRecord, ExperimentConfig, ExperimentState, ExperimentStore,
