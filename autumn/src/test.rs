@@ -1152,6 +1152,19 @@ impl TestApp {
             },
         )
         .expect("failed to build test router");
+        // Mirror production's outermost access-log fallback (#999): in
+        // production it is applied in `apply_startup_barrier`, outside the
+        // session and exception-filter layers, and emits only for responses
+        // the primary in-stack layer never saw (e.g. session-store outage
+        // 503s), so tests observe the same access-log behavior an operator
+        // would.
+        let router = if self.config.log.access_log {
+            router.layer(crate::middleware::AccessLogLayer::fallback(
+                self.config.log.access_log_exclude.clone(),
+            ))
+        } else {
+            router
+        };
         TestClient {
             router,
             probes,

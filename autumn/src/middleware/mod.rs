@@ -5,6 +5,8 @@
 //! - [`RequestIdLayer`] / [`RequestId`] -- assigns a unique UUID v4 to every
 //!   incoming HTTP request, available in handler extensions and the
 //!   `X-Request-Id` response header.
+//! - [`AccessLogLayer`] -- emits one structured access-log event per served
+//!   request (method, route template, status, `duration_ms`, `request_id`).
 //! - [`ExceptionFilterLayer`] / [`ExceptionFilter`] -- intercepts error
 //!   responses and runs a user-registered filter chain for logging,
 //!   transformation, or replacement.
@@ -16,6 +18,7 @@
 //! when at least one exception filter is registered via
 //! [`AppBuilder::exception_filter`](crate::app::AppBuilder::exception_filter).
 
+pub(crate) mod access_log;
 pub(crate) mod dev;
 pub(crate) mod error_page_filter;
 pub(crate) mod exception_filter;
@@ -27,6 +30,9 @@ pub(crate) mod request_id;
 #[cfg(feature = "telemetry-otlp")]
 pub(crate) mod trace_context;
 
+pub use access_log::{
+    ACCESS_LOG_TARGET, AccessLogEmitted, AccessLogLayer, AccessLogService, UNMATCHED_ROUTE,
+};
 pub use exception_filter::{AutumnErrorInfo, ExceptionFilter, ExceptionFilterLayer};
 pub use log_context::{LogContextLayer, LogContextService};
 pub use maintenance::{DEFAULT_HEALTH_PREFIX, MaintenanceLayer, MaintenanceService};
