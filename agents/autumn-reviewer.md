@@ -89,7 +89,10 @@ Check every file you review against these items. Report only items that fail.
   function that returns `Vec<JobInfo>` (e.g. `.jobs(registered_jobs())`).
   Only flag when no `.jobs(...)` is present at all or the job is provably absent.
 - **Task not in `main.rs`**: A `#[task]` function must be in
-  `.one_off_tasks(one_off_tasks![...])`.
+  `.one_off_tasks(one_off_tasks![...])` or via a helper that returns
+  `Vec<OneOffTaskInfo>` (e.g. `.one_off_tasks(tasks::registered_tasks())`).
+  Only flag when no `.one_off_tasks(...)` call is present at all or the task
+  is provably absent from all registration paths.
 
 ### Correctness (MEDIUM)
 

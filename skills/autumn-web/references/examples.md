@@ -158,6 +158,8 @@ Pattern from `examples/ws-echo`:
 ```rust
 use autumn_web::prelude::*;
 use autumn_web::ws::{Message, WebSocket, WithShutdown, WsHandler};
+// WithShutdown requires CancellationToken — tokio-util is a transitive dep,
+// not a re-export, so add it to Cargo.toml: tokio-util = { version = "0.7", features = ["sync"] }
 use tokio_util::sync::CancellationToken;
 
 #[ws("/echo")]

@@ -62,8 +62,8 @@ pub async fn find_post(conn: &mut AsyncPgConnection, post_id: i64) -> AutumnResu
         .map_err(|_| AutumnError::not_found_msg("post not found"))
 }
 
-// Use #[repository] when you need a generated REST API
-#[repository(Post, api = "/api/posts", policy = PostPolicy, scope = PostScope)]
+// Use #[autumn_web::repository] when you need a generated REST API
+#[autumn_web::repository(Post, api = "/api/posts", policy = PostPolicy, scope = PostScope)]
 pub trait PostRepository {}
 ```
 

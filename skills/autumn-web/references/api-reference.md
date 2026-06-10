@@ -39,8 +39,9 @@ All publishable crates share `[workspace.package].version = "0.5.0"`.
 ### Feature-gated top-level types
 
 - `Mail`, `Mailer`, `MailConfig`, `MailTransport`, `MailDeliveryQueue`,
-  `MailDeliveryQueueHandle`, `MailPreview`, `Transport`, `SmtpConfig`,
-  `TlsMode` (`mail`)
+  `MailDeliveryQueueHandle`, `Transport`, `SmtpConfig`,
+  `TlsMode` (`mail`) — `MailPreview` is available via `autumn_web::mail::MailPreview`
+  (not re-exported at the crate root)
 - `DbApiTokenStore`, `API_TOKEN_MIGRATIONS`, repository hooks (`db`)
 - `Multipart` (`multipart`)
 - `Flash`, `FlashLevel`, `FlashMessage` (`flash`)
