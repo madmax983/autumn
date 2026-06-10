@@ -20,6 +20,7 @@ Replaces the existing standalone `/health` endpoint with a comprehensive actuato
 | `/actuator/env` | Active config values with redacted secrets | Yes | Enabled | Disabled |
 | `/actuator/configprops` | All config properties with source tracking | Yes | Enabled | Disabled |
 | `/actuator/loggers` | View and change log levels at runtime | Yes | Enabled | Disabled |
+| `/actuator/logfile` | Recent structured log entries from in-memory ring buffer | Yes | Enabled | Disabled |
 | `/actuator/tasks` | Active tokio tasks / scheduled task status | Yes | Enabled | Disabled |
 
 ## Configuration
