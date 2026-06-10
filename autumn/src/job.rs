@@ -9910,6 +9910,7 @@ mod tests {
                 &tx,
                 &state,
                 &job_admin,
+                &Arc::new(LocalJobCoordination::default()),
             )
             .await;
 
