@@ -2592,7 +2592,8 @@ impl AppBuilder {
                 let robots_body =
                     crate::seo::robots_txt(profile, sitemap_url_for_robots, additional_rules);
                 let sitemap_body = crate::seo::sitemap_xml(&sitemap_entries, base_url);
-                let seo_router = crate::seo::build_seo_router_from_bodies(robots_body, sitemap_body);
+                let seo_router =
+                    crate::seo::build_seo_router_from_bodies(robots_body, sitemap_body);
                 merge_routers.push(seo_router);
             }
         }
@@ -3306,9 +3307,8 @@ impl AppBuilder {
             if let Some(bu) = base_url {
                 for meta in &static_metas {
                     if !meta.path.contains('{') {
-                        sitemap_entries.push(crate::seo::SitemapEntry::new(
-                            format!("{bu}{}", meta.path),
-                        ));
+                        sitemap_entries
+                            .push(crate::seo::SitemapEntry::new(format!("{bu}{}", meta.path)));
                     }
                 }
             }

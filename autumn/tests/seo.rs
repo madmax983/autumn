@@ -520,9 +520,16 @@ async fn write_seo_files_injects_sitemap_url_in_robots() {
     use autumn_web::seo::write_seo_files;
 
     let dir = tempfile::tempdir().unwrap();
-    write_seo_files(dir.path(), "prod", Some("https://example.com"), None, &[], &[])
-        .await
-        .unwrap();
+    write_seo_files(
+        dir.path(),
+        "prod",
+        Some("https://example.com"),
+        None,
+        &[],
+        &[],
+    )
+    .await
+    .unwrap();
 
     let robots = std::fs::read_to_string(dir.path().join("robots.txt")).unwrap();
     assert!(
