@@ -168,8 +168,16 @@ Semantics:
   locks and atomic Lua claim/settle scripts.
 - With neither attribute set, behavior is unchanged: no dedup and unbounded
   per-type concurrency.
-- Retries keep the unique key held (the job is still in flight) but release
-  the concurrency slot while waiting out the backoff.
+- Retries keep a `running`-window key held (the job is still in flight) and
+  re-acquire a `pending`-window key while waiting out the backoff; the
+  concurrency slot is released during the backoff either way.
+- Operator actions respect uniqueness: canceling an enqueued job (including
+  one parked behind a concurrency slot) releases its key immediately, and
+  retrying a failed unique job re-takes the key — or fails with a clear
+  conflict error when an equivalent job is already pending or running.
+- On Redis, pending/running unique locks carry a 24-hour crash backstop TTL
+  that is refreshed every time the job is claimed, retried, or recovered, so
+  only a job left completely untouched for a full day can lose its lock.
 - The Postgres backend needs the additive `autumn migrate` migration that
   adds the nullable `unique_key`/`unique_window`/`concurrency_key`/
   `concurrency_limit` columns; rows and jobs without them behave as before.

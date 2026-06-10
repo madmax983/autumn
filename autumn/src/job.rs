@@ -1162,6 +1162,22 @@ fn redis_release_unique_on_settle(record: &RedisJobRecord, mode: &str) -> bool {
         && matches!(mode, "success" | "dead")
 }
 
+/// Lock maintenance a requeueing transition (retry backoff, stale requeue)
+/// must perform: pending-window keys were released at claim and need to be
+/// re-acquired for the again-pending job; running-window locks get their
+/// crash backstop refreshed so long-lived jobs never outlive their lock.
+#[cfg(feature = "redis")]
+fn redis_requeue_unique_action(record: &RedisJobRecord) -> &'static str {
+    if record.unique_key.is_none() {
+        return "";
+    }
+    match record.unique_window.as_deref() {
+        Some("pending") => "pending",
+        Some("running") => "running",
+        _ => "",
+    }
+}
+
 #[cfg(feature = "redis")]
 const REDIS_WORKER_IDLE_SLEEP_MAX: std::time::Duration = std::time::Duration::from_millis(200);
 
@@ -2280,8 +2296,18 @@ async fn execute_local_job(
         }
         JobExecutionOutcome::Failed(error) => {
             if job.attempt < max_attempts {
-                // The unique key stays held across retries: the job is still
-                // logically in flight until it settles.
+                // Running-window keys stay held across retries (the job is
+                // still in flight until it settles). A pending-window key was
+                // released when execution started, so re-acquire it now —
+                // best effort — to keep duplicates coalescing while the retry
+                // waits out its backoff as a pending job again.
+                if let Some(unique) = &uniqueness
+                    && unique.window == JobUniquenessWindow::Pending
+                {
+                    let key = job_unique_key(unique, &job.payload);
+                    let _ =
+                        coordination.try_acquire_unique(&job.name, &key, &job.id, unique.window);
+                }
                 state
                     .job_registry
                     .record_retry(&job.name, &error, job.attempt);
@@ -2607,8 +2633,10 @@ struct RedisJobAdminBackend {
     processing_key: String,
     dead_key: String,
     completed_key: String,
+    blocked_key: String,
     record_prefix: String,
     dead_record_prefix: String,
+    unique_prefix: String,
     history_limit: usize,
 }
 
@@ -2621,8 +2649,10 @@ impl RedisJobAdminBackend {
         processing_key: String,
         dead_key: String,
         completed_key: String,
+        blocked_key: String,
         record_prefix: String,
         dead_record_prefix: String,
+        unique_prefix: String,
         history_limit: usize,
     ) -> Self {
         Self {
@@ -2631,8 +2661,10 @@ impl RedisJobAdminBackend {
             processing_key,
             dead_key,
             completed_key,
+            blocked_key,
             record_prefix,
             dead_record_prefix,
+            unique_prefix,
             history_limit: history_limit.max(1),
         }
     }
@@ -2696,6 +2728,10 @@ impl RedisJobAdminBackend {
         let mut connection = self.connection.clone();
         let new_id = uuid::Uuid::new_v4().to_string();
         let dead_record_key = format!("{}{id}", self.dead_record_prefix);
+        // The unique lock was released when the job dead-lettered, so a
+        // retried unique job must take it again under its new id — and the
+        // retry must be refused when an equivalent job is already holding it,
+        // otherwise the retry duplicates the very execution `unique` guards.
         let result: i64 = redis::cmd("EVAL")
             .arg(
                 r"
@@ -2703,12 +2739,23 @@ local failed = redis.call('GET', KEYS[1])
 if not failed then
   return 0
 end
-if redis.call('LREM', KEYS[2], 0, failed) == 0 then
-  return -1
-end
 local ok, record = pcall(cjson.decode, failed)
 if not ok then
   return -2
+end
+local lock = nil
+if record['unique_key'] and record['unique_key'] ~= cjson.null
+   and record['unique_window'] ~= 'ttl' then
+  lock = KEYS[5] .. record['name'] .. ':' .. record['unique_key']
+  if not redis.call('SET', lock, ARGV[1], 'NX', 'PX', tonumber(ARGV[3])) then
+    return -3
+  end
+end
+if redis.call('LREM', KEYS[2], 0, failed) == 0 then
+  if lock and redis.call('GET', lock) == ARGV[1] then
+    redis.call('DEL', lock)
+  end
+  return -1
 end
 redis.call('DEL', KEYS[1])
 record['id'] = ARGV[1]
@@ -2725,13 +2772,15 @@ redis.call('LPUSH', KEYS[4], ARGV[1])
 return 1
 ",
             )
-            .arg(4)
+            .arg(5)
             .arg(dead_record_key)
             .arg(&self.dead_key)
             .arg(&self.record_prefix)
             .arg(&self.queue_key)
+            .arg(&self.unique_prefix)
             .arg(new_id)
             .arg(now_unix_ms())
+            .arg(REDIS_UNIQUE_LOCK_TTL_BACKSTOP_MS)
             .query_async(&mut connection)
             .await
             .map_err(|error| redis_admin_error("retry failed job", &error))?;
@@ -2767,22 +2816,40 @@ return 1
     async fn cancel_enqueued_redis(&self, id: &str) -> AutumnResult<()> {
         let mut connection = self.connection.clone();
         let active_record_key = redis_record_key(&self.record_prefix, id);
+        // A concurrency-parked job lives in the blocked zset rather than the
+        // queue list, and a canceled unique job must hand its lock back so
+        // future enqueues are not coalesced against work that will never run.
         let result: i64 = redis::cmd("EVAL")
             .arg(
                 r"
-if not redis.call('GET', KEYS[1]) then
+local body = redis.call('GET', KEYS[1])
+if not body then
   return 0
 end
-if redis.call('LREM', KEYS[2], 0, ARGV[1]) == 0 then
+local removed = redis.call('LREM', KEYS[2], 0, ARGV[1])
+if removed == 0 then
+  removed = redis.call('ZREM', KEYS[3], ARGV[1])
+end
+if removed == 0 then
   return -1
+end
+local ok, record = pcall(cjson.decode, body)
+if ok and record['unique_key'] and record['unique_key'] ~= cjson.null
+   and record['unique_window'] ~= 'ttl' then
+  local lock = KEYS[4] .. record['name'] .. ':' .. record['unique_key']
+  if redis.call('GET', lock) == ARGV[1] then
+    redis.call('DEL', lock)
+  end
 end
 redis.call('DEL', KEYS[1])
 return 1
 ",
             )
-            .arg(2)
+            .arg(4)
             .arg(active_record_key)
             .arg(&self.queue_key)
+            .arg(&self.blocked_key)
+            .arg(&self.unique_prefix)
             .arg(id)
             .query_async(&mut connection)
             .await
@@ -2830,6 +2897,10 @@ fn redis_admin_operation_result(result: i64, id: &str, operation: &str) -> Autum
         ))),
         -2 => Err(AutumnError::internal_server_error_msg(format!(
             "job '{id}' has an invalid stored payload"
+        ))),
+        -3 => Err(AutumnError::bad_request_msg(format!(
+            "an equivalent unique job is already pending or running; \
+             retry job '{id}' after it settles"
         ))),
         _ => Err(AutumnError::internal_server_error_msg(format!(
             "redis job admin {operation} returned unexpected code {result}"
@@ -3067,11 +3138,14 @@ for attempt = 1, tonumber(ARGV[6]) do
       end
     end
     if not blocked then
-      if record['unique_key'] and record['unique_key'] ~= cjson.null
-         and record['unique_window'] == 'pending' then
+      if record['unique_key'] and record['unique_key'] ~= cjson.null then
         local lock = ARGV[7] .. record['name'] .. ':' .. record['unique_key']
-        if redis.call('GET', lock) == record['id'] then
-          redis.call('DEL', lock)
+        if record['unique_window'] == 'pending' then
+          if redis.call('GET', lock) == record['id'] then
+            redis.call('DEL', lock)
+          end
+        elseif record['unique_window'] == 'running' then
+          redis.call('PEXPIRE', lock, tonumber(ARGV[8]))
         end
       end
       record['claimed_by'] = ARGV[1]
@@ -3105,6 +3179,7 @@ return nil
         .arg(blocked_due_ms)
         .arg(REDIS_CLAIM_SCAN_LIMIT)
         .arg(&worker_config.unique_prefix)
+        .arg(REDIS_UNIQUE_LOCK_TTL_BACKSTOP_MS)
         .query_async(connection)
         .await?;
 
@@ -3383,6 +3458,11 @@ if ARGV[4] == 'success' then
 elseif ARGV[4] == 'retry' then
   redis.call('SET', key, ARGV[5])
   redis.call('ZADD', KEYS[3], ARGV[6], ARGV[1])
+  if ARGV[10] == 'pending' then
+    redis.call('SET', KEYS[7], ARGV[1], 'NX', 'PX', tonumber(ARGV[11]))
+  elseif ARGV[10] == 'running' then
+    redis.call('PEXPIRE', KEYS[7], tonumber(ARGV[11]))
+  end
 elseif ARGV[4] == 'dead' then
   redis.call('LPUSH', KEYS[4], ARGV[5])
   redis.call('SET', KEYS[6] .. ARGV[1], ARGV[5])
@@ -3440,6 +3520,12 @@ async fn apply_claimed_redis_transition(
         .arg(DEFAULT_JOB_ADMIN_HISTORY_LIMIT)
         .arg(release_unique)
         .arg(decrement_slot)
+        .arg(if mode == "retry" {
+            redis_requeue_unique_action(expected)
+        } else {
+            ""
+        })
+        .arg(REDIS_UNIQUE_LOCK_TTL_BACKSTOP_MS)
         .query_async(connection)
         .await?;
 
@@ -3559,6 +3645,11 @@ end
 if ARGV[4] == 'requeue' then
   redis.call('SET', key, ARGV[5])
   redis.call('LPUSH', KEYS[3], ARGV[1])
+  if ARGV[9] == 'pending' then
+    redis.call('SET', KEYS[6], ARGV[1], 'NX', 'PX', tonumber(ARGV[10]))
+  elseif ARGV[9] == 'running' then
+    redis.call('PEXPIRE', KEYS[6], tonumber(ARGV[10]))
+  end
 elseif ARGV[4] == 'dead' then
   redis.call('LPUSH', KEYS[4], ARGV[5])
   redis.call('SET', KEYS[5] .. ARGV[1], ARGV[5])
@@ -3620,6 +3711,12 @@ async fn apply_stale_redis_recovery(
         .arg(DEFAULT_JOB_ADMIN_HISTORY_LIMIT)
         .arg(release_unique)
         .arg(decrement_slot)
+        .arg(if mode == "requeue" {
+            redis_requeue_unique_action(expected)
+        } else {
+            ""
+        })
+        .arg(REDIS_UNIQUE_LOCK_TTL_BACKSTOP_MS)
         .query_async(connection)
         .await?;
 
@@ -4086,8 +4183,10 @@ fn start_redis_runtime(
             processing_key.clone(),
             dead_key.clone(),
             completed_key.clone(),
+            blocked_key.clone(),
             record_prefix.clone(),
             dead_record_prefix.clone(),
+            unique_prefix.clone(),
             DEFAULT_JOB_ADMIN_HISTORY_LIMIT,
         ))));
     }
@@ -4753,6 +4852,7 @@ async fn pg_nack_failure(
     worker_id: &str,
     error: &str,
     row: &PgJobRow,
+    pending_unique_key: Option<&str>,
 ) -> AutumnResult<bool> {
     use diesel_async::RunQueryDsl as _;
 
@@ -4763,7 +4863,7 @@ async fn pg_nack_failure(
 
     if row.attempt < row.max_attempts {
         let delay_ms = pg_retry_delay_ms(row.initial_backoff_ms, row.attempt);
-        diesel::sql_query(
+        let applied = diesel::sql_query(
             "UPDATE autumn_jobs \
              SET status = 'enqueued', \
                  attempt = attempt + 1, \
@@ -4782,7 +4882,30 @@ async fn pg_nack_failure(
         .execute(&mut *conn)
         .await
         .map(pg_claim_transition_applied)
-        .map_err(|e| AutumnError::internal_server_error_msg(format!("pg job retry failed: {e}")))
+        .map_err(|e| AutumnError::internal_server_error_msg(format!("pg job retry failed: {e}")))?;
+
+        // A pending-window unique key was cleared when the job was claimed.
+        // The retried row is pending again, so restore the key best-effort:
+        // if a duplicate was accepted in the meantime, the partial unique
+        // index rejects this UPDATE and the retry simply runs without the key.
+        if applied && let Some(key) = pending_unique_key {
+            let restored = diesel::sql_query(
+                "UPDATE autumn_jobs SET unique_key = $1 \
+                 WHERE id = $2 AND status = 'enqueued'",
+            )
+            .bind::<diesel::sql_types::Text, _>(key)
+            .bind::<diesel::sql_types::Text, _>(job_id)
+            .execute(&mut *conn)
+            .await;
+            if let Err(error) = restored {
+                tracing::debug!(
+                    job_id = %job_id,
+                    error = %error,
+                    "pending unique key not restored on retry (duplicate already in flight)"
+                );
+            }
+        }
+        Ok(applied)
     } else {
         diesel::sql_query(
             "UPDATE autumn_jobs \
@@ -4903,18 +5026,25 @@ async fn pg_execute_job(
     let max_attempts = u32::try_from(row.max_attempts).unwrap_or(1);
 
     if job_admin.try_record_start(&row.id, attempt) == JobAdminStartDecision::Canceled {
-        let ack = pg_nack_failure(pool, &row.id, worker_id, "canceled by operator", &row).await;
+        let ack =
+            pg_nack_failure(pool, &row.id, worker_id, "canceled by operator", &row, None).await;
         record_pg_row_cancel_after_ack(ack, &row, state);
         return;
     }
     state.job_registry.record_start(&row.name);
 
     let payload = serde_json::from_str::<Value>(&row.payload).unwrap_or(Value::Null);
-    let handler_opt = jobs_by_name
+    let job_info_snapshot = jobs_by_name
         .read()
         .expect("job registry lock poisoned")
         .get(&row.name)
-        .map(|info| info.handler);
+        .map(|info| (info.handler, info.uniqueness.clone()));
+    let pending_unique_key = job_info_snapshot
+        .as_ref()
+        .and_then(|(_, uniqueness)| uniqueness.as_ref())
+        .filter(|unique| unique.window == JobUniquenessWindow::Pending)
+        .map(|unique| job_unique_key(unique, &payload));
+    let handler_opt = job_info_snapshot.map(|(handler, _)| handler);
 
     let Some(handler) = handler_opt else {
         // Dead-letter immediately: no handler will ever exist on this process,
@@ -4957,7 +5087,15 @@ async fn pg_execute_job(
             } else {
                 PgLifecycleRecord::Failure { error: &error }
             };
-            let ack = pg_nack_failure(pool, &row.id, worker_id, &error, &row).await;
+            let ack = pg_nack_failure(
+                pool,
+                &row.id,
+                worker_id,
+                &error,
+                &row,
+                pending_unique_key.as_deref(),
+            )
+            .await;
             record_pg_row_lifecycle_ack_result(ack, &row, "failure", lifecycle, state, job_admin);
         }
         // Panics dead-letter immediately regardless of remaining attempts,
@@ -5099,15 +5237,25 @@ impl PgJobAdminBackend {
             "UPDATE autumn_jobs \
              SET status = 'enqueued', attempt = 1, run_at = NOW(), enqueued_at = NOW(), \
                  started_at = NULL, finished_at = NULL, \
-                 claimed_by = NULL, claimed_at = NULL, last_error = NULL, \
-                 unique_key = NULL \
+                 claimed_by = NULL, claimed_at = NULL, last_error = NULL \
              WHERE id = $1 AND status = 'failed'",
         )
         .bind::<diesel::sql_types::Text, _>(id)
         .execute(&mut *conn)
         .await
         .map_err(|e| {
-            AutumnError::internal_server_error_msg(format!("pg admin retry failed: {e}"))
+            // The retried row keeps its unique_key, so re-enqueueing while an
+            // equivalent job is already in flight trips the partial unique
+            // index — surface that as an operator-actionable conflict rather
+            // than silently dropping uniqueness for the retried job.
+            if e.to_string().contains("idx_autumn_jobs_unique_inflight") {
+                AutumnError::bad_request_msg(
+                    "an equivalent unique job is already pending or running; \
+                     retry after it settles",
+                )
+            } else {
+                AutumnError::internal_server_error_msg(format!("pg admin retry failed: {e}"))
+            }
         })?;
         if updated == 0 {
             return Err(AutumnError::not_found_msg(format!(
@@ -6672,8 +6820,10 @@ mod tests {
             worker_config.processing_key.clone(),
             worker_config.dead_key.clone(),
             worker_config.completed_key.clone(),
+            worker_config.blocked_key.clone(),
             worker_config.record_prefix.clone(),
             worker_config.dead_record_prefix.clone(),
+            worker_config.unique_prefix.clone(),
             128,
         )
     }
@@ -7251,6 +7401,130 @@ mod tests {
         let encoded = encode_redis_record(&record).unwrap();
         assert!(!encoded.contains("unique_key"));
         assert!(!encoded.contains("concurrency_limit"));
+    }
+
+    #[cfg(feature = "redis")]
+    #[test]
+    fn redis_admin_retry_conflict_code_maps_to_actionable_error() {
+        let error = redis_admin_operation_result(-3, "job-1", "retry failed job").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("an equivalent unique job is already pending or running"),
+            "{error}"
+        );
+    }
+
+    #[cfg(feature = "redis")]
+    #[test]
+    fn redis_requeue_unique_action_matches_window() {
+        let mut record = redis_test_record(1, 3);
+        assert_eq!(redis_requeue_unique_action(&record), "");
+
+        record.unique_key = Some("k".to_string());
+        record.unique_window = Some("pending".to_string());
+        assert_eq!(redis_requeue_unique_action(&record), "pending");
+
+        record.unique_window = Some("running".to_string());
+        assert_eq!(redis_requeue_unique_action(&record), "running");
+
+        // TTL locks expire by time; requeues neither re-acquire nor refresh.
+        record.unique_window = Some("ttl".to_string());
+        assert_eq!(redis_requeue_unique_action(&record), "");
+    }
+
+    #[cfg(feature = "redis")]
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn redis_admin_cancel_releases_unique_lock_and_covers_blocked_jobs() {
+        let (_container, client) = redis_test_client().await;
+        let worker_config = redis_test_worker_config("cancel", "worker-1", 30_000);
+        let mut connection = new_redis_connection_manager(&client, "test redis worker").unwrap();
+        let admin = redis_admin_test_backend(&client, &worker_config);
+
+        let constraints = ResolvedJobConstraints {
+            unique_key: Some("invoice-9".to_string()),
+            unique_window: Some(JobUniquenessWindow::Running),
+            concurrency_limit: None,
+            concurrency_scope: None,
+        };
+        assert_eq!(
+            redis_enqueue_with_constraints(
+                &client,
+                &worker_config,
+                "k1",
+                "send_invoice",
+                &constraints
+            )
+            .await,
+            EnqueueOutcome::Queued
+        );
+
+        // Canceling the queued job must hand the unique lock back so the next
+        // enqueue is accepted instead of coalescing against canceled work.
+        admin.cancel_enqueued_redis("k1").await.unwrap();
+        let lock: Option<String> = redis::cmd("GET")
+            .arg(redis_unique_lock_key(
+                &worker_config.unique_prefix,
+                "send_invoice",
+                "invoice-9",
+            ))
+            .query_async(&mut connection)
+            .await
+            .unwrap();
+        assert!(lock.is_none(), "cancel must release the unique lock");
+        assert_eq!(
+            redis_enqueue_with_constraints(
+                &client,
+                &worker_config,
+                "k2",
+                "send_invoice",
+                &constraints
+            )
+            .await,
+            EnqueueOutcome::Queued
+        );
+
+        // A concurrency-parked job (in the blocked zset, not the queue list)
+        // must be cancelable too.
+        let limited = ResolvedJobConstraints {
+            unique_key: None,
+            unique_window: None,
+            concurrency_limit: Some(1),
+            concurrency_scope: None,
+        };
+        for id in ["b1", "b2"] {
+            redis_enqueue_with_constraints(&client, &worker_config, id, "recalculate", &limited)
+                .await;
+        }
+        // Claim k2 out of the way first, then claim b1 so b2 parks.
+        let mut parked_target = None;
+        while let Some(record) = claim_next_redis_job(&mut connection, &worker_config)
+            .await
+            .unwrap()
+        {
+            if record.name == "recalculate" {
+                parked_target = Some(record);
+            }
+        }
+        let _running = parked_target.expect("one recalculate claimed");
+        let parked: i64 = redis::cmd("ZCARD")
+            .arg(&worker_config.blocked_key)
+            .query_async(&mut connection)
+            .await
+            .unwrap();
+        assert_eq!(parked, 1, "second recalculate should be parked");
+        let parked_id: Vec<String> = redis::cmd("ZRANGE")
+            .arg(&worker_config.blocked_key)
+            .arg(0)
+            .arg(-1)
+            .query_async(&mut connection)
+            .await
+            .unwrap();
+        admin
+            .cancel_enqueued_redis(&parked_id[0])
+            .await
+            .expect("parked jobs must be cancelable");
     }
 
     #[cfg(feature = "redis")]
@@ -8670,7 +8944,7 @@ mod tests {
                 .await
                 .expect("first claim should succeed");
             assert_eq!(job.attempt, 1);
-            pg_nack_failure(&pool, &job_id, "worker-1", "first failure", &job)
+            pg_nack_failure(&pool, &job_id, "worker-1", "first failure", &job, None)
                 .await
                 .unwrap();
 
@@ -8690,7 +8964,7 @@ mod tests {
                 .await
                 .expect("second claim should succeed");
             assert_eq!(job2.attempt, 2);
-            pg_nack_failure(&pool, &job_id, "worker-1", "second failure", &job2)
+            pg_nack_failure(&pool, &job_id, "worker-1", "second failure", &job2, None)
                 .await
                 .unwrap();
 
@@ -8834,7 +9108,7 @@ mod tests {
             let job_f = pg_claim_next_job(&pool, "w1", false)
                 .await
                 .expect("failed job to claim");
-            pg_nack_failure(&pool, &job_f.id, "w1", "server down", &job_f)
+            pg_nack_failure(&pool, &job_f.id, "w1", "server down", &job_f, None)
                 .await
                 .unwrap();
 
@@ -8880,7 +9154,7 @@ mod tests {
             .await
             .unwrap();
             let jf = pg_claim_next_job(&pool, "w", false).await.unwrap();
-            pg_nack_failure(&pool, &jf.id, "w", "boom", &jf)
+            pg_nack_failure(&pool, &jf.id, "w", "boom", &jf, None)
                 .await
                 .unwrap();
 
@@ -8907,7 +9181,7 @@ mod tests {
             )
             .await;
             let jd = pg_claim_next_job(&pool, "w", false).await.unwrap();
-            pg_nack_failure(&pool, &jd.id, "w", "boom", &jd)
+            pg_nack_failure(&pool, &jd.id, "w", "boom", &jd, None)
                 .await
                 .unwrap();
 
@@ -9261,6 +9535,91 @@ mod tests {
             assert!(
                 pg_claim_next_job(&pool, "w2", true).await.is_some(),
                 "the concurrency slot must be free after stale recovery"
+            );
+        }
+
+        #[tokio::test]
+        #[ignore = "requires Docker (testcontainers)"]
+        async fn pg_admin_retry_keeps_unique_key_and_conflicts_with_inflight_twin() {
+            use testcontainers::runners::AsyncRunner as _;
+            use testcontainers_modules::postgres::Postgres;
+
+            let container = Postgres::default().start().await.unwrap();
+            let port = container.get_host_port_ipv4(5432).await.unwrap();
+            let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+            let pool = pg_test_pool(&url);
+            pg_run_migration(&pool).await;
+            let backend = PgJobAdminBackend { pool: pool.clone() };
+
+            let constraints = unique_constraints("invoice-3", JobUniquenessWindow::Running);
+            pg_enqueue_job(
+                &pool,
+                "fail-uq".to_string(),
+                "send_invoice",
+                serde_json::json!({}),
+                1,
+                10,
+                &constraints,
+            )
+            .await
+            .unwrap();
+            // Dead-letter it: claim, then terminal nack (attempt == max).
+            let row = pg_claim_next_job(&pool, "w1", false).await.expect("claim");
+            assert!(
+                pg_nack_failure(&pool, &row.id, "w1", "boom", &row, None)
+                    .await
+                    .unwrap()
+            );
+
+            // The key is free after dead-letter, so a twin can be enqueued.
+            assert_eq!(
+                pg_enqueue_job(
+                    &pool,
+                    "twin".to_string(),
+                    "send_invoice",
+                    serde_json::json!({}),
+                    1,
+                    10,
+                    &constraints,
+                )
+                .await
+                .unwrap(),
+                EnqueueOutcome::Queued
+            );
+
+            // Retrying the failed job while the twin is in flight must be
+            // refused — uniqueness is preserved, not silently dropped.
+            let error = backend.pg_retry_failed("fail-uq").await.unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("an equivalent unique job is already pending or running"),
+                "{error}"
+            );
+
+            // Once the twin settles, the retry goes through and the retried
+            // row still carries its unique key.
+            let twin = pg_claim_next_job(&pool, "w1", false)
+                .await
+                .expect("claim twin");
+            assert!(pg_ack_success(&pool, &twin.id, "w1").await.unwrap());
+            backend.pg_retry_failed("fail-uq").await.unwrap();
+            let retried = pg_fetch_by_id(&pool, "fail-uq").await.unwrap();
+            assert_eq!(retried.status, "enqueued");
+            // And duplicates coalesce against the retried job again.
+            assert_eq!(
+                pg_enqueue_job(
+                    &pool,
+                    "dup".to_string(),
+                    "send_invoice",
+                    serde_json::json!({}),
+                    1,
+                    10,
+                    &constraints,
+                )
+                .await
+                .unwrap(),
+                EnqueueOutcome::Deduplicated
             );
         }
 
@@ -10321,6 +10680,81 @@ mod uniqueness_concurrency_tests {
         );
         assert!(KEYED_MAX_A.load(Ordering::SeqCst) <= 1);
         assert!(KEYED_MAX_B.load(Ordering::SeqCst) <= 1);
+
+        shutdown.cancel();
+        clear_global_job_client();
+    }
+
+    static PENDING_RETRY_CALLS: AtomicUsize = AtomicUsize::new(0);
+    fn pending_retry_handler(
+        _state: AppState,
+        _payload: Value,
+    ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'static>> {
+        Box::pin(async move {
+            if PENDING_RETRY_CALLS.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(AutumnError::internal_server_error(std::io::Error::other(
+                    "first attempt fails",
+                )));
+            }
+            Ok(())
+        })
+    }
+
+    #[tokio::test]
+    async fn local_pending_window_key_is_reacquired_while_retry_waits_out_backoff() {
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+        PENDING_RETRY_CALLS.store(0, Ordering::SeqCst);
+
+        let state = AppState::for_test().with_profile("dev");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        start_local_runtime(
+            vec![JobInfo {
+                name: "pending_retry".to_string(),
+                max_attempts: 2,
+                initial_backoff_ms: 400,
+                uniqueness: Some(JobUniqueness {
+                    by: Vec::new(),
+                    window: JobUniquenessWindow::Pending,
+                }),
+                concurrency: None,
+                handler: pending_retry_handler,
+            }],
+            &state,
+            &shutdown,
+            2,
+            5,
+            250,
+        );
+
+        let payload = serde_json::json!({"invoice_id": 11});
+        enqueue("pending_retry", payload.clone()).await.unwrap();
+
+        // Wait until the first attempt has failed and the retry is scheduled:
+        // record_retry stores the error after the pending key is re-acquired.
+        let retry_scheduled = |state: &AppState| {
+            state
+                .job_registry()
+                .snapshot()
+                .get("pending_retry")
+                .is_some_and(|status| status.last_error.is_some())
+        };
+        assert!(wait_for(2_000, || retry_scheduled(&state)).await);
+
+        // While the retry waits out its backoff the job is pending again, so
+        // a duplicate enqueue must coalesce against the re-acquired key.
+        enqueue("pending_retry", payload).await.unwrap();
+        assert!(
+            wait_for(2_000, || deduplicated(&state, "pending_retry") == 1).await,
+            "duplicate enqueued during retry backoff must coalesce"
+        );
+
+        assert!(wait_for(3_000, || successes(&state, "pending_retry") == 1).await);
+        assert_eq!(
+            PENDING_RETRY_CALLS.load(Ordering::SeqCst),
+            2,
+            "exactly the original two attempts run; the duplicate never does"
+        );
 
         shutdown.cancel();
         clear_global_job_client();
