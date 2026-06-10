@@ -688,7 +688,13 @@ mod tests {
         let subscriber = tracing_subscriber::registry().with(layer);
         let _guard = tracing::dispatcher::set_default(&tracing::Dispatch::new(subscriber));
 
-        tracing::info!(count = 42i64, size = 100u64, ratio = 0.5f64, active = true, "typed fields");
+        tracing::info!(
+            count = 42i64,
+            size = 100u64,
+            ratio = 0.5f64,
+            active = true,
+            "typed fields"
+        );
 
         let snap = buf.snapshot(None, None);
         assert_eq!(snap.len(), 1);
