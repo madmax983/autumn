@@ -96,7 +96,7 @@ pub async fn show_url(
     csrf_field: Option<CsrfFormField>,
 ) -> impl IntoResponse {
     let wizard = wizard_context(session.clone());
-    if let Err(redirect_url) = wizard.guard_step("url", "/bookmarks/add/url").await {
+    if let Err(redirect_url) = wizard.guard_step("url", "/bookmarks/add").await {
         return Redirect::to(&redirect_url).into_response();
     }
     let data: UrlStep = wizard.step_data("url").await.unwrap_or_default();
@@ -126,7 +126,7 @@ pub async fn show_url(
 #[post("/bookmarks/add/url")]
 pub async fn submit_url(session: Session, form: ChangesetForm<UrlStep>) -> impl IntoResponse {
     let wizard = wizard_context(session.clone());
-    if let Err(redirect_url) = wizard.guard_step("url", "/bookmarks/add/url").await {
+    if let Err(redirect_url) = wizard.guard_step("url", "/bookmarks/add").await {
         return Redirect::to(&redirect_url).into_response();
     }
     match form.into_valid() {
@@ -168,7 +168,7 @@ pub async fn show_details(
     csrf_field: Option<CsrfFormField>,
 ) -> impl IntoResponse {
     let wizard = wizard_context(session.clone());
-    if let Err(redirect_url) = wizard.guard_step("details", "/bookmarks/add/url").await {
+    if let Err(redirect_url) = wizard.guard_step("details", "/bookmarks/add").await {
         return Redirect::to(&redirect_url).into_response();
     }
     let data: DetailsStep = wizard.step_data("details").await.unwrap_or_default();
@@ -213,7 +213,7 @@ pub async fn submit_details(
     form: ChangesetForm<DetailsStep>,
 ) -> impl IntoResponse {
     let wizard = wizard_context(session.clone());
-    if let Err(redirect_url) = wizard.guard_step("details", "/bookmarks/add/url").await {
+    if let Err(redirect_url) = wizard.guard_step("details", "/bookmarks/add").await {
         return Redirect::to(&redirect_url).into_response();
     }
     match form.into_valid() {
@@ -345,7 +345,6 @@ pub async fn commit(session: Session, repo: PgBookmarkRepository) -> impl IntoRe
                 url: u.url,
                 title: d.title,
                 tag: d.tag,
-                alive: true,
             };
             if repo.save(&new_bookmark).await.is_err() {
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
