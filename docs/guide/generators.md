@@ -9,6 +9,7 @@ single command. Four subcommands cover the cases you actually hit:
 | `autumn generate migration`          | A Diesel migration directory; columns are inferred when the name matches a verb |
 | `autumn generate task`               | A one-off operational `#[task]` skeleton under `tasks/`                         |
 | `autumn generate scaffold`           | Everything `model` does plus `#[repository]`, HTML routes, smoke test, `routes![]` registration |
+| `autumn generate wizard`             | A session-backed multi-step form wizard with per-step validation and a confirm/commit/cancel flow |
 | `autumn generate admin`              | An `AdminModel` adapter for an existing model, wired to `autumn-admin-plugin`   |
 
 The generators only emit code that uses macros and conventions Autumn already
@@ -423,6 +424,43 @@ to install the OpenSSL libraries through `vcpkg` and set `VCPKG_ROOT` so
 The release SemVer gate checks `autumn-web` optional public feature APIs, so this
 native dependency must be present on machines that run `scripts/check-semver.sh`
 locally.
+
+## `autumn generate wizard`
+
+Multi-step forms where each step is validated before the user advances.
+Session-backed: step data survives page refreshes and back-button navigation
+without requiring the user to re-enter earlier steps.
+
+```bash
+autumn generate wizard checkout shipping payment review
+```
+
+Produces:
+
+```
+src/wizards/checkout.rs        # step structs + GET/POST handlers + confirm/commit/cancel
+src/wizards/mod.rs             # pub mod checkout;  (created or appended)
+tests/checkout_wizard.rs       # ignored integration test skeletons
+```
+
+Step names must be valid Rust identifiers (letters, digits, underscores;
+no hyphens). The names `confirm`, `commit`, and `cancel` are reserved. A
+minimum of two steps is required.
+
+For each step the generator emits:
+- A `{PascalStep}Form` struct with `Serialize`, `Deserialize`, `Validate`, and `Default`.
+- A `GET /{name}/{step}` handler that guards, re-populates from session, and renders the form.
+- A `POST /{name}/{step}` handler that validates, saves to session, and redirects — or returns 422 with errors.
+
+Plus three fixed handlers:
+- `GET  /{name}/confirm` — summary page; guards that all steps are complete.
+- `POST /{name}/commit` — assembles all step data, performs the write, clears session.
+- `POST /{name}/cancel` — clears session state and redirects.
+
+Mount the routes in `src/main.rs` and add `mod wizards;`.
+
+See the [Wizards guide](./wizards.md) for the full runtime API reference and
+the [`examples/bookmarks`](../../examples/bookmarks) app for a worked example.
 
 ## Common flags
 

@@ -2973,3 +2973,32 @@ fn generate_wizard_rejects_duplicate_step_names() {
         "error must mention the duplicate step name; got: {stderr}"
     );
 }
+
+#[test]
+fn generate_wizard_rejects_rust_keyword_as_name() {
+    let (_tmp, project) = fresh_project("wizard-keyword-app");
+    // "type" normalizes to the Rust keyword `type`; `pub mod type;` is invalid Rust.
+    let (_, stderr, code) = run_autumn_failing(
+        &project,
+        &["generate", "wizard", "type", "shipping", "payment"],
+    );
+    assert_eq!(code, Some(1), "Rust keyword wizard name must be rejected");
+    assert!(
+        stderr.contains("keyword") || stderr.contains("type"),
+        "error must mention the keyword issue; got: {stderr}"
+    );
+}
+
+#[test]
+fn generate_wizard_rejects_rust_keyword_as_step_name() {
+    let (_tmp, project) = fresh_project("wizard-keyword-step-app");
+    let (_, stderr, code) = run_autumn_failing(
+        &project,
+        &["generate", "wizard", "checkout", "mod", "payment"],
+    );
+    assert_eq!(code, Some(1), "Rust keyword step name must be rejected");
+    assert!(
+        stderr.contains("keyword") || stderr.contains("mod"),
+        "error must mention the keyword issue; got: {stderr}"
+    );
+}

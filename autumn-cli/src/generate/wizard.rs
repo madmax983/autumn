@@ -124,6 +124,13 @@ fn validate_wizard_name(name: &str) -> Result<(), GenerateError> {
             "only ASCII letters, digits, and underscores are allowed".into(),
         ));
     }
+    let normalized = snake(name);
+    if super::dsl::is_rust_keyword(&normalized) {
+        return Err(GenerateError::InvalidName(
+            name.to_owned(),
+            format!("'{normalized}' is a Rust keyword and cannot be used as a module name"),
+        ));
+    }
     Ok(())
 }
 
