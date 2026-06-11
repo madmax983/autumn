@@ -77,6 +77,9 @@ pub use crate::mail::{
     Mail, MailConfig, MailDeliveryQueue, MailDeliveryQueueHandle, MailError, MailPreview,
     MailPreviewError, MailPreviewRegistry, MailTransport, Mailer, SmtpConfig, TlsMode, Transport,
 };
+/// Shard routing extractors and types for `[[database.shards]]` apps.
+#[cfg(feature = "db")]
+pub use crate::sharding::{ShardKey, ShardKeyOverride, ShardedDb, Shards};
 /// Server-Sent Events (SSE) support.
 pub use crate::sse::{Event, Sse};
 /// Structured CLI argument extractor for one-off `#[task]` handlers.
@@ -255,6 +258,7 @@ mod tests {
             )),
             pool: None,
             replica_pool: None,
+            shards: None,
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: false,

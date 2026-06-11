@@ -970,6 +970,8 @@ impl TestApp {
             pool,
             #[cfg(feature = "db")]
             replica_pool,
+            #[cfg(feature = "db")]
+            shards: None,
             profile: self.config.profile.clone(),
             started_at: std::time::Instant::now(),
             health_detailed: self.config.health.detailed,

@@ -107,6 +107,23 @@ impl ReplicaMigrationReadiness {
     }
 }
 
+/// Borrow an [`EmbeddedMigrations`] as a [`diesel::migration::MigrationSource`].
+///
+/// `EmbeddedMigrations` is neither `Copy` nor `Clone`, but multi-target
+/// (control + shards) startup migration needs to apply the same embedded
+/// set against several databases.
+pub(crate) struct EmbeddedMigrationsRef<'a>(pub &'a EmbeddedMigrations);
+
+impl<DB: diesel::backend::Backend> diesel::migration::MigrationSource<DB>
+    for EmbeddedMigrationsRef<'_>
+{
+    fn migrations(
+        &self,
+    ) -> diesel::migration::Result<Vec<Box<dyn diesel::migration::Migration<DB>>>> {
+        diesel::migration::MigrationSource::<DB>::migrations(self.0)
+    }
+}
+
 /// Run all pending migrations against the given database URL.
 ///
 /// Uses a **synchronous** `PgConnection` (not the async pool) because
@@ -121,7 +138,7 @@ impl ReplicaMigrationReadiness {
 /// or [`MigrationError::Migration`] if a migration fails.
 pub fn run_pending(
     database_url: &str,
-    migrations: EmbeddedMigrations,
+    migrations: impl diesel::migration::MigrationSource<diesel::pg::Pg>,
 ) -> Result<MigrationResult, MigrationError> {
     let mut conn = diesel::PgConnection::establish(database_url)
         .map_err(|e| MigrationError::Connection(e.to_string()))?;
@@ -145,7 +162,7 @@ pub fn run_pending(
 /// or [`MigrationError::Migration`] if status cannot be determined.
 pub fn pending_migrations(
     database_url: &str,
-    migrations: EmbeddedMigrations,
+    migrations: impl diesel::migration::MigrationSource<diesel::pg::Pg>,
 ) -> Result<Vec<String>, MigrationError> {
     let mut conn = diesel::PgConnection::establish(database_url)
         .map_err(|e| MigrationError::Connection(e.to_string()))?;
@@ -238,6 +255,12 @@ fn should_auto_apply(profile: Option<&str>, allow_auto_migrate_in_production: bo
 ///   `allow_auto_migrate_in_production` is enabled.
 /// - **other profiles**: logs pending migrations without auto-applying.
 ///
+/// `target` labels the database being migrated (`"control"` or
+/// `"shard:<name>"`) so a failing target is unambiguous in sharded
+/// deployments. Apply failures exit the process (fail fast): a
+/// half-migrated fleet that boots is worse than a crashed deploy, and
+/// already-migrated targets are skipped idempotently on retry.
+///
 /// Called internally by [`AppBuilder::run`](crate::app::AppBuilder::run)
 /// when migrations are registered via `.migrations()`.
 #[allow(clippy::cognitive_complexity)]
@@ -245,7 +268,8 @@ pub(crate) fn auto_migrate(
     database_url: &str,
     profile: Option<&str>,
     allow_auto_migrate_in_production: bool,
-    migrations: EmbeddedMigrations,
+    migrations: &EmbeddedMigrations,
+    target: &str,
 ) {
     let profile_name = profile.unwrap_or("none");
     let is_dev = matches!(profile_name, "dev" | "development");
@@ -254,36 +278,38 @@ pub(crate) fn auto_migrate(
 
     if should_auto_apply {
         if is_dev {
-            tracing::info!("Development profile: running pending database migrations...");
+            tracing::info!(target = %target, "Development profile: running pending database migrations...");
         } else {
             tracing::warn!(
                 profile = profile_name,
+                target = %target,
                 "Production auto-migration is enabled; running pending database migrations"
             );
         }
-        match run_pending(database_url, migrations) {
+        match run_pending(database_url, EmbeddedMigrationsRef(migrations)) {
             Ok(result) if result.applied.is_empty() => {
-                tracing::info!("No pending migrations");
+                tracing::info!(target = %target, "No pending migrations");
             }
             Ok(result) => {
                 for name in &result.applied {
-                    tracing::info!(migration = %name, "Applied migration");
+                    tracing::info!(migration = %name, target = %target, "Applied migration");
                 }
                 tracing::info!(
                     count = result.applied.len(),
+                    target = %target,
                     "All pending migrations applied"
                 );
             }
             Err(e) => {
-                tracing::error!(error = %e, "Failed to run migrations");
+                tracing::error!(error = %e, target = %target, "Failed to run migrations");
                 std::process::exit(1);
             }
         }
     } else {
         // In non-dev modes, just report status
-        match pending_migrations(database_url, migrations) {
+        match pending_migrations(database_url, EmbeddedMigrationsRef(migrations)) {
             Ok(pending) if pending.is_empty() => {
-                tracing::info!("Database migrations are up to date");
+                tracing::info!(target = %target, "Database migrations are up to date");
             }
             Ok(pending) => {
                 if is_prod {
@@ -298,14 +324,15 @@ pub(crate) fn auto_migrate(
                 }
                 tracing::warn!(
                     count = pending.len(),
+                    target = %target,
                     "Pending migrations detected. Run `autumn migrate` to apply them."
                 );
                 for name in &pending {
-                    tracing::warn!(migration = %name, "Pending migration");
+                    tracing::warn!(migration = %name, target = %target, "Pending migration");
                 }
             }
             Err(e) => {
-                tracing::warn!(error = %e, "Could not check migration status");
+                tracing::warn!(error = %e, target = %target, "Could not check migration status");
             }
         }
     }

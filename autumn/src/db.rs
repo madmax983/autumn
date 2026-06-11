@@ -220,6 +220,13 @@ pub trait DbState {
         self.replica_pool().or_else(|| self.pool())
     }
 
+    /// Returns the configured shard set, when `[[database.shards]]`
+    /// entries exist. Defaults to `None` so unsharded states need no
+    /// changes.
+    fn shards(&self) -> Option<&crate::sharding::ShardSet> {
+        None
+    }
+
     /// Returns any registered database connection checkout interceptors.
     fn db_interceptors(
         &self,
@@ -690,6 +697,36 @@ pub fn create_topology(config: &DatabaseConfig) -> Result<Option<DatabaseTopolog
         .transpose()?;
 
     Ok(Some(DatabaseTopology { primary, replica }))
+}
+
+/// Create one shard's primary and optional replica pools, applying the
+/// shard's pool-size and timeout fallbacks to the `[database]` defaults.
+///
+/// # Errors
+///
+/// Returns [`PoolError`] if either configured role cannot be built.
+pub fn create_shard_topology(
+    shard: &crate::config::ShardConfig,
+    defaults: &DatabaseConfig,
+) -> Result<DatabaseTopology, PoolError> {
+    let primary = build_pool(
+        &shard.primary_url,
+        shard.effective_primary_pool_size(defaults),
+        defaults.connect_timeout_secs,
+    )?;
+    let replica = shard
+        .replica_url
+        .as_deref()
+        .map(|url| {
+            build_pool(
+                url,
+                shard.effective_replica_pool_size(defaults),
+                defaults.connect_timeout_secs,
+            )
+        })
+        .transpose()?;
+
+    Ok(DatabaseTopology { primary, replica })
 }
 
 // ── Db extractor ─────────────────────────────────────────────
@@ -1166,6 +1203,25 @@ pub trait DatabasePoolProvider: Send + Sync + 'static {
 
             Ok(Some(DatabaseTopology::from_pools(primary, replica)))
         }
+    }
+
+    /// Create one shard's [`DatabaseTopology`] from its
+    /// `[[database.shards]]` entry.
+    ///
+    /// The default implementation uses Autumn's deadpool factory for both
+    /// roles. Override to decorate per-shard pools (metrics wrappers,
+    /// circuit breakers) the same way `create_pool` decorates the control
+    /// role.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PoolError`] if either configured role cannot be built.
+    fn create_shard_topology(
+        &self,
+        shard: &crate::config::ShardConfig,
+        defaults: &DatabaseConfig,
+    ) -> impl std::future::Future<Output = Result<DatabaseTopology, PoolError>> + Send {
+        async move { create_shard_topology(shard, defaults) }
     }
 }
 
