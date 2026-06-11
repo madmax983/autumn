@@ -123,6 +123,7 @@ impl WizardContext {
     }
 
     /// The session key used to store `step`'s data.
+    #[must_use]
     pub fn session_key(&self, step: &str) -> String {
         format!("{WIZARD_KEY_PREFIX}:{}:{}", self.name, step)
     }
@@ -151,6 +152,10 @@ impl WizardContext {
     /// step is the first incomplete step (or all prior steps are complete),
     /// returns `Ok(())`.
     ///
+    /// # Errors
+    ///
+    /// Returns `Err(redirect_url)` when a prior step is incomplete.
+    ///
     /// # Usage
     ///
     /// ```rust,ignore
@@ -159,9 +164,8 @@ impl WizardContext {
     /// }
     /// ```
     pub async fn guard_step(&self, current_step: &str, base_path: &str) -> Result<(), String> {
-        let current_idx = match self.step_index(current_step) {
-            Some(i) => i,
-            None => return Ok(()), // unknown step — let the handler decide
+        let Some(current_idx) = self.step_index(current_step) else {
+            return Ok(()); // unknown step — let the handler decide
         };
         let base_path = base_path.trim_end_matches('/');
         for step in &self.steps[..current_idx] {
@@ -180,7 +184,11 @@ impl WizardContext {
     /// # Errors
     ///
     /// Returns [`WizardError::Serialize`] when `data` cannot be serialized.
-    pub async fn save_step<T: Serialize>(&self, step: &str, data: &T) -> Result<(), WizardError> {
+    pub async fn save_step<T: Serialize + Sync>(
+        &self,
+        step: &str,
+        data: &T,
+    ) -> Result<(), WizardError> {
         let json = serde_json::to_string(data)?;
         let key = self.session_key(step);
         self.session.insert(key, json).await;
@@ -336,14 +344,13 @@ pub async fn wizard_progress(ctx: &WizardContext, current_step: &str) -> Markup 
 
 /// Convert a `snake_case` or `kebab-case` step name into a Title Case label.
 fn title_case(s: &str) -> String {
-    s.split(|c| c == '_' || c == '-')
+    s.split(['_', '-'])
         .filter(|w| !w.is_empty())
         .map(|w| {
             let mut c = w.chars();
-            match c.next() {
-                None => String::new(),
-                Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
-            }
+            c.next().map_or_else(String::new, |f| {
+                f.to_uppercase().collect::<String>() + c.as_str()
+            })
         })
         .collect::<Vec<_>>()
         .join(" ")
@@ -664,7 +671,7 @@ mod tests {
         let wizard = make_wizard(make_session());
         let all = wizard.all_step_data_json().await;
         assert_eq!(all.len(), 3);
-        assert!(all.iter().all(|v| v.is_none()));
+        assert!(all.iter().all(Option::is_none));
     }
 
     #[tokio::test]
