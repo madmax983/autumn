@@ -254,3 +254,13 @@ All generated bulk methods (`save_many`, `update_many`, `delete_many`, `upsert_m
 - **Atomic Execution**: On repositories with hooks configured, the entire batch query and hook execution are wrapped in an atomic database transaction. If any individual record hook fails or if the database returns an error, the entire operation is automatically rolled back.
 - **Participation in `db.tx`**: If a bulk operation is called inside a `db.tx` block, it automatically participates in that outer transaction. No new nested transaction is started, conforming to Autumn's nesting policy.
 - **Durable Commit Hooks**: If commit hooks are enabled (`commit_hooks = true`), post-commit hooks like `after_create_commit` will be staged during bulk writes and executed sequentially only when the surrounding database transaction successfully commits.
+
+## Transactions and Read Replicas
+
+When `database.replica_url` is configured, generated repository read methods normally route to the replica pool (see the [repositories guide](repositories.md#read-replicas-automatic-read-routing)). Transactions are the exception: **everything inside a transaction stays on the single primary connection that owns it**.
+
+- `db.tx(|conn| ...)` hands your closure the transaction's primary connection; every query you run on `conn` — reads included — executes on the primary. There is no split-brain where a transaction writes to the primary but reads stale data from a replica.
+- `repo.with_lock(id, |record, conn| ...)` performs its `SELECT ... FOR UPDATE` and runs your closure on a primary transaction connection, since locking reads are only meaningful on the writer.
+- The internal transactions opened by generated write methods (`save`, `update`, bulk operations, hook lifecycles) acquire from the primary pool, so hook-driven reads-during-write also see the primary.
+
+For read-your-writes *outside* a transaction — e.g. a handler that saves and then re-fetches — use the repository's `on_primary()` escape hatch instead of opening a transaction just to pin the connection.

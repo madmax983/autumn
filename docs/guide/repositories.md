@@ -124,6 +124,43 @@ RETURNING *;
 
 ---
 
+## Read Replicas: Automatic Read Routing
+
+When `database.replica_url` is configured, every generated **read-only** method — `find_by_id`, `find_all`, `count`, `exists_by_id`, `paginate`, `cursor_page`, derived `find_by_*` / `count_by_*` / `exists_by_*` queries, and full-text `search` / `search_page` — automatically acquires its connection from the replica pool. Mutating methods (`save`, `update`, `delete_by_id`, the bulk operations, hook-driven writes, `with_lock`) always run on the primary. Provisioning a replica therefore offloads your primary with **zero application code changes**.
+
+When no replica is configured, all methods use the primary — single-pool apps are unaffected.
+
+The routing decision is snapshotted per request from `AppState::read_pool()`, so it honors the `database.replica_fallback` policy: when the replica is unready, reads either fall back to the primary (`replica_fallback = "primary"`) or fail fast with `503 Service Unavailable` (`replica_fallback = "fail_readiness"`) rather than silently serving from the wrong role.
+
+### Opting Out: `primary_reads`
+
+Replica reads can be **stale** by up to your replication lag. For aggregates where a stale read is worse than extra primary load (e.g. account balances, inventory counters), pin the whole repository to the primary:
+
+```rust
+#[autumn_web::repository(AccountBalance, primary_reads)]
+pub trait AccountBalanceRepository {}
+```
+
+All generated reads on this repository use the primary pool, even when a replica is configured. Prefer the per-call escape hatch below when only *some* call sites are read-after-write-sensitive — a repository-wide opt-out gives up replica offloading everywhere.
+
+### Read-Your-Writes: `on_primary()`
+
+After a handler performs a write, an immediate read may land on a replica that has not replayed it yet. The generated `on_primary()` method returns a clone of the repository whose reads are pinned to the primary, so you can read-your-writes without dropping to raw Diesel:
+
+```rust
+let created = repo.save(&new_post).await?;
+// The replica may not have seen this row yet — read it from the primary.
+let fresh = repo.on_primary().find_by_id(created.id).await?;
+```
+
+The original `repo` keeps routing reads to the replica; only the pinned clone (and call chains on it) use the primary.
+
+### Transactions
+
+Reads executed inside an explicit transaction (`db.tx(...)` or `repo.with_lock(...)`) run on the transaction's own primary connection — a transaction never splits reads onto a replica.
+
+---
+
 ## Performance & Scaling Guidelines
 
 Bulk operations are built for maximum performance, with the following built-in safeguards:
