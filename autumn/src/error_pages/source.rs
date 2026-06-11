@@ -24,23 +24,18 @@ pub fn read_source_context(file_path: &str, failing_line: u32) -> Vec<SourceLine
         return Vec::new();
     };
 
-    let all_lines: Vec<&str> = contents.lines().collect();
-    let Ok(total) = u32::try_from(all_lines.len()) else {
-        return Vec::new();
-    };
-
-    if failing_line > total {
-        return Vec::new();
-    }
-
     let start = failing_line.saturating_sub(CONTEXT_RADIUS).max(1);
-    let end = (failing_line + CONTEXT_RADIUS).min(total);
+    let end = failing_line + CONTEXT_RADIUS;
 
-    (start..=end)
-        .map(|n| SourceLine {
-            line_no: n,
-            content: all_lines[(n - 1) as usize].to_owned(),
-            is_highlighted: n == failing_line,
+    contents
+        .lines()
+        .enumerate()
+        .skip((start - 1) as usize)
+        .take((end - start + 1) as usize)
+        .map(|(i, line)| SourceLine {
+            line_no: (i + 1) as u32,
+            content: line.to_owned(),
+            is_highlighted: (i + 1) as u32 == failing_line,
         })
         .collect()
 }
@@ -161,25 +156,17 @@ pub fn parse_backtrace_string(
 /// Windows drive-letter colons (e.g. `C:\path\file.rs:42`) are handled
 /// correctly — the drive letter colon is not mistaken for a line/col separator.
 fn parse_location(s: &str) -> (String, u32) {
-    let parts: Vec<&str> = s.split(':').collect();
-    let n = parts.len();
-    if n >= 2
-        && let Some(&last) = parts.last()
-        && last.parse::<u32>().is_ok()
-    {
-        {
-            // Last part is numeric — could be COL. Check if second-last is LINE.
-            if n >= 3
-                && let Ok(line_no) = parts[n - 2].parse::<u32>()
-            {
-                let file = parts[..n - 2].join(":");
-                return (file, line_no);
+    if let Some((rest, last_str)) = s.rsplit_once(':') {
+        if last_str.parse::<u32>().is_ok() {
+            if let Some((file_str, second_last_str)) = rest.rsplit_once(':') {
+                if let Ok(line_no) = second_last_str.parse::<u32>() {
+                    return (file_str.to_string(), line_no);
+                }
             }
-            // No COL: last part is LINE.
-            let line_no = last.parse::<u32>().unwrap_or(0);
-            if line_no > 0 {
-                let file = parts[..n - 1].join(":");
-                return (file, line_no);
+            if let Ok(line_no) = last_str.parse::<u32>() {
+                if line_no > 0 {
+                    return (rest.to_string(), line_no);
+                }
             }
         }
     }
