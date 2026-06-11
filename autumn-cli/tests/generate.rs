@@ -2663,12 +2663,7 @@ fn generate_wizard_creates_expected_files() {
     run_autumn(
         &project,
         &[
-            "generate",
-            "wizard",
-            "checkout",
-            "shipping",
-            "payment",
-            "review",
+            "generate", "wizard", "checkout", "shipping", "payment", "review",
         ],
     );
 
@@ -2886,16 +2881,14 @@ fn generate_wizard_force_overwrites() {
     run_autumn(
         &project,
         &[
-            "generate",
-            "wizard",
-            "checkout",
-            "shipping",
-            "payment",
-            "--force",
+            "generate", "wizard", "checkout", "shipping", "payment", "--force",
         ],
     );
     let regenerated = fs::read_to_string(&wizard_path).unwrap();
-    assert_eq!(regenerated, original, "--force must restore original content");
+    assert_eq!(
+        regenerated, original,
+        "--force must restore original content"
+    );
 }
 
 #[test]
@@ -2904,23 +2897,13 @@ fn generate_wizard_mod_rs_is_idempotent() {
     run_autumn(
         &project,
         &[
-            "generate",
-            "wizard",
-            "checkout",
-            "shipping",
-            "payment",
-            "--force",
+            "generate", "wizard", "checkout", "shipping", "payment", "--force",
         ],
     );
     run_autumn(
         &project,
         &[
-            "generate",
-            "wizard",
-            "checkout",
-            "shipping",
-            "payment",
-            "--force",
+            "generate", "wizard", "checkout", "shipping", "payment", "--force",
         ],
     );
     let mod_rs = fs::read_to_string(project.join("src/wizards/mod.rs")).unwrap();
