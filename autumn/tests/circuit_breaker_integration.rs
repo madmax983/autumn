@@ -168,7 +168,7 @@ async fn test_circuit_breaker_downstream_outage_flow() {
     act_health.assert_status(503);
     act_health.assert_json::<serde_json::Value, _>(|val| {
         assert_eq!(val["status"], "DOWN");
-        let cb_details = &val["components"]["circuit_breaker.127.0.0.1"];
+        let cb_details = &val["components"][&format!("circuit_breaker.127.0.0.1:{}", port)];
         assert_eq!(cb_details["status"], "DOWN");
         assert_eq!(cb_details["details"]["state"], "OPEN");
     });
@@ -194,9 +194,76 @@ async fn test_circuit_breaker_downstream_outage_flow() {
     act_health_final.assert_ok();
     act_health_final.assert_json::<serde_json::Value, _>(|val| {
         assert_eq!(val["status"], "UP");
-        let cb_details = &val["components"]["circuit_breaker.127.0.0.1"];
+        let cb_details = &val["components"][&format!("circuit_breaker.127.0.0.1:{}", port)];
         assert_eq!(cb_details["status"], "UP");
         assert_eq!(cb_details["details"]["state"], "CLOSED");
     });
+    autumn_web::circuit_breaker::global_registry().clear();
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines, clippy::await_holding_lock)]
+async fn test_circuit_breaker_distinct_ports() {
+    let _lock = autumn_web::circuit_breaker::TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    autumn_web::circuit_breaker::global_registry().clear();
+
+    // Setup two mock downstream servers on different ports
+    // Port 1 always returns 500 (internal error)
+    let mock_app_1 = Router::new().route(
+        "/downstream-target",
+        get(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
+    );
+    let listener_1 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port1 = listener_1.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        axum::serve(listener_1, mock_app_1).await.unwrap();
+    });
+
+    // Port 2 always returns 200 (OK)
+    let mock_app_2 = Router::new().route(
+        "/downstream-target",
+        get(|| async { StatusCode::OK }),
+    );
+    let listener_2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port2 = listener_2.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        axum::serve(listener_2, mock_app_2).await.unwrap();
+    });
+
+    // Configure Autumn app with minimum_sample_count = 2
+    let mut config = AutumnConfig::default();
+    config.health.detailed = true;
+    config.resilience.circuit_breaker.defaults.failure_ratio_threshold = Some(0.5);
+    config.resilience.circuit_breaker.defaults.minimum_sample_count = Some(2);
+    config.resilience.circuit_breaker.defaults.open_duration_secs = Some(60);
+    config.resilience.circuit_breaker.defaults.sample_window_secs = Some(10);
+    config.resilience.circuit_breaker.defaults.half_open_trial_count = Some(1);
+
+    let client = TestApp::new()
+        .config(config)
+        .routes(routes![call_downstream, unrelated])
+        .build();
+
+    // Call port 1 (failures) twice to trip its breaker
+    let _ = client.get(&format!("/call-downstream/{port1}")).send().await;
+    let _ = client.get(&format!("/call-downstream/{port1}")).send().await;
+
+    // Call port 2 (successes) twice
+    let resp2_1 = client.get(&format!("/call-downstream/{port2}")).send().await;
+    resp2_1.assert_ok();
+    let resp2_2 = client.get(&format!("/call-downstream/{port2}")).send().await;
+    resp2_2.assert_ok();
+
+    // Port 1 should fail fast now due to Open circuit breaker
+    let resp1_fast = client.get(&format!("/call-downstream/{port1}")).send().await;
+    resp1_fast.assert_status(503);
+    assert_eq!(resp1_fast.text(), "circuit breaker open");
+
+    // Port 2 should still be completely healthy and closed!
+    let resp2_fast = client.get(&format!("/call-downstream/{port2}")).send().await;
+    resp2_fast.assert_ok();
+
     autumn_web::circuit_breaker::global_registry().clear();
 }

@@ -779,7 +779,14 @@ impl RequestBuilder {
         // ── Resilience / Circuit Breaker ──────────────────────────────────
         let host = url::Url::parse(&self.url)
             .ok()
-            .and_then(|u| u.host_str().map(ToOwned::to_owned))
+            .map(|u| {
+                let h = u.host_str().unwrap_or("unknown");
+                if let Some(port) = u.port() {
+                    format!("{}:{}", h, port)
+                } else {
+                    h.to_owned()
+                }
+            })
             .unwrap_or_else(|| "unknown".to_owned());
 
         let breaker = self.resilience_config.as_ref().map_or_else(
