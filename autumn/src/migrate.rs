@@ -75,7 +75,7 @@ pub enum MigrationError {
     },
 }
 
-/// PostgreSQL advisory lock key used to serialize concurrent migration runs.
+/// `PostgreSQL` advisory lock key used to serialize concurrent migration runs.
 ///
 /// Derived from the big-endian encoding of the ASCII bytes `autn_mig` (`i64`).
 /// The value is stable across framework versions so operators can monitor
@@ -91,7 +91,7 @@ pub enum MigrationError {
 ///   AND objid   = 1601005927
 ///   AND objsubid = 1;
 /// ```
-pub const MIGRATION_ADVISORY_LOCK_KEY: i64 = 0x6175_746E_5F6D_6967_u64 as i64;
+pub const MIGRATION_ADVISORY_LOCK_KEY: i64 = 0x6175_746E_5F6D_6967_u64.cast_signed();
 
 /// Default time to wait for the migration advisory lock before failing.
 ///
@@ -274,14 +274,14 @@ pub(crate) async fn check_replica_migration_readiness_blocking(
     })
 }
 
-/// Acquire the PostgreSQL session-level advisory lock that serializes migration runs.
+/// Acquire the `PostgreSQL` session-level advisory lock that serializes migration runs.
 ///
 /// Polls [`pg_try_advisory_lock`] at 500 ms intervals until the lock is
 /// acquired or `timeout` elapses. Logs at `INFO` on acquisition and `DEBUG`
 /// while waiting.
 ///
-/// **Non-Postgres note:** advisory locks are a PostgreSQL-specific primitive.
-/// SQLite and in-memory test harnesses do not support them. Those backends are
+/// **Non-`PostgreSQL` note:** advisory locks are a `PostgreSQL`-specific primitive.
+/// `SQLite` and in-memory test harnesses do not support them. Those backends are
 /// single-process by nature; `run_pending` (the unlocked variant) is the right
 /// choice there.
 ///
@@ -331,11 +331,11 @@ pub fn acquire_migration_lock(
     }
 }
 
-/// Release the PostgreSQL session-level advisory lock acquired by
+/// Release the `PostgreSQL` session-level advisory lock acquired by
 /// [`acquire_migration_lock`].
 ///
 /// Called automatically by [`MigrationLockGuard`] on drop. Logs at `INFO` on
-/// success and `WARN` if the lock was not held or the query fails. PostgreSQL
+/// success and `WARN` if the lock was not held or the query fails. `PostgreSQL`
 /// also releases session-level advisory locks automatically when the connection
 /// closes, so a missed explicit release is safe.
 pub fn release_migration_lock(conn: &mut diesel::PgConnection) {
@@ -355,16 +355,16 @@ pub fn release_migration_lock(conn: &mut diesel::PgConnection) {
     }
 }
 
-/// RAII guard that holds a PostgreSQL advisory lock for the duration of a
+/// RAII guard that holds a `PostgreSQL` advisory lock for the duration of a
 /// migration run.
 ///
 /// Created by [`hold_migration_lock`]. The lock is released when this guard
 /// drops, or automatically when the underlying connection closes on process
 /// exit (so `std::process::exit` is safe).
 ///
-/// # Non-Postgres backends
+/// # Non-`PostgreSQL` backends
 ///
-/// SQLite and in-memory test harnesses do not support advisory locks and do
+/// `SQLite` and in-memory test harnesses do not support advisory locks and do
 /// not need cross-process serialization (they are single-process by nature).
 /// Skip this guard when running against those backends.
 pub struct MigrationLockGuard {
@@ -421,9 +421,9 @@ pub fn hold_migration_lock(
 ///
 /// Pass `wait_timeout = None` to use [`DEFAULT_LOCK_WAIT_TIMEOUT`] (60 s).
 ///
-/// # Non-Postgres note
+/// # Non-`PostgreSQL` note
 ///
-/// Advisory locks are PostgreSQL-specific. For SQLite or in-memory test
+/// Advisory locks are `PostgreSQL`-specific. For `SQLite` or in-memory test
 /// harnesses call [`run_pending`] directly — those backends are single-process
 /// and do not require cross-process serialization.
 ///
@@ -567,14 +567,11 @@ mod tests {
 
     #[test]
     fn migration_advisory_lock_key_is_positive_and_stable() {
-        assert!(
-            MIGRATION_ADVISORY_LOCK_KEY > 0,
-            "lock key must be representable as a positive i64 for pg_advisory_lock"
-        );
+        const { assert!(MIGRATION_ADVISORY_LOCK_KEY > 0) };
         // Exact value is part of the public API; it must not drift across versions.
         assert_eq!(
             MIGRATION_ADVISORY_LOCK_KEY,
-            0x6175_746E_5F6D_6967_u64 as i64
+            0x6175_746E_5F6D_6967_u64.cast_signed()
         );
     }
 
