@@ -1,0 +1,108 @@
+x-bookmarks-base: &bookmarks-base
+  build:
+    context: ../..
+    dockerfile: examples/bookmarks-sharded/Dockerfile
+  environment:
+    AUTUMN_PROFILE: docker
+    AUTUMN_MANIFEST_DIR: /app/examples/bookmarks-sharded
+    # All replicas must share the same signing secret so that session cookies
+    # and CSRF tokens signed by one replica are accepted by the others.
+    # Generate once: openssl rand -hex 32
+    AUTUMN_SECURITY__SIGNING_SECRET: "${AUTUMN_SECURITY__SIGNING_SECRET:?AUTUMN_SECURITY__SIGNING_SECRET is required. Generate with: openssl rand -hex 32}"
+  restart: unless-stopped
+
+x-postgres-base: &postgres-base
+  image: postgres:16
+  restart: unless-stopped
+
+services:
+  bookmarks-migrate:
+    <<: *bookmarks-base
+    command: ["/app/bookmarks-sharded-migrate"]
+    restart: "no"
+    depends_on:
+      postgres-control:
+        condition: service_healthy
+      postgres-shard-0:
+        condition: service_healthy
+      postgres-shard-1:
+        condition: service_healthy
+
+  # Control database: framework state (jobs, sessions, flags). NOT sharded.
+  postgres-control:
+    <<: *postgres-base
+    environment:
+      POSTGRES_DB: bookmarks_control
+      POSTGRES_USER: autumn
+      POSTGRES_PASSWORD: autumn
+    ports:
+      - "5442:5432"
+    volumes:
+      - pgdata-control:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U autumn -d bookmarks_control"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # Shard primaries: tenant data, routed by slot.
+  postgres-shard-0:
+    <<: *postgres-base
+    environment:
+      POSTGRES_DB: bookmarks_shard0
+      POSTGRES_USER: autumn
+      POSTGRES_PASSWORD: autumn
+    ports:
+      - "5443:5432"
+    volumes:
+      - pgdata-shard-0:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U autumn -d bookmarks_shard0"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  postgres-shard-1:
+    <<: *postgres-base
+    environment:
+      POSTGRES_DB: bookmarks_shard1
+      POSTGRES_USER: autumn
+      POSTGRES_PASSWORD: autumn
+    ports:
+      - "5444:5432"
+    volumes:
+      - pgdata-shard-1:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U autumn -d bookmarks_shard1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # Two stateless web replicas behind nginx. Both hash the same tenant to
+  # the same shard — the routing function is deterministic across processes.
+  bookmarks-1:
+    <<: *bookmarks-base
+    depends_on:
+      bookmarks-migrate:
+        condition: service_completed_successfully
+
+  bookmarks-2:
+    <<: *bookmarks-base
+    depends_on:
+      bookmarks-migrate:
+        condition: service_completed_successfully
+
+  nginx:
+    image: nginx:1.27
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - bookmarks-1
+      - bookmarks-2
+
+volumes:
+  pgdata-control:
+  pgdata-shard-0:
+  pgdata-shard-1:

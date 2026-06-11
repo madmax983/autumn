@@ -97,6 +97,21 @@ blocks publishing `autumn-web` or `autumn-cli`.
 
 ---
 
+### `examples/bookmarks-sharded` — Horizontal Sharding
+
+<!-- catalog:example name=bookmarks-sharded tier=supported -->
+
+| Field | Value |
+|-------|-------|
+| **Persona** | Developer scaling tenant data horizontally across multiple Postgres databases |
+| **Journey** | Framework-native sharding: tenant id → logical slot → shard, control database for framework state, multi-replica web tier, one-shot multi-target migrator |
+| **Key capabilities** | `[[database.shards]]` + `slots` config, `ShardedDb`/`Shards` extractors, concurrent `each_shard` fan-out, `db:shard:*` health components, per-shard metrics |
+| **Prerequisites** | Docker and Docker Compose |
+| **Run command** | `docker compose -f examples/bookmarks-sharded/docker-compose.yml up -d --build` |
+| **Success proof** | `curl -H 'X-Tenant-Id: acme' http://localhost:3000/api/bookmarks` returns `{"shard":"shard0","bookmarks":[]}` |
+
+---
+
 ### `examples/wiki` — Mutation Hooks and Revision History
 
 <!-- catalog:example name=wiki tier=supported -->
@@ -229,6 +244,7 @@ can pick the closest starting point without overlap.
 | Admin / static rendering | `blog` | Blog engine with admin UI and `#[static_get]` pre-rendering |
 | Profiles / tasks | `bookmarks` | Repository macro, profile layering, actuator, hourly scheduled task |
 | Distributed deployment | `bookmarks-distributed` | Primary + replica Postgres, multi-replica web tier, Docker Compose |
+| Horizontal sharding | `bookmarks-sharded` | Tenant → slot → shard routing, control DB, cross-shard fan-out, Docker Compose |
 | Hooks / revisions | `wiki` | Before/after-save hooks, slug lifecycle, full revision trail |
 | Full-stack clone | `reddit-clone` | Auth, sessions, jobs, channels, email — the complete server-first stack |
 | Custom config loading | `custom_config_loader` | Replace the default config loader with a custom `ConfigLoader` |
