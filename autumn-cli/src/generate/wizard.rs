@@ -56,6 +56,17 @@ pub fn plan_wizard(
         )));
     }
 
+    // Reject duplicate step names after normalization.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for step in steps {
+        let normalized = snake(step);
+        if !seen.insert(normalized.clone()) {
+            return Err(GenerateError::Config(format!(
+                "duplicate step name after normalization: '{normalized}'"
+            )));
+        }
+    }
+
     let snake_name = snake(name);
     let pascal_name = pascal(name);
 
@@ -76,7 +87,9 @@ pub fn plan_wizard(
 
     // Integration test
     plan.create(
-        project_root.join("tests").join(format!("{snake_name}_wizard.rs")),
+        project_root
+            .join("tests")
+            .join(format!("{snake_name}_wizard.rs")),
         render_wizard_test(&snake_name, &pascal_name, steps),
     );
 
@@ -90,13 +103,17 @@ fn validate_wizard_name(name: &str) -> Result<(), GenerateError> {
             "name cannot be empty".into(),
         ));
     }
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-    {
+    let first = name.chars().next().unwrap();
+    if !first.is_ascii_alphabetic() && first != '_' {
         return Err(GenerateError::InvalidName(
             name.to_owned(),
-            "only ASCII letters, digits, underscores, and hyphens are allowed".into(),
+            "name must start with an ASCII letter or underscore".into(),
+        ));
+    }
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Err(GenerateError::InvalidName(
+            name.to_owned(),
+            "only ASCII letters, digits, and underscores are allowed".into(),
         ));
     }
     Ok(())
@@ -121,9 +138,7 @@ fn render_wizard_file(snake_name: &str, pascal_name: &str, steps: &[String]) -> 
 use autumn_web::prelude::*;
 use autumn_web::form::ChangesetForm;
 use autumn_web::wizard::{{WizardContext, wizard_progress}};
-use axum::response::Redirect;
 use serde::{{Deserialize, Serialize}};
-use validator::Validate;
 
 // ── Wizard configuration ───────────────────────────────────────────
 
@@ -166,6 +181,7 @@ fn render_route_list_comment(snake_name: &str, steps: &[String]) -> String {
         lines.push(format!("//!     {snake_name}::show_{s},"));
         lines.push(format!("//!     {snake_name}::submit_{s},"));
     }
+    lines.push(format!("//!     {snake_name}::show_confirm,"));
     lines.push(format!("//!     {snake_name}::commit,"));
     lines.push(format!("//!     {snake_name}::cancel,"));
     lines.join("\n")
@@ -195,7 +211,7 @@ pub struct {pascal_step}Form {{
         .join("\n")
 }
 
-fn render_step_handlers(snake_name: &str, pascal_name: &str, steps: &[String]) -> String {
+fn render_step_handlers(snake_name: &str, _pascal_name: &str, steps: &[String]) -> String {
     let mut out = Vec::new();
     let base_path = format!("/{snake_name}");
 
@@ -205,20 +221,20 @@ fn render_step_handlers(snake_name: &str, pascal_name: &str, steps: &[String]) -
         let next_path = if i + 1 < steps.len() {
             format!("{}/{}", base_path, snake(&steps[i + 1]))
         } else {
-            format!("{base_path}/commit")
+            format!("{base_path}/confirm")
         };
 
         // GET handler
         out.push(format!(
             r#"/// Show the `{s}` step form.
 #[get("/{snake_name}/{s}")]
-pub async fn show_{s}(session: Session, csrf: CsrfToken) -> impl IntoResponse {{
+pub async fn show_{s}(session: Session, csrf: CsrfToken, csrf_field: CsrfFormField) -> impl IntoResponse {{
     let wizard = wizard_context(session.clone());
     if let Err(redirect_url) = wizard.guard_step("{s}", "{base_path}").await {{
         return Redirect::to(&redirect_url).into_response();
     }}
     let data: {pascal_step}Form = wizard.step_data("{s}").await.unwrap_or_default();
-    let form = ChangesetForm::blank(data, csrf.token());
+    let form = ChangesetForm::blank(data, csrf.token()).with_csrf_field(csrf_field.0);
     html! {{
         (wizard_progress(&wizard, "{s}").await)
         (form.form_tag("/{snake_name}/{s}", "post", html! {{
@@ -239,8 +255,7 @@ pub async fn submit_{s}(session: Session, form: ChangesetForm<{pascal_step}Form>
     }}
     match form.into_valid() {{
         Ok(data) => {{
-            if let Err(e) = wizard.save_step("{s}", &data).await {{
-                tracing::error!(wizard = "{snake_name}", step = "{s}", error = %e, "Failed to save step");
+            if wizard.save_step("{s}", &data).await.is_err() {{
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }}
             Redirect::to("{next_path}").into_response()
@@ -267,11 +282,47 @@ pub async fn submit_{s}(session: Session, form: ChangesetForm<{pascal_step}Form>
         ));
     }
 
-    // Commit handler
+    // Confirm (GET) + Commit (POST) + Cancel handlers
+    let load_steps_code = steps
+        .iter()
+        .map(|step| {
+            let s = snake(step);
+            let pascal_step = pascal(step);
+            format!(
+                "    let {s}_data: Option<{pascal_step}Form> = wizard.step_data(\"{s}\").await;"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
     out.push(format!(
-        r#"/// Commit the wizard: assemble all step data and perform the final action.
-#[get("/{snake_name}/commit")]
-pub async fn commit(session: Session, flash: Flash) -> impl IntoResponse {{
+        r#"/// Show a summary of all wizard steps for the user to review before committing.
+#[get("/{snake_name}/confirm")]
+pub async fn show_confirm(session: Session, csrf: CsrfToken) -> impl IntoResponse {{
+    let wizard = wizard_context(session.clone());
+
+    // Guard: redirect to the first incomplete step if not all steps are done.
+    if let Some(incomplete) = wizard.first_incomplete_step().await {{
+        return Redirect::to(&format!("{base_path}/{{incomplete}}")).into_response();
+    }}
+
+{load_steps}
+    html! {{
+        (wizard_progress(&wizard, "confirm").await)
+        // TODO: render a summary of all step data for the user to review.
+        form action="/{snake_name}/commit" method="post" {{
+            input type="hidden" name="_authenticity_token" value=(csrf.token()) {{}}
+            button type="submit" {{ "Confirm and Submit" }}
+        }}
+    }}
+    .into_response()
+}}
+
+/// Commit the wizard — POST only to prevent CSRF attacks.
+///
+/// Assembles all step data, performs the final action, then clears the wizard state.
+#[post("/{snake_name}/commit")]
+pub async fn commit(session: Session) -> impl IntoResponse {{
     let wizard = wizard_context(session.clone());
 
     // Guard: if any step is incomplete, redirect to the first incomplete step.
@@ -287,33 +338,22 @@ pub async fn commit(session: Session, flash: Flash) -> impl IntoResponse {{
 
     // Clear wizard state from the session.
     wizard.clear().await;
-    flash.success("{pascal_name} completed successfully!").await;
+    // TODO: add a flash success message and redirect to a confirmation page.
     Redirect::to("/").into_response()
 }}
 
 /// Cancel the wizard: discard all in-progress state.
 #[get("/{snake_name}/cancel")]
-pub async fn cancel(session: Session, flash: Flash) -> impl IntoResponse {{
+pub async fn cancel(session: Session) -> impl IntoResponse {{
     let wizard = wizard_context(session.clone());
     wizard.clear().await;
-    flash.info("{pascal_name} cancelled.").await;
+    // TODO: add a flash message and redirect appropriately.
     Redirect::to("/").into_response()
 }}
 "#,
         snake_name = snake_name,
-        pascal_name = pascal_name,
         base_path = base_path,
-        load_steps = steps
-            .iter()
-            .map(|step| {
-                let s = snake(step);
-                let pascal_step = pascal(step);
-                format!(
-                    "    let {s}_data: Option<{pascal_step}Form> = wizard.step_data(\"{s}\").await;"
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
+        load_steps = load_steps_code,
     ));
 
     out.join("\n")
@@ -321,7 +361,11 @@ pub async fn cancel(session: Session, flash: Flash) -> impl IntoResponse {{
 
 fn render_wizard_test(snake_name: &str, _pascal_name: &str, steps: &[String]) -> String {
     let first_step = snake(&steps[0]);
-    let second_step = if steps.len() > 1 { snake(&steps[1]) } else { first_step.clone() };
+    let second_step = if steps.len() > 1 {
+        snake(&steps[1])
+    } else {
+        first_step.clone()
+    };
 
     format!(
         r#"//! Integration test for the `{snake_name}` wizard — generated by `autumn generate wizard`.
@@ -350,6 +394,7 @@ async fn {snake_name}_wizard_happy_path() {{
     //         {snake_name}::submit_{first_step},
     //         {snake_name}::show_{second_step},
     //         {snake_name}::submit_{second_step},
+    //         {snake_name}::show_confirm,
     //         {snake_name}::commit,
     //         {snake_name}::cancel,
     //     ])
@@ -507,7 +552,9 @@ mod tests {
     #[test]
     fn wizard_file_contains_steps_constant() {
         let content = render_wizard_file("checkout", "Checkout", &steps3());
-        assert!(content.contains("pub const STEPS: &[&str] = &[\"shipping\", \"payment\", \"review\"]"));
+        assert!(
+            content.contains("pub const STEPS: &[&str] = &[\"shipping\", \"payment\", \"review\"]")
+        );
     }
 
     #[test]
@@ -538,6 +585,26 @@ mod tests {
         let content = render_wizard_file("checkout", "Checkout", &steps3());
         assert!(content.contains("pub async fn commit("));
         assert!(content.contains("pub async fn cancel("));
+    }
+
+    #[test]
+    fn wizard_file_commit_uses_post_not_get() {
+        let content = render_wizard_file("checkout", "Checkout", &steps3());
+        assert!(
+            content.contains("#[post(\"/checkout/commit\")]"),
+            "commit handler must use POST to prevent CSRF"
+        );
+        assert!(
+            !content.contains("#[get(\"/checkout/commit\")]"),
+            "commit handler must not use GET"
+        );
+    }
+
+    #[test]
+    fn wizard_file_has_confirm_handler() {
+        let content = render_wizard_file("checkout", "Checkout", &steps3());
+        assert!(content.contains("pub async fn show_confirm("));
+        assert!(content.contains("#[get(\"/checkout/confirm\")]"));
     }
 
     #[test]
@@ -575,7 +642,10 @@ mod tests {
         let content = render_wizard_file("checkout", "Checkout", &steps3());
         // clear() appears at least twice (commit + cancel)
         let count = content.matches("wizard.clear().await").count();
-        assert!(count >= 2, "expected clear() in both commit and cancel handlers");
+        assert!(
+            count >= 2,
+            "expected clear() in both commit and cancel handlers"
+        );
     }
 
     #[test]
@@ -626,21 +696,62 @@ mod tests {
     fn plan_rejects_empty_wizard_name() {
         let tmp = project();
         let result = plan_wizard(tmp.path(), "", &steps3());
-        assert!(matches!(result.unwrap_err(), GenerateError::InvalidName(_, _)));
+        assert!(matches!(
+            result.unwrap_err(),
+            GenerateError::InvalidName(_, _)
+        ));
     }
 
     #[test]
     fn plan_rejects_empty_step_name() {
         let tmp = project();
         let result = plan_wizard(tmp.path(), "checkout", &["".into(), "payment".into()]);
-        assert!(matches!(result.unwrap_err(), GenerateError::InvalidName(_, _)));
+        assert!(matches!(
+            result.unwrap_err(),
+            GenerateError::InvalidName(_, _)
+        ));
     }
 
     #[test]
     fn plan_rejects_step_name_with_spaces() {
         let tmp = project();
-        let result = plan_wizard(tmp.path(), "checkout", &["step one".into(), "payment".into()]);
-        assert!(matches!(result.unwrap_err(), GenerateError::InvalidName(_, _)));
+        let result = plan_wizard(
+            tmp.path(),
+            "checkout",
+            &["step one".into(), "payment".into()],
+        );
+        assert!(matches!(
+            result.unwrap_err(),
+            GenerateError::InvalidName(_, _)
+        ));
+    }
+
+    #[test]
+    fn plan_rejects_step_name_with_hyphens() {
+        let tmp = project();
+        let result = plan_wizard(
+            tmp.path(),
+            "checkout",
+            &["personal-info".into(), "payment".into()],
+        );
+        assert!(
+            matches!(result.unwrap_err(), GenerateError::InvalidName(_, _)),
+            "hyphens produce invalid Rust identifiers"
+        );
+    }
+
+    #[test]
+    fn plan_rejects_duplicate_normalized_step_names() {
+        let tmp = project();
+        let result = plan_wizard(
+            tmp.path(),
+            "checkout",
+            &["shipping".into(), "shipping".into(), "review".into()],
+        );
+        assert!(
+            matches!(result.unwrap_err(), GenerateError::Config(_)),
+            "duplicate step names should be rejected"
+        );
     }
 
     #[test]

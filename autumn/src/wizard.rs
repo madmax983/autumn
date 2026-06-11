@@ -1,8 +1,8 @@
 //! First-class multi-step form wizards with session-backed state.
 //!
 //! Orchestrates multi-step flows (onboarding, checkout, KYC) on top of the
-//! existing [`Session`], [`Changeset`], and [`Flash`] primitives — no new
-//! storage machinery.
+//! existing [`crate::session::Session`], [`crate::form::Changeset`], and
+//! [`crate::flash::Flash`] primitives — no new storage machinery.
 //!
 //! ## Session key format
 //!
@@ -163,6 +163,7 @@ impl WizardContext {
             Some(i) => i,
             None => return Ok(()), // unknown step — let the handler decide
         };
+        let base_path = base_path.trim_end_matches('/');
         for step in &self.steps[..current_idx] {
             if !self.is_step_complete(step).await {
                 return Err(format!("{base_path}/{step}"));
@@ -179,11 +180,7 @@ impl WizardContext {
     /// # Errors
     ///
     /// Returns [`WizardError::Serialize`] when `data` cannot be serialized.
-    pub async fn save_step<T: Serialize>(
-        &self,
-        step: &str,
-        data: &T,
-    ) -> Result<(), WizardError> {
+    pub async fn save_step<T: Serialize>(&self, step: &str, data: &T) -> Result<(), WizardError> {
         let json = serde_json::to_string(data)?;
         let key = self.session_key(step);
         self.session.insert(key, json).await;
@@ -388,8 +385,14 @@ mod tests {
     #[test]
     fn session_key_uses_namespaced_format() {
         let wizard = make_wizard(make_session());
-        assert_eq!(wizard.session_key("shipping"), "__autumn_wizard:checkout:shipping");
-        assert_eq!(wizard.session_key("payment"), "__autumn_wizard:checkout:payment");
+        assert_eq!(
+            wizard.session_key("shipping"),
+            "__autumn_wizard:checkout:shipping"
+        );
+        assert_eq!(
+            wizard.session_key("payment"),
+            "__autumn_wizard:checkout:payment"
+        );
     }
 
     // ── step metadata ──────────────────────────────────────────────
@@ -446,22 +449,33 @@ mod tests {
             address: "First".into(),
             city: "A".into(),
         };
-        let payment = PaymentData { card_last4: "4242".into() };
+        let payment = PaymentData {
+            card_last4: "4242".into(),
+        };
 
         wizard.save_step("shipping", &shipping).await.unwrap();
         wizard.save_step("payment", &payment).await.unwrap();
 
         // Update shipping
-        let shipping2 = ShippingData { address: "Second".into(), city: "B".into() };
+        let shipping2 = ShippingData {
+            address: "Second".into(),
+            city: "B".into(),
+        };
         wizard.save_step("shipping", &shipping2).await.unwrap();
 
         // Payment is still there
         let loaded_payment: Option<PaymentData> = wizard.step_data("payment").await;
-        assert_eq!(loaded_payment.as_ref().map(|p| p.card_last4.as_str()), Some("4242"));
+        assert_eq!(
+            loaded_payment.as_ref().map(|p| p.card_last4.as_str()),
+            Some("4242")
+        );
 
         // Shipping is updated
         let loaded_shipping: Option<ShippingData> = wizard.step_data("shipping").await;
-        assert_eq!(loaded_shipping.as_ref().map(|s| s.address.as_str()), Some("Second"));
+        assert_eq!(
+            loaded_shipping.as_ref().map(|s| s.address.as_str()),
+            Some("Second")
+        );
     }
 
     // ── completion check ───────────────────────────────────────────
@@ -472,7 +486,13 @@ mod tests {
         assert!(!wizard.is_step_complete("shipping").await);
 
         wizard
-            .save_step("shipping", &ShippingData { address: "A".into(), city: "B".into() })
+            .save_step(
+                "shipping",
+                &ShippingData {
+                    address: "A".into(),
+                    city: "B".into(),
+                },
+            )
             .await
             .unwrap();
 
@@ -483,22 +503,42 @@ mod tests {
     async fn first_incomplete_step_returns_first_missing() {
         let wizard = make_wizard(make_session());
         wizard
-            .save_step("shipping", &ShippingData { address: "A".into(), city: "B".into() })
+            .save_step(
+                "shipping",
+                &ShippingData {
+                    address: "A".into(),
+                    city: "B".into(),
+                },
+            )
             .await
             .unwrap();
 
-        assert_eq!(wizard.first_incomplete_step().await.as_deref(), Some("payment"));
+        assert_eq!(
+            wizard.first_incomplete_step().await.as_deref(),
+            Some("payment")
+        );
     }
 
     #[tokio::test]
     async fn first_incomplete_step_returns_none_when_all_complete() {
         let wizard = make_wizard(make_session());
         wizard
-            .save_step("shipping", &ShippingData { address: "A".into(), city: "B".into() })
+            .save_step(
+                "shipping",
+                &ShippingData {
+                    address: "A".into(),
+                    city: "B".into(),
+                },
+            )
             .await
             .unwrap();
         wizard
-            .save_step("payment", &PaymentData { card_last4: "4242".into() })
+            .save_step(
+                "payment",
+                &PaymentData {
+                    card_last4: "4242".into(),
+                },
+            )
             .await
             .unwrap();
         wizard
@@ -531,7 +571,13 @@ mod tests {
     async fn guard_step_allows_step_2_when_step_1_complete() {
         let wizard = make_wizard(make_session());
         wizard
-            .save_step("shipping", &ShippingData { address: "A".into(), city: "B".into() })
+            .save_step(
+                "shipping",
+                &ShippingData {
+                    address: "A".into(),
+                    city: "B".into(),
+                },
+            )
             .await
             .unwrap();
         assert!(wizard.guard_step("payment", "/checkout").await.is_ok());
@@ -541,7 +587,13 @@ mod tests {
     async fn guard_step_blocks_step_3_when_step_2_incomplete() {
         let wizard = make_wizard(make_session());
         wizard
-            .save_step("shipping", &ShippingData { address: "A".into(), city: "B".into() })
+            .save_step(
+                "shipping",
+                &ShippingData {
+                    address: "A".into(),
+                    city: "B".into(),
+                },
+            )
             .await
             .unwrap();
         // review is step 2 — payment (step 1) must be complete
@@ -556,11 +608,22 @@ mod tests {
     async fn clear_removes_all_wizard_keys() {
         let wizard = make_wizard(make_session());
         wizard
-            .save_step("shipping", &ShippingData { address: "A".into(), city: "B".into() })
+            .save_step(
+                "shipping",
+                &ShippingData {
+                    address: "A".into(),
+                    city: "B".into(),
+                },
+            )
             .await
             .unwrap();
         wizard
-            .save_step("payment", &PaymentData { card_last4: "4242".into() })
+            .save_step(
+                "payment",
+                &PaymentData {
+                    card_last4: "4242".into(),
+                },
+            )
             .await
             .unwrap();
 
@@ -576,13 +639,22 @@ mod tests {
         session.insert("unrelated_key", "keep_me").await;
         let wizard = make_wizard(session.clone());
         wizard
-            .save_step("shipping", &ShippingData { address: "A".into(), city: "B".into() })
+            .save_step(
+                "shipping",
+                &ShippingData {
+                    address: "A".into(),
+                    city: "B".into(),
+                },
+            )
             .await
             .unwrap();
 
         wizard.clear().await;
 
-        assert_eq!(session.get("unrelated_key").await.as_deref(), Some("keep_me"));
+        assert_eq!(
+            session.get("unrelated_key").await.as_deref(),
+            Some("keep_me")
+        );
     }
 
     // ── all_step_data_json ─────────────────────────────────────────
@@ -599,7 +671,13 @@ mod tests {
     async fn all_step_data_json_returns_data_for_completed_steps() {
         let wizard = make_wizard(make_session());
         wizard
-            .save_step("shipping", &ShippingData { address: "A".into(), city: "B".into() })
+            .save_step(
+                "shipping",
+                &ShippingData {
+                    address: "A".into(),
+                    city: "B".into(),
+                },
+            )
             .await
             .unwrap();
 
@@ -638,7 +716,13 @@ mod tests {
     async fn wizard_progress_steps_marks_prior_steps_completed() {
         let wizard = make_wizard(make_session());
         wizard
-            .save_step("shipping", &ShippingData { address: "A".into(), city: "B".into() })
+            .save_step(
+                "shipping",
+                &ShippingData {
+                    address: "A".into(),
+                    city: "B".into(),
+                },
+            )
             .await
             .unwrap();
 
@@ -693,7 +777,13 @@ mod tests {
     async fn wizard_progress_applies_correct_css_classes() {
         let wizard = make_wizard(make_session());
         wizard
-            .save_step("shipping", &ShippingData { address: "A".into(), city: "B".into() })
+            .save_step(
+                "shipping",
+                &ShippingData {
+                    address: "A".into(),
+                    city: "B".into(),
+                },
+            )
             .await
             .unwrap();
         let markup = wizard_progress(&wizard, "payment").await;
