@@ -194,7 +194,7 @@ async fn test_circuit_breaker_downstream_outage_flow() {
     act_health.assert_status(503);
     act_health.assert_json::<serde_json::Value, _>(|val| {
         assert_eq!(val["status"], "DOWN");
-        let cb_details = &val["components"][&format!("circuit_breaker.127.0.0.1:{}", port)];
+        let cb_details = &val["components"][&format!("circuit_breaker.127.0.0.1:{port}")];
         assert_eq!(cb_details["status"], "DOWN");
         assert_eq!(cb_details["details"]["state"], "OPEN");
     });
@@ -220,7 +220,7 @@ async fn test_circuit_breaker_downstream_outage_flow() {
     act_health_final.assert_ok();
     act_health_final.assert_json::<serde_json::Value, _>(|val| {
         assert_eq!(val["status"], "UP");
-        let cb_details = &val["components"][&format!("circuit_breaker.127.0.0.1:{}", port)];
+        let cb_details = &val["components"][&format!("circuit_breaker.127.0.0.1:{port}")];
         assert_eq!(cb_details["status"], "UP");
         assert_eq!(cb_details["details"]["state"], "CLOSED");
     });
@@ -330,6 +330,7 @@ async fn test_circuit_breaker_distinct_ports() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn test_circuit_breaker_blanket_from_http_client() {
     let _lock = autumn_web::circuit_breaker::TEST_LOCK
         .lock()
@@ -426,6 +427,7 @@ async fn test_circuit_breaker_blanket_from_http_client() {
 
 #[tokio::test]
 #[cfg(feature = "mail")]
+#[allow(clippy::await_holding_lock)]
 async fn test_circuit_breaker_blanket_from_smtp() {
     let _lock = autumn_web::circuit_breaker::TEST_LOCK
         .lock()

@@ -9011,6 +9011,7 @@ mod tests {
 
         #[tokio::test]
         #[ignore = "requires Docker (testcontainers)"]
+        #[allow(clippy::await_holding_lock)]
         async fn pg_enqueue_on_conn_circuit_breaker() {
             use testcontainers::runners::AsyncRunner as _;
             use testcontainers_modules::postgres::Postgres;
@@ -9064,7 +9065,7 @@ mod tests {
                 .enqueue_on_conn(
                     "send_email",
                     serde_json::json!({ "user_id": 42 }),
-                    &mut *conn,
+                    &mut conn,
                 )
                 .await;
             assert!(res.is_ok());
@@ -9078,13 +9079,13 @@ mod tests {
             for _ in 0..3 {
                 let mut conn_fail = pool.get().await.unwrap();
                 let _ = diesel::sql_query("SELECT pg_terminate_backend(pg_backend_pid())")
-                    .execute(&mut *conn_fail)
+                    .execute(&mut conn_fail)
                     .await;
                 let res = client
                     .enqueue_on_conn(
                         "send_email",
                         serde_json::json!({ "user_id": 42 }),
-                        &mut *conn_fail,
+                        &mut conn_fail,
                     )
                     .await;
                 assert!(res.is_err());
@@ -9098,7 +9099,7 @@ mod tests {
                 .enqueue_on_conn(
                     "send_email",
                     serde_json::json!({ "user_id": 42 }),
-                    &mut *conn,
+                    &mut conn,
                 )
                 .await;
             assert!(res.is_err());

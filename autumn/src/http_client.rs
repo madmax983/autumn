@@ -777,17 +777,13 @@ impl RequestBuilder {
         }
 
         // ── Resilience / Circuit Breaker ──────────────────────────────────
-        let host = url::Url::parse(&self.url)
-            .ok()
-            .map(|u| {
+        let host = url::Url::parse(&self.url).ok().map_or_else(
+            || "unknown".to_owned(),
+            |u| {
                 let h = u.host_str().unwrap_or("unknown");
-                if let Some(port) = u.port() {
-                    format!("{}:{}", h, port)
-                } else {
-                    h.to_owned()
-                }
-            })
-            .unwrap_or_else(|| "unknown".to_owned());
+                u.port().map_or_else(|| h.to_owned(), |port| format!("{h}:{port}"))
+            },
+        );
 
         let breaker = self.resilience_config.as_ref().map_or_else(
             || {
