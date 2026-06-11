@@ -103,21 +103,25 @@ impl WizardContext {
     }
 
     /// The total number of steps in this wizard.
-    pub fn total_steps(&self) -> usize {
+    #[must_use]
+    pub const fn total_steps(&self) -> usize {
         self.steps.len()
     }
 
     /// The 0-based index of the named step, or `None` if not found.
+    #[must_use]
     pub fn step_index(&self, step: &str) -> Option<usize> {
         self.steps.iter().position(|s| s == step)
     }
 
     /// The 1-based step number for display (e.g. `"step 2 of 4"`), or `None`.
+    #[must_use]
     pub fn step_number(&self, step: &str) -> Option<usize> {
         self.step_index(step).map(|i| i + 1)
     }
 
     /// An ordered slice of all step names.
+    #[must_use]
     pub fn steps(&self) -> &[String] {
         &self.steps
     }
