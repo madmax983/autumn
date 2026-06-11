@@ -90,13 +90,15 @@ If a prerequisite step is missing, `guard_step` returns an `Err(redirect_url)`
 pointing at the first incomplete step.
 
 ```rust
-if let Err(redirect_url) = wizard.guard_step("payment", "/checkout/shipping").await {
+if let Err(redirect_url) = wizard.guard_step("payment", "/checkout").await {
     return Redirect::to(&redirect_url).into_response();
 }
 ```
 
-The second argument is the fallback path used when the first step itself has
-no prerequisites to check — typically the path to step 1.
+The second argument is the wizard URL prefix. `guard_step` appends
+`/{first_incomplete_step}` to it, so passing `/checkout` redirects to
+`/checkout/shipping`, `/checkout/payment`, etc. Passing the full step path
+(e.g. `/checkout/shipping`) would produce `/checkout/shipping/shipping`.
 
 ### `save_step`
 
