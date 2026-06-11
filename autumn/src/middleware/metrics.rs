@@ -602,10 +602,10 @@ where
                     let latency_ms =
                         u64::try_from(this.start.elapsed().as_millis()).unwrap_or(u64::MAX);
                     let method_str = this.method.as_str();
-                    let route_str = this
-                        .route
-                        .as_ref()
-                        .map_or("_unmatched", axum::extract::MatchedPath::as_str);
+                    let route_str = this.route.as_ref().map_or(
+                        super::access_log::UNMATCHED_ROUTE,
+                        axum::extract::MatchedPath::as_str,
+                    );
                     let status = response.status().as_u16();
                     collector.record(method_str, route_str, status, latency_ms);
                     collector.decrement_active();

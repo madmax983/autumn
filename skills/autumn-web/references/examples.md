@@ -158,6 +158,8 @@ Pattern from `examples/ws-echo`:
 ```rust
 use autumn_web::prelude::*;
 use autumn_web::ws::{Message, WebSocket, WithShutdown, WsHandler};
+// WithShutdown requires CancellationToken — tokio-util is a transitive dep,
+// not a re-export, so add it to Cargo.toml: tokio-util = { version = "0.7", features = ["sync"] }
 use tokio_util::sync::CancellationToken;
 
 #[ws("/echo")]
@@ -344,7 +346,8 @@ async fn main() {
 ```
 
 The plugin mounts at `/admin` by default and requires the `admin` session role.
-In 0.4.0 it includes `/admin/jobs` for job inspection and recovery.
+In 0.5.0 it includes jobs, feature-flag, and experiment administration
+surfaces.
 
 ## S3 storage plugin
 
@@ -380,9 +383,12 @@ async fn main() {
 Enable test support for integration-style app tests:
 
 ```toml
-autumn-web = { version = "0.4", features = ["test-support"] }
+autumn-web = { version = "0.5", features = ["test-support"] }
 ```
 
 Use `TestApp`, `TestClient`, `TestResponse`, and `TestDb` from
 `autumn_web::test`. Doctests are still important because they compile public
 examples from an external-consumer context.
+`TestResponse` also supports CSS-selector assertions such as
+`assert_selector`, `assert_no_selector`, `assert_selector_count`,
+`assert_text`, `assert_text_contains`, and `assert_attr`.

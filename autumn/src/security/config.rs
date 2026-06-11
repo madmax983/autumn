@@ -375,6 +375,14 @@ pub struct SecurityConfig {
     #[serde(default)]
     pub webhooks: crate::webhook::WebhookConfig,
 
+    /// Paths that must bypass CAPTCHA bot-protection independently of CSRF
+    /// exemptions.  Framework-managed inbound-mail and webhook receiver paths
+    /// are added here automatically; user-configured CSRF-exempt paths are
+    /// deliberately NOT copied here so that a form route that skips CSRF for
+    /// non-cookie auth still requires a CAPTCHA token.
+    #[serde(default)]
+    pub captcha_exempt_paths: Vec<String>,
+
     /// HTTP status returned when a [`Policy`](crate::authorization::Policy)
     /// denies a record-level action. Defaults to `"404"` to mirror the
     /// Rails / Phoenix posture of hiding existence from unauthorized
