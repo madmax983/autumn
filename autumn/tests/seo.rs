@@ -131,23 +131,29 @@ fn sitemap_xml_escapes_special_chars_in_url() {
 }
 
 #[test]
-fn sitemap_xml_generates_sitemapindex_for_large_sites() {
-    // Generate more than 50,000 entries to trigger sitemapindex
+fn sitemap_xml_truncates_at_50k_for_large_sites() {
+    // Generate more than 50,000 entries; the function caps at 50,000 and
+    // always returns a <urlset> (never a <sitemapindex>).
     let entries: Vec<SitemapEntry> = (0..50_001)
         .map(|i| SitemapEntry::new(format!("https://example.com/page/{i}")))
         .collect();
     let xml = sitemap_xml(&entries, Some("https://example.com"));
     assert!(
-        xml.contains("<sitemapindex"),
-        "should use sitemapindex for large sites"
+        xml.contains("<urlset"),
+        "large sites must still return a urlset, not a sitemapindex"
     );
     assert!(
-        xml.contains("<sitemap>"),
-        "should have sitemap entries in index"
+        !xml.contains("<sitemapindex"),
+        "sitemapindex must not be generated"
+    );
+    // The last entry (index 50_000) must be absent — only 0..50_000 included.
+    assert!(
+        !xml.contains("https://example.com/page/50000"),
+        "entry beyond the 50k cap must be truncated"
     );
     assert!(
-        xml.contains("https://example.com/sitemap-1.xml"),
-        "should reference sub-sitemaps"
+        xml.contains("https://example.com/page/49999"),
+        "entry at the 50k cap must be present"
     );
 }
 
