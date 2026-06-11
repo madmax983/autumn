@@ -6114,7 +6114,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         };
         let policy_check_update_pre = if has_policy {
             quote! {
-                let __existing = repo.find_by_id(id).await?
+                let __existing = repo.on_primary().find_by_id(id).await?
                     .ok_or_else(|| ::autumn_web::AutumnError::not_found_msg("not found"))?;
                 ::autumn_web::authorization::__check_policy::<#model_name>(
                     &__autumn_state,
@@ -6129,7 +6129,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         };
         let policy_check_delete_pre = if has_policy {
             quote! {
-                let __existing = repo.find_by_id(id).await?
+                let __existing = repo.on_primary().find_by_id(id).await?
                     .ok_or_else(|| ::autumn_web::AutumnError::not_found_msg("not found"))?;
                 ::autumn_web::authorization::__check_policy::<#model_name>(
                     &__autumn_state,
@@ -6370,7 +6370,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         };
         let update_body = if has_policy {
             quote! {
-                let __existing = match repo.find_by_id(id).await {
+                let __existing = match repo.on_primary().find_by_id(id).await {
                     ::core::result::Result::Ok(::core::option::Option::Some(existing)) => existing,
                     ::core::result::Result::Ok(::core::option::Option::None) => {
                         return ::autumn_web::idempotency::IdempotencyReplayOr::Inner(
@@ -6440,7 +6440,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         &__autumn_idempotency_replay,
                         "repository.delete.record",
                     );
-                let __existing = match repo.find_by_id(id).await {
+                let __existing = match repo.on_primary().find_by_id(id).await {
                     ::core::result::Result::Ok(::core::option::Option::Some(existing)) => existing,
                     ::core::result::Result::Ok(::core::option::Option::None) => {
                         if let ::core::option::Option::Some(bytes) = __autumn_replay_deleted_record {
@@ -8196,6 +8196,45 @@ mod tests {
         assert!(
             err.to_string().contains("requires hooks"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_api_mutation_prechecks_pin_reads_to_primary() {
+        let generated = repository_macro(
+            quote! { Post, api = "/api/posts", policy = PostPolicy },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        // The PUT/DELETE handlers load the row before writing (404 + policy
+        // decision). Under replication lag a replica read could 404 or
+        // authorize against a stale row even though the write itself runs on
+        // the primary — mutation prechecks must be read-your-writes safe.
+        assert_eq!(
+            generated
+                .matches("repo . on_primary () . find_by_id")
+                .count(),
+            2,
+            "update/delete prechecks must pin find_by_id to the primary"
+        );
+
+        // The plain GET endpoint is an ordinary read and stays on the
+        // replica route.
+        let get_fn = generated
+            .find("async fn post_api_get")
+            .expect("get handler must be generated");
+        let get_end = generated[get_fn..]
+            .find("async fn post_api_create")
+            .map_or(generated.len(), |offset| get_fn + offset);
+        let section = &generated[get_fn..get_end];
+        assert!(
+            section.contains("repo . find_by_id"),
+            "get handler must read through the repository: {section}"
+        );
+        assert!(
+            !section.contains("on_primary"),
+            "get handler reads must stay replica-eligible: {section}"
         );
     }
 
