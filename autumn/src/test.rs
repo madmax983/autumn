@@ -270,9 +270,6 @@ pub struct TestApp {
         crate::actuator::IndicatorGroup,
         std::sync::Arc<dyn crate::actuator::HealthIndicator>,
     )>,
-    /// Inbound mail router registered via [`TestApp::inbound_mail_router`].
-    #[cfg(feature = "inbound-mail")]
-    inbound_mail_router: Option<std::sync::Arc<crate::inbound_mail::InboundMailRouter>>,
 }
 
 type TestPolicyRegistration = Box<dyn FnOnce(&crate::authorization::PolicyRegistry) + Send>;
@@ -328,8 +325,6 @@ impl TestApp {
             api_versions: Vec::new(),
             metrics_sources: Vec::new(),
             health_indicators: Vec::new(),
-            #[cfg(feature = "inbound-mail")]
-            inbound_mail_router: None,
         }
     }
 
@@ -360,16 +355,6 @@ impl TestApp {
         self.policy_registrations.push(Box::new(move |registry| {
             registry.register_scope::<R, _>(scope);
         }));
-        self
-    }
-
-    /// Register an inbound mail router for this test app.
-    ///
-    /// Mirrors [`crate::app::AppBuilder::inbound_mail_router`].
-    #[cfg(feature = "inbound-mail")]
-    #[must_use]
-    pub fn inbound_mail_router(mut self, router: crate::inbound_mail::InboundMailRouter) -> Self {
-        self.inbound_mail_router = Some(std::sync::Arc::new(router));
         self
     }
 
@@ -639,12 +624,6 @@ impl TestApp {
         self.exception_filters.extend(app_builder.exception_filters);
         self.metrics_sources.extend(app_builder.metrics_sources);
         self.health_indicators.extend(app_builder.health_indicators);
-        // Carry plugin-registered inbound mail router into the test app so
-        // webhook plugins behave identically under TestApp.
-        #[cfg(feature = "inbound-mail")]
-        if let Some(router) = app_builder.inbound_mail_router {
-            self.inbound_mail_router = Some(router);
-        }
 
         // Carry plugin-registered error reporters into the test app so
         // reporting-enabled plugins exercise the same behavior under `TestApp`
@@ -892,8 +871,7 @@ impl TestApp {
     /// per-function Moka stores and do not accidentally inherit a Redis or
     /// other shared backend installed by a previous test.
     #[must_use]
-    #[cfg_attr(not(feature = "inbound-mail"), allow(unused_mut))]
-    pub fn build(mut self) -> TestClient {
+    pub fn build(self) -> TestClient {
         // Reset the global cache to prevent cross-test contamination.
         crate::cache::clear_global_cache();
 
@@ -1006,7 +984,8 @@ impl TestApp {
         crate::app::install_webhook_registry(&state, &self.config);
 
         // Install AutumnConfig so DbState::statement_timeout / slow_query_threshold
-        // and HTTP Client resilience can read the test-supplied config.
+        // read the test-supplied config rather than always returning defaults.
+        #[cfg(feature = "db")]
         state.insert_extension(self.config.clone());
 
         #[cfg(feature = "mail")]
@@ -1088,50 +1067,6 @@ impl TestApp {
             Some(TestJobRuntime { shutdown })
         };
 
-        #[cfg_attr(not(feature = "inbound-mail"), allow(unused_mut))]
-        let mut merge_routers = self.merge_routers;
-        #[cfg(feature = "inbound-mail")]
-        if let Some(ref im_router) = self.inbound_mail_router {
-            let mut registered_inbound: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
-            for (path, axum_router) in crate::inbound_mail::build_routes(im_router) {
-                if self
-                    .routes
-                    .iter()
-                    .any(|r| r.method == Method::POST && r.path == path.as_str())
-                    || self.scoped_groups.iter().any(|g| {
-                        g.routes.iter().any(|r| {
-                            r.method == Method::POST
-                                && format!("{}{}", g.prefix, r.path) == path.as_str()
-                        })
-                    })
-                    || self.nest_routers.iter().any(|(nest_path, _)| {
-                        let p = nest_path.as_str();
-                        path.as_str() == p
-                            || path.starts_with(p)
-                                && (p.ends_with('/') || path.as_bytes().get(p.len()) == Some(&b'/'))
-                    })
-                {
-                    tracing::warn!(
-                        path = %path,
-                        "inbound_mail: skipping webhook route — a POST handler is \
-                         already registered at this path by the application"
-                    );
-                    continue;
-                }
-                if !registered_inbound.insert(path.clone()) {
-                    tracing::warn!(
-                        path = %path,
-                        "inbound_mail: skipping duplicate inbound webhook path"
-                    );
-                    continue;
-                }
-                self.config.security.csrf.exempt_paths.push(path.clone());
-                self.config.security.captcha_exempt_paths.push(path);
-                merge_routers.push(axum_router);
-            }
-        }
-
         let router = crate::router::try_build_router_inner(
             self.routes,
             &self.config,
@@ -1139,7 +1074,7 @@ impl TestApp {
             crate::router::RouterContext {
                 exception_filters: self.exception_filters,
                 scoped_groups: self.scoped_groups,
-                merge_routers,
+                merge_routers: self.merge_routers,
                 nest_routers: self.nest_routers,
                 custom_layers: self.custom_layers,
                 error_page_renderer: None,
@@ -1151,19 +1086,6 @@ impl TestApp {
             },
         )
         .expect("failed to build test router");
-        // Mirror production's outermost access-log fallback (#999): in
-        // production it is applied in `apply_startup_barrier`, outside the
-        // session and exception-filter layers, and emits only for responses
-        // the primary in-stack layer never saw (e.g. session-store outage
-        // 503s), so tests observe the same access-log behavior an operator
-        // would.
-        let router = if self.config.log.access_log {
-            router.layer(crate::middleware::AccessLogLayer::fallback(
-                self.config.log.access_log_exclude.clone(),
-            ))
-        } else {
-            router
-        };
         TestClient {
             router,
             probes,

@@ -182,15 +182,11 @@ pub async fn __check_secured_with_key(
     roles: &[&str],
 ) -> crate::AutumnResult<()> {
     // Check authentication: session must contain the auth key
-    let Some(user_id) = session.get(auth_session_key).await else {
+    if session.get(auth_session_key).await.is_none() {
         return Err(crate::AutumnError::unauthorized_msg(
             "authentication required",
         ));
-    };
-
-    // Tag the request-scoped log context (#1169) with the authenticated user
-    // so every subsequent event automatically carries `user_id`.
-    crate::log::context::set_user_id(user_id);
+    }
 
     // Check authorization: if roles are specified, the session's "role"
     // must match at least one of them
@@ -347,17 +343,13 @@ where
             // Check if session has the required key
             let session = req.extensions().get::<crate::session::Session>().cloned();
 
-            let user_id = if let Some(ref session) = session {
-                session.get(&session_key).await
+            let is_authenticated = if let Some(ref session) = session {
+                session.contains_key(&session_key).await
             } else {
-                None
+                false
             };
 
-            if let Some(user_id) = user_id {
-                // Tag the request-scoped log context (#1169) so handler logs for
-                // middleware-authenticated requests carry `user_id` too, matching
-                // the `#[secured]` path.
-                crate::log::context::set_user_id(user_id);
+            if is_authenticated {
                 inner.call(req).await
             } else {
                 let body = crate::error::problem_details_json_string(
