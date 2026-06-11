@@ -4748,6 +4748,7 @@ fn pg_claim_sql() -> String {
     format!(
         "UPDATE autumn_jobs \
          SET status = 'running', started_at = NOW(), claimed_by = $1, claimed_at = NOW(), \
+             pending_unique_key = CASE WHEN unique_window = 'pending' THEN unique_key ELSE NULL END, \
              unique_key = CASE WHEN unique_window = 'pending' THEN NULL ELSE unique_key END \
          WHERE id = ( \
            SELECT candidate.id FROM autumn_jobs candidate \
@@ -4926,7 +4927,7 @@ async fn pg_nack_failure(
         // index rejects this UPDATE and the retry simply runs without the key.
         if applied && let Some(key) = pending_unique_key {
             let restored = diesel::sql_query(
-                "UPDATE autumn_jobs SET unique_key = $1 \
+                "UPDATE autumn_jobs SET unique_key = $1, pending_unique_key = NULL \
                  WHERE id = $2 AND status = 'enqueued'",
             )
             .bind::<diesel::sql_types::Text, _>(key)
@@ -5046,6 +5047,31 @@ async fn pg_recover_stale_claims(pool: &PgPool, visibility_timeout_ms: u64) {
     .execute(&mut *conn)
     .await
     .map_err(|e| tracing::warn!(error = %e, "postgres stale claim recovery failed"));
+
+    // For pending-window unique jobs that were just re-enqueued, restore the
+    // dedup key that was cleared at claim time.  Best-effort: if a duplicate was
+    // accepted while this job was running the unique index will block the restore
+    // and the job retries without the key (same behaviour as pg_nack_failure).
+    let _ = diesel::sql_query(
+        "UPDATE autumn_jobs \
+         SET \
+           unique_key = CASE \
+             WHEN NOT EXISTS ( \
+               SELECT 1 FROM autumn_jobs dup \
+               WHERE dup.unique_key = autumn_jobs.pending_unique_key \
+                 AND dup.name = autumn_jobs.name \
+                 AND dup.id != autumn_jobs.id \
+                 AND dup.status IN ('enqueued', 'running') \
+             ) THEN autumn_jobs.pending_unique_key \
+             ELSE autumn_jobs.unique_key \
+           END, \
+           pending_unique_key = NULL \
+         WHERE status = 'enqueued' \
+           AND pending_unique_key IS NOT NULL",
+    )
+    .execute(&mut *conn)
+    .await
+    .map_err(|e| tracing::warn!(error = %e, "postgres stale claim key restore failed"));
 }
 
 /// Execute one claimed job and ack/nack based on the outcome.
