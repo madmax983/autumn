@@ -302,7 +302,6 @@ pub(crate) fn sitemap_urlset_xml(entries: &[SitemapEntry]) -> String {
     xml
 }
 
-
 /// Escape XML special characters in a single pass over the input.
 fn xml_escape(s: &str) -> String {
     let mut escaped = String::with_capacity(s.len());
