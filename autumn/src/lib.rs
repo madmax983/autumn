@@ -204,6 +204,7 @@ pub mod step_up;
 pub mod storage;
 pub mod tenancy;
 pub mod time;
+pub mod user_agent;
 
 pub mod experiments;
 pub mod feature_flags;

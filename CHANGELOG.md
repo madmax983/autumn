@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **auth:** Active session management with device list and revocation in the auth starter (#819)
+  - `autumn generate auth` now persists a `{user}_sessions` row per login
+    (SHA-256 digest of the opaque session id — never the raw id — plus user id,
+    IP at login, raw + parsed User-Agent, optional device label, `created_at`,
+    `last_seen_at`), created on password login, email confirmation, TOTP verify,
+    and passkey login, and removed on logout.
+  - Generated handler APIs on the user model: `sessions()`, `revoke_session(id)`,
+    `revoke_other_sessions(current_digest)`, and `revoke_all_sessions()`, plus a
+    `require_tracked_session` gate used by every generated authenticated route.
+    The row is the source of truth: revoking it makes the device's **next**
+    request 401 (the cookie session is destroyed too), with no reliance on
+    cookie expiry. `last_seen_at` writes are throttled to at most one per
+    `[auth.sessions].last_seen_update_secs` (default 60 s) per session.
+  - New `/account/sessions` Maud + htmx page: per-session revoke buttons,
+    device labels, and a one-click "Sign out everywhere else".
+  - Credential-changing events — password reset, TOTP enrollment/disable, and
+    passkey add/remove — revoke all *other* sessions by default, configurable
+    via the new `[auth.sessions] revoke_on_credential_change` flag (default on).
+  - New `autumn_web::user_agent` module: a dependency-free heuristic
+    `parse_user_agent` (browser family / OS / device class) with a documented
+    one-line swap point for custom parsers.
+  - Generated `tests/auth_sessions.rs` covers the two-client flow (log in twice,
+    revoke from one client, the other's replayed cookie 401s) and generated
+    `docs/guide/session-management.md` documents the APIs, the privacy posture
+    for stored IP/UA (purpose limitation, retention scrubbing SQL, IP
+    truncation), and the migration path for existing auth-starter apps.
+  - Additive only: one new table in the auth-starter migration; no public API
+    removed.
 - **jobs:** Job uniqueness keys and concurrency limits for `#[job]` (#829)
   - `#[job(unique)]` dedupes enqueues on a stable hash of the full args;
     `unique_by = "field, …"` derives the key from selected args fields. The
