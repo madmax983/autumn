@@ -201,6 +201,7 @@ impl CircuitBreaker {
         inner.failure_ratio()
     }
 
+    #[allow(clippy::significant_drop_tightening)]
     pub(crate) fn before_call(&self) -> Result<(), CircuitBreakerError<()>> {
         let mut inner = self.inner.lock().unwrap();
         let now = Instant::now();

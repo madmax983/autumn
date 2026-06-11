@@ -128,7 +128,6 @@ async fn test_circuit_breaker_downstream_outage_flow() {
                 b.name().to_string(),
                 b.state(),
                 b.failure_ratio(),
-                b.config().clone()
             ))
             .collect::<Vec<_>>()
     );
