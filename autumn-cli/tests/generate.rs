@@ -2658,6 +2658,7 @@ fn generate_auth_passkeys_revocation_is_atomic() {
 // ── autumn generate wizard (issue #832) ──────────────────────────────────────
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn generate_wizard_creates_expected_files() {
     let (_tmp, project) = fresh_project("wizard-app");
     run_autumn(
