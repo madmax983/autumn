@@ -71,7 +71,7 @@ impl CircuitBreakerPolicy {
             policy.open_duration = Duration::from_secs(duration);
         }
         if let Some(trials) = defs.half_open_trial_count {
-            policy.half_open_trial_count = trials;
+            policy.half_open_trial_count = trials.max(1);
         }
 
         if let Some(host_cfg) = rc.circuit_breaker.hosts.get(name) {
@@ -88,7 +88,7 @@ impl CircuitBreakerPolicy {
                 policy.open_duration = Duration::from_secs(duration);
             }
             if let Some(trials) = host_cfg.half_open_trial_count {
-                policy.half_open_trial_count = trials;
+                policy.half_open_trial_count = trials.max(1);
             }
         }
         policy
@@ -594,5 +594,42 @@ mod tests {
         // Subsequent call should fail fast
         let res = svc.call("ok").await;
         assert!(matches!(res, Err(CircuitBreakerError::Open)));
+    }
+
+    #[test]
+    fn test_circuit_breaker_policy_clamps_zero_half_open_trial_count() {
+        let rc = crate::config::ResilienceConfig {
+            circuit_breaker: crate::config::CircuitBreakerConfig {
+                defaults: crate::config::CircuitBreakerPolicyConfig {
+                    failure_ratio_threshold: None,
+                    sample_window_secs: None,
+                    minimum_sample_count: None,
+                    open_duration_secs: None,
+                    half_open_trial_count: Some(0),
+                },
+                hosts: {
+                    let mut m = std::collections::HashMap::new();
+                    m.insert(
+                        "override-zero".to_string(),
+                        crate::config::CircuitBreakerPolicyConfig {
+                            failure_ratio_threshold: None,
+                            sample_window_secs: None,
+                            minimum_sample_count: None,
+                            open_duration_secs: None,
+                            half_open_trial_count: Some(0),
+                        },
+                    );
+                    m
+                },
+            },
+        };
+
+        // defaults check
+        let policy_default = CircuitBreakerPolicy::from_config(&rc, "some-other-host");
+        assert_eq!(policy_default.half_open_trial_count, 1);
+
+        // host override check
+        let policy_override = CircuitBreakerPolicy::from_config(&rc, "override-zero");
+        assert_eq!(policy_override.half_open_trial_count, 1);
     }
 }

@@ -2520,7 +2520,8 @@ impl AppBuilder {
                     || scoped_groups.iter().any(|g| {
                         g.routes.iter().any(|r| {
                             r.method == http::Method::POST
-                                && format!("{}{}", g.prefix, r.path) == path.as_str()
+                                && crate::router::join_nested_path(&g.prefix, r.path)
+                                    == path.as_str()
                         })
                     })
                     || nest_routers.iter().any(|(nest_path, _)| {
