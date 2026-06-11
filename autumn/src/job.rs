@@ -4589,12 +4589,16 @@ async fn pg_insert_job(
 ) -> AutumnResult<EnqueueOutcome> {
     use diesel_async::RunQueryDsl as _;
 
+    // For TTL-window jobs we check ONLY the time window so a long-running job
+    // that outlives its TTL does not block replacement enqueues.  For all other
+    // windows (pending, running) we check status instead.
     const DEDUP_GUARD: &str = "($6::TEXT IS NULL OR NOT EXISTS ( \
            SELECT 1 FROM autumn_jobs dup \
            WHERE dup.name = $2 AND dup.unique_key = $6 \
-             AND (dup.status IN ('enqueued', 'running') \
-                  OR ($8::BIGINT IS NOT NULL \
-                      AND dup.enqueued_at > NOW() - ($8 * INTERVAL '1 millisecond'))) \
+             AND CASE WHEN $8::BIGINT IS NOT NULL \
+                      THEN dup.enqueued_at > NOW() - ($8::BIGINT * INTERVAL '1 millisecond') \
+                      ELSE dup.status IN ('enqueued', 'running') \
+                 END \
          ))";
     const UNIQUE_CONFLICT: &str = "ON CONFLICT (name, unique_key) \
          WHERE unique_key IS NOT NULL AND status IN ('enqueued', 'running') DO NOTHING";
@@ -4619,6 +4623,26 @@ async fn pg_insert_job(
     } else {
         None
     };
+
+    // For TTL-window jobs, evict any expired unique holds before the INSERT.
+    // Without this, a long-running job whose TTL has elapsed would still occupy
+    // the partial unique index (idx_autumn_jobs_unique_inflight) and cause the
+    // ON CONFLICT DO NOTHING to silently drop a legitimate replacement enqueue.
+    if let (Some(ttl), Some(key)) = (unique_ttl_ms, &constraints.unique_key) {
+        let _ = diesel::sql_query(
+            "UPDATE autumn_jobs \
+             SET unique_key = NULL \
+             WHERE name = $1 AND unique_key = $2 \
+               AND unique_window = 'ttl' \
+               AND enqueued_at <= NOW() - ($3::BIGINT * INTERVAL '1 millisecond') \
+               AND status IN ('enqueued', 'running')",
+        )
+        .bind::<diesel::sql_types::Text, _>(name)
+        .bind::<diesel::sql_types::Text, _>(key.as_str())
+        .bind::<diesel::sql_types::BigInt, _>(ttl)
+        .execute(conn)
+        .await;
+    }
 
     #[cfg(not(feature = "telemetry-otlp"))]
     let query = diesel::sql_query(format!(
@@ -4904,8 +4928,9 @@ async fn pg_nack_failure(
         // UPDATE to eliminate the window where status='enqueued' and
         // unique_key=NULL co-exist, which would let a concurrent enqueue bypass
         // the dedup index.  The CASE subquery checks for an already-committed
-        // duplicate; if one exists the key is left NULL (best-effort, same as
-        // before) and the retried run proceeds without dedup protection.
+        // duplicate; pending-window jobs keep NULL if a duplicate won the race,
+        // while running/ttl-window jobs keep their existing key (unique_key was
+        // never cleared at claim time, so $5 is NULL and the ELSE branch applies).
         let applied = diesel::sql_query(
             "UPDATE autumn_jobs \
              SET status = 'enqueued', \
@@ -4926,7 +4951,7 @@ async fn pg_nack_failure(
                               AND dup.status IN ('enqueued', 'running') \
                         ) \
                    THEN $5::TEXT \
-                   ELSE NULL \
+                   ELSE unique_key \
                    END, \
                  pending_unique_key = NULL \
              WHERE id = $3 AND claimed_by = $4 AND status = 'running'",
