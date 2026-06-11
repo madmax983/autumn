@@ -498,6 +498,8 @@ struct AttrPred {
 enum AttrOp {
     Exists,
     Equals(String),
+    Includes(String),
+    DashMatch(String),
     Prefix(String),
     Suffix(String),
     Substring(String),
@@ -618,6 +620,13 @@ impl AttrPred {
         match &self.op {
             AttrOp::Exists => true,
             AttrOp::Equals(v) => value == v,
+            AttrOp::Includes(v) => {
+                !v.is_empty() && value.split_whitespace().any(|word| word == v.as_str())
+            }
+            AttrOp::DashMatch(v) => {
+                !v.is_empty()
+                    && (value == v.as_str() || value.starts_with(&format!("{}-", v.as_str())))
+            }
             AttrOp::Prefix(v) => !v.is_empty() && value.starts_with(v.as_str()),
             AttrOp::Suffix(v) => !v.is_empty() && value.ends_with(v.as_str()),
             AttrOp::Substring(v) => !v.is_empty() && value.contains(v.as_str()),
@@ -843,7 +852,7 @@ fn parse_attr_pred(chars: &[char], i: &mut usize, full: &str) -> Result<AttrPred
             *i += 1;
             Some('=')
         }
-        Some(c @ ('^' | '$' | '*')) if chars.get(*i + 1) == Some(&'=') => {
+        Some(c @ ('^' | '$' | '*' | '~' | '|')) if chars.get(*i + 1) == Some(&'=') => {
             *i += 2;
             Some(*c)
         }
@@ -862,6 +871,8 @@ fn parse_attr_pred(chars: &[char], i: &mut usize, full: &str) -> Result<AttrPred
     *i += 1;
     let op = match op_kind {
         Some('=') => AttrOp::Equals(value),
+        Some('~') => AttrOp::Includes(value),
+        Some('|') => AttrOp::DashMatch(value),
         Some('^') => AttrOp::Prefix(value),
         Some('$') => AttrOp::Suffix(value),
         Some('*') => AttrOp::Substring(value),
@@ -1004,7 +1015,8 @@ mod tests {
 
     #[test]
     fn tag_class_id_attribute_selectors() {
-        let html = r#"<a class="link primary" id="go" href="/notes/1" data-x="y">Go</a>"#;
+        let html =
+            r#"<a class="link primary" id="go" href="/notes/1" data-x="y" lang="en-US">Go</a>"#;
         assert_eq!(count(html, "a"), 1);
         assert_eq!(count(html, ".link"), 1);
         assert_eq!(count(html, ".primary.link"), 1);
@@ -1016,6 +1028,11 @@ mod tests {
         assert_eq!(count(html, "[href$=\"/1\"]"), 1);
         assert_eq!(count(html, "[href*=\"notes\"]"), 1);
         assert_eq!(count(html, "[href=\"/notes/2\"]"), 0);
+        assert_eq!(count(html, "[class~=\"primary\"]"), 1);
+        assert_eq!(count(html, "[class~=\"prim\"]"), 0);
+        assert_eq!(count(html, "[lang|=\"en\"]"), 1);
+        assert_eq!(count(html, "[lang|=\"en-US\"]"), 1);
+        assert_eq!(count(html, "[lang|=\"fr\"]"), 0);
         assert_eq!(count(html, ".missing"), 0);
     }
 
