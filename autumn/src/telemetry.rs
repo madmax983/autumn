@@ -105,15 +105,23 @@ pub enum TelemetryInitError {
 }
 
 /// RAII handle that flushes the OTLP tracer provider on drop.
+///
+/// Also carries the optional in-memory log-capture buffer when
+/// `log.capture.enabled = true`.  Callers (typically `AppBuilder`) read
+/// [`Self::log_buffer`] after telemetry init and wire it into the
+/// application state so the `/actuator/logfile` endpoint can serve it.
 #[must_use]
 #[derive(Debug)]
 pub struct TelemetryGuard {
     #[cfg(feature = "telemetry-otlp")]
     provider: Option<SdkTracerProvider>,
+    /// In-memory log buffer installed by the capture layer, or `None` when
+    /// `log.capture.enabled = false`.
+    pub log_buffer: Option<crate::log::capture::LogBuffer>,
 }
 
 impl TelemetryGuard {
-    /// Construct a no-op telemetry guard.
+    /// Construct a no-op telemetry guard (capture disabled).
     ///
     /// Useful for [`TelemetryProvider`] implementations that decide at runtime
     /// not to register a global tracing subscriber — e.g. a Datadog provider
@@ -123,14 +131,21 @@ impl TelemetryGuard {
         Self {
             #[cfg(feature = "telemetry-otlp")]
             provider: None,
+            log_buffer: None,
         }
     }
 
     #[cfg(feature = "telemetry-otlp")]
-    const fn with_provider(provider: SdkTracerProvider) -> Self {
+    fn with_provider(provider: SdkTracerProvider) -> Self {
         Self {
             provider: Some(provider),
+            log_buffer: None,
         }
+    }
+
+    fn with_log_buffer(mut self, buffer: crate::log::capture::LogBuffer) -> Self {
+        self.log_buffer = Some(buffer);
+        self
     }
 }
 
@@ -317,25 +332,54 @@ fn build_filter(log: &LogConfig) -> EnvFilter {
     })
 }
 
+fn build_capture_layer(
+    log: &LogConfig,
+) -> Option<(
+    crate::log::capture::LogCaptureLayer,
+    crate::log::capture::LogBuffer,
+)> {
+    if !log.capture.enabled {
+        return None;
+    }
+    // Include encrypted-column names so plaintext values never reach the buffer.
+    let mut filter_parameters = log.filter_parameters.clone();
+    filter_parameters.extend(crate::encryption::registered_encrypted_column_names());
+    let filter =
+        crate::log::filter::ParameterFilter::new(&filter_parameters, &log.unfilter_parameters);
+    let buffer = crate::log::capture::LogBuffer::new(log.capture.capacity, filter);
+    let layer = crate::log::capture::LogCaptureLayer::new(buffer.clone());
+    Some((layer, buffer))
+}
+
 fn init_logging_only(
     log: &LogConfig,
     log_format: ResolvedLogFormat,
 ) -> Result<TelemetryGuard, TelemetryInitError> {
     let filter = build_filter(log);
+    let capture = build_capture_layer(log);
+    let capture_layer = capture.as_ref().map(|(layer, _)| layer.clone());
+
     match log_format {
         ResolvedLogFormat::Json => tracing_subscriber::registry()
             .with(filter)
             .with(fmt::layer().json())
+            .with(capture_layer)
             .try_init()
             .map_err(|error| TelemetryInitError::SubscriberInit(error.to_string()))?,
         ResolvedLogFormat::Pretty => tracing_subscriber::registry()
             .with(filter)
             .with(fmt::layer().pretty())
+            .with(capture_layer)
             .try_init()
             .map_err(|error| TelemetryInitError::SubscriberInit(error.to_string()))?,
     }
 
-    Ok(TelemetryGuard::disabled())
+    let guard = TelemetryGuard::disabled();
+    if let Some((_, buffer)) = capture {
+        Ok(guard.with_log_buffer(buffer))
+    } else {
+        Ok(guard)
+    }
 }
 
 #[cfg(feature = "telemetry-otlp")]
@@ -358,22 +402,32 @@ fn init_otlp_runtime(
 
     let tracer = provider.tracer("autumn-web");
     let filter = build_filter(log);
+    let capture = build_capture_layer(log);
+    let capture_layer = capture.as_ref().map(|(layer, _)| layer.clone());
+
     match log_format {
         ResolvedLogFormat::Json => tracing_subscriber::registry()
             .with(filter)
             .with(fmt::layer().json())
             .with(tracing_opentelemetry::layer().with_tracer(tracer))
+            .with(capture_layer)
             .try_init()
             .map_err(|error| TelemetryInitError::SubscriberInit(error.to_string()))?,
         ResolvedLogFormat::Pretty => tracing_subscriber::registry()
             .with(filter)
             .with(fmt::layer().pretty())
             .with(tracing_opentelemetry::layer().with_tracer(tracer))
+            .with(capture_layer)
             .try_init()
             .map_err(|error| TelemetryInitError::SubscriberInit(error.to_string()))?,
     }
 
-    Ok(TelemetryGuard::with_provider(provider))
+    let guard = TelemetryGuard::with_provider(provider);
+    if let Some((_, buffer)) = capture {
+        Ok(guard.with_log_buffer(buffer))
+    } else {
+        Ok(guard)
+    }
 }
 
 #[cfg(not(feature = "telemetry-otlp"))]
@@ -549,6 +603,30 @@ mod tests {
         // Sanity: the disabled guard must be droppable without panic.
         drop(guard);
     }
+    #[test]
+    fn build_capture_layer_returns_none_when_disabled() {
+        let log = LogConfig::default(); // capture.enabled = false
+        assert!(build_capture_layer(&log).is_none());
+    }
+
+    #[test]
+    fn build_capture_layer_returns_layer_and_buffer_when_enabled() {
+        let log = LogConfig {
+            capture: crate::log::capture::LogCaptureConfig {
+                enabled: true,
+                capacity: 50,
+            },
+            ..Default::default()
+        };
+        let result = build_capture_layer(&log);
+        assert!(
+            result.is_some(),
+            "should build layer when capture.enabled = true"
+        );
+        let (_, buffer) = result.unwrap();
+        assert!(buffer.is_empty(), "newly created buffer should be empty");
+    }
+
     #[test]
     fn build_filter_falls_back_to_info_on_invalid_level() {
         let log = LogConfig {

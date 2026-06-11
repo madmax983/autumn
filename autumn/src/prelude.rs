@@ -206,6 +206,16 @@ pub use crate::circuit_breaker::{
     CircuitBreaker, CircuitBreakerError, CircuitBreakerPolicy, CircuitState,
 };
 
+// ── SEO helpers ──────────────────────────────────────────────────
+/// Per-page SEO meta tag builder (title, description, canonical, OG, Twitter).
+pub use crate::seo::SeoMeta;
+/// Sitemap change frequency values.
+pub use crate::seo::SitemapChangefreq;
+/// A single sitemap entry (URL, lastmod, changefreq, priority).
+pub use crate::seo::SitemapEntry;
+/// Trait for dynamic sitemap URL providers (e.g. database-driven blog posts).
+pub use crate::seo::SitemapSource;
+
 // ── Application state ────────────────────────────────────────────
 /// Shared application state (for custom extractors).
 pub use crate::state::AppState;

@@ -811,6 +811,71 @@ pub struct AutumnConfig {
     /// Resilience settings (circuit breakers, fallbacks).
     #[serde(default)]
     pub resilience: ResilienceConfig,
+
+    /// SEO settings (`[seo]` section in `autumn.toml`).
+    ///
+    /// Controls sitemap generation, robots.txt behavior, and canonical URL
+    /// computation. See [`crate::seo`] for the full surface.
+    ///
+    /// # Example `autumn.toml`
+    ///
+    /// ```toml
+    /// [seo]
+    /// base_url = "https://example.com"
+    ///
+    /// [seo.robots]
+    /// additional_rules = ["Disallow: /admin"]
+    /// ```
+    #[serde(default)]
+    pub seo: SeoConfig,
+}
+
+/// SEO configuration (`[seo]` section in `autumn.toml`).
+///
+/// # Example
+///
+/// ```toml
+/// [seo]
+/// base_url = "https://example.com"
+///
+/// [seo.robots]
+/// additional_rules = ["Disallow: /admin"]
+/// ```
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SeoConfig {
+    /// Base URL used for canonical URL computation and sitemap auto-injection.
+    ///
+    /// E.g. `"https://example.com"`. When set, the `Sitemap:` directive is
+    /// automatically injected into `robots.txt`.
+    pub base_url: Option<String>,
+
+    /// Robots.txt overrides.
+    #[serde(default)]
+    pub robots: RobotsConfig,
+}
+
+/// Per-profile `robots.txt` overrides (`[seo.robots]` in `autumn.toml`).
+///
+/// The framework default behavior (dev/test → disallow all; prod → allow all)
+/// can be overridden here.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RobotsConfig {
+    /// Override the profile-driven allow/disallow default.
+    ///
+    /// `None` means: use the profile default (dev → disallow, prod → allow).
+    /// `Some(true)` forces `Allow: /`; `Some(false)` forces `Disallow: /`.
+    pub allow_all: Option<bool>,
+
+    /// Additional directives appended after the main `User-agent` block.
+    ///
+    /// Example: `["Disallow: /admin", "Crawl-delay: 5"]`
+    #[serde(default)]
+    pub additional_rules: Vec<String>,
+
+    /// Explicit `Sitemap:` URL.
+    ///
+    /// When `None`, the URL is auto-computed from `[seo] base_url` if set.
+    pub sitemap_url: Option<String>,
 }
 
 /// Error-reporting settings (`[reporting]` section in `autumn.toml`).
@@ -3058,6 +3123,15 @@ pub struct LogConfig {
     /// (`health.path` etc.), mirror the new paths here.
     #[serde(default = "default_access_log_exclude")]
     pub access_log_exclude: Vec<String>,
+
+    /// In-memory log capture buffer for `/actuator/logfile`.
+    ///
+    /// When enabled, recent structured log entries are visible over HTTP
+    /// through the sensitive actuator endpoint without SSH access or an
+    /// external log aggregator.  The buffer is bounded and never grows
+    /// unbounded.
+    #[serde(default)]
+    pub capture: crate::log::capture::LogCaptureConfig,
 }
 
 /// Log output format.
@@ -3595,6 +3669,7 @@ impl Default for LogConfig {
             unfilter_parameters: Vec::new(),
             access_log: default_access_log(),
             access_log_exclude: default_access_log_exclude(),
+            capture: crate::log::capture::LogCaptureConfig::default(),
         }
     }
 }

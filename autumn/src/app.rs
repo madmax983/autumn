@@ -124,6 +124,7 @@ pub fn app() -> AppBuilder {
         channels_interceptor: None,
         #[cfg(feature = "oauth2")]
         http_interceptor: None,
+        seo_sources: Vec::new(),
         metrics_sources: Vec::new(),
         health_indicators: Vec::new(),
         #[cfg(feature = "inbound-mail")]
@@ -332,6 +333,10 @@ pub struct AppBuilder {
     channels_interceptor: Option<Arc<dyn crate::interceptor::ChannelsInterceptor>>,
     #[cfg(feature = "oauth2")]
     http_interceptor: Option<Arc<dyn crate::interceptor::HttpInterceptor>>,
+    /// Sitemap sources registered via [`AppBuilder::seo_source`].
+    /// Each source provides dynamic URL entries for `/sitemap.xml`.
+    seo_sources: Vec<Arc<dyn crate::seo::SitemapSource>>,
+
     /// Plugin-contributed metrics sources registered via [`AppBuilder::metrics_source`].
     pub(crate) metrics_sources: Vec<(String, Arc<dyn crate::actuator::MetricsSource>)>,
     /// Custom health indicators registered via [`AppBuilder::health_indicator`].
@@ -520,6 +525,49 @@ impl AppBuilder {
     #[must_use]
     pub fn static_routes(mut self, metas: Vec<crate::static_gen::StaticRouteMeta>) -> Self {
         self.static_metas.extend(metas);
+        self
+    }
+
+    /// Register a [`SitemapSource`](crate::seo::SitemapSource) for dynamic sitemap entries.
+    ///
+    /// When called at least once, the framework automatically serves `/sitemap.xml` and
+    /// `/robots.txt`. Dynamic sources (e.g. blog posts from a database) produce entries
+    /// collected at request time.
+    ///
+    /// Combine with `[seo] base_url` in `autumn.toml` to auto-inject the `Sitemap:`
+    /// directive in `robots.txt` and compute canonical URLs.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use autumn_web::prelude::*;
+    /// use autumn_web::seo::{SitemapEntry, SitemapSource};
+    /// use std::pin::Pin;
+    /// use std::future::Future;
+    ///
+    /// struct PostsSitemap;
+    ///
+    /// impl SitemapSource for PostsSitemap {
+    ///     fn entries(&self) -> Pin<Box<dyn Future<Output = Vec<SitemapEntry>> + Send>> {
+    ///         Box::pin(async {
+    ///             vec![SitemapEntry::new("https://example.com/posts/hello")]
+    ///         })
+    ///     }
+    /// }
+    ///
+    /// # #[autumn_web::main]
+    /// # async fn main() {
+    /// # #[get("/")] async fn index() -> &'static str { "" }
+    /// autumn_web::app()
+    ///     .routes(routes![index])
+    ///     .seo_source(PostsSitemap)
+    ///     .run()
+    ///     .await;
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn seo_source<S: crate::seo::SitemapSource + 'static>(mut self, source: S) -> Self {
+        self.seo_sources.push(Arc::new(source));
         self
     }
 
@@ -2125,7 +2173,7 @@ impl AppBuilder {
             tasks,
             one_off_tasks: _,
             jobs,
-            static_metas: _,
+            static_metas,
             exception_filters,
             scoped_groups,
             merge_routers,
@@ -2176,6 +2224,7 @@ impl AppBuilder {
             channels_interceptor,
             #[cfg(feature = "oauth2")]
             http_interceptor,
+            seo_sources,
             metrics_sources,
             health_indicators,
             #[cfg(feature = "inbound-mail")]
@@ -2185,7 +2234,7 @@ impl AppBuilder {
         let all_routes = routes;
 
         // 1 & 2. Load configuration and initialize logging/telemetry
-        let (mut config, _telemetry_guard) =
+        let (mut config, telemetry_guard) =
             load_config_and_telemetry(config_loader_factory, telemetry_provider).await;
 
         // Apply builder-level flag: `.idempotent()` enables the middleware when
@@ -2314,6 +2363,12 @@ impl AppBuilder {
             #[cfg(feature = "ws")]
             channels_backend,
         );
+
+        // Wire the in-memory log capture buffer from the telemetry guard into the
+        // app state so the `/actuator/logfile` endpoint can serve it.
+        if let Some(buf) = telemetry_guard.log_buffer.clone() {
+            state.insert_extension(buf);
+        }
 
         // Instantiate MaintenanceState, load flag synchronously at startup, insert as extension, and start background poller task
         let maintenance_state = crate::maintenance::MaintenanceState::new();
@@ -2505,6 +2560,27 @@ impl AppBuilder {
         if let Some(router) = storage_router {
             merge_routers.push(router);
         }
+
+        // Register SEO routes (/robots.txt and /sitemap.xml) when any SEO
+        // configuration is present or dynamic sources are registered.
+        if !seo_sources.is_empty() || crate::seo::has_seo_config(&config.seo) {
+            let seo_cfg = &config.seo;
+            let raw_profile = config.profile.as_deref().unwrap_or("dev");
+            let profile = crate::seo::effective_seo_profile(raw_profile, seo_cfg.robots.allow_all);
+            let static_paths: Vec<&str> = static_metas.iter().map(|m| m.path).collect();
+            let (robots_body, sitemap_body) = crate::seo::assemble_seo_bodies(
+                profile,
+                seo_cfg.base_url.as_deref(),
+                seo_cfg.robots.sitemap_url.as_deref(),
+                &seo_cfg.robots.additional_rules,
+                &seo_sources,
+                &static_paths,
+            )
+            .await;
+            let seo_router = crate::seo::build_seo_router_from_bodies(robots_body, sitemap_body);
+            merge_routers.push(seo_router);
+        }
+
         #[cfg(feature = "inbound-mail")]
         if let Some(ref im_router) = inbound_mail_router {
             let mut registered_inbound: std::collections::HashSet<String> =
@@ -2903,6 +2979,7 @@ impl AppBuilder {
             channels_interceptor,
             #[cfg(feature = "oauth2")]
             http_interceptor,
+            seo_sources,
             metrics_sources,
             health_indicators,
             #[cfg(feature = "inbound-mail")]
@@ -2915,7 +2992,7 @@ impl AppBuilder {
         let all_routes = routes;
 
         // Load config (same as normal startup)
-        let (mut config, _telemetry_guard) =
+        let (mut config, telemetry_guard) =
             load_config_and_telemetry(config_loader_factory, telemetry_provider).await;
         if idempotency_enabled {
             let env_disabled = std::env::var("AUTUMN_IDEMPOTENCY__ENABLED")
@@ -3028,6 +3105,9 @@ impl AppBuilder {
             #[cfg(feature = "ws")]
             channels_backend,
         );
+        if let Some(buf) = telemetry_guard.log_buffer.clone() {
+            state.insert_extension(buf);
+        }
         state.insert_extension(RegisteredApiVersions(api_versions.clone()));
         #[cfg(feature = "mail")]
         if let Some(interceptor) = mail_interceptor {
@@ -3190,6 +3270,55 @@ impl AppBuilder {
                 }
                 Err(e) => {
                     eprintln!("  \u{26A0} Failed to write OpenAPI spec: {e}");
+                }
+            }
+        }
+
+        // Write robots.txt and sitemap.xml to dist/ — only when SEO is explicitly
+        // configured or dynamic sources are registered, and never overwrite files
+        // already produced by a custom #[static_get("/robots.txt")] route.
+        if !seo_sources.is_empty() || crate::seo::has_seo_config(&config.seo) {
+            let seo_cfg = &config.seo;
+            let raw_profile = config.profile.as_deref().unwrap_or("dev");
+            let profile = crate::seo::effective_seo_profile(raw_profile, seo_cfg.robots.allow_all);
+            let static_paths: Vec<&str> = static_metas.iter().map(|m| m.path).collect();
+            let (robots_body, sitemap_body) = crate::seo::assemble_seo_bodies(
+                profile,
+                seo_cfg.base_url.as_deref(),
+                seo_cfg.robots.sitemap_url.as_deref(),
+                &seo_cfg.robots.additional_rules,
+                &seo_sources,
+                &static_paths,
+            )
+            .await;
+            // Write each file only if it wasn't already produced by a
+            // custom #[static_get] route.
+            let robots_path = dist_dir.join("robots.txt");
+            let sitemap_path = dist_dir.join("sitemap.xml");
+            if robots_path.exists() {
+                eprintln!(
+                    "  \u{2713} SEO: robots.txt already present (custom static route), skipping"
+                );
+            } else {
+                match tokio::fs::write(&robots_path, robots_body).await {
+                    Ok(()) => eprintln!(
+                        "  \u{2713} SEO: robots.txt written \u{2192} {}",
+                        robots_path.display()
+                    ),
+                    Err(e) => eprintln!("  \u{26A0} Failed to write robots.txt: {e}"),
+                }
+            }
+            if sitemap_path.exists() {
+                eprintln!(
+                    "  \u{2713} SEO: sitemap.xml already present (custom static route), skipping"
+                );
+            } else {
+                match tokio::fs::write(&sitemap_path, sitemap_body).await {
+                    Ok(()) => eprintln!(
+                        "  \u{2713} SEO: sitemap.xml written \u{2192} {}",
+                        sitemap_path.display()
+                    ),
+                    Err(e) => eprintln!("  \u{26A0} Failed to write sitemap.xml: {e}"),
                 }
             }
         }
@@ -3379,7 +3508,7 @@ impl AppBuilder {
             std::process::exit(1);
         });
 
-        let (config, _telemetry_guard) =
+        let (config, telemetry_guard) =
             load_config_and_telemetry(config_loader_factory, telemetry_provider).await;
 
         #[cfg(feature = "i18n")]
@@ -3428,6 +3557,9 @@ impl AppBuilder {
             #[cfg(feature = "ws")]
             channels_backend,
         );
+        if let Some(buf) = telemetry_guard.log_buffer.clone() {
+            state.insert_extension(buf);
+        }
         #[cfg(feature = "mail")]
         if let Some(interceptor) = mail_interceptor {
             state.insert_extension(interceptor);
@@ -6617,6 +6749,8 @@ mod tests {
                 name: "startup-seed".to_string(),
                 max_attempts: 1,
                 initial_backoff_ms: 1,
+                uniqueness: None,
+                concurrency: None,
                 handler: startup_noop_job_handler,
             }])
             .on_startup(|_state| async {
@@ -6674,6 +6808,8 @@ mod tests {
                 name: "startup-seed".to_string(),
                 max_attempts: 1,
                 initial_backoff_ms: 1,
+                uniqueness: None,
+                concurrency: None,
                 handler: startup_noop_job_handler,
             }],
             &state,

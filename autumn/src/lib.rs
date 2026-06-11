@@ -96,6 +96,7 @@ pub mod hooks;
 #[cfg(feature = "i18n")]
 pub mod i18n;
 pub mod idempotency;
+pub mod seo;
 /// Translation lookup macro with compile-time key validation.
 ///
 /// Re-exported from [`crate::i18n::t`] for ergonomic
@@ -204,6 +205,7 @@ pub mod step_up;
 pub mod storage;
 pub mod tenancy;
 pub mod time;
+pub mod user_agent;
 
 pub mod experiments;
 pub mod feature_flags;

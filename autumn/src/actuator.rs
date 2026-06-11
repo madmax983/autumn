@@ -348,6 +348,15 @@ pub trait ProvideActuatorState {
     fn webhook_outbound(&self) -> Option<crate::webhook_outbound::WebhookOutboundManager> {
         None
     }
+
+    /// Returns the in-memory log capture buffer, if capture is enabled.
+    ///
+    /// The default returns `None` (capture disabled). [`crate::AppState`]
+    /// overrides this to return the buffer installed at startup when
+    /// `log.capture.enabled = true`.
+    fn log_buffer(&self) -> Option<crate::log::capture::LogBuffer> {
+        None
+    }
 }
 
 // ── Shared types for AppState ──────────────────────────────────
@@ -486,15 +495,34 @@ pub struct JobStatus {
     pub queued: u64,
     /// Number of currently running jobs.
     pub in_flight: u64,
+    /// Approximate jobs currently waiting on a free concurrency slot.
+    pub blocked_on_concurrency: u64,
     /// Total successful executions.
     pub total_successes: u64,
     /// Total failed executions.
     pub total_failures: u64,
     /// Total dead-lettered executions.
     pub dead_letters: u64,
+    /// Total enqueues coalesced because a matching unique job was already held.
+    pub total_deduplicated: u64,
     /// Last observed error for this job, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+}
+
+impl JobStatus {
+    const fn empty() -> Self {
+        Self {
+            queued: 0,
+            in_flight: 0,
+            blocked_on_concurrency: 0,
+            total_successes: 0,
+            total_failures: 0,
+            dead_letters: 0,
+            total_deduplicated: 0,
+            last_error: None,
+        }
+    }
 }
 
 /// Registry of ad-hoc jobs and their runtime status.
@@ -515,29 +543,59 @@ impl JobRegistry {
     /// Register a job name with initial counters.
     pub fn register(&self, name: &str) {
         if let Ok(mut guard) = self.inner.write() {
-            guard.entry(name.to_string()).or_insert(JobStatus {
-                queued: 0,
-                in_flight: 0,
-                total_successes: 0,
-                total_failures: 0,
-                dead_letters: 0,
-                last_error: None,
-            });
+            guard.entry(name.to_string()).or_insert(JobStatus::empty());
         }
     }
 
     /// Record that a new job instance was enqueued.
     pub fn record_enqueue(&self, name: &str) {
         if let Ok(mut guard) = self.inner.write() {
-            let status = guard.entry(name.to_string()).or_insert(JobStatus {
-                queued: 0,
-                in_flight: 0,
-                total_successes: 0,
-                total_failures: 0,
-                dead_letters: 0,
-                last_error: None,
-            });
+            let status = guard.entry(name.to_string()).or_insert(JobStatus::empty());
             status.queued = status.queued.saturating_add(1);
+        }
+    }
+
+    /// Record that an enqueue was coalesced into an existing unique job.
+    ///
+    /// Reverses the `record_enqueue` bookkeeping for the coalesced instance
+    /// and bumps the deduplication counter.
+    pub fn record_deduplicated(&self, name: &str) {
+        if let Ok(mut guard) = self.inner.write()
+            && let Some(status) = guard.get_mut(name)
+        {
+            status.queued = status.queued.saturating_sub(1);
+            status.total_deduplicated = status.total_deduplicated.saturating_add(1);
+        }
+    }
+
+    /// Record that a job is parked waiting on a free concurrency slot.
+    pub fn record_concurrency_blocked(&self, name: &str) {
+        if let Ok(mut guard) = self.inner.write()
+            && let Some(status) = guard.get_mut(name)
+        {
+            status.blocked_on_concurrency = status.blocked_on_concurrency.saturating_add(1);
+        }
+    }
+
+    /// Record that a parked job was released back to the queue.
+    pub fn record_concurrency_unblocked(&self, name: &str) {
+        if let Ok(mut guard) = self.inner.write()
+            && let Some(status) = guard.get_mut(name)
+        {
+            status.blocked_on_concurrency = status.blocked_on_concurrency.saturating_sub(1);
+        }
+    }
+
+    /// Replace the blocked-on-concurrency gauges from a backend-wide survey.
+    ///
+    /// Names absent from `counts` are reset to zero. Used by the durable
+    /// backends whose blocked set is observed periodically rather than
+    /// tracked per event.
+    pub fn set_concurrency_blocked_counts(&self, counts: &HashMap<String, u64>) {
+        if let Ok(mut guard) = self.inner.write() {
+            for (name, status) in guard.iter_mut() {
+                status.blocked_on_concurrency = counts.get(name).copied().unwrap_or(0);
+            }
         }
     }
 
@@ -898,6 +956,20 @@ impl ConfigProperties {
             "log.format",
             &format!("{:?}", config.log.format),
             &format!("{:?}", defaults.log.format),
+            profile_str,
+        );
+        Self::track_property(
+            props,
+            "log.capture.enabled",
+            &config.log.capture.enabled.to_string(),
+            &defaults.log.capture.enabled.to_string(),
+            profile_str,
+        );
+        Self::track_property(
+            props,
+            "log.capture.capacity",
+            &config.log.capture.capacity.to_string(),
+            &defaults.log.capture.capacity.to_string(),
             profile_str,
         );
     }
@@ -2290,6 +2362,82 @@ pub(crate) async fn loggers_put<S: ProvideActuatorState + Send + Sync + 'static>
     )
 }
 
+// ── Logfile (sensitive) ────────────────────────────────────────
+
+/// Query parameters for `GET <actuator-prefix>/logfile`.
+#[derive(Debug, Deserialize, Default)]
+pub(crate) struct LogfileQuery {
+    /// Minimum log level to include (case-insensitive).
+    ///
+    /// Valid values: `trace`, `debug`, `info`, `warn`, `error`.
+    /// When absent all levels are returned.
+    pub level: Option<String>,
+    /// Maximum number of entries to return (most-recent N, newest-last).
+    pub limit: Option<usize>,
+}
+
+/// JSON response shape for `GET <actuator-prefix>/logfile`.
+#[derive(Debug, Serialize)]
+pub(crate) struct LogfileResponse {
+    /// Captured log entries, oldest first.
+    pub entries: Vec<crate::log::capture::CapturedLogEntry>,
+    /// Total entries in the buffer (before `limit` is applied).
+    pub total: usize,
+    /// `true` when the capture buffer is enabled and populated by the layer.
+    pub capture_enabled: bool,
+}
+
+/// `GET <actuator-prefix>/logfile` — recent structured log entries.
+///
+/// Returns entries from the in-memory capture buffer, filtered by `?level=`
+/// and capped by `?limit=`. Only available when `actuator.sensitive = true`
+/// and `log.capture.enabled = true`.  When capture is disabled the endpoint
+/// still responds with `200` and an empty list so API consumers can handle
+/// the case uniformly.
+///
+/// Returns `400 Bad Request` when an unrecognised `?level=` value is supplied
+/// so that typos (e.g. `?level=warning`) are rejected rather than silently
+/// broadening the response to all captured entries.
+pub(crate) async fn logfile_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
+    State(state): State<S>,
+    axum::extract::Query(query): axum::extract::Query<LogfileQuery>,
+) -> Result<axum::Json<LogfileResponse>, (StatusCode, axum::Json<serde_json::Value>)> {
+    let min_level = match query.level.as_deref() {
+        None => None,
+        Some(s) => match crate::log::capture::level_from_str(s) {
+            Some(level) => Some(level),
+            None => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    axum::Json(serde_json::json!({
+                        "error": format!(
+                            "invalid level {:?}; valid values: TRACE, DEBUG, INFO, WARN, ERROR",
+                            s
+                        )
+                    })),
+                ));
+            }
+        },
+    };
+
+    Ok(match state.log_buffer() {
+        None => axum::Json(LogfileResponse {
+            entries: vec![],
+            total: 0,
+            capture_enabled: false,
+        }),
+        Some(buf) => {
+            let total = buf.len();
+            let entries = buf.snapshot(min_level, query.limit);
+            axum::Json(LogfileResponse {
+                entries,
+                total,
+                capture_enabled: true,
+            })
+        }
+    })
+}
+
 // ── Tasks (sensitive) ──────────────────────────────────────────
 
 /// `GET <actuator-prefix>/tasks` -- scheduled task status.
@@ -2667,6 +2815,7 @@ pub(crate) fn actuator_endpoint_paths(
         paths.push(actuator_route_path(prefix, "/env"));
         paths.push(actuator_route_path(prefix, "/configprops"));
         paths.push(actuator_route_path(prefix, "/loggers"));
+        paths.push(actuator_route_path(prefix, "/logfile"));
         paths.push(actuator_route_path(prefix, "/tasks"));
         paths.push(actuator_route_path(prefix, "/jobs"));
         paths.push(actuator_route_path(prefix, "/ui/tasks"));
@@ -2759,6 +2908,10 @@ pub(crate) fn actuator_router_with_prefix<
             .route(
                 &actuator_route_path(prefix, "/loggers/{name}"),
                 axum::routing::put(loggers_put::<S>),
+            )
+            .route(
+                &actuator_route_path(prefix, "/logfile"),
+                axum::routing::get(logfile_endpoint::<S>),
             )
             .route(
                 &actuator_route_path(prefix, "/tasks"),
@@ -2944,6 +3097,7 @@ mod tests {
         metrics_source_registry: MetricsSourceRegistry,
         health_indicator_registry: HealthIndicatorRegistry,
         health_detailed: bool,
+        log_buffer: Option<crate::log::capture::LogBuffer>,
         #[cfg(feature = "http-client")]
         webhook_outbound: Option<crate::webhook_outbound::WebhookOutboundManager>,
         #[cfg(feature = "db")]
@@ -3009,6 +3163,9 @@ mod tests {
         fn health_detailed(&self) -> bool {
             self.health_detailed
         }
+        fn log_buffer(&self) -> Option<crate::log::capture::LogBuffer> {
+            self.log_buffer.clone()
+        }
     }
 
     fn test_state() -> TestActuatorState {
@@ -3027,6 +3184,7 @@ mod tests {
             metrics_source_registry: MetricsSourceRegistry::new(),
             health_indicator_registry: HealthIndicatorRegistry::new(),
             health_detailed: config.health.detailed,
+            log_buffer: None,
             #[cfg(feature = "http-client")]
             webhook_outbound: None,
             #[cfg(feature = "db")]
@@ -3227,6 +3385,8 @@ mod tests {
                 name: "autumn_webhook_delivery".to_string(),
                 max_attempts: 1,
                 initial_backoff_ms: 1,
+                uniqueness: None,
+                concurrency: None,
                 handler: |_state, _payload| Box::pin(async move { Ok(()) }),
             }],
             &runtime_state,
@@ -3299,6 +3459,8 @@ mod tests {
                 name: "autumn_webhook_delivery".to_string(),
                 max_attempts: 1,
                 initial_backoff_ms: 1,
+                uniqueness: None,
+                concurrency: None,
                 handler: |_state, _payload| Box::pin(async move { Ok(()) }),
             }],
             &runtime_state,
@@ -5304,6 +5466,216 @@ mod tests {
             !text.contains("dup_series_metric{region=\"us\"} 20"),
             "duplicate series must be dropped:\n{text}"
         );
+    }
+
+    // ── RED then GREEN: /actuator/logfile endpoint ─────────────
+
+    fn make_log_buffer_with_entries() -> crate::log::capture::LogBuffer {
+        use crate::log::capture::{CapturedLogEntry, LogBuffer};
+        use crate::log::filter::ParameterFilter;
+        let buf = LogBuffer::new(100, ParameterFilter::default());
+        buf.push(CapturedLogEntry {
+            timestamp: "2024-01-01T00:00:00.000Z".to_owned(),
+            level: "INFO".to_owned(),
+            target: "myapp::orders".to_owned(),
+            message: "order created".to_owned(),
+            fields: {
+                let mut m = serde_json::Map::new();
+                m.insert("order_id".to_owned(), serde_json::json!("A-1001"));
+                m
+            },
+            request_id: Some("req-abc".to_owned()),
+        });
+        buf.push(CapturedLogEntry {
+            timestamp: "2024-01-01T00:00:01.000Z".to_owned(),
+            level: "WARN".to_owned(),
+            target: "myapp::payments".to_owned(),
+            message: "payment slow".to_owned(),
+            fields: serde_json::Map::new(),
+            request_id: None,
+        });
+        buf.push(CapturedLogEntry {
+            timestamp: "2024-01-01T00:00:02.000Z".to_owned(),
+            level: "ERROR".to_owned(),
+            target: "myapp::payments".to_owned(),
+            message: "payment failed".to_owned(),
+            fields: serde_json::Map::new(),
+            request_id: None,
+        });
+        buf
+    }
+
+    #[tokio::test]
+    async fn green_logfile_returns_empty_when_capture_disabled() {
+        let state = test_state(); // log_buffer = None
+        let response =
+            logfile_endpoint(State(state), axum::extract::Query(LogfileQuery::default()))
+                .await
+                .unwrap();
+        let body = response.0;
+        assert!(!body.capture_enabled);
+        assert!(body.entries.is_empty());
+        assert_eq!(body.total, 0);
+    }
+
+    #[tokio::test]
+    async fn green_logfile_returns_all_entries_when_no_filter() {
+        let mut state = test_state();
+        state.log_buffer = Some(make_log_buffer_with_entries());
+
+        let response =
+            logfile_endpoint(State(state), axum::extract::Query(LogfileQuery::default()))
+                .await
+                .unwrap();
+        let body = response.0;
+        assert!(body.capture_enabled);
+        assert_eq!(body.total, 3);
+        assert_eq!(body.entries.len(), 3);
+        // newest-last ordering
+        assert_eq!(body.entries[0].level, "INFO");
+        assert_eq!(body.entries[2].level, "ERROR");
+    }
+
+    #[tokio::test]
+    async fn green_logfile_level_filter_excludes_info_when_min_warn() {
+        let mut state = test_state();
+        state.log_buffer = Some(make_log_buffer_with_entries());
+
+        let response = logfile_endpoint(
+            State(state),
+            axum::extract::Query(LogfileQuery {
+                level: Some("warn".to_owned()),
+                limit: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let body = response.0;
+        assert_eq!(body.entries.len(), 2);
+        assert!(body.entries.iter().all(|e| e.level != "INFO"));
+    }
+
+    #[tokio::test]
+    async fn green_logfile_limit_returns_most_recent_n() {
+        let mut state = test_state();
+        state.log_buffer = Some(make_log_buffer_with_entries());
+
+        let response = logfile_endpoint(
+            State(state),
+            axum::extract::Query(LogfileQuery {
+                level: None,
+                limit: Some(2),
+            }),
+        )
+        .await
+        .unwrap();
+        let body = response.0;
+        assert_eq!(body.entries.len(), 2);
+        // Most recent 2 = WARN and ERROR
+        assert_eq!(body.entries[0].level, "WARN");
+        assert_eq!(body.entries[1].level, "ERROR");
+    }
+
+    #[tokio::test]
+    async fn green_logfile_sensitive_fields_in_response_are_served_scrubbed() {
+        use crate::log::capture::{CapturedLogEntry, LogBuffer};
+        use crate::log::filter::{FILTERED_PLACEHOLDER, ParameterFilter};
+        let buf = LogBuffer::new(10, ParameterFilter::default());
+        // The layer scrubs before storage; simulate stored entry with scrubbed value.
+        buf.push(CapturedLogEntry {
+            timestamp: "2024-01-01T00:00:00.000Z".to_owned(),
+            level: "INFO".to_owned(),
+            target: "auth".to_owned(),
+            message: "login attempt".to_owned(),
+            fields: {
+                let mut m = serde_json::Map::new();
+                m.insert(
+                    "password".to_owned(),
+                    serde_json::Value::String(FILTERED_PLACEHOLDER.to_owned()),
+                );
+                m
+            },
+            request_id: None,
+        });
+
+        let mut state = test_state();
+        state.log_buffer = Some(buf);
+
+        let response =
+            logfile_endpoint(State(state), axum::extract::Query(LogfileQuery::default()))
+                .await
+                .unwrap();
+        let body = response.0;
+        assert_eq!(
+            body.entries[0].fields["password"].as_str().unwrap(),
+            FILTERED_PLACEHOLDER,
+            "sensitive value must remain scrubbed in the response"
+        );
+    }
+
+    #[tokio::test]
+    async fn green_logfile_invalid_level_returns_400() {
+        let state = test_state();
+        let result = logfile_endpoint(
+            State(state),
+            axum::extract::Query(LogfileQuery {
+                level: Some("warning".to_owned()), // invalid — should be "warn"
+                limit: None,
+            }),
+        )
+        .await;
+        let (status, _body) = result.unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn green_logfile_endpoint_in_sensitive_router() {
+        // The endpoint must be reachable when sensitive=true.
+        let state = test_state();
+        let app = actuator_router::<TestActuatorState>(true).with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/logfile")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn green_logfile_endpoint_not_in_non_sensitive_router() {
+        // The endpoint must NOT be reachable when sensitive=false.
+        let state = test_state();
+        let app = actuator_router::<TestActuatorState>(false).with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/logfile")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn green_logfile_structured_fields_preserved() {
+        let mut state = test_state();
+        state.log_buffer = Some(make_log_buffer_with_entries());
+
+        let response =
+            logfile_endpoint(State(state), axum::extract::Query(LogfileQuery::default()))
+                .await
+                .unwrap();
+        let body = response.0;
+        let first = &body.entries[0];
+        assert_eq!(first.target, "myapp::orders");
+        assert_eq!(first.fields["order_id"].as_str().unwrap(), "A-1001");
+        assert_eq!(first.request_id.as_deref(), Some("req-abc"));
     }
 }
 

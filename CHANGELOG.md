@@ -9,6 +9,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **auth:** Active session management with device list and revocation in the auth starter (#819)
+  - `autumn generate auth` now persists a `{user}_sessions` row per login
+    (SHA-256 digest of the opaque session id — never the raw id — plus user id,
+    IP at login, raw + parsed User-Agent, optional device label, `created_at`,
+    `last_seen_at`), created on password login, email confirmation, TOTP verify,
+    and passkey login, and removed on logout.
+  - Generated handler APIs on the user model: `sessions()`, `revoke_session(id)`,
+    `revoke_other_sessions(current_digest)`, and `revoke_all_sessions()`, plus a
+    `require_tracked_session` gate used by every generated authenticated route.
+    The row is the source of truth: revoking it makes the device's **next**
+    request 401 (the cookie session is destroyed too), with no reliance on
+    cookie expiry. `last_seen_at` writes are throttled to at most one per
+    `[auth.sessions].last_seen_update_secs` (default 60 s) per session.
+  - New `/account/sessions` Maud + htmx page: per-session revoke buttons,
+    device labels, and a one-click "Sign out everywhere else".
+  - Credential-changing events — password reset, TOTP enrollment/disable, and
+    passkey add/remove — revoke all *other* sessions by default, configurable
+    via the new `[auth.sessions] revoke_on_credential_change` flag (default on).
+  - New `autumn_web::user_agent` module: a dependency-free heuristic
+    `parse_user_agent` (browser family / OS / device class) with a documented
+    one-line swap point for custom parsers.
+  - Generated `tests/auth_sessions.rs` covers the two-client flow (log in twice,
+    revoke from one client, the other's replayed cookie 401s) and generated
+    `docs/guide/session-management.md` documents the APIs, the privacy posture
+    for stored IP/UA (purpose limitation, retention scrubbing SQL, IP
+    truncation), and the migration path for existing auth-starter apps.
+  - Additive only: one new table in the auth-starter migration; no public API
+    removed.
+- **jobs:** Job uniqueness keys and concurrency limits for `#[job]` (#829)
+  - `#[job(unique)]` dedupes enqueues on a stable hash of the full args;
+    `unique_by = "field, …"` derives the key from selected args fields. The
+    uniqueness window is configurable: `unique_window = "running"` (default:
+    held while pending or running), `"pending"` (released when execution
+    starts), or `unique_for_ms = N` (TTL debounce from enqueue time). A
+    coalesced enqueue is a no-op `Ok(())` — N identical enqueues in a burst
+    execute exactly once.
+  - `#[job(concurrency = N)]` caps simultaneously-executing jobs of the type;
+    `concurrency_key = "field"` scopes the cap per distinct args value
+    (e.g. at most one `recalculate_account` per account). Excess jobs wait
+    for a slot rather than running or being dropped.
+  - Enforced consistently on all three backends and distributed-safe on the
+    durable ones: Postgres uses an additive schema (nullable columns + a
+    partial unique index with `ON CONFLICT DO NOTHING`) and concurrency-aware
+    claims serialized by a transaction-scoped advisory lock only when a
+    limited job is registered; Redis uses `SET NX PX` unique locks and atomic
+    Lua claim/settle scripts with a parked-jobs zset.
+  - Keys and slots are released on success, terminal failure, and worker
+    crash (visibility-timeout recovery / TTL backstop), so a dead worker
+    cannot deadlock a unique key or leak a concurrency slot. Retries keep
+    the key held but free the slot during backoff.
+  - Observability: `/actuator/jobs` adds `total_deduplicated` and
+    `blocked_on_concurrency` per job, and the job admin model gains the
+    `deduplicated` status.
+  - Additive and non-breaking: jobs without the new attributes behave
+    exactly as before; the `autumn_jobs` schema change is additive; minor
+    version bump.
+
 - **log:** Structured per-request access log, on by default (#999)
   - Every served HTTP request now emits **exactly one** structured access-log
     event (`tracing` target `autumn::access`, level `INFO`) at the response
