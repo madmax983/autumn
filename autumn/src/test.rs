@@ -1102,7 +1102,8 @@ impl TestApp {
                     || self.scoped_groups.iter().any(|g| {
                         g.routes.iter().any(|r| {
                             r.method == Method::POST
-                                && format!("{}{}", g.prefix, r.path) == path.as_str()
+                                && crate::router::join_nested_path(&g.prefix, r.path)
+                                    == path.as_str()
                         })
                     })
                     || self.nest_routers.iter().any(|(nest_path, _)| {

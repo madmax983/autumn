@@ -59,7 +59,7 @@ impl CircuitBreakerPolicy {
         let mut policy = Self::default();
         let defs = &rc.circuit_breaker.defaults;
         if let Some(ratio) = defs.failure_ratio_threshold {
-            policy.failure_ratio_threshold = ratio;
+            policy.failure_ratio_threshold = ratio.clamp(0.000_1, 1.0);
         }
         if let Some(window) = defs.sample_window_secs {
             policy.sample_window = Duration::from_secs(window);
@@ -76,7 +76,7 @@ impl CircuitBreakerPolicy {
 
         if let Some(host_cfg) = rc.circuit_breaker.hosts.get(name) {
             if let Some(ratio) = host_cfg.failure_ratio_threshold {
-                policy.failure_ratio_threshold = ratio;
+                policy.failure_ratio_threshold = ratio.clamp(0.000_1, 1.0);
             }
             if let Some(window) = host_cfg.sample_window_secs {
                 policy.sample_window = Duration::from_secs(window);
@@ -148,7 +148,8 @@ impl CircuitBreakerInner {
 }
 
 impl CircuitBreaker {
-    pub fn new(name: impl Into<String>, config: CircuitBreakerPolicy) -> Self {
+    pub fn new(name: impl Into<String>, mut config: CircuitBreakerPolicy) -> Self {
+        config.failure_ratio_threshold = config.failure_ratio_threshold.clamp(0.000_1, 1.0);
         Self {
             name: name.into(),
             inner: Arc::new(Mutex::new(CircuitBreakerInner {
@@ -189,7 +190,8 @@ impl CircuitBreaker {
         inner.config.clone()
     }
 
-    pub fn update_config(&self, config: CircuitBreakerPolicy) {
+    pub fn update_config(&self, mut config: CircuitBreakerPolicy) {
+        config.failure_ratio_threshold = config.failure_ratio_threshold.clamp(0.000_1, 1.0);
         let mut inner = self.inner.lock().unwrap();
         inner.config = config;
     }
@@ -687,5 +689,28 @@ mod tests {
         // half_open_in_flight should be decremented back to 0!
         let in_flight_after = breaker.inner.lock().unwrap().half_open_in_flight;
         assert_eq!(in_flight_after, 0);
+    }
+
+    #[tokio::test]
+    async fn test_circuit_breaker_clamps_zero_failure_ratio_threshold() {
+        let policy = CircuitBreakerPolicy {
+            failure_ratio_threshold: 0.0,
+            sample_window: Duration::from_secs(10),
+            minimum_sample_count: 5,
+            open_duration: Duration::from_secs(60),
+            half_open_trial_count: 2,
+        };
+        let breaker = CircuitBreaker::new("clamp_test", policy);
+        let config = breaker.config();
+        assert!(config.failure_ratio_threshold > 0.0);
+        assert!(config.failure_ratio_threshold <= 1.0);
+
+        // Even with successful calls, it shouldn't trip
+        for _ in 0..5 {
+            let res: Result<(), CircuitBreakerError<&'static str>> =
+                breaker.run(async { Ok::<(), &'static str>(()) }).await;
+            assert!(res.is_ok());
+        }
+        assert_eq!(breaker.state(), CircuitState::Closed);
     }
 }

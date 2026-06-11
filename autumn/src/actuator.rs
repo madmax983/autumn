@@ -1569,6 +1569,9 @@ fn build_health_components(
     // Custom indicators first so the built-in "db" key inserted below can never
     // be overwritten by a user-registered indicator with the same name.
     for result in indicator_results {
+        if !detailed && result.name.starts_with("circuit_breaker.") {
+            continue;
+        }
         let details = (detailed && !result.output.details.is_empty())
             .then(|| serde_json::to_value(&result.output.details).unwrap_or_default());
         components.insert(
@@ -2939,6 +2942,7 @@ mod tests {
         job_registry: JobRegistry,
         config_props: ConfigProperties,
         metrics_source_registry: MetricsSourceRegistry,
+        health_indicator_registry: HealthIndicatorRegistry,
         health_detailed: bool,
         #[cfg(feature = "http-client")]
         webhook_outbound: Option<crate::webhook_outbound::WebhookOutboundManager>,
@@ -2999,6 +3003,9 @@ mod tests {
         fn shutdown_token(&self) -> tokio_util::sync::CancellationToken {
             self.shutdown.clone()
         }
+        fn health_indicator_registry(&self) -> Option<&HealthIndicatorRegistry> {
+            Some(&self.health_indicator_registry)
+        }
         fn health_detailed(&self) -> bool {
             self.health_detailed
         }
@@ -3018,6 +3025,7 @@ mod tests {
             job_registry: JobRegistry::new(),
             config_props: ConfigProperties::from_config(config),
             metrics_source_registry: MetricsSourceRegistry::new(),
+            health_indicator_registry: HealthIndicatorRegistry::new(),
             health_detailed: config.health.detailed,
             #[cfg(feature = "http-client")]
             webhook_outbound: None,
@@ -3464,6 +3472,77 @@ mod tests {
         assert_eq!(item_undetailed["state"], "CLOSED");
         assert!(item_undetailed.get("failure_ratio_threshold").is_none());
         assert!(item_undetailed.get("minimum_sample_count").is_none());
+        crate::circuit_breaker::global_registry().clear();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_health_hides_circuit_breakers_when_undetailed() {
+        let _lock = crate::circuit_breaker::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::circuit_breaker::global_registry().clear();
+
+        let _breaker = crate::circuit_breaker::global_registry().get_or_create(
+            "test_health_hide_breaker",
+            crate::circuit_breaker::CircuitBreakerPolicy {
+                failure_ratio_threshold: 0.5,
+                sample_window: std::time::Duration::from_secs(10),
+                minimum_sample_count: 2,
+                open_duration: std::time::Duration::from_secs(60),
+                half_open_trial_count: 2,
+            },
+        );
+
+        let mut detailed_config = AutumnConfig::default();
+        detailed_config.health.detailed = true;
+        let state = test_state_with_config(&detailed_config);
+        let app = actuator_router(true).with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["components"]["circuit_breaker.test_health_hide_breaker"].is_object());
+
+        let mut undetailed_config = AutumnConfig::default();
+        undetailed_config.health.detailed = false;
+        let undetailed_state = test_state_with_config(&undetailed_config);
+        let app_undetailed = actuator_router(true).with_state(undetailed_state);
+        let resp_undetailed = app_undetailed
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp_undetailed.status(), StatusCode::OK);
+        let body_undetailed = axum::body::to_bytes(resp_undetailed.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json_undetailed: serde_json::Value = serde_json::from_slice(&body_undetailed).unwrap();
+
+        if let Some(components) = json_undetailed.get("components") {
+            assert!(
+                components
+                    .get("circuit_breaker.test_health_hide_breaker")
+                    .is_none()
+            );
+        }
+
         crate::circuit_breaker::global_registry().clear();
     }
 
