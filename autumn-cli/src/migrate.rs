@@ -118,6 +118,14 @@ fn run_migrations_with_maintenance(
     let _lock_guard =
         hold_migration_lock(database_url, DEFAULT_LOCK_WAIT_TIMEOUT).unwrap_or_else(|e| {
             eprintln!("\u{274C} Failed to acquire migration lock: {e}");
+            if with_maintenance {
+                eprintln!();
+                eprintln!(
+                    "  \u{26A0}\u{FE0F}  Lock acquisition failed — maintenance mode left ON for safety."
+                );
+                eprintln!("      Fix the blocking migration then run `autumn migrate` to retry.");
+                eprintln!("      Run `autumn maintenance off` to re-open traffic manually.");
+            }
             std::process::exit(1);
         });
 
