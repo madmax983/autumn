@@ -3053,6 +3053,15 @@ pub struct LogConfig {
     /// (`health.path` etc.), mirror the new paths here.
     #[serde(default = "default_access_log_exclude")]
     pub access_log_exclude: Vec<String>,
+
+    /// In-memory log capture buffer for `/actuator/logfile`.
+    ///
+    /// When enabled, recent structured log entries are visible over HTTP
+    /// through the sensitive actuator endpoint without SSH access or an
+    /// external log aggregator.  The buffer is bounded and never grows
+    /// unbounded.
+    #[serde(default)]
+    pub capture: crate::log::capture::LogCaptureConfig,
 }
 
 /// Log output format.
@@ -3590,6 +3599,7 @@ impl Default for LogConfig {
             unfilter_parameters: Vec::new(),
             access_log: default_access_log(),
             access_log_exclude: default_access_log_exclude(),
+            capture: crate::log::capture::LogCaptureConfig::default(),
         }
     }
 }

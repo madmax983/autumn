@@ -2185,7 +2185,7 @@ impl AppBuilder {
         let all_routes = routes;
 
         // 1 & 2. Load configuration and initialize logging/telemetry
-        let (mut config, _telemetry_guard) =
+        let (mut config, telemetry_guard) =
             load_config_and_telemetry(config_loader_factory, telemetry_provider).await;
 
         // Apply builder-level flag: `.idempotent()` enables the middleware when
@@ -2314,6 +2314,12 @@ impl AppBuilder {
             #[cfg(feature = "ws")]
             channels_backend,
         );
+
+        // Wire the in-memory log capture buffer from the telemetry guard into the
+        // app state so the `/actuator/logfile` endpoint can serve it.
+        if let Some(buf) = telemetry_guard.log_buffer.clone() {
+            state.insert_extension(buf);
+        }
 
         // Instantiate MaintenanceState, load flag synchronously at startup, insert as extension, and start background poller task
         let maintenance_state = crate::maintenance::MaintenanceState::new();
@@ -2914,7 +2920,7 @@ impl AppBuilder {
         let all_routes = routes;
 
         // Load config (same as normal startup)
-        let (mut config, _telemetry_guard) =
+        let (mut config, telemetry_guard) =
             load_config_and_telemetry(config_loader_factory, telemetry_provider).await;
         if idempotency_enabled {
             let env_disabled = std::env::var("AUTUMN_IDEMPOTENCY__ENABLED")
@@ -3027,6 +3033,9 @@ impl AppBuilder {
             #[cfg(feature = "ws")]
             channels_backend,
         );
+        if let Some(buf) = telemetry_guard.log_buffer.clone() {
+            state.insert_extension(buf);
+        }
         state.insert_extension(RegisteredApiVersions(api_versions.clone()));
         #[cfg(feature = "mail")]
         if let Some(interceptor) = mail_interceptor {
@@ -3378,7 +3387,7 @@ impl AppBuilder {
             std::process::exit(1);
         });
 
-        let (config, _telemetry_guard) =
+        let (config, telemetry_guard) =
             load_config_and_telemetry(config_loader_factory, telemetry_provider).await;
 
         #[cfg(feature = "i18n")]
@@ -3427,6 +3436,9 @@ impl AppBuilder {
             #[cfg(feature = "ws")]
             channels_backend,
         );
+        if let Some(buf) = telemetry_guard.log_buffer.clone() {
+            state.insert_extension(buf);
+        }
         #[cfg(feature = "mail")]
         if let Some(interceptor) = mail_interceptor {
             state.insert_extension(interceptor);
