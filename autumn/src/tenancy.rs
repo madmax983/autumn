@@ -1,3 +1,45 @@
+//! Multi-tenancy support and extraction.
+//!
+//! This module provides the tools to extract and manage tenant identifiers
+//! across an Autumn application. When tenancy is enabled in the configuration
+//! (`autumn.toml`), the framework can determine the current tenant from either
+//! an HTTP header or a subdomain.
+//!
+//! # Mechanics
+//!
+//! 1. **Extractor**: The [`Tenant`] extractor can be used in route handlers
+//!    to get the current tenant ID. If the tenant is missing or the configuration
+//!    is invalid, it rejects the request with a `400 Bad Request`.
+//! 2. **Task-Local Storage**: The `CURRENT_TENANT` task-local variable stores
+//!    the tenant ID, making it accessible to background jobs, database hooks,
+//!    and other contexts that don't have direct access to the HTTP request.
+//!
+//! # Examples
+//!
+//! Using the `Tenant` extractor in a route handler:
+//!
+//! ```rust,ignore
+//! use autumn_web::prelude::*;
+//! use autumn_web::tenancy::Tenant;
+//!
+//! #[get("/dashboard")]
+//! async fn dashboard(tenant: Tenant) -> Markup {
+//!     html! {
+//!         h1 { "Dashboard for Tenant: " (tenant.0) }
+//!     }
+//! }
+//! ```
+//!
+//! # Configuration
+//!
+//! Tenancy is configured via `autumn.toml`:
+//!
+//! ```toml
+//! [tenancy]
+//! enabled = true
+//! source = "header" # or "subdomain"
+//! header_name = "x-tenant-id"
+//! ```
 use axum::{
     extract::State,
     http::Request,
