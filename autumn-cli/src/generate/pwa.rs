@@ -227,6 +227,39 @@ fn render_pwa_register_js() -> String {
 
 fn render_pwa_system_test() -> String {
     let manifest_selector = r#"link[rel="manifest"]"#;
+    // Handler stubs are defined inline so this integration test crate compiles without
+    // depending on src/main.rs.  The real handlers (with include_str! paths and the app's
+    // layout helper) are injected there by `inject_pwa_into_main`.
+    let stubs = concat!(
+        "#[get(\"/manifest.webmanifest\")]\n",
+        "async fn pwa_manifest() -> impl IntoResponse {\n",
+        "    ([(\"content-type\", \"application/manifest+json\")], \"\")\n",
+        "}\n",
+        "\n",
+        "#[get(\"/service-worker.js\")]\n",
+        "async fn pwa_service_worker() -> impl IntoResponse {\n",
+        "    (\n",
+        "        [\n",
+        "            (\"content-type\", \"text/javascript; charset=utf-8\"),\n",
+        "            (\"service-worker-allowed\", \"/\"),\n",
+        "        ],\n",
+        "        \"\",\n",
+        "    )\n",
+        "}\n",
+        "\n",
+        "#[get(\"/pwa-register.js\")]\n",
+        "async fn pwa_register_js() -> impl IntoResponse {\n",
+        "    ([(\"content-type\", \"text/javascript; charset=utf-8\")], \"\")\n",
+        "}\n",
+        "\n",
+        "#[get(\"/offline\")]\n",
+        "async fn pwa_offline() -> impl IntoResponse {\n",
+        "    axum::response::Html(\n",
+        "        \"<html><head><link rel=\\\"manifest\\\" href=\\\"/manifest.webmanifest\\\"></head><body></body></html>\",\n",
+        "    )\n",
+        "}\n",
+        "\n",
+    );
     format!(
         "//! PWA smoke test \u{2014} manifest content-type + service-worker registration.\n\
          //!\n\
@@ -235,8 +268,10 @@ fn render_pwa_system_test() -> String {
          \n\
          #![cfg(feature = \"system-tests\")]\n\
          \n\
+         use autumn_web::prelude::*;\n\
          use autumn_web::system_test::SystemTest;\n\
          \n\
+         {stubs}\
          /// Checks that `GET /manifest.webmanifest` returns `application/manifest+json`\n\
          /// and that the `<link rel=\"manifest\">` tag is present in the page DOM.\n\
          #[tokio::test]\n\

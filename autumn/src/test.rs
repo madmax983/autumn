@@ -1099,7 +1099,7 @@ impl TestApp {
                 if self
                     .routes
                     .iter()
-                    .any(|r| r.method == Method::POST && r.path == path.as_str())
+                    .any(|r| r.method == Method::POST && r.path == path)
                     || self.scoped_groups.iter().any(|g| {
                         g.routes.iter().any(|r| {
                             r.method == Method::POST
@@ -1108,7 +1108,7 @@ impl TestApp {
                     })
                     || self.nest_routers.iter().any(|(nest_path, _)| {
                         let p = nest_path.as_str();
-                        path.as_str() == p
+                        path == nest_path
                             || path.starts_with(p)
                                 && (p.ends_with('/') || path.as_bytes().get(p.len()) == Some(&b'/'))
                     })

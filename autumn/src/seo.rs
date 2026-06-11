@@ -242,24 +242,31 @@ pub fn robots_txt(profile: &str, sitemap_url: Option<&str>, additional_rules: &[
 
 /// Generate a valid `sitemap.xml` string.
 ///
-/// For sites with more than 50,000 URLs, generates a
-/// `<sitemapindex>` document that references numbered sub-sitemaps
-/// (`/sitemap-1.xml`, `/sitemap-2.xml`, …).
+/// Produces a `<urlset>` document with up to 50,000 entries (the Sitemap
+/// protocol limit per file).  When more entries are supplied the first 50,000
+/// are included and a `tracing::warn!` is emitted.  For sites that genuinely
+/// exceed this limit, register a custom `/sitemap.xml` handler that builds and
+/// serves a sitemap index alongside the numbered shard files.
 ///
 /// # Arguments
 ///
 /// * `entries` — The sitemap entries to include.
-/// * `base_url` — The site base URL (e.g. `"https://example.com"`), used to
-///   build sub-sitemap URLs in sitemapindex mode.
+/// * `_base_url` — Reserved for future sitemap-index support; currently unused.
 #[must_use]
-pub fn sitemap_xml(entries: &[SitemapEntry], base_url: Option<&str>) -> String {
+pub fn sitemap_xml(entries: &[SitemapEntry], _base_url: Option<&str>) -> String {
     const CHUNK_SIZE: usize = 50_000;
 
     if entries.len() > CHUNK_SIZE {
-        sitemap_index_xml(entries, base_url.unwrap_or(""), CHUNK_SIZE)
-    } else {
-        sitemap_urlset_xml(entries)
+        tracing::warn!(
+            count = entries.len(),
+            limit = CHUNK_SIZE,
+            "sitemap: entry count exceeds the {CHUNK_SIZE}-URL per-file limit; \
+             only the first {CHUNK_SIZE} entries will be served. \
+             Register a custom /sitemap.xml handler to serve a sitemap index for larger sites.",
+        );
+        return sitemap_urlset_xml(&entries[..CHUNK_SIZE]);
     }
+    sitemap_urlset_xml(entries)
 }
 
 /// Build a `<urlset>` sitemap.
@@ -295,24 +302,6 @@ pub(crate) fn sitemap_urlset_xml(entries: &[SitemapEntry]) -> String {
     xml
 }
 
-/// Build a `<sitemapindex>` for sites with more than `chunk_size` URLs.
-fn sitemap_index_xml(entries: &[SitemapEntry], base_url: &str, chunk_size: usize) -> String {
-    let chunk_count = entries.len().div_ceil(chunk_size);
-    let mut xml = String::from(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
-         <sitemapindex xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">",
-    );
-    for i in 0..chunk_count {
-        let idx = i + 1;
-        xml.push_str("\n  <sitemap>\n    <loc>");
-        xml.push_str(base_url);
-        xml.push_str("/sitemap-");
-        write!(xml, "{idx}").ok();
-        xml.push_str(".xml</loc>\n  </sitemap>");
-    }
-    xml.push_str("\n</sitemapindex>");
-    xml
-}
 
 /// Escape XML special characters in a single pass over the input.
 fn xml_escape(s: &str) -> String {
