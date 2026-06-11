@@ -3492,11 +3492,15 @@ if ARGV[4] == 'success' then
   redis.call('LTRIM', KEYS[5], 0, tonumber(ARGV[7]) - 1)
   redis.call('DEL', key)
 elseif ARGV[4] == 'retry' then
+  if ARGV[10] == 'pending' then
+    if not redis.call('SET', KEYS[7], ARGV[1], 'NX', 'PX', tonumber(ARGV[11])) then
+      redis.call('DEL', key)
+      return 1
+    end
+  end
   redis.call('SET', key, ARGV[5])
   redis.call('ZADD', KEYS[3], ARGV[6], ARGV[1])
-  if ARGV[10] == 'pending' then
-    redis.call('SET', KEYS[7], ARGV[1], 'NX', 'PX', tonumber(ARGV[11]))
-  elseif ARGV[10] == 'running' then
+  if ARGV[10] == 'running' then
     redis.call('PEXPIRE', KEYS[7], tonumber(ARGV[11]))
   end
 elseif ARGV[4] == 'dead' then
@@ -3679,11 +3683,15 @@ if ARGV[7] == '1' and redis.call('GET', KEYS[6]) == ARGV[1] then
   redis.call('DEL', KEYS[6])
 end
 if ARGV[4] == 'requeue' then
+  if ARGV[9] == 'pending' then
+    if not redis.call('SET', KEYS[6], ARGV[1], 'NX', 'PX', tonumber(ARGV[10])) then
+      redis.call('DEL', key)
+      return 1
+    end
+  end
   redis.call('SET', key, ARGV[5])
   redis.call('LPUSH', KEYS[3], ARGV[1])
-  if ARGV[9] == 'pending' then
-    redis.call('SET', KEYS[6], ARGV[1], 'NX', 'PX', tonumber(ARGV[10]))
-  elseif ARGV[9] == 'running' then
+  if ARGV[9] == 'running' then
     redis.call('PEXPIRE', KEYS[6], tonumber(ARGV[10]))
   end
 elseif ARGV[4] == 'dead' then
