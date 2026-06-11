@@ -131,23 +131,35 @@ fn sitemap_xml_escapes_special_chars_in_url() {
 }
 
 #[test]
-fn sitemap_xml_generates_sitemapindex_for_large_sites() {
-    // Generate more than 50,000 entries to trigger sitemapindex
+fn sitemap_xml_caps_entries_at_protocol_limit() {
+    // The sitemap-index feature was removed in favor of a hard cap: when
+    // more than 50,000 entries (the Sitemap protocol per-file limit) are
+    // supplied, only the first 50,000 are served and a warning is logged.
+    // Sites beyond the limit register a custom /sitemap.xml handler.
     let entries: Vec<SitemapEntry> = (0..50_001)
         .map(|i| SitemapEntry::new(format!("https://example.com/page/{i}")))
         .collect();
     let xml = sitemap_xml(&entries, Some("https://example.com"));
     assert!(
-        xml.contains("<sitemapindex"),
-        "should use sitemapindex for large sites"
+        xml.contains("<urlset"),
+        "capped output is still a plain urlset document"
     );
     assert!(
-        xml.contains("<sitemap>"),
-        "should have sitemap entries in index"
+        !xml.contains("<sitemapindex"),
+        "sitemap-index generation was intentionally removed"
+    );
+    assert_eq!(
+        xml.matches("<url>").count(),
+        50_000,
+        "should serve exactly the first 50,000 entries"
     );
     assert!(
-        xml.contains("https://example.com/sitemap-1.xml"),
-        "should reference sub-sitemaps"
+        xml.contains("https://example.com/page/49999"),
+        "last entry within the cap is included"
+    );
+    assert!(
+        !xml.contains("https://example.com/page/50000<"),
+        "entries beyond the cap are dropped"
     );
 }
 
