@@ -27,6 +27,9 @@ fn read_or_empty(path: &std::path::Path) -> String {
 /// Minimum two steps are required.
 const MIN_STEPS: usize = 2;
 
+/// Step names reserved for internal wizard handlers.
+const RESERVED_STEP_NAMES: &[&str] = &["confirm", "commit", "cancel"];
+
 /// Compute the file actions for `autumn generate wizard`.
 ///
 /// `name` is the wizard name (e.g. `checkout`).
@@ -56,10 +59,15 @@ pub fn plan_wizard(
         )));
     }
 
-    // Reject duplicate step names after normalization.
+    // Reject reserved step names and duplicates after normalization.
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for step in steps {
         let normalized = snake(step);
+        if RESERVED_STEP_NAMES.contains(&normalized.as_str()) {
+            return Err(GenerateError::Config(format!(
+                "step name '{normalized}' is reserved by the wizard generator"
+            )));
+        }
         if !seen.insert(normalized.clone()) {
             return Err(GenerateError::Config(format!(
                 "duplicate step name after normalization: '{normalized}'"
@@ -228,13 +236,18 @@ fn render_step_handlers(snake_name: &str, _pascal_name: &str, steps: &[String]) 
         out.push(format!(
             r#"/// Show the `{s}` step form.
 #[get("/{snake_name}/{s}")]
-pub async fn show_{s}(session: Session, csrf: CsrfToken, csrf_field: CsrfFormField) -> impl IntoResponse {{
+pub async fn show_{s}(
+    session: Session,
+    csrf: Option<CsrfToken>,
+    csrf_field: Option<CsrfFormField>,
+) -> impl IntoResponse {{
     let wizard = wizard_context(session.clone());
     if let Err(redirect_url) = wizard.guard_step("{s}", "{base_path}").await {{
         return Redirect::to(&redirect_url).into_response();
     }}
     let data: {pascal_step}Form = wizard.step_data("{s}").await.unwrap_or_default();
-    let form = ChangesetForm::blank(data, csrf.token()).with_csrf_field(csrf_field.0);
+    let form = ChangesetForm::blank(data, csrf.as_ref().map_or("", |t| t.token()))
+        .with_csrf_field(csrf_field.map_or_else(|| "_csrf".to_string(), |f| f.0));
     html! {{
         (wizard_progress(&wizard, "{s}").await)
         (form.form_tag("/{snake_name}/{s}", "post", html! {{
@@ -298,7 +311,11 @@ pub async fn submit_{s}(session: Session, form: ChangesetForm<{pascal_step}Form>
     out.push(format!(
         r#"/// Show a summary of all wizard steps for the user to review before committing.
 #[get("/{snake_name}/confirm")]
-pub async fn show_confirm(session: Session, csrf: CsrfToken) -> impl IntoResponse {{
+pub async fn show_confirm(
+    session: Session,
+    csrf: Option<CsrfToken>,
+    csrf_field: Option<CsrfFormField>,
+) -> impl IntoResponse {{
     let wizard = wizard_context(session.clone());
 
     // Guard: redirect to the first incomplete step if not all steps are done.
@@ -307,11 +324,13 @@ pub async fn show_confirm(session: Session, csrf: CsrfToken) -> impl IntoRespons
     }}
 
 {load_steps}
+    let csrf_field_name = csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str());
+    let csrf_token_value = csrf.as_ref().map_or("", |t| t.token());
     html! {{
         (wizard_progress(&wizard, "confirm").await)
         // TODO: render a summary of all step data for the user to review.
         form action="/{snake_name}/commit" method="post" {{
-            input type="hidden" name="_authenticity_token" value=(csrf.token()) {{}}
+            input type="hidden" name=(csrf_field_name) value=(csrf_token_value) {{}}
             button type="submit" {{ "Confirm and Submit" }}
         }}
     }}
@@ -342,8 +361,10 @@ pub async fn commit(session: Session) -> impl IntoResponse {{
     Redirect::to("/").into_response()
 }}
 
-/// Cancel the wizard: discard all in-progress state.
-#[get("/{snake_name}/cancel")]
+/// Cancel the wizard — POST only to prevent accidental state loss.
+///
+/// Clears all wizard session data and redirects away.
+#[post("/{snake_name}/cancel")]
 pub async fn cancel(session: Session) -> impl IntoResponse {{
     let wizard = wizard_context(session.clone());
     wizard.clear().await;
@@ -454,7 +475,7 @@ async fn {snake_name}_cancel_clears_session_state() {{
     //
     // // Save step 1 then cancel
     // client.post("/{snake_name}/{first_step}").form("...").send().await;
-    // client.get("/{snake_name}/cancel").send().await.assert_status(302);
+    // client.post("/{snake_name}/cancel").send().await.assert_status(302);
     //
     // // After cancel, step 1 guard should redirect back to step 1
     // client.get("/{snake_name}/{second_step}").send().await
@@ -585,6 +606,19 @@ mod tests {
         let content = render_wizard_file("checkout", "Checkout", &steps3());
         assert!(content.contains("pub async fn commit("));
         assert!(content.contains("pub async fn cancel("));
+    }
+
+    #[test]
+    fn wizard_file_cancel_uses_post_not_get() {
+        let content = render_wizard_file("checkout", "Checkout", &steps3());
+        assert!(
+            content.contains("#[post(\"/checkout/cancel\")]"),
+            "cancel handler must use POST to prevent accidental state loss"
+        );
+        assert!(
+            !content.contains("#[get(\"/checkout/cancel\")]"),
+            "cancel handler must not use GET"
+        );
     }
 
     #[test]
@@ -738,6 +772,22 @@ mod tests {
             matches!(result.unwrap_err(), GenerateError::InvalidName(_, _)),
             "hyphens produce invalid Rust identifiers"
         );
+    }
+
+    #[test]
+    fn plan_rejects_reserved_step_names() {
+        let tmp = project();
+        for reserved in &["confirm", "commit", "cancel"] {
+            let result = plan_wizard(
+                tmp.path(),
+                "checkout",
+                &[(*reserved).into(), "payment".into()],
+            );
+            assert!(
+                matches!(result.unwrap_err(), GenerateError::Config(_)),
+                "'{reserved}' should be rejected as a reserved step name"
+            );
+        }
     }
 
     #[test]

@@ -132,10 +132,17 @@ impl WizardContext {
         format!("{WIZARD_KEY_PREFIX}:{}:{}", self.name, step)
     }
 
-    /// Returns `true` if `step` has data persisted in the session.
+    /// Returns `true` if `step` has valid, parseable data persisted in the session.
+    ///
+    /// Returns `false` if the key is absent or the stored value is no longer
+    /// valid JSON (e.g. after a schema change), ensuring `first_incomplete_step`
+    /// correctly routes users back through invalidated steps.
     pub async fn is_step_complete(&self, step: &str) -> bool {
         let key = self.session_key(step);
-        self.session.contains_key(&key).await
+        let Some(json) = self.session.get(&key).await else {
+            return false;
+        };
+        serde_json::from_str::<serde_json::Value>(&json).is_ok()
     }
 
     /// Returns the name of the first step that has *not* been completed, or
