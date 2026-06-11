@@ -6628,6 +6628,8 @@ mod tests {
                 name: "startup-seed".to_string(),
                 max_attempts: 1,
                 initial_backoff_ms: 1,
+                uniqueness: None,
+                concurrency: None,
                 handler: startup_noop_job_handler,
             }])
             .on_startup(|_state| async {
@@ -6685,6 +6687,8 @@ mod tests {
                 name: "startup-seed".to_string(),
                 max_attempts: 1,
                 initial_backoff_ms: 1,
+                uniqueness: None,
+                concurrency: None,
                 handler: startup_noop_job_handler,
             }],
             &state,

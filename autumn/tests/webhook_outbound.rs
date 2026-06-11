@@ -57,6 +57,8 @@ async fn test_webhook_outbound_lifecycle() {
         name: "autumn_webhook_delivery".to_owned(),
         max_attempts: 1,
         initial_backoff_ms: 1,
+        uniqueness: None,
+        concurrency: None,
         handler: autumn_web::webhook_outbound::deliver_webhook_job,
     };
     job::start_runtime(vec![job_info], state, &shutdown, &config).unwrap();
@@ -150,6 +152,8 @@ async fn test_webhook_outbound_retries_and_dlq() {
         name: "autumn_webhook_delivery".to_owned(),
         max_attempts: 5,
         initial_backoff_ms: 1,
+        uniqueness: None,
+        concurrency: None,
         handler: autumn_web::webhook_outbound::deliver_webhook_job,
     };
     job::start_runtime(vec![job_info], state, &shutdown, &config).unwrap();
@@ -236,6 +240,8 @@ async fn test_webhook_outbound_failure_caps_deactivation() {
         name: "autumn_webhook_delivery".to_owned(),
         max_attempts: 5,
         initial_backoff_ms: 1,
+        uniqueness: None,
+        concurrency: None,
         handler: autumn_web::webhook_outbound::deliver_webhook_job,
     };
     job::start_runtime(vec![job_info], state, &shutdown, &config).unwrap();
@@ -314,6 +320,8 @@ async fn test_webhook_outbound_actuator_endpoints() {
         name: "autumn_webhook_delivery".to_owned(),
         max_attempts: 5,
         initial_backoff_ms: 1,
+        uniqueness: None,
+        concurrency: None,
         handler: autumn_web::webhook_outbound::deliver_webhook_job,
     };
     job::start_runtime(vec![job_info], state, &shutdown, &config).unwrap();
