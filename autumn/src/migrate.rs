@@ -276,7 +276,7 @@ pub(crate) async fn check_replica_migration_readiness_blocking(
 
 /// Acquire the `PostgreSQL` session-level advisory lock that serializes migration runs.
 ///
-/// Polls [`pg_try_advisory_lock`] at 500 ms intervals until the lock is
+/// Polls `pg_try_advisory_lock` at 500 ms intervals until the lock is
 /// acquired or `timeout` elapses. Logs at `INFO` on acquisition and `DEBUG`
 /// while waiting.
 ///
