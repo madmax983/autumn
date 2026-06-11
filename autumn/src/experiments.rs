@@ -627,12 +627,18 @@ impl InMemoryExperimentStore {
 
 impl ExperimentStore for InMemoryExperimentStore {
     fn get(&self, name: &str) -> Result<Option<ExperimentConfig>, ExperimentStoreError> {
-        Ok(self.inner.read().unwrap().experiments.get(name).cloned())
+        Ok(self
+            .inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .experiments
+            .get(name)
+            .cloned())
     }
 
     fn list(&self) -> Result<Vec<ExperimentConfig>, ExperimentStoreError> {
         let mut exps: Vec<ExperimentConfig> = {
-            let inner = self.inner.read().unwrap();
+            let inner = self.inner.read().unwrap_or_else(std::sync::PoisonError::into_inner);
             inner.experiments.values().cloned().collect()
         };
         exps.sort_by(|a, b| a.name.cmp(&b.name));
@@ -642,7 +648,7 @@ impl ExperimentStore for InMemoryExperimentStore {
     fn upsert(&self, config: ExperimentConfig) -> Result<(), ExperimentStoreError> {
         let name = config.name.clone();
         {
-            let mut inner = self.inner.write().unwrap();
+            let mut inner = self.inner.write().unwrap_or_else(std::sync::PoisonError::into_inner);
             let active_variants: std::collections::HashSet<String> = inner
                 .assignments
                 .values()
@@ -680,7 +686,7 @@ impl ExperimentStore for InMemoryExperimentStore {
         winner: Option<&str>,
     ) -> Result<(), ExperimentStoreError> {
         {
-            let mut inner = self.inner.write().unwrap();
+            let mut inner = self.inner.write().unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(exp) = inner.experiments.get_mut(name) {
                 exp.state = state;
                 if let Some(w) = winner {
@@ -708,7 +714,7 @@ impl ExperimentStore for InMemoryExperimentStore {
         actor: Option<&str>,
     ) -> Result<(), ExperimentStoreError> {
         {
-            let mut inner = self.inner.write().unwrap();
+            let mut inner = self.inner.write().unwrap_or_else(std::sync::PoisonError::into_inner);
             let active_variants: std::collections::HashSet<String> = inner
                 .assignments
                 .values()
@@ -745,7 +751,7 @@ impl ExperimentStore for InMemoryExperimentStore {
         experiment: &str,
         actor: &str,
     ) -> Result<Option<Assignment>, ExperimentStoreError> {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read().unwrap_or_else(std::sync::PoisonError::into_inner);
         Ok(inner
             .assignments
             .get(&(experiment.to_owned(), actor.to_owned()))
@@ -753,7 +759,7 @@ impl ExperimentStore for InMemoryExperimentStore {
     }
 
     fn record_assignment(&self, assignment: Assignment) -> Result<String, ExperimentStoreError> {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write().unwrap_or_else(std::sync::PoisonError::into_inner);
 
         if !assignment.is_override {
             // Find the exclusion group for this experiment.
@@ -792,7 +798,7 @@ impl ExperimentStore for InMemoryExperimentStore {
         experiment: &str,
         actor: &str,
     ) -> Result<Option<String>, ExperimentStoreError> {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read().unwrap_or_else(std::sync::PoisonError::into_inner);
         Ok(inner
             .overrides
             .get(&(experiment.to_owned(), actor.to_owned()))
@@ -808,7 +814,7 @@ impl ExperimentStore for InMemoryExperimentStore {
         let key = (experiment.to_owned(), actor.to_owned());
         self.inner
             .write()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .overrides
             .insert(key, variant.to_owned());
         Ok(())
@@ -820,7 +826,7 @@ impl ExperimentStore for InMemoryExperimentStore {
         group: &str,
         exclude_experiment: &str,
     ) -> Result<bool, ExperimentStoreError> {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read().unwrap_or_else(std::sync::PoisonError::into_inner);
         for (exp_name, config) in &inner.experiments {
             if exp_name == exclude_experiment {
                 continue;
@@ -844,7 +850,7 @@ impl ExperimentStore for InMemoryExperimentStore {
         limit: usize,
     ) -> Result<Vec<ChangeRecord>, ExperimentStoreError> {
         let records = {
-            let inner = self.inner.read().unwrap();
+            let inner = self.inner.read().unwrap_or_else(std::sync::PoisonError::into_inner);
             inner
                 .changes
                 .get(experiment)

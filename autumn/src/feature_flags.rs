@@ -317,7 +317,7 @@ impl InMemoryFlagStore {
     }
 
     fn upsert(&self, key: &str, f: impl FnOnce(&mut FlagConfig)) {
-        let mut flags = self.flags.write().unwrap();
+        let mut flags = self.flags.write().unwrap_or_else(std::sync::PoisonError::into_inner);
         let flag = flags
             .entry(key.to_owned())
             .or_insert_with(|| FlagConfig::new(key));
@@ -328,7 +328,7 @@ impl InMemoryFlagStore {
     fn record(&self, record: FlagChangeRecord) {
         self.history
             .write()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .entry(record.key.clone())
             .or_default()
             .push(record);
@@ -337,11 +337,22 @@ impl InMemoryFlagStore {
 
 impl FlagStore for InMemoryFlagStore {
     fn get(&self, key: &str) -> Result<Option<FlagConfig>, FlagStoreError> {
-        Ok(self.flags.read().unwrap().get(key).cloned())
+        Ok(self
+            .flags
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(key)
+            .cloned())
     }
 
     fn list(&self) -> Result<Vec<FlagConfig>, FlagStoreError> {
-        let mut flags: Vec<FlagConfig> = self.flags.read().unwrap().values().cloned().collect();
+        let mut flags: Vec<FlagConfig> = self
+            .flags
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .cloned()
+            .collect();
         flags.sort_by(|a, b| a.key.cmp(&b.key));
         Ok(flags)
     }
@@ -422,7 +433,7 @@ impl FlagStore for InMemoryFlagStore {
         Ok(self
             .history
             .read()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(key)
             .map(|records| records.iter().rev().take(limit).cloned().collect())
             .unwrap_or_default())

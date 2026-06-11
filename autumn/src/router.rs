@@ -4792,7 +4792,11 @@ async fn api_versioning_middleware(
                 ));
             }
             if auth_failed {
-                return auth_error.unwrap().into_response();
+                return auth_error
+                    .unwrap_or_else(|| {
+                        crate::error::AutumnError::unauthorized_msg("authentication required")
+                    })
+                    .into_response();
             }
         }
 

@@ -845,7 +845,12 @@ impl InMemoryConfigStore {
 
 impl ConfigStore for InMemoryConfigStore {
     fn get_raw(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
-        Ok(self.values.read().unwrap().get(key).cloned())
+        Ok(self
+            .values
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(key)
+            .cloned())
     }
 
     fn set_raw(
@@ -858,10 +863,13 @@ impl ConfigStore for InMemoryConfigStore {
         let old_value = old_raw.map(ConfigValue::Text);
         let new_value = Some(ConfigValue::Text(new_raw.clone()));
         let record = ConfigChangeRecord::now(key, old_value, new_value, actor);
-        self.values.write().unwrap().insert(key.to_owned(), new_raw);
+        self.values
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(key.to_owned(), new_raw);
         self.history
             .write()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .entry(key.to_owned())
             .or_default()
             .push(record);
@@ -876,10 +884,13 @@ impl ConfigStore for InMemoryConfigStore {
     ) -> Result<(), ConfigStoreError> {
         let old_value = old_raw.map(ConfigValue::Text);
         let record = ConfigChangeRecord::now(key, old_value, None, actor);
-        self.values.write().unwrap().remove(key);
+        self.values
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(key);
         self.history
             .write()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .entry(key.to_owned())
             .or_default()
             .push(record);
@@ -890,7 +901,7 @@ impl ConfigStore for InMemoryConfigStore {
         let mut pairs: Vec<(String, String)> = self
             .values
             .read()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
@@ -903,7 +914,7 @@ impl ConfigStore for InMemoryConfigStore {
         key: &str,
         limit: usize,
     ) -> Result<Vec<ConfigChangeRecord>, ConfigStoreError> {
-        let guard = self.history.read().unwrap();
+        let guard = self.history.read().unwrap_or_else(std::sync::PoisonError::into_inner);
         Ok(guard
             .get(key)
             .map(|records| records.iter().rev().take(limit).cloned().collect())
