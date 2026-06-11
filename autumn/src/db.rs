@@ -977,7 +977,10 @@ impl Db {
             })?;
 
         let start_time = std::time::Instant::now();
-        let is_test_tx = params.interceptors.iter().any(|i| i.is_transactional_test());
+        let is_test_tx = params
+            .interceptors
+            .iter()
+            .any(|i| i.is_transactional_test());
 
         Ok(Self {
             conn,

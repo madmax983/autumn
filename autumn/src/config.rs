@@ -51,6 +51,14 @@
 //! | `AUTUMN_DATABASE__REPLICA_FALLBACK` | `database.replica_fallback` | `fail_readiness` / `primary` |
 //! | `AUTUMN_DATABASE__CONNECT_TIMEOUT_SECS` | `database.connect_timeout_secs` | `u64` |
 //! | `AUTUMN_DATABASE__AUTO_MIGRATE_IN_PRODUCTION` | `database.auto_migrate_in_production` | `bool` |
+//! | `AUTUMN_DATABASE__SLOT_COUNT` | `database.slot_count` | `u16` |
+//! | `AUTUMN_DATABASE__SHARDS__{i}__NAME` | `database.shards[i].name` | `String` |
+//! | `AUTUMN_DATABASE__SHARDS__{i}__PRIMARY_URL` | `database.shards[i].primary_url` | `String` |
+//! | `AUTUMN_DATABASE__SHARDS__{i}__SLOTS` | `database.shards[i].slots` | CSV of indices / `A-B` ranges |
+//! | `AUTUMN_DATABASE__SHARDS__{i}__REPLICA_URL` | `database.shards[i].replica_url` | `String` |
+//! | `AUTUMN_DATABASE__SHARDS__{i}__PRIMARY_POOL_SIZE` | `database.shards[i].primary_pool_size` | `usize` |
+//! | `AUTUMN_DATABASE__SHARDS__{i}__REPLICA_POOL_SIZE` | `database.shards[i].replica_pool_size` | `usize` |
+//! | `AUTUMN_DATABASE__SHARDS__{i}__REPLICA_FALLBACK` | `database.shards[i].replica_fallback` | `fail_readiness` / `primary` |
 //! | `AUTUMN_LOG__LEVEL` | `log.level` | tracing filter directive |
 //! | `AUTUMN_LOG__FORMAT` | `log.format` | `Auto` / `Pretty` / `Json` |
 //! | `AUTUMN_TELEMETRY__ENABLED` | `telemetry.enabled` | `bool` |
@@ -1806,6 +1814,22 @@ impl AutumnConfig {
         self.database.validate()?;
         self.cors.validate()?;
         self.scheduler.validate()?;
+        // Framework state (autumn_jobs, scheduler advisory locks) lives on
+        // the control topology and is never sharded. Sharded apps that use a
+        // Postgres-backed jobs or scheduler backend therefore need a control
+        // role alongside their shards.
+        if self.database.has_shards()
+            && self.database.effective_primary_url().is_none()
+            && (self.scheduler.backend == SchedulerBackend::Postgres
+                || self.jobs.backend == "postgres")
+        {
+            return Err(ConfigError::Validation(
+                "jobs/scheduler require a control database: set database.primary_url (or \
+                 database.url) alongside [[database.shards]] — framework state such as \
+                 autumn_jobs and scheduler locks is not sharded (see docs/guide/sharding.md)"
+                    .to_owned(),
+            ));
+        }
         let is_production = matches!(self.profile.as_deref(), Some("prod" | "production"));
         self.security
             .webhooks
@@ -2077,6 +2101,59 @@ impl AutumnConfig {
             "AUTUMN_DATABASE__AUTO_MIGRATE_IN_PRODUCTION",
             &mut self.database.auto_migrate_in_production,
         );
+        parse_env(
+            env,
+            "AUTUMN_DATABASE__SLOT_COUNT",
+            &mut self.database.slot_count,
+        );
+        self.apply_shard_env_overrides(env);
+    }
+
+    /// Apply `AUTUMN_DATABASE__SHARDS__{i}__*` environment overrides.
+    ///
+    /// The [`Env`] abstraction can only probe known keys, so shard entries
+    /// are addressed positionally: index `i` corresponds to the i-th
+    /// `[[database.shards]]` entry in declaration order. Existing entries
+    /// can have individual fields overridden; a brand-new entry is appended
+    /// when both `__NAME` and `__PRIMARY_URL` are provided for the next
+    /// free index. Probing stops at the first index that neither exists in
+    /// TOML nor defines a complete new shard (bounded at 64).
+    fn apply_shard_env_overrides(&mut self, env: &dyn Env) {
+        const MAX_ENV_SHARDS: usize = 64;
+        for i in 0..MAX_ENV_SHARDS {
+            let key = |field: &str| format!("AUTUMN_DATABASE__SHARDS__{i}__{field}");
+            if i >= self.database.shards.len() {
+                let (Ok(name), Ok(primary_url)) =
+                    (env.var(&key("NAME")), env.var(&key("PRIMARY_URL")))
+                else {
+                    break;
+                };
+                self.database.shards.push(ShardConfig {
+                    name,
+                    primary_url,
+                    slots: None,
+                    replica_url: None,
+                    primary_pool_size: None,
+                    replica_pool_size: None,
+                    replica_fallback: None,
+                });
+            }
+            let shard = &mut self.database.shards[i];
+            parse_env_string(env, &key("NAME"), &mut shard.name);
+            parse_env_string(env, &key("PRIMARY_URL"), &mut shard.primary_url);
+            // Comma-separated indices and/or "A-B" ranges, e.g. "0-15,40,62-63".
+            if let Ok(val) = env.var(&key("SLOTS")) {
+                shard.slots = Some(
+                    val.split(',')
+                        .map(|token| SlotSpec::Range(token.trim().to_owned()))
+                        .collect(),
+                );
+            }
+            parse_env_option_string(env, &key("REPLICA_URL"), &mut shard.replica_url);
+            parse_env_option(env, &key("PRIMARY_POOL_SIZE"), &mut shard.primary_pool_size);
+            parse_env_option(env, &key("REPLICA_POOL_SIZE"), &mut shard.replica_pool_size);
+            parse_env_option(env, &key("REPLICA_FALLBACK"), &mut shard.replica_fallback);
+        }
     }
 
     fn apply_log_env_overrides_with_env(&mut self, env: &dyn Env) {
@@ -2905,6 +2982,159 @@ impl std::str::FromStr for ReplicaFallback {
     }
 }
 
+/// A logical slot assignment entry in a shard's `slots` list.
+///
+/// Accepts a single slot index (`5`) or an inclusive range written as a
+/// string (`"0-31"`). A string holding a single number (`"5"`) is also
+/// accepted so environment-variable overrides can pass everything as text.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum SlotSpec {
+    /// A single slot index.
+    Index(u16),
+    /// `"A-B"` inclusive range, or `"N"` single index.
+    Range(String),
+}
+
+impl SlotSpec {
+    /// Expand into concrete slot indices.
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable message when a range string is malformed
+    /// or inverted (`"31-0"`).
+    pub fn expand(&self) -> Result<Vec<u16>, String> {
+        match self {
+            Self::Index(slot) => Ok(vec![*slot]),
+            Self::Range(spec) => {
+                let spec = spec.trim();
+                let parse = |s: &str| {
+                    s.trim()
+                        .parse::<u16>()
+                        .map_err(|_| format!("invalid slot {s:?} in {spec:?}"))
+                };
+                match spec.split_once('-') {
+                    None => Ok(vec![parse(spec)?]),
+                    Some((start, end)) => {
+                        let (start, end) = (parse(start)?, parse(end)?);
+                        if start > end {
+                            return Err(format!("inverted slot range {spec:?}"));
+                        }
+                        Ok((start..=end).collect())
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// One horizontal shard of the application's data, declared via
+/// `[[database.shards]]` in `autumn.toml`.
+///
+/// Each shard is a full primary/replica topology of its own, so the
+/// replica story composes with sharding: any shard may have a read
+/// replica, role-specific pool sizes, and its own fallback behavior.
+/// Fields left unset fall back to the corresponding `[database]` value.
+///
+/// # Routing: keys → logical slots → shards
+///
+/// Routing keys hash onto a fixed set of **logical slots**
+/// (`database.slot_count`, default 64), and each slot maps to one shard.
+/// The key→slot hash is a permanent contract; the slot→shard map is
+/// plain configuration. Growing from two shards to three means moving
+/// whole slots — copy a slot's rows to the new shard, flip its `slots`
+/// entry, deploy — without rehashing any keys.
+///
+/// When **every** shard declares [`slots`](Self::slots), declaration
+/// order is meaningless and entries can be reordered, renamed, or
+/// removed freely (as long as the map still covers every slot exactly
+/// once). When **no** shard declares `slots`, the framework auto-splits
+/// the slot space into contiguous even ranges **by declaration order**
+/// — convenient to start with, but reordering entries then moves data.
+/// Pin explicit `slots` before making any topology change.
+///
+/// # Example
+///
+/// ```toml
+/// [database]
+/// primary_url = "postgres://db-control/app"   # control role: jobs, sessions, flags
+///
+/// [[database.shards]]
+/// name = "shard0"
+/// primary_url = "postgres://db-shard0/app"
+/// slots = ["0-31"]
+///
+/// [[database.shards]]
+/// name = "shard1"
+/// primary_url = "postgres://db-shard1/app"
+/// slots = ["32-63"]
+/// replica_url = "postgres://db-shard1-ro/app"
+/// replica_fallback = "primary"
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct ShardConfig {
+    /// Stable shard identity used in logs, metric tags, health component
+    /// names (`db:shard:<name>`), and `autumn migrate --shard <name>`.
+    ///
+    /// Must be non-empty, unique across shards, and restricted to
+    /// `[a-z0-9_-]` so it can be embedded in metric/health keys.
+    pub name: String,
+
+    /// Postgres URL for this shard's primary/write role. Required.
+    pub primary_url: String,
+
+    /// Logical slots this shard owns, as indices and/or `"A-B"` inclusive
+    /// ranges (e.g. `slots = ["0-15", 40, "62-63"]`).
+    ///
+    /// All-or-none across shards: either every shard declares `slots`
+    /// (explicit map covering `0..slot_count` exactly once; an empty list
+    /// marks a drained shard being decommissioned) or none does
+    /// (contiguous auto-split by declaration order).
+    #[serde(default)]
+    pub slots: Option<Vec<SlotSpec>>,
+
+    /// Optional Postgres URL for this shard's read-replica role.
+    #[serde(default)]
+    pub replica_url: Option<String>,
+
+    /// Optional primary pool size override. Falls back to
+    /// `database.primary_pool_size`, then `database.pool_size`.
+    #[serde(default)]
+    pub primary_pool_size: Option<usize>,
+
+    /// Optional replica pool size override. Falls back to
+    /// `database.replica_pool_size`, then `database.pool_size`.
+    #[serde(default)]
+    pub replica_pool_size: Option<usize>,
+
+    /// Optional replica fallback override. Falls back to
+    /// `database.replica_fallback`.
+    #[serde(default)]
+    pub replica_fallback: Option<ReplicaFallback>,
+}
+
+impl ShardConfig {
+    /// Resolved primary pool size for this shard.
+    #[must_use]
+    pub fn effective_primary_pool_size(&self, defaults: &DatabaseConfig) -> usize {
+        self.primary_pool_size
+            .unwrap_or_else(|| defaults.effective_primary_pool_size())
+    }
+
+    /// Resolved replica pool size for this shard.
+    #[must_use]
+    pub fn effective_replica_pool_size(&self, defaults: &DatabaseConfig) -> usize {
+        self.replica_pool_size
+            .unwrap_or_else(|| defaults.effective_replica_pool_size())
+    }
+
+    /// Resolved replica fallback behavior for this shard.
+    #[must_use]
+    pub fn effective_replica_fallback(&self, defaults: &DatabaseConfig) -> ReplicaFallback {
+        self.replica_fallback.unwrap_or(defaults.replica_fallback)
+    }
+}
+
 /// Database connection configuration.
 ///
 /// When `url` is `None` (the default), the application runs without a
@@ -2925,6 +3155,8 @@ impl std::str::FromStr for ReplicaFallback {
 /// | `replica_fallback` | `fail_readiness` |
 /// | `connect_timeout_secs` | `5` |
 /// | `auto_migrate_in_production` | `false` |
+/// | `slot_count` | `64` |
+/// | `shards` | `[]` |
 ///
 /// # Examples
 ///
@@ -3004,7 +3236,36 @@ pub struct DatabaseConfig {
         default = "default_slow_query_threshold"
     )]
     pub slow_query_threshold: std::time::Duration,
+
+    /// Number of logical routing slots shared across all shards.
+    /// Default: `64`. Maximum: `8192`.
+    ///
+    /// Keys hash onto `0..slot_count` and each slot maps to one shard, so
+    /// resharding means moving whole slots between shards rather than
+    /// rehashing keys. **Choose this once, before data lands on shards**:
+    /// changing it later re-routes every key — a full reshard. Pick a value
+    /// comfortably above the number of physical shards you ever expect
+    /// (the default 64 supports up to 64 shards).
+    #[serde(default = "default_slot_count")]
+    pub slot_count: u16,
+
+    /// Horizontal shards, declared as `[[database.shards]]` entries.
+    ///
+    /// Empty (the default) means the application is unsharded and only the
+    /// `url`/`primary_url`/`replica_url` roles above apply. When non-empty,
+    /// those top-level roles become the **control** topology — framework
+    /// state (jobs, scheduler locks, sessions, feature flags) lives there
+    /// while tenant data is routed across the shards. See [`ShardConfig`].
+    #[serde(default)]
+    pub shards: Vec<ShardConfig>,
 }
+
+const fn default_slot_count() -> u16 {
+    64
+}
+
+/// Hard ceiling for `database.slot_count`.
+pub const MAX_SLOT_COUNT: u16 = 8192;
 
 impl DatabaseConfig {
     /// Resolved primary/write database URL.
@@ -3025,11 +3286,111 @@ impl DatabaseConfig {
         self.replica_pool_size.unwrap_or(self.pool_size)
     }
 
+    /// Whether any `[[database.shards]]` entries are configured.
+    #[must_use]
+    pub const fn has_shards(&self) -> bool {
+        !self.shards.is_empty()
+    }
+
+    /// Resolve the slot→shard map: element `s` is the index (into
+    /// [`shards`](Self::shards)) of the shard that owns slot `s`.
+    ///
+    /// This is the single source of truth for slot assignment, used by both
+    /// configuration validation and runtime
+    /// [`ShardSet`](crate::sharding::ShardSet) construction:
+    ///
+    /// - When **no** shard declares `slots`, the slot space is auto-split
+    ///   into contiguous even ranges by declaration order.
+    /// - When **every** shard declares `slots`, the explicit assignments are
+    ///   used and must cover `0..slot_count` exactly once.
+    /// - Mixing declared and undeclared `slots` is an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Validation`] for an invalid `slot_count`,
+    /// mixed declarations, malformed/out-of-range/duplicate slots, or
+    /// incomplete coverage.
+    pub fn resolved_slot_map(&self) -> Result<Vec<usize>, ConfigError> {
+        let slot_count = usize::from(self.slot_count);
+        if self.slot_count == 0 || self.slot_count > MAX_SLOT_COUNT {
+            return Err(ConfigError::Validation(format!(
+                "database.slot_count must be between 1 and {MAX_SLOT_COUNT}, got {}",
+                self.slot_count
+            )));
+        }
+
+        if self.shards.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let declared = self.shards.iter().filter(|s| s.slots.is_some()).count();
+        if declared != 0 && declared != self.shards.len() {
+            return Err(ConfigError::Validation(
+                "database.shards: either every shard must declare `slots` or none may \
+                 (mixing explicit and auto-assigned slots is ambiguous)"
+                    .to_owned(),
+            ));
+        }
+
+        if declared == 0 {
+            // Contiguous even auto-split by declaration order.
+            if self.shards.len() > slot_count {
+                return Err(ConfigError::Validation(format!(
+                    "database.slot_count ({slot_count}) must be at least the number of \
+                     shards ({})",
+                    self.shards.len()
+                )));
+            }
+            let n = self.shards.len();
+            return Ok((0..slot_count).map(|slot| slot * n / slot_count).collect());
+        }
+
+        let mut map: Vec<Option<usize>> = vec![None; slot_count];
+        for (idx, shard) in self.shards.iter().enumerate() {
+            let specs = shard.slots.as_deref().unwrap_or_default();
+            for spec in specs {
+                let slots = spec.expand().map_err(|e| {
+                    ConfigError::Validation(format!("database.shards[{idx}].slots: {e}"))
+                })?;
+                for slot in slots {
+                    if usize::from(slot) >= slot_count {
+                        return Err(ConfigError::Validation(format!(
+                            "database.shards[{idx}].slots: slot {slot} is out of range \
+                             (slot_count is {slot_count})"
+                        )));
+                    }
+                    if let Some(owner) = map[usize::from(slot)] {
+                        return Err(ConfigError::Validation(format!(
+                            "database.shards[{idx}].slots: slot {slot} is already owned \
+                             by shard {:?}",
+                            self.shards[owner].name
+                        )));
+                    }
+                    map[usize::from(slot)] = Some(idx);
+                }
+            }
+        }
+        let unassigned: Vec<usize> = map
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, owner)| owner.is_none().then_some(slot))
+            .collect();
+        if !unassigned.is_empty() {
+            return Err(ConfigError::Validation(format!(
+                "database.shards: slot map must cover every slot in 0..{slot_count}; \
+                 unassigned slots: {unassigned:?}"
+            )));
+        }
+        // Coverage was just verified, so flatten cannot drop entries.
+        Ok(map.into_iter().flatten().collect())
+    }
+
     /// Validate database configuration.
     ///
     /// # Errors
     ///
-    /// Returns a validation error if the URL has an invalid scheme.
+    /// Returns a validation error if a URL has an invalid scheme or a
+    /// shard declaration is malformed.
     pub fn validate(&self) -> Result<(), ConfigError> {
         for (field, url) in [
             ("database.url", self.url.as_deref()),
@@ -3056,6 +3417,48 @@ impl DatabaseConfig {
                 "database.replica_url requires database.primary_url or database.url".to_owned(),
             ));
         }
+
+        let mut seen_names = std::collections::HashSet::new();
+        for (idx, shard) in self.shards.iter().enumerate() {
+            if shard.name.is_empty() {
+                return Err(ConfigError::Validation(format!(
+                    "database.shards[{idx}].name must not be empty"
+                )));
+            }
+            if !shard
+                .name
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+            {
+                return Err(ConfigError::Validation(format!(
+                    "database.shards[{idx}].name {:?} is invalid: shard names are used in \
+                     metric tags and health component names and must match [a-z0-9_-]",
+                    shard.name
+                )));
+            }
+            if !seen_names.insert(shard.name.as_str()) {
+                return Err(ConfigError::Validation(format!(
+                    "database.shards[{idx}].name {:?} is declared more than once; \
+                     shard names must be unique",
+                    shard.name
+                )));
+            }
+            for (field, url) in [
+                ("primary_url", Some(shard.primary_url.as_str())),
+                ("replica_url", shard.replica_url.as_deref()),
+            ] {
+                if let Some(url) = url
+                    && !url.starts_with("postgres://")
+                    && !url.starts_with("postgresql://")
+                {
+                    return Err(ConfigError::Validation(format!(
+                        "Invalid database.shards[{idx}].{field}: must start with \
+                         postgres:// or postgresql://, got {url:?}"
+                    )));
+                }
+            }
+        }
+        self.resolved_slot_map()?;
         Ok(())
     }
 }
@@ -3651,6 +4054,8 @@ impl Default for DatabaseConfig {
             auto_migrate_in_production: false,
             statement_timeout: None,
             slow_query_threshold: default_slow_query_threshold(),
+            slot_count: default_slot_count(),
+            shards: Vec::new(),
         }
     }
 }
@@ -4196,6 +4601,444 @@ pool_size = 7
         assert_eq!(config.database.primary_pool_size, Some(9));
         assert_eq!(config.database.replica_pool_size, Some(3));
         assert_eq!(config.database.replica_fallback, ReplicaFallback::Primary);
+    }
+
+    #[test]
+    fn database_shards_parse_from_toml_with_effective_fallbacks() {
+        let config: AutumnConfig = toml::from_str(
+            r#"
+[database]
+primary_url = "postgres://control.example/app"
+pool_size = 8
+replica_fallback = "primary"
+
+[[database.shards]]
+name = "shard0"
+primary_url = "postgres://shard0.example/app"
+
+[[database.shards]]
+name = "shard1"
+primary_url = "postgres://shard1.example/app"
+replica_url = "postgres://shard1-ro.example/app"
+primary_pool_size = 3
+replica_pool_size = 2
+replica_fallback = "fail_readiness"
+"#,
+        )
+        .expect("sharded database config should parse");
+
+        let db = &config.database;
+        assert!(db.has_shards());
+        assert_eq!(db.shards.len(), 2);
+
+        let shard0 = &db.shards[0];
+        assert_eq!(shard0.name, "shard0");
+        assert_eq!(shard0.primary_url, "postgres://shard0.example/app");
+        assert!(shard0.replica_url.is_none());
+        // Unset shard fields fall back to the [database] defaults.
+        assert_eq!(shard0.effective_primary_pool_size(db), 8);
+        assert_eq!(shard0.effective_replica_pool_size(db), 8);
+        assert_eq!(
+            shard0.effective_replica_fallback(db),
+            ReplicaFallback::Primary
+        );
+
+        let shard1 = &db.shards[1];
+        assert_eq!(shard1.effective_primary_pool_size(db), 3);
+        assert_eq!(shard1.effective_replica_pool_size(db), 2);
+        assert_eq!(
+            shard1.effective_replica_fallback(db),
+            ReplicaFallback::FailReadiness
+        );
+
+        config.validate().expect("sharded config should validate");
+    }
+
+    #[test]
+    fn database_shards_default_to_empty() {
+        let config = AutumnConfig::default();
+        assert!(!config.database.has_shards());
+        assert!(config.database.shards.is_empty());
+    }
+
+    #[test]
+    fn database_shard_env_overrides_existing_entry_fields() {
+        let mut config: AutumnConfig = toml::from_str(
+            r#"
+[[database.shards]]
+name = "shard0"
+primary_url = "postgres://toml.example/app"
+"#,
+        )
+        .expect("config should parse");
+        let env = MockEnv::new()
+            .with(
+                "AUTUMN_DATABASE__SHARDS__0__PRIMARY_URL",
+                "postgres://env.example/app",
+            )
+            .with(
+                "AUTUMN_DATABASE__SHARDS__0__REPLICA_URL",
+                "postgres://env-ro.example/app",
+            )
+            .with("AUTUMN_DATABASE__SHARDS__0__PRIMARY_POOL_SIZE", "5")
+            .with("AUTUMN_DATABASE__SHARDS__0__REPLICA_FALLBACK", "primary");
+
+        config.apply_env_overrides_with_env(&env);
+
+        let shard = &config.database.shards[0];
+        assert_eq!(shard.name, "shard0");
+        assert_eq!(shard.primary_url, "postgres://env.example/app");
+        assert_eq!(
+            shard.replica_url.as_deref(),
+            Some("postgres://env-ro.example/app")
+        );
+        assert_eq!(shard.primary_pool_size, Some(5));
+        assert_eq!(shard.replica_fallback, Some(ReplicaFallback::Primary));
+    }
+
+    #[test]
+    fn database_shard_env_appends_new_entry_when_name_and_primary_url_present() {
+        let mut config = AutumnConfig::default();
+        let env = MockEnv::new()
+            .with("AUTUMN_DATABASE__SHARDS__0__NAME", "shard0")
+            .with(
+                "AUTUMN_DATABASE__SHARDS__0__PRIMARY_URL",
+                "postgres://shard0.env/app",
+            )
+            .with("AUTUMN_DATABASE__SHARDS__1__NAME", "shard1")
+            .with(
+                "AUTUMN_DATABASE__SHARDS__1__PRIMARY_URL",
+                "postgres://shard1.env/app",
+            )
+            // Index 3 is unreachable because index 2 is absent: probing stops.
+            .with("AUTUMN_DATABASE__SHARDS__3__NAME", "orphan")
+            .with(
+                "AUTUMN_DATABASE__SHARDS__3__PRIMARY_URL",
+                "postgres://orphan.env/app",
+            );
+
+        config.apply_env_overrides_with_env(&env);
+
+        assert_eq!(config.database.shards.len(), 2);
+        assert_eq!(config.database.shards[0].name, "shard0");
+        assert_eq!(config.database.shards[1].name, "shard1");
+    }
+
+    #[test]
+    fn database_shard_env_does_not_append_incomplete_entry() {
+        let mut config = AutumnConfig::default();
+        // NAME without PRIMARY_URL is not enough to create a shard.
+        let env = MockEnv::new().with("AUTUMN_DATABASE__SHARDS__0__NAME", "shard0");
+
+        config.apply_env_overrides_with_env(&env);
+
+        assert!(config.database.shards.is_empty());
+    }
+
+    fn shard(name: &str, primary_url: &str) -> ShardConfig {
+        ShardConfig {
+            name: name.to_owned(),
+            primary_url: primary_url.to_owned(),
+            slots: None,
+            replica_url: None,
+            primary_pool_size: None,
+            replica_pool_size: None,
+            replica_fallback: None,
+        }
+    }
+
+    fn shard_with_slots(name: &str, primary_url: &str, slots: &[&str]) -> ShardConfig {
+        let mut config = shard(name, primary_url);
+        config.slots = Some(
+            slots
+                .iter()
+                .map(|spec| SlotSpec::Range((*spec).to_owned()))
+                .collect(),
+        );
+        config
+    }
+
+    #[test]
+    fn slot_spec_expands_indices_and_ranges() {
+        assert_eq!(SlotSpec::Index(5).expand().unwrap(), vec![5]);
+        assert_eq!(SlotSpec::Range("7".to_owned()).expand().unwrap(), vec![7]);
+        assert_eq!(
+            SlotSpec::Range("3-6".to_owned()).expand().unwrap(),
+            vec![3, 4, 5, 6]
+        );
+        assert!(SlotSpec::Range("6-3".to_owned()).expand().is_err());
+        assert!(SlotSpec::Range("x-3".to_owned()).expand().is_err());
+        assert!(SlotSpec::Range(String::new()).expand().is_err());
+    }
+
+    #[test]
+    fn slot_map_auto_splits_contiguously_by_declaration_order() {
+        let config = DatabaseConfig {
+            slot_count: 8,
+            shards: vec![
+                shard("a", "postgres://a/app"),
+                shard("b", "postgres://b/app"),
+                shard("c", "postgres://c/app"),
+            ],
+            ..Default::default()
+        };
+        let map = config
+            .resolved_slot_map()
+            .expect("auto-split should resolve");
+        assert_eq!(map, vec![0, 0, 0, 1, 1, 1, 2, 2]);
+    }
+
+    #[test]
+    fn slot_map_uses_explicit_assignments_regardless_of_order() {
+        let config = DatabaseConfig {
+            slot_count: 8,
+            shards: vec![
+                shard_with_slots("late", "postgres://late/app", &["4-7"]),
+                shard_with_slots("early", "postgres://early/app", &["0-3"]),
+            ],
+            ..Default::default()
+        };
+        let map = config
+            .resolved_slot_map()
+            .expect("explicit map should resolve");
+        assert_eq!(map, vec![1, 1, 1, 1, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn slot_map_allows_drained_shard_with_empty_slots() {
+        let config = DatabaseConfig {
+            slot_count: 4,
+            shards: vec![
+                shard_with_slots("live", "postgres://live/app", &["0-3"]),
+                shard_with_slots("drained", "postgres://drained/app", &[]),
+            ],
+            ..Default::default()
+        };
+        let map = config
+            .resolved_slot_map()
+            .expect("drained shard is allowed");
+        assert_eq!(map, vec![0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn slot_map_rejects_mixed_declared_and_undeclared_slots() {
+        let config = DatabaseConfig {
+            slot_count: 8,
+            shards: vec![
+                shard_with_slots("a", "postgres://a/app", &["0-7"]),
+                shard("b", "postgres://b/app"),
+            ],
+            ..Default::default()
+        };
+        assert!(config.resolved_slot_map().is_err());
+    }
+
+    #[test]
+    fn slot_map_rejects_overlap_gap_and_out_of_range() {
+        // Overlap.
+        let config = DatabaseConfig {
+            slot_count: 8,
+            shards: vec![
+                shard_with_slots("a", "postgres://a/app", &["0-4"]),
+                shard_with_slots("b", "postgres://b/app", &["4-7"]),
+            ],
+            ..Default::default()
+        };
+        let Err(ConfigError::Validation(message)) = config.resolved_slot_map() else {
+            panic!("overlapping slots should fail");
+        };
+        assert!(message.contains("already owned"));
+
+        // Gap.
+        let config = DatabaseConfig {
+            slot_count: 8,
+            shards: vec![
+                shard_with_slots("a", "postgres://a/app", &["0-2"]),
+                shard_with_slots("b", "postgres://b/app", &["4-7"]),
+            ],
+            ..Default::default()
+        };
+        let Err(ConfigError::Validation(message)) = config.resolved_slot_map() else {
+            panic!("uncovered slots should fail");
+        };
+        assert!(message.contains("unassigned"));
+
+        // Out of range.
+        let config = DatabaseConfig {
+            slot_count: 8,
+            shards: vec![shard_with_slots("a", "postgres://a/app", &["0-8"])],
+            ..Default::default()
+        };
+        assert!(config.resolved_slot_map().is_err());
+    }
+
+    #[test]
+    fn slot_map_rejects_bad_slot_count() {
+        for slot_count in [0u16, MAX_SLOT_COUNT + 1] {
+            let config = DatabaseConfig {
+                slot_count,
+                shards: vec![shard("a", "postgres://a/app")],
+                ..Default::default()
+            };
+            assert!(
+                config.resolved_slot_map().is_err(),
+                "slot_count {slot_count} should be rejected"
+            );
+        }
+        // More shards than slots cannot auto-split.
+        let config = DatabaseConfig {
+            slot_count: 1,
+            shards: vec![
+                shard("a", "postgres://a/app"),
+                shard("b", "postgres://b/app"),
+            ],
+            ..Default::default()
+        };
+        assert!(config.resolved_slot_map().is_err());
+    }
+
+    #[test]
+    fn slots_parse_from_toml_ints_and_ranges() {
+        let config: AutumnConfig = toml::from_str(
+            r#"
+[database]
+slot_count = 16
+
+[[database.shards]]
+name = "a"
+primary_url = "postgres://a/app"
+slots = ["0-7", 8, "9"]
+
+[[database.shards]]
+name = "b"
+primary_url = "postgres://b/app"
+slots = ["10-15"]
+"#,
+        )
+        .expect("slots config should parse");
+        let map = config
+            .database
+            .resolved_slot_map()
+            .expect("mixed int/range specs should resolve");
+        assert_eq!(map[..10], [0; 10]);
+        assert_eq!(map[10..], [1; 6]);
+        config.validate().expect("config should validate");
+    }
+
+    #[test]
+    fn slot_env_overrides_assignments_and_count() {
+        let mut config = AutumnConfig::default();
+        let env = MockEnv::new()
+            .with("AUTUMN_DATABASE__SLOT_COUNT", "4")
+            .with("AUTUMN_DATABASE__SHARDS__0__NAME", "a")
+            .with(
+                "AUTUMN_DATABASE__SHARDS__0__PRIMARY_URL",
+                "postgres://a/app",
+            )
+            .with("AUTUMN_DATABASE__SHARDS__0__SLOTS", "0-1, 3")
+            .with("AUTUMN_DATABASE__SHARDS__1__NAME", "b")
+            .with(
+                "AUTUMN_DATABASE__SHARDS__1__PRIMARY_URL",
+                "postgres://b/app",
+            )
+            .with("AUTUMN_DATABASE__SHARDS__1__SLOTS", "2");
+
+        config.apply_env_overrides_with_env(&env);
+
+        assert_eq!(config.database.slot_count, 4);
+        let map = config
+            .database
+            .resolved_slot_map()
+            .expect("env slot specs should resolve");
+        assert_eq!(map, vec![0, 0, 1, 0]);
+    }
+
+    #[test]
+    fn database_shard_validation_rejects_bad_names() {
+        for bad_name in ["", "Shard0", "shard 0", "shard:0", "shärd"] {
+            let config = DatabaseConfig {
+                shards: vec![shard(bad_name, "postgres://s0.example/app")],
+                ..Default::default()
+            };
+            assert!(
+                config.validate().is_err(),
+                "shard name should be rejected: {bad_name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn database_shard_validation_rejects_duplicate_names() {
+        let config = DatabaseConfig {
+            shards: vec![
+                shard("shard0", "postgres://a.example/app"),
+                shard("shard0", "postgres://b.example/app"),
+            ],
+            ..Default::default()
+        };
+        let Err(ConfigError::Validation(message)) = config.validate() else {
+            panic!("duplicate shard names should fail validation");
+        };
+        assert!(message.contains("unique"));
+    }
+
+    #[test]
+    fn database_shard_validation_rejects_bad_urls() {
+        let config = DatabaseConfig {
+            shards: vec![shard("shard0", "mysql://s0.example/app")],
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+
+        let mut with_bad_replica = shard("shard0", "postgres://s0.example/app");
+        with_bad_replica.replica_url = Some("http://s0-ro.example/app".to_owned());
+        let config = DatabaseConfig {
+            shards: vec![with_bad_replica],
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn database_shards_without_control_role_are_allowed() {
+        let config = DatabaseConfig {
+            shards: vec![shard("shard0", "postgres://s0.example/app")],
+            ..Default::default()
+        };
+        config
+            .validate()
+            .expect("shards without a control role should validate");
+    }
+
+    #[test]
+    fn postgres_scheduler_with_shards_requires_control_database() {
+        let mut config = AutumnConfig::default();
+        config.database.shards = vec![shard("shard0", "postgres://s0.example/app")];
+        config.scheduler.backend = SchedulerBackend::Postgres;
+
+        let Err(ConfigError::Validation(message)) = config.validate() else {
+            panic!("postgres scheduler without a control database should fail validation");
+        };
+        assert!(message.contains("control database"));
+
+        config.database.primary_url = Some("postgres://control.example/app".to_owned());
+        config
+            .validate()
+            .expect("control role should satisfy the scheduler requirement");
+    }
+
+    #[test]
+    fn postgres_jobs_with_shards_requires_control_database() {
+        let mut config = AutumnConfig::default();
+        config.database.shards = vec![shard("shard0", "postgres://s0.example/app")];
+        config.jobs.backend = "postgres".to_owned();
+
+        assert!(config.validate().is_err());
+
+        config.database.url = Some("postgres://control.example/app".to_owned());
+        config
+            .validate()
+            .expect("legacy url should satisfy the jobs requirement");
     }
 
     #[test]
