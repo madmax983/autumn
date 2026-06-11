@@ -2614,7 +2614,7 @@ impl AppBuilder {
                     })
                     || nest_routers.iter().any(|(nest_path, _)| {
                         let p = nest_path.as_str();
-                        path == nest_path
+                        path.as_str() == p
                             || path.starts_with(p)
                                 && (p.ends_with('/') || path.as_bytes().get(p.len()) == Some(&b'/'))
                     })
