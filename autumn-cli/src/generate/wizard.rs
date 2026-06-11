@@ -202,7 +202,7 @@ fn render_step_structs(steps: &[String]) -> String {
             let pascal_step = pascal(step);
             let snake_step = snake(step);
             format!(
-                r#"/// Form data for the `{snake_step}` step.
+                r"/// Form data for the `{snake_step}` step.
 ///
 /// Add `#[validate(...)]` rules to enforce per-step constraints.
 #[derive(Debug, Default, Clone, Serialize, Deserialize, Validate)]
@@ -210,31 +210,22 @@ pub struct {pascal_step}Form {{
     // TODO: add fields for the {snake_step} step, e.g.:
     // pub field_name: String,
 }}
-"#,
-                pascal_step = pascal_step,
-                snake_step = snake_step,
+"
             )
         })
         .collect::<Vec<_>>()
         .join("\n")
 }
 
-fn render_step_handlers(snake_name: &str, _pascal_name: &str, steps: &[String]) -> String {
-    let mut out = Vec::new();
-    let base_path = format!("/{snake_name}");
-
-    for (i, step) in steps.iter().enumerate() {
-        let s = snake(step);
-        let pascal_step = pascal(step);
-        let next_path = if i + 1 < steps.len() {
-            format!("{}/{}", base_path, snake(&steps[i + 1]))
-        } else {
-            format!("{base_path}/confirm")
-        };
-
-        // GET handler
-        out.push(format!(
-            r#"/// Show the `{s}` step form.
+fn render_single_step_handler(
+    s: &str,
+    pascal_step: &str,
+    snake_name: &str,
+    base_path: &str,
+    next_path: &str,
+) -> String {
+    format!(
+        r#"/// Show the `{s}` step form.
 #[get("/{snake_name}/{s}")]
 pub async fn show_{s}(
     session: Session,
@@ -286,17 +277,33 @@ pub async fn submit_{s}(session: Session, form: ChangesetForm<{pascal_step}Form>
             .into_response(),
     }}
 }}
-"#,
-            s = s,
-            pascal_step = pascal_step,
-            snake_name = snake_name,
-            base_path = base_path,
-            next_path = next_path,
+"#
+    )
+}
+
+fn render_step_handlers(snake_name: &str, _pascal_name: &str, steps: &[String]) -> String {
+    let mut out = Vec::new();
+    let base_path = format!("/{snake_name}");
+
+    for (i, step) in steps.iter().enumerate() {
+        let s = snake(step);
+        let pascal_step = pascal(step);
+        let next_path = if i + 1 < steps.len() {
+            format!("{}/{}", base_path, snake(&steps[i + 1]))
+        } else {
+            format!("{base_path}/confirm")
+        };
+        out.push(render_single_step_handler(
+            &s,
+            &pascal_step,
+            snake_name,
+            &base_path,
+            &next_path,
         ));
     }
 
     // Confirm (GET) + Commit (POST) + Cancel handlers
-    let load_steps_code = steps
+    let load_steps = steps
         .iter()
         .map(|step| {
             let s = snake(step);
@@ -371,10 +378,7 @@ pub async fn cancel(session: Session) -> impl IntoResponse {{
     // TODO: add a flash message and redirect appropriately.
     Redirect::to("/").into_response()
 }}
-"#,
-        snake_name = snake_name,
-        base_path = base_path,
-        load_steps = load_steps_code,
+"#
     ));
 
     out.join("\n")
@@ -483,10 +487,7 @@ async fn {snake_name}_cancel_clears_session_state() {{
 
     todo!("fill in step fields and form values, then remove #[ignore]");
 }}
-"#,
-        snake_name = snake_name,
-        first_step = first_step,
-        second_step = second_step,
+"#
     )
 }
 
@@ -739,7 +740,7 @@ mod tests {
     #[test]
     fn plan_rejects_empty_step_name() {
         let tmp = project();
-        let result = plan_wizard(tmp.path(), "checkout", &["".into(), "payment".into()]);
+        let result = plan_wizard(tmp.path(), "checkout", &[String::new(), "payment".into()]);
         assert!(matches!(
             result.unwrap_err(),
             GenerateError::InvalidName(_, _)
