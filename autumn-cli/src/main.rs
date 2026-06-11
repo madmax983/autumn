@@ -96,6 +96,14 @@ enum Commands {
         /// on so no corrupt traffic reaches the database.
         #[arg(long)]
         with_maintenance: bool,
+        /// Target a single shard by its configured `[[database.shards]]`
+        /// name instead of all databases.
+        #[arg(long, value_name = "NAME", conflicts_with = "control_only")]
+        shard: Option<String>,
+        /// Target only the control database (`database.primary_url`),
+        /// skipping any configured shards.
+        #[arg(long)]
+        control_only: bool,
     },
     /// Live monitoring dashboard for a running Autumn application
     Monitor {
@@ -1253,13 +1261,20 @@ fn run_command(command: Commands) {
         Commands::Migrate {
             action,
             with_maintenance,
+            shard,
+            control_only,
         } => {
             let action = match action {
                 Some(MigrateCommands::Status) => migrate::MigrateAction::Status,
                 Some(MigrateCommands::Check) => migrate::MigrateAction::Check,
                 None => migrate::MigrateAction::Run,
             };
-            migrate::run(action, with_maintenance);
+            let target = match (shard, control_only) {
+                (Some(name), _) => migrate::MigrateTarget::Shard(name),
+                (None, true) => migrate::MigrateTarget::ControlOnly,
+                (None, false) => migrate::MigrateTarget::All,
+            };
+            migrate::run(action, with_maintenance, &target);
         }
         Commands::Maintenance(cmd) => match cmd {
             MaintenanceCommands::On {
@@ -3447,12 +3462,45 @@ mod tests {
         let Commands::Migrate {
             action,
             with_maintenance,
+            ..
         } = cli.command
         else {
             panic!("expected migrate");
         };
         assert!(matches!(action, Some(MigrateCommands::Status)));
         assert!(with_maintenance);
+    }
+
+    #[test]
+    fn parse_migrate_shard_flag() {
+        let cli = Cli::try_parse_from(["autumn", "migrate", "--shard", "shard1"]).unwrap();
+        let Commands::Migrate { shard, .. } = cli.command else {
+            panic!("expected migrate");
+        };
+        assert_eq!(shard.as_deref(), Some("shard1"));
+    }
+
+    #[test]
+    fn parse_migrate_control_only_flag() {
+        let cli = Cli::try_parse_from(["autumn", "migrate", "--control-only", "status"]).unwrap();
+        let Commands::Migrate {
+            action,
+            control_only,
+            ..
+        } = cli.command
+        else {
+            panic!("expected migrate");
+        };
+        assert!(control_only);
+        assert!(matches!(action, Some(MigrateCommands::Status)));
+    }
+
+    #[test]
+    fn parse_migrate_shard_conflicts_with_control_only() {
+        assert!(
+            Cli::try_parse_from(["autumn", "migrate", "--shard", "shard1", "--control-only"])
+                .is_err()
+        );
     }
 
     #[test]
