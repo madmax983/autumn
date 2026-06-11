@@ -2654,3 +2654,339 @@ fn generate_auth_passkeys_revocation_is_atomic() {
         );
     }
 }
+
+// ── autumn generate wizard (issue #832) ──────────────────────────────────────
+
+#[test]
+fn generate_wizard_creates_expected_files() {
+    let (_tmp, project) = fresh_project("wizard-app");
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "wizard",
+            "checkout",
+            "shipping",
+            "payment",
+            "review",
+        ],
+    );
+
+    // ── main wizard file ──────────────────────────────────────────────
+    let wizard = fs::read_to_string(project.join("src/wizards/checkout.rs")).unwrap();
+
+    // Wizard configuration constants
+    assert!(
+        wizard.contains("pub const WIZARD_NAME: &str = \"checkout\";"),
+        "wizard file missing WIZARD_NAME constant"
+    );
+    assert!(
+        wizard.contains("pub const STEPS: &[&str] = &[\"shipping\", \"payment\", \"review\"];"),
+        "wizard file missing STEPS constant with all step names"
+    );
+    assert!(
+        wizard.contains("pub fn wizard_context(session: Session) -> WizardContext"),
+        "wizard file missing wizard_context helper"
+    );
+
+    // Step structs
+    for (pascal_struct, snake_step) in [
+        ("ShippingForm", "shipping"),
+        ("PaymentForm", "payment"),
+        ("ReviewForm", "review"),
+    ] {
+        assert!(
+            wizard.contains(&format!("pub struct {pascal_struct}")),
+            "wizard file missing step struct: {pascal_struct}"
+        );
+        assert!(
+            wizard.contains(&format!("Serialize, Deserialize")),
+            "step struct for {snake_step} must derive Serialize and Deserialize"
+        );
+    }
+
+    // GET + POST handlers for every step
+    for step in ["shipping", "payment", "review"] {
+        assert!(
+            wizard.contains(&format!("#[get(\"/checkout/{step}\")]")),
+            "wizard file missing GET route attribute for step: {step}"
+        );
+        assert!(
+            wizard.contains(&format!("pub async fn show_{step}(")),
+            "wizard file missing show_{step} handler"
+        );
+        assert!(
+            wizard.contains(&format!("#[post(\"/checkout/{step}\")]")),
+            "wizard file missing POST route attribute for step: {step}"
+        );
+        assert!(
+            wizard.contains(&format!("pub async fn submit_{step}(")),
+            "wizard file missing submit_{step} handler"
+        );
+    }
+
+    // Confirm is a GET (summary before final commit)
+    assert!(
+        wizard.contains("#[get(\"/checkout/confirm\")]"),
+        "wizard file missing GET /checkout/confirm route"
+    );
+    assert!(
+        wizard.contains("pub async fn show_confirm("),
+        "wizard file missing show_confirm handler"
+    );
+
+    // Commit and cancel are POST-only
+    assert!(
+        wizard.contains("#[post(\"/checkout/commit\")]"),
+        "commit must be POST, not GET"
+    );
+    assert!(
+        wizard.contains("pub async fn commit("),
+        "wizard file missing commit handler"
+    );
+    assert!(
+        wizard.contains("#[post(\"/checkout/cancel\")]"),
+        "cancel must be POST, not GET"
+    );
+    assert!(
+        wizard.contains("pub async fn cancel("),
+        "wizard file missing cancel handler"
+    );
+
+    // Guard and progress rendering
+    assert!(
+        wizard.contains("wizard.guard_step("),
+        "step handlers must call guard_step"
+    );
+    assert!(
+        wizard.contains("wizard_progress("),
+        "step handlers must render wizard_progress"
+    );
+
+    // CSRF uses optional extractors
+    assert!(
+        wizard.contains("csrf: Option<CsrfToken>"),
+        "GET step handlers must use optional CsrfToken"
+    );
+    assert!(
+        wizard.contains("csrf_field: Option<CsrfFormField>"),
+        "GET step handlers must use optional CsrfFormField"
+    );
+
+    // ChangesetForm used for step submission
+    assert!(
+        wizard.contains("use autumn_web::form::ChangesetForm;"),
+        "wizard file must import ChangesetForm"
+    );
+
+    // 422 on invalid data
+    assert!(
+        wizard.contains("StatusCode::UNPROCESSABLE_ENTITY"),
+        "submit handlers must return 422 on validation failure"
+    );
+
+    // wizard.clear() called on both commit and cancel
+    assert_eq!(
+        wizard.matches("wizard.clear()").count(),
+        2,
+        "wizard.clear() must be called in both commit and cancel handlers"
+    );
+
+    // ── mod.rs ────────────────────────────────────────────────────────
+    let mod_rs = fs::read_to_string(project.join("src/wizards/mod.rs")).unwrap();
+    assert!(
+        mod_rs.contains("pub mod checkout;"),
+        "src/wizards/mod.rs missing pub mod checkout"
+    );
+
+    // ── integration test skeleton ─────────────────────────────────────
+    let test = fs::read_to_string(project.join("tests/checkout_wizard.rs")).unwrap();
+    assert!(
+        test.contains("checkout_wizard_happy_path"),
+        "test file missing checkout_wizard_happy_path test"
+    );
+    assert!(
+        test.contains("checkout_step2_invalid_rerender_with_errors"),
+        "test file missing step2 invalid-data test"
+    );
+    assert!(
+        test.contains("checkout_cancel_clears_session_state"),
+        "test file missing cancel test"
+    );
+    assert!(
+        test.contains(".wizard-progress"),
+        "test file must reference the .wizard-progress CSS selector"
+    );
+    assert!(
+        test.contains("#[ignore"),
+        "generated tests must be #[ignore] until the user fills them in"
+    );
+}
+
+#[test]
+fn generate_wizard_dry_run_writes_nothing() {
+    let (_tmp, project) = fresh_project("wizard-dry-app");
+    let (stdout, _) = run_autumn(
+        &project,
+        &[
+            "generate",
+            "wizard",
+            "checkout",
+            "shipping",
+            "payment",
+            "--dry-run",
+        ],
+    );
+    assert!(
+        stdout.contains("Dry run"),
+        "expected Dry run header; got: {stdout}"
+    );
+    assert!(
+        !project.join("src/wizards/checkout.rs").exists(),
+        "dry run must not create the wizard file"
+    );
+    assert!(
+        !project.join("src/wizards/mod.rs").exists(),
+        "dry run must not create mod.rs"
+    );
+    assert!(
+        !project.join("tests/checkout_wizard.rs").exists(),
+        "dry run must not create the test file"
+    );
+}
+
+#[test]
+fn generate_wizard_collision_without_force_fails() {
+    let (_tmp, project) = fresh_project("wizard-collide-app");
+    run_autumn(
+        &project,
+        &["generate", "wizard", "checkout", "shipping", "payment"],
+    );
+    let (_, stderr, code) = run_autumn_failing(
+        &project,
+        &["generate", "wizard", "checkout", "shipping", "payment"],
+    );
+    assert_eq!(code, Some(1), "re-run without --force must exit 1");
+    assert!(
+        stderr.contains("would overwrite") || stderr.contains("checkout.rs"),
+        "must report collision; got stderr: {stderr}"
+    );
+}
+
+#[test]
+fn generate_wizard_force_overwrites() {
+    let (_tmp, project) = fresh_project("wizard-force-app");
+    run_autumn(
+        &project,
+        &["generate", "wizard", "checkout", "shipping", "payment"],
+    );
+    let wizard_path = project.join("src/wizards/checkout.rs");
+    let original = fs::read_to_string(&wizard_path).unwrap();
+    fs::write(&wizard_path, "// corrupted").unwrap();
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "wizard",
+            "checkout",
+            "shipping",
+            "payment",
+            "--force",
+        ],
+    );
+    let regenerated = fs::read_to_string(&wizard_path).unwrap();
+    assert_eq!(regenerated, original, "--force must restore original content");
+}
+
+#[test]
+fn generate_wizard_mod_rs_is_idempotent() {
+    let (_tmp, project) = fresh_project("wizard-idempotent-app");
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "wizard",
+            "checkout",
+            "shipping",
+            "payment",
+            "--force",
+        ],
+    );
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "wizard",
+            "checkout",
+            "shipping",
+            "payment",
+            "--force",
+        ],
+    );
+    let mod_rs = fs::read_to_string(project.join("src/wizards/mod.rs")).unwrap();
+    assert_eq!(
+        mod_rs.matches("pub mod checkout;").count(),
+        1,
+        "mod.rs must not gain duplicate pub mod declarations on re-run"
+    );
+}
+
+#[test]
+fn generate_wizard_rejects_fewer_than_two_steps() {
+    let (_tmp, project) = fresh_project("wizard-toofew-app");
+    let (_, stderr, code) =
+        run_autumn_failing(&project, &["generate", "wizard", "checkout", "shipping"]);
+    assert_eq!(code, Some(1));
+    assert!(
+        stderr.contains("at least") || stderr.contains("2"),
+        "error must mention the minimum step requirement; got: {stderr}"
+    );
+}
+
+#[test]
+fn generate_wizard_rejects_reserved_step_names() {
+    let (_tmp, project) = fresh_project("wizard-reserved-app");
+    for reserved in ["confirm", "commit", "cancel"] {
+        let (_, stderr, code) = run_autumn_failing(
+            &project,
+            &["generate", "wizard", "checkout", reserved, "payment"],
+        );
+        assert_eq!(
+            code,
+            Some(1),
+            "reserved step name '{reserved}' must be rejected"
+        );
+        assert!(
+            stderr.contains(reserved) || stderr.contains("reserved"),
+            "error must mention the reserved name '{reserved}'; got: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn generate_wizard_rejects_step_name_with_hyphen() {
+    let (_tmp, project) = fresh_project("wizard-hyphen-app");
+    let (_, stderr, code) = run_autumn_failing(
+        &project,
+        &["generate", "wizard", "checkout", "ship-ping", "payment"],
+    );
+    assert_eq!(code, Some(1));
+    assert!(
+        stderr.contains("ship-ping") || stderr.contains("only ASCII"),
+        "error must mention the invalid step name; got: {stderr}"
+    );
+}
+
+#[test]
+fn generate_wizard_rejects_duplicate_step_names() {
+    let (_tmp, project) = fresh_project("wizard-dupe-app");
+    let (_, stderr, code) = run_autumn_failing(
+        &project,
+        &["generate", "wizard", "checkout", "shipping", "shipping"],
+    );
+    assert_eq!(code, Some(1));
+    assert!(
+        stderr.contains("shipping") || stderr.contains("duplicate"),
+        "error must mention the duplicate step name; got: {stderr}"
+    );
+}
