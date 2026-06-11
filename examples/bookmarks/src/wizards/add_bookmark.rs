@@ -89,6 +89,19 @@ fn layout(title: &str, content: Markup) -> Markup {
 // ── Route handlers ─────────────────────────────────────────────────
 
 /// Show the `url` step form.
+///
+/// Draft restore pattern (TurboTax-style persistence across sessions):
+///
+/// ```rust,ignore
+/// // In a real app with authentication, restore a saved draft here:
+/// if wizard.first_incomplete_step().await.as_deref() == Some("url") {
+///     let key = wizard.draft_key(&current_user.id.to_string());
+///     if let Ok(Some(json)) = db.load_wizard_draft(&key).await {
+///         let draft: serde_json::Value = serde_json::from_str(&json).unwrap_or_default();
+///         wizard.restore_draft(&draft).await;
+///     }
+/// }
+/// ```
 #[get("/bookmarks/add/url")]
 pub async fn show_url(
     session: Session,

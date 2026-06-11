@@ -200,6 +200,108 @@ The generated `show_confirm` handler renders the hidden CSRF input manually
 (not via `ChangesetForm`) because the confirm page has two forms — commit and
 cancel — each needing the token.
 
+## Long-lived drafts (TurboTax-style persistence)
+
+By default, wizard state lives in the session and expires with it (hours to
+days). For wizards where the user needs to fill things in over several visits —
+tax forms, lengthy onboarding flows, multi-day quote builders — you can persist
+step data to a database using three helpers on `WizardContext`:
+
+| Method | What it does |
+|---|---|
+| `draft_key(user_key)` | Returns a stable `"wizard:{name}:{user_key}"` string to use as a DB column value or cache key |
+| `export_draft()` | Serializes all saved steps to a single `serde_json::Value` object keyed by step name |
+| `restore_draft(json)` | Loads from that object back into the session; steps already in the session are left unchanged |
+
+The framework provides the serialization format and the session↔draft bridge.
+You provide the storage backend and the auth context.
+
+### Saving a draft
+
+Call `export_draft` whenever you want to snapshot progress — on each step
+submission, on a "save and exit" button, or in the commit handler if you want
+to preserve the draft until the user explicitly discards it:
+
+```rust
+#[post("/checkout/shipping")]
+async fn submit_shipping(
+    session: Session,
+    current_user: CurrentUser,
+    form: ChangesetForm<ShippingForm>,
+    db: Db,
+) -> impl IntoResponse {
+    let wizard = wizard_context(session.clone());
+    // ... validate and save to session as usual ...
+    wizard.save_step("shipping", &data).await?;
+
+    // Persist draft so the user can pick up where they left off.
+    let key   = wizard.draft_key(&current_user.id.to_string());
+    let draft = wizard.export_draft().await.to_string();
+    db.upsert_wizard_draft(&key, &draft).await?;
+
+    Redirect::to("/checkout/payment").into_response()
+}
+```
+
+### Restoring a draft
+
+Restore on the first step's GET handler, before re-populating the form from
+the session. `restore_draft` only writes steps that are missing from the
+current session — if the user has already filled a step in this session, their
+current work is preserved:
+
+```rust
+#[get("/checkout/shipping")]
+async fn show_shipping(
+    session: Session,
+    current_user: CurrentUser,
+    db: Db,
+) -> impl IntoResponse {
+    let wizard = wizard_context(session.clone());
+
+    // Restore a saved draft when the session is empty.
+    if wizard.first_incomplete_step().await.as_deref() == Some("shipping") {
+        let key = wizard.draft_key(&current_user.id.to_string());
+        if let Ok(Some(json)) = db.load_wizard_draft(&key).await {
+            if let Ok(draft) = serde_json::from_str(&json) {
+                wizard.restore_draft(&draft).await;
+            }
+        }
+    }
+
+    // The rest of the handler is unchanged — step_data now returns the
+    // restored values if the session was empty.
+    let data: ShippingForm = wizard.step_data("shipping").await.unwrap_or_default();
+    // ...
+}
+```
+
+### Cleaning up
+
+Delete the draft row after a successful commit so stale data doesn't
+pre-populate the next run:
+
+```rust
+#[post("/checkout/commit")]
+async fn commit(session: Session, current_user: CurrentUser, db: Db) -> impl IntoResponse {
+    let wizard = wizard_context(session.clone());
+    // ... assemble data and write ...
+    wizard.clear().await;
+    db.delete_wizard_draft(&wizard.draft_key(&current_user.id.to_string())).await?;
+    Redirect::to("/orders").into_response()
+}
+```
+
+A minimal draft table looks like:
+
+```sql
+CREATE TABLE wizard_drafts (
+    key        TEXT PRIMARY KEY,          -- wizard.draft_key(&user_id.to_string())
+    data       JSONB NOT NULL,
+    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+```
+
 ## Session storage
 
 Wizard state lives in the session store, namespaced by wizard name. If the

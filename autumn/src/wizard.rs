@@ -216,6 +216,103 @@ impl WizardContext {
         serde_json::from_str(&json).ok()
     }
 
+    /// Produce a stable key for storing this wizard's draft in an external
+    /// data store (database, Redis, etc.).
+    ///
+    /// `user_key` scopes the draft to a specific user — typically a user ID
+    /// converted to a string (`&user_id.to_string()`).
+    ///
+    /// The returned string has the form `wizard:{name}:{user_key}` and is safe
+    /// to use as a database column value, cache key, or filename.
+    ///
+    /// ## Example
+    ///
+    /// ```rust,ignore
+    /// let key = wizard.draft_key(&current_user.id.to_string());
+    /// db.upsert_wizard_draft(&key, &wizard.export_draft().await.to_string()).await?;
+    /// ```
+    #[must_use]
+    pub fn draft_key(&self, user_key: &str) -> String {
+        format!("wizard:{}:{}", self.name, user_key)
+    }
+
+    /// Serialize all completed steps into a single JSON object for external storage.
+    ///
+    /// Returns a `serde_json::Value::Object` keyed by step name.  Steps that
+    /// have not been saved yet are omitted.  The value is the canonical draft
+    /// format consumed by [`restore_draft`](Self::restore_draft).
+    ///
+    /// Store the result with [`draft_key`](Self::draft_key); restore it on the
+    /// user's next visit with [`restore_draft`](Self::restore_draft).
+    ///
+    /// ## Example
+    ///
+    /// ```rust,ignore
+    /// // In a POST handler or on a "save progress" button:
+    /// let key   = wizard.draft_key(&user.id.to_string());
+    /// let draft = wizard.export_draft().await;
+    /// db.upsert("wizard_drafts", &key, &draft.to_string()).await?;
+    /// ```
+    #[must_use]
+    pub async fn export_draft(&self) -> serde_json::Value {
+        let mut map = serde_json::Map::new();
+        for step in &self.steps {
+            let key = self.session_key(step);
+            if let Some(json_str) = self.session.get(&key).await
+                && let Ok(val) = serde_json::from_str(&json_str)
+            {
+                map.insert(step.clone(), val);
+            }
+        }
+        serde_json::Value::Object(map)
+    }
+
+    /// Restore wizard step data from a previously exported draft.
+    ///
+    /// For each step in the wizard, if the session does **not** already have
+    /// data for that step but the draft does, the draft data is written back
+    /// into the session.  Steps that are already complete in the current
+    /// session are left unchanged — **session takes precedence over draft**.
+    ///
+    /// Returns the number of steps restored into the session.
+    ///
+    /// Call this on the first GET handler when the session is empty, after
+    /// loading the stored draft from your data store:
+    ///
+    /// ```rust,ignore
+    /// #[get("/checkout/shipping")]
+    /// async fn show_shipping(session: Session, current_user: CurrentUser) -> impl IntoResponse {
+    ///     let wizard = wizard_context(session.clone());
+    ///
+    ///     // Restore a saved draft if the session is empty.
+    ///     if wizard.first_incomplete_step().await.as_deref() == Some("shipping") {
+    ///         let key = wizard.draft_key(&current_user.id.to_string());
+    ///         if let Some(json) = db.load_wizard_draft(&key).await? {
+    ///             let draft: serde_json::Value = serde_json::from_str(&json)?;
+    ///             wizard.restore_draft(&draft).await;
+    ///         }
+    ///     }
+    ///     // ... render the form as usual
+    /// }
+    /// ```
+    pub async fn restore_draft(&self, draft: &serde_json::Value) -> usize {
+        let Some(map) = draft.as_object() else {
+            return 0;
+        };
+        let mut restored = 0;
+        for step in &self.steps {
+            if !self.is_step_complete(step).await
+                && let Some(val) = map.get(step.as_str())
+                && let Ok(json) = serde_json::to_string(val)
+            {
+                let key = self.session_key(step);
+                self.session.insert(key, json).await;
+                restored += 1;
+            }
+        }
+        restored
+    }
+
     /// Remove all wizard-state keys for this wizard from the session.
     ///
     /// Call on `commit` (successful completion) or `cancel`.  Abandoned
@@ -703,6 +800,180 @@ mod tests {
         assert!(all[0].is_some()); // shipping
         assert!(all[1].is_none()); // payment
         assert!(all[2].is_none()); // review
+    }
+
+    // ── draft persistence helpers ──────────────────────────────────
+
+    #[test]
+    fn draft_key_is_namespaced() {
+        let wizard = make_wizard(make_session());
+        assert_eq!(wizard.draft_key("42"), "wizard:checkout:42");
+        assert_eq!(wizard.draft_key("user-abc"), "wizard:checkout:user-abc");
+    }
+
+    #[tokio::test]
+    async fn export_draft_only_includes_complete_steps() {
+        let wizard = make_wizard(make_session());
+        wizard
+            .save_step(
+                "shipping",
+                &ShippingData {
+                    address: "1 Main St".into(),
+                    city: "Springfield".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let draft = wizard.export_draft().await;
+        let obj = draft.as_object().unwrap();
+        assert!(obj.contains_key("shipping"), "shipping should be in draft");
+        assert!(
+            !obj.contains_key("payment"),
+            "payment not saved — must be absent"
+        );
+        assert!(
+            !obj.contains_key("review"),
+            "review not saved — must be absent"
+        );
+    }
+
+    #[tokio::test]
+    async fn export_draft_is_keyed_by_step_name() {
+        let wizard = make_wizard(make_session());
+        wizard
+            .save_step(
+                "shipping",
+                &ShippingData {
+                    address: "1 Main St".into(),
+                    city: "Springfield".into(),
+                },
+            )
+            .await
+            .unwrap();
+        wizard
+            .save_step(
+                "payment",
+                &PaymentData {
+                    card_last4: "4242".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let draft = wizard.export_draft().await;
+        let obj = draft.as_object().unwrap();
+        assert_eq!(obj["shipping"]["address"], "1 Main St");
+        assert_eq!(obj["payment"]["card_last4"], "4242");
+    }
+
+    #[tokio::test]
+    async fn restore_draft_fills_empty_session_steps() {
+        let wizard = make_wizard(make_session());
+        let draft = serde_json::json!({
+            "shipping": { "address": "Restored St", "city": "ReturnCity" },
+            "payment":  { "card_last4": "9999" }
+        });
+
+        let count = wizard.restore_draft(&draft).await;
+        assert_eq!(count, 2);
+        assert!(wizard.is_step_complete("shipping").await);
+        assert!(wizard.is_step_complete("payment").await);
+
+        let shipping: Option<ShippingData> = wizard.step_data("shipping").await;
+        assert_eq!(shipping.unwrap().address, "Restored St");
+    }
+
+    #[tokio::test]
+    async fn restore_draft_skips_already_complete_steps() {
+        let wizard = make_wizard(make_session());
+        // Pre-fill shipping in the session.
+        wizard
+            .save_step(
+                "shipping",
+                &ShippingData {
+                    address: "Current".into(),
+                    city: "Here".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Draft has different shipping data.
+        let draft = serde_json::json!({
+            "shipping": { "address": "Stale", "city": "Elsewhere" },
+            "payment":  { "card_last4": "1111" }
+        });
+
+        let count = wizard.restore_draft(&draft).await;
+        // Only payment should be restored; shipping is already in session.
+        assert_eq!(count, 1);
+        let shipping: Option<ShippingData> = wizard.step_data("shipping").await;
+        assert_eq!(
+            shipping.unwrap().address,
+            "Current",
+            "session must win over draft"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_draft_ignores_unknown_step_names() {
+        let wizard = make_wizard(make_session());
+        // Draft contains a step name not in this wizard.
+        let draft = serde_json::json!({
+            "shipping":    { "address": "A", "city": "B" },
+            "nonexistent": { "foo": "bar" }
+        });
+
+        let count = wizard.restore_draft(&draft).await;
+        assert_eq!(count, 1, "only known steps should be restored");
+        assert!(wizard.is_step_complete("shipping").await);
+        assert!(!wizard.is_step_complete("nonexistent").await);
+    }
+
+    #[tokio::test]
+    async fn export_restore_roundtrip_preserves_all_step_data() {
+        let wizard = make_wizard(make_session());
+        wizard
+            .save_step(
+                "shipping",
+                &ShippingData {
+                    address: "42 Loop".into(),
+                    city: "Rustville".into(),
+                },
+            )
+            .await
+            .unwrap();
+        wizard
+            .save_step(
+                "payment",
+                &PaymentData {
+                    card_last4: "1234".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Export, then restore into a brand new session.
+        let draft = wizard.export_draft().await;
+        let wizard2 = make_wizard(make_session());
+        wizard2.restore_draft(&draft).await;
+
+        let shipping: Option<ShippingData> = wizard2.step_data("shipping").await;
+        assert_eq!(shipping.unwrap().city, "Rustville");
+        let payment: Option<PaymentData> = wizard2.step_data("payment").await;
+        assert_eq!(payment.unwrap().card_last4, "1234");
+    }
+
+    #[tokio::test]
+    async fn restore_draft_returns_zero_for_non_object_json() {
+        let wizard = make_wizard(make_session());
+        let count = wizard
+            .restore_draft(&serde_json::json!("not an object"))
+            .await;
+        assert_eq!(count, 0);
+        let count = wizard.restore_draft(&serde_json::json!(null)).await;
+        assert_eq!(count, 0);
     }
 
     // ── title_case helper ──────────────────────────────────────────

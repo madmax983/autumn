@@ -2695,7 +2695,7 @@ fn generate_wizard_creates_expected_files() {
             "wizard file missing step struct: {pascal_struct}"
         );
         assert!(
-            wizard.contains(&format!("Serialize, Deserialize")),
+            wizard.contains("Serialize, Deserialize"),
             "step struct for {snake_step} must derive Serialize and Deserialize"
         );
     }
@@ -2921,7 +2921,7 @@ fn generate_wizard_rejects_fewer_than_two_steps() {
         run_autumn_failing(&project, &["generate", "wizard", "checkout", "shipping"]);
     assert_eq!(code, Some(1));
     assert!(
-        stderr.contains("at least") || stderr.contains("2"),
+        stderr.contains("at least") || stderr.contains('2'),
         "error must mention the minimum step requirement; got: {stderr}"
     );
 }
