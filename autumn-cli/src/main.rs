@@ -1,7 +1,6 @@
 use clap::{Parser, Subcommand};
 
 mod build;
-mod canary;
 mod check;
 mod config;
 mod credentials;
@@ -403,22 +402,6 @@ enum Commands {
     #[command(subcommand, verbatim_doc_comment)]
     Maintenance(MaintenanceCommands),
 
-    /// Drive canary rollback / promotion at the framework level.
-    ///
-    /// Autumn does not own the load-balancer traffic split (platform concern).
-    /// These commands drive the framework primitives a canary controller needs:
-    /// `rollback` tells a bad canary replica to drain and exit cleanly (no
-    /// manual SIGTERM); `promote` clears the rollback signal; `status` reports
-    /// whether a rollback is pending.
-    ///
-    /// # Examples
-    ///
-    ///   autumn canary rollback --reason "p99 latency exceeded"
-    ///   autumn canary promote
-    ///   autumn canary status
-    #[command(subcommand, verbatim_doc_comment)]
-    Canary(CanaryCommands),
-
     /// Print every mounted route — method, path, handler, source, middleware.
     ///
     /// Compiles the application (debug profile) and introspects its route
@@ -696,35 +679,6 @@ enum MaintenanceCommands {
     ///
     /// Exits 0 on success (or when maintenance was already off).
     Off,
-}
-
-/// Subcommands for `autumn canary`.
-#[derive(Subcommand)]
-enum CanaryCommands {
-    /// Signal a canary rollback: write the flag file so the canary replica
-    /// drains (/ready → 503) and exits cleanly without a manual SIGTERM.
-    ///
-    /// The running replica detects the flag within ~500 ms.
-    ///
-    /// # Examples
-    ///
-    ///   autumn canary rollback
-    ///   autumn canary rollback --reason "error rate spiked" --by ci-controller
-    #[command(verbatim_doc_comment)]
-    Rollback {
-        /// Human-readable reason recorded in the rollback flag.
-        #[arg(long, value_name = "REASON")]
-        reason: Option<String>,
-        /// Identifier of the actor or controller requesting the rollback.
-        #[arg(long, value_name = "WHO")]
-        by: Option<String>,
-    },
-    /// Promote the canary: clear any pending rollback flag.
-    ///
-    /// Shifting platform traffic to 100% remains a platform action.
-    Promote,
-    /// Report whether a canary rollback is currently pending.
-    Status,
 }
 
 /// Subcommands for `autumn token`.
@@ -1126,31 +1080,6 @@ enum GenerateCommands {
         #[arg(long)]
         force: bool,
     },
-    /// Generate an `#[inbound_mail]` handler skeleton for receiving email via
-    /// provider webhooks (Mailgun, SES, or generic RFC 5322).
-    ///
-    /// Creates:
-    ///   - `src/inbound_mailers/<snake>.rs`  — handler with `#[inbound_mail]` macro
-    ///   - `src/inbound_mailers/mod.rs`      — created/updated with `pub mod`
-    ///   - `tests/<snake>_inbound_mail.rs`   — integration smoke test
-    ///   - `src/main.rs`                    — wired into `InboundMailRouter`
-    ///   - `Cargo.toml`                     — `inbound-mail` feature added
-    ///
-    /// Example:
-    ///
-    ///   autumn generate inbound-mail Support
-    ///   autumn generate inbound-mail Support --dry-run
-    #[command(name = "inbound-mail", verbatim_doc_comment)]
-    InboundMail {
-        /// Handler name (`PascalCase` or `snake_case`, e.g. `Support`).
-        name: String,
-        /// Print the file plan and exit without writing anything.
-        #[arg(long)]
-        dry_run: bool,
-        /// Overwrite existing files instead of erroring on collision.
-        #[arg(long)]
-        force: bool,
-    },
     /// Generate a system-test skeleton under `tests/system/`.
     ///
     /// The generated test is gated behind `#[cfg(feature = "system-tests")]` and
@@ -1168,30 +1097,6 @@ enum GenerateCommands {
     SystemTest {
         /// Test name (`PascalCase` or `snake_case`, e.g. `TodoFlow`).
         name: String,
-        /// Print the file plan and exit without writing anything.
-        #[arg(long)]
-        dry_run: bool,
-        /// Overwrite existing files instead of erroring on collision.
-        #[arg(long)]
-        force: bool,
-    },
-    /// Scaffold an installable Progressive Web App (manifest, service worker,
-    /// icons, and layout meta tags).
-    ///
-    /// Creates:
-    ///   - `static/manifest.webmanifest` — Web App Manifest (served as application/manifest+json)
-    ///   - `static/service-worker.js`    — Offline-shell service worker
-    ///   - `static/icons/icon.svg`       — Placeholder icon (replace with real PNG for full compat)
-    ///   - `static/icons/maskable-icon.svg` — Maskable icon variant
-    ///   - `src/main.rs`                 — Route handlers + PWA `<link>`/`<meta>` tags in layout
-    ///   - `tests/system/pwa_smoke.rs`   — Smoke test for manifest content-type + SW registration
-    ///
-    /// Example:
-    ///
-    ///   autumn generate pwa
-    ///   autumn generate pwa --dry-run
-    #[command(verbatim_doc_comment)]
-    Pwa {
         /// Print the file plan and exit without writing anything.
         #[arg(long)]
         dry_run: bool,
@@ -1285,17 +1190,6 @@ fn run_command(command: Commands) {
             MaintenanceCommands::Off => {
                 maintenance::run_off(None);
             }
-        },
-        Commands::Canary(cmd) => match cmd {
-            CanaryCommands::Rollback { reason, by } => {
-                canary::run_rollback(&canary::RollbackOptions {
-                    reason: reason.as_deref(),
-                    requested_by: by.as_deref(),
-                    flag_file: None,
-                });
-            }
-            CanaryCommands::Promote => canary::run_promote(None),
-            CanaryCommands::Status => canary::run_status(None),
         },
         Commands::Monitor { url, interval } => monitor::run(&url, interval),
         Commands::Export { url, output } => export::run(&url, &output),
@@ -1777,19 +1671,11 @@ fn run_generate_command(cmd: GenerateCommands) {
             dry_run,
             force,
         } => generate::mailer::run(&name, generate::Flags { dry_run, force }),
-        GenerateCommands::InboundMail {
-            name,
-            dry_run,
-            force,
-        } => generate::inbound_mail::run(&name, generate::Flags { dry_run, force }),
         GenerateCommands::SystemTest {
             name,
             dry_run,
             force,
         } => generate::system_test::run(&name, generate::Flags { dry_run, force }),
-        GenerateCommands::Pwa { dry_run, force } => {
-            generate::pwa::run(generate::Flags { dry_run, force });
-        }
         GenerateCommands::Auth {
             name,
             oauth,
@@ -3811,40 +3697,6 @@ mod tests {
         let Commands::Generate(GenerateCommands::SystemTest { force, .. }) = cli.command else {
             panic!("expected SystemTest variant");
         };
-        assert!(force);
-    }
-
-    // ── autumn generate pwa ────────────────────────────────────────────────
-
-    #[test]
-    fn parse_generate_pwa() {
-        let cli = Cli::try_parse_from(["autumn", "generate", "pwa"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Commands::Generate(GenerateCommands::Pwa {
-                dry_run: false,
-                force: false
-            })
-        ));
-    }
-
-    #[test]
-    fn parse_generate_pwa_dry_run() {
-        let cli = Cli::try_parse_from(["autumn", "generate", "pwa", "--dry-run"]).unwrap();
-        let Commands::Generate(GenerateCommands::Pwa { dry_run, force }) = cli.command else {
-            panic!("expected Pwa variant");
-        };
-        assert!(dry_run);
-        assert!(!force);
-    }
-
-    #[test]
-    fn parse_generate_pwa_force() {
-        let cli = Cli::try_parse_from(["autumn", "generate", "pwa", "--force"]).unwrap();
-        let Commands::Generate(GenerateCommands::Pwa { dry_run, force }) = cli.command else {
-            panic!("expected Pwa variant");
-        };
-        assert!(!dry_run);
         assert!(force);
     }
 }

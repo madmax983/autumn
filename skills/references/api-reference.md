@@ -39,17 +39,14 @@ All publishable crates share `[workspace.package].version = "0.5.0"`.
 ### Feature-gated top-level types
 
 - `Mail`, `Mailer`, `MailConfig`, `MailTransport`, `MailDeliveryQueue`,
-  `MailDeliveryQueueHandle`, `Transport`, `SmtpConfig`,
-  `TlsMode` (`mail`) — `MailPreview` is available via `autumn_web::mail::MailPreview`
-  (not re-exported at the crate root)
+  `MailDeliveryQueueHandle`, `MailPreview`, `Transport`, `SmtpConfig`,
+  `TlsMode` (`mail`)
 - `DbApiTokenStore`, `API_TOKEN_MIGRATIONS`, repository hooks (`db`)
 - `Multipart` (`multipart`)
 - `Flash`, `FlashLevel`, `FlashMessage` (`flash`)
 - `Broadcast`, `Channels`, `ChannelsBackend`, `LocalChannelsBackend`,
   `ChannelMessage`, `ChannelStats` (`ws`)
 - `Locale`, `t!` (`i18n`)
-- OAuth2/OIDC config, provider presets, callback helpers, and identity values
-  (`oauth2`)
 
 ## Proc macros
 
@@ -81,10 +78,8 @@ All publishable crates share `[workspace.package].version = "0.5.0"`.
 
 - Route macros: `get`, `post`, `put`, `patch`, `delete`, `routes`, `main`,
   `static_get`, `static_routes`, `scheduled`, `tasks`, `job`, `jobs`, `task`,
-  `one_off_tasks`, `secured`, `authorize`, `service`, `cached`, `api_doc`,
-  `oauth2_callback`, `paths`, `step_up`, `ws` (when `ws` feature enabled).
-  **Note**: `#[model]` and `#[repository]` are NOT in the prelude — use
-  `#[autumn_web::model]` and `#[autumn_web::repository]` (qualified paths).
+  `one_off_tasks`, `secured`, `authorize`, `service`, `repository`, `model`,
+  `cached`, `api_doc`, `oauth2_callback`, `paths`, `ws` when enabled.
 - Rendering: `asset_url`, `Markup`, `PreEscaped`, `html!`.
 - Extractors: `Db`, `Form`, `Json`, `Path`, `Query`, `State`, `Session`,
   `Auth`, `ApiToken`, `RequireApiToken`, `CsrfToken`, `CsrfFormField`,
@@ -110,7 +105,6 @@ All publishable crates share `[workspace.package].version = "0.5.0"`.
 | `one_off_tasks(Vec<OneOffTaskInfo>)` | CLI tasks |
 | `migrations(EmbeddedMigrations)` | Diesel embedded migrations |
 | `openapi(OpenApiConfig)` | OpenAPI generation |
-| `mount_mcp(path)`, `expose_all_as_mcp()`, `secure_mcp(layer)` | MCP endpoint projection (`mcp`) |
 | `exception_filter(...)`, `error_pages(...)` | Error rendering |
 | `scoped(prefix, layer, routes)` | Scoped route group |
 | `layer(...)`, `has_layer<T>()`, `get_layer_types()` | Tower middleware |
@@ -137,7 +131,7 @@ All publishable crates share `[workspace.package].version = "0.5.0"`.
 
 ```toml
 [features]
-default = ["maud", "htmx", "tailwind", "db", "cache-moka", "http-client", "reporting"]
+default = ["maud", "htmx", "tailwind", "db", "cache-moka"]
 ws = ["dep:tokio-stream"]
 flash = []
 cache-moka = ["dep:moka"]
@@ -145,11 +139,8 @@ maud = ["dep:maud"]
 htmx = []
 multipart = ["axum/multipart"]
 tailwind = []
-oauth2 = ["http-client"]
-http-client = ["dep:reqwest"]
+oauth2 = ["dep:reqwest", "dep:jsonwebtoken"]
 openapi = ["dep:serde_yaml"]
-mcp = ["openapi"]
-markdown = ["dep:pulldown-cmark"]
 db = [
     "dep:deadpool",
     "dep:diesel",
@@ -158,9 +149,7 @@ db = [
     "dep:libsqlite3-sys",
     "dep:pq-sys",
     "dep:scoped-futures",
-    "dep:tokio-postgres",
     "diesel/postgres",
-    "diesel/chrono",
 ]
 test-support = ["dep:testcontainers", "dep:testcontainers-modules"]
 telemetry-otlp = [
@@ -175,10 +164,6 @@ storage = ["diesel?/serde_json"]
 mail = ["dep:lettre", "maud"]
 seed = ["db"]
 system-info = []
-reporting = []
-webauthn = ["dep:webauthn-rs"]
-csv = ["dep:csv"]
-system-tests = ["dep:chromiumoxide"]
 ```
 
 `storage-s3` is not a feature in 0.5.0. Use `autumn-storage-s3 = "0.5"`.
@@ -188,7 +173,7 @@ system-tests = ["dep:chromiumoxide"]
 ```toml
 axum = { version = "0.8", features = ["macros", "ws"] }
 tokio-util = "0.7"
-diesel = { version = "2", features = ["sqlite", "postgres"] }
+diesel = { version = "2", features = ["sqlite"] }
 pq-sys = { version = "0.7", features = ["bundled_without_openssl"] }
 diesel-async = { version = "0.8", features = ["deadpool", "postgres"] }
 diesel_migrations = "2"
@@ -202,14 +187,14 @@ thiserror = "2"
 maud = { version = "0.27", features = ["axum"] }
 toml = "1.1"
 tower = "0.5"
-tower-http = { version = "0.6", features = ["cors", "fs", "trace", "compression-gzip", "compression-br"] }
+tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 tracing-opentelemetry = "0.32.1"
 opentelemetry = { version = "0.31.0", default-features = false, features = ["trace"] }
 opentelemetry_sdk = { version = "0.31.0", default-features = false, features = ["trace"] }
 opentelemetry-otlp = { version = "0.31.0", default-features = false, features = ["trace", "grpc-tonic", "http-proto", "reqwest-client"] }
-redis = { version = "1.2.0", default-features = false, features = ["aio", "tokio-comp", "connection-manager", "script"] }
+redis = { version = "1.2.0", default-features = false, features = ["aio", "tokio-comp", "connection-manager"] }
 tokio-cron-scheduler = { version = "0.15", features = ["signal"] }
 chrono-tz = "0.10"
 validator = { version = "0.20", features = ["derive"] }
@@ -237,7 +222,7 @@ time = { version = ">=0.3, <0.4" }
 - `conflict(err)` / `conflict_msg(msg)` - 409
 - `validation(details)` - 422 with field errors
 
-JSON clients receive `application/problem+json`.
+JSON clients receive `application/problem+json` in 0.4.0.
 
 ## Signed webhook API
 

@@ -332,17 +332,6 @@ pub trait ProvideActuatorState {
         true
     }
 
-    /// Returns the deploy-version label for this replica (e.g. `"stable"` or
-    /// `"canary"`), used to tag Prometheus metrics so a canary controller can
-    /// compare canary vs. stable cohorts.
-    ///
-    /// Defaults to [`crate::canary::STABLE`]. [`crate::AppState`] overrides this
-    /// to return the value resolved from `AUTUMN_DEPLOY_VERSION` /
-    /// `AUTUMN_CANARY` (see [`crate::canary`]).
-    fn deploy_version(&self) -> String {
-        crate::canary::STABLE.to_owned()
-    }
-
     #[cfg(feature = "http-client")]
     /// Returns the optional webhook outbound manager if enabled/registered.
     fn webhook_outbound(&self) -> Option<crate::webhook_outbound::WebhookOutboundManager> {
@@ -1410,46 +1399,19 @@ impl HealthIndicatorRegistry {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
 
-        let mut results = futures::future::join_all(entries.into_iter().map(
-            |(name, group, indicator)| async move {
-                let output = run_with_timeout(indicator.as_ref()).await;
-                HealthRunResult {
-                    name,
-                    group,
-                    output,
-                }
-            },
-        ))
-        .await;
-
-        for breaker in crate::circuit_breaker::global_registry().all_breakers() {
-            let state = breaker.state();
-            let status = match state {
-                crate::circuit_breaker::CircuitState::Open
-                | crate::circuit_breaker::CircuitState::HalfOpen => HealthStatus::Down,
-                crate::circuit_breaker::CircuitState::Closed => HealthStatus::Up,
-            };
-
-            let mut details = HashMap::new();
-            details.insert(
-                "state".to_string(),
-                serde_json::Value::String(state.as_str().to_string()),
-            );
-            if let Some(ratio_num) = serde_json::Number::from_f64(breaker.failure_ratio()) {
-                details.insert(
-                    "failure_ratio".to_string(),
-                    serde_json::Value::Number(ratio_num),
-                );
-            }
-
-            results.push(HealthRunResult {
-                name: format!("circuit_breaker.{}", breaker.name()),
-                group: IndicatorGroup::HealthOnly,
-                output: HealthCheckOutput { status, details },
-            });
-        }
-
-        results
+        futures::future::join_all(
+            entries
+                .into_iter()
+                .map(|(name, group, indicator)| async move {
+                    let output = run_with_timeout(indicator.as_ref()).await;
+                    HealthRunResult {
+                        name,
+                        group,
+                        output,
+                    }
+                }),
+        )
+        .await
     }
 
     /// Run only `Readiness`-group indicators with per-indicator timeouts.
@@ -1836,47 +1798,6 @@ pub(crate) async fn metrics_endpoint<S: ProvideActuatorState + Send + Sync + 'st
     Json(result)
 }
 
-#[derive(Serialize)]
-pub(crate) struct CircuitBreakerActuatorResponse {
-    pub name: String,
-    pub state: &'static str,
-    pub failure_ratio: f64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub failure_ratio_threshold: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sample_window_secs: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub minimum_sample_count: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub open_duration_secs: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub half_open_trial_count: Option<u64>,
-}
-
-/// `GET <actuator-prefix>/circuitbreakers`
-pub(crate) async fn circuitbreakers_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
-    State(state): State<S>,
-) -> Json<Vec<CircuitBreakerActuatorResponse>> {
-    let detailed = state.health_detailed();
-    let mut responses = Vec::new();
-
-    for breaker in crate::circuit_breaker::global_registry().all_breakers() {
-        let policy = breaker.config();
-        responses.push(CircuitBreakerActuatorResponse {
-            name: breaker.name().to_string(),
-            state: breaker.state().as_str(),
-            failure_ratio: breaker.failure_ratio(),
-            failure_ratio_threshold: detailed.then_some(policy.failure_ratio_threshold),
-            sample_window_secs: detailed.then_some(policy.sample_window.as_secs()),
-            minimum_sample_count: detailed.then_some(policy.minimum_sample_count),
-            open_duration_secs: detailed.then_some(policy.open_duration.as_secs()),
-            half_open_trial_count: detailed.then_some(policy.half_open_trial_count),
-        });
-    }
-
-    Json(responses)
-}
-
 // ── Prometheus ─────────────────────────────────────────────────
 
 /// Render label set `{k="v",...}` or empty string for no labels.
@@ -1920,20 +1841,6 @@ fn is_valid_label_name(s: &str) -> bool {
     let mut it = s.chars();
     matches!(it.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
         && it.all(|c| c.is_ascii_alphanumeric() || c == '_')
-}
-
-/// Escape a Prometheus label value (backslash, newline, and double-quote).
-fn escape_prometheus_label_value(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for c in value.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '"' => out.push_str("\\\""),
-            other => out.push(other),
-        }
-    }
-    out
 }
 
 /// Escape a Prometheus HELP string (backslash and newline only).
@@ -2060,22 +1967,21 @@ fn render_plugin_sources(
     }
 }
 
-/// Render the built-in `autumn_http_*` metric families into `out`, tagged with
-/// the replica's deploy `version` label so canary and stable cohorts can be
-/// compared by a controller scraping both.
-fn write_builtin_http_metrics(
-    out: &mut String,
-    version: &str,
-    snapshot: &crate::middleware::metrics::MetricsSnapshot,
-) {
+/// `GET <actuator-prefix>/prometheus` -- export metrics in Prometheus format.
+pub(crate) async fn prometheus_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
+    State(state): State<S>,
+) -> impl IntoResponse {
     use std::fmt::Write;
+
+    let snapshot = state.metrics().snapshot();
+    let mut out = String::with_capacity(2048);
 
     // requests_total
     out.push_str("# HELP autumn_http_requests_total Total number of HTTP requests\n");
     out.push_str("# TYPE autumn_http_requests_total counter\n");
     let _ = writeln!(
         out,
-        "autumn_http_requests_total{{version=\"{version}\"}} {}",
+        "autumn_http_requests_total {}",
         snapshot.http.requests_total
     );
 
@@ -2084,44 +1990,33 @@ fn write_builtin_http_metrics(
     out.push_str("# TYPE autumn_http_requests_active gauge\n");
     let _ = writeln!(
         out,
-        "autumn_http_requests_active{{version=\"{version}\"}} {}",
+        "autumn_http_requests_active {}",
         snapshot.http.requests_active
     );
 
     // by_status
     out.push_str("# HELP autumn_http_responses_total HTTP responses by status code\n");
     out.push_str("# TYPE autumn_http_responses_total counter\n");
-    for (status, count) in [
-        ("2xx", snapshot.http.by_status.s2xx),
-        ("3xx", snapshot.http.by_status.s3xx),
-        ("4xx", snapshot.http.by_status.s4xx),
-        ("5xx", snapshot.http.by_status.s5xx),
-    ] {
-        let _ = writeln!(
-            out,
-            "autumn_http_responses_total{{version=\"{version}\",status=\"{status}\"}} {count}"
-        );
-    }
-
-    // request_duration_seconds — global latency percentiles exposed as Prometheus
-    // summary-style quantiles, labelled by deploy version so a canary controller
-    // can gate promotion on p99 latency per cohort.
-    out.push_str(
-        "# HELP autumn_http_request_duration_seconds HTTP request latency percentiles in seconds\n",
+    let _ = writeln!(
+        out,
+        "autumn_http_responses_total{{status=\"2xx\"}} {}",
+        snapshot.http.by_status.s2xx
     );
-    out.push_str("# TYPE autumn_http_request_duration_seconds summary\n");
-    for (quantile, millis) in [
-        ("0.5", snapshot.http.latency_ms.p50),
-        ("0.95", snapshot.http.latency_ms.p95),
-        ("0.99", snapshot.http.latency_ms.p99),
-    ] {
-        #[allow(clippy::cast_precision_loss)]
-        let seconds = millis as f64 / 1000.0;
-        let _ = writeln!(
-            out,
-            "autumn_http_request_duration_seconds{{version=\"{version}\",quantile=\"{quantile}\"}} {seconds}"
-        );
-    }
+    let _ = writeln!(
+        out,
+        "autumn_http_responses_total{{status=\"3xx\"}} {}",
+        snapshot.http.by_status.s3xx
+    );
+    let _ = writeln!(
+        out,
+        "autumn_http_responses_total{{status=\"4xx\"}} {}",
+        snapshot.http.by_status.s4xx
+    );
+    let _ = writeln!(
+        out,
+        "autumn_http_responses_total{{status=\"5xx\"}} {}",
+        snapshot.http.by_status.s5xx
+    );
 
     // autumn_shutdown_aborted_requests_total
     out.push_str(
@@ -2131,7 +2026,7 @@ fn write_builtin_http_metrics(
     out.push_str("# TYPE autumn_shutdown_aborted_requests_total counter\n");
     let _ = writeln!(
         out,
-        "autumn_shutdown_aborted_requests_total{{version=\"{version}\"}} {}",
+        "autumn_shutdown_aborted_requests_total {}",
         snapshot.http.shutdown_aborted_requests_total
     );
 
@@ -2143,7 +2038,7 @@ fn write_builtin_http_metrics(
     out.push_str("# TYPE autumn_request_timeouts_total counter\n");
     let _ = writeln!(
         out,
-        "autumn_request_timeouts_total{{version=\"{version}\"}} {}",
+        "autumn_request_timeouts_total {}",
         snapshot.http.request_timeouts_total
     );
 
@@ -2159,26 +2054,12 @@ fn write_builtin_http_metrics(
             if let Some((method, path)) = route_key.split_once(' ') {
                 let _ = writeln!(
                     out,
-                    "autumn_http_route_requests_total{{version=\"{version}\",method=\"{method}\",route=\"{path}\"}} {}",
-                    metrics.count
+                    "autumn_http_route_requests_total{{method=\"{}\",route=\"{}\"}} {}",
+                    method, path, metrics.count
                 );
             }
         }
     }
-}
-
-/// `GET <actuator-prefix>/prometheus` -- export metrics in Prometheus format.
-pub(crate) async fn prometheus_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
-    State(state): State<S>,
-) -> impl IntoResponse {
-    let snapshot = state.metrics().snapshot();
-    // Deploy-version label so a canary controller can compare canary vs. stable
-    // cohorts. Escaped defensively in case an operator sets an exotic value via
-    // AUTUMN_DEPLOY_VERSION.
-    let version = escape_prometheus_label_value(&state.deploy_version());
-    let mut out = String::with_capacity(2048);
-
-    write_builtin_http_metrics(&mut out, &version, &snapshot);
 
     // Plugin-contributed metric families — seed with built-in names so
     // plugins cannot shadow or duplicate them.
@@ -2187,7 +2068,6 @@ pub(crate) async fn prometheus_endpoint<S: ProvideActuatorState + Send + Sync + 
             "autumn_http_requests_total",
             "autumn_http_requests_active",
             "autumn_http_responses_total",
-            "autumn_http_request_duration_seconds",
             "autumn_shutdown_aborted_requests_total",
             "autumn_request_timeouts_total",
             "autumn_http_route_requests_total",
@@ -2660,7 +2540,6 @@ pub(crate) fn actuator_endpoint_paths(
     }
 
     if sensitive {
-        paths.push(actuator_route_path(prefix, "/circuitbreakers"));
         paths.push(actuator_route_path(prefix, "/env"));
         paths.push(actuator_route_path(prefix, "/configprops"));
         paths.push(actuator_route_path(prefix, "/loggers"));
@@ -2737,10 +2616,6 @@ pub(crate) fn actuator_router_with_prefix<
 
     if sensitive {
         router = router
-            .route(
-                &actuator_route_path(prefix, "/circuitbreakers"),
-                axum::routing::get(circuitbreakers_endpoint::<S>),
-            )
             .route(
                 &actuator_route_path(prefix, "/env"),
                 axum::routing::get(env_endpoint::<S>),
@@ -2932,14 +2807,12 @@ mod tests {
     #[derive(Clone)]
     struct TestActuatorState {
         profile: String,
-        deploy_version: String,
         metrics: crate::middleware::MetricsCollector,
         log_levels: LogLevels,
         task_registry: TaskRegistry,
         job_registry: JobRegistry,
         config_props: ConfigProperties,
         metrics_source_registry: MetricsSourceRegistry,
-        health_detailed: bool,
         #[cfg(feature = "http-client")]
         webhook_outbound: Option<crate::webhook_outbound::WebhookOutboundManager>,
         #[cfg(feature = "db")]
@@ -2974,9 +2847,6 @@ mod tests {
         fn uptime_display(&self) -> String {
             "test_uptime".to_string()
         }
-        fn deploy_version(&self) -> String {
-            self.deploy_version.clone()
-        }
         fn metrics_source_registry(&self) -> Option<&MetricsSourceRegistry> {
             Some(&self.metrics_source_registry)
         }
@@ -2999,9 +2869,6 @@ mod tests {
         fn shutdown_token(&self) -> tokio_util::sync::CancellationToken {
             self.shutdown.clone()
         }
-        fn health_detailed(&self) -> bool {
-            self.health_detailed
-        }
     }
 
     fn test_state() -> TestActuatorState {
@@ -3011,14 +2878,12 @@ mod tests {
     fn test_state_with_config(config: &AutumnConfig) -> TestActuatorState {
         TestActuatorState {
             profile: config.profile.clone().unwrap_or_else(|| "dev".into()),
-            deploy_version: crate::canary::STABLE.to_owned(),
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: LogLevels::new("info"),
             task_registry: TaskRegistry::new(),
             job_registry: JobRegistry::new(),
             config_props: ConfigProperties::from_config(config),
             metrics_source_registry: MetricsSourceRegistry::new(),
-            health_detailed: config.health.detailed,
             #[cfg(feature = "http-client")]
             webhook_outbound: None,
             #[cfg(feature = "db")]
@@ -3387,87 +3252,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
-    async fn actuator_circuitbreakers_returns_breakers() {
-        let _lock = crate::circuit_breaker::TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        crate::circuit_breaker::global_registry().clear();
-        let breaker = crate::circuit_breaker::global_registry().get_or_create(
-            "actuator_endpoint_test_breaker",
-            crate::circuit_breaker::CircuitBreakerPolicy {
-                failure_ratio_threshold: 0.5,
-                sample_window: std::time::Duration::from_secs(10),
-                minimum_sample_count: 2,
-                open_duration: std::time::Duration::from_secs(60),
-                half_open_trial_count: 2,
-            },
-        );
-        assert_eq!(
-            breaker.state(),
-            crate::circuit_breaker::CircuitState::Closed
-        );
-
-        let mut detailed_config = AutumnConfig::default();
-        detailed_config.health.detailed = true;
-        let state = test_state_with_config(&detailed_config);
-        let app = actuator_router(true).with_state(state);
-        let resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/actuator/circuitbreakers")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let list = json.as_array().expect("Should be a JSON array");
-        let item = list
-            .iter()
-            .find(|i| i["name"] == "actuator_endpoint_test_breaker")
-            .expect("Should find our breaker");
-        assert_eq!(item["state"], "CLOSED");
-        assert_eq!(item["failure_ratio_threshold"], 0.5);
-        assert_eq!(item["minimum_sample_count"], 2);
-
-        let mut undetailed_config = AutumnConfig::default();
-        undetailed_config.health.detailed = false;
-        let undetailed_state = test_state_with_config(&undetailed_config);
-        let app_undetailed = actuator_router(true).with_state(undetailed_state);
-        let resp_undetailed = app_undetailed
-            .oneshot(
-                Request::builder()
-                    .uri("/actuator/circuitbreakers")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(resp_undetailed.status(), StatusCode::OK);
-        let body_undetailed = axum::body::to_bytes(resp_undetailed.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json_undetailed: serde_json::Value = serde_json::from_slice(&body_undetailed).unwrap();
-        let list_undetailed = json_undetailed.as_array().expect("Should be a JSON array");
-        let item_undetailed = list_undetailed
-            .iter()
-            .find(|i| i["name"] == "actuator_endpoint_test_breaker")
-            .expect("Should find our breaker");
-        assert_eq!(item_undetailed["state"], "CLOSED");
-        assert!(item_undetailed.get("failure_ratio_threshold").is_none());
-        assert!(item_undetailed.get("minimum_sample_count").is_none());
-        crate::circuit_breaker::global_registry().clear();
-    }
-
-    #[tokio::test]
     async fn actuator_routes_respect_custom_prefix() {
         let app = actuator_router_with_prefix("/ops", true, true).with_state(test_state());
 
@@ -3573,21 +3357,6 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/actuator/env")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn actuator_circuitbreakers_hidden_in_nonsensitive_mode() {
-        let app = actuator_router(false).with_state(test_state());
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/actuator/circuitbreakers")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -3895,81 +3664,22 @@ mod tests {
 
         assert!(text.contains("# HELP autumn_http_requests_total Total number of HTTP requests"));
         assert!(text.contains("# TYPE autumn_http_requests_total counter"));
-        assert!(text.contains("autumn_http_requests_total{version=\"stable\"} 2"));
+        assert!(text.contains("autumn_http_requests_total 2"));
 
-        assert!(text.contains("autumn_http_requests_active{version=\"stable\"} "));
-        assert!(text.contains("autumn_http_responses_total{version=\"stable\",status=\"2xx\"} 1"));
-        assert!(text.contains("autumn_http_responses_total{version=\"stable\",status=\"5xx\"} 1"));
+        assert!(text.contains("autumn_http_requests_active "));
+        assert!(text.contains("autumn_http_responses_total{status=\"2xx\"} 1"));
+        assert!(text.contains("autumn_http_responses_total{status=\"5xx\"} 1"));
 
-        // Latency percentiles are exposed in seconds, labelled by version.
-        assert!(text.contains("# TYPE autumn_http_request_duration_seconds summary"));
-        assert!(text.contains(
-            "autumn_http_request_duration_seconds{version=\"stable\",quantile=\"0.99\"}"
-        ));
-
-        assert!(text.contains(
-            "autumn_http_route_requests_total{version=\"stable\",method=\"GET\",route=\"/test\"} 1"
-        ));
-        assert!(text.contains(
-            "autumn_http_route_requests_total{version=\"stable\",method=\"POST\",route=\"/test\"} 1"
-        ));
+        assert!(
+            text.contains("autumn_http_route_requests_total{method=\"GET\",route=\"/test\"} 1")
+        );
+        assert!(
+            text.contains("autumn_http_route_requests_total{method=\"POST\",route=\"/test\"} 1")
+        );
 
         assert!(text.contains("# HELP autumn_request_timeouts_total"));
         assert!(text.contains("# TYPE autumn_request_timeouts_total counter"));
-        assert!(text.contains("autumn_request_timeouts_total{version=\"stable\"} 0"));
-    }
-
-    #[tokio::test]
-    async fn actuator_prometheus_labels_metrics_with_canary_version() {
-        // A replica whose deploy_version() is "canary" must tag its metric
-        // families with version="canary" so a controller can compare cohorts.
-        let mut state = test_state();
-        state.deploy_version = crate::canary::CANARY.to_owned();
-        // Latencies in ms: spread so p50 < p95/p99 and the slowest is 1200 ms.
-        state.metrics().record("GET", "/test", 200, 10);
-        state.metrics().record("GET", "/test", 200, 20);
-        state.metrics().record("GET", "/test", 500, 1200);
-
-        let app = actuator_router(true).with_state(state);
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/actuator/prometheus")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let text = String::from_utf8(body.to_vec()).unwrap();
-
-        assert!(text.contains("autumn_http_requests_total{version=\"canary\"} 3"));
-        assert!(text.contains("autumn_http_responses_total{version=\"canary\",status=\"5xx\"} 1"));
-        // Must not leak the default "stable" label when running as canary.
-        assert!(!text.contains("version=\"stable\""));
-
-        // Verify the percentile math: values are reported in seconds (ms / 1000)
-        // and satisfy the quantile invariant p50 <= p95 <= p99.
-        let quantile = |q: &str| -> f64 {
-            let needle = format!(
-                "autumn_http_request_duration_seconds{{version=\"canary\",quantile=\"{q}\"}} "
-            );
-            let line = text
-                .lines()
-                .find(|l| l.starts_with(&needle))
-                .unwrap_or_else(|| panic!("missing duration line for quantile {q}"));
-            line[needle.len()..].trim().parse().unwrap()
-        };
-        let (p50, p95, p99) = (quantile("0.5"), quantile("0.95"), quantile("0.99"));
-        assert!(p50 <= p95, "p50 ({p50}) must be <= p95 ({p95})");
-        assert!(p95 <= p99, "p95 ({p95}) must be <= p99 ({p99})");
-        // Slowest sample was 1200 ms, so the top quantile must read 1.2 seconds.
-        assert!(
-            (p99 - 1.2).abs() < f64::EPSILON,
-            "p99 should be 1.2s, got {p99}"
-        );
+        assert!(text.contains("autumn_request_timeouts_total 0"));
     }
 
     #[tokio::test]
@@ -5120,59 +4830,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prometheus_endpoint_skips_builtin_duration_family_collision() {
-        // The new built-in latency family must be in the duplicate guard so a
-        // plugin emitting the same family cannot produce a second HELP/TYPE block.
-        struct ShadowLatency;
-        impl MetricsSource for ShadowLatency {
-            fn collect(&self) -> Vec<MetricFamily> {
-                vec![MetricFamily {
-                    name: "autumn_http_request_duration_seconds".to_string(),
-                    help: "plugin trying to shadow built-in latency".to_string(),
-                    kind: MetricKind::Gauge,
-                    samples: vec![MetricSample {
-                        labels: vec![],
-                        value: 999.0,
-                    }],
-                }]
-            }
-        }
-
-        let state = test_state();
-        state
-            .metrics_source_registry
-            .register("shadow_latency", Arc::new(ShadowLatency))
-            .unwrap();
-
-        let app = actuator_router(true).with_state(state);
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/actuator/prometheus")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let text = String::from_utf8(body.to_vec()).unwrap();
-
-        let occurrences = text
-            .matches("# HELP autumn_http_request_duration_seconds")
-            .count();
-        assert_eq!(
-            occurrences, 1,
-            "built-in latency family must not be shadowed by plugin:\n{text}"
-        );
-        assert!(
-            !text.contains("999"),
-            "plugin shadow value must not appear:\n{text}"
-        );
-    }
-
-    #[tokio::test]
     async fn prometheus_endpoint_skips_duplicate_series_within_family() {
         struct DupSeriesSource;
         impl MetricsSource for DupSeriesSource {
@@ -5303,6 +4960,7 @@ mod health_indicator_tests {
             .unwrap();
 
         let results = registry.run_all().await;
+        assert_eq!(results.len(), 2);
         assert!(
             results
                 .iter()
@@ -5353,89 +5011,11 @@ mod health_indicator_tests {
             .register("slow", IndicatorGroup::Readiness, Arc::new(SlowIndicator))
             .unwrap();
         let results = registry.run_all().await;
-        let slow_res = results
-            .iter()
-            .find(|r| r.name == "slow")
-            .expect("slow indicator not found");
-        assert_eq!(slow_res.output.status, HealthStatus::Unknown);
+        assert_eq!(results[0].output.status, HealthStatus::Unknown);
         assert_eq!(
-            slow_res.output.details.get("timed_out"),
+            results[0].output.details.get("timed_out"),
             Some(&serde_json::Value::Bool(true))
         );
-    }
-
-    #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
-    async fn test_circuit_breakers_in_health_indicator_registry() {
-        let _lock = crate::circuit_breaker::TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        crate::circuit_breaker::global_registry().clear();
-        let registry = HealthIndicatorRegistry::new();
-        let breaker = crate::circuit_breaker::global_registry().get_or_create(
-            "actuator_test_breaker",
-            crate::circuit_breaker::CircuitBreakerPolicy {
-                failure_ratio_threshold: 0.5,
-                sample_window: std::time::Duration::from_secs(10),
-                minimum_sample_count: 2,
-                open_duration: std::time::Duration::from_secs(60),
-                half_open_trial_count: 2,
-            },
-        );
-
-        let results = registry.run_all().await;
-        let found = results
-            .iter()
-            .find(|r| r.name == "circuit_breaker.actuator_test_breaker");
-        assert!(found.is_some(), "Should find circuit breaker in run_all");
-        let result = found.unwrap();
-        assert_eq!(result.group, IndicatorGroup::HealthOnly);
-        assert_eq!(result.output.status, HealthStatus::Up);
-        assert_eq!(result.output.details.get("state").unwrap(), "CLOSED");
-
-        breaker.after_call(false);
-        breaker.after_call(false);
-        assert_eq!(breaker.state(), crate::circuit_breaker::CircuitState::Open);
-
-        let results = registry.run_all().await;
-        let found = results
-            .iter()
-            .find(|r| r.name == "circuit_breaker.actuator_test_breaker");
-        assert_eq!(found.unwrap().output.status, HealthStatus::Down);
-        assert_eq!(found.unwrap().output.details.get("state").unwrap(), "OPEN");
-
-        // Transition to HalfOpen manually to check status
-        {
-            let mut inner = breaker.inner.lock().unwrap();
-            inner.state = crate::circuit_breaker::CircuitState::HalfOpen;
-            inner.half_open_in_flight = 0;
-            inner.half_open_successes = 0;
-            inner.half_open_failures = 0;
-        }
-        assert_eq!(
-            breaker.state(),
-            crate::circuit_breaker::CircuitState::HalfOpen
-        );
-
-        let results = registry.run_all().await;
-        let found = results
-            .iter()
-            .find(|r| r.name == "circuit_breaker.actuator_test_breaker");
-        assert_eq!(found.unwrap().output.status, HealthStatus::Down);
-        assert_eq!(
-            found.unwrap().output.details.get("state").unwrap(),
-            "HALF_OPEN"
-        );
-
-        let readiness_results = registry.run_readiness().await;
-        let found_readiness = readiness_results
-            .iter()
-            .find(|r| r.name == "circuit_breaker.actuator_test_breaker");
-        assert!(
-            found_readiness.is_none(),
-            "Should NOT find circuit breaker in run_readiness"
-        );
-        crate::circuit_breaker::global_registry().clear();
     }
 }
 

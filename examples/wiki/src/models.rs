@@ -34,10 +34,6 @@ pub struct Page {
     pub slug: String,
     #[searchable(weight = "B")]
     pub body: String,
-    #[state_machine(transitions(
-        draft -> published: "can_publish",
-        published -> archived,
-    ))]
     pub status: String,
     #[lock_version]
     pub lock_version: i32,
@@ -45,12 +41,6 @@ pub struct Page {
     pub created_at: chrono::NaiveDateTime,
     #[default]
     pub updated_at: chrono::NaiveDateTime,
-}
-
-impl Page {
-    pub fn can_publish(&self) -> bool {
-        !self.title.trim().is_empty() && !self.body.trim().is_empty()
-    }
 }
 
 // Revision is manual — write-only from hooks, read-only from routes

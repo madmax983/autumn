@@ -807,10 +807,6 @@ pub struct AutumnConfig {
     /// ```
     #[serde(default)]
     pub bot_protection: crate::security::captcha::BotProtectionConfig,
-
-    /// Resilience settings (circuit breakers, fallbacks).
-    #[serde(default)]
-    pub resilience: ResilienceConfig,
 }
 
 /// Error-reporting settings (`[reporting]` section in `autumn.toml`).
@@ -1851,7 +1847,6 @@ impl AutumnConfig {
         self.apply_storage_env_overrides_with_env(env);
         #[cfg(feature = "mail")]
         self.apply_mail_env_overrides_with_env(env);
-        self.apply_resilience_env_overrides_with_env(env);
     }
 
     #[cfg(feature = "reporting")]
@@ -2021,12 +2016,6 @@ impl AutumnConfig {
 
     fn apply_log_env_overrides_with_env(&mut self, env: &dyn Env) {
         parse_env_string(env, "AUTUMN_LOG__LEVEL", &mut self.log.level);
-        parse_env_bool(env, "AUTUMN_LOG__ACCESS_LOG", &mut self.log.access_log);
-        parse_env_csv(
-            env,
-            "AUTUMN_LOG__ACCESS_LOG_EXCLUDE",
-            &mut self.log.access_log_exclude,
-        );
         if let Ok(val) = env.var("AUTUMN_LOG__FORMAT") {
             match val.as_str() {
                 "Auto" => self.log.format = LogFormat::Auto,
@@ -3013,7 +3002,6 @@ impl DatabaseConfig {
 /// let log = LogConfig::default();
 /// assert_eq!(log.level, "info");
 /// assert_eq!(log.format, LogFormat::Auto);
-/// assert!(log.access_log);
 /// ```
 #[derive(Debug, Clone, Deserialize)]
 pub struct LogConfig {
@@ -3035,29 +3023,6 @@ pub struct LogConfig {
     /// Explicitly remove default sensitive keys from the built-in deny-list.
     #[serde(default)]
     pub unfilter_parameters: Vec<String>,
-
-    /// Emit one structured access-log event per served HTTP request.
-    /// Default: `true`.
-    ///
-    /// The event (target `autumn::access`, level `INFO`) carries `method`,
-    /// `route` (the matched low-cardinality template), `status`,
-    /// `duration_ms`, and `request_id`, and is rendered by the standard
-    /// subscriber according to [`format`](Self::format). It requires no
-    /// telemetry feature or collector.
-    #[serde(default = "default_access_log")]
-    pub access_log: bool,
-
-    /// Path prefixes excluded from access logging so steady-state probe and
-    /// asset traffic does not drown application signal. Default:
-    /// `["/health", "/live", "/ready", "/startup", "/actuator", "/static"]`
-    /// (the built-in probe, actuator, and static-asset mounts).
-    ///
-    /// Prefixes match whole path segments: `"/actuator"` excludes
-    /// `/actuator/health` but not `/actuators`. Setting this replaces the
-    /// default set entirely — and if you move the probe endpoints
-    /// (`health.path` etc.), mirror the new paths here.
-    #[serde(default = "default_access_log_exclude")]
-    pub access_log_exclude: Vec<String>,
 }
 
 /// Log output format.
@@ -3511,21 +3476,6 @@ fn default_log_level() -> String {
     "info".to_owned()
 }
 
-const fn default_access_log() -> bool {
-    true
-}
-
-fn default_access_log_exclude() -> Vec<String> {
-    vec![
-        "/health".to_owned(),
-        "/live".to_owned(),
-        "/ready".to_owned(),
-        "/startup".to_owned(),
-        "/actuator".to_owned(),
-        "/static".to_owned(),
-    ]
-}
-
 fn default_telemetry_service_name() -> String {
     "autumn-app".to_owned()
 }
@@ -3593,8 +3543,6 @@ impl Default for LogConfig {
             format: LogFormat::default(),
             filter_parameters: Vec::new(),
             unfilter_parameters: Vec::new(),
-            access_log: default_access_log(),
-            access_log_exclude: default_access_log_exclude(),
         }
     }
 }
@@ -3866,84 +3814,6 @@ impl Default for TenancyConfig {
             jwt_audience: None,
             base_domain: None,
         }
-    }
-}
-
-// ── Resilience configuration ───────────────────────────────────────────────
-
-/// Resilience policy configurations.
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct ResilienceConfig {
-    /// Circuit breaker configurations.
-    #[serde(default)]
-    pub circuit_breaker: CircuitBreakerConfig,
-}
-
-/// Circuit breaker configuration structure.
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct CircuitBreakerConfig {
-    /// Default circuit breaker policies.
-    #[serde(default)]
-    pub defaults: CircuitBreakerPolicyConfig,
-    /// Per-host circuit breaker policy overrides.
-    #[serde(default)]
-    pub hosts: std::collections::HashMap<String, CircuitBreakerPolicyConfig>,
-}
-
-/// Configurable settings for a circuit breaker policy.
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct CircuitBreakerPolicyConfig {
-    /// Failure ratio threshold (e.g. 0.5) to trip the breaker.
-    pub failure_ratio_threshold: Option<f64>,
-    /// Sample window duration in seconds.
-    pub sample_window_secs: Option<u64>,
-    /// Minimum samples required to evaluate failure ratio.
-    pub minimum_sample_count: Option<u64>,
-    /// Open state duration in seconds before entering half-open.
-    pub open_duration_secs: Option<u64>,
-    /// Number of successful trials required in half-open state to close the breaker.
-    pub half_open_trial_count: Option<u64>,
-}
-
-impl AutumnConfig {
-    fn apply_resilience_env_overrides_with_env(&mut self, env: &dyn Env) {
-        parse_env_option(
-            env,
-            "AUTUMN_RESILIENCE__CIRCUIT_BREAKER__DEFAULTS__FAILURE_RATIO_THRESHOLD",
-            &mut self
-                .resilience
-                .circuit_breaker
-                .defaults
-                .failure_ratio_threshold,
-        );
-        parse_env_option(
-            env,
-            "AUTUMN_RESILIENCE__CIRCUIT_BREAKER__DEFAULTS__SAMPLE_WINDOW_SECS",
-            &mut self.resilience.circuit_breaker.defaults.sample_window_secs,
-        );
-        parse_env_option(
-            env,
-            "AUTUMN_RESILIENCE__CIRCUIT_BREAKER__DEFAULTS__MINIMUM_SAMPLE_COUNT",
-            &mut self
-                .resilience
-                .circuit_breaker
-                .defaults
-                .minimum_sample_count,
-        );
-        parse_env_option(
-            env,
-            "AUTUMN_RESILIENCE__CIRCUIT_BREAKER__DEFAULTS__OPEN_DURATION_SECS",
-            &mut self.resilience.circuit_breaker.defaults.open_duration_secs,
-        );
-        parse_env_option(
-            env,
-            "AUTUMN_RESILIENCE__CIRCUIT_BREAKER__DEFAULTS__HALF_OPEN_TRIAL_COUNT",
-            &mut self
-                .resilience
-                .circuit_breaker
-                .defaults
-                .half_open_trial_count,
-        );
     }
 }
 
@@ -4400,54 +4270,6 @@ path = "/healthz"
         assert_eq!(config.server.host, "127.0.0.1");
         assert_eq!(config.database.pool_size, 10);
         assert_eq!(config.log.level, "info");
-    }
-
-    #[test]
-    fn access_log_defaults_on_with_probe_and_asset_exclusions() {
-        let log = LogConfig::default();
-        assert!(log.access_log);
-        assert_eq!(
-            log.access_log_exclude,
-            vec![
-                "/health",
-                "/live",
-                "/ready",
-                "/startup",
-                "/actuator",
-                "/static"
-            ]
-        );
-    }
-
-    #[test]
-    fn env_override_access_log_off() {
-        let env = MockEnv::new().with("AUTUMN_LOG__ACCESS_LOG", "false");
-        let mut config = AutumnConfig::default();
-        config.apply_env_overrides_with_env(&env);
-        assert!(!config.log.access_log);
-    }
-
-    #[test]
-    fn env_override_access_log_exclude_csv() {
-        let env = MockEnv::new().with("AUTUMN_LOG__ACCESS_LOG_EXCLUDE", "/internal, /probes");
-        let mut config = AutumnConfig::default();
-        config.apply_env_overrides_with_env(&env);
-        assert_eq!(config.log.access_log_exclude, vec!["/internal", "/probes"]);
-    }
-
-    #[test]
-    fn access_log_is_configurable_from_toml() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("autumn.toml");
-        std::fs::write(
-            &path,
-            "[log]\naccess_log = false\naccess_log_exclude = [\"/internal\"]\n",
-        )
-        .unwrap();
-
-        let config = AutumnConfig::load_from(&path).unwrap();
-        assert!(!config.log.access_log);
-        assert_eq!(config.log.access_log_exclude, vec!["/internal"]);
     }
 
     #[test]
@@ -6404,78 +6226,6 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
         assert!(
             config.server.timeouts.request_timeout_ms.is_none(),
             "dev profile must not enable a request timeout by default"
-        );
-    }
-
-    #[test]
-    fn test_resilience_config_defaults() {
-        let config = AutumnConfig::default();
-        assert!(
-            config
-                .resilience
-                .circuit_breaker
-                .defaults
-                .failure_ratio_threshold
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn test_resilience_config_parsing() {
-        let toml_str = r#"
-            [resilience.circuit_breaker.defaults]
-            failure_ratio_threshold = 0.6
-            sample_window_secs = 20
-            minimum_sample_count = 15
-            open_duration_secs = 30
-            half_open_trial_count = 5
-
-            [resilience.circuit_breaker.hosts."api.github.com"]
-            failure_ratio_threshold = 0.3
-            open_duration_secs = 10
-        "#;
-        let config: AutumnConfig = toml::from_str(toml_str).unwrap();
-        let cb = &config.resilience.circuit_breaker;
-        assert_eq!(cb.defaults.failure_ratio_threshold, Some(0.6));
-        assert_eq!(cb.defaults.sample_window_secs, Some(20));
-        assert_eq!(cb.defaults.minimum_sample_count, Some(15));
-        assert_eq!(cb.defaults.open_duration_secs, Some(30));
-        assert_eq!(cb.defaults.half_open_trial_count, Some(5));
-
-        let host_cb = cb.hosts.get("api.github.com").unwrap();
-        assert_eq!(host_cb.failure_ratio_threshold, Some(0.3));
-        assert_eq!(host_cb.open_duration_secs, Some(10));
-        assert!(host_cb.sample_window_secs.is_none());
-    }
-
-    #[test]
-    fn test_resilience_config_env_overrides() {
-        struct FakeEnv(std::collections::HashMap<String, String>);
-        impl Env for FakeEnv {
-            fn var(&self, key: &str) -> Result<String, std::env::VarError> {
-                self.0
-                    .get(key)
-                    .cloned()
-                    .ok_or(std::env::VarError::NotPresent)
-            }
-        }
-
-        let mut config = AutumnConfig::default();
-        let env = FakeEnv(
-            [(
-                "AUTUMN_RESILIENCE__CIRCUIT_BREAKER__DEFAULTS__FAILURE_RATIO_THRESHOLD".to_owned(),
-                "0.7".to_owned(),
-            )]
-            .into(),
-        );
-        config.apply_resilience_env_overrides_with_env(&env);
-        assert_eq!(
-            config
-                .resilience
-                .circuit_breaker
-                .defaults
-                .failure_ratio_threshold,
-            Some(0.7)
         );
     }
 }

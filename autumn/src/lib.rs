@@ -80,8 +80,6 @@ pub use channels::{
     Broadcast, BroadcastError, BroadcastPayload, ChannelBackendConfigError, ChannelMessage,
     ChannelPublishError, ChannelStats, Channels, ChannelsBackend, LocalChannelsBackend,
 };
-pub mod canary;
-pub mod circuit_breaker;
 pub mod config;
 pub mod credentials;
 #[cfg(feature = "db")]
@@ -102,8 +100,6 @@ pub mod idempotency;
 /// `autumn_web::t!(locale, "key")` usage.
 #[cfg(feature = "i18n")]
 pub use crate::i18n::t;
-#[cfg(feature = "inbound-mail")]
-pub mod inbound_mail;
 pub mod inspector;
 pub mod interceptor;
 #[cfg(feature = "mail")]
@@ -409,11 +405,6 @@ pub use autumn_macros::api_doc;
 /// }
 /// ```
 pub use autumn_macros::get;
-/// Annotate an async function as a first-class inbound mail handler.
-///
-/// See [`inbound_mail`] for usage documentation.
-#[cfg(feature = "inbound-mail")]
-pub use autumn_macros::inbound_mail;
 /// Collect mailer preview registrations into an `AppBuilder`.
 #[cfg(feature = "mail")]
 pub use autumn_macros::mail_previews;
