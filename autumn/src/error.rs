@@ -171,14 +171,18 @@ where
 
         #[cfg(feature = "http-client")]
         {
-            if matches!(any_err.downcast_ref::<crate::http_client::ClientError>(), Some(crate::http_client::ClientError::CircuitBreakerOpen)) {
+            if matches!(
+                any_err.downcast_ref::<crate::http_client::ClientError>(),
+                Some(crate::http_client::ClientError::CircuitBreakerOpen)
+            ) {
                 status = StatusCode::SERVICE_UNAVAILABLE;
             }
         }
 
         #[cfg(feature = "mail")]
         {
-            if let Some(crate::mail::MailError::RuntimeUnavailable(msg)) = any_err.downcast_ref::<crate::mail::MailError>()
+            if let Some(crate::mail::MailError::RuntimeUnavailable(msg)) =
+                any_err.downcast_ref::<crate::mail::MailError>()
                 && msg.contains("circuit breaker is open")
             {
                 status = StatusCode::SERVICE_UNAVAILABLE;

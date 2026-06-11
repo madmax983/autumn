@@ -781,7 +781,8 @@ impl RequestBuilder {
             || "unknown".to_owned(),
             |u| {
                 let h = u.host_str().unwrap_or("unknown");
-                u.port().map_or_else(|| h.to_owned(), |port| format!("{h}:{port}"))
+                u.port()
+                    .map_or_else(|| h.to_owned(), |port| format!("{h}:{port}"))
             },
         );
 
