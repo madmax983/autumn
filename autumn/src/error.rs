@@ -166,9 +166,35 @@ where
     E: std::error::Error + Send + Sync + 'static,
 {
     fn from(err: E) -> Self {
+        let mut status = StatusCode::INTERNAL_SERVER_ERROR;
+        let any_err: &dyn std::any::Any = &err;
+
+        #[cfg(feature = "http-client")]
+        {
+            if let Some(client_err) = any_err.downcast_ref::<crate::http_client::ClientError>() {
+                if matches!(
+                    client_err,
+                    crate::http_client::ClientError::CircuitBreakerOpen
+                ) {
+                    status = StatusCode::SERVICE_UNAVAILABLE;
+                }
+            }
+        }
+
+        #[cfg(feature = "mail")]
+        {
+            if let Some(mail_err) = any_err.downcast_ref::<crate::mail::MailError>() {
+                if let crate::mail::MailError::RuntimeUnavailable(msg) = mail_err {
+                    if msg.contains("circuit breaker is open") {
+                        status = StatusCode::SERVICE_UNAVAILABLE;
+                    }
+                }
+            }
+        }
+
         Self {
             inner: Box::new(err),
-            status: StatusCode::INTERNAL_SERVER_ERROR,
+            status,
             details: None,
             problem_type: None,
             cache_idempotency_response: false,

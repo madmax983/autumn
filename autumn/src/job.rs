@@ -1842,7 +1842,7 @@ impl JobClient {
         );
 
         if breaker.before_call().is_err() {
-            return Err(AutumnError::internal_server_error(std::io::Error::other(
+            return Err(AutumnError::service_unavailable(std::io::Error::other(
                 "job queue circuit breaker is open",
             )));
         }
@@ -1950,7 +1950,7 @@ impl JobClient {
             );
 
             if breaker.before_call().is_err() {
-                return Err(AutumnError::internal_server_error(std::io::Error::other(
+                return Err(AutumnError::service_unavailable(std::io::Error::other(
                     "job queue circuit breaker is open",
                 )));
             }

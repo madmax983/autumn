@@ -8,6 +8,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+#[cfg(feature = "mail")]
+use autumn_web::mail::{Mail, Mailer, Transport};
+
 #[get("/call-downstream/{port}")]
 async fn call_downstream(
     client: Client,
@@ -22,6 +25,29 @@ async fn call_downstream(
         )),
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
     }
+}
+
+#[get("/call-downstream-result/{port}")]
+async fn call_downstream_result(
+    client: Client,
+    axum::extract::Path(port): axum::extract::Path<u16>,
+) -> AutumnResult<String> {
+    let url = format!("http://127.0.0.1:{port}/downstream-target");
+    let res = client.get(&url).send().await?;
+    Ok(format!("Status: {}", res.status()))
+}
+
+#[cfg(feature = "mail")]
+#[get("/send-mail-result")]
+async fn send_mail_result(mailer: Mailer) -> AutumnResult<&'static str> {
+    let mail = Mail::builder()
+        .from("noreply@example.com")
+        .to("ada@example.com")
+        .subject("Test")
+        .text("hello")
+        .build()?;
+    mailer.send(mail).await?;
+    Ok("ok")
 }
 
 #[get("/unrelated")]
@@ -299,6 +325,160 @@ async fn test_circuit_breaker_distinct_ports() {
         .send()
         .await;
     resp2_fast.assert_ok();
+
+    autumn_web::circuit_breaker::global_registry().clear();
+}
+
+#[tokio::test]
+async fn test_circuit_breaker_blanket_from_http_client() {
+    let _lock = autumn_web::circuit_breaker::TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    autumn_web::circuit_breaker::global_registry().clear();
+
+    let is_outage = Arc::new(AtomicBool::new(false));
+    let is_outage_clone = is_outage.clone();
+    let mock_app = Router::new().route(
+        "/downstream-target",
+        get(move || {
+            let outage = is_outage_clone.load(Ordering::SeqCst);
+            async move {
+                if outage {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                } else {
+                    StatusCode::OK
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let port = addr.port();
+    tokio::spawn(async move {
+        axum::serve(listener, mock_app).await.unwrap();
+    });
+
+    let mut config = AutumnConfig::default();
+    config.health.detailed = true;
+    config
+        .resilience
+        .circuit_breaker
+        .defaults
+        .failure_ratio_threshold = Some(0.5);
+    config
+        .resilience
+        .circuit_breaker
+        .defaults
+        .minimum_sample_count = Some(2);
+    config
+        .resilience
+        .circuit_breaker
+        .defaults
+        .open_duration_secs = Some(10);
+    config
+        .resilience
+        .circuit_breaker
+        .defaults
+        .sample_window_secs = Some(10);
+    config
+        .resilience
+        .circuit_breaker
+        .defaults
+        .half_open_trial_count = Some(1);
+
+    let client = TestApp::new()
+        .config(config)
+        .routes(routes![call_downstream_result])
+        .build();
+
+    // CLOSED state
+    let resp = client
+        .get(&format!("/call-downstream-result/{port}"))
+        .send()
+        .await;
+    resp.assert_ok();
+
+    // Outage starts
+    is_outage.store(true, Ordering::SeqCst);
+
+    // Fail twice to trip the breaker
+    for _ in 0..2 {
+        let _ = client
+            .get(&format!("/call-downstream-result/{port}"))
+            .send()
+            .await;
+    }
+
+    // Next request should fail fast with 503 from the mapped ClientError::CircuitBreakerOpen
+    let resp_open = client
+        .get(&format!("/call-downstream-result/{port}"))
+        .send()
+        .await;
+    resp_open.assert_status(503);
+    assert!(
+        resp_open
+            .text()
+            .contains("outbound circuit breaker is open")
+    );
+
+    autumn_web::circuit_breaker::global_registry().clear();
+}
+
+#[tokio::test]
+#[cfg(feature = "mail")]
+async fn test_circuit_breaker_blanket_from_smtp() {
+    let _lock = autumn_web::circuit_breaker::TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    autumn_web::circuit_breaker::global_registry().clear();
+
+    let mut config = AutumnConfig::default();
+    config.mail.transport = Transport::Smtp;
+    config.mail.smtp.host = Some("127.0.0.1".to_string());
+    config.mail.smtp.port = Some(1); // non-existent port to force connection failures
+    config
+        .resilience
+        .circuit_breaker
+        .defaults
+        .failure_ratio_threshold = Some(0.5);
+    config
+        .resilience
+        .circuit_breaker
+        .defaults
+        .minimum_sample_count = Some(2);
+    config
+        .resilience
+        .circuit_breaker
+        .defaults
+        .open_duration_secs = Some(10);
+    config
+        .resilience
+        .circuit_breaker
+        .defaults
+        .sample_window_secs = Some(10);
+    config
+        .resilience
+        .circuit_breaker
+        .defaults
+        .half_open_trial_count = Some(1);
+
+    let client = TestApp::new()
+        .config(config)
+        .routes(routes![send_mail_result])
+        .build();
+
+    // Trigger two failures (connection refused)
+    let _ = client.get("/send-mail-result").send().await;
+    let _ = client.get("/send-mail-result").send().await;
+
+    // The third attempt should fail fast with 503 from SMTP breaker open mapped in From
+    let resp_open = client.get("/send-mail-result").send().await;
+    resp_open.assert_status(503);
+    assert!(
+        resp_open
+            .text()
+            .contains("smtp mailer circuit breaker is open")
+    );
 
     autumn_web::circuit_breaker::global_registry().clear();
 }
