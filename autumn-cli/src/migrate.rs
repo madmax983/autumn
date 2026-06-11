@@ -115,8 +115,8 @@ fn run_migrations_with_maintenance(
     // The lock is released when `_lock_guard` drops (end of this function or
     // process exit — both are safe because PostgreSQL releases session-level
     // advisory locks on connection close).
-    let _lock_guard = hold_migration_lock(database_url, DEFAULT_LOCK_WAIT_TIMEOUT)
-        .unwrap_or_else(|e| {
+    let _lock_guard =
+        hold_migration_lock(database_url, DEFAULT_LOCK_WAIT_TIMEOUT).unwrap_or_else(|e| {
             eprintln!("\u{274C} Failed to acquire migration lock: {e}");
             std::process::exit(1);
         });

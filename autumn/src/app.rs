@@ -4822,13 +4822,22 @@ async fn setup_database(
     if topology.is_some()
         && let Some(url) = config.database.effective_primary_url()
     {
+        let url = url.to_owned();
+        let profile = config.profile.clone();
+        let auto_in_prod = config.database.auto_migrate_in_production;
         for mig in migrations {
-            crate::migrate::auto_migrate(
-                url,
-                config.profile.as_deref(),
-                config.database.auto_migrate_in_production,
-                mig,
-            );
+            let url = url.clone();
+            let profile = profile.clone();
+            // run_pending_locked polls with std::thread::sleep (up to 60 s under
+            // contention), so we must not call auto_migrate on a Tokio worker thread.
+            tokio::task::spawn_blocking(move || {
+                crate::migrate::auto_migrate(&url, profile.as_deref(), auto_in_prod, mig);
+            })
+            .await
+            .unwrap_or_else(|e| {
+                tracing::error!(error = %e, "Migration task panicked");
+                std::process::exit(1);
+            });
         }
     }
 

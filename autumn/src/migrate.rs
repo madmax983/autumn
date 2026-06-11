@@ -621,9 +621,7 @@ mod tests {
         let handles: Vec<_> = (0..4)
             .map(|_| {
                 let url = url.clone();
-                tokio::task::spawn_blocking(move || {
-                    run_pending_locked(&url, TEST_MIGRATIONS, None)
-                })
+                tokio::task::spawn_blocking(move || run_pending_locked(&url, TEST_MIGRATIONS, None))
             })
             .collect();
 
@@ -652,8 +650,8 @@ mod tests {
 
         // (b) The final schema must include all expected tables.
         // We verify by checking that a subsequent run finds no pending migrations.
-        let final_check = run_pending_locked(&url, TEST_MIGRATIONS, None)
-            .expect("post-run check failed");
+        let final_check =
+            run_pending_locked(&url, TEST_MIGRATIONS, None).expect("post-run check failed");
         assert!(
             final_check.applied.is_empty(),
             "schema must be fully applied after concurrent run"
