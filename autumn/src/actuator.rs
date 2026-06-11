@@ -1425,9 +1425,9 @@ impl HealthIndicatorRegistry {
         for breaker in crate::circuit_breaker::global_registry().all_breakers() {
             let state = breaker.state();
             let status = match state {
-                crate::circuit_breaker::CircuitState::Open => HealthStatus::Down,
-                crate::circuit_breaker::CircuitState::Closed
-                | crate::circuit_breaker::CircuitState::HalfOpen => HealthStatus::Up,
+                crate::circuit_breaker::CircuitState::Open
+                | crate::circuit_breaker::CircuitState::HalfOpen => HealthStatus::Down,
+                crate::circuit_breaker::CircuitState::Closed => HealthStatus::Up,
             };
 
             let mut details = HashMap::new();
@@ -2650,7 +2650,6 @@ pub(crate) fn actuator_endpoint_paths(
         actuator_route_path(prefix, "/health"),
         actuator_route_path(prefix, "/info"),
         actuator_route_path(prefix, "/metrics"),
-        actuator_route_path(prefix, "/circuitbreakers"),
         actuator_route_path(prefix, "/a11y"),
         actuator_route_path(prefix, "/ui"),
         actuator_route_path(prefix, "/ui/metrics"),
@@ -2661,6 +2660,7 @@ pub(crate) fn actuator_endpoint_paths(
     }
 
     if sensitive {
+        paths.push(actuator_route_path(prefix, "/circuitbreakers"));
         paths.push(actuator_route_path(prefix, "/env"));
         paths.push(actuator_route_path(prefix, "/configprops"));
         paths.push(actuator_route_path(prefix, "/loggers"));
@@ -2724,10 +2724,6 @@ pub(crate) fn actuator_router_with_prefix<
             axum::routing::get(metrics_endpoint::<S>),
         )
         .route(
-            &actuator_route_path(prefix, "/circuitbreakers"),
-            axum::routing::get(circuitbreakers_endpoint::<S>),
-        )
-        .route(
             &actuator_route_path(prefix, "/a11y"),
             axum::routing::get(a11y_endpoint::<S>),
         );
@@ -2741,6 +2737,10 @@ pub(crate) fn actuator_router_with_prefix<
 
     if sensitive {
         router = router
+            .route(
+                &actuator_route_path(prefix, "/circuitbreakers"),
+                axum::routing::get(circuitbreakers_endpoint::<S>),
+            )
             .route(
                 &actuator_route_path(prefix, "/env"),
                 axum::routing::get(env_endpoint::<S>),
@@ -3573,6 +3573,21 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/actuator/env")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn actuator_circuitbreakers_hidden_in_nonsensitive_mode() {
+        let app = actuator_router(false).with_state(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/circuitbreakers")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -5388,6 +5403,29 @@ mod health_indicator_tests {
             .find(|r| r.name == "circuit_breaker.actuator_test_breaker");
         assert_eq!(found.unwrap().output.status, HealthStatus::Down);
         assert_eq!(found.unwrap().output.details.get("state").unwrap(), "OPEN");
+
+        // Transition to HalfOpen manually to check status
+        {
+            let mut inner = breaker.inner.lock().unwrap();
+            inner.state = crate::circuit_breaker::CircuitState::HalfOpen;
+            inner.half_open_in_flight = 0;
+            inner.half_open_successes = 0;
+            inner.half_open_failures = 0;
+        }
+        assert_eq!(
+            breaker.state(),
+            crate::circuit_breaker::CircuitState::HalfOpen
+        );
+
+        let results = registry.run_all().await;
+        let found = results
+            .iter()
+            .find(|r| r.name == "circuit_breaker.actuator_test_breaker");
+        assert_eq!(found.unwrap().output.status, HealthStatus::Down);
+        assert_eq!(
+            found.unwrap().output.details.get("state").unwrap(),
+            "HALF_OPEN"
+        );
 
         let readiness_results = registry.run_readiness().await;
         let found_readiness = readiness_results

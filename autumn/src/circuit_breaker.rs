@@ -106,17 +106,17 @@ pub enum CircuitBreakerError<E> {
 #[derive(Clone)]
 pub struct CircuitBreaker {
     name: String,
-    inner: Arc<Mutex<CircuitBreakerInner>>,
+    pub(crate) inner: Arc<Mutex<CircuitBreakerInner>>,
 }
 
-struct CircuitBreakerInner {
-    state: CircuitState,
-    history: Vec<(Instant, bool)>,
-    open_until: Option<Instant>,
-    half_open_successes: u64,
-    half_open_failures: u64,
-    half_open_in_flight: u64,
-    config: CircuitBreakerPolicy,
+pub(crate) struct CircuitBreakerInner {
+    pub(crate) state: CircuitState,
+    pub(crate) history: Vec<(Instant, bool)>,
+    pub(crate) open_until: Option<Instant>,
+    pub(crate) half_open_successes: u64,
+    pub(crate) half_open_failures: u64,
+    pub(crate) half_open_in_flight: u64,
+    pub(crate) config: CircuitBreakerPolicy,
 }
 
 impl CircuitBreakerInner {
@@ -443,7 +443,7 @@ pin_project_lite::pin_project! {
         Executing {
             #[pin]
             fut: F,
-            breaker: CircuitBreaker,
+            guard: Option<CircuitBreakerGuard>,
         },
         Open,
     }
@@ -460,13 +460,17 @@ where
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
         match self.project() {
-            CircuitBreakerServiceFutureProj::Executing { fut, breaker } => match fut.poll(cx) {
+            CircuitBreakerServiceFutureProj::Executing { fut, guard } => match fut.poll(cx) {
                 std::task::Poll::Ready(Ok(val)) => {
-                    breaker.after_call(true);
+                    if let Some(g) = guard.take() {
+                        g.success();
+                    }
                     std::task::Poll::Ready(Ok(val))
                 }
                 std::task::Poll::Ready(Err(err)) => {
-                    breaker.after_call(false);
+                    if let Some(g) = guard.take() {
+                        g.failure();
+                    }
                     std::task::Poll::Ready(Err(CircuitBreakerError::Execution(err)))
                 }
                 std::task::Poll::Pending => std::task::Poll::Pending,
@@ -501,7 +505,7 @@ where
                 let fut = self.inner.call(req);
                 CircuitBreakerServiceFuture::Executing {
                     fut,
-                    breaker: self.breaker.clone(),
+                    guard: Some(CircuitBreakerGuard::new(self.breaker.clone())),
                 }
             }
             Err(_) => CircuitBreakerServiceFuture::Open,
@@ -631,5 +635,57 @@ mod tests {
         // host override check
         let policy_override = CircuitBreakerPolicy::from_config(&rc, "override-zero");
         assert_eq!(policy_override.half_open_trial_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_circuit_breaker_tower_service_cancellation() {
+        use tower::{Layer, Service};
+        let policy = CircuitBreakerPolicy {
+            failure_ratio_threshold: 0.5,
+            sample_window: Duration::from_secs(10),
+            minimum_sample_count: 5,
+            open_duration: Duration::from_secs(60),
+            half_open_trial_count: 2,
+        };
+        let breaker = CircuitBreaker::new("tower_cancel_test", policy);
+
+        // Put the breaker in HalfOpen state
+        {
+            let mut inner = breaker.inner.lock().unwrap();
+            inner.state = CircuitState::HalfOpen;
+            inner.half_open_in_flight = 0;
+        }
+
+        struct PendingService;
+        impl tower::Service<&'static str> for PendingService {
+            type Response = &'static str;
+            type Error = &'static str;
+            type Future = std::future::Pending<Result<Self::Response, Self::Error>>;
+
+            fn poll_ready(
+                &mut self,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Result<(), Self::Error>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+
+            fn call(&mut self, _: &'static str) -> Self::Future {
+                std::future::pending()
+            }
+        }
+
+        let mut svc = CircuitBreakerLayer::new(breaker.clone()).layer(PendingService);
+
+        // Call the service: this will increment half_open_in_flight since it's HalfOpen
+        let fut = svc.call("ok");
+        let in_flight_before = breaker.inner.lock().unwrap().half_open_in_flight;
+        assert_eq!(in_flight_before, 1);
+
+        // Drop the future (cancellation)
+        drop(fut);
+
+        // half_open_in_flight should be decremented back to 0!
+        let in_flight_after = breaker.inner.lock().unwrap().half_open_in_flight;
+        assert_eq!(in_flight_after, 0);
     }
 }
