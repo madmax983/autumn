@@ -17,6 +17,11 @@ place:
 6. an explicit migration job before web replicas start
 7. a clear choice between `#[scheduled]` and Harvest for background work
 
+When a single primary (plus replicas) stops being enough for writes, see
+the [Horizontal Sharding guide](sharding.md) — `[[database.shards]]`
+routes tenant data across multiple Postgres databases while framework
+state stays on the control role.
+
 ## What `autumn new` Gives You
 
 The scaffold now includes:

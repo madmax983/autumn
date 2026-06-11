@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **db:** Framework-native horizontal sharding (`[[database.shards]]`)
+  - Tenant data routes key → logical slot (`database.slot_count`, default 64;
+    deterministic FNV-1a/splitmix64 hash pinned by golden-vector tests) →
+    physical shard per an explicit `slots` map, so resharding moves whole
+    slots in config instead of rehashing keys. Each shard is a full
+    primary/replica `DatabaseTopology` with per-shard `replica_fallback`.
+  - New `autumn_web::sharding` module and prelude extractors: `ShardedDb`
+    (tenant-routed via `ShardKeyOverride` → tenancy task-local → tenant
+    extraction; derefs like `Db` with the same `tx` semantics) and `Shards`
+    (`db_for`/`read_for`/`db_on` plus a bounded concurrent `each_shard`
+    fan-out that collects per-shard results — there are no cross-shard
+    transactions). Pluggable `ShardRouter` via
+    `AppBuilder::with_shard_router`; per-shard pool decoration via
+    `DatabasePoolProvider::create_shard_topology`. `#[repository]` gains a
+    `with_pool` constructor for shard-scoped repositories.
+  - Startup auto-migrate and `autumn migrate` apply migrations control-first
+    then per shard, fail-fast with target labels; new `--shard <name>` /
+    `--control-only` flags and per-target `status`. Per-shard replica
+    migration parity gates each shard's replica reads.
+  - `/ready` and `/actuator/health` gain `db:shard:<name>` components;
+    `/actuator/metrics` gains a `database_shards` block; shard-routed
+    checkouts tag spans (`db.shard`) and route metrics (`shard=<name>`).
+  - Framework state (jobs, scheduler locks, sessions, flags) stays on the
+    unsharded control role — enforced at config validation. New
+    `examples/bookmarks-sharded` Docker Compose stack and
+    `docs/guide/sharding.md`.
+
 - **auth:** Active session management with device list and revocation in the auth starter (#819)
   - `autumn generate auth` now persists a `{user}_sessions` row per login
     (SHA-256 digest of the opaque session id — never the raw id — plus user id,

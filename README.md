@@ -196,6 +196,7 @@ See [EXAMPLES.md](EXAMPLES.md) for the full catalog with personas, journeys, pre
 - [Code Generators](docs/guide/generators.md) — `autumn generate model | migration | scaffold`
 - [One-Off Tasks](docs/guide/tasks.md) - `#[task]`, `one_off_tasks![]`, and `autumn task`
 - [Multi-Replica Scheduled Tasks](docs/guide/scheduled-multi-replica.md) - `#[scheduled]` with Postgres advisory-lock coordination
+- [Horizontal Sharding](docs/guide/sharding.md) — `[[database.shards]]`, slot-based routing, `ShardedDb`/`Shards` extractors, per-shard health and migrations
 - [Operating Background Jobs](docs/guide/operating-background-jobs.md) - admin dashboard and recovery actions for `#[job]`
 - [Exposing Your API as MCP Tools](docs/guide/mcp.md) — project typed endpoints into a Model Context Protocol server with `#[api_doc(mcp)]` + `mount_mcp`
 - [Mail Guide](docs/guide/mail.md)
