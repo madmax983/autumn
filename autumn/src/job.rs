@@ -54,6 +54,7 @@ pub struct JobClient {
     default_initial_backoff_ms: u64,
     per_job_defaults: HashMap<String, (u32, u64)>,
     pub interceptor: Option<Arc<dyn crate::interceptor::JobInterceptor>>,
+    resilience_config: Option<Arc<crate::config::ResilienceConfig>>,
 }
 
 #[derive(Debug)]
@@ -1417,19 +1418,36 @@ impl JobClient {
         max_attempts: u32,
         backoff_ms: u64,
     ) -> AutumnResult<()> {
-        let policy = crate::circuit_breaker::CircuitBreakerPolicy::default();
-        let breaker = crate::circuit_breaker::global_registry().get_or_create("job_queue", policy);
+        let breaker = self.resilience_config.as_ref().map_or_else(
+            || {
+                crate::circuit_breaker::global_registry().get_or_create(
+                    "job_queue",
+                    crate::circuit_breaker::CircuitBreakerPolicy::default(),
+                )
+            },
+            |rc| {
+                let policy =
+                    crate::circuit_breaker::CircuitBreakerPolicy::from_config(rc, "job_queue");
+                crate::circuit_breaker::global_registry()
+                    .get_or_create_with_config("job_queue", policy)
+            },
+        );
 
         if breaker.before_call().is_err() {
             return Err(AutumnError::internal_server_error(std::io::Error::other(
                 "job queue circuit breaker is open",
             )));
         }
+        let guard = crate::circuit_breaker::CircuitBreakerGuard::new(breaker.clone());
 
         let res = self
             .enqueue_durable_inner(id, name, payload, max_attempts, backoff_ms)
             .await;
-        breaker.after_call(res.is_ok());
+        if res.is_ok() {
+            guard.success();
+        } else {
+            guard.failure();
+        }
         res
     }
 
@@ -1697,6 +1715,9 @@ pub(crate) fn start_local_runtime(
         interceptor: state
             .extension::<Arc<dyn crate::interceptor::JobInterceptor>>()
             .map(|arc| (*arc).clone()),
+        resilience_config: state
+            .extension::<crate::config::AutumnConfig>()
+            .map(|c| Arc::new(c.resilience.clone())),
     };
     init_global_job_client(client);
 
@@ -3294,6 +3315,9 @@ fn start_redis_runtime(
         interceptor: state
             .extension::<Arc<dyn crate::interceptor::JobInterceptor>>()
             .map(|arc| (*arc).clone()),
+        resilience_config: state
+            .extension::<crate::config::AutumnConfig>()
+            .map(|c| Arc::new(c.resilience.clone())),
     });
 
     let worker_count = config.workers.max(1);
@@ -4337,6 +4361,9 @@ fn start_postgres_runtime(
         interceptor: state
             .extension::<Arc<dyn crate::interceptor::JobInterceptor>>()
             .map(|arc| (*arc).clone()),
+        resilience_config: state
+            .extension::<crate::config::AutumnConfig>()
+            .map(|c| Arc::new(c.resilience.clone())),
     });
 
     let visibility_timeout_ms = config.postgres.visibility_timeout_ms;
@@ -4536,6 +4563,7 @@ mod tests {
             default_initial_backoff_ms: 250,
             per_job_defaults: HashMap::from([("send_email".to_string(), (5, 250))]),
             interceptor: None,
+            resilience_config: None,
         });
 
         let failed_id = backend.record_enqueue_for_test(
@@ -4597,6 +4625,7 @@ mod tests {
             default_initial_backoff_ms: 250,
             per_job_defaults: HashMap::from([("send_email".to_string(), (5, 250))]),
             interceptor: None,
+            resilience_config: None,
         });
 
         let failed_id =
@@ -4649,6 +4678,7 @@ mod tests {
             default_initial_backoff_ms: 250,
             per_job_defaults: HashMap::from([("send_email".to_string(), (5, 250))]),
             interceptor: None,
+            resilience_config: None,
         });
 
         let failed_id =
@@ -4879,6 +4909,7 @@ mod tests {
                 (3_u32, 100_u64),
             )]),
             interceptor: Some(Arc::new(PanickingEnqueueInterceptor)),
+            resilience_config: None,
         };
 
         let res = client.enqueue("test_job", serde_json::json!({})).await;
@@ -4937,6 +4968,7 @@ mod tests {
                 (3_u32, 100_u64),
             )]),
             interceptor: Some(Arc::new(AsyncPanickingEnqueueInterceptor)),
+            resilience_config: None,
         };
 
         let res = client.enqueue("test_job", serde_json::json!({})).await;
@@ -6278,6 +6310,7 @@ mod tests {
             default_initial_backoff_ms: 250,
             per_job_defaults: HashMap::new(),
             interceptor: None,
+            resilience_config: None,
         });
         assert!(global_job_client().is_some());
 
@@ -7507,6 +7540,7 @@ mod tests {
             default_initial_backoff_ms: 100,
             per_job_defaults: HashMap::from([("test_job".to_string(), (3_u32, 100_u64))]),
             interceptor: None,
+            resilience_config: None,
         };
         (client, rx)
     }
@@ -7873,6 +7907,7 @@ mod tests {
                 default_initial_backoff_ms: 100,
                 per_job_defaults: HashMap::from([("test_job".to_string(), (3_u32, 100_u64))]),
                 interceptor: None,
+                resilience_config: None,
             };
             rt.block_on(async {
                 client
@@ -7889,7 +7924,12 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_job_enqueue_durable_circuit_breaker() {
+        let _lock = crate::circuit_breaker::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::circuit_breaker::global_registry().clear();
         let policy = crate::circuit_breaker::CircuitBreakerPolicy {
             failure_ratio_threshold: 0.5,
             sample_window: Duration::from_secs(10),
@@ -7917,6 +7957,7 @@ mod tests {
             default_initial_backoff_ms: 1000,
             per_job_defaults: HashMap::new(),
             interceptor: None,
+            resilience_config: None,
         };
 
         for _ in 0..3 {
@@ -7952,5 +7993,6 @@ mod tests {
                 || err_str.contains("open")
                 || err_str.contains("Open")
         );
+        crate::circuit_breaker::global_registry().clear();
     }
 }

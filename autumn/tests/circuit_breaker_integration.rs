@@ -13,7 +13,7 @@ async fn call_downstream(
     client: Client,
     axum::extract::Path(port): axum::extract::Path<u16>,
 ) -> Result<String, (StatusCode, String)> {
-    let url = format!("http://127.0.0.98:{port}/downstream-target");
+    let url = format!("http://127.0.0.1:{port}/downstream-target");
     match client.get(&url).send().await {
         Ok(res) => Ok(format!("Status: {}", res.status())),
         Err(ClientError::CircuitBreakerOpen) => Err((
@@ -30,8 +30,12 @@ async fn unrelated() -> &'static str {
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::await_holding_lock)]
 async fn test_circuit_breaker_downstream_outage_flow() {
+    let _lock = autumn_web::circuit_breaker::TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    autumn_web::circuit_breaker::global_registry().clear();
     // 1. Setup mock downstream server that can simulate an outage
     let is_outage = Arc::new(AtomicBool::new(false));
     let is_outage_clone = is_outage.clone();
@@ -48,7 +52,7 @@ async fn test_circuit_breaker_downstream_outage_flow() {
             }
         }),
     );
-    let listener = tokio::net::TcpListener::bind("127.0.0.98:0").await.unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let port = addr.port();
     tokio::spawn(async move {
@@ -169,7 +173,7 @@ async fn test_circuit_breaker_downstream_outage_flow() {
     act_health.assert_status(503);
     act_health.assert_json::<serde_json::Value, _>(|val| {
         assert_eq!(val["status"], "DOWN");
-        let cb_details = &val["components"]["circuit_breaker.127.0.0.98"];
+        let cb_details = &val["components"]["circuit_breaker.127.0.0.1"];
         assert_eq!(cb_details["status"], "DOWN");
         assert_eq!(cb_details["details"]["state"], "OPEN");
     });
@@ -195,8 +199,9 @@ async fn test_circuit_breaker_downstream_outage_flow() {
     act_health_final.assert_ok();
     act_health_final.assert_json::<serde_json::Value, _>(|val| {
         assert_eq!(val["status"], "UP");
-        let cb_details = &val["components"]["circuit_breaker.127.0.0.98"];
+        let cb_details = &val["components"]["circuit_breaker.127.0.0.1"];
         assert_eq!(cb_details["status"], "UP");
         assert_eq!(cb_details["details"]["state"], "CLOSED");
     });
+    autumn_web::circuit_breaker::global_registry().clear();
 }

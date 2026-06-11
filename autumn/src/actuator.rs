@@ -3389,7 +3389,9 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn actuator_circuitbreakers_returns_breakers() {
-        let _lock = crate::circuit_breaker::TEST_LOCK.lock().unwrap();
+        let _lock = crate::circuit_breaker::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         crate::circuit_breaker::global_registry().clear();
         let breaker = crate::circuit_breaker::global_registry().get_or_create(
             "actuator_endpoint_test_breaker",
@@ -5350,7 +5352,9 @@ mod health_indicator_tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn test_circuit_breakers_in_health_indicator_registry() {
-        let _lock = crate::circuit_breaker::TEST_LOCK.lock().unwrap();
+        let _lock = crate::circuit_breaker::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         crate::circuit_breaker::global_registry().clear();
         let registry = HealthIndicatorRegistry::new();
         let breaker = crate::circuit_breaker::global_registry().get_or_create(

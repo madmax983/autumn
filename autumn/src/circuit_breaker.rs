@@ -54,6 +54,47 @@ impl Default for CircuitBreakerPolicy {
     }
 }
 
+impl CircuitBreakerPolicy {
+    pub fn from_config(rc: &crate::config::ResilienceConfig, name: &str) -> Self {
+        let mut policy = Self::default();
+        let defs = &rc.circuit_breaker.defaults;
+        if let Some(ratio) = defs.failure_ratio_threshold {
+            policy.failure_ratio_threshold = ratio;
+        }
+        if let Some(window) = defs.sample_window_secs {
+            policy.sample_window = Duration::from_secs(window);
+        }
+        if let Some(count) = defs.minimum_sample_count {
+            policy.minimum_sample_count = count;
+        }
+        if let Some(duration) = defs.open_duration_secs {
+            policy.open_duration = Duration::from_secs(duration);
+        }
+        if let Some(trials) = defs.half_open_trial_count {
+            policy.half_open_trial_count = trials;
+        }
+
+        if let Some(host_cfg) = rc.circuit_breaker.hosts.get(name) {
+            if let Some(ratio) = host_cfg.failure_ratio_threshold {
+                policy.failure_ratio_threshold = ratio;
+            }
+            if let Some(window) = host_cfg.sample_window_secs {
+                policy.sample_window = Duration::from_secs(window);
+            }
+            if let Some(count) = host_cfg.minimum_sample_count {
+                policy.minimum_sample_count = count;
+            }
+            if let Some(duration) = host_cfg.open_duration_secs {
+                policy.open_duration = Duration::from_secs(duration);
+            }
+            if let Some(trials) = host_cfg.half_open_trial_count {
+                policy.half_open_trial_count = trials;
+            }
+        }
+        policy
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum CircuitBreakerError<E> {
     #[error("circuit breaker is open")]
@@ -65,7 +106,6 @@ pub enum CircuitBreakerError<E> {
 #[derive(Clone)]
 pub struct CircuitBreaker {
     name: String,
-    config: CircuitBreakerPolicy,
     inner: Arc<Mutex<CircuitBreakerInner>>,
 }
 
@@ -75,6 +115,8 @@ struct CircuitBreakerInner {
     open_until: Option<Instant>,
     half_open_successes: u64,
     half_open_failures: u64,
+    half_open_in_flight: u64,
+    config: CircuitBreakerPolicy,
 }
 
 impl CircuitBreakerInner {
@@ -109,13 +151,14 @@ impl CircuitBreaker {
     pub fn new(name: impl Into<String>, config: CircuitBreakerPolicy) -> Self {
         Self {
             name: name.into(),
-            config,
             inner: Arc::new(Mutex::new(CircuitBreakerInner {
                 state: CircuitState::Closed,
                 history: Vec::new(),
                 open_until: None,
                 half_open_successes: 0,
                 half_open_failures: 0,
+                half_open_in_flight: 0,
+                config,
             })),
         }
     }
@@ -133,6 +176,7 @@ impl CircuitBreaker {
                     inner.transition_to(&self.name, CircuitState::HalfOpen, 1.0);
                     inner.half_open_successes = 0;
                     inner.half_open_failures = 0;
+                    inner.half_open_in_flight = 0;
                     inner.open_until = None;
                 }
             }
@@ -140,13 +184,20 @@ impl CircuitBreaker {
         inner.state
     }
 
-    pub fn config(&self) -> &CircuitBreakerPolicy {
-        &self.config
+    pub fn config(&self) -> CircuitBreakerPolicy {
+        let inner = self.inner.lock().unwrap();
+        inner.config.clone()
+    }
+
+    pub fn update_config(&self, config: CircuitBreakerPolicy) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.config = config;
     }
 
     pub fn failure_ratio(&self) -> f64 {
         let mut inner = self.inner.lock().unwrap();
-        inner.clean_history(self.config.sample_window, Instant::now());
+        let window = inner.config.sample_window;
+        inner.clean_history(window, Instant::now());
         inner.failure_ratio()
     }
 
@@ -160,47 +211,66 @@ impl CircuitBreaker {
                     inner.transition_to(&self.name, CircuitState::HalfOpen, 1.0);
                     inner.half_open_successes = 0;
                     inner.half_open_failures = 0;
+                    inner.half_open_in_flight = 0;
                     inner.open_until = None;
                 }
             }
         }
 
-        if inner.state == CircuitState::Open {
-            Err(CircuitBreakerError::Open)
-        } else {
-            Ok(())
+        match inner.state {
+            CircuitState::Open => Err(CircuitBreakerError::Open),
+            CircuitState::HalfOpen => {
+                let trial_count = inner.config.half_open_trial_count;
+                if inner.half_open_successes + inner.half_open_in_flight >= trial_count {
+                    Err(CircuitBreakerError::Open)
+                } else {
+                    inner.half_open_in_flight += 1;
+                    Ok(())
+                }
+            }
+            CircuitState::Closed => Ok(()),
         }
     }
 
     pub(crate) fn after_call(&self, success: bool) {
         let mut inner = self.inner.lock().unwrap();
         let now = Instant::now();
-        inner.clean_history(self.config.sample_window, now);
+        let window = inner.config.sample_window;
+        inner.clean_history(window, now);
 
         match inner.state {
             CircuitState::Closed => {
                 inner.history.push((now, success));
-                inner.clean_history(self.config.sample_window, now);
+                let window = inner.config.sample_window;
+                inner.clean_history(window, now);
 
-                if inner.history.len() as u64 >= self.config.minimum_sample_count {
+                let min_sample = inner.config.minimum_sample_count;
+                let failure_ratio_threshold = inner.config.failure_ratio_threshold;
+                let open_duration = inner.config.open_duration;
+                if inner.history.len() as u64 >= min_sample {
                     let ratio = inner.failure_ratio();
-                    if ratio >= self.config.failure_ratio_threshold {
+                    if ratio >= failure_ratio_threshold {
                         inner.transition_to(&self.name, CircuitState::Open, ratio);
-                        inner.open_until = Some(now + self.config.open_duration);
+                        inner.open_until = Some(now + open_duration);
                     }
                 }
             }
             CircuitState::HalfOpen => {
+                if inner.half_open_in_flight > 0 {
+                    inner.half_open_in_flight -= 1;
+                }
+                let trial_count = inner.config.half_open_trial_count;
+                let open_duration = inner.config.open_duration;
                 if success {
                     inner.half_open_successes += 1;
-                    if inner.half_open_successes >= self.config.half_open_trial_count {
+                    if inner.half_open_successes >= trial_count {
                         inner.transition_to(&self.name, CircuitState::Closed, 0.0);
                         inner.history.clear();
                     }
                 } else {
                     inner.half_open_failures += 1;
                     inner.transition_to(&self.name, CircuitState::Open, 1.0);
-                    inner.open_until = Some(now + self.config.open_duration);
+                    inner.open_until = Some(now + open_duration);
                 }
             }
             CircuitState::Open => {}
@@ -212,12 +282,13 @@ impl CircuitBreaker {
         F: Future<Output = Result<T, E>>,
     {
         self.before_call().map_err(|_| CircuitBreakerError::Open)?;
+        let guard = CircuitBreakerGuard::new(self.clone());
 
         let res = fut.await;
 
         match &res {
-            Ok(_) => self.after_call(true),
-            Err(_) => self.after_call(false),
+            Ok(_) => guard.success(),
+            Err(_) => guard.failure(),
         }
 
         res.map_err(CircuitBreakerError::Execution)
@@ -231,6 +302,43 @@ impl CircuitBreaker {
         match self.run(fut).await {
             Ok(val) => Ok(val),
             Err(err) => fallback(err),
+        }
+    }
+}
+
+pub struct CircuitBreakerGuard {
+    breaker: CircuitBreaker,
+    completed: bool,
+}
+
+impl CircuitBreakerGuard {
+    pub fn new(breaker: CircuitBreaker) -> Self {
+        Self {
+            breaker,
+            completed: false,
+        }
+    }
+
+    pub fn success(mut self) {
+        self.completed = true;
+        self.breaker.after_call(true);
+    }
+
+    pub fn failure(mut self) {
+        self.completed = true;
+        self.breaker.after_call(false);
+    }
+}
+
+impl Drop for CircuitBreakerGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            let mut inner = self.breaker.inner.lock().unwrap();
+            if inner.state == CircuitState::HalfOpen {
+                if inner.half_open_in_flight > 0 {
+                    inner.half_open_in_flight -= 1;
+                }
+            }
         }
     }
 }
@@ -252,6 +360,22 @@ impl CircuitBreakerRegistry {
             .entry(name.to_owned())
             .or_insert_with(|| CircuitBreaker::new(name, config))
             .clone()
+    }
+
+    pub fn get_or_create_with_config(
+        &self,
+        name: &str,
+        config: CircuitBreakerPolicy,
+    ) -> CircuitBreaker {
+        let mut breakers = self.breakers.lock().unwrap();
+        if let Some(breaker) = breakers.get(name) {
+            breaker.update_config(config);
+            breaker.clone()
+        } else {
+            let breaker = CircuitBreaker::new(name, config);
+            breakers.insert(name.to_owned(), breaker.clone());
+            breaker
+        }
     }
 
     /// Returns a list of all currently registered circuit breakers.
@@ -281,7 +405,6 @@ pub fn global_registry() -> &'static CircuitBreakerRegistry {
     REGISTRY.get_or_init(CircuitBreakerRegistry::new)
 }
 
-#[cfg(test)]
 pub static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[derive(Clone)]
