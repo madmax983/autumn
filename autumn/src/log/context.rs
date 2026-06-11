@@ -177,7 +177,7 @@ impl LogContext {
         let key = key.into();
         // Never let a custom field shadow a built-in correlation id: the core
         // ids have dedicated setters and are flattened alongside `fields`.
-        if RESERVED_FIELD_KEYS.contains(&*key) {
+        if RESERVED_FIELD_KEYS.contains(&key.as_str()) {
             return;
         }
         let value = if self.filter.matches_key(&key) {
