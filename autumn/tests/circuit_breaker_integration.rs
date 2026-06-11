@@ -222,10 +222,7 @@ async fn test_circuit_breaker_distinct_ports() {
     });
 
     // Port 2 always returns 200 (OK)
-    let mock_app_2 = Router::new().route(
-        "/downstream-target",
-        get(|| async { StatusCode::OK }),
-    );
+    let mock_app_2 = Router::new().route("/downstream-target", get(|| async { StatusCode::OK }));
     let listener_2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port2 = listener_2.local_addr().unwrap().port();
     tokio::spawn(async move {
@@ -235,11 +232,31 @@ async fn test_circuit_breaker_distinct_ports() {
     // Configure Autumn app with minimum_sample_count = 2
     let mut config = AutumnConfig::default();
     config.health.detailed = true;
-    config.resilience.circuit_breaker.defaults.failure_ratio_threshold = Some(0.5);
-    config.resilience.circuit_breaker.defaults.minimum_sample_count = Some(2);
-    config.resilience.circuit_breaker.defaults.open_duration_secs = Some(60);
-    config.resilience.circuit_breaker.defaults.sample_window_secs = Some(10);
-    config.resilience.circuit_breaker.defaults.half_open_trial_count = Some(1);
+    config
+        .resilience
+        .circuit_breaker
+        .defaults
+        .failure_ratio_threshold = Some(0.5);
+    config
+        .resilience
+        .circuit_breaker
+        .defaults
+        .minimum_sample_count = Some(2);
+    config
+        .resilience
+        .circuit_breaker
+        .defaults
+        .open_duration_secs = Some(60);
+    config
+        .resilience
+        .circuit_breaker
+        .defaults
+        .sample_window_secs = Some(10);
+    config
+        .resilience
+        .circuit_breaker
+        .defaults
+        .half_open_trial_count = Some(1);
 
     let client = TestApp::new()
         .config(config)
@@ -247,22 +264,40 @@ async fn test_circuit_breaker_distinct_ports() {
         .build();
 
     // Call port 1 (failures) twice to trip its breaker
-    let _ = client.get(&format!("/call-downstream/{port1}")).send().await;
-    let _ = client.get(&format!("/call-downstream/{port1}")).send().await;
+    let _ = client
+        .get(&format!("/call-downstream/{port1}"))
+        .send()
+        .await;
+    let _ = client
+        .get(&format!("/call-downstream/{port1}"))
+        .send()
+        .await;
 
     // Call port 2 (successes) twice
-    let resp2_1 = client.get(&format!("/call-downstream/{port2}")).send().await;
+    let resp2_1 = client
+        .get(&format!("/call-downstream/{port2}"))
+        .send()
+        .await;
     resp2_1.assert_ok();
-    let resp2_2 = client.get(&format!("/call-downstream/{port2}")).send().await;
+    let resp2_2 = client
+        .get(&format!("/call-downstream/{port2}"))
+        .send()
+        .await;
     resp2_2.assert_ok();
 
     // Port 1 should fail fast now due to Open circuit breaker
-    let resp1_fast = client.get(&format!("/call-downstream/{port1}")).send().await;
+    let resp1_fast = client
+        .get(&format!("/call-downstream/{port1}"))
+        .send()
+        .await;
     resp1_fast.assert_status(503);
     assert_eq!(resp1_fast.text(), "circuit breaker open");
 
     // Port 2 should still be completely healthy and closed!
-    let resp2_fast = client.get(&format!("/call-downstream/{port2}")).send().await;
+    let resp2_fast = client
+        .get(&format!("/call-downstream/{port2}"))
+        .send()
+        .await;
     resp2_fast.assert_ok();
 
     autumn_web::circuit_breaker::global_registry().clear();

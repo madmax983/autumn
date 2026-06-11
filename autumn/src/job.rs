@@ -8921,7 +8921,7 @@ mod tests {
 
         async fn pg_run_migration(pool: &PgPool) {
             let mut conn = pool.get().await.unwrap();
-            
+
             let sql1 = include_str!("../migrations/20260513000000_create_job_queue/up.sql");
             for stmt in sql1.split(';') {
                 let stmt = stmt.trim();
@@ -8930,7 +8930,8 @@ mod tests {
                 }
             }
 
-            let sql2 = include_str!("../migrations/20260610000000_add_job_uniqueness_concurrency/up.sql");
+            let sql2 =
+                include_str!("../migrations/20260610000000_add_job_uniqueness_concurrency/up.sql");
             for stmt in sql2.split(';') {
                 let stmt = stmt.trim();
                 if !stmt.is_empty() {
@@ -9033,14 +9034,12 @@ mod tests {
                 open_duration: Duration::from_secs(60),
                 half_open_trial_count: 2,
             };
-            let breaker = crate::circuit_breaker::global_registry().get_or_create("job_queue", policy);
+            let breaker =
+                crate::circuit_breaker::global_registry().get_or_create("job_queue", policy);
 
             // Construct a client configured with the postgres backend
             let mut settings = std::collections::HashMap::new();
-            settings.insert(
-                "send_email".to_string(),
-                JobRuntimeSettings::basic(5, 250),
-            );
+            settings.insert("send_email".to_string(), JobRuntimeSettings::basic(5, 250));
 
             let client = JobClient {
                 local_sender: None,
@@ -9069,7 +9068,10 @@ mod tests {
                 )
                 .await;
             assert!(res.is_ok());
-            assert_eq!(breaker.state(), crate::circuit_breaker::CircuitState::Closed);
+            assert_eq!(
+                breaker.state(),
+                crate::circuit_breaker::CircuitState::Closed
+            );
 
             // Intentionally terminate the backend to make enqueues fail.
             // Run 3 failing attempts to trip the breaker.
