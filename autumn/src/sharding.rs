@@ -222,6 +222,10 @@ pub(crate) struct ShardRuntime {
     connection_ready: AtomicBool,
     migrations_ready: AtomicBool,
     detail: std::sync::RwLock<Option<String>>,
+    /// `(primary_url, replica_url)` for re-running the migration parity
+    /// check from the per-shard health indicator. `None` when the app
+    /// registered no migrations.
+    migration_check: std::sync::RwLock<Option<(String, String)>>,
 }
 
 // Mutators are driven by startup migration parity checks and the
@@ -238,7 +242,22 @@ impl ShardRuntime {
             detail: std::sync::RwLock::new(
                 replica_configured.then(|| "replica has not passed a readiness check".to_owned()),
             ),
+            migration_check: std::sync::RwLock::new(None),
         }
+    }
+
+    pub(crate) fn configure_migration_check(&self, primary_url: String, replica_url: String) {
+        *self
+            .migration_check
+            .write()
+            .expect("shard runtime lock poisoned") = Some((primary_url, replica_url));
+    }
+
+    fn migration_check(&self) -> Option<(String, String)> {
+        self.migration_check
+            .read()
+            .expect("shard runtime lock poisoned")
+            .clone()
     }
 
     fn replica_ready(&self) -> bool {
@@ -615,6 +634,117 @@ pub fn build_shard_set(
             router,
         }),
     })
+}
+
+// ── Health ───────────────────────────────────────────────────────────────────
+
+/// Framework health indicator registered per shard as `db:shard:<name>`.
+///
+/// Mirrors the control topology's lifecycle: on every readiness probe it
+/// snapshots the primary pool, live-checks replica connectivity, and
+/// re-runs the migration parity comparison, feeding the shard's runtime
+/// state (which gates [`Shard::read_pool`]).
+///
+/// Reports `Down` — gating `/ready` — only when the shard's replica is
+/// unready **and** its `replica_fallback` is `fail_readiness`; a
+/// `primary`-fallback shard degrades to primary reads and stays `Up`
+/// with the replica state in its details.
+pub(crate) struct ShardHealthIndicator {
+    shard: Shard,
+}
+
+impl ShardHealthIndicator {
+    pub(crate) const fn new(shard: Shard) -> Self {
+        Self { shard }
+    }
+
+    async fn refresh_replica_readiness(&self) {
+        let Some(replica_pool) = self.shard.replica_pool() else {
+            return;
+        };
+        match replica_pool.get().await {
+            Ok(conn) => {
+                drop(conn);
+                self.shard.runtime().mark_replica_connection_ready();
+                if let Some((primary_url, replica_url)) = self.shard.runtime().migration_check() {
+                    let readiness = crate::migrate::check_replica_migration_readiness_blocking(
+                        primary_url,
+                        replica_url,
+                    )
+                    .await;
+                    if readiness.is_ready() {
+                        self.shard.runtime().mark_replica_migrations_ready();
+                    } else if let Some(detail) = readiness.detail() {
+                        self.shard.runtime().mark_replica_migrations_unready(detail);
+                    }
+                }
+            }
+            Err(error) => self
+                .shard
+                .runtime()
+                .mark_replica_connection_unready(format!("replica connection failed: {error}")),
+        }
+    }
+}
+
+impl crate::actuator::HealthIndicator for ShardHealthIndicator {
+    fn check(&self) -> futures::future::BoxFuture<'_, crate::actuator::HealthCheckOutput> {
+        Box::pin(async move {
+            self.refresh_replica_readiness().await;
+
+            let mut details = HashMap::new();
+            let status = self.shard.primary_pool().status();
+            details.insert("pool_size".to_owned(), serde_json::json!(status.max_size));
+            details.insert(
+                "active_connections".to_owned(),
+                serde_json::json!((status.max_size as u64).saturating_sub(status.available as u64)),
+            );
+            details.insert(
+                "idle_connections".to_owned(),
+                serde_json::json!(status.available),
+            );
+            details.insert(
+                "slots".to_owned(),
+                serde_json::json!(self.shard.slots().len()),
+            );
+            if self.shard.replica_pool().is_some() {
+                details.insert(
+                    "replica_ready".to_owned(),
+                    serde_json::json!(self.shard.runtime().replica_ready()),
+                );
+                if let Some(detail) = self.shard.runtime().detail() {
+                    details.insert("replica_detail".to_owned(), serde_json::json!(detail));
+                }
+            }
+
+            // `read_pool()` is `None` exactly when the replica is unready
+            // under `fail_readiness` — the only state that gates `/ready`.
+            let output = if self.shard.read_pool().is_some() {
+                crate::actuator::HealthCheckOutput::up()
+            } else {
+                crate::actuator::HealthCheckOutput::down()
+            };
+            output.with_details(details)
+        })
+    }
+}
+
+/// Register one `db:shard:<name>` readiness indicator per configured
+/// shard onto `registry`. Called once at startup by `build_state`.
+pub(crate) fn register_shard_health_indicators(
+    set: &ShardSet,
+    registry: &crate::actuator::HealthIndicatorRegistry,
+) {
+    for shard in set.iter() {
+        let name = format!("db:shard:{}", shard.name());
+        if let Err(error) = registry.register(
+            name,
+            crate::actuator::IndicatorGroup::Readiness,
+            Arc::new(ShardHealthIndicator::new(shard.clone())),
+        ) {
+            tracing::warn!("{error}");
+        }
+    }
 }
 
 // ── Extractors ───────────────────────────────────────────────────────────────
@@ -1254,6 +1384,72 @@ mod tests {
             .mark_replica_migrations_unready("replica lags primary");
         assert!(shard.read_pool().is_none());
         assert!(shard.runtime().detail().expect("detail").contains("lags"));
+    }
+
+    // ── per-shard health indicator ──────────────────────────────────────
+
+    fn shard_with_unreachable_replica(fallback: ReplicaFallback) -> Shard {
+        let mut config = sharded_config(&["a"]);
+        // Nothing listens on these URLs; keep the failing checks fast.
+        config.connect_timeout_secs = 1;
+        config.shards[0].replica_url = Some("postgres://localhost:1/a_ro".to_owned());
+        config.shards[0].replica_fallback = Some(fallback);
+        let set = create_shard_set(&config, Arc::new(HashShardRouter))
+            .expect("build")
+            .expect("configured");
+        set.get(ShardId(0)).expect("shard").clone()
+    }
+
+    #[tokio::test]
+    async fn shard_indicator_gates_readiness_for_fail_readiness_replica() {
+        use crate::actuator::HealthIndicator as _;
+
+        let shard = shard_with_unreachable_replica(ReplicaFallback::FailReadiness);
+        let indicator = ShardHealthIndicator::new(shard);
+        let output = indicator.check().await;
+
+        assert!(
+            !output.status.is_healthy(),
+            "unreachable replica under fail_readiness must report Down"
+        );
+        assert_eq!(output.details["replica_ready"], serde_json::json!(false));
+        assert!(output.details.contains_key("replica_detail"));
+    }
+
+    #[tokio::test]
+    async fn shard_indicator_stays_up_for_primary_fallback_replica() {
+        use crate::actuator::HealthIndicator as _;
+
+        let shard = shard_with_unreachable_replica(ReplicaFallback::Primary);
+        let indicator = ShardHealthIndicator::new(shard);
+        let output = indicator.check().await;
+
+        assert!(
+            output.status.is_healthy(),
+            "primary fallback degrades to primary reads and must stay Up"
+        );
+        assert_eq!(output.details["replica_ready"], serde_json::json!(false));
+    }
+
+    #[tokio::test]
+    async fn register_shard_health_indicators_names_components() {
+        let set = shard_set(&["alpha", "beta"]);
+        let registry = crate::actuator::HealthIndicatorRegistry::new();
+
+        register_shard_health_indicators(&set, &registry);
+        // Re-registration is ignored with a warning rather than panicking.
+        register_shard_health_indicators(&set, &registry);
+
+        let results = registry.run_all().await;
+        let mut names: Vec<&str> = results.iter().map(|r| r.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["db:shard:alpha", "db:shard:beta"]);
+        assert!(
+            results
+                .iter()
+                .all(|r| matches!(r.group, crate::actuator::IndicatorGroup::Readiness)),
+            "shard indicators gate readiness"
+        );
     }
 
     #[test]

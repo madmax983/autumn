@@ -2126,13 +2126,14 @@ impl AppBuilder {
         // "db" is a reserved built-in component name. Allowing a custom indicator
         // under this name would produce an inconsistent response: the custom result
         // would still gate the aggregate status while the built-in pool check owns
-        // the components.db / checks.database display.
+        // the components.db / checks.database display. The "db:shard:" prefix is
+        // reserved for the framework's per-shard indicators for the same reason.
         #[cfg(feature = "db")]
-        if name == "db" {
+        if name == "db" || name.starts_with("db:shard:") {
             tracing::warn!(
                 indicator_name = %name,
-                "\"db\" is a reserved built-in health indicator name; registration skipped. \
-                 Use a different name for your custom indicator."
+                "\"db\" and \"db:shard:*\" are reserved built-in health indicator names; \
+                 registration skipped. Use a different name for your custom indicator."
             );
             return self;
         }
@@ -5029,6 +5030,11 @@ async fn check_shard_replica_migration_parity(
         let Some(replica_url) = shard_config.replica_url.as_deref() else {
             continue;
         };
+        // Remember the URLs so the per-shard health indicator can re-run
+        // the parity comparison on later readiness probes.
+        shard
+            .runtime()
+            .configure_migration_check(shard_config.primary_url.clone(), replica_url.to_owned());
         let readiness = crate::migrate::check_replica_migration_readiness_blocking(
             shard_config.primary_url.clone(),
             replica_url.to_owned(),
@@ -5834,6 +5840,12 @@ fn build_state(
         state
             .probes()
             .configure_replica_dependency(config.database.replica_fallback);
+    }
+    // Surface every shard in /ready and /actuator/health as a
+    // `db:shard:<name>` component (replica readiness refresh + pool stats).
+    #[cfg(feature = "db")]
+    if let Some(set) = state.shards() {
+        crate::sharding::register_shard_health_indicators(set, &state.health_indicator_registry);
     }
     state.insert_extension(config.clone());
     state.insert_extension(crate::step_up::StepUpGlobalConfig {

@@ -297,6 +297,13 @@ pub trait ProvideActuatorState {
         &self,
     ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>;
 
+    /// Returns the configured shard set, used to expose per-shard pool
+    /// metrics in the `/actuator/metrics` endpoint. Defaults to `None`.
+    #[cfg(feature = "db")]
+    fn shards(&self) -> Option<&crate::sharding::ShardSet> {
+        None
+    }
+
     /// Returns the scaffold-level accessibility posture reported by `/actuator/a11y`.
     ///
     /// Override this in your `AppState` implementation to declare which
@@ -1846,6 +1853,43 @@ pub(crate) async fn metrics_endpoint<S: ProvideActuatorState + Send + Sync + 'st
         }
     }
 
+    // Include per-shard pool stats keyed by shard name
+    #[cfg(feature = "db")]
+    if let Some(shards) = state.shards() {
+        let mut shard_stats = serde_json::Map::new();
+        for shard in shards.iter() {
+            let status = shard.primary_pool().status();
+            let mut entry = serde_json::json!({
+                "pool_size": status.max_size,
+                "active_connections":
+                    (status.max_size as u64).saturating_sub(status.available as u64),
+                "idle_connections": status.available,
+                "slots": shard.slots().len(),
+            });
+            if let Some(replica) = shard.replica_pool() {
+                let replica_status = replica.status();
+                if let serde_json::Value::Object(ref mut entry_map) = entry {
+                    entry_map.insert(
+                        "replica".to_string(),
+                        serde_json::json!({
+                            "pool_size": replica_status.max_size,
+                            "active_connections": (replica_status.max_size as u64)
+                                .saturating_sub(replica_status.available as u64),
+                            "idle_connections": replica_status.available,
+                        }),
+                    );
+                }
+            }
+            shard_stats.insert(shard.name().to_owned(), entry);
+        }
+        if let serde_json::Value::Object(ref mut map) = result {
+            map.insert(
+                "database_shards".to_string(),
+                serde_json::Value::Object(shard_stats),
+            );
+        }
+    }
+
     // Include plugin-contributed sources under the "sources" key
     if let Some(registry) = state.metrics_source_registry() {
         let all = registry.collect_all();
@@ -3026,6 +3070,8 @@ mod tests {
         pool: Option<
             diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
         >,
+        #[cfg(feature = "db")]
+        shards: Option<crate::sharding::ShardSet>,
         #[cfg(feature = "ws")]
         channels: crate::channels::Channels,
         #[cfg(feature = "ws")]
@@ -3071,6 +3117,10 @@ mod tests {
         {
             self.pool.as_ref()
         }
+        #[cfg(feature = "db")]
+        fn shards(&self) -> Option<&crate::sharding::ShardSet> {
+            self.shards.as_ref()
+        }
         #[cfg(feature = "ws")]
         fn channels(&self) -> &crate::channels::Channels {
             &self.channels
@@ -3103,6 +3153,8 @@ mod tests {
             webhook_outbound: None,
             #[cfg(feature = "db")]
             pool: None,
+            #[cfg(feature = "db")]
+            shards: None,
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
@@ -3635,6 +3687,64 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "db")]
+    async fn actuator_metrics_returns_per_shard_stats_when_sharded() {
+        let mut state = test_state();
+        let config = crate::config::DatabaseConfig {
+            shards: vec![
+                crate::config::ShardConfig {
+                    name: "alpha".to_owned(),
+                    primary_url: "postgres://localhost/alpha".to_owned(),
+                    slots: None,
+                    replica_url: None,
+                    primary_pool_size: Some(4),
+                    replica_pool_size: None,
+                    replica_fallback: None,
+                },
+                crate::config::ShardConfig {
+                    name: "beta".to_owned(),
+                    primary_url: "postgres://localhost/beta".to_owned(),
+                    slots: None,
+                    replica_url: Some("postgres://localhost/beta_ro".to_owned()),
+                    primary_pool_size: None,
+                    replica_pool_size: Some(2),
+                    replica_fallback: None,
+                },
+            ],
+            ..Default::default()
+        };
+        state.shards = crate::sharding::create_shard_set(
+            &config,
+            std::sync::Arc::new(crate::sharding::HashShardRouter),
+        )
+        .expect("lazy pools build");
+
+        let app = actuator_router(true).with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let shards = json
+            .get("database_shards")
+            .expect("sharded state exposes database_shards");
+        assert_eq!(shards["alpha"]["pool_size"], 4);
+        assert_eq!(shards["alpha"]["slots"], 32);
+        assert_eq!(shards["beta"]["replica"]["pool_size"], 2);
     }
 
     #[tokio::test]
