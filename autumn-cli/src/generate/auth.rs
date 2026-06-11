@@ -3810,7 +3810,8 @@ pub struct AdminGdprActionForm {{
 ///
 /// Stamps `export_requested_at` and enqueues the export job.
 /// Records `actor_id` (the operator) + `reason` in the audit log.
-/// Mount behind your admin authentication middleware.
+/// Requires the caller to have the `"admin"` role in their session.
+#[secured("admin")]
 #[post("/admin/{table}/{{id}}/data-export")]
 pub async fn admin_data_export(
     Path(user_id): Path<i64>,
@@ -3863,7 +3864,8 @@ pub async fn admin_data_export(
 ///
 /// Schedules the account for deletion (30-day grace period).
 /// Records `actor_id` (the operator), `reason`, and timestamp in the audit log.
-/// Mount behind your admin authentication middleware.
+/// Requires the caller to have the `"admin"` role in their session.
+#[secured("admin")]
 #[post("/admin/{table}/{{id}}/delete")]
 pub async fn admin_delete_account(
     Path(user_id): Path<i64>,
@@ -6964,8 +6966,10 @@ document.getElementById('register-btn').addEventListener('click', async () => {
 
 /// `POST /passkeys/register/begin` — start a registration ceremony.
 ///
-/// Requires authentication. Stores the pending challenge in the session.
+/// Requires authentication and a fresh step-up claim to prevent a hijacked
+/// session from silently adding a new authenticator.
 #[secured]
+#[step_up]
 #[post("/passkeys/register/begin")]
 pub async fn passkey_register_begin(
     session: Session,
@@ -7291,6 +7295,9 @@ pub async fn passkey_login_finish(
     session
         .insert(state.auth_session_key(), __SNAKE___id.to_string())
         .await;
+    // Stamp the step-up claim so `#[step_up]` routes (e.g. passkey management)
+    // are immediately accessible after a passkey login.
+    autumn_web::step_up::set_last_strong_auth_at(&session).await;
     // Track this login as an active session (device list + revocation).
     crate::routes::auth::record_login_session(&mut db, &session, __SNAKE___id, addr_ip, &headers)
         .await?;

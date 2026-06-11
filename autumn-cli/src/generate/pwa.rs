@@ -254,7 +254,7 @@ fn render_pwa_system_test() -> String {
         "\n",
         "#[get(\"/offline\")]\n",
         "async fn pwa_offline() -> impl IntoResponse {\n",
-        "    axum::response::Html(\n",
+        "    autumn_web::reexports::axum::response::Html(\n",
         "        \"<html><head><link rel=\\\"manifest\\\" href=\\\"/manifest.webmanifest\\\"></head><body></body></html>\",\n",
         "    )\n",
         "}\n",

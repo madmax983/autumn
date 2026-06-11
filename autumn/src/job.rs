@@ -4900,6 +4900,12 @@ async fn pg_nack_failure(
 
     if row.attempt < row.max_attempts {
         let delay_ms = pg_retry_delay_ms(row.initial_backoff_ms, row.attempt);
+        // Re-enqueue and restore the pending-window unique key atomically in one
+        // UPDATE to eliminate the window where status='enqueued' and
+        // unique_key=NULL co-exist, which would let a concurrent enqueue bypass
+        // the dedup index.  The CASE subquery checks for an already-committed
+        // duplicate; if one exists the key is left NULL (best-effort, same as
+        // before) and the retried run proceeds without dedup protection.
         let applied = diesel::sql_query(
             "UPDATE autumn_jobs \
              SET status = 'enqueued', \
@@ -4909,39 +4915,31 @@ async fn pg_nack_failure(
                  finished_at = NULL, \
                  claimed_by = NULL, \
                  claimed_at = NULL, \
-                 last_error = $2 \
+                 last_error = $2, \
+                 unique_key = CASE \
+                   WHEN $5::TEXT IS NOT NULL \
+                        AND NOT EXISTS ( \
+                            SELECT 1 FROM autumn_jobs dup \
+                            WHERE dup.name = autumn_jobs.name \
+                              AND dup.unique_key = $5::TEXT \
+                              AND dup.id != autumn_jobs.id \
+                              AND dup.status IN ('enqueued', 'running') \
+                        ) \
+                   THEN $5::TEXT \
+                   ELSE NULL \
+                   END, \
+                 pending_unique_key = NULL \
              WHERE id = $3 AND claimed_by = $4 AND status = 'running'",
         )
         .bind::<diesel::sql_types::BigInt, _>(delay_ms)
         .bind::<diesel::sql_types::Text, _>(error)
         .bind::<diesel::sql_types::Text, _>(job_id)
         .bind::<diesel::sql_types::Text, _>(worker_id)
+        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(pending_unique_key)
         .execute(&mut *conn)
         .await
         .map(pg_claim_transition_applied)
         .map_err(|e| AutumnError::internal_server_error_msg(format!("pg job retry failed: {e}")))?;
-
-        // A pending-window unique key was cleared when the job was claimed.
-        // The retried row is pending again, so restore the key best-effort:
-        // if a duplicate was accepted in the meantime, the partial unique
-        // index rejects this UPDATE and the retry simply runs without the key.
-        if applied && let Some(key) = pending_unique_key {
-            let restored = diesel::sql_query(
-                "UPDATE autumn_jobs SET unique_key = $1, pending_unique_key = NULL \
-                 WHERE id = $2 AND status = 'enqueued'",
-            )
-            .bind::<diesel::sql_types::Text, _>(key)
-            .bind::<diesel::sql_types::Text, _>(job_id)
-            .execute(&mut *conn)
-            .await;
-            if let Err(error) = restored {
-                tracing::debug!(
-                    job_id = %job_id,
-                    error = %error,
-                    "pending unique key not restored on retry (duplicate already in flight)"
-                );
-            }
-        }
         Ok(applied)
     } else {
         diesel::sql_query(
