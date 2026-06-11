@@ -1822,18 +1822,17 @@ pub async fn session_token_digest(session: &Session) -> String {{
     sha256_hex(&session.id().await)
 }}
 
-/// Persist a `{sess_table}` row for a successful login on this device.
+/// Build the tracked-session row for the current session id and device.
 ///
 /// To plug in a custom User-Agent parser, replace the
 /// `autumn_web::user_agent::parse_user_agent` call below — this is the only
 /// parse site. See docs/guide/session-management.md.
-pub async fn record_login_session(
-    db: &mut Db,
+pub async fn build_session_row(
     session: &Session,
     {snake_name}_id: i64,
     ip: std::net::IpAddr,
     headers: &axum::http::HeaderMap,
-) -> AutumnResult<()> {{
+) -> New{pascal_name}Session {{
     let user_agent = headers
         .get(axum::http::header::USER_AGENT)
         .and_then(|v| v.to_str().ok())
@@ -1842,17 +1841,28 @@ pub async fn record_login_session(
         .take(512)
         .collect::<String>();
     let parsed = autumn_web::user_agent::parse_user_agent(&user_agent);
-    let token_digest = session_token_digest(session).await;
+    New{pascal_name}Session {{
+        user_id: {snake_name}_id,
+        token_digest: session_token_digest(session).await,
+        ip: ip.to_string(),
+        user_agent,
+        ua_family: parsed.family,
+        ua_os: parsed.os,
+        ua_device: parsed.device_class.to_string(),
+    }}
+}}
+
+/// Persist a `{sess_table}` row for a successful login on this device.
+pub async fn record_login_session(
+    db: &mut Db,
+    session: &Session,
+    {snake_name}_id: i64,
+    ip: std::net::IpAddr,
+    headers: &axum::http::HeaderMap,
+) -> AutumnResult<()> {{
+    let row = build_session_row(session, {snake_name}_id, ip, headers).await;
     diesel::insert_into({sess_table}::table)
-        .values(&New{pascal_name}Session {{
-            user_id: {snake_name}_id,
-            token_digest,
-            ip: ip.to_string(),
-            user_agent,
-            ua_family: parsed.family,
-            ua_os: parsed.os,
-            ua_device: parsed.device_class.to_string(),
-        }})
+        .values(&row)
         .execute(&mut **db)
         .await
         .map_err(|e| {{
@@ -2262,7 +2272,13 @@ pub async fn signup(
 
     // Rotate session to prevent any pending 2FA or enrollment state from a
     // previous flow in this browser from being resumed under the new account.
+    // The rotation preserves any existing login's keys, so re-point that
+    // login's tracked row at the new session id — otherwise the next
+    // authenticated request would miss the row (treated as revoked) and the
+    // old row would linger as a phantom device.
+    let pre_rotation_digest = session_token_digest(&session).await;
     session.rotate_id().await;
+    rebind_tracked_session(&mut db, &session, &pre_rotation_digest).await?;
     session.remove("totp_pending_id").await;
     session.remove("totp_pending_reset_digest").await;
     session.remove("totp_pending_reset_token").await;
@@ -3134,13 +3150,18 @@ pub async fn reset_password(
     // now — otherwise it would linger as a phantom device.
     untrack_current_session(&mut db, &session).await?;
 {totp_reset_branch}
-    // Commit the password change, the reset-token consumption, and the
-    // session revocation atomically: if any part fails everything rolls
-    // back, so the reset link stays usable and no state is half-applied.
-    // Revoking every existing session is the standard response to
-    // credential theft (defaulted on, configurable via
-    // [auth.sessions].revoke_on_credential_change); this brand-new login is
-    // recorded below.
+    // Rotate before the commit so the fresh session's row can be inserted
+    // in the same transaction (the rotation itself is in-memory until the
+    // response is sent, so a rollback leaves no half-applied state).
+    session.rotate_id().await;
+    let new_session_row = build_session_row(&session, {snake_name}.id, addr_ip, &headers).await;
+
+    // Commit the password change, the reset-token consumption, the session
+    // revocation, and the new session row atomically: if any part fails
+    // everything rolls back, so the reset link stays usable and no state is
+    // half-applied. Revoking every existing session is the standard
+    // response to credential theft (defaulted on, configurable via
+    // [auth.sessions].revoke_on_credential_change).
     let revoke_existing_sessions = state.config().auth.sessions.revoke_on_credential_change;
     let {snake_name}_id = {snake_name}.id;
     (*db)
@@ -3154,6 +3175,8 @@ pub async fn reset_password(
                     ))
                     .execute(conn)
                     .await?;
+                // Revoke before inserting so the bulk delete cannot eat the
+                // fresh row.
                 if revoke_existing_sessions {{
                     diesel::delete(
                         {sess_table}::table.filter({sess_table}::user_id.eq({snake_name}_id)),
@@ -3161,6 +3184,10 @@ pub async fn reset_password(
                     .execute(conn)
                     .await?;
                 }}
+                diesel::insert_into({sess_table}::table)
+                    .values(&new_session_row)
+                    .execute(conn)
+                    .await?;
                 Ok(())
             }})
         }})
@@ -3169,16 +3196,12 @@ pub async fn reset_password(
             AutumnError::internal_server_error_msg(format!("Failed to reset password: {{e}}"))
         }})?;
 
-    // Rotate session to invalidate any previous authenticated state.
-    session.rotate_id().await;
 {totp_clear_pending}    session.insert("{snake_name}_id", {snake_name}.id.to_string()).await;
     session.insert("{snake_name}_email", &{snake_name}.email).await;
     // Use the same session key checked by `#[secured]` / `#[authorize]`.
     session.insert(state.auth_session_key(), {snake_name}.id.to_string()).await;
     // Stamp the step-up claim so `#[step_up]` routes are immediately accessible.
     autumn_web::step_up::set_last_strong_auth_at(&session).await;
-    // Track this fresh login as an active session.
-    record_login_session(&mut db, &session, {snake_name}.id, addr_ip, &headers).await?;
     Ok(redirect_to("/account"))
 }}
 
@@ -4591,7 +4614,7 @@ recognise their own devices. Treat both as personal data:
   Pair this with your session cookie `max_age_secs` so rows do not outlive
   the cookies that reference them.
 - **Scrubbing/minimisation.** If full IPs are more than you need, truncate
-  before storing (e.g. zero the last IPv4 octet) in `record_login_session`,
+  before storing (e.g. zero the last IPv4 octet) in `build_session_row`,
   or store only the parsed UA fields and set `user_agent` to `""`.
 - **No geolocation.** The framework stores the IP only; GeoIP lookups are
   deliberately left to userland.
@@ -4602,11 +4625,11 @@ recognise their own devices. Treat both as personal data:
 
 The default parser (`autumn_web::user_agent::parse_user_agent`) is a small
 heuristic covering the major browser/OS families. Every parse goes through
-one call site — `record_login_session` in `src/routes/auth.rs` — so
+one call site — `build_session_row` in `src/routes/auth.rs` — so
 swapping in a dedicated crate is a one-line change:
 
 ```rust
-// In record_login_session, replace:
+// In build_session_row, replace:
 let parsed = autumn_web::user_agent::parse_user_agent(&user_agent);
 // with your parser of choice, mapping into the same three fields:
 let ua = my_ua_crate::parse(&user_agent);
@@ -6824,6 +6847,7 @@ fn render_passkeys_routes_file(pascal_name: &str, snake_name: &str, user_table: 
 
 use autumn_web::prelude::*;
 use diesel::prelude::*;
+use diesel_async::AsyncConnection as _;
 use diesel_async::RunQueryDsl;
 use serde::{Deserialize, Serialize};
 use webauthn_rs::prelude::*;
@@ -7044,31 +7068,40 @@ pub async fn passkey_register_finish(
     let cred_id = passkey.cred_id().to_string();
     let cred_json = serde_json::to_string(&passkey)
         .map_err(|_| AutumnError::internal_server_error_msg("Failed to serialise passkey."))?;
-    diesel::insert_into(crate::schema::webauthn_credentials::table)
-        .values((
-            crate::schema::webauthn_credentials::user_id.eq(__SNAKE___id),
-            crate::schema::webauthn_credentials::credential_id.eq(&cred_id),
-            crate::schema::webauthn_credentials::credential_json.eq(&cred_json),
-            crate::schema::webauthn_credentials::name.eq("Passkey"),
-        ))
-        .execute(&mut *db)
+    // Store the passkey and revoke every *other* session in one
+    // transaction: the documented revoke-on-credential-change guarantee
+    // (defaulted on, configurable via
+    // [auth.sessions].revoke_on_credential_change) can never be silently
+    // skipped, and a failure rolls the credential back so the client can
+    // retry without storing a duplicate.
+    let revoke_other_sessions_in_txn = state.config().auth.sessions.revoke_on_credential_change;
+    let current_token_digest = crate::routes::auth::session_token_digest(&session).await;
+    (*db)
+        .transaction::<_, diesel::result::Error, _>(|conn| {
+            Box::pin(async move {
+                diesel::insert_into(crate::schema::webauthn_credentials::table)
+                    .values((
+                        crate::schema::webauthn_credentials::user_id.eq(__SNAKE___id),
+                        crate::schema::webauthn_credentials::credential_id.eq(&cred_id),
+                        crate::schema::webauthn_credentials::credential_json.eq(&cred_json),
+                        crate::schema::webauthn_credentials::name.eq("Passkey"),
+                    ))
+                    .execute(conn)
+                    .await?;
+                if revoke_other_sessions_in_txn {
+                    diesel::delete(
+                        crate::schema::__SESSTABLE__::table
+                            .filter(crate::schema::__SESSTABLE__::user_id.eq(__SNAKE___id))
+                            .filter(crate::schema::__SESSTABLE__::token_digest.ne(current_token_digest)),
+                    )
+                    .execute(conn)
+                    .await?;
+                }
+                Ok(())
+            })
+        })
         .await
         .map_err(|_| AutumnError::internal_server_error_msg("Failed to store passkey."))?;
-    // Credential change (passkey added): sign out every *other* device
-    // (defaulted on, configurable via
-    // [auth.sessions].revoke_on_credential_change). Best-effort: the
-    // passkey is already stored, so a revocation hiccup must not turn the
-    // successful registration into a 500 (the client could retry and store
-    // a duplicate credential).
-    if state.config().auth.sessions.revoke_on_credential_change {
-        let current_digest = crate::routes::auth::session_token_digest(&session).await;
-        if let Err(e) = current
-            .revoke_other_sessions(&mut *db, &current_digest)
-            .await
-        {
-            tracing::warn!("failed to revoke other sessions after passkey registration: {e}");
-        }
-    }
     Ok(axum::Json(serde_json::json!({ "ok": true })))
 }
 
@@ -7337,34 +7370,47 @@ pub async fn passkey_revoke(
     // Validates the tracked session row (401s immediately if revoked).
     let current =
         crate::routes::auth::require_tracked_session(&session, &mut db, &state).await?;
-    diesel::delete(
-        crate::schema::webauthn_credentials::table
-            .filter(crate::schema::webauthn_credentials::id.eq(form.id))
-            .filter(crate::schema::webauthn_credentials::user_id.eq(current.id)),
-    )
-    .execute(&mut *db)
-    .await
-    .map_err(|_| AutumnError::internal_server_error_msg("Failed to revoke passkey."))?;
-    // Credential change (passkey removed): sign out every *other* device
+    // Remove the passkey and revoke every *other* session in one
+    // transaction: the documented revoke-on-credential-change guarantee
     // (defaulted on, configurable via
-    // [auth.sessions].revoke_on_credential_change). Best-effort: the
-    // passkey is already deleted, so a revocation hiccup must not turn the
-    // successful removal into a 500.
-    if state.config().auth.sessions.revoke_on_credential_change {
-        let current_digest = crate::routes::auth::session_token_digest(&session).await;
-        if let Err(e) = current
-            .revoke_other_sessions(&mut *db, &current_digest)
-            .await
-        {
-            tracing::warn!("failed to revoke other sessions after passkey removal: {e}");
-        }
-    }
+    // [auth.sessions].revoke_on_credential_change) can never be silently
+    // skipped, and a failure rolls the removal back instead of 500ing
+    // after it.
+    let user_id = current.id;
+    let credential_id = form.id;
+    let revoke_other_sessions_in_txn = state.config().auth.sessions.revoke_on_credential_change;
+    let current_token_digest = crate::routes::auth::session_token_digest(&session).await;
+    (*db)
+        .transaction::<_, diesel::result::Error, _>(|conn| {
+            Box::pin(async move {
+                diesel::delete(
+                    crate::schema::webauthn_credentials::table
+                        .filter(crate::schema::webauthn_credentials::id.eq(credential_id))
+                        .filter(crate::schema::webauthn_credentials::user_id.eq(user_id)),
+                )
+                .execute(conn)
+                .await?;
+                if revoke_other_sessions_in_txn {
+                    diesel::delete(
+                        crate::schema::__SESSTABLE__::table
+                            .filter(crate::schema::__SESSTABLE__::user_id.eq(user_id))
+                            .filter(crate::schema::__SESSTABLE__::token_digest.ne(current_token_digest)),
+                    )
+                    .execute(conn)
+                    .await?;
+                }
+                Ok(())
+            })
+        })
+        .await
+        .map_err(|_| AutumnError::internal_server_error_msg("Failed to revoke passkey."))?;
     Ok(redirect_to("/passkeys"))
 }
 "##;
     tpl.replace("__PASCAL__", pascal_name)
         .replace("__SNAKE__", snake_name)
         .replace("__TABLE__", user_table)
+        .replace("__SESSTABLE__", &sessions_table_name(snake_name))
 }
 
 fn render_passkeys_tests_file(pascal_name: &str, _snake_name: &str) -> String {

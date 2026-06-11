@@ -2252,8 +2252,8 @@ fn generate_auth_reset_password_revokes_sessions() {
         "session revocation on password change must be configurable"
     );
     assert!(
-        reset_body.contains("record_login_session"),
-        "reset_password logs the user in and must record the new session"
+        reset_body.contains("insert_into(user_sessions::table)"),
+        "reset_password logs the user in and must record the new session in its transaction"
     );
 }
 
@@ -2312,7 +2312,7 @@ fn generate_auth_passkeys_changes_revoke_other_sessions() {
         let body = &routes[start..];
         let body = &body[..body.find("\n/// `").unwrap_or(body.len())];
         assert!(
-            body.contains("revoke_other_sessions"),
+            body.contains("token_digest.ne(") || body.contains("revoke_other_sessions"),
             "{handler} must revoke other sessions"
         );
         assert!(
@@ -2562,4 +2562,95 @@ fn generate_auth_totp_revocation_is_atomic() {
         verify.contains(".transaction"),
         "login_verify's deferred password-reset commit must be atomic with revocation"
     );
+}
+
+/// PR #1176 Codex round 3: signup must survive an already-authenticated
+/// browser (rebind the tracked row across its rotation), the password-reset
+/// transaction must include the new session-row insert (no 500 after the
+/// reset link is consumed), and passkey changes must revoke other sessions
+/// in the same transaction as the credential change.
+#[test]
+fn generate_auth_sessions_codex_round3() {
+    let (_tmp, project) = fresh_project("auth-sess-codex3");
+    run_autumn(&project, &["generate", "auth", "User"]);
+    let routes = fs::read_to_string(project.join("src/routes/auth.rs")).unwrap();
+
+    let body_of = |handler: &str| {
+        let start = routes
+            .find(handler)
+            .unwrap_or_else(|| panic!("missing {handler}"));
+        let body = &routes[start..];
+        &body[..body.find("\n/// `").unwrap_or(body.len())]
+    };
+
+    // signup: rotation preserves a previous login's keys, so the tracked row
+    // must be re-pointed at the new session id.
+    let signup = body_of("pub async fn signup(");
+    let rotate_at = signup
+        .find("session.rotate_id()")
+        .expect("signup must rotate");
+    let rebind_at = signup
+        .find("rebind_tracked_session")
+        .expect("signup must rebind the tracked row across its rotation");
+    assert!(
+        rotate_at < rebind_at,
+        "signup must rebind AFTER rotating the session id"
+    );
+
+    // reset_password: the new session row is inserted inside the same
+    // transaction as the password change + token consumption, so a failure
+    // rolls everything back and the link stays usable.
+    let reset = body_of("pub async fn reset_password(");
+    assert!(
+        reset.contains("insert_into(user_sessions::table)"),
+        "reset_password must insert the new session row inside its transaction"
+    );
+    assert!(
+        !reset.contains("record_login_session"),
+        "reset_password must not record the session outside the transaction"
+    );
+
+    // The UA parse stays funneled through one documented helper.
+    assert!(
+        routes.contains("pub async fn build_session_row"),
+        "session-row construction must be a shared helper"
+    );
+}
+
+/// PR #1176 Codex round 3 (`--passkeys`): the credential change and the
+/// other-sessions revocation commit atomically — the documented
+/// revoke-on-credential-change guarantee can never be silently skipped, and
+/// a failure rolls back the credential change instead of 500ing after it.
+#[test]
+fn generate_auth_passkeys_revocation_is_atomic() {
+    let (_tmp, project) = fresh_project("auth-sess-pk-atomic");
+    run_autumn(&project, &["generate", "auth", "User", "--passkeys"]);
+    let routes = fs::read_to_string(project.join("src/routes/passkeys.rs")).unwrap();
+
+    let body_of = |handler: &str| {
+        let start = routes
+            .find(handler)
+            .unwrap_or_else(|| panic!("missing {handler}"));
+        let body = &routes[start..];
+        &body[..body.find("\n/// `").unwrap_or(body.len())]
+    };
+
+    for handler in [
+        "pub async fn passkey_register_finish(",
+        "pub async fn passkey_revoke(",
+    ] {
+        let body = body_of(handler);
+        assert!(
+            body.contains(".transaction"),
+            "{handler} must commit the credential change and revocation atomically"
+        );
+        assert!(
+            body.contains("token_digest.ne("),
+            "{handler} must revoke other sessions inside the transaction"
+        );
+        assert!(
+            body.contains("revoke_on_credential_change"),
+            "{handler} revocation must stay config-gated"
+        );
+    }
 }
