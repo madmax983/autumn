@@ -81,6 +81,7 @@ pub use channels::{
     ChannelPublishError, ChannelStats, Channels, ChannelsBackend, LocalChannelsBackend,
 };
 pub mod canary;
+pub mod circuit_breaker;
 pub mod config;
 pub mod credentials;
 #[cfg(feature = "db")]

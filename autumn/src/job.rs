@@ -125,6 +125,7 @@ pub struct JobClient {
     default_initial_backoff_ms: u64,
     per_job_settings: HashMap<String, JobRuntimeSettings>,
     pub interceptor: Option<Arc<dyn crate::interceptor::JobInterceptor>>,
+    resilience_config: Option<Arc<crate::config::ResilienceConfig>>,
 }
 
 /// Per-job configuration captured from [`JobInfo`] at runtime start.
@@ -1825,6 +1826,48 @@ impl JobClient {
         backoff_ms: u64,
         constraints: &ResolvedJobConstraints,
     ) -> AutumnResult<EnqueueOutcome> {
+        let breaker = self.resilience_config.as_ref().map_or_else(
+            || {
+                crate::circuit_breaker::global_registry().get_or_create(
+                    "job_queue",
+                    crate::circuit_breaker::CircuitBreakerPolicy::default(),
+                )
+            },
+            |rc| {
+                let policy =
+                    crate::circuit_breaker::CircuitBreakerPolicy::from_config(rc, "job_queue");
+                crate::circuit_breaker::global_registry()
+                    .get_or_create_with_config("job_queue", policy)
+            },
+        );
+
+        if breaker.before_call().is_err() {
+            return Err(AutumnError::service_unavailable(std::io::Error::other(
+                "job queue circuit breaker is open",
+            )));
+        }
+        let guard = crate::circuit_breaker::CircuitBreakerGuard::new(breaker.clone());
+
+        let res = self
+            .enqueue_durable_inner(id, name, payload, max_attempts, backoff_ms, constraints)
+            .await;
+        if res.is_ok() {
+            guard.success();
+        } else {
+            guard.failure();
+        }
+        res
+    }
+
+    async fn enqueue_durable_inner(
+        &self,
+        id: String,
+        name: &str,
+        payload: Value,
+        max_attempts: u32,
+        backoff_ms: u64,
+        constraints: &ResolvedJobConstraints,
+    ) -> AutumnResult<EnqueueOutcome> {
         #[cfg(feature = "redis")]
         if let Some(redis) = &self.redis {
             return redis
@@ -1891,6 +1934,28 @@ impl JobClient {
         // transaction commits, so we cannot safely update process-local counters
         // here — the row may disappear on rollback while the counter persists.
         if self.pg_pool.is_some() {
+            let breaker = self.resilience_config.as_ref().map_or_else(
+                || {
+                    crate::circuit_breaker::global_registry().get_or_create(
+                        "job_queue",
+                        crate::circuit_breaker::CircuitBreakerPolicy::default(),
+                    )
+                },
+                |rc| {
+                    let policy =
+                        crate::circuit_breaker::CircuitBreakerPolicy::from_config(rc, "job_queue");
+                    crate::circuit_breaker::global_registry()
+                        .get_or_create_with_config("job_queue", policy)
+                },
+            );
+
+            if breaker.before_call().is_err() {
+                return Err(AutumnError::service_unavailable(std::io::Error::other(
+                    "job queue circuit breaker is open",
+                )));
+            }
+            let guard = crate::circuit_breaker::CircuitBreakerGuard::new(breaker.clone());
+
             let id_for_enqueue = id.clone();
             let payload_for_enqueue = payload.clone();
             let constraints_ref = &constraints;
@@ -1904,16 +1969,27 @@ impl JobClient {
                     job_backoff_ms,
                     constraints_ref,
                 )
-                .await?;
-                if outcome == EnqueueOutcome::Deduplicated {
-                    // A dedup decision is final even if the surrounding
-                    // transaction rolls back (no row was ever written), so the
-                    // counter can be recorded immediately. Balance the queued
-                    // gauge that record_deduplicated decrements.
-                    self.registry.record_enqueue(name);
-                    self.record_deduplicated_enqueue(name, &id_for_enqueue);
+                .await;
+
+                match &outcome {
+                    Ok(EnqueueOutcome::Deduplicated) => {
+                        guard.success();
+                        // A dedup decision is final even if the surrounding
+                        // transaction rolls back (no row was ever written), so the
+                        // counter can be recorded immediately. Balance the queued
+                        // gauge that record_deduplicated decrements.
+                        self.registry.record_enqueue(name);
+                        self.record_deduplicated_enqueue(name, &id_for_enqueue);
+                    }
+                    Ok(_) => {
+                        guard.success();
+                    }
+                    Err(_) => {
+                        guard.failure();
+                    }
                 }
-                Ok(())
+
+                outcome.map(|_| ())
             };
             return if let Some(interceptor) = &self.interceptor {
                 let interceptor = (*interceptor).clone();
@@ -2179,6 +2255,9 @@ pub(crate) fn start_local_runtime(
         interceptor: state
             .extension::<Arc<dyn crate::interceptor::JobInterceptor>>()
             .map(|arc| (*arc).clone()),
+        resilience_config: state
+            .extension::<crate::config::AutumnConfig>()
+            .map(|c| Arc::new(c.resilience.clone())),
     };
     init_global_job_client(client);
 
@@ -4273,6 +4352,9 @@ fn start_redis_runtime(
         interceptor: state
             .extension::<Arc<dyn crate::interceptor::JobInterceptor>>()
             .map(|arc| (*arc).clone()),
+        resilience_config: state
+            .extension::<crate::config::AutumnConfig>()
+            .map(|c| Arc::new(c.resilience.clone())),
     });
 
     let worker_count = config.workers.max(1);
@@ -5574,6 +5656,9 @@ fn start_postgres_runtime(
         interceptor: state
             .extension::<Arc<dyn crate::interceptor::JobInterceptor>>()
             .map(|arc| (*arc).clone()),
+        resilience_config: state
+            .extension::<crate::config::AutumnConfig>()
+            .map(|c| Arc::new(c.resilience.clone())),
     });
 
     let visibility_timeout_ms = config.postgres.visibility_timeout_ms;
@@ -5810,6 +5895,7 @@ mod tests {
                 JobRuntimeSettings::basic(5, 250),
             )]),
             interceptor: None,
+            resilience_config: None,
         });
 
         let failed_id = backend.record_enqueue_for_test(
@@ -5875,6 +5961,7 @@ mod tests {
                 JobRuntimeSettings::basic(5, 250),
             )]),
             interceptor: None,
+            resilience_config: None,
         });
 
         let failed_id =
@@ -5931,6 +6018,7 @@ mod tests {
                 JobRuntimeSettings::basic(5, 250),
             )]),
             interceptor: None,
+            resilience_config: None,
         });
 
         let failed_id =
@@ -6162,6 +6250,7 @@ mod tests {
                 JobRuntimeSettings::basic(3, 100),
             )]),
             interceptor: Some(Arc::new(PanickingEnqueueInterceptor)),
+            resilience_config: None,
         };
 
         let res = client.enqueue("test_job", serde_json::json!({})).await;
@@ -6221,6 +6310,7 @@ mod tests {
                 JobRuntimeSettings::basic(3, 100),
             )]),
             interceptor: Some(Arc::new(AsyncPanickingEnqueueInterceptor)),
+            resilience_config: None,
         };
 
         let res = client.enqueue("test_job", serde_json::json!({})).await;
@@ -8056,6 +8146,7 @@ mod tests {
             default_initial_backoff_ms: 250,
             per_job_settings: HashMap::new(),
             interceptor: None,
+            resilience_config: None,
         });
         assert!(global_job_client().is_some());
 
@@ -8888,18 +8979,23 @@ mod tests {
 
         async fn pg_run_migration(pool: &PgPool) {
             let mut conn = pool.get().await.unwrap();
-            diesel::sql_query(include_str!(
-                "../migrations/20260513000000_create_job_queue/up.sql"
-            ))
-            .execute(&mut *conn)
-            .await
-            .unwrap();
-            diesel::sql_query(include_str!(
-                "../migrations/20260610000000_add_job_uniqueness_concurrency/up.sql"
-            ))
-            .execute(&mut *conn)
-            .await
-            .unwrap();
+
+            let sql1 = include_str!("../migrations/20260513000000_create_job_queue/up.sql");
+            for stmt in sql1.split(';') {
+                let stmt = stmt.trim();
+                if !stmt.is_empty() {
+                    diesel::sql_query(stmt).execute(&mut *conn).await.unwrap();
+                }
+            }
+
+            let sql2 =
+                include_str!("../migrations/20260610000000_add_job_uniqueness_concurrency/up.sql");
+            for stmt in sql2.split(';') {
+                let stmt = stmt.trim();
+                if !stmt.is_empty() {
+                    diesel::sql_query(stmt).execute(&mut *conn).await.unwrap();
+                }
+            }
         }
 
         fn unique_constraints(key: &str, window: JobUniquenessWindow) -> ResolvedJobConstraints {
@@ -8969,6 +9065,105 @@ mod tests {
             assert_eq!(finished.status, PG_STATUS_COMPLETED);
             assert!(finished.finished_at.is_some());
             assert!(finished.claimed_by.is_none());
+        }
+
+        #[tokio::test]
+        #[ignore = "requires Docker (testcontainers)"]
+        #[allow(clippy::await_holding_lock)]
+        async fn pg_enqueue_on_conn_circuit_breaker() {
+            use testcontainers::runners::AsyncRunner as _;
+            use testcontainers_modules::postgres::Postgres;
+
+            let _lock = crate::circuit_breaker::TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            crate::circuit_breaker::global_registry().clear();
+
+            let container = Postgres::default().start().await.unwrap();
+            let port = container.get_host_port_ipv4(5432).await.unwrap();
+            let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+
+            let pool = pg_test_pool(&url);
+            pg_run_migration(&pool).await;
+
+            let policy = crate::circuit_breaker::CircuitBreakerPolicy {
+                failure_ratio_threshold: 0.5,
+                sample_window: Duration::from_secs(10),
+                minimum_sample_count: 3,
+                open_duration: Duration::from_secs(60),
+                half_open_trial_count: 2,
+            };
+            let breaker =
+                crate::circuit_breaker::global_registry().get_or_create("job_queue", policy);
+
+            // Construct a client configured with the postgres backend
+            let mut settings = std::collections::HashMap::new();
+            settings.insert("send_email".to_string(), JobRuntimeSettings::basic(5, 250));
+
+            let client = JobClient {
+                local_sender: None,
+                local_coordination: None,
+                #[cfg(feature = "redis")]
+                redis: None,
+                #[cfg(feature = "db")]
+                pg_pool: Some(pool.clone()),
+                registry: crate::actuator::JobRegistry::new(),
+                job_admin: JobAdminMemoryBackend::new_for_test(32),
+                default_max_attempts: 1,
+                default_initial_backoff_ms: 1000,
+                per_job_settings: settings,
+                interceptor: None,
+                resilience_config: None,
+            };
+
+            let mut conn = pool.get().await.unwrap();
+
+            // Run a few successful enqueues on the connection.
+            let res = client
+                .enqueue_on_conn(
+                    "send_email",
+                    serde_json::json!({ "user_id": 42 }),
+                    &mut conn,
+                )
+                .await;
+            assert!(res.is_ok());
+            assert_eq!(
+                breaker.state(),
+                crate::circuit_breaker::CircuitState::Closed
+            );
+
+            // Intentionally terminate the backend to make enqueues fail.
+            // Run 3 failing attempts to trip the breaker.
+            for _ in 0..3 {
+                let mut conn_fail = pool.get().await.unwrap();
+                let _ = diesel::sql_query("SELECT pg_terminate_backend(pg_backend_pid())")
+                    .execute(&mut conn_fail)
+                    .await;
+                let res = client
+                    .enqueue_on_conn(
+                        "send_email",
+                        serde_json::json!({ "user_id": 42 }),
+                        &mut conn_fail,
+                    )
+                    .await;
+                assert!(res.is_err());
+            }
+
+            // Breaker should now be Open!
+            assert_eq!(breaker.state(), crate::circuit_breaker::CircuitState::Open);
+
+            // Subsequent enqueues should fail fast without hitting the database connection
+            let res = client
+                .enqueue_on_conn(
+                    "send_email",
+                    serde_json::json!({ "user_id": 42 }),
+                    &mut conn,
+                )
+                .await;
+            assert!(res.is_err());
+            assert!(res.err().unwrap().to_string().contains("circuit breaker"));
+
+            crate::circuit_breaker::global_registry().clear();
         }
 
         #[tokio::test]
@@ -9751,6 +9946,7 @@ mod tests {
                 JobRuntimeSettings::basic(3, 100),
             )]),
             interceptor: None,
+            resilience_config: None,
         };
         (client, rx)
     }
@@ -10132,6 +10328,7 @@ mod tests {
                     JobRuntimeSettings::basic(3, 100),
                 )]),
                 interceptor: None,
+                resilience_config: None,
             };
             rt.block_on(async {
                 client
@@ -10145,6 +10342,82 @@ mod tests {
                 assert_eq!(job.name, "test_job");
             });
         }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_job_enqueue_durable_circuit_breaker() {
+        let _lock = crate::circuit_breaker::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::circuit_breaker::global_registry().clear();
+        let policy = crate::circuit_breaker::CircuitBreakerPolicy {
+            failure_ratio_threshold: 0.5,
+            sample_window: Duration::from_secs(10),
+            minimum_sample_count: 3,
+            open_duration: Duration::from_secs(60),
+            half_open_trial_count: 2,
+        };
+        let breaker = crate::circuit_breaker::global_registry().get_or_create("job_queue", policy);
+
+        // Ensure it is closed initially
+        assert_eq!(
+            breaker.state(),
+            crate::circuit_breaker::CircuitState::Closed
+        );
+
+        let client = JobClient {
+            local_sender: None,
+            local_coordination: None,
+            #[cfg(feature = "redis")]
+            redis: None,
+            #[cfg(feature = "db")]
+            pg_pool: None,
+            registry: crate::actuator::JobRegistry::new(),
+            job_admin: JobAdminMemoryBackend::new_for_test(32),
+            default_max_attempts: 1,
+            default_initial_backoff_ms: 1000,
+            per_job_settings: std::collections::HashMap::new(),
+            interceptor: None,
+            resilience_config: None,
+        };
+
+        for _ in 0..3 {
+            let res = client
+                .enqueue_durable(
+                    "job_id".to_string(),
+                    "job_name",
+                    serde_json::Value::Null,
+                    1,
+                    1000,
+                    &ResolvedJobConstraints::default(),
+                )
+                .await;
+            assert!(res.is_err());
+        }
+
+        // Breaker should be Open now!
+        assert_eq!(breaker.state(), crate::circuit_breaker::CircuitState::Open);
+
+        let res = client
+            .enqueue_durable(
+                "job_id".to_string(),
+                "job_name",
+                serde_json::Value::Null,
+                1,
+                1000,
+                &ResolvedJobConstraints::default(),
+            )
+            .await;
+
+        assert!(res.is_err());
+        let err_str = res.err().unwrap().to_string();
+        assert!(
+            err_str.contains("circuit breaker")
+                || err_str.contains("open")
+                || err_str.contains("Open")
+        );
+        crate::circuit_breaker::global_registry().clear();
     }
 }
 

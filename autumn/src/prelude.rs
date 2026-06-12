@@ -201,6 +201,11 @@ pub use crate::webhook::{
 #[cfg(feature = "http-client")]
 pub use crate::http_client::Client;
 
+// ── Circuit Breaker ──────────────────────────────────────────────
+pub use crate::circuit_breaker::{
+    CircuitBreaker, CircuitBreakerError, CircuitBreakerPolicy, CircuitState,
+};
+
 // ── SEO helpers ──────────────────────────────────────────────────
 /// Per-page SEO meta tag builder (title, description, canonical, OG, Twitter).
 pub use crate::seo::SeoMeta;

@@ -808,6 +808,10 @@ pub struct AutumnConfig {
     #[serde(default)]
     pub bot_protection: crate::security::captcha::BotProtectionConfig,
 
+    /// Resilience settings (circuit breakers, fallbacks).
+    #[serde(default)]
+    pub resilience: ResilienceConfig,
+
     /// SEO settings (`[seo]` section in `autumn.toml`).
     ///
     /// Controls sitemap generation, robots.txt behavior, and canonical URL
@@ -1912,6 +1916,7 @@ impl AutumnConfig {
         self.apply_storage_env_overrides_with_env(env);
         #[cfg(feature = "mail")]
         self.apply_mail_env_overrides_with_env(env);
+        self.apply_resilience_env_overrides_with_env(env);
     }
 
     #[cfg(feature = "reporting")]
@@ -3936,6 +3941,84 @@ impl Default for TenancyConfig {
             jwt_audience: None,
             base_domain: None,
         }
+    }
+}
+
+// ── Resilience configuration ───────────────────────────────────────────────
+
+/// Resilience policy configurations.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ResilienceConfig {
+    /// Circuit breaker configurations.
+    #[serde(default)]
+    pub circuit_breaker: CircuitBreakerConfig,
+}
+
+/// Circuit breaker configuration structure.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct CircuitBreakerConfig {
+    /// Default circuit breaker policies.
+    #[serde(default)]
+    pub defaults: CircuitBreakerPolicyConfig,
+    /// Per-host circuit breaker policy overrides.
+    #[serde(default)]
+    pub hosts: std::collections::HashMap<String, CircuitBreakerPolicyConfig>,
+}
+
+/// Configurable settings for a circuit breaker policy.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct CircuitBreakerPolicyConfig {
+    /// Failure ratio threshold (e.g. 0.5) to trip the breaker.
+    pub failure_ratio_threshold: Option<f64>,
+    /// Sample window duration in seconds.
+    pub sample_window_secs: Option<u64>,
+    /// Minimum samples required to evaluate failure ratio.
+    pub minimum_sample_count: Option<u64>,
+    /// Open state duration in seconds before entering half-open.
+    pub open_duration_secs: Option<u64>,
+    /// Number of successful trials required in half-open state to close the breaker.
+    pub half_open_trial_count: Option<u64>,
+}
+
+impl AutumnConfig {
+    fn apply_resilience_env_overrides_with_env(&mut self, env: &dyn Env) {
+        parse_env_option(
+            env,
+            "AUTUMN_RESILIENCE__CIRCUIT_BREAKER__DEFAULTS__FAILURE_RATIO_THRESHOLD",
+            &mut self
+                .resilience
+                .circuit_breaker
+                .defaults
+                .failure_ratio_threshold,
+        );
+        parse_env_option(
+            env,
+            "AUTUMN_RESILIENCE__CIRCUIT_BREAKER__DEFAULTS__SAMPLE_WINDOW_SECS",
+            &mut self.resilience.circuit_breaker.defaults.sample_window_secs,
+        );
+        parse_env_option(
+            env,
+            "AUTUMN_RESILIENCE__CIRCUIT_BREAKER__DEFAULTS__MINIMUM_SAMPLE_COUNT",
+            &mut self
+                .resilience
+                .circuit_breaker
+                .defaults
+                .minimum_sample_count,
+        );
+        parse_env_option(
+            env,
+            "AUTUMN_RESILIENCE__CIRCUIT_BREAKER__DEFAULTS__OPEN_DURATION_SECS",
+            &mut self.resilience.circuit_breaker.defaults.open_duration_secs,
+        );
+        parse_env_option(
+            env,
+            "AUTUMN_RESILIENCE__CIRCUIT_BREAKER__DEFAULTS__HALF_OPEN_TRIAL_COUNT",
+            &mut self
+                .resilience
+                .circuit_breaker
+                .defaults
+                .half_open_trial_count,
+        );
     }
 }
 
@@ -6396,6 +6479,78 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
         assert!(
             config.server.timeouts.request_timeout_ms.is_none(),
             "dev profile must not enable a request timeout by default"
+        );
+    }
+
+    #[test]
+    fn test_resilience_config_defaults() {
+        let config = AutumnConfig::default();
+        assert!(
+            config
+                .resilience
+                .circuit_breaker
+                .defaults
+                .failure_ratio_threshold
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_resilience_config_parsing() {
+        let toml_str = r#"
+            [resilience.circuit_breaker.defaults]
+            failure_ratio_threshold = 0.6
+            sample_window_secs = 20
+            minimum_sample_count = 15
+            open_duration_secs = 30
+            half_open_trial_count = 5
+
+            [resilience.circuit_breaker.hosts."api.github.com"]
+            failure_ratio_threshold = 0.3
+            open_duration_secs = 10
+        "#;
+        let config: AutumnConfig = toml::from_str(toml_str).unwrap();
+        let cb = &config.resilience.circuit_breaker;
+        assert_eq!(cb.defaults.failure_ratio_threshold, Some(0.6));
+        assert_eq!(cb.defaults.sample_window_secs, Some(20));
+        assert_eq!(cb.defaults.minimum_sample_count, Some(15));
+        assert_eq!(cb.defaults.open_duration_secs, Some(30));
+        assert_eq!(cb.defaults.half_open_trial_count, Some(5));
+
+        let host_cb = cb.hosts.get("api.github.com").unwrap();
+        assert_eq!(host_cb.failure_ratio_threshold, Some(0.3));
+        assert_eq!(host_cb.open_duration_secs, Some(10));
+        assert!(host_cb.sample_window_secs.is_none());
+    }
+
+    #[test]
+    fn test_resilience_config_env_overrides() {
+        struct FakeEnv(std::collections::HashMap<String, String>);
+        impl Env for FakeEnv {
+            fn var(&self, key: &str) -> Result<String, std::env::VarError> {
+                self.0
+                    .get(key)
+                    .cloned()
+                    .ok_or(std::env::VarError::NotPresent)
+            }
+        }
+
+        let mut config = AutumnConfig::default();
+        let env = FakeEnv(
+            [(
+                "AUTUMN_RESILIENCE__CIRCUIT_BREAKER__DEFAULTS__FAILURE_RATIO_THRESHOLD".to_owned(),
+                "0.7".to_owned(),
+            )]
+            .into(),
+        );
+        config.apply_resilience_env_overrides_with_env(&env);
+        assert_eq!(
+            config
+                .resilience
+                .circuit_breaker
+                .defaults
+                .failure_ratio_threshold,
+            Some(0.7)
         );
     }
 }

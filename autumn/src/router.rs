@@ -753,7 +753,7 @@ fn build_openapi_router(
 /// end up either missing real collisions (the reviewer's case:
 /// `/api` + `/` recorded as `/api/` but axum routes it at `/api`) or
 /// generating a spec whose URLs don't match what axum serves.
-#[cfg(feature = "openapi")]
+#[allow(dead_code)]
 pub fn join_nested_path(prefix: &str, child: &str) -> String {
     let prefix_trimmed = prefix.trim_end_matches('/');
     if child == "/" || child.is_empty() {
@@ -3377,7 +3377,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "openapi")]
     #[test]
     fn join_nested_path_normalizes_like_axum() {
         // Reviewer's reported case: scope "/api" + child "/" must
