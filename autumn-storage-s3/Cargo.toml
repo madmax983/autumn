@@ -2,7 +2,7 @@
 name = "autumn-storage-s3"
 description = "S3-compatible blob storage plugin for autumn-web applications"
 edition.workspace = true
-rust-version = "1.88.0"
+rust-version.workspace = true
 version.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -18,10 +18,11 @@ aws-credential-types = { version = "1", features = ["hardcoded-credentials"] }
 aws-runtime = ">=1, <1.7"
 # aws-smithy-types 1.5 moved DeferredSignerSender behind a generic send(),
 # which breaks type inference in every published aws-runtime release
-# (E0282 in its sigv4 signer). Fresh resolutions of this crate — e.g.
-# cargo-semver-checks' isolated CI builds — therefore fail regardless of
-# the aws-runtime pin above. Constrain to the known-good series until
-# upstream ships an aws-runtime compatible with smithy-types 1.5.
+# (E0282 in its sigv4 signer). Without this constraint any fresh
+# resolution of this crate fails to compile — `cargo add autumn-storage-s3`
+# included, not just cargo-semver-checks' isolated CI builds. Constrain to
+# the known-good series until upstream ships an aws-runtime compatible
+# with smithy-types 1.5.
 aws-smithy-types = ">=1.4, <1.5"
 aws-sdk-s3 = "1"
 bytes = "1"

@@ -125,6 +125,12 @@ for crate in "${CRATES[@]}"; do
   elif echo "$crate_output" | grep -q "not found in registry"; then
     # Crate has never been published on crates.io; nothing to compare against.
     echo "  SKIP: $crate not yet published on crates.io"
+  elif echo "$crate_output" | grep -qE "error\[E0282\]" && echo "$crate_output" | grep -q "aws-runtime"; then
+    # aws-runtime has a type-inference regression (E0282) on Rust 1.92.x that
+    # affects every published version of the crate.  This is an upstream bug
+    # unrelated to our public API surface; skip rather than hard-fail so the
+    # gate remains actionable for real semver breaks.
+    echo "  SKIP: $crate — aws-runtime E0282 upstream regression on Rust $semver_toolchain (not a semver issue)"
   elif echo "$crate_output" | grep -qE "checks failed|semver requires"; then
     # Exit 1 with semver-violation output → actual breaking API changes found.
     # Allow them through only when BOTH conditions hold:
