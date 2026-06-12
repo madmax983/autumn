@@ -846,7 +846,9 @@ pub(crate) fn apply_session_layer<S: Clone + Send + Sync + 'static>(
     signing_keys: Option<Arc<crate::security::config::ResolvedSigningKeys>>,
 ) -> Result<axum::Router<S>, SessionBackendConfigError> {
     if let Some(store) = custom_store {
-        tracing::debug!("Custom session store installed via with_session_store(); skipping config-driven backend selection");
+        tracing::debug!(
+            "Custom session store installed via with_session_store(); skipping config-driven backend selection"
+        );
         let mut layer = SessionLayer::new(ArcSessionStore(store), config.clone());
         if let Some(keys) = signing_keys {
             layer = layer.with_signing_keys(keys);

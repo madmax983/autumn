@@ -2105,7 +2105,9 @@ fn build_generic_route(
             // Fail closed: if a signing key was configured but could not be resolved
             // (e.g. missing env var), reject instead of silently skipping verification.
             if key_configured && key.is_none() {
-                tracing::error!("inbound_mail.generic: signing key env var not resolved; rejecting request");
+                tracing::error!(
+                    "inbound_mail.generic: signing key env var not resolved; rejecting request"
+                );
                 return StatusCode::INTERNAL_SERVER_ERROR;
             }
             match parse_generic(body, key.as_deref(), &headers) {
