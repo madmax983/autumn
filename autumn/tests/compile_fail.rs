@@ -89,6 +89,8 @@ fn compile_pass_tests() {
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/repository_no_hooks.rs");
     #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/repository_replica_reads.rs");
+    #[cfg(feature = "db")]
     t.pass("tests/compile-pass/repository_with_hooks.rs");
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/repository_hooks_serde_skipped_model.rs");
