@@ -146,6 +146,47 @@ async fn test_app_builds_shards_from_config() {
 }
 
 #[tokio::test]
+async fn sharded_db_resolves_key_from_override_then_attempts_checkout() {
+    let state = sharded_state(&["alpha"]);
+    state.insert_extension(AutumnConfig::default());
+    let mut parts = request_parts("/");
+    parts
+        .extensions
+        .insert(ShardKeyOverride("tenant-1".to_owned()));
+
+    // The override resolves the key, routing succeeds, and the failure is
+    // the checkout against a nonexistent server — not key-resolution
+    // guidance.
+    let rejection = ShardedDb::from_request_parts(&mut parts, &state)
+        .await
+        .err()
+        .expect("checkout should fail without a server");
+    assert!(
+        !rejection.to_string().contains("ShardKeyOverride"),
+        "must get past key resolution: {rejection}"
+    );
+}
+
+#[tokio::test]
+async fn sharded_db_resolves_key_from_tenancy_task_local() {
+    let state = sharded_state(&["alpha"]);
+    state.insert_extension(AutumnConfig::default());
+
+    let rejection = autumn_web::tenancy::with_tenant("tenant-1".to_owned(), async {
+        let mut parts = request_parts("/");
+        ShardedDb::from_request_parts(&mut parts, &state)
+            .await
+            .err()
+            .expect("checkout should fail without a server")
+    })
+    .await;
+    assert!(
+        !rejection.to_string().contains("ShardKeyOverride"),
+        "tenant context must resolve the key: {rejection}"
+    );
+}
+
+#[tokio::test]
 async fn each_shard_collects_results_in_declaration_order() {
     // Checkouts fail (no real database), but each_shard must still return
     // one entry per shard, in declaration order, with the failure captured

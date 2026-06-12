@@ -1290,6 +1290,40 @@ mod tests {
     // ── ShardSet behavior ───────────────────────────────────────────────
 
     #[tokio::test]
+    async fn db_for_and_read_for_attempt_routed_checkouts() {
+        // No server is listening, so both calls must surface checkout
+        // failures (not routing errors) after resolving the shard.
+        let shards = shards_handle(&["alpha"]);
+        let Err(error) = shards.db_for("tenant-1").await else {
+            panic!("checkout must fail without a server");
+        };
+        assert!(!error.to_string().contains("Unknown shard"));
+
+        // Without a replica, reads route to the primary role.
+        let Err(error) = shards.read_for("tenant-1").await else {
+            panic!("checkout must fail without a server");
+        };
+        assert!(!error.to_string().contains("fail_readiness"));
+    }
+
+    #[test]
+    fn parity_recheck_is_throttled_per_window() {
+        let set = shard_set(&["a"]);
+        let runtime = set.get(ShardId(0)).expect("shard").runtime();
+        runtime.configure_migration_check(
+            "postgres://localhost/a".to_owned(),
+            "postgres://localhost/a_ro".to_owned(),
+        );
+        assert!(runtime.migration_check().is_some());
+
+        assert!(runtime.parity_check_due(), "first check claims the window");
+        assert!(
+            !runtime.parity_check_due(),
+            "checks within the window are suppressed"
+        );
+    }
+
+    #[tokio::test]
     async fn route_is_deterministic_and_respects_slot_map() {
         let mut config = sharded_config(&["a", "b"]);
         config.slot_count = 4;
