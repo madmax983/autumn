@@ -139,6 +139,6 @@ async fn each_shard_collects_results_in_declaration_order() {
     for (_, result) in results {
         // No Postgres is listening, so every checkout must surface its
         // own error instead of aborting the whole fan-out.
-        result.err().expect("checkout should fail without a server");
+        result.expect_err("checkout should fail without a server");
     }
 }

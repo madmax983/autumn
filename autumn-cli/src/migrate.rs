@@ -115,7 +115,14 @@ fn resolve_targets(target: &MigrateTarget) -> Vec<(String, String)> {
             vec![(format!("shard:{name}"), url.clone())]
         }
         MigrateTarget::All => {
-            let mut targets = vec![("control".to_owned(), resolve_database_url())];
+            // Shard-only deployments (no control role) are a valid shape:
+            // include the control target only when a control URL resolves.
+            let mut targets = Vec::new();
+            if let Some(control_url) = try_resolve_database_url() {
+                targets.push(("control".to_owned(), control_url));
+            } else if shards.is_empty() {
+                resolve_database_url(); // prints the standard guidance and exits
+            }
             for (name, url) in shards {
                 targets.push((format!("shard:{name}"), url));
             }
@@ -362,6 +369,13 @@ fn check_concurrent_index_transaction_opt_out(
 /// 5. `database.url` from `autumn.toml`
 fn resolve_database_url() -> String {
     resolve_database_url_with_env(|key| std::env::var(key))
+}
+
+/// Like [`resolve_database_url`], but returns `None` instead of exiting
+/// when no control URL is configured (valid for shard-only deployments).
+fn try_resolve_database_url() -> Option<String> {
+    let config_table = read_autumn_toml_table();
+    resolve_primary_database_url_from_sources(|key| std::env::var(key), config_table.as_ref())
 }
 
 fn resolve_database_url_with_env<F>(env_var: F) -> String

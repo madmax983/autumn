@@ -33,7 +33,13 @@ slots = ["32-63"]
 Resharding means moving whole slots: copy a slot's rows to the new
 shard, flip its `slots` entry, deploy. Keys are never rehashed.
 
-## Run it
+## Prerequisites
+
+- Docker and Docker Compose (the stack runs three Postgres containers,
+  two web replicas, nginx, and a one-shot migrator — nothing is needed
+  on the host besides Docker)
+
+## Quick Start
 
 ```bash
 export AUTUMN_SECURITY__SIGNING_SECRET="$(openssl rand -hex 32)"

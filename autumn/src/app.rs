@@ -5031,10 +5031,12 @@ async fn check_shard_replica_migration_parity(
             continue;
         };
         // Remember the URLs so the per-shard health indicator can re-run
-        // the parity comparison on later readiness probes.
+        // the parity comparison on later readiness probes, and claim the
+        // recheck throttle slot for the check that runs right here.
         shard
             .runtime()
             .configure_migration_check(shard_config.primary_url.clone(), replica_url.to_owned());
+        let _ = shard.runtime().parity_check_due();
         let readiness = crate::migrate::check_replica_migration_readiness_blocking(
             shard_config.primary_url.clone(),
             replica_url.to_owned(),
@@ -7444,40 +7446,7 @@ mod tests {
             },
         ];
         let config = AutumnConfig::default();
-        let state = AppState {
-            extensions: std::sync::Arc::new(std::sync::RwLock::new(
-                std::collections::HashMap::new(),
-            )),
-            #[cfg(feature = "db")]
-            pool: None,
-            #[cfg(feature = "db")]
-            replica_pool: None,
-            #[cfg(feature = "db")]
-            shards: None,
-            profile: None,
-            started_at: std::time::Instant::now(),
-            health_detailed: true,
-            probes: crate::probe::ProbeState::ready_for_test(),
-            metrics: crate::middleware::MetricsCollector::new(),
-            log_levels: crate::actuator::LogLevels::new("info"),
-            task_registry: crate::actuator::TaskRegistry::new(),
-            job_registry: crate::actuator::JobRegistry::new(),
-            config_props: crate::actuator::ConfigProperties::default(),
-            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
-            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
-            #[cfg(feature = "ws")]
-            channels: crate::channels::Channels::new(32),
-            #[cfg(feature = "presence")]
-            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
-            #[cfg(feature = "ws")]
-            shutdown: tokio_util::sync::CancellationToken::new(),
-            policy_registry: crate::authorization::PolicyRegistry::default(),
-            forbidden_response: crate::authorization::ForbiddenResponse::default(),
-            auth_session_key: "user_id".to_owned(),
-            shared_cache: None,
-            clock: std::sync::Arc::new(crate::time::SystemClock),
-        };
-        let router = crate::router::build_router(route_list, &config, state);
+        let router = crate::router::build_router(route_list, &config, AppState::for_test());
 
         // GET /admin should return "list"
         let resp = router

@@ -226,7 +226,19 @@ pub(crate) struct ShardRuntime {
     /// check from the per-shard health indicator. `None` when the app
     /// registered no migrations.
     migration_check: std::sync::RwLock<Option<(String, String)>>,
+    /// When the parity comparison last ran, for throttling: unlike the
+    /// pooled connectivity check, parity opens fresh synchronous
+    /// connections to both roles, so it must not run on every probe.
+    parity_checked_at: std::sync::Mutex<Option<std::time::Instant>>,
 }
+
+/// Minimum interval between migration parity re-checks per shard.
+///
+/// Readiness probes fire every few seconds per replica; the parity check
+/// opens fresh synchronous connections to the shard's primary *and*
+/// replica, so running it per probe per shard would exhaust Postgres
+/// connection limits as shard counts grow.
+const PARITY_RECHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 // Mutators are driven by startup migration parity checks and the
 // per-shard health indicators; some are exercised only by tests until
@@ -243,6 +255,7 @@ impl ShardRuntime {
                 replica_configured.then(|| "replica has not passed a readiness check".to_owned()),
             ),
             migration_check: std::sync::RwLock::new(None),
+            parity_checked_at: std::sync::Mutex::new(None),
         }
     }
 
@@ -258,6 +271,21 @@ impl ShardRuntime {
             .read()
             .expect("shard runtime lock poisoned")
             .clone()
+    }
+
+    /// Whether the throttle window has elapsed; claims the slot when it
+    /// has, so concurrent probes run at most one parity check per window.
+    pub(crate) fn parity_check_due(&self) -> bool {
+        let mut checked_at = self
+            .parity_checked_at
+            .lock()
+            .expect("shard runtime lock poisoned");
+        if checked_at.is_none_or(|at| at.elapsed() >= PARITY_RECHECK_INTERVAL) {
+            *checked_at = Some(std::time::Instant::now());
+            true
+        } else {
+            false
+        }
     }
 
     fn replica_ready(&self) -> bool {
@@ -662,11 +690,16 @@ impl ShardHealthIndicator {
         let Some(replica_pool) = self.shard.replica_pool() else {
             return;
         };
+        // Connectivity goes through the deadpool pool (cheap, reused
+        // connections) and runs on every probe; the parity comparison
+        // opens fresh connections to both roles and is throttled.
         match replica_pool.get().await {
             Ok(conn) => {
                 drop(conn);
                 self.shard.runtime().mark_replica_connection_ready();
-                if let Some((primary_url, replica_url)) = self.shard.runtime().migration_check() {
+                if self.shard.runtime().parity_check_due()
+                    && let Some((primary_url, replica_url)) = self.shard.runtime().migration_check()
+                {
                     let readiness = crate::migrate::check_replica_migration_readiness_blocking(
                         primary_url,
                         replica_url,
@@ -908,20 +941,34 @@ impl Shards {
         Fut: std::future::Future<Output = Result<T, AutumnError>> + Send,
         F: Fn(&Shard, crate::db::Db) -> Fut + Send + Sync,
     {
-        // Chunked join_all rather than stream buffering: a named async fn
-        // per shard keeps the future properly higher-ranked over the shard
-        // borrow (closures returning async blocks trip rustc #89976 when
-        // the handler future is checked for Send).
-        let shards: Vec<&Shard> = self.set.iter().collect();
-        let mut results = Vec::with_capacity(shards.len());
-        for chunk in shards.chunks(FAN_OUT_CONCURRENCY) {
-            let mut batch = Vec::with_capacity(chunk.len());
-            for shard in chunk {
-                batch.push(self.run_on_shard(shard, &f));
+        // FuturesUnordered keeps the pipeline full at FAN_OUT_CONCURRENCY
+        // (no head-of-line blocking on a slow shard); results are placed
+        // by ShardId so declaration order is preserved. Futures come from
+        // a named async fn rather than a closure returning an async block,
+        // which would trip rustc #89976 when the handler future is checked
+        // for Send.
+        use futures::StreamExt as _;
+
+        let mut results: Vec<Option<(ShardId, Result<T, AutumnError>)>> =
+            std::iter::repeat_with(|| None)
+                .take(self.set.len())
+                .collect();
+        let mut in_flight: futures::stream::FuturesUnordered<
+            futures::future::BoxFuture<'_, (ShardId, Result<T, AutumnError>)>,
+        > = futures::stream::FuturesUnordered::new();
+
+        for shard in self.set.iter() {
+            if in_flight.len() >= FAN_OUT_CONCURRENCY
+                && let Some((id, result)) = in_flight.next().await
+            {
+                results[id.0] = Some((id, result));
             }
-            results.extend(futures::future::join_all(batch).await);
+            in_flight.push(Box::pin(self.run_on_shard(shard, &f)));
         }
-        results
+        while let Some((id, result)) = in_flight.next().await {
+            results[id.0] = Some((id, result));
+        }
+        results.into_iter().flatten().collect()
     }
 
     async fn run_on_shard<T, Fut, F>(
@@ -1079,7 +1126,7 @@ impl axum::extract::FromRequestParts<crate::AppState> for ShardedDb {
         let shards = Shards::from_request_parts(parts, state).await?;
         let key = resolve_shard_key(parts, state).await?;
 
-        let shard = shards.set.route(key.as_str()).await?;
+        let shard = shards.set.route(&key).await?;
         let shard_name = Arc::clone(&shard.name);
         let shard_id = shard.id();
         let db = shards.checkout_primary(shard).await?;
