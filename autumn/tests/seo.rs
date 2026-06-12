@@ -131,23 +131,25 @@ fn sitemap_xml_escapes_special_chars_in_url() {
 }
 
 #[test]
-fn sitemap_xml_generates_sitemapindex_for_large_sites() {
-    // Generate more than 50,000 entries to trigger sitemapindex
+fn sitemap_xml_caps_at_50k_entries_for_large_sites() {
+    // sitemap_xml caps at 50,000 entries and emits a tracing::warn rather than
+    // generating a sitemapindex. Use a custom /sitemap.xml handler for that.
     let entries: Vec<SitemapEntry> = (0..50_001)
         .map(|i| SitemapEntry::new(format!("https://example.com/page/{i}")))
         .collect();
     let xml = sitemap_xml(&entries, Some("https://example.com"));
     assert!(
-        xml.contains("<sitemapindex"),
-        "should use sitemapindex for large sites"
+        xml.contains("<urlset"),
+        "large sitemaps should be returned as a capped <urlset>"
     );
     assert!(
-        xml.contains("<sitemap>"),
-        "should have sitemap entries in index"
+        !xml.contains("<sitemapindex"),
+        "sitemapindex is not generated automatically; use a custom handler"
     );
-    assert!(
-        xml.contains("https://example.com/sitemap-1.xml"),
-        "should reference sub-sitemaps"
+    assert_eq!(
+        xml.matches("<url>").count(),
+        50_000,
+        "should include exactly 50,000 entries (first 50k, extras silently dropped)"
     );
 }
 
